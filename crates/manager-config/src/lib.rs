@@ -51,6 +51,10 @@ pub struct AppConfig {
     /// Per-component pin / auto-update toggles.
     pub updates: UpdatePolicy,
     pub notifications: NotificationConfig,
+    /// Set when the user finishes the setup wizard; the UI opens the wizard
+    /// on launch until this is true.
+    #[serde(default)]
+    pub setup_completed: bool,
 }
 
 /// Presenter mode for a data window (spec §4 hybrid view matrix).
@@ -338,6 +342,7 @@ impl AppConfig {
                 components: HashMap::new(),
             },
             notifications: NotificationConfig { enabled: true },
+            setup_completed: false,
         }
     }
 }
@@ -792,13 +797,25 @@ mod tests {
         assert_eq!(cfg.version, CURRENT_VERSION);
         assert_eq!(cfg.gateway.port, 4000);
         assert_eq!(cfg.gateway.groups.len(), 4);
+        assert!(!cfg.setup_completed, "fresh installs must run the wizard");
         let json = serde_json::to_string(&cfg).expect("serialize");
         let back: AppConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.version, CURRENT_VERSION);
+        assert!(!back.setup_completed);
         assert_eq!(
             back.gateway.groups[0].strategy,
             RoutingStrategy::LatencyBased
         );
+    }
+
+    #[test]
+    fn setup_completed_defaults_false_for_old_configs() {
+        // Configs written before the flag existed must still parse.
+        let cfg = AppConfig::default_config();
+        let mut v = serde_json::to_value(&cfg).expect("serialize");
+        v.as_object_mut().expect("object").remove("setup_completed");
+        let back: AppConfig = serde_json::from_value(v).expect("deserialize");
+        assert!(!back.setup_completed);
     }
 
     #[test]

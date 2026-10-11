@@ -123,6 +123,24 @@ export async function getWizardSteps(): Promise<CallResult<WizardStepState[]>> {
   return { data: mockWizardSteps(), live: false };
 }
 
+/** setup_status — whether the setup wizard has been completed. */
+export async function getSetupStatus(): Promise<CallResult<{ setup_completed: boolean }>> {
+  if (!isTauri()) return { data: { setup_completed: true }, live: false };
+  try {
+    const data = await invoke<{ setup_completed: boolean }>("setup_status");
+    return { data, live: true };
+  } catch (e) { return { data: { setup_completed: true }, live: false, error: String(e) }; }
+}
+
+/** setup_mark_complete — mark the setup wizard complete (persisted). */
+export async function markSetupComplete(): Promise<CallResult<{ ok: boolean; persisted: boolean }>> {
+  if (!isTauri()) return { data: { ok: true, persisted: false }, live: false };
+  try {
+    const data = await invoke<{ ok: boolean; persisted: boolean }>("setup_mark_complete");
+    return { data, live: true };
+  } catch (e) { return { data: { ok: false, persisted: false }, live: false, error: String(e) }; }
+}
+
 /** setup_step_help_url — help URL a wizard step offers (e.g. driver download page). */
 export async function getStepHelpUrl(stepId: string): Promise<CallResult<{ url: string | null; step_id: string }>> {
   if (!isTauri()) return { data: { url: null, step_id: stepId }, live: false };

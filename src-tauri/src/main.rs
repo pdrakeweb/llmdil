@@ -952,12 +952,30 @@ async fn setup_get_commands(state: State<'_, AppState>, step_id: String) -> ApiR
     Ok(serde_json::to_value(&commands).map_err(jerr)?)
 }
 
+/// Whether the user has finished the setup wizard. The UI opens the wizard
+/// on launch until this is true.
+#[tauri::command]
+async fn setup_status(state: State<'_, AppState>) -> ApiResult {
+    let cfg = state.config.read().await;
+    Ok(json!({ "setup_completed": cfg.setup_completed }))
+}
+
+/// Mark the setup wizard complete and persist the flag.
+#[tauri::command]
+async fn setup_mark_complete(state: State<'_, AppState>) -> ApiResult {
+    let mut cfg = state.config.write().await;
+    cfg.setup_completed = true;
+    match manager_config::save(&cfg, &state.config_path) {
+        Ok(()) => Ok(json!({ "ok": true, "persisted": true })),
+        Err(e) => Ok(json!({ "ok": true, "persisted": false, "error": e.to_string() })),
+    }
+}
+
 /// Help URL a wizard step offers alongside its remediation hint
 /// (e.g. the NVIDIA driver download page on the hardware-detect step).
 /// Returns `{"url": string|null, "step_id": string}`.
 #[tauri::command]
-async fn setup_step_help_url(state: State<'_, AppState>, step_id: String) -> ApiResult {
-    let wizard = state.wizard(RunMode::Install).await;
+async fn setup_step_help_url(state: State<'_, AppState>, step_id: String) -> ApiResult {    let wizard = state.wizard(RunMode::Install).await;
     let url = wizard.lock().await.help_url(&step_id).map(String::from);
     Ok(json!({ "url": url, "step_id": step_id }))
 }
@@ -1978,6 +1996,8 @@ fn main() {
             setup_skip_step,
             setup_get_commands,
             setup_mark_manual,
+            setup_status,
+            setup_mark_complete,
             setup_step_help_url,
             open_url,
             // Models

@@ -7,7 +7,7 @@ import { mockBackends, mockDashboard, mockGpus, mockWizardSteps, GPU_COLORS } fr
 import { gaugeRing, meter, multiLine, sparkline, stackedBar, walk } from "../charts";
 import { icon } from "../icons";
 import { esc } from "../html";
-import { runWizardStep, isTauri, openUrl } from "../api";
+import { runWizardStep, isTauri, openUrl, markSetupComplete } from "../api";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
 
@@ -264,7 +264,13 @@ export function wireWizard(root: HTMLElement): void {
       alert(`Audit accepted: ${r.data.task_id}`);
     } catch (e) { alert(`run_wizard_step failed: ${String(e)}`); }
   });
-  root.querySelector("#finishBtn")?.addEventListener("click", () => { location.hash = "#/dashboard"; });
+  root.querySelector("#finishBtn")?.addEventListener("click", async () => {
+    if (isTauri()) {
+      const r = await markSetupComplete();
+      if (r.error) { alert(`Could not mark setup complete: ${r.error}`); return; }
+    }
+    location.hash = "#/dashboard";
+  });
   root.addEventListener("click", async (ev) => {
     const btn = (ev.target as HTMLElement).closest("[data-help-url]") as HTMLElement | null;
     if (!btn) return;

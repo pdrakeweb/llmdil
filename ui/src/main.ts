@@ -3,7 +3,7 @@
    framework can replace this file later without changing command contracts. */
 
 import "./styles.css";
-import { getStatus, isTauri, listBackends } from "./api";
+import { getStatus, isTauri, listBackends, getSetupStatus } from "./api";
 import { esc } from "./html";
 import { icon, type IconName } from "./icons";
 import { mountDashboard } from "./views/dashboard";
@@ -128,12 +128,19 @@ async function render(): Promise<void> {
   void renderSideFoot();
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const app = document.getElementById("app");
   if (!app) return;
   app.innerHTML = shell();
   window.addEventListener("hashchange", () => void render());
+  // First launch: open the setup wizard until it is marked complete.
+  if (isTauri() && !location.hash) {
+    try {
+      const s = await getSetupStatus();
+      if (s.live && !s.data.setup_completed) location.hash = "#/wizard";
+    } catch { /* fall through to default route */ }
+  }
   void render();
 }
 
-main();
+void main();
