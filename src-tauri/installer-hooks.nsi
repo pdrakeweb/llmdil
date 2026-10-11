@@ -24,7 +24,9 @@
 ; %APPDATA%\local-llm-service-manager (config.json, logs, downloaded GGUF
 ; models, managed Python env) is KEPT BY DEFAULT and deleted only when the
 ; user explicitly answers "Yes". The prompt defaults to "No" (MB_DEFBUTTON2).
+; In silent uninstalls (/S) the prompt is skipped and data is kept.
 !macro NSIS_HOOK_PREUNINSTALL
+  IfSilent +5
   IfFileExists "$APPDATA\local-llm-service-manager\*.*" 0 +4
   MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "Remove user data (configuration, logs, downloaded models) in %APPDATA%\local-llm-service-manager?$\n$\nSelect No (recommended) to keep your data for a future reinstall." IDYES +2
   Goto +2
@@ -32,7 +34,10 @@
 !macroend
 
 ; --- Install finish: offer to launch ------------------------------------------
+; Skipped entirely in silent installs (/S): there is no user to answer the
+; prompt, and a headless install must never block on a MessageBox.
 !macro NSIS_HOOK_POSTINSTALL
+  IfSilent +3
   MessageBox MB_YESNO|MB_ICONQUESTION "Launch Local LLM Service Manager now?" IDNO +2
   Exec '"$INSTDIR\local-llm-service-manager.exe"'
 !macroend
