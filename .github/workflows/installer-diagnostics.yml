@@ -1,0 +1,44 @@
+name: Installer diagnostics
+
+# Manual diagnostic: downloads the published installer and runs it with
+# detailed polling to find where a silent install hangs. No rebuild.
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Download installer from release
+        run: gh release download v0.1.0 --repo pdrakeweb/local-llm-service-manager --pattern "*-setup.exe" --dir installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Probe silent install
+        run: |
+          $exe = Get-ChildItem installer\*-setup.exe | Select-Object -First 1
+          Unblock-File -Path $exe.FullName
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList "/S" -PassThru
+          Write-Host "installer pid: $($p.Id)"
+          $deadline = (Get-Date).AddMinutes(3)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            $p.Refresh()
+            $alive = -not $p.HasExited
+            $dirExists = Test-Path "$env:LOCALAPPDATA\Local LLM Service Manager"
+            $wins = @(Get-Process | Where-Object { $_.Id -eq $p.Id -and $_.MainWindowTitle } | Select-Object -ExpandProperty MainWindowTitle)
+            $appRunning = @(Get-Process | Where-Object { $_.ProcessName -like "*local-llm*" } | Select-Object ProcessName, Id)
+            Write-Host "t=$((Get-Date).ToString('HH:mm:ss')) installerAlive=$alive installDir=$dirExists windows=[$($wins -join ';')] appProcs=[$($appRunning | ForEach-Object { "$($_.ProcessName):$($_.Id)" } | Join-String -Separator ',')]"
+            if (-not $alive) { break }
+          }
+          $p.Refresh()
+          if (-not $p.HasExited) {
+            Write-Host "INSTALLER STILL ALIVE after 3 min - dumping child/window info"
+            Get-Process | Where-Object { $_.MainWindowTitle } | Select-Object ProcessName, MainWindowTitle | Format-Table | Out-String | Write-Host
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            throw "installer hung"
+          }
+          Write-Host "installer exited with code $($p.ExitCode)"
