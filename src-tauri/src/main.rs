@@ -952,6 +952,42 @@ async fn setup_get_commands(state: State<'_, AppState>, step_id: String) -> ApiR
     Ok(serde_json::to_value(&commands).map_err(jerr)?)
 }
 
+/// Help URL a wizard step offers alongside its remediation hint
+/// (e.g. the NVIDIA driver download page on the hardware-detect step).
+/// Returns `{"url": string|null, "step_id": string}`.
+#[tauri::command]
+async fn setup_step_help_url(state: State<'_, AppState>, step_id: String) -> ApiResult {
+    let wizard = state.wizard(RunMode::Install).await;
+    let url = wizard.lock().await.help_url(&step_id).map(String::from);
+    Ok(json!({ "url": url, "step_id": step_id }))
+}
+
+/// Open an external URL in the system browser. Only http/https URLs are
+/// accepted; anything else is rejected before spawning.
+#[tauri::command]
+async fn open_url(url: String) -> ApiResult {
+    let ok = url.starts_with("http://") || url.starts_with("https://");
+    if !ok {
+        return Err(err(ApiError::InvalidInput(
+            "open_url accepts http/https URLs only".to_string(),
+        )));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .spawn()
+            .map_err(|e| err(ApiError::Internal(format!("failed to open URL: {e}"))))?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Err(err(ApiError::Unsupported(
+            "open_url is only supported on Windows".to_string(),
+        )));
+    }
+    Ok(json!({ "ok": true }))
+}
+
 /// Mark a step as manually completed by the user.
 #[tauri::command]
 async fn setup_mark_manual(
@@ -1942,6 +1978,8 @@ fn main() {
             setup_skip_step,
             setup_get_commands,
             setup_mark_manual,
+            setup_step_help_url,
+            open_url,
             // Models
             list_models,
             download_model,

@@ -122,3 +122,21 @@ export async function runWizardStep(stepId: string): Promise<CallResult<{ task_i
 export async function getWizardSteps(): Promise<CallResult<WizardStepState[]>> {
   return { data: mockWizardSteps(), live: false };
 }
+
+/** setup_step_help_url — help URL a wizard step offers (e.g. driver download page). */
+export async function getStepHelpUrl(stepId: string): Promise<CallResult<{ url: string | null; step_id: string }>> {
+  if (!isTauri()) return { data: { url: null, step_id: stepId }, live: false };
+  try {
+    const data = await invoke<{ url: string | null; step_id: string }>("setup_step_help_url", { stepId });
+    return { data, live: true };
+  } catch (e) { return { data: { url: null, step_id: stepId }, live: false, error: String(e) }; }
+}
+
+/** open_url — open an external URL in the system browser (http/https only). */
+export async function openUrl(url: string): Promise<CallResult<{ ok: boolean }>> {
+  if (!isTauri()) { window.open(url, "_blank", "noopener"); return { data: { ok: true }, live: false }; }
+  try {
+    const data = await invoke<{ ok: boolean }>("open_url", { url });
+    return { data, live: true };
+  } catch (e) { return { data: { ok: false }, live: false, error: String(e) }; }
+}

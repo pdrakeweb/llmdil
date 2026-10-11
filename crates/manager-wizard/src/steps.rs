@@ -115,7 +115,10 @@ impl WizardStep for DetectHardware {
         ]
     }
     fn remediation_hint(&self) -> Option<&str> {
-        Some("install a current NVIDIA driver (R550+, i.e. 551.61+) and re-run the hardware check")
+        Some("install a current NVIDIA driver (R550+, i.e. 551.61+) and re-run the hardware check — download: https://www.nvidia.com/Download/index.aspx")
+    }
+    fn help_url(&self) -> Option<&str> {
+        Some(crate::NVIDIA_DRIVER_DOWNLOAD_URL)
     }
     async fn run(&self, ctx: &WizardContext) -> Result<StepOutcome, WizardError> {
         let gpus = match ctx.ops.gpu_inventory().await {
@@ -1769,6 +1772,17 @@ mod tests {
         let out = DetectHardware.run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Failed);
         assert!(out.message.contains("no NVIDIA GPUs"));
+    }
+
+    #[test]
+    fn detect_hardware_offers_driver_download_url() {
+        assert_eq!(
+            DetectHardware.help_url(),
+            Some(crate::NVIDIA_DRIVER_DOWNLOAD_URL)
+        );
+        assert!(crate::NVIDIA_DRIVER_DOWNLOAD_URL.starts_with("https://"));
+        let hint = DetectHardware.remediation_hint().unwrap();
+        assert!(hint.contains(crate::NVIDIA_DRIVER_DOWNLOAD_URL));
     }
 
     #[tokio::test]

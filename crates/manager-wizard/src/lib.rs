@@ -32,6 +32,11 @@ pub const LOG_TAIL_LINES: usize = 20;
 /// R550+ branches also carry the P100.
 pub const MIN_DRIVER_MAJOR: u32 = 550;
 
+/// Stable entry point for manual NVIDIA driver downloads (driver search;
+/// per-GPU prefilled deep links are not stable, so the wizard links the
+/// search page and states the required branch in text).
+pub const NVIDIA_DRIVER_DOWNLOAD_URL: &str = "https://www.nvidia.com/Download/index.aspx";
+
 /// Lifecycle state of one wizard step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -173,6 +178,11 @@ pub trait WizardStep: Send + Sync {
     /// Human-readable remediation offered (not forced) when this step fails
     /// in audit mode, e.g. "model checksum mismatch → re-download?".
     fn remediation_hint(&self) -> Option<&str> {
+        None
+    }
+    /// Optional help URL surfaced alongside the remediation hint (e.g. a
+    /// driver download page). Rendered as a button by the UI.
+    fn help_url(&self) -> Option<&str> {
         None
     }
     async fn run(&self, ctx: &WizardContext) -> Result<StepOutcome, WizardError>;
@@ -402,6 +412,11 @@ impl Wizard {
     /// failure).
     pub fn remediation_hint(&self, id: &str) -> Option<&str> {
         self.find(id)?.remediation_hint()
+    }
+
+    /// Help URL for a step, if the step offers one.
+    pub fn help_url(&self, id: &str) -> Option<&str> {
+        self.find(id)?.help_url()
     }
 
     fn find(&self, id: &str) -> Option<&dyn WizardStep> {

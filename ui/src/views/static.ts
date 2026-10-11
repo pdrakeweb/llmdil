@@ -7,7 +7,7 @@ import { mockBackends, mockDashboard, mockGpus, mockWizardSteps, GPU_COLORS } fr
 import { gaugeRing, meter, multiLine, sparkline, stackedBar, walk } from "../charts";
 import { icon } from "../icons";
 import { esc } from "../html";
-import { runWizardStep, isTauri } from "../api";
+import { runWizardStep, isTauri, openUrl } from "../api";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
 
@@ -222,8 +222,10 @@ export function renderWizard(): string {
       : s.state === "failed" ? `<span style="color:var(--err)">${icon("err")}</span>`
       : `<span style="color:var(--text3)">○</span>`;
     const stateTxt = s.state === "done" ? `done · ${esc(s.duration ?? "")}` : s.state === "running" ? esc(s.note ?? "running…") : esc(s.state);
+    const helpBtn = s.state === "failed" && s.helpUrl
+      ? `<div style="margin-top:6px"><button class="btn" data-help-url="${esc(s.helpUrl)}">Open driver download</button></div>` : "";
     return `<div class="step ${s.state}">${stIcon}${icon("wrench")}
-      <div><div class="sname">${esc(s.name)}</div><div class="sdetail">${esc(s.detail)}</div></div>
+      <div><div class="sname">${esc(s.name)}</div><div class="sdetail">${esc(s.detail)}</div>${helpBtn}</div>
       <div class="sstate">${s.note && s.state === "done" ? `<span class="chip badge-warn">${esc(s.note)}</span> ` : ""}${stateTxt}</div></div>`;
   }).join("");
   return `<div class="topbar"><h1>Setup</h1><span class="spacer"></span><a class="btn" href="#/dashboard">Back to dashboard</a></div>
@@ -263,6 +265,15 @@ export function wireWizard(root: HTMLElement): void {
     } catch (e) { alert(`run_wizard_step failed: ${String(e)}`); }
   });
   root.querySelector("#finishBtn")?.addEventListener("click", () => { location.hash = "#/dashboard"; });
+  root.addEventListener("click", async (ev) => {
+    const btn = (ev.target as HTMLElement).closest("[data-help-url]") as HTMLElement | null;
+    if (!btn) return;
+    const url = btn.getAttribute("data-help-url") ?? "";
+    btn.setAttribute("disabled", "");
+    const r = await openUrl(url);
+    btn.removeAttribute("disabled");
+    if (r.error) alert(`Could not open the download page: ${r.error}`);
+  });
 }
 
 /* ---------------- Throughput chart data for dashboard (shared) ---------------- */
