@@ -32,7 +32,7 @@ impl FakeCommandBehavior {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct FakeState {
     commands: HashMap<String, FakeCommandBehavior>,
     executed: Vec<Vec<String>>,
@@ -50,6 +50,35 @@ struct FakeState {
     gpu_error: Option<String>,
     credentials: HashSet<String>,
     home: Option<PathBuf>,
+    free_space: u64,
+    head_lengths: HashMap<String, u64>,
+}
+
+impl Default for FakeState {
+    fn default() -> Self {
+        Self {
+            commands: HashMap::new(),
+            executed: Vec::new(),
+            spawns: Vec::new(),
+            files: HashMap::new(),
+            downloads: HashMap::new(),
+            progress_calls: Vec::new(),
+            downloaded_to: Vec::new(),
+            extracted: Vec::new(),
+            http_get: HashMap::new(),
+            http_post: HashMap::new(),
+            posts: Vec::new(),
+            gets: Vec::new(),
+            gpus: Vec::new(),
+            gpu_error: None,
+            credentials: HashSet::new(),
+            home: None,
+            // Default: effectively unlimited, so existing tests never trip
+            // the disk-space pre-check.
+            free_space: u64::MAX,
+            head_lengths: HashMap::new(),
+        }
+    }
 }
 
 fn key(argv: &[String]) -> String {
@@ -163,6 +192,22 @@ impl FakeSystemOps {
         self
     }
 
+    /// Script the free space reported by `free_space_bytes`.
+    pub fn with_free_space(&self, bytes: u64) -> &Self {
+        self.state.lock().unwrap().free_space = bytes;
+        self
+    }
+
+    /// Script the Content-Length reported by `http_head_content_length`.
+    pub fn with_head_length(&self, url: &str, bytes: u64) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .head_lengths
+            .insert(url.to_string(), bytes);
+        self
+    }
+
     /// Every argv passed to `run_command`, in order.
     pub fn executed_commands(&self) -> Vec<Vec<String>> {
         self.state.lock().unwrap().executed.clone()
@@ -196,6 +241,11 @@ impl FakeSystemOps {
     /// Current fake file contents.
     pub fn file_bytes(&self, path: &PathBuf) -> Option<Vec<u8>> {
         self.state.lock().unwrap().files.get(path).cloned()
+    }
+
+    /// Every (url, dest) passed to `download`, in order.
+    pub fn downloaded_to(&self) -> Vec<(String, PathBuf)> {
+        self.state.lock().unwrap().downloaded_to.clone()
     }
 
     pub fn ok_output(stdout: &str) -> CommandOutput {
@@ -292,6 +342,14 @@ impl SystemOps for FakeSystemOps {
                 url: url.to_string(),
                 reason: "no scripted POST response for this URL".to_string(),
             })
+    }
+
+    async fn http_head_content_length(&self, url: &str) -> Result<Option<u64>, WizardError> {
+        Ok(self.state.lock().unwrap().head_lengths.get(url).copied())
+    }
+
+    async fn free_space_bytes(&self, _path: &Path) -> Result<u64, WizardError> {
+        Ok(self.state.lock().unwrap().free_space)
     }
 
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>, WizardError> {

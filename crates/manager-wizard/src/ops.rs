@@ -282,6 +282,80 @@ impl SystemOps for RealSystemOps {
         })
     }
 
+    async fn http_head_content_length(&self, url: &str) -> Result<Option<u64>, WizardError> {
+        let client = reqwest::Client::builder()
+            .timeout(HTTP_GET_TIMEOUT)
+            .build()
+            .map_err(|e| WizardError::HttpError {
+                url: url.to_string(),
+                reason: format!("client build failed: {e}"),
+            })?;
+        let resp = client
+            .head(url)
+            .send()
+            .await
+            .map_err(|e| WizardError::HttpError {
+                url: url.to_string(),
+                reason: e.to_string(),
+            })?;
+        Ok(resp.content_length())
+    }
+
+    async fn free_space_bytes(&self, path: &Path) -> Result<u64, WizardError> {
+        // Shell out rather than linking winapi: the wizard already spawns
+        // subprocesses for every other probe, and this keeps the dep tree
+        // unchanged.
+        #[cfg(target_os = "windows")]
+        let probe = PlannedCommand::new(vec![
+            "powershell".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            format!(
+                "(Get-Item '{}').PSDrive.Free",
+                path.display().to_string().replace('\'', "''")
+            ),
+        ]);
+        #[cfg(not(target_os = "windows"))]
+        let probe = PlannedCommand::new(vec![
+            "df".to_string(),
+            "-k".to_string(),
+            "--output=avail".to_string(),
+            path.display().to_string(),
+        ]);
+        let out = self.run_command(&probe).await?;
+        if !out.success() {
+            return Err(WizardError::CommandFailed {
+                argv: probe.argv.clone(),
+                code: out.exit_code,
+                stderr: out.stderr.clone(),
+            });
+        }
+        #[cfg(target_os = "windows")]
+        let bytes = out
+            .stdout
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| WizardError::CommandFailed {
+                argv: probe.argv.clone(),
+                code: out.exit_code,
+                stderr: format!("could not parse free-space output {:?}: {e}", out.stdout),
+            })?;
+        #[cfg(not(target_os = "windows"))]
+        let bytes = out
+            .stdout
+            .lines()
+            .last()
+            .and_then(|l| l.trim().parse::<u64>().ok())
+            .map(|kb| kb * 1024)
+            .ok_or_else(|| WizardError::CommandFailed {
+                argv: probe.argv.clone(),
+                code: out.exit_code,
+                stderr: format!("could not parse df output {:?}", out.stdout),
+            })?;
+        Ok(bytes)
+    }
+
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>, WizardError> {
         tokio::fs::read(path)
             .await

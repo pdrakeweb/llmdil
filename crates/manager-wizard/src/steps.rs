@@ -231,6 +231,21 @@ impl InstallLlamaCpp {
         ctx.data_dir.join("llamacpp")
     }
 
+    /// The MSVC-built llama.cpp CUDA binaries need the VC++ runtime.
+    /// Probe: vcruntime140.dll loadable from System32. Windows-only;
+    /// other platforms always pass.
+    fn vcredist_present(system32: &std::path::Path) -> bool {
+        if !cfg!(target_os = "windows") {
+            return true;
+        }
+        system32.join("vcruntime140.dll").exists()
+    }
+
+    fn system32_dir() -> PathBuf {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        PathBuf::from(root).join("System32")
+    }
+
     fn download_command(&self, ctx: &WizardContext) -> Option<PlannedCommand> {
         let pin = self.pin.as_ref()?;
         let dest = self.install_dir(ctx).join(&pin.asset);
@@ -260,7 +275,10 @@ impl WizardStep for InstallLlamaCpp {
         self.download_command(ctx).into_iter().collect()
     }
     fn remediation_hint(&self) -> Option<&str> {
-        Some("re-run install-llamacpp to re-download and re-verify the build")
+        Some("re-run install-llamacpp to re-download and re-verify the build; if llama-server fails to start, install the VC++ redistributable first")
+    }
+    fn help_url(&self) -> Option<&str> {
+        Some(crate::VC_REDIST_DOWNLOAD_URL)
     }
     async fn run(&self, ctx: &WizardContext) -> Result<StepOutcome, WizardError> {
         let pin = match &self.pin {
@@ -275,6 +293,20 @@ impl WizardStep for InstallLlamaCpp {
                 ))
             }
         };
+        // VC++ runtime check before any download: the MSVC-built CUDA
+        // binaries fail to start without it, with a cryptic DLL error.
+        if ctx.mode == RunMode::Install && !Self::vcredist_present(&Self::system32_dir()) {
+            return Ok(StepOutcome::failed(
+                "VC++ redistributable not detected (vcruntime140.dll missing from System32)",
+                vec![
+                    "the llama.cpp CUDA build needs the Visual C++ runtime".to_string(),
+                    format!(
+                        "download and install it, then re-run this step: {}",
+                        crate::VC_REDIST_DOWNLOAD_URL
+                    ),
+                ],
+            ));
+        }
         // Pascal rule, checked before any download.
         let gpus = ctx.ops.gpu_inventory().await.unwrap_or_default();
         if let Err(e) = pin.validate_for_gpus(&gpus) {
@@ -633,6 +665,11 @@ impl WizardStep for DownloadModels {
         }
         let mut log = Vec::new();
         let mut verified = 0;
+        if ctx.mode == RunMode::Install {
+            if let Err(outcome) = self.check_disk_space(ctx, &mut log).await {
+                return Ok(outcome);
+            }
+        }
         for model in &ctx.config.models {
             let dest = resolve_dest(&ctx.data_dir, &model.gguf_path);
             if model.source_url.is_empty() {
@@ -723,6 +760,82 @@ impl WizardStep for DownloadModels {
     }
 }
 
+impl DownloadModels {
+    /// Fail when the models still needing download exceed the free space on
+    /// the data volume (10% headroom). Sizes come from HEAD Content-Length;
+    /// models whose size cannot be determined are logged, not counted. A
+    /// failed free-space probe warns instead of blocking.
+    async fn check_disk_space(
+        &self,
+        ctx: &WizardContext,
+        log: &mut Vec<String>,
+    ) -> Result<(), StepOutcome> {
+        let mut known: u64 = 0;
+        let mut unknown: u32 = 0;
+        for model in &ctx.config.models {
+            if model.source_url.is_empty() {
+                continue; // the per-model loop reports this properly
+            }
+            let dest = resolve_dest(&ctx.data_dir, &model.gguf_path);
+            let needs_download = if ctx.ops.file_exists(&dest).await {
+                !matches!(ctx.ops.sha256_file(&dest).await, Ok(h) if checksums_match(&h, &model.sha256))
+            } else {
+                true
+            };
+            if !needs_download {
+                continue;
+            }
+            match ctx.ops.http_head_content_length(&model.source_url).await {
+                Ok(Some(n)) => {
+                    known = known.saturating_add(n);
+                    log.push(format!("{}: download size ~{n} bytes", model.id));
+                }
+                _ => {
+                    unknown += 1;
+                    log.push(format!(
+                        "{}: size unknown, excluded from space check",
+                        model.id
+                    ));
+                }
+            }
+        }
+        if known == 0 {
+            log.push(format!(
+                "disk-space pre-check skipped: no download sizes known ({unknown} model(s) with unknown size)"
+            ));
+            return Ok(());
+        }
+        let free = match ctx.ops.free_space_bytes(&ctx.data_dir).await {
+            Ok(f) => f,
+            Err(e) => {
+                log.push(format!(
+                    "free-space probe failed ({e}); skipping space check"
+                ));
+                return Ok(());
+            }
+        };
+        let needed = known + known / 10; // 10% headroom for temp files
+        log.push(format!(
+            "space check: need ~{needed} bytes, {free} bytes free on {}",
+            ctx.data_dir.display()
+        ));
+        if free < needed {
+            return Err(StepOutcome::failed(
+                format!(
+                    "insufficient disk space: need ~{:.1} GB for model downloads, have {:.1} GB free on {}",
+                    needed as f64 / 1e9,
+                    free as f64 / 1e9,
+                    ctx.data_dir.display()
+                ),
+                vec![
+                    "free up disk space or point data_dir at a larger volume, then re-run".to_string(),
+                ],
+            ));
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 5. Start LiteLLM gateway
 // ---------------------------------------------------------------------------
@@ -746,6 +859,98 @@ impl Default for StartGateway {
 impl StartGateway {
     fn venv_dir(&self, ctx: &WizardContext) -> PathBuf {
         ctx.data_dir.join("python").join("venv")
+    }
+
+    /// Directory holding the bootstrapped uv binary.
+    fn uv_bin_dir(ctx: &WizardContext) -> PathBuf {
+        ctx.data_dir.join("bin")
+    }
+
+    fn uv_binary_name() -> &'static str {
+        if cfg!(target_os = "windows") {
+            "uv.exe"
+        } else {
+            "uv"
+        }
+    }
+
+    fn bundled_uv(ctx: &WizardContext) -> PathBuf {
+        Self::uv_bin_dir(ctx).join(Self::uv_binary_name())
+    }
+
+    /// Find the uv binary in `dirs`. Pure and unit-testable.
+    fn find_uv_in(dirs: &[PathBuf]) -> Option<PathBuf> {
+        let name = Self::uv_binary_name();
+        dirs.iter().map(|d| d.join(name)).find(|p| p.is_file())
+    }
+
+    /// `uv` on the real process PATH.
+    fn uv_on_path() -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        Self::find_uv_in(&dirs)
+    }
+
+    /// Synchronously resolve the uv argv0 for display, plus whether run()
+    /// will need to bootstrap it first.
+    fn uv_argv0(ctx: &WizardContext) -> (PathBuf, bool) {
+        if let Some(p) = Self::uv_on_path() {
+            return (p, false);
+        }
+        let bundled = Self::bundled_uv(ctx);
+        if bundled.is_file() {
+            return (bundled, false);
+        }
+        // Not resolvable synchronously: run() bootstraps it on Windows;
+        // elsewhere the bare name documents the PATH requirement.
+        (bundled, crate::uv_download_url().is_some())
+    }
+
+    fn uv_archive_name() -> String {
+        format!("uv-{}.zip", crate::UV_PINNED_VERSION)
+    }
+
+    /// Resolve a usable `uv`: PATH first, then the bootstrapped copy under
+    /// data_dir/bin, else download + extract the pinned standalone build
+    /// (Windows only; other platforms fail with install guidance).
+    async fn ensure_uv(&self, ctx: &WizardContext) -> Result<PathBuf, StepOutcome> {
+        if let Some(p) = Self::uv_on_path() {
+            return Ok(p);
+        }
+        let bundled = Self::bundled_uv(ctx);
+        if ctx.ops.file_exists(&bundled).await {
+            return Ok(bundled);
+        }
+        let url = match crate::uv_download_url() {
+            Some(u) => u,
+            None => {
+                return Err(StepOutcome::failed(
+                    "uv not found on PATH and auto-bootstrap is only supported on Windows",
+                    vec![format!(
+                        "install uv from {} and re-run this step",
+                        crate::UV_INSTALL_DOCS_URL
+                    )],
+                ))
+            }
+        };
+        let dir = Self::uv_bin_dir(ctx);
+        let archive = dir.join(Self::uv_archive_name());
+        ctx.ops
+            .download(&url, &archive, &|_, _| {})
+            .await
+            .map_err(|e| {
+                StepOutcome::failed(
+                    format!("uv bootstrap download failed: {e}"),
+                    vec![format!("{e:?}")],
+                )
+            })?;
+        ctx.ops.extract_zip(&archive, &dir).await.map_err(|e| {
+            StepOutcome::failed(
+                format!("uv bootstrap extraction failed: {e}"),
+                vec![format!("{e:?}")],
+            )
+        })?;
+        Ok(bundled)
     }
 
     fn venv_python(&self, ctx: &WizardContext) -> PathBuf {
@@ -774,17 +979,17 @@ impl StartGateway {
         }
     }
 
-    fn venv_command(&self, ctx: &WizardContext) -> PlannedCommand {
+    fn venv_command(&self, ctx: &WizardContext, uv: &std::path::Path) -> PlannedCommand {
         PlannedCommand::new(vec![
-            "uv".to_string(),
+            uv.display().to_string(),
             "venv".to_string(),
             self.venv_dir(ctx).display().to_string(),
         ])
     }
 
-    fn pip_command(&self, ctx: &WizardContext) -> PlannedCommand {
+    fn pip_command(&self, ctx: &WizardContext, uv: &std::path::Path) -> PlannedCommand {
         PlannedCommand::new(vec![
-            "uv".to_string(),
+            uv.display().to_string(),
             "pip".to_string(),
             "install".to_string(),
             "--python".to_string(),
@@ -850,12 +1055,26 @@ impl WizardStep for StartGateway {
     }
     fn planned_commands(&self, ctx: &WizardContext) -> Vec<PlannedCommand> {
         match ctx.mode {
-            // Exactly the commands run() spawns, in order.
-            RunMode::Install => vec![
-                self.venv_command(ctx),
-                self.pip_command(ctx),
-                self.spawn_command(ctx),
-            ],
+            // Exactly the commands run() spawns, in order (plus the uv
+            // bootstrap download when uv is not yet resolvable).
+            RunMode::Install => {
+                let (uv, needs_bootstrap) = Self::uv_argv0(ctx);
+                let mut cmds = Vec::new();
+                if needs_bootstrap {
+                    let url = crate::uv_download_url()
+                        .expect("needs_bootstrap is only true when a download URL exists");
+                    let archive = Self::uv_bin_dir(ctx).join(Self::uv_archive_name());
+                    cmds.push(PlannedCommand::new(vec![
+                        "download".to_string(),
+                        url,
+                        archive.display().to_string(),
+                    ]));
+                }
+                cmds.push(self.venv_command(ctx, &uv));
+                cmds.push(self.pip_command(ctx, &uv));
+                cmds.push(self.spawn_command(ctx));
+                cmds
+            }
             // Audit only re-probes the health endpoint; nothing is spawned.
             RunMode::Audit => vec![PlannedCommand::new(vec![
                 "http-get".to_string(),
@@ -870,7 +1089,14 @@ impl WizardStep for StartGateway {
         let mut log = Vec::new();
         match ctx.mode {
             RunMode::Install => {
-                for cmd in [self.venv_command(ctx), self.pip_command(ctx)] {
+                let uv = match self.ensure_uv(ctx).await {
+                    Ok(p) => {
+                        log.push(format!("using uv at {}", p.display()));
+                        p
+                    }
+                    Err(outcome) => return Ok(outcome),
+                };
+                for cmd in [self.venv_command(ctx, &uv), self.pip_command(ctx, &uv)] {
                     log.push(format!("running: {}", cmd.argv.join(" ")));
                     match ctx.ops.run_command(&cmd).await {
                         Ok(out) if out.success() => {
@@ -1743,6 +1969,50 @@ mod tests {
         WizardContext::new(test_config_with_models(), PathBuf::from("/data"), mode, ops)
     }
 
+    /// Guard that swaps PATH for the duration of a test. uv resolution
+    /// reads the real process PATH, so tests that assert on it must
+    /// control it. Restores on drop.
+    struct PathGuard {
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl PathGuard {
+        fn set_to(dir: &std::path::Path) -> Self {
+            let old = std::env::var_os("PATH");
+            std::env::set_var("PATH", dir.as_os_str());
+            Self { old }
+        }
+    }
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// Temp dir acting as a PATH entry. When `with_uv` is true it contains
+    /// a fake `uv` binary so uv resolution hits PATH deterministically.
+    fn path_dir_with_uv(with_uv: bool) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "llm-wiz-uv-{}-{}",
+            std::process::id(),
+            if with_uv { "hit" } else { "miss" }
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        if with_uv {
+            let name = if cfg!(target_os = "windows") {
+                "uv.exe"
+            } else {
+                "uv"
+            };
+            std::fs::write(dir.join(name), b"fake-uv").unwrap();
+        }
+        dir
+    }
+
     fn smoke_post_response() -> crate::HttpResponse {
         FakeSystemOps::http_ok(r#"{"choices":[{"message":{"content":"ok"}}]}"#)
     }
@@ -2083,6 +2353,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_gateway_install_spawns_and_healthchecks() {
+        let _guard = PathGuard::set_to(&path_dir_with_uv(true));
         let ops = Arc::new(FakeSystemOps::new());
         ops.with_http_get(
             "http://127.0.0.1:4000/v1/models",
@@ -2095,7 +2366,7 @@ mod tests {
         };
         let planned = step.planned_commands(&ctx);
         assert_eq!(planned.len(), 3);
-        assert_eq!(planned[0].argv[0], "uv");
+        assert!(planned[0].argv[0].ends_with("uv"));
 
         let out = step.run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done, "{out:?}");
@@ -2117,6 +2388,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_gateway_fails_when_unhealthy() {
+        let _guard = PathGuard::set_to(&path_dir_with_uv(true));
         let ops = Arc::new(FakeSystemOps::new());
         // No scripted health response → probes fail.
         let ctx = ctx_with(ops, RunMode::Install);
@@ -2140,6 +2412,131 @@ mod tests {
         let out = StartGateway::default().run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done);
         assert!(ops.spawns().is_empty(), "audit spawns nothing");
+    }
+
+    #[test]
+    fn find_uv_in_detects_binary() {
+        let dir = path_dir_with_uv(true);
+        let found = StartGateway::find_uv_in(std::slice::from_ref(&dir));
+        assert!(found.is_some());
+        let empty = path_dir_with_uv(false);
+        assert!(StartGateway::find_uv_in(std::slice::from_ref(&empty)).is_none());
+        assert!(StartGateway::find_uv_in(&[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn start_gateway_uses_bundled_uv_when_present() {
+        // uv not on PATH, but the bootstrapped copy exists in the fake fs.
+        let _guard = PathGuard::set_to(&path_dir_with_uv(false));
+        let ops = Arc::new(FakeSystemOps::new());
+        let name = if cfg!(target_os = "windows") {
+            "uv.exe"
+        } else {
+            "uv"
+        };
+        ops.with_file(PathBuf::from("/data/bin").join(name), b"fake-uv".to_vec());
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+        };
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let executed = ops.executed_commands();
+        assert!(executed[0][0].ends_with(name), "{:?}", executed[0]);
+        // No bootstrap download happened.
+        assert!(ops.downloaded_to().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_gateway_planned_shows_bootstrap_when_uv_missing() {
+        let _guard = PathGuard::set_to(&path_dir_with_uv(false));
+        let ctx = ctx_with(Arc::new(FakeSystemOps::new()), RunMode::Install);
+        let planned = StartGateway::default().planned_commands(&ctx);
+        if cfg!(target_os = "windows") {
+            assert_eq!(planned.len(), 4);
+            assert_eq!(planned[0].argv[0], "download");
+            assert!(
+                planned[0].argv[1].contains("astral-sh/uv"),
+                "{:?}",
+                planned[0].argv
+            );
+        } else {
+            // No auto-bootstrap off Windows: uv path shown, run() fails
+            // with install guidance instead.
+            assert_eq!(planned.len(), 3);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn start_gateway_fails_with_install_guidance_without_uv() {
+        let _guard = PathGuard::set_to(&path_dir_with_uv(false));
+        let ops = Arc::new(FakeSystemOps::new());
+        let ctx = ctx_with(ops, RunMode::Install);
+        let out = StartGateway::default().run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed);
+        assert!(
+            out.message
+                .contains("auto-bootstrap is only supported on Windows"),
+            "{out:?}"
+        );
+    }
+
+    // --- InstallLlamaCpp: VC++ redistributable ---
+
+    #[test]
+    fn vcredist_check_passes_off_windows() {
+        // The probe is Windows-only; other platforms always pass.
+        assert!(InstallLlamaCpp::vcredist_present(&PathBuf::from(
+            "/nonexistent-system32"
+        )));
+    }
+
+    #[test]
+    fn llamacpp_offers_vcredist_download_url() {
+        assert_eq!(
+            InstallLlamaCpp::with_pin(test_pin()).help_url(),
+            Some(crate::VC_REDIST_DOWNLOAD_URL)
+        );
+        assert!(crate::VC_REDIST_DOWNLOAD_URL.starts_with("https://"));
+    }
+
+    // --- DownloadModels: disk-space pre-check ---
+
+    #[tokio::test]
+    async fn download_models_fails_when_disk_full() {
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_head_length("https://example.com/qwen3-8b.gguf", 50_000_000_000);
+        ops.with_head_length("https://example.com/qwen2.5-coder-7b.gguf", 40_000_000_000);
+        ops.with_free_space(1_000_000);
+        let ctx = ctx_with(ops, RunMode::Install);
+        let out = DownloadModels.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed);
+        assert!(out.message.contains("insufficient disk space"), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn download_models_proceeds_when_space_sufficient() {
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_head_length("https://example.com/qwen3-8b.gguf", 5_000_000_000);
+        ops.with_head_length("https://example.com/qwen2.5-coder-7b.gguf", 4_000_000_000);
+        ops.with_free_space(100_000_000_000);
+        ops.with_download(
+            "https://example.com/qwen3-8b.gguf",
+            b"gguf-8b-bytes".to_vec(),
+        );
+        ops.with_download(
+            "https://example.com/qwen2.5-coder-7b.gguf",
+            b"gguf-7b-bytes".to_vec(),
+        );
+        let ctx = ctx_with(ops, RunMode::Install);
+        let out = DownloadModels.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
     }
 
     // --- VscodeExtensions ---
@@ -2419,6 +2816,7 @@ mod tests {
 
     #[test]
     fn planned_commands_match_mode() {
+        let _guard = PathGuard::set_to(&path_dir_with_uv(true));
         // Install mode: StartGateway shows the three spawned commands...
         let install_ctx = WizardContext::new(
             test_config_with_models(),
@@ -2428,7 +2826,7 @@ mod tests {
         );
         let install_cmds = StartGateway::default().planned_commands(&install_ctx);
         assert_eq!(install_cmds.len(), 3);
-        assert_eq!(install_cmds[0].argv[0], "uv");
+        assert!(install_cmds[0].argv[0].ends_with("uv"));
 
         // ...audit mode shows only the health probe.
         let audit_ctx = WizardContext::new(

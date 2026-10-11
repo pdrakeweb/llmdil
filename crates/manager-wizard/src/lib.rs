@@ -37,6 +37,31 @@ pub const MIN_DRIVER_MAJOR: u32 = 550;
 /// search page and states the required branch in text).
 pub const NVIDIA_DRIVER_DOWNLOAD_URL: &str = "https://www.nvidia.com/Download/index.aspx";
 
+/// Permanent aka.ms link to the latest VC++ redistributable (x64).
+/// Microsoft documents this as the stable "latest" URL.
+pub const VC_REDIST_DOWNLOAD_URL: &str = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
+
+/// Pinned uv version bootstrapped by the gateway step when `uv` is not on
+/// PATH. uv is a self-contained binary: no install, no admin needed.
+pub const UV_PINNED_VERSION: &str = "0.13.0";
+
+/// Download URL for the pinned uv standalone archive for the current
+/// platform. Windows uses the MSVC zip (extracted with the `zip` crate);
+/// other platforms are unsupported for auto-bootstrap.
+pub fn uv_download_url() -> Option<String> {
+    let asset = if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+        "uv-x86_64-pc-windows-msvc.zip"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "https://github.com/astral-sh/uv/releases/download/{UV_PINNED_VERSION}/{asset}"
+    ))
+}
+
+/// Install docs for platforms where uv cannot be auto-bootstrapped.
+pub const UV_INSTALL_DOCS_URL: &str = "https://docs.astral.sh/uv/getting-started/installation/";
+
 /// Lifecycle state of one wizard step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -326,6 +351,11 @@ pub trait SystemOps: Send + Sync {
     async fn http_get(&self, url: &str) -> Result<HttpResponse, WizardError>;
     /// HTTP POST with a JSON body; used for smoke tests.
     async fn http_post(&self, url: &str, body: &str) -> Result<HttpResponse, WizardError>;
+    /// HTTP HEAD; returns the Content-Length when the server provides one.
+    /// Used for download size estimation (disk-space pre-check).
+    async fn http_head_content_length(&self, url: &str) -> Result<Option<u64>, WizardError>;
+    /// Free bytes available on the volume containing `path`.
+    async fn free_space_bytes(&self, path: &Path) -> Result<u64, WizardError>;
     /// Read a whole file.
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>, WizardError>;
     /// Write a whole file, creating parent directories.
