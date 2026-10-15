@@ -1915,18 +1915,34 @@ function wizardStepRow(s: WizardStepState, live: boolean): string {
     <div class="sstate">${s.note && s.state === "done" ? `<span class="chip badge-warn">${esc(s.note)}</span> ` : ""}${stateTxt}</div></div>`;
 }
 
-function paintWizard(root: HTMLElement, steps: WizardStepState[], live: boolean): void {
-  const done = steps.filter((s) => s.state === "done" || s.state === "manual").length;
-  const pct = steps.length ? Math.round((done / steps.length) * 100) : 0;
+interface WizardPaintOpts {
+  busy?: boolean;
+  runningStepId?: string | null;
+  statusLine?: string | null;
+}
+
+function paintWizard(root: HTMLElement, steps: WizardStepState[], live: boolean, opts: WizardPaintOpts = {}): void {
+  // The backend's Running state cannot be observed mid-step (the run
+  // command holds the wizard lock for the whole execution, and the
+  // state query needs the same lock), so the view marks the step it
+  // invoked as running itself. The override applies only while the
+  // server state is still queued — a finished step keeps its real
+  // state.
+  const eff = opts.runningStepId
+    ? steps.map((s) => (s.id === opts.runningStepId && s.state === "queued" ? { ...s, state: "running" as const } : s))
+    : steps;
+  const done = eff.filter((s) => s.state === "done" || s.state === "manual").length;
+  const pct = eff.length ? Math.round((done / eff.length) * 100) : 0;
   const progress = root.querySelector("#wizProgress");
   if (progress) {
-    progress.innerHTML = `<b>${done}</b><span style="color:var(--text3);font-size:12px">of ${steps.length} steps \u00b7 ${pct}%</span>
-      <div class="segbar">${steps.map((s) => `<i class="${s.state === "done" || s.state === "manual" ? "done" : s.state === "running" ? "run" : ""}"></i>`).join("")}</div>`;
+    progress.innerHTML = `<b>${done}</b><span style="color:var(--text3);font-size:12px">of ${eff.length} steps \u00b7 ${pct}%</span>
+      <div class="segbar">${eff.map((s) => `<i class="${s.state === "done" || s.state === "manual" ? "done" : s.state === "running" ? "run" : ""}"></i>`).join("")}</div>`
+      + (opts.statusLine ? `<div style="margin-top:4px;font-size:12px;color:var(--text2)">${esc(opts.statusLine)}</div>` : "");
   }
   const list = root.querySelector("#wizSteps");
   if (list) {
     list.innerHTML = `<div class="sec-title">Setup checklist <span style="color:var(--text3);font-weight:400">\u2014 runs in order</span></div>`
-      + steps.map((s) => wizardStepRow(s, live)).join("");
+      + eff.map((s) => wizardStepRow(s, live)).join("");
   }
   const banner = root.querySelector("#wizBanner");
   if (banner) {
@@ -1934,6 +1950,16 @@ function paintWizard(root: HTMLElement, steps: WizardStepState[], live: boolean)
       ? `${icon("check")} Live \u2014 steps execute against this machine. A failed step pauses the run; fix the cause and retry it.`
       : `${icon("warn")} Sample mode \u2014 open the installed app to run setup against this machine.`;
   }
+  // Busy state is painted, not remembered per element: every control
+  // that can start work is disabled while a run is in flight, so the
+  // state survives repaints and cannot be bypassed by clicking a
+  // per-step button during a full run.
+  const busy = !!opts.busy;
+  for (const sel of ["#runBtn", "#auditBtn", "#finishBtn"]) {
+    const b = root.querySelector(sel) as HTMLButtonElement | null;
+    if (b) b.disabled = busy;
+  }
+  root.querySelectorAll("[data-run-step]").forEach((b) => { (b as HTMLButtonElement).disabled = busy; });
 }
 
 export function renderWizard(): string {
@@ -1971,12 +1997,19 @@ export function wireWizard(root: HTMLElement): () => void {
   };
 
   let steps: WizardStepState[] = [];
+  let liveNow = false;
+  let busy = false;
+  let runningStepId: string | null = null;
+  let statusLine: string | null = null;
+
+  const paint = (): void => paintWizard(root, steps, liveNow, { busy, runningStepId, statusLine });
 
   const refresh = async (): Promise<void> => {
     const r = await getWizardSteps();
     if (disposed) return;
     steps = r.data;
-    paintWizard(root, steps, r.live);
+    liveNow = r.live;
+    paint();
     if (r.error) logLine(`could not load setup state: ${r.error}`, "lvl-err");
   };
 
@@ -1993,28 +2026,64 @@ export function wireWizard(root: HTMLElement): () => void {
   const runBtn = root.querySelector("#runBtn") as HTMLButtonElement | null;
   runBtn?.addEventListener("click", async () => {
     if (!isTauri()) { alert("Sample mode: setup runs in the installed app."); return; }
-    runBtn.disabled = true;
+    if (busy) return;
+    busy = true;
+    paint();
     try {
       await refresh();
+      let paused: string | null = null;
       for (const s of [...steps]) {
         if (s.state === "done" || s.state === "manual" || s.state === "skipped") continue;
+        runningStepId = s.id;
+        statusLine = `Running step: ${s.name}\u2026`;
+        paint();
         const ok = await runOne(s.id);
-        if (!ok) { logLine("setup paused \u2014 fix the failed step and retry", "lvl-warn"); break; }
+        runningStepId = null;
+        if (!ok) { paused = s.name; break; }
       }
-    } finally { runBtn.disabled = false; }
+      if (paused) {
+        statusLine = `Setup paused \u2014 ${paused} failed. Fix the cause and retry.`;
+        logLine("setup paused \u2014 fix the failed step and retry", "lvl-warn");
+      } else {
+        statusLine = "Setup run finished.";
+      }
+    } finally {
+      busy = false;
+      runningStepId = null;
+      paint();
+    }
   });
 
   const audit = root.querySelector("#auditBtn");
   audit?.addEventListener("click", async () => {
     if (!isTauri()) { alert("Sample mode: audit would re-run all checks here."); return; }
+    if (busy) return;
+    busy = true;
+    statusLine = "Running audit \u2014 re-checking all steps\u2026";
+    paint();
     logLine("running audit\u2026");
-    const r = await runAudit();
-    if (r.error) { logLine(`audit failed: ${r.error}`, "lvl-err"); return; }
-    logLine(`audit complete: ${r.data.done}/${r.data.total} checks passed`);
-    await refresh();
+    try {
+      const r = await runAudit();
+      if (r.error) {
+        statusLine = `Audit failed: ${r.error}`;
+        logLine(`audit failed: ${r.error}`, "lvl-err");
+        await refresh();
+        return;
+      }
+      // Paint the audit's own per-step results: refresh() would reload
+      // the install wizard's state, which an audit never changes — that
+      // is why the old handler appeared to do nothing.
+      steps = r.data.steps;
+      statusLine = `Audit complete: ${r.data.done}/${r.data.total} checks passed \u2014 the checklist shows the audit results.`;
+      logLine(`audit complete: ${r.data.done}/${r.data.total} checks passed`);
+    } finally {
+      busy = false;
+      paint();
+    }
   });
 
   root.querySelector("#finishBtn")?.addEventListener("click", async () => {
+    if (busy) return;
     if (isTauri()) {
       const remaining = steps.filter((s) => !(s.state === "done" || s.state === "manual" || s.state === "skipped")).length;
       if (remaining > 0 && !confirm(`${remaining} setup step(s) are not complete. Mark setup complete anyway?`)) return;
@@ -2037,10 +2106,20 @@ export function wireWizard(root: HTMLElement): () => void {
     }
     const runStepBtn = t.closest("[data-run-step]") as HTMLElement | null;
     if (runStepBtn) {
+      if (busy) return;
       const id = runStepBtn.getAttribute("data-run-step") ?? "";
-      runStepBtn.setAttribute("disabled", "");
-      await runOne(id);
-      runStepBtn.removeAttribute("disabled");
+      busy = true;
+      runningStepId = id;
+      statusLine = `Running step: ${steps.find((s) => s.id === id)?.name ?? id}\u2026`;
+      paint();
+      try {
+        await runOne(id);
+      } finally {
+        busy = false;
+        runningStepId = null;
+        statusLine = null;
+        paint();
+      }
     }
   };
   root.addEventListener("click", onRootClick);

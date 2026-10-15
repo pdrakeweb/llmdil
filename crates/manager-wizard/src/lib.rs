@@ -64,6 +64,15 @@ pub fn uv_download_url() -> Option<String> {
 /// Install docs for platforms where uv cannot be auto-bootstrapped.
 pub const UV_INSTALL_DOCS_URL: &str = "https://docs.astral.sh/uv/getting-started/installation/";
 
+/// CPython version the gateway venv is built with. Pinned because the
+/// LiteLLM dependency tree lags new CPython releases: under 3.15,
+/// `hiredis` (a `litellm[proxy]` dependency) ships no wheel and its
+/// source build requires MSVC (verified on PyPI 2026-10-15: hiredis
+/// 3.4.2 has a cp312 win_amd64 wheel and no cp315 files at all), so an
+/// unpinned `uv venv` — which picks the newest Python — cannot install
+/// the gateway on a stock Windows machine.
+pub const GATEWAY_PYTHON_VERSION: &str = "3.12";
+
 /// Lifecycle state of one wizard step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

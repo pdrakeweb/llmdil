@@ -1171,11 +1171,67 @@ impl StartGateway {
     }
 
     fn venv_command(&self, ctx: &WizardContext, uv: &std::path::Path) -> PlannedCommand {
+        // --python pins the interpreter (see GATEWAY_PYTHON_VERSION);
+        // --clear makes re-runs idempotent: a venv left behind by a
+        // failed install or built with the wrong Python is replaced
+        // instead of failing with "already exists".
         PlannedCommand::new(vec![
             uv.display().to_string(),
             "venv".to_string(),
+            "--python".to_string(),
+            crate::GATEWAY_PYTHON_VERSION.to_string(),
+            "--clear".to_string(),
             self.venv_dir(ctx).display().to_string(),
         ])
+    }
+
+    /// Probe printing the venv interpreter's "major.minor" version.
+    fn version_probe_command(&self, ctx: &WizardContext) -> PlannedCommand {
+        PlannedCommand::new(vec![
+            self.venv_python(ctx).display().to_string(),
+            "-c".to_string(),
+            "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')".to_string(),
+        ])
+    }
+
+    /// Probe that succeeds only when litellm imports in the venv.
+    fn litellm_probe_command(&self, ctx: &WizardContext) -> PlannedCommand {
+        PlannedCommand::new(vec![
+            self.venv_python(ctx).display().to_string(),
+            "-c".to_string(),
+            "import litellm".to_string(),
+        ])
+    }
+
+    /// The existing venv interpreter's "major.minor" version, or None
+    /// when there is no venv interpreter or it cannot report one.
+    async fn venv_python_version(&self, ctx: &WizardContext) -> Option<String> {
+        let python = self.venv_python(ctx);
+        if !ctx.ops.file_exists(&python).await {
+            return None;
+        }
+        let out = ctx
+            .ops
+            .run_command(&self.version_probe_command(ctx))
+            .await
+            .ok()?;
+        if !out.success() {
+            return None;
+        }
+        let v = out.stdout.trim().to_string();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    /// Whether litellm already imports in the venv.
+    async fn litellm_importable(&self, ctx: &WizardContext) -> bool {
+        matches!(
+            ctx.ops.run_command(&self.litellm_probe_command(ctx)).await,
+            Ok(out) if out.success()
+        )
     }
 
     fn pip_command(&self, ctx: &WizardContext, uv: &std::path::Path) -> PlannedCommand {
@@ -1346,8 +1402,10 @@ impl WizardStep for StartGateway {
     }
     fn planned_commands(&self, ctx: &WizardContext) -> Vec<PlannedCommand> {
         match ctx.mode {
-            // Exactly the commands run() spawns, in order (plus the uv
-            // bootstrap download when uv is not yet resolvable).
+            // The commands run() may spawn, in order (plus the uv
+            // bootstrap download when uv is not yet resolvable). The two
+            // venv probes always run; the venv/pip commands are skipped
+            // when the probes show a current venv with litellm installed.
             RunMode::Install => {
                 let (uv, needs_bootstrap) = Self::uv_argv0(ctx);
                 let mut cmds = Vec::new();
@@ -1361,6 +1419,8 @@ impl WizardStep for StartGateway {
                         archive.display().to_string(),
                     ]));
                 }
+                cmds.push(self.version_probe_command(ctx));
+                cmds.push(self.litellm_probe_command(ctx));
                 cmds.push(self.venv_command(ctx, &uv));
                 cmds.push(self.pip_command(ctx, &uv));
                 let mut spawn = self.spawn_command(ctx);
@@ -1398,9 +1458,42 @@ impl WizardStep for StartGateway {
                     }
                     Err(outcome) => return Ok(outcome),
                 };
-                for cmd in [self.venv_command(ctx, &uv), self.pip_command(ctx, &uv)] {
+                // Reuse a healthy existing venv: one already on the
+                // pinned Python with litellm importable needs no venv
+                // creation and no package install. Anything else is
+                // (re)created — `uv venv --clear` replaces a venv left
+                // behind by a failed install or built with an unpinned
+                // (too new) Python, which previously made every retry
+                // fail with "already exists" before the real error.
+                let existing_version = self.venv_python_version(ctx).await;
+                let venv_current =
+                    existing_version.as_deref() == Some(crate::GATEWAY_PYTHON_VERSION);
+                let reuse = venv_current && self.litellm_importable(ctx).await;
+                if reuse {
+                    log.push(format!(
+                        "reusing existing venv (Python {}) — litellm already installed",
+                        crate::GATEWAY_PYTHON_VERSION
+                    ));
+                } else if !venv_current {
+                    match &existing_version {
+                        Some(v) => log.push(format!(
+                            "existing venv uses Python {v}; recreating it with Python {}",
+                            crate::GATEWAY_PYTHON_VERSION
+                        )),
+                        None => log.push(format!(
+                            "creating venv with Python {}",
+                            crate::GATEWAY_PYTHON_VERSION
+                        )),
+                    }
+                }
+                let setup_cmds: Vec<PlannedCommand> = if reuse {
+                    Vec::new()
+                } else {
+                    vec![self.venv_command(ctx, &uv), self.pip_command(ctx, &uv)]
+                };
+                for cmd in &setup_cmds {
                     log.push(format!("running: {}", cmd.argv.join(" ")));
-                    match ctx.ops.run_command(&cmd).await {
+                    match ctx.ops.run_command(cmd).await {
                         Ok(out) if out.success() => {
                             if !out.stdout.trim().is_empty() {
                                 log.push(out.stdout.trim().to_string());
@@ -3065,18 +3158,25 @@ mod tests {
             health_interval_ms: 1,
         };
         let planned = step.planned_commands(&ctx);
-        assert_eq!(planned.len(), 3);
-        assert!(planned[0].argv[0].ends_with("uv"));
+        assert_eq!(planned.len(), 5);
+        // Probes first, then the pinned venv creation, pip, and spawn.
+        assert!(planned[2].argv[0].ends_with("uv"));
+        assert!(planned[2].argv.contains(&"--python".to_string()));
+        assert!(planned[2]
+            .argv
+            .contains(&crate::GATEWAY_PYTHON_VERSION.to_string()));
+        assert!(planned[2].argv.contains(&"--clear".to_string()));
 
         let out = step.run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done, "{out:?}");
-        // venv + pip install ran; gateway spawned with the right port.
+        // No venv exists yet, so the probes execute nothing: venv + pip
+        // install ran; gateway spawned with the right port.
         let executed = ops.executed_commands();
-        assert_eq!(executed[0], planned[0].argv);
-        assert_eq!(executed[1], planned[1].argv);
+        assert_eq!(executed[0], planned[2].argv);
+        assert_eq!(executed[1], planned[3].argv);
         let spawns = ops.spawns();
         assert_eq!(spawns.len(), 1);
-        assert_eq!(spawns[0], planned[2].argv);
+        assert_eq!(spawns[0], planned[4].argv);
         assert!(spawns[0].contains(&"4000".to_string()));
         // config.yaml generated from app state.
         let cfg = ops
@@ -3084,6 +3184,94 @@ mod tests {
             .expect("config written");
         let text = String::from_utf8(cfg).unwrap();
         assert!(text.contains("8081"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn start_gateway_recreates_venv_on_wrong_python_version() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+        };
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        // An existing venv whose interpreter reports Python 3.15 — the
+        // unpinned failure mode (hiredis has no cp315 wheel). The step
+        // must recreate it pinned instead of failing at `uv venv`.
+        ops.with_file(step.venv_python(&ctx), Vec::new());
+        let probe = step.version_probe_command(&ctx);
+        let probe_argv: Vec<&str> = probe.argv.iter().map(String::as_str).collect();
+        ops.with_command(
+            &probe_argv,
+            crate::CommandOutput {
+                exit_code: 0,
+                stdout: "3.15\n".to_string(),
+                stderr: String::new(),
+            },
+        );
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("recreating it with Python")),
+            "{out:?}"
+        );
+        let executed = ops.executed_commands();
+        let venv_cmd = executed
+            .iter()
+            .find(|a| a.iter().any(|x| x == "venv"))
+            .expect("venv recreated");
+        assert!(venv_cmd.contains(&"--clear".to_string()));
+        assert!(venv_cmd.contains(&crate::GATEWAY_PYTHON_VERSION.to_string()));
+        assert!(
+            executed.iter().any(|a| a.iter().any(|x| x == "install")),
+            "pip install ran: {executed:?}"
+        );
+        assert_eq!(ops.spawns().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_gateway_reuses_current_venv_with_litellm() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+        };
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        // Venv already on the pinned Python; the version probe reports
+        // it and the import probe succeeds by default — no venv or pip
+        // command may run, but the gateway still spawns.
+        ops.with_file(step.venv_python(&ctx), Vec::new());
+        let probe = step.version_probe_command(&ctx);
+        let probe_argv: Vec<&str> = probe.argv.iter().map(String::as_str).collect();
+        ops.with_command(
+            &probe_argv,
+            crate::CommandOutput {
+                exit_code: 0,
+                stdout: format!("{}\n", crate::GATEWAY_PYTHON_VERSION),
+                stderr: String::new(),
+            },
+        );
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let executed = ops.executed_commands();
+        assert!(
+            executed
+                .iter()
+                .all(|a| !a.iter().any(|x| x == "venv" || x == "install")),
+            "no venv/pip commands may run: {executed:?}"
+        );
+        assert_eq!(ops.spawns().len(), 1);
     }
 
     #[tokio::test]
@@ -3320,7 +3508,7 @@ mod tests {
         let ctx = ctx_with(Arc::new(FakeSystemOps::new()), RunMode::Install);
         let planned = StartGateway::default().planned_commands(&ctx);
         if cfg!(target_os = "windows") {
-            assert_eq!(planned.len(), 4);
+            assert_eq!(planned.len(), 6);
             assert_eq!(planned[0].argv[0], "download");
             assert!(
                 planned[0].argv[1].contains("astral-sh/uv"),
@@ -3330,7 +3518,7 @@ mod tests {
         } else {
             // No auto-bootstrap off Windows: uv path shown, run() fails
             // with install guidance instead.
-            assert_eq!(planned.len(), 3);
+            assert_eq!(planned.len(), 5);
         }
     }
 
@@ -3679,7 +3867,8 @@ mod tests {
     #[test]
     fn planned_commands_match_mode() {
         let _guard = PathGuard::set_to(&path_dir_with_uv(true));
-        // Install mode: StartGateway shows the three spawned commands...
+        // Install mode: StartGateway shows the five commands it may
+        // spawn (two venv probes, venv creation, pip install, spawn)...
         let install_ctx = WizardContext::new(
             test_config_with_models(),
             PathBuf::from("/data"),
@@ -3687,8 +3876,8 @@ mod tests {
             Arc::new(FakeSystemOps::new()),
         );
         let install_cmds = StartGateway::default().planned_commands(&install_ctx);
-        assert_eq!(install_cmds.len(), 3);
-        assert!(install_cmds[0].argv[0].ends_with("uv"));
+        assert_eq!(install_cmds.len(), 5);
+        assert!(install_cmds[2].argv[0].ends_with("uv"));
 
         // ...audit mode shows only the health probe.
         let audit_ctx = WizardContext::new(

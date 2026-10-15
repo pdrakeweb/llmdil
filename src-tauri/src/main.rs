@@ -1222,7 +1222,15 @@ async fn run_wizard_step(app: AppHandle, state: State<'_, AppState>, step_id: St
         .await;
     let ctx = state.wizard_ctx(RunMode::Install).await;
     let wizard = state.wizard(RunMode::Install).await;
-    let mut guard = wizard.lock().await;
+    // try_lock, not lock: a second invocation (e.g. a stray double
+    // click while a step runs) must fail fast with a clear error
+    // instead of queueing on the mutex and executing a step again
+    // after the current run finishes.
+    let mut guard = wizard.try_lock().map_err(|_| {
+        jerr(ApiError::Wizard(
+            "a setup step is already running".to_string(),
+        ))
+    })?;
     let (_done_before, total) = guard.progress();
     let outcome: StepOutcome = guard
         .run_step(&ctx, &step_id)
@@ -1256,9 +1264,36 @@ async fn run_audit(app: AppHandle, state: State<'_, AppState>) -> ApiResult {
     let task_id = state.record_task("audit", json!({})).await;
     let ctx = state.wizard_ctx(RunMode::Audit).await;
     let wizard = state.wizard(RunMode::Audit).await;
-    let mut guard = wizard.lock().await;
+    // try_lock, not lock: see run_wizard_step — a duplicate audit
+    // invocation fails fast instead of queueing a second execution.
+    let mut guard = wizard.try_lock().map_err(|_| {
+        jerr(ApiError::Wizard(
+            "an audit is already running".to_string(),
+        ))
+    })?;
     let report: WizardReport = guard.run_all(&ctx).await;
     let (done, total) = report.progress();
+    // The per-step results ride along in the response: the checklist is
+    // painted from the install wizard's state (setup_get_steps), which
+    // an audit never changes, so without this payload the audit's
+    // outcome is invisible in the UI.
+    let steps: Vec<Value> = report
+        .steps
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "name": s.name,
+                "state": s.state,
+                "message": s.message,
+                "duration_ms": s.duration_ms,
+                "log_tail": s.log_tail,
+                "note": s.note,
+                "remediation": guard.remediation_hint(&s.id),
+                "help_url": guard.help_url(&s.id),
+            })
+        })
+        .collect();
     drop(guard);
     let payload = WizardProgressPayload {
         task_id: task_id.clone(),
@@ -1276,7 +1311,7 @@ async fn run_audit(app: AppHandle, state: State<'_, AppState>) -> ApiResult {
             json!({ "done": done, "total": total }),
         )
         .await;
-    Ok(json!({ "task_id": task_id, "done": done, "total": total }))
+    Ok(json!({ "task_id": task_id, "done": done, "total": total, "steps": steps }))
 }
 
 // ---------------------------------------------------------------------------
