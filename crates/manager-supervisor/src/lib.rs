@@ -464,6 +464,15 @@ impl SupervisedProcess {
         if let Some(w) = workdir {
             cmd.current_dir(w);
         }
+        // Backends are headless: stdout/stderr are piped into the log
+        // store below. On Windows a console child spawned from the
+        // GUI app would otherwise open a visible console window.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW
+            cmd.creation_flags(0x08000000);
+        }
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);

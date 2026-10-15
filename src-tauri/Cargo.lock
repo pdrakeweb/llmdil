@@ -1913,7 +1913,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "local-llm-service-manager"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "manager-config",
@@ -1976,7 +1976,7 @@ dependencies = [
 
 [[package]]
 name = "manager-config"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "serde",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "manager-gateway"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "manager-config",
@@ -1999,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "manager-mcp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "manager-supervisor",
  "serde",
@@ -2010,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "manager-models"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "manager-config",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "manager-mxc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "serde",
@@ -2033,7 +2033,7 @@ dependencies = [
 
 [[package]]
 name = "manager-supervisor"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2048,7 +2048,7 @@ dependencies = [
 
 [[package]]
 name = "manager-telemetry"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2060,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "manager-winml"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2074,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "manager-wizard"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "chrono",

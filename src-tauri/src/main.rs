@@ -1882,9 +1882,14 @@ async fn open_url(url: String) -> ApiResult {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &url])
-            .spawn()
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "start", "", &url]);
+        // CREATE_NO_WINDOW suppresses only the transient cmd console;
+        // the browser that `start` opens is a separate GUI process and
+        // still appears.
+        cmd.creation_flags(0x08000000);
+        cmd.spawn()
             .map_err(|e| err(ApiError::Io(format!("failed to open URL: {e}"))))?;
         Ok(json!({ "ok": true }))
     }
@@ -2757,9 +2762,12 @@ async fn mcp_list(state: State<'_, AppState>) -> ApiResult {
 fn cmdkey_target_exists(target: &str) -> bool {
     #[cfg(windows)]
     {
-        std::process::Command::new("cmdkey")
-            .arg(format!("/list:{target}"))
-            .output()
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("cmdkey");
+        cmd.arg(format!("/list:{target}"));
+        // CREATE_NO_WINDOW: this probe runs from a GUI process.
+        cmd.creation_flags(0x08000000);
+        cmd.output()
             .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(target))
             .unwrap_or(false)
     }

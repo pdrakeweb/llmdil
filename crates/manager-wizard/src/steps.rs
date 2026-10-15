@@ -68,7 +68,7 @@ fn json_pretty(v: &serde_json::Value) -> String {
 pub fn default_steps() -> Vec<Box<dyn WizardStep>> {
     vec![
         Box::new(DetectHardware),
-        Box::new(InstallLlamaCpp::unconfigured()),
+        Box::new(InstallLlamaCpp::with_pin(LlamaCppPin::default_pin())),
         Box::new(ConfigureTensorSplit),
         Box::new(DownloadModels),
         Box::new(StartGateway::default()),
@@ -180,10 +180,22 @@ impl WizardStep for DetectHardware {
 // 2. Install llama.cpp CUDA build
 // ---------------------------------------------------------------------------
 
+/// One archive of a pinned llama.cpp release: file name + expected SHA-256.
+#[derive(Debug, Clone)]
+pub struct LlamaCppAsset {
+    pub asset: String,
+    pub sha256: String,
+}
+
 /// Pinned llama.cpp build (spec §3.4).
 ///
-/// The pin is data, not code: the tag/SHA-256 come from the update manifest
-/// (`updates.components.llamacpp`). [`LlamaCppPin::validate_for_gpus`]
+/// The pin is compiled into the build: [`LlamaCppPin::default_pin`] carries
+/// the tag and SHA-256 of both upstream archives (the binaries archive and
+/// the companion CUDA-runtime archive — the binaries ship without the
+/// cudart/cublas DLLs, so both are required). A release covers exactly one
+/// tag; `updates.components.llamacpp.pinned_version` acts as a guard, not a
+/// source: naming any other version fails closed in the step, because this
+/// build carries no verified pin for it. [`LlamaCppPin::validate_for_gpus`]
 /// enforces the Pascal rule — cuda-12.4 assets carry the sm_60 targets,
 /// cuda-13.x dropped them.
 #[derive(Debug, Clone)]
@@ -191,34 +203,83 @@ pub struct LlamaCppPin {
     pub tag: String,
     pub asset: String,
     pub sha256: String,
+    /// Companion CUDA-runtime archive (cudart/cublas DLLs), same release.
+    pub runtime: LlamaCppAsset,
 }
 
 impl LlamaCppPin {
     pub const BASE_URL: &'static str = "https://github.com/ggml-org/llama.cpp/releases/download";
 
+    /// The verified pin shipped with this build: ggml-org llama.cpp
+    /// **b11658**, cuda-12.4 x64. Both SHA-256 hashes were computed from
+    /// the official release downloads on 2026-10-15 (not copied from a
+    /// listing), and both archives were content-checked: the binaries
+    /// archive carries `llama-server.exe` and `ggml-cuda.dll` at its root
+    /// but no CUDA runtime DLLs; the runtime archive carries exactly
+    /// `cublas64_12.dll`, `cublasLt64_12.dll`, and `cudart64_12.dll`.
+    /// Both extract flat into the install dir.
+    pub fn default_pin() -> Self {
+        Self {
+            tag: "b11658".to_string(),
+            asset: "llama-b11658-bin-win-cuda-12.4-x64.zip".to_string(),
+            sha256: "4268543cfffee11e62dbe1fb4ee907da508c2a70de7b845ed7b338bf8cabd76d".to_string(),
+            runtime: LlamaCppAsset {
+                asset: "cudart-llama-bin-win-cuda-12.4-x64.zip".to_string(),
+                sha256: "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"
+                    .to_string(),
+            },
+        }
+    }
+
     pub fn download_url(&self) -> String {
-        format!("{}/{}/{}", Self::BASE_URL, self.tag, self.asset)
+        self.asset_url(&self.asset)
+    }
+
+    pub fn runtime_download_url(&self) -> String {
+        self.asset_url(&self.runtime.asset)
+    }
+
+    fn asset_url(&self, asset: &str) -> String {
+        format!("{}/{}/{}", Self::BASE_URL, self.tag, asset)
+    }
+
+    /// Both archives of the release, binaries first, in download order.
+    fn archives(&self) -> [LlamaCppAsset; 2] {
+        [
+            LlamaCppAsset {
+                asset: self.asset.clone(),
+                sha256: self.sha256.clone(),
+            },
+            self.runtime.clone(),
+        ]
     }
 
     /// Refuse cuda-13.x assets on Pascal-bearing machines (spec §3.4).
+    /// Both archive names are checked: a cuda-13 runtime archive is just
+    /// as unusable on Pascal as a cuda-13 binaries archive.
     pub fn validate_for_gpus(&self, gpus: &[crate::GpuDescriptor]) -> Result<(), WizardError> {
-        let asset = self.asset.to_lowercase();
-        let is_cuda13 = asset.contains("cuda-13") || asset.contains("cuda13");
         let has_pascal = gpus.iter().any(|g| g.is_pascal_or_older());
-        if is_cuda13 && has_pascal {
-            return Err(WizardError::UnsupportedBuild {
-                asset: self.asset.clone(),
-                reason: "cuda-13.x builds dropped Pascal (sm_60) support; \
-                         pin a cuda-12.4 asset (spec §3.4)"
-                    .to_string(),
-            });
+        if !has_pascal {
+            return Ok(());
+        }
+        for archive in self.archives() {
+            let asset = archive.asset.to_lowercase();
+            if asset.contains("cuda-13") || asset.contains("cuda13") {
+                return Err(WizardError::UnsupportedBuild {
+                    asset: archive.asset.clone(),
+                    reason: "cuda-13.x builds dropped Pascal (sm_60) support; \
+                             pin a cuda-12.4 asset (spec §3.4)"
+                        .to_string(),
+                });
+            }
         }
         Ok(())
     }
 }
 
-/// Step 2: download the pinned llama.cpp CUDA build, verify SHA-256,
-/// extract to the app dir. Audit mode re-verifies the installed build.
+/// Step 2: download the pinned llama.cpp CUDA build (binaries archive +
+/// CUDA-runtime archive), verify both SHA-256s, extract both flat into
+/// the app dir. Audit mode re-verifies the installed build.
 pub struct InstallLlamaCpp {
     pub pin: Option<LlamaCppPin>,
 }
@@ -250,14 +311,21 @@ impl InstallLlamaCpp {
         PathBuf::from(root).join("System32")
     }
 
-    fn download_command(&self, ctx: &WizardContext) -> Option<PlannedCommand> {
-        let pin = self.pin.as_ref()?;
-        let dest = self.install_dir(ctx).join(&pin.asset);
-        Some(PlannedCommand::new(vec![
-            "download".to_string(),
-            pin.download_url(),
-            dest.display().to_string(),
-        ]))
+    fn download_commands(&self, ctx: &WizardContext) -> Vec<PlannedCommand> {
+        let Some(pin) = self.pin.as_ref() else {
+            return Vec::new();
+        };
+        let dir = self.install_dir(ctx);
+        pin.archives()
+            .iter()
+            .map(|archive| {
+                PlannedCommand::new(vec![
+                    "download".to_string(),
+                    pin.asset_url(&archive.asset),
+                    dir.join(&archive.asset).display().to_string(),
+                ])
+            })
+            .collect()
     }
 }
 
@@ -276,7 +344,7 @@ impl WizardStep for InstallLlamaCpp {
         true
     }
     fn planned_commands(&self, ctx: &WizardContext) -> Vec<PlannedCommand> {
-        self.download_command(ctx).into_iter().collect()
+        self.download_commands(ctx)
     }
     fn remediation_hint(&self) -> Option<&str> {
         Some("re-run install-llamacpp to re-download and re-verify the build; if llama-server fails to start, install the VC++ redistributable first")
@@ -291,12 +359,40 @@ impl WizardStep for InstallLlamaCpp {
                 return Ok(StepOutcome::failed(
                     "no llama.cpp build pinned",
                     vec![
-                        "configure updates.components.llamacpp with a pinned cuda-12.4 asset (spec §3.4)".to_string(),
+                        "this build ships without a built-in llama.cpp pin; that is a packaging error in the app, not a configuration problem".to_string(),
                         "failing closed: will not download an unpinned binary".to_string(),
                     ],
                 ))
             }
         };
+        // Config guard: updates.components.llamacpp.pinned_version may name
+        // the version the operator expects, but this build carries a
+        // verified pin for exactly one tag. A different version is refused
+        // (fail closed), never silently ignored or downloaded unverified.
+        if let Some(wanted) = ctx
+            .config
+            .updates
+            .components
+            .get("llamacpp")
+            .and_then(|c| c.pinned_version.as_deref())
+        {
+            if wanted != pin.tag {
+                return Ok(StepOutcome::failed(
+                    format!(
+                        "updates.components.llamacpp pins llama.cpp {wanted}, but this build carries a verified pin only for {}",
+                        pin.tag
+                    ),
+                    vec![
+                        format!(
+                            "operator-pinned version: {wanted}; verified built-in pin: {}",
+                            pin.tag
+                        ),
+                        "failing closed: will not download a build without a verified SHA-256 pin"
+                            .to_string(),
+                    ],
+                ));
+            }
+        }
         // VC++ runtime check before any download: the MSVC-built CUDA
         // binaries fail to start without it, with a cryptic DLL error.
         if ctx.mode == RunMode::Install && !Self::vcredist_present(&Self::system32_dir()) {
@@ -318,55 +414,82 @@ impl WizardStep for InstallLlamaCpp {
         }
 
         let dir = self.install_dir(ctx);
-        let archive = dir.join(&pin.asset);
         let marker = dir.join(".installed.json");
-        let mut log = vec![format!("pinned build: {} ({})", pin.asset, pin.tag)];
-
-        let archive_ok = ctx.ops.file_exists(&archive).await
-            && matches!(ctx.ops.sha256_file(&archive).await, Ok(h) if checksums_match(&h, &pin.sha256));
+        let archives = pin.archives();
+        let mut log = vec![
+            format!("pinned build: {} ({})", pin.asset, pin.tag),
+            format!("pinned runtime: {} ({})", pin.runtime.asset, pin.tag),
+        ];
 
         match ctx.mode {
             RunMode::Install => {
-                if !archive_ok {
-                    let url = pin.download_url();
-                    log.push(format!("downloading {url}"));
-                    // The planned command must equal the spawned action: the
-                    // download below is exactly planned_commands()[0].
-                    match ctx.ops.download(&url, &archive, &|_, _| {}).await {
-                        Ok(bytes) => log.push(format!("downloaded {bytes} bytes")),
-                        Err(e) => {
-                            return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
+                // Both archives are required: the binaries archive has no
+                // CUDA runtime DLLs, the runtime archive has no binaries.
+                // Each is downloaded, SHA-256-verified, and extracted flat
+                // into the install dir; an archive already on disk with a
+                // matching checksum is kept (per-archive skip).
+                for archive_pin in &archives {
+                    let archive = dir.join(&archive_pin.asset);
+                    let archive_ok = ctx.ops.file_exists(&archive).await
+                        && matches!(ctx.ops.sha256_file(&archive).await, Ok(h) if checksums_match(&h, &archive_pin.sha256));
+                    if !archive_ok {
+                        let url = pin.asset_url(&archive_pin.asset);
+                        log.push(format!("downloading {url}"));
+                        // The planned commands must equal the spawned
+                        // actions: the downloads in this loop are exactly
+                        // planned_commands()[0] and planned_commands()[1],
+                        // in this order, when they are needed at all.
+                        match ctx.ops.download(&url, &archive, &|_, _| {}).await {
+                            Ok(bytes) => log.push(format!("downloaded {bytes} bytes")),
+                            Err(e) => {
+                                return Ok(StepOutcome::failed(
+                                    format!("{e}"),
+                                    vec![format!("{e:?}")],
+                                ))
+                            }
                         }
-                    }
-                    let actual = match ctx.ops.sha256_file(&archive).await {
-                        Ok(h) => h,
-                        Err(e) => {
-                            return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
+                        let actual = match ctx.ops.sha256_file(&archive).await {
+                            Ok(h) => h,
+                            Err(e) => {
+                                return Ok(StepOutcome::failed(
+                                    format!("{e}"),
+                                    vec![format!("{e:?}")],
+                                ))
+                            }
+                        };
+                        if !checksums_match(&actual, &archive_pin.sha256) {
+                            return Ok(StepOutcome::failed(
+                                format!(
+                                    "checksum mismatch for {}: expected {}, got {}",
+                                    archive.display(),
+                                    archive_pin.sha256,
+                                    actual
+                                ),
+                                vec!["archive rejected; not installed".to_string()],
+                            ));
                         }
-                    };
-                    if !checksums_match(&actual, &pin.sha256) {
-                        return Ok(StepOutcome::failed(
-                            format!(
-                                "checksum mismatch for {}: expected {}, got {}",
-                                archive.display(),
-                                pin.sha256,
-                                actual
-                            ),
-                            vec!["archive rejected; not installed".to_string()],
+                        log.push(format!("SHA-256 verified for {}", archive_pin.asset));
+                    } else {
+                        log.push(format!(
+                            "{} already present with matching checksum",
+                            archive_pin.asset
                         ));
                     }
-                    log.push("SHA-256 verified".to_string());
-                } else {
-                    log.push("archive already present with matching checksum".to_string());
+                    if let Err(e) = ctx.ops.extract_zip(&archive, &dir).await {
+                        return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
+                    }
+                    log.push(format!(
+                        "extracted {} to {}",
+                        archive_pin.asset,
+                        dir.display()
+                    ));
                 }
-                if let Err(e) = ctx.ops.extract_zip(&archive, &dir).await {
-                    return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
-                }
-                log.push(format!("extracted to {}", dir.display()));
                 let marker_json = serde_json::json!({
                     "tag": pin.tag,
                     "asset": pin.asset,
                     "sha256": pin.sha256,
+                    "runtime_asset": pin.runtime.asset,
+                    "runtime_sha256": pin.runtime.sha256,
                 });
                 if let Err(e) = ctx
                     .ops
@@ -381,30 +504,42 @@ impl WizardStep for InstallLlamaCpp {
                 ))
             }
             RunMode::Audit => {
-                // Re-verify without reinstalling: marker + archive checksum.
+                // Re-verify without reinstalling: marker + BOTH archive
+                // checksums.
                 if !ctx.ops.file_exists(&marker).await {
                     return Ok(StepOutcome::failed(
                         "llama.cpp install marker missing",
                         vec![format!("{} not found", marker.display())],
                     ));
                 }
-                match ctx.ops.sha256_file(&archive).await {
-                    Ok(h) if checksums_match(&h, &pin.sha256) => Ok(StepOutcome::done(
-                        format!("llama.cpp {} build verified ({})", pin.tag, pin.asset),
-                        log,
-                    )),
-                    Ok(h) => Ok(StepOutcome::failed(
-                        format!(
-                            "installed build checksum mismatch: expected {}, got {}",
-                            pin.sha256, h
-                        ),
-                        log,
-                    )),
-                    Err(e) => Ok(StepOutcome::failed(
-                        format!("cannot read installed archive: {e}"),
-                        vec![format!("{e:?}")],
-                    )),
+                for archive_pin in &archives {
+                    let archive = dir.join(&archive_pin.asset);
+                    match ctx.ops.sha256_file(&archive).await {
+                        Ok(h) if checksums_match(&h, &archive_pin.sha256) => {}
+                        Ok(h) => {
+                            return Ok(StepOutcome::failed(
+                                format!(
+                                    "installed build checksum mismatch for {}: expected {}, got {}",
+                                    archive_pin.asset, archive_pin.sha256, h
+                                ),
+                                log,
+                            ))
+                        }
+                        Err(e) => {
+                            return Ok(StepOutcome::failed(
+                                format!("cannot read installed archive {}: {e}", archive.display()),
+                                vec![format!("{e:?}")],
+                            ))
+                        }
+                    }
                 }
+                Ok(StepOutcome::done(
+                    format!(
+                        "llama.cpp {} build verified ({} + {})",
+                        pin.tag, pin.asset, pin.runtime.asset
+                    ),
+                    log,
+                ))
             }
         }
     }
@@ -2084,7 +2219,7 @@ mod tests {
     use super::*;
     use crate::fake::FakeSystemOps;
     use crate::{GpuDescriptor, RunMode, StepState, WizardContext};
-    use manager_config::{AppConfig, ModelConfig};
+    use manager_config::{AppConfig, ComponentUpdate, ModelConfig};
     use sha2::{Digest, Sha256};
     use std::sync::Arc;
 
@@ -2128,7 +2263,17 @@ mod tests {
             tag: "b9999".to_string(),
             asset: "llama-b9999-bin-win-cuda-12.4-x64.zip".to_string(),
             sha256: sha256_hex(b"fake-zip-bytes"),
+            runtime: LlamaCppAsset {
+                asset: "cudart-llama-bin-win-cuda-12.4-x64.zip".to_string(),
+                sha256: sha256_hex(b"fake-cudart-bytes"),
+            },
         }
+    }
+
+    /// Script both archive downloads for `pin` under their real URLs.
+    fn script_pin_downloads(ops: &FakeSystemOps, pin: &LlamaCppPin) {
+        ops.with_download(&pin.download_url(), b"fake-zip-bytes".to_vec());
+        ops.with_download(&pin.runtime_download_url(), b"fake-cudart-bytes".to_vec());
     }
 
     fn test_config_with_models() -> AppConfig {
@@ -2298,32 +2443,47 @@ mod tests {
         let ops = Arc::new(FakeSystemOps::new());
         ops.with_gpus(test_gpus());
         let pin = test_pin();
-        ops.with_download(&pin.download_url(), b"fake-zip-bytes".to_vec());
+        script_pin_downloads(&ops, &pin);
         let ctx = ctx_with(ops.clone(), RunMode::Install);
         let step = InstallLlamaCpp::with_pin(pin.clone());
 
-        // Transparency: planned commands equal what will run.
+        // Transparency: planned commands equal what will run — BOTH
+        // archive downloads, binaries first.
         let planned = step.planned_commands(&ctx);
-        assert_eq!(planned.len(), 1);
+        assert_eq!(planned.len(), 2);
         assert_eq!(planned[0].argv[0], "download");
+        assert_eq!(planned[0].argv[1], pin.download_url());
         assert!(
             planned[0].argv[1].contains("cuda-12.4"),
             "{:?}",
             planned[0].argv
         );
+        assert_eq!(planned[1].argv[0], "download");
+        assert_eq!(planned[1].argv[1], pin.runtime_download_url());
 
         let out = step.run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done, "{out:?}");
         assert!(out.message.contains("b9999"));
 
-        // Archive + marker written, extraction recorded.
+        // Both archives downloaded + extracted; marker records both.
         let archive = PathBuf::from("/data/llamacpp").join(&pin.asset);
+        let runtime_archive = PathBuf::from("/data/llamacpp").join(&pin.runtime.asset);
         assert!(ops.file_bytes(&archive).is_some());
-        assert!(ops
+        assert!(ops.file_bytes(&runtime_archive).is_some());
+        assert_eq!(ops.downloads_made().len(), 2);
+        let marker_bytes = ops
             .file_bytes(&PathBuf::from("/data/llamacpp/.installed.json"))
-            .is_some());
-        assert_eq!(ops.extractions().len(), 1);
+            .expect("marker written");
+        let marker: serde_json::Value =
+            serde_json::from_slice(&marker_bytes).expect("marker is JSON");
+        assert_eq!(marker["tag"], "b9999");
+        assert_eq!(marker["asset"], pin.asset);
+        assert_eq!(marker["sha256"], pin.sha256);
+        assert_eq!(marker["runtime_asset"], pin.runtime.asset);
+        assert_eq!(marker["runtime_sha256"], pin.runtime.sha256);
+        assert_eq!(ops.extractions().len(), 2);
         assert_eq!(ops.extractions()[0].0, archive);
+        assert_eq!(ops.extractions()[1].0, runtime_archive);
     }
 
     #[tokio::test]
@@ -2333,6 +2493,8 @@ mod tests {
         let pin = test_pin();
         let archive = PathBuf::from("/data/llamacpp").join(&pin.asset);
         ops.with_file(archive.clone(), b"fake-zip-bytes".to_vec());
+        let runtime_archive = PathBuf::from("/data/llamacpp").join(&pin.runtime.asset);
+        ops.with_file(runtime_archive, b"fake-cudart-bytes".to_vec());
         let ctx = ctx_with(ops.clone(), RunMode::Install);
         let out = InstallLlamaCpp::with_pin(pin).run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done);
@@ -2344,6 +2506,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_llamacpp_redownloads_only_the_missing_archive() {
+        // Binaries archive already verified on disk; the runtime archive
+        // is missing, so exactly one download happens (the runtime one).
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_gpus(test_gpus());
+        let pin = test_pin();
+        let archive = PathBuf::from("/data/llamacpp").join(&pin.asset);
+        ops.with_file(archive, b"fake-zip-bytes".to_vec());
+        script_pin_downloads(&ops, &pin);
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = InstallLlamaCpp::with_pin(pin.clone())
+            .run(&ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let made = ops.downloads_made();
+        assert_eq!(made.len(), 1, "{made:?}");
+        assert_eq!(made[0].0, pin.runtime_download_url());
+    }
+
+    #[tokio::test]
     async fn install_llamacpp_fails_closed_without_pin() {
         let ops = Arc::new(FakeSystemOps::new());
         ops.with_gpus(test_gpus());
@@ -2351,6 +2534,12 @@ mod tests {
         let out = InstallLlamaCpp::unconfigured().run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Failed);
         assert!(out.message.contains("no llama.cpp build pinned"));
+        // The message must state the real cause (a packaging error in the
+        // build) and must NOT direct the operator to configure
+        // updates.components — that path cannot supply a pin.
+        let detail = out.log_tail.join("\n");
+        assert!(detail.contains("packaging error"), "{detail}");
+        assert!(!detail.contains("configure updates.components"), "{detail}");
     }
 
     #[tokio::test]
@@ -2361,11 +2550,44 @@ mod tests {
             tag: "b9999".to_string(),
             asset: "llama-b9999-bin-win-cuda-13.0-x64.zip".to_string(),
             sha256: sha256_hex(b"x"),
+            runtime: LlamaCppAsset {
+                asset: "cudart-llama-bin-win-cuda-12.4-x64.zip".to_string(),
+                sha256: sha256_hex(b"y"),
+            },
         };
         let ctx = ctx_with(ops.clone(), RunMode::Install);
         let out = InstallLlamaCpp::with_pin(pin).run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Failed);
         assert!(out.message.contains("cuda-13"), "{}", out.message);
+        assert!(ops.downloads_made().is_empty(), "no download attempted");
+    }
+
+    #[tokio::test]
+    async fn install_llamacpp_rejects_cuda13_runtime_on_pascal() {
+        // The Pascal rule covers BOTH archives: a cuda-12.4 binaries
+        // archive paired with a cuda-13 runtime archive is still refused,
+        // and the error names the runtime asset.
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_gpus(test_gpus()); // includes P100s
+        let pin = LlamaCppPin {
+            tag: "b9999".to_string(),
+            asset: "llama-b9999-bin-win-cuda-12.4-x64.zip".to_string(),
+            sha256: sha256_hex(b"x"),
+            runtime: LlamaCppAsset {
+                asset: "cudart-llama-bin-win-cuda-13.0-x64.zip".to_string(),
+                sha256: sha256_hex(b"y"),
+            },
+        };
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = InstallLlamaCpp::with_pin(pin).run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed);
+        assert!(out.message.contains("cuda-13"), "{}", out.message);
+        assert!(
+            out.message
+                .contains("cudart-llama-bin-win-cuda-13.0-x64.zip"),
+            "{}",
+            out.message
+        );
         assert!(ops.downloads_made().is_empty(), "no download attempted");
     }
 
@@ -2377,8 +2599,12 @@ mod tests {
             tag: "b9999".to_string(),
             asset: "llama-b9999-bin-win-cuda-13.0-x64.zip".to_string(),
             sha256: sha256_hex(b"fake-zip-bytes"),
+            runtime: LlamaCppAsset {
+                asset: "cudart-llama-bin-win-cuda-12.4-x64.zip".to_string(),
+                sha256: sha256_hex(b"fake-cudart-bytes"),
+            },
         };
-        ops.with_download(&pin.download_url(), b"fake-zip-bytes".to_vec());
+        script_pin_downloads(&ops, &pin);
         let ctx = ctx_with(ops, RunMode::Install);
         let out = InstallLlamaCpp::with_pin(pin).run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done);
@@ -2401,7 +2627,7 @@ mod tests {
         let ops = Arc::new(FakeSystemOps::new());
         ops.with_gpus(test_gpus());
         let pin = test_pin();
-        ops.with_download(&pin.download_url(), b"fake-zip-bytes".to_vec());
+        script_pin_downloads(&ops, &pin);
         let install_ctx = ctx_with(ops.clone(), RunMode::Install);
         let step = InstallLlamaCpp::with_pin(pin.clone());
         assert_eq!(step.run(&install_ctx).await.unwrap().state, StepState::Done);
@@ -2418,6 +2644,141 @@ mod tests {
         assert_eq!(out.state, StepState::Failed);
         assert!(out.message.contains("checksum mismatch"));
         assert!(step.remediation_hint().unwrap().contains("re-download"));
+    }
+
+    #[tokio::test]
+    async fn install_llamacpp_audit_fails_on_runtime_checksum_mismatch() {
+        // Audit verifies BOTH archives: a tampered runtime archive fails
+        // even when the binaries archive is pristine, and the message
+        // names the runtime archive.
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_gpus(test_gpus());
+        let pin = test_pin();
+        script_pin_downloads(&ops, &pin);
+        let install_ctx = ctx_with(ops.clone(), RunMode::Install);
+        let step = InstallLlamaCpp::with_pin(pin.clone());
+        assert_eq!(step.run(&install_ctx).await.unwrap().state, StepState::Done);
+
+        let runtime_archive = PathBuf::from("/data/llamacpp").join(&pin.runtime.asset);
+        ops.with_file(runtime_archive, b"tampered-cudart".to_vec());
+        let audit_ctx = ctx_with(ops.clone(), RunMode::Audit);
+        let out = step.run(&audit_ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed);
+        assert!(out.message.contains("checksum mismatch"), "{}", out.message);
+        assert!(out.message.contains(&pin.runtime.asset), "{}", out.message);
+    }
+
+    #[test]
+    fn default_pin_is_verified_b11658_cuda124_pair() {
+        let pin = LlamaCppPin::default_pin();
+        assert_eq!(pin.tag, "b11658");
+        assert_eq!(pin.asset, "llama-b11658-bin-win-cuda-12.4-x64.zip");
+        assert_eq!(
+            pin.sha256,
+            "4268543cfffee11e62dbe1fb4ee907da508c2a70de7b845ed7b338bf8cabd76d"
+        );
+        assert_eq!(pin.runtime.asset, "cudart-llama-bin-win-cuda-12.4-x64.zip");
+        assert_eq!(
+            pin.runtime.sha256,
+            "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"
+        );
+        for sha in [&pin.sha256, &pin.runtime.sha256] {
+            assert_eq!(sha.len(), 64, "{sha}");
+            assert!(
+                sha.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "{sha}"
+            );
+        }
+        for name in [&pin.asset, &pin.runtime.asset] {
+            assert!(name.contains("cuda-12.4"), "{name}");
+            assert!(!name.contains("cuda-13"), "{name}");
+        }
+        assert_eq!(
+            pin.download_url(),
+            "https://github.com/ggml-org/llama.cpp/releases/download/b11658/llama-b11658-bin-win-cuda-12.4-x64.zip"
+        );
+        assert_eq!(
+            pin.runtime_download_url(),
+            "https://github.com/ggml-org/llama.cpp/releases/download/b11658/cudart-llama-bin-win-cuda-12.4-x64.zip"
+        );
+        // Regression for the shipped defect: the default step list must
+        // carry the pin (it previously shipped unconfigured and step 2
+        // could never pass).
+        let ctx = WizardContext::new(
+            AppConfig::default_config(),
+            PathBuf::from("/data"),
+            RunMode::Install,
+            Arc::new(FakeSystemOps::new()),
+        );
+        let step = default_steps()
+            .into_iter()
+            .find(|s| s.id() == STEP_INSTALL_LLAMACPP)
+            .expect("llamacpp step present in default steps");
+        let planned = step.planned_commands(&ctx);
+        assert_eq!(planned.len(), 2, "{planned:?}");
+        assert!(
+            planned[0].argv[1].contains("b11658"),
+            "{:?}",
+            planned[0].argv
+        );
+        assert!(
+            planned[1].argv[1].contains("cudart"),
+            "{:?}",
+            planned[1].argv
+        );
+    }
+
+    /// Context whose config pins `updates.components.llamacpp` to the
+    /// given version (or leaves the component unpinned when `None`).
+    fn ctx_with_llamacpp_pin(
+        ops: Arc<FakeSystemOps>,
+        mode: RunMode,
+        pinned_version: Option<&str>,
+    ) -> WizardContext {
+        let mut cfg = test_config_with_models();
+        cfg.updates.components.insert(
+            "llamacpp".to_string(),
+            ComponentUpdate {
+                pinned_version: pinned_version.map(str::to_string),
+                auto_update: false,
+                last_checked: None,
+            },
+        );
+        WizardContext::new(cfg, PathBuf::from("/data"), mode, ops)
+    }
+
+    #[tokio::test]
+    async fn install_llamacpp_config_version_mismatch_fails_closed() {
+        // The config names a version this build carries no verified pin
+        // for: refused before any download, naming both versions.
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_gpus(test_gpus());
+        let pin = test_pin(); // built-in tag b9999
+        script_pin_downloads(&ops, &pin);
+        let ctx = ctx_with_llamacpp_pin(ops.clone(), RunMode::Install, Some("b1111"));
+        let out = InstallLlamaCpp::with_pin(pin).run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed);
+        assert!(out.message.contains("b1111"), "{}", out.message);
+        assert!(out.message.contains("b9999"), "{}", out.message);
+        assert!(
+            ops.downloads_made().is_empty(),
+            "refused before any download"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_llamacpp_config_version_match_proceeds() {
+        // A config pin naming exactly the built-in tag is a no-op guard:
+        // the step proceeds with the verified pin.
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_gpus(test_gpus());
+        let pin = test_pin(); // built-in tag b9999
+        script_pin_downloads(&ops, &pin);
+        let ctx = ctx_with_llamacpp_pin(ops.clone(), RunMode::Install, Some("b9999"));
+        let out = InstallLlamaCpp::with_pin(pin).run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert_eq!(ops.downloads_made().len(), 2);
     }
 
     // --- ConfigureTensorSplit ---

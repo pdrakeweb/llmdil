@@ -39,16 +39,23 @@ impl NvidiaSmiSource {
 
     /// Spawn `nvidia-smi --query --xml-format` and capture stdout.
     pub async fn run_query(&self) -> Result<String, TelemetryError> {
-        let output = tokio::process::Command::new(&self.nvidia_smi_path)
-            .args(["--query", "--xml-format"])
-            .output()
-            .await
-            .map_err(|e| {
-                TelemetryError::SmiFailed(format!(
-                    "failed to spawn {}: {e}",
-                    self.nvidia_smi_path.display()
-                ))
-            })?;
+        let mut cmd = tokio::process::Command::new(&self.nvidia_smi_path);
+        cmd.args(["--query", "--xml-format"]);
+        // The poller spawns this from a GUI process every tick; on
+        // Windows a console child without CREATE_NO_WINDOW opens a
+        // visible console window each time (focus-stealing flash).
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW
+            cmd.creation_flags(0x08000000);
+        }
+        let output = cmd.output().await.map_err(|e| {
+            TelemetryError::SmiFailed(format!(
+                "failed to spawn {}: {e}",
+                self.nvidia_smi_path.display()
+            ))
+        })?;
         if !output.status.success() {
             return Err(TelemetryError::SmiFailed(format!(
                 "exit {}: {}",

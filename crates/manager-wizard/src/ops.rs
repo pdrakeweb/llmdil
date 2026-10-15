@@ -102,9 +102,12 @@ pub fn process_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output()
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("tasklist");
+        cmd.args(["/FI", &format!("PID eq {pid}"), "/NH"]);
+        // CREATE_NO_WINDOW: this probe runs from a GUI process.
+        cmd.creation_flags(0x08000000);
+        cmd.output()
             .map(|o| {
                 o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
             })
@@ -144,9 +147,12 @@ pub fn kill_process(pid: u32) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        let out = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output()?;
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        // CREATE_NO_WINDOW: this runs from a GUI process.
+        cmd.creation_flags(0x08000000);
+        let out = cmd.output()?;
         if out.status.success() {
             Ok(())
         } else {
@@ -231,6 +237,15 @@ impl SystemOps for RealSystemOps {
         }
         for (k, v) in &cmd.env {
             c.env(k, v);
+        }
+        // Planned commands (uv, nvidia-smi probes, installers) all run
+        // headless from the GUI app; on Windows each spawn would open
+        // a visible console window without CREATE_NO_WINDOW.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW
+            c.creation_flags(0x08000000);
         }
         let out = c.output().await.map_err(|e| WizardError::CommandFailed {
             argv: cmd.argv.clone(),
@@ -574,14 +589,15 @@ impl SystemOps for RealSystemOps {
     async fn credential_exists(&self, target: &str) -> Result<bool, WizardError> {
         #[cfg(windows)]
         {
-            let out = tokio::process::Command::new("cmdkey")
-                .arg(format!("/list:{target}"))
-                .output()
-                .await
-                .map_err(|e| WizardError::IoError {
-                    path: PathBuf::from("cmdkey"),
-                    reason: e.to_string(),
-                })?;
+            use std::os::windows::process::CommandExt;
+            let mut cmd = tokio::process::Command::new("cmdkey");
+            cmd.arg(format!("/list:{target}"));
+            // CREATE_NO_WINDOW: this probe runs from a GUI process.
+            cmd.creation_flags(0x08000000);
+            let out = cmd.output().await.map_err(|e| WizardError::IoError {
+                path: PathBuf::from("cmdkey"),
+                reason: e.to_string(),
+            })?;
             Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).contains(target))
         }
         #[cfg(not(windows))]

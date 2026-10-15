@@ -1,6 +1,6 @@
 # AFK Session — Local LLM Service Manager full wiring
 
-- **Status:** ACTIVE
+- **Status:** COMPLETE (v0.1.2 released and verified 2026-10-15)
 - **Departed:** 2026-10-15 ~02:29 EDT (instruction received via Android app)
 - **Expected return:** not stated — run until the queue completes or blocks
 - **Remote Control:** unknown — user reachable via this chat (Android app). Conservative mode applies to discretionary medium-stakes decisions not covered by the user's explicit instructions.
