@@ -607,19 +607,19 @@ fn is_real_pin(sha: &str) -> bool {
 /// Seeded models start enabled (the wizard's download step installs
 /// enabled models) and pre-assigned to their default backend. A default
 /// backend whose `model_file` still carries the untouched default
-/// (`models/<backend-id>.gguf`) is aligned to the seeded model's path,
-/// so a downloaded model is the file its backend starts and config
-/// validation (an enabled backend's model_file must be a registered
-/// model) passes when the backend is enabled.
+/// (`models/<backend-id>.gguf`) is aligned to the seeded model's path
+/// and enabled, so the default fleet is ready to start once its models
+/// are downloaded and verified, and config validation (an enabled
+/// backend's model_file must be a registered model) passes.
+///
+/// Configurations written before the catalog carried real hash pins
+/// and parameter counts get a one-time repair first
+/// ([`manager_config::repair_catalog_defaults`], gated on
+/// `AppConfig::defaults_repaired`): placeholder hashes become the real
+/// pins, parameter counts are filled in, default backend assignments
+/// and model_file alignment are applied, and the default fleet is
+/// enabled — exactly the state the current seeding produces.
 async fn ensure_catalog_models(state: &AppState) {
-    let mut cfg = state.config.write().await;
-    if cfg.catalog_seeded {
-        return;
-    }
-    if !cfg.models.is_empty() {
-        cfg.catalog_seeded = true;
-        return;
-    }
     let backend_for = |model_id: &str| -> Option<&'static str> {
         match model_id {
             "qwen3-27b-planner" => Some("planner"),
@@ -629,6 +629,40 @@ async fn ensure_catalog_models(state: &AppState) {
             _ => None,
         }
     };
+    let mut cfg = state.config.write().await;
+    let mut dirty = false;
+    if !cfg.defaults_repaired {
+        let catalog: Vec<manager_config::CatalogModelDefaults> = manager_models::curated_models()
+            .into_iter()
+            .filter_map(|spec| {
+                backend_for(&spec.id).map(|backend_id| manager_config::CatalogModelDefaults {
+                    model_id: spec.id,
+                    sha256: spec.sha256,
+                    params_b: spec.params_b,
+                    backend_id: backend_id.to_string(),
+                })
+            })
+            .collect();
+        dirty = manager_config::repair_catalog_defaults(
+            &mut cfg,
+            &catalog,
+            manager_models::PLACEHOLDER_SHA256,
+        );
+        cfg.defaults_repaired = true;
+    }
+    if cfg.catalog_seeded {
+        if dirty {
+            let _ = manager_config::save(&cfg, &state.config_path);
+        }
+        return;
+    }
+    if !cfg.models.is_empty() {
+        cfg.catalog_seeded = true;
+        if dirty {
+            let _ = manager_config::save(&cfg, &state.config_path);
+        }
+        return;
+    }
     cfg.models = manager_models::curated_models()
         .into_iter()
         .map(|spec| {
@@ -645,7 +679,7 @@ async fn ensure_catalog_models(state: &AppState) {
                 id: spec.id,
                 gguf_path: PathBuf::from("models").join(file_name),
                 quant: spec.quant,
-                params_b: 0.0,
+                params_b: spec.params_b,
                 sha256: spec.sha256,
                 verified_at: None,
                 source_url: spec.url,
@@ -668,6 +702,10 @@ async fn ensure_catalog_models(state: &AppState) {
             if backend.model_file == PathBuf::from(format!("models/{backend_id}.gguf")) {
                 backend.model_file = path;
             }
+            // The default fleet is enabled by default; a backend
+            // whose model is not downloaded and verified yet fails
+            // its start preflight rather than starting unconfigured.
+            backend.enabled = true;
         }
     }
     cfg.catalog_seeded = true;
@@ -728,6 +766,10 @@ async fn get_config(state: State<'_, AppState>) -> ApiResult {
 /// and disk never diverge.
 #[tauri::command]
 async fn update_config(state: State<'_, AppState>, patch: Value) -> ApiResult {
+    // Seeding/repair first: this command validates the patched config,
+    // and a fresh install's pre-seed config (default backends not yet
+    // aligned to registered models) must not fail that validation.
+    ensure_catalog_models(&state).await;
     let mut cfg = state.config.write().await;
     let mut v = serde_json::to_value(&*cfg).map_err(jerr)?;
     merge_json(&mut v, patch);
@@ -1504,6 +1546,7 @@ fn download_spec_for(cfg: &AppConfig, id: &str) -> Result<manager_models::ModelS
                 manager_models::PLACEHOLDER_SHA256.to_string()
             },
             url: m.source_url.clone(),
+            params_b: m.params_b,
         });
     }
     Err(err(ApiError::NotFound(format!(
@@ -2824,6 +2867,7 @@ async fn placement_propose(
                 sha256: m.sha256.clone(),
                 url: m.source_url.clone(),
                 size_bytes,
+                params_b: m.params_b,
             }
         }
     };

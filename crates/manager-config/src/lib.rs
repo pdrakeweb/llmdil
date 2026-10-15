@@ -61,6 +61,14 @@ pub struct AppConfig {
     /// have the catalog resurrected on the next launch.
     #[serde(default)]
     pub catalog_seeded: bool,
+    /// Set once the one-time defaults repair has run (see
+    /// [`repair_catalog_defaults`]): configurations written before the
+    /// catalog carried real hash pins and parameter counts, and before
+    /// the default backends were enabled by default, are repaired
+    /// exactly once. Configurations created by current code are born
+    /// with this set.
+    #[serde(default)]
+    pub defaults_repaired: bool,
 }
 
 /// Presenter mode for a data window (spec §4 hybrid view matrix).
@@ -279,8 +287,14 @@ impl AppConfig {
     /// Sensible first-run defaults matching the spec's port/strategy conventions.
     ///
     /// The four conventional backends (planner :8081, coder :8082,
-    /// coder-fast :8083, tool-runner :8084) are present but disabled; the
-    /// wizard enables them as models are downloaded and verified.
+    /// coder-fast :8083, tool-runner :8084) start disabled in this raw
+    /// default because their model files are not registered models
+    /// until the catalog is seeded; the first-run seeding pass aligns
+    /// their model files to the seeded models and enables them, so the
+    /// persisted configuration the app runs with has the default fleet
+    /// enabled. A backend whose model is not downloaded and verified
+    /// yet fails its start preflight rather than starting
+    /// unconfigured.
     pub fn default_config() -> Self {
         let strategies = [
             (
@@ -370,8 +384,76 @@ impl AppConfig {
             notifications: NotificationConfig { enabled: true },
             setup_completed: false,
             catalog_seeded: false,
+            defaults_repaired: true,
         }
     }
+}
+
+/// One curated catalog entry's repair data for
+/// [`repair_catalog_defaults`]: the values a configuration seeded by an
+/// older version may be missing or hold as placeholders.
+pub struct CatalogModelDefaults {
+    pub model_id: String,
+    pub sha256: String,
+    pub params_b: f32,
+    /// The default backend this model belongs to.
+    pub backend_id: String,
+}
+
+/// One-time repair for configurations written before the catalog
+/// carried real values. For each catalog model present in the config:
+///
+/// - a `sha256` still equal to `placeholder_sha` is replaced with the
+///   catalog's real pinned hash (a deliberately emptied or otherwise
+///   edited hash is left alone);
+/// - a non-positive `params_b` is set from the catalog (validation
+///   requires a positive value, and older seeding wrote 0);
+/// - the model's default backend is recorded in `assigned_backends`
+///   when missing.
+///
+/// For each catalog backend: a `model_file` still equal to the
+/// untouched default (`models/<backend-id>.gguf`) is aligned to its
+/// model's registered path, and the backend is enabled (older
+/// defaults shipped the fleet disabled; enabling is what the current
+/// defaults do — a backend whose model is not downloaded and verified
+/// still fails its start preflight). Returns true when anything
+/// changed. The caller gates this on [`AppConfig::defaults_repaired`]
+/// so it runs exactly once and never overrides later operator choices.
+pub fn repair_catalog_defaults(
+    cfg: &mut AppConfig,
+    catalog: &[CatalogModelDefaults],
+    placeholder_sha: &str,
+) -> bool {
+    let mut changed = false;
+    for entry in catalog {
+        let Some(model) = cfg.models.iter_mut().find(|m| m.id == entry.model_id) else {
+            continue;
+        };
+        if model.sha256 == placeholder_sha {
+            model.sha256 = entry.sha256.clone();
+            changed = true;
+        }
+        if model.params_b <= 0.0 {
+            model.params_b = entry.params_b;
+            changed = true;
+        }
+        if !model.assigned_backends.contains(&entry.backend_id) {
+            model.assigned_backends.push(entry.backend_id.clone());
+            changed = true;
+        }
+        let gguf_path = model.gguf_path.clone();
+        if let Some(backend) = cfg.backends.iter_mut().find(|b| b.id == entry.backend_id) {
+            if backend.model_file == format!("models/{}.gguf", entry.backend_id) {
+                backend.model_file = gguf_path;
+                changed = true;
+            }
+            if !backend.enabled {
+                backend.enabled = true;
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// Load, migrate, and validate the config at `path`.
@@ -997,6 +1079,87 @@ mod tests {
         let mut cfg = working_config();
         cfg.models[0].sha256 = String::new();
         validate(&cfg).expect("empty sha256 must validate");
+    }
+
+    #[test]
+    fn repair_catalog_defaults_heals_stale_seed() {
+        // A config as an older version wrote it: placeholder hash,
+        // params_b 0, no backend assignment, backend disabled with the
+        // untouched default model_file (the state that made every
+        // backend enable fail validation).
+        let mut cfg = AppConfig::default_config();
+        cfg.models.push(ModelConfig {
+            id: "qwen3-8b".to_string(),
+            gguf_path: PathBuf::from("models/Qwen3-8B-Q4_K_M.gguf"),
+            quant: "Q4_K_M".to_string(),
+            params_b: 0.0,
+            sha256: "PLACEHOLDER-pin".to_string(),
+            verified_at: None,
+            source_url: "https://example.com/q.gguf".to_string(),
+            assigned_backends: Vec::new(),
+            enabled: true,
+        });
+        let catalog = vec![CatalogModelDefaults {
+            model_id: "qwen3-8b".to_string(),
+            sha256: "a".repeat(64),
+            params_b: 8.0,
+            backend_id: "tool-runner".to_string(),
+        }];
+        assert!(repair_catalog_defaults(
+            &mut cfg,
+            &catalog,
+            "PLACEHOLDER-pin"
+        ));
+        let m = &cfg.models[0];
+        assert_eq!(m.sha256, "a".repeat(64));
+        assert_eq!(m.params_b, 8.0);
+        assert_eq!(m.assigned_backends, vec!["tool-runner".to_string()]);
+        let b = cfg.backends.iter().find(|b| b.id == "tool-runner").unwrap();
+        assert!(b.enabled);
+        assert_eq!(b.model_file, PathBuf::from("models/Qwen3-8B-Q4_K_M.gguf"));
+        validate(&cfg).expect("repaired config validates");
+        // A second pass changes nothing.
+        assert!(!repair_catalog_defaults(
+            &mut cfg,
+            &catalog,
+            "PLACEHOLDER-pin"
+        ));
+    }
+
+    #[test]
+    fn repair_preserves_custom_hash_and_model_file() {
+        let mut cfg = AppConfig::default_config();
+        cfg.models.push(ModelConfig {
+            id: "qwen3-8b".to_string(),
+            gguf_path: PathBuf::from("models/custom.gguf"),
+            quant: "Q8_0".to_string(),
+            params_b: 8.0,
+            sha256: String::new(), // deliberately unpinned
+            verified_at: None,
+            source_url: "https://example.com/q.gguf".to_string(),
+            assigned_backends: vec!["tool-runner".to_string()],
+            enabled: true,
+        });
+        // The operator pointed the backend at a custom file; neither
+        // the file nor the model's hash/params may be rewritten. (The
+        // one-time pass does enable the default backend — that is its
+        // documented purpose.)
+        cfg.backends
+            .iter_mut()
+            .find(|b| b.id == "tool-runner")
+            .unwrap()
+            .model_file = PathBuf::from("models/custom.gguf");
+        let catalog = vec![CatalogModelDefaults {
+            model_id: "qwen3-8b".to_string(),
+            sha256: "a".repeat(64),
+            params_b: 8.0,
+            backend_id: "tool-runner".to_string(),
+        }];
+        repair_catalog_defaults(&mut cfg, &catalog, "PLACEHOLDER-pin");
+        assert_eq!(cfg.models[0].sha256, "");
+        assert_eq!(cfg.models[0].params_b, 8.0);
+        let b = cfg.backends.iter().find(|b| b.id == "tool-runner").unwrap();
+        assert_eq!(b.model_file, PathBuf::from("models/custom.gguf"));
     }
 
     #[test]

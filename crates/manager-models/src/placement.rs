@@ -152,6 +152,7 @@ mod tests {
             size_bytes: 10 * MIB,
             sha256: String::new(),
             url: String::new(),
+            params_b: 1.0,
         }
     }
 

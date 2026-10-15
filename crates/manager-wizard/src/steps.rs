@@ -1834,6 +1834,20 @@ impl Default for VscodeExtensions {
     }
 }
 
+/// True when a command error is the ops layer's spawn-level failure
+/// (the executable could not be started at all), as opposed to a
+/// program that ran and exited nonzero. The ops layer reports spawn
+/// failures with exit code -1 and its own `spawn failed:` prefix.
+/// Steps whose external tool is optional (VS Code, the MXC runtime)
+/// skip instead of failing when their executable is absent.
+fn spawn_failed(e: &WizardError) -> bool {
+    matches!(
+        e,
+        WizardError::CommandFailed { code: -1, stderr, .. }
+            if stderr.starts_with("spawn failed")
+    )
+}
+
 impl VscodeExtensions {
     /// Generate a Continue config with every gateway group as a model,
     /// carrying the gateway master key as each model's apiKey.
@@ -1863,17 +1877,9 @@ impl VscodeExtensions {
             .collect()
     }
 
-    /// True when a command error is the ops layer's spawn-level
-    /// failure (the executable could not be started at all), as opposed
-    /// to a program that ran and exited nonzero. The ops layer reports
-    /// spawn failures with exit code -1 and its own `spawn failed:`
-    /// prefix.
+    /// See [`spawn_failed`].
     fn spawn_failed(e: &WizardError) -> bool {
-        matches!(
-            e,
-            WizardError::CommandFailed { code: -1, stderr, .. }
-                if stderr.starts_with("spawn failed")
-        )
+        spawn_failed(e)
     }
 
     /// The skip outcome for a machine without VS Code: the extensions
@@ -2302,6 +2308,15 @@ impl WizardStep for MxcPolicies {
                     vec![out.stderr],
                 ))
             }
+            Err(e) if spawn_failed(&e) => {
+                // The MXC runtime is a separate Microsoft distribution
+                // (@microsoft/mxc-sdk); it is not installed by this
+                // app. Absent runtime = optional component missing,
+                // a skip — the same treatment as a missing VS Code.
+                return Ok(StepOutcome::skipped(
+                    "MXC runtime (wxc-exec.exe) is not installed; MXC policy application skipped",
+                ));
+            }
             Err(e) => {
                 return Ok(StepOutcome::failed(
                     format!("MXC runtime not available: {e}"),
@@ -2409,12 +2424,21 @@ pub const SMOKE_MAX_LATENCY_MS: u64 = 120_000;
 /// assert non-empty completion + sane latency; record baselines.
 pub struct SmokeTest {
     pub max_latency_ms: u64,
+    /// Install mode only: how long to wait for each enabled member
+    /// backend to answer its health endpoint before probing the
+    /// gateway (llama-server needs time to load its model; the wizard
+    /// starts the backends right before this step).
+    pub ready_budget_ms: u64,
+    /// Delay between health polls while waiting.
+    pub ready_poll_ms: u64,
 }
 
 impl Default for SmokeTest {
     fn default() -> Self {
         Self {
             max_latency_ms: SMOKE_MAX_LATENCY_MS,
+            ready_budget_ms: 240_000,
+            ready_poll_ms: 2_000,
         }
     }
 }
@@ -2422,6 +2446,52 @@ impl Default for SmokeTest {
 impl SmokeTest {
     fn baselines_path(&self, ctx: &WizardContext) -> PathBuf {
         ctx.data_dir.join("wizard").join("smoke-baselines.json")
+    }
+
+    /// Wait until every enabled backend a gateway group routes to
+    /// answers `GET /health` with 200 (llama-server returns 503 while
+    /// its model loads and refuses connections before it binds).
+    /// Returns Some(failed outcome) when a backend does not become
+    /// healthy inside the budget; None when probing may proceed.
+    async fn wait_for_backends(
+        &self,
+        ctx: &WizardContext,
+        log: &mut Vec<String>,
+    ) -> Option<StepOutcome> {
+        let mut targets: Vec<(String, u16)> = Vec::new();
+        for group in &ctx.config.gateway.groups {
+            for member in &group.members {
+                if let Some(b) = ctx.config.backends.iter().find(|b| &b.id == member) {
+                    if b.enabled && !targets.iter().any(|(id, _)| id == &b.id) {
+                        targets.push((b.id.clone(), b.port));
+                    }
+                }
+            }
+        }
+        for (id, port) in targets {
+            let url = format!("http://127.0.0.1:{port}/health");
+            let start = std::time::Instant::now();
+            loop {
+                if let Ok(resp) = ctx.ops.http_get(&url).await {
+                    if resp.status == 200 {
+                        log.push(format!("backend '{id}' healthy on :{port}"));
+                        break;
+                    }
+                }
+                if start.elapsed().as_millis() as u64 >= self.ready_budget_ms {
+                    return Some(StepOutcome::failed(
+                        format!(
+                            "backend '{id}' did not become healthy within {} s; start it from the Backends view, then re-run smoke-test",
+                            self.ready_budget_ms / 1000
+                        ),
+                        log.clone(),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(self.ready_poll_ms.max(1)))
+                    .await;
+            }
+        }
+        None
     }
 }
 
@@ -2474,6 +2544,12 @@ impl WizardStep for SmokeTest {
                 vec![],
             ));
         }
+        let mut log = Vec::new();
+        if ctx.mode == RunMode::Install {
+            if let Some(outcome) = self.wait_for_backends(ctx, &mut log).await {
+                return Ok(outcome);
+            }
+        }
         let tag = format!("wizard-{}", chrono::Utc::now().timestamp());
         let url = format!(
             "http://127.0.0.1:{}/v1/chat/completions",
@@ -2491,7 +2567,6 @@ impl WizardStep for SmokeTest {
             }
             _ => Vec::new(),
         };
-        let mut log = Vec::new();
         let mut baselines = Vec::new();
         for group in &groups {
             let body = serde_json::json!({
@@ -4077,6 +4152,42 @@ mod tests {
         assert!(out2.message.contains("saoudrizwan.claude-dev"));
     }
 
+    #[tokio::test]
+    async fn smoke_test_fails_when_backend_never_healthy() {
+        let ops = Arc::new(FakeSystemOps::new());
+        script_backends_healthy(&ops);
+        // The planner backend (first group member polled) stays in
+        // its model-loading state.
+        ops.with_http_get(
+            "http://127.0.0.1:8081/health",
+            crate::HttpResponse {
+                status: 503,
+                body: b"loading".to_vec(),
+                elapsed_ms: 1,
+            },
+        );
+        ops.with_http_post(
+            "http://127.0.0.1:4000/v1/chat/completions",
+            smoke_post_response(),
+        );
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let step = SmokeTest {
+            max_latency_ms: SMOKE_MAX_LATENCY_MS,
+            ready_budget_ms: 40,
+            ready_poll_ms: 5,
+        };
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(
+            out.message.contains("did not become healthy"),
+            "{}",
+            out.message
+        );
+        assert!(out.message.contains("planner"), "{}", out.message);
+        // No gateway probe was attempted.
+        assert!(ops.posts().is_empty());
+    }
+
     // --- McpServers ---
 
     #[tokio::test]
@@ -4202,6 +4313,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mxc_missing_runtime_skips() {
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_command_failure(
+            &["wxc-exec.exe", "--probe-json"],
+            -1,
+            "spawn failed: program not found",
+        );
+        let ctx = ctx_with(ops, RunMode::Install);
+        let out = MxcPolicies.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Skipped, "{out:?}");
+        assert!(out.message.contains("not installed"), "{}", out.message);
+    }
+
+    #[tokio::test]
     async fn mxc_probe_failure_fails_step() {
         let ops = Arc::new(FakeSystemOps::new());
         ops.with_command_failure(&["wxc-exec.exe", "--probe-json"], 1, "not found");
@@ -4213,6 +4338,18 @@ mod tests {
 
     // --- SmokeTest ---
 
+    /// Install-mode smoke tests: the step waits for every enabled
+    /// member backend to answer /health before probing. Script all
+    /// four default backends healthy.
+    fn script_backends_healthy(ops: &FakeSystemOps) {
+        for port in [8081u16, 8082, 8083, 8084] {
+            ops.with_http_get(
+                &format!("http://127.0.0.1:{port}/health"),
+                FakeSystemOps::http_ok("{}"),
+            );
+        }
+    }
+
     #[tokio::test]
     async fn smoke_test_passes_and_writes_baselines() {
         let ops = Arc::new(FakeSystemOps::new());
@@ -4220,6 +4357,7 @@ mod tests {
             "http://127.0.0.1:4000/v1/chat/completions",
             smoke_post_response(),
         );
+        script_backends_healthy(&ops);
         let ctx = ctx_with(ops.clone(), RunMode::Install);
         let step = SmokeTest::default();
         assert_eq!(step.planned_commands(&ctx).len(), 4, "one probe per group");
@@ -4245,6 +4383,7 @@ mod tests {
             "http://127.0.0.1:4000/v1/chat/completions",
             FakeSystemOps::http_ok(r#"{"choices":[{"message":{"content":"  "}}]}"#),
         );
+        script_backends_healthy(&ops);
         let ctx = ctx_with(ops, RunMode::Install);
         let out = SmokeTest::default().run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Failed);
@@ -4262,6 +4401,7 @@ mod tests {
                 elapsed_ms: 5,
             },
         );
+        script_backends_healthy(&ops);
         let ctx = ctx_with(ops, RunMode::Install);
         let out = SmokeTest::default().run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Failed);

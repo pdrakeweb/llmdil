@@ -183,6 +183,14 @@ function baseName(p: string): string {
   return p.split(/[\\/]/).pop() ?? p;
 }
 
+/** Does a backend's model_file resolve to a model's gguf_path?
+ *  model_assign writes the gguf_path verbatim, so an exact match is
+ *  the assigned state; a basename match covers configs written with
+ *  a different directory prefix. */
+function sameModelFile(modelFile: string, ggufPath: string): boolean {
+  return modelFile !== "" && (modelFile === ggufPath || baseName(modelFile) === baseName(ggufPath));
+}
+
 export async function wireGpus(root: HTMLElement): Promise<() => void> {
   let disposed = false;
   let loading = false;
@@ -256,6 +264,10 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
   let placeModelRows: ModelRow[] = [];
   let projection: { backendId: string; modelId: string; data: PlacementProjectionData } | null = null;
   let placeBusy = false;
+  /** GPU indices (nvidia-smi order) the operator has unchecked: the
+   *  proposed split gives them a 0 fraction so the backend leaves
+   *  their memory alone (for example the display GPU). */
+  const placeExcluded = new Set<number>();
 
   /** Does the backend's model_file already resolve to the model's
    *  gguf_path? model_assign writes the gguf_path verbatim, so an
@@ -289,7 +301,7 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
         <td>${Math.round(frac * 100)}%</td>
         <td>${p.per_gpu_mib[i]} MiB</td>
         <td>${freeMib !== null ? `${freeMib} MiB` : "\u2014"}</td>
-        <td>${fits ? `<span style="color:var(--ok)">fits</span>` : `<span style="color:var(--err)">does not fit</span>`}</td></tr>`;
+        <td>${frac === 0 ? `<span style="color:var(--text3)">not used</span>` : fits ? `<span style="color:var(--ok)">fits</span>` : `<span style="color:var(--err)">does not fit</span>`}</td></tr>`;
     }).join("");
     const ageMs = p.snapshot_age_ms ?? (lastAtMs !== null ? Math.max(0, Date.now() - lastAtMs) : null);
     const agePart = ageMs !== null
@@ -297,8 +309,8 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
       : "Based on the latest telemetry snapshot \u00b7 fractions map to GPUs in nvidia-smi index order.";
     res.innerHTML = `<div style="margin-top:10px">
       <div style="font-size:12px;color:var(--text2)">${p.fits
-        ? "The proposed split fits the free VRAM on every GPU."
-        : "The proposed split does not fit \u2014 at least one GPU lacks the free VRAM."}</div>
+        ? "The proposed split fits the free VRAM on every GPU in the split."
+        : "The proposed split does not fit \u2014 at least one GPU in the split lacks the free VRAM."}</div>
       <table class="tbl" style="margin-top:8px"><thead><tr><th>GPU</th><th>Fraction</th><th>Required</th><th>Free</th><th>Fit</th></tr></thead>
       <tbody>${rows}</tbody></table>
       <div style="font-size:12px;color:var(--text2);margin-top:8px">Weights only \u2014 excludes KV cache and runtime overhead; a split that fits here can still fail at load.</div>
@@ -329,6 +341,11 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
         <button class="btn" id="placeApply" disabled>Apply split</button>
       </div>
       ${placeModelRows.length ? "" : `<div style="font-size:12px;color:var(--text2);margin-top:8px">No models are configured \u2014 a model is needed before a split can be proposed or applied.</div>`}
+      ${lastGpus.length ? `<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px">
+        <span style="font-size:12px;color:var(--text2)">GPUs in the split:</span>
+        ${lastGpus.map((g, i) => `<label style="font-size:12px;display:inline-flex;align-items:center;gap:5px"><input type="checkbox" data-place-gpu="${i}"${placeExcluded.has(i) ? "" : " checked"}> ${esc(g.name)}</label>`).join("")}
+      </div>
+      <div style="font-size:12px;color:var(--text2);margin-top:6px">The split divides the model's weights across the selected GPUs, in nvidia-smi index order. Uncheck a GPU to leave it out of this backend \u2014 for example the display GPU, whose memory Windows already uses.</div>` : ""}
       <div id="placeMsg" style="font-size:12px;margin-top:8px"></div>
       <div id="placeResult"></div>
     </div>`;
@@ -340,6 +357,14 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     modelSel?.addEventListener("change", onPlaceSelectionChange);
     proposeBtn?.addEventListener("click", onPropose);
     applyBtn?.addEventListener("click", onApply);
+    placeEl.querySelectorAll("[data-place-gpu]").forEach((el) => {
+      el.addEventListener("change", () => {
+        const idx = Number(el.getAttribute("data-place-gpu"));
+        if ((el as HTMLInputElement).checked) placeExcluded.delete(idx);
+        else placeExcluded.add(idx);
+        onPlaceSelectionChange();
+      });
+    });
   };
 
   const onPlaceSelectionChange = (): void => {
@@ -372,10 +397,21 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
         && flags.tensor_split.every((x) => typeof x === "number" && Number.isFinite(x))) {
         split = flags.tensor_split as number[];
       }
+      const n = lastGpus.length;
+      if (!n) { placeMsg("No GPU telemetry yet \u2014 a split cannot be proposed until telemetry reports the GPUs.", true); return; }
+      const used = lastGpus.map((_, i) => i).filter((i) => !placeExcluded.has(i));
+      if (!used.length) { placeMsg("Select at least one GPU for the split.", true); return; }
+      if (split.length) {
+        // The backend's configured split applies only when it covers
+        // exactly the selected GPUs; a different selection needs a
+        // fresh composition.
+        const nz = split.map((f, i) => (f > 0 ? i : -1)).filter((i) => i >= 0);
+        const sameSet = split.length === n && nz.length === used.length && nz.every((i) => used.includes(i));
+        if (!sameSet) split = [];
+      }
       if (!split.length) {
-        const n = lastGpus.length;
-        if (!n) { placeMsg("No GPU telemetry yet \u2014 a split cannot be proposed until telemetry reports the GPUs.", true); return; }
-        split = Array.from({ length: n }, () => 1 / n);
+        // Even split across the selected GPUs; 0 for the rest.
+        split = lastGpus.map((_, i) => (used.includes(i) ? 1 / used.length : 0));
       }
       const r = await placementPropose(modelId, split);
       if (disposed) return;
@@ -601,6 +637,18 @@ function quoteArg(a: string): string {
   return /[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a;
 }
 
+/** Options for a backend card's model dropdown: every registered
+ *  model, with the one the backend currently serves selected. When
+ *  the backend's model_file matches no registered model (a custom
+ *  path), a leading option carries the current file so the control
+ *  shows the true state; choosing it is a no-op. */
+function modelOptions(b: BackendRow, models: ModelRow[]): string {
+  const matched = models.some((m) => sameModelFile(b.model_file, m.gguf_path));
+  const lead = matched ? "" : `<option value="" selected>${esc(b.model_file ? baseName(b.model_file) : "no model assigned")} (current)</option>`;
+  return lead + models.map((m) =>
+    `<option value="${esc(m.id)}"${sameModelFile(b.model_file, m.gguf_path) ? " selected" : ""}>${esc(m.id)} \u2014 ${esc(baseName(m.gguf_path))}</option>`).join("");
+}
+
 function backendCard(
   b: BackendRow,
   openArgv: Set<string>,
@@ -608,6 +656,7 @@ function backendCard(
   msgs: Map<string, CardNote>,
   logTails: Map<string, LogRow[]>,
   inFlight: Set<string>,
+  models: ModelRow[],
 ): string {
   const active = b.state === "running" || b.state === "starting";
   // Buttons render disabled while this card's action is in flight.
@@ -672,7 +721,9 @@ function backendCard(
         ${b.configured ? "" : `<span class="chip badge-warn">not in config</span>`}
         ${b.configured ? `<span class="chip">${b.enabled ? "enabled" : "disabled"}</span>` : ""}
         <span class="chip">${esc(b.state)}</span></h3>
-      <div style="font-size:12px;color:var(--text2);margin-top:6px">Model: <span style="font-family:var(--mono)">${esc(b.model_file)}</span></div>
+      ${b.configured ? `<div style="font-size:12px;color:var(--text2);margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">Model:
+        <select data-back-model="${esc(b.id)}" style="${SELECT_STYLE}"${dis}>${modelOptions(b, models)}</select></div>`
+      : `<div style="font-size:12px;color:var(--text2);margin-top:6px">Model: <span style="font-family:var(--mono)">${esc(b.model_file)}</span></div>`}
       ${orphanNote}
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0">
         ${[["State", b.state], ["PID", b.pid !== null ? String(b.pid) : "\u2014"],
@@ -705,6 +756,8 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
    *  render disabled (the set outlives any single repaint). */
   const inFlight = new Set<string>();
   let lastRows: BackendRow[] = [];
+  /** Registered models for the per-card model dropdowns. */
+  let lastModels: ModelRow[] = [];
   let actionInFlight = false;
   let disposed = false;
   /** Load sequence: only the most recently started load may paint. */
@@ -713,7 +766,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const paint = (): void => {
     const b = root.querySelector("#backBody");
     if (!b) return;
-    b.innerHTML = `<div class="grid2">${lastRows.map((row) => backendCard(row, openArgv, argvCache, msgs, logTails, inFlight)).join("")}</div>`;
+    b.innerHTML = `<div class="grid2">${lastRows.map((row) => backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels)).join("")}</div>`;
   };
 
   /** Lazily fetch the last log lines for failed backends and repaint.
@@ -741,8 +794,9 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
 
   const load = async (): Promise<void> => {
     const seq = ++loadSeq;
-    const r = await getBackends();
+    const [r, mr] = await Promise.all([getBackends(), getModels()]);
     if (disposed || seq !== loadSeq) return; // a newer load supersedes this one
+    if (!mr.error && mr.data) lastModels = mr.data;
     setBanner(root, "backBanner", bannerHtml(r));
     const b = root.querySelector("#backBody");
     if (!b) return;
@@ -841,7 +895,46 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       if (!disposed) paint();
     }
   };
+  /** Model dropdown change: assign the chosen model to the backend
+   *  through model_assign, carrying the backend's current tensor
+   *  split so the assignment changes the model only. The card note
+   *  tells the operator a restart applies it to a running backend. */
+  const onModelChange = async (ev: Event): Promise<void> => {
+    const sel = (ev.target as HTMLElement).closest("[data-back-model]") as HTMLSelectElement | null;
+    if (!sel || sel.disabled) return;
+    const backendId = sel.getAttribute("data-back-model") ?? "";
+    const modelId = sel.value;
+    if (!backendId || !modelId) return;
+    const row = lastRows.find((b) => b.id === backendId);
+    const model = lastModels.find((m) => m.id === modelId);
+    if (!row || !model || sameModelFile(row.model_file, model.gguf_path)) return;
+    inFlight.add(backendId);
+    paint();
+    try {
+      const cfgR = await getBackendConfig(backendId);
+      const flags = cfgR.data?.flags as { tensor_split?: unknown } | undefined;
+      const split = Array.isArray(flags?.tensor_split)
+        && flags.tensor_split.every((x) => typeof x === "number" && Number.isFinite(x))
+        ? (flags.tensor_split as number[]) : [];
+      const r = await modelAssign(backendId, modelId, split);
+      if (disposed) return;
+      if (r.error) {
+        msgs.set(backendId, { text: `Model change failed: ${r.error}`, err: true });
+      } else {
+        msgs.set(backendId, {
+          text: row.state === "running" || row.state === "starting"
+            ? `Model set to ${modelId}. Restart the backend to use it.`
+            : `Model set to ${modelId}.`,
+          err: false,
+        });
+      }
+    } finally {
+      inFlight.delete(backendId);
+      if (!disposed) await load();
+    }
+  };
   root.addEventListener("click", onClick);
+  root.addEventListener("change", onModelChange);
 
   await load();
 
@@ -855,6 +948,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     disposed = true;
     window.clearInterval(timer);
     root.removeEventListener("click", onClick);
+    root.removeEventListener("change", onModelChange);
     refreshBtn?.removeEventListener("click", onRefresh);
   };
 }
@@ -2113,7 +2207,7 @@ export function renderWizard(): string {
       <div class="wiz-side"><p>Steps run in order. A failed step pauses the run \u2014 retry it to continue.</p>
         <div style="margin-top:14px;display:grid;gap:6px">
           <div>${icon("shield")} checksums verified per file</div>
-          <div>${icon("server")} services start at the gateway step</div></div></div>
+          <div>${icon("server")} the gateway starts at its step; backends start before the smoke test</div></div></div>
       <div class="wiz-steps" id="wizSteps"></div>
     </div>
     <div class="wiz-foot"><button class="btn" disabled>Back</button><span class="spacer"></span>
@@ -2181,7 +2275,28 @@ export function wireWizard(root: HTMLElement): () => void {
     void enrichFailed();
   };
 
+  /** The wizard's steps run in the wizard layer, which has no handle
+   *  to the backend supervisor — only the gateway has a wizard step.
+   *  Before the smoke test, start every enabled backend that is not
+   *  already running: the smoke test probes through the gateway to
+   *  the backends, so they must be up (the step itself then waits for
+   *  their health endpoints while the models load). A backend that
+   *  fails to start is logged; the smoke test reports the consequence. */
+  const startEnabledBackends = async (): Promise<void> => {
+    const r = await getBackends();
+    if (r.error || !r.data) { logLine(`could not list backends before the smoke test: ${r.error ?? "no data"}`, "lvl-warn"); return; }
+    for (const b of r.data) {
+      if (!b.configured || !b.enabled) continue;
+      if (b.state === "running" || b.state === "starting") continue;
+      logLine(`starting backend: ${b.id}\u2026`);
+      const sr = await startBackend(b.id);
+      if (sr.error) logLine(`backend ${b.id} did not start: ${sr.error}`, "lvl-err");
+      else logLine(`backend ${b.id} starting`);
+    }
+  };
+
   const runOne = async (stepId: string): Promise<"ok" | "failed" | "busy"> => {
+    if (stepId === "smoke-test") await startEnabledBackends();
     logLine(`running step: ${stepId}`);
     const r = await runWizardStep(stepId);
     if (r.error) { logLine(`step ${stepId} error: ${r.error}`, "lvl-err"); await refresh(); return "failed"; }
