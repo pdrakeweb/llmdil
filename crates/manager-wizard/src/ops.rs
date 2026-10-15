@@ -732,6 +732,110 @@ impl SystemOps for RealSystemOps {
             .or_else(|| std::env::var_os("HOME"))
             .map(PathBuf::from)
     }
+
+    async fn vscode_cli(&self) -> Option<String> {
+        #[cfg(windows)]
+        {
+            find_vscode_cli_windows()
+        }
+        #[cfg(not(windows))]
+        {
+            // The PATH probe in the step is the detection mechanism
+            // off Windows.
+            None
+        }
+    }
+}
+
+/// Read a registry key's (Default) string value; `None` on any
+/// failure (missing key/value, non-string value).
+#[cfg(windows)]
+fn reg_default_string(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    subkey: &str,
+) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, KEY_READ, REG_EXPAND_SZ, REG_SZ,
+    };
+    let subkey_w: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut key: windows_sys::Win32::System::Registry::HKEY = std::ptr::null_mut();
+    let rc = unsafe { RegOpenKeyExW(root, subkey_w.as_ptr(), 0, KEY_READ, &mut key) };
+    if rc != 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    let mut ty: u32 = 0;
+    let rc = unsafe {
+        RegQueryValueExW(
+            key,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            &mut ty,
+            buf.as_mut_ptr() as *mut u8,
+            &mut len,
+        )
+    };
+    unsafe { RegCloseKey(key) };
+    if rc != 0 || (ty != REG_SZ && ty != REG_EXPAND_SZ) {
+        return None;
+    }
+    buf.truncate((len as usize / 2).min(buf.len()));
+    let s = String::from_utf16_lossy(&buf);
+    let s = s.trim().trim_matches('"').trim_end_matches('\0').trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Locate the VS Code CLI without relying on this process's PATH.
+///
+/// A GUI process inherits the environment of whatever launched it,
+/// which may predate the VS Code install (or the PATH edit its
+/// installer made), so spawning bare `code` can fail on a machine
+/// where typing `code` in PowerShell works. VS Code's installer
+/// registers the editor under the App Paths registry key — the
+/// Windows mechanism for exactly this lookup — and the CLI lives in
+/// the `bin` directory of the install root. Standard install
+/// locations (system and per-user installers, stable and Insiders)
+/// are the fallback.
+#[cfg(windows)]
+fn find_vscode_cli_windows() -> Option<String> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    for root in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
+        if let Some(exe) = reg_default_string(
+            root,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Code.exe",
+        ) {
+            if let Some(install_dir) = PathBuf::from(exe).parent() {
+                let cli = install_dir.join("bin").join("code.cmd");
+                if cli.exists() {
+                    return Some(cli.display().to_string());
+                }
+            }
+        }
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(pf) = std::env::var_os("ProgramFiles") {
+        roots.push(PathBuf::from(pf));
+    }
+    if let Some(la) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(PathBuf::from(la).join("Programs"));
+    }
+    for root in &roots {
+        for (dir, cli_name) in [
+            ("Microsoft VS Code", "code.cmd"),
+            ("Microsoft VS Code Insiders", "code-insiders.cmd"),
+        ] {
+            let cli = root.join(dir).join("bin").join(cli_name);
+            if cli.exists() {
+                return Some(cli.display().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Read a generic credential's blob via CredReadW (advapi32). Returns

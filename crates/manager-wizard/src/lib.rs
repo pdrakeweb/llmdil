@@ -454,6 +454,16 @@ pub trait SystemOps: Send + Sync {
         let _ = headers;
         self.http_post(url, body).await
     }
+    /// Absolute path to the VS Code command-line tool when VS Code
+    /// is installed but its `bin` directory is not on this process's
+    /// PATH (resolved from the Windows registry's App Paths entry and
+    /// the standard install locations). `None` when no installation
+    /// is found — callers then fall back to the bare `code` command
+    /// and its PATH lookup. The default finds nothing; the real
+    /// Windows implementation overrides it.
+    async fn vscode_cli(&self) -> Option<String> {
+        None
+    }
     /// HTTP HEAD; returns the Content-Length when the server provides one.
     /// Used for download size estimation (disk-space pre-check).
     async fn http_head_content_length(&self, url: &str) -> Result<Option<u64>, WizardError>;
@@ -627,6 +637,48 @@ impl Wizard {
             }
             let current = self.states.get(&step.id).copied();
             if matches!(current, None | Some(StepState::Queued)) {
+                self.states.insert(step.id.clone(), step.state);
+                self.reports.insert(step.id.clone(), step.clone());
+            }
+        }
+    }
+
+    /// Adopt a previously persisted report (this wizard's own
+    /// `report()` output, saved by the app layer) as this wizard's
+    /// state, so setup progress survives an app restart: the user
+    /// picks back up where they left off instead of facing an
+    /// untouched checklist. Unlike [`Self::hydrate`] — which adopts
+    /// only passing checks from a fresh audit — restore adopts every
+    /// recorded outcome, including failures and skips: they are the
+    /// user's progress, not machine checks. A step recorded as
+    /// Running was interrupted by the app closing; it comes back
+    /// Queued with a note saying so. Only steps still Queued here
+    /// are adopted, unknown ids are ignored, and a report from the
+    /// other mode is rejected wholesale (audit outcomes must go
+    /// through `hydrate`, never restore).
+    pub fn restore(&mut self, report: &WizardReport) {
+        if report.mode != self.mode {
+            return;
+        }
+        for step in &report.steps {
+            if self.find(&step.id).is_none() {
+                continue;
+            }
+            let current = self.states.get(&step.id).copied();
+            if !matches!(current, None | Some(StepState::Queued)) {
+                continue;
+            }
+            if step.state == StepState::Running {
+                let mut r = step.clone();
+                r.state = StepState::Queued;
+                r.message = String::new();
+                r.duration_ms = 0;
+                r.log_tail = Vec::new();
+                r.note =
+                    Some("interrupted — the app closed while this step was running".to_string());
+                self.states.insert(step.id.clone(), StepState::Queued);
+                self.reports.insert(step.id.clone(), r);
+            } else {
                 self.states.insert(step.id.clone(), step.state);
                 self.reports.insert(step.id.clone(), step.clone());
             }
@@ -1043,6 +1095,68 @@ mod tests {
         let a2 = w2.report().steps.into_iter().find(|s| s.id == "a").unwrap();
         assert_eq!(a2.state, StepState::Done);
         assert_ne!(a2.message, "verified by audit");
+    }
+
+    #[test]
+    fn restore_adopts_all_outcomes_and_marks_interrupted() {
+        let step_report = |id: &str, state: StepState, message: &str| StepReport {
+            id: id.to_string(),
+            name: id.to_string(),
+            state,
+            message: message.to_string(),
+            duration_ms: 42,
+            log_tail: vec!["line".to_string()],
+            note: None,
+        };
+        let persisted = WizardReport {
+            mode: RunMode::Install,
+            steps: vec![
+                step_report("a", StepState::Done, "installed"),
+                step_report("b", StepState::Failed, "boom"),
+                step_report("c", StepState::Running, ""),
+                step_report("ghost", StepState::Done, "unknown id"),
+            ],
+        };
+        let mut w = wizard(&[("a", false), ("b", false), ("c", false)]);
+        w.restore(&persisted);
+        let after = w.report();
+        let get = |id: &str| after.steps.iter().find(|s| s.id == id).unwrap();
+        // Done and Failed are adopted verbatim — progress and the
+        // record of what failed both survive the restart.
+        assert_eq!(get("a").state, StepState::Done);
+        assert_eq!(get("a").message, "installed");
+        assert_eq!(get("b").state, StepState::Failed);
+        assert_eq!(get("b").message, "boom");
+        // The interrupted step is runnable again, with the note.
+        assert_eq!(get("c").state, StepState::Queued);
+        assert!(get("c")
+            .note
+            .as_deref()
+            .unwrap_or("")
+            .contains("interrupted"));
+        // Unknown ids did not appear.
+        assert_eq!(after.steps.len(), 3);
+    }
+
+    #[test]
+    fn restore_rejects_other_mode_and_never_overwrites_session_state() {
+        let step_report = |id: &str, state: StepState| StepReport {
+            id: id.to_string(),
+            name: id.to_string(),
+            state,
+            message: "from audit".to_string(),
+            duration_ms: 1,
+            log_tail: Vec::new(),
+            note: None,
+        };
+        // An audit report must not be restored into the install
+        // wizard (its failures are checks, not install outcomes).
+        let mut w = wizard(&[("a", false)]);
+        w.restore(&WizardReport {
+            mode: RunMode::Audit,
+            steps: vec![step_report("a", StepState::Failed)],
+        });
+        assert_eq!(w.report().steps[0].state, StepState::Queued);
     }
 
     #[tokio::test]

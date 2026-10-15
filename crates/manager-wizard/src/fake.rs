@@ -65,6 +65,8 @@ struct FakeState {
     /// When true, `kill_process` fails (and the pid stays live).
     kill_fails: bool,
     home: Option<PathBuf>,
+    /// Scripted VS Code CLI resolution (`vscode_cli`).
+    vscode_cli: Option<String>,
     free_space: u64,
     head_lengths: HashMap<String, u64>,
 }
@@ -95,6 +97,7 @@ impl Default for FakeState {
             killed_pids: Vec::new(),
             kill_fails: false,
             home: None,
+            vscode_cli: None,
             // Default: effectively unlimited, so existing tests never trip
             // the disk-space pre-check.
             free_space: u64::MAX,
@@ -169,6 +172,13 @@ impl FakeSystemOps {
             .unwrap()
             .downloads
             .insert(url.to_string(), bytes);
+        self
+    }
+
+    /// Script the VS Code CLI location the ops layer resolves
+    /// (as if found via the registry / install locations).
+    pub fn with_vscode_cli(&self, cli: &str) -> &Self {
+        self.state.lock().unwrap().vscode_cli = Some(cli.to_string());
         self
     }
 
@@ -347,6 +357,10 @@ impl FakeSystemOps {
 
 #[async_trait]
 impl SystemOps for FakeSystemOps {
+    async fn vscode_cli(&self) -> Option<String> {
+        self.state.lock().unwrap().vscode_cli.clone()
+    }
+
     async fn run_command(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError> {
         let mut st = self.state.lock().unwrap();
         st.executed.push(cmd.argv.clone());

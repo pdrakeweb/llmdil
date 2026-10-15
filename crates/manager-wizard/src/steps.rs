@@ -1319,26 +1319,56 @@ impl StartGateway {
         ])
     }
 
-    /// The venv's litellm console script. LiteLLM cannot be run as
-    /// `python -m litellm` — the package ships no `__main__` and exits
-    /// immediately with "No module named litellm.__main__" (found on
-    /// real hardware 2026-10-15; the detached spawn discarded the
-    /// output, so the failure surfaced only as a health-check
-    /// timeout). The gateway must be spawned through the `litellm`
-    /// entry point the installer lays down in the venv.
-    fn litellm_cli(&self, ctx: &WizardContext) -> PathBuf {
+    /// The venv's Python interpreter, used to run the gateway.
+    ///
+    /// The gateway is NOT spawned through the venv's `litellm.exe`
+    /// console script. That file is a launcher (uv/pip trampoline):
+    /// it spawns the real python.exe as its own child, forwarding
+    /// neither our CREATE_NO_WINDOW flag nor our console — and
+    /// because the launcher itself has no console, Windows allocates
+    /// a fresh console window for python.exe, which stays on the
+    /// desktop for the gateway's whole lifetime (found on real
+    /// hardware 2026-10-15; the same indirection also made the
+    /// recorded gateway pid the launcher's, not the server's).
+    /// Spawning the interpreter directly keeps one process level:
+    /// the creation flags hold, no window appears, and the pid is
+    /// the server itself.
+    ///
+    /// On Windows pythonw.exe (the GUI-subsystem interpreter) is
+    /// preferred when the venv provides one: it cannot own a console
+    /// window at all. Stdio is always redirected to the gateway log
+    /// files, which pythonw requires.
+    fn gateway_python(&self, ctx: &WizardContext) -> PathBuf {
         let venv = self.venv_dir(ctx);
         if cfg!(windows) {
-            venv.join("Scripts").join("litellm.exe")
+            let windowless = venv.join("Scripts").join("pythonw.exe");
+            if windowless.exists() {
+                return windowless;
+            }
+            venv.join("Scripts").join("python.exe")
         } else {
-            venv.join("bin").join("litellm")
+            venv.join("bin").join("python")
         }
     }
+
+    /// The exact bootstrap the venv's `litellm` console script runs
+    /// (verified against the litellm 1.105.1 wheel's entry_points.txt:
+    /// `litellm = litellm:run_server`, a click command that parses
+    /// sys.argv[1:] when called with no arguments). Running it via
+    /// `-c` invokes the same entry point with our arguments in
+    /// sys.argv[1:], without the launcher process in between.
+    /// `python -m litellm` is not an alternative — the package ships
+    /// no `__main__` and exits immediately (found on real hardware
+    /// 2026-10-15).
+    const GATEWAY_BOOTSTRAP: &str =
+        "import sys; from litellm import run_server; sys.exit(run_server())";
 
     fn spawn_command(&self, ctx: &WizardContext) -> PlannedCommand {
         let cfg = ctx.data_dir.join("gateway").join("config.yaml");
         let mut cmd = PlannedCommand::new(vec![
-            self.litellm_cli(ctx).display().to_string(),
+            self.gateway_python(ctx).display().to_string(),
+            "-c".to_string(),
+            Self::GATEWAY_BOOTSTRAP.to_string(),
             "--config".to_string(),
             cfg.display().to_string(),
             // Loopback only: without --host LiteLLM binds 0.0.0.0 and
@@ -1863,12 +1893,12 @@ impl VscodeExtensions {
         Ok(continue_editor_config(&ctx.config, Some(&key)))
     }
 
-    fn install_commands(&self) -> Vec<PlannedCommand> {
+    fn install_commands(&self, cli: &str) -> Vec<PlannedCommand> {
         self.extensions
             .iter()
             .map(|ext| {
                 PlannedCommand::new(vec![
-                    "code".to_string(),
+                    cli.to_string(),
                     "--install-extension".to_string(),
                     ext.clone(),
                     "--force".to_string(),
@@ -1890,6 +1920,22 @@ impl VscodeExtensions {
             "VS Code is not installed (the `code` command was not found); extension install skipped",
         )
     }
+
+    /// The skip outcome when a VS Code install was located but its
+    /// CLI still could not be started.
+    fn vscode_unusable(cli: &str) -> StepOutcome {
+        StepOutcome::skipped(format!(
+            "VS Code was found at {cli} but its command-line tool could not be started; extension install skipped"
+        ))
+    }
+
+    fn missing_or_unusable(resolved: bool, cli: &str) -> StepOutcome {
+        if resolved {
+            Self::vscode_unusable(cli)
+        } else {
+            Self::vscode_missing()
+        }
+    }
 }
 
 #[async_trait]
@@ -1908,7 +1954,10 @@ impl WizardStep for VscodeExtensions {
     }
     fn planned_commands(&self, ctx: &WizardContext) -> Vec<PlannedCommand> {
         match ctx.mode {
-            RunMode::Install => self.install_commands(),
+            // The CLI shown here is the bare command; at runtime it
+            // is resolved to an absolute path when the app process's
+            // PATH cannot see the install (see `run`).
+            RunMode::Install => self.install_commands("code"),
             // Audit only probes which extensions are present.
             RunMode::Audit => vec![PlannedCommand::new(vec![
                 "code".to_string(),
@@ -1921,20 +1970,36 @@ impl WizardStep for VscodeExtensions {
     }
     async fn run(&self, ctx: &WizardContext) -> Result<StepOutcome, WizardError> {
         let mut log = Vec::new();
+        // Resolve the CLI before touching PATH: a GUI process
+        // inherits the environment of whatever launched it, which
+        // may predate the VS Code install (or the PATH edit its
+        // installer made), so bare `code` can be unspawnable on a
+        // machine where `code` works in a shell. The ops layer
+        // resolves the install from the registry (App Paths) and
+        // standard install locations; the bare command is the
+        // fallback when nothing is found.
+        let cli = ctx
+            .ops
+            .vscode_cli()
+            .await
+            .unwrap_or_else(|| "code".to_string());
+        let resolved = cli != "code";
         match ctx.mode {
             RunMode::Install => {
-                // Probe first: without the `code` CLI there is nothing
+                // Probe first: without the CLI there is nothing
                 // to install into, and the step skips instead of
                 // failing on the first extension.
-                let probe = PlannedCommand::new(vec!["code".to_string(), "--version".to_string()]);
+                let probe = PlannedCommand::new(vec![cli.clone(), "--version".to_string()]);
                 match ctx.ops.run_command(&probe).await {
                     Ok(_) => {}
-                    Err(e) if Self::spawn_failed(&e) => return Ok(Self::vscode_missing()),
+                    Err(e) if Self::spawn_failed(&e) => {
+                        return Ok(Self::missing_or_unusable(resolved, &cli))
+                    }
                     Err(e) => {
                         return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
                     }
                 }
-                for cmd in self.install_commands() {
+                for cmd in self.install_commands(&cli) {
                     log.push(format!("running: {}", cmd.argv.join(" ")));
                     match ctx.ops.run_command(&cmd).await {
                         Ok(out) if out.success() => {}
@@ -1948,7 +2013,9 @@ impl WizardStep for VscodeExtensions {
                                 vec![out.stderr],
                             ))
                         }
-                        Err(e) if Self::spawn_failed(&e) => return Ok(Self::vscode_missing()),
+                        Err(e) if Self::spawn_failed(&e) => {
+                            return Ok(Self::missing_or_unusable(resolved, &cli))
+                        }
                         Err(e) => {
                             return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
                         }
@@ -1999,11 +2066,12 @@ impl WizardStep for VscodeExtensions {
                 ))
             }
             RunMode::Audit => {
-                let cmd =
-                    PlannedCommand::new(vec!["code".to_string(), "--list-extensions".to_string()]);
+                let cmd = PlannedCommand::new(vec![cli.clone(), "--list-extensions".to_string()]);
                 let out = match ctx.ops.run_command(&cmd).await {
                     Ok(o) => o,
-                    Err(e) if Self::spawn_failed(&e) => return Ok(Self::vscode_missing()),
+                    Err(e) if Self::spawn_failed(&e) => {
+                        return Ok(Self::missing_or_unusable(resolved, &cli))
+                    }
                     Err(e) => {
                         return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
                     }
@@ -2453,6 +2521,25 @@ impl SmokeTest {
     /// its model loads and refuses connections before it binds).
     /// Returns Some(failed outcome) when a backend does not become
     /// healthy inside the budget; None when probing may proceed.
+    /// The probe request body. The probe verifies routing and
+    /// generation, not reasoning: thinking models (the planner)
+    /// otherwise spend the whole token budget inside the think
+    /// block and return an empty visible completion (found on real
+    /// hardware 2026-10-15 — with max_tokens at 8, all 8 generated
+    /// tokens were reasoning and the step reported "empty
+    /// completion" against a healthy backend). Thinking is disabled
+    /// for the probe; templates that do not know the flag ignore it.
+    fn probe_body(group: &str, tag: &str) -> String {
+        serde_json::json!({
+            "model": group,
+            "messages": [{ "role": "user", "content": format!("wizard smoke test {tag}") }],
+            "max_tokens": 128,
+            "stream": false,
+            "chat_template_kwargs": { "enable_thinking": false },
+        })
+        .to_string()
+    }
+
     async fn wait_for_backends(
         &self,
         ctx: &WizardContext,
@@ -2522,7 +2609,7 @@ impl WizardStep for SmokeTest {
                         "http://127.0.0.1:{}/v1/chat/completions",
                         ctx.config.gateway.port
                     ),
-                    format!("{{\"model\":\"{}\"}}", g.name),
+                    Self::probe_body(&g.name, "wizard-smoke"),
                 ])
             })
             .collect()
@@ -2569,13 +2656,7 @@ impl WizardStep for SmokeTest {
         };
         let mut baselines = Vec::new();
         for group in &groups {
-            let body = serde_json::json!({
-                "model": group,
-                "messages": [{ "role": "user", "content": format!("wizard smoke test {tag}") }],
-                "max_tokens": 8,
-                "stream": false,
-            })
-            .to_string();
+            let body = Self::probe_body(group, &tag);
             let resp = match ctx.ops.http_post_with_headers(&url, &body, &headers).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -2600,15 +2681,37 @@ impl WizardStep for SmokeTest {
                     ))
                 }
             };
-            let content = v
+            let mut content = v
                 .pointer("/choices/0/message/content")
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            // A response that is entirely reasoning still proves
+            // routing and generation (the server splits reasoning
+            // into its own field, and a template that ignored
+            // enable_thinking=false leaves the visible completion
+            // empty within the token budget).
+            let mut reasoning_only = false;
             if content.is_empty() {
+                let reasoning = v
+                    .pointer("/choices/0/message/reasoning_content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !reasoning.is_empty() {
+                    content = reasoning;
+                    reasoning_only = true;
+                }
+            }
+            if content.is_empty() {
+                let finish = v
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("unknown");
                 return Ok(StepOutcome::failed(
-                    format!("smoke test for '{group}': empty completion"),
+                    format!("smoke test for '{group}': empty completion (finish_reason: {finish})"),
                     log,
                 ));
             }
@@ -2621,11 +2724,19 @@ impl WizardStep for SmokeTest {
                     log,
                 ));
             }
-            log.push(format!(
-                "{group}: {} ms, {} chars",
-                resp.elapsed_ms,
-                content.chars().count()
-            ));
+            if reasoning_only {
+                log.push(format!(
+                    "{group}: {} ms, reasoning-only response ({} chars)",
+                    resp.elapsed_ms,
+                    content.chars().count()
+                ));
+            } else {
+                log.push(format!(
+                    "{group}: {} ms, {} chars",
+                    resp.elapsed_ms,
+                    content.chars().count()
+                ));
+            }
             baselines.push(serde_json::json!({
                 "group": group,
                 "latency_ms": resp.elapsed_ms,
@@ -3670,7 +3781,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_gateway_spawn_uses_litellm_cli_and_captures_logs() {
+    async fn start_gateway_spawn_uses_venv_python_and_captures_logs() {
         let ops = Arc::new(FakeSystemOps::new());
         with_bundled_uv(&ops);
         ops.with_http_get(
@@ -3686,9 +3797,20 @@ mod tests {
         assert_eq!(out.state, StepState::Done, "{out:?}");
         let cmds = ops.spawn_cmds();
         assert_eq!(cmds.len(), 1);
-        // The console script, never `python -m litellm` (no __main__).
+        // The venv interpreter directly, running the console
+        // script's entry point via -c: never the litellm.exe launcher
+        // (its child python.exe gets a visible console window) and
+        // never `python -m litellm` (no __main__ in the package).
         assert!(
-            cmds[0].argv[0].ends_with("litellm") || cmds[0].argv[0].ends_with("litellm.exe"),
+            cmds[0].argv[0].ends_with("python")
+                || cmds[0].argv[0].ends_with("python.exe")
+                || cmds[0].argv[0].ends_with("pythonw.exe"),
+            "{:?}",
+            cmds[0].argv
+        );
+        assert_eq!(cmds[0].argv[1], "-c");
+        assert!(
+            cmds[0].argv[2].contains("from litellm import run_server"),
             "{:?}",
             cmds[0].argv
         );
@@ -4108,6 +4230,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vscode_install_uses_resolved_cli() {
+        // The app process's PATH cannot see VS Code, but the ops
+        // layer resolved the install (registry / install locations):
+        // every command must use the resolved absolute path.
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_home(PathBuf::from("/home/test"));
+        ops.with_vscode_cli("C:\\Program Files\\Microsoft VS Code\\bin\\code.cmd");
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let step = VscodeExtensions::default();
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let executed = ops.executed_commands();
+        assert_eq!(executed.len(), 3);
+        assert!(
+            executed
+                .iter()
+                .all(|a| a[0] == "C:\\Program Files\\Microsoft VS Code\\bin\\code.cmd"),
+            "{executed:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn vscode_install_skips_when_code_cli_missing() {
         let ops = Arc::new(FakeSystemOps::new());
         ops.with_command_failure(
@@ -4388,6 +4532,30 @@ mod tests {
         let out = SmokeTest::default().run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Failed);
         assert!(out.message.contains("empty completion"));
+    }
+
+    #[tokio::test]
+    async fn smoke_test_passes_on_reasoning_only_completion() {
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_http_post(
+            "http://127.0.0.1:4000/v1/chat/completions",
+            FakeSystemOps::http_ok(
+                r#"{"choices":[{"message":{"content":"","reasoning_content":"thinking about the probe"},"finish_reason":"length"}]}"#,
+            ),
+        );
+        script_backends_healthy(&ops);
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = SmokeTest::default().run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.log_tail.iter().any(|l| l.contains("reasoning-only")),
+            "{out:?}"
+        );
+        // The probe asks the backend not to think and gives the
+        // reply room to arrive.
+        let posts = ops.posts();
+        assert!(posts[0].1.contains("enable_thinking"), "{}", posts[0].1);
+        assert!(posts[0].1.contains("\"max_tokens\":128"), "{}", posts[0].1);
     }
 
     #[tokio::test]

@@ -345,6 +345,16 @@ pub struct AppState {
     winml: OnceCell<Mutex<manager_winml::WinMlRegistry>>,
 }
 
+/// On-disk form of the install wizard's progress
+/// (`<data_dir>/wizard-state.json`): the wizard's own report,
+/// restored at launch so closing the app does not reset the
+/// checklist. Written after every state mutation.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedWizard {
+    version: u32,
+    report: WizardReport,
+}
+
 impl AppState {
     fn new(config: AppConfig, config_path: PathBuf, data_dir: PathBuf) -> Self {
         Self {
@@ -537,6 +547,45 @@ impl AppState {
         let install = self.wizard(RunMode::Install).await;
         let mut guard = install.lock().await;
         guard.hydrate(&report);
+        *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
+    }
+
+    /// Persist the install wizard's current report to
+    /// `wizard-state.json` (atomic tmp + rename). Best effort: a
+    /// failed write must never fail the step that triggered it.
+    async fn persist_wizard(&self) {
+        let wizard = self.wizard(RunMode::Install).await;
+        let report = {
+            let guard = wizard.lock().await;
+            guard.report()
+        };
+        let persisted = PersistedWizard {
+            version: 1,
+            report,
+        };
+        let Ok(text) = serde_json::to_string(&persisted) else {
+            return;
+        };
+        let path = self.data_dir.join("wizard-state.json");
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// Restore persisted wizard progress at launch, before the
+    /// hydration audit fills still-Queued steps from machine checks.
+    /// A missing or unreadable file leaves the wizard untouched.
+    async fn restore_wizard(&self) {
+        let Ok(text) = std::fs::read_to_string(self.data_dir.join("wizard-state.json")) else {
+            return;
+        };
+        let Ok(persisted) = serde_json::from_str::<PersistedWizard>(&text) else {
+            return;
+        };
+        let wizard = self.wizard(RunMode::Install).await;
+        let mut guard = wizard.lock().await;
+        guard.restore(&persisted.report);
         *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
 
@@ -1354,6 +1403,7 @@ async fn run_wizard_step(app: AppHandle, state: State<'_, AppState>, step_id: St
     let (done, _) = guard.progress();
     *state.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
     drop(guard);
+    state.persist_wizard().await;
     let payload = WizardProgressPayload {
         task_id: task_id.clone(),
         step_id: Some(step_id.clone()),
@@ -2020,6 +2070,7 @@ async fn setup_get_prerequisites(state: State<'_, AppState>) -> ApiResult {
 async fn setup_retry_step(state: State<'_, AppState>, step_id: String) -> ApiResult {
     let wizard = state.wizard(RunMode::Install).await;
     wizard.lock().await.retry(&step_id);
+    state.persist_wizard().await;
     Ok(json!({ "ok": true, "step_id": step_id }))
 }
 
@@ -2028,6 +2079,7 @@ async fn setup_retry_step(state: State<'_, AppState>, step_id: String) -> ApiRes
 async fn setup_skip_step(state: State<'_, AppState>, step_id: String, note: String) -> ApiResult {
     let wizard = state.wizard(RunMode::Install).await;
     wizard.lock().await.skip(&step_id, note);
+    state.persist_wizard().await;
     Ok(json!({ "ok": true, "step_id": step_id }))
 }
 
@@ -2222,6 +2274,7 @@ async fn setup_mark_manual(
 ) -> ApiResult {
     let wizard = state.wizard(RunMode::Install).await;
     wizard.lock().await.mark_manual(&step_id, path, version);
+    state.persist_wizard().await;
     Ok(json!({ "ok": true, "step_id": step_id }))
 }
 
@@ -3064,7 +3117,20 @@ async fn tasks_list(state: State<'_, AppState>) -> ApiResult {
 #[tauri::command]
 async fn diagnostics_export_bundle(state: State<'_, AppState>) -> ApiResult {
     let cfg = state.config.read().await.clone();
-    let samples: Vec<GpuSample> = lock_telemetry(&state.telemetry().await).snapshot();
+    // The telemetry poller starts lazily on first use; in a session
+    // that never opened a telemetry view, this call starts it and an
+    // immediate snapshot is still empty. Give the first poll a short
+    // window to land so the bundle carries the machine's GPU state
+    // instead of an empty array.
+    let store = state.telemetry().await;
+    let mut samples: Vec<GpuSample> = lock_telemetry(&store).snapshot();
+    for _ in 0..10 {
+        if !samples.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        samples = lock_telemetry(&store).snapshot();
+    }
     let telemetry_json = serde_json::to_string_pretty(&samples).map_err(jerr)?;
     let scopes: Vec<String> = {
         let sup = state.supervisor().await.lock().await;
@@ -3660,7 +3726,9 @@ fn main() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<AppState>();
+                state.restore_wizard().await;
                 state.hydrate_wizard().await;
+                state.persist_wizard().await;
             });
             Ok(())
         })

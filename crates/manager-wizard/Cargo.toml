@@ -1,6 +1,6 @@
 [package]
 name = "manager-wizard"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 
 [dependencies]
@@ -24,4 +24,4 @@ libc = "0.2"
 # a spawned process's environment. Windows-only; minimal feature set
 # (Foundation is required by the CREDENTIALW struct's FILETIME field).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_System_Registry"] }
