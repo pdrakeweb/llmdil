@@ -1041,7 +1041,13 @@ pub struct StartGateway {
 impl Default for StartGateway {
     fn default() -> Self {
         Self {
-            health_retries: 30,
+            // Two minutes: a cold LiteLLM start (interpreter + full
+            // dependency import on a fresh venv, under antivirus
+            // scanning) routinely exceeds the previous 30 s budget.
+            // A process that exits is detected within one interval by
+            // the liveness check in wait_healthy, so the larger budget
+            // costs nothing on real failures.
+            health_retries: 120,
             health_interval_ms: 1000,
         }
     }
@@ -1245,12 +1251,26 @@ impl StartGateway {
         ])
     }
 
+    /// The venv's litellm console script. LiteLLM cannot be run as
+    /// `python -m litellm` — the package ships no `__main__` and exits
+    /// immediately with "No module named litellm.__main__" (found on
+    /// real hardware 2026-10-15; the detached spawn discarded the
+    /// output, so the failure surfaced only as a health-check
+    /// timeout). The gateway must be spawned through the `litellm`
+    /// entry point the installer lays down in the venv.
+    fn litellm_cli(&self, ctx: &WizardContext) -> PathBuf {
+        let venv = self.venv_dir(ctx);
+        if cfg!(windows) {
+            venv.join("Scripts").join("litellm.exe")
+        } else {
+            venv.join("bin").join("litellm")
+        }
+    }
+
     fn spawn_command(&self, ctx: &WizardContext) -> PlannedCommand {
         let cfg = ctx.data_dir.join("gateway").join("config.yaml");
         PlannedCommand::new(vec![
-            self.venv_python(ctx).display().to_string(),
-            "-m".to_string(),
-            "litellm".to_string(),
+            self.litellm_cli(ctx).display().to_string(),
             "--config".to_string(),
             cfg.display().to_string(),
             // Loopback only: without --host LiteLLM binds 0.0.0.0 and
@@ -1358,9 +1378,48 @@ impl StartGateway {
         Ok(())
     }
 
-    async fn wait_healthy(&self, ctx: &WizardContext, log: &mut Vec<String>) -> bool {
+    /// Files the gateway child's stdout/stderr are captured to.
+    fn gateway_stdout_log(&self, ctx: &WizardContext) -> PathBuf {
+        ctx.data_dir.join("logs").join("gateway.stdout.log")
+    }
+
+    fn gateway_stderr_log(&self, ctx: &WizardContext) -> PathBuf {
+        ctx.data_dir.join("logs").join("gateway.stderr.log")
+    }
+
+    /// Append the tail of the captured gateway logs to the step log,
+    /// so a startup failure shows the process's own error output in
+    /// the wizard instead of only a probe timeout.
+    async fn append_gateway_log_tail(&self, ctx: &WizardContext, log: &mut Vec<String>) {
+        for (label, path) in [
+            ("stderr", self.gateway_stderr_log(ctx)),
+            ("stdout", self.gateway_stdout_log(ctx)),
+        ] {
+            if let Ok(bytes) = ctx.ops.read_file(&path).await {
+                let text = String::from_utf8_lossy(&bytes);
+                let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                if !lines.is_empty() {
+                    log.push(format!("gateway {label} ({}), last lines:", path.display()));
+                    for l in lines.iter().rev().take(20).rev() {
+                        log.push((*l).to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    async fn wait_healthy(&self, ctx: &WizardContext, pid: u32, log: &mut Vec<String>) -> bool {
         let url = self.gateway_url(ctx);
         for attempt in 1..=self.health_retries {
+            // Fail fast when the child is gone: probing a dead process
+            // for the full budget reports a timeout and hides the real
+            // failure, which the captured log tail then has to explain.
+            if !ctx.ops.process_alive(pid) {
+                log.push(format!(
+                    "gateway process (pid {pid}) exited during startup (probe attempt {attempt})"
+                ));
+                return false;
+            }
             match ctx.ops.http_get(&url).await {
                 Ok(resp) if resp.status == 200 => {
                     log.push(format!(
@@ -1535,10 +1594,19 @@ impl WizardStep for StartGateway {
                 if let Err(outcome) = self.stop_previous_gateway(ctx, &mut log).await {
                     return Ok(outcome);
                 }
-                let (spawn, openrouter_warning) = self.spawn_command_with_env(ctx).await;
+                let (mut spawn, openrouter_warning) = self.spawn_command_with_env(ctx).await;
                 if let Some(w) = &openrouter_warning {
                     log.push(format!("warning: {w}"));
                 }
+                // Capture the gateway's own output: without it a
+                // startup failure is undiagnosable from inside the app.
+                spawn.stdout_log = Some(self.gateway_stdout_log(ctx));
+                spawn.stderr_log = Some(self.gateway_stderr_log(ctx));
+                log.push(format!(
+                    "gateway output is captured to {} and {}",
+                    self.gateway_stdout_log(ctx).display(),
+                    self.gateway_stderr_log(ctx).display()
+                ));
                 let pid = match ctx.ops.spawn_detached(&spawn).await {
                     Ok(pid) => pid,
                     Err(e) => {
@@ -1562,11 +1630,13 @@ impl WizardStep for StartGateway {
                         pid_path.display()
                     )),
                 }
-                if !self.wait_healthy(ctx, &mut log).await {
+                if !self.wait_healthy(ctx, pid, &mut log).await {
+                    self.append_gateway_log_tail(ctx, &mut log).await;
                     return Ok(StepOutcome::failed(
                         format!(
-                            "gateway did not become healthy on :{} after {} probes",
-                            ctx.config.gateway.port, self.health_retries
+                            "gateway did not become healthy on :{} — the gateway log tail follows; full logs in {}",
+                            ctx.config.gateway.port,
+                            ctx.data_dir.join("logs").display()
                         ),
                         log,
                     ));
@@ -3272,6 +3342,77 @@ mod tests {
             "no venv/pip commands may run: {executed:?}"
         );
         assert_eq!(ops.spawns().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_gateway_spawn_uses_litellm_cli_and_captures_logs() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+        };
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let cmds = ops.spawn_cmds();
+        assert_eq!(cmds.len(), 1);
+        // The console script, never `python -m litellm` (no __main__).
+        assert!(
+            cmds[0].argv[0].ends_with("litellm") || cmds[0].argv[0].ends_with("litellm.exe"),
+            "{:?}",
+            cmds[0].argv
+        );
+        assert!(
+            !cmds[0].argv.iter().any(|a| a == "-m"),
+            "{:?}",
+            cmds[0].argv
+        );
+        // Output capture is wired to the gateway log files.
+        assert_eq!(
+            cmds[0].stdout_log.as_deref(),
+            Some(std::path::Path::new("/data/logs/gateway.stdout.log"))
+        );
+        assert_eq!(
+            cmds[0].stderr_log.as_deref(),
+            Some(std::path::Path::new("/data/logs/gateway.stderr.log"))
+        );
+    }
+
+    #[tokio::test]
+    async fn start_gateway_fails_fast_when_process_exits() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        // The spawned gateway exits immediately; its captured stderr
+        // carries the interpreter error the operator needs to see.
+        ops.with_dead_spawn();
+        ops.with_file(
+            PathBuf::from("/data/logs/gateway.stderr.log"),
+            b"C:\\venv\\python.exe: No module named litellm.__main__; 'litellm' is a package and cannot be directly executed\n".to_vec(),
+        );
+        let step = StartGateway {
+            health_retries: 30,
+            health_interval_ms: 1,
+        };
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        // Detected on the first probe, not after the full budget.
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("exited during startup (probe attempt 1)")),
+            "{out:?}"
+        );
+        // The captured gateway stderr tail rides in the outcome.
+        assert!(
+            out.log_tail.iter().any(|l| l.contains("No module named")),
+            "{out:?}"
+        );
     }
 
     #[tokio::test]

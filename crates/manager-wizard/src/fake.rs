@@ -39,6 +39,11 @@ struct FakeState {
     spawns: Vec<Vec<String>>,
     /// Env map of each `spawn_detached` call, parallel to `spawns`.
     spawn_envs: Vec<HashMap<String, String>>,
+    /// Full command of each `spawn_detached` call, parallel to `spawns`.
+    spawn_cmds: Vec<PlannedCommand>,
+    /// When true, a spawned pid is NOT registered as live, simulating
+    /// a process that exits immediately after spawn.
+    spawn_dies: bool,
     files: HashMap<PathBuf, Vec<u8>>,
     downloads: HashMap<String, Vec<u8>>,
     progress_calls: Vec<(u64, u64)>,
@@ -71,6 +76,8 @@ impl Default for FakeState {
             executed: Vec::new(),
             spawns: Vec::new(),
             spawn_envs: Vec::new(),
+            spawn_cmds: Vec::new(),
+            spawn_dies: false,
             files: HashMap::new(),
             downloads: HashMap::new(),
             progress_calls: Vec::new(),
@@ -267,6 +274,19 @@ impl FakeSystemOps {
         self.state.lock().unwrap().spawn_envs.clone()
     }
 
+    /// Full command of every `spawn_detached` call, in order (parallel
+    /// to [`Self::spawns`]).
+    pub fn spawn_cmds(&self) -> Vec<PlannedCommand> {
+        self.state.lock().unwrap().spawn_cmds.clone()
+    }
+
+    /// Script spawned processes as exiting immediately: the pid is
+    /// never registered as live.
+    pub fn with_dead_spawn(&self) -> &Self {
+        self.state.lock().unwrap().spawn_dies = true;
+        self
+    }
+
     /// (url, dest) download calls, in order.
     pub fn downloads_made(&self) -> Vec<(String, PathBuf)> {
         self.state.lock().unwrap().downloaded_to.clone()
@@ -334,8 +354,12 @@ impl SystemOps for FakeSystemOps {
         let mut st = self.state.lock().unwrap();
         st.spawns.push(cmd.argv.clone());
         st.spawn_envs.push(cmd.env.clone());
-        // The scripted spawn is a live process until killed.
-        st.live_pids.insert(4242);
+        st.spawn_cmds.push(cmd.clone());
+        // The scripted spawn is a live process until killed, unless the
+        // test scripted an immediately-exiting process.
+        if !st.spawn_dies {
+            st.live_pids.insert(4242);
+        }
         Ok(4242)
     }
 

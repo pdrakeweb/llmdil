@@ -1188,7 +1188,7 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
       if (meta) {
         const trunc = r.data.truncated
           ? `Showing the latest ${r.data.lines.length} of ${r.data.total_matching} matching lines. ` : "";
-        meta.textContent = `${trunc}Logs are kept in memory for this session only \u2014 up to 10,000 lines per process; one previous run per process is kept.`;
+        meta.textContent = `${trunc}Backend logs are kept in memory for this session only \u2014 up to 10,000 lines per process; one previous run per process is kept. The gateway log is file-backed (under the data directory's logs folder) and survives restarts.`;
       }
       const b = root.querySelector("#logBody");
       if (!b) return;

@@ -29,14 +29,14 @@ use manager_config::{
 use manager_models::{self, DownloadHandle};
 use manager_mxc::{self, Policy};
 use manager_supervisor::{
-    test_request, BackoffPolicy, HealthProbe, HttpHealthProbe, ProcessSpec, ProcessState,
-    Supervisor,
+    test_request, BackoffPolicy, HealthProbe, HttpHealthProbe, LogLevelFilter, LogRecord,
+    LogStream, ProcessSpec, ProcessState, Supervisor,
 };
 use manager_telemetry::{
     FallbackSource, GpuSample, NvidiaSmiSource, NvmlSource, PollCadence, Poller, TelemetryStore,
 };
 use manager_wizard::{
-    ops::RealSystemOps,
+    ops::{prev_log_path, RealSystemOps},
     steps::{continue_editor_config, default_steps, VscodeExtensions},
     RunMode, StepOutcome, StepState, Wizard, WizardContext, WizardReport,
 };
@@ -301,6 +301,11 @@ pub struct AppState {
     telemetry_poller: OnceCell<std::sync::Mutex<manager_telemetry::store::PollHandle>>,
     wizard_install: OnceCell<Mutex<Wizard>>,
     wizard_audit: OnceCell<Mutex<Wizard>>,
+    /// Last setup_get_steps payload, refreshed whenever the install
+    /// wizard's state is read or mutated under its lock. Served when
+    /// the wizard lock is held by a running step, so the checklist
+    /// never sits blank for the duration of a step.
+    wizard_steps_cache: RwLock<Option<Value>>,
     tasks: Mutex<HashMap<String, TaskRecord>>,
     task_counter: AtomicU64,
     /// Live model-download handles by model id (spec §14 download commands).
@@ -351,6 +356,7 @@ impl AppState {
             telemetry_poller: OnceCell::new(),
             wizard_install: OnceCell::new(),
             wizard_audit: OnceCell::new(),
+            wizard_steps_cache: RwLock::new(None),
             tasks: Mutex::new(HashMap::new()),
             task_counter: AtomicU64::new(1),
             downloads: Mutex::new(HashMap::new()),
@@ -507,6 +513,24 @@ impl AppState {
             )
         })
         .await
+    }
+
+    /// Seed the install wizard's checklist from the machine's actual
+    /// state: run the audit wizard's checks once and adopt the passing
+    /// outcomes, so the checklist does not reset to all-Queued on
+    /// every launch. Runs in the background at startup; best-effort —
+    /// the wizard stays usable (in its default state) while it runs.
+    async fn hydrate_wizard(&self) {
+        let ctx = self.wizard_ctx(RunMode::Audit).await;
+        let audit = self.wizard(RunMode::Audit).await;
+        let report = {
+            let mut guard = audit.lock().await;
+            guard.run_all(&ctx).await
+        };
+        let install = self.wizard(RunMode::Install).await;
+        let mut guard = install.lock().await;
+        guard.hydrate(&report);
+        *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
 
     /// MCP server registry with in-memory mode overrides applied.
@@ -1238,6 +1262,7 @@ async fn run_wizard_step(app: AppHandle, state: State<'_, AppState>, step_id: St
         .map_err(ApiError::from)
         .map_err(jerr)?;
     let (done, _) = guard.progress();
+    *state.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
     drop(guard);
     let payload = WizardProgressPayload {
         task_id: task_id.clone(),
@@ -1646,10 +1671,58 @@ async fn cancel_download(state: State<'_, AppState>, id: String) -> ApiResult {
 // Logs
 // ---------------------------------------------------------------------------
 
+/// The file-backed gateway log records: the current run's
+/// `gateway.stdout.log` / `gateway.stderr.log` under `<data_dir>/logs`
+/// plus their rotated `.prev` runs (marked archived). The capture
+/// writes no per-line timestamps, so every line is stamped with its
+/// file's modification time; lines are emitted newest-first within
+/// each file so the merged ordering stays correct under the caller's
+/// stable sort. At most the last 2,000 lines of each file are read.
+fn gateway_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord>, bool) {
+    let logs = data_dir.join("logs");
+    let mut records = Vec::new();
+    let mut has_previous = false;
+    for (name, stream) in [
+        ("gateway.stdout.log", LogStream::Stdout),
+        ("gateway.stderr.log", LogStream::Stderr),
+    ] {
+        for archived in [false, true] {
+            let base = logs.join(name);
+            let path = if archived {
+                prev_log_path(&base)
+            } else {
+                base
+            };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if archived {
+                has_previous = true;
+            }
+            let ts = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map(chrono::DateTime::<chrono::Utc>::from)
+                .unwrap_or_else(|_| chrono::Utc::now());
+            let text = String::from_utf8_lossy(&bytes);
+            for line in text.lines().rev().take(2000) {
+                records.push(LogRecord {
+                    ts,
+                    stream,
+                    line: line.to_string(),
+                    source: "gateway".to_string(),
+                    archived,
+                });
+            }
+        }
+    }
+    (records, has_previous)
+}
+
 /// Query captured logs. `scope` is a process id — live, stopped, or an
 /// id that also has an archived previous-run ring; querying the id
-/// returns current and archived lines merged — or `"all"`, which
-/// merges every process's records into one stream. `level` is an
+/// returns current and archived lines merged — `"gateway"`, the
+/// file-backed gateway log (also merged into `"all"`) — or `"all"`,
+/// which merges every source's records into one stream. `level` is an
 /// optional error/warn/info/debug heuristic filter; `search` is an
 /// optional case-insensitive substring. Ordering is newest-first in
 /// every scope, archives included.
@@ -1670,22 +1743,44 @@ async fn get_logs(
     search: Option<String>,
     limit: Option<u64>,
 ) -> ApiResult {
+    let limit = limit.unwrap_or(200) as usize;
     let sup = state.supervisor().await.lock().await;
-    let result = sup.logs_query(
-        &scope,
-        level.as_deref(),
-        search.as_deref(),
-        limit.unwrap_or(200) as usize,
-    );
-    let scopes: Vec<Value> = sup
+    // Unfiltered fetch: filtering, merging with the file-backed
+    // gateway records, ordering, and pagination happen here so every
+    // source is treated identically.
+    let mut records: Vec<LogRecord> = if scope == "gateway" {
+        Vec::new()
+    } else {
+        sup.logs_query(&scope, None, None, usize::MAX).records
+    };
+    let mut scopes: Vec<Value> = sup
         .log_scopes()
         .into_iter()
         .map(|s| json!({ "id": s.id, "previous": s.previous }))
         .collect();
+    let (gateway_records, gateway_previous) = gateway_log_records(&state.data_dir);
+    if !gateway_records.is_empty() {
+        scopes.push(json!({ "id": "gateway", "previous": gateway_previous }));
+        if scope == "all" || scope == "gateway" {
+            records.extend(gateway_records);
+        }
+    }
+    if let Some(filter) = level.as_deref().and_then(LogLevelFilter::parse) {
+        records.retain(|r| filter.matches(&r.line));
+    }
+    if let Some(search) = &search {
+        let needle = search.to_lowercase();
+        records.retain(|r| r.line.to_lowercase().contains(&needle));
+    }
+    // Newest first; the sort is stable, so records sharing a timestamp
+    // keep their source order (gateway files emit newest-first).
+    records.sort_by(|a, b| b.ts.cmp(&a.ts));
+    let total_matching = records.len();
+    records.truncate(limit);
     Ok(json!({
-        "lines": serde_json::to_value(&result.records).map_err(jerr)?,
-        "total_matching": result.total_matching,
-        "truncated": result.total_matching > result.records.len(),
+        "lines": serde_json::to_value(&records).map_err(jerr)?,
+        "total_matching": total_matching,
+        "truncated": total_matching > records.len(),
         "scopes": scopes,
     }))
 }
@@ -1841,12 +1936,9 @@ async fn setup_get_commands(state: State<'_, AppState>, step_id: String) -> ApiR
     Ok(serde_json::to_value(&commands).map_err(jerr)?)
 }
 
-/// Live wizard step states for the Setup view: id, name, state, last
-/// outcome message/log tail, plus remediation + help URL per step.
-#[tauri::command]
-async fn setup_get_steps(state: State<'_, AppState>) -> ApiResult {
-    let wizard = state.wizard(RunMode::Install).await;
-    let guard = wizard.lock().await;
+/// The setup steps payload shared by `setup_get_steps` and the
+/// last-known snapshot cached in AppState.
+fn wizard_steps_payload(guard: &Wizard) -> Value {
     let report = guard.report();
     let steps: Vec<Value> = report
         .steps
@@ -1866,7 +1958,38 @@ async fn setup_get_steps(state: State<'_, AppState>) -> ApiResult {
         })
         .collect();
     let (done, total) = report.progress();
-    Ok(json!({ "steps": steps, "done": done, "total": total }))
+    json!({ "steps": steps, "done": done, "total": total })
+}
+
+/// Live wizard step states for the Setup view: id, name, state, last
+/// outcome message/log tail, plus remediation + help URL per step.
+/// While a step is executing (the wizard lock is held for the whole
+/// run), the last known snapshot is served with `busy: true` instead
+/// of blocking — blocking left the checklist blank for the duration
+/// of long steps.
+#[tauri::command]
+async fn setup_get_steps(state: State<'_, AppState>) -> ApiResult {
+    let wizard = state.wizard(RunMode::Install).await;
+    match wizard.try_lock() {
+        Ok(guard) => {
+            let payload = wizard_steps_payload(&guard);
+            *state.wizard_steps_cache.write().await = Some(payload.clone());
+            Ok(payload)
+        }
+        Err(_) => {
+            // A step holds the wizard lock for its entire execution;
+            // blocking on it here left the checklist blank for the
+            // duration of the step. Serve the last known snapshot,
+            // flagged busy, instead.
+            match state.wizard_steps_cache.read().await.clone() {
+                Some(mut payload) => {
+                    payload["busy"] = json!(true);
+                    Ok(payload)
+                }
+                None => Ok(json!({ "steps": [], "done": 0, "total": 0, "busy": true })),
+            }
+        }
+    }
 }
 
 /// Whether the user has finished the setup wizard. The UI opens the wizard
@@ -3264,6 +3387,15 @@ fn main() {
                 }
             };
             app.manage(AppState::new(config, config_path, data_dir));
+            // Hydrate the wizard checklist from the machine's actual
+            // state in the background (audit checks adopted into the
+            // install wizard), so a relaunched app does not present
+            // setup as untouched when most of it is already in place.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<AppState>();
+                state.hydrate_wizard().await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

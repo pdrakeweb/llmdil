@@ -236,6 +236,13 @@ pub struct PlannedCommand {
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
+    /// For detached spawns: files the child's stdout/stderr are
+    /// captured to (rotated to `<path>.prev` on each spawn, one
+    /// previous run kept). `None` discards the output. A detached
+    /// process whose output goes nowhere fails invisibly, so any
+    /// long-running service spawn should set these.
+    pub stdout_log: Option<PathBuf>,
+    pub stderr_log: Option<PathBuf>,
 }
 
 impl PlannedCommand {
@@ -244,6 +251,8 @@ impl PlannedCommand {
             argv,
             cwd: None,
             env: HashMap::new(),
+            stdout_log: None,
+            stderr_log: None,
         }
     }
 }
@@ -519,6 +528,28 @@ impl Wizard {
         }
         let avg = done_ms.iter().sum::<u64>() / done_ms.len() as u64;
         Some(Duration::from_millis(avg.saturating_mul(remaining as u64)))
+    }
+
+    /// Adopt check outcomes from another wizard's report (produced by
+    /// an Audit-mode `run_all`) as this wizard's initial state, so the
+    /// checklist reflects the machine across app restarts instead of
+    /// resetting to all-Queued on every launch. Only steps whose check
+    /// passed (Done/Manual) are adopted, and only into steps that are
+    /// still Queued here — a step run in this session is never
+    /// overwritten. A failing check is not adopted: an unsatisfied
+    /// check means "not in place yet", which the checklist correctly
+    /// shows as Queued rather than as a failed install attempt.
+    pub fn hydrate(&mut self, report: &WizardReport) {
+        for step in &report.steps {
+            if !matches!(step.state, StepState::Done | StepState::Manual) {
+                continue;
+            }
+            let current = self.states.get(&step.id).copied();
+            if matches!(current, None | Some(StepState::Queued)) {
+                self.states.insert(step.id.clone(), step.state);
+                self.reports.insert(step.id.clone(), step.clone());
+            }
+        }
     }
 
     /// (done, total) for the overall completion bar.
@@ -884,6 +915,46 @@ mod tests {
         );
         assert!(report.steps.iter().all(|s| s.state == StepState::Done));
         assert!((report.fraction() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn hydrate_adopts_passing_checks_without_overwriting_session_state() {
+        let step_report = |id: &str, state: StepState, message: &str| StepReport {
+            id: id.to_string(),
+            name: id.to_string(),
+            state,
+            message: message.to_string(),
+            duration_ms: 1,
+            log_tail: Vec::new(),
+            note: None,
+        };
+        let audit_report = WizardReport {
+            mode: RunMode::Audit,
+            steps: vec![
+                step_report("a", StepState::Done, "verified by audit"),
+                step_report("b", StepState::Failed, "not in place"),
+            ],
+        };
+        // Fresh wizard: the passing check is adopted; the failing one
+        // stays Queued (not a failed install attempt).
+        let mut w = wizard(&[("a", false), ("b", false)]);
+        w.hydrate(&audit_report);
+        let after = w.report();
+        let a = after.steps.iter().find(|s| s.id == "a").unwrap();
+        assert_eq!(a.state, StepState::Done);
+        assert_eq!(a.message, "verified by audit");
+        let b = after.steps.iter().find(|s| s.id == "b").unwrap();
+        assert_eq!(b.state, StepState::Queued);
+
+        // A step already run this session keeps its own outcome.
+        let c = ctx();
+        let mut w2 = wizard(&[("a", false), ("b", false)]);
+        let session = w2.run_step(&c, "a").await.unwrap();
+        assert_eq!(session.state, StepState::Done);
+        w2.hydrate(&audit_report);
+        let a2 = w2.report().steps.into_iter().find(|s| s.id == "a").unwrap();
+        assert_eq!(a2.state, StepState::Done);
+        assert_ne!(a2.message, "verified by audit");
     }
 
     #[tokio::test]

@@ -219,6 +219,32 @@ pub fn stop_gateway(data_dir: &Path) -> Result<bool, String> {
     Ok(stopped)
 }
 
+/// The rotation sibling of a log file: `gateway.stdout.log` rotates
+/// to `gateway.stdout.log.prev` (one previous run kept, matching the
+/// log retention the Logs view documents).
+pub fn prev_log_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".prev");
+    PathBuf::from(s)
+}
+
+/// Open `path` for appending, first rotating any existing file to its
+/// `.prev` sibling. Creates parent directories as needed.
+fn open_rotated_log(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        let prev = prev_log_path(path);
+        let _ = std::fs::remove_file(&prev);
+        std::fs::rename(path, &prev)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
 #[async_trait]
 impl SystemOps for RealSystemOps {
     async fn run_command(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError> {
@@ -294,9 +320,34 @@ impl SystemOps for RealSystemOps {
                 });
             }
         }
+        // Capture the child's output when the caller named log files:
+        // a detached process with null stdio fails invisibly — when
+        // the gateway dies at startup, its own error output is the
+        // only place the cause exists. A failure to open the log is
+        // reported, not silently degraded to discarding output.
+        let stdout_stdio = match &cmd.stdout_log {
+            Some(path) => std::process::Stdio::from(open_rotated_log(path).map_err(|e| {
+                WizardError::CommandFailed {
+                    argv: cmd.argv.clone(),
+                    code: -1,
+                    stderr: format!("could not open stdout log {}: {e}", path.display()),
+                }
+            })?),
+            None => std::process::Stdio::null(),
+        };
+        let stderr_stdio = match &cmd.stderr_log {
+            Some(path) => std::process::Stdio::from(open_rotated_log(path).map_err(|e| {
+                WizardError::CommandFailed {
+                    argv: cmd.argv.clone(),
+                    code: -1,
+                    stderr: format!("could not open stderr log {}: {e}", path.display()),
+                }
+            })?),
+            None => std::process::Stdio::null(),
+        };
         c.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(stdout_stdio)
+            .stderr(stderr_stdio)
             .kill_on_drop(false);
         let child = c.spawn().map_err(|e| WizardError::CommandFailed {
             argv: cmd.argv.clone(),
@@ -789,6 +840,55 @@ mod tests {
         }
         let _ = std::fs::remove_file(&out_path);
         assert_eq!(contents, "env-delivered");
+    }
+
+    /// A detached spawn with log files named captures the child's
+    /// stdout and stderr to them, and a second spawn rotates the
+    /// first run's files to `.prev`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_detached_captures_output_to_log_files() {
+        let ops = RealSystemOps;
+        let dir = std::env::temp_dir().join(format!("wizard-spawn-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out_log = dir.join("gateway.stdout.log");
+        let err_log = dir.join("gateway.stderr.log");
+        let spawn_once = |marker: &str| {
+            let mut cmd = PlannedCommand::new(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("echo out-{marker}; echo err-{marker} >&2"),
+            ]);
+            cmd.stdout_log = Some(out_log.clone());
+            cmd.stderr_log = Some(err_log.clone());
+            cmd
+        };
+        let read_when = async |path: &std::path::Path, needle: &str| {
+            for _ in 0..50 {
+                if let Ok(s) = std::fs::read_to_string(path) {
+                    if s.contains(needle) {
+                        return s;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            String::new()
+        };
+        ops.spawn_detached(&spawn_once("one")).await.unwrap();
+        assert!(read_when(&out_log, "out-one").await.contains("out-one"));
+        assert!(read_when(&err_log, "err-one").await.contains("err-one"));
+        // Second spawn: run one's logs rotate to .prev.
+        ops.spawn_detached(&spawn_once("two")).await.unwrap();
+        assert!(read_when(&out_log, "out-two").await.contains("out-two"));
+        let prev = prev_log_path(&out_log);
+        assert!(
+            std::fs::read_to_string(&prev)
+                .unwrap_or_default()
+                .contains("out-one"),
+            "previous run kept in {}",
+            prev.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

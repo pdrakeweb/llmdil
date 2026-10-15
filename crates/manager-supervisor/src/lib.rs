@@ -1138,6 +1138,14 @@ impl LogLevelFilter {
         }
     }
 
+    /// Whether a raw log line passes this level filter (the same
+    /// heuristic [`Supervisor::logs_query`] applies). Exposed so other
+    /// log sources merged into the Logs view (the file-backed gateway
+    /// log) are filtered identically.
+    pub fn matches(&self, line: &str) -> bool {
+        self.matches_line(line)
+    }
+
     fn matches_line(&self, line: &str) -> bool {
         let lc = line.to_lowercase();
         match self {
