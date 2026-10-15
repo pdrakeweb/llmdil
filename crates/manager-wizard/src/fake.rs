@@ -276,6 +276,17 @@ impl FakeSystemOps {
 
     /// Full command of every `spawn_detached` call, in order (parallel
     /// to [`Self::spawns`]).
+    /// The stored value for a credential target, if any (test view of
+    /// what `credential_write` persisted).
+    pub fn credential_value(&self, target: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .credential_values
+            .get(target)
+            .cloned()
+    }
+
     pub fn spawn_cmds(&self) -> Vec<PlannedCommand> {
         self.state.lock().unwrap().spawn_cmds.clone()
     }
@@ -500,6 +511,14 @@ impl SystemOps for FakeSystemOps {
             .credential_values
             .get(target)
             .cloned()
+    }
+
+    async fn credential_write(&self, target: &str, secret: &str) -> Result<(), WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.credentials.insert(target.to_string());
+        st.credential_values
+            .insert(target.to_string(), secret.to_string());
+        Ok(())
     }
 
     fn home_dir(&self) -> Option<PathBuf> {

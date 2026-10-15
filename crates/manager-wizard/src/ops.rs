@@ -219,6 +219,78 @@ pub fn stop_gateway(data_dir: &Path) -> Result<bool, String> {
     Ok(stopped)
 }
 
+/// Shared GET implementation behind the trait's plain and
+/// header-carrying variants.
+async fn http_get_impl(
+    url: &str,
+    headers: &[(String, String)],
+) -> Result<HttpResponse, WizardError> {
+    let start = std::time::Instant::now();
+    let client = reqwest::Client::builder()
+        .timeout(HTTP_GET_TIMEOUT)
+        .build()
+        .map_err(|e| WizardError::HttpError {
+            url: url.to_string(),
+            reason: format!("client build failed: {e}"),
+        })?;
+    let mut req = client.get(url);
+    for (name, value) in headers {
+        req = req.header(name.as_str(), value.as_str());
+    }
+    let resp = req.send().await.map_err(|e| WizardError::HttpError {
+        url: url.to_string(),
+        reason: e.to_string(),
+    })?;
+    let status = resp.status().as_u16();
+    let body = resp.bytes().await.map_err(|e| WizardError::HttpError {
+        url: url.to_string(),
+        reason: e.to_string(),
+    })?;
+    Ok(HttpResponse {
+        status,
+        body: body.to_vec(),
+        elapsed_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
+/// Shared POST implementation behind the trait's plain and
+/// header-carrying variants.
+async fn http_post_impl(
+    url: &str,
+    body: &str,
+    headers: &[(String, String)],
+) -> Result<HttpResponse, WizardError> {
+    let start = std::time::Instant::now();
+    let client = reqwest::Client::builder()
+        .timeout(HTTP_POST_TIMEOUT)
+        .build()
+        .map_err(|e| WizardError::HttpError {
+            url: url.to_string(),
+            reason: format!("client build failed: {e}"),
+        })?;
+    let mut req = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body.to_string());
+    for (name, value) in headers {
+        req = req.header(name.as_str(), value.as_str());
+    }
+    let resp = req.send().await.map_err(|e| WizardError::HttpError {
+        url: url.to_string(),
+        reason: e.to_string(),
+    })?;
+    let status = resp.status().as_u16();
+    let bytes = resp.bytes().await.map_err(|e| WizardError::HttpError {
+        url: url.to_string(),
+        reason: e.to_string(),
+    })?;
+    Ok(HttpResponse {
+        status,
+        body: bytes.to_vec(),
+        elapsed_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
 /// The rotation sibling of a log file: `gateway.stdout.log` rotates
 /// to `gateway.stdout.log.prev` (one previous run kept, matching the
 /// log retention the Logs view documents).
@@ -436,63 +508,28 @@ impl SystemOps for RealSystemOps {
     }
 
     async fn http_get(&self, url: &str) -> Result<HttpResponse, WizardError> {
-        let start = std::time::Instant::now();
-        let client = reqwest::Client::builder()
-            .timeout(HTTP_GET_TIMEOUT)
-            .build()
-            .map_err(|e| WizardError::HttpError {
-                url: url.to_string(),
-                reason: format!("client build failed: {e}"),
-            })?;
-        let resp = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| WizardError::HttpError {
-                url: url.to_string(),
-                reason: e.to_string(),
-            })?;
-        let status = resp.status().as_u16();
-        let body = resp.bytes().await.map_err(|e| WizardError::HttpError {
-            url: url.to_string(),
-            reason: e.to_string(),
-        })?;
-        Ok(HttpResponse {
-            status,
-            body: body.to_vec(),
-            elapsed_ms: start.elapsed().as_millis() as u64,
-        })
+        http_get_impl(url, &[]).await
+    }
+
+    async fn http_get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, WizardError> {
+        http_get_impl(url, headers).await
     }
 
     async fn http_post(&self, url: &str, body: &str) -> Result<HttpResponse, WizardError> {
-        let start = std::time::Instant::now();
-        let client = reqwest::Client::builder()
-            .timeout(HTTP_POST_TIMEOUT)
-            .build()
-            .map_err(|e| WizardError::HttpError {
-                url: url.to_string(),
-                reason: format!("client build failed: {e}"),
-            })?;
-        let resp = client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|e| WizardError::HttpError {
-                url: url.to_string(),
-                reason: e.to_string(),
-            })?;
-        let status = resp.status().as_u16();
-        let bytes = resp.bytes().await.map_err(|e| WizardError::HttpError {
-            url: url.to_string(),
-            reason: e.to_string(),
-        })?;
-        Ok(HttpResponse {
-            status,
-            body: bytes.to_vec(),
-            elapsed_ms: start.elapsed().as_millis() as u64,
-        })
+        http_post_impl(url, body, &[]).await
+    }
+
+    async fn http_post_with_headers(
+        &self,
+        url: &str,
+        body: &str,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, WizardError> {
+        http_post_impl(url, body, headers).await
     }
 
     async fn http_head_content_length(&self, url: &str) -> Result<Option<u64>, WizardError> {
@@ -672,6 +709,24 @@ impl SystemOps for RealSystemOps {
         }
     }
 
+    async fn credential_write(&self, target: &str, secret: &str) -> Result<(), WizardError> {
+        #[cfg(windows)]
+        {
+            cred_write_windows(target, secret).ok_or_else(|| WizardError::IoError {
+                path: PathBuf::from("Credential Manager"),
+                reason: format!("CredWriteW failed for target '{target}'"),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (target, secret);
+            Err(WizardError::IoError {
+                path: PathBuf::from("Credential Manager"),
+                reason: "credential storage is only supported on Windows".to_string(),
+            })
+        }
+    }
+
     fn home_dir(&self) -> Option<PathBuf> {
         std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
@@ -706,6 +761,35 @@ fn cred_read_windows(target: &str) -> Option<String> {
     };
     unsafe { CredFree(cred as *const std::ffi::c_void) };
     value.filter(|v| !v.is_empty())
+}
+
+/// Store a generic credential via CredWriteW (advapi32), replacing
+/// any existing value for the target. The blob is written as
+/// UTF-16LE text — the encoding cmdkey / PowerShell-written secrets
+/// use and the one [`cred_read_windows`] decodes natively. Persisted
+/// per-user on this machine (CRED_PERSIST_LOCAL_MACHINE).
+#[cfg(windows)]
+fn cred_write_windows(target: &str, secret: &str) -> Option<()> {
+    use windows_sys::Win32::Security::Credentials::{
+        CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+    };
+    let mut target_wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+    let blob: Vec<u8> = secret
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    let mut cred: CREDENTIALW = unsafe { std::mem::zeroed() };
+    cred.Type = CRED_TYPE_GENERIC;
+    cred.TargetName = target_wide.as_mut_ptr();
+    cred.CredentialBlobSize = blob.len() as u32;
+    cred.CredentialBlob = blob.as_ptr() as *mut u8;
+    cred.Persist = CRED_PERSIST_LOCAL_MACHINE;
+    let ok = unsafe { CredWriteW(&cred, 0) };
+    if ok == 0 {
+        None
+    } else {
+        Some(())
+    }
 }
 
 /// Decode a credential blob: generic credentials written by cmdkey /

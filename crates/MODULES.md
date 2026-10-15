@@ -113,9 +113,9 @@ Result<Wizard, WizardError>` (duplicate step ids rejected, no panic),
 `Wizard::run_step(ctx, id)`, `Wizard::retry(id)`, `Wizard::skip(id, note)`,
 `Wizard::mark_manual(id, path, version)`, `Wizard::progress()`,
 `Wizard::get_step(id)` (public step lookup for the "Show commands" UI),
-`steps::continue_editor_config(config)` (Continue `config.json` content,
-shared by the VscodeExtensions step and the Tauri `vscode_write_config`
-command).
+`steps::continue_editor_config(config, master_key)` (Continue `config.json`
+content with the gateway master key as each model's `apiKey`, shared by
+the VscodeExtensions step and the Tauri `vscode_write_config` command).
 
 ---
 

@@ -73,6 +73,58 @@ pub const UV_INSTALL_DOCS_URL: &str = "https://docs.astral.sh/uv/getting-started
 /// the gateway on a stock Windows machine.
 pub const GATEWAY_PYTHON_VERSION: &str = "3.12";
 
+/// Credential Manager target holding the LiteLLM gateway's master
+/// key. Current LiteLLM refuses to boot without one. The key is
+/// generated on first gateway start and stored here; the generated
+/// config.yaml references it as `os.environ/LITELLM_MASTER_KEY` and
+/// the wizard injects it into the gateway process's environment at
+/// spawn. Like the OpenRouter key, it never appears in config files
+/// or logs.
+pub const LITELLM_MASTER_KEY_CRED_TARGET: &str = "local-llm-service-manager/litellm-master-key";
+
+/// Generate a new gateway master key: `sk-` plus the hex SHA-256 of
+/// OS-seeded hasher state mixed with the current time and the pid.
+/// The key is a localhost bearer secret; it is stored only in
+/// Windows Credential Manager (and, by design, in client configs the
+/// user applies, e.g. the editor config) and injected into the
+/// gateway process's environment at spawn.
+pub fn generate_master_key() -> String {
+    use sha2::Digest;
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h1 = RandomState::new().build_hasher();
+    h1.write_u128(nanos);
+    h1.write_u32(std::process::id());
+    let mut h2 = RandomState::new().build_hasher();
+    h2.write_u128(nanos ^ 0x9e37_79b9_7f4a_7c15);
+    h2.write_u64(h1.finish());
+    let seed = format!("{}:{}", h1.finish(), h2.finish());
+    let digest = sha2::Sha256::digest(seed.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sk-{hex}")
+}
+
+/// The gateway master key from Credential Manager, generating and
+/// storing one when absent. An existing key is always reused, so
+/// clients already configured with it keep working across restarts.
+/// Shared by the gateway spawn, the editor-config writers, and the
+/// Tauri layer.
+pub async fn ensure_gateway_master_key(ops: &dyn SystemOps) -> Result<String, WizardError> {
+    if let Some(existing) = ops.credential_read(LITELLM_MASTER_KEY_CRED_TARGET).await {
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+    }
+    let key = generate_master_key();
+    ops.credential_write(LITELLM_MASTER_KEY_CRED_TARGET, &key)
+        .await?;
+    Ok(key)
+}
+
 /// Lifecycle state of one wizard step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -376,8 +428,32 @@ pub trait SystemOps: Send + Sync {
     async fn extract_zip(&self, archive: &Path, dest: &Path) -> Result<(), WizardError>;
     /// HTTP GET; used for health probes.
     async fn http_get(&self, url: &str) -> Result<HttpResponse, WizardError>;
+    /// HTTP GET with extra request headers — e.g. the Authorization
+    /// bearer the master-key-guarded gateway requires. The default
+    /// implementation ignores the headers and delegates to
+    /// [`Self::http_get`]; implementations that can send headers
+    /// override it.
+    async fn http_get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, WizardError> {
+        let _ = headers;
+        self.http_get(url).await
+    }
     /// HTTP POST with a JSON body; used for smoke tests.
     async fn http_post(&self, url: &str, body: &str) -> Result<HttpResponse, WizardError>;
+    /// HTTP POST with extra request headers; see
+    /// [`Self::http_get_with_headers`] for the default behavior.
+    async fn http_post_with_headers(
+        &self,
+        url: &str,
+        body: &str,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, WizardError> {
+        let _ = headers;
+        self.http_post(url, body).await
+    }
     /// HTTP HEAD; returns the Content-Length when the server provides one.
     /// Used for download size estimation (disk-space pre-check).
     async fn http_head_content_length(&self, url: &str) -> Result<Option<u64>, WizardError>;
@@ -404,6 +480,11 @@ pub trait SystemOps: Send + Sync {
     /// write it to disk — it exists to inject a secret into a spawned
     /// process's environment (e.g. the gateway's OpenRouter key).
     async fn credential_read(&self, target: &str) -> Option<String>;
+    /// Store a credential's value in Windows Credential Manager under
+    /// `target`, replacing any existing value. Pair with
+    /// [`Self::credential_read`]. The value is a secret: callers must
+    /// never log it.
+    async fn credential_write(&self, target: &str, secret: &str) -> Result<(), WizardError>;
     /// User home directory, if known.
     fn home_dir(&self) -> Option<PathBuf>;
 }
@@ -1200,7 +1281,7 @@ mod tests {
     #[test]
     fn continue_editor_config_points_at_gateway() {
         let cfg = manager_config::AppConfig::default_config();
-        let json = crate::steps::continue_editor_config(&cfg);
+        let json = crate::steps::continue_editor_config(&cfg, None);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let models = v["models"].as_array().unwrap();
         assert_eq!(models.len(), cfg.gateway.groups.len());
@@ -1210,6 +1291,14 @@ mod tests {
                 .unwrap()
                 .contains(&cfg.gateway.port.to_string()));
             assert!(m["title"].as_str().unwrap().ends_with("(local)"));
+            assert!(m.get("apiKey").is_none(), "no key without one given: {m}");
+        }
+        // With a master key, every model carries it as its apiKey —
+        // the gateway refuses unauthenticated calls.
+        let json = crate::steps::continue_editor_config(&cfg, Some("sk-test-key"));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for m in v["models"].as_array().unwrap() {
+            assert_eq!(m["apiKey"], "sk-test-key");
         }
     }
 }

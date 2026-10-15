@@ -17,18 +17,26 @@ use std::path::{Path, PathBuf};
 ///
 /// Shared by the [`VscodeExtensions`] wizard step and the Tauri
 /// `vscode_write_config` command so both write byte-identical configs.
-pub fn continue_editor_config(config: &AppConfig) -> String {
+/// When `master_key` is given it is written as each model's `apiKey`:
+/// the gateway requires it, and an editor client config is where such
+/// a key conventionally lives (the user's own profile, on their own
+/// machine).
+pub fn continue_editor_config(config: &AppConfig, master_key: Option<&str>) -> String {
     let models: Vec<serde_json::Value> = config
         .gateway
         .groups
         .iter()
         .map(|g| {
-            serde_json::json!({
+            let mut m = serde_json::json!({
                 "title": format!("{} (local)", g.name),
                 "provider": "openai",
                 "model": g.name,
                 "apiBase": format!("http://127.0.0.1:{}/v1", config.gateway.port),
-            })
+            });
+            if let Some(key) = master_key {
+                m["apiKey"] = serde_json::Value::String(key.to_string());
+            }
+            m
         })
         .collect();
     json_pretty(&serde_json::json!({ "models": models }))
@@ -1205,7 +1213,10 @@ impl StartGateway {
         PlannedCommand::new(vec![
             self.venv_python(ctx).display().to_string(),
             "-c".to_string(),
-            "import litellm".to_string(),
+            // prisma rides along: a venv that predates its addition
+            // to the install spec (see pip_command) must not pass
+            // this probe, so the pip step runs and completes it.
+            "import litellm, prisma".to_string(),
         ])
     }
 
@@ -1248,6 +1259,14 @@ impl StartGateway {
             "--python".to_string(),
             self.venv_python(ctx).display().to_string(),
             self.litellm_spec(ctx),
+            // prisma is not part of litellm[proxy] (it sits in the
+            // separate extra-proxy extra), but the proxy's auth
+            // exception handler imports it unconditionally when
+            // classifying an authentication error — without it an
+            // unauthenticated request returns HTTP 500 (the handler
+            // itself crashes on ModuleNotFoundError) instead of a
+            // clean 401. Found on real hardware 2026-10-15.
+            "prisma".to_string(),
         ])
     }
 
@@ -1289,35 +1308,79 @@ impl StartGateway {
     /// written into the YAML. When the tier is enabled but the key
     /// cannot be read, the gateway still starts and the returned warning
     /// states the OpenRouter fallback is not armed.
+    /// The gateway master key, generating and storing one on first
+    /// use. Stored in Windows Credential Manager under
+    /// [`crate::LITELLM_MASTER_KEY_CRED_TARGET`]; an existing key is
+    /// always reused, so clients already configured with it (editor
+    /// configs the wizard wrote) keep working across restarts.
+    async fn ensure_master_key(&self, ctx: &WizardContext) -> Result<String, StepOutcome> {
+        crate::ensure_gateway_master_key(ctx.ops.as_ref())
+            .await
+            .map_err(|e| {
+                StepOutcome::failed(
+                    format!(
+                        "could not store the gateway master key in Windows Credential Manager: {e}"
+                    ),
+                    vec![format!("{e:?}")],
+                )
+            })
+    }
+
+    /// The master key for authenticating this app's own calls to the
+    /// gateway (health probes, smoke tests), when one is stored.
+    /// Never generates: probe paths must not create credentials.
+    async fn stored_master_key(&self, ctx: &WizardContext) -> Option<String> {
+        ctx.ops
+            .credential_read(crate::LITELLM_MASTER_KEY_CRED_TARGET)
+            .await
+            .filter(|k| !k.is_empty())
+    }
+
+    /// The Authorization header for this app's own gateway calls,
+    /// when a master key is stored. A gateway that requires a key was
+    /// started by a run of this step, which stored the key first, so
+    /// the header is present exactly when the gateway demands it.
+    async fn gateway_auth_headers(&self, ctx: &WizardContext) -> Vec<(String, String)> {
+        match self.stored_master_key(ctx).await {
+            Some(key) => vec![("Authorization".to_string(), format!("Bearer {key}"))],
+            None => Vec::new(),
+        }
+    }
+
     async fn spawn_command_with_env(
         &self,
         ctx: &WizardContext,
-    ) -> (PlannedCommand, Option<String>) {
+    ) -> Result<(PlannedCommand, Option<String>), StepOutcome> {
         let mut cmd = self.spawn_command(ctx);
+        // The master key is unconditional: current LiteLLM refuses
+        // to boot without one. Failing to obtain it fails the step
+        // here rather than spawning a gateway that exits at startup.
+        let master_key = self.ensure_master_key(ctx).await?;
+        cmd.env.insert("LITELLM_MASTER_KEY".to_string(), master_key);
         let tier = &ctx.config.gateway.openrouter;
         if !tier.enabled {
-            return (cmd, None);
+            return Ok((cmd, None));
         }
         let Some(cred_ref) = tier.cred_ref.as_deref().filter(|r| !r.is_empty()) else {
-            return (
+            return Ok((
                 cmd,
                 Some(
                     "OpenRouter fallback is not armed: the cloud tier is enabled but no credential reference is configured"
                         .to_string(),
                 ),
-            );
+            ));
         };
         match ctx.ops.credential_read(cred_ref).await {
             Some(key) => {
                 cmd.env.insert("OPENROUTER_API_KEY".to_string(), key);
-                (cmd, None)
+                Ok((cmd, None))
             }
-            None => (
+            None => Ok((
                 cmd,
                 Some(format!(
                     "OpenRouter fallback is not armed: credential '{cred_ref}' could not be read from Windows Credential Manager"
                 )),
-            ),
+            )),
         }
     }
 
@@ -1410,6 +1473,7 @@ impl StartGateway {
 
     async fn wait_healthy(&self, ctx: &WizardContext, pid: u32, log: &mut Vec<String>) -> bool {
         let url = self.gateway_url(ctx);
+        let headers = self.gateway_auth_headers(ctx).await;
         for attempt in 1..=self.health_retries {
             // Fail fast when the child is gone: probing a dead process
             // for the full budget reports a timeout and hides the real
@@ -1420,7 +1484,7 @@ impl StartGateway {
                 ));
                 return false;
             }
-            match ctx.ops.http_get(&url).await {
+            match ctx.ops.http_get_with_headers(&url, &headers).await {
                 Ok(resp) if resp.status == 200 => {
                     log.push(format!(
                         "gateway healthy on :{} (attempt {attempt})",
@@ -1483,6 +1547,14 @@ impl WizardStep for StartGateway {
                 cmds.push(self.venv_command(ctx, &uv));
                 cmds.push(self.pip_command(ctx, &uv));
                 let mut spawn = self.spawn_command(ctx);
+                // The gateway master key is always set at spawn (read
+                // from — or first generated into — Credential
+                // Manager); the plan only records that the variable
+                // will be set. The value never appears here.
+                spawn.env.insert(
+                    "LITELLM_MASTER_KEY".to_string(),
+                    "<set from credential manager>".to_string(),
+                );
                 let tier = &ctx.config.gateway.openrouter;
                 if tier.enabled && tier.cred_ref.as_deref().is_some_and(|r| !r.is_empty()) {
                     // The real key is read from Credential Manager when
@@ -1594,7 +1666,10 @@ impl WizardStep for StartGateway {
                 if let Err(outcome) = self.stop_previous_gateway(ctx, &mut log).await {
                     return Ok(outcome);
                 }
-                let (mut spawn, openrouter_warning) = self.spawn_command_with_env(ctx).await;
+                let (mut spawn, openrouter_warning) = match self.spawn_command_with_env(ctx).await {
+                    Ok(pair) => pair,
+                    Err(outcome) => return Ok(outcome),
+                };
                 if let Some(w) = &openrouter_warning {
                     log.push(format!("warning: {w}"));
                 }
@@ -1652,7 +1727,12 @@ impl WizardStep for StartGateway {
             }
             RunMode::Audit => {
                 // Re-probe backend health without reinstalling.
-                match ctx.ops.http_get(&self.gateway_url(ctx)).await {
+                let headers = self.gateway_auth_headers(ctx).await;
+                match ctx
+                    .ops
+                    .http_get_with_headers(&self.gateway_url(ctx), &headers)
+                    .await
+                {
                     Ok(resp) if resp.status == 200 => Ok(StepOutcome::done(
                         format!("gateway healthy on :{}", ctx.config.gateway.port),
                         vec![format!("GET /v1/models → 200 in {} ms", resp.elapsed_ms)],
@@ -1693,9 +1773,18 @@ impl Default for VscodeExtensions {
 }
 
 impl VscodeExtensions {
-    /// Generate a Continue config with every gateway group as a model.
-    fn continue_config_json(&self, ctx: &WizardContext) -> String {
-        continue_editor_config(&ctx.config)
+    /// Generate a Continue config with every gateway group as a model,
+    /// carrying the gateway master key as each model's apiKey.
+    async fn continue_config_json(&self, ctx: &WizardContext) -> Result<String, StepOutcome> {
+        let key = crate::ensure_gateway_master_key(ctx.ops.as_ref())
+            .await
+            .map_err(|e| {
+                StepOutcome::failed(
+                    format!("could not obtain the gateway master key for the editor config: {e}"),
+                    vec![format!("{e:?}")],
+                )
+            })?;
+        Ok(continue_editor_config(&ctx.config, Some(&key)))
     }
 
     fn install_commands(&self) -> Vec<PlannedCommand> {
@@ -1763,7 +1852,10 @@ impl WizardStep for VscodeExtensions {
                         }
                     }
                 }
-                let config_json = self.continue_config_json(ctx);
+                let config_json = match self.continue_config_json(ctx).await {
+                    Ok(json) => json,
+                    Err(outcome) => return Ok(outcome),
+                };
                 // Never clobber an existing Continue config: write ours to the
                 // data dir always, and to the canonical location only when
                 // nothing is there yet.
@@ -2290,6 +2382,18 @@ impl WizardStep for SmokeTest {
             "http://127.0.0.1:{}/v1/chat/completions",
             ctx.config.gateway.port
         );
+        // The gateway requires its master key when one is set; it is
+        // read from Credential Manager, never generated here.
+        let headers: Vec<(String, String)> = match ctx
+            .ops
+            .credential_read(crate::LITELLM_MASTER_KEY_CRED_TARGET)
+            .await
+        {
+            Some(key) if !key.is_empty() => {
+                vec![("Authorization".to_string(), format!("Bearer {key}"))]
+            }
+            _ => Vec::new(),
+        };
         let mut log = Vec::new();
         let mut baselines = Vec::new();
         for group in &groups {
@@ -2300,7 +2404,7 @@ impl WizardStep for SmokeTest {
                 "stream": false,
             })
             .to_string();
-            let resp = match ctx.ops.http_post(&url, &body).await {
+            let resp = match ctx.ops.http_post_with_headers(&url, &body, &headers).await {
                 Ok(r) => r,
                 Err(e) => {
                     return Ok(StepOutcome::failed(
@@ -3380,6 +3484,20 @@ mod tests {
         assert_eq!(
             cmds[0].stderr_log.as_deref(),
             Some(std::path::Path::new("/data/logs/gateway.stderr.log"))
+        );
+        // A master key was generated, stored, and injected into the
+        // gateway's environment (current LiteLLM refuses to boot
+        // without one).
+        let key = cmds[0]
+            .env
+            .get("LITELLM_MASTER_KEY")
+            .expect("master key env set");
+        assert!(key.starts_with("sk-") && key.len() > 32, "{key}");
+        assert_eq!(
+            ops.credential_value(crate::LITELLM_MASTER_KEY_CRED_TARGET)
+                .as_deref(),
+            Some(key.as_str()),
+            "stored credential matches the injected key"
         );
     }
 

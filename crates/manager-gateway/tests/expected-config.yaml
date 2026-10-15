@@ -45,3 +45,5 @@ litellm_settings:
     - coder-fast: [coder, openrouter]
     - coder: [openrouter]
     - tool-runner: [openrouter]
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

@@ -3073,7 +3073,13 @@ fn home_dir() -> Option<PathBuf> {
 #[tauri::command]
 async fn vscode_write_config(state: State<'_, AppState>, backup: bool) -> ApiResult {
     let cfg = state.config.read().await;
-    let new_json = continue_editor_config(&cfg);
+    // The editor client needs the gateway master key as its apiKey;
+    // ensure (generate + store on first use) so the written config
+    // works against the key-guarded gateway.
+    let master_key = manager_wizard::ensure_gateway_master_key(&RealSystemOps)
+        .await
+        .map_err(jerr)?;
+    let new_json = continue_editor_config(&cfg, Some(&master_key));
     let new_models: Value = serde_json::from_str::<Value>(&new_json)
         .map_err(jerr)?
         .get("models")
