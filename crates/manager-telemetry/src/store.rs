@@ -163,7 +163,11 @@ impl TelemetryStore {
             raise_mark(&mut peak.vram_util_pct, vram_util_pct, ts);
             raise_mark(&mut peak.vram_used_mib, sample.vram_used_mib, ts);
             raise_mark(&mut peak.temp_c, sample.temp_c, ts);
-            raise_mark(&mut peak.power_w, sample.power_w, ts);
+            // Power is optional: cards that report N/A simply never
+            // raise a power peak.
+            if let Some(power_w) = sample.power_w {
+                raise_mark(&mut peak.power_w, power_w, ts);
+            }
 
             let ring = self.history.entry(idx).or_default();
             ring.push_back(sample.clone());
@@ -600,7 +604,7 @@ mod tests {
         let mut store = TelemetryStore::new();
         store.update(vec![sample_at(0, 0, 60.0)]);
         let mut s = sample_at(0, 0, 70.0);
-        s.power_w = 120.0;
+        s.power_w = Some(120.0);
         s.vram_used_mib = 8192; // of 16384 total -> 50% VRAM util
         s.utilization_pct = 42.0;
         let peak_ts = s.ts;

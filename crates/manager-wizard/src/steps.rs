@@ -1288,7 +1288,7 @@ impl StartGateway {
 
     fn spawn_command(&self, ctx: &WizardContext) -> PlannedCommand {
         let cfg = ctx.data_dir.join("gateway").join("config.yaml");
-        PlannedCommand::new(vec![
+        let mut cmd = PlannedCommand::new(vec![
             self.litellm_cli(ctx).display().to_string(),
             "--config".to_string(),
             cfg.display().to_string(),
@@ -1298,7 +1298,20 @@ impl StartGateway {
             "127.0.0.1".to_string(),
             "--port".to_string(),
             ctx.config.gateway.port.to_string(),
-        ])
+        ]);
+        // Force UTF-8 stdio in the gateway process. With stdout
+        // redirected (the captured log file), Python on Windows
+        // encodes output with the ANSI code page (cp1252); LiteLLM's
+        // startup banner contains box-drawing characters cp1252
+        // cannot represent, the print raises UnicodeEncodeError, and
+        // application startup fails (found on real hardware
+        // 2026-10-15 — a manual console run worked because a real
+        // console takes the Unicode path). PYTHONIOENCODING targets
+        // stdio; PYTHONUTF8 also covers the filesystem encoding.
+        cmd.env
+            .insert("PYTHONIOENCODING".to_string(), "utf-8".to_string());
+        cmd.env.insert("PYTHONUTF8".to_string(), "1".to_string());
+        cmd
     }
 
     /// The spawn command plus the OpenRouter key environment. The
@@ -3492,6 +3505,13 @@ mod tests {
             .env
             .get("LITELLM_MASTER_KEY")
             .expect("master key env set");
+        // UTF-8 stdio is forced: with redirected output, cp1252
+        // cannot encode LiteLLM's startup banner and startup fails.
+        assert_eq!(
+            cmds[0].env.get("PYTHONIOENCODING").map(String::as_str),
+            Some("utf-8")
+        );
+        assert_eq!(cmds[0].env.get("PYTHONUTF8").map(String::as_str), Some("1"));
         assert!(key.starts_with("sk-") && key.len() > 32, "{key}");
         assert_eq!(
             ops.credential_value(crate::LITELLM_MASTER_KEY_CRED_TARGET)

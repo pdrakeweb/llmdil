@@ -38,7 +38,7 @@ export interface GpuInfo {
   vram_used_gb: number;
   vram_total_gb: number;
   temp_c: number;
-  power_w: number;
+  power_w: number | null;
   /* temp_peak_c and power_limit_w ARE carried by the live payload
      (nullable there; undefined here when the payload carries null), as
      are fan_pct / mem_util_pct (nullable per GPU — e.g. fanless P100s

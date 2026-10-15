@@ -25,11 +25,23 @@
 ; models, managed Python env) is KEPT BY DEFAULT and deleted only when the
 ; user explicitly answers "Yes". The prompt defaults to "No" (MB_DEFBUTTON2).
 ; In silent uninstalls (/S) the prompt is skipped and data is kept.
+;
+; The removal itself is a single `rd /s /q` run through nsExec (hidden,
+; no console window) with ONE DetailPrint line. NSIS's own RMDir /r
+; deletes and logs every file individually — a managed Python venv is
+; ~15,000 files, which took minutes and flooded the uninstall log
+; (real hardware, 2026-10-15). The RMDir /r remains only as a fallback
+; for whatever rd could not remove (e.g. a file locked by a process
+; that is still running).
 !macro NSIS_HOOK_PREUNINSTALL
-  IfSilent +5
-  IfFileExists "$APPDATA\local-llm-service-manager\*.*" 0 +4
+  IfSilent +9
+  IfFileExists "$APPDATA\local-llm-service-manager\*.*" 0 +8
   MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "Remove user data (configuration, logs, downloaded models) in %APPDATA%\local-llm-service-manager?$\n$\nSelect No (recommended) to keep your data for a future reinstall." IDYES +2
-  Goto +2
+  Goto +6
+  DetailPrint "Removing user data in %APPDATA%\local-llm-service-manager ..."
+  nsExec::Exec '"$SYSDIR\cmd.exe" /c rd /s /q "$APPDATA\local-llm-service-manager"'
+  Pop $0
+  IfFileExists "$APPDATA\local-llm-service-manager\*.*" 0 +2
   RMDir /r "$APPDATA\local-llm-service-manager"
 !macroend
 

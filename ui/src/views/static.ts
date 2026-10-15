@@ -16,7 +16,7 @@ import {
   modelAssign,
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
   verifyModel, deleteModel,
-  getLogs, exportDiagnostics, getGatewayConfig, getGatewayStatus, getGatewayYaml,
+  getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
 } from "../api";
@@ -139,7 +139,7 @@ function gpuCard(g: GpuInfo): string {
         <div class="mrow"><span class="mlabel">VRAM</span><span class="mval">${g.vram_used_gb.toFixed(1)} / ${g.vram_total_gb.toFixed(1)} GiB</span></div>
         <div class="mrow"><span class="mlabel">Temperature</span><span class="mval">${g.temp_c} \u00b0C${peak}</span></div>
         ${tempSpark}
-        <div class="mrow"><span class="mlabel">Power</span><span class="mval">${g.power_w} W${limit}</span></div>
+        <div class="mrow"><span class="mlabel">Power</span><span class="mval">${g.power_w == null ? "N/A" : `${g.power_w} W${limit}`}</span></div>
         ${powerSpark}
         ${memUtil}
         ${fan}
@@ -1123,6 +1123,7 @@ export function renderLogs(): string {
     <button class="btn" id="logRefresh">${icon("restart")} Refresh</button>
     <span class="spacer" style="flex:1"></span>
     <button class="btn" id="logExport">${icon("download")} Export diagnostics bundle</button>
+    <button class="btn" id="logOpenFolder" style="display:none">Open folder</button>
   </div>
   <div style="font-size:11px;color:var(--text3);margin-top:8px">The bundle contains raw, unredacted process logs. Review it before sharing.</div>
   <div id="logMsg" style="font-size:12px;margin-top:6px"></div></div>
@@ -1230,6 +1231,8 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
       void load();
     }
   };
+  const openFolderBtn = root.querySelector("#logOpenFolder") as HTMLButtonElement | null;
+  let lastExportPath = "";
   const onExport = async (): Promise<void> => {
     if (exportBtn) exportBtn.disabled = true;
     const r = await exportDiagnostics();
@@ -1237,7 +1240,12 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
     if (disposed) return;
     if (r.error) { msg(`Export failed: ${r.error}`, true); return; }
     msg(r.data.path ? `Diagnostics bundle written to ${r.data.path}.` : "Diagnostics bundle written.");
+    if (r.data.path && openFolderBtn) {
+      lastExportPath = r.data.path;
+      openFolderBtn.style.display = "";
+    }
   };
+  openFolderBtn?.addEventListener("click", () => { if (lastExportPath) void openFolder(lastExportPath); });
   scopeSel?.addEventListener("change", onChange);
   levelSel?.addEventListener("change", onChange);
   limitSel?.addEventListener("change", onChange);
@@ -1753,7 +1761,8 @@ function settingsPaint(
   const updatesInner = `${updatesBody}
     <div style="margin-top:10px;font-size:12px;color:var(--text2)">Update checking is not supported in v0.1.x.</div>
     <div class="card-actions"><a class="btn" href="#/wizard">${icon("search")} Open Setup Wizard</a>
-    <button class="btn" id="setExportBtn">${icon("download")} Export diagnostics bundle</button></div>
+    <button class="btn" id="setExportBtn">${icon("download")} Export diagnostics bundle</button>
+    <button class="btn" id="setOpenFolder" style="display:none">Open folder</button></div>
     <div style="font-size:11px;color:var(--text3);margin-top:8px">The bundle contains raw, unredacted process logs. Review it before sharing.</div>`;
   const updatesCard = settingsCard("Updates & diagnostics", "wrench", updatesInner);
 
@@ -1804,6 +1813,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
   /** Self-test result HTML survives repaints (kept in the closure). */
   let selfTestHtml = "";
 
+  let lastExportPath = "";
   const setMsg = (text: string, isErr = false): void => {
     const m = root.querySelector("#setMsg");
     if (m) m.innerHTML = text ? `<span style="color:${isErr ? "var(--err)" : "var(--text2)"}">${esc(text)}</span>` : "";
@@ -1837,7 +1847,20 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       exportBtn.disabled = false;
       if (disposed) return;
       if (r.error) setMsg(`Export failed: ${r.error}`, true);
-      else setMsg(r.data.path ? `Diagnostics bundle written to ${r.data.path}.` : "Diagnostics bundle written.");
+      else {
+        setMsg(r.data.path ? `Diagnostics bundle written to ${r.data.path}.` : "Diagnostics bundle written.");
+        if (r.data.path) {
+          lastExportPath = r.data.path;
+          const of = root.querySelector("#setOpenFolder") as HTMLButtonElement | null;
+          if (of) of.style.display = "";
+        }
+      }
+      return;
+    }
+
+    const openFolderBtn = t.closest("#setOpenFolder") as HTMLButtonElement | null;
+    if (openFolderBtn) {
+      if (lastExportPath) void openFolder(lastExportPath);
       return;
     }
 

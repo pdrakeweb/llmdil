@@ -2059,6 +2059,50 @@ async fn open_url(url: String) -> ApiResult {
     }
 }
 
+/// Open a folder in Windows Explorer. `path` may name the folder
+/// itself or a file inside it (the diagnostics bundle path is a
+/// file; its containing folder is opened). Backs the "Open folder"
+/// button shown after a diagnostics export.
+#[tauri::command]
+async fn open_folder(path: String) -> ApiResult {
+    let p = std::path::Path::new(&path);
+    let dir = if p.is_dir() {
+        p.to_path_buf()
+    } else if p.is_file() {
+        match p.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => {
+                return Err(err(ApiError::InvalidInput(format!(
+                    "no containing folder for: {path}"
+                ))))
+            }
+        }
+    } else {
+        return Err(err(ApiError::InvalidInput(format!(
+            "path does not exist: {path}"
+        ))));
+    };
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("explorer.exe");
+        cmd.arg(&dir);
+        // CREATE_NO_WINDOW: no console host for the spawn; Explorer
+        // itself is a GUI process and still appears.
+        cmd.creation_flags(0x08000000);
+        cmd.spawn()
+            .map_err(|e| err(ApiError::Io(format!("failed to open folder: {e}"))))?;
+        Ok(json!({ "ok": true }))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = dir;
+        Err(err(ApiError::Unsupported(
+            "open_folder is only supported on Windows".to_string(),
+        )))
+    }
+}
+
 /// Mark a step as manually completed by the user.
 #[tauri::command]
 async fn setup_mark_manual(
@@ -2863,6 +2907,27 @@ async fn diagnostics_export_bundle(state: State<'_, AppState>) -> ApiResult {
             .collect();
         log_scopes.push((scope, lines));
     }
+    // The file-backed gateway log joins the bundle as the "gateway"
+    // scope: it is the record of the most recent gateway failures
+    // (startup errors included) and the supervisor hub never sees it.
+    let (gateway_records, _) = gateway_log_records(&state.data_dir);
+    if !gateway_records.is_empty() {
+        let lines: Vec<String> = gateway_records
+            .iter()
+            .rev()
+            .map(|r| {
+                let archived = if r.archived { " [archived]" } else { "" };
+                format!(
+                    "[{}] [{:?}]{} {}",
+                    r.ts.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+                    r.stream,
+                    archived,
+                    r.line
+                )
+            })
+            .collect();
+        log_scopes.push(("gateway".to_string(), lines));
+    }
     let versions = vec![
         ("app".to_string(), env!("CARGO_PKG_VERSION").to_string()),
         (
@@ -3432,6 +3497,7 @@ fn main() {
             setup_mark_complete,
             setup_step_help_url,
             open_url,
+            open_folder,
             // Models
             list_models,
             download_model,

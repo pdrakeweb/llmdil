@@ -102,7 +102,7 @@ interface GpuSample {
   vram_used_mib: number;
   vram_total_mib: number;
   temp_c: number;
-  power_w: number;
+  power_w: number | null;
   stale: boolean;
   source: string;
   mem_util_pct: number | null;
@@ -806,6 +806,19 @@ export async function exportDiagnostics(): Promise<CallResult<{ path: string }>>
     return { data, live: true };
   } catch (e) {
     return { data: { path: "" }, live: true, error: errOf(e) };
+  }
+}
+
+/** open_folder — open a folder (or a file's containing folder) in
+ *  Windows Explorer. Backs the "Open folder" button shown after a
+ *  diagnostics export. */
+export async function openFolder(path: string): Promise<CallResult<{ ok: boolean }>> {
+  if (!isTauri()) return { data: { ok: false }, live: false, error: "open_folder is not available in sample mode" };
+  try {
+    const data = await invoke<{ ok: boolean }>("open_folder", { path });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { ok: false }, live: true, error: errOf(e) };
   }
 }
 

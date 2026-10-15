@@ -10,9 +10,14 @@
 //! - Unknown extra elements are ignored, so new driver versions that add
 //!   fields do not break the parser.
 //! - Required fields (`product_name`, `uuid`, memory totals, `gpu_temp`,
-//!   `gpu_util`, `power_draw`) missing or `N/A` → [`TelemetryError::ParseError`]
+//!   `gpu_util`) missing or `N/A` → [`TelemetryError::ParseError`]
 //!   naming the GPU. The poller treats a failed poll as a missed tick and the
 //!   store marks the GPU STALE; we never synthesize zeros.
+//! - `power_draw` is NOT required: some cards (an RTX A4000 under
+//!   current drivers) report `N/A` for power readings while every
+//!   other field is valid. It degrades to `None` like the other
+//!   optional metrics — requiring it took the whole source down on
+//!   real hardware (2026-10-15).
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -207,7 +212,7 @@ struct ParsedGpu {
     gpu_util_pct: f32,
     mem_util_pct: Option<f32>,
     temp_c: f32,
-    power_w: f32,
+    power_w: Option<f32>,
     power_limit_w: Option<f32>,
     fan_pct: Option<f32>,
     clocks_graphics_mhz: Option<u32>,
@@ -504,12 +509,9 @@ fn finalize_gpu(
         &name,
         get("temperature/gpu_temp").and_then(|s| parse_celsius(&s)),
     )?;
-    let power_w = required(
-        "gpu_power_readings/power_draw",
-        index,
-        &name,
-        get("gpu_power_readings/power_draw").and_then(|s| parse_watts(&s)),
-    )?;
+    // Optional: N/A or missing on cards whose power sensor the driver
+    // does not expose in XML (see module docs).
+    let power_w = get("gpu_power_readings/power_draw").and_then(|s| parse_watts(&s));
 
     let pci_bus_id = get("pci/pci_bus").unwrap_or_else(|| id_attr.to_string());
 
@@ -550,7 +552,7 @@ mod tests {
         assert_eq!(a4000.vram_used_mib, 9216);
         assert_eq!(a4000.vram_total_mib, 16384);
         assert!((a4000.temp_c - 67.0).abs() < f32::EPSILON);
-        assert!((a4000.power_w - 95.30).abs() < 0.01);
+        assert!((a4000.power_w.expect("power reported") - 95.30).abs() < 0.01);
         assert_eq!(a4000.fan_pct, Some(32.0));
         assert_eq!(a4000.power_limit_w, Some(140.0));
         assert_eq!(a4000.clocks_graphics_mhz, Some(1560));
@@ -565,7 +567,7 @@ mod tests {
         assert!((p100_0.utilization_pct - 45.0).abs() < f32::EPSILON);
         assert_eq!(p100_0.vram_used_mib, 12288);
         assert!((p100_0.temp_c - 61.0).abs() < f32::EPSILON);
-        assert!((p100_0.power_w - 118.75).abs() < 0.01);
+        assert!((p100_0.power_w.expect("power reported") - 118.75).abs() < 0.01);
         assert_eq!(
             p100_0.fan_pct, None,
             "P100 has no fan: N/A must map to None"
@@ -651,7 +653,35 @@ mod tests {
             "missing <clocks> must not error"
         );
         assert_eq!(s.mem_util_pct, None);
-        assert!((s.power_w - 38.20).abs() < 0.01);
+        assert!((s.power_w.expect("power reported") - 38.20).abs() < 0.01);
+    }
+
+    #[test]
+    fn na_power_draw_maps_to_none_without_error() {
+        // An RTX A4000 under current drivers reports N/A here while
+        // every other field is valid; the sample must survive with
+        // power_w = None (real hardware, 2026-10-15 — requiring the
+        // field failed the entire telemetry source).
+        let xml = r#"<?xml version="1.0" ?><nvidia_smi_log>
+<driver_version>582.78</driver_version><attached_gpus>1</attached_gpus>
+<gpu id="00000000:65:00.0">
+<product_name>NVIDIA RTX A4000</product_name>
+<uuid>GPU-bbbb</uuid><minor_number>0</minor_number>
+<pci><pci_bus>00000000:65:00.0</pci_bus></pci>
+<fan_speed>30 %</fan_speed>
+<fb_memory_usage><total>16384 MiB</total><used>1024 MiB</used></fb_memory_usage>
+<utilization><gpu_util>12 %</gpu_util></utilization>
+<temperature><gpu_temp>41 C</gpu_temp></temperature>
+<gpu_power_readings><power_draw>N/A</power_draw><power_limit>140.00 W</power_limit></gpu_power_readings>
+<processes></processes>
+</gpu></nvidia_smi_log>"#;
+        let samples = NvidiaSmiSource::parse_xml(xml).expect("N/A power_draw must parse");
+        assert_eq!(samples.len(), 1);
+        let s = &samples[0];
+        assert_eq!(s.power_w, None);
+        assert_eq!(s.power_limit_w, Some(140.0));
+        assert_eq!(s.vram_total_mib, 16384);
+        assert!((s.temp_c - 41.0).abs() < f32::EPSILON);
     }
 
     #[test]

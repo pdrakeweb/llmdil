@@ -71,7 +71,11 @@ pub struct GpuSample {
     pub vram_used_mib: u64,
     pub vram_total_mib: u64,
     pub temp_c: f32,
-    pub power_w: f32,
+    /// Instant power draw W, when the card reports it. Some cards
+    /// (e.g. an RTX A4000 under current drivers) answer `N/A` for
+    /// power readings in nvidia-smi XML; that must degrade to None,
+    /// never fail the sample or the source.
+    pub power_w: Option<f32>,
     /// True when no successful poll within [`STALE_AFTER_SECS`].
     pub stale: bool,
     pub source: TelemetrySourceKind,
@@ -118,7 +122,7 @@ impl GpuSample {
             vram_used_mib,
             vram_total_mib,
             temp_c,
-            power_w,
+            power_w: Some(power_w),
             stale: false,
             source,
             mem_util_pct: None,

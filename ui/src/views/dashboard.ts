@@ -140,7 +140,7 @@ function gpuStripCard(g: GpuInfo): string {
       <div class="mrow"><span></span>${meter(vramPct, 220, 8, C.purple)}</div>
       <div class="mrow"><span class="mlabel">Temperature</span><span class="mval">${g.temp_c} °C${peak}</span></div>
       ${tempSpark}
-      <div class="mrow"><span class="mlabel">Power</span><span class="mval">${g.power_w}${limit} W</span></div>
+      <div class="mrow"><span class="mlabel">Power</span><span class="mval">${g.power_w == null ? "N/A" : `${g.power_w}${limit} W`}</span></div>
       ${powerSpark}
     </div>
   </div>`;
@@ -230,7 +230,7 @@ function consoleView(m: DashboardModel): string {
       <td>${meter(g.util_pct, 120, 8, C.blue)}</td>
       <td>${g.vram_used_gb.toFixed(1)}/${g.vram_total_gb} GB</td>
       <td>${meter(vramPct, 120, 8, C.purple)}</td>
-      <td>${g.temp_c}°C</td><td>${g.power_w}W</td></tr>`;
+      <td>${g.temp_c}°C</td><td>${g.power_w == null ? "N/A" : `${g.power_w}W`}</td></tr>`;
   }).join("");
   return `<div class="card" style="margin-bottom:12px"><div class="sec-title">Services</div>
     <table class="tbl"><thead><tr><th>Service</th><th>Port</th><th>Model</th><th>Health</th><th>Rate</th><th>Trend</th></tr></thead>
