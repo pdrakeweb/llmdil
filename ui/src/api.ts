@@ -341,17 +341,20 @@ export interface WizardStepOutcome {
   duration_ms: number;
 }
 
-/** run_wizard_step — runs one step to completion; the outcome is in the result. */
-export async function runWizardStep(stepId: string): Promise<CallResult<{ task_id: string; outcome: WizardStepOutcome }>> {
+/** run_wizard_step — runs one step to completion; the outcome is in the
+ * result. `busy` is true when another step already holds the wizard
+ * lock: that is a running state to report, not a failure, and
+ * `outcome` is null. */
+export async function runWizardStep(stepId: string): Promise<CallResult<{ task_id: string; busy: boolean; outcome: WizardStepOutcome | null }>> {
   if (isTauri()) {
     try {
-      const data = await invoke<{ task_id: string; outcome: WizardStepOutcome }>("run_wizard_step", { stepId });
-      return { data, live: true };
+      const data = await invoke<{ task_id: string; busy?: boolean; outcome: WizardStepOutcome | null }>("run_wizard_step", { stepId });
+      return { data: { task_id: data.task_id, busy: Boolean(data.busy), outcome: data.outcome ?? null }, live: true };
     } catch (e) {
-      return { data: { task_id: "", outcome: { state: "failed", message: String(e), log_tail: [], duration_ms: 0 } }, live: true, error: errOf(e) };
+      return { data: { task_id: "", busy: false, outcome: { state: "failed", message: String(e), log_tail: [], duration_ms: 0 } }, live: true, error: errOf(e) };
     }
   }
-  return { data: { task_id: "sample-task", outcome: { state: "done", message: "sample mode", log_tail: [], duration_ms: 0 } }, live: false };
+  return { data: { task_id: "sample-task", busy: false, outcome: { state: "done", message: "sample mode", log_tail: [], duration_ms: 0 } }, live: false };
 }
 
 /** run_audit — re-run all check-type steps in audit mode. The response
@@ -364,18 +367,43 @@ export interface AuditResult {
   done: number;
   total: number;
   steps: WizardStepState[];
+  /** True when an audit was already in flight (e.g. the launch-time
+   * hydration audit): a running state to report, not a failure. The
+   * running audit's results land in the checklist when it finishes. */
+  already_running: boolean;
 }
 
 export async function runAudit(): Promise<CallResult<AuditResult>> {
   if (isTauri()) {
     try {
-      const r = await invoke<{ task_id: string; done: number; total: number; steps: BackendStep[] }>("run_audit");
-      return { data: { task_id: r.task_id, done: r.done, total: r.total, steps: r.steps.map(mapBackendStep) }, live: true };
+      const r = await invoke<{ task_id: string; done: number; total: number; steps: BackendStep[]; already_running?: boolean }>("run_audit");
+      return { data: { task_id: r.task_id, done: r.done, total: r.total, steps: r.steps.map(mapBackendStep), already_running: Boolean(r.already_running) }, live: true };
     } catch (e) {
-      return { data: { task_id: "", done: 0, total: 0, steps: [] }, live: true, error: errOf(e) };
+      return { data: { task_id: "", done: 0, total: 0, steps: [], already_running: false }, live: true, error: errOf(e) };
     }
   }
-  return { data: { task_id: "sample-task", done: 0, total: 0, steps: [] }, live: false };
+  return { data: { task_id: "sample-task", done: 0, total: 0, steps: [], already_running: false }, live: false };
+}
+
+/** One command a wizard step will run (setup_get_commands wire shape). */
+export interface PlannedCommandWire {
+  argv: string[];
+  cwd: string | null;
+  env: Record<string, string>;
+  stdout_log: string | null;
+  stderr_log: string | null;
+}
+
+/** setup_get_commands — the exact commands a step runs, for the
+ * failed-step "run it manually" block in the wizard. */
+export async function getWizardCommands(stepId: string): Promise<CallResult<PlannedCommandWire[]>> {
+  if (!isTauri()) return { data: [], live: false };
+  try {
+    const data = await invoke<PlannedCommandWire[]>("setup_get_commands", { stepId });
+    return { data: Array.isArray(data) ? data : [], live: true };
+  } catch (e) {
+    return { data: [], live: true, error: errOf(e) };
+  }
 }
 
 interface BackendStep {
@@ -601,6 +629,8 @@ export interface ModelRow {
   params_b: number;
   sha256: string;
   verified_at: string | null;
+  /** Whether the setup wizard's download step includes this model. */
+  enabled: boolean;
   on_disk: boolean;
   size_bytes: number | null;
   /** True while a download for this model is in flight (backend-tracked,
@@ -699,6 +729,37 @@ export async function verifyModel(id: string): Promise<CallResult<{ id: string; 
     return { data, live: true };
   } catch (e) {
     return { data: { id, ok: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** model_set_enabled — include/exclude a model from wizard downloads.
+ *  The model's file and configuration are kept either way. */
+export async function modelSetEnabled(id: string, enabled: boolean): Promise<CallResult<{ model_id: string; enabled: boolean }>> {
+  if (!isTauri()) return { data: { model_id: id, enabled }, live: false };
+  try {
+    const data = await invoke<{ model_id: string; enabled: boolean }>("model_set_enabled", { id, enabled });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { model_id: id, enabled: !enabled }, live: true, error: errOf(e) };
+  }
+}
+
+/** model_add — register a new model by id and GGUF source URL. File
+ *  name and quant are optional (the file name defaults to the URL's
+ *  last path segment). The model starts enabled with no pinned hash. */
+export async function modelAdd(id: string, sourceUrl: string, fileName?: string, quant?: string): Promise<CallResult<{ model_id: string }>> {
+  if (!isTauri()) return { data: { model_id: id }, live: false };
+  try {
+    const data = await invoke<{ model_id: string }>("model_add", {
+      id,
+      sourceUrl,
+      fileName: fileName ?? null,
+      quant: quant ?? null,
+      paramsB: null,
+    });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { model_id: id }, live: true, error: errOf(e) };
   }
 }
 

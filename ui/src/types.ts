@@ -123,4 +123,8 @@ export interface WizardStepState {
   message?: string;
   logTail?: string[];
   remediation?: string;
+  /** PowerShell text for running this step manually (failed steps
+   * only), rendered with a copy button. Filled in by the wizard view
+   * from setup_get_commands. */
+  manualCommands?: string;
 }

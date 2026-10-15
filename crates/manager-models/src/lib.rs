@@ -22,9 +22,10 @@ pub use placement::{apply_placement, propose_placement, validate_split, Placemen
 /// Bytes in one MiB.
 pub const MIB: u64 = 1024 * 1024;
 
-/// Marker used for catalog SHA-256 values until the wizard pins real hashes
-/// at install time. A model whose sha256 is still the placeholder must be
-/// re-verified against the pinned hash before it is marked "installed".
+/// Marker for an unpinned SHA-256 value. The curated catalog ships real
+/// pinned hashes (below); this marker remains for hand-written specs and
+/// tests. Verification fails closed on it: a model whose sha256 is still
+/// the placeholder can never be marked "installed".
 pub const PLACEHOLDER_SHA256: &str = "PLACEHOLDER-pin-real-sha256-at-install-time";
 
 /// One downloadable model.
@@ -58,27 +59,23 @@ impl DownloadProgress {
 
 /// The four curated models from the plan (spec §4.6).
 ///
-/// Sizes are realistic Q4_K_M estimates (~4.92 bits/weight plus GGUF
-/// overhead), used for fit-check projections only. URLs point at the
-/// upstream Hugging Face GGUF repos (Qwen's canonical `<Model>-Q4_K_M.gguf`
-/// naming); the planner slot keeps the spec's "Qwen3.8-27B" display name and
-/// points at the closest real artifact, Qwen3-32B (dense 32B-class) — the
-/// exact file is confirmed and the hash pinned at install time.
-/// All sha256 values are [`PLACEHOLDER_SHA256`] until the wizard pins the
-/// real hash into the config at install time; [`verify_sha256`] fails closed
-/// on the placeholder, so a model can never be marked "installed" against
-/// an unpinned hash.
+/// SHA-256 values and sizes are the real values from the publisher's
+/// Hugging Face file metadata (the LFS object hash and size for each
+/// file, pinned 2026-10-15), so [`verify_sha256`] runs against a real
+/// pin from the first download. The planner slot keeps the spec's
+/// "Qwen3.8-27B" display name and points at the closest real artifact,
+/// Qwen3-32B (dense 32B-class). Qwen publishes no official GGUF repo
+/// for Qwen3-Coder-30B-A3B-Instruct, so the coder slot uses unsloth's
+/// GGUF conversion of the official weights.
 pub fn curated_models() -> Vec<ModelSpec> {
     vec![
         ModelSpec {
             id: "qwen3-27b-planner".to_string(),
             name: "Qwen3.8-27B".to_string(),
             quant: "Q4_K_M".to_string(),
-            size_bytes: 19_800_000_000,
-            sha256: PLACEHOLDER_SHA256.to_string(),
+            size_bytes: 19_762_149_024,
+            sha256: "efd971561896866f0e910cce52761ca77b1b138090c7f15fe284676d57d1f689".to_string(),
             // Closest real artifact for the planner slot: Qwen3-32B dense.
-            // The wizard confirms this URL and pins the real SHA-256 at
-            // install time before any download is marked "installed".
             url: "https://huggingface.co/Qwen/Qwen3-32B-GGUF/resolve/main/Qwen3-32B-Q4_K_M.gguf"
                 .to_string(),
         },
@@ -86,17 +83,17 @@ pub fn curated_models() -> Vec<ModelSpec> {
             id: "qwen3-coder-30b".to_string(),
             name: "Qwen3-Coder-30B".to_string(),
             quant: "Q4_K_M".to_string(),
-            size_bytes: 18_300_000_000,
-            sha256: PLACEHOLDER_SHA256.to_string(),
-            url: "https://huggingface.co/Qwen/Qwen3-Coder-30B-GGUF/resolve/main/Qwen3-Coder-30B-Q4_K_M.gguf"
+            size_bytes: 18_556_689_568,
+            sha256: "fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad".to_string(),
+            url: "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
                 .to_string(),
         },
         ModelSpec {
             id: "qwen2.5-coder-7b".to_string(),
             name: "Qwen2.5-Coder-7B".to_string(),
             quant: "Q4_K_M".to_string(),
-            size_bytes: 4_680_000_000,
-            sha256: PLACEHOLDER_SHA256.to_string(),
+            size_bytes: 4_683_073_536,
+            sha256: "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c".to_string(),
             url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
                 .to_string(),
         },
@@ -104,8 +101,8 @@ pub fn curated_models() -> Vec<ModelSpec> {
             id: "qwen3-8b".to_string(),
             name: "Qwen3-8B".to_string(),
             quant: "Q4_K_M".to_string(),
-            size_bytes: 5_280_000_000,
-            sha256: PLACEHOLDER_SHA256.to_string(),
+            size_bytes: 5_027_783_488,
+            sha256: "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785".to_string(),
             url: "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
                 .to_string(),
         },
@@ -1501,7 +1498,7 @@ mod tests {
     // -- catalog + registry tests ---------------------------------------------
 
     #[test]
-    fn curated_models_are_four_with_placeholder_hashes() {
+    fn curated_models_are_four_with_pinned_hashes() {
         let models = curated_models();
         assert_eq!(models.len(), 4);
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
@@ -1515,7 +1512,15 @@ mod tests {
             ]
         );
         for m in &models {
-            assert_eq!(m.sha256, PLACEHOLDER_SHA256, "hash for {}", m.id);
+            // Real pins from the publishers' Hugging Face file metadata:
+            // 64 hex chars, never the placeholder.
+            assert_eq!(m.sha256.len(), 64, "hash length for {}", m.id);
+            assert!(
+                m.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+                "hash for {} is not hex",
+                m.id
+            );
+            assert_ne!(m.sha256, PLACEHOLDER_SHA256, "hash for {}", m.id);
             assert!(!m.url.is_empty() && !m.quant.is_empty());
             assert!(m.size_bytes > 0);
         }
@@ -1559,6 +1564,7 @@ mod tests {
             verified_at: None,
             source_url: String::new(),
             assigned_backends: Vec::new(),
+            enabled: true,
         }
     }
 

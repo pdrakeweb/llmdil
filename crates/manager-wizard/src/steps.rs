@@ -6,10 +6,11 @@
 //! [`FakeSystemOps`](crate::fake::FakeSystemOps).
 
 use crate::{
-    checksums_match, PlannedCommand, RunMode, StepOutcome, WizardContext, WizardError, WizardStep,
+    checksums_match, is_pinned_hash, PlannedCommand, RunMode, StepOutcome, WizardContext,
+    WizardError, WizardStep,
 };
 use async_trait::async_trait;
-use manager_config::AppConfig;
+use manager_config::{AppConfig, ModelConfig};
 use std::path::{Path, PathBuf};
 
 /// Generate the Continue `config.json` content with every gateway model
@@ -795,7 +796,7 @@ impl WizardStep for DownloadModels {
         ctx.config
             .models
             .iter()
-            .filter(|m| !m.source_url.is_empty())
+            .filter(|m| m.enabled && !m.source_url.is_empty())
             .map(|m| {
                 let dest = resolve_dest(&ctx.data_dir, &m.gguf_path);
                 PlannedCommand::new(vec![
@@ -816,14 +817,24 @@ impl WizardStep for DownloadModels {
                 vec![],
             ));
         }
+        // Disabled models are out of scope for the wizard: their files
+        // and configuration stay, but nothing downloads or verifies.
+        let targets: Vec<&ModelConfig> = ctx.config.models.iter().filter(|m| m.enabled).collect();
+        if targets.is_empty() {
+            return Ok(StepOutcome::done(
+                "no models enabled; nothing to download (enable models in the Models view)",
+                vec![],
+            ));
+        }
         let mut log = Vec::new();
         let mut verified = 0;
+        let mut unverified = 0;
         if ctx.mode == RunMode::Install {
             if let Err(outcome) = self.check_disk_space(ctx, &mut log).await {
                 return Ok(outcome);
             }
         }
-        for model in &ctx.config.models {
+        for model in &targets {
             let dest = resolve_dest(&ctx.data_dir, &model.gguf_path);
             if model.source_url.is_empty() {
                 return Ok(StepOutcome::failed(
@@ -832,20 +843,33 @@ impl WizardStep for DownloadModels {
                 ));
             }
             let url = model.source_url.clone();
-            let verify = |actual: &str| checksums_match(actual, &model.sha256);
+            // Only a pinned hash can verify. A model without one (a
+            // user-added model with no recorded SHA-256) downloads and
+            // runs unverified rather than failing a comparison that can
+            // never succeed.
+            let pinned = is_pinned_hash(&model.sha256);
+            let verify = |actual: &str| pinned && checksums_match(actual, &model.sha256);
             match ctx.mode {
                 RunMode::Install => {
                     let mut needs_download = true;
                     if ctx.ops.file_exists(&dest).await {
-                        match ctx.ops.sha256_file(&dest).await {
-                            Ok(h) if verify(&h) => {
-                                log.push(format!("{}: already present and verified", model.id));
-                                needs_download = false;
-                            }
-                            _ => log.push(format!(
-                                "{}: present but checksum mismatch; re-downloading",
+                        if !pinned {
+                            log.push(format!(
+                                "{}: already present (no pinned SHA-256; not verified)",
                                 model.id
-                            )),
+                            ));
+                            needs_download = false;
+                        } else {
+                            match ctx.ops.sha256_file(&dest).await {
+                                Ok(h) if verify(&h) => {
+                                    log.push(format!("{}: already present and verified", model.id));
+                                    needs_download = false;
+                                }
+                                _ => log.push(format!(
+                                    "{}: present but checksum mismatch; re-downloading",
+                                    model.id
+                                )),
+                            }
                         }
                     }
                     if needs_download {
@@ -853,28 +877,39 @@ impl WizardStep for DownloadModels {
                         if let Err(e) = ctx.ops.download(&url, &dest, &|_, _| {}).await {
                             return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
                         }
-                        let actual = match ctx.ops.sha256_file(&dest).await {
-                            Ok(h) => h,
-                            Err(e) => {
+                        if pinned {
+                            let actual = match ctx.ops.sha256_file(&dest).await {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    return Ok(StepOutcome::failed(
+                                        format!("{e}"),
+                                        vec![format!("{e:?}")],
+                                    ))
+                                }
+                            };
+                            if !verify(&actual) {
                                 return Ok(StepOutcome::failed(
-                                    format!("{e}"),
-                                    vec![format!("{e:?}")],
-                                ))
+                                    format!(
+                                        "checksum mismatch for '{}': expected {}, got {}",
+                                        model.id, model.sha256, actual
+                                    ),
+                                    vec!["downloaded file rejected".to_string()],
+                                ));
                             }
-                        };
-                        if !verify(&actual) {
-                            return Ok(StepOutcome::failed(
-                                format!(
-                                    "checksum mismatch for '{}': expected {}, got {}",
-                                    model.id, model.sha256, actual
-                                ),
-                                vec!["downloaded file rejected".to_string()],
+                            log.push(format!("{}: downloaded and SHA-256 verified", model.id));
+                        } else {
+                            log.push(format!(
+                                "{}: downloaded (no pinned SHA-256; not verified)",
+                                model.id
                             ));
                         }
-                        log.push(format!("{}: downloaded and SHA-256 verified", model.id));
                     }
-                    Self::stamp_verified_at(ctx, &model.id, &mut log);
-                    verified += 1;
+                    if pinned {
+                        Self::stamp_verified_at(ctx, &model.id, &mut log);
+                        verified += 1;
+                    } else {
+                        unverified += 1;
+                    }
                 }
                 RunMode::Audit => {
                     if !ctx.ops.file_exists(&dest).await {
@@ -882,6 +917,14 @@ impl WizardStep for DownloadModels {
                             format!("model '{}' missing at {}", model.id, dest.display()),
                             vec![],
                         ));
+                    }
+                    if !pinned {
+                        log.push(format!(
+                            "{}: present (no pinned SHA-256; cannot verify)",
+                            model.id
+                        ));
+                        unverified += 1;
+                        continue;
                     }
                     match ctx.ops.sha256_file(&dest).await {
                         Ok(h) if verify(&h) => {
@@ -908,10 +951,13 @@ impl WizardStep for DownloadModels {
                 }
             }
         }
-        Ok(StepOutcome::done(
-            format!("{verified}/{} model(s) verified", ctx.config.models.len()),
-            log,
-        ))
+        let mut message = format!("{verified}/{} model(s) verified", targets.len());
+        if unverified > 0 {
+            message.push_str(&format!(
+                "; {unverified} present without a pinned SHA-256 (not verified)"
+            ));
+        }
+        Ok(StepOutcome::done(message, log))
     }
 }
 
@@ -972,12 +1018,15 @@ impl DownloadModels {
         let mut known: u64 = 0;
         let mut unknown: u32 = 0;
         for model in &ctx.config.models {
-            if model.source_url.is_empty() {
-                continue; // the per-model loop reports this properly
+            if !model.enabled || model.source_url.is_empty() {
+                continue; // disabled models are out of scope; the per-model loop reports a missing URL
             }
             let dest = resolve_dest(&ctx.data_dir, &model.gguf_path);
             let needs_download = if ctx.ops.file_exists(&dest).await {
-                !matches!(ctx.ops.sha256_file(&dest).await, Ok(h) if checksums_match(&h, &model.sha256))
+                // An unpinned model already on disk cannot be verified,
+                // so it counts as present — same rule as the run loop.
+                is_pinned_hash(&model.sha256)
+                    && !matches!(ctx.ops.sha256_file(&dest).await, Ok(h) if checksums_match(&h, &model.sha256))
             } else {
                 true
             };
@@ -1813,6 +1862,28 @@ impl VscodeExtensions {
             })
             .collect()
     }
+
+    /// True when a command error is the ops layer's spawn-level
+    /// failure (the executable could not be started at all), as opposed
+    /// to a program that ran and exited nonzero. The ops layer reports
+    /// spawn failures with exit code -1 and its own `spawn failed:`
+    /// prefix.
+    fn spawn_failed(e: &WizardError) -> bool {
+        matches!(
+            e,
+            WizardError::CommandFailed { code: -1, stderr, .. }
+                if stderr.starts_with("spawn failed")
+        )
+    }
+
+    /// The skip outcome for a machine without VS Code: the extensions
+    /// are optional editor tooling, so a missing `code` executable is
+    /// a skip, never a setup failure.
+    fn vscode_missing() -> StepOutcome {
+        StepOutcome::skipped(
+            "VS Code is not installed (the `code` command was not found); extension install skipped",
+        )
+    }
 }
 
 #[async_trait]
@@ -1846,6 +1917,17 @@ impl WizardStep for VscodeExtensions {
         let mut log = Vec::new();
         match ctx.mode {
             RunMode::Install => {
+                // Probe first: without the `code` CLI there is nothing
+                // to install into, and the step skips instead of
+                // failing on the first extension.
+                let probe = PlannedCommand::new(vec!["code".to_string(), "--version".to_string()]);
+                match ctx.ops.run_command(&probe).await {
+                    Ok(_) => {}
+                    Err(e) if Self::spawn_failed(&e) => return Ok(Self::vscode_missing()),
+                    Err(e) => {
+                        return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
+                    }
+                }
                 for cmd in self.install_commands() {
                     log.push(format!("running: {}", cmd.argv.join(" ")));
                     match ctx.ops.run_command(&cmd).await {
@@ -1860,6 +1942,7 @@ impl WizardStep for VscodeExtensions {
                                 vec![out.stderr],
                             ))
                         }
+                        Err(e) if Self::spawn_failed(&e) => return Ok(Self::vscode_missing()),
                         Err(e) => {
                             return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
                         }
@@ -1914,6 +1997,7 @@ impl WizardStep for VscodeExtensions {
                     PlannedCommand::new(vec!["code".to_string(), "--list-extensions".to_string()]);
                 let out = match ctx.ops.run_command(&cmd).await {
                     Ok(o) => o,
+                    Err(e) if Self::spawn_failed(&e) => return Ok(Self::vscode_missing()),
                     Err(e) => {
                         return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
                     }
@@ -2571,6 +2655,7 @@ mod tests {
                 verified_at: None,
                 source_url: "https://example.com/qwen3-8b.gguf".to_string(),
                 assigned_backends: vec!["tool-runner".to_string()],
+                enabled: true,
             },
             ModelConfig {
                 id: "qwen2.5-coder-7b".to_string(),
@@ -2581,6 +2666,7 @@ mod tests {
                 verified_at: None,
                 source_url: "https://example.com/qwen2.5-coder-7b.gguf".to_string(),
                 assigned_backends: vec!["coder-fast".to_string()],
+                enabled: true,
             },
         ];
         c
@@ -3159,6 +3245,53 @@ mod tests {
         assert_eq!(out.state, StepState::Done, "{out:?}");
         assert!(out.message.contains("2/2"));
         assert_eq!(ops.downloads_made().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn download_models_skips_disabled_models() {
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_download(
+            "https://example.com/qwen3-8b.gguf",
+            b"gguf-8b-bytes".to_vec(),
+        );
+        ops.with_download(
+            "https://example.com/qwen2.5-coder-7b.gguf",
+            b"gguf-7b-bytes".to_vec(),
+        );
+        let mut config = test_config_with_models();
+        config.models[1].enabled = false;
+        let ctx = WizardContext::new(
+            config,
+            PathBuf::from("/data"),
+            RunMode::Install,
+            ops.clone(),
+        );
+        let step = DownloadModels;
+        // Planned commands cover enabled models only.
+        assert_eq!(step.planned_commands(&ctx).len(), 1);
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(out.message.contains("1/1"), "{}", out.message);
+        assert_eq!(ops.downloads_made().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn download_models_none_enabled_is_a_no_op() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let mut config = test_config_with_models();
+        for m in &mut config.models {
+            m.enabled = false;
+        }
+        let ctx = WizardContext::new(
+            config,
+            PathBuf::from("/data"),
+            RunMode::Install,
+            ops.clone(),
+        );
+        let out = DownloadModels.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(out.message.contains("no models enabled"), "{}", out.message);
+        assert_eq!(ops.downloads_made().len(), 0);
     }
 
     #[tokio::test]
@@ -3879,8 +4012,8 @@ mod tests {
         assert_eq!(step.planned_commands(&ctx).len(), 2);
         let out = step.run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done, "{out:?}");
-        // Two extension installs ran.
-        assert_eq!(ops.executed_commands().len(), 2);
+        // The `code --version` probe plus two extension installs ran.
+        assert_eq!(ops.executed_commands().len(), 3);
         // Canonical config written (nothing existed).
         let canonical = ops
             .file_bytes(&PathBuf::from("/home/test/.continue/config.json"))
@@ -3897,6 +4030,35 @@ mod tests {
                 "/home/test/.continue/config.json.llm-manager"
             ))
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn vscode_install_skips_when_code_cli_missing() {
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_command_failure(
+            &["code", "--version"],
+            -1,
+            "spawn failed: program not found",
+        );
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = VscodeExtensions::default().run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Skipped, "{out:?}");
+        assert!(out.message.contains("not installed"), "{}", out.message);
+        // Only the probe ran — no install was attempted.
+        assert_eq!(ops.executed_commands().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn vscode_audit_skips_when_code_cli_missing() {
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_command_failure(
+            &["code", "--list-extensions"],
+            -1,
+            "spawn failed: program not found",
+        );
+        let ctx = ctx_with(ops, RunMode::Audit);
+        let out = VscodeExtensions::default().run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Skipped, "{out:?}");
     }
 
     #[tokio::test]

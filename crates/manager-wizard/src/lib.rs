@@ -896,6 +896,13 @@ pub fn checksums_match(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
 
+/// True when `sha` is a real pinned SHA-256 (64 hex chars), as opposed
+/// to an empty value or a placeholder. Only a pinned hash can verify a
+/// file; unpinned models download and run unverified by design.
+pub fn is_pinned_hash(sha: &str) -> bool {
+    sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

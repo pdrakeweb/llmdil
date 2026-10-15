@@ -32,6 +32,7 @@ fn rich_config() -> AppConfig {
         verified_at: None,
         source_url: "https://example.com/qwen3-8b.gguf".to_string(),
         assigned_backends: vec!["tool-runner".to_string()],
+        enabled: true,
     });
     let backend = cfg
         .backends

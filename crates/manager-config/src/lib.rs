@@ -172,6 +172,13 @@ pub struct CloudTierConfig {
     pub model_allowlist: Vec<String>,
 }
 
+/// Serde default for [`ModelConfig::enabled`]: configurations written
+/// before the flag existed carry models that were always in scope, so
+/// an absent flag means enabled.
+fn default_model_enabled() -> bool {
+    true
+}
+
 /// A downloaded GGUF model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
@@ -187,6 +194,11 @@ pub struct ModelConfig {
     /// Backend ids this model is assigned to (spec §10).
     #[serde(default)]
     pub assigned_backends: Vec<String>,
+    /// Whether the setup wizard's download step includes this model.
+    /// The curated defaults are seeded enabled; disabling a model keeps
+    /// its file and configuration but excludes it from wizard downloads.
+    #[serde(default = "default_model_enabled")]
+    pub enabled: bool,
 }
 
 /// Telemetry polling configuration (spec §5).
@@ -793,6 +805,7 @@ mod tests {
             verified_at: None,
             source_url: "https://example.com/qwen3-8b.gguf".to_string(),
             assigned_backends: vec!["tool-runner".to_string()],
+            enabled: true,
         });
         let backend = cfg
             .backends

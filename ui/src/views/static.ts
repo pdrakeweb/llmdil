@@ -10,17 +10,18 @@ import { icon } from "../icons";
 import { esc } from "../html";
 import {
   runWizardStep, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit,
+  getWizardCommands,
   getGpuTelemetry, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
   getBackends, startBackend, stopBackend, restartBackend, getBackendLaunchCommand,
   getBackendConfig, applyBackendConfig, testBackend, placementPropose, placementApply,
   modelAssign,
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
-  verifyModel, deleteModel,
+  verifyModel, deleteModel, modelSetEnabled, modelAdd,
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
 } from "../api";
-import type { BackendRow, GatewayConfigData, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData } from "../api";
+import type { BackendRow, GatewayConfigData, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
 import type { GpuInfo, WizardStepState } from "../types";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
@@ -923,11 +924,14 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
     actions = `${hashPinned(m) ? `<button class="btn" data-model-act="verify" data-model-id="${esc(m.id)}">${icon("shield")} Verify checksum</button>` : ""}
       <button class="btn" data-model-act="delete" data-model-id="${esc(m.id)}">${icon("err")} Delete</button>`;
   }
+  // Enable/disable is always offered: it controls whether the setup
+  // wizard's download step includes this model.
+  actions += ` <button class="btn" data-model-act="toggle-enabled" data-model-id="${esc(m.id)}">${m.enabled ? "Disable" : "Enable"}</button>`;
   const sizeText = m.on_disk
     ? esc(fmtBytes(m.size_bytes))
     : partial > 0 ? `${esc(fmtBytes(partial))} (partial)` : "not downloaded";
   return `<div class="card" style="margin-bottom:12px">
-    <h3>${icon("box")} ${esc(m.id)} <span class="chip">${esc(m.quant)}</span>
+    <h3>${icon("box")} ${esc(m.id)} <span class="chip">${esc(m.quant)}</span>${m.enabled ? "" : ` <span class="chip badge-warn">disabled</span>`}
       <span class="spacer" style="flex:1"></span>
       ${modelShaBadge(m)}</h3>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin:12px 0;align-items:center">
@@ -945,7 +949,22 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
 export function renderModels(): string {
   return `${topbar("Models")}
   <div class="view" style="max-width:900px"><div id="modelBanner"></div>
-  <div id="modelBody">${loadingHtml("Loading models…")}</div></div>`;
+  <div id="modelBody">${loadingHtml("Loading models…")}</div>
+  <div class="card"><h3>${icon("box")} Add a model</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+      <label style="font-size:12px;color:var(--text2)">Model id<br>
+        <input id="addModelId" type="text" placeholder="my-model-7b" style="${SELECT_STYLE};width:100%"></label>
+      <label style="font-size:12px;color:var(--text2)">Quant label (optional)<br>
+        <input id="addModelQuant" type="text" placeholder="Q4_K_M" style="${SELECT_STYLE};width:100%"></label>
+    </div>
+    <label style="font-size:12px;color:var(--text2);display:block;margin-top:10px">GGUF source URL (https)<br>
+      <input id="addModelUrl" type="text" placeholder="https://huggingface.co/…/model.gguf" style="${SELECT_STYLE};width:100%"></label>
+    <label style="font-size:12px;color:var(--text2);display:block;margin-top:10px">File name (optional — defaults to the URL's file name)<br>
+      <input id="addModelFile" type="text" placeholder="model.gguf" style="${SELECT_STYLE};width:100%"></label>
+    <div class="card-actions"><button class="btn" id="addModelBtn">Add model</button></div>
+    <div style="font-size:12px;color:var(--text2);margin-top:6px">The model is added enabled, with no pinned SHA-256 — its downloads run unverified until a hash is recorded in the configuration.</div>
+    <div id="addModelMsg" style="font-size:12px;margin-top:6px"></div>
+  </div></div>`;
 }
 
 export async function wireModels(root: HTMLElement): Promise<() => void> {
@@ -980,7 +999,7 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     if (!r.data.length) {
       lastRows = [];
       b.innerHTML = emptyHtml(r.live
-        ? "No models are configured. Models are defined in the app configuration."
+        ? "No models are configured. Add one with the form below."
         : "No model data in sample mode.");
       syncPoll();
       return;
@@ -1043,6 +1062,25 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       return;
     }
 
+    if (act === "toggle-enabled") {
+      (t as HTMLButtonElement).disabled = true;
+      const row = lastRows.find((m) => m.id === id);
+      const target = !(row?.enabled ?? true);
+      const r = await modelSetEnabled(id, target);
+      if (r.error) {
+        notes.set(id, { text: `${target ? "Enable" : "Disable"} failed: ${r.error}`, err: true });
+      } else {
+        notes.set(id, {
+          text: target
+            ? "Enabled — the setup wizard's download step will include this model."
+            : "Disabled — the setup wizard's download step will skip this model. The file and configuration are kept.",
+          err: false,
+        });
+      }
+      await load();
+      return;
+    }
+
     if (act === "verify") {
       const btn = t as HTMLButtonElement;
       btn.disabled = true;
@@ -1070,6 +1108,27 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     }
   };
   root.addEventListener("click", onClick);
+
+  const addBtn = root.querySelector("#addModelBtn") as HTMLButtonElement | null;
+  addBtn?.addEventListener("click", async () => {
+    const msg = root.querySelector("#addModelMsg") as HTMLElement | null;
+    const val = (sel: string): string => (root.querySelector(sel) as HTMLInputElement | null)?.value.trim() ?? "";
+    const id = val("#addModelId");
+    const url = val("#addModelUrl");
+    if (!isTauri()) { if (msg) msg.textContent = "Sample mode: adding models runs in the installed app."; return; }
+    if (!id || !url) {
+      if (msg) { msg.style.color = "var(--err)"; msg.textContent = "Model id and source URL are required."; }
+      return;
+    }
+    addBtn.disabled = true;
+    const r = await modelAdd(id, url, val("#addModelFile") || undefined, val("#addModelQuant") || undefined);
+    addBtn.disabled = false;
+    if (msg) {
+      msg.style.color = r.error ? "var(--err)" : "var(--text2)";
+      msg.textContent = r.error ? `Add failed: ${r.error}` : `Added ${id}.`;
+    }
+    if (!r.error) await load();
+  });
 
   await load();
 
@@ -1525,6 +1584,8 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
         if (disposed) return;
         if (r.error) {
           gwMsg(`Gateway start failed: ${r.error}`, true);
+        } else if (r.data.busy || !r.data.outcome) {
+          gwMsg("A setup step is already running \u2014 wait for it to finish, then start the gateway again.", true);
         } else {
           const o = r.data.outcome;
           const tail = o.log_tail.length ? ` ${o.log_tail[o.log_tail.length - 1]}` : "";
@@ -1915,6 +1976,56 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
 
 /* ---------------- Setup wizard ---------------- */
 
+/** Quote one argument for PowerShell when it contains whitespace or
+ * quotes; plain tokens pass through unquoted. */
+function psQuoteArg(a: string): string {
+  return a === "" || /[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a;
+}
+
+/** Render a step's planned commands as a PowerShell block the user can
+ * paste into a terminal to run the step manually. Paths in the planned
+ * commands are absolute, so the block works from any directory.
+ * Pseudo-commands are translated to their manual equivalents
+ * (download → curl.exe; http-get/http-post → Invoke-RestMethod).
+ * Secret env values are never printed: the gateway master key renders
+ * as a self-generated value, which makes a manual gateway run
+ * self-consistent (it will not match the app's stored key — that only
+ * matters when the app itself probes the manual instance). */
+function formatManualCommands(cmds: PlannedCommandWire[]): string {
+  const lines: string[] = [];
+  for (const c of cmds) {
+    if (c.argv[0] === "download" && c.argv.length === 3) {
+      lines.push(`curl.exe -L -o ${psQuoteArg(c.argv[2])} ${psQuoteArg(c.argv[1])}`);
+      continue;
+    }
+    if (c.argv[0] === "http-get" && c.argv.length >= 2) {
+      lines.push(`Invoke-RestMethod ${psQuoteArg(c.argv[1])}`);
+      continue;
+    }
+    if (c.argv[0] === "http-post" && c.argv.length >= 2) {
+      const body = c.argv[2] ? ` -ContentType "application/json" -Body '${c.argv[2].replace(/'/g, "''")}'` : "";
+      lines.push(`Invoke-RestMethod -Method Post -Uri ${psQuoteArg(c.argv[1])}${body}`);
+      continue;
+    }
+    if (c.cwd) lines.push(`Set-Location ${psQuoteArg(c.cwd)}`);
+    for (const k of Object.keys(c.env).sort()) {
+      const v = c.env[k];
+      if (k === "LITELLM_MASTER_KEY" && v.includes("credential")) {
+        lines.push(`$env:LITELLM_MASTER_KEY = "sk-local-" + [guid]::NewGuid().ToString("N")  # manual-run key; the app uses its stored Credential Manager key`);
+      } else {
+        lines.push(`$env:${k} = "${v.replace(/"/g, '\\"')}"`);
+      }
+    }
+    const argv = c.argv.map(psQuoteArg).join(" ");
+    const needsCall = c.argv.length > 0 && /[\\/]/.test(c.argv[0]);
+    lines.push(needsCall ? `& ${argv}` : argv);
+    if (c.stdout_log) {
+      lines.push(`# the app captures this command's output to ${c.stdout_log}${c.stderr_log ? ` and ${c.stderr_log}` : ""}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 function wizardStepRow(s: WizardStepState, live: boolean): string {
   const stIcon = s.state === "done" || s.state === "manual" ? `<span style="color:var(--ok)">${icon("check")}</span>`
     : s.state === "running" ? `<span style="color:var(--accent)">${icon("clock")}</span>`
@@ -1933,8 +2044,12 @@ function wizardStepRow(s: WizardStepState, live: boolean): string {
     ? `<div style="margin-top:4px;color:var(--text2)">${esc(s.remediation)}</div>` : "";
   const logTail = s.state === "failed" && s.logTail && s.logTail.length
     ? `<div style="margin-top:4px;font-family:var(--mono);font-size:11px;color:var(--text3)">${s.logTail.slice(-3).map((l) => esc(l)).join("<br>")}</div>` : "";
+  const manual = s.state === "failed" && s.manualCommands
+    ? `<div style="margin-top:8px"><div style="font-size:11px;color:var(--text3)">Run this step manually (PowerShell):</div>
+      <pre style="margin:4px 0;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px">${esc(s.manualCommands)}</pre>
+      <button class="btn" data-copy-step="${esc(s.id)}">Copy commands</button></div>` : "";
   return `<div class="step ${s.state}">${stIcon}${icon("wrench")}
-    <div><div class="sname">${esc(s.name)}</div><div class="sdetail">${esc(s.detail)}</div>${remediation}${logTail}${actions}</div>
+    <div><div class="sname">${esc(s.name)}</div><div class="sdetail">${esc(s.detail)}</div>${remediation}${logTail}${manual}${actions}</div>
     <div class="sstate">${s.note && s.state === "done" ? `<span class="chip badge-warn">${esc(s.note)}</span> ` : ""}${stateTxt}</div></div>`;
 }
 
@@ -2027,6 +2142,35 @@ export function wireWizard(root: HTMLElement): () => void {
 
   const paint = (): void => paintWizard(root, steps, liveNow, { busy, runningStepId, statusLine });
 
+  /** Manual-command text per failed step id, fetched once per step
+   * from setup_get_commands and rendered by the row with a copy
+   * button. An empty string marks a step whose commands could not be
+   * loaded, so it is not refetched on every paint. */
+  const manualCmds = new Map<string, string>();
+  const enrichFailed = async (): Promise<void> => {
+    if (!liveNow) return;
+    let changed = false;
+    for (const s of steps) {
+      if (s.state !== "failed") continue;
+      const cached = manualCmds.get(s.id);
+      if (cached !== undefined) {
+        if (cached && s.manualCommands !== cached) { s.manualCommands = cached; changed = true; }
+        continue;
+      }
+      const r = await getWizardCommands(s.id);
+      if (disposed) return;
+      if (!r.error && r.data.length) {
+        const text = formatManualCommands(r.data);
+        manualCmds.set(s.id, text);
+        s.manualCommands = text;
+        changed = true;
+      } else {
+        manualCmds.set(s.id, "");
+      }
+    }
+    if (changed) paint();
+  };
+
   const refresh = async (): Promise<void> => {
     const r = await getWizardSteps();
     if (disposed) return;
@@ -2034,16 +2178,22 @@ export function wireWizard(root: HTMLElement): () => void {
     liveNow = r.live;
     paint();
     if (r.error) logLine(`could not load setup state: ${r.error}`, "lvl-err");
+    void enrichFailed();
   };
 
-  const runOne = async (stepId: string): Promise<boolean> => {
+  const runOne = async (stepId: string): Promise<"ok" | "failed" | "busy"> => {
     logLine(`running step: ${stepId}`);
     const r = await runWizardStep(stepId);
-    if (r.error) { logLine(`step ${stepId} error: ${r.error}`, "lvl-err"); await refresh(); return false; }
+    if (r.error) { logLine(`step ${stepId} error: ${r.error}`, "lvl-err"); await refresh(); return "failed"; }
+    if (r.data.busy || !r.data.outcome) {
+      logLine("a setup step is already running", "lvl-warn");
+      await refresh();
+      return "busy";
+    }
     const o = r.data.outcome;
     logLine(`step ${stepId}: ${o.state} \u2014 ${o.message}`, o.state === "done" || o.state === "manual" ? "lvl-info" : "lvl-err");
     await refresh();
-    return o.state === "done" || o.state === "manual" || o.state === "skipped";
+    return o.state === "done" || o.state === "manual" || o.state === "skipped" ? "ok" : "failed";
   };
 
   const runBtn = root.querySelector("#runBtn") as HTMLButtonElement | null;
@@ -2055,16 +2205,20 @@ export function wireWizard(root: HTMLElement): () => void {
     try {
       await refresh();
       let paused: string | null = null;
+      let busyStop = false;
       for (const s of [...steps]) {
         if (s.state === "done" || s.state === "manual" || s.state === "skipped") continue;
         runningStepId = s.id;
         statusLine = `Running step: ${s.name}\u2026`;
         paint();
-        const ok = await runOne(s.id);
+        const res = await runOne(s.id);
         runningStepId = null;
-        if (!ok) { paused = s.name; break; }
+        if (res === "busy") { busyStop = true; break; }
+        if (res !== "ok") { paused = s.name; break; }
       }
-      if (paused) {
+      if (busyStop) {
+        statusLine = "A setup step is already running \u2014 wait for it to finish.";
+      } else if (paused) {
         statusLine = `Setup paused \u2014 ${paused} failed. Fix the cause and retry.`;
         logLine("setup paused \u2014 fix the failed step and retry", "lvl-warn");
       } else {
@@ -2093,12 +2247,21 @@ export function wireWizard(root: HTMLElement): () => void {
         await refresh();
         return;
       }
+      if (r.data.already_running) {
+        // Not a failure: an audit (often the launch-time hydration
+        // audit) is already in flight. Its results land in the
+        // checklist when it finishes.
+        statusLine = "Audit already running \u2014 its results will appear in the checklist when it finishes.";
+        logLine("audit already running");
+        return;
+      }
       // Paint the audit's own per-step results: refresh() would reload
       // the install wizard's state, which an audit never changes — that
       // is why the old handler appeared to do nothing.
       steps = r.data.steps;
       statusLine = `Audit complete: ${r.data.done}/${r.data.total} checks passed \u2014 the checklist shows the audit results.`;
       logLine(`audit complete: ${r.data.done}/${r.data.total} checks passed`);
+      void enrichFailed();
     } finally {
       busy = false;
       paint();
@@ -2127,6 +2290,28 @@ export function wireWizard(root: HTMLElement): () => void {
       if (r.error) alert(`Could not open the download page: ${r.error}`);
       return;
     }
+    const copyBtn = t.closest("[data-copy-step]") as HTMLElement | null;
+    if (copyBtn) {
+      const id = copyBtn.getAttribute("data-copy-step") ?? "";
+      const text = steps.find((s) => s.id === id)?.manualCommands ?? "";
+      if (text) {
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch {
+          // Clipboard API unavailable in this webview context: fall
+          // back to a temporary textarea + execCommand.
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          ta.remove();
+        }
+        statusLine = "Commands copied to the clipboard.";
+        paint();
+      }
+      return;
+    }
     const runStepBtn = t.closest("[data-run-step]") as HTMLElement | null;
     if (runStepBtn) {
       if (busy) return;
@@ -2135,12 +2320,13 @@ export function wireWizard(root: HTMLElement): () => void {
       runningStepId = id;
       statusLine = `Running step: ${steps.find((s) => s.id === id)?.name ?? id}\u2026`;
       paint();
+      let res: "ok" | "failed" | "busy" = "failed";
       try {
-        await runOne(id);
+        res = await runOne(id);
       } finally {
         busy = false;
         runningStepId = null;
-        statusLine = null;
+        statusLine = res === "busy" ? "A setup step is already running \u2014 wait for it to finish." : null;
         paint();
       }
     }

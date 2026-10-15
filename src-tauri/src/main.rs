@@ -441,6 +441,13 @@ impl AppState {
     }
 
     async fn wizard_ctx(&self, mode: RunMode) -> WizardContext {
+        // The wizard reads the same model registry as every other view;
+        // make sure the first-run catalog seeding has happened before
+        // the snapshot is taken, whichever view runs first. (Seeding
+        // used to live only inside the Models commands, so a wizard run
+        // before the first Models visit saw an empty registry and its
+        // download step reported "no models configured".)
+        ensure_catalog_models(self).await;
         WizardContext {
             config: self.config.read().await.clone(),
             data_dir: self.data_dir.clone(),
@@ -596,6 +603,14 @@ fn is_real_pin(sha: &str) -> bool {
 /// across restarts. A config that already holds models but predates
 /// the flag gets the flag set in memory only (it persists on the next
 /// save) and is never reseeded.
+///
+/// Seeded models start enabled (the wizard's download step installs
+/// enabled models) and pre-assigned to their default backend. A default
+/// backend whose `model_file` still carries the untouched default
+/// (`models/<backend-id>.gguf`) is aligned to the seeded model's path,
+/// so a downloaded model is the file its backend starts and config
+/// validation (an enabled backend's model_file must be a registered
+/// model) passes when the backend is enabled.
 async fn ensure_catalog_models(state: &AppState) {
     let mut cfg = state.config.write().await;
     if cfg.catalog_seeded {
@@ -605,6 +620,15 @@ async fn ensure_catalog_models(state: &AppState) {
         cfg.catalog_seeded = true;
         return;
     }
+    let backend_for = |model_id: &str| -> Option<&'static str> {
+        match model_id {
+            "qwen3-27b-planner" => Some("planner"),
+            "qwen3-coder-30b" => Some("coder"),
+            "qwen2.5-coder-7b" => Some("coder-fast"),
+            "qwen3-8b" => Some("tool-runner"),
+            _ => None,
+        }
+    };
     cfg.models = manager_models::curated_models()
         .into_iter()
         .map(|spec| {
@@ -614,6 +638,9 @@ async fn ensure_catalog_models(state: &AppState) {
                 .next()
                 .unwrap_or("model.gguf")
                 .to_string();
+            let assigned_backends = backend_for(&spec.id)
+                .map(|b| vec![b.to_string()])
+                .unwrap_or_default();
             manager_config::ModelConfig {
                 id: spec.id,
                 gguf_path: PathBuf::from("models").join(file_name),
@@ -622,10 +649,27 @@ async fn ensure_catalog_models(state: &AppState) {
                 sha256: spec.sha256,
                 verified_at: None,
                 source_url: spec.url,
-                assigned_backends: Vec::new(),
+                assigned_backends,
+                enabled: true,
             }
         })
         .collect();
+    let seeded_paths: Vec<(String, PathBuf)> = cfg
+        .models
+        .iter()
+        .flat_map(|m| {
+            m.assigned_backends
+                .iter()
+                .map(move |b| (b.clone(), m.gguf_path.clone()))
+        })
+        .collect();
+    for (backend_id, path) in seeded_paths {
+        if let Some(backend) = cfg.backends.iter_mut().find(|b| b.id == backend_id) {
+            if backend.model_file == PathBuf::from(format!("models/{backend_id}.gguf")) {
+                backend.model_file = path;
+            }
+        }
+    }
     cfg.catalog_seeded = true;
     // Best effort: the seeded entries are live in memory either way; a
     // failed save only means the seeding repeats on the next launch.
@@ -1247,14 +1291,18 @@ async fn run_wizard_step(app: AppHandle, state: State<'_, AppState>, step_id: St
     let ctx = state.wizard_ctx(RunMode::Install).await;
     let wizard = state.wizard(RunMode::Install).await;
     // try_lock, not lock: a second invocation (e.g. a stray double
-    // click while a step runs) must fail fast with a clear error
-    // instead of queueing on the mutex and executing a step again
-    // after the current run finishes.
-    let mut guard = wizard.try_lock().map_err(|_| {
-        jerr(ApiError::Wizard(
-            "a setup step is already running".to_string(),
-        ))
-    })?;
+    // click while a step runs) must not queue on the mutex and execute
+    // a step again after the current run finishes. Like the audit, it
+    // reports the running state instead of failing.
+    let mut guard = match wizard.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            state
+                .finish_task(&task_id, TaskStatus::Done, json!({ "busy": true }))
+                .await;
+            return Ok(json!({ "task_id": task_id, "busy": true, "outcome": null }));
+        }
+    };
     let (_done_before, total) = guard.progress();
     let outcome: StepOutcome = guard
         .run_step(&ctx, &step_id)
@@ -1289,13 +1337,30 @@ async fn run_audit(app: AppHandle, state: State<'_, AppState>) -> ApiResult {
     let task_id = state.record_task("audit", json!({})).await;
     let ctx = state.wizard_ctx(RunMode::Audit).await;
     let wizard = state.wizard(RunMode::Audit).await;
-    // try_lock, not lock: see run_wizard_step — a duplicate audit
-    // invocation fails fast instead of queueing a second execution.
-    let mut guard = wizard.try_lock().map_err(|_| {
-        jerr(ApiError::Wizard(
-            "an audit is already running".to_string(),
-        ))
-    })?;
+    // try_lock, not lock: a duplicate audit invocation must not queue
+    // a second execution. But a concurrent audit (the launch-time
+    // hydration audit, or a second click from a re-opened view) is a
+    // state to report, not a failure — the running audit's results
+    // land in the checklist when it finishes.
+    let mut guard = match wizard.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            state
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Done,
+                    json!({ "already_running": true }),
+                )
+                .await;
+            return Ok(json!({
+                "task_id": task_id,
+                "already_running": true,
+                "done": 0,
+                "total": 0,
+                "steps": [],
+            }));
+        }
+    };
     let report: WizardReport = guard.run_all(&ctx).await;
     let (done, total) = report.progress();
     // The per-step results ride along in the response: the checklist is
@@ -1389,6 +1454,7 @@ async fn list_models(state: State<'_, AppState>) -> ApiResult {
                 "params_b": m.params_b,
                 "sha256": m.sha256,
                 "verified_at": m.verified_at,
+                "enabled": m.enabled,
                 "fit_check_available": false,
                 "on_disk": meta.is_some(),
                 "size_bytes": meta.map(|md| md.len()),
@@ -2503,6 +2569,91 @@ async fn model_delete(state: State<'_, AppState>, id: String) -> ApiResult {
     }))
 }
 
+/// Enable or disable a model for wizard downloads. Disabling keeps the
+/// model's file and configuration; the setup wizard's download step
+/// skips disabled models.
+#[tauri::command]
+async fn model_set_enabled(state: State<'_, AppState>, id: String, enabled: bool) -> ApiResult {
+    let mut cfg = state.config.write().await;
+    let model = cfg
+        .models
+        .iter_mut()
+        .find(|m| m.id == id)
+        .ok_or_else(|| err(ApiError::NotFound(format!("model {id}"))))?;
+    model.enabled = enabled;
+    manager_config::save(&cfg, &state.config_path).map_err(jerr)?;
+    drop(cfg);
+    Ok(json!({ "model_id": id, "enabled": enabled }))
+}
+
+/// Add a model to the registry: an id, the https URL of its GGUF file,
+/// and optionally an explicit file name, quant label, and parameter
+/// count. The model starts enabled with no pinned SHA-256 — its
+/// downloads run unverified (the Models view shows "hash not pinned")
+/// until a hash is recorded in the configuration.
+#[tauri::command]
+async fn model_add(
+    state: State<'_, AppState>,
+    id: String,
+    source_url: String,
+    file_name: Option<String>,
+    quant: Option<String>,
+    params_b: Option<f32>,
+) -> ApiResult {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(err(ApiError::InvalidInput(
+            "model id is required".to_string(),
+        )));
+    }
+    if !source_url.starts_with("https://") {
+        return Err(err(ApiError::InvalidInput(
+            "source URL must be an https:// URL for a GGUF file".to_string(),
+        )));
+    }
+    let file_name = file_name
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty())
+        .unwrap_or_else(|| {
+            source_url
+                .rsplit('/')
+                .next()
+                .unwrap_or("model.gguf")
+                .to_string()
+        });
+    if !file_name.to_lowercase().ends_with(".gguf")
+        || file_name.contains('/')
+        || file_name.contains('\\')
+    {
+        return Err(err(ApiError::InvalidInput(
+            "file name must be a plain .gguf file name".to_string(),
+        )));
+    }
+    let mut cfg = state.config.write().await;
+    if cfg.models.iter().any(|m| m.id == id) {
+        return Err(err(ApiError::InvalidInput(format!(
+            "a model with id '{id}' already exists"
+        ))));
+    }
+    cfg.models.push(manager_config::ModelConfig {
+        gguf_path: PathBuf::from("models").join(&file_name),
+        id: id.clone(),
+        quant: quant
+            .map(|q| q.trim().to_string())
+            .filter(|q| !q.is_empty())
+            .unwrap_or_else(|| "unknown".to_string()),
+        params_b: params_b.filter(|p| *p > 0.0).unwrap_or(0.0),
+        sha256: String::new(),
+        verified_at: None,
+        source_url,
+        assigned_backends: Vec::new(),
+        enabled: true,
+    });
+    manager_config::save(&cfg, &state.config_path).map_err(jerr)?;
+    drop(cfg);
+    Ok(json!({ "model_id": id }))
+}
+
 /// Assign a model to a backend with a tensor split (spec §14
 /// `model_assign`). Sets the backend's model file, applies the split, and
 /// records a restart task for the guided rolling restart.
@@ -3507,6 +3658,8 @@ fn main() {
             model_verify_checksum,
             model_delete,
             model_assign,
+            model_add,
+            model_set_enabled,
             // Logs
             get_logs,
             // Gateway
