@@ -995,6 +995,20 @@ export interface GatewayStatusData {
 
 /** gateway_status — probe state (up) + port + group/rule counts + the
  *  recorded routing-test trace count. */
+/** gateway_master_key — the LiteLLM master key: the API key local
+ *  clients present and the admin UI password (username admin). The
+ *  backend reads it from Windows Credential Manager (generating and
+ *  storing on first use), so the returned value is the one in force. */
+export async function getGatewayMasterKey(): Promise<CallResult<{ master_key: string }>> {
+  if (!isTauri()) return { data: { master_key: "" }, live: false, error: "gateway_master_key is not available in sample mode" };
+  try {
+    const data = await invoke<{ master_key: string }>("gateway_master_key");
+    return { data, live: true };
+  } catch (e) {
+    return { data: { master_key: "" }, live: true, error: errOf(e) };
+  }
+}
+
 export async function getGatewayStatus(): Promise<CallResult<GatewayStatusData>> {
   const fallback: GatewayStatusData = { port: 4000, groups: 0, routing_rules: 0, up: false, routing_log_len: 0, openrouter_cred_present: null };
   if (!isTauri()) return { data: fallback, live: false };

@@ -49,6 +49,16 @@ struct FakeState {
     progress_calls: Vec<(u64, u64)>,
     downloaded_to: Vec<(String, PathBuf)>,
     extracted: Vec<(PathBuf, PathBuf)>,
+    /// (archive, dest, prefix, strip_prefix) tar.gz extraction calls.
+    extracted_tar_gz: Vec<(PathBuf, PathBuf, String, String)>,
+    /// Argv of every `run_elevated` call, in order.
+    elevated: Vec<Vec<String>>,
+    /// Files an extraction materializes: when an extract call's dest
+    /// is a prefix of a staged path, the file appears in the fake fs.
+    extraction_files: Vec<(PathBuf, Vec<u8>)>,
+    /// When set, `run_elevated` fails with this reason (e.g. the user
+    /// declined the UAC prompt).
+    elevated_error: Option<String>,
     http_get: HashMap<String, HttpResponse>,
     http_post: HashMap<String, HttpResponse>,
     posts: Vec<(String, String)>,
@@ -85,6 +95,10 @@ impl Default for FakeState {
             progress_calls: Vec::new(),
             downloaded_to: Vec::new(),
             extracted: Vec::new(),
+            extracted_tar_gz: Vec::new(),
+            elevated: Vec::new(),
+            extraction_files: Vec::new(),
+            elevated_error: None,
             http_get: HashMap::new(),
             http_post: HashMap::new(),
             posts: Vec::new(),
@@ -314,6 +328,23 @@ impl FakeSystemOps {
     }
 
     /// (archive, dest) extraction calls, in order.
+    /// Script `run_elevated` to fail with this reason (e.g. the user
+    /// declined the UAC prompt).
+    pub fn with_elevated_error(&self, reason: &str) -> &Self {
+        self.state.lock().unwrap().elevated_error = Some(reason.to_string());
+        self
+    }
+
+    /// (archive, dest, prefix, strip_prefix) tar.gz extraction calls.
+    pub fn tar_gz_extractions(&self) -> Vec<(PathBuf, PathBuf, String, String)> {
+        self.state.lock().unwrap().extracted_tar_gz.clone()
+    }
+
+    /// Argv of every `run_elevated` call, in order.
+    pub fn elevated_calls(&self) -> Vec<Vec<String>> {
+        self.state.lock().unwrap().elevated.clone()
+    }
+
     pub fn extractions(&self) -> Vec<(PathBuf, PathBuf)> {
         self.state.lock().unwrap().extracted.clone()
     }
@@ -336,6 +367,30 @@ impl FakeSystemOps {
     /// Every (url, dest) passed to `download`, in order.
     pub fn downloaded_to(&self) -> Vec<(String, PathBuf)> {
         self.state.lock().unwrap().downloaded_to.clone()
+    }
+
+    /// Stage a file an extraction will produce: after any extract
+    /// call whose dest prefixes `path`, the file exists in the fake
+    /// fs with these bytes.
+    pub fn with_extracted_file(&self, path: PathBuf, bytes: Vec<u8>) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .extraction_files
+            .push((path, bytes));
+        self
+    }
+
+    fn materialize_extraction(st: &mut FakeState, dest: &Path) {
+        let staged: Vec<(PathBuf, Vec<u8>)> = st
+            .extraction_files
+            .iter()
+            .filter(|(p, _)| p.starts_with(dest))
+            .cloned()
+            .collect();
+        for (path, bytes) in staged {
+            st.files.insert(path, bytes);
+        }
     }
 
     pub fn ok_output(stdout: &str) -> CommandOutput {
@@ -428,12 +483,45 @@ impl SystemOps for FakeSystemOps {
     }
 
     async fn extract_zip(&self, archive: &Path, dest: &Path) -> Result<(), WizardError> {
-        self.state
-            .lock()
-            .unwrap()
-            .extracted
+        let mut st = self.state.lock().unwrap();
+        st.extracted
             .push((archive.to_path_buf(), dest.to_path_buf()));
+        Self::materialize_extraction(&mut st, dest);
         Ok(())
+    }
+
+    async fn extract_tar_gz(
+        &self,
+        archive: &Path,
+        dest: &Path,
+        prefix: &str,
+        strip_prefix: &str,
+    ) -> Result<(), WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.extracted_tar_gz.push((
+            archive.to_path_buf(),
+            dest.to_path_buf(),
+            prefix.to_string(),
+            strip_prefix.to_string(),
+        ));
+        Self::materialize_extraction(&mut st, dest);
+        Ok(())
+    }
+
+    async fn run_elevated(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.elevated.push(cmd.argv.clone());
+        if let Some(reason) = &st.elevated_error {
+            return Err(WizardError::IoError {
+                path: PathBuf::from(cmd.argv.first().cloned().unwrap_or_default()),
+                reason: reason.clone(),
+            });
+        }
+        Ok(CommandOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
     }
 
     async fn http_get(&self, url: &str) -> Result<HttpResponse, WizardError> {

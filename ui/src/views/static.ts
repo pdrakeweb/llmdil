@@ -18,6 +18,7 @@ import {
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
   verifyModel, deleteModel, modelSetEnabled, modelAdd,
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
+  getGatewayMasterKey,
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
 } from "../api";
@@ -1443,6 +1444,8 @@ function gatewayPaint(
   starting: boolean,
   stopping: boolean,
   backendsError: string | null,
+  masterKey: string | null,
+  keyRevealed: boolean,
 ): string {
   const port = status.port || cfg.port;
   const backendById = new Map(backends.map((b) => [b.id, b]));
@@ -1496,12 +1499,17 @@ function gatewayPaint(
     <div style="font-size:12px;color:var(--text2);display:grid;gap:4px">
       <div>Base URL: <span style="font-family:var(--mono);color:var(--text)">http://127.0.0.1:${port}/v1</span></div>
       <div>Bound to loopback (127.0.0.1) only \u2014 reachable from this machine, not from the LAN.</div>
-      <div>No API key is required from local clients.</div>
+      <div>Clients authenticate with the master key below \u2014 LiteLLM requires one. The VS Code LiteLLM extension takes the base URL without /v1 (<span style="font-family:var(--mono);color:var(--text)">http://127.0.0.1:${port}</span>); it appends /v1 itself.</div>
+      <div>Master key: <span style="font-family:var(--mono);color:var(--text)">${masterKey === null ? "not loaded \u2014 Reveal loads it" : keyRevealed ? esc(masterKey) : "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"}</span>
+        <button class="btn" id="gwKeyRevealBtn">${keyRevealed ? "Hide" : "Reveal"}</button>
+        <button class="btn" id="gwKeyCopyBtn">Copy</button></div>
+      <div>LiteLLM admin UI: sign in as <span style="font-family:var(--mono);color:var(--text)">admin</span> with the master key as the password. The admin UI requires a database, which the gateway does not have configured yet \u2014 its login is unavailable until one is added.</div>
     </div>
     <div class="card-actions">
       <button class="btn" id="gwStartBtn"${starting || stopping ? " disabled" : ""}>${icon("restart")} ${status.up ? "Restart gateway" : "Start gateway"}</button>
       <button class="btn" id="gwStopBtn"${status.up && !starting && !stopping ? "" : " disabled"}>${icon("pause")} Stop gateway</button>
       <a class="btn" href="#/wizard">${icon("wrench")} Setup Wizard</a>
+      <button class="btn" id="gwAdminUiBtn">${icon("gateway")} LiteLLM admin UI</button>
     </div>
     <div style="font-size:12px;color:var(--text2);margin-top:6px">Runs the Setup Wizard's start-gateway step: LiteLLM binds 127.0.0.1. When the OpenRouter tier is enabled, the fallback is armed from Windows Credential Manager.</div></div>`;
 
@@ -1599,10 +1607,28 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
   let lastUp = false;
   /** Last loaded config (the toggle handler patches against it). */
   let lastCfg: GatewayConfigData | null = null;
+  /** Gateway port from the latest load (the admin UI link target). */
+  let lastPort = 4000;
+  /** Master key, fetched on first Reveal/Copy; kept in the closure
+   *  so repaints do not re-read the credential store. */
+  let masterKey: string | null = null;
+  let keyRevealed = false;
 
   const gwMsg = (text: string, isErr = false): void => {
     const m = root.querySelector("#gwMsg");
     if (m) m.innerHTML = text ? `<span style="color:${isErr ? "var(--err)" : "var(--text2)"}">${esc(text)}</span>` : "";
+  };
+
+  /** Fetch the master key on first use and cache it in the closure. */
+  const ensureMasterKey = async (): Promise<string | null> => {
+    if (masterKey !== null) return masterKey;
+    const r = await getGatewayMasterKey();
+    if (r.error || !r.data.master_key) {
+      gwMsg(`Master key unavailable: ${r.error ?? "empty response"}`, true);
+      return null;
+    }
+    masterKey = r.data.master_key;
+    return masterKey;
   };
 
   const load = async (): Promise<void> => {
@@ -1621,7 +1647,8 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     }
     lastCfg = cfg.data;
     lastUp = st.data.up;
-    b.innerHTML = gatewayPaint(st.data, cfg.data, backs.data, yamlOpen, yamlText, yamlErr, starting, stopping, backs.error ?? null);
+    lastPort = st.data.port || cfg.data.port;
+    b.innerHTML = gatewayPaint(st.data, cfg.data, backs.data, yamlOpen, yamlText, yamlErr, starting, stopping, backs.error ?? null, masterKey, keyRevealed);
   };
 
   const onClick = async (ev: Event): Promise<void> => {
@@ -1644,6 +1671,38 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
       if (r.error) yamlErr = r.error;
       else yamlText = r.data.yaml;
       await load();
+      return;
+    }
+
+    if (t.closest("#gwKeyRevealBtn")) {
+      if (keyRevealed) {
+        keyRevealed = false;
+        await load();
+        return;
+      }
+      if ((await ensureMasterKey()) === null) return;
+      if (disposed) return;
+      keyRevealed = true;
+      await load();
+      return;
+    }
+
+    if (t.closest("#gwKeyCopyBtn")) {
+      const key = await ensureMasterKey();
+      if (key === null || disposed) return;
+      try {
+        await navigator.clipboard.writeText(key);
+        gwMsg("Master key copied to the clipboard.");
+      } catch {
+        gwMsg("Copy failed \u2014 Reveal the key and copy it manually.", true);
+      }
+      return;
+    }
+
+    if (t.closest("#gwAdminUiBtn")) {
+      const r = await openUrl(`http://127.0.0.1:${lastPort}/ui`);
+      if (disposed) return;
+      if (r.error) gwMsg(`Could not open the admin UI: ${r.error}`, true);
       return;
     }
 

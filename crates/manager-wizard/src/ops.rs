@@ -221,6 +221,84 @@ pub fn stop_gateway(data_dir: &Path) -> Result<bool, String> {
 
 /// Shared GET implementation behind the trait's plain and
 /// header-carrying variants.
+/// Quote one argument for a ShellExecuteExW parameter string: wrap in
+/// double quotes when it contains whitespace or a quote, escaping
+/// embedded quotes. Good enough for the paths and flags the wizard
+/// launches elevated (a .cmd path and subcommand words).
+#[cfg(windows)]
+fn shell_quote_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+    if !arg.chars().any(|c| c.is_whitespace() || c == '"') {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    for c in arg.chars() {
+        if c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// Launch `cmd` elevated via ShellExecuteExW with the "runas" verb
+/// (one UAC prompt), wait for the process to exit, and return its exit
+/// code. The user declining the prompt makes ShellExecuteExW fail,
+/// which surfaces as an IoError naming the program.
+#[cfg(windows)]
+fn run_elevated_windows(cmd: &PlannedCommand) -> Result<CommandOutput, WizardError> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, WaitForSingleObject, INFINITE,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    let program = cmd.argv.first().cloned().unwrap_or_default();
+    let params = cmd
+        .argv
+        .iter()
+        .skip(1)
+        .map(|a| shell_quote_arg(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let verb: Vec<u16> = "runas\0".encode_utf16().collect();
+    let file: Vec<u16> = program.encode_utf16().chain(std::iter::once(0)).collect();
+    let params_w: Vec<u16> = params.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = params_w.as_ptr();
+    info.nShow = SW_HIDE;
+    let ok = unsafe { ShellExecuteExW(&mut info) };
+    if ok == 0 {
+        let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        return Err(WizardError::IoError {
+            path: PathBuf::from(&program),
+            reason: format!("elevation failed or was declined (ShellExecuteEx error {code})"),
+        });
+    }
+    let mut exit_code: u32 = 0;
+    unsafe {
+        WaitForSingleObject(info.hProcess, INFINITE);
+        GetExitCodeProcess(info.hProcess, &mut exit_code);
+        CloseHandle(info.hProcess);
+    }
+    Ok(CommandOutput {
+        exit_code: exit_code as i32,
+        stdout: String::new(),
+        stderr: String::new(),
+    })
+}
+
 async fn http_get_impl(
     url: &str,
     headers: &[(String, String)],
@@ -505,6 +583,89 @@ impl SystemOps for RealSystemOps {
             path: archive.to_path_buf(),
             reason: format!("extraction task failed: {e}"),
         })?
+    }
+
+    async fn extract_tar_gz(
+        &self,
+        archive: &Path,
+        dest: &Path,
+        prefix: &str,
+        strip_prefix: &str,
+    ) -> Result<(), WizardError> {
+        let archive_c = archive.to_path_buf();
+        let dest_c = dest.to_path_buf();
+        let prefix_c = prefix.to_string();
+        let strip_c = strip_prefix.to_string();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read as _;
+            let file = std::fs::File::open(&archive_c).map_err(|e| Self::io_err(&archive_c, e))?;
+            let gz = flate2::read::GzDecoder::new(file);
+            let mut tar = tar::Archive::new(gz);
+            let entries = tar.entries().map_err(|e| Self::io_err(&archive_c, e))?;
+            for entry in entries {
+                let mut entry = entry.map_err(|e| Self::io_err(&archive_c, e))?;
+                let path = entry.path().map_err(|e| Self::io_err(&archive_c, e))?;
+                let path_str = path.to_string_lossy().replace('\\', "/");
+                if !path_str.starts_with(&prefix_c) {
+                    continue;
+                }
+                let Some(rel) = path_str.strip_prefix(&strip_c) else {
+                    continue;
+                };
+                if rel.is_empty() {
+                    continue;
+                }
+                let rel_path = Path::new(rel);
+                // Entries are written manually (not via unpack) so a
+                // hostile or malformed archive cannot escape `dest`.
+                if rel_path.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                }) {
+                    return Err(WizardError::IoError {
+                        path: archive_c.clone(),
+                        reason: format!("tar entry escapes the destination: {path_str}"),
+                    });
+                }
+                let target = dest_c.join(rel_path);
+                if entry.header().entry_type().is_dir() {
+                    std::fs::create_dir_all(&target).map_err(|e| Self::io_err(&target, e))?;
+                    continue;
+                }
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| Self::io_err(parent, e))?;
+                }
+                let mut bytes = Vec::new();
+                entry
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| Self::io_err(&archive_c, e))?;
+                std::fs::write(&target, &bytes).map_err(|e| Self::io_err(&target, e))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| WizardError::IoError {
+            path: archive.to_path_buf(),
+            reason: format!("extraction task failed: {e}"),
+        })?
+    }
+
+    async fn run_elevated(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError> {
+        #[cfg(windows)]
+        {
+            run_elevated_windows(cmd)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(WizardError::IoError {
+                path: PathBuf::from(cmd.argv.first().cloned().unwrap_or_default()),
+                reason: "elevated execution is only supported on Windows".to_string(),
+            })
+        }
     }
 
     async fn http_get(&self, url: &str) -> Result<HttpResponse, WizardError> {

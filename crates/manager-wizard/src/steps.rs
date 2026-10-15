@@ -52,6 +52,7 @@ pub const STEP_START_GATEWAY: &str = "start-gateway";
 pub const STEP_VSCODE_EXTENSIONS: &str = "vscode-extensions";
 pub const STEP_MCP_SERVERS: &str = "mcp-servers";
 pub const STEP_WINML_REGISTER: &str = "winml-register";
+pub const STEP_INSTALL_MXC: &str = "install-mxc";
 pub const STEP_MXC_POLICIES: &str = "mxc-policies";
 pub const STEP_SMOKE_TEST: &str = "smoke-test";
 
@@ -73,7 +74,7 @@ fn json_pretty(v: &serde_json::Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| format!("{v:#?}"))
 }
 
-/// Build the ten steps in spec order.
+/// Build the eleven steps in spec order.
 pub fn default_steps() -> Vec<Box<dyn WizardStep>> {
     vec![
         Box::new(DetectHardware),
@@ -84,6 +85,7 @@ pub fn default_steps() -> Vec<Box<dyn WizardStep>> {
         Box::new(VscodeExtensions::default()),
         Box::new(McpServers),
         Box::new(WinMlRegister),
+        Box::new(InstallMxc::with_pin(MxcSdkPin::default_pin())),
         Box::new(MxcPolicies),
         Box::new(SmokeTest::default()),
     ]
@@ -2307,10 +2309,410 @@ impl WizardStep for WinMlRegister {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Apply MXC policies
+// 9. Install MXC runtime
 // ---------------------------------------------------------------------------
 
-/// Step 9: probe MXC, write the default policy JSON, validate it,
+/// Verified pin for the Microsoft MXC SDK distribution the wizard
+/// installs: `@microsoft/mxc-sdk` 1.0.0 (published 2026-10-06). The
+/// package has no install scripts and no PATH shims — the runtime is
+/// payload the SDK locates relative to its own package root — so the
+/// step downloads the npm tarball itself, verifies its SHA-256,
+/// extracts only `package/bin/x64/` (the whole folder: wxc-exec.exe
+/// resolves sibling daemons and DLLs from its own directory at
+/// runtime) into `<data_dir>/mxc/bin/x64/`, and verifies both named
+/// executables against their pins. All hashes were computed from the
+/// actual registry tarball on 2026-10-15 (tarball SHA-256
+/// 39e59ffd…; registry SHA-1 5e211c18… cross-checked).
+#[derive(Debug, Clone)]
+pub struct MxcSdkPin {
+    pub version: String,
+    pub tarball_asset: String,
+    pub tarball_sha256: String,
+    pub tarball_size: u64,
+    pub wxc_exec_sha256: String,
+    pub wxc_host_prep_sha256: String,
+}
+
+impl MxcSdkPin {
+    pub const TARBALL_BASE: &'static str = "https://registry.npmjs.org/@microsoft/mxc-sdk/-";
+
+    pub fn default_pin() -> Self {
+        Self {
+            version: "1.0.0".to_string(),
+            tarball_asset: "mxc-sdk-1.0.0.tgz".to_string(),
+            tarball_sha256: "39e59ffd9d0832334889b0cd583d0beb43b1bbbe9f783dd7c6980203d23e9602"
+                .to_string(),
+            tarball_size: 37_746_375,
+            wxc_exec_sha256: "8a6d1db4dd1846981127d9014741be18b094d07be967765dff6754bda1d40259"
+                .to_string(),
+            wxc_host_prep_sha256:
+                "c07c94acf62844c5c20590a2d3e7944d0beaaf424df934afc8c83d531bf72825".to_string(),
+        }
+    }
+
+    pub fn tarball_url(&self) -> String {
+        format!("{}/{}", Self::TARBALL_BASE, self.tarball_asset)
+    }
+}
+
+/// The app-installed MXC runtime directory: `<data_dir>/mxc/bin/x64`,
+/// mirroring the SDK package layout (`bin/<arch>/`).
+fn mxc_bin_dir(ctx: &WizardContext) -> PathBuf {
+    ctx.data_dir.join("mxc").join("bin").join("x64")
+}
+
+/// Absolute path of the app-installed `wxc-exec.exe`.
+pub fn mxc_wxc_exec_path(ctx: &WizardContext) -> PathBuf {
+    mxc_bin_dir(ctx).join("wxc-exec.exe")
+}
+
+fn mxc_host_prep_path(ctx: &WizardContext) -> PathBuf {
+    mxc_bin_dir(ctx).join("wxc-host-prep.exe")
+}
+
+/// Resolve the wxc-exec invocation for the MXC steps: the
+/// app-installed runtime when install-mxc has placed it, else the
+/// bare program name (a system install on PATH).
+async fn resolve_wxc_exec(ctx: &WizardContext) -> String {
+    let installed = mxc_wxc_exec_path(ctx);
+    if ctx.ops.file_exists(&installed).await {
+        installed.display().to_string()
+    } else {
+        "wxc-exec.exe".to_string()
+    }
+}
+
+/// Step 9: install the MXC runtime (pinned `@microsoft/mxc-sdk`
+/// binaries) under the app data dir and run the one-time elevated
+/// host preparation. MXC is installed for setup completeness — Pete's
+/// decision (2026-10-15): nothing in the app routes MCP launches
+/// through wxc-exec yet, so the policy step that follows records
+/// configuration only.
+pub struct InstallMxc {
+    pub pin: Option<MxcSdkPin>,
+}
+
+impl InstallMxc {
+    pub fn unconfigured() -> Self {
+        Self { pin: None }
+    }
+    pub fn with_pin(pin: MxcSdkPin) -> Self {
+        Self { pin: Some(pin) }
+    }
+
+    fn install_root(&self, ctx: &WizardContext) -> PathBuf {
+        ctx.data_dir.join("mxc")
+    }
+
+    fn marker_path(&self, ctx: &WizardContext) -> PathBuf {
+        self.install_root(ctx).join(".installed.json")
+    }
+
+    fn tarball_path(&self, ctx: &WizardContext, pin: &MxcSdkPin) -> PathBuf {
+        self.install_root(ctx)
+            .join("downloads")
+            .join(&pin.tarball_asset)
+    }
+
+    fn prep_script_path(&self, ctx: &WizardContext) -> PathBuf {
+        self.install_root(ctx).join("host-prep.cmd")
+    }
+
+    /// The elevated launch that performs host preparation: a small
+    /// script chaining both wxc-host-prep subcommands, so the user
+    /// sees exactly one UAC prompt. `prepare-system-drive` persists
+    /// across reboots; `prepare-null-device` reapplies the
+    /// `\Device\Null` security descriptor, which the kernel resets
+    /// every boot — it is re-run here so a completed setup works
+    /// immediately, and will need re-applying before sandboxed runs
+    /// after a reboot (owned by the future enforcement phase, not
+    /// this setup step).
+    fn elevated_prep_command(&self, ctx: &WizardContext) -> PlannedCommand {
+        PlannedCommand::new(vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            self.prep_script_path(ctx).display().to_string(),
+        ])
+    }
+
+    fn prep_script_contents(&self, ctx: &WizardContext) -> String {
+        let prep = mxc_host_prep_path(ctx).display().to_string();
+        format!(
+            "@echo off\r\n\"{prep}\" prepare-system-drive --quiet\r\n\"{prep}\" prepare-null-device --quiet\r\n"
+        )
+    }
+
+    async fn binaries_verified(&self, ctx: &WizardContext, pin: &MxcSdkPin) -> bool {
+        let exec_ok = matches!(
+            ctx.ops.sha256_file(&mxc_wxc_exec_path(ctx)).await,
+            Ok(h) if checksums_match(&h, &pin.wxc_exec_sha256)
+        );
+        let prep_ok = matches!(
+            ctx.ops.sha256_file(&mxc_host_prep_path(ctx)).await,
+            Ok(h) if checksums_match(&h, &pin.wxc_host_prep_sha256)
+        );
+        exec_ok && prep_ok
+    }
+
+    async fn read_marker(&self, ctx: &WizardContext) -> Option<serde_json::Value> {
+        let raw = ctx.ops.read_file(&self.marker_path(ctx)).await.ok()?;
+        serde_json::from_slice(&raw).ok()
+    }
+
+    fn marker_prep_done(marker: &Option<serde_json::Value>) -> bool {
+        marker
+            .as_ref()
+            .and_then(|m| m.get("host_prep"))
+            .map(|p| {
+                p.get("system_drive").and_then(|v| v.as_bool()) == Some(true)
+                    && p.get("null_device").and_then(|v| v.as_bool()) == Some(true)
+            })
+            .unwrap_or(false)
+    }
+
+    async fn write_marker(
+        &self,
+        ctx: &WizardContext,
+        pin: &MxcSdkPin,
+        prep_done: bool,
+    ) -> Result<(), WizardError> {
+        let marker = serde_json::json!({
+            "version": pin.version,
+            "tarball_sha256": pin.tarball_sha256,
+            "wxc_exec_sha256": pin.wxc_exec_sha256,
+            "wxc_host_prep_sha256": pin.wxc_host_prep_sha256,
+            "host_prep": {
+                "system_drive": prep_done,
+                "null_device": prep_done,
+                "at": chrono::Utc::now().to_rfc3339(),
+            },
+        });
+        ctx.ops
+            .write_file(&self.marker_path(ctx), json_pretty(&marker).as_bytes())
+            .await
+    }
+}
+
+#[async_trait]
+impl WizardStep for InstallMxc {
+    fn id(&self) -> &str {
+        STEP_INSTALL_MXC
+    }
+    fn name(&self) -> &str {
+        "Install MXC runtime"
+    }
+    fn prerequisites(&self) -> Vec<String> {
+        vec![STEP_DETECT_HARDWARE.to_string()]
+    }
+    fn is_check(&self) -> bool {
+        true
+    }
+    fn planned_commands(&self, ctx: &WizardContext) -> Vec<PlannedCommand> {
+        let Some(pin) = self.pin.as_ref() else {
+            return Vec::new();
+        };
+        vec![
+            PlannedCommand::new(vec![
+                "download".to_string(),
+                pin.tarball_url(),
+                self.tarball_path(ctx, pin).display().to_string(),
+            ]),
+            self.elevated_prep_command(ctx),
+        ]
+    }
+    fn remediation_hint(&self) -> Option<&str> {
+        Some("re-run install-mxc and accept the Windows elevation prompt so wxc-host-prep can prepare the host")
+    }
+    async fn run(&self, ctx: &WizardContext) -> Result<StepOutcome, WizardError> {
+        let pin = match &self.pin {
+            Some(p) => p.clone(),
+            None => {
+                return Ok(StepOutcome::failed(
+                    "no MXC SDK build pinned",
+                    vec![
+                        "this build ships without a built-in MXC SDK pin; that is a packaging error in the app, not a configuration problem".to_string(),
+                        "failing closed: will not download an unpinned runtime".to_string(),
+                    ],
+                ))
+            }
+        };
+        let root = self.install_root(ctx);
+        let mut log = vec![format!(
+            "pinned MXC SDK: @microsoft/mxc-sdk@{} ({})",
+            pin.version, pin.tarball_asset
+        )];
+
+        match ctx.mode {
+            RunMode::Audit => {
+                if !ctx.ops.file_exists(&self.marker_path(ctx)).await {
+                    return Ok(StepOutcome::failed(
+                        "MXC runtime not installed; run the install-mxc step",
+                        vec![format!("{} not found", self.marker_path(ctx).display())],
+                    ));
+                }
+                if !self.binaries_verified(ctx, &pin).await {
+                    return Ok(StepOutcome::failed(
+                        format!(
+                            "installed MXC binaries fail checksum verification against the pinned SDK {}",
+                            pin.version
+                        ),
+                        log,
+                    ));
+                }
+                // Host preparation is deliberately not audited: the
+                // null-device preparation resets every boot by design,
+                // so an audit after any reboot would always fail.
+                return Ok(StepOutcome::done(
+                    format!("MXC runtime {} verified", pin.version),
+                    log,
+                ));
+            }
+            RunMode::Install => {}
+        }
+
+        // Install the binaries unless the pinned pair already verifies.
+        if self.binaries_verified(ctx, &pin).await {
+            log.push("MXC binaries already installed with matching checksums".to_string());
+        } else {
+            let tarball = self.tarball_path(ctx, &pin);
+            let tarball_ok = ctx.ops.file_exists(&tarball).await
+                && matches!(ctx.ops.sha256_file(&tarball).await, Ok(h) if checksums_match(&h, &pin.tarball_sha256));
+            if !tarball_ok {
+                let url = pin.tarball_url();
+                log.push(format!("downloading {url}"));
+                match ctx.ops.download(&url, &tarball, &|_, _| {}).await {
+                    Ok(bytes) => log.push(format!("downloaded {bytes} bytes")),
+                    Err(e) => {
+                        return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
+                    }
+                }
+                let actual = match ctx.ops.sha256_file(&tarball).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
+                    }
+                };
+                if !checksums_match(&actual, &pin.tarball_sha256) {
+                    return Ok(StepOutcome::failed(
+                        format!(
+                            "checksum mismatch for {}: expected {}, got {}",
+                            tarball.display(),
+                            pin.tarball_sha256,
+                            actual
+                        ),
+                        vec!["tarball rejected; not installed".to_string()],
+                    ));
+                }
+                log.push(format!("SHA-256 verified for {}", pin.tarball_asset));
+            } else {
+                log.push(format!(
+                    "{} already present with matching checksum",
+                    pin.tarball_asset
+                ));
+            }
+            if let Err(e) = ctx
+                .ops
+                .extract_tar_gz(&tarball, &root, "package/bin/x64/", "package/")
+                .await
+            {
+                return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
+            }
+            log.push(format!(
+                "extracted package/bin/x64 to {}",
+                mxc_bin_dir(ctx).display()
+            ));
+            if !self.binaries_verified(ctx, &pin).await {
+                return Ok(StepOutcome::failed(
+                    "extraction did not produce the pinned wxc executables",
+                    vec![
+                        format!("expected {} and {}", mxc_wxc_exec_path(ctx).display(), mxc_host_prep_path(ctx).display()),
+                        "the tarball verified against its pin, so its layout differs from the pinned SDK's — failing closed".to_string(),
+                    ],
+                ));
+            }
+        }
+
+        // One-time elevated host preparation. Skipped when a previous
+        // run already recorded it — re-prompting UAC on every wizard
+        // run would be hostile, and prepare-system-drive persists.
+        let marker = self.read_marker(ctx).await;
+        if Self::marker_prep_done(&marker) {
+            log.push("host preparation already recorded; elevation not requested".to_string());
+            return Ok(StepOutcome::done(
+                format!(
+                    "MXC runtime {} installed to {}; host preparation complete",
+                    pin.version,
+                    mxc_bin_dir(ctx).display()
+                ),
+                log,
+            ));
+        }
+        if let Err(e) = ctx
+            .ops
+            .write_file(
+                &self.prep_script_path(ctx),
+                self.prep_script_contents(ctx).as_bytes(),
+            )
+            .await
+        {
+            return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
+        }
+        let prep_note = match ctx.ops.run_elevated(&self.elevated_prep_command(ctx)).await {
+            Ok(out) if out.success() => {
+                log.push(
+                    "host preparation completed (prepare-system-drive, prepare-null-device)"
+                        .to_string(),
+                );
+                None
+            }
+            Ok(out) => Some(format!(
+                "host preparation exited with code {}",
+                out.exit_code
+            )),
+            Err(e) => Some(format!("host preparation was not completed: {e}")),
+        };
+        match prep_note {
+            None => {
+                if let Err(e) = self.write_marker(ctx, &pin, true).await {
+                    return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
+                }
+                Ok(StepOutcome::done(
+                    format!(
+                        "MXC runtime {} installed to {}; host preparation complete",
+                        pin.version,
+                        mxc_bin_dir(ctx).display()
+                    ),
+                    log,
+                ))
+            }
+            Some(note) => {
+                // The runtime itself is installed and verified; only
+                // the elevated preparation is outstanding. Record it
+                // as not-done so a re-run retries the elevation
+                // without re-downloading, and say so in the message —
+                // the AppContainer tier stays unavailable until then.
+                if let Err(e) = self.write_marker(ctx, &pin, false).await {
+                    return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
+                }
+                log.push(note.clone());
+                Ok(StepOutcome::done(
+                    format!(
+                        "MXC runtime {} installed to {}; {note} — re-run this step and accept the elevation prompt to finish host preparation",
+                        pin.version,
+                        mxc_bin_dir(ctx).display()
+                    ),
+                    log,
+                ))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 10. Apply MXC policies
+// ---------------------------------------------------------------------------
+
+/// Step 10: probe MXC, write the default policy JSON, validate it,
 /// run a harmless sandboxed self-test.
 pub struct MxcPolicies;
 
@@ -2319,16 +2721,30 @@ impl MxcPolicies {
         ctx.data_dir.join("mxc").join("policy.json")
     }
 
-    fn probe_command() -> PlannedCommand {
-        PlannedCommand::new(vec!["wxc-exec.exe".to_string(), "--probe-json".to_string()])
+    /// The probe is `wxc-exec --probe`: "run the fallback detector
+    /// and emit JSON, without spawning a sandbox" — the SDK's own
+    /// invocation, verified against the pinned 1.0.0 binary. An
+    /// earlier `--probe-json` form does not exist in that binary.
+    fn probe_command(exe: &str) -> PlannedCommand {
+        PlannedCommand::new(vec![exe.to_string(), "--probe".to_string()])
     }
 
-    fn self_test_command(&self, ctx: &WizardContext) -> PlannedCommand {
+    /// A self-test is the pinned policy loaded in `--dry-run` mode
+    /// (config parse + tier selection, nothing spawned) with a
+    /// harmless command attached, per the 1.0.0 CLI contract:
+    /// `wxc-exec [--config <policy>] [--dry-run] [-- <command>]`. The
+    /// earlier `--policy ... --self-test` form does not exist in the
+    /// real binary.
+    fn self_test_command(&self, ctx: &WizardContext, exe: &str) -> PlannedCommand {
         PlannedCommand::new(vec![
-            "wxc-exec.exe".to_string(),
-            "--policy".to_string(),
+            exe.to_string(),
+            "--config".to_string(),
             self.policy_path(ctx).display().to_string(),
-            "--self-test".to_string(),
+            "--dry-run".to_string(),
+            "--".to_string(),
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "echo llm-manager-mxc-self-test".to_string(),
         ])
     }
 }
@@ -2348,18 +2764,25 @@ impl WizardStep for MxcPolicies {
         true
     }
     fn planned_commands(&self, ctx: &WizardContext) -> Vec<PlannedCommand> {
+        // Planned commands name the canonical app-installed runtime;
+        // run() resolves the same path when it exists and falls back
+        // to a PATH install otherwise.
+        let exe = mxc_wxc_exec_path(ctx).display().to_string();
         match ctx.mode {
-            RunMode::Install => vec![Self::probe_command(), self.self_test_command(ctx)],
-            RunMode::Audit => vec![Self::probe_command()],
+            RunMode::Install => {
+                vec![Self::probe_command(&exe), self.self_test_command(ctx, &exe)]
+            }
+            RunMode::Audit => vec![Self::probe_command(&exe)],
         }
     }
     fn remediation_hint(&self) -> Option<&str> {
-        Some("verify the MXC runtime is installed, then re-run mxc-policies")
+        Some("verify the MXC runtime is installed (run install-mxc), then re-run mxc-policies")
     }
     async fn run(&self, ctx: &WizardContext) -> Result<StepOutcome, WizardError> {
         let mut log = Vec::new();
+        let exe = resolve_wxc_exec(ctx).await;
         // Probe PSEC/ingress availability.
-        match ctx.ops.run_command(&Self::probe_command()).await {
+        match ctx.ops.run_command(&Self::probe_command(&exe)).await {
             Ok(out) if out.success() => {
                 log.push("MXC probe succeeded".to_string());
                 let stdout = out.stdout.trim();
@@ -2416,7 +2839,11 @@ impl WizardStep for MxcPolicies {
                 log.push(format!("wrote default policy to {}", path.display()));
                 log.push(format!("mode: {mode:?} (Learning recommended first)"));
                 // Harmless sandboxed self-test; activity shown inline.
-                match ctx.ops.run_command(&self.self_test_command(ctx)).await {
+                match ctx
+                    .ops
+                    .run_command(&self.self_test_command(ctx, &exe))
+                    .await
+                {
                     Ok(out) if out.success() => {
                         log.push("policy self-test passed".to_string());
                         if !out.stdout.trim().is_empty() {
@@ -2482,7 +2909,7 @@ impl WizardStep for MxcPolicies {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Smoke-test inference
+// 11. Smoke-test inference
 // ---------------------------------------------------------------------------
 
 /// Sanity bound for a smoke-test request (non-streaming proxy for TTFT).
@@ -4422,7 +4849,7 @@ mod tests {
     async fn mxc_policy_written_validated_and_self_tested() {
         let ops = Arc::new(FakeSystemOps::new());
         ops.with_command(
-            &["wxc-exec.exe", "--probe-json"],
+            &["wxc-exec.exe", "--probe"],
             FakeSystemOps::ok_output(r#"{"psec":"1.1","ingress_loopback":true}"#),
         );
         let ctx = ctx_with(ops.clone(), RunMode::Install);
@@ -4436,11 +4863,12 @@ mod tests {
             .expect("policy written");
         let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(v["default_deny"], true);
-        // Self-test ran against the written policy path.
+        // Self-test ran the pinned policy in --dry-run mode (the
+        // 1.0.0 CLI has no --policy/--self-test form).
         let executed = ops.executed_commands();
-        assert!(executed
-            .iter()
-            .any(|a| a.contains(&"--self-test".to_string())));
+        assert!(executed.iter().any(|a| {
+            a.contains(&"--config".to_string()) && a.contains(&"--dry-run".to_string())
+        }));
     }
 
     #[tokio::test]
@@ -4460,7 +4888,7 @@ mod tests {
     async fn mxc_missing_runtime_skips() {
         let ops = Arc::new(FakeSystemOps::new());
         ops.with_command_failure(
-            &["wxc-exec.exe", "--probe-json"],
+            &["wxc-exec.exe", "--probe"],
             -1,
             "spawn failed: program not found",
         );
@@ -4473,11 +4901,175 @@ mod tests {
     #[tokio::test]
     async fn mxc_probe_failure_fails_step() {
         let ops = Arc::new(FakeSystemOps::new());
-        ops.with_command_failure(&["wxc-exec.exe", "--probe-json"], 1, "not found");
+        ops.with_command_failure(&["wxc-exec.exe", "--probe"], 1, "not found");
         let ctx = ctx_with(ops, RunMode::Install);
         let out = MxcPolicies.run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Failed);
         assert!(out.message.contains("not available"), "{}", out.message);
+    }
+
+    // --- InstallMxc ---
+
+    fn mxc_pin_for(tarball: &[u8], exec: &[u8], prep: &[u8]) -> MxcSdkPin {
+        MxcSdkPin {
+            version: "1.0.0".to_string(),
+            tarball_asset: "mxc-sdk-1.0.0.tgz".to_string(),
+            tarball_sha256: sha256_hex(tarball),
+            tarball_size: tarball.len() as u64,
+            wxc_exec_sha256: sha256_hex(exec),
+            wxc_host_prep_sha256: sha256_hex(prep),
+        }
+    }
+
+    #[tokio::test]
+    async fn install_mxc_downloads_extracts_verifies_and_preps() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let tarball = b"fake-tarball-bytes";
+        let exec = b"fake-wxc-exec";
+        let prep = b"fake-wxc-host-prep";
+        let pin = mxc_pin_for(tarball, exec, prep);
+        ops.with_download(&pin.tarball_url(), tarball.to_vec());
+        ops.with_extracted_file(
+            PathBuf::from("/data/mxc/bin/x64/wxc-exec.exe"),
+            exec.to_vec(),
+        );
+        ops.with_extracted_file(
+            PathBuf::from("/data/mxc/bin/x64/wxc-host-prep.exe"),
+            prep.to_vec(),
+        );
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = InstallMxc::with_pin(pin.clone()).run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.message.contains("host preparation complete"),
+            "{}",
+            out.message
+        );
+        assert_eq!(ops.downloaded_to().len(), 1);
+        let extractions = ops.tar_gz_extractions();
+        assert_eq!(extractions.len(), 1);
+        assert_eq!(extractions[0].2, "package/bin/x64/");
+        assert_eq!(extractions[0].3, "package/");
+        let elevated = ops.elevated_calls();
+        assert_eq!(elevated.len(), 1);
+        assert_eq!(elevated[0][0], "cmd.exe");
+        let marker = ops
+            .file_bytes(&PathBuf::from("/data/mxc/.installed.json"))
+            .expect("marker written");
+        let v: serde_json::Value = serde_json::from_slice(&marker).unwrap();
+        assert_eq!(v["host_prep"]["system_drive"], true);
+        // A re-run is a no-op: no second download, no second prompt.
+        let out2 = InstallMxc::with_pin(pin).run(&ctx).await.unwrap();
+        assert_eq!(out2.state, StepState::Done, "{out2:?}");
+        assert_eq!(ops.downloaded_to().len(), 1);
+        assert_eq!(ops.elevated_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn install_mxc_already_installed_skips_download() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let exec = b"fake-wxc-exec";
+        let prep = b"fake-wxc-host-prep";
+        let pin = mxc_pin_for(b"unused-tarball", exec, prep);
+        ops.with_file(
+            PathBuf::from("/data/mxc/bin/x64/wxc-exec.exe"),
+            exec.to_vec(),
+        );
+        ops.with_file(
+            PathBuf::from("/data/mxc/bin/x64/wxc-host-prep.exe"),
+            prep.to_vec(),
+        );
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = InstallMxc::with_pin(pin).run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(ops.downloaded_to().is_empty());
+        assert!(ops.tar_gz_extractions().is_empty());
+        assert_eq!(ops.elevated_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn install_mxc_tarball_checksum_mismatch_fails_closed() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let pin = mxc_pin_for(b"the-real-tarball", b"e", b"p");
+        ops.with_download(&pin.tarball_url(), b"tampered-bytes".to_vec());
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = InstallMxc::with_pin(pin).run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(out.message.contains("checksum mismatch"), "{}", out.message);
+        assert!(ops.tar_gz_extractions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn install_mxc_declined_elevation_completes_with_prep_outstanding() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let exec = b"fake-wxc-exec";
+        let prep = b"fake-wxc-host-prep";
+        let pin = mxc_pin_for(b"unused-tarball", exec, prep);
+        ops.with_file(
+            PathBuf::from("/data/mxc/bin/x64/wxc-exec.exe"),
+            exec.to_vec(),
+        );
+        ops.with_file(
+            PathBuf::from("/data/mxc/bin/x64/wxc-host-prep.exe"),
+            prep.to_vec(),
+        );
+        ops.with_elevated_error("elevation failed or was declined (ShellExecuteEx error 1223)");
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = InstallMxc::with_pin(pin).run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.message.contains("host preparation was not completed"),
+            "{}",
+            out.message
+        );
+        let marker = ops
+            .file_bytes(&PathBuf::from("/data/mxc/.installed.json"))
+            .expect("marker written");
+        let v: serde_json::Value = serde_json::from_slice(&marker).unwrap();
+        assert_eq!(v["host_prep"]["system_drive"], false);
+    }
+
+    #[tokio::test]
+    async fn install_mxc_audit_requires_install_then_verifies() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let exec = b"fake-wxc-exec";
+        let prep = b"fake-wxc-host-prep";
+        let pin = mxc_pin_for(b"unused-tarball", exec, prep);
+        let audit_ctx = ctx_with(ops.clone(), RunMode::Audit);
+        let out = InstallMxc::with_pin(pin.clone())
+            .run(&audit_ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(out.message.contains("not installed"), "{}", out.message);
+        ops.with_file(
+            PathBuf::from("/data/mxc/bin/x64/wxc-exec.exe"),
+            exec.to_vec(),
+        );
+        ops.with_file(
+            PathBuf::from("/data/mxc/bin/x64/wxc-host-prep.exe"),
+            prep.to_vec(),
+        );
+        let install_ctx = ctx_with(ops.clone(), RunMode::Install);
+        assert_eq!(
+            InstallMxc::with_pin(pin.clone())
+                .run(&install_ctx)
+                .await
+                .unwrap()
+                .state,
+            StepState::Done
+        );
+        let out = InstallMxc::with_pin(pin).run(&audit_ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn install_mxc_unconfigured_fails_closed() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let ctx = ctx_with(ops, RunMode::Install);
+        let out = InstallMxc::unconfigured().run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed);
+        assert!(out.message.contains("no MXC SDK build pinned"));
     }
 
     // --- SmokeTest ---
@@ -4581,7 +5173,7 @@ mod tests {
     #[test]
     fn default_steps_have_unique_ids_and_valid_prereq_order() {
         let steps = default_steps();
-        assert_eq!(steps.len(), 10);
+        assert_eq!(steps.len(), 11);
         let ids: Vec<&str> = steps.iter().map(|s| s.id()).collect();
         let mut seen = std::collections::HashSet::new();
         for id in &ids {
@@ -4598,7 +5190,7 @@ mod tests {
                 );
             }
         }
-        // All ten are checks (audit covers everything).
+        // All eleven are checks (audit covers everything).
         assert!(steps.iter().all(|s| s.is_check()));
     }
 

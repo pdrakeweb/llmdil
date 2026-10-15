@@ -156,7 +156,7 @@ impl StepState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RunMode {
-    /// Full install: all ten steps, installs included.
+    /// Full install: all eleven steps, installs included.
     Install,
     /// Re-run audit: check-type steps only, no reinstalls.
     Audit,
@@ -426,6 +426,26 @@ pub trait SystemOps: Send + Sync {
     ) -> Result<u64, WizardError>;
     /// Extract a zip archive into `dest`.
     async fn extract_zip(&self, archive: &Path, dest: &Path) -> Result<(), WizardError>;
+    /// Extract a `.tar.gz` archive into `dest`, keeping only entries
+    /// under `prefix` (a package-internal path such as
+    /// `package/bin/x64/`) and stripping `strip_prefix` from their
+    /// paths (e.g. `package/`, so the kept tree lands at
+    /// `dest/bin/x64/...`). For distributions that ship as a tarball
+    /// with a wrapping folder (the MXC SDK's npm tarball).
+    async fn extract_tar_gz(
+        &self,
+        archive: &Path,
+        dest: &Path,
+        prefix: &str,
+        strip_prefix: &str,
+    ) -> Result<(), WizardError>;
+    /// Run a command elevated (Windows: the UAC "runas" prompt) and
+    /// wait for it to finish, returning its exit code. For one-time
+    /// host preparation that requires an administrator token (MXC
+    /// host prep). The user can decline the prompt; that surfaces as
+    /// an error here and callers decide how to report it. Captured
+    /// output is not available for elevated processes.
+    async fn run_elevated(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError>;
     /// HTTP GET; used for health probes.
     async fn http_get(&self, url: &str) -> Result<HttpResponse, WizardError>;
     /// HTTP GET with extra request headers — e.g. the Authorization

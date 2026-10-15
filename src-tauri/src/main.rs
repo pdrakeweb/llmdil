@@ -2303,6 +2303,20 @@ async fn open_url(url: String) -> ApiResult {
     }
 }
 
+/// The gateway master key, for the Gateway view's client-endpoint
+/// card: it is both the API key local clients present and the
+/// LiteLLM admin UI password (username `admin`). Read from Windows
+/// Credential Manager, generating and storing on first use — the
+/// same ensure the gateway spawn and the editor-config writer use,
+/// so the value shown is the value in force.
+#[tauri::command]
+async fn gateway_master_key() -> ApiResult {
+    let key = manager_wizard::ensure_gateway_master_key(&RealSystemOps)
+        .await
+        .map_err(jerr)?;
+    Ok(json!({ "master_key": key }))
+}
+
 /// Open a folder in Windows Explorer. `path` may name the folder
 /// itself or a file inside it (the diagnostics bundle path is a
 /// file; its containing folder is opened). Backs the "Open folder"
@@ -3845,6 +3859,7 @@ fn main() {
             setup_step_help_url,
             open_url,
             open_folder,
+            gateway_master_key,
             // Models
             list_models,
             download_model,
