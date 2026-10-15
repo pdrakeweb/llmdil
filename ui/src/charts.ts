@@ -1,6 +1,8 @@
 /* Hand-rolled SVG chart helpers — no external charting library.
    All charts render offline from plain number arrays. */
 
+import { esc } from "./html";
+
 function points(values: number[], w: number, h: number, pad = 1): string {
   if (values.length === 0) return "";
   const min = Math.min(...values);
@@ -52,7 +54,7 @@ export function gaugeRing(
         stroke-linecap="round" stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}"
         transform="rotate(-90 ${s} ${s})"/>
     </svg>
-    <span class="ring-label"><b>${centerTop}</b><span>${centerBottom}</span></span>
+    <span class="ring-label"><b>${esc(centerTop)}</b><span>${esc(centerBottom)}</span></span>
   </span>`;
 }
 
@@ -66,7 +68,7 @@ export function stackedBar(
   const rects = segments
     .map((s) => {
       const w = (s.pct / 100) * width;
-      const el = `<rect x="${x.toFixed(1)}" y="0" width="${Math.max(0, w - 1).toFixed(1)}" height="${height}" rx="3" fill="${s.color}">${s.label ? `<title>${s.label}</title>` : ""}</rect>`;
+      const el = `<rect x="${x.toFixed(1)}" y="0" width="${Math.max(0, w - 1).toFixed(1)}" height="${height}" rx="3" fill="${s.color}">${s.label ? `<title>${esc(s.label)}</title>` : ""}</rect>`;
       x += w;
       return el;
     })

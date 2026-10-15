@@ -55,6 +55,12 @@ pub struct AppConfig {
     /// on launch until this is true.
     #[serde(default)]
     pub setup_completed: bool,
+    /// Set once the curated model catalog has been seeded into `models`
+    /// (first run). Seeding keys off this marker rather than
+    /// `models.is_empty()`: an operator who deletes every model must not
+    /// have the catalog resurrected on the next launch.
+    #[serde(default)]
+    pub catalog_seeded: bool,
 }
 
 /// Presenter mode for a data window (spec §4 hybrid view matrix).
@@ -70,12 +76,18 @@ pub enum ViewMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendConfig {
     pub id: String,
+    /// Operator switch: a disabled backend cannot be started or restarted
+    /// (the command layer rejects it); stopping is always allowed.
     pub enabled: bool,
     pub model_file: PathBuf,
     pub port: u16,
     /// Structured server flags.
     pub flags: ServerFlags,
-    /// Raw extra flags appended verbatim; None means none.
+    /// Raw extra flags for llama-server, tokenized on whitespace when the
+    /// launch command is built (values containing spaces are not
+    /// supported). `--host` is reserved and filtered out: backends bind
+    /// loopback and the gateway is the only network entry point. None
+    /// means no extra flags.
     pub raw_flags: Option<String>,
     pub restart_policy: RestartPolicy,
     pub overrides_global: bool,
@@ -330,7 +342,9 @@ impl AppConfig {
                 retention_secs: 60,
             },
             mxc: MxcPolicyRef {
-                path: default_data_dir().join("mxc-policy.json"),
+                // Same location the wizard's MxcPolicies step installs
+                // and validates: <data_dir>/mxc/policy.json.
+                path: default_data_dir().join("mxc").join("policy.json"),
                 mode: MxcMode::Learning,
             },
             winml: WinMlConfig {
@@ -343,6 +357,7 @@ impl AppConfig {
             },
             notifications: NotificationConfig { enabled: true },
             setup_completed: false,
+            catalog_seeded: false,
         }
     }
 }

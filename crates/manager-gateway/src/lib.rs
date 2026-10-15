@@ -1,9 +1,11 @@
 //! LiteLLM gateway config generation and routing policy (spec §7).
 //!
-//! Generates LiteLLM `config.yaml` from [`AppConfig`]. The generated file is
-//! never hand-edited: the UI shows a diff preview ([`diff_config_yaml`]), and
-//! applying writes a new generated file (hot-reload where supported, drained
-//! restart otherwise).
+//! Generates LiteLLM `config.yaml` from [`AppConfig`]. The generated file
+//! is never hand-edited: it is regenerated from the app config whenever
+//! the gateway is (re)started from the Setup Wizard (the start-gateway
+//! step writes a fresh file before spawning LiteLLM). [`diff_config_yaml`]
+//! is a library utility for comparing two generated documents; no UI
+//! flow currently calls it.
 //!
 //! Model groups and default strategies (spec §7):
 //! `planner` (latency-based) → coder → OpenRouter;
@@ -15,9 +17,12 @@
 //! - LiteLLM's `router_settings.routing_strategy` is global, but our groups
 //!   want per-group strategies. [`generate_config_yaml`] emits the global
 //!   setting from the first multi-member group's strategy (falling back to the
-//!   planner group's, then the first group's), while per-group strategies are
-//!   enforced by the app itself through [`pick_backend`] (health-gated
-//!   pre-routing used by the supervisor and UI).
+//!   planner group's, then the first group's). Per-group strategies are
+//!   recorded in the generated YAML for reference only: live traffic is
+//!   routed by LiteLLM under that single global strategy. The app's
+//!   [`pick_backend`] does not route live traffic — it backs only the
+//!   routing-trace explainer behind the gateway view's test-routing action
+//!   (`gateway_test_routing` in the Tauri layer).
 //! - Rubric-based escalation is decided at runtime by the local planner model;
 //!   this crate evaluates the verdict via [`RubricInput`].
 //! - Overflow "for N seconds" is tracked by the app; this crate evaluates the
@@ -209,6 +214,10 @@ pub struct RoutingDecision {
     pub strategy: RoutingStrategy,
     /// Human-readable explanation of the decision.
     pub reason: String,
+    /// Always `true` for decisions produced by [`trace_routing`]: the
+    /// trace is a dry run over caller-supplied health, never a record of
+    /// a live request being routed.
+    pub dry_run: bool,
 }
 
 /// How many decisions the request ring keeps.
@@ -263,9 +272,10 @@ impl Default for RoutingLog {
     }
 }
 
-/// Trace routing for one request: run the same [`pick_backend`] logic the
-/// app uses and describe the decision. Pure — it does not record into the
-/// ring; the caller records the returned decision.
+/// Trace routing for one request: run [`pick_backend`] and describe the
+/// decision. This is an explainer for the gateway view, not the live
+/// traffic path (LiteLLM routes live requests). Pure — it does not
+/// record into the ring; the caller records the returned decision.
 ///
 /// `stats` is live backend health when available; the UI dry-run passes one
 /// healthy stat per group member with no load/latency data, so the trace
@@ -288,21 +298,45 @@ pub fn trace_routing(
         RoutingStrategy::LeastBusy => "least-busy",
         RoutingStrategy::LatencyBased => "latency-based",
     };
+    // The basis wording must describe the draw that actually happened:
+    // least-busy with no load data (and latency-based with no latency
+    // data) silently degrade to a shuffle draw inside pick_backend, so
+    // claiming "lowest reported load" would misstate the decision.
+    let candidates: Vec<&BackendStats> = stats
+        .iter()
+        .filter(|s| s.healthy && group.members.iter().any(|m| m == &s.id))
+        .collect();
     let reason = match &backend {
         Some(b) => {
             let basis = match strategy {
                 RoutingStrategy::SimpleShuffle => format!("shuffle draw (seed {seed})"),
-                RoutingStrategy::LeastBusy => "lowest reported load".to_string(),
-                RoutingStrategy::LatencyBased => "lowest p50 latency".to_string(),
+                RoutingStrategy::LeastBusy => {
+                    if candidates.iter().any(|m| m.load.is_some()) {
+                        "lowest reported load".to_string()
+                    } else {
+                        format!(
+                            "shuffle draw (seed {seed}); least-busy degraded — no load data"
+                        )
+                    }
+                }
+                RoutingStrategy::LatencyBased => {
+                    if candidates.iter().any(|m| m.p50_latency_ms.is_some()) {
+                        "lowest p50 latency".to_string()
+                    } else {
+                        format!(
+                            "shuffle draw (seed {seed}); latency-based degraded — no latency data"
+                        )
+                    }
+                }
             };
             format!(
-                "{strategy_name} -> '{b}' ({basis}); {} healthy member(s) in group '{}'",
+                "dry-run trace (backends assumed healthy): {strategy_name} -> '{b}' ({basis}); {} healthy member(s) in group '{}'",
                 healthy.len(),
                 group.name
             )
         }
         None => format!(
-            "no healthy members in group '{}'; OpenRouter fallback would fire (failover)",
+            "dry-run trace (backends assumed healthy): no healthy members in group '{}'; OpenRouter fallback would fire (failover)",
             group.name
         ),
     };
@@ -312,6 +346,7 @@ pub fn trace_routing(
         backend,
         strategy,
         reason,
+        dry_run: true,
     }
 }
 
@@ -525,12 +560,15 @@ fn strategy_to_litellm(s: RoutingStrategy) -> &'static str {
 
 /// Generate the full LiteLLM `config.yaml` from the app config.
 ///
-/// The YAML is built with a deterministic string writer (stable key order
-/// for the snapshot test and the diff preview). LiteLLM applies
-/// `router_settings.routing_strategy` globally; the emitted value comes
-/// from the first multi-member group's strategy, else the planner group's,
-/// else the first group's. Per-group strategies remain enforced by
-/// [`pick_backend`].
+/// The YAML is built with a deterministic string writer (stable key
+/// order for the snapshot test). It is written to disk by the Setup
+/// Wizard's start-gateway step each time the gateway is (re)started.
+/// LiteLLM applies `router_settings.routing_strategy` globally; the
+/// emitted value comes from the first multi-member group's strategy,
+/// else the planner group's, else the first group's. Per-group
+/// strategies are recorded in the YAML for reference only — LiteLLM
+/// routes live traffic under the one global strategy, and
+/// [`pick_backend`] serves only the routing-trace explainer.
 pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> {
     if config.gateway.groups.is_empty() {
         return Err(GatewayError::ConfigInvalid(
@@ -547,7 +585,7 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
 
     let mut out = String::new();
     out.push_str("# Generated by Local LLM Service Manager — DO NOT HAND-EDIT.\n");
-    out.push_str("# Regenerate from the Gateway page; a diff preview is shown before apply.\n");
+    out.push_str("# Regenerated from the app configuration whenever the gateway is (re)started from the Setup Wizard.\n");
 
     // --- model_list ---
     out.push_str("model_list:\n");
@@ -581,13 +619,16 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
             ));
             // Record the group's intended strategy alongside the entry so the
             // app's picker and the UI can reconcile it with LiteLLM's global
-            // router_settings below.
+            // router_settings below. The group name is operator-settable
+            // config interpolated into a `#` comment: sanitize it so a
+            // name containing newlines cannot inject lines into the
+            // generated file.
             if e.model_name == OPENROUTER_MODEL_NAME {
                 out.push_str("      # shared OpenRouter fallback deployments\n");
             } else {
                 out.push_str(&format!(
                     "      # intended routing strategy for group '{}': {}\n",
-                    group.name,
+                    yaml_comment_text(&group.name),
                     strategy_to_litellm(e.litellm_params.strategy)
                 ));
             }
@@ -652,6 +693,17 @@ fn resolve_global_strategy(config: &AppConfig) -> RoutingStrategy {
 }
 
 /// Minimal YAML scalar quoting: bare when safe, double-quoted otherwise.
+/// Sanitize text interpolated into a generated `#` comment: control
+/// characters (newlines above all) become spaces, so operator-settable
+/// values cannot break out of the comment and inject lines into the
+/// generated config.
+fn yaml_comment_text(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// Minimal YAML scalar quoting: bare when safe, double-quoted otherwise.
 fn yaml_scalar(s: &str) -> String {
     let safe = !s.is_empty()
         && s.chars()
@@ -666,7 +718,7 @@ fn yaml_scalar(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Config diff (for the "review before apply" flow)
+// Config diff (library utility; no UI flow currently calls it)
 // ---------------------------------------------------------------------------
 
 /// One line of a config diff.
@@ -685,7 +737,8 @@ pub struct DiffLine {
 }
 
 /// Line-based diff of two YAML documents (old vs new), via LCS.
-/// Small inputs (configs); O(n*m) is fine.
+/// Small inputs (configs); O(n*m) is fine. Library utility: currently
+/// unwired — no command or UI flow calls it.
 pub fn diff_config_yaml(old: &str, new: &str) -> Vec<DiffLine> {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
@@ -865,6 +918,20 @@ mod tests {
         let expected =
             std::fs::read_to_string("tests/expected-config.yaml").expect("read snapshot");
         assert_eq!(yaml, expected, "generated YAML drifted from snapshot");
+    }
+
+    #[test]
+    fn yaml_group_name_cannot_inject_comment_lines() {
+        // Group names are operator-settable and land in a `#` comment;
+        // an embedded newline must not inject lines into the file.
+        let mut cfg = four_backend_config();
+        cfg.gateway.groups[0].name = "planner\nmalicious: true".to_string();
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(
+            !yaml.lines().any(|l| l == "malicious: true"),
+            "injected line present:\n{yaml}"
+        );
+        assert!(yaml.contains("group 'planner malicious: true'"));
     }
 
     #[test]

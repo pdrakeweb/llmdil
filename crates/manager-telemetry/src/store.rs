@@ -59,6 +59,16 @@ fn raise_mark<T: PartialOrd>(slot: &mut Option<PeakMark<T>>, value: T, at: DateT
     }
 }
 
+/// One failed poll, as recorded by the poll loop: the error message plus
+/// when it happened. Kept until the next successful poll clears it, so
+/// readers can distinguish "the telemetry source is failing" from "this
+/// machine has no GPUs" — two states an empty snapshot alone conflates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PollError {
+    pub message: String,
+    pub at: DateTime<Utc>,
+}
+
 struct StoredSample {
     sample: GpuSample,
     /// Monotonic instant of the last successful poll for this GPU.
@@ -78,6 +88,10 @@ pub struct TelemetryStore {
     peaks: HashMap<u32, PeakMarks>,
     inventory: HashMap<u32, GpuInfo>,
     last_processes: Vec<ProcessSample>,
+    /// Most recent poll failure not yet superseded by a success.
+    last_error: Option<PollError>,
+    /// Wall-clock time of the most recent successful poll.
+    last_ok_at: Option<DateTime<Utc>>,
 }
 
 impl TelemetryStore {
@@ -88,17 +102,52 @@ impl TelemetryStore {
             peaks: HashMap::new(),
             inventory: HashMap::new(),
             last_processes: Vec::new(),
+            last_error: None,
+            last_ok_at: None,
         }
     }
 
     /// Record a fresh poll; clears STALE for reported GPUs, extends history
     /// rings, and raises peak marks.
+    ///
+    /// A poll that reached `update` succeeded, so it also stamps the
+    /// last-successful-poll time and clears any recorded poll error.
     pub fn update(&mut self, samples: Vec<GpuSample>) {
+        self.last_ok_at = Some(Utc::now());
+        self.last_error = None;
         let now = Instant::now();
         self.update_at(samples, now);
     }
 
+    /// Record a failed poll (called by the poll loop, the store's only
+    /// writer). The error stays visible via [`Self::last_poll_error`]
+    /// until the next successful poll clears it.
+    pub fn record_poll_error(&mut self, message: String) {
+        self.last_error = Some(PollError {
+            message,
+            at: Utc::now(),
+        });
+    }
+
+    /// The most recent poll failure, if polls are currently failing
+    /// (a later success clears it). `None` before the first poll and
+    /// whenever the last poll succeeded.
+    pub fn last_poll_error(&self) -> Option<&PollError> {
+        self.last_error.as_ref()
+    }
+
+    /// Wall-clock time of the most recent successful poll, if any.
+    pub fn last_successful_poll_at(&self) -> Option<DateTime<Utc>> {
+        self.last_ok_at
+    }
+
     fn update_at(&mut self, samples: Vec<GpuSample>, now: Instant) {
+        // Prune GPUs absent from this snapshot: a physically removed GPU
+        // must leave the snapshot (and the peak marks) instead of being
+        // carried as stale forever and counted by gpu_count().
+        let present: std::collections::HashSet<u32> = samples.iter().map(|s| s.index).collect();
+        self.latest.retain(|idx, _| present.contains(idx));
+        self.peaks.retain(|idx, _| present.contains(idx));
         for mut sample in samples {
             sample.stale = false;
             let idx = sample.index;
@@ -227,8 +276,11 @@ impl PollCadence {
 }
 
 /// Runs the poll loop: one poller, the store is the single writer.
-/// On poll failure the tick is simply missed — the store's staleness rule
-/// (no successful poll within [`STALE_AFTER_SECS`]) handles labeling.
+/// On poll failure the tick is missed for sampling purposes — the
+/// store's staleness rule (no successful poll within
+/// [`STALE_AFTER_SECS`]) handles labeling — and the error is recorded in
+/// the store via [`TelemetryStore::record_poll_error`] so the UI can
+/// tell a failing source apart from a GPU-less machine.
 pub struct Poller<S> {
     source: S,
     store: Arc<Mutex<TelemetryStore>>,
@@ -251,13 +303,19 @@ impl<S: TelemetrySource> Poller<S> {
     }
 
     /// Run a single poll cycle now. Returns the number of GPUs reported
-    /// (0 on poll failure — the tick is missed, staleness handles the rest).
-    /// Uses the combined poll so sources like nvidia-smi pay one
-    /// acquisition per tick instead of two.
+    /// (0 on poll failure — the tick is missed, staleness handles the
+    /// rest, and the error is recorded in the store). Uses the combined
+    /// poll so sources like nvidia-smi pay one acquisition per tick
+    /// instead of two.
     pub async fn poll_once(&self) -> usize {
         let (samples, processes) = match self.source.sample_with_processes().await {
             Ok(out) => out,
-            Err(_) => return 0,
+            Err(e) => {
+                if let Ok(mut store) = self.store.lock() {
+                    store.record_poll_error(e.to_string());
+                }
+                return 0;
+            }
         };
         let n = samples.len();
         if let Ok(mut store) = self.store.lock() {
@@ -597,6 +655,26 @@ mod tests {
     }
 
     #[test]
+    fn update_prunes_vanished_gpus() {
+        let mut store = TelemetryStore::new();
+        store.update(vec![sample_at(0, 0, 60.0), sample_at(1, 0, 50.0)]);
+        assert_eq!(store.gpu_count(), 2);
+        assert!(store.peaks(1).is_some());
+        // GPU 1 disappears from the next snapshot (physically removed):
+        // its sample and peak marks are dropped, not carried as stale.
+        store.update(vec![sample_at(0, 0, 61.0)]);
+        assert_eq!(store.gpu_count(), 1);
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].index, 0);
+        assert!(
+            store.peaks(1).is_none(),
+            "peaks for a removed GPU are pruned"
+        );
+        assert!(store.peaks(0).is_some());
+    }
+
+    #[test]
     fn inventory_round_trip() {
         let mut store = TelemetryStore::new();
         assert!(store.inventory().is_empty());
@@ -703,6 +781,57 @@ mod tests {
         );
         assert_eq!(poller.poll_once().await, 0);
         assert!(store.lock().unwrap().snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_error_is_recorded_and_cleared_by_success() {
+        // A source that fails until flipped healthy.
+        struct FlakySource {
+            fail: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait]
+        impl TelemetrySource for FlakySource {
+            fn kind(&self) -> TelemetrySourceKind {
+                TelemetrySourceKind::Nvml
+            }
+            async fn sample(&self) -> Result<Vec<GpuSample>, TelemetryError> {
+                if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err(TelemetryError::SmiFailed("flaky failure".into()))
+                } else {
+                    Ok(vec![test_sample(0)])
+                }
+            }
+            async fn processes(&self) -> Result<Vec<ProcessSample>, TelemetryError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let (poller, store) = Poller::new(
+            FlakySource {
+                fail: std::sync::atomic::AtomicBool::new(true),
+            },
+            PollCadence::Every1s,
+        );
+
+        // Failing poll: no samples, but the failure is now visible in the
+        // store — distinguishable from a GPU-less machine's empty snapshot.
+        assert_eq!(poller.poll_once().await, 0);
+        {
+            let store = store.lock().unwrap();
+            let err = store.last_poll_error().expect("error recorded");
+            assert!(err.message.contains("flaky failure"), "{}", err.message);
+            assert!(store.last_successful_poll_at().is_none());
+        }
+
+        // Next poll succeeds: error cleared, success time stamped.
+        poller
+            .source
+            .fail
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(poller.poll_once().await, 1);
+        let store = store.lock().unwrap();
+        assert!(store.last_poll_error().is_none());
+        assert!(store.last_successful_poll_at().is_some());
     }
 
     #[tokio::test]

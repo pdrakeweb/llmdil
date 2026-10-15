@@ -19,6 +19,11 @@ pub struct PlacementProjection {
     pub split: Vec<f32>,
     /// Projected allocation per GPU in MiB, in split order.
     pub per_gpu_mib: Vec<u64>,
+    /// Free VRAM per GPU in MiB from the same snapshot the fit verdict
+    /// was computed against, in split order. Carried in the payload so
+    /// the UI does not reconstruct "free" from a different (newer or
+    /// older) telemetry copy than the one `per_gpu_fits` was judged on.
+    pub free_mib: Vec<u64>,
     /// Per-GPU fit: projected allocation <= free VRAM.
     pub per_gpu_fits: Vec<bool>,
     /// True when every GPU's allocation fits its free VRAM.
@@ -95,6 +100,7 @@ pub fn propose_placement(
         model_id: spec.id.clone(),
         split: split.to_vec(),
         per_gpu_mib,
+        free_mib: free_vram_mib_per_gpu.to_vec(),
         per_gpu_fits,
         fits,
         verdict: fit_check(spec, free_vram_mib_per_gpu),
@@ -153,6 +159,7 @@ mod tests {
     fn propose_projects_allocation_per_gpu() {
         let p = propose_placement(&spec(), &[0.6, 0.4], &[8, 8]).unwrap();
         assert_eq!(p.per_gpu_mib, vec![6, 4]);
+        assert_eq!(p.free_mib, vec![8, 8]);
         assert_eq!(p.per_gpu_fits, vec![true, true]);
         assert!(p.fits);
     }

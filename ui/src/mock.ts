@@ -70,10 +70,10 @@ export function mockDashboard(): DashboardModel {
     backends,
     gpus: mockGpus(),
     placement: [
-      { model: "qwen3.8-27b", segments: [{ gpu: "a4000", pct: 60 }, { gpu: "p100-0", pct: 40 }] },
-      { model: "qwen3-coder-30b", segments: [{ gpu: "a4000", pct: 45 }, { gpu: "p100-0", pct: 35 }, { gpu: "p100-1", pct: 20 }] },
-      { model: "qwen2.5-coder-7b", segments: [{ gpu: "p100-0", pct: 100 }] },
-      { model: "qwen3-8b", segments: [{ gpu: "p100-1", pct: 100 }] },
+      { model: "qwen3.8-27b", backendId: "planner", segments: [{ gpu: "a4000", pct: 60 }, { gpu: "p100-0", pct: 40 }] },
+      { model: "qwen3-coder-30b", backendId: "coder-30b", segments: [{ gpu: "a4000", pct: 45 }, { gpu: "p100-0", pct: 35 }, { gpu: "p100-1", pct: 20 }] },
+      { model: "qwen2.5-coder-7b", backendId: "coder-7b", segments: [{ gpu: "p100-0", pct: 100 }] },
+      { model: "qwen3-8b", backendId: "tool-runner", segments: [{ gpu: "p100-1", pct: 100 }] },
     ],
     throughputSeries: [
       { name: "planner", color: C.blue, values: walk(48, 8.4, 2.5, 201) },
@@ -81,6 +81,8 @@ export function mockDashboard(): DashboardModel {
       { name: "coder-7b", color: C.teal, values: walk(48, 41.2, 7, 203) },
       { name: "tool-runner", color: C.grey, values: walk(48, 1, 1, 204) },
     ],
+    gatewayUp: true,
+    gatewayStrategy: "least-busy",
     events: [
       { time: "06:13:52", level: "warn", text: "mcp-gdrive reconnect 3 · backoff 30s" },
       { time: "06:12:10", level: "ok", text: "coder-7b queue normalized" },

@@ -5,6 +5,13 @@
 //! delegating to the `manager-*` crates.
 //!
 //! Wiring status: all §14 commands are wired to real crate functions.
+//! Known gap, documented at the command: model fit-check
+//! (`fit_check_available` is always false in v0.1.x).
+//!
+//! LOAD-BEARING CONFIG: `app.withGlobalTauri` in tauri.conf.json must stay
+//! true. The UI detects Tauri via `window.__TAURI__.core.invoke`, and that
+//! global is injected only with the flag on. Removing it silently degrades
+//! every view to sample data (the v0.1.1 bug).
 //! Subsystems are lazily initialized (`OnceCell`) so a failure surfaces on
 //! first use of that subsystem, never at startup.
 
@@ -21,8 +28,13 @@ use manager_config::{
 };
 use manager_models::{self, DownloadHandle};
 use manager_mxc::{self, Policy};
-use manager_supervisor::{test_request, BackoffPolicy, HealthProbe, HttpHealthProbe, Supervisor};
-use manager_telemetry::{GpuSample, TelemetryStore};
+use manager_supervisor::{
+    test_request, BackoffPolicy, HealthProbe, HttpHealthProbe, ProcessSpec, ProcessState,
+    Supervisor,
+};
+use manager_telemetry::{
+    FallbackSource, GpuSample, NvidiaSmiSource, NvmlSource, PollCadence, Poller, TelemetryStore,
+};
 use manager_wizard::{
     ops::RealSystemOps,
     steps::{continue_editor_config, default_steps, VscodeExtensions},
@@ -38,17 +50,21 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 // Events (Rust -> UI, spec §14)
 // ---------------------------------------------------------------------------
 
-/// Frontend event names. The four primary streams are emitted below; the rest
-/// are reserved per spec §14 and go live with their producers.
+/// Frontend event names. The primary streams are emitted below;
+/// BACKEND_STATUS is emitted by the backend start/stop/restart commands;
+/// the rest are reserved per spec §14 and go live with their producers.
 pub mod events {
     pub const TELEMETRY_UPDATE: &str = "telemetry-update";
-    pub const LOG_LINE: &str = "log-line";
     pub const WIZARD_PROGRESS: &str = "wizard-progress";
     pub const DOWNLOAD_PROGRESS: &str = "download-progress";
-    // Reserved (spec §14): emitted by future producers.
+    // Emitted by the backend start/stop/restart commands.
+    pub const BACKEND_STATUS: &str = "backend-status";
+    // Reserved (spec §14): emitted by future producers. LOG_LINE is
+    // declared (with its LogLinePayload shape) but nothing emits it yet;
+    // log records reach the UI through the get_logs command instead.
+    pub const LOG_LINE: &str = "log-line";
     pub const TELEMETRY_TICK: &str = "telemetry-tick";
     pub const TASK_PROGRESS: &str = "task-progress";
-    pub const BACKEND_STATUS: &str = "backend-status";
     pub const GATEWAY_REQUEST: &str = "gateway-request";
     pub const ALERT_RAISED: &str = "alert-raised";
     pub const VRAM_CHANGED: &str = "vram-changed";
@@ -143,49 +159,53 @@ impl fmt::Display for ApiError {
     }
 }
 
+// Conversions format with Display (`{e}`), not Debug: these strings
+// reach the UI, and every crate error type derives thiserror::Error
+// with operator-readable messages (e.g. SupervisorError::PortInUse
+// reads "port 8081 is already in use", not "PortInUse(8081)").
 impl From<manager_config::ConfigError> for ApiError {
     fn from(e: manager_config::ConfigError) -> Self {
-        ApiError::Config(format!("{e:?}"))
+        ApiError::Config(format!("{e}"))
     }
 }
 impl From<manager_supervisor::SupervisorError> for ApiError {
     fn from(e: manager_supervisor::SupervisorError) -> Self {
-        ApiError::Supervisor(format!("{e:?}"))
+        ApiError::Supervisor(format!("{e}"))
     }
 }
 impl From<manager_wizard::WizardError> for ApiError {
     fn from(e: manager_wizard::WizardError) -> Self {
-        ApiError::Wizard(format!("{e:?}"))
+        ApiError::Wizard(format!("{e}"))
     }
 }
 impl From<manager_telemetry::TelemetryError> for ApiError {
     fn from(e: manager_telemetry::TelemetryError) -> Self {
-        ApiError::Telemetry(format!("{e:?}"))
+        ApiError::Telemetry(format!("{e}"))
     }
 }
 impl From<manager_gateway::GatewayError> for ApiError {
     fn from(e: manager_gateway::GatewayError) -> Self {
-        ApiError::Gateway(format!("{e:?}"))
+        ApiError::Gateway(format!("{e}"))
     }
 }
 impl From<manager_models::ModelError> for ApiError {
     fn from(e: manager_models::ModelError) -> Self {
-        ApiError::Models(format!("{e:?}"))
+        ApiError::Models(format!("{e}"))
     }
 }
 impl From<manager_mxc::MxcError> for ApiError {
     fn from(e: manager_mxc::MxcError) -> Self {
-        ApiError::Mxc(format!("{e:?}"))
+        ApiError::Mxc(format!("{e}"))
     }
 }
 impl From<manager_winml::WinMlError> for ApiError {
     fn from(e: manager_winml::WinMlError) -> Self {
-        ApiError::WinMl(format!("{e:?}"))
+        ApiError::WinMl(format!("{e}"))
     }
 }
 impl From<manager_mcp::McpError> for ApiError {
     fn from(e: manager_mcp::McpError) -> Self {
-        ApiError::Mcp(format!("{e:?}"))
+        ApiError::Mcp(format!("{e}"))
     }
 }
 impl From<std::io::Error> for ApiError {
@@ -246,6 +266,26 @@ fn now_ms() -> u64 {
 // App state
 // ---------------------------------------------------------------------------
 
+/// Terminal outcome of a model download, recorded by the completion
+/// watcher spawned in `download_model`.
+#[derive(Debug, Clone)]
+struct DownloadOutcome {
+    /// Token of the `download_model` attempt that produced this
+    /// outcome (0 for outcomes recorded outside a download, i.e. a
+    /// manual `model_verify_checksum` mismatch). The watcher writes
+    /// only when its token is still the model's latest attempt, so a
+    /// superseded download cannot overwrite a newer attempt's outcome.
+    attempt: u64,
+    /// The failure message when the download — or the hash verification
+    /// that follows it — failed; `None` when it completed.
+    failed: Option<String>,
+    /// True when the failure is a SHA-256 verification failure
+    /// (post-download watcher or manual verify). Only verification
+    /// failures gate backend start in the preflight; transfer failures
+    /// set this false and do not gate.
+    verification_failure: bool,
+}
+
 /// Shared backend state. Subsystems are lazily initialized (`OnceCell`) so
 /// a failure surfaces on first use of that subsystem, never at startup.
 pub struct AppState {
@@ -253,13 +293,42 @@ pub struct AppState {
     config_path: PathBuf,
     data_dir: PathBuf,
     supervisor: OnceCell<Mutex<Supervisor>>,
-    telemetry: OnceCell<Mutex<TelemetryStore>>,
+    /// The telemetry store is owned by the poll loop (single writer); the
+    /// Arc is shared with the Poller built in `telemetry()`. The std Mutex
+    /// is the store's own lock type from manager-telemetry.
+    telemetry: OnceCell<Arc<std::sync::Mutex<TelemetryStore>>>,
+    /// Keeps the telemetry poll loop alive for the app's lifetime.
+    telemetry_poller: OnceCell<std::sync::Mutex<manager_telemetry::store::PollHandle>>,
     wizard_install: OnceCell<Mutex<Wizard>>,
     wizard_audit: OnceCell<Mutex<Wizard>>,
     tasks: Mutex<HashMap<String, TaskRecord>>,
     task_counter: AtomicU64,
     /// Live model-download handles by model id (spec §14 download commands).
     downloads: Mutex<HashMap<String, DownloadHandle>>,
+    /// Terminal download outcomes by model id, recorded by the
+    /// completion watcher spawned in `download_model`: `failed` is the
+    /// failure message, or `None` when the download completed (verified
+    /// against the pinned hash when one exists). Read by `list_models`
+    /// to surface `download_error` and by the backend start preflight
+    /// to gate on verification failures.
+    download_outcomes: Mutex<HashMap<String, DownloadOutcome>>,
+    /// Monotonic download-attempt counter; each `download_model` call
+    /// takes the next token (see [`DownloadOutcome::attempt`]).
+    download_attempt_counter: AtomicU64,
+    /// Latest download-attempt token per model id. The completion
+    /// watcher writes its outcome only when its token still matches.
+    download_latest_attempt: Mutex<HashMap<String, u64>>,
+    /// Model ids whose post-download SHA-256 verification is currently
+    /// running in the completion watcher. Backend start is refused for
+    /// these: the file may be seconds from being deleted as corrupt.
+    /// std Mutex like `backend_spec_ids` — only synchronous membership
+    /// checks and inserts are needed.
+    verifying_downloads: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Ids of the supervisor specs this layer registered as backends.
+    /// The Supervisor is shared with the MCP subsystem (process ids
+    /// `mcp-<id>`); pruning and orphan-surfacing in the backend commands
+    /// must only ever touch ids in this set.
+    backend_spec_ids: std::sync::Mutex<std::collections::HashSet<String>>,
     /// MCP server modes, overlaid on `manager_mcp::default_servers()`.
     /// (No MCP section exists in `AppConfig` yet; modes are in-memory until
     /// one lands.)
@@ -279,11 +348,17 @@ impl AppState {
             data_dir,
             supervisor: OnceCell::new(),
             telemetry: OnceCell::new(),
+            telemetry_poller: OnceCell::new(),
             wizard_install: OnceCell::new(),
             wizard_audit: OnceCell::new(),
             tasks: Mutex::new(HashMap::new()),
             task_counter: AtomicU64::new(1),
             downloads: Mutex::new(HashMap::new()),
+            download_outcomes: Mutex::new(HashMap::new()),
+            download_attempt_counter: AtomicU64::new(1),
+            download_latest_attempt: Mutex::new(HashMap::new()),
+            verifying_downloads: std::sync::Mutex::new(std::collections::HashSet::new()),
+            backend_spec_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
             mcp_modes: Mutex::new(HashMap::new()),
             routing_log: Mutex::new(manager_gateway::RoutingLog::default()),
             winml: OnceCell::new(),
@@ -293,6 +368,50 @@ impl AppState {
     fn next_task_id(&self) -> String {
         let n = self.task_counter.fetch_add(1, Ordering::Relaxed);
         format!("task-{n:06}")
+    }
+
+    /// Take the next download-attempt token and record it as the
+    /// model's latest attempt.
+    async fn begin_download_attempt(&self, model_id: &str) -> u64 {
+        let attempt = self
+            .download_attempt_counter
+            .fetch_add(1, Ordering::Relaxed);
+        self.download_latest_attempt
+            .lock()
+            .await
+            .insert(model_id.to_string(), attempt);
+        attempt
+    }
+
+    /// Record a download outcome only if its attempt token is still
+    /// the model's latest; a superseded watcher's outcome is dropped.
+    async fn record_download_outcome(&self, model_id: &str, outcome: DownloadOutcome) {
+        let latest = self
+            .download_latest_attempt
+            .lock()
+            .await
+            .get(model_id)
+            .copied();
+        if latest == Some(outcome.attempt) {
+            self.download_outcomes
+                .lock()
+                .await
+                .insert(model_id.to_string(), outcome);
+        }
+    }
+
+    /// Clear a download outcome (e.g. cancellation) under the same
+    /// latest-attempt gate as [`Self::record_download_outcome`].
+    async fn clear_download_outcome(&self, model_id: &str, attempt: u64) {
+        let latest = self
+            .download_latest_attempt
+            .lock()
+            .await
+            .get(model_id)
+            .copied();
+        if latest == Some(attempt) {
+            self.download_outcomes.lock().await.remove(model_id);
+        }
     }
 
     async fn record_task(&self, kind: &str, detail: Value) -> String {
@@ -336,13 +455,32 @@ impl AppState {
             .await
     }
 
-    async fn telemetry(&self) -> &Mutex<TelemetryStore> {
+    /// The shared telemetry store. The first call builds the poll loop
+    /// (NVML with an nvidia-smi fallback) at the configured cadence and
+    /// starts it; the store the loop writes is the store readers see.
+    /// Before this wiring the store was never fed and snapshots were
+    /// always empty.
+    async fn telemetry(&self) -> Arc<std::sync::Mutex<TelemetryStore>> {
         self.telemetry
-            .get_or_init(|| async { Mutex::new(TelemetryStore::new()) })
+            .get_or_init(|| async {
+                let interval_ms = self.config.read().await.telemetry.poll_interval_ms;
+                let cadence = if interval_ms == 0 {
+                    PollCadence::Off
+                } else if interval_ms <= 1500 {
+                    PollCadence::Every1s
+                } else {
+                    PollCadence::Every5s
+                };
+                let source = FallbackSource::new(NvmlSource::new(), NvidiaSmiSource::default());
+                let (poller, store) = Poller::new(source, cadence);
+                let handle = poller.start();
+                let _ = self.telemetry_poller.set(std::sync::Mutex::new(handle));
+                store
+            })
             .await
+            .clone()
     }
 
-    /// WinML registry, built lazily with the real HTTP probe transport.
     /// Transport setup can only fail on local client misconfiguration;
     /// the error is surfaced to the caller instead of panicking.
     async fn winml(&self) -> Result<&Mutex<manager_winml::WinMlRegistry>, String> {
@@ -386,6 +524,90 @@ impl AppState {
     }
 }
 
+/// Lock the shared telemetry store, recovering from a poisoned mutex
+/// (a panicked poll write must not wedge every later read).
+fn lock_telemetry(
+    store: &Arc<std::sync::Mutex<TelemetryStore>>,
+) -> std::sync::MutexGuard<'_, TelemetryStore> {
+    store.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// WinML registry, built lazily with the real HTTP probe transport.
+
+/// Resolve a config path against the data dir (absolute paths pass
+/// through). Config model paths are relative (`models/{id}.gguf`); every
+/// filesystem operation must go through this so it agrees with the path
+/// list_models probes and download_model writes.
+fn resolve_under_data_dir(data_dir: &PathBuf, path: &PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        data_dir.join(path)
+    }
+}
+
+/// Drop download handles that reached a terminal state (done, failed,
+/// cancelled). Without this, a finished download sits in the map
+/// forever: list_models reports `downloading: true` permanently and the
+/// start preflight rejects the backend as "still downloading" until the
+/// app restarts. Called on the paths that consult the map.
+async fn reap_downloads(state: &AppState) {
+    state.downloads.lock().await.retain(|_, h| !h.is_terminal());
+}
+
+/// True when `sha` is a real pinned SHA-256 — 64 hex chars — as opposed
+/// to the catalog placeholder (`PLACEHOLDER_SHA256`, which contains
+/// non-hex characters and is not 64 chars) or an unset value. Matches
+/// the check `download_spec_for` has always applied.
+fn is_real_pin(sha: &str) -> bool {
+    sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Seed the model config from the curated catalog on first run: the
+/// Models view and the download path operate on configured models, so
+/// without seeding a fresh install would show an empty list even
+/// though the catalog exists. Seeding happens at most once per config
+/// file, gated on `AppConfig.catalog_seeded`: after seeding, the flag
+/// is set and saved, so models the operator later deletes stay deleted
+/// across restarts. A config that already holds models but predates
+/// the flag gets the flag set in memory only (it persists on the next
+/// save) and is never reseeded.
+async fn ensure_catalog_models(state: &AppState) {
+    let mut cfg = state.config.write().await;
+    if cfg.catalog_seeded {
+        return;
+    }
+    if !cfg.models.is_empty() {
+        cfg.catalog_seeded = true;
+        return;
+    }
+    cfg.models = manager_models::curated_models()
+        .into_iter()
+        .map(|spec| {
+            let file_name = spec
+                .url
+                .rsplit('/')
+                .next()
+                .unwrap_or("model.gguf")
+                .to_string();
+            manager_config::ModelConfig {
+                id: spec.id,
+                gguf_path: PathBuf::from("models").join(file_name),
+                quant: spec.quant,
+                params_b: 0.0,
+                sha256: spec.sha256,
+                verified_at: None,
+                source_url: spec.url,
+                assigned_backends: Vec::new(),
+            }
+        })
+        .collect();
+    cfg.catalog_seeded = true;
+    // Best effort: the seeded entries are live in memory either way; a
+    // failed save only means the seeding repeats on the next launch.
+    let _ = manager_config::save(&cfg, &state.config_path);
+}
+
 /// Deep-merge a JSON patch into a base value (objects merge recursively).
 fn merge_json(base: &mut Value, patch: Value) {
     match (base, patch) {
@@ -416,77 +638,358 @@ async fn get_status(state: State<'_, AppState>) -> ApiResult {
     }))
 }
 
-/// Full application configuration.
+/// Full application configuration, plus `config_path`: the file the
+/// config was loaded from (and saves go to), for the Settings view.
 #[tauri::command]
 async fn get_config(state: State<'_, AppState>) -> ApiResult {
     let cfg = state.config.read().await;
-    Ok(serde_json::to_value(&*cfg).map_err(jerr)?)
+    let mut v = serde_json::to_value(&*cfg).map_err(jerr)?;
+    if let Value::Object(map) = &mut v {
+        map.insert(
+            "config_path".to_string(),
+            json!(state.config_path.to_string_lossy()),
+        );
+    }
+    Ok(v)
 }
 
 /// Merge a JSON patch into the config, validate, and persist to disk via
 /// `manager_config::save` (atomic write with `.bak` rotation). The merged
-/// value is kept in memory even when the save fails; `persisted` reports
-/// which happened.
+/// value is installed in memory ONLY when the save succeeds: on failure
+/// the in-memory config is unchanged and the error surfaces, so memory
+/// and disk never diverge.
 #[tauri::command]
 async fn update_config(state: State<'_, AppState>, patch: Value) -> ApiResult {
     let mut cfg = state.config.write().await;
     let mut v = serde_json::to_value(&*cfg).map_err(jerr)?;
     merge_json(&mut v, patch);
     let new_cfg: AppConfig = serde_json::from_value(v).map_err(jerr)?;
-    // `save` validates before writing, so a failed save never clobbers the
-    // last-known-good file; the in-memory value is kept either way.
-    match manager_config::save(&new_cfg, &state.config_path) {
-        Ok(()) => {
-            *cfg = new_cfg;
-            Ok(json!({ "ok": true, "persisted": true }))
-        }
-        Err(e) => {
-            *cfg = new_cfg;
-            Ok(json!({
-                "ok": true,
-                "persisted": false,
-                "error": e.to_string(),
-            }))
-        }
-    }
+    // `save` validates before writing, so a failed save never clobbers
+    // the last-known-good file.
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    Ok(json!({ "ok": true, "persisted": true }))
 }
 
 // ---------------------------------------------------------------------------
 // Backends
 // ---------------------------------------------------------------------------
 
-/// Configured backends with their launch ports and models.
+/// Build the supervisor process spec for one configured backend: the
+/// wizard-installed llama-server binary, the configured model (relative
+/// paths resolve under the data dir), port, and structured flags.
+fn backend_spec(cfg: &AppConfig, b: &manager_config::BackendConfig) -> ProcessSpec {
+    let program = cfg.data_dir.join("llamacpp").join(if cfg!(windows) {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    });
+    let model = if b.model_file.is_absolute() {
+        b.model_file.clone()
+    } else {
+        cfg.data_dir.join(&b.model_file)
+    };
+    let mut args: Vec<String> = vec![
+        "-m".into(),
+        model.to_string_lossy().into_owned(),
+        "--port".into(),
+        b.port.to_string(),
+        "-c".into(),
+        b.flags.n_ctx.to_string(),
+        "-b".into(),
+        b.flags.n_batch.to_string(),
+    ];
+    if !b.flags.tensor_split.is_empty() {
+        args.push("--tensor-split".into());
+        args.push(
+            b.flags
+                .tensor_split
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    args.push("--split-mode".into());
+    args.push(
+        match b.flags.split_mode {
+            manager_config::SplitMode::None => "none",
+            manager_config::SplitMode::Layer => "layer",
+            manager_config::SplitMode::Row => "row",
+        }
+        .into(),
+    );
+    if let Some(raw) = &b.raw_flags {
+        // raw_flags are operator-supplied llama-server arguments, with one
+        // reservation: --host is filtered out (both "--host X" and
+        // "--host=X"). Backends bind loopback; the LiteLLM gateway is the
+        // only network entry point, and an unauthenticated llama-server
+        // bound to the LAN by a stray flag would bypass it.
+        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        let mut i = 0;
+        while i < tokens.len() {
+            let t = tokens[i];
+            if t == "--host" {
+                i += 2; // skip the flag and its value
+                continue;
+            }
+            if t.starts_with("--host=") {
+                i += 1;
+                continue;
+            }
+            args.push(t.to_string());
+            i += 1;
+        }
+    }
+    ProcessSpec {
+        id: b.id.clone(),
+        program,
+        args,
+        env: Vec::new(),
+        workdir: None,
+        port: Some(b.port),
+    }
+}
+
+/// (Re)register supervisor specs from the current config so start/stop/
+/// restart/status always act on what is configured now. Registration only
+/// touches the spec table, never live processes: re-registering a running
+/// backend replaces the spec its NEXT spawn will use. Specs for ids no
+/// longer configured are pruned — except while their process is live
+/// (unregister refuses), so a removed-but-running backend stays visible
+/// and stoppable until it exits.
+async fn ensure_backend_specs(state: &AppState) {
+    let cfg = state.config.read().await.clone();
+    let mut sup = state.supervisor().await.lock().await;
+    for b in &cfg.backends {
+        sup.register_spec(backend_spec(&cfg, b));
+    }
+    let configured: std::collections::HashSet<&str> =
+        cfg.backends.iter().map(|b| b.id.as_str()).collect();
+    // Record which spec ids belong to backends. The Supervisor is
+    // shared with the MCP subsystem, whose specs must never be pruned
+    // or surfaced by the backend commands.
+    {
+        let mut owned = state
+            .backend_spec_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for b in &cfg.backends {
+            owned.insert(b.id.clone());
+        }
+        // Prune backend-owned specs whose ids left the config.
+        // unregister_spec refuses while a process is live under the id,
+        // so a removed-but-running backend keeps its spec (and stays
+        // visible + stoppable via list_backends) until it exits.
+        let stale: Vec<String> = owned
+            .iter()
+            .filter(|id| !configured.contains(id.as_str()))
+            .cloned()
+            .collect();
+        for id in stale {
+            if sup.unregister_spec(&id) {
+                owned.remove(&id);
+            }
+        }
+    }
+}
+
+fn process_state_str(s: ProcessState) -> &'static str {
+    match s {
+        ProcessState::Stopped => "stopped",
+        ProcessState::Starting => "starting",
+        ProcessState::Running => "running",
+        ProcessState::Stopping => "stopping",
+        ProcessState::Failed => "failed",
+    }
+}
+
+/// Gates a start/restart: the backend must be configured and enabled,
+/// its model must not be mid-download or mid-verification, must not
+/// carry a recorded SHA-256 verification failure, and — when it has a
+/// real pinned hash — must have passed verification at least once
+/// (`verified_at` set). The llama-server binary and model file must
+/// exist. Errors name the missing piece and the fix, so a first Start
+/// after a skipped wizard step explains itself.
+async fn backend_start_preflight(state: &AppState, id: &str) -> Result<(), String> {
+    let cfg = state.config.read().await.clone();
+    let b = cfg
+        .backends
+        .iter()
+        .find(|b| b.id == id)
+        .ok_or_else(|| err(ApiError::NotFound(format!("backend {id}"))))?;
+    if !b.enabled {
+        return Err(err(ApiError::InvalidInput(format!(
+            "backend {id} is disabled in the configuration; enable it before starting"
+        ))));
+    }
+    reap_downloads(state).await;
+    let resolved_model = resolve_under_data_dir(&cfg.data_dir, &b.model_file);
+    if let Some(m) = cfg
+        .models
+        .iter()
+        .find(|m| resolve_under_data_dir(&cfg.data_dir, &m.gguf_path) == resolved_model)
+    {
+        if state.downloads.lock().await.contains_key(&m.id) {
+            return Err(err(ApiError::InvalidInput(format!(
+                "model {} is still downloading; a backend started now would load a truncated file",
+                m.id
+            ))));
+        }
+        if state.verifying_downloads.lock().unwrap().contains(&m.id) {
+            return Err(err(ApiError::InvalidInput(format!(
+                "SHA-256 verification is still running for model {}.",
+                m.id
+            ))));
+        }
+        // A recorded verification failure gates start until the model
+        // is re-downloaded or passes a manual verify: the file that
+        // came down did not match its pinned hash.
+        if let Some(outcome) = state.download_outcomes.lock().await.get(&m.id) {
+            if outcome.verification_failure {
+                return Err(err(ApiError::InvalidInput(outcome.failed.clone().unwrap_or_else(
+                    || {
+                        format!(
+                            "model {} has not passed SHA-256 verification — open Models and run Verify.",
+                            m.id
+                        )
+                    },
+                ))));
+            }
+        }
+        // Durable gate: a model with a real pinned hash that has never
+        // passed verification (verified_at unset) must not start even
+        // across app restarts, where no in-memory outcome survives.
+        // Wizard-downloaded models land here too: the wizard's
+        // DownloadModels step verifies the hash in-step but never
+        // stamps verified_at, so their first start asks for a
+        // Models > Verify pass — the remediation in the message.
+        if is_real_pin(&m.sha256) && m.verified_at.is_none() && resolved_model.exists() {
+            return Err(err(ApiError::InvalidInput(format!(
+                "model {} has not passed SHA-256 verification — open Models and run Verify.",
+                m.id
+            ))));
+        }
+    }
+    let spec = backend_spec(&cfg, b);
+    if !spec.program.exists() {
+        return Err(err(ApiError::InvalidInput(format!(
+            "llama-server is not installed (missing {}) — run the setup wizard to install llama.cpp",
+            spec.program.display()
+        ))));
+    }
+    let model_path = if b.model_file.is_absolute() {
+        b.model_file.clone()
+    } else {
+        cfg.data_dir.join(&b.model_file)
+    };
+    if !model_path.exists() {
+        return Err(err(ApiError::InvalidInput(format!(
+            "model file is missing ({}) — download it in the Models view",
+            model_path.display()
+        ))));
+    }
+    Ok(())
+}
+
+/// All backends with their launch ports, models, and live supervisor
+/// runtime state (process state, pid, restarts, uptime). Configured
+/// backends carry `configured: true`; the list also appends
+/// supervisor-only rows (`configured: false`, `enabled: false`) for
+/// backend processes still live under ids that left the config, so they
+/// stay visible and stoppable instead of silently holding their port.
+/// MCP server processes share the Supervisor but are never listed here.
 #[tauri::command]
 async fn list_backends(state: State<'_, AppState>) -> ApiResult {
+    ensure_backend_specs(&state).await;
     let cfg = state.config.read().await;
-    let backends: Vec<Value> = cfg
+    let mut sup = state.supervisor().await.lock().await;
+    // Reap children that exited since the last read so a crashed backend
+    // reports "failed" instead of "running" forever.
+    sup.reap_exited();
+    let statuses: HashMap<String, manager_supervisor::ProcessStatus> = sup
+        .status()
+        .into_iter()
+        .map(|s| (s.id.clone(), s))
+        .collect();
+    let mut backends: Vec<Value> = cfg
         .backends
         .iter()
         .map(|b| {
+            let st = statuses.get(&b.id);
             json!({
                 "id": b.id,
                 "enabled": b.enabled,
                 "port": b.port,
                 "model_file": b.model_file,
+                "configured": true,
+                "state": st.map(|s| process_state_str(s.state)).unwrap_or("stopped"),
+                "pid": st.and_then(|s| s.pid),
+                "restarts": st.map(|s| s.restarts).unwrap_or(0),
+                "uptime_secs": st.and_then(|s| s.uptime).map(|u| u.as_secs()),
             })
         })
         .collect();
+    // Processes still live under ids that left the config (their specs
+    // survive pruning while live): surface them so they stay visible and
+    // stoppable instead of silently holding their port.
+    let configured: std::collections::HashSet<&str> =
+        cfg.backends.iter().map(|b| b.id.as_str()).collect();
+    let backend_owned: std::collections::HashSet<String> = state
+        .backend_spec_ids
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    for (id, st) in &statuses {
+        if configured.contains(id.as_str()) || !backend_owned.contains(id) || st.pid.is_none() {
+            continue;
+        }
+        let spec = sup.spec(id);
+        let model_file = spec
+            .and_then(|sp| {
+                sp.args
+                    .iter()
+                    .position(|a| a == "-m")
+                    .map(|i| sp.args[i + 1].clone())
+            })
+            .unwrap_or_default();
+        // The spec argv carries the data-dir-resolved absolute path;
+        // configured rows show the config-relative path. Strip the
+        // data-dir prefix so orphan rows display the same form.
+        let model_file = match std::path::Path::new(&model_file).strip_prefix(&cfg.data_dir) {
+            Ok(rel) => rel.to_string_lossy().into_owned(),
+            Err(_) => model_file,
+        };
+        backends.push(json!({
+            "id": id,
+            "enabled": false,
+            "port": spec.and_then(|sp| sp.port).unwrap_or(0),
+            "model_file": model_file,
+            "configured": false,
+            "state": process_state_str(st.state),
+            "pid": st.pid,
+            "restarts": st.restarts,
+            "uptime_secs": st.uptime.map(|u| u.as_secs()),
+        }));
+    }
     Ok(json!({ "backends": backends }))
 }
 
 /// Start a backend (supervisor spawn). Returns a task id.
 #[tauri::command]
 async fn start_backend(app: AppHandle, state: State<'_, AppState>, id: String) -> ApiResult {
+    ensure_backend_specs(&state).await;
+    backend_start_preflight(&state, &id).await?;
     let task_id = state
         .record_task("backend_start", json!({ "backend_id": id }))
         .await;
-    let outcome = state
-        .supervisor()
-        .await
-        .lock()
-        .await
-        .spawn_backend(&id)
-        .await;
+    let mut sup = state.supervisor().await.lock().await;
+    // Reap first: without this, a backend that crashed since the last
+    // list_backends poll would read as AlreadyRunning for a corpse.
+    sup.reap_exited();
+    let outcome = sup.spawn_backend(&id).await;
     match outcome {
         Ok(()) => {
             state
@@ -519,6 +1022,7 @@ async fn stop_backend(
     id: String,
     graceful: bool,
 ) -> ApiResult {
+    ensure_backend_specs(&state).await;
     let task_id = state
         .record_task(
             "backend_stop",
@@ -564,6 +1068,8 @@ async fn restart_backend(
     id: String,
     graceful: bool,
 ) -> ApiResult {
+    ensure_backend_specs(&state).await;
+    backend_start_preflight(&state, &id).await?;
     let task_id = state
         .record_task(
             "backend_restart",
@@ -625,15 +1131,83 @@ async fn test_backend(state: State<'_, AppState>, id: String, prompt: String) ->
 // ---------------------------------------------------------------------------
 
 /// Current GPU telemetry snapshot; also emits `telemetry-update`.
+///
+/// The command payload is `{samples, processes, at_ms, has_polled,
+/// source_error}`. `at_ms` is when the store last polled successfully
+/// (epoch ms; the newest sample's timestamp as a fallback, `null` when
+/// no poll has completed yet) — it describes the data, not the moment
+/// this command ran. `has_polled` says whether any poll has succeeded.
+/// `processes` is the latest snapshot's per-process VRAM attribution
+/// (each row carries its GPU index; `backend_id` is filled in here by
+/// matching the pid against the supervisor's live backend pids, `null`
+/// for processes the app does not supervise). `source_error` is the last
+/// poll error's message while polls are failing and `null` when the last
+/// poll succeeded — a failing source must not look like a GPU-less
+/// machine returning an empty snapshot.
 #[tauri::command]
 async fn get_gpu_telemetry(app: AppHandle, state: State<'_, AppState>) -> ApiResult {
-    let samples: Vec<GpuSample> = state.telemetry().await.lock().await.snapshot();
+    let store = state.telemetry().await;
+    let (samples, raw_processes, source_error, last_poll_at) = {
+        let guard = lock_telemetry(&store);
+        (
+            guard.snapshot(),
+            guard.last_processes().to_vec(),
+            guard.last_poll_error().map(|e| e.message.clone()),
+            guard.last_successful_poll_at(),
+        )
+    };
     let payload = TelemetryUpdatePayload {
         samples: samples.clone(),
         at_ms: now_ms(),
     };
     let _ = app.emit(events::TELEMETRY_UPDATE, &payload);
-    Ok(serde_json::to_value(&payload).map_err(jerr)?)
+    // pid -> backend id from the supervisor's live status (the same data
+    // list_backends reads; reap first so a just-exited backend's pid is
+    // not attributed to a recycled process).
+    let pid_to_backend: HashMap<u32, String> = {
+        let mut sup = state.supervisor().await.lock().await;
+        sup.reap_exited();
+        sup.status()
+            .into_iter()
+            .filter_map(|s| s.pid.map(|pid| (pid, s.id)))
+            .collect()
+    };
+    let processes: Vec<Value> = raw_processes
+        .iter()
+        .map(|p| {
+            let mut v = serde_json::to_value(p).map_err(jerr)?;
+            v["backend_id"] = json!(pid_to_backend.get(&p.pid));
+            Ok(v)
+        })
+        .collect::<Result<_, String>>()?;
+    // The command return enriches each sample with the store's peak
+    // temperature mark (the event payload keeps the crate shape).
+    let enriched: Vec<Value> = {
+        let guard = lock_telemetry(&store);
+        samples
+            .iter()
+            .map(|s| {
+                let mut v = serde_json::to_value(s).map_err(jerr)?;
+                let peak = guard.peaks(s.index).and_then(|p| p.temp_c).map(|m| m.value);
+                v["temp_peak_c"] = json!(peak);
+                Ok(v)
+            })
+            .collect::<Result<_, String>>()?
+    };
+    // The command's at_ms stamps the DATA: the store's last successful
+    // poll time (fallback: the newest sample's own timestamp; null
+    // until a poll has completed). The emitted event keeps its
+    // emit-time stamp.
+    let at_ms: Option<i64> = last_poll_at
+        .map(|t| t.timestamp_millis())
+        .or_else(|| samples.iter().map(|s| s.ts.timestamp_millis()).max());
+    Ok(json!({
+        "samples": enriched,
+        "processes": processes,
+        "at_ms": at_ms,
+        "has_polled": last_poll_at.is_some(),
+        "source_error": source_error,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -709,15 +1283,45 @@ async fn run_audit(app: AppHandle, state: State<'_, AppState>) -> ApiResult {
 // Models
 // ---------------------------------------------------------------------------
 
-/// Model catalog from config. Fit-check is unavailable until the catalog
-/// carries size/download-URL fields (see CONTRACT GAP in download_model).
+/// Configured models, probed against the filesystem: on_disk/size_bytes
+/// reflect the completed file at the model's gguf_path right now (the
+/// download worker only moves a finished transfer into place, so a
+/// partial download never shows as on_disk). `partial_bytes` is the size
+/// of the in-progress `.part` sibling when one exists, `downloading`
+/// marks a live download handle or a running post-download SHA-256
+/// verification, `verifying` marks the verification alone, `paused` a
+/// parked download, and `download_error` carries the last terminal
+/// failure recorded by the completion watcher. `catalog_size_bytes` is
+/// the curated catalog's size estimate for the model, when it has one.
+/// `fit_check_available` is always false in v0.1.x: the catalog carries
+/// no VRAM-fit model yet.
 #[tauri::command]
 async fn list_models(state: State<'_, AppState>) -> ApiResult {
+    ensure_catalog_models(&state).await;
+    reap_downloads(&state).await;
     let cfg = state.config.read().await;
+    let downloads = state.downloads.lock().await;
+    let outcomes = state.download_outcomes.lock().await;
+    let verifying = state
+        .verifying_downloads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let catalog = manager_models::curated_models();
+    let catalog_sizes: HashMap<&str, u64> = catalog
+        .iter()
+        .map(|s| (s.id.as_str(), s.size_bytes))
+        .collect();
     let models: Vec<Value> = cfg
         .models
         .iter()
         .map(|m| {
+            let path = resolve_under_data_dir(&cfg.data_dir, &m.gguf_path);
+            let meta = std::fs::metadata(&path).ok().filter(|md| md.is_file());
+            let partial_meta = std::fs::metadata(manager_models::partial_path(&path))
+                .ok()
+                .filter(|md| md.is_file());
+            let is_verifying = verifying.contains(&m.id);
             json!({
                 "id": m.id,
                 "gguf_path": m.gguf_path,
@@ -726,6 +1330,14 @@ async fn list_models(state: State<'_, AppState>) -> ApiResult {
                 "sha256": m.sha256,
                 "verified_at": m.verified_at,
                 "fit_check_available": false,
+                "on_disk": meta.is_some(),
+                "size_bytes": meta.map(|md| md.len()),
+                "partial_bytes": partial_meta.map(|md| md.len()),
+                "downloading": downloads.contains_key(&m.id) || is_verifying,
+                "verifying": is_verifying,
+                "paused": downloads.get(&m.id).map(|h| h.is_paused()).unwrap_or(false),
+                "download_error": outcomes.get(&m.id).and_then(|o| o.failed.clone()),
+                "catalog_size_bytes": catalog_sizes.get(m.id.as_str()).copied(),
             })
         })
         .collect();
@@ -734,42 +1346,105 @@ async fn list_models(state: State<'_, AppState>) -> ApiResult {
 
 /// Build a download spec for a configured model: the curated catalog
 /// provides URL/size; the config's sha256 wins when it is a real pinned
-/// hash (64 hex chars), otherwise the catalog value stands.
+/// hash (64 hex chars), otherwise the catalog value stands. A model
+/// with no catalog entry falls back to its own configured `source_url`
+/// (which must be an https URL), with the placeholder hash unless the
+/// config pins a real one — verification then fails closed, exactly as
+/// for unpinned catalog models.
 fn download_spec_for(cfg: &AppConfig, id: &str) -> Result<manager_models::ModelSpec, String> {
     let m = cfg
         .models
         .iter()
         .find(|m| m.id == id)
         .ok_or_else(|| err(ApiError::NotFound(format!("model {id}"))))?;
-    let mut spec = manager_models::curated_models()
+    if let Some(mut spec) = manager_models::curated_models()
         .into_iter()
         .find(|s| s.id == id)
-        .ok_or_else(|| {
-            err(ApiError::NotFound(format!(
-                "no catalog entry for model {id}"
-            )))
-        })?;
-    if m.sha256.len() == 64 && m.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-        spec.sha256 = m.sha256.clone();
+    {
+        if is_real_pin(&m.sha256) {
+            spec.sha256 = m.sha256.clone();
+        }
+        return Ok(spec);
     }
-    Ok(spec)
+    if m.source_url.starts_with("https://") {
+        return Ok(manager_models::ModelSpec {
+            id: m.id.clone(),
+            name: m.id.clone(),
+            quant: m.quant.clone(),
+            size_bytes: 0,
+            sha256: if is_real_pin(&m.sha256) {
+                m.sha256.clone()
+            } else {
+                manager_models::PLACEHOLDER_SHA256.to_string()
+            },
+            url: m.source_url.clone(),
+        });
+    }
+    Err(err(ApiError::NotFound(format!(
+        "no catalog entry for model {id} and no https source_url configured"
+    ))))
 }
 
 /// Start a model download; progress streams via `download-progress`.
+/// A completion watcher records the terminal outcome in
+/// `download_outcomes` (surfaced by `list_models` as `download_error`)
+/// and, when the model has a real pinned SHA-256, verifies the finished
+/// file and stamps `verified_at` on success. The model is marked
+/// verifying before the watcher spawns and unmarked on every watcher
+/// exit path; each attempt carries a token so a superseded watcher
+/// cannot overwrite a newer attempt's outcome.
 #[tauri::command]
 async fn download_model(app: AppHandle, state: State<'_, AppState>, id: String) -> ApiResult {
+    ensure_catalog_models(&state).await;
     let (spec, dest) = {
         let cfg = state.config.read().await;
         let spec = download_spec_for(&cfg, &id)?;
-        (
-            spec,
-            state.data_dir.join("models").join(format!("{id}.gguf")),
-        )
+        // Download to the model's configured gguf_path (resolved under
+        // the data dir) — the same path list_models probes — so a
+        // completed download always reports on_disk, for any config.
+        let model = cfg
+            .models
+            .iter()
+            .find(|m| m.id == id)
+            .ok_or_else(|| err(ApiError::NotFound(format!("model {id}"))))?;
+        let dest = resolve_under_data_dir(&cfg.data_dir, &model.gguf_path);
+        (spec, dest)
     };
-    if state.downloads.lock().await.contains_key(&id) {
+    // Hold the downloads lock across the check, the in-use guard, and
+    // the insert: two concurrent invokes for the same model must not
+    // both spawn workers onto one destination file (Range-append vs
+    // truncate corrupts it, and the second insert would orphan the
+    // first handle).
+    let mut downloads = state.downloads.lock().await;
+    downloads.retain(|_, h| !h.is_terminal());
+    if downloads.contains_key(&id) {
         return Err(err(ApiError::Models(format!(
             "download already in flight for model {id}"
         ))));
+    }
+    // In-use guard: re-downloading a file a running backend has loaded
+    // truncates it under llama-server's mmap. Refuse while any running
+    // backend's model resolves to this destination.
+    {
+        let cfg = state.config.read().await;
+        let mut sup = state.supervisor().await.lock().await;
+        sup.reap_exited();
+        let running: std::collections::HashSet<String> = sup
+            .status()
+            .into_iter()
+            .filter(|st| st.state == manager_supervisor::ProcessState::Running)
+            .map(|st| st.id)
+            .collect();
+        for b in &cfg.backends {
+            if running.contains(&b.id)
+                && resolve_under_data_dir(&cfg.data_dir, &b.model_file) == dest
+            {
+                return Err(err(ApiError::InvalidInput(format!(
+                    "model {id} is loaded by running backend {}; stop it before re-downloading",
+                    b.id
+                ))));
+            }
+        }
     }
     let app_handle = app.clone();
     let model_id = id.clone();
@@ -785,13 +1460,140 @@ async fn download_model(app: AppHandle, state: State<'_, AppState>, id: String) 
     .await
     .map_err(ApiError::from)
     .map_err(jerr)?;
-    state.downloads.lock().await.insert(id.clone(), handle);
+    let watcher_handle = handle.clone();
+    downloads.insert(id.clone(), handle);
+    // Starting a new attempt clears the previous terminal outcome and
+    // any earlier verification stamp: until this attempt's file passes
+    // verification the model counts as unverified (the start
+    // preflight's durable gate reads `verified_at`).
+    state.download_outcomes.lock().await.remove(&id);
+    let attempt = state.begin_download_attempt(&id).await;
+    {
+        let mut cfg = state.config.write().await;
+        if let Some(m) = cfg.models.iter_mut().find(|m| m.id == id) {
+            m.verified_at = None;
+        }
+    }
+    // Mark verification-pending BEFORE the watcher spawns; the watcher
+    // removes the mark on every exit path. While marked, list_models
+    // reports the model as verifying and the start preflight refuses
+    // to launch a backend on a file that may be deleted as corrupt.
+    state
+        .verifying_downloads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.clone());
+    // Completion watcher: `download_model` returns as soon as the
+    // transfer is spawned; the watcher observes the terminal state so
+    // failures are recorded instead of dropped, and a pinned hash is
+    // actually verified against the finished file.
+    let watcher_app = app.clone();
+    let watcher_id = id.clone();
+    let watcher_dest = dest.clone();
+    tokio::spawn(async move {
+        let outcome = watcher_handle.wait().await;
+        let st = watcher_app.state::<AppState>();
+        // Every path below leaves verification; clear the mark first
+        // so no outcome branch can skip it.
+        st.verifying_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&watcher_id);
+        match outcome {
+            Ok(()) => {
+                let pinned = {
+                    let cfg = st.config.read().await;
+                    cfg.models
+                        .iter()
+                        .find(|m| m.id == watcher_id)
+                        .map(|m| m.sha256.clone())
+                };
+                let (failed, verification_failure) = match pinned {
+                    Some(sha) if is_real_pin(&sha) => {
+                        match manager_models::verify_sha256(&watcher_dest, &sha).await {
+                            Ok(true) => {
+                                let mut cfg = st.config.write().await;
+                                if let Some(m) = cfg.models.iter_mut().find(|m| m.id == watcher_id)
+                                {
+                                    m.verified_at = Some(chrono::Utc::now());
+                                }
+                                let _ = manager_config::save(&cfg, &st.config_path);
+                                (None, false)
+                            }
+                            Ok(false) => {
+                                // Fail closed: a file that does not match
+                                // the pinned hash is not kept as a model.
+                                match tokio::fs::remove_file(&watcher_dest).await {
+                                    Ok(()) => {
+                                        let mut cfg = st.config.write().await;
+                                        if let Some(m) =
+                                            cfg.models.iter_mut().find(|m| m.id == watcher_id)
+                                        {
+                                            m.verified_at = None;
+                                        }
+                                        let _ = manager_config::save(&cfg, &st.config_path);
+                                        (
+                                            Some(
+                                                "SHA-256 mismatch after download — file removed; \
+                                                 the download did not match the pinned hash."
+                                                    .to_string(),
+                                            ),
+                                            true,
+                                        )
+                                    }
+                                    Err(e) => (
+                                        Some(format!(
+                                            "SHA-256 mismatch after download — the file could not be removed: {e}"
+                                        )),
+                                        true,
+                                    ),
+                                }
+                            }
+                            Err(e) => (Some(format!("verification failed: {e}")), true),
+                        }
+                    }
+                    _ => (None, false),
+                };
+                st.record_download_outcome(
+                    &watcher_id,
+                    DownloadOutcome {
+                        attempt,
+                        failed,
+                        verification_failure,
+                    },
+                )
+                .await;
+            }
+            Err(manager_models::ModelError::Cancelled(_)) => {
+                // Operator-initiated: neither a completion nor a
+                // failure — clear the outcome instead of recording one.
+                st.clear_download_outcome(&watcher_id, attempt).await;
+            }
+            Err(e) => {
+                // Transfer failures are not verification failures and
+                // do not gate backend start.
+                st.record_download_outcome(
+                    &watcher_id,
+                    DownloadOutcome {
+                        attempt,
+                        failed: Some(format!("download failed: {e}")),
+                        verification_failure: false,
+                    },
+                )
+                .await;
+            }
+        }
+    });
     Ok(json!({ "model_id": id, "dest": dest }))
 }
 
 /// Cancel an in-flight download (partial file removed by the worker).
 #[tauri::command]
 async fn cancel_download(state: State<'_, AppState>, id: String) -> ApiResult {
+    // Reap first: cancelling a download that already finished must not
+    // report success — the terminal handle is dropped here and the
+    // lookup below honestly reports that nothing is in flight.
+    reap_downloads(&state).await;
     let handle = state.downloads.lock().await.remove(&id).ok_or_else(|| {
         err(ApiError::NotFound(format!(
             "no download in flight for {id}"
@@ -809,9 +1611,22 @@ async fn cancel_download(state: State<'_, AppState>, id: String) -> ApiResult {
 // Logs
 // ---------------------------------------------------------------------------
 
-/// Query captured logs. `scope` is a process id or `"all"`; `level` is an
-/// optional error/warn/info/debug heuristic filter; `search` is an optional
-/// case-insensitive substring; newest-first, capped at `limit` (default 200).
+/// Query captured logs. `scope` is a process id — live, stopped, or an
+/// id that also has an archived previous-run ring; querying the id
+/// returns current and archived lines merged — or `"all"`, which
+/// merges every process's records into one stream. `level` is an
+/// optional error/warn/info/debug heuristic filter; `search` is an
+/// optional case-insensitive substring. Ordering is newest-first in
+/// every scope, archives included.
+///
+/// Returns `{lines, total_matching, truncated, scopes}`: `lines` is the
+/// page capped at `limit` (default 200), each record stamped with its
+/// `source` process id and an `archived` flag for previous-run records;
+/// `total_matching` counts every record that matched before the cap and
+/// `truncated` says whether the cap cut the page, so the UI can signal
+/// omission. `scopes` lists every retained scope as `{id, previous}`,
+/// where `previous` means the id also has an archived previous-run
+/// ring (incl. previous run).
 #[tauri::command]
 async fn get_logs(
     state: State<'_, AppState>,
@@ -820,13 +1635,24 @@ async fn get_logs(
     search: Option<String>,
     limit: Option<u64>,
 ) -> ApiResult {
-    let records = state.supervisor().await.lock().await.logs_query(
+    let sup = state.supervisor().await.lock().await;
+    let result = sup.logs_query(
         &scope,
         level.as_deref(),
         search.as_deref(),
         limit.unwrap_or(200) as usize,
     );
-    Ok(serde_json::to_value(&records).map_err(jerr)?)
+    let scopes: Vec<Value> = sup
+        .log_scopes()
+        .into_iter()
+        .map(|s| json!({ "id": s.id, "previous": s.previous }))
+        .collect();
+    Ok(json!({
+        "lines": serde_json::to_value(&result.records).map_err(jerr)?,
+        "total_matching": result.total_matching,
+        "truncated": result.total_matching > result.records.len(),
+        "scopes": scopes,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -841,15 +1667,24 @@ async fn get_gateway_config(state: State<'_, AppState>) -> ApiResult {
     Ok(serde_json::to_value(gw).map_err(jerr)?)
 }
 
-/// Merge a JSON patch into the gateway config (in-memory until save lands).
+/// Merge a JSON patch into the gateway config and persist: the patch is
+/// merged into a clone of the config, the clone is saved via
+/// `manager_config::save` (which validates before writing), and only a
+/// successful save installs the clone in memory. `persisted` is true
+/// only after that save; on failure the in-memory config is unchanged
+/// and the error surfaces.
 #[tauri::command]
 async fn update_gateway_config(state: State<'_, AppState>, patch: Value) -> ApiResult {
     let mut cfg = state.config.write().await;
-    let mut v = serde_json::to_value(&cfg.gateway).map_err(jerr)?;
+    let mut new_cfg = cfg.clone();
+    let mut v = serde_json::to_value(&new_cfg.gateway).map_err(jerr)?;
     merge_json(&mut v, patch);
-    let new_gw: GatewayConfig = serde_json::from_value(v).map_err(jerr)?;
-    cfg.gateway = new_gw;
-    Ok(json!({ "ok": true, "persisted": false }))
+    new_cfg.gateway = serde_json::from_value(v).map_err(jerr)?;
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    Ok(json!({ "ok": true, "persisted": true }))
 }
 
 // ---------------------------------------------------------------------------
@@ -879,26 +1714,42 @@ async fn get_mxc_policy(state: State<'_, AppState>) -> ApiResult {
     Ok(json!({ "policy": policy, "source": source, "mode": cfg.mxc.mode }))
 }
 
-/// Validate and store a new sandbox policy.
+/// Validate and store a new sandbox policy. The validator returns a
+/// report rather than an error for a bad policy (`valid: false` with
+/// the problems listed): the write is refused in that case — an
+/// invalid policy file must never reach disk, where the sandbox would
+/// read it as authoritative.
 #[tauri::command]
 async fn update_mxc_policy(state: State<'_, AppState>, policy: Value) -> ApiResult {
     let p: Policy = serde_json::from_value(policy).map_err(jerr)?;
-    // Wired to the real validator; live when manager-mxc lands.
     let report = manager_mxc::validate(&p)
         .map_err(ApiError::from)
         .map_err(jerr)?;
+    if !report.valid {
+        return Err(err(ApiError::Mxc(format!(
+            "MXC policy failed validation: {}",
+            report.errors.join("; ")
+        ))));
+    }
     let cfg = state.config.read().await;
     if let Some(parent) = cfg.mxc.path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(ApiError::from)
             .map_err(jerr)?;
     }
-    std::fs::write(
-        &cfg.mxc.path,
-        serde_json::to_string_pretty(&p).map_err(jerr)?,
-    )
-    .map_err(ApiError::from)
-    .map_err(jerr)?;
+    // Atomic replace (the manager_config::save pattern): serialize to
+    // a temp file in the same directory, then rename over the target,
+    // so a crash mid-write can never leave a truncated policy behind.
+    let serialized = serde_json::to_string_pretty(&p).map_err(jerr)?;
+    let mut tmp_path = cfg.mxc.path.clone();
+    tmp_path.as_mut_os_string().push(".tmp");
+    std::fs::write(&tmp_path, serialized)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    if let Err(e) = std::fs::rename(&tmp_path, &cfg.mxc.path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err(ApiError::from(e)));
+    }
     Ok(serde_json::to_value(report).map_err(jerr)?)
 }
 
@@ -991,15 +1842,22 @@ async fn setup_status(state: State<'_, AppState>) -> ApiResult {
     Ok(json!({ "setup_completed": cfg.setup_completed }))
 }
 
-/// Mark the setup wizard complete and persist the flag.
+/// Mark the setup wizard complete and persist the flag: the flag is
+/// set on a clone of the config, the clone is saved via
+/// `manager_config::save`, and only a successful save installs it in
+/// memory — a failed save returns an error rather than an ok:true
+/// payload, so the UI never reports completion that a restart would
+/// silently undo.
 #[tauri::command]
 async fn setup_mark_complete(state: State<'_, AppState>) -> ApiResult {
     let mut cfg = state.config.write().await;
-    cfg.setup_completed = true;
-    match manager_config::save(&cfg, &state.config_path) {
-        Ok(()) => Ok(json!({ "ok": true, "persisted": true })),
-        Err(e) => Ok(json!({ "ok": true, "persisted": false, "error": e.to_string() })),
-    }
+    let mut new_cfg = cfg.clone();
+    new_cfg.setup_completed = true;
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    Ok(json!({ "ok": true, "persisted": true }))
 }
 
 /// Help URL a wizard step offers alongside its remediation hint
@@ -1082,10 +1940,13 @@ async fn backend_preview_diff(state: State<'_, AppState>, id: String, patch: Val
 }
 
 /// Apply a config patch with restart semantics (spec §14
-/// `backend_apply_config`). Applied in-memory and validated; the backend is
-/// rolled back untouched if validation fails. `apply_mode` is
-/// `RestartNow | OnNextRestart` — `RestartNow` records a restart task for
-/// the UI to dispatch; the restart itself goes through `restart_backend`.
+/// `backend_apply_config`). The patch is applied to a clone of the
+/// config (`apply_config_diff` validates and rolls the clone back on
+/// failure), the clone is persisted via `manager_config::save`, and
+/// only a successful save installs it in memory — `persisted` reports
+/// that truthfully. `apply_mode` is `RestartNow | OnNextRestart` —
+/// `RestartNow` records a restart task for the UI to dispatch; the
+/// restart itself goes through `restart_backend`.
 #[tauri::command]
 async fn backend_apply_config(
     state: State<'_, AppState>,
@@ -1105,9 +1966,15 @@ async fn backend_apply_config(
     };
     let diff: ConfigDiff = {
         let mut cfg = state.config.write().await;
-        manager_config::apply_config_diff(&mut *cfg, &id, &patch)
+        let mut new_cfg = cfg.clone();
+        let diff = manager_config::apply_config_diff(&mut new_cfg, &id, &patch)
             .map_err(ApiError::from)
-            .map_err(jerr)?
+            .map_err(jerr)?;
+        manager_config::save(&new_cfg, &state.config_path)
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
+        *cfg = new_cfg;
+        diff
     };
     let restart_task = if apply_mode == "RestartNow" {
         Some(
@@ -1123,7 +1990,7 @@ async fn backend_apply_config(
         "diff": diff,
         "apply_mode": apply_mode,
         "restart_task_id": restart_task,
-        "persisted": false,
+        "persisted": true,
     }))
 }
 
@@ -1131,6 +1998,7 @@ async fn backend_apply_config(
 /// planned_commands output per spec).
 #[tauri::command]
 async fn backend_get_launch_command(state: State<'_, AppState>, id: String) -> ApiResult {
+    ensure_backend_specs(&state).await;
     let argv = state
         .supervisor()
         .await
@@ -1146,15 +2014,101 @@ async fn backend_get_launch_command(state: State<'_, AppState>, id: String) -> A
 // Gateway: additional §14 commands
 // ---------------------------------------------------------------------------
 
-/// Gateway liveness summary.
+/// Gateway liveness summary: the configured shape plus a live probe.
+/// The probe is a plain TCP/HTTP check against 127.0.0.1:<port>
+/// (`GET /v1/models`; any syntactically valid HTTP status line = up)
+/// run on a blocking thread — the gateway is a separate LiteLLM
+/// process, so config alone cannot say whether it is up.
+/// `routing_log_len` is the routing decision ring's actual current
+/// entry count (not its capacity). `openrouter_cred_present` reports
+/// whether the cloud tier's configured credential reference exists in
+/// Windows Credential Manager (presence only — the value is never
+/// read); it is null when no reference is configured.
 #[tauri::command]
 async fn gateway_status(state: State<'_, AppState>) -> ApiResult {
-    let cfg = state.config.read().await;
+    let (port, groups, routing_rules, cred_ref) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.gateway.port,
+            cfg.gateway.groups.len(),
+            cfg.gateway.routing_rules.len(),
+            cfg.gateway.openrouter.cred_ref.clone(),
+        )
+    };
+    let up = tokio::task::spawn_blocking(move || probe_gateway(port))
+        .await
+        .unwrap_or(false);
+    // The cmdkey presence check is a blocking subprocess call; run it
+    // off the async worker like the MCP presence checks.
+    let openrouter_cred_present: Option<bool> = match cred_ref.filter(|r| !r.is_empty()) {
+        Some(target) => Some(
+            tokio::task::spawn_blocking(move || cmdkey_target_exists(&target))
+                .await
+                .unwrap_or(false),
+        ),
+        None => None,
+    };
+    let routing_log_len = state.routing_log.lock().await.len();
     Ok(json!({
-        "port": cfg.gateway.port,
-        "groups": cfg.gateway.groups.len(),
-        "routing_rules": cfg.gateway.routing_rules.len(),
+        "port": port,
+        "groups": groups,
+        "routing_rules": routing_rules,
+        "up": up,
+        "routing_log_len": routing_log_len,
+        "openrouter_cred_present": openrouter_cred_present,
     }))
+}
+
+/// Stop the running gateway: terminate the process recorded in
+/// `<data_dir>/gateway.pid` by the start-gateway step (see
+/// [`manager_wizard::stop_gateway`]). Restarting is stop + re-running
+/// the start-gateway step, which is what the wizard does itself.
+#[tauri::command]
+async fn gateway_stop(state: State<'_, AppState>) -> ApiResult {
+    let data_dir = state.data_dir.clone();
+    let stopped = tokio::task::spawn_blocking(move || manager_wizard::stop_gateway(&data_dir))
+        .await
+        .map_err(|e| err(ApiError::Gateway(format!("gateway stop task failed: {e}"))))?
+        .map_err(|e| err(ApiError::Gateway(e)))?;
+    Ok(json!({ "ok": true, "stopped": stopped }))
+}
+
+/// One-shot gateway liveness probe: connect to 127.0.0.1:<port> with a
+/// 500 ms timeout, `GET /v1/models` with a 1 s read timeout, and report
+/// whether the reply's first line is a syntactically valid HTTP status
+/// line. Any status code counts — 200, 401, and 404 all prove a live
+/// HTTP listener, which is all "up" means here. Any error (refused,
+/// timeout, malformed reply) is simply "not up"; runs on a blocking
+/// thread and never fails the caller.
+fn probe_gateway(port: u16) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(1)));
+    if stream
+        .write_all(b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    if reader.read_line(&mut status_line).is_err() {
+        return false;
+    }
+    // "HTTP/1.1 200 OK" — a valid status line starts with "HTTP/" and
+    // carries a numeric status code as its second token.
+    status_line.starts_with("HTTP/")
+        && status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse::<u16>().ok())
+            .is_some()
 }
 
 /// Preview the generated LiteLLM config.yaml.
@@ -1168,9 +2122,12 @@ async fn gateway_preview_yaml(state: State<'_, AppState>) -> ApiResult {
 }
 
 /// Trace routing for a tagged request: `request` carries the model group
-/// name (`{"group": "planner"}`). Runs the live `pick_backend` logic as a
-/// dry run (every group member assumed healthy, no load/latency data — the
-/// reason string says so) and records the decision in the request ring.
+/// name (`{"group": "planner"}`). Runs `pick_backend` as an explainer
+/// over the current config (every group member assumed healthy, no
+/// load/latency data — the reason string says so) and records the
+/// decision in the request ring. This is a dry run for the UI: live
+/// traffic is routed by LiteLLM under its single global strategy, not
+/// by `pick_backend`.
 #[tauri::command]
 async fn gateway_test_routing(state: State<'_, AppState>, request: Value) -> ApiResult {
     let group_name = request
@@ -1240,27 +2197,71 @@ async fn model_resume_download(state: State<'_, AppState>, id: String) -> ApiRes
     Ok(json!({ "model_id": id, "resumed": true }))
 }
 
-/// SHA-256-verify an installed model file against the catalog hash.
+/// SHA-256-verify an installed model file against the hash pinned in
+/// the model's config entry. Records the outcome in `verified_at`
+/// (stamped on success, cleared on mismatch) and persists the config.
+/// The download-outcome gate follows the same result: success REMOVES
+/// any recorded verification failure for the model (the start
+/// preflight stops refusing), a mismatch records one.
 #[tauri::command]
 async fn model_verify_checksum(state: State<'_, AppState>, id: String) -> ApiResult {
-    let cfg = state.config.read().await;
-    let m = cfg
-        .models
-        .iter()
-        .find(|m| m.id == id)
-        .ok_or_else(|| err(ApiError::NotFound(format!("model {id}"))))?;
-    let ok = manager_models::verify_sha256(&m.gguf_path, &m.sha256)
+    let (path, sha) = {
+        let cfg = state.config.read().await;
+        let m = cfg
+            .models
+            .iter()
+            .find(|m| m.id == id)
+            .ok_or_else(|| err(ApiError::NotFound(format!("model {id}"))))?;
+        if !is_real_pin(&m.sha256) {
+            return Err(err(ApiError::InvalidInput(format!(
+                "no SHA-256 hash is pinned for model {id}; pin one in the app configuration to enable verification"
+            ))));
+        }
+        (
+            resolve_under_data_dir(&cfg.data_dir, &m.gguf_path),
+            m.sha256.clone(),
+        )
+    };
+    let ok = manager_models::verify_sha256(&path, &sha)
         .await
         .map_err(ApiError::from)
         .map_err(jerr)?;
+    {
+        let mut cfg = state.config.write().await;
+        if let Some(m) = cfg.models.iter_mut().find(|m| m.id == id) {
+            m.verified_at = if ok { Some(chrono::Utc::now()) } else { None };
+        }
+        manager_config::save(&cfg, &state.config_path).map_err(jerr)?;
+    }
+    if ok {
+        // A passing manual verify clears the start gate recorded by an
+        // earlier failed verification.
+        state.download_outcomes.lock().await.remove(&id);
+    } else {
+        state.download_outcomes.lock().await.insert(
+            id.clone(),
+            DownloadOutcome {
+                // Not produced by a download attempt; direct insert
+                // (the attempt-token gate applies to watchers only).
+                attempt: 0,
+                failed: Some(
+                    "SHA-256 verification failed: the file on disk does not match the pinned hash"
+                        .to_string(),
+                ),
+                verification_failure: true,
+            },
+        );
+    }
     Ok(json!({ "id": id, "ok": ok }))
 }
 
-/// Delete a model file (guarded): refuses while any backend references the
-/// model, or while a download is in flight for it. Removes the model from
-/// the config on success.
+/// Delete a model file (guarded): refuses while any backend references
+/// the model, or while a download is in flight for it. Removes the
+/// model from the config on success and persists the removal; any
+/// partial download file beside it is deleted too.
 #[tauri::command]
 async fn model_delete(state: State<'_, AppState>, id: String) -> ApiResult {
+    reap_downloads(&state).await;
     if state.downloads.lock().await.contains_key(&id) {
         return Err(err(ApiError::Models(format!(
             "download in flight for model {id}; cancel it before deleting"
@@ -1273,11 +2274,19 @@ async fn model_delete(state: State<'_, AppState>, id: String) -> ApiResult {
         .position(|m| m.id == id)
         .ok_or_else(|| err(ApiError::NotFound(format!("model {id}"))))?;
     let model = cfg.models[pos].clone();
-    // Delete the file first: on failure the config entry is kept.
-    let report = manager_models::delete_model_file(&model, &cfg.backends)
+    // Delete the file first: on failure the config entry is kept. The
+    // file path is the model's gguf_path resolved under the data dir —
+    // the same path download_model wrote and list_models probes.
+    let file_path = resolve_under_data_dir(&cfg.data_dir, &model.gguf_path);
+    let report = manager_models::delete_model_file(&model, &cfg.backends, &file_path)
         .map_err(ApiError::from)
         .map_err(jerr)?;
     cfg.models.remove(pos);
+    // Persist the removal — without the save, the deleted model
+    // reappears in the config (and the Models view) on the next launch.
+    manager_config::save(&cfg, &state.config_path).map_err(jerr)?;
+    // Drop any partial download left beside the deleted file.
+    let _ = std::fs::remove_file(manager_models::partial_path(&file_path));
     Ok(json!({
         "model_id": id,
         "deleted": true,
@@ -1297,6 +2306,20 @@ async fn model_assign(
     backend_id: String,
     split: Vec<f32>,
 ) -> ApiResult {
+    // Validate the split against the discovered GPU count before
+    // touching the config. Done before the config write lock is taken:
+    // the telemetry accessor reads the config while initializing, so
+    // calling it under the write lock could deadlock. A count of 0
+    // means telemetry has not polled yet — the check is skipped rather
+    // than rejecting against an unknown count.
+    let gpu_count = lock_telemetry(&state.telemetry().await).gpu_count();
+    if gpu_count > 0 && split.len() != gpu_count {
+        // Same wording as manager_models::validate_split.
+        return Err(err(ApiError::InvalidInput(format!(
+            "tensor split has {} entries but there are {gpu_count} GPUs",
+            split.len()
+        ))));
+    }
     let mut cfg = state.config.write().await;
     let model = cfg
         .models
@@ -1323,37 +2346,58 @@ async fn model_assign(
     manager_config::validate(&*cfg)
         .map_err(ApiError::from)
         .map_err(jerr)?;
+    manager_config::save(&cfg, &state.config_path).map_err(jerr)?;
+    drop(cfg);
     let task_id = state
         .record_task(
             "model_assign",
             json!({ "model_id": id, "backend_id": backend_id, "split": split }),
         )
         .await;
-    Ok(json!({ "task_id": task_id, "persisted": false }))
+    // The assignment is already applied and persisted above; the task is
+    // the UI's rolling-restart handle, recorded complete rather than
+    // left Running forever.
+    state
+        .finish_task(
+            &task_id,
+            TaskStatus::Done,
+            json!({ "model_id": id, "backend_id": backend_id }),
+        )
+        .await;
+    Ok(json!({ "task_id": task_id, "persisted": true }))
 }
 
 // ---------------------------------------------------------------------------
 // Telemetry: additional §14 commands
 // ---------------------------------------------------------------------------
 
-/// Set the telemetry poll interval (in-memory until save lands).
+/// Set the telemetry poll interval. Persisted immediately via
+/// `manager_config::save`; the running poller's cadence is fixed when
+/// the poller starts (PollHandle exposes no re-cadence), so the new
+/// interval takes effect on the next app start.
 #[tauri::command]
 async fn telemetry_set_interval(state: State<'_, AppState>, ms: u64) -> ApiResult {
-    state.config.write().await.telemetry.poll_interval_ms = ms;
+    // Persisted immediately. The running poller's cadence is fixed when
+    // the poller starts (PollHandle exposes no re-cadence), so the new
+    // interval takes effect on the next app start; the GPUs view labels
+    // the control accordingly.
+    let mut cfg = state.config.write().await;
+    cfg.telemetry.poll_interval_ms = ms;
+    manager_config::save(&cfg, &state.config_path).map_err(jerr)?;
     Ok(json!({ "ok": true, "poll_interval_ms": ms }))
 }
 
 /// Reset peak trackers (spec §5: peak marks are resettable).
 #[tauri::command]
 async fn telemetry_reset_peaks(state: State<'_, AppState>) -> ApiResult {
-    state.telemetry().await.lock().await.reset_peaks();
+    lock_telemetry(&state.telemetry().await).reset_peaks();
     Ok(json!({ "ok": true }))
 }
 
 /// Write the current snapshot to the data dir.
 #[tauri::command]
 async fn telemetry_save_snapshot(state: State<'_, AppState>) -> ApiResult {
-    let samples: Vec<GpuSample> = state.telemetry().await.lock().await.snapshot();
+    let samples: Vec<GpuSample> = lock_telemetry(&state.telemetry().await).snapshot();
     let path = state
         .data_dir
         .join(format!("telemetry-snapshot-{}.json", now_ms()));
@@ -1364,87 +2408,227 @@ async fn telemetry_save_snapshot(state: State<'_, AppState>) -> ApiResult {
 }
 
 /// Project a tensor split onto discovered VRAM (spec §14
-/// `placement_propose`). Free VRAM comes from the latest telemetry
-/// snapshot; stale GPUs count their last-known values (the projection is
-/// labeled with the snapshot age by the UI).
+/// `placement_propose`). The model resolves from the curated catalog
+/// first, else from the config (size = the on-disk file when downloaded,
+/// else a params_b estimate — see the resolution code). Free VRAM comes
+/// from the latest telemetry snapshot — the same snapshot the fits
+/// verdict and the payload's per-GPU `free_mib` are computed from;
+/// stale GPUs count their last-known values. The response is the
+/// projection plus provenance for the UI's labels: `snapshot_age_ms`
+/// (age of the telemetry snapshot the projection was computed from),
+/// `gpu_indices` (the GPU index each split fraction maps to), and
+/// `weights_only` — the projection covers model weights only, with no
+/// KV-cache or compute allowance, so "fits" is not a load guarantee.
 #[tauri::command]
 async fn placement_propose(
     state: State<'_, AppState>,
     model_id: String,
     split: Vec<f32>,
 ) -> ApiResult {
-    let spec = manager_models::curated_models()
+    let spec = match manager_models::curated_models()
         .into_iter()
         .find(|s| s.id == model_id)
-        .ok_or_else(|| {
-            err(ApiError::NotFound(format!(
-                "no catalog entry for model {model_id}"
-            )))
-        })?;
-    let mut samples = state.telemetry().await.lock().await.snapshot();
+    {
+        Some(spec) => spec,
+        None => {
+            // Not a catalog model: resolve the configured model. Size
+            // basis, in order: the on-disk file's size when the model
+            // is downloaded; else an estimate from params_b using the
+            // catalog's derivation (~4.92 bits per weight plus ~5%
+            // overhead — an estimate, like the catalog's own sizes).
+            // The config read finishes before telemetry is touched:
+            // the telemetry accessor reads the config while
+            // initializing, so the two must not nest.
+            let cfg = state.config.read().await;
+            let m = cfg
+                .models
+                .iter()
+                .find(|m| m.id == model_id)
+                .ok_or_else(|| {
+                    err(ApiError::NotFound(format!(
+                        "model {model_id} is neither a catalog entry nor a configured model"
+                    )))
+                })?;
+            let path = resolve_under_data_dir(&cfg.data_dir, &m.gguf_path);
+            let size_bytes = match std::fs::metadata(&path) {
+                Ok(md) if md.is_file() => md.len(),
+                _ if m.params_b > 0.0 => (m.params_b as f64 * 1e9 * 4.92 / 8.0 * 1.05) as u64,
+                _ => {
+                    return Err(err(ApiError::InvalidInput(format!(
+                        "model size unknown for {model_id}: the file is not downloaded and no params_b is configured to estimate from"
+                    ))))
+                }
+            };
+            manager_models::ModelSpec {
+                id: m.id.clone(),
+                name: m.id.clone(),
+                quant: m.quant.clone(),
+                sha256: m.sha256.clone(),
+                url: m.source_url.clone(),
+                size_bytes,
+            }
+        }
+    };
+    let store = state.telemetry().await;
+    let guard = lock_telemetry(&store);
+    let mut samples = guard.snapshot();
     samples.sort_by_key(|s| s.index);
     if samples.is_empty() {
         return Err(err(ApiError::Telemetry(
             "no telemetry yet; cannot project placement".to_string(),
         )));
     }
+    // Age of the snapshot: now minus the last successful poll that fed
+    // the store (falling back to the newest sample's own timestamp).
+    let snapshot_age_ms = guard
+        .last_successful_poll_at()
+        .map(|t| t.timestamp_millis())
+        .or_else(|| samples.iter().map(|s| s.ts.timestamp_millis()).max())
+        .map(|then_ms| now_ms().saturating_sub(then_ms.max(0) as u64));
+    let gpu_indices: Vec<u32> = samples.iter().map(|s| s.index).collect();
     let free_mib: Vec<u64> = samples
         .iter()
         .map(|s| s.vram_total_mib.saturating_sub(s.vram_used_mib))
         .collect();
+    drop(guard);
     let projection = manager_models::propose_placement(&spec, &split, &free_mib)
         .map_err(ApiError::from)
         .map_err(jerr)?;
-    Ok(serde_json::to_value(&projection).map_err(jerr)?)
+    let mut payload = serde_json::to_value(&projection).map_err(jerr)?;
+    payload["snapshot_age_ms"] = json!(snapshot_age_ms);
+    payload["gpu_indices"] = json!(gpu_indices);
+    payload["weights_only"] = json!(true);
+    Ok(payload)
 }
 
-/// Apply a tensor split to a backend (spec §14 `placement_apply`).
-/// Validates the split, writes it to the backend config in-memory, and
-/// records a rolling-restart task for the UI to dispatch via
-/// `restart_backend`.
+/// Apply a tensor split to the backends serving a model (spec §14
+/// `placement_apply`). Validates the split against the telemetry
+/// snapshot's GPU count (the same parity rule `placement_propose`
+/// enforces), writes it into the config of every backend the model is
+/// assigned to, persists via `manager_config::save`, and completes the
+/// task it records. When the model has no recorded assignment, the
+/// target backends are derived from the backends whose model file
+/// resolves to the model's gguf_path, and the apply records them into
+/// `assigned_backends` — so a model configured by hand (or installed
+/// by the wizard, which never records assignments) is still placeable.
+/// The split takes effect on each backend's next start. All mutation
+/// happens on a clone installed in memory only after a successful
+/// save, so a late failure leaves memory and disk in agreement.
 #[tauri::command]
 async fn placement_apply(
     state: State<'_, AppState>,
     model_id: String,
     split: Vec<f32>,
 ) -> ApiResult {
-    // placement_apply targets the backends serving the model: it applies the
-    // split to every backend the model is assigned to (assign via
-    // model_assign first).
+    // Validate the split length against the telemetry snapshot first.
+    // Done before any config lock is taken: the telemetry accessor reads
+    // the config while initializing, so calling it under the write lock
+    // could deadlock (the same constraint model_assign documents).
+    let gpu_count = lock_telemetry(&state.telemetry().await).snapshot().len();
+    if gpu_count == 0 {
+        return Err(err(ApiError::Telemetry(
+            "no telemetry yet; cannot validate placement".to_string(),
+        )));
+    }
+    if split.len() != gpu_count {
+        // Same wording as manager_models::validate_split.
+        return Err(err(ApiError::InvalidInput(format!(
+            "tensor split has {} entries but there are {gpu_count} GPUs",
+            split.len()
+        ))));
+    }
     let cfg = state.config.read().await;
-    let backend_ids: Vec<String> = cfg
+    let model = cfg
         .models
         .iter()
         .find(|m| m.id == model_id)
-        .map(|m| m.assigned_backends.clone())
-        .unwrap_or_default();
+        .ok_or_else(|| err(ApiError::NotFound(format!("model {model_id}"))))?;
+    let mut backend_ids = model.assigned_backends.clone();
+    if backend_ids.is_empty() {
+        // No recorded assignment: derive the targets from the backends
+        // whose model file resolves (under the data dir) to the model's
+        // gguf_path. The apply below records them into
+        // assigned_backends, so later applies take the direct path.
+        let model_path = resolve_under_data_dir(&cfg.data_dir, &model.gguf_path);
+        backend_ids = cfg
+            .backends
+            .iter()
+            .filter(|b| resolve_under_data_dir(&cfg.data_dir, &b.model_file) == model_path)
+            .map(|b| b.id.clone())
+            .collect();
+    }
     drop(cfg);
     if backend_ids.is_empty() {
         return Err(err(ApiError::NotFound(format!(
-            "model {model_id} is not assigned to any backend; use model_assign first"
+            "model {model_id} is not referenced by any backend; point a backend's model file at it first"
         ))));
     }
-    let mut cfg = state.config.write().await;
-    for bid in &backend_ids {
-        let backend = cfg
-            .backends
-            .iter_mut()
-            .find(|b| &b.id == bid)
-            .ok_or_else(|| err(ApiError::NotFound(format!("backend {bid}"))))?;
-        manager_models::apply_placement(backend, &split)
-            .map_err(ApiError::from)
-            .map_err(jerr)?;
-    }
-    manager_config::validate(&*cfg)
-        .map_err(ApiError::from)
-        .map_err(jerr)?;
     let task_id = state
         .record_task(
             "placement_apply",
             json!({ "model_id": model_id, "backends": backend_ids, "split": split }),
         )
         .await;
-    Ok(json!({ "task_id": task_id, "backends": backend_ids, "persisted": false }))
+    let mut cfg = state.config.write().await;
+    let outcome: Result<(), String> = (|| {
+        let mut new_cfg = cfg.clone();
+        // Existence first: a missing backend must not leave earlier
+        // backends mutated while the command reports failure.
+        for bid in &backend_ids {
+            if !new_cfg.backends.iter().any(|b| &b.id == bid) {
+                return Err(err(ApiError::NotFound(format!("backend {bid}"))));
+            }
+        }
+        for bid in &backend_ids {
+            let backend = new_cfg
+                .backends
+                .iter_mut()
+                .find(|b| &b.id == bid)
+                .expect("existence checked above");
+            manager_models::apply_placement(backend, &split)
+                .map_err(ApiError::from)
+                .map_err(jerr)?;
+        }
+        // Record the (possibly derived) assignment on the model.
+        if let Some(m) = new_cfg.models.iter_mut().find(|m| m.id == model_id) {
+            for bid in &backend_ids {
+                if !m.assigned_backends.contains(bid) {
+                    m.assigned_backends.push(bid.clone());
+                }
+            }
+        }
+        manager_config::validate(&new_cfg)
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
+        // Persist — without the save, the applied split silently
+        // vanished on app restart while the command reported success.
+        manager_config::save(&new_cfg, &state.config_path).map_err(jerr)?;
+        *cfg = new_cfg;
+        Ok(())
+    })();
+    drop(cfg);
+    match outcome {
+        Ok(()) => {
+            state
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Done,
+                    json!({ "model_id": model_id, "backends": backend_ids }),
+                )
+                .await;
+            Ok(json!({ "task_id": task_id, "backends": backend_ids, "persisted": true }))
+        }
+        Err(e) => {
+            state
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Failed,
+                    json!({ "model_id": model_id, "error": e }),
+                )
+                .await;
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1478,11 +2662,14 @@ async fn tasks_list(state: State<'_, AppState>) -> ApiResult {
 #[tauri::command]
 async fn diagnostics_export_bundle(state: State<'_, AppState>) -> ApiResult {
     let cfg = state.config.read().await.clone();
-    let samples: Vec<GpuSample> = state.telemetry().await.lock().await.snapshot();
+    let samples: Vec<GpuSample> = lock_telemetry(&state.telemetry().await).snapshot();
     let telemetry_json = serde_json::to_string_pretty(&samples).map_err(jerr)?;
     let scopes: Vec<String> = {
         let sup = state.supervisor().await.lock().await;
-        let mut ids = sup.spec_ids();
+        // Every retained log scope, not just registered specs:
+        // log_scopes() also covers scopes whose process was pruned but
+        // whose ring (incl. an archived previous run) is retained.
+        let mut ids: Vec<String> = sup.log_scopes().into_iter().map(|s| s.id).collect();
         ids.sort();
         ids
     };
@@ -1493,15 +2680,20 @@ async fn diagnostics_export_bundle(state: State<'_, AppState>) -> ApiResult {
             .await
             .lock()
             .await
-            .logs_query(&scope, None, None, 5000);
+            .logs_query(&scope, None, None, 5000)
+            .records;
         let lines: Vec<String> = records
             .iter()
             .rev()
             .map(|r| {
+                // Archived (previous-run) records keep their marker in
+                // the bundle so the distinction survives export.
+                let archived = if r.archived { " [archived]" } else { "" };
                 format!(
-                    "[{}] [{:?}] {}",
+                    "[{}] [{:?}]{} {}",
                     r.ts.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
                     r.stream,
+                    archived,
                     r.line
                 )
             })
@@ -1509,7 +2701,7 @@ async fn diagnostics_export_bundle(state: State<'_, AppState>) -> ApiResult {
         log_scopes.push((scope, lines));
     }
     let versions = vec![
-        ("app".to_string(), "0.1.0".to_string()),
+        ("app".to_string(), env!("CARGO_PKG_VERSION").to_string()),
         (
             "config_schema".to_string(),
             manager_config::CURRENT_VERSION.to_string(),
@@ -1787,11 +2979,20 @@ async fn vscode_write_config(state: State<'_, AppState>, backup: bool) -> ApiRes
 // MXC: additional §14 commands
 // ---------------------------------------------------------------------------
 
-/// Set the MXC enforcement mode (in-memory until save lands).
+/// Set the MXC enforcement mode and persist it: the mode is set on a
+/// clone of the config, the clone is saved via `manager_config::save`,
+/// and only a successful save installs it in memory. `persisted` is
+/// true only after that save.
 #[tauri::command]
 async fn mxc_set_mode(state: State<'_, AppState>, mode: MxcMode) -> ApiResult {
-    state.config.write().await.mxc.mode = mode;
-    Ok(json!({ "ok": true, "mode": mode }))
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    new_cfg.mxc.mode = mode;
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    Ok(json!({ "ok": true, "mode": mode, "persisted": true }))
 }
 
 /// Run the MXC policy self-test against the current policy. Harmless by
@@ -1939,7 +3140,11 @@ async fn updates_apply(_state: State<'_, AppState>, component_id: String) -> Api
     )))
 }
 
-/// Pin a component to a version (in-memory until save lands).
+/// Pin a component to a version and persist it: the pin is set on a
+/// clone of the config, the clone is saved via `manager_config::save`,
+/// and only a successful save installs it in memory. `persisted` is
+/// true only after that save; on failure the in-memory config is
+/// unchanged and the error surfaces.
 #[tauri::command]
 async fn updates_pin(
     state: State<'_, AppState>,
@@ -1947,7 +3152,9 @@ async fn updates_pin(
     version: Option<String>,
 ) -> ApiResult {
     let mut cfg = state.config.write().await;
-    cfg.updates
+    let mut new_cfg = cfg.clone();
+    new_cfg
+        .updates
         .components
         .entry(component_id.clone())
         .and_modify(|c| c.pinned_version = version.clone())
@@ -1956,10 +3163,15 @@ async fn updates_pin(
             auto_update: true,
             last_checked: None,
         });
-    Ok(json!({ "ok": true, "component_id": component_id, "pinned_version": version }))
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    Ok(json!({ "ok": true, "persisted": true, "component_id": component_id, "pinned_version": version }))
 }
 
-/// Toggle auto-update for a component (in-memory until save lands).
+/// Toggle auto-update for a component and persist it: same
+/// clone → save → install pattern as [`updates_pin`].
 #[tauri::command]
 async fn updates_set_auto(
     state: State<'_, AppState>,
@@ -1967,7 +3179,9 @@ async fn updates_set_auto(
     enabled: bool,
 ) -> ApiResult {
     let mut cfg = state.config.write().await;
-    cfg.updates
+    let mut new_cfg = cfg.clone();
+    new_cfg
+        .updates
         .components
         .entry(component_id.clone())
         .and_modify(|c| c.auto_update = enabled)
@@ -1976,7 +3190,11 @@ async fn updates_set_auto(
             auto_update: enabled,
             last_checked: None,
         });
-    Ok(json!({ "ok": true, "component_id": component_id, "auto_update": enabled }))
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    Ok(json!({ "ok": true, "persisted": true, "component_id": component_id, "auto_update": enabled }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2048,6 +3266,7 @@ fn main() {
             get_gateway_config,
             update_gateway_config,
             gateway_status,
+            gateway_stop,
             gateway_preview_yaml,
             gateway_test_routing,
             gateway_recent_requests,
@@ -2088,4 +3307,101 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Local LLM Service Manager");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cfg() -> AppConfig {
+        let mut cfg = AppConfig::default_config();
+        cfg.data_dir = PathBuf::from("/data");
+        cfg
+    }
+
+    fn backend(cfg: &AppConfig, id: &str) -> manager_config::BackendConfig {
+        cfg.backends.iter().find(|b| b.id == id).unwrap().clone()
+    }
+
+    #[test]
+    fn backend_spec_uses_wizard_binary_and_resolves_model() {
+        let cfg = test_cfg();
+        let b = backend(&cfg, "planner");
+        let spec = backend_spec(&cfg, &b);
+        let expected_prog = PathBuf::from("/data")
+            .join("llamacpp")
+            .join(if cfg!(windows) {
+                "llama-server.exe"
+            } else {
+                "llama-server"
+            });
+        assert_eq!(spec.program, expected_prog);
+        assert_eq!(spec.port, Some(b.port));
+        // -m carries the data_dir-resolved model path.
+        let pos = spec.args.iter().position(|a| a == "-m").unwrap();
+        assert_eq!(
+            spec.args[pos + 1],
+            PathBuf::from("/data").join(&b.model_file).to_string_lossy()
+        );
+        // --port carries the configured port.
+        let pos = spec.args.iter().position(|a| a == "--port").unwrap();
+        assert_eq!(spec.args[pos + 1], b.port.to_string());
+    }
+
+    #[test]
+    fn backend_spec_split_modes() {
+        let cfg = test_cfg();
+        for (mode, want) in [
+            (manager_config::SplitMode::None, "none"),
+            (manager_config::SplitMode::Layer, "layer"),
+            (manager_config::SplitMode::Row, "row"),
+        ] {
+            let mut b = backend(&cfg, "planner");
+            b.flags.split_mode = mode;
+            let spec = backend_spec(&cfg, &b);
+            let pos = spec.args.iter().position(|a| a == "--split-mode").unwrap();
+            assert_eq!(spec.args[pos + 1], want);
+        }
+    }
+
+    #[test]
+    fn backend_spec_tensor_split_joined_with_commas() {
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        b.flags.tensor_split = vec![0.5, 0.3, 0.2];
+        let spec = backend_spec(&cfg, &b);
+        let pos = spec
+            .args
+            .iter()
+            .position(|a| a == "--tensor-split")
+            .unwrap();
+        assert_eq!(spec.args[pos + 1], "0.5,0.3,0.2");
+    }
+
+    #[test]
+    fn backend_spec_filters_host_from_raw_flags() {
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        b.raw_flags = Some("--host 0.0.0.0 --threads 4".into());
+        let spec = backend_spec(&cfg, &b);
+        assert!(!spec.args.iter().any(|a| a == "--host" || a == "0.0.0.0"));
+        assert!(spec.args.iter().any(|a| a == "--threads"));
+        b.raw_flags = Some("--host=0.0.0.0 --threads 4".into());
+        let spec = backend_spec(&cfg, &b);
+        assert!(!spec.args.iter().any(|a| a.starts_with("--host")));
+        assert!(spec.args.iter().any(|a| a == "--threads"));
+    }
+
+    #[test]
+    fn process_state_str_covers_all_variants() {
+        for (v, want) in [
+            (ProcessState::Stopped, "stopped"),
+            (ProcessState::Starting, "starting"),
+            (ProcessState::Running, "running"),
+            (ProcessState::Stopping, "stopping"),
+            (ProcessState::Failed, "failed"),
+        ] {
+            assert_eq!(process_state_str(v), want);
+        }
+    }
 }

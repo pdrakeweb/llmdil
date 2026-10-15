@@ -17,9 +17,10 @@ pub mod smi;
 pub mod store;
 
 pub use nvml::NvmlSource;
-pub use smi::NvidiaSmiSource;
+pub use smi::{default_smi_path, NvidiaSmiSource};
 pub use store::{
-    FallbackSource, PeakMark, PeakMarks, PollCadence, Poller, TelemetryStore, HISTORY_CAP,
+    FallbackSource, PeakMark, PeakMarks, PollCadence, PollError, Poller, TelemetryStore,
+    HISTORY_CAP,
 };
 
 use async_trait::async_trait;
@@ -135,6 +136,11 @@ pub struct ProcessSample {
     pub pid: u32,
     pub name: String,
     pub vram_mib: u64,
+    /// Index of the GPU this process was collected under — the same index
+    /// assigned to that GPU's [`GpuSample`]. Processes are reported per GPU
+    /// by both sources (nested per-GPU in the nvidia-smi XML), and one pid
+    /// legitimately appears once per GPU it holds memory on (tensor split).
+    pub gpu_index: u32,
     /// Backend id this process belongs to, when known.
     pub backend_id: Option<String>,
 }

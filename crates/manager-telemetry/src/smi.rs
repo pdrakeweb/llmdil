@@ -131,8 +131,33 @@ impl NvidiaSmiSource {
 
 impl Default for NvidiaSmiSource {
     fn default() -> Self {
-        Self::new("nvidia-smi")
+        Self::new(default_smi_path())
     }
+}
+
+/// Program path for the default source.
+///
+/// On Windows the bare name `nvidia-smi` resolves through PATH (and the
+/// current directory), so a planted executable could be picked up by
+/// every poll tick. Prefer the canonical System32 location when it
+/// exists; fall back to the bare name otherwise. Non-Windows builds are
+/// unchanged.
+///
+/// Public so every spawn site (telemetry poller, wizard probes) resolves
+/// the binary the same way instead of re-implementing the rule.
+#[cfg(windows)]
+pub fn default_smi_path() -> PathBuf {
+    let system = PathBuf::from(r"C:\Windows\System32\nvidia-smi.exe");
+    if system.exists() {
+        system
+    } else {
+        PathBuf::from("nvidia-smi")
+    }
+}
+
+#[cfg(not(windows))]
+pub fn default_smi_path() -> PathBuf {
+    PathBuf::from("nvidia-smi")
 }
 
 #[async_trait]
@@ -364,6 +389,10 @@ fn parse_document(xml: &str) -> Result<ParsedDoc, TelemetryError> {
                                 .map(|s| s.trim().to_string())
                                 .unwrap_or_default(),
                             vram_mib,
+                            // Stamped with the enclosing GPU's index in
+                            // finalize_gpu, which is where the index
+                            // (minor_number, else document order) is known.
+                            gpu_index: 0,
                             backend_id: None,
                         });
                     }
@@ -433,6 +462,16 @@ fn finalize_gpu(
     let index = get("minor_number")
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(order);
+
+    // Processes were parsed out of this <gpu> element; stamp each with the
+    // index just resolved for it — the same index the GpuSample carries.
+    let processes = processes
+        .into_iter()
+        .map(|mut p| {
+            p.gpu_index = index;
+            p
+        })
+        .collect();
 
     let mem_total_mib = required(
         "fb_memory_usage/total",
@@ -544,6 +583,23 @@ mod tests {
         assert_eq!(procs[1].vram_mib, 2048);
         assert_eq!(procs[2].pid, 4321);
         assert_eq!(procs[2].vram_mib, 11264);
+        // Each process carries the index of its enclosing <gpu> — the same
+        // index that GPU's sample carries. pid 4321 appears on both GPU 0
+        // and GPU 1 (a tensor split); the two rows must not be conflated.
+        assert_eq!(procs[0].gpu_index, 0, "first process lives under GPU 0");
+        assert_eq!(procs[1].gpu_index, 0, "second process lives under GPU 0");
+        assert_eq!(procs[2].gpu_index, 1, "third process lives under GPU 1");
+    }
+
+    #[test]
+    fn default_path_is_bare_name_off_windows() {
+        // The System32 hardening is Windows-only; other builds keep the
+        // bare program name.
+        #[cfg(not(windows))]
+        assert_eq!(
+            NvidiaSmiSource::default().binary_path(),
+            Path::new("nvidia-smi")
+        );
     }
 
     #[test]
@@ -690,6 +746,25 @@ mod tests {
         // pci falls back to the id attribute when <pci><pci_bus> is absent
         let infos = NvidiaSmiSource::parse_inventory(xml).expect("must parse");
         assert_eq!(infos[0].pci_bus_id, "00000000:01:00.0");
+    }
+
+    #[test]
+    fn process_gpu_index_follows_minor_number() {
+        // minor_number (5) disagrees with document order (0): the process
+        // must be stamped with the same index the GpuSample gets.
+        let xml = r#"<?xml version="1.0" ?><nvidia_smi_log>
+<gpu id="00000000:01:00.0">
+<product_name>Card A</product_name><uuid>GPU-a</uuid><minor_number>5</minor_number>
+<fb_memory_usage><total>8192 MiB</total><used>0 MiB</used></fb_memory_usage>
+<utilization><gpu_util>0 %</gpu_util></utilization>
+<temperature><gpu_temp>30 C</gpu_temp></temperature>
+<gpu_power_readings><power_draw>20.00 W</power_draw></gpu_power_readings>
+<processes><process_info><pid>777</pid><process_name>llama-server</process_name><used_memory>1024 MiB</used_memory></process_info></processes>
+</gpu></nvidia_smi_log>"#;
+        let (samples, procs) = NvidiaSmiSource::parse_xml_with_processes(xml).expect("must parse");
+        assert_eq!(samples[0].index, 5);
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].gpu_index, samples[0].index);
     }
 
     #[tokio::test]

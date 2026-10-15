@@ -3,14 +3,15 @@
    framework can replace this file later without changing command contracts. */
 
 import "./styles.css";
-import { getStatus, isTauri, listBackends, getSetupStatus } from "./api";
+import { getAppConfig, getBackends, getGatewayStatus, getSetupStatus, getStatus, isTauri } from "./api";
 import { esc } from "./html";
 import { icon, type IconName } from "./icons";
 import { mountDashboard } from "./views/dashboard";
-import { renderServiceMap } from "./views/serviceMap";
+import { renderServiceMap, wireServiceMap } from "./views/serviceMap";
 import {
   renderBackends, renderGateway, renderGpus, renderLogs,
-  renderModels, renderSettings, renderWizard, wireWizard,
+  renderModels, renderSettings, renderWizard,
+  wireBackends, wireGateway, wireGpus, wireLogs, wireModels, wireSettings, wireWizard,
 } from "./views/static";
 
 export {}; // module marker
@@ -32,6 +33,11 @@ const ROUTES: Route[] = [
 let cleanup: (() => void) | null = null;
 /** Incremented per render; async mounts that lose the race clean up after themselves. */
 let renderGen = 0;
+/** The sidebar footer's own refresh timer. The footer otherwise only
+ *  repaints on navigation, so a gateway that dies while the operator
+ *  stays on one view would keep showing its last-probed state. Started
+ *  once (guarded), never stacked by repeated render() calls. */
+let sideFootTimer: number | null = null;
 
 function shell(): string {
   return `<aside class="sidebar">
@@ -53,19 +59,22 @@ async function renderSideFoot(): Promise<void> {
     el.innerHTML = `<div class="row"><span class="dot idle"></span> disconnected · sample data</div>`;
     return;
   }
-  const [s, b] = await Promise.all([getStatus(), listBackends()]);
+  const [s, b, gw, cfg] = await Promise.all([getStatus(), getBackends(), getGatewayStatus(), getAppConfig()]);
   if (s.error || b.error) {
     el.innerHTML = `<div class="row"><span class="dot err"></span> backend unreachable</div>`;
     return;
   }
-  const gw = b.data.find((x) => x.id === "gateway" || x.port === 4000) ?? null;
-  const backs = gw ? b.data.filter((x) => x !== gw) : b.data;
-  const up = backs.filter((x) => x.status === "ok").length;
-  const gwOk = gw?.status === "ok";
+  const up = b.data.filter((x) => x.state === "running").length;
+  const mxc = (cfg.data?.mxc as { mode?: string } | undefined)?.mode;
+  // The LiteLLM row keys to the gateway probe: an errored status call
+  // paints no port and no green dot (the state is unknown, not up).
+  const gwRow = gw.error
+    ? `<div class="row"><span class="dot err"></span> LiteLLM status unknown</div>`
+    : `<div class="row"><span class="dot ${gw.data.up ? "ok" : "err"}"></span> LiteLLM :${gw.data.port}${gw.data.up ? "" : " · down"}</div>`;
   el.innerHTML = `
-    <div class="row"><span class="dot ${gw ? (gwOk ? "ok" : "warn") : "idle"}"></span> LiteLLM :4000${gw ? "" : " · not reported"}</div>
-    <div class="row"><span class="dot ${backs.length && up === backs.length ? "ok" : "warn"}"></span> ${up}/${backs.length} backends up</div>
-    <div class="row"><span class="dot warn"></span> MXC · Learning-mode</div>`;
+    ${gwRow}
+    <div class="row"><span class="dot ${b.data.length && up === b.data.length ? "ok" : "warn"}"></span> ${up}/${b.data.length} backends up</div>
+    <div class="row"><span class="dot warn"></span> MXC · ${mxc ? esc(mxc) : "unknown"}</div>`;
 }
 
 function renderTaskbar(): void {
@@ -76,11 +85,19 @@ function renderTaskbar(): void {
     <span class="grow"></span><span class="quiet">Task drawer</span>`;
 }
 
+/** Query params in the hash (e.g. #/logs?scope=llama-a4000 — the Logs
+ *  deep link from the Backends view). */
+function hashParams(): URLSearchParams {
+  return new URLSearchParams((location.hash.split("?")[1] ?? ""));
+}
+
 async function render(): Promise<void> {
   const gen = ++renderGen;
   if (cleanup) { cleanup(); cleanup = null; }
   const hash = location.hash || "#/dashboard";
-  const route = ROUTES.find((r) => r.hash === hash) ?? ROUTES[0];
+  // Routes match on the path part only; the query carries view params.
+  const path = hash.split("?")[0];
+  const route = ROUTES.find((r) => r.hash === path) ?? ROUTES[0];
   document.querySelectorAll(".nav a").forEach((a) =>
     a.classList.toggle("active", (a as HTMLElement).dataset.route === route.hash));
   const view = document.getElementById("view");
@@ -97,28 +114,63 @@ async function render(): Promise<void> {
       break;
     case "#/map":
       view.innerHTML = renderServiceMap();
+      {
+        const c = await wireServiceMap(view);
+        if (gen !== renderGen) { c(); return; }
+        cleanup = c;
+      }
       break;
     case "#/gpus":
       view.innerHTML = renderGpus();
+      {
+        const c = await wireGpus(view);
+        if (gen !== renderGen) { c(); return; } // superseded by a newer navigation
+        cleanup = c;
+      }
       break;
     case "#/backends":
       view.innerHTML = renderBackends();
+      {
+        const c = await wireBackends(view);
+        if (gen !== renderGen) { c(); return; }
+        cleanup = c;
+      }
       break;
     case "#/models":
       view.innerHTML = renderModels();
+      {
+        const c = await wireModels(view);
+        if (gen !== renderGen) { c(); return; }
+        cleanup = c;
+      }
       break;
     case "#/logs":
       view.innerHTML = renderLogs();
+      {
+        const c = await wireLogs(view, hashParams().get("scope") ?? undefined);
+        if (gen !== renderGen) { c(); return; }
+        cleanup = c;
+      }
       break;
     case "#/gateway":
       view.innerHTML = renderGateway();
+      {
+        const c = await wireGateway(view);
+        if (gen !== renderGen) { c(); return; }
+        cleanup = c;
+      }
       break;
     case "#/settings":
       view.innerHTML = renderSettings();
+      {
+        const c = await wireSettings(view);
+        if (gen !== renderGen) { c(); return; }
+        cleanup = c;
+      }
       break;
     case "#/wizard":
       view.innerHTML = renderWizard();
-      wireWizard(view);
+      cleanup = wireWizard(view);
       break;
     default:
       view.innerHTML = "";
@@ -126,6 +178,9 @@ async function render(): Promise<void> {
   if (gen !== renderGen) return; // a newer render took over mid-flight
   renderTaskbar();
   void renderSideFoot();
+  if (sideFootTimer === null) {
+    sideFootTimer = window.setInterval(() => { void renderSideFoot(); }, 15000);
+  }
 }
 
 async function main(): Promise<void> {

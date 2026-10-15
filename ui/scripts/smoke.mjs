@@ -32,10 +32,22 @@ const html = existsSync(indexHtml) ? readFileSync(indexHtml, "utf8") : "";
 check(/assets\/.*\.js/.test(html), "index.html references the JS bundle");
 
 const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
-for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete"]) {
+for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_test_request", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval"]) {
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
+check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
+check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
 check(bundle.includes("__TAURI__"), "bundle contains the Tauri detection hook");
+
+// The UI detects Tauri via window.__TAURI__, which Tauri only injects when
+// app.withGlobalTauri is true. Without it the installed app silently
+// degrades to sample data on every screen.
+const tauriConfPath = join(root, "..", "src-tauri", "tauri.conf.json");
+let withGlobalTauri = false;
+try {
+  withGlobalTauri = JSON.parse(readFileSync(tauriConfPath, "utf8"))?.app?.withGlobalTauri === true;
+} catch { /* unreadable/missing config fails the check below */ }
+check(withGlobalTauri, "tauri.conf.json sets app.withGlobalTauri=true (without it window.__TAURI__ is absent in the installed app and the UI silently degrades to sample data)");
 
 const external = bundle.match(/https?:\/\/[a-z0-9.-]+\//gi) || [];
 const allowed = external.filter((u) => !u.includes("localhost"));

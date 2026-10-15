@@ -1,133 +1,352 @@
 /* Service Map — full cluster topology (spec §4.3).
-   Static layout faithful to mockup 05-service-map.png: clients -> LiteLLM ->
-   backends -> GPUs -> loaded models, MCP servers, dashed MXC boundary,
-   throughput edge labels, cluster summary inspector, recent events.
-   Live data wiring pending: node positions/labels come from sample data;
-   node click would deep-link to canonical windows once live. */
+   Layout faithful to mockup 05-service-map.png: LiteLLM gateway -> backends
+   -> GPUs, dashed MXC boundary around the backends, cluster summary
+   inspector, GPU load rings.
+   Live wiring: renderServiceMap() returns the shell; wireServiceMap(root)
+   loads backends (getBackends), GPU telemetry (getGpuTelemetry), and the
+   gateway summary (getGatewayStatus) and paints real nodes — gateway port
+   and group count, backend id/port/process state, GPU name and VRAM
+   used/total. Node dots and edges are colored by backend state. Nothing is
+   fabricated: with no backends configured the canvas shows an empty state,
+   and in the browser (live=false) a sample-mode banner says so. */
 
-import { mockDashboard } from "../mock";
+import { getAppConfig, getBackends, getGatewayStatus, getGpuTelemetry, systemVerdict } from "../api";
+import type { BackendRow, GatewayStatusData } from "../api";
 import { gaugeRing } from "../charts";
 import { icon } from "../icons";
 import { esc } from "../html";
+import type { GpuInfo } from "../types";
 
 const C = { green: "#3fb950", amber: "#d29922", red: "#f85149", blue: "#4a9eff", grey: "#6d7686" };
 
-export function renderServiceMap(): string {
-  const m = mockDashboard();
-  const W = 1200, H = 640;
+/** Dot color for a supervisor process state. */
+function stateColor(state: string): string {
+  switch (state) {
+    case "running": return C.green;
+    case "starting": case "stopping": return C.amber;
+    case "failed": return C.red;
+    default: return C.grey; // stopped and anything unknown
+  }
+}
 
-  interface N { x: number; y: number; title: string; sub: string; dot: string; ring?: { pct: number; color: string; label: string } }
-  const clients: N[] = [
-    { x: 90, y: 120, title: "VS Code", sub: "2 sessions", dot: C.green },
-    { x: 90, y: 250, title: "Continue.dev", sub: "1 session", dot: C.green },
-    { x: 90, y: 380, title: "Cline", sub: "1 session", dot: C.green },
-    { x: 90, y: 510, title: "CLI test", sub: "idle", dot: C.grey },
-  ];
-  const gateway: N = { x: 300, y: 315, title: "LiteLLM", sub: ":4000 · 1,284 req/1h", dot: C.green };
-  const backends: N[] = [
-    { x: 510, y: 90, title: "planner-27b", sub: ":8081 · 8.4 tok/s", dot: C.green, ring: { pct: 92, color: C.green, label: "92" } },
-    { x: 510, y: 235, title: "coder-30b", sub: ":8082 · 22.6 tok/s", dot: C.green, ring: { pct: 96, color: C.green, label: "96" } },
-    { x: 510, y: 380, title: "coder-7b", sub: ":8083 · 41.2 tok/s", dot: C.green, ring: { pct: 88, color: C.green, label: "88" } },
-    { x: 510, y: 525, title: "tool-runner", sub: ":8084 · starting", dot: C.amber, ring: { pct: 60, color: C.amber, label: "60" } },
-  ];
-  const gpus: N[] = [
-    { x: 730, y: 140, title: "A4000", sub: "16 GB · 71 °C", dot: C.green, ring: { pct: 62, color: C.amber, label: "62%" } },
-    { x: 730, y: 330, title: "P100-0", sub: "16 GB · 68 °C", dot: C.green, ring: { pct: 45, color: C.green, label: "45%" } },
-    { x: 730, y: 520, title: "P100-1", sub: "16 GB · 54 °C", dot: C.green, ring: { pct: 12, color: C.green, label: "12%" } },
-  ];
-  const models: N[] = [
-    { x: 950, y: 100, title: "Qwen3.8-27B", sub: "Q4_K_M · 16.2 GB", dot: C.green },
-    { x: 950, y: 240, title: "Qwen3-Coder-30B", sub: "Q4_K_M · 18.1 GB", dot: C.green },
-    { x: 950, y: 380, title: "Qwen2.5-Coder-7B", sub: "Q5_K_M · 5.2 GB", dot: C.green },
-    { x: 950, y: 520, title: "Qwen3-8B", sub: "Q8_0 · 8.6 GB · loading", dot: C.amber },
-  ];
-  const mcp: N[] = [
-    { x: 300, y: 590, title: "mcp-github", sub: "connected", dot: C.green },
-    { x: 510, y: 590, title: "mcp-gdrive", sub: "reconnecting", dot: C.amber },
-  ];
+/** Edge styling for a backend state: running = hot (blue), transitioning =
+ *  warn (amber dashed), failed = red (no CSS class exists, inline stroke),
+ *  stopped = plain grey. */
+function stateEdge(state: string): { cls: string; stroke: string } {
+  switch (state) {
+    case "running": return { cls: "hot", stroke: "" };
+    case "starting": case "stopping": return { cls: "warn", stroke: "" };
+    case "failed": return { cls: "", stroke: C.red };
+    default: return { cls: "", stroke: "" };
+  }
+}
 
-  const NW = 150, NH = 62;
+/** Node rect stroke for a backend state: only failure/transition override
+ *  the default border, so running/stopped keep the approved quiet look. */
+function stateStroke(state: string): string {
+  switch (state) {
+    case "failed": return C.red;
+    case "starting": case "stopping": return C.amber;
+    default: return "";
+  }
+}
+
+function gpuDot(g: GpuInfo): string {
+  switch (g.status) {
+    case "ok": return C.green;
+    case "degraded": case "starting": return C.amber;
+    case "down": return C.red;
+    default: return C.grey;
+  }
+}
+
+function fmtUptime(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  return m ? `${h}h${m}m` : `${h}h`;
+}
+
+interface MapData {
+  backends: BackendRow[];
+  gpus: GpuInfo[];
+  stale: boolean;
+  gateway: GatewayStatusData;
+  /** True when the gateway_status call itself failed — the gateway's
+   *  state is unknown, and the node renders that explicitly instead
+   *  of the zeroed fallback payload (port 0, no groups/rules). */
+  gatewayError: boolean;
+  /** The list_backends error, when it failed — distinguishes "no
+   *  backends configured" from "the backend list could not be
+   *  loaded" in the empty-canvas state. */
+  backendsError: string | null;
+  /** Configured MXC mode (learning | enforced | disabled), or null
+   *  when the config did not report one. */
+  mxcMode: string | null;
+  /** Backend id -> configured tensor split (fractions per GPU index),
+   *  from the app config; backends absent here get no GPU edges. */
+  splits: Map<string, number[]>;
+  live: boolean;
+  errors: string[];
+  /** When this paint's data was fetched (epoch ms). */
+  updatedAt: number;
+}
+
+const W = 1200, H = 640;
+const NW = 170, NH = 62;
+const COL = { gateway: 110, backends: 470, gpus: 830 };
+
+/** Even vertical spread for a column of n nodes on the canvas. */
+function spreadY(i: number, n: number): number {
+  if (n <= 1) return H / 2;
+  const top = 110, bottom = 570;
+  return top + (i * (bottom - top)) / (n - 1);
+}
+
+function topologySvg(d: MapData): string {
+  const { backends, gpus, gateway } = d;
   let s = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="display:block;width:100%" role="img" aria-label="Full cluster service map">`;
-  // MXC dashed boundary around backends
-  s += `<rect x="470" y="30" width="230" height="540" rx="10" fill="none" stroke="#4a9eff" stroke-width="1" stroke-dasharray="7 5" opacity="0.55"/>
-        <text x="585" y="22" text-anchor="middle" fill="#4a9eff" font-size="10" letter-spacing="1">MXC · LEARNING-MODE</text>`;
-  const edge = (x1: number, y1: number, x2: number, y2: number, label = "", cls = "") => {
-    const mx = (x1 + x2) / 2;
-    s += `<path class="map-edge ${cls}" d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/>`;
-    if (label) s += `<text class="map-edge-label" x="${mx}" y="${(y1 + y2) / 2 - 5}" text-anchor="middle">${label}</text>`;
-  };
-  const node = (n: N, accent = false) => {
-    s += `<g>
-      <rect class="map-node" x="${n.x}" y="${n.y - NH / 2}" width="${NW}" height="${NH}" rx="8"${accent ? ` stroke="${C.blue}" stroke-width="1.5"` : ""}/>
-      <circle cx="${n.x + 16}" cy="${n.y - 10}" r="4" fill="${n.dot}"/>
-      <text class="map-node-text" x="${n.x + 28}" y="${n.y - 4}">${n.title}</text>
-      <text class="map-node-sub" x="${n.x + 16}" y="${n.y + 16}">${n.sub}</text>
-      ${n.ring ? `<g transform="translate(${n.x + NW - 26},${n.y - 12})"><circle r="13" fill="none" stroke="#2b313b" stroke-width="4"/><circle r="13" fill="none" stroke="${n.ring.color}" stroke-width="4" stroke-linecap="round" stroke-dasharray="${(2 * Math.PI * 13).toFixed(1)}" stroke-dashoffset="${(2 * Math.PI * 13 * (1 - n.ring.pct / 100)).toFixed(1)}" transform="rotate(-90)"/><text y="4" text-anchor="middle" fill="#e8ebf0" font-size="9" font-weight="700">${n.ring.label}</text></g>` : ""}
-    </g>`;
-  };
-  clients.forEach((c, i) => {
-    node(c);
-    edge(c.x + NW, c.y, gateway.x, gateway.y, ["0.14/s", "0.09/s", "0.08/s", "idle"][i], i === 3 ? "" : "hot");
-  });
-  node(gateway, true);
-  backends.forEach((b, i) => {
-    node(b);
-    edge(gateway.x + NW, gateway.y, b.x, b.y, ["28%", "24%", "26%", "22%"][i], i === 3 ? "warn" : "hot");
-  });
-  // backend -> gpu edges (tensor-split shares)
-  const shares: [number, number, string][] = [
-    [0, 0, "60%"], [0, 1, "40%"],
-    [1, 0, "45%"], [1, 1, "35%"], [1, 2, "20%"],
-    [2, 1, "100%"],
-    [3, 2, "100%"],
-  ];
-  shares.forEach(([bi, gi, label]) => edge(backends[bi].x + NW, backends[bi].y, gpus[gi].x, gpus[gi].y, label, "hot"));
-  gpus.forEach((g) => node(g));
-  models.forEach((p, i) => {
-    node(p);
-    const gi = i === 0 ? 0 : i === 1 ? 1 : i === 2 ? 1 : 2;
-    edge(gpus[gi].x + NW, gpus[gi].y, p.x, p.y);
-  });
-  mcp.forEach((n, i) => {
-    node(n);
-    if (i === 1) edge(gateway.x + 40, gateway.y + NH / 2, n.x + 40, n.y - NH / 2, "", "warn");
-  });
-  s += `<text class="map-col-label" x="90" y="52">CLIENTS</text>
-    <text class="map-col-label" x="300" y="240">GATEWAY</text>
-    <text class="map-col-label" x="510" y="52">BACKENDS · POLICY-CHECKED</text>
-    <text class="map-col-label" x="730" y="72">GPUS</text>
-    <text class="map-col-label" x="950" y="52">LOADED MODELS</text>
-    <text class="map-col-label" x="300" y="566">MCP SERVERS</text></svg>`;
 
-  const summary: [string, string][] = [
-    ["Backends", "4 / 4 up"], ["GPUs", "3 / 3 healthy"], ["Throughput", "72.2 tok/s"],
-    ["VRAM held", "35.7 / 48 GB"], ["MXC policy", "learning-mode"], ["Download", "qwen2.5-coder-7b · 62%"],
-  ];
-  return `<div class="topbar"><h1>Service Map</h1>
-      <span class="status-pill"><span class="dot ok"></span> All systems normal</span>
-      <span class="spacer"></span><span class="updated">Last updated 3s ago · sample data</span>
-      <button class="btn" disabled>Pause live</button></div>
-    <div class="view"><div class="banner">${icon("warn")} live data wiring pending — topology rendered from sample data</div>
-    <div class="map-wrap">
-      <div class="map-canvas">${s}
+  // MXC dashed boundary around the backends column. The label states
+  // the configured mode; "POLICY-CHECKED" is claimed only when the
+  // sandbox is not disabled.
+  const ys = backends.map((_, i) => spreadY(i, backends.length));
+  const rectY = Math.max(36, Math.min(...ys) - NH / 2 - 44);
+  const rectH = Math.max(...ys) + NH / 2 + 44 - rectY;
+  const mxcLabel = d.mxcMode ? `MXC \u00b7 ${d.mxcMode.toUpperCase()}` : "MXC";
+  s += `<rect x="${COL.backends - 40}" y="${rectY}" width="${NW + 80}" height="${rectH}" rx="10" fill="none" stroke="#4a9eff" stroke-width="1" stroke-dasharray="7 5" opacity="0.55"/>
+        <text x="${COL.backends + NW / 2}" y="${rectY - 8}" text-anchor="middle" fill="#4a9eff" font-size="10" letter-spacing="1">${esc(mxcLabel)}</text>`;
+
+  const edge = (x1: number, y1: number, x2: number, y2: number, cls = "", stroke = "") => {
+    const mx = (x1 + x2) / 2;
+    s += `<path class="map-edge ${cls}"${stroke ? ` style="stroke:${stroke}"` : ""} d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/>`;
+  };
+  const node = (x: number, y: number, title: string, sub: string, dot: string, stroke = "", ring?: { pct: number; color: string; label: string }, href?: string) => {
+    const g = `<g>
+      <rect class="map-node" x="${x}" y="${y - NH / 2}" width="${NW}" height="${NH}" rx="8"${stroke ? ` stroke="${stroke}" stroke-width="1.5"` : ""}/>
+      <circle cx="${x + 16}" cy="${y - 10}" r="4" fill="${dot}"/>
+      <text class="map-node-text" x="${x + 28}" y="${y - 4}">${esc(title)}</text>
+      <text class="map-node-sub" x="${x + 16}" y="${y + 16}">${esc(sub)}</text>
+      ${ring ? `<g transform="translate(${x + NW - 26},${y - 12})"><circle r="13" fill="none" stroke="#2b313b" stroke-width="4"/><circle r="13" fill="none" stroke="${ring.color}" stroke-width="4" stroke-linecap="round" stroke-dasharray="${(2 * Math.PI * 13).toFixed(1)}" stroke-dashoffset="${(2 * Math.PI * 13 * (1 - ring.pct / 100)).toFixed(1)}" transform="rotate(-90)"/><text y="4" text-anchor="middle" fill="#e8ebf0" font-size="9" font-weight="700">${esc(ring.label)}</text></g>` : ""}
+    </g>`;
+    // Nodes are actionable: backend nodes link to the Backends view,
+    // the gateway node to the Gateway view (SVG <a> elements).
+    s += href ? `<a href="${href}">${g}</a>` : g;
+  };
+
+  // Gateway -> backends for every backend; backends -> GPUs only
+  // where the config assigns a tensor split (a positive fraction for
+  // that GPU index). A backend with no split gets no GPU edges — the
+  // edges show configured placement, not a full mesh.
+  backends.forEach((b, i) => {
+    const e = stateEdge(b.state);
+    edge(COL.gateway + NW, H / 2, COL.backends, ys[i], e.cls, e.stroke);
+    const split = d.splits.get(b.id);
+    if (split) {
+      split.forEach((frac, j) => {
+        if (frac > 0 && gpus[j]) edge(COL.backends + NW, ys[i], COL.gpus, spreadY(j, gpus.length), e.cls, e.stroke);
+      });
+    }
+  });
+
+  // A failed gateway_status call leaves only a zeroed fallback
+  // payload — render the measured-nothing state ("status unknown",
+  // neutral dot) rather than a fabricated ":0 · 0 groups · down".
+  if (d.gatewayError) {
+    node(COL.gateway, H / 2, "LiteLLM", "status unknown", C.grey, "", undefined, "#/gateway");
+  } else {
+    node(COL.gateway, H / 2, "LiteLLM",
+      `:${gateway.port} \u00b7 ${gateway.groups} groups \u00b7 ${gateway.routing_rules} rules${d.live && !gateway.up ? " \u00b7 down" : ""}`,
+      d.live ? (gateway.up ? C.green : C.red) : C.grey, C.blue, undefined, "#/gateway");
+  }
+
+  backends.forEach((b, i) => {
+    const up = b.state === "running" && b.uptime_secs != null ? ` \u00b7 up ${fmtUptime(b.uptime_secs)}` : "";
+    const model = b.model_file ? ` \u00b7 ${b.model_file.split(/[\\/]/).pop()}` : "";
+    node(COL.backends, ys[i], b.id, `:${b.port} \u00b7 ${b.state}${up}${model}`, stateColor(b.state), stateStroke(b.state), undefined, "#/backends");
+  });
+
+  gpus.forEach((g, j) => {
+    const pct = g.vram_total_gb > 0 ? Math.round((g.vram_used_gb / g.vram_total_gb) * 100) : 0;
+    node(COL.gpus, spreadY(j, gpus.length), g.name,
+      `${g.vram_used_gb.toFixed(1)} / ${g.vram_total_gb.toFixed(1)} GB VRAM`,
+      gpuDot(g), "", { pct, color: pct >= 80 ? C.amber : C.green, label: `${pct}%` });
+  });
+
+  s += `<text class="map-col-label" x="${COL.gateway}" y="48">GATEWAY</text>
+    <text class="map-col-label" x="${COL.backends}" y="48">${d.mxcMode === "learning" || d.mxcMode === "enforced" ? "BACKENDS \u00b7 POLICY-CHECKED" : "BACKENDS"}</text>
+    ${gpus.length ? `<text class="map-col-label" x="${COL.gpus}" y="48">GPUS</text>` : ""}</svg>`;
+  return s;
+}
+
+function paintServiceMap(root: HTMLElement, d: MapData): void {
+  const banner = root.querySelector("#mapBanner") as HTMLElement | null;
+  if (banner) {
+    if (d.errors.length) {
+      banner.style.display = "";
+      banner.innerHTML = `${icon("warn")} backend error — showing what could be loaded: ${esc(d.errors.join("; "))}`;
+    } else if (!d.live) {
+      banner.style.display = "";
+      banner.innerHTML = `${icon("warn")} Sample mode — open the installed app to see this machine's topology.`;
+    } else {
+      banner.style.display = "none";
+    }
+  }
+
+  const running = d.backends.filter((b) => b.state === "running").length;
+  const pill = root.querySelector("#mapPill");
+  if (pill) {
+    // The shared verdict rule (api.ts systemVerdict) — the same one
+    // the Dashboard header pill uses. In sample mode the gateway state
+    // is unmeasured, so it does not degrade the verdict.
+    const verdict = systemVerdict({
+      total: d.backends.length,
+      running,
+      stale: d.stale,
+      error: d.errors.length ? d.errors.join("; ") : null,
+      gatewayUp: d.live ? d.gateway.up : true,
+    });
+    pill.innerHTML = `<span class="dot ${verdict.dot}"></span> ${esc(verdict.text)}`;
+  }
+
+  const updated = root.querySelector("#mapUpdated");
+  if (updated) {
+    updated.textContent = `${d.live ? "live data" : "sample data"} \u00b7 updated ${new Date(d.updatedAt).toLocaleTimeString("en-GB")}` + (d.stale ? " \u00b7 telemetry stale" : "");
+  }
+
+  const canvas = root.querySelector("#mapCanvas");
+  if (canvas) {
+    if (!d.backends.length) {
+      // Three distinct empty states: the list could not be loaded
+      // (an error, disclosed in the banner too), live with none
+      // configured, and sample mode's honest no-data state.
+      const emptyText = d.backendsError
+        ? "Backend list could not be loaded."
+        : d.live
+          ? "No backends configured — run the setup wizard to install and configure the stack."
+          : "No backend data in sample mode — open the installed app to see this machine's topology.";
+      canvas.innerHTML = `<div class="empty" style="padding:24px">${emptyText}</div>`;
+    } else {
+      canvas.innerHTML = `${topologySvg(d)}
         <div class="legend" style="margin-top:8px">
-          <span><span class="sw" style="background:${C.green}"></span>healthy</span>
-          <span><span class="sw" style="background:${C.amber}"></span>degraded</span>
-          <span><span class="sw" style="background:${C.red}"></span>down</span>
+          <span><span class="sw" style="background:${C.green}"></span>running</span>
+          <span><span class="sw" style="background:${C.amber}"></span>starting / stopping</span>
+          <span><span class="sw" style="background:${C.red}"></span>failed</span>
+          <span><span class="sw" style="background:${C.grey}"></span>stopped</span>
+          <span><span class="dot ok"></span>GPU ok</span>
+          <span><span class="dot warn"></span>GPU degraded</span>
+          <span><span class="dot err"></span>GPU down</span>
           <span style="border:1px dashed #4a9eff;border-radius:3px;padding:0 5px">MXC boundary</span>
-          <span>edge width = tok/s</span>
-        </div>
-      </div>
+          <span style="color:var(--text3)">Edges to GPUs show configured tensor splits</span>
+          <span><a href="#/backends" style="color:var(--accent)">Backends</a> \u00b7 <a href="#/gateway" style="color:var(--accent)">Gateway</a></span>
+        </div>`;
+    }
+  }
+
+  const vramUsed = d.gpus.reduce((a, g) => a + g.vram_used_gb, 0);
+  const vramTotal = d.gpus.reduce((a, g) => a + g.vram_total_gb, 0);
+  const summary: [string, string][] = [
+    ["Backends", `${running} / ${d.backends.length} running`],
+    ["Gateway", d.gatewayError ? "status unknown" : `:${d.gateway.port} \u00b7 ${d.gateway.groups} groups${d.live && !d.gateway.up ? " \u00b7 down" : ""}`],
+    ["Routing rules", String(d.gateway.routing_rules)],
+    ["GPUs", `${d.gpus.length} detected`],
+    ["VRAM used (all processes)", d.gpus.length ? `${vramUsed.toFixed(1)} / ${vramTotal.toFixed(1)} GB` : "—"],
+  ];
+  const summaryEl = root.querySelector("#mapSummary");
+  if (summaryEl) {
+    summaryEl.innerHTML = summary.map(([k, v]) => `<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #232a34"><span class="k">${esc(k)}</span><span class="v" style="font-size:12px">${esc(v)}</span></div>`).join("");
+  }
+
+  const gpuLoad = root.querySelector("#mapGpuLoad");
+  if (gpuLoad) {
+    gpuLoad.innerHTML = d.gpus.length
+      ? d.gpus.map((g) => `<div style="display:flex;align-items:center;gap:10px;margin:8px 0"><span style="font-size:12px;width:70px">${esc(g.name.replace("Tesla ", ""))}</span>${gaugeRing(g.util_pct, 44, g.util_pct > 60 ? C.amber : C.green, String(g.util_pct), "%")}</div>`).join("")
+      : `<div class="empty">no GPUs reported</div>`;
+  }
+}
+
+export function renderServiceMap(): string {
+  return `<div class="topbar"><h1>Service Map</h1>
+      <span class="status-pill" id="mapPill"><span class="dot idle"></span> Loading</span>
+      <span class="spacer"></span><span class="updated" id="mapUpdated"></span></div>
+    <div class="view"><div class="banner" id="mapBanner">${icon("clock")} Loading topology…</div>
+    <div class="map-wrap">
+      <div class="map-canvas" id="mapCanvas"><div class="empty" style="padding:24px">Loading topology…</div></div>
       <div>
         <div class="card" style="margin-bottom:12px"><div class="sec-title">Cluster summary</div>
-          <div class="kv">${summary.map(([k, v]) => `<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #232a34"><span class="k">${k}</span><span class="v" style="font-size:12px">${v}</span></div>`).join("")}</div>
+          <div class="kv" id="mapSummary"></div>
         </div>
-        <div class="card"><div class="sec-title">Recent events</div>
-          <div class="events">${m.events.map((e) => `<div class="ev"><span class="dot ${e.level === "ok" ? "ok" : e.level === "warn" ? "warn" : "idle"}"></span><time>${esc(e.time)}</time><span>${esc(e.text)}</span></div>`).join("")}</div>
-        </div>
-        <div class="card" style="margin-top:12px"><div class="sec-title">GPU load</div>
-          ${m.gpus.map((g) => `<div style="display:flex;align-items:center;gap:10px;margin:8px 0"><span style="font-size:12px;width:70px">${esc(g.name.replace("Tesla ", ""))}</span>${gaugeRing(g.util_pct, 44, g.util_pct > 60 ? C.amber : C.green, String(g.util_pct), "%")}</div>`).join("")}
+        <div class="card"><div class="sec-title">GPU load</div>
+          <div id="mapGpuLoad"><div class="empty">Loading…</div></div>
         </div>
       </div>
     </div></div>`;
+}
+
+/** Configured tensor splits by backend id, from the app config's
+ *  backends[].flags.tensor_split (the same source the dashboard
+ *  placement derivation reads). */
+function splitsFromConfig(cfg: Record<string, unknown> | null): Map<string, number[]> {
+  const out = new Map<string, number[]>();
+  const backs = Array.isArray(cfg?.backends) ? cfg.backends : [];
+  for (const b of backs) {
+    if (!b || typeof b !== "object" || Array.isArray(b)) continue;
+    const rec = b as Record<string, unknown>;
+    const flags = rec.flags && typeof rec.flags === "object" && !Array.isArray(rec.flags)
+      ? (rec.flags as Record<string, unknown>) : null;
+    // Index-preserving: entry i belongs to GPU i, so a non-numeric
+    // entry becomes 0 rather than being filtered out (filtering would
+    // shift every later fraction onto the wrong GPU — the dashboard's
+    // placementFromConfig maps over the raw array the same way).
+    const split = Array.isArray(flags?.tensor_split)
+      ? (flags.tensor_split as unknown[]).map((x) => (typeof x === "number" && Number.isFinite(x) ? x : 0))
+      : [];
+    if (typeof rec.id === "string" && split.length) out.set(rec.id, split);
+  }
+  return out;
+}
+
+export async function wireServiceMap(root: HTMLElement): Promise<() => void> {
+  let disposed = false;
+  let loading = false;
+
+  const load = async (): Promise<void> => {
+    if (loading) return;
+    loading = true;
+    try {
+      const [b, g, gw, cfg] = await Promise.all([getBackends(), getGpuTelemetry(), getGatewayStatus(), getAppConfig()]);
+      if (disposed) return;
+      // A config failure belongs in the banner too: without it the MXC
+      // labels fall back and the tensor-split edges vanish silently.
+      const errors = [b.error, g.error, gw.error, cfg.error].filter((e): e is string => Boolean(e));
+      const mxc = cfg.data?.mxc as { mode?: unknown } | undefined;
+      paintServiceMap(root, {
+        backends: b.data,
+        gpus: g.data.gpus,
+        stale: g.data.stale,
+        gateway: gw.data,
+        gatewayError: Boolean(gw.error),
+        backendsError: b.error ?? null,
+        mxcMode: typeof mxc?.mode === "string" ? mxc.mode : null,
+        splits: splitsFromConfig(cfg.data),
+        live: b.live && g.live && gw.live,
+        errors,
+        updatedAt: Date.now(),
+      });
+    } finally {
+      loading = false;
+    }
+  };
+
+  await load();
+
+  // Poll on the dashboard pattern: the map asserts live state, so it
+  // refreshes while open and stops on teardown.
+  const timer = window.setInterval(() => { if (!disposed) void load(); }, 5000);
+
+  return () => {
+    disposed = true;
+    window.clearInterval(timer);
+  };
 }

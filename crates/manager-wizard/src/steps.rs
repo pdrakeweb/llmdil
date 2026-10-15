@@ -104,14 +104,18 @@ impl WizardStep for DetectHardware {
     fn planned_commands(&self, _ctx: &WizardContext) -> Vec<PlannedCommand> {
         // Exactly what RealSystemOps::gpu_inventory runs, in order: the
         // per-GPU query, then the plain nvidia-smi header for the driver
-        // version.
+        // version. The program is manager-telemetry's System32-first
+        // resolution (same as the real probe), not a bare PATH lookup.
+        let smi = manager_telemetry::default_smi_path()
+            .to_string_lossy()
+            .into_owned();
         vec![
             PlannedCommand::new(vec![
-                "nvidia-smi".to_string(),
+                smi.clone(),
                 "--query-gpu=index,name,uuid,memory.total,compute_cap".to_string(),
                 "--format=csv,noheader".to_string(),
             ]),
-            PlannedCommand::new(vec!["nvidia-smi".to_string()]),
+            PlannedCommand::new(vec![smi]),
         ]
     }
     fn remediation_hint(&self) -> Option<&str> {
@@ -619,6 +623,12 @@ impl WizardStep for ConfigureTensorSplit {
 /// Step 4: download curated GGUFs with SHA-256 verification.
 /// Audit mode re-verifies installed files without downloading.
 ///
+/// Every model whose checksum matches during a run — downloaded,
+/// already present, or audited — gets `verified_at` stamped into the
+/// persisted config (see [`DownloadModels::stamp_verified_at`]), so
+/// the app's fail-closed backend-start gate accepts wizard-verified
+/// models without a second verification in the Models view.
+///
 /// Download URLs come from [`ModelConfig::source_url`](manager_config::ModelConfig)
 /// (the curated catalog, spec §4.6); a model with an empty `source_url` fails
 /// closed with a clear message.
@@ -720,6 +730,7 @@ impl WizardStep for DownloadModels {
                         }
                         log.push(format!("{}: downloaded and SHA-256 verified", model.id));
                     }
+                    Self::stamp_verified_at(ctx, &model.id, &mut log);
                     verified += 1;
                 }
                 RunMode::Audit => {
@@ -732,6 +743,7 @@ impl WizardStep for DownloadModels {
                     match ctx.ops.sha256_file(&dest).await {
                         Ok(h) if verify(&h) => {
                             log.push(format!("{}: checksum verified", model.id));
+                            Self::stamp_verified_at(ctx, &model.id, &mut log);
                             verified += 1;
                         }
                         Ok(h) => {
@@ -761,6 +773,50 @@ impl WizardStep for DownloadModels {
 }
 
 impl DownloadModels {
+    /// Stamp `verified_at` for one model this run just verified into
+    /// the persisted config.
+    ///
+    /// Steps receive a snapshot clone of the app config
+    /// (`WizardContext::config` is built fresh by the caller and steps
+    /// run through `&WizardContext`), so the stamp cannot ride back
+    /// through `ctx.config` — nothing a step does to it reaches the
+    /// saved `AppConfig`. The persisted config lives at
+    /// `<data_dir>/config.json` (the path the app loads at startup);
+    /// it is the base when it loads. On a first run, when nothing has
+    /// saved that file yet, the context config is the base instead —
+    /// it is the caller's current config, cloned for this step run,
+    /// so saving it back persists exactly what the app would save
+    /// later, plus the stamp. When there is no real data dir on disk
+    /// (unit tests drive the step with fake ops and a fictional data
+    /// dir) there is no persisted config to stamp and this is a no-op.
+    ///
+    /// Best-effort: failures are logged, never failed into the step
+    /// outcome. The verification itself already succeeded; an
+    /// unstamped model simply stays gated until something else
+    /// verifies it.
+    fn stamp_verified_at(ctx: &WizardContext, model_id: &str, log: &mut Vec<String>) {
+        let config_path = ctx.data_dir.join("config.json");
+        let mut config = match manager_config::load(&config_path) {
+            Ok(cfg) => cfg,
+            Err(_) if ctx.data_dir.is_dir() => ctx.config.clone(),
+            Err(_) => return,
+        };
+        let Some(model) = config.models.iter_mut().find(|m| m.id == model_id) else {
+            return;
+        };
+        model.verified_at = Some(chrono::Utc::now());
+        match manager_config::save(&config, &config_path) {
+            Ok(()) => log.push(format!(
+                "{model_id}: verified_at stamped in {}",
+                config_path.display()
+            )),
+            Err(e) => log.push(format!(
+                "{model_id}: could not stamp verified_at in {}: {e}",
+                config_path.display()
+            )),
+        }
+    }
+
     /// Fail when the models still needing download exceed the free space on
     /// the data volume (10% headroom). Sizes come from HEAD Content-Length;
     /// models whose size cannot be determined are logged, not counted. A
@@ -1006,9 +1062,109 @@ impl StartGateway {
             "litellm".to_string(),
             "--config".to_string(),
             cfg.display().to_string(),
+            // Loopback only: without --host LiteLLM binds 0.0.0.0 and
+            // exposes the gateway (and its upstream keys) to the LAN.
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
             "--port".to_string(),
             ctx.config.gateway.port.to_string(),
         ])
+    }
+
+    /// The spawn command plus the OpenRouter key environment. The
+    /// generated YAML references `os.environ/OPENROUTER_API_KEY`; the key
+    /// itself lives in Windows Credential Manager under the tier's
+    /// `cred_ref` and is read here — it is never logged and never
+    /// written into the YAML. When the tier is enabled but the key
+    /// cannot be read, the gateway still starts and the returned warning
+    /// states the OpenRouter fallback is not armed.
+    async fn spawn_command_with_env(
+        &self,
+        ctx: &WizardContext,
+    ) -> (PlannedCommand, Option<String>) {
+        let mut cmd = self.spawn_command(ctx);
+        let tier = &ctx.config.gateway.openrouter;
+        if !tier.enabled {
+            return (cmd, None);
+        }
+        let Some(cred_ref) = tier.cred_ref.as_deref().filter(|r| !r.is_empty()) else {
+            return (
+                cmd,
+                Some(
+                    "OpenRouter fallback is not armed: the cloud tier is enabled but no credential reference is configured"
+                        .to_string(),
+                ),
+            );
+        };
+        match ctx.ops.credential_read(cred_ref).await {
+            Some(key) => {
+                cmd.env.insert("OPENROUTER_API_KEY".to_string(), key);
+                (cmd, None)
+            }
+            None => (
+                cmd,
+                Some(format!(
+                    "OpenRouter fallback is not armed: credential '{cred_ref}' could not be read from Windows Credential Manager"
+                )),
+            ),
+        }
+    }
+
+    /// Stop the gateway recorded in `<data_dir>/gateway.pid`, if any.
+    ///
+    /// Restart semantics: the previously spawned LiteLLM still holds
+    /// the port and serves the old generated config, so spawning a
+    /// second one would fail to bind (silently — its stdio is nulled)
+    /// while the health check passes against the old process. Stopping
+    /// the recorded pid first is what makes re-running this step a
+    /// real restart. A live recorded process that cannot be stopped
+    /// fails the step: failing loudly beats a duplicate spawn.
+    async fn stop_previous_gateway(
+        &self,
+        ctx: &WizardContext,
+        log: &mut Vec<String>,
+    ) -> Result<(), StepOutcome> {
+        let pid_path = crate::gateway_pid_path(&ctx.data_dir);
+        let recorded = match ctx.ops.read_file(&pid_path).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).trim().parse::<u32>().ok(),
+            Err(_) => None,
+        };
+        let Some(old_pid) = recorded else {
+            return Ok(());
+        };
+        if ctx.ops.process_alive(old_pid) {
+            if let Err(e) = ctx.ops.kill_process(old_pid) {
+                return Err(StepOutcome::failed(
+                    format!(
+                        "could not stop the previous gateway (pid {old_pid}): {e}; \
+                         refusing to spawn a duplicate on :{}",
+                        ctx.config.gateway.port
+                    ),
+                    log.clone(),
+                ));
+            }
+            log.push(format!("stopped previous gateway (pid {old_pid})"));
+            // Wait briefly for the process to actually exit so the
+            // port is free before the replacement spawns.
+            for _ in 0..30 {
+                if !ctx.ops.process_alive(old_pid) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if ctx.ops.process_alive(old_pid) {
+                return Err(StepOutcome::failed(
+                    format!(
+                        "previous gateway (pid {old_pid}) is still running after a stop \
+                         request; refusing to spawn a duplicate on :{}",
+                        ctx.config.gateway.port
+                    ),
+                    log.clone(),
+                ));
+            }
+        }
+        let _ = ctx.ops.remove_file(&pid_path).await;
+        Ok(())
     }
 
     async fn wait_healthy(&self, ctx: &WizardContext, log: &mut Vec<String>) -> bool {
@@ -1072,7 +1228,18 @@ impl WizardStep for StartGateway {
                 }
                 cmds.push(self.venv_command(ctx, &uv));
                 cmds.push(self.pip_command(ctx, &uv));
-                cmds.push(self.spawn_command(ctx));
+                let mut spawn = self.spawn_command(ctx);
+                let tier = &ctx.config.gateway.openrouter;
+                if tier.enabled && tier.cred_ref.as_deref().is_some_and(|r| !r.is_empty()) {
+                    // The real key is read from Credential Manager when
+                    // the step runs; the plan only records that the
+                    // variable will be set. The value never appears here.
+                    spawn.env.insert(
+                        "OPENROUTER_API_KEY".to_string(),
+                        "<set from credential manager>".to_string(),
+                    );
+                }
+                cmds.push(spawn);
                 cmds
             }
             // Audit only re-probes the health endpoint; nothing is spawned.
@@ -1134,7 +1301,16 @@ impl WizardStep for StartGateway {
                     return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
                 }
                 log.push(format!("wrote {}", cfg_path.display()));
-                let spawn = self.spawn_command(ctx);
+                // Restart = stop the recorded gateway first; without
+                // this the spawn below is a duplicate that fails to
+                // bind while the old process keeps serving.
+                if let Err(outcome) = self.stop_previous_gateway(ctx, &mut log).await {
+                    return Ok(outcome);
+                }
+                let (spawn, openrouter_warning) = self.spawn_command_with_env(ctx).await;
+                if let Some(w) = &openrouter_warning {
+                    log.push(format!("warning: {w}"));
+                }
                 let pid = match ctx.ops.spawn_detached(&spawn).await {
                     Ok(pid) => pid,
                     Err(e) => {
@@ -1142,6 +1318,22 @@ impl WizardStep for StartGateway {
                     }
                 };
                 log.push(format!("LiteLLM spawned (pid {pid})"));
+                // Record the pid so a later stop (the gateway_stop
+                // command) or restart (this step re-run) terminates
+                // exactly this process instead of guessing by port.
+                let pid_path = crate::gateway_pid_path(&ctx.data_dir);
+                match ctx
+                    .ops
+                    .write_file(&pid_path, pid.to_string().as_bytes())
+                    .await
+                {
+                    Ok(()) => log.push(format!("recorded gateway pid in {}", pid_path.display())),
+                    Err(e) => log.push(format!(
+                        "warning: could not record the gateway pid in {}: {e}; \
+                         stopping this gateway later will not be possible",
+                        pid_path.display()
+                    )),
+                }
                 if !self.wait_healthy(ctx, &mut log).await {
                     return Ok(StepOutcome::failed(
                         format!(
@@ -1151,10 +1343,14 @@ impl WizardStep for StartGateway {
                         log,
                     ));
                 }
-                Ok(StepOutcome::done(
-                    format!("LiteLLM gateway running on :{}", ctx.config.gateway.port),
-                    log,
-                ))
+                let message = match &openrouter_warning {
+                    Some(w) => format!(
+                        "LiteLLM gateway running on :{} — warning: {w}",
+                        ctx.config.gateway.port
+                    ),
+                    None => format!("LiteLLM gateway running on :{}", ctx.config.gateway.port),
+                };
+                Ok(StepOutcome::done(message, log))
             }
             RunMode::Audit => {
                 // Re-probe backend health without reinstalling.
@@ -1969,18 +2165,35 @@ mod tests {
         WizardContext::new(test_config_with_models(), PathBuf::from("/data"), mode, ops)
     }
 
+    /// Serializes every test that swaps the process-global PATH.
+    /// PATH is shared by all test threads in this process, so two
+    /// PathGuard tests running in parallel can restore each other's
+    /// PATH mid-test (the intermittent start-gateway failures: one
+    /// test resolves uv against another test's PATH). PathGuard
+    /// holds this lock from construction until drop, so only one
+    /// swapped PATH is ever live at a time.
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Guard that swaps PATH for the duration of a test. uv resolution
     /// reads the real process PATH, so tests that assert on it must
-    /// control it. Restores on drop.
+    /// control it. Restores on drop. Holds [`PATH_LOCK`] for its whole
+    /// lifetime so PATH-swapping tests never overlap.
     struct PathGuard {
         old: Option<std::ffi::OsString>,
+        // Held purely for its Drop, which releases PATH_LOCK.
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl PathGuard {
         fn set_to(dir: &std::path::Path) -> Self {
+            // Recover from poisoning: a panicking holder must not
+            // wedge every later PATH test in the process.
+            let lock = PATH_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let old = std::env::var_os("PATH");
             std::env::set_var("PATH", dir.as_os_str());
-            Self { old }
+            Self { old, _lock: lock }
         }
     }
 
@@ -2349,6 +2562,132 @@ mod tests {
         assert_eq!(ops.downloads_made().len(), 2, "audit added no downloads");
     }
 
+    // --- DownloadModels: verified_at stamping ---
+
+    /// Config fixture that passes `manager_config::save` validation.
+    /// The shared fixture enables every backend, but its backends point
+    /// at model files absent from the replaced models list, which
+    /// save() rejects. The stamp tests persist the config, so they
+    /// disable the backends (DownloadModels ignores backends).
+    fn stamp_test_config() -> AppConfig {
+        let mut c = test_config_with_models();
+        for b in c.backends.iter_mut() {
+            b.enabled = false;
+        }
+        c
+    }
+
+    /// Unique real temp data dir for the stamp tests: the stamp
+    /// targets `<data_dir>/config.json` on the real filesystem.
+    fn stamp_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("llm-wiz-stamp-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn download_models_install_stamps_verified_at() {
+        let data_dir = stamp_test_dir("install");
+        let config_path = data_dir.join("config.json");
+        // Nothing persisted yet (first run): the stamp falls back to
+        // the context config and creates the persisted file.
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_download(
+            "https://example.com/qwen3-8b.gguf",
+            b"gguf-8b-bytes".to_vec(),
+        );
+        ops.with_download(
+            "https://example.com/qwen2.5-coder-7b.gguf",
+            b"gguf-7b-bytes".to_vec(),
+        );
+        let ctx = WizardContext::new(stamp_test_config(), data_dir.clone(), RunMode::Install, ops);
+        let out = DownloadModels.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+
+        let persisted = manager_config::load(&config_path).unwrap();
+        assert_eq!(persisted.models.len(), 2);
+        for m in &persisted.models {
+            assert!(m.verified_at.is_some(), "{} verified but not stamped", m.id);
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn download_models_audit_stamps_verified_at() {
+        let data_dir = stamp_test_dir("audit");
+        let config_path = data_dir.join("config.json");
+        // A persisted config with no stamps yet: audit loads it as
+        // the stamp base.
+        let config = stamp_test_config();
+        manager_config::save(&config, &config_path).unwrap();
+
+        // Both model files already installed with matching bytes.
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_file(
+            data_dir.join("models/qwen3-8b.gguf"),
+            b"gguf-8b-bytes".to_vec(),
+        );
+        ops.with_file(
+            data_dir.join("models/qwen2.5-coder-7b.gguf"),
+            b"gguf-7b-bytes".to_vec(),
+        );
+        let ctx = WizardContext::new(config, data_dir.clone(), RunMode::Audit, ops);
+        let out = DownloadModels.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(out.message.contains("2/2"), "{out:?}");
+
+        let persisted = manager_config::load(&config_path).unwrap();
+        for m in &persisted.models {
+            assert!(m.verified_at.is_some(), "{} audited but not stamped", m.id);
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn download_models_mismatch_is_not_stamped() {
+        let data_dir = stamp_test_dir("mismatch");
+        let config_path = data_dir.join("config.json");
+        let config = stamp_test_config();
+        manager_config::save(&config, &config_path).unwrap();
+
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_download(
+            "https://example.com/qwen3-8b.gguf",
+            b"gguf-8b-bytes".to_vec(),
+        );
+        // The second model's bytes do not match its pinned hash.
+        ops.with_download(
+            "https://example.com/qwen2.5-coder-7b.gguf",
+            b"tampered-bytes".to_vec(),
+        );
+        let ctx = WizardContext::new(config, data_dir.clone(), RunMode::Install, ops);
+        let out = DownloadModels.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed);
+        assert!(out.message.contains("checksum mismatch"), "{out:?}");
+
+        let persisted = manager_config::load(&config_path).unwrap();
+        let good = persisted
+            .models
+            .iter()
+            .find(|m| m.id == "qwen3-8b")
+            .unwrap();
+        assert!(
+            good.verified_at.is_some(),
+            "model verified earlier in the same run is stamped"
+        );
+        let bad = persisted
+            .models
+            .iter()
+            .find(|m| m.id == "qwen2.5-coder-7b")
+            .unwrap();
+        assert!(
+            bad.verified_at.is_none(),
+            "mismatching model must not be stamped"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     // --- StartGateway ---
 
     #[tokio::test]
@@ -2384,6 +2723,168 @@ mod tests {
             .expect("config written");
         let text = String::from_utf8(cfg).unwrap();
         assert!(text.contains("8081"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn start_gateway_install_stops_previous_and_records_pid() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        // A previous gateway (pid 7777) is recorded and still running.
+        ops.with_file(PathBuf::from("/data/gateway.pid"), b"7777".to_vec());
+        ops.with_live_pid(7777);
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+        };
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        // The old process was terminated before the replacement spawned,
+        // and the pid file now records the new spawn (fake pid 4242).
+        assert_eq!(ops.killed_pids(), vec![7777]);
+        assert_eq!(ops.spawns().len(), 1);
+        let pid_file = ops
+            .file_bytes(&PathBuf::from("/data/gateway.pid"))
+            .expect("pid file written");
+        assert_eq!(String::from_utf8(pid_file).unwrap(), "4242");
+    }
+
+    #[tokio::test]
+    async fn start_gateway_install_fails_when_previous_cannot_be_stopped() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        ops.with_file(PathBuf::from("/data/gateway.pid"), b"7777".to_vec());
+        ops.with_live_pid(7777);
+        ops.with_kill_failure();
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+        };
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(
+            out.message.contains("could not stop the previous gateway"),
+            "{out:?}"
+        );
+        // No duplicate was spawned over the still-running old process.
+        assert!(ops.spawns().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_gateway_audit_does_not_stop_recorded_gateway() {
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok("{}"),
+        );
+        ops.with_file(PathBuf::from("/data/gateway.pid"), b"7777".to_vec());
+        ops.with_live_pid(7777);
+        let ctx = ctx_with(ops.clone(), RunMode::Audit);
+        let out = StartGateway::default().run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done);
+        assert!(ops.killed_pids().is_empty(), "audit kills nothing");
+        assert!(ops.spawns().is_empty(), "audit spawns nothing");
+    }
+
+    fn gateway_ctx_with_openrouter(ops: Arc<FakeSystemOps>, mode: RunMode) -> WizardContext {
+        let mut cfg = test_config_with_models();
+        cfg.gateway.openrouter.enabled = true;
+        cfg.gateway.openrouter.cred_ref = Some("LocalLLM/OpenRouter".to_string());
+        cfg.gateway.openrouter.model_allowlist = vec!["openai/gpt-4o-mini".to_string()];
+        WizardContext::new(cfg, PathBuf::from("/data"), mode, ops)
+    }
+
+    /// Script the bootstrapped uv in the fake fs so gateway tests do
+    /// not need the PATH-mutating PathGuard (parallel tests share the
+    /// process PATH; these tests must not race the ones that use it).
+    fn with_bundled_uv(ops: &FakeSystemOps) {
+        let name = if cfg!(target_os = "windows") {
+            "uv.exe"
+        } else {
+            "uv"
+        };
+        ops.with_file(PathBuf::from("/data/bin").join(name), b"fake-uv".to_vec());
+    }
+
+    #[tokio::test]
+    async fn start_gateway_injects_openrouter_key_from_credential() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_credential_value("LocalLLM/OpenRouter", "sk-test-value");
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let ctx = gateway_ctx_with_openrouter(ops.clone(), RunMode::Install);
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+        };
+        // The plan records the variable but never the value.
+        let planned = step.planned_commands(&ctx);
+        let plan_spawn = planned.last().unwrap();
+        assert_eq!(
+            plan_spawn.env.get("OPENROUTER_API_KEY").map(String::as_str),
+            Some("<set from credential manager>")
+        );
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        // The spawned gateway carries the key in its environment.
+        let envs = ops.spawn_envs();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].get("OPENROUTER_API_KEY").map(String::as_str),
+            Some("sk-test-value")
+        );
+        // Loopback bind on the spawn argv.
+        let spawns = ops.spawns();
+        let host = spawns[0]
+            .windows(2)
+            .find(|w| w[0] == "--host")
+            .expect("--host present");
+        assert_eq!(host[1], "127.0.0.1");
+        // The key never lands in the generated YAML.
+        let cfg = ops
+            .file_bytes(&PathBuf::from("/data/gateway/config.yaml"))
+            .expect("config written");
+        let text = String::from_utf8(cfg).unwrap();
+        assert!(!text.contains("sk-test-value"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn start_gateway_warns_when_openrouter_credential_unreadable() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        // No credential scripted: credential_read returns None.
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let ctx = gateway_ctx_with_openrouter(ops.clone(), RunMode::Install);
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+        };
+        let out = step.run(&ctx).await.unwrap();
+        // The step still succeeds; the outcome carries the warning and
+        // the spawn has no key.
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.message.contains("OpenRouter fallback is not armed"),
+            "{out:?}"
+        );
+        let envs = ops.spawn_envs();
+        assert_eq!(envs.len(), 1);
+        assert!(!envs[0].contains_key("OPENROUTER_API_KEY"));
     }
 
     #[tokio::test]
@@ -2853,11 +3354,16 @@ mod tests {
         );
 
         // DetectHardware: the per-GPU query plus the driver-version header
-        // probe that RealSystemOps::gpu_inventory actually runs.
+        // probe that RealSystemOps::gpu_inventory actually runs. argv[0]
+        // is telemetry's resolved smi path (bare "nvidia-smi" unless a
+        // System32 copy exists).
+        let smi = manager_telemetry::default_smi_path()
+            .to_string_lossy()
+            .into_owned();
         let hw_cmds = DetectHardware.planned_commands(&install_ctx);
         assert_eq!(hw_cmds.len(), 2);
-        assert_eq!(hw_cmds[0].argv[0], "nvidia-smi");
+        assert_eq!(hw_cmds[0].argv[0], smi);
         assert!(hw_cmds[0].argv.iter().any(|a| a.contains("--query-gpu")));
-        assert_eq!(hw_cmds[1].argv, vec!["nvidia-smi".to_string()]);
+        assert_eq!(hw_cmds[1].argv, vec![smi]);
     }
 }

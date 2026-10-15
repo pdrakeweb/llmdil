@@ -23,6 +23,8 @@ pub mod fake;
 pub mod ops;
 pub mod steps;
 
+pub use ops::{gateway_pid_path, stop_gateway};
+
 /// Number of log lines surfaced inline on a failed step (spec §4.1).
 pub const LOG_TAIL_LINES: usize = 20;
 
@@ -337,6 +339,13 @@ pub trait SystemOps: Send + Sync {
     async fn run_command(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError>;
     /// Spawn a long-lived process (gateway); returns the pid.
     async fn spawn_detached(&self, cmd: &PlannedCommand) -> Result<u32, WizardError>;
+    /// Whether a process with `pid` is currently alive.
+    fn process_alive(&self, pid: u32) -> bool;
+    /// Terminate the process with `pid`. On Windows the whole process
+    /// tree dies with it (`taskkill /T`); the recorded gateway pid is
+    /// the server process itself, so a bare termination suffices
+    /// elsewhere.
+    fn kill_process(&self, pid: u32) -> std::io::Result<()>;
     /// Download a URL to `dest`, calling `on_progress(downloaded, total)`.
     /// The callback must be `Sync` so the future stays `Send`.
     async fn download(
@@ -360,6 +369,8 @@ pub trait SystemOps: Send + Sync {
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>, WizardError>;
     /// Write a whole file, creating parent directories.
     async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), WizardError>;
+    /// Remove a file; a missing file is not an error.
+    async fn remove_file(&self, path: &Path) -> Result<(), WizardError>;
     async fn file_exists(&self, path: &Path) -> bool;
     /// Hex-encoded lowercase SHA-256 of a file.
     async fn sha256_file(&self, path: &Path) -> Result<String, WizardError>;
@@ -368,6 +379,13 @@ pub trait SystemOps: Send + Sync {
     /// Check a Windows Credential Manager target exists. The value is never
     /// read — presence only.
     async fn credential_exists(&self, target: &str) -> Result<bool, WizardError>;
+    /// Read a credential's value from Windows Credential Manager by
+    /// target name; `None` when the target is absent or the platform has
+    /// no credential store. Unlike [`Self::credential_exists`] this DOES
+    /// read the secret: callers must never log the returned value or
+    /// write it to disk — it exists to inject a secret into a spawned
+    /// process's environment (e.g. the gateway's OpenRouter key).
+    async fn credential_read(&self, target: &str) -> Option<String>;
     /// User home directory, if known.
     fn home_dir(&self) -> Option<PathBuf>;
 }

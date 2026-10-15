@@ -37,6 +37,8 @@ struct FakeState {
     commands: HashMap<String, FakeCommandBehavior>,
     executed: Vec<Vec<String>>,
     spawns: Vec<Vec<String>>,
+    /// Env map of each `spawn_detached` call, parallel to `spawns`.
+    spawn_envs: Vec<HashMap<String, String>>,
     files: HashMap<PathBuf, Vec<u8>>,
     downloads: HashMap<String, Vec<u8>>,
     progress_calls: Vec<(u64, u64)>,
@@ -49,6 +51,14 @@ struct FakeState {
     gpus: Vec<GpuDescriptor>,
     gpu_error: Option<String>,
     credentials: HashSet<String>,
+    /// Scripted credential values served by `credential_read`.
+    credential_values: HashMap<String, String>,
+    /// Pids `process_alive` reports as running.
+    live_pids: HashSet<u32>,
+    /// Every pid passed to a successful `kill_process`, in order.
+    killed_pids: Vec<u32>,
+    /// When true, `kill_process` fails (and the pid stays live).
+    kill_fails: bool,
     home: Option<PathBuf>,
     free_space: u64,
     head_lengths: HashMap<String, u64>,
@@ -60,6 +70,7 @@ impl Default for FakeState {
             commands: HashMap::new(),
             executed: Vec::new(),
             spawns: Vec::new(),
+            spawn_envs: Vec::new(),
             files: HashMap::new(),
             downloads: HashMap::new(),
             progress_calls: Vec::new(),
@@ -72,6 +83,10 @@ impl Default for FakeState {
             gpus: Vec::new(),
             gpu_error: None,
             credentials: HashSet::new(),
+            credential_values: HashMap::new(),
+            live_pids: HashSet::new(),
+            killed_pids: Vec::new(),
+            kill_fails: false,
             home: None,
             // Default: effectively unlimited, so existing tests never trip
             // the disk-space pre-check.
@@ -187,6 +202,34 @@ impl FakeSystemOps {
         self
     }
 
+    /// Script a credential value: `credential_exists` reports the target
+    /// and `credential_read` returns the value.
+    pub fn with_credential_value(&self, target: &str, value: &str) -> &Self {
+        let mut st = self.state.lock().unwrap();
+        st.credentials.insert(target.to_string());
+        st.credential_values
+            .insert(target.to_string(), value.to_string());
+        drop(st);
+        self
+    }
+
+    /// Script a pid as currently running (for `process_alive`).
+    pub fn with_live_pid(&self, pid: u32) -> &Self {
+        self.state.lock().unwrap().live_pids.insert(pid);
+        self
+    }
+
+    /// Script `kill_process` to fail (the pid stays live).
+    pub fn with_kill_failure(&self) -> &Self {
+        self.state.lock().unwrap().kill_fails = true;
+        self
+    }
+
+    /// Every pid passed to a successful `kill_process`, in order.
+    pub fn killed_pids(&self) -> Vec<u32> {
+        self.state.lock().unwrap().killed_pids.clone()
+    }
+
     pub fn with_home(&self, home: PathBuf) -> &Self {
         self.state.lock().unwrap().home = Some(home);
         self
@@ -216,6 +259,12 @@ impl FakeSystemOps {
     /// Every argv passed to `spawn_detached`, in order.
     pub fn spawns(&self) -> Vec<Vec<String>> {
         self.state.lock().unwrap().spawns.clone()
+    }
+
+    /// Env map of every `spawn_detached` call, in order (parallel to
+    /// [`Self::spawns`]).
+    pub fn spawn_envs(&self) -> Vec<HashMap<String, String>> {
+        self.state.lock().unwrap().spawn_envs.clone()
     }
 
     /// (url, dest) download calls, in order.
@@ -282,8 +331,26 @@ impl SystemOps for FakeSystemOps {
     }
 
     async fn spawn_detached(&self, cmd: &PlannedCommand) -> Result<u32, WizardError> {
-        self.state.lock().unwrap().spawns.push(cmd.argv.clone());
+        let mut st = self.state.lock().unwrap();
+        st.spawns.push(cmd.argv.clone());
+        st.spawn_envs.push(cmd.env.clone());
+        // The scripted spawn is a live process until killed.
+        st.live_pids.insert(4242);
         Ok(4242)
+    }
+
+    fn process_alive(&self, pid: u32) -> bool {
+        self.state.lock().unwrap().live_pids.contains(&pid)
+    }
+
+    fn kill_process(&self, pid: u32) -> std::io::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        if st.kill_fails {
+            return Err(std::io::Error::other("scripted kill failure"));
+        }
+        st.live_pids.remove(&pid);
+        st.killed_pids.push(pid);
+        Ok(())
     }
 
     async fn download(
@@ -374,6 +441,11 @@ impl SystemOps for FakeSystemOps {
         Ok(())
     }
 
+    async fn remove_file(&self, path: &Path) -> Result<(), WizardError> {
+        self.state.lock().unwrap().files.remove(path);
+        Ok(())
+    }
+
     async fn file_exists(&self, path: &Path) -> bool {
         self.state.lock().unwrap().files.contains_key(path)
     }
@@ -395,6 +467,15 @@ impl SystemOps for FakeSystemOps {
 
     async fn credential_exists(&self, target: &str) -> Result<bool, WizardError> {
         Ok(self.state.lock().unwrap().credentials.contains(target))
+    }
+
+    async fn credential_read(&self, target: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .credential_values
+            .get(target)
+            .cloned()
     }
 
     fn home_dir(&self) -> Option<PathBuf> {

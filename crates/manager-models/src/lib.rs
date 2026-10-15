@@ -263,6 +263,7 @@ type ProgressCallback = Arc<Mutex<Box<dyn Fn(DownloadProgress) + Send + 'static>
 /// `download()` returns immediately after spawning the background task; use
 /// [`DownloadHandle::wait`] to await completion, [`DownloadHandle::progress`]
 /// to poll, and pause/resume/cancel to control the transfer.
+#[derive(Clone)]
 pub struct DownloadHandle {
     spec_id: String,
     shared: Arc<DownloadShared>,
@@ -334,6 +335,22 @@ impl DownloadHandle {
         Ok(())
     }
 
+    /// Whether the download has reached a terminal state (done, failed,
+    /// or cancelled). Paused is NOT terminal: the transfer can resume.
+    /// Callers use this to reap finished handles from their registries.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.shared.current_state(),
+            WorkerState::Done | WorkerState::Failed | WorkerState::Cancelled
+        )
+    }
+
+    /// Whether the download is currently paused (parked, partial file
+    /// kept for resume).
+    pub fn is_paused(&self) -> bool {
+        self.shared.current_state() == WorkerState::Paused
+    }
+
     /// Latest progress snapshot (lock-free read).
     pub fn progress(&self) -> DownloadProgress {
         DownloadProgress {
@@ -356,9 +373,12 @@ impl DownloadHandle {
 /// Start downloading `spec` to `dest`, invoking `on_progress` as chunks land.
 ///
 /// Returns immediately with a [`DownloadHandle`]; the transfer runs on a
-/// background task. An existing partial file at `dest` is resumed with
-/// `Range` when the server honors it, otherwise the transfer restarts from
-/// zero. Fails fast on an unparseable URL or an unwritable destination.
+/// background task. Bytes land in a sibling partial file (`dest` with
+/// `.part` appended) and are moved into place at `dest` only once the
+/// transfer completes, so `dest` never holds a partial file. An existing
+/// partial file is resumed with `Range` when the server honors it,
+/// otherwise the transfer restarts from zero. Fails fast on an
+/// unparseable URL or an unwritable destination.
 pub async fn download<F>(
     spec: &ModelSpec,
     dest: &Path,
@@ -456,40 +476,166 @@ async fn download_worker(
     shared.notify.notify_waiters();
 }
 
+/// The partial-file path for a download destination: `dest` with `.part`
+/// appended to the file name. Transfers write here and are renamed into
+/// place at `dest` only on success.
+pub fn partial_path(dest: &Path) -> PathBuf {
+    let mut os = dest.as_os_str().to_owned();
+    os.push(".part");
+    PathBuf::from(os)
+}
+
+/// Parse `Content-Range: bytes START-END/TOTAL` into `(start, total)`.
+fn parse_content_range(header: &str) -> Option<(u64, u64)> {
+    let rest = header.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, _end) = range.split_once('-')?;
+    Some((start.trim().parse().ok()?, total.trim().parse().ok()?))
+}
+
+/// Stream a response body into the partial file (appending when
+/// `append`, truncating otherwise), starting the byte counter at
+/// `downloaded`. Pause parks the transfer; cancel deletes the partial
+/// file. On a complete body the counter and the on-disk length must
+/// agree, then the partial file is moved into place at `dest`.
+#[allow(clippy::too_many_arguments)]
+async fn transfer_body(
+    response: &mut reqwest::Response,
+    part: &Path,
+    dest: &Path,
+    append: bool,
+    mut downloaded: u64,
+    total: u64,
+    spec: &ModelSpec,
+    shared: &DownloadShared,
+    callback: &ProgressCallback,
+) -> Result<(), ModelError> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = if append {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(part)
+            .await
+            .map_err(|e| ModelError::Io(e.to_string()))?
+    } else {
+        tokio::fs::File::create(part)
+            .await
+            .map_err(|e| ModelError::Io(e.to_string()))?
+    };
+    report_progress(shared, callback, downloaded, total);
+
+    loop {
+        match shared.current_state() {
+            WorkerState::Cancelled => {
+                drop(file);
+                let _ = tokio::fs::remove_file(part).await;
+                return Err(ModelError::Cancelled(spec.id.clone()));
+            }
+            WorkerState::Paused => {
+                wait_while_paused(shared).await;
+                continue;
+            }
+            _ => {}
+        }
+
+        tokio::select! {
+            chunk_result = response.chunk() => {
+                match chunk_result {
+                    Ok(Some(chunk)) => {
+                        file.write_all(&chunk)
+                            .await
+                            .map_err(|e| ModelError::Io(e.to_string()))?;
+                        downloaded += chunk.len() as u64;
+                        report_progress(shared, callback, downloaded, total);
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(ModelError::Network(e.to_string())),
+                }
+            }
+            _ = shared.notify.notified() => {
+                // Control state changed (pause/cancel); re-check above.
+                continue;
+            }
+        }
+    }
+
+    if total > 0 && downloaded < total {
+        return Err(ModelError::Network(format!(
+            "short read for {}: {downloaded}/{total} bytes",
+            spec.id
+        )));
+    }
+    // The byte counter and the file must agree before we report
+    // success: never mark a download done with a short file.
+    // `sync_all` first: the durability check below must observe
+    // every byte `write_all` reported, even on filesystems where
+    // close() completion and stat visibility can otherwise race
+    // under heavy parallel load.
+    file.sync_all()
+        .await
+        .map_err(|e| ModelError::Io(e.to_string()))?;
+    drop(file);
+    let file_len = tokio::fs::metadata(part)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if file_len != downloaded {
+        return Err(ModelError::Network(format!(
+            "file size mismatch for {}: counted {downloaded} bytes but file is {file_len} bytes",
+            spec.id
+        )));
+    }
+    // Transfer complete: move the partial file into place. A previous
+    // file at `dest` (e.g. an older download being replaced) is removed
+    // first — rename does not overwrite on Windows.
+    if tokio::fs::metadata(dest).await.is_ok() {
+        tokio::fs::remove_file(dest)
+            .await
+            .map_err(|e| ModelError::Io(e.to_string()))?;
+    }
+    tokio::fs::rename(part, dest)
+        .await
+        .map_err(|e| ModelError::Io(e.to_string()))?;
+    Ok(())
+}
+
 async fn download_inner(
     spec: &ModelSpec,
     dest: &Path,
     shared: &DownloadShared,
     callback: &ProgressCallback,
 ) -> Result<(), ModelError> {
-    use tokio::io::AsyncWriteExt;
-
     // Parent dir is created fail-fast in `download()`; the worker assumes it.
+    let part = partial_path(dest);
     let client = reqwest::Client::new();
-    let mut offset: u64 = match tokio::fs::metadata(dest).await {
+    let mut offset: u64 = match tokio::fs::metadata(&part).await {
         Ok(meta) => meta.len(),
         Err(_) => 0,
     };
-    // At most two attempts: the second drops the Range header after a
-    // server-ignored range (HTTP 200 to a ranged request).
-    let mut range_attempted = false;
 
-    for _ in 0..2 {
+    // Bounded attempts: a ranged try, plus fresh restarts after a
+    // mismatched 206 range or a stale-partial 416.
+    for _ in 0..3 {
         match shared.current_state() {
-            WorkerState::Cancelled => return Err(ModelError::Cancelled(spec.id.clone())),
+            WorkerState::Cancelled => {
+                let _ = tokio::fs::remove_file(&part).await;
+                return Err(ModelError::Cancelled(spec.id.clone()));
+            }
             WorkerState::Paused => {
                 wait_while_paused(shared).await;
                 if shared.current_state() == WorkerState::Cancelled {
+                    let _ = tokio::fs::remove_file(&part).await;
                     return Err(ModelError::Cancelled(spec.id.clone()));
                 }
             }
             _ => {}
         }
 
+        let ranged = offset > 0;
         let mut request = client.get(&spec.url);
-        if offset > 0 {
+        if ranged {
             request = request.header("Range", format!("bytes={offset}-"));
-            range_attempted = true;
         }
         let mut response = request
             .send()
@@ -497,132 +643,88 @@ async fn download_inner(
             .map_err(|e| ModelError::Network(e.to_string()))?;
         let status = response.status();
 
-        enum Mode {
-            Append { total: u64 },
-            Restart { total: u64 },
-            AlreadyComplete,
-        }
-        let mode = if status == reqwest::StatusCode::PARTIAL_CONTENT {
-            let total = response
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            let (start, total) = response
                 .headers()
                 .get("Content-Range")
                 .and_then(|v| v.to_str().ok())
-                .and_then(parse_content_range_total)
+                .and_then(parse_content_range)
                 .ok_or_else(|| {
                     ModelError::Network("206 response without a parseable Content-Range".into())
                 })?;
-            Mode::Append { total }
-        } else if status == reqwest::StatusCode::OK {
-            if range_attempted && offset > 0 {
-                // Server ignored the Range header: restart from zero.
+            if start != offset {
+                // The server answered a different range than requested:
+                // appending would corrupt the file. Discard the response
+                // and the partial, and restart with a plain GET.
+                drop(response);
+                let _ = tokio::fs::remove_file(&part).await;
                 offset = 0;
-                range_attempted = false;
-                tokio::fs::write(dest, &[] as &[u8])
-                    .await
-                    .map_err(|e| ModelError::Io(e.to_string()))?;
                 continue;
             }
+            return transfer_body(
+                &mut response,
+                &part,
+                dest,
+                true,
+                offset,
+                total,
+                spec,
+                shared,
+                callback,
+            )
+            .await;
+        } else if status == reqwest::StatusCode::OK {
+            // A 200 to a ranged request means the server ignored the
+            // Range header: this body is the whole file from byte zero,
+            // so the partial is truncated and rewritten from scratch.
             let total = response
                 .headers()
                 .get(reqwest::header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(spec.size_bytes);
-            Mode::Restart { total }
+            return transfer_body(
+                &mut response,
+                &part,
+                dest,
+                false,
+                0,
+                total,
+                spec,
+                shared,
+                callback,
+            )
+            .await;
         } else if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-            Mode::AlreadyComplete
+            // The partial is at or past the end of the resource. It is
+            // the complete file only when its size matches the total
+            // the server reports in `Content-Range: bytes */TOTAL`.
+            let total = response
+                .headers()
+                .get("Content-Range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_range_total);
+            if offset > 0 && total == Some(offset) {
+                report_progress(shared, callback, offset, offset);
+                if tokio::fs::metadata(dest).await.is_ok() {
+                    tokio::fs::remove_file(dest)
+                        .await
+                        .map_err(|e| ModelError::Io(e.to_string()))?;
+                }
+                tokio::fs::rename(&part, dest)
+                    .await
+                    .map_err(|e| ModelError::Io(e.to_string()))?;
+                return Ok(());
+            }
+            // Stale or oversized partial: delete it and retry fresh.
+            let _ = tokio::fs::remove_file(&part).await;
+            offset = 0;
+            continue;
         } else {
             return Err(ModelError::Network(format!(
                 "download of {} failed: HTTP {status}",
                 spec.id
             )));
-        };
-
-        match mode {
-            Mode::AlreadyComplete => {
-                let total = offset;
-                report_progress(shared, callback, total, total);
-                return Ok(());
-            }
-            Mode::Append { total } | Mode::Restart { total } => {
-                let append = matches!(mode, Mode::Append { .. });
-                let mut file = if append {
-                    tokio::fs::OpenOptions::new()
-                        .append(true)
-                        .open(dest)
-                        .await
-                        .map_err(|e| ModelError::Io(e.to_string()))?
-                } else {
-                    tokio::fs::File::create(dest)
-                        .await
-                        .map_err(|e| ModelError::Io(e.to_string()))?
-                };
-                let mut downloaded = offset;
-                report_progress(shared, callback, downloaded, total);
-
-                loop {
-                    match shared.current_state() {
-                        WorkerState::Cancelled => {
-                            drop(file);
-                            let _ = tokio::fs::remove_file(dest).await;
-                            return Err(ModelError::Cancelled(spec.id.clone()));
-                        }
-                        WorkerState::Paused => {
-                            wait_while_paused(shared).await;
-                            continue;
-                        }
-                        _ => {}
-                    }
-
-                    tokio::select! {
-                        chunk_result = response.chunk() => {
-                            match chunk_result {
-                                Ok(Some(chunk)) => {
-                                    file.write_all(&chunk)
-                                        .await
-                                        .map_err(|e| ModelError::Io(e.to_string()))?;
-                                    downloaded += chunk.len() as u64;
-                                    report_progress(shared, callback, downloaded, total);
-                                }
-                                Ok(None) => break,
-                                Err(e) => return Err(ModelError::Network(e.to_string())),
-                            }
-                        }
-                        _ = shared.notify.notified() => {
-                            // Control state changed (pause/cancel); re-check above.
-                            continue;
-                        }
-                    }
-                }
-
-                if total > 0 && downloaded < total {
-                    return Err(ModelError::Network(format!(
-                        "short read for {}: {downloaded}/{total} bytes",
-                        spec.id
-                    )));
-                }
-                // The byte counter and the file must agree before we report
-                // success: never mark a download done with a short file.
-                // `sync_all` first: the durability check below must observe
-                // every byte `write_all` reported, even on filesystems where
-                // close() completion and stat visibility can otherwise race
-                // under heavy parallel load.
-                file.sync_all()
-                    .await
-                    .map_err(|e| ModelError::Io(e.to_string()))?;
-                drop(file);
-                let file_len = tokio::fs::metadata(dest)
-                    .await
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                if file_len != downloaded {
-                    return Err(ModelError::Network(format!(
-                        "file size mismatch for {}: counted {downloaded} bytes but file is {file_len} bytes",
-                        spec.id
-                    )));
-                }
-                return Ok(());
-            }
         }
     }
 
@@ -728,24 +830,36 @@ pub struct DeleteReport {
     pub bytes_freed: u64,
 }
 
+/// Path comparison key for the reference guard: separators unified and
+/// case folded — the same normalization `manager_config::validate`
+/// applies when comparing a backend's `model_file` to a model's
+/// `gguf_path` (replicated here; the original lives in manager-config).
+fn normalize_model_path(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
 /// Guarded model deletion.
 ///
 /// Refuses when any backend references the model — either by pointing its
-/// `model_file` at the model's `gguf_path`, or by appearing in the model's
-/// `assigned_backends`. Otherwise deletes the file at `gguf_path` (a missing
-/// file is not an error: the desired end state is already reached) and
-/// returns a [`DeleteReport`].
+/// `model_file` at the model's `gguf_path` (compared after path
+/// normalization), or by appearing in the model's `assigned_backends`.
+/// Otherwise deletes the file at `file_path` (a missing file is not an
+/// error: the desired end state is already reached) and returns a
+/// [`DeleteReport`].
 ///
 /// Removing the model from the caller's registry / config is the caller's
 /// job, after this returns `Ok`.
 pub fn delete_model_file(
     model: &manager_config::ModelConfig,
     backends: &[manager_config::BackendConfig],
+    file_path: &Path,
 ) -> Result<DeleteReport, ModelError> {
+    let target = normalize_model_path(&model.gguf_path);
     let referencing: Vec<String> = backends
         .iter()
         .filter(|b| {
-            b.model_file == model.gguf_path || model.assigned_backends.iter().any(|a| a == &b.id)
+            normalize_model_path(&b.model_file) == target
+                || model.assigned_backends.iter().any(|a| a == &b.id)
         })
         .map(|b| b.id.clone())
         .collect();
@@ -755,10 +869,10 @@ pub fn delete_model_file(
             backends: referencing,
         });
     }
-    let (file_existed, bytes_freed) = match std::fs::metadata(&model.gguf_path) {
+    let (file_existed, bytes_freed) = match std::fs::metadata(file_path) {
         Ok(meta) => {
             let bytes = meta.len();
-            std::fs::remove_file(&model.gguf_path)?;
+            std::fs::remove_file(file_path)?;
             (true, bytes)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, 0),
@@ -766,7 +880,7 @@ pub fn delete_model_file(
     };
     Ok(DeleteReport {
         id: model.id.clone(),
-        path: model.gguf_path.clone(),
+        path: file_path.to_path_buf(),
         file_existed,
         bytes_freed,
     })
@@ -850,6 +964,7 @@ mod tests {
     struct TestServer {
         addr: std::net::SocketAddr,
         served_range: Arc<AtomicBool>,
+        served_bad_range: Arc<AtomicBool>,
     }
 
     async fn start_server() -> TestServer {
@@ -857,20 +972,33 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let served_range = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&served_range);
+        let served_bad_range = Arc::new(AtomicBool::new(false));
+        let bad_flag = Arc::clone(&served_bad_range);
         tokio::spawn(async move {
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
                 let flag = Arc::clone(&flag);
-                tokio::spawn(async move { handle_test_conn(socket, flag).await });
+                let bad_flag = Arc::clone(&bad_flag);
+                tokio::spawn(async move { handle_test_conn(socket, flag, bad_flag).await });
             }
         });
-        TestServer { addr, served_range }
+        TestServer {
+            addr,
+            served_range,
+            served_bad_range,
+        }
     }
 
     /// Minimal HTTP/1.1 server. `/file` honors `Range` (206); `/no-range`
-    /// ignores it (200, no Accept-Ranges). Body is drip-fed in 64 KiB
-    /// chunks so pause/cancel can interleave deterministically.
-    async fn handle_test_conn(mut socket: TcpStream, served_range: Arc<AtomicBool>) {
+    /// ignores it (200, no Accept-Ranges); `/bad-range` answers a Range
+    /// request with a 206 whose Content-Range lies about the start (always
+    /// claims 0). Body is drip-fed in 64 KiB chunks so pause/cancel can
+    /// interleave deterministically.
+    async fn handle_test_conn(
+        mut socket: TcpStream,
+        served_range: Arc<AtomicBool>,
+        served_bad_range: Arc<AtomicBool>,
+    ) {
         let mut req = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
@@ -912,7 +1040,7 @@ mod tests {
 
         let payload = test_payload();
         let payload_len = payload.len() as u64;
-        let supports_range = path == "/file";
+        let supports_range = path == "/file" || path == "/bad-range";
 
         if supports_range {
             if let Some(start) = range_start {
@@ -923,6 +1051,24 @@ mod tests {
                          Connection: close\r\nContent-Length: 0\r\n\r\n"
                     );
                     let _ = socket.write_all(headers.as_bytes()).await;
+                    return;
+                }
+                if path == "/bad-range" {
+                    // Lie about the range: claim the body starts at 0
+                    // whatever was requested, and send the whole payload.
+                    served_bad_range.store(true, Ordering::SeqCst);
+                    let headers = format!(
+                        "HTTP/1.1 206 Partial Content\r\n\
+                         Content-Length: {payload_len}\r\n\
+                         Accept-Ranges: bytes\r\n\
+                         Content-Range: bytes 0-{}/{payload_len}\r\n\
+                         Connection: close\r\n\r\n",
+                        payload_len - 1
+                    );
+                    if socket.write_all(headers.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    drip_body(&mut socket, payload, 0).await;
                     return;
                 }
                 served_range.store(true, Ordering::SeqCst);
@@ -1025,6 +1171,10 @@ mod tests {
         handle.wait().await.unwrap();
 
         assert_eq!(std::fs::read(&dest).unwrap(), test_payload());
+        assert!(
+            !partial_path(&dest).exists(),
+            "partial file must be moved into place on success"
+        );
         let fractions = fractions.lock().unwrap();
         assert!(!fractions.is_empty());
         assert!((fractions.last().unwrap() - 1.0).abs() < 1e-9);
@@ -1046,6 +1196,11 @@ mod tests {
         handle.pause().await.unwrap();
         let snap = handle.progress().downloaded_bytes;
         assert!(snap > 0);
+        // While paused the bytes live only in the partial file; the
+        // destination must not exist yet.
+        assert!(handle.is_paused());
+        assert!(partial_path(&dest).exists());
+        assert!(!dest.exists(), "dest must not hold a partial download");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             handle.progress().downloaded_bytes,
@@ -1056,6 +1211,7 @@ mod tests {
         handle.resume().await.unwrap();
         handle.wait().await.unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), test_payload());
+        assert!(!partial_path(&dest).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1075,7 +1231,37 @@ mod tests {
             matches!(result, Err(ModelError::Cancelled(_))),
             "expected Cancelled, got {result:?}"
         );
-        assert!(!dest.exists(), "partial file must be removed on cancel");
+        assert!(!dest.exists(), "dest must never hold a partial file");
+        assert!(
+            !partial_path(&dest).exists(),
+            "partial file must be removed on cancel"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn download_cancel_while_paused_deletes_partial() {
+        let server = start_server().await;
+        let dir = test_temp_dir("dl-cancel-paused");
+        let dest = dir.join("model.gguf");
+        let spec = download_spec(&server, "/file");
+
+        let handle = download(&spec, &dest, |_| {}).await.unwrap();
+        wait_for_partial(&handle).await;
+
+        handle.pause().await.unwrap();
+        assert!(partial_path(&dest).exists());
+        handle.cancel().await.unwrap();
+        let result = handle.wait().await;
+        assert!(
+            matches!(result, Err(ModelError::Cancelled(_))),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(!dest.exists(), "dest must never hold a partial file");
+        assert!(
+            !partial_path(&dest).exists(),
+            "partial file must be removed when a paused download is cancelled"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1084,8 +1270,9 @@ mod tests {
         let server = start_server().await;
         let dir = test_temp_dir("dl-resume");
         let dest = dir.join("model.gguf");
-        // Pre-write the first MiB as if from an earlier interrupted download.
-        std::fs::write(&dest, &test_payload()[..1024 * 1024]).unwrap();
+        // Pre-write the first MiB of the partial file, as if from an
+        // earlier interrupted download.
+        std::fs::write(partial_path(&dest), &test_payload()[..1024 * 1024]).unwrap();
         let spec = download_spec(&server, "/file");
 
         let handle = download(&spec, &dest, |_| {}).await.unwrap();
@@ -1095,6 +1282,7 @@ mod tests {
             server.served_range.load(Ordering::SeqCst),
             "server should have seen a Range request"
         );
+        assert!(!partial_path(&dest).exists());
         let got = std::fs::read(&dest).unwrap();
         let want = test_payload();
         if got != want {
@@ -1114,11 +1302,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_finalizes_complete_partial_on_416() {
+        let server = start_server().await;
+        let dir = test_temp_dir("dl-complete-part");
+        let dest = dir.join("model.gguf");
+        // The partial already holds the whole file (e.g. a previous
+        // transfer finished writing but the app died before the rename).
+        std::fs::write(partial_path(&dest), test_payload()).unwrap();
+        let spec = download_spec(&server, "/file");
+
+        let handle = download(&spec, &dest, |_| {}).await.unwrap();
+        handle.wait().await.unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), test_payload());
+        assert!(!partial_path(&dest).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn download_restarts_when_server_ignores_range() {
         let server = start_server().await;
         let dir = test_temp_dir("dl-norange");
         let dest = dir.join("model.gguf");
-        std::fs::write(&dest, &test_payload()[..1024]).unwrap();
+        std::fs::write(partial_path(&dest), &test_payload()[..1024]).unwrap();
         let spec = download_spec(&server, "/no-range");
 
         let handle = download(&spec, &dest, |_| {}).await.unwrap();
@@ -1129,6 +1335,54 @@ mod tests {
             "server must not see a Range request on /no-range"
         );
         assert_eq!(std::fs::read(&dest).unwrap(), test_payload());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn download_restarts_on_mismatched_206_range() {
+        let server = start_server().await;
+        let dir = test_temp_dir("dl-badrange");
+        let dest = dir.join("model.gguf");
+        // Partial from an earlier interrupted download: the client asks
+        // for `Range: bytes=1048576-`, the server answers 206 claiming
+        // the range starts at 0. Appending that body would corrupt the
+        // file; the client must discard the partial and restart with a
+        // plain GET.
+        std::fs::write(partial_path(&dest), &test_payload()[..1024 * 1024]).unwrap();
+        let spec = download_spec(&server, "/bad-range");
+
+        let handle = download(&spec, &dest, |_| {}).await.unwrap();
+        handle.wait().await.unwrap();
+
+        assert!(
+            server.served_bad_range.load(Ordering::SeqCst),
+            "server should have served the mismatched 206"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), test_payload());
+        assert!(!partial_path(&dest).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn download_discards_stale_partial_on_416_total_mismatch() {
+        let server = start_server().await;
+        let dir = test_temp_dir("dl-stale416");
+        let dest = dir.join("model.gguf");
+        // Stale partial larger than the resource itself (e.g. the model
+        // file changed upstream). The Range request starts past the end;
+        // the server's 416 reports the real total, which does not match
+        // the partial size, so the partial must be deleted — not renamed
+        // into place — and the download retried fresh.
+        let mut stale = test_payload().to_vec();
+        stale.extend_from_slice(&[0xEE; 1024 * 1024]);
+        std::fs::write(partial_path(&dest), &stale).unwrap();
+        let spec = download_spec(&server, "/file");
+
+        let handle = download(&spec, &dest, |_| {}).await.unwrap();
+        handle.wait().await.unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), test_payload());
+        assert!(!partial_path(&dest).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1341,7 +1595,7 @@ mod tests {
         let model = test_model_config("m1", path.clone());
         let backends = vec![test_backend("planner", PathBuf::from("/other/model.gguf"))];
 
-        let report = delete_model_file(&model, &backends).expect("delete");
+        let report = delete_model_file(&model, &backends, &path).expect("delete");
         assert_eq!(report.id, "m1");
         assert_eq!(report.path, path);
         assert!(report.file_existed);
@@ -1355,7 +1609,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let model = test_model_config("m2", path);
 
-        let report = delete_model_file(&model, &[]).expect("delete");
+        let report = delete_model_file(&model, &[], &model.gguf_path.clone()).expect("delete");
         assert!(!report.file_existed);
         assert_eq!(report.bytes_freed, 0);
     }
@@ -1366,9 +1620,24 @@ mod tests {
         let model = test_model_config("m3", path.clone());
         let backends = vec![test_backend("planner", path.clone())];
 
-        let err = delete_model_file(&model, &backends).expect_err("must refuse");
+        let err = delete_model_file(&model, &backends, &path).expect_err("must refuse");
         assert!(matches!(err, ModelError::InUse { .. }));
         assert!(err.to_string().contains("planner"));
+        assert!(path.exists(), "refused delete must leave the file");
+        std::fs::remove_file(&path).expect("cleanup");
+    }
+
+    #[test]
+    fn delete_model_file_refuses_with_normalized_path_match() {
+        let path = temp_gguf("delete-refused-normalized", b"gguf-bytes");
+        let model = test_model_config("m5", path.clone());
+        // Same file, spelled with different case and separators: the
+        // guard compares normalized paths, so this still refuses.
+        let spelled = path.to_string_lossy().replace('/', "\\").to_uppercase();
+        let backends = vec![test_backend("planner", PathBuf::from(spelled))];
+
+        let err = delete_model_file(&model, &backends, &path).expect_err("must refuse");
+        assert!(matches!(err, ModelError::InUse { .. }));
         assert!(path.exists(), "refused delete must leave the file");
         std::fs::remove_file(&path).expect("cleanup");
     }
@@ -1381,7 +1650,7 @@ mod tests {
         // Backend points at a *different* file: the assignment alone guards.
         let backends = vec![test_backend("coder", PathBuf::from("/other/model.gguf"))];
 
-        let err = delete_model_file(&model, &backends).expect_err("must refuse");
+        let err = delete_model_file(&model, &backends, &path).expect_err("must refuse");
         assert!(matches!(err, ModelError::InUse { .. }));
         assert!(path.exists(), "refused delete must leave the file");
         std::fs::remove_file(&path).expect("cleanup");

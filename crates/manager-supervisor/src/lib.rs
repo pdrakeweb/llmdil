@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
@@ -202,6 +202,15 @@ pub struct LogRecord {
     pub ts: DateTime<Utc>,
     pub stream: LogStream,
     pub line: String,
+    /// Process id that produced the line. Empty at capture time — the
+    /// stream readers do not know their ring's key — and stamped from the
+    /// ring key by [`Supervisor::logs_query`] on every record it returns,
+    /// so a merged "all" view can attribute each line to its process.
+    pub source: String,
+    /// True when the record comes from the archived previous-run ring of
+    /// its process rather than the current ring. Stamped at query time,
+    /// like `source`.
+    pub archived: bool,
 }
 
 impl LogRecord {
@@ -210,6 +219,8 @@ impl LogRecord {
             ts: Utc::now(),
             stream,
             line: line.into(),
+            source: String::new(),
+            archived: false,
         }
     }
 }
@@ -310,6 +321,49 @@ fn send_graceful_signal(child: &Child) {
     }
 }
 
+/// Max bytes accumulated for one captured log line (64 KiB). A supervised
+/// process emitting a never-terminated line must not grow the manager's
+/// memory without bound: past the cap the accumulated line is emitted
+/// with a truncation marker and the rest of the line is discarded.
+pub const MAX_LOG_LINE_BYTES: usize = 64 * 1024;
+
+/// Append `bytes` to the line being accumulated, capping the total at
+/// [`MAX_LOG_LINE_BYTES`]. Sets `truncated` when any byte had to be
+/// dropped; once set, further appends discard until the line ends.
+fn append_capped(line: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {
+    if *truncated {
+        return;
+    }
+    let room = MAX_LOG_LINE_BYTES.saturating_sub(line.len());
+    if bytes.len() > room {
+        line.extend_from_slice(&bytes[..room]);
+        *truncated = true;
+    } else {
+        line.extend_from_slice(bytes);
+    }
+}
+
+/// Push one completed captured line into the ring. Lossy UTF-8 (a
+/// non-UTF8 byte sequence must not kill capture), trailing CR stripped
+/// (the LF was already consumed by the splitter), truncation marked.
+fn push_captured_line(
+    ring: &Arc<Mutex<RingBuffer<LogRecord>>>,
+    which: LogStream,
+    bytes: &[u8],
+    truncated: bool,
+) {
+    let text = String::from_utf8_lossy(bytes);
+    let line = text.strip_suffix('\r').unwrap_or(&text);
+    let line = if truncated {
+        format!("{line} [truncated: line exceeded the 64 KiB capture cap]")
+    } else {
+        line.to_string()
+    };
+    if let Ok(mut r) = ring.lock() {
+        r.push(LogRecord::new(which, line));
+    }
+}
+
 fn spawn_reader<R>(
     stream: R,
     which: LogStream,
@@ -319,26 +373,39 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        // read_until + from_utf8_lossy: a non-UTF8 byte sequence must not
-        // kill the reader (BufRead::lines would end the loop on the first
-        // decode error and silently drop all subsequent output).
+        // Fixed-size chunk reads, split on LF manually: read_until would
+        // accumulate a whole unterminated line in memory before returning
+        // anything, which is exactly the unbounded growth the cap exists
+        // to prevent. The accumulated line never exceeds
+        // MAX_LOG_LINE_BYTES.
         let mut reader = BufReader::new(stream);
-        let mut buf = Vec::new();
+        let mut line: Vec<u8> = Vec::new();
+        let mut truncated = false;
+        let mut chunk = [0u8; 8192];
         loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf).await {
+            match reader.read(&mut chunk).await {
                 Ok(0) => break, // EOF
-                Ok(_) => {
-                    let text = String::from_utf8_lossy(&buf);
-                    let line = text.strip_suffix('\n').unwrap_or(&text);
-                    let line = line.strip_suffix('\r').unwrap_or(line);
-                    let rec = LogRecord::new(which, line.to_string());
-                    if let Ok(mut r) = ring.lock() {
-                        r.push(rec);
+                Ok(n) => {
+                    let data = &chunk[..n];
+                    let mut start = 0usize;
+                    for (i, &b) in data.iter().enumerate() {
+                        if b == b'\n' {
+                            append_capped(&mut line, &data[start..i], &mut truncated);
+                            push_captured_line(&ring, which, &line, truncated);
+                            line.clear();
+                            truncated = false;
+                            start = i + 1;
+                        }
                     }
+                    append_capped(&mut line, &data[start..], &mut truncated);
                 }
                 Err(_) => break,
             }
+        }
+        // EOF with an unterminated tail: emit what was captured (the
+        // previous read_until loop did the same via its final read).
+        if !line.is_empty() || truncated {
+            push_captured_line(&ring, which, &line, truncated);
         }
     })
 }
@@ -617,8 +684,15 @@ pub struct Supervisor {
     specs: HashMap<String, ProcessSpec>,
     live: HashMap<String, SupervisedProcess>,
     /// Retained log rings of stopped/reaped processes so `logs_query` keeps
-    /// working after a process exits. Replaced on the next spawn of the id.
+    /// working after a process exits. Moved to `archived_rings` on the next
+    /// spawn of the id.
     dead_rings: HashMap<String, Arc<Mutex<RingBuffer<LogRecord>>>>,
+    /// One archived previous-run ring per id: when an id is spawned again,
+    /// its retained ring moves here (replacing any older archive) so the
+    /// previous run's output — usually the failure being recovered from —
+    /// survives the respawn. Records from these rings are returned by
+    /// `logs_query` flagged `archived`.
+    archived_rings: HashMap<String, Arc<Mutex<RingBuffer<LogRecord>>>>,
     probes: HashMap<String, Arc<dyn HealthProbe>>,
     trackers: HashMap<String, HealthTracker>,
     failed_ids: HashSet<String>,
@@ -632,6 +706,7 @@ impl Supervisor {
             specs: HashMap::new(),
             live: HashMap::new(),
             dead_rings: HashMap::new(),
+            archived_rings: HashMap::new(),
             probes: HashMap::new(),
             trackers: HashMap::new(),
             failed_ids: HashSet::new(),
@@ -648,6 +723,32 @@ impl Supervisor {
     /// `spawn_backend` spawns and what `launch_argv` reports.
     pub fn register_spec(&mut self, spec: ProcessSpec) {
         self.specs.insert(spec.id.clone(), spec);
+    }
+
+    /// The registered spec for `id`, if any.
+    pub fn spec(&self, id: &str) -> Option<&ProcessSpec> {
+        self.specs.get(id)
+    }
+
+    /// Remove the spec for `id`. Refused (returns false) while a process
+    /// with that id is live — a running process keeps its spec so status
+    /// and stop keep working after the id leaves the configuration.
+    pub fn unregister_spec(&mut self, id: &str) -> bool {
+        if self.live.contains_key(id) {
+            return false;
+        }
+        let removed = self.specs.remove(id).is_some();
+        if removed {
+            // Drop the id's runtime history too: a config entry later
+            // re-added under the same id must start clean, not inherit a
+            // stale "failed" state and restart count.
+            self.failed_ids.remove(id);
+            self.crash_counts.remove(id);
+            self.trackers.remove(id);
+            self.dead_rings.remove(id);
+            self.archived_rings.remove(id);
+        }
+        removed
     }
 
     pub fn spec_ids(&self) -> Vec<String> {
@@ -688,7 +789,13 @@ impl Supervisor {
         )
         .await?;
         self.live.insert(id.to_string(), proc);
-        self.dead_rings.remove(id);
+        // Archive the previous run's retained ring before the fresh ring
+        // takes over the id: restarting a failed backend is the standard
+        // recovery action, and it must not destroy the run that failed.
+        // One generation only — an existing archive is replaced.
+        if let Some(previous) = self.dead_rings.remove(id) {
+            self.archived_rings.insert(id.to_string(), previous);
+        }
         self.failed_ids.remove(id);
         self.crash_counts.insert(id.to_string(), 0);
         self.trackers.entry(id.to_string()).or_default();
@@ -697,18 +804,34 @@ impl Supervisor {
 
     /// Stop a process; graceful drain first when `graceful` is true.
     /// The process's log ring is retained so `logs_query` still serves its
-    /// history until the id is spawned again.
+    /// history; when the id is spawned again the ring becomes the archived
+    /// previous run instead of being dropped.
     pub async fn stop(&mut self, id: &str, graceful: bool) -> Result<(), SupervisorError> {
         let mut proc = self
             .live
             .remove(id)
             .ok_or_else(|| SupervisorError::NotFound(id.to_string()))?;
-        if graceful {
-            proc.drain(DEFAULT_DRAIN_TIMEOUT).await?;
+        let stop_result = if graceful {
+            // On Windows the graceful signal is a no-op (see
+            // send_graceful_signal), so a long drain window is pure
+            // latency: the child either exits on its own almost
+            // immediately or never will. Use a short window there.
+            #[cfg(windows)]
+            let drain_timeout = Duration::from_secs(3);
+            #[cfg(not(windows))]
+            let drain_timeout = DEFAULT_DRAIN_TIMEOUT;
+            proc.drain(drain_timeout).await
         } else {
-            proc.kill().await?;
-        }
+            proc.kill().await
+        };
         self.dead_rings.insert(id.to_string(), proc.log_ring());
+        if let Err(e) = stop_result {
+            // The child could not be confirmed dead (e.g. DrainTimeout):
+            // it may still be alive and holding its port. Report the id
+            // as failed rather than stopped so the state stays honest.
+            self.failed_ids.insert(id.to_string());
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -832,47 +955,97 @@ impl Supervisor {
             .ok_or_else(|| SupervisorError::NotFound(id.to_string()))
     }
 
+    /// The current-generation ring for `id`: the live process's ring, or
+    /// the retained ring of a stopped/reaped one.
+    fn current_ring(&self, id: &str) -> Option<Arc<Mutex<RingBuffer<LogRecord>>>> {
+        self.live
+            .get(id)
+            .map(|p| p.log_ring())
+            .or_else(|| self.dead_rings.get(id).cloned())
+    }
+
+    /// Every retained log scope, sorted by id: live processes, retained
+    /// rings of stopped ones, and ids with an archived previous run.
+    /// Drives the Logs view's scope picker — including scopes whose
+    /// process no longer exists in the configuration at all.
+    pub fn log_scopes(&self) -> Vec<LogScope> {
+        let mut ids: Vec<&String> = self
+            .live
+            .keys()
+            .chain(self.dead_rings.keys())
+            .chain(self.archived_rings.keys())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids.into_iter()
+            .map(|id| LogScope {
+                id: id.clone(),
+                previous: self.archived_rings.contains_key(id),
+            })
+            .collect()
+    }
+
     /// Query captured logs across scopes (spec §14 `logs_query`).
     ///
     /// `scope` is a process id or `"all"`. `level` is an optional
     /// error/warn/info/debug filter; llama-server emits no structured
     /// levels, so this is a documented heuristic substring match on the
-    /// line. `search` is an optional case-insensitive substring. Returns
-    /// newest-first, capped at `limit`. Covers live processes and retained
-    /// rings of stopped/reaped ones.
+    /// line. `search` is an optional case-insensitive substring.
+    ///
+    /// A single scope covers the process's current ring plus its archived
+    /// previous-run ring when one exists (archived records are flagged
+    /// `archived`). Scope `"all"` merges **every** ring — live, retained,
+    /// and archived — into one stream. Either way the result is sorted
+    /// newest-first by timestamp and only then capped at `limit`, so a
+    /// chatty process can no longer crowd every other process's newest
+    /// lines out of an "all" page. [`LogsQueryResult::total_matching`]
+    /// counts all matches before the cap, letting callers signal
+    /// truncation. Every returned record is stamped with `source` (its
+    /// process id).
     pub fn logs_query(
         &self,
         scope: &str,
         level: Option<&str>,
         search: Option<&str>,
         limit: usize,
-    ) -> Vec<LogRecord> {
+    ) -> LogsQueryResult {
         let level_filter = level.and_then(LogLevelFilter::parse);
         let search_lc = search.map(|s| s.to_lowercase());
-        let mut ids: Vec<&String> = if scope == "all" {
-            let mut all: Vec<&String> = self.live.keys().chain(self.dead_rings.keys()).collect();
+
+        // Resolve the rings in scope: (id, ring, archived) triples,
+        // deterministic id order for deterministic tie-breaking below.
+        let mut scope_ids: Vec<&String> = if scope == "all" {
+            let mut all: Vec<&String> = self
+                .live
+                .keys()
+                .chain(self.dead_rings.keys())
+                .chain(self.archived_rings.keys())
+                .collect();
             all.sort();
             all.dedup();
             all
         } else {
-            let mut one: Vec<&String> = Vec::new();
-            if let Some(id) = self.live.keys().find(|k| k.as_str() == scope) {
-                one.push(id);
-            } else if let Some(id) = self.dead_rings.keys().find(|k| k.as_str() == scope) {
-                one.push(id);
-            }
-            one
+            self.live
+                .keys()
+                .chain(self.dead_rings.keys())
+                .chain(self.archived_rings.keys())
+                .find(|k| k.as_str() == scope)
+                .into_iter()
+                .collect()
         };
-        // Deterministic scope order for "all".
-        ids.sort();
-        let mut out: Vec<LogRecord> = Vec::new();
-        for id in ids {
-            let ring = self
-                .live
-                .get(id)
-                .map(|p| p.log_ring())
-                .or_else(|| self.dead_rings.get(id).cloned());
-            let Some(ring) = ring else { continue };
+        scope_ids.sort();
+        let mut rings: Vec<ScopedRing<'_>> = Vec::new();
+        for id in scope_ids {
+            if let Some(ring) = self.current_ring(id) {
+                rings.push((id, ring, false));
+            }
+            if let Some(ring) = self.archived_rings.get(id) {
+                rings.push((id, Arc::clone(ring), true));
+            }
+        }
+
+        let mut matched: Vec<LogRecord> = Vec::new();
+        for (id, ring, archived) in &rings {
             let Ok(guard) = ring.lock() else { continue };
             for rec in guard.recent(usize::MAX) {
                 if let Some(lf) = level_filter {
@@ -885,17 +1058,48 @@ impl Supervisor {
                         continue;
                     }
                 }
-                out.push(rec.clone());
-                if out.len() >= limit.max(1) {
-                    break;
-                }
-            }
-            if out.len() >= limit.max(1) {
-                break;
+                let mut rec = rec.clone();
+                rec.source = (*id).clone();
+                rec.archived = *archived;
+                matched.push(rec);
             }
         }
-        out
+        // Newest-first across the merged stream. The sort is stable and
+        // each ring contributed newest-first, so records sharing a
+        // timestamp keep their per-ring newest-first order.
+        matched.sort_by_key(|r| std::cmp::Reverse(r.ts));
+        let total_matching = matched.len();
+        matched.truncate(limit.max(1));
+        LogsQueryResult {
+            records: matched,
+            total_matching,
+        }
     }
+}
+
+/// One ring participating in a [`Supervisor::logs_query`]: the owning
+/// process id, the ring, and whether it is the archived previous run.
+type ScopedRing<'a> = (&'a String, Arc<Mutex<RingBuffer<LogRecord>>>, bool);
+
+/// Result of [`Supervisor::logs_query`]: the requested newest-first page
+/// plus the total number of records that matched the filters before the
+/// limit was applied, so callers can signal truncation instead of
+/// rendering a capped slice as if it were complete.
+#[derive(Debug, Clone)]
+pub struct LogsQueryResult {
+    pub records: Vec<LogRecord>,
+    pub total_matching: usize,
+}
+
+/// One retained log scope, as enumerated by [`Supervisor::log_scopes`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogScope {
+    pub id: String,
+    /// True when the id also has an archived previous-run ring, i.e. its
+    /// logs include records from before the most recent spawn, flagged
+    /// `archived`. Querying the id returns current and archived lines
+    /// merged (incl. previous run).
+    pub previous: bool,
 }
 
 /// Log-level filter for [`Supervisor::logs_query`].
@@ -1036,6 +1240,38 @@ pub enum SupervisorError {
 mod tests {
     use super::*;
     use std::net::TcpListener as StdTcpListener;
+
+    #[test]
+    fn unregister_spec_removes_idle_and_reports() {
+        let mut sup = Supervisor::new(test_policy());
+        let spec = ProcessSpec {
+            id: "idle".into(),
+            program: PathBuf::from("/bin/true"),
+            args: vec![],
+            env: vec![],
+            workdir: None,
+            port: None,
+        };
+        sup.register_spec(spec);
+        assert!(sup.spec("idle").is_some());
+        assert!(sup.unregister_spec("idle"));
+        assert!(sup.spec("idle").is_none());
+        // Second removal and unknown ids report false.
+        assert!(!sup.unregister_spec("idle"));
+        assert!(!sup.unregister_spec("never-registered"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unregister_spec_refused_while_live() {
+        let mut sup = Supervisor::new(test_policy());
+        sup.register_spec(sh_spec("sleeper", "exec sleep 30"));
+        sup.spawn_backend("sleeper").await.unwrap();
+        assert!(!sup.unregister_spec("sleeper"));
+        assert!(sup.spec("sleeper").is_some());
+        sup.stop("sleeper", false).await.unwrap();
+        assert!(sup.unregister_spec("sleeper"));
+    }
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -1516,6 +1752,16 @@ mod tests {
             sup.crash_delay("ghost"),
             Err(SupervisorError::NotFound(_))
         ));
+
+        // Unregistering the reaped id clears its runtime history:
+        // status() no longer reports it, and crash_delay treats it as
+        // unknown rather than resurrecting the old budget.
+        assert!(sup.unregister_spec("quitter"));
+        assert!(sup.status().iter().all(|s| s.id != "quitter"));
+        assert!(matches!(
+            sup.crash_delay("quitter"),
+            Err(SupervisorError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
@@ -1637,38 +1883,211 @@ mod tests {
         ));
         sup.spawn_backend("a").await.unwrap();
         wait_for(
-            || sup.logs_query("a", None, None, 10).len() >= 3,
+            || sup.logs_query("a", None, None, 10).records.len() >= 3,
             Duration::from_secs(5),
         )
         .await;
 
         let all = sup.logs_query("a", None, None, 10);
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.records.len(), 3);
+        assert_eq!(all.total_matching, 3);
         // Newest-first.
-        assert!(all[0].line.contains("gamma"));
-        assert!(all[2].line.contains("alpha"));
+        assert!(all.records[0].line.contains("gamma"));
+        assert!(all.records[2].line.contains("alpha"));
+        // Records are stamped with their source id; nothing is archived.
+        assert!(all.records.iter().all(|r| r.source == "a"));
+        assert!(all.records.iter().all(|r| !r.archived));
 
-        assert_eq!(sup.logs_query("a", Some("error"), None, 10).len(), 1);
-        assert_eq!(sup.logs_query("a", Some("warn"), None, 10).len(), 1);
-        assert_eq!(sup.logs_query("a", Some("info"), None, 10).len(), 1);
+        assert_eq!(
+            sup.logs_query("a", Some("error"), None, 10).records.len(),
+            1
+        );
+        assert_eq!(sup.logs_query("a", Some("warn"), None, 10).records.len(), 1);
+        assert_eq!(sup.logs_query("a", Some("info"), None, 10).records.len(), 1);
         // Unknown level string = no filter.
-        assert_eq!(sup.logs_query("a", Some("bogus"), None, 10).len(), 3);
+        assert_eq!(
+            sup.logs_query("a", Some("bogus"), None, 10).records.len(),
+            3
+        );
 
         let found = sup.logs_query("a", None, Some("ALPHA"), 10);
-        assert_eq!(found.len(), 1);
-        assert!(found[0].line.contains("alpha"));
+        assert_eq!(found.records.len(), 1);
+        assert!(found.records[0].line.contains("alpha"));
 
         let limited = sup.logs_query("a", None, None, 2);
-        assert_eq!(limited.len(), 2);
-        assert!(limited[0].line.contains("gamma"));
+        assert_eq!(limited.records.len(), 2);
+        assert_eq!(
+            limited.total_matching, 3,
+            "total counts matches before the limit binds"
+        );
+        assert!(limited.records[0].line.contains("gamma"));
 
-        assert!(sup.logs_query("ghost", None, None, 10).is_empty());
+        assert!(sup.logs_query("ghost", None, None, 10).records.is_empty());
+        assert_eq!(sup.logs_query("ghost", None, None, 10).total_matching, 0);
 
         // Ring is retained after stop; "all" scope sees it.
         sup.stop("a", false).await.unwrap();
         let retained = sup.logs_query("a", None, None, 10);
-        assert_eq!(retained.len(), 3);
-        assert_eq!(sup.logs_query("all", None, None, 10).len(), 3);
+        assert_eq!(retained.records.len(), 3);
+        assert_eq!(sup.logs_query("all", None, None, 10).records.len(), 3);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn logs_query_all_merges_chronologically_and_reports_total() {
+        let mut sup = Supervisor::new(test_policy());
+        sup.register_spec(sh_spec("a", "echo 'a-one'; echo 'a-two'; echo 'a-three'"));
+        sup.register_spec(sh_spec("b", "echo 'b-one'; echo 'b-two'; echo 'b-three'"));
+        sup.spawn_backend("a").await.unwrap();
+        wait_for(
+            || sup.logs_query("a", None, None, 10).records.len() >= 3,
+            Duration::from_secs(5),
+        )
+        .await;
+        // b starts strictly after a's lines were captured, so b's lines
+        // are the globally newest.
+        sup.spawn_backend("b").await.unwrap();
+        wait_for(
+            || sup.logs_query("all", None, None, 100).total_matching >= 6,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let merged = sup.logs_query("all", None, None, 100);
+        assert_eq!(merged.total_matching, 6);
+        assert_eq!(merged.records.len(), 6);
+        // Chronological merge: all of b's lines precede a's, newest-first
+        // within each process — the old ring-by-ring fill returned a's
+        // block first regardless of timestamps.
+        let lines: Vec<&str> = merged.records.iter().map(|r| r.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            vec!["b-three", "b-two", "b-one", "a-three", "a-two", "a-one"]
+        );
+        // Attribution survives the merge.
+        assert!(merged.records[..3].iter().all(|r| r.source == "b"));
+        assert!(merged.records[3..].iter().all(|r| r.source == "a"));
+
+        // The limit applies to the merged stream: the page holds the
+        // globally newest lines, not the first ring's.
+        let page = sup.logs_query("all", None, None, 2);
+        assert_eq!(page.records.len(), 2);
+        assert_eq!(page.total_matching, 6);
+        assert_eq!(page.records[0].line, "b-three");
+        assert_eq!(page.records[1].line, "b-two");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn logs_survive_respawn_as_one_archived_generation() {
+        let mut sup = Supervisor::new(test_policy());
+        sup.register_spec(sh_spec("a", "echo 'run1 first'; echo 'run1 second'"));
+        sup.spawn_backend("a").await.unwrap();
+        wait_for(
+            || sup.logs_query("a", None, None, 10).total_matching >= 2,
+            Duration::from_secs(5),
+        )
+        .await;
+        sup.stop("a", false).await.unwrap();
+
+        // Respawn: run1's ring must survive as the archived previous run.
+        sup.register_spec(sh_spec("a", "echo 'run2 first'; echo 'run2 second'"));
+        sup.spawn_backend("a").await.unwrap();
+        wait_for(
+            || sup.logs_query("a", None, None, 10).total_matching >= 4,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let merged = sup.logs_query("a", None, None, 10);
+        assert_eq!(merged.total_matching, 4);
+        // Newest-first across generations: run2 (current) before run1.
+        assert!(merged.records[0].line.contains("run2"));
+        assert!(merged.records[3].line.contains("run1"));
+        for rec in &merged.records {
+            if rec.line.contains("run1") {
+                assert!(rec.archived, "previous run must be flagged: {rec:?}");
+            } else {
+                assert!(!rec.archived, "current run must not be flagged: {rec:?}");
+            }
+            assert_eq!(rec.source, "a");
+        }
+        // The archived ring is part of the "all" merge too.
+        assert_eq!(sup.logs_query("all", None, None, 10).total_matching, 4);
+        // The scope picker sees the id with a previous run.
+        let scopes = sup.log_scopes();
+        let a = scopes.iter().find(|s| s.id == "a").expect("scope listed");
+        assert!(a.previous);
+
+        // A second respawn keeps exactly one archived generation: run1 is
+        // gone, run2 becomes the archive.
+        sup.stop("a", false).await.unwrap();
+        sup.register_spec(sh_spec("a", "echo 'run3 only'"));
+        sup.spawn_backend("a").await.unwrap();
+        wait_for(
+            || {
+                sup.logs_query("a", None, None, 10)
+                    .records
+                    .iter()
+                    .any(|r| r.line.contains("run3"))
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        let third = sup.logs_query("a", None, None, 10);
+        assert_eq!(third.total_matching, 3, "run3 (1) + archived run2 (2)");
+        assert!(
+            third.records.iter().all(|r| !r.line.contains("run1")),
+            "oldest archive must be replaced: {:?}",
+            third.records
+        );
+        assert!(third
+            .records
+            .iter()
+            .filter(|r| r.line.contains("run2"))
+            .all(|r| r.archived));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn reader_caps_overlong_lines() {
+        // One 100 KiB unterminated-until-the-echo line, then a short line.
+        let ring = test_ring();
+        let mut proc = SupervisedProcess::spawn(
+            "loud",
+            &PathBuf::from("/bin/sh"),
+            &[
+                "-c".to_string(),
+                "head -c 102400 /dev/zero | tr '\\0' 'x'; echo; echo after-line".to_string(),
+            ],
+            &[],
+            Arc::clone(&ring),
+        )
+        .await
+        .unwrap();
+        wait_for(
+            || ring_lines_chronological(&ring).len() >= 2,
+            Duration::from_secs(5),
+        )
+        .await;
+        proc.kill().await.unwrap();
+
+        let lines = ring_lines_chronological(&ring);
+        assert_eq!(lines.len(), 2);
+        let long = &lines[0];
+        assert!(long.starts_with("xxxx"), "capped content kept");
+        assert!(
+            long.len() <= MAX_LOG_LINE_BYTES + 64,
+            "line must be capped near 64 KiB, got {} bytes",
+            long.len()
+        );
+        assert!(
+            long.contains("truncated"),
+            "truncation must be marked: …{}",
+            &long[long.len() - 80..]
+        );
+        // The reader survived the overlong line: the next line is intact.
+        assert_eq!(lines[1], "after-line");
     }
 
     /// Read one HTTP request from `sock` (headers + body per Content-Length).

@@ -81,6 +81,138 @@ impl RealSystemOps {
     }
 }
 
+/// A pid is only safe to signal when it names one specific process:
+/// 0 means "my own process group" and a value above `i32::MAX` wraps
+/// to a negative `pid_t` — -1 is "every process I own". A corrupt or
+/// hand-edited pid file must never turn a liveness check or a stop
+/// into a broadcast signal, so out-of-range pids are refused here,
+/// at the only place pids reach the OS.
+fn pid_is_signalable(pid: u32) -> bool {
+    pid >= 1 && pid <= i32::MAX as u32
+}
+
+/// Whether a process with `pid` is currently alive.
+///
+/// Windows: `tasklist` filtered to the pid (same shell-out approach as
+/// the cmdkey presence checks elsewhere in this crate — no extra FFI).
+/// Unix: `kill(pid, 0)` via `/bin/kill -0`.
+pub fn process_alive(pid: u32) -> bool {
+    if !pid_is_signalable(pid) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .map(|o| {
+                o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(unix)]
+    {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Terminate the process with `pid`.
+///
+/// Windows: `taskkill /PID <pid> /T /F` — tree semantics, because a
+/// launcher's children must die with it. Unix: SIGTERM to the bare
+/// pid via `/bin/kill`. The recorded gateway pid IS the server (the
+/// start-gateway step spawns the venv's python directly), so no tree
+/// walk is needed; the negative-pid group form is deliberately not
+/// used — it targets whatever group numerically matches the pid,
+/// which is only the target's own group for session leaders and is
+/// an unacceptable blast radius for a pid read from a file.
+pub fn kill_process(pid: u32) -> std::io::Result<()> {
+    if !pid_is_signalable(pid) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to signal out-of-range pid {pid}"),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output()?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "taskkill /PID {pid} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
+    }
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "kill {pid} failed with {status}"
+            )))
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "process termination is not supported on this platform",
+        ))
+    }
+}
+
+/// Path of the file recording the running gateway's pid:
+/// `<data_dir>/gateway.pid`. Written by the start-gateway step after
+/// each successful spawn; read by [`stop_gateway`] and by the step
+/// itself to stop the previous gateway before spawning a replacement.
+pub fn gateway_pid_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("gateway.pid")
+}
+
+/// Stop the gateway process recorded in `<data_dir>/gateway.pid`.
+///
+/// Returns `Ok(true)` when a live recorded process was terminated,
+/// `Ok(false)` when there was nothing to stop (no pid file, an
+/// unparsable pid, or the process already gone). The pid file is
+/// removed in both cases; it is kept only when the kill itself fails,
+/// so a retry still knows which pid to target.
+pub fn stop_gateway(data_dir: &Path) -> Result<bool, String> {
+    let pid_path = gateway_pid_path(data_dir);
+    let text = match std::fs::read_to_string(&pid_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("could not read {}: {e}", pid_path.display())),
+    };
+    let pid: Option<u32> = text.trim().parse().ok();
+    let stopped = match pid {
+        Some(pid) if process_alive(pid) => {
+            kill_process(pid).map_err(|e| format!("could not stop gateway (pid {pid}): {e}"))?;
+            true
+        }
+        _ => false,
+    };
+    let _ = std::fs::remove_file(&pid_path);
+    Ok(stopped)
+}
+
 #[async_trait]
 impl SystemOps for RealSystemOps {
     async fn run_command(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError> {
@@ -123,6 +255,13 @@ impl SystemOps for RealSystemOps {
             })?;
         let mut c = tokio::process::Command::new(prog);
         c.args(args);
+        // The planned environment must reach the child: the gateway's
+        // OpenRouter key travels exclusively this way (the generated
+        // YAML references it as os.environ/OPENROUTER_API_KEY). Dropping
+        // it here silently disarms the fallback in production.
+        for (k, v) in &cmd.env {
+            c.env(k, v);
+        }
         // Detach from this process group so the child outlives the wizard.
         #[cfg(windows)]
         {
@@ -150,6 +289,14 @@ impl SystemOps for RealSystemOps {
             stderr: format!("spawn failed: {e}"),
         })?;
         Ok(child.id().unwrap_or(0))
+    }
+
+    fn process_alive(&self, pid: u32) -> bool {
+        process_alive(pid)
+    }
+
+    fn kill_process(&self, pid: u32) -> std::io::Result<()> {
+        kill_process(pid)
     }
 
     async fn download(
@@ -375,6 +522,14 @@ impl SystemOps for RealSystemOps {
             .map_err(|e| Self::io_err(path, e))
     }
 
+    async fn remove_file(&self, path: &Path) -> Result<(), WizardError> {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Self::io_err(path, e)),
+        }
+    }
+
     async fn file_exists(&self, path: &Path) -> bool {
         tokio::fs::metadata(path).await.is_ok()
     }
@@ -387,8 +542,14 @@ impl SystemOps for RealSystemOps {
     }
 
     async fn gpu_inventory(&self) -> Result<Vec<GpuDescriptor>, WizardError> {
+        // Same System32-first nvidia-smi resolution as telemetry
+        // (manager_telemetry::default_smi_path): a bare name resolves
+        // through PATH, which a same-named executable could shadow.
+        let smi = manager_telemetry::default_smi_path()
+            .to_string_lossy()
+            .into_owned();
         let rows = PlannedCommand::new(vec![
-            "nvidia-smi".to_string(),
+            smi.clone(),
             "--query-gpu=index,name,uuid,memory.total,compute_cap".to_string(),
             "--format=csv,noheader".to_string(),
         ]);
@@ -403,7 +564,7 @@ impl SystemOps for RealSystemOps {
             )));
         }
         let header = self
-            .run_command(&PlannedCommand::new(vec!["nvidia-smi".to_string()]))
+            .run_command(&PlannedCommand::new(vec![smi]))
             .await
             .map_err(|e| WizardError::GpuProbeFailed(format!("nvidia-smi failed: {e}")))?;
         let driver = Self::parse_driver_version(&header.stdout);
@@ -431,10 +592,104 @@ impl SystemOps for RealSystemOps {
         }
     }
 
+    async fn credential_read(&self, target: &str) -> Option<String> {
+        #[cfg(windows)]
+        {
+            cred_read_windows(target)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = target;
+            // No Credential Manager off Windows.
+            None
+        }
+    }
+
     fn home_dir(&self) -> Option<PathBuf> {
         std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(PathBuf::from)
+    }
+}
+
+/// Read a generic credential's blob via CredReadW (advapi32). Returns
+/// `None` on any failure (missing target, empty blob, undecodable
+/// content). The returned value is a secret: it is never logged and
+/// never written to disk by callers — it goes straight into a spawned
+/// process's environment.
+#[cfg(windows)]
+fn cred_read_windows(target: &str) -> Option<String> {
+    use windows_sys::Win32::Security::Credentials::{
+        CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
+    };
+    let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut cred: *mut CREDENTIALW = std::ptr::null_mut();
+    let ok = unsafe { CredReadW(wide.as_ptr(), CRED_TYPE_GENERIC, 0, &mut cred) };
+    if ok == 0 || cred.is_null() {
+        return None;
+    }
+    let value = unsafe {
+        let size = (*cred).CredentialBlobSize as usize;
+        let ptr = (*cred).CredentialBlob;
+        if ptr.is_null() || size == 0 {
+            None
+        } else {
+            decode_credential_blob(std::slice::from_raw_parts(ptr, size))
+        }
+    };
+    unsafe { CredFree(cred as *const std::ffi::c_void) };
+    value.filter(|v| !v.is_empty())
+}
+
+/// Decode a credential blob: generic credentials written by cmdkey /
+/// PowerShell hold the secret as UTF-16LE text; anything else is read as
+/// UTF-8. Trailing NULs are trimmed either way.
+///
+/// The UTF-16LE reading is accepted outright only when every decoded
+/// char is ASCII: `String::from_utf16` succeeds for most arbitrary byte
+/// pairs, so an even-length UTF-8 blob would otherwise "decode" into
+/// garbage codepoints and be mistaken for the secret. When the UTF-16
+/// reading is not plain ASCII, a valid UTF-8 reading wins; the UTF-16
+/// reading remains the fallback (genuine UTF-16LE secrets containing
+/// non-ASCII chars are not valid UTF-8 as bytes, so they land there).
+#[cfg(any(windows, test))]
+fn decode_credential_blob(blob: &[u8]) -> Option<String> {
+    let utf16 = if blob.len() >= 2 && blob.len().is_multiple_of(2) {
+        let units: Vec<u16> = blob
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| u16::from_le_bytes(*p))
+            .collect();
+        String::from_utf16(&units)
+            .ok()
+            .map(|s| s.trim_end_matches('\0').to_string())
+    } else {
+        None
+    };
+    if let Some(s) = &utf16 {
+        if !s.is_empty() && s.is_ascii() {
+            return Some(s.clone());
+        }
+    }
+    if let Ok(s) = std::str::from_utf8(blob) {
+        let s = s.trim_end_matches('\0').to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    if let Some(s) = utf16 {
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    let s = String::from_utf8_lossy(blob)
+        .trim_end_matches('\0')
+        .to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 
@@ -486,5 +741,163 @@ mod tests {
         );
         assert!(ops.file_exists(&path).await);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Regression (S6): `spawn_detached` must deliver `PlannedCommand.env`
+    /// to the child — the gateway's OpenRouter key travels exclusively
+    /// that way, and the fake records env verbatim so only a real-spawn
+    /// test can catch the drop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_detached_delivers_env_to_child() {
+        let ops = RealSystemOps;
+        let out_path =
+            std::env::temp_dir().join(format!("wizard-spawn-env-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&out_path);
+        let mut cmd = PlannedCommand::new(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("printf %s \"$WAVE3_TEST_VAR\" > {}", out_path.display()),
+        ]);
+        cmd.env
+            .insert("WAVE3_TEST_VAR".to_string(), "env-delivered".to_string());
+        let pid = ops.spawn_detached(&cmd).await.unwrap();
+        assert!(pid > 0);
+        let mut contents = String::new();
+        for _ in 0..50 {
+            if let Ok(s) = std::fs::read_to_string(&out_path) {
+                contents = s;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let _ = std::fs::remove_file(&out_path);
+        assert_eq!(contents, "env-delivered");
+    }
+
+    #[test]
+    fn decode_credential_blob_reads_utf16le_ascii() {
+        let blob: Vec<u8> = "s3cret"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        assert_eq!(decode_credential_blob(&blob).as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn decode_credential_blob_reads_even_length_utf8() {
+        // An 8-byte ASCII blob: the previous UTF-16LE-first heuristic
+        // "decoded" this into garbage codepoints and returned those.
+        assert_eq!(
+            decode_credential_blob(b"hunter22").as_deref(),
+            Some("hunter22")
+        );
+    }
+
+    #[test]
+    fn decode_credential_blob_reads_utf16le_non_ascii() {
+        let blob: Vec<u8> = "pässwörd"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        assert_eq!(decode_credential_blob(&blob).as_deref(), Some("pässwörd"));
+    }
+
+    #[test]
+    fn decode_credential_blob_edge_cases() {
+        // Odd length: no UTF-16 reading is attempted.
+        assert_eq!(decode_credential_blob(b"abc").as_deref(), Some("abc"));
+        assert_eq!(decode_credential_blob(b""), None);
+        assert_eq!(decode_credential_blob(&[0, 0]), None);
+    }
+
+    /// `kill_process` terminates a real spawned process (bare-pid
+    /// SIGTERM on unix; the recorded gateway pid is the server itself).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_process_terminates_spawned_process() {
+        let ops = RealSystemOps;
+        let cmd = PlannedCommand::new(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 30".to_string(),
+        ]);
+        let pid = ops.spawn_detached(&cmd).await.unwrap();
+        assert!(pid > 0 && process_alive(pid));
+        kill_process(pid).unwrap();
+        let mut alive = true;
+        for _ in 0..50 {
+            if !process_alive(pid) {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!alive, "spawned process was not terminated");
+    }
+
+    #[test]
+    fn stop_gateway_without_pid_file_is_false() {
+        let dir = std::env::temp_dir().join(format!("wizard-stop-gw-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(stop_gateway(&dir), Ok(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_gateway_with_stale_pid_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("wizard-stop-gw-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A pid guaranteed dead: a child that already exited and was
+        // reaped. (A merely huge number would be a dangerous stand-in:
+        // values above i32::MAX wrap to negative pid_t values, where
+        // -1 signals every process the user owns.)
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        std::fs::write(gateway_pid_path(&dir), dead_pid.to_string()).unwrap();
+        assert_eq!(stop_gateway(&dir), Ok(false));
+        assert!(!gateway_pid_path(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn out_of_range_pids_are_never_signalled() {
+        // 0 = own process group; i32::MAX+1.. wraps to negative pid_t
+        // (-1 = every process the user owns). Both must be refused
+        // before any syscall.
+        assert!(!process_alive(0));
+        assert!(!process_alive(u32::MAX));
+        assert!(kill_process(0).is_err());
+        assert!(kill_process(u32::MAX).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_gateway_kills_recorded_process() {
+        let dir = std::env::temp_dir().join(format!("wizard-stop-gw-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        std::fs::write(gateway_pid_path(&dir), pid.to_string()).unwrap();
+        assert!(process_alive(pid));
+        assert_eq!(stop_gateway(&dir), Ok(true));
+        assert!(!gateway_pid_path(&dir).exists());
+        let mut exited = false;
+        for _ in 0..50 {
+            if child.try_wait().unwrap().is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(exited, "recorded process was not terminated");
     }
 }
