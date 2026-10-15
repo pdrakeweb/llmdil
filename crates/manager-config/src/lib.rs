@@ -69,6 +69,15 @@ pub struct AppConfig {
     /// with this set.
     #[serde(default)]
     pub defaults_repaired: bool,
+    /// The catalog revision this configuration has synced to (see
+    /// `CATALOG_REVISION` in manager-models). When the curated
+    /// catalog gains entries, an existing configuration appends the
+    /// missing models exactly once per revision (see
+    /// [`append_missing_catalog_models`]) — a model the operator
+    /// deliberately deleted is not resurrected until the catalog
+    /// next changes.
+    #[serde(default)]
+    pub catalog_revision: u32,
 }
 
 /// Presenter mode for a data window (spec §4 hybrid view matrix).
@@ -385,6 +394,7 @@ impl AppConfig {
             setup_completed: false,
             catalog_seeded: false,
             defaults_repaired: true,
+            catalog_revision: 0,
         }
     }
 }
@@ -452,6 +462,49 @@ pub fn repair_catalog_defaults(
                 changed = true;
             }
         }
+    }
+    changed
+}
+
+/// One catalog entry for [`append_missing_catalog_models`]: a model
+/// a configuration may predate.
+pub struct CatalogModelEntry {
+    pub model_id: String,
+    pub gguf_file_name: String,
+    pub quant: String,
+    pub params_b: f32,
+    pub sha256: String,
+    pub source_url: String,
+    pub assigned_backends: Vec<String>,
+    pub enabled: bool,
+}
+
+/// Append catalog models the configuration does not have yet (by
+/// id). Used when the curated catalog gains entries after a
+/// configuration was seeded: the new models arrive with their
+/// catalog defaults (opt-in candidates disabled and unassigned)
+/// instead of never reaching installed systems. Existing entries —
+/// including operator-edited ones — are untouched. The caller
+/// gates this on [`AppConfig::catalog_revision`] so it runs once
+/// per catalog revision. Returns true when anything was appended.
+pub fn append_missing_catalog_models(cfg: &mut AppConfig, entries: &[CatalogModelEntry]) -> bool {
+    let mut changed = false;
+    for entry in entries {
+        if cfg.models.iter().any(|m| m.id == entry.model_id) {
+            continue;
+        }
+        cfg.models.push(ModelConfig {
+            id: entry.model_id.clone(),
+            gguf_path: PathBuf::from("models").join(&entry.gguf_file_name),
+            quant: entry.quant.clone(),
+            params_b: entry.params_b,
+            sha256: entry.sha256.clone(),
+            verified_at: None,
+            source_url: entry.source_url.clone(),
+            assigned_backends: entry.assigned_backends.clone(),
+            enabled: entry.enabled,
+        });
+        changed = true;
     }
     changed
 }
@@ -858,6 +911,48 @@ fn replace_file(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn append_missing_catalog_models_appends_only_missing() {
+        let mut cfg = AppConfig::default_config();
+        cfg.models.push(ModelConfig {
+            id: "existing".to_string(),
+            gguf_path: PathBuf::from("models/existing.gguf"),
+            quant: "Q4_K_M".to_string(),
+            params_b: 8.0,
+            sha256: String::new(),
+            verified_at: None,
+            source_url: String::new(),
+            assigned_backends: Vec::new(),
+            enabled: true,
+        });
+        let entry = |id: &str, enabled: bool| CatalogModelEntry {
+            model_id: id.to_string(),
+            gguf_file_name: format!("{id}.gguf"),
+            quant: "Q4_K_M".to_string(),
+            params_b: 31.6,
+            sha256: "a".repeat(64),
+            source_url: "https://example.com/x.gguf".to_string(),
+            assigned_backends: Vec::new(),
+            enabled,
+        };
+        // "existing" is skipped; "new-opt-in" is appended disabled.
+        let changed = append_missing_catalog_models(
+            &mut cfg,
+            &[entry("existing", true), entry("new-opt-in", false)],
+        );
+        assert!(changed);
+        assert_eq!(cfg.models.len(), 2);
+        let added = cfg.models.iter().find(|m| m.id == "new-opt-in").unwrap();
+        assert!(!added.enabled);
+        assert_eq!(added.gguf_path, PathBuf::from("models/new-opt-in.gguf"));
+        assert_eq!(added.params_b, 31.6);
+        // A second run appends nothing.
+        assert!(!append_missing_catalog_models(
+            &mut cfg,
+            &[entry("new-opt-in", false)]
+        ));
+    }
+
     use super::*;
 
     fn unique_tmpdir(name: &str) -> PathBuf {

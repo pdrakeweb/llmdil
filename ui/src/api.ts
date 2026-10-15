@@ -84,6 +84,7 @@ export async function listBackends(): Promise<CallResult<BackendInfo[]>> {
         port: b.port,
         model: b.model_file,
         status: BACKEND_STATUS[b.state] ?? "idle",
+        adopted: b.adopted,
       }));
       return { data, live: true };
     } catch (e) {
@@ -499,6 +500,9 @@ export interface BackendRow {
   /** Supervisor process state: stopped | starting | running | stopping | failed. */
   state: string;
   pid: number | null;
+  /** True when this session adopted the process (started by a previous
+   *  launch; the app tracks it by pid rather than as its own child). */
+  adopted: boolean;
   /** Supervisor crash-backoff attempt count for this backend. It counts
    *  crash-restart backoff attempts, not starts: nothing consumes it yet,
    *  so it reads 0 until a restart monitor exists (v0.1.2 has none). */

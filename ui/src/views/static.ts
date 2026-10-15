@@ -703,6 +703,13 @@ function backendCard(
         ? "Still running, but its entry was removed from the configuration. It can be stopped here; it cannot be restarted."
         : "Its entry was removed from the configuration. It cannot be restarted."}</div>`
     : "";
+  // An adopted backend was started by a previous launch of the app
+  // (its processes survive the app closing) and taken over by pid:
+  // it can be stopped/restarted here, but its earlier output is not
+  // in this session's log ring.
+  const adoptedNote = b.adopted
+    ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Started by a previous launch and adopted by this session. Output from before adoption is not in the Logs view.</div>`
+    : "";
   let logsBlock = "";
   if (b.state === "failed") {
     const tail = logTails.get(b.id);
@@ -720,11 +727,13 @@ function backendCard(
         <span class="spacer" style="flex:1"></span>
         ${b.configured ? "" : `<span class="chip badge-warn">not in config</span>`}
         ${b.configured ? `<span class="chip">${b.enabled ? "enabled" : "disabled"}</span>` : ""}
+        ${b.adopted ? `<span class="chip">adopted</span>` : ""}
         <span class="chip">${esc(b.state)}</span></h3>
       ${b.configured ? `<div style="font-size:12px;color:var(--text2);margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">Model:
         <select data-back-model="${esc(b.id)}" style="${SELECT_STYLE}"${dis}>${modelOptions(b, models)}</select></div>`
       : `<div style="font-size:12px;color:var(--text2);margin-top:6px">Model: <span style="font-family:var(--mono)">${esc(b.model_file)}</span></div>`}
       ${orphanNote}
+      ${adoptedNote}
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0">
         ${[["State", b.state], ["PID", b.pid !== null ? String(b.pid) : "\u2014"],
            ["Uptime", fmtUptime(b.uptime_secs)]]

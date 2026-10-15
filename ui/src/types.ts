@@ -18,6 +18,9 @@ export interface BackendInfo {
   port: number;
   status: Status;
   model: string;
+  /** True when the running process was adopted by this session (it was
+   *  started by a previous launch and survived the app closing). */
+  adopted?: boolean;
   /* The fields below have no backend source in the list_backends payload;
      they are only populated by the sample data. Live code must treat them
      as possibly absent and never render them as measurements when unset. */

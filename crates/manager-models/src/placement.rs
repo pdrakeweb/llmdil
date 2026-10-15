@@ -153,6 +153,7 @@ mod tests {
             sha256: String::new(),
             url: String::new(),
             params_b: 1.0,
+            enabled_by_default: true,
         }
     }
 

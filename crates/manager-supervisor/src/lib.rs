@@ -297,6 +297,9 @@ pub struct ProcessStatus {
     pub id: String,
     pub state: ProcessState,
     pub pid: Option<u32>,
+    /// True when the process was adopted (started outside this app
+    /// session — e.g. by a previous launch — and taken over by pid).
+    pub adopted: bool,
     /// Crash-restart attempts since the last healthy observation or manual
     /// (re)start.
     pub restarts: u32,
@@ -414,6 +417,10 @@ where
 pub struct SupervisedProcess {
     pub id: String,
     child: Option<Child>,
+    /// Pid of a process this supervisor did not spawn but adopted
+    /// (see [`SupervisedProcess::adopt`]); mutually exclusive with
+    /// `child`.
+    adopted_pid: Option<u32>,
     readers: Vec<JoinHandle<()>>,
     log_ring: Arc<Mutex<RingBuffer<LogRecord>>>,
     state: ProcessState,
@@ -493,6 +500,7 @@ impl SupervisedProcess {
         Ok(Self {
             id: id.to_string(),
             child: Some(child),
+            adopted_pid: None,
             readers,
             log_ring,
             state: ProcessState::Running,
@@ -502,11 +510,62 @@ impl SupervisedProcess {
         })
     }
 
+    /// Adopt a live process this supervisor did not spawn — a
+    /// backend started by a previous app session survives the app
+    /// closing (nothing kills it), and the new session must still
+    /// see it: status, pid-keyed VRAM attribution, and stop all key
+    /// off the tracked pid. There is no captured output (the log
+    /// ring starts empty) and no known start time (uptime None).
+    pub fn adopt(id: &str, pid: u32, log_ring: Arc<Mutex<RingBuffer<LogRecord>>>) -> Self {
+        Self {
+            id: id.to_string(),
+            child: None,
+            adopted_pid: Some(pid),
+            readers: Vec::new(),
+            log_ring,
+            state: ProcessState::Running,
+            restart_attempts: 0,
+            started_at: None,
+            last_exit: None,
+        }
+    }
+
+    /// For an adopted process: true once the tracked pid is gone.
+    /// The state becomes Failed (the exit was not ours), matching
+    /// how an unexpected child exit is reported.
+    pub fn adopted_exited(&mut self) -> bool {
+        match self.adopted_pid {
+            Some(pid) if !pid_alive(pid) => {
+                self.adopted_pid = None;
+                self.state = ProcessState::Failed;
+                self.abort_readers();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Graceful drain: send the graceful signal, wait `timeout` for natural
     /// exit, then kill. Returns `Ok` once the process is stopped either way.
     pub async fn drain(&mut self, timeout: Duration) -> Result<(), SupervisorError> {
         let mut child = match self.child.take() {
             None => {
+                if let Some(pid) = self.adopted_pid {
+                    // No graceful channel exists to a process we did
+                    // not spawn: wait out the window for a natural
+                    // exit, then kill the tree.
+                    let deadline = Instant::now() + timeout;
+                    while pid_alive(pid) && Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    if pid_alive(pid) {
+                        kill_pid_tree(pid);
+                    }
+                    self.adopted_pid = None;
+                    self.state = ProcessState::Stopped;
+                    self.abort_readers();
+                    return Ok(());
+                }
                 self.state = ProcessState::Stopped;
                 return Ok(());
             }
@@ -575,7 +634,11 @@ impl SupervisedProcess {
     pub async fn kill(&mut self) -> Result<(), SupervisorError> {
         let mut child = match self.child.take() {
             None => {
+                if let Some(pid) = self.adopted_pid.take() {
+                    kill_pid_tree(pid);
+                }
                 self.state = ProcessState::Stopped;
+                self.abort_readers();
                 return Ok(());
             }
             Some(c) => c,
@@ -637,11 +700,14 @@ impl SupervisedProcess {
     }
 
     pub fn pid(&self) -> Option<u32> {
-        self.child.as_ref().and_then(|c| c.id())
+        self.child
+            .as_ref()
+            .and_then(|c| c.id())
+            .or(self.adopted_pid)
     }
 
     pub fn is_running(&self) -> bool {
-        self.child.is_some()
+        self.child.is_some() || self.adopted_pid.is_some()
     }
 
     pub fn uptime(&self) -> Option<Duration> {
@@ -686,6 +752,159 @@ impl SupervisedProcess {
 
 fn port_free(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Whether a process with `pid` currently exists.
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        const STILL_ACTIVE: u32 = 259;
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+        ok != 0 && code == STILL_ACTIVE
+    }
+    #[cfg(unix)]
+    {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Kill a process and (on Windows) its whole tree; best effort —
+/// used for adopted processes, which have no child handle.
+fn kill_pid_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            // CREATE_NO_WINDOW: no console flash from the GUI app.
+            .creation_flags(0x08000000)
+            .output();
+    }
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{kill, Signal};
+        let _ = kill(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGKILL);
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+    }
+}
+
+/// The pid owning the LISTEN socket on `port`, when one exists.
+/// Windows: the TCP table via iphlpapi (the same data `netstat
+/// -ano` prints). Other platforms: not resolved (None) — adoption
+/// is a Windows-path feature for now.
+pub fn port_owner_pid(port: u16) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        windows_port_owner_pid(port)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = port;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_port_owner_pid(port: u16) -> Option<u32> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+    };
+    const AF_INET: u32 = 2;
+    // MIB_TCP_STATE_LISTEN
+    const LISTEN: u32 = 2;
+    let mut size: u32 = 0;
+    let rc = unsafe {
+        GetExtendedTcpTable(
+            std::ptr::null_mut(),
+            &mut size,
+            0,
+            AF_INET,
+            TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+    };
+    if rc != 122 || size == 0 {
+        // ERROR_INSUFFICIENT_BUFFER (122) is the expected first call.
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    let rc = unsafe {
+        GetExtendedTcpTable(
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            &mut size,
+            0,
+            AF_INET,
+            TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let count = u32::from_ne_bytes(buf[0..4].try_into().ok()?) as usize;
+    let row_size = std::mem::size_of::<MIB_TCPROW_OWNER_PID>();
+    for i in 0..count {
+        let off = 4 + i * row_size;
+        let row_bytes = buf.get(off..off + row_size)?;
+        let row: MIB_TCPROW_OWNER_PID =
+            unsafe { std::ptr::read_unaligned(row_bytes.as_ptr() as *const MIB_TCPROW_OWNER_PID) };
+        // Ports are stored in network byte order in the low 16 bits.
+        let local_port = u16::from_be((row.dwLocalPort & 0xffff) as u16);
+        if local_port == port && row.dwState == LISTEN {
+            return Some(row.dwOwningPid);
+        }
+    }
+    None
+}
+
+/// Whether `pid`'s executable file name equals `name`
+/// (case-insensitive) — the guard against adopting whatever
+/// unrelated program happens to sit on a backend's port.
+pub fn process_image_is(pid: u32, name: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut buf = vec![0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) };
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+        if ok == 0 {
+            return false;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.rsplit(['\\', '/'])
+            .next()
+            .map(|f| f.eq_ignore_ascii_case(name))
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (pid, name);
+        false
+    }
 }
 
 /// Owns all supervised processes: llama-servers, LiteLLM, MCP servers, WinML.
@@ -811,6 +1030,28 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Adopt a live external process as `id`'s backend (started by
+    /// a previous app session and still holding its port and VRAM).
+    /// Fails like `spawn_backend` when the id is already live or has
+    /// no registered spec.
+    pub fn adopt(&mut self, id: &str, pid: u32) -> Result<(), SupervisorError> {
+        if self.live.contains_key(id) {
+            return Err(SupervisorError::AlreadyRunning(id.to_string()));
+        }
+        if !self.specs.contains_key(id) {
+            return Err(SupervisorError::NotFound(id.to_string()));
+        }
+        let ring = Arc::new(Mutex::new(RingBuffer::new(DEFAULT_LOG_RING_CAPACITY)));
+        let proc = SupervisedProcess::adopt(id, pid, ring);
+        self.live.insert(id.to_string(), proc);
+        if let Some(previous) = self.dead_rings.remove(id) {
+            self.archived_rings.insert(id.to_string(), previous);
+        }
+        self.failed_ids.remove(id);
+        self.trackers.entry(id.to_string()).or_default();
+        Ok(())
+    }
+
     /// Stop a process; graceful drain first when `graceful` is true.
     /// The process's log ring is retained so `logs_query` still serves its
     /// history; when the id is spawned again the ring becomes the archived
@@ -860,6 +1101,23 @@ impl Supervisor {
         let mut dead = Vec::new();
         let ids: Vec<String> = self.live.keys().cloned().collect();
         for id in ids {
+            // Adopted processes have no ExitStatus to reap; their
+            // deaths are detected by pid liveness and reported the
+            // same way (removed from live, marked failed), just
+            // without an entry in the returned status list.
+            let adopted_dead = self
+                .live
+                .get_mut(&id)
+                .map(|p| p.adopted_exited())
+                .unwrap_or(false);
+            if adopted_dead {
+                if let Some(proc) = self.live.remove(&id) {
+                    self.dead_rings.insert(id.clone(), proc.log_ring());
+                }
+                self.failed_ids.insert(id.clone());
+                tracing::warn!(process = id, "adopted process exited unexpectedly");
+                continue;
+            }
             let exited = self
                 .live
                 .get_mut(&id)
@@ -929,6 +1187,7 @@ impl Supervisor {
                         id: id.clone(),
                         state: proc.state(),
                         pid: proc.pid(),
+                        adopted: proc.adopted_pid.is_some(),
                         restarts,
                         uptime: proc.uptime(),
                     }
@@ -937,6 +1196,7 @@ impl Supervisor {
                         id: id.clone(),
                         state: ProcessState::Failed,
                         pid: None,
+                        adopted: false,
                         restarts,
                         uptime: None,
                     }
@@ -945,6 +1205,7 @@ impl Supervisor {
                         id: id.clone(),
                         state: ProcessState::Stopped,
                         pid: None,
+                        adopted: false,
                         restarts,
                         uptime: None,
                     }
@@ -1386,6 +1647,65 @@ mod tests {
         assert!(p.allows_retry(0));
         assert!(p.allows_retry(2));
         assert!(!p.allows_retry(3));
+    }
+
+    #[tokio::test]
+    async fn adopt_external_process_lifecycle() {
+        // A live process the supervisor did not spawn.
+        #[cfg(unix)]
+        let mut ext = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let mut ext = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = ext.id();
+        let mut sup = Supervisor::new(test_policy());
+        sup.register_spec(sh_spec("ext", "exec sleep 60"));
+        // Unknown id and double-adoption are errors, like spawn.
+        assert!(sup.adopt("missing", pid).is_err());
+        sup.adopt("ext", pid).unwrap();
+        assert!(sup.adopt("ext", pid).is_err());
+        let st = sup.status().into_iter().find(|s| s.id == "ext").unwrap();
+        assert_eq!(st.state, ProcessState::Running);
+        assert_eq!(st.pid, Some(pid));
+        assert!(st.adopted);
+        // Stop kills the external process by pid.
+        sup.stop("ext", false).await.unwrap();
+        let _ = ext.wait();
+        assert!(!pid_alive(pid));
+        let st = sup.status().into_iter().find(|s| s.id == "ext").unwrap();
+        assert_eq!(st.state, ProcessState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn adopted_process_death_is_reaped_as_failed() {
+        #[cfg(unix)]
+        let mut ext = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let mut ext = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = ext.id();
+        let mut sup = Supervisor::new(test_policy());
+        sup.register_spec(sh_spec("ext", "exec sleep 60"));
+        sup.adopt("ext", pid).unwrap();
+        // The external process dies on its own.
+        ext.kill().unwrap();
+        let _ = ext.wait();
+        sup.reap_exited();
+        let st = sup.status().into_iter().find(|s| s.id == "ext").unwrap();
+        assert_eq!(st.state, ProcessState::Failed);
+        assert_eq!(st.pid, None);
     }
 
     #[test]

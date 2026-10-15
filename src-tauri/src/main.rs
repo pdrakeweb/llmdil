@@ -699,6 +699,41 @@ async fn ensure_catalog_models(state: &AppState) {
         );
         cfg.defaults_repaired = true;
     }
+    // Catalog sync: when the curated catalog has gained entries
+    // since this configuration last synced (revision bump), append
+    // the missing models with their catalog defaults — opt-in
+    // candidates arrive disabled and unassigned. Runs once per
+    // revision, so a model the operator deleted is not resurrected
+    // until the catalog next changes.
+    if cfg.catalog_seeded && cfg.catalog_revision < manager_models::CATALOG_REVISION {
+        let entries: Vec<manager_config::CatalogModelEntry> =
+            manager_models::curated_models()
+                .into_iter()
+                .map(|spec| {
+                    let file_name = spec
+                        .url
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("model.gguf")
+                        .to_string();
+                    manager_config::CatalogModelEntry {
+                        model_id: spec.id.clone(),
+                        gguf_file_name: file_name,
+                        quant: spec.quant.clone(),
+                        params_b: spec.params_b,
+                        sha256: spec.sha256.clone(),
+                        source_url: spec.url.clone(),
+                        assigned_backends: backend_for(&spec.id)
+                            .map(|b| vec![b.to_string()])
+                            .unwrap_or_default(),
+                        enabled: spec.enabled_by_default,
+                    }
+                })
+                .collect();
+        manager_config::append_missing_catalog_models(&mut cfg, &entries);
+        cfg.catalog_revision = manager_models::CATALOG_REVISION;
+        dirty = true;
+    }
     if cfg.catalog_seeded {
         if dirty {
             let _ = manager_config::save(&cfg, &state.config_path);
@@ -707,6 +742,8 @@ async fn ensure_catalog_models(state: &AppState) {
     }
     if !cfg.models.is_empty() {
         cfg.catalog_seeded = true;
+        // The catalog sync above keys off catalog_seeded, so it
+        // applies from the next launch for this config.
         if dirty {
             let _ = manager_config::save(&cfg, &state.config_path);
         }
@@ -733,7 +770,7 @@ async fn ensure_catalog_models(state: &AppState) {
                 verified_at: None,
                 source_url: spec.url,
                 assigned_backends,
-                enabled: true,
+                enabled: spec.enabled_by_default,
             }
         })
         .collect();
@@ -758,6 +795,7 @@ async fn ensure_catalog_models(state: &AppState) {
         }
     }
     cfg.catalog_seeded = true;
+    cfg.catalog_revision = manager_models::CATALOG_REVISION;
     // Best effort: the seeded entries are live in memory either way; a
     // failed save only means the seeding repeats on the next launch.
     let _ = manager_config::save(&cfg, &state.config_path);
@@ -955,6 +993,44 @@ async fn ensure_backend_specs(state: &AppState) {
     }
 }
 
+/// Adopt llama-server processes already listening on a configured
+/// backend's port that this session does not supervise. Backend
+/// processes are detached and survive the app closing, so after a
+/// restart the previous session's llama-servers still hold their
+/// ports and GPU memory while the new supervisor reports every
+/// backend stopped — and every pid-keyed stat (VRAM attribution,
+/// process health) reads empty. Adoption is conservative: the port
+/// owner must be a live `llama-server` image, and a backend that is
+/// already supervised is never touched.
+async fn adopt_orphan_backends(state: &AppState) {
+    ensure_backend_specs(state).await;
+    let ports: Vec<(String, u16)> = {
+        let cfg = state.config.read().await;
+        cfg.backends
+            .iter()
+            .map(|b| (b.id.clone(), b.port))
+            .collect()
+    };
+    let mut sup = state.supervisor().await.lock().await;
+    sup.reap_exited();
+    let live: std::collections::HashSet<String> = sup
+        .status()
+        .into_iter()
+        .filter(|s| s.pid.is_some())
+        .map(|s| s.id)
+        .collect();
+    for (id, port) in ports {
+        if live.contains(&id) {
+            continue;
+        }
+        if let Some(pid) = manager_supervisor::port_owner_pid(port) {
+            if manager_supervisor::process_image_is(pid, "llama-server.exe") {
+                let _ = sup.adopt(&id, pid);
+            }
+        }
+    }
+}
+
 fn process_state_str(s: ProcessState) -> &'static str {
     match s {
         ProcessState::Stopped => "stopped",
@@ -1062,7 +1138,7 @@ async fn backend_start_preflight(state: &AppState, id: &str) -> Result<(), Strin
 /// MCP server processes share the Supervisor but are never listed here.
 #[tauri::command]
 async fn list_backends(state: State<'_, AppState>) -> ApiResult {
-    ensure_backend_specs(&state).await;
+    adopt_orphan_backends(&state).await;
     let cfg = state.config.read().await;
     let mut sup = state.supervisor().await.lock().await;
     // Reap children that exited since the last read so a crashed backend
@@ -1086,6 +1162,7 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
                 "configured": true,
                 "state": st.map(|s| process_state_str(s.state)).unwrap_or("stopped"),
                 "pid": st.and_then(|s| s.pid),
+                "adopted": st.map(|s| s.adopted).unwrap_or(false),
                 "restarts": st.map(|s| s.restarts).unwrap_or(0),
                 "uptime_secs": st.and_then(|s| s.uptime).map(|u| u.as_secs()),
             })
@@ -1129,6 +1206,7 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
             "configured": false,
             "state": process_state_str(st.state),
             "pid": st.pid,
+            "adopted": st.adopted,
             "restarts": st.restarts,
             "uptime_secs": st.uptime.map(|u| u.as_secs()),
         }));
@@ -1305,6 +1383,10 @@ async fn test_backend(state: State<'_, AppState>, id: String, prompt: String) ->
 /// machine returning an empty snapshot.
 #[tauri::command]
 async fn get_gpu_telemetry(app: AppHandle, state: State<'_, AppState>) -> ApiResult {
+    // Adoption first: the pid -> backend map below is how telemetry
+    // processes get attributed, and an unadopted orphan attributes
+    // to nothing.
+    adopt_orphan_backends(&state).await;
     let store = state.telemetry().await;
     let (samples, raw_processes, source_error, last_poll_at) = {
         let guard = lock_telemetry(&store);
@@ -1597,6 +1679,7 @@ fn download_spec_for(cfg: &AppConfig, id: &str) -> Result<manager_models::ModelS
             },
             url: m.source_url.clone(),
             params_b: m.params_b,
+            enabled_by_default: m.enabled,
         });
     }
     Err(err(ApiError::NotFound(format!(
@@ -2921,6 +3004,7 @@ async fn placement_propose(
                 url: m.source_url.clone(),
                 size_bytes,
                 params_b: m.params_b,
+                enabled_by_default: m.enabled,
             }
         }
     };

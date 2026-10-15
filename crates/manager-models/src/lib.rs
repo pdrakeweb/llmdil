@@ -41,7 +41,20 @@ pub struct ModelSpec {
     /// Parameter count in billions. Seeded into the model config,
     /// whose validation requires a positive value.
     pub params_b: f32,
+    /// Whether seeding enables this model. The default fleet is
+    /// enabled; opt-in candidates (alternative models for a role)
+    /// seed disabled and unassigned — the operator enables one in
+    /// the Models view, downloads it, and assigns it to a backend.
+    pub enabled_by_default: bool,
 }
+
+/// The curated catalog's revision. Bump whenever
+/// [`curated_models`] changes: existing configurations append
+/// newly added models exactly once per revision (see
+/// `append_missing_catalog_models` in manager-config), so catalog
+/// additions reach installed systems without resurrecting models
+/// an operator deliberately deleted.
+pub const CATALOG_REVISION: u32 = 1;
 
 /// Download progress snapshot for the progress callback.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -79,6 +92,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             size_bytes: 19_762_149_024,
             sha256: "efd971561896866f0e910cce52761ca77b1b138090c7f15fe284676d57d1f689".to_string(),
             params_b: 32.0,
+            enabled_by_default: true,
             // Closest real artifact for the planner slot: Qwen3-32B dense.
             url: "https://huggingface.co/Qwen/Qwen3-32B-GGUF/resolve/main/Qwen3-32B-Q4_K_M.gguf"
                 .to_string(),
@@ -90,6 +104,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             size_bytes: 18_556_689_568,
             sha256: "fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad".to_string(),
             params_b: 30.0,
+            enabled_by_default: true,
             url: "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
                 .to_string(),
         },
@@ -100,6 +115,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             size_bytes: 4_683_073_536,
             sha256: "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c".to_string(),
             params_b: 7.0,
+            enabled_by_default: true,
             url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
                 .to_string(),
         },
@@ -110,7 +126,26 @@ pub fn curated_models() -> Vec<ModelSpec> {
             size_bytes: 5_027_783_488,
             sha256: "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785".to_string(),
             params_b: 8.0,
+            enabled_by_default: true,
             url: "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
+                .to_string(),
+        },
+        // Opt-in candidate for the coder role (added at catalog
+        // revision 1): NVIDIA's agent-execution model — hybrid
+        // Mamba-2 + MoE, 31.6B total / ~3.6B active. Seeds disabled
+        // and unassigned; the pinned llama.cpp build carries the
+        // nemotron_h_moe architecture. Mamba-2 execution on Pascal
+        // (P100) is unvalidated — that is part of what the opt-in
+        // evaluation is for.
+        ModelSpec {
+            id: "nemotron-3.5-lightning-30b".to_string(),
+            name: "Nemotron 3.5 Lightning 30B-A3B".to_string(),
+            quant: "Q4_K_M".to_string(),
+            size_bytes: 25_266_255_936,
+            sha256: "edcb5d4650796ed2fb412498de6f83b585862312c747ddb74f0ea04b22206181".to_string(),
+            params_b: 31.6,
+            enabled_by_default: false,
+            url: "https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF/resolve/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf"
                 .to_string(),
         },
     ]
@@ -936,6 +971,7 @@ mod tests {
             sha256: PLACEHOLDER_SHA256.to_string(),
             url: "https://example.com/x.gguf".to_string(),
             params_b: 8.0,
+            enabled_by_default: true,
         }
     }
 
@@ -949,6 +985,7 @@ mod tests {
             sha256: "abc123".to_string(),
             url: "https://example.com/qwen3-8b-q4_k_m.gguf".to_string(),
             params_b: 8.0,
+            enabled_by_default: true,
         };
         assert_eq!(spec.quant, "Q4_K_M");
         let p = DownloadProgress {
@@ -1145,6 +1182,7 @@ mod tests {
             sha256: PLACEHOLDER_SHA256.to_string(),
             url: format!("http://{}{path}", server.addr),
             params_b: 1.0,
+            enabled_by_default: true,
         }
     }
 
@@ -1508,9 +1546,9 @@ mod tests {
     // -- catalog + registry tests ---------------------------------------------
 
     #[test]
-    fn curated_models_are_four_with_pinned_hashes() {
+    fn curated_models_are_five_with_pinned_hashes() {
         let models = curated_models();
-        assert_eq!(models.len(), 4);
+        assert_eq!(models.len(), 5);
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1518,9 +1556,22 @@ mod tests {
                 "qwen3-27b-planner",
                 "qwen3-coder-30b",
                 "qwen2.5-coder-7b",
-                "qwen3-8b"
+                "qwen3-8b",
+                "nemotron-3.5-lightning-30b"
             ]
         );
+        // The default fleet seeds enabled; the opt-in candidate does not.
+        for m in &models {
+            assert_eq!(
+                m.enabled_by_default,
+                m.id != "nemotron-3.5-lightning-30b",
+                "{}",
+                m.id
+            );
+        }
+        let nemotron = &models[4];
+        assert_eq!(nemotron.params_b, 31.6);
+        assert_eq!(nemotron.size_bytes, 25_266_255_936);
         for m in &models {
             // Real pins from the publishers' Hugging Face file metadata:
             // 64 hex chars, never the placeholder.
