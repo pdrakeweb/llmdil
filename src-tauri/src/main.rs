@@ -952,6 +952,34 @@ async fn setup_get_commands(state: State<'_, AppState>, step_id: String) -> ApiR
     Ok(serde_json::to_value(&commands).map_err(jerr)?)
 }
 
+/// Live wizard step states for the Setup view: id, name, state, last
+/// outcome message/log tail, plus remediation + help URL per step.
+#[tauri::command]
+async fn setup_get_steps(state: State<'_, AppState>) -> ApiResult {
+    let wizard = state.wizard(RunMode::Install).await;
+    let guard = wizard.lock().await;
+    let report = guard.report();
+    let steps: Vec<Value> = report
+        .steps
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "name": s.name,
+                "state": s.state,
+                "message": s.message,
+                "duration_ms": s.duration_ms,
+                "log_tail": s.log_tail,
+                "note": s.note,
+                "remediation": guard.remediation_hint(&s.id),
+                "help_url": guard.help_url(&s.id),
+            })
+        })
+        .collect();
+    let (done, total) = report.progress();
+    Ok(json!({ "steps": steps, "done": done, "total": total }))
+}
+
 /// Whether the user has finished the setup wizard. The UI opens the wizard
 /// on launch until this is true.
 #[tauri::command]
@@ -1996,6 +2024,7 @@ fn main() {
             setup_skip_step,
             setup_get_commands,
             setup_mark_manual,
+            setup_get_steps,
             setup_status,
             setup_mark_complete,
             setup_step_help_url,

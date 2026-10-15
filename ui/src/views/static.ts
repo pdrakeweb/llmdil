@@ -1,13 +1,13 @@
-/* Secondary views — faithful static layouts from the approved mockups.
-   Sample data throughout; each carries a "live data wiring pending" banner.
-   The dashboard is the fully wired view; these follow as the backend
-   commands grow (spec §14). */
+/* Secondary views. The Setup wizard is fully wired to the backend
+   (live step states, run/retry, audit); the remaining views are static
+   layouts with sample data and a "live data wiring pending" banner. */
 
-import { mockBackends, mockDashboard, mockGpus, mockWizardSteps, GPU_COLORS } from "../mock";
+import { mockBackends, mockDashboard, mockGpus, GPU_COLORS } from "../mock";
 import { gaugeRing, meter, multiLine, sparkline, stackedBar, walk } from "../charts";
 import { icon } from "../icons";
 import { esc } from "../html";
-import { runWizardStep, isTauri, openUrl, markSetupComplete } from "../api";
+import { runWizardStep, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit } from "../api";
+import type { WizardStepState } from "../types";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
 
@@ -212,74 +212,155 @@ export function renderSettings(): string {
 }
 
 /* ---------------- Setup wizard ---------------- */
+
+function wizardStepRow(s: WizardStepState, live: boolean): string {
+  const stIcon = s.state === "done" || s.state === "manual" ? `<span style="color:var(--ok)">${icon("check")}</span>`
+    : s.state === "running" ? `<span style="color:var(--accent)">${icon("clock")}</span>`
+    : s.state === "failed" ? `<span style="color:var(--err)">${icon("err")}</span>`
+    : `<span style="color:var(--text3)">\u25cb</span>`;
+  const stateTxt = s.state === "done" ? `done \u00b7 ${esc(s.duration ?? "")}`
+    : s.state === "manual" ? "manual"
+    : s.state === "running" ? esc(s.note ?? "running\u2026")
+    : esc(s.state);
+  const helpBtn = s.state === "failed" && s.helpUrl
+    ? `<button class="btn" data-help-url="${esc(s.helpUrl)}">Open driver download</button>` : "";
+  const runBtn = live && (s.state === "queued" || s.state === "failed")
+    ? `<button class="btn" data-run-step="${esc(s.id)}">${s.state === "failed" ? "Retry" : "Run"}</button>` : "";
+  const actions = helpBtn || runBtn ? `<div style="margin-top:6px;display:flex;gap:6px">${helpBtn}${runBtn}</div>` : "";
+  const remediation = s.state === "failed" && s.remediation
+    ? `<div style="margin-top:4px;color:var(--text2)">${esc(s.remediation)}</div>` : "";
+  const logTail = s.state === "failed" && s.logTail && s.logTail.length
+    ? `<div style="margin-top:4px;font-family:var(--mono);font-size:11px;color:var(--text3)">${s.logTail.slice(-3).map((l) => esc(l)).join("<br>")}</div>` : "";
+  return `<div class="step ${s.state}">${stIcon}${icon("wrench")}
+    <div><div class="sname">${esc(s.name)}</div><div class="sdetail">${esc(s.detail)}</div>${remediation}${logTail}${actions}</div>
+    <div class="sstate">${s.note && s.state === "done" ? `<span class="chip badge-warn">${esc(s.note)}</span> ` : ""}${stateTxt}</div></div>`;
+}
+
+function paintWizard(root: HTMLElement, steps: WizardStepState[], live: boolean): void {
+  const done = steps.filter((s) => s.state === "done" || s.state === "manual").length;
+  const pct = steps.length ? Math.round((done / steps.length) * 100) : 0;
+  const progress = root.querySelector("#wizProgress");
+  if (progress) {
+    progress.innerHTML = `<b>${done}</b><span style="color:var(--text3);font-size:12px">of ${steps.length} steps \u00b7 ${pct}%</span>
+      <div class="segbar">${steps.map((s) => `<i class="${s.state === "done" || s.state === "manual" ? "done" : s.state === "running" ? "run" : ""}"></i>`).join("")}</div>`;
+  }
+  const list = root.querySelector("#wizSteps");
+  if (list) {
+    list.innerHTML = `<div class="sec-title">Setup checklist <span style="color:var(--text3);font-weight:400">\u2014 runs in order</span></div>`
+      + steps.map((s) => wizardStepRow(s, live)).join("");
+  }
+  const banner = root.querySelector("#wizBanner");
+  if (banner) {
+    banner.innerHTML = live
+      ? `${icon("check")} Live \u2014 steps execute against this machine. A failed step pauses the run; fix the cause and retry it.`
+      : `${icon("warn")} Sample mode \u2014 open the installed app to run setup against this machine.`;
+  }
+}
+
 export function renderWizard(): string {
-  const steps = mockWizardSteps();
-  const done = steps.filter((s) => s.state === "done").length;
-  const pct = Math.round((done / steps.length) * 100);
-  const rows = steps.map((s) => {
-    const stIcon = s.state === "done" ? `<span style="color:var(--ok)">${icon("check")}</span>`
-      : s.state === "running" ? `<span style="color:var(--accent)">${icon("clock")}</span>`
-      : s.state === "failed" ? `<span style="color:var(--err)">${icon("err")}</span>`
-      : `<span style="color:var(--text3)">○</span>`;
-    const stateTxt = s.state === "done" ? `done · ${esc(s.duration ?? "")}` : s.state === "running" ? esc(s.note ?? "running…") : esc(s.state);
-    const helpBtn = s.state === "failed" && s.helpUrl
-      ? `<div style="margin-top:6px"><button class="btn" data-help-url="${esc(s.helpUrl)}">Open driver download</button></div>` : "";
-    return `<div class="step ${s.state}">${stIcon}${icon("wrench")}
-      <div><div class="sname">${esc(s.name)}</div><div class="sdetail">${esc(s.detail)}</div>${helpBtn}</div>
-      <div class="sstate">${s.note && s.state === "done" ? `<span class="chip badge-warn">${esc(s.note)}</span> ` : ""}${stateTxt}</div></div>`;
-  }).join("");
+  const live = isTauri();
   return `<div class="topbar"><h1>Setup</h1><span class="spacer"></span><a class="btn" href="#/dashboard">Back to dashboard</a></div>
-  <div class="view"><div class="banner">${icon("warn")} live data wiring pending — wizard step execution via run_wizard_step when under Tauri</div>
+  <div class="view"><div class="banner" id="wizBanner">${icon("clock")} Loading setup state\u2026</div>
   <div class="wiz">
     <div class="wiz-head">${icon("wrench")}<h2>Set up Local LLM Service</h2><span class="spacer" style="flex:1"></span>
-      <button class="btn" id="auditBtn">${icon("search")} Re-run audit</button></div>
-    <div class="wiz-progress"><b>${done}</b><span style="color:var(--text3);font-size:12px">of ${steps.length} steps · ${pct}%</span>
-      <div class="segbar">${steps.map((s) => `<i class="${s.state === "done" ? "done" : s.state === "running" ? "run" : ""}"></i>`).join("")}</div>
-      <span class="updated">14m 09s elapsed · ~4m left</span></div>
+      <button class="btn" id="auditBtn">${icon("search")} Re-run audit</button>
+      <button class="btn primary" id="runBtn">Run setup</button></div>
+    <div class="wiz-progress" id="wizProgress"></div>
     <div class="wiz-body">
-      <div class="wiz-side"><p>Steps run in order. A failed step pauses the run — retry it to continue.</p>
+      <div class="wiz-side"><p>Steps run in order. A failed step pauses the run \u2014 retry it to continue.</p>
         <div style="margin-top:14px;display:grid;gap:6px">
-          <div><span style="font-family:var(--mono)">D:\\llm\\</span> · 46.5 GB</div>
           <div>${icon("shield")} checksums verified per file</div>
-          <div>${icon("server")} services start at step 5</div></div></div>
-      <div class="wiz-steps"><div class="sec-title">Setup checklist <span style="color:var(--text3);font-weight:400">— runs automatically, in order</span></div>${rows}</div>
+          <div>${icon("server")} services start at the gateway step</div></div></div>
+      <div class="wiz-steps" id="wizSteps"></div>
     </div>
     <div class="wiz-foot"><button class="btn" disabled>Back</button><span class="spacer"></span>
-      <button class="btn" disabled>Pause</button><button class="btn primary" id="finishBtn">Finish</button></div>
-    <div class="logstream" style="border:0;border-top:1px solid var(--border);border-radius:0">
-      <div class="ln"><span class="t">06:42:03</span> <span class="lvl-info">step 6</span> running: installing Continue.dev 1.4.2…</div>
-      <div class="ln"><span class="t">06:41:54</span> <span class="lvl-info">ok</span> step 5: gateway :4000 — 4 groups · 0 validation errors</div>
-      <div class="ln"><span class="t">06:30:22</span> <span class="lvl-warn">retry 1/3</span> step 4: checksum mismatch qwen2.5-coder-7b — resumed ok</div>
-      <div class="ln"><span class="t">06:18:40</span> <span class="lvl-info">ok</span> step 4: 4/4 models verified (46.5 GB)</div>
-    </div>
+      <button class="btn primary" id="finishBtn">Finish</button></div>
+    <div class="logstream" id="wizLog" style="border:0;border-top:1px solid var(--border);border-radius:0"></div>
   </div></div>`;
 }
 
 export function wireWizard(root: HTMLElement): void {
+  const logEl = root.querySelector("#wizLog");
+  const logLine = (text: string, cls = "lvl-info") => {
+    if (!logEl) return;
+    const t = new Date().toLocaleTimeString("en-GB");
+    logEl.insertAdjacentHTML("beforeend", `<div class="ln"><span class="t">${t}</span> <span class="${cls}">${esc(text)}</span></div>`);
+  };
+
+  let steps: WizardStepState[] = [];
+
+  const refresh = async (): Promise<void> => {
+    const r = await getWizardSteps();
+    steps = r.data;
+    paintWizard(root, steps, r.live);
+    if (r.error) logLine(`could not load setup state: ${r.error}`, "lvl-err");
+  };
+
+  const runOne = async (stepId: string): Promise<boolean> => {
+    logLine(`running step: ${stepId}`);
+    const r = await runWizardStep(stepId);
+    if (r.error) { logLine(`step ${stepId} error: ${r.error}`, "lvl-err"); await refresh(); return false; }
+    const o = r.data.outcome;
+    logLine(`step ${stepId}: ${o.state} \u2014 ${o.message}`, o.state === "done" || o.state === "manual" ? "lvl-info" : "lvl-err");
+    await refresh();
+    return o.state === "done" || o.state === "manual" || o.state === "skipped";
+  };
+
+  const runBtn = root.querySelector("#runBtn") as HTMLButtonElement | null;
+  runBtn?.addEventListener("click", async () => {
+    if (!isTauri()) { alert("Sample mode: setup runs in the installed app."); return; }
+    runBtn.disabled = true;
+    try {
+      await refresh();
+      for (const s of [...steps]) {
+        if (s.state === "done" || s.state === "manual" || s.state === "skipped") continue;
+        const ok = await runOne(s.id);
+        if (!ok) { logLine("setup paused \u2014 fix the failed step and retry", "lvl-warn"); break; }
+      }
+    } finally { runBtn.disabled = false; }
+  });
+
   const audit = root.querySelector("#auditBtn");
   audit?.addEventListener("click", async () => {
     if (!isTauri()) { alert("Sample mode: audit would re-run all checks here."); return; }
-    try {
-      const r = await runWizardStep("audit");
-      alert(`Audit accepted: ${r.data.task_id}`);
-    } catch (e) { alert(`run_wizard_step failed: ${String(e)}`); }
+    logLine("running audit\u2026");
+    const r = await runAudit();
+    if (r.error) { logLine(`audit failed: ${r.error}`, "lvl-err"); return; }
+    logLine(`audit complete: ${r.data.done}/${r.data.total} checks passed`);
+    await refresh();
   });
+
   root.querySelector("#finishBtn")?.addEventListener("click", async () => {
     if (isTauri()) {
+      const remaining = steps.filter((s) => !(s.state === "done" || s.state === "manual" || s.state === "skipped")).length;
+      if (remaining > 0 && !confirm(`${remaining} setup step(s) are not complete. Mark setup complete anyway?`)) return;
       const r = await markSetupComplete();
       if (r.error) { alert(`Could not mark setup complete: ${r.error}`); return; }
     }
     location.hash = "#/dashboard";
   });
+
   root.addEventListener("click", async (ev) => {
-    const btn = (ev.target as HTMLElement).closest("[data-help-url]") as HTMLElement | null;
-    if (!btn) return;
-    const url = btn.getAttribute("data-help-url") ?? "";
-    btn.setAttribute("disabled", "");
-    const r = await openUrl(url);
-    btn.removeAttribute("disabled");
-    if (r.error) alert(`Could not open the download page: ${r.error}`);
+    const t = ev.target as HTMLElement;
+    const helpBtn = t.closest("[data-help-url]") as HTMLElement | null;
+    if (helpBtn) {
+      const url = helpBtn.getAttribute("data-help-url") ?? "";
+      helpBtn.setAttribute("disabled", "");
+      const r = await openUrl(url);
+      helpBtn.removeAttribute("disabled");
+      if (r.error) alert(`Could not open the download page: ${r.error}`);
+      return;
+    }
+    const runStepBtn = t.closest("[data-run-step]") as HTMLElement | null;
+    if (runStepBtn) {
+      const id = runStepBtn.getAttribute("data-run-step") ?? "";
+      runStepBtn.setAttribute("disabled", "");
+      await runOne(id);
+      runStepBtn.removeAttribute("disabled");
+    }
   });
+
+  void refresh();
 }
 
 /* ---------------- Throughput chart data for dashboard (shared) ---------------- */

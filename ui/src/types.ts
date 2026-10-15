@@ -75,8 +75,11 @@ export interface WizardStepState {
   id: string;
   name: string;
   detail: string;
-  state: "done" | "running" | "queued" | "failed" | "skipped";
+  state: "done" | "running" | "queued" | "failed" | "skipped" | "manual";
   duration?: string;
   note?: string;
   helpUrl?: string;
+  message?: string;
+  logTail?: string[];
+  remediation?: string;
 }

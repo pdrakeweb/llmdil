@@ -104,23 +104,72 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
   return errors.length ? { data, live: true, error: errors.join("; ") } : { data, live: true };
 }
 
-/** run_wizard_step — returns a task id; progress arrives via events (stub: accepted only). */
-export async function runWizardStep(stepId: string): Promise<CallResult<{ task_id: string; step_id: string; accepted: boolean }>> {
-  if (isTauri()) {
-    try {
-      const data = await invoke<{ task_id: string; step_id: string; accepted: boolean }>("run_wizard_step", { stepId });
-      return { data, live: true };
-    } catch (e) {
-      return { data: { task_id: "", step_id: stepId, accepted: false }, live: true, error: errOf(e) };
-    }
-  }
-  return { data: { task_id: "sample-task", step_id: stepId, accepted: true }, live: false };
+export interface WizardStepOutcome {
+  state: string;
+  message: string;
+  log_tail: string[];
+  duration_ms: number;
 }
 
-/** Wizard steps — sample layout in the browser AND under Tauri until the
-    backend exposes step state. Always reported as non-live sample data. */
+/** run_wizard_step — runs one step to completion; the outcome is in the result. */
+export async function runWizardStep(stepId: string): Promise<CallResult<{ task_id: string; outcome: WizardStepOutcome }>> {
+  if (isTauri()) {
+    try {
+      const data = await invoke<{ task_id: string; outcome: WizardStepOutcome }>("run_wizard_step", { stepId });
+      return { data, live: true };
+    } catch (e) {
+      return { data: { task_id: "", outcome: { state: "failed", message: String(e), log_tail: [], duration_ms: 0 } }, live: true, error: errOf(e) };
+    }
+  }
+  return { data: { task_id: "sample-task", outcome: { state: "done", message: "sample mode", log_tail: [], duration_ms: 0 } }, live: false };
+}
+
+/** run_audit — re-run all check-type steps in audit mode. */
+export async function runAudit(): Promise<CallResult<{ task_id: string; done: number; total: number }>> {
+  if (isTauri()) {
+    try {
+      const data = await invoke<{ task_id: string; done: number; total: number }>("run_audit");
+      return { data, live: true };
+    } catch (e) {
+      return { data: { task_id: "", done: 0, total: 0 }, live: true, error: errOf(e) };
+    }
+  }
+  return { data: { task_id: "sample-task", done: 0, total: 0 }, live: false };
+}
+
+interface BackendStep {
+  id: string;
+  name: string;
+  state: WizardStepState["state"];
+  message: string;
+  duration_ms: number;
+  log_tail: string[];
+  note: string | null;
+  remediation: string | null;
+  help_url: string | null;
+}
+
+/** setup_get_steps — live wizard step states under Tauri; sample data in the browser. */
 export async function getWizardSteps(): Promise<CallResult<WizardStepState[]>> {
-  return { data: mockWizardSteps(), live: false };
+  if (!isTauri()) return { data: mockWizardSteps(), live: false };
+  try {
+    const r = await invoke<{ steps: BackendStep[]; done: number; total: number }>("setup_get_steps");
+    const data: WizardStepState[] = r.steps.map((s) => ({
+      id: s.id,
+      name: s.name,
+      detail: s.message,
+      state: s.state,
+      duration: s.duration_ms > 0 ? `${(s.duration_ms / 1000).toFixed(1)}s` : undefined,
+      note: s.note ?? undefined,
+      helpUrl: s.help_url ?? undefined,
+      message: s.message,
+      logTail: s.log_tail,
+      remediation: s.remediation ?? undefined,
+    }));
+    return { data, live: true };
+  } catch (e) {
+    return { data: [], live: true, error: errOf(e) };
+  }
 }
 
 /** setup_status — whether the setup wizard has been completed. */
