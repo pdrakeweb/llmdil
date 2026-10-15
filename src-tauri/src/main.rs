@@ -110,6 +110,8 @@ pub enum ApiError {
     Mcp(String),
     WinMl(String),
     NotFound(String),
+    /// Caller supplied an invalid argument (e.g. a non-http URL).
+    InvalidInput(String),
     /// A crate's public API cannot express what the command needs.
     /// Reported to the parent; do not silently work around.
     ContractGap(String),
@@ -132,6 +134,7 @@ impl fmt::Display for ApiError {
             ApiError::Mcp(e) => write!(f, "mcp error: {e}"),
             ApiError::WinMl(e) => write!(f, "winml error: {e}"),
             ApiError::NotFound(e) => write!(f, "not found: {e}"),
+            ApiError::InvalidInput(e) => write!(f, "invalid input: {e}"),
             ApiError::ContractGap(e) => write!(f, "contract gap: {e}"),
             ApiError::Unsupported(e) => write!(f, "unsupported in this version: {e}"),
             ApiError::Io(e) => write!(f, "io error: {e}"),
@@ -1003,7 +1006,8 @@ async fn setup_mark_complete(state: State<'_, AppState>) -> ApiResult {
 /// (e.g. the NVIDIA driver download page on the hardware-detect step).
 /// Returns `{"url": string|null, "step_id": string}`.
 #[tauri::command]
-async fn setup_step_help_url(state: State<'_, AppState>, step_id: String) -> ApiResult {    let wizard = state.wizard(RunMode::Install).await;
+async fn setup_step_help_url(state: State<'_, AppState>, step_id: String) -> ApiResult {
+    let wizard = state.wizard(RunMode::Install).await;
     let url = wizard.lock().await.help_url(&step_id).map(String::from);
     Ok(json!({ "url": url, "step_id": step_id }))
 }
@@ -1023,15 +1027,15 @@ async fn open_url(url: String) -> ApiResult {
         std::process::Command::new("cmd")
             .args(["/C", "start", "", &url])
             .spawn()
-            .map_err(|e| err(ApiError::Internal(format!("failed to open URL: {e}"))))?;
+            .map_err(|e| err(ApiError::Io(format!("failed to open URL: {e}"))))?;
+        Ok(json!({ "ok": true }))
     }
     #[cfg(not(target_os = "windows"))]
     {
-        return Err(err(ApiError::Unsupported(
+        Err(err(ApiError::Unsupported(
             "open_url is only supported on Windows".to_string(),
-        )));
+        )))
     }
-    Ok(json!({ "ok": true }))
 }
 
 /// Mark a step as manually completed by the user.
