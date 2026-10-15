@@ -2151,18 +2151,33 @@ interface WizardPaintOpts {
   busy?: boolean;
   runningStepId?: string | null;
   statusLine?: string | null;
+  /** A run or audit is in progress: steps without a result from
+   *  this run (freshIds) render blank instead of the previous
+   *  session's success/failure. */
+  hideStale?: boolean;
+  freshIds?: Set<string>;
 }
 
 function paintWizard(root: HTMLElement, steps: WizardStepState[], live: boolean, opts: WizardPaintOpts = {}): void {
   // The backend's Running state cannot be observed mid-step (the run
   // command holds the wizard lock for the whole execution, and the
   // state query needs the same lock), so the view marks the step it
-  // invoked as running itself. The override applies only while the
-  // server state is still queued — a finished step keeps its real
-  // state.
-  const eff = opts.runningStepId
-    ? steps.map((s) => (s.id === opts.runningStepId && s.state === "queued" ? { ...s, state: "running" as const } : s))
-    : steps;
+  // invoked as running itself. While a step runs, its box must not
+  // keep showing the previous session's result: it renders blank,
+  // labeled "running", in the blue running style — whatever its prior
+  // state was. During a full run or audit (hideStale), steps that
+  // have not produced a result in this run render blank as well, so
+  // no stale success or failure stays on screen while work is in
+  // progress.
+  const blank = (s: WizardStepState, state: WizardStepState["state"]): WizardStepState => ({
+    ...s, state, detail: "", note: undefined, duration: undefined,
+    remediation: undefined, logTail: undefined, manualCommands: undefined,
+  });
+  const eff = steps.map((s) => {
+    if (opts.runningStepId && s.id === opts.runningStepId) return blank(s, "running");
+    if (opts.hideStale && !(opts.freshIds && opts.freshIds.has(s.id))) return blank(s, "queued");
+    return s;
+  });
   const done = eff.filter((s) => s.state === "done" || s.state === "manual").length;
   const pct = eff.length ? Math.round((done / eff.length) * 100) : 0;
   const progress = root.querySelector("#wizProgress");
@@ -2233,8 +2248,13 @@ export function wireWizard(root: HTMLElement): () => void {
   let busy = false;
   let runningStepId: string | null = null;
   let statusLine: string | null = null;
+  /** While a setup run or audit is in progress, steps that have not
+   *  produced a result in this run render blank (paintWizard's
+   *  hideStale); freshIds collects the steps that have. */
+  let hideStale = false;
+  const freshIds = new Set<string>();
 
-  const paint = (): void => paintWizard(root, steps, liveNow, { busy, runningStepId, statusLine });
+  const paint = (): void => paintWizard(root, steps, liveNow, { busy, runningStepId, statusLine, hideStale, freshIds });
 
   /** Manual-command text per failed step id, fetched once per step
    * from setup_get_commands and rendered by the row with a copy
@@ -2299,13 +2319,14 @@ export function wireWizard(root: HTMLElement): () => void {
     if (stepId === "smoke-test") await startEnabledBackends();
     logLine(`running step: ${stepId}`);
     const r = await runWizardStep(stepId);
-    if (r.error) { logLine(`step ${stepId} error: ${r.error}`, "lvl-err"); await refresh(); return "failed"; }
+    if (r.error) { freshIds.add(stepId); logLine(`step ${stepId} error: ${r.error}`, "lvl-err"); await refresh(); return "failed"; }
     if (r.data.busy || !r.data.outcome) {
       logLine("a setup step is already running", "lvl-warn");
       await refresh();
       return "busy";
     }
     const o = r.data.outcome;
+    freshIds.add(stepId);
     logLine(`step ${stepId}: ${o.state} \u2014 ${o.message}`, o.state === "done" || o.state === "manual" ? "lvl-info" : "lvl-err");
     await refresh();
     return o.state === "done" || o.state === "manual" || o.state === "skipped" ? "ok" : "failed";
@@ -2316,6 +2337,8 @@ export function wireWizard(root: HTMLElement): () => void {
     if (!isTauri()) { alert("Sample mode: setup runs in the installed app."); return; }
     if (busy) return;
     busy = true;
+    hideStale = true;
+    freshIds.clear();
     paint();
     try {
       await refresh();
@@ -2342,6 +2365,7 @@ export function wireWizard(root: HTMLElement): () => void {
     } finally {
       busy = false;
       runningStepId = null;
+      hideStale = false;
       paint();
     }
   });
@@ -2351,6 +2375,8 @@ export function wireWizard(root: HTMLElement): () => void {
     if (!isTauri()) { alert("Sample mode: audit would re-run all checks here."); return; }
     if (busy) return;
     busy = true;
+    hideStale = true;
+    freshIds.clear();
     statusLine = "Running audit \u2014 re-checking all steps\u2026";
     paint();
     logLine("running audit\u2026");
@@ -2379,6 +2405,7 @@ export function wireWizard(root: HTMLElement): () => void {
       void enrichFailed();
     } finally {
       busy = false;
+      hideStale = false;
       paint();
     }
   });

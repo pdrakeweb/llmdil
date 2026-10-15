@@ -37,6 +37,7 @@
         "displayLanguageSelector": false,
         "installMode": "currentUser",
         "installerHooks": "installer-hooks.nsi",
+        "template": "installer-template.nsi",
         "languages": [
           "English"
         ],
@@ -55,5 +56,5 @@
   },
   "identifier": "com.pdrakeweb.llm-manager",
   "productName": "Local LLM Service Manager",
-  "version": "0.1.9"
+  "version": "0.1.10"
 }

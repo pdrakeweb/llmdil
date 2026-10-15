@@ -224,7 +224,7 @@ table.tbl tr:last-child td { border-bottom: 0; }
 .step .sdetail { color: var(--text3); font-size: 11px; font-family: var(--mono); }
 .step .sstate { font-size: 11px; font-family: var(--mono); }
 .step.done .sstate { color: var(--ok); }
-.step.running { border-color: var(--accent); }
+.step.running { border-color: var(--accent); background: rgba(74, 158, 255, 0.08); }
 .step.running .sstate { color: var(--accent); }
 .step.queued { opacity: 0.55; }
 .step.failed { border-color: var(--err); }
