@@ -1,6 +1,6 @@
 # Crate map — implementation contract
 
-Rust workspace scaffold for the Local LLM Service Manager. Nine library
+Rust workspace scaffold for the Local LLM Service Manager. Ten library
 crates under `crates/` (workspace members) plus the Tauri shell in
 `src-tauri/` (excluded from the workspace; path-deps to the crates).
 The UI shell is in `ui/` (Vite + plain TypeScript; framework-independent
@@ -311,3 +311,14 @@ GTK/WebKit); kept syntactically valid.
 Vite + plain TypeScript scaffold (no framework lock-in). `npm run build`
 emits `ui/dist`. `src/main.ts` renders the scaffold page and calls the
 `get_status` Tauri command when running under Tauri.
+
+## manager-present
+
+Canonical number presentation for user-facing quantities (Pete,
+2026-10-15: raw floats like 15.9921875 GB are not a useful
+presentation). Pure functions, no dependencies: `trim1` (one decimal
+at most, trailing ".0" dropped, whole numbers at magnitude >= 100),
+`gb`, `bytes`, `mib`, `count`, `percent`, `rate`, `latency_ms`,
+`duration_secs`. The TypeScript UI mirrors the same rules in
+`ui/src/charts.ts` (`trim1`/`fmtGb`); wizard step messages format
+through this crate.

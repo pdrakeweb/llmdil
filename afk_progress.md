@@ -176,3 +176,51 @@ Content (app-managed PostgreSQL, Pete's decision Oct 15 — the LiteLLM admin UI
 - Gateway activation plans (Pete's report: adding a backend saved silently — no plan was created, nothing indicated a gateway restart was required, and dismissing the transient post-add card lost the information entirely). New src-tauri module `activation`: a persisted change journal (<data_dir>/activation-journal.json) records gateway-affecting saves — backend_add, backend_delete, backend_apply_config, update_gateway_config, gateway_set_bind_host — but only when the change alters the generated gateway YAML (bind host forced, since the YAML does not carry it), judged by comparing generate_config_yaml before/after. The first unresolved entry snapshots the pre-change config. Resolution rule: the start-gateway step regenerates gateway/config.yaml on every start, so entries older than that file's mtime are resolved; pending = unresolved entries OR live config drift (generated YAML vs the file). Commands: gateway_activation_plan, gateway_activation_cancel (restores the snapshot; refused when the config changed through another path since, with the reason), gateway_activation_complete, gateway_quiesce_wait (polls litellm_in_flight_requests from /metrics until zero or timeout). gateway_status gains activation_pending/activation_changes.
 - UI: a persistent plan card at the top of the Backends and Gateway views — itemized changes, gateway state, and the operator options: "Quiesce, then restart" (drain in-flight requests first), "Restart gateway now", "Decide later" (collapses to a persistent one-line pending bar with Review), "Cancel changes" (two-click, restores the snapshot). When the gateway is down the plan offers Start gateway and states the changes apply at next start. The post-add card now points at the plan instead of offering its own transient restart. A manual gateway (re)start from the Gateway view also completes the plan.
 - Scope note: literal traffic migration to a backup is not offered — LiteLLM fixes routes at process start and no dynamic route API is configured; quiesce drains in-flight work before the restart, and other group members keep serving until the restart itself.
+
+## v0.1.23 — GPU residency, layered statistics, list ergonomics, number presentation
+
+Pete's reports (Oct 15, 2026, late evening): the GPUs view process
+table overflowed its cards; no view showed which backends are loaded
+on which GPU; block lists were neither sortable nor filterable and
+had no overview; statistics were missing at the model and gateway
+layers; the Service Map did not show backends per GPU; dashboard
+stat fields rendered as unexplained blanks; and raw floats
+(15.1/15.9921875 GB on the console view) were presented unrounded.
+
+- GPUs view: the process table is now a compact list inside a
+  contained scroll region (max-height, overflow-y auto); each row is
+  one line (backend or process name + VRAM + context-only chip) and
+  clicks open to full detail (process, PID, per-GPU VRAM, backend,
+  context explanation). Expansion state lives outside the repainted
+  DOM so the 2 s poll cannot collapse an open row.
+- Residency: a backend -> GPU map is built from telemetry's
+  per-process attribution in the Backends view, the Service Map, and
+  the dashboard. Backend cards show "Loaded on: GPU n (name) — X GiB"
+  (context-only under 1 GiB; "not measured" when a running backend
+  has no attributed process). Dashboard backend cards now fill VRAM
+  HELD from the same data (previously no live source). Service Map
+  edges prefer measured residency (configured splits only where
+  nothing is measured), backend node subtitles carry per-GPU GiB,
+  and a "GPU residency (measured)" card lists backends per GPU.
+- Lists: Backends and GPUs views gain a short overview strip (one
+  line per item) plus sort and filter controls (backends: name/port/
+  state/requests + state filter + text filter; GPUs: index/util/
+  VRAM/temp + name filter). Grouping by gateway group is preserved;
+  sorting applies within sections.
+- Statistics: backend cards render Requests (1h) / Errors (1h) /
+  Throughput from the existing metrics window store (previously
+  dashboard-only). Model cards aggregate the same figures over the
+  backends serving the model. The Gateway summary card shows totals
+  across backends plus the hottest backend. Where no metrics window
+  exists, each surface says so in words — the dashboard shows an
+  explicit "statistics are not available yet" card explaining the
+  gateway-restart precondition instead of unexplained dashes.
+  Per-deployment latency is not exposed by LiteLLM's verified
+  Prometheus metric set and is not estimated.
+- Number presentation: new crate manager-present holds the
+  canonical rounding rules (trim1/gb/bytes/mib/count/percent/rate/
+  latency_ms/duration_secs; unit tests). Wizard user-facing
+  messages (GPU detection, split assignment, disk-space checks)
+  format through it. The UI mirrors the rules in charts.ts
+  (trim1/fmtGb) applied to every VRAM/GB figure, throughput rate,
+  and step duration — the console view now reads 15.1/16 GB.

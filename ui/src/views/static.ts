@@ -5,7 +5,7 @@
    (live=false) views show a sample-mode banner and honest empty states
    instead of fabricated data. */
 
-import { gaugeRing, sparkline } from "../charts";
+import { fmtGb, gaugeRing, sparkline, trim1 } from "../charts";
 import { icon } from "../icons";
 import { esc } from "../html";
 import {
@@ -76,7 +76,7 @@ function fmtBytes(n: number | null): string {
   let v = n;
   let u = 0;
   while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
-  return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${units[u]}`;
+  return `${v >= 100 ? v.toFixed(0) : trim1(v)} ${units[u]}`;
 }
 
 function fmtUptime(secs: number | null): string {
@@ -103,7 +103,7 @@ function fmtDate(ts: string): string {
 
 /* ---------------- GPUs ---------------- */
 
-function gpuCard(g: GpuInfo): string {
+function gpuCard(g: GpuInfo, expanded: Set<string>): string {
   const vramPct = g.vram_total_gb > 0 ? Math.round((g.vram_used_gb / g.vram_total_gb) * 100) : 0;
   // pci/driver are absent from the telemetry payload; omit them when
   // unset (esc(undefined) would print the literal text "undefined").
@@ -130,14 +130,26 @@ function gpuCard(g: GpuInfo): string {
   // on several GPUs, and an unsplit one appears on every GPU it
   // initialized a context on while its weights sit on the main GPU.
   const procRow = (p: { process: string; pid: number; vram_mib: number; backend: string }): string => {
-    const backend = p.backend !== "—" && p.vram_mib < 1024
-      ? `${esc(p.backend)} <span class="chip">context only</span>`
-      : esc(p.backend);
-    return `<tr><td>${esc(p.process)}</td><td>${p.pid}</td><td>${p.vram_mib} MiB</td><td>${backend}</td></tr>`;
+    const key = `${g.id}:${p.pid}`;
+    const open = expanded.has(key);
+    const label = p.backend !== "—" ? p.backend : baseName(p.process);
+    const ctx = p.backend !== "—" && p.vram_mib < 1024 ? ` <span class="chip">context only</span>` : "";
+    const head = `<div data-proc-toggle="${esc(key)}" role="button" tabindex="0" style="display:flex;gap:8px;align-items:center;padding:5px 6px;cursor:pointer;border-bottom:1px solid #232a34">
+      <span style="color:var(--text3);font-size:10px">${open ? "\u25be" : "\u25b8"}</span>
+      <span style="flex:1;min-width:0;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(label)}${ctx}</span>
+      <span style="font-size:12px;font-family:var(--mono)">${p.vram_mib} MiB</span></div>`;
+    const detail = open ? `<div style="padding:6px 6px 8px 24px;font-size:11px;color:var(--text2);display:grid;gap:2px;border-bottom:1px solid #232a34">
+      <div>Process: ${esc(p.process)}</div>
+      <div>PID: ${p.pid}</div>
+      <div>VRAM on GPU ${esc(g.id)}: ${p.vram_mib} MiB</div>
+      <div>Backend: ${p.backend !== "—" ? esc(p.backend) : "not attributed to a backend"}</div>
+      ${p.backend !== "—" && p.vram_mib < 1024 ? `<div>Under 1 GiB: this process holds only its CUDA context on this GPU, not model weights.</div>` : ""}
+    </div>` : "";
+    return head + detail;
   };
   const procs = g.processes && g.processes.length
-    ? `<table class="tbl" style="margin-top:10px"><thead><tr><th>Process</th><th>PID</th><th>VRAM</th><th>Backend</th></tr></thead>
-      <tbody>${g.processes.map(procRow).join("")}</tbody></table>` : "";
+    ? `<div style="margin-top:10px"><div style="font-size:11px;color:var(--text3);margin-bottom:4px">PROCESSES (${g.processes.length}) \u2014 click a row for detail</div>
+      <div style="max-height:176px;overflow-y:auto;border:1px solid #232a34;border-radius:6px">${g.processes.map(procRow).join("")}</div></div>` : "";
   const models = g.models && g.models.length
     ? `<div style="margin-top:8px;font-size:11px;color:var(--text3);display:grid;gap:4px">
         ${g.models.map((m) => `<div>${icon("layers")} ${esc(m.model)} \u00b7 ${esc(m.layers)}</div>`).join("")}
@@ -147,11 +159,11 @@ function gpuCard(g: GpuInfo): string {
         <span class="spacer" style="flex:1"></span>${driver}</div>
       <div style="display:flex;gap:18px;justify-content:center;margin:12px 0">
         ${gaugeRing(g.util_pct, 84, C.blue, String(g.util_pct), "UTIL")}
-        ${gaugeRing(vramPct, 84, C.purple, g.vram_used_gb.toFixed(1), "GiB VRAM")}
+        ${gaugeRing(vramPct, 84, C.purple, fmtGb(g.vram_used_gb), "GiB VRAM")}
       </div>
       <div class="gpu-metrics">
         <div class="mrow"><span class="mlabel">UTILIZATION</span><span class="mval">${g.util_pct}%</span></div>
-        <div class="mrow"><span class="mlabel">VRAM</span><span class="mval">${g.vram_used_gb.toFixed(1)} / ${g.vram_total_gb.toFixed(1)} GiB</span></div>
+        <div class="mrow"><span class="mlabel">VRAM</span><span class="mval">${fmtGb(g.vram_used_gb)} / ${fmtGb(g.vram_total_gb)} GiB</span></div>
         <div class="mrow"><span class="mlabel">Temperature</span><span class="mval">${g.temp_c} \u00b0C${peak}</span></div>
         ${tempSpark}
         <div class="mrow"><span class="mlabel">Power</span><span class="mval">${g.power_w == null ? "N/A" : `${g.power_w} W${limit}`}</span></div>
@@ -179,6 +191,17 @@ export function renderGpus(): string {
   <div id="gpuMeta" style="font-size:12px;color:var(--text3);margin-bottom:8px"></div>
   <div style="font-size:11px;color:var(--text3);margin-bottom:8px">This view refreshes every 2 s. The Telemetry poll control sets the sampler cadence and applies on restart.</div>
   <div id="gpuMsg" style="font-size:12px;margin-bottom:8px"></div>
+  <div id="gpuOverview" style="margin-bottom:10px"></div>
+  <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+    <label style="font-size:12px;color:var(--text2)">Sort
+      <select id="gpuSortSel" style="${SELECT_STYLE}">
+        <option value="index">GPU index</option>
+        <option value="util">Utilization</option>
+        <option value="vram">VRAM used</option>
+        <option value="temp">Temperature</option>
+      </select></label>
+    <input id="gpuFilter" type="text" placeholder="Filter by GPU name" style="background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:5px 8px;font-size:12px;min-width:180px">
+  </div>
   <div id="gpuBody">${loadingHtml("Loading GPU telemetry\u2026")}</div>
   <div id="gpuPlacement" style="margin-top:12px"></div></div>`;
 }
@@ -213,6 +236,28 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
   /** Age anchor for the placement snapshot label when the projection
    *  itself carries no snapshot_age_ms. */
   let lastAtMs: number | null = null;
+  /** Expanded process rows (key "gpuId:pid"), sort, and filter state
+   *  for the GPU cards — held outside the repainted DOM so the 2 s
+   *  telemetry repaint cannot collapse a row the operator opened. */
+  const expandedProcs = new Set<string>();
+  let gpuSort = "index";
+  let gpuFilter = "";
+  const paintBody = (): void => {
+    const ov = root.querySelector("#gpuOverview");
+    if (ov) {
+      ov.innerHTML = lastGpus.length ? `<div class="card" style="padding:8px 12px">${lastGpus.map((g) => `<div style="display:flex;gap:12px;font-size:12px;padding:2px 0"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(g.name)}</span><span>${g.util_pct}% util</span><span>${fmtGb(g.vram_used_gb)} / ${fmtGb(g.vram_total_gb)} GiB</span><span>${g.temp_c} \u00b0C</span><span>${(g.processes ?? []).length} proc</span></div>`).join("")}</div>` : "";
+    }
+    const b = root.querySelector("#gpuBody");
+    if (!b) return;
+    const f = gpuFilter.trim().toLowerCase();
+    let list = lastGpus.filter((g) => !f || g.name.toLowerCase().includes(f));
+    if (gpuSort === "util") list = [...list].sort((a, z) => z.util_pct - a.util_pct);
+    else if (gpuSort === "vram") list = [...list].sort((a, z) => z.vram_used_gb - a.vram_used_gb);
+    else if (gpuSort === "temp") list = [...list].sort((a, z) => z.temp_c - a.temp_c);
+    b.innerHTML = list.length
+      ? `<div class="cards3">${list.map((g) => gpuCard(g, expandedProcs)).join("")}</div>`
+      : emptyHtml("No GPUs match the filter.");
+  };
 
   const msg = (text: string, isErr = false): void => {
     const m = root.querySelector("#gpuMsg");
@@ -259,7 +304,7 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
       }
       lastGpus = r.data.gpus;
       lastAtMs = r.data.atMs;
-      b.innerHTML = `<div class="cards3">${r.data.gpus.map(gpuCard).join("")}</div>`;
+      paintBody();
     } finally {
       loading = false;
     }
@@ -599,6 +644,18 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
   resetBtn?.addEventListener("click", onResetPeaks);
   snapshotBtn?.addEventListener("click", onSnapshot);
   pollSel?.addEventListener("change", onPollChange);
+  const gpuSortSel = root.querySelector("#gpuSortSel") as HTMLSelectElement | null;
+  const gpuFilterInput = root.querySelector("#gpuFilter") as HTMLInputElement | null;
+  gpuSortSel?.addEventListener("change", () => { gpuSort = gpuSortSel.value; paintBody(); });
+  gpuFilterInput?.addEventListener("input", () => { gpuFilter = gpuFilterInput.value; paintBody(); });
+  root.addEventListener("click", (ev) => {
+    const t = (ev.target as HTMLElement).closest("[data-proc-toggle]");
+    if (!t) return;
+    const key = t.getAttribute("data-proc-toggle") ?? "";
+    if (!key) return;
+    if (expandedProcs.has(key)) expandedProcs.delete(key); else expandedProcs.add(key);
+    paintBody();
+  });
 
   // Initialize the poll select from the configured interval, bucketed
   // to the cadence the backend actually honors.
@@ -819,6 +876,7 @@ function backendCard(
   inFlight: Set<string>,
   models: ModelRow[],
   confirmRemove: Set<string>,
+  residency: Map<string, { gpu: number; name: string; mib: number }[]>,
 ): string {
   const active = b.state === "running" || b.state === "starting";
   // Buttons render disabled while this card's action is in flight.
@@ -888,6 +946,24 @@ function backendCard(
       ? `<div style="margin-top:8px;font-size:11px;color:var(--text3)">Latest output (stderr preferred)</div>` : "";
     logsBlock = `${caption}${lines}<div style="margin-top:6px;font-size:12px"><a href="#/logs?scope=${esc(encodeURIComponent(b.id))}" style="color:var(--accent)">Open in Logs</a></div>`;
   }
+  // Measured GPU residency (telemetry per-process attribution): which
+  // GPUs this backend's process actually holds memory on. Under 1 GiB
+  // on a GPU is a CUDA context only, labeled as such.
+  const res = residency.get(b.id) ?? [];
+  const resHtml = res.length
+    ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Loaded on: ${res.map((r) => `GPU ${r.gpu} (${esc(r.name)}) — ${fmtGb(r.mib / 1024)} GiB${r.mib < 1024 ? " · context only" : ""}`).join(" · ")}</div>`
+    : (b.configured && active
+      ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Loaded on: not measured — no process attributed in the latest telemetry sample</div>` : "");
+  // Gateway statistics for this backend (trailing hour, from the
+  // LiteLLM metrics window store). Absent until a window exists.
+  const statsHtml = b.requests_1h !== undefined || b.errors_1h !== undefined || b.throughput_toks !== undefined
+    ? `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:8px">
+        ${[["Requests (1h)", b.requests_1h !== undefined ? b.requests_1h.toLocaleString() : "—"],
+           ["Errors (1h)", b.errors_1h !== undefined ? String(b.errors_1h) : "—"],
+           ["Throughput", b.throughput_toks !== undefined ? `${trim1(b.throughput_toks)} tok/s` : "—"]]
+          .map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
+      </div>`
+    : (b.configured && b.enabled ? `<div style="font-size:11px;color:var(--text3);margin-top:6px">Gateway stats: no metrics window yet for this backend.</div>` : "");
   return `<div class="card">
       <h3>${stateDot(b.state)} ${esc(b.id)} <span class="port">:${b.port}</span>
         <span class="spacer" style="flex:1"></span>
@@ -901,6 +977,8 @@ function backendCard(
       ${orphanNote}
       ${adoptedNote}
       ${b.configured && b.n_ctx !== undefined ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Context ${b.n_ctx} · Batch ${b.n_batch ?? "—"}</div>` : ""}
+            ${resHtml}
+      ${statsHtml}
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0">
         ${[["State", b.state], ["PID", b.pid !== null ? String(b.pid) : "\u2014"],
            ["Uptime", fmtUptime(b.uptime_secs)]]
@@ -918,6 +996,25 @@ function backendCard(
 export function renderBackends(): string {
   return `${topbar("Backends", `<button class="btn" id="backAdd">${icon("server")} Add backend</button> <button class="btn" id="backRefresh">${icon("restart")} Refresh</button>`)}
   <div class="view"><div id="backBanner"></div>
+  <div id="backOverview"></div>
+  <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+    <label style="font-size:12px;color:var(--text2)">Sort
+      <select id="backSortSel" style="${SELECT_STYLE}">
+        <option value="name">Name</option>
+        <option value="port">Port</option>
+        <option value="state">State</option>
+        <option value="requests">Requests (1h)</option>
+      </select></label>
+    <label style="font-size:12px;color:var(--text2)">State
+      <select id="backStateSel" style="${SELECT_STYLE}">
+        <option value="all">All</option>
+        <option value="running">Running</option>
+        <option value="stopped">Stopped</option>
+        <option value="failed">Failed</option>
+        <option value="starting">Starting</option>
+      </select></label>
+    <input id="backFilter" type="text" placeholder="Filter by name, group, or model file" style="background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:5px 8px;font-size:12px;min-width:200px">
+  </div>
   <div id="backPlan"></div>
   <div id="backAddForm"></div>
   <div id="backFlagsForm"></div>
@@ -936,6 +1033,13 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
    *  render disabled (the set outlives any single repaint). */
   const inFlight = new Set<string>();
   let lastRows: BackendRow[] = [];
+  /** Measured GPU residency by backend id (telemetry attribution). */
+  let residency = new Map<string, { gpu: number; name: string; mib: number }[]>();
+  /** Backends list controls (sort / state filter / text filter),
+   *  held outside the repainted DOM. */
+  let backSort = "name";
+  let backFilter = "";
+  let backState = "all";
   /** Registered models for the per-card model dropdowns. */
   let lastModels: ModelRow[] = [];
   /** Gateway groups + port, for the add-backend form. */
@@ -959,13 +1063,35 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const paint = (): void => {
     const b = root.querySelector("#backBody");
     if (!b) return;
+    // Short overview strip: one line per backend (all rows, ignoring
+    // the list filter) — state, group, measured GPUs, request rate.
+    const ov = root.querySelector("#backOverview");
+    if (ov) {
+      ov.innerHTML = lastRows.length ? `<div class="card" style="padding:8px 12px;margin-bottom:10px">${lastRows.map((row) => {
+        const res = (residency.get(row.id) ?? []).map((r) => `GPU ${r.gpu}`).join("+") || "\u2014";
+        const req = row.requests_1h !== undefined ? `<span>${row.requests_1h.toLocaleString()} req/1h</span>` : "<span></span>";
+        return `<div style="display:flex;gap:12px;font-size:12px;padding:2px 0"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(row.id)}</span><span>${esc(row.state)}</span><span>${esc(row.group ?? "ungrouped")}</span><span>${res}</span>${req}</div>`;
+      }).join("")}</div>` : "";
+    }
+    const f = backFilter.trim().toLowerCase();
+    const viewRows = lastRows.filter((row) =>
+      (backState === "all" || row.state === backState) &&
+      (!f || row.id.toLowerCase().includes(f) || (row.group ?? "").toLowerCase().includes(f) || row.model_file.toLowerCase().includes(f)));
+    const sorted = (list: BackendRow[]): BackendRow[] => {
+      const c = [...list];
+      if (backSort === "port") c.sort((a, z) => a.port - z.port);
+      else if (backSort === "requests") c.sort((a, z) => (z.requests_1h ?? -1) - (a.requests_1h ?? -1));
+      else if (backSort === "state") c.sort((a, z) => a.state.localeCompare(z.state) || a.id.localeCompare(z.id));
+      else c.sort((a, z) => a.id.localeCompare(z.id));
+      return c;
+    };
     // Cards are grouped by gateway group (Pete's request, 2026-10-15):
     // a section per group in the order groups first appear across
     // the rows (backend config order), ungrouped rows and orphans
     // last under "Ungrouped".
     const sections: { name: string | null; rows: BackendRow[] }[] = [];
     const byKey = new Map<string, { name: string | null; rows: BackendRow[] }>();
-    for (const row of lastRows) {
+    for (const row of viewRows) {
       const key = row.group ?? "";
       let sec = byKey.get(key);
       if (!sec) {
@@ -981,8 +1107,16 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     ];
     b.innerHTML = ordered.map((sec) => `
       <div class="sec-title" style="margin:18px 0 10px">${sec.name !== null ? `Group: ${esc(sec.name)}` : "Ungrouped"} <span style="color:var(--text3);font-weight:400">— ${sec.rows.length} backend${sec.rows.length === 1 ? "" : "s"}</span></div>
-      <div class="grid2">${sec.rows.map((row) => backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove)).join("")}</div>`).join("");
+      <div class="grid2">${sorted(sec.rows).map((row) => backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency)).join("")}</div>`).join("");
+    if (!viewRows.length && lastRows.length) b.innerHTML = emptyHtml("No backends match the current filter.");
   };
+
+  const backSortSel = root.querySelector("#backSortSel") as HTMLSelectElement | null;
+  const backStateSel = root.querySelector("#backStateSel") as HTMLSelectElement | null;
+  const backFilterInput = root.querySelector("#backFilter") as HTMLInputElement | null;
+  backSortSel?.addEventListener("change", () => { backSort = backSortSel.value; paint(); });
+  backStateSel?.addEventListener("change", () => { backState = backStateSel.value; paint(); });
+  backFilterInput?.addEventListener("input", () => { backFilter = backFilterInput.value; paint(); });
 
   /** Lazily fetch the last log lines for failed backends and repaint.
    *  get_logs takes the bare process id (the same scope the Logs view
@@ -1009,9 +1143,21 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
 
   const load = async (): Promise<void> => {
     const seq = ++loadSeq;
-    const [r, mr, gr, pr] = await Promise.all([getBackends(), getModels(), getGatewayConfig(), getActivationPlan()]);
+    const [r, mr, gr, pr, tr] = await Promise.all([getBackends(), getModels(), getGatewayConfig(), getActivationPlan(), getGpuTelemetry()]);
     if (disposed || seq !== loadSeq) return; // a newer load supersedes this one
     if (!pr.error && pr.data) { lastPlan = pr.data; paintPlan(); }
+    if (!tr.error && tr.data) {
+      const m = new Map<string, { gpu: number; name: string; mib: number }[]>();
+      for (const g of tr.data.gpus) {
+        for (const p of g.processes ?? []) {
+          if (p.backend === "\u2014") continue;
+          const arr = m.get(p.backend) ?? [];
+          arr.push({ gpu: Number(g.id), name: g.name, mib: p.vram_mib });
+          m.set(p.backend, arr);
+        }
+      }
+      residency = m;
+    }
     if (!mr.error && mr.data) lastModels = mr.data;
     if (!gr.error && gr.data) {
       lastGroups = gr.data.groups;
@@ -1337,7 +1483,7 @@ function modelShaBadge(m: ModelRow): string {
 
 type ModelNote = { text: string; err: boolean };
 
-function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>): string {
+function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }): string {
   const note = notes.get(m.id);
   const noteHtml = note
     ? `<div style="margin-top:8px;font-size:12px;color:${note.err ? "var(--err)" : "var(--text2)"}">${esc(note.text)}</div>` : "";
@@ -1395,6 +1541,7 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
       ${m.params_b > 0 ? `<div class="kv"><span class="k">Parameters</span><span class="v" style="font-size:12px">${m.params_b}B</span></div>` : ""}
     </div>
     <div style="font-size:11px;color:var(--text3);font-family:var(--mono)">sha256: ${esc(m.sha256 ? `${m.sha256.slice(0, 16)}…` : "—")}</div>
+    ${stats && stats.backends > 0 ? `<div style="font-size:12px;color:var(--text2);margin-bottom:8px">Gateway (1h, ${stats.backends} backend${stats.backends === 1 ? "" : "s"}): ${stats.req !== undefined ? `${stats.req.toLocaleString()} requests · ${stats.err ?? 0} errors · ${trim1(stats.toks ?? 0)} tok/s` : "no metrics window yet"}</div>` : ""}
     <div class="card-actions">${actions}</div>
     ${dlErrHtml}
     ${noteHtml}
@@ -1428,6 +1575,9 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
   const downloading = new Set<string>();
   const notes = new Map<string, ModelNote>();
   let lastRows: ModelRow[] = [];
+  /** Per-model gateway statistics, aggregated over the backends whose
+   *  model_file matches the model's gguf_path. */
+  let modelStats = new Map<string, { backends: number; req?: number; err?: number; toks?: number }>();
   let pollTimer: number | null = null;
   let disposed = false;
 
@@ -1447,6 +1597,24 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
   const load = async (): Promise<void> => {
     const r = await getModels();
     if (disposed) return;
+    const br = await getBackends();
+    if (!disposed && !br.error) {
+      const m = new Map<string, { backends: number; req?: number; err?: number; toks?: number }>();
+      for (const model of r.data) {
+        const serving = br.data.filter((b) => b.configured && sameModelFile(b.model_file, model.gguf_path));
+        if (!serving.length) continue;
+        const withWin = serving.filter((b) => b.requests_1h !== undefined);
+        m.set(model.id, withWin.length
+          ? {
+              backends: serving.length,
+              req: withWin.reduce((a, b) => a + (b.requests_1h ?? 0), 0),
+              err: withWin.reduce((a, b) => a + (b.errors_1h ?? 0), 0),
+              toks: withWin.reduce((a, b) => a + (b.throughput_toks ?? 0), 0),
+            }
+          : { backends: serving.length });
+      }
+      modelStats = m;
+    }
     setBanner(root, "modelBanner", bannerHtml(r));
     const b = root.querySelector("#modelBody");
     if (!b) return;
@@ -1460,7 +1628,7 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       return;
     }
     lastRows = r.data;
-    b.innerHTML = lastRows.map((m) => modelCard(m, downloading, notes)).join("");
+    b.innerHTML = lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id))).join("");
     syncPoll();
   };
 
@@ -1841,11 +2009,22 @@ function gatewayPaint(
     ? `<div class="banner" style="margin-bottom:12px">${icon("warn")} Backend list unavailable (${esc(backendsError)}) \u2014 exclusion states in this view may be incomplete.</div>`
     : "";
 
+  const withWin = backends.filter((b) => b.requests_1h !== undefined);
+  const gwStats = withWin.length
+    ? `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:10px">
+        ${[["Requests (1h, all backends)", String(withWin.reduce((a, b) => a + (b.requests_1h ?? 0), 0))],
+           ["Errors (1h)", String(withWin.reduce((a, b) => a + (b.errors_1h ?? 0), 0))],
+           ["Throughput (tok/s)", trim1(withWin.reduce((a, b) => a + (b.throughput_toks ?? 0), 0))],
+           ["Hottest backend", (() => { const h = [...withWin].sort((a, z) => (z.requests_1h ?? 0) - (a.requests_1h ?? 0))[0]; return h ? `${h.id} (${h.requests_1h ?? 0} req)` : "\u2014"; })()]]
+          .map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
+      </div>`
+    : `<div style="font-size:12px;color:var(--text2);margin-top:8px">No gateway metrics window yet \u2014 per-backend statistics appear after the gateway has been restarted through the app with metrics enabled and about 30 s of polling.</div>`;
   const summary = `<div class="card" style="margin-bottom:12px"><div class="sec-title">${dot(status.up ? "ok" : "err")} Gateway \u2014 LiteLLM \u00b7 ${status.up ? "up" : "down"}</div>
     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px">
       ${[["Port", `:${port}`], ["Groups", String(status.groups)], ["Routing rules", String(status.routing_rules)], ["Routing test traces", `${status.routing_log_len} recorded`]]
         .map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
     </div>
+    ${gwStats}
     <div style="font-size:12px;color:var(--text2);margin-top:8px">Routing test traces are dry-run decisions recorded from routing tests this session \u2014 live requests are not logged.</div></div>`;
 
   const endpoint = `<div class="card" style="margin-bottom:12px"><div class="sec-title">${icon("gateway")} Client endpoint</div>

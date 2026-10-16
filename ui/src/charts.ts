@@ -124,3 +124,19 @@ export function walk(n: number, base: number, amp: number, seed: number): number
   }
   return out;
 }
+
+/** Number presentation — mirrors the canonical Rust rules in
+ *  crates/manager-present: at most one decimal, a trailing ".0"
+ *  dropped (16.0 -> "16", 15.1 -> "15.1"), whole numbers at
+ *  magnitude >= 100, non-finite -> em dash. */
+export function trim1(v: number): string {
+  if (!Number.isFinite(v)) return "\u2014";
+  if (Math.abs(v) >= 100) return String(Math.round(v));
+  const s = v.toFixed(1);
+  return s.endsWith(".0") ? s.slice(0, -2) : s;
+}
+
+/** A GB/GiB quantity under the trim1 rule: fmtGb(15.9921875) is "16". */
+export function fmtGb(v: number): string {
+  return trim1(v);
+}

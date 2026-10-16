@@ -626,11 +626,11 @@ impl WizardStep for DetectHardware {
         let mut log = Vec::new();
         for g in &gpus {
             log.push(format!(
-                "gpu{}: {} ({}) — {} MiB VRAM, sm_{}{}, driver {}",
+                "gpu{}: {} ({}) — {} VRAM, sm_{}{}, driver {}",
                 g.index,
                 g.name,
                 g.uuid,
-                g.total_vram_mib,
+                manager_present::mib(g.total_vram_mib),
                 g.compute_capability.0,
                 g.compute_capability.1,
                 g.driver_version
@@ -1331,11 +1331,14 @@ impl ConfigureTensorSplit {
             }
             changed += 1;
             log.push(format!(
-                "{}: split [{}] assigned (model ~{:.1} GB)",
+                "{}: split [{}] assigned (model ~{} GB)",
                 b.id,
                 fmt_split(split),
-                inputs[enabled.iter().position(|x| x.id == b.id).unwrap_or(0)].model_bytes as f64
-                    / 1_073_741_824.0
+                manager_present::gb(
+                    inputs[enabled.iter().position(|x| x.id == b.id).unwrap_or(0)].model_bytes
+                        as f64
+                        / 1_073_741_824.0
+                )
             ));
         }
         if changed > 0 {
@@ -1770,19 +1773,22 @@ impl DownloadModels {
         };
         let needed = known + known / 10; // 10% headroom for temp files
         log.push(format!(
-            "space check: need ~{needed} bytes, {free} bytes free on {}",
+            "space check: need ~{}, {} free on {}",
+            manager_present::bytes(needed),
+            manager_present::bytes(free),
             ctx.data_dir.display()
         ));
         if free < needed {
             return Err(StepOutcome::failed(
                 format!(
-                    "insufficient disk space: need ~{:.1} GB for model downloads, have {:.1} GB free on {}",
-                    needed as f64 / 1e9,
-                    free as f64 / 1e9,
+                    "insufficient disk space: need ~{} for model downloads, have {} free on {}",
+                    manager_present::bytes(needed),
+                    manager_present::bytes(free),
                     ctx.data_dir.display()
                 ),
                 vec![
-                    "free up disk space or point data_dir at a larger volume, then re-run".to_string(),
+                    "free up disk space or point data_dir at a larger volume, then re-run"
+                        .to_string(),
                 ],
             ));
         }

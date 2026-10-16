@@ -825,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "manager-config"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "chrono",
  "serde",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "manager-gateway"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "chrono",
  "manager-config",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "manager-mcp"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "manager-supervisor",
  "serde",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "manager-models"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "chrono",
  "manager-config",
@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "manager-mxc"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "chrono",
  "serde",
@@ -881,8 +881,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "manager-present"
+version = "0.1.23"
+
+[[package]]
 name = "manager-supervisor"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "async-trait",
  "chrono",
@@ -898,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "manager-telemetry"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "async-trait",
  "chrono",
@@ -910,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "manager-winml"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "async-trait",
  "chrono",
@@ -924,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "manager-wizard"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "async-trait",
  "chrono",
@@ -934,6 +938,7 @@ dependencies = [
  "manager-config",
  "manager-gateway",
  "manager-mxc",
+ "manager-present",
  "manager-telemetry",
  "manager-winml",
  "reqwest",

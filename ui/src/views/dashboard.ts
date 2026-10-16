@@ -10,7 +10,7 @@
 import { getDashboard, isTauri, restartBackend, systemVerdict } from "../api";
 import type { SystemVerdict } from "../api";
 import { esc } from "../html";
-import { gaugeRing, meter, multiLine, sparkline, stackedBar } from "../charts";
+import { fmtGb, gaugeRing, meter, multiLine, sparkline, stackedBar, trim1 } from "../charts";
 import { icon } from "../icons";
 import type { BackendInfo, DashboardModel, GpuInfo, PlacementSegment } from "../types";
 
@@ -72,12 +72,12 @@ function serviceCard(b: BackendInfo, isGateway: boolean): string {
   const m1k = isGateway ? "REQUESTS / 1H" : "THROUGHPUT";
   const m1v = isGateway
     ? (b.requests_1h !== undefined ? b.requests_1h.toLocaleString() : "—")
-    : (b.throughput_toks !== undefined ? b.throughput_toks.toFixed(1) : "—");
+    : (b.throughput_toks !== undefined ? trim1(b.throughput_toks) : "—");
   const m1u = isGateway || b.throughput_toks === undefined ? "" : " tok/s";
   const m2k = isGateway ? "ERRORS / 1H" : "VRAM HELD";
   const m2v = isGateway
     ? (b.errors_1h !== undefined ? String(b.errors_1h) : "—")
-    : (b.vram_held_gb !== undefined ? b.vram_held_gb.toFixed(1) : "—");
+    : (b.vram_held_gb !== undefined ? fmtGb(b.vram_held_gb) : "—");
   const m2u = isGateway || b.vram_held_gb === undefined ? "" : " GB";
   // The ring's arc is the metric itself: when the metric is absent the
   // arc must not assert a value — draw the neutral track only. The
@@ -138,7 +138,7 @@ function gpuStripCard(g: GpuInfo): string {
     <div class="gpu-metrics">
       <div class="mrow"><span class="mlabel">Utilization</span><span class="mval">${g.util_pct}%</span></div>
       ${utilSpark}
-      <div class="mrow"><span class="mlabel">VRAM ${g.vram_used_gb.toFixed(1)}/${g.vram_total_gb} GB</span><span class="mval">${vramPct}%</span></div>
+      <div class="mrow"><span class="mlabel">VRAM ${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GB</span><span class="mval">${vramPct}%</span></div>
       <div class="mrow"><span></span>${meter(vramPct, 220, 8, C.purple)}</div>
       <div class="mrow"><span class="mlabel">Temperature</span><span class="mval">${g.temp_c} °C${peak}</span></div>
       ${tempSpark}
@@ -204,7 +204,13 @@ function applianceView(m: DashboardModel, live: boolean): string {
     : "";
   const empty = !svcs.length && !m.gpus.length
     ? `<div class="card"><div class="empty">No backends or GPUs reported. Run the setup wizard to install and configure the stack.</div></div>` : "";
+  // Blank stat fields were reported as a defect (Oct 15, 2026): when
+  // no metrics window exists, state why instead of rendering dashes.
+  const noWindow = live && m.gateway !== null && svcs.every((b) => b.requests_1h === undefined)
+    ? `<div class="card" style="margin-bottom:12px;font-size:12px;color:var(--text2)">${icon("warn")} Gateway statistics are not available yet. They appear after the gateway has been restarted through the app (metrics are enabled at gateway start) and about 30 s of polling.</div>`
+    : "";
   return `${empty}
+    ${noWindow}
     <div class="cards5">${cards}</div>
     <div class="cards3" style="margin-top:12px">${gpus}</div>
     <div class="grid2">
@@ -219,7 +225,7 @@ function consoleView(m: DashboardModel): string {
     // health/throughput/requests have no live source; show "—" when absent
     // (the old expression printed "undefined req/h" and could not render).
     const rate = b.throughput_toks
-      ? `${b.throughput_toks.toFixed(1)} tok/s`
+      ? `${trim1(b.throughput_toks)} tok/s`
       : b.requests_1h !== undefined ? `${b.requests_1h} req/h` : "—";
     return `<tr>
     <td>${statusDot(b.status)} ${esc(b.name)}</td><td>:${b.port}</td><td>${b.model ? esc(b.model) : "—"}</td>
@@ -230,7 +236,7 @@ function consoleView(m: DashboardModel): string {
     const vramPct = Math.round((g.vram_used_gb / g.vram_total_gb) * 100);
     return `<tr><td>${statusDot(g.status)} ${esc(g.name)}</td><td>${g.util_pct}%</td>
       <td>${meter(g.util_pct, 120, 8, C.blue)}</td>
-      <td>${g.vram_used_gb.toFixed(1)}/${g.vram_total_gb} GB</td>
+      <td>${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GB</td>
       <td>${meter(vramPct, 120, 8, C.purple)}</td>
       <td>${g.temp_c}°C</td><td>${g.power_w == null ? "N/A" : `${g.power_w}W`}</td></tr>`;
   }).join("");
@@ -281,7 +287,7 @@ function topologyView(m: DashboardModel): string {
     m.gateway ? statusColor(m.gateway.status) : "#6d7686");
   backs.forEach((b, i) => {
     const y = cy(i, backs.length);
-    node(colX[1], y, b.name, `:${b.port}${b.throughput_toks !== undefined ? ` \u00b7 ${b.throughput_toks.toFixed(1)} tok/s` : ""}`, statusColor(b.status));
+    node(colX[1], y, b.name, `:${b.port}${b.throughput_toks !== undefined ? ` \u00b7 ${trim1(b.throughput_toks)} tok/s` : ""}`, statusColor(b.status));
     edge(colX[0] + nodeW, H / 2, colX[1], y, "", edgeCls(b.status));
   });
   gpus.forEach((g, i) => {

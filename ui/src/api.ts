@@ -8,6 +8,7 @@
      healthy live data.
 */
 
+import { trim1 } from "./charts";
 import { mockBackends, mockDashboard, mockGpus, mockWizardSteps } from "./mock";
 import type { BackendInfo, DashboardModel, GpuInfo, Status, StatusResponse, WizardStepState } from "./types";
 
@@ -336,7 +337,19 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
         errors_1h: sumStat((x) => x.errors_1h),
         throughput_toks: sumStat((x) => x.throughput_toks),
       };
-  const backends = b.data;
+  // VRAM held per backend, measured from telemetry's per-process
+  // attribution (the dashboard card's "VRAM HELD" figure previously
+  // had no live source and always rendered absent).
+  const heldMib = new Map<string, number>();
+  for (const gpu of g.data.gpus) {
+    for (const p of gpu.processes ?? []) {
+      if (p.backend !== "—") heldMib.set(p.backend, (heldMib.get(p.backend) ?? 0) + p.vram_mib);
+    }
+  }
+  const backends = b.data.map((x) => {
+    const mib = heldMib.get(x.id);
+    return mib !== undefined ? { ...x, vram_held_gb: mib / 1024 } : x;
+  });
   const cfg = await getAppConfig();
   const gwCfg = await getGatewayConfig();
   const data: DashboardModel = {
@@ -442,7 +455,7 @@ function mapBackendStep(s: BackendStep): WizardStepState {
     name: s.name,
     detail: s.message,
     state: s.state,
-    duration: s.duration_ms > 0 ? `${(s.duration_ms / 1000).toFixed(1)}s` : undefined,
+    duration: s.duration_ms > 0 ? `${trim1(s.duration_ms / 1000)}s` : undefined,
     note: s.note ?? undefined,
     helpUrl: s.help_url ?? undefined,
     message: s.message,

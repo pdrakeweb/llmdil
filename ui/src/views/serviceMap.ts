@@ -12,7 +12,7 @@
 
 import { getAppConfig, getBackends, getGatewayStatus, getGpuTelemetry, systemVerdict } from "../api";
 import type { BackendRow, GatewayStatusData } from "../api";
-import { gaugeRing } from "../charts";
+import { fmtGb, gaugeRing } from "../charts";
 import { icon } from "../icons";
 import { esc } from "../html";
 import type { GpuInfo } from "../types";
@@ -87,6 +87,9 @@ interface MapData {
   /** Backend id -> configured tensor split (fractions per GPU index),
    *  from the app config; backends absent here get no GPU edges. */
   splits: Map<string, number[]>;
+  /** Backend id -> measured residency: GPU index -> MiB held there,
+   *  from telemetry's per-process attribution. */
+  residency: Map<string, Map<number, number>>;
   live: boolean;
   errors: string[];
   /** When this paint's data was fetched (epoch ms). */
@@ -142,11 +145,18 @@ function topologySvg(d: MapData): string {
   backends.forEach((b, i) => {
     const e = stateEdge(b.state);
     edge(COL.gateway + NW, H / 2, COL.backends, ys[i], e.cls, e.stroke);
-    const split = d.splits.get(b.id);
-    if (split) {
-      split.forEach((frac, j) => {
-        if (frac > 0 && gpus[j]) edge(COL.backends + NW, ys[i], COL.gpus, spreadY(j, gpus.length), e.cls, e.stroke);
-      });
+    const measured = d.residency.get(b.id);
+    if (measured && measured.size) {
+      for (const j of measured.keys()) {
+        if (gpus[j]) edge(COL.backends + NW, ys[i], COL.gpus, spreadY(j, gpus.length), e.cls, e.stroke);
+      }
+    } else {
+      const split = d.splits.get(b.id);
+      if (split) {
+        split.forEach((frac, j) => {
+          if (frac > 0 && gpus[j]) edge(COL.backends + NW, ys[i], COL.gpus, spreadY(j, gpus.length), e.cls, e.stroke);
+        });
+      }
     }
   });
 
@@ -164,13 +174,15 @@ function topologySvg(d: MapData): string {
   backends.forEach((b, i) => {
     const up = b.state === "running" && b.uptime_secs != null ? ` \u00b7 up ${fmtUptime(b.uptime_secs)}` : "";
     const model = b.model_file ? ` \u00b7 ${b.model_file.split(/[\\/]/).pop()}` : "";
-    node(COL.backends, ys[i], b.id, `:${b.port} \u00b7 ${b.state}${up}${model}`, stateColor(b.state), stateStroke(b.state), undefined, "#/backends");
+    const res = d.residency.get(b.id);
+    const resTxt = res && res.size ? ` \u00b7 ${[...res.entries()].map(([j, mib]) => `GPU${j} ${fmtGb(mib / 1024)}G`).join(" ")}` : "";
+    node(COL.backends, ys[i], b.id, `:${b.port} \u00b7 ${b.state}${up}${model}${resTxt}`, stateColor(b.state), stateStroke(b.state), undefined, "#/backends");
   });
 
   gpus.forEach((g, j) => {
     const pct = g.vram_total_gb > 0 ? Math.round((g.vram_used_gb / g.vram_total_gb) * 100) : 0;
     node(COL.gpus, spreadY(j, gpus.length), g.name,
-      `${g.vram_used_gb.toFixed(1)} / ${g.vram_total_gb.toFixed(1)} GB VRAM`,
+      `${fmtGb(g.vram_used_gb)} / ${fmtGb(g.vram_total_gb)} GB VRAM`,
       gpuDot(g), "", { pct, color: pct >= 80 ? C.amber : C.green, label: `${pct}%` });
   });
 
@@ -238,7 +250,7 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
           <span><span class="dot warn"></span>GPU degraded</span>
           <span><span class="dot err"></span>GPU down</span>
           <span style="border:1px dashed #4a9eff;border-radius:3px;padding:0 5px">MXC boundary</span>
-          <span style="color:var(--text3)">Edges to GPUs show configured tensor splits</span>
+          <span style="color:var(--text3)">Edges to GPUs show measured residency; configured tensor splits where nothing is measured</span>
           <span><a href="#/backends" style="color:var(--accent)">Backends</a> \u00b7 <a href="#/gateway" style="color:var(--accent)">Gateway</a></span>
         </div>`;
     }
@@ -251,11 +263,29 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
     ["Gateway", d.gatewayError ? "status unknown" : `:${d.gateway.port} \u00b7 ${d.gateway.groups} groups${d.live && !d.gateway.up ? " \u00b7 down" : ""}`],
     ["Routing rules", String(d.gateway.routing_rules)],
     ["GPUs", `${d.gpus.length} detected`],
-    ["VRAM used (all processes)", d.gpus.length ? `${vramUsed.toFixed(1)} / ${vramTotal.toFixed(1)} GB` : "—"],
+    ["VRAM used (all processes)", d.gpus.length ? `${fmtGb(vramUsed)} / ${fmtGb(vramTotal)} GB` : "—"],
   ];
   const summaryEl = root.querySelector("#mapSummary");
   if (summaryEl) {
     summaryEl.innerHTML = summary.map(([k, v]) => `<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #232a34"><span class="k">${esc(k)}</span><span class="v" style="font-size:12px">${esc(v)}</span></div>`).join("");
+  }
+
+  const resEl = root.querySelector("#mapResidency");
+  if (resEl) {
+    const byGpu = new Map<number, [string, number][]>();
+    for (const [bid, gm] of d.residency) {
+      for (const [j, mib] of gm) {
+        const a = byGpu.get(j) ?? [];
+        a.push([bid, mib]);
+        byGpu.set(j, a);
+      }
+    }
+    resEl.innerHTML = d.gpus.length
+      ? d.gpus.map((g) => {
+          const rows = byGpu.get(Number(g.id)) ?? [];
+          return `<div style="margin-bottom:8px"><div style="font-size:12px">${esc(g.name)}</div>${rows.length ? rows.map(([bid, mib]) => `<div style="display:flex;justify-content:space-between;font-size:12px;padding:2px 0"><span>${esc(bid)}${mib < 1024 ? ` <span class="chip">context only</span>` : ""}</span><span>${fmtGb(mib / 1024)} GiB</span></div>`).join("") : `<div style="font-size:12px;color:var(--text3)">no backend processes measured</div>`}</div>`;
+        }).join("")
+      : `<div class="empty">no GPUs reported</div>`;
   }
 
   const gpuLoad = root.querySelector("#mapGpuLoad");
@@ -279,6 +309,9 @@ export function renderServiceMap(): string {
         </div>
         <div class="card"><div class="sec-title">GPU load</div>
           <div id="mapGpuLoad"><div class="empty">Loading…</div></div>
+        </div>
+        <div class="card" style="margin-top:12px"><div class="sec-title">GPU residency (measured)</div>
+          <div id="mapResidency"><div class="empty">Loading…</div></div>
         </div>
       </div>
     </div></div>`;
@@ -321,6 +354,15 @@ export async function wireServiceMap(root: HTMLElement): Promise<() => void> {
       // labels fall back and the tensor-split edges vanish silently.
       const errors = [b.error, g.error, gw.error, cfg.error].filter((e): e is string => Boolean(e));
       const mxc = cfg.data?.mxc as { mode?: unknown } | undefined;
+      const residency = new Map<string, Map<number, number>>();
+      for (const gpu of g.data.gpus) {
+        for (const p of gpu.processes ?? []) {
+          if (p.backend === "\u2014") continue;
+          const gm = residency.get(p.backend) ?? new Map<number, number>();
+          gm.set(Number(gpu.id), p.vram_mib);
+          residency.set(p.backend, gm);
+        }
+      }
       paintServiceMap(root, {
         backends: b.data,
         gpus: g.data.gpus,
@@ -330,6 +372,7 @@ export async function wireServiceMap(root: HTMLElement): Promise<() => void> {
         backendsError: b.error ?? null,
         mxcMode: typeof mxc?.mode === "string" ? mxc.mode : null,
         splits: splitsFromConfig(cfg.data),
+        residency,
         live: b.live && g.live && gw.live,
         errors,
         updatedAt: Date.now(),
