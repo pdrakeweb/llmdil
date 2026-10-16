@@ -1073,6 +1073,11 @@ export interface GatewayStatusData {
   /** The workstation's primary LAN address when bound beyond
    *  loopback, for the client endpoint shown to other machines. */
   lan_ip: string | null;
+  /** True when saved configuration changes are waiting on a gateway
+   *  restart (an activation plan is pending). */
+  activation_pending: boolean;
+  /** How many journaled changes the pending plan carries. */
+  activation_changes: number;
 }
 
 /** gateway_status — probe state (up) + port + group/rule counts + the
@@ -1092,7 +1097,7 @@ export async function getGatewayMasterKey(): Promise<CallResult<{ master_key: st
 }
 
 export async function getGatewayStatus(): Promise<CallResult<GatewayStatusData>> {
-  const fallback: GatewayStatusData = { port: 4000, groups: 0, routing_rules: 0, up: false, routing_log_len: 0, openrouter_cred_present: null, bind_host: "0.0.0.0", lan_ip: null };
+  const fallback: GatewayStatusData = { port: 4000, groups: 0, routing_rules: 0, up: false, routing_log_len: 0, openrouter_cred_present: null, bind_host: "0.0.0.0", lan_ip: null, activation_pending: false, activation_changes: 0 };
   if (!isTauri()) return { data: fallback, live: false };
   try {
     const raw = await invoke<Partial<GatewayStatusData>>("gateway_status");
@@ -1106,6 +1111,8 @@ export async function getGatewayStatus(): Promise<CallResult<GatewayStatusData>>
         openrouter_cred_present: typeof raw.openrouter_cred_present === "boolean" ? raw.openrouter_cred_present : null,
         bind_host: typeof raw.bind_host === "string" ? raw.bind_host : "0.0.0.0",
         lan_ip: typeof raw.lan_ip === "string" ? raw.lan_ip : null,
+        activation_pending: Boolean(raw.activation_pending),
+        activation_changes: typeof raw.activation_changes === "number" ? raw.activation_changes : 0,
       },
       live: true,
     };
@@ -1138,6 +1145,83 @@ export async function gatewayStop(): Promise<CallResult<{ ok: boolean; stopped: 
     return { data, live: true };
   } catch (e) {
     return { data: { ok: false, stopped: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** One saved change inside a pending activation plan. */
+export interface ActivationChange {
+  ts: string;
+  kind: string;
+  summary: string;
+}
+
+/** gateway_activation_plan — saved configuration changes the
+ *  running gateway has not picked up yet. The gateway generates its
+ *  routes at start, so these changes are inert until the operator
+ *  executes the plan (restart, with or without a quiesce wait),
+ *  defers it, or cancels the changes. */
+export interface ActivationPlanData {
+  pending: boolean;
+  gateway_up: boolean;
+  drift: boolean;
+  /** Pending while the gateway is down: the changes take effect at
+   *  the next start rather than needing a restart. */
+  applies_at_next_start: boolean;
+  changes: ActivationChange[];
+  /** A pre-change config snapshot exists, so cancel can restore it. */
+  snapshot_available: boolean;
+}
+
+const EMPTY_PLAN: ActivationPlanData = {
+  pending: false, gateway_up: false, drift: false,
+  applies_at_next_start: false, changes: [], snapshot_available: false,
+};
+
+export async function getActivationPlan(): Promise<CallResult<ActivationPlanData>> {
+  if (!isTauri()) return { data: EMPTY_PLAN, live: false };
+  try {
+    const data = await invoke<ActivationPlanData>("gateway_activation_plan");
+    return { data, live: true };
+  } catch (e) {
+    return { data: EMPTY_PLAN, live: true, error: errOf(e) };
+  }
+}
+
+/** gateway_activation_cancel — restore the pre-change snapshot and
+ *  clear the plan. Refused (error) when the config has since changed
+ *  through another path. */
+export async function activationCancelChanges(): Promise<CallResult<{ cancelled: boolean; reason?: string }>> {
+  if (!isTauri()) return { data: { cancelled: false }, live: false };
+  try {
+    const data = await invoke<{ cancelled: boolean; reason?: string }>("gateway_activation_cancel");
+    return { data, live: true };
+  } catch (e) {
+    return { data: { cancelled: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** gateway_activation_complete — clear the plan after a successful
+ *  gateway (re)start made the saved changes live. */
+export async function activationComplete(): Promise<CallResult<{ cleared: boolean }>> {
+  if (!isTauri()) return { data: { cleared: false }, live: false };
+  try {
+    const data = await invoke<{ cleared: boolean }>("gateway_activation_complete");
+    return { data, live: true };
+  } catch (e) {
+    return { data: { cleared: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** gateway_quiesce_wait — wait for in-flight gateway requests to
+ *  drain to zero (bounded by timeoutSecs); reports the final count
+ *  when the wait times out. */
+export async function quiesceWait(timeoutSecs: number): Promise<CallResult<{ drained: boolean; in_flight: number; timed_out: boolean }>> {
+  if (!isTauri()) return { data: { drained: true, in_flight: 0, timed_out: false }, live: false };
+  try {
+    const data = await invoke<{ drained: boolean; in_flight: number; timed_out: boolean }>("gateway_quiesce_wait", { timeoutSecs });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { drained: false, in_flight: 0, timed_out: false }, live: true, error: errOf(e) };
   }
 }
 

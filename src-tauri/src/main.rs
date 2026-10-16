@@ -46,6 +46,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
+mod activation;
 mod gateway_stats;
 
 // ---------------------------------------------------------------------------
@@ -2244,6 +2245,7 @@ async fn get_gateway_config(state: State<'_, AppState>) -> ApiResult {
 #[tauri::command]
 async fn update_gateway_config(state: State<'_, AppState>, patch: Value) -> ApiResult {
     let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     let mut v = serde_json::to_value(&new_cfg.gateway).map_err(jerr)?;
     merge_json(&mut v, patch);
@@ -2252,7 +2254,40 @@ async fn update_gateway_config(state: State<'_, AppState>, patch: Value) -> ApiR
         .map_err(ApiError::from)
         .map_err(jerr)?;
     *cfg = new_cfg;
+    record_gateway_change(
+        &state.data_dir,
+        &pre_cfg,
+        &cfg,
+        "gateway_config",
+        "Gateway configuration changed".to_string(),
+        false,
+    );
     Ok(json!({ "ok": true, "persisted": true }))
+}
+
+/// Journal a saved change for the gateway activation plan when it
+/// affects what the running gateway serves: the generated gateway
+/// configuration differs between `pre` and `post`, or `force` is set
+/// for changes the YAML does not carry (the bind address). Saves
+/// that leave the gateway configuration identical (a backend's
+/// context length, a tensor split) are backend-process concerns and
+/// create no gateway plan.
+fn record_gateway_change(
+    data_dir: &std::path::Path,
+    pre: &AppConfig,
+    post: &AppConfig,
+    kind: &str,
+    summary: String,
+    force: bool,
+) {
+    if !force {
+        let before = manager_gateway::generate_config_yaml(pre).unwrap_or_default();
+        let after = manager_gateway::generate_config_yaml(post).unwrap_or_default();
+        if before == after {
+            return;
+        }
+    }
+    activation::record_change(data_dir, pre, post, kind, summary);
 }
 
 // ---------------------------------------------------------------------------
@@ -2628,6 +2663,7 @@ async fn backend_apply_config(
     };
     let diff: ConfigDiff = {
         let mut cfg = state.config.write().await;
+        let pre_cfg = cfg.clone();
         let mut new_cfg = cfg.clone();
         let diff = manager_config::apply_config_diff(&mut new_cfg, &id, &patch)
             .map_err(ApiError::from)
@@ -2636,6 +2672,14 @@ async fn backend_apply_config(
             .map_err(ApiError::from)
             .map_err(jerr)?;
         *cfg = new_cfg;
+        record_gateway_change(
+            &state.data_dir,
+            &pre_cfg,
+            &cfg,
+            "backend_apply_config",
+            format!("Backend `{id}` settings changed"),
+            false,
+        );
         diff
     };
     let restart_task = if apply_mode == "RestartNow" {
@@ -2763,6 +2807,7 @@ async fn backend_add(
         }
     };
     let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     if new_cfg.backends.iter().any(|b| b.id == id) {
         return Err(err(ApiError::InvalidInput(format!(
@@ -2832,6 +2877,14 @@ async fn backend_add(
         .map_err(ApiError::from)
         .map_err(jerr)?;
     *cfg = new_cfg;
+    record_gateway_change(
+        &state.data_dir,
+        &pre_cfg,
+        &cfg,
+        "backend_add",
+        format!("Backend `{id}` added to group `{group}`"),
+        false,
+    );
     drop(cfg);
     ensure_backend_specs(&state).await;
     Ok(json!({ "backend_id": id, "group": group, "persisted": true }))
@@ -2902,6 +2955,7 @@ async fn backend_delete(state: State<'_, AppState>, id: String) -> ApiResult {
         }
     }
     let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     let pos = new_cfg
         .backends
@@ -2922,6 +2976,14 @@ async fn backend_delete(state: State<'_, AppState>, id: String) -> ApiResult {
         .map_err(ApiError::from)
         .map_err(jerr)?;
     *cfg = new_cfg;
+    record_gateway_change(
+        &state.data_dir,
+        &pre_cfg,
+        &cfg,
+        "backend_delete",
+        format!("Backend `{id}` removed"),
+        false,
+    );
     drop(cfg);
     ensure_backend_specs(&state).await;
     Ok(json!({ "backend_id": id, "deleted": true, "persisted": true }))
@@ -2994,6 +3056,18 @@ async fn gateway_status(state: State<'_, AppState>) -> ApiResult {
         None => None,
     };
     let routing_log_len = state.routing_log.lock().await.len();
+    // Activation-plan state for the status surfaces: saved changes
+    // the running gateway has not picked up (journal entries no
+    // gateway start has resolved, or live config drift).
+    let (activation_pending, activation_changes) = {
+        let cfg = state.config.read().await;
+        let journal = activation::load_journal(&state.data_dir);
+        let unresolved = activation::unresolved_entries(&state.data_dir, &journal);
+        (
+            !unresolved.is_empty() || activation::config_drift(&cfg, &state.data_dir),
+            unresolved.len(),
+        )
+    };
     Ok(json!({
         "port": port,
         "bind_host": bind_host,
@@ -3003,7 +3077,127 @@ async fn gateway_status(state: State<'_, AppState>) -> ApiResult {
         "up": up,
         "routing_log_len": routing_log_len,
         "openrouter_cred_present": openrouter_cred_present,
+        "activation_pending": activation_pending,
+        "activation_changes": activation_changes,
     }))
+}
+
+/// The gateway activation plan: saved changes waiting on a gateway
+/// restart, with the state the operator's decision depends on.
+#[tauri::command]
+async fn gateway_activation_plan(state: State<'_, AppState>) -> ApiResult {
+    let cfg = state.config.read().await.clone();
+    let journal = activation::load_journal(&state.data_dir);
+    let unresolved = activation::unresolved_entries(&state.data_dir, &journal);
+    let drift = activation::config_drift(&cfg, &state.data_dir);
+    let pending = !unresolved.is_empty() || drift;
+    let probe_host = manager_wizard::steps::gateway_probe_host(&cfg);
+    let port = cfg.gateway.port;
+    let up = tokio::task::spawn_blocking(move || probe_gateway(&probe_host, port))
+        .await
+        .unwrap_or(false);
+    let changes: Vec<Value> = unresolved
+        .iter()
+        .map(|e| json!({ "ts": e.ts, "kind": e.kind, "summary": e.summary }))
+        .collect();
+    Ok(json!({
+        "pending": pending,
+        "gateway_up": up,
+        "drift": drift,
+        "applies_at_next_start": pending && !up,
+        "changes": changes,
+        "snapshot_available": journal.snapshot.is_some() && !unresolved.is_empty(),
+    }))
+}
+
+/// Cancel the pending activation plan's changes: restore the
+/// configuration snapshot taken before the first unresolved change.
+/// Refused when the configuration has changed through another path
+/// since (the restore would discard that change too).
+#[tauri::command]
+async fn gateway_activation_cancel(state: State<'_, AppState>) -> ApiResult {
+    let mut cfg = state.config.write().await;
+    let restored = match activation::cancel_target(&state.data_dir, &cfg) {
+        Ok(Some(restored)) => restored,
+        Ok(None) => return Ok(json!({ "cancelled": false, "reason": "no pending changes" })),
+        Err(msg) => return Err(err(ApiError::InvalidInput(msg))),
+    };
+    manager_config::validate(&restored)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    manager_config::save(&restored, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = restored;
+    drop(cfg);
+    activation::clear_journal(&state.data_dir);
+    ensure_backend_specs(&state).await;
+    Ok(json!({ "cancelled": true }))
+}
+
+/// Mark the activation plan complete after a successful gateway
+/// (re)start. The start-gateway step regenerates everything from
+/// the live configuration, so journaled changes are live by
+/// definition at that point; the plan also self-resolves through
+/// the journal's mtime rule, this just clears the files promptly.
+#[tauri::command]
+async fn gateway_activation_complete(state: State<'_, AppState>) -> ApiResult {
+    activation::clear_journal(&state.data_dir);
+    Ok(json!({ "cleared": true }))
+}
+
+/// Quiesce wait: poll the gateway's in-flight request gauge until
+/// it reaches zero or the timeout expires. A gateway that does not
+/// answer metrics (down, or the metrics config not yet active)
+/// counts as drained — nothing can be in flight through a gateway
+/// that is not serving, and the gauge series only exists once
+/// traffic has flowed.
+#[tauri::command]
+async fn gateway_quiesce_wait(state: State<'_, AppState>, timeout_secs: u64) -> ApiResult {
+    let timeout = timeout_secs.clamp(5, 600);
+    let (host, port) = {
+        let cfg = state.config.read().await;
+        (
+            manager_wizard::steps::gateway_probe_host(&cfg),
+            cfg.gateway.port,
+        )
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    let mut last_in_flight: Option<f64> = None;
+    loop {
+        let key = RealSystemOps
+            .credential_read(manager_wizard::LITELLM_MASTER_KEY_CRED_TARGET)
+            .await
+            .unwrap_or_default();
+        let body = if key.is_empty() {
+            None
+        } else {
+            let (h, k) = (host.clone(), key);
+            tokio::task::spawn_blocking(move || fetch_gateway_metrics(&h, port, &k))
+                .await
+                .ok()
+                .flatten()
+        };
+        match body {
+            Some(text) => match activation::parse_in_flight(&text) {
+                Some(0.0) | None => {
+                    return Ok(json!({ "drained": true, "in_flight": 0, "timed_out": false }))
+                }
+                Some(n) => last_in_flight = Some(n),
+            },
+            None => {
+                return Ok(json!({ "drained": true, "in_flight": 0, "timed_out": false }))
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(json!({
+                "drained": false,
+                "in_flight": last_in_flight.unwrap_or(0.0),
+                "timed_out": true,
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 /// Stop the running gateway: terminate the process recorded in
@@ -3104,6 +3298,7 @@ async fn gateway_set_bind_host(state: State<'_, AppState>, host: String) -> ApiR
         ))));
     }
     let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     new_cfg.gateway.bind_host = host.clone();
     manager_config::validate(&new_cfg)
@@ -3113,6 +3308,14 @@ async fn gateway_set_bind_host(state: State<'_, AppState>, host: String) -> ApiR
         .map_err(ApiError::from)
         .map_err(jerr)?;
     *cfg = new_cfg;
+    record_gateway_change(
+        &state.data_dir,
+        &pre_cfg,
+        &cfg,
+        "gateway_bind",
+        format!("Gateway network access changed to {host}"),
+        true,
+    );
     Ok(json!({ "bind_host": host, "restart_required": true }))
 }
 
@@ -4552,6 +4755,10 @@ fn main() {
             update_gateway_config,
             gateway_status,
             gateway_stop,
+            gateway_activation_plan,
+            gateway_activation_cancel,
+            gateway_activation_complete,
+            gateway_quiesce_wait,
             gateway_preview_yaml,
             gateway_test_routing,
             gateway_recent_requests,

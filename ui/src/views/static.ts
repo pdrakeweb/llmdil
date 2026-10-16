@@ -20,9 +20,10 @@ import {
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
   getGatewayMasterKey, setGatewayBindHost,
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
+  getActivationPlan, activationCancelChanges, activationComplete, quiesceWait,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
 } from "../api";
-import type { BackendRow, GatewayConfigData, GatewayGroup, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
+import type { ActivationPlanData, BackendRow, GatewayConfigData, GatewayGroup, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
 import type { GpuInfo, WizardStepState } from "../types";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
@@ -662,6 +663,153 @@ function modelOptions(b: BackendRow, models: ModelRow[]): string {
     `<option value="${esc(m.id)}"${sameModelFile(b.model_file, m.gguf_path) ? " selected" : ""}>${esc(m.id)} \u2014 ${esc(baseName(m.gguf_path))}</option>`).join("");
 }
 
+/* ---------------- Gateway activation plan ----------------
+ * Saved configuration changes the running gateway has not picked
+ * up. The card renders from the server-side plan (a persisted
+ * journal plus live config drift), so it survives navigation and
+ * app restarts until the operator executes, defers, or cancels it —
+ * the pre-v0.1.22 behavior (a transient card on the add-backend
+ * form, nothing after dismissal) is what Pete reported on
+ * 2026-10-15. */
+
+interface PlanUiState {
+  dismissed: boolean;
+  status: string;
+  statusErr: boolean;
+  confirmCancel: boolean;
+  acting: boolean;
+}
+
+function newPlanUi(): PlanUiState {
+  return { dismissed: false, status: "", statusErr: false, confirmCancel: false, acting: false };
+}
+
+function activationPlanHtml(plan: ActivationPlanData | null, ui: PlanUiState): string {
+  if (!plan || !plan.pending) return "";
+  const n = plan.changes.length;
+  const dis = ui.acting ? " disabled" : "";
+  if (ui.dismissed) {
+    return `<div class="card" style="margin-bottom:12px;border-color:var(--amber)">
+      <div style="font-size:12px">${icon("warn")} <b>Activation pending</b> — ${n ? `${n} saved change${n === 1 ? "" : "s"}` : "Saved changes"} not live in the gateway yet.
+      <button class="btn" data-plan-act="review"${dis}>Review plan</button></div></div>`;
+  }
+  const changeList = n
+    ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">${plan.changes.map((c) => `<div>${esc(c.summary)} <span style="color:var(--text3)">${esc(fmtTime(c.ts))}</span></div>`).join("")}</div>`
+    : `<div style="font-size:12px;color:var(--text2);margin-top:6px">The running gateway's configuration differs from the saved configuration.</div>`;
+  const stateLine = plan.applies_at_next_start
+    ? "The gateway is not running — these changes take effect at its next start. No restart is needed."
+    : "The gateway generates its routes when it starts, so these changes take effect only after a gateway restart.";
+  const cancelBtn = plan.snapshot_available
+    ? (ui.confirmCancel
+      ? `<button class="btn" data-plan-act="cancel-confirm"${dis}>Confirm cancel changes</button>`
+      : `<button class="btn" data-plan-act="cancel"${dis}>Cancel changes</button>`)
+    : "";
+  const restartBtns = plan.applies_at_next_start
+    ? `<button class="btn" data-plan-act="start"${dis}>${icon("play")} Start gateway</button>`
+    : `<button class="btn" data-plan-act="quiesce"${dis}>${icon("pause")} Quiesce, then restart</button>
+       <button class="btn" data-plan-act="restart"${dis}>${icon("restart")} Restart gateway now</button>`;
+  return `<div class="card" style="margin-bottom:12px;border-color:var(--amber)">
+    <h3>${icon("warn")} Activation plan — saved changes are not live</h3>
+    ${changeList}
+    <div style="font-size:12px;color:var(--text2);margin-top:6px">${stateLine}</div>
+    <div class="card-actions">${restartBtns}
+      <button class="btn" data-plan-act="later"${dis}>Decide later</button>
+      ${cancelBtn}</div>
+    ${ui.confirmCancel && !ui.status ? `<div style="font-size:12px;margin-top:6px;color:var(--text2)">Cancelling restores the configuration from before these changes and clears the plan.</div>` : ""}
+    ${ui.status ? `<div style="font-size:12px;margin-top:6px;color:${ui.statusErr ? "var(--err)" : "var(--text2)"}">${esc(ui.status)}</div>` : ""}
+  </div>`;
+}
+
+/** Execute the restart side of an activation plan with the
+ *  existing primitives: the quiesce wait (optional), gateway stop,
+ *  the start-gateway wizard step, then mark the plan complete. */
+async function executeActivationRestart(
+  mode: "quiesce" | "restart" | "start",
+  setStatus: (text: string, err?: boolean) => void,
+): Promise<boolean> {
+  if (mode === "quiesce") {
+    setStatus("Waiting for in-flight gateway requests to finish (up to 120 seconds)…");
+    const q = await quiesceWait(120);
+    if (q.error) { setStatus(`Quiesce check failed: ${q.error}`, true); return false; }
+    if (!q.data.drained) {
+      setStatus(`${q.data.in_flight} request(s) still in flight after the wait — restarting now.`);
+    }
+  }
+  if (mode !== "start") {
+    const st = await getGatewayStatus();
+    if (st.data.up) {
+      setStatus("Stopping the running gateway…");
+      const sr = await gatewayStop();
+      if (sr.error) { setStatus(`Gateway stop failed: ${sr.error}`, true); return false; }
+    }
+  }
+  setStatus("Running the start-gateway step…");
+  const r = await runWizardStep("start-gateway");
+  if (r.error) { setStatus(`Gateway start failed: ${r.error}`, true); return false; }
+  if (r.data.busy || !r.data.outcome) {
+    setStatus("A setup step is already running — wait for it to finish, then execute the plan again.", true);
+    return false;
+  }
+  if (r.data.outcome.state === "failed") {
+    setStatus(`Start-gateway step failed — ${r.data.outcome.message}`, true);
+    return false;
+  }
+  await activationComplete();
+  setStatus("Gateway restarted — the saved changes are live.");
+  return true;
+}
+
+/** Shared click handling for the plan card's buttons, used by the
+ *  Backends and Gateway views. `repaint` re-renders the card in
+ *  place; `reload` refreshes the whole view afterwards. */
+async function handlePlanAction(
+  act: string,
+  ui: PlanUiState,
+  repaint: () => void,
+  reload: () => Promise<void>,
+): Promise<void> {
+  if (act === "review") { ui.dismissed = false; repaint(); return; }
+  if (act === "later") {
+    ui.dismissed = true; ui.confirmCancel = false; ui.status = "";
+    repaint();
+    return;
+  }
+  if (act === "cancel") { ui.confirmCancel = true; repaint(); return; }
+  if (ui.acting) return;
+  if (act === "cancel-confirm") {
+    ui.acting = true;
+    repaint();
+    const r = await activationCancelChanges();
+    ui.acting = false;
+    ui.confirmCancel = false;
+    if (r.error) {
+      ui.status = `Cancel failed: ${r.error}`;
+      ui.statusErr = true;
+      repaint();
+      return;
+    }
+    ui.status = r.data.cancelled
+      ? "Changes cancelled — the previous configuration was restored."
+      : "Nothing to cancel — the plan had already resolved.";
+    ui.statusErr = false;
+    repaint();
+    await reload();
+    return;
+  }
+  if (act === "quiesce" || act === "restart" || act === "start") {
+    ui.acting = true;
+    const setStatus = (text: string, err = false): void => {
+      ui.status = text;
+      ui.statusErr = err;
+      repaint();
+    };
+    await executeActivationRestart(act, setStatus);
+    ui.acting = false;
+    repaint();
+    await reload();
+  }
+}
+
 function backendCard(
   b: BackendRow,
   openArgv: Set<string>,
@@ -770,6 +918,7 @@ function backendCard(
 export function renderBackends(): string {
   return `${topbar("Backends", `<button class="btn" id="backAdd">${icon("server")} Add backend</button> <button class="btn" id="backRefresh">${icon("restart")} Refresh</button>`)}
   <div class="view"><div id="backBanner"></div>
+  <div id="backPlan"></div>
   <div id="backAddForm"></div>
   <div id="backFlagsForm"></div>
   <div id="backBody">${loadingHtml("Loading backends\u2026")}</div></div>`;
@@ -794,6 +943,14 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   let gatewayPort = 4000;
   /** Backend ids whose Remove button is armed for confirmation. */
   const confirmRemove = new Set<string>();
+  /** Gateway activation plan (saved changes awaiting a gateway
+   *  restart), painted into #backPlan above the add form. */
+  let lastPlan: ActivationPlanData | null = null;
+  const planUi = newPlanUi();
+  const paintPlan = (): void => {
+    const host = root.querySelector("#backPlan");
+    if (host) host.innerHTML = activationPlanHtml(lastPlan, planUi);
+  };
   let actionInFlight = false;
   let disposed = false;
   /** Load sequence: only the most recently started load may paint. */
@@ -852,8 +1009,9 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
 
   const load = async (): Promise<void> => {
     const seq = ++loadSeq;
-    const [r, mr, gr] = await Promise.all([getBackends(), getModels(), getGatewayConfig()]);
+    const [r, mr, gr, pr] = await Promise.all([getBackends(), getModels(), getGatewayConfig(), getActivationPlan()]);
     if (disposed || seq !== loadSeq) return; // a newer load supersedes this one
+    if (!pr.error && pr.data) { lastPlan = pr.data; paintPlan(); }
     if (!mr.error && mr.data) lastModels = mr.data;
     if (!gr.error && gr.data) {
       lastGroups = gr.data.groups;
@@ -997,19 +1155,9 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         return;
       }
       addHost.innerHTML = `<div class="card"><h3>${icon("check")} Backend added</h3>
-        <div style="font-size:12px;color:var(--text2);margin-top:6px">Backend <b>${esc(name)}</b> was created in group <b>${esc(group)}</b>. The gateway generates its routes from the configuration when it starts, so the new backend is routed after a gateway restart.</div>
-        <div class="card-actions"><button class="btn" id="addBackRestartGw">Restart gateway now</button> <button class="btn" id="addBackDone">Done</button></div>
-        <div id="addBackGwMsg" style="font-size:12px;margin-top:6px"></div></div>`;
+        <div style="font-size:12px;color:var(--text2);margin-top:6px">Backend <b>${esc(name)}</b> was created in group <b>${esc(group)}</b>. The change is recorded in the activation plan at the top of this page — the gateway routes the new backend after the plan is executed.</div>
+        <div class="card-actions"><button class="btn" id="addBackDone">Done</button></div></div>`;
       addHost.querySelector("#addBackDone")?.addEventListener("click", closeAddForm);
-      addHost.querySelector("#addBackRestartGw")?.addEventListener("click", async () => {
-        const gwMsg = addHost.querySelector("#addBackGwMsg") as HTMLElement | null;
-        if (gwMsg) gwMsg.textContent = "Restarting the gateway\u2026";
-        const rr = await runWizardStep("start-gateway");
-        if (disposed || !gwMsg) return;
-        gwMsg.innerHTML = rr.error
-          ? `<span style="color:var(--err)">Gateway restart failed: ${esc(rr.error)}</span>`
-          : "Gateway restarted \u2014 the new backend is now routed. Start it from its card when you are ready.";
-      });
       await load();
     });
   };
@@ -1017,6 +1165,11 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   addBtn?.addEventListener("click", openAddForm);
 
   const onClick = async (ev: Event): Promise<void> => {
+    const pt = (ev.target as HTMLElement).closest("[data-plan-act]") as HTMLElement | null;
+    if (pt) {
+      await handlePlanAction(pt.getAttribute("data-plan-act") ?? "", planUi, paintPlan, load);
+      return;
+    }
     const t = (ev.target as HTMLElement).closest("[data-back-act]") as HTMLElement | null;
     if (!t) return;
     const id = t.getAttribute("data-back-id") ?? "";
@@ -1644,6 +1797,8 @@ function gatewayPaint(
   backendsError: string | null,
   masterKey: string | null,
   keyRevealed: boolean,
+  plan: ActivationPlanData | null,
+  planUi: PlanUiState,
 ): string {
   const port = status.port || cfg.port;
   const backendById = new Map(backends.map((b) => [b.id, b]));
@@ -1791,7 +1946,7 @@ function gatewayPaint(
          <div style="font-size:11px;color:var(--text3);margin-top:6px">\`api_key: local\` in the generated config is LiteLLM's required non-empty placeholder \u2014 it is not a real key.</div>`) : ""}
   </div>`;
 
-  return backendsNote + summary + endpoint + openrouter + flow + groups + rules + yaml;
+  return activationPlanHtml(plan, planUi) + backendsNote + summary + endpoint + openrouter + flow + groups + rules + yaml;
 }
 
 export function renderGateway(): string {
@@ -1819,6 +1974,9 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
    *  so repaints do not re-read the credential store. */
   let masterKey: string | null = null;
   let keyRevealed = false;
+  /** Gateway activation plan, painted at the top of the view. */
+  let lastPlan: ActivationPlanData | null = null;
+  const planUi = newPlanUi();
 
   const gwMsg = (text: string, isErr = false): void => {
     const m = root.querySelector("#gwMsg");
@@ -1838,8 +1996,9 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
   };
 
   const load = async (): Promise<void> => {
-    const [st, cfg, backs] = await Promise.all([getGatewayStatus(), getGatewayConfig(), getBackends()]);
+    const [st, cfg, backs, pr] = await Promise.all([getGatewayStatus(), getGatewayConfig(), getBackends(), getActivationPlan()]);
     if (disposed) return;
+    if (!pr.error && pr.data) lastPlan = pr.data;
     const err = st.error ?? cfg.error;
     setBanner(root, "gwBanner", bannerHtml({ live: st.live && cfg.live, error: err }));
     const b = root.querySelector("#gwBody");
@@ -1854,11 +2013,17 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     lastCfg = cfg.data;
     lastUp = st.data.up;
     lastPort = st.data.port || cfg.data.port;
-    b.innerHTML = gatewayPaint(st.data, cfg.data, backs.data, yamlOpen, yamlText, yamlErr, starting, stopping, backs.error ?? null, masterKey, keyRevealed);
+    b.innerHTML = gatewayPaint(st.data, cfg.data, backs.data, yamlOpen, yamlText, yamlErr, starting, stopping, backs.error ?? null, masterKey, keyRevealed, lastPlan, planUi);
   };
 
   const onClick = async (ev: Event): Promise<void> => {
     const t = ev.target as HTMLElement;
+
+    const pt = t.closest("[data-plan-act]") as HTMLElement | null;
+    if (pt) {
+      await handlePlanAction(pt.getAttribute("data-plan-act") ?? "", planUi, () => { void load(); }, load);
+      return;
+    }
 
     if (t.closest("#gwYamlBtn")) {
       if (yamlOpen) {
@@ -1957,6 +2122,10 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
         } else {
           const o = r.data.outcome;
           const tail = o.log_tail.length ? ` ${o.log_tail[o.log_tail.length - 1]}` : "";
+          // A successful (re)start makes any pending activation
+          // plan live; clear it promptly instead of waiting for the
+          // journal's mtime resolution.
+          if (o.state !== "failed") await activationComplete();
           gwMsg(`Start-gateway step ${o.state} \u2014 ${o.message}${tail}`, o.state === "failed");
         }
       } finally {
