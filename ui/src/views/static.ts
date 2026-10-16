@@ -6,7 +6,7 @@
    instead of fabricated data. */
 
 import { fmtGb, gaugeRing, sparkline, trim1 } from "../charts";
-import { icon } from "../icons";
+import { icon, type IconName } from "../icons";
 import { esc } from "../html";
 import {
   runWizardStep, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit,
@@ -44,6 +44,25 @@ function stateDot(state: string): string {
   return dot(state === "running" ? "ok"
     : state === "starting" || state === "stopping" ? "starting"
     : state === "failed" ? "err" : "idle");
+}
+
+/** Status/health button for an overview-list row: a colored dot and
+ *  icon; clicking it scrolls to the item's card (data-ov-goto holds
+ *  the card's element id). kind colors both the dot and the icon. */
+function ovStatusBtn(kind: "ok" | "warn" | "err" | "idle", ic: IconName, target: string, label: string): string {
+  return `<button class="ov-goto ${kind}" data-ov-goto="${esc(target)}" title="${esc(label)}">${dot(kind)}${icon(ic)}</button>`;
+}
+
+/** Shared click handler for overview status buttons: scroll the
+ *  target card into view and flash its outline briefly. */
+function onOvGoto(ev: Event): void {
+  const t = (ev.target as HTMLElement).closest("[data-ov-goto]") as HTMLElement | null;
+  if (!t) return;
+  const el = document.getElementById(t.getAttribute("data-ov-goto") ?? "");
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "start" });
+  el.classList.add("flash");
+  window.setTimeout(() => el.classList.remove("flash"), 1300);
 }
 
 interface LoadMeta { live: boolean; error?: string }
@@ -154,7 +173,7 @@ function gpuCard(g: GpuInfo, expanded: Set<string>): string {
     ? `<div style="margin-top:8px;font-size:11px;color:var(--text3);display:grid;gap:4px">
         ${g.models.map((m) => `<div>${icon("layers")} ${esc(m.model)} \u00b7 ${esc(m.layers)}</div>`).join("")}
       </div>` : "";
-  return `<div class="card">
+  return `<div class="card" id="card-gpu-${esc(g.id)}">
       <div class="gpu-head">${dot(g.status)} ${esc(g.name)}${pci}${staleChip}
         <span class="spacer" style="flex:1"></span>${driver}</div>
       <div style="display:flex;gap:18px;justify-content:center;margin:12px 0">
@@ -245,7 +264,15 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
   const paintBody = (): void => {
     const ov = root.querySelector("#gpuOverview");
     if (ov) {
-      ov.innerHTML = lastGpus.length ? `<div class="card" style="padding:8px 12px">${lastGpus.map((g) => `<div style="display:flex;gap:12px;font-size:12px;padding:2px 0"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(g.name)}</span><span>${g.util_pct}% util</span><span>${fmtGb(g.vram_used_gb)} / ${fmtGb(g.vram_total_gb)} GiB</span><span>${g.temp_c} \u00b0C</span><span>${(g.processes ?? []).length} proc</span></div>`).join("")}</div>` : "";
+      ov.innerHTML = lastGpus.length ? `<div class="ovlist ov-g">
+        <div class="ov-head"><span></span><span>GPU</span><span>Util</span><span>VRAM</span><span>Temp</span><span>Power</span><span>Processes</span></div>
+        ${lastGpus.map((g) => {
+          const btn = g.status === "ok" ? ovStatusBtn("ok", "check", `card-gpu-${g.id}`, `${g.name}: ok — go to card`)
+            : g.status === "down" ? ovStatusBtn("err", "err", `card-gpu-${g.id}`, `${g.name}: down — go to card`)
+            : g.status === "degraded" || g.status === "starting" ? ovStatusBtn("warn", "warn", `card-gpu-${g.id}`, `${g.name}: ${g.status} — go to card`)
+            : ovStatusBtn("idle", "pause", `card-gpu-${g.id}`, `${g.name}: ${g.status} — go to card`);
+          return `<div class="ov-row">${btn}<span class="ov-name">${esc(g.name)}</span><span class="ov-dim">${g.util_pct}%</span><span class="ov-dim">${fmtGb(g.vram_used_gb)} / ${fmtGb(g.vram_total_gb)} GiB</span><span class="ov-dim">${g.temp_c} \u00b0C</span><span class="ov-dim">${g.power_w == null ? "N/A" : `${g.power_w} W`}</span><span class="ov-dim">${(g.processes ?? []).length}</span></div>`;
+        }).join("")}</div>` : "";
     }
     const b = root.querySelector("#gpuBody");
     if (!b) return;
@@ -656,6 +683,7 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     if (expandedProcs.has(key)) expandedProcs.delete(key); else expandedProcs.add(key);
     paintBody();
   });
+  root.addEventListener("click", onOvGoto);
 
   // Initialize the poll select from the configured interval, bucketed
   // to the cadence the backend actually honors.
@@ -683,6 +711,7 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
   return () => {
     disposed = true;
     window.clearInterval(timer);
+    root.removeEventListener("click", onOvGoto);
     refreshBtn?.removeEventListener("click", onRefresh);
     resetBtn?.removeEventListener("click", onResetPeaks);
     snapshotBtn?.removeEventListener("click", onSnapshot);
@@ -964,7 +993,7 @@ function backendCard(
           .map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
       </div>`
     : (b.configured && b.enabled ? `<div style="font-size:11px;color:var(--text3);margin-top:6px">Gateway stats: no metrics window yet for this backend.</div>` : "");
-  return `<div class="card">
+  return `<div class="card" id="card-backend-${esc(b.id)}">
       <h3>${stateDot(b.state)} ${esc(b.id)} <span class="port">:${b.port}</span>
         <span class="spacer" style="flex:1"></span>
         ${b.configured ? "" : `<span class="chip badge-warn">not in config</span>`}
@@ -1063,20 +1092,6 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const paint = (): void => {
     const b = root.querySelector("#backBody");
     if (!b) return;
-    // Short overview strip: one line per backend (all rows, ignoring
-    // the list filter) — state, group, measured GPUs, request rate.
-    const ov = root.querySelector("#backOverview");
-    if (ov) {
-      ov.innerHTML = lastRows.length ? `<div class="card" style="padding:8px 12px;margin-bottom:10px">${lastRows.map((row) => {
-        const res = (residency.get(row.id) ?? []).map((r) => `GPU ${r.gpu}`).join("+") || "\u2014";
-        const req = row.requests_1h !== undefined ? `<span>${row.requests_1h.toLocaleString()} req/1h</span>` : "<span></span>";
-        return `<div style="display:flex;gap:12px;font-size:12px;padding:2px 0"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(row.id)}</span><span>${esc(row.state)}</span><span>${esc(row.group ?? "ungrouped")}</span><span>${res}</span>${req}</div>`;
-      }).join("")}</div>` : "";
-    }
-    const f = backFilter.trim().toLowerCase();
-    const viewRows = lastRows.filter((row) =>
-      (backState === "all" || row.state === backState) &&
-      (!f || row.id.toLowerCase().includes(f) || (row.group ?? "").toLowerCase().includes(f) || row.model_file.toLowerCase().includes(f)));
     const sorted = (list: BackendRow[]): BackendRow[] => {
       const c = [...list];
       if (backSort === "port") c.sort((a, z) => a.port - z.port);
@@ -1085,6 +1100,31 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       else c.sort((a, z) => a.id.localeCompare(z.id));
       return c;
     };
+    // Overview list: one line per backend (all rows, ignoring the
+    // list filter), with column headings, divider lines, and a
+    // status button that scrolls to the backend's card. The GPUs
+    // column names only GPUs where the backend holds at least 1 GiB
+    // measured — under that it holds only a CUDA context there.
+    const ov = root.querySelector("#backOverview");
+    if (ov) {
+      ov.innerHTML = lastRows.length ? `<div class="ovlist ov-b">
+        <div class="ov-head"><span></span><span>Backend</span><span>State</span><span>Group</span><span>Port</span><span>GPUs (measured)</span><span>Requests (1h)</span><span>Errors (1h)</span></div>
+        ${sorted(lastRows).map((row) => {
+          const res = residency.get(row.id) ?? [];
+          const resident = res.filter((r) => r.mib >= 1024);
+          const gpuTxt = resident.length ? resident.map((r) => `GPU ${r.gpu}`).join(", ")
+            : res.length ? "context only" : "\u2014";
+          const btn = row.state === "running" ? ovStatusBtn("ok", "check", `card-backend-${row.id}`, `${row.id}: running — go to card`)
+            : row.state === "failed" ? ovStatusBtn("err", "err", `card-backend-${row.id}`, `${row.id}: failed — go to card`)
+            : row.state === "starting" || row.state === "stopping" ? ovStatusBtn("warn", "clock", `card-backend-${row.id}`, `${row.id}: ${row.state} — go to card`)
+            : ovStatusBtn("idle", "pause", `card-backend-${row.id}`, `${row.id}: ${row.state} — go to card`);
+          return `<div class="ov-row">${btn}<span class="ov-name">${esc(row.id)}</span><span class="ov-dim">${esc(row.state)}</span><span class="ov-dim">${esc(row.group ?? "ungrouped")}</span><span class="ov-dim">${row.port}</span><span class="ov-dim">${esc(gpuTxt)}</span><span class="ov-dim">${row.requests_1h !== undefined ? row.requests_1h.toLocaleString() : "\u2014"}</span><span class="ov-dim">${row.errors_1h !== undefined ? String(row.errors_1h) : "\u2014"}</span></div>`;
+        }).join("")}</div>` : "";
+    }
+    const f = backFilter.trim().toLowerCase();
+    const viewRows = lastRows.filter((row) =>
+      (backState === "all" || row.state === backState) &&
+      (!f || row.id.toLowerCase().includes(f) || (row.group ?? "").toLowerCase().includes(f) || row.model_file.toLowerCase().includes(f)));
     // Cards are grouped by gateway group (Pete's request, 2026-10-15):
     // a section per group in the order groups first appear across
     // the rows (backend config order), ungrouped rows and orphans
@@ -1106,8 +1146,10 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       ...sections.filter((s) => s.name === null),
     ];
     b.innerHTML = ordered.map((sec) => `
-      <div class="sec-title" style="margin:18px 0 10px">${sec.name !== null ? `Group: ${esc(sec.name)}` : "Ungrouped"} <span style="color:var(--text3);font-weight:400">— ${sec.rows.length} backend${sec.rows.length === 1 ? "" : "s"}</span></div>
-      <div class="grid2">${sorted(sec.rows).map((row) => backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency)).join("")}</div>`).join("");
+      <div class="group-box">
+      <div class="sec-title" style="margin:0 0 10px">${sec.name !== null ? `Group: ${esc(sec.name)}` : "Ungrouped"} <span style="color:var(--text3);font-weight:400">— ${sec.rows.length} backend${sec.rows.length === 1 ? "" : "s"}</span></div>
+      <div class="grid2">${sorted(sec.rows).map((row) => backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency)).join("")}</div>
+      </div>`).join("");
     if (!viewRows.length && lastRows.length) b.innerHTML = emptyHtml("No backends match the current filter.");
   };
 
@@ -1441,6 +1483,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     }
   };
   root.addEventListener("click", onClick);
+  root.addEventListener("click", onOvGoto);
   root.addEventListener("change", onModelChange);
 
   await load();
@@ -1455,6 +1498,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     disposed = true;
     window.clearInterval(timer);
     root.removeEventListener("click", onClick);
+    root.removeEventListener("click", onOvGoto);
     root.removeEventListener("change", onModelChange);
     refreshBtn?.removeEventListener("click", onRefresh);
   };
@@ -1482,6 +1526,32 @@ function modelShaBadge(m: ModelRow): string {
 }
 
 type ModelNote = { text: string; err: boolean };
+
+/** Overview list for the Models view: one line per model with column
+ *  headings, divider lines, and a status button that scrolls to the
+ *  model's card. The status reflects the file/download lifecycle:
+ *  verified > on disk unverified > partial > downloading/verifying >
+ *  disabled > not downloaded; a recorded download failure outranks
+ *  all but an in-flight retry. */
+function modelOverviewHtml(rows: ModelRow[], stats: Map<string, { backends: number; req?: number }>): string {
+  if (!rows.length) return "";
+  const body = rows.map((m) => {
+    const st = stats.get(m.id);
+    let btn: string;
+    let stateTxt: string;
+    if (m.download_error && !m.downloading) { btn = ovStatusBtn("err", "err", `card-model-${m.id}`, `${m.id}: download failed — go to card`); stateTxt = "download failed"; }
+    else if (m.downloading) { btn = ovStatusBtn("warn", m.paused ? "pause" : "clock", `card-model-${m.id}`, `${m.id}: ${m.paused ? "download paused" : "downloading"} — go to card`); stateTxt = m.paused ? "download paused" : "downloading"; }
+    else if (m.verifying) { btn = ovStatusBtn("warn", "shield", `card-model-${m.id}`, `${m.id}: verifying checksum — go to card`); stateTxt = "verifying checksum"; }
+    else if (!m.enabled) { btn = ovStatusBtn("idle", "pause", `card-model-${m.id}`, `${m.id}: disabled — go to card`); stateTxt = "disabled"; }
+    else if (m.on_disk && m.verified_at) { btn = ovStatusBtn("ok", "check", `card-model-${m.id}`, `${m.id}: downloaded and verified — go to card`); stateTxt = "verified"; }
+    else if (m.on_disk) { btn = ovStatusBtn("warn", "shield", `card-model-${m.id}`, `${m.id}: on disk, checksum not verified — go to card`); stateTxt = "on disk, not verified"; }
+    else if ((m.partial_bytes ?? 0) > 0) { btn = ovStatusBtn("warn", "warn", `card-model-${m.id}`, `${m.id}: partial download — go to card`); stateTxt = "partial download"; }
+    else { btn = ovStatusBtn("idle", "download", `card-model-${m.id}`, `${m.id}: not downloaded — go to card`); stateTxt = "not downloaded"; }
+    const size = m.on_disk ? fmtBytes(m.size_bytes) : (m.partial_bytes ? `${fmtBytes(m.partial_bytes)} partial` : "\u2014");
+    return `<div class="ov-row">${btn}<span class="ov-name">${esc(m.id)}</span><span class="ov-dim">${esc(m.quant)}</span><span class="ov-dim">${esc(size)}</span><span class="ov-dim">${esc(stateTxt)}</span><span class="ov-dim">${st ? String(st.backends) : "0"}</span><span class="ov-dim">${st?.req !== undefined ? st.req.toLocaleString() : "\u2014"}</span></div>`;
+  }).join("");
+  return `<div class="ovlist ov-m"><div class="ov-head"><span></span><span>Model</span><span>Quant</span><span>Size</span><span>State</span><span>Serving backends</span><span>Requests (1h)</span></div>${body}</div>`;
+}
 
 function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }): string {
   const note = notes.get(m.id);
@@ -1531,7 +1601,7 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
   const sizeText = m.on_disk
     ? esc(fmtBytes(m.size_bytes))
     : partial > 0 ? `${esc(fmtBytes(partial))} (partial)` : "not downloaded";
-  return `<div class="card" style="margin-bottom:12px">
+  return `<div class="card" id="card-model-${esc(m.id)}">
     <h3>${icon("box")} ${esc(m.id)} <span class="chip">${esc(m.quant)}</span>${m.enabled ? "" : ` <span class="chip badge-warn">disabled</span>`}
       <span class="spacer" style="flex:1"></span>
       ${modelShaBadge(m)}</h3>
@@ -1550,7 +1620,8 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
 
 export function renderModels(): string {
   return `${topbar("Models")}
-  <div class="view" style="max-width:900px"><div id="modelBanner"></div>
+  <div class="view"><div id="modelBanner"></div>
+  <div id="modelOverview"></div>
   <div id="modelBody">${loadingHtml("Loading models…")}</div>
   <div class="card"><h3>${icon("box")} Add a model</h3>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
@@ -1618,9 +1689,11 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     setBanner(root, "modelBanner", bannerHtml(r));
     const b = root.querySelector("#modelBody");
     if (!b) return;
-    if (r.error) { b.innerHTML = emptyHtml(`Models unavailable: ${r.error}`); return; }
+    const mov = root.querySelector("#modelOverview");
+    if (r.error) { if (mov) mov.innerHTML = ""; b.innerHTML = emptyHtml(`Models unavailable: ${r.error}`); return; }
     if (!r.data.length) {
       lastRows = [];
+      if (mov) mov.innerHTML = "";
       b.innerHTML = emptyHtml(r.live
         ? "No models are configured. Add one with the form below."
         : "No model data in sample mode.");
@@ -1628,7 +1701,8 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       return;
     }
     lastRows = r.data;
-    b.innerHTML = lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id))).join("");
+    if (mov) mov.innerHTML = modelOverviewHtml(lastRows, modelStats);
+    b.innerHTML = `<div class="cards-fluid">${lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id))).join("")}</div>`;
     syncPoll();
   };
 
@@ -1731,6 +1805,7 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     }
   };
   root.addEventListener("click", onClick);
+  root.addEventListener("click", onOvGoto);
 
   const addBtn = root.querySelector("#addModelBtn") as HTMLButtonElement | null;
   addBtn?.addEventListener("click", async () => {
@@ -1759,6 +1834,7 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     disposed = true;
     if (pollTimer !== null) window.clearInterval(pollTimer);
     root.removeEventListener("click", onClick);
+    root.removeEventListener("click", onOvGoto);
   };
 }
 

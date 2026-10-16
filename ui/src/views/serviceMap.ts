@@ -88,13 +88,25 @@ interface MapData {
    *  from the app config; backends absent here get no GPU edges. */
   splits: Map<string, number[]>;
   /** Backend id -> measured residency: GPU index -> MiB held there,
-   *  from telemetry's per-process attribution. */
+   *  from telemetry's per-process attribution. Raw attribution: a
+   *  backend appears on every GPU where its process holds even a
+   *  bare CUDA context, so consumers must apply RESIDENCY_MIN_MIB
+   *  before treating an entry as model residency. */
   residency: Map<string, Map<number, number>>;
   live: boolean;
   errors: string[];
   /** When this paint's data was fetched (epoch ms). */
   updatedAt: number;
 }
+
+/** Minimum measured per-GPU memory for a backend to count as
+ *  resident on that GPU. Below this a process holds only its CUDA
+ *  context there (llama.cpp initializes a context on every visible
+ *  GPU — 256 MiB each on Pete's P100 — while its weights sit where
+ *  the tensor split, or the main GPU by default, placed them). The
+ *  same 1 GiB threshold the GPUs view and backend cards label
+ *  "context only" with. */
+const RESIDENCY_MIN_MIB = 1024;
 
 const W = 1200, H = 640;
 const NW = 170, NH = 62;
@@ -138,24 +150,43 @@ function topologySvg(d: MapData): string {
     s += href ? `<a href="${href}">${g}</a>` : g;
   };
 
-  // Gateway -> backends for every backend; backends -> GPUs only
-  // where the config assigns a tensor split (a positive fraction for
-  // that GPU index). A backend with no split gets no GPU edges — the
-  // edges show configured placement, not a full mesh.
+  // Gateway -> backends for every backend. Backend -> GPU edges
+  // claim where the model actually resides, from the strongest data
+  // available:
+  // 1. Measured residency of RESIDENCY_MIN_MIB or more on a GPU
+  //    (solid edge). Raw per-process attribution alone is NOT
+  //    residency: a llama-server process holds a small CUDA context
+  //    on every visible GPU, so drawing every attribution row made
+  //    every backend appear on every GPU.
+  // 2. For a live backend with no measured residency anywhere, its
+  //    configured placement (dotted edge): the tensor split it was
+  //    launched with, or the main GPU (index 0) when no split is
+  //    set — llama.cpp's default device. This is also the only
+  //    placement signal for a display GPU under WDDM, where
+  //    nvidia-smi cannot measure per-process memory at all.
+  // A stopped or failed backend resides nowhere: no GPU edges.
   backends.forEach((b, i) => {
     const e = stateEdge(b.state);
     edge(COL.gateway + NW, H / 2, COL.backends, ys[i], e.cls, e.stroke);
     const measured = d.residency.get(b.id);
-    if (measured && measured.size) {
-      for (const j of measured.keys()) {
+    const resident = measured
+      ? [...measured.entries()].filter(([, mib]) => mib >= RESIDENCY_MIN_MIB)
+      : [];
+    if (resident.length) {
+      for (const [j] of resident) {
         if (gpus[j]) edge(COL.backends + NW, ys[i], COL.gpus, spreadY(j, gpus.length), e.cls, e.stroke);
       }
-    } else {
+    } else if (b.state === "running" || b.state === "starting") {
       const split = d.splits.get(b.id);
-      if (split) {
-        split.forEach((frac, j) => {
-          if (frac > 0 && gpus[j]) edge(COL.backends + NW, ys[i], COL.gpus, spreadY(j, gpus.length), e.cls, e.stroke);
-        });
+      const targets = split
+        ? split.map((frac, j) => (frac > 0 ? j : -1)).filter((j) => j >= 0)
+        : [];
+      if (targets.length) {
+        for (const j of targets) {
+          if (gpus[j]) edge(COL.backends + NW, ys[i], COL.gpus, spreadY(j, gpus.length), "configured", "");
+        }
+      } else if (gpus.length) {
+        edge(COL.backends + NW, ys[i], COL.gpus, spreadY(0, gpus.length), "configured", "");
       }
     }
   });
@@ -175,7 +206,10 @@ function topologySvg(d: MapData): string {
     const up = b.state === "running" && b.uptime_secs != null ? ` \u00b7 up ${fmtUptime(b.uptime_secs)}` : "";
     const model = b.model_file ? ` \u00b7 ${b.model_file.split(/[\\/]/).pop()}` : "";
     const res = d.residency.get(b.id);
-    const resTxt = res && res.size ? ` \u00b7 ${[...res.entries()].map(([j, mib]) => `GPU${j} ${fmtGb(mib / 1024)}G`).join(" ")}` : "";
+    const resident = res ? [...res.entries()].filter(([, mib]) => mib >= RESIDENCY_MIN_MIB) : [];
+    const resTxt = resident.length
+      ? ` \u00b7 ${resident.map(([j, mib]) => `GPU${j} ${fmtGb(mib / 1024)}G`).join(" ")}`
+      : res && res.size ? " \u00b7 context only" : "";
     node(COL.backends, ys[i], b.id, `:${b.port} \u00b7 ${b.state}${up}${model}${resTxt}`, stateColor(b.state), stateStroke(b.state), undefined, "#/backends");
   });
 
@@ -250,7 +284,7 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
           <span><span class="dot warn"></span>GPU degraded</span>
           <span><span class="dot err"></span>GPU down</span>
           <span style="border:1px dashed #4a9eff;border-radius:3px;padding:0 5px">MXC boundary</span>
-          <span style="color:var(--text3)">Edges to GPUs show measured residency; configured tensor splits where nothing is measured</span>
+          <span style="color:var(--text3)">Solid GPU edges: measured residency of 1 GiB or more. Dotted edges: configured placement for a live backend with no measured residency (its tensor split, or the main GPU when no split is set). A process holding under 1 GiB on a GPU holds only a CUDA context there — it is listed under GPU residency, not drawn as placement.</span>
           <span><a href="#/backends" style="color:var(--accent)">Backends</a> \u00b7 <a href="#/gateway" style="color:var(--accent)">Gateway</a></span>
         </div>`;
     }
