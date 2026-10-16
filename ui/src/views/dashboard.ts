@@ -60,9 +60,11 @@ function allServices(m: DashboardModel): BackendInfo[] {
 
 function serviceCard(b: BackendInfo, isGateway: boolean): string {
   const ringColor = b.status === "ok" ? C.green : b.status === "starting" ? C.amber : C.red;
-  // health / requests_1h / errors_1h / throughput_toks / vram_held_gb have
-  // no live backend source; render "—" when absent instead of crashing on
-  // .toFixed or presenting a fabricated measurement.
+  // requests_1h / errors_1h / throughput_toks come from LiteLLM's
+  // Prometheus counters via the app's metrics poller (live since
+  // v0.1.18); health / vram_held_gb still have no live source. Render
+  // "—" when absent instead of crashing on .toFixed or presenting a
+  // fabricated measurement.
   const ringVal = isGateway
     ? (b.requests_1h !== undefined ? String(b.requests_1h) : "—")
     : (b.health !== undefined ? b.health.toFixed(0) : "—");

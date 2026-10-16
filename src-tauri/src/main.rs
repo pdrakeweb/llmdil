@@ -38,13 +38,15 @@ use manager_telemetry::{
 use manager_wizard::{
     ops::{prev_log_path, RealSystemOps},
     steps::{continue_config_yaml, default_steps, merge_env_contents, VscodeExtensions},
-    RunMode, StepOutcome, StepState, Wizard, WizardContext, WizardReport,
+    RunMode, StepOutcome, StepState, SystemOps, Wizard, WizardContext, WizardReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{Mutex, OnceCell, RwLock};
+
+mod gateway_stats;
 
 // ---------------------------------------------------------------------------
 // Events (Rust -> UI, spec §14)
@@ -341,6 +343,11 @@ pub struct AppState {
     /// Recent gateway routing decisions (spec §14 `gateway_recent_requests`).
     /// Every `gateway_test_routing` trace records here.
     routing_log: Mutex<manager_gateway::RoutingLog>,
+    /// Gateway request-statistic snapshots scraped from LiteLLM's
+    /// Prometheus endpoint by the background poller (see
+    /// [`gateway_stats`]); `list_backends` turns them into the
+    /// Dashboard's trailing-hour request/error/throughput figures.
+    gateway_stats: Mutex<gateway_stats::GatewayStatsStore>,
     /// WinML secondary-backend registry (stateful single-model rule).
     winml: OnceCell<Mutex<manager_winml::WinMlRegistry>>,
 }
@@ -377,6 +384,7 @@ impl AppState {
             backend_spec_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
             mcp_modes: Mutex::new(HashMap::new()),
             routing_log: Mutex::new(manager_gateway::RoutingLog::default()),
+            gateway_stats: Mutex::new(gateway_stats::GatewayStatsStore::default()),
             winml: OnceCell::new(),
         }
     }
@@ -1168,6 +1176,30 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
             })
         })
         .collect();
+    // Gateway request statistics (LiteLLM Prometheus snapshots from
+    // the background poller): attach the trailing-hour figures where
+    // the store has a window for the backend. Absent fields render
+    // as "—" in the UI — no stats yet is not zero stats.
+    {
+        let pairs: Vec<(String, u16)> = cfg
+            .backends
+            .iter()
+            .map(|b| (b.id.clone(), b.port))
+            .collect();
+        if let Some(windows) = state.gateway_stats.lock().await.window_stats(&pairs) {
+            for row in backends.iter_mut() {
+                let Some(id) = row["id"].as_str().map(str::to_string) else {
+                    continue;
+                };
+                let Some(w) = windows.get(&id) else {
+                    continue;
+                };
+                row["requests_1h"] = json!(w.requests);
+                row["errors_1h"] = json!(w.errors);
+                row["throughput_toks"] = json!((w.tokens as f64 / w.window_secs * 10.0).round() / 10.0);
+            }
+        }
+    }
     // Processes still live under ids that left the config (their specs
     // survive pruning while live): surface them so they stay visible and
     // stoppable instead of silently holding their port.
@@ -2807,6 +2839,84 @@ async fn gateway_set_bind_host(state: State<'_, AppState>, host: String) -> ApiR
     Ok(json!({ "bind_host": host, "restart_required": true }))
 }
 
+/// Fetch the gateway's Prometheus exposition (`GET /metrics`, the
+/// master key as Bearer). Returns the body only on an HTTP 200;
+/// anything else — gateway down, the metrics callback not active
+/// (config predates v0.1.18 until the next gateway start), an auth
+/// failure — is None and the poll cycle is skipped.
+fn fetch_gateway_metrics(host: &str, port: u16, master_key: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    let addr = std::net::SocketAddr::new(ip, port);
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800))
+            .ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+    let req = format!(
+        "GET /metrics HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {master_key}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > 8 * 1024 * 1024 {
+                    return None;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let mut parts = text.splitn(2, "\r\n\r\n");
+    let head = parts.next()?;
+    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+        return None;
+    }
+    // A chunked body would corrupt the exposition parse. LiteLLM's
+    // /metrics answers with a content-length body, but skip the cycle
+    // rather than misread if that ever changes.
+    if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        return None;
+    }
+    Some(parts.next()?.to_string())
+}
+
+/// One gateway-metrics poll cycle: resolve the probe host and port,
+/// read the stored master key (never generate one here — polling
+/// must not create credentials), fetch and record a snapshot. Any
+/// missing piece skips the cycle silently.
+async fn poll_gateway_metrics_once(state: &AppState) {
+    let (host, port) = {
+        let cfg = state.config.read().await;
+        (
+            manager_wizard::steps::gateway_probe_host(&cfg),
+            cfg.gateway.port,
+        )
+    };
+    let Some(key) = RealSystemOps
+        .credential_read(manager_wizard::LITELLM_MASTER_KEY_CRED_TARGET)
+        .await
+    else {
+        return;
+    };
+    if key.is_empty() {
+        return;
+    }
+    let body = tokio::task::spawn_blocking(move || fetch_gateway_metrics(&host, port, &key))
+        .await
+        .ok()
+        .flatten();
+    if let Some(body) = body {
+        let snap = gateway_stats::parse_metrics(&body, std::time::Instant::now());
+        state.gateway_stats.lock().await.record(snap);
+    }
+}
+
 /// Preview the generated LiteLLM config.yaml.
 #[tauri::command]
 async fn gateway_preview_yaml(state: State<'_, AppState>) -> ApiResult {
@@ -4098,6 +4208,18 @@ fn main() {
                 state.restore_wizard().await;
                 state.hydrate_wizard().await;
                 state.persist_wizard().await;
+            });
+            // Gateway metrics poller: scrape LiteLLM's Prometheus
+            // endpoint every 15 s into the stats store that feeds
+            // the Dashboard's request/error/throughput figures.
+            // Cycles skip silently while the gateway is down.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<AppState>();
+                loop {
+                    poll_gateway_metrics_once(&state).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                }
             });
             Ok(())
         })

@@ -2306,10 +2306,11 @@ impl StartGateway {
         PlannedCommand::new(vec![
             self.venv_python(ctx).display().to_string(),
             "-c".to_string(),
-            // prisma rides along: a venv that predates its addition
-            // to the install spec (see pip_command) must not pass
-            // this probe, so the pip step runs and completes it.
-            "import litellm, prisma".to_string(),
+            // prisma and prometheus_client ride along: a venv that
+            // predates either addition to the install spec (see
+            // pip_command) must not pass this probe, so the pip step
+            // runs and completes it.
+            "import litellm, prisma, prometheus_client".to_string(),
         ])
     }
 
@@ -2360,6 +2361,13 @@ impl StartGateway {
             // itself crashes on ModuleNotFoundError) instead of a
             // clean 401. Found on real hardware 2026-10-15.
             "prisma".to_string(),
+            // prometheus-client is only in litellm's proxy-runtime
+            // extra. The generated gateway config enables the
+            // prometheus success callback (dashboard request/error
+            // stats), and LiteLLM fails to start when the callback
+            // is set but this package is missing — the mount is
+            // unguarded during config load. Verified 2026-10-15.
+            "prometheus-client".to_string(),
         ])
     }
 

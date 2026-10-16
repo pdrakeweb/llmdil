@@ -67,12 +67,14 @@ const BACKEND_STATUS: Record<string, Status> = {
 /** list_backends — returns { backends: BackendRow[] } (configured backends
  *  merged with live supervisor state). Each row is mapped to the UI-side
  *  BackendInfo: name = id, model = model_file, status from the supervisor
- *  state. BackendInfo's health/quant/throughput/vram/request/error/spark
- *  fields have no backend source and are left undefined — views render an
- *  honest placeholder for them, never a fabricated measurement. Rows
- *  carry `configured`: false marks a supervisor-only orphan (a process
- *  still live under an id that left the config); the Backends view badges
- *  those "not in config" and offers Stop only. */
+ *  state. Rows also carry trailing-hour gateway statistics
+ *  (requests_1h / errors_1h / throughput_toks) when the metrics poller
+ *  has a window — those come from LiteLLM's Prometheus counters via
+ *  the Rust stats store; absent fields render an honest placeholder,
+ *  never a fabricated measurement. Rows carry `configured`: false
+ *  marks a supervisor-only orphan (a process still live under an id
+ *  that left the config); the Backends view badges those "not in
+ *  config" and offers Stop only. */
 export async function listBackends(): Promise<CallResult<BackendInfo[]>> {
   if (isTauri()) {
     try {
@@ -85,6 +87,9 @@ export async function listBackends(): Promise<CallResult<BackendInfo[]>> {
         model: b.model_file,
         status: BACKEND_STATUS[b.state] ?? "idle",
         adopted: b.adopted,
+        requests_1h: typeof b.requests_1h === "number" ? b.requests_1h : undefined,
+        errors_1h: typeof b.errors_1h === "number" ? b.errors_1h : undefined,
+        throughput_toks: typeof b.throughput_toks === "number" ? b.throughput_toks : undefined,
       }));
       return { data, live: true };
     } catch (e) {
@@ -313,6 +318,12 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
   // Live path: map whatever the backend returned. No fabrication — when
   // the probe errors, the gateway card is absent instead of a card
   // asserting a state we did not measure.
+  // Gateway totals are the sum of the per-backend windows (external
+  // deployments such as the cloud fallback are not in backend rows
+  // and are not counted); absent when no backend has a window yet.
+  const statRows = b.data.filter((x) => x.requests_1h !== undefined);
+  const sumStat = (pick: (x: BackendInfo) => number | undefined): number | undefined =>
+    statRows.length ? statRows.reduce((a, x) => a + (pick(x) ?? 0), 0) : undefined;
   const gateway: BackendInfo | null = gw.error
     ? null
     : {
@@ -321,6 +332,9 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
         port: gw.data.port,
         status: gw.data.up ? "ok" : "down",
         model: "",
+        requests_1h: sumStat((x) => x.requests_1h),
+        errors_1h: sumStat((x) => x.errors_1h),
+        throughput_toks: sumStat((x) => x.throughput_toks),
       };
   const backends = b.data;
   const cfg = await getAppConfig();
@@ -508,6 +522,12 @@ export interface BackendRow {
    *  so it reads 0 until a restart monitor exists (v0.1.2 has none). */
   restarts: number;
   uptime_secs: number | null;
+  /** Trailing-hour gateway statistics from LiteLLM's Prometheus
+   *  counters (present only once the metrics poller has a window;
+   *  absent renders as "—", not zero). */
+  requests_1h?: number;
+  errors_1h?: number;
+  throughput_toks?: number;
 }
 
 /** list_backends — configured backends merged with live supervisor state. */

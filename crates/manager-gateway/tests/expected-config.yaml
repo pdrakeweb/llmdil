@@ -40,6 +40,7 @@ model_list:
 router_settings:
   routing_strategy: latency-based-routing
 litellm_settings:
+  success_callback: ["prometheus"]
   fallbacks:
     - planner: [coder, openrouter]
     - coder-fast: [coder, openrouter]

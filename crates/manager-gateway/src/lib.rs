@@ -643,8 +643,16 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
         strategy_to_litellm(global_strategy)
     ));
 
-    // --- litellm_settings.fallbacks ---
+    // --- litellm_settings ---
     out.push_str("litellm_settings:\n");
+    // Prometheus metrics for the app dashboard (Pete approved
+    // 2026-10-15): the callback mounts /metrics on the gateway port
+    // and maintains the per-deployment success/failure counters the
+    // app polls. This REQUIRES the prometheus-client package in the
+    // gateway venv — LiteLLM fails to start when the callback is set
+    // but the package is missing (verified against 1.105.1); the
+    // wizard's install spec carries it.
+    out.push_str("  success_callback: [\"prometheus\"]\n");
     out.push_str("  fallbacks:\n");
     let known_names: Vec<&str> = group_entries
         .iter()
