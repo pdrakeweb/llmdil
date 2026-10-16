@@ -548,6 +548,9 @@ export interface BackendRow {
   /** Configured llama-server sizing flags (configured rows only). */
   n_ctx?: number;
   n_batch?: number;
+  /** Configured tensor split fractions in nvidia-smi index order
+   *  (configured rows only); empty when the backend is unsplit. */
+  tensor_split?: number[];
   /** Gateway group this backend belongs to, or null when ungrouped. */
   group?: string | null;
 }

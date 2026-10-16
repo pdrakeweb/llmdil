@@ -308,3 +308,15 @@ Fix (manager-wizard steps.rs):
   GPU as zero free VRAM and names it in the payload/UI, so no
   split is planned onto a dead card. Split-length validation
   still counts it (the split describes the machine's GPU set).
+
+## v0.1.28 — Placement form is backend-only
+- The GPUs Placement form now has one select: the backend. The
+  model is derived from the backend's model_file (matched against
+  the configured models) and shown as text; a backend whose file
+  matches no configured model states that and cannot be proposed.
+- placement_apply gained a backend scope: with a backend id, the
+  split is written to that backend only (the command verifies the
+  backend serves the model). The old form behavior is gone: Apply
+  no longer reassigns the backend's model via model_assign, and no
+  longer writes the split to every backend serving the model.
+  The model-wide apply remains when no backend id is passed.

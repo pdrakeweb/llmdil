@@ -1200,6 +1200,7 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
                 "configured": true,
                 "n_ctx": b.flags.n_ctx,
                 "n_batch": b.flags.n_batch,
+                "tensor_split": b.flags.tensor_split,
                 "group": cfg.gateway.groups.iter()
                     .find(|g| g.members.iter().any(|m| m == &b.id))
                     .map(|g| g.name.clone()),

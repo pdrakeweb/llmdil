@@ -122,7 +122,12 @@ function fmtDate(ts: string): string {
 
 /* ---------------- GPUs ---------------- */
 
-function gpuCard(g: GpuInfo, expanded: Set<string>): string {
+/** One model resident on a GPU, for the card's read-only listing:
+ *  the configured share of the model on this GPU and the measured
+ *  VRAM the serving backend holds here. */
+export interface GpuModelRow { model: string; backend: string; pct: number; mib: number }
+
+function gpuCard(g: GpuInfo, expanded: Set<string>, modelRows: GpuModelRow[] = []): string {
   const vramPct = g.vram_total_gb > 0 ? Math.round((g.vram_used_gb / g.vram_total_gb) * 100) : 0;
   // pci/driver are absent from the telemetry payload; omit them when
   // unset (esc(undefined) would print the literal text "undefined").
@@ -173,7 +178,13 @@ function gpuCard(g: GpuInfo, expanded: Set<string>): string {
   const procs = g.processes && g.processes.length
     ? `<div style="margin-top:10px"><div style="font-size:11px;color:var(--text3);margin-bottom:4px">PROCESSES (${g.processes.length}) \u2014 click a row for detail</div>
       <div style="max-height:176px;overflow-y:auto;border:1px solid #232a34;border-radius:6px">${g.processes.map(procRow).join("")}</div></div>` : "";
-  const models = g.models && g.models.length
+  // Resident models (live mode): read-only — the configured share
+  // of the model on this GPU and the VRAM its backend holds here.
+  // Sample mode keeps the mock placement lines.
+  const models = modelRows.length
+    ? `<div style="margin-top:10px"><div style="font-size:11px;color:var(--text3);margin-bottom:4px">MODELS ON THIS GPU</div>
+        <div style="display:grid;gap:4px">${modelRows.map((r) => `<div style="font-size:12px">${icon("layers")} ${esc(r.model)} <span style="color:var(--text3)">via ${esc(r.backend)} \u00b7 ${r.pct}% of the model \u00b7 ${fmtGb(r.mib / 1024)} GiB held</span></div>`).join("")}</div></div>`
+    : g.models && g.models.length
     ? `<div style="margin-top:8px;font-size:11px;color:var(--text3);display:grid;gap:4px">
         ${g.models.map((m) => `<div>${icon("layers")} ${esc(m.model)} \u00b7 ${esc(m.layers)}</div>`).join("")}
       </div>` : "";
@@ -226,8 +237,7 @@ export function renderGpus(): string {
       </select></label>
     <input id="gpuFilter" type="text" placeholder="Filter by GPU name" style="background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:5px 8px;font-size:12px;min-width:180px">
   </div>
-  <div id="gpuBody">${loadingHtml("Loading GPU telemetry\u2026")}</div>
-  <div id="gpuPlacement" style="margin-top:12px"></div></div>`;
+  <div id="gpuBody">${loadingHtml("Loading GPU telemetry\u2026")}</div></div>`;
 }
 
 /** The backend cadence buckets: Off, anything up to 1500 ms runs at 1s,
@@ -287,7 +297,7 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     else if (gpuSort === "vram") list = [...list].sort((a, z) => z.vram_used_gb - a.vram_used_gb);
     else if (gpuSort === "temp") list = [...list].sort((a, z) => z.temp_c - a.temp_c);
     b.innerHTML = list.length
-      ? `<div class="cards3">${list.map((g) => gpuCard(g, expandedProcs)).join("")}</div>`
+      ? `<div class="cards3">${list.map((g) => gpuCard(g, expandedProcs, modelRowsFor(g))).join("")}</div>`
       : emptyHtml("No GPUs match the filter.");
   };
 
@@ -300,6 +310,12 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     if (loading) return;
     loading = true;
     try {
+      // Backends + models for the read-only resident-model listing;
+      // failures keep the previous fetch.
+      const [br, mr] = await Promise.all([getBackends(), getModels()]);
+      if (disposed) return;
+      if (br.live && !br.error) gpuBackends = br.data;
+      if (mr.live && !mr.error) gpuModels = mr.data;
       const r = await getGpuTelemetry();
       if (disposed) return;
       const srcErr = r.data.sourceError;
@@ -342,287 +358,35 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     }
   };
 
-  /* ---------------- Placement ----------------
-     Lives in its own container: telemetry repaints never touch it, so
-     the poll cannot clobber the form or a rendered projection.
-     Backend-only (Pete's direction, 2026-10-16): the operator picks
-     the backend; the model is derived from the backend's model_file
-     and shown as text, never chosen separately. Apply writes the
-     split to that one backend (placement_apply's backend scope) —
-     it never reassigns the backend's model, and it never touches
-     other backends that happen to serve the same model. */
-  const placeEl = root.querySelector("#gpuPlacement");
-  let placeBackendRows: BackendRow[] = [];
-  let placeModelRows: ModelRow[] = [];
-  /** The operator's selected backend; falls back to the first
-   *  configured backend while unset or no longer present. */
-  let placeBackendId: string | null = null;
-  const placeBackend = (): BackendRow | undefined =>
-    placeBackendRows.find((b) => b.id === placeBackendId) ?? placeBackendRows[0];
-  /** The model a backend serves, derived from its model_file. */
-  const placeDerivedModel = (b: BackendRow | undefined): ModelRow | undefined =>
-    b ? placeModelRows.find((mdl) => sameModelFile(b.model_file, mdl.gguf_path)) : undefined;
-  const placeModelLineHtml = (): string => {
-    const b = placeBackend();
-    if (!b) return "";
-    const mdl = placeDerivedModel(b);
-    return mdl
-      ? `Model: <span style="color:var(--text)">${esc(mdl.id)}</span> \u2014 from the backend's configuration`
-      : `<span style="color:var(--err)">This backend's model file matches no configured model, so a split cannot be proposed or applied for it.</span>`;
-  };
-  let projection: { backendId: string; modelId: string; data: PlacementProjectionData } | null = null;
-  let placeBusy = false;
-  /** GPU indices (nvidia-smi order) the operator has unchecked: the
-   *  proposed split gives them a 0 fraction so the backend leaves
-   *  their memory alone (for example the display GPU). */
-  const placeExcluded = new Set<number>();
-
-  /** Does the backend's model_file already resolve to the model's
-   *  gguf_path? model_assign writes the gguf_path verbatim, so an
-   *  exact match is the assigned state; a basename match covers
-   *  configs written with a different directory prefix. */
-  const sameModelFile = (modelFile: string, ggufPath: string): boolean =>
-    modelFile !== "" && (modelFile === ggufPath || baseName(modelFile) === baseName(ggufPath));
-
-  const placeMsg = (text: string, isErr = false): void => {
-    const m = root.querySelector("#placeMsg");
-    if (m) m.innerHTML = text ? `<span style="color:${isErr ? "var(--err)" : "var(--text2)"}">${esc(text)}</span>` : "";
-  };
-
-  const paintProjection = (): void => {
-    const res = root.querySelector("#placeResult");
-    if (!res) return;
-    if (!projection) { res.innerHTML = ""; return; }
-    const p = projection.data;
-    const rows = p.split.map((frac, i) => {
-      const gpuIdx = p.gpu_indices?.[i] ?? i;
-      const gpu = lastGpus.find((g) => Number(g.id) === gpuIdx) ?? lastGpus[i];
-      // Free VRAM comes from the server's projection (the same
-      // snapshot the fit verdict used) when it carries it; the view's
-      // own latest telemetry is only a fallback basis.
-      const serverFree = p.free_mib?.[i];
-      const freeMib = serverFree !== undefined
-        ? serverFree
-        : gpu ? Math.max(0, Math.round((gpu.vram_total_gb - gpu.vram_used_gb) * 1024)) : null;
-      const fits = p.per_gpu_fits[i];
-      return `<tr><td>${esc(gpu ? gpu.name : `GPU ${gpuIdx}`)}</td>
-        <td>${Math.round(frac * 100)}%</td>
-        <td>${p.per_gpu_mib[i]} MiB</td>
-        <td>${freeMib !== null ? `${freeMib} MiB` : "\u2014"}</td>
-        <td>${frac === 0 ? `<span style="color:var(--text3)">not used</span>` : fits ? `<span style="color:var(--ok)">fits</span>` : `<span style="color:var(--err)">does not fit</span>`}</td></tr>`;
-    }).join("");
-    const ageMs = p.snapshot_age_ms ?? (lastAtMs !== null ? Math.max(0, Date.now() - lastAtMs) : null);
-    const agePart = ageMs !== null
-      ? `Based on telemetry from ${Math.round(ageMs / 1000)}s ago \u00b7 fractions map to GPUs in nvidia-smi index order.`
-      : "Based on the latest telemetry snapshot \u00b7 fractions map to GPUs in nvidia-smi index order.";
-    res.innerHTML = `<div style="margin-top:10px">
-      ${p.down_indices && p.down_indices.length ? `<div style="font-size:12px;color:var(--err);margin-bottom:4px">GPU ${p.down_indices.join(", GPU ")} is down and is treated as having no free VRAM.</div>` : ""}
-      <div style="font-size:12px;color:var(--text2)">${p.fits
-        ? "The proposed split fits the free VRAM on every GPU in the split."
-        : "The proposed split does not fit \u2014 at least one GPU in the split lacks the free VRAM."}</div>
-      <table class="tbl" style="margin-top:8px"><thead><tr><th>GPU</th><th>Fraction</th><th>Required</th><th>Free</th><th>Fit</th></tr></thead>
-      <tbody>${rows}</tbody></table>
-      <div style="font-size:12px;color:var(--text2);margin-top:8px">Weights only \u2014 excludes KV cache and runtime overhead; a split that fits here can still fail at load.</div>
-      <div style="font-size:12px;color:var(--text3);margin-top:4px">${esc(agePart)}</div>
-    </div>`;
-  };
-
-  const paintPlacement = (): void => {
-    if (!placeEl) return;
-    if (!placeBackendRows.length) {
-      placeEl.innerHTML = `<div class="card"><div class="sec-title">${icon("layers")} Placement</div>
-        <div style="font-size:12px;color:var(--text2)">No configured backends. Placement applies a tensor split to a backend, for the model it serves.</div></div>`;
-      return;
+  /* ---------------- Resident models (read-only) ----------------
+     Placement moved to the backend cards (Pete's direction,
+     2026-10-16): the split is a per-backend setting, edited there.
+     This view only reports: each GPU card lists the models present
+     on it — the configured percentage from the serving backend's
+     tensor split (100% when unsplit) and the measured VRAM held,
+     using the Service Map's residency rule (a bare CUDA context
+     under 1 GiB is not a model presence). The backends/models fetch
+     rides the telemetry load; failures keep the previous data. */
+  let gpuBackends: BackendRow[] = [];
+  let gpuModels: ModelRow[] = [];
+  const modelRowsFor = (g: GpuInfo): GpuModelRow[] => {
+    const pos = lastGpus.findIndex((x) => x.id === g.id);
+    const rows: GpuModelRow[] = [];
+    for (const b of gpuBackends) {
+      if (!b.configured || (b.state !== "running" && b.state !== "starting")) continue;
+      const mdl = gpuModels.find((m) => sameModelFile(b.model_file, m.gguf_path));
+      const measured = (g.processes ?? [])
+        .filter((p) => p.backend === b.id)
+        .reduce((s, p) => s + p.vram_mib, 0);
+      const split = b.tensor_split ?? [];
+      const frac = pos >= 0 && split.length ? split[pos] : undefined;
+      if (frac !== undefined && frac > 0) {
+        rows.push({ model: mdl?.id ?? baseName(b.model_file), backend: b.id, pct: Math.round(frac * 100), mib: measured });
+      } else if (!split.length && measured >= 1024) {
+        rows.push({ model: mdl?.id ?? baseName(b.model_file), backend: b.id, pct: 100, mib: measured });
+      }
     }
-    // Every configured backend is selectable; the label shows the
-    // model it currently serves (the basename of its model_file), and
-    // the derived model is restated as text beside the select.
-    const selId = placeBackend()?.id ?? "";
-    const backOpts = placeBackendRows.map((b) =>
-      `<option value="${esc(b.id)}"${b.id === selId ? " selected" : ""}>${esc(b.id)} \u2014 ${esc(b.model_file ? baseName(b.model_file) : "no model assigned")}</option>`).join("");
-    placeEl.innerHTML = `<div class="card"><div class="sec-title">${icon("layers")} Placement</div>
-      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px">Backend
-          <select id="placeBackend" style="${SELECT_STYLE}">${backOpts}</select></label>
-        <span id="placeModelLine" style="font-size:12px;color:var(--text2)">${placeModelLineHtml()}</span>
-        <button class="btn" id="placePropose"${placeDerivedModel(placeBackend()) ? "" : " disabled"}>Propose split</button>
-        <button class="btn" id="placeApply" disabled>Apply split</button>
-      </div>
-      ${lastGpus.length ? `<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px">
-        <span style="font-size:12px;color:var(--text2)">GPUs in the split:</span>
-        ${lastGpus.map((g, i) => `<label style="font-size:12px;display:inline-flex;align-items:center;gap:5px"><input type="checkbox" data-place-gpu="${i}"${placeExcluded.has(i) ? "" : " checked"}> ${esc(g.name)}</label>`).join("")}
-      </div>
-      <div style="font-size:12px;color:var(--text2);margin-top:6px">The split divides the model's weights across the selected GPUs, in nvidia-smi index order. Uncheck a GPU to leave it out of this backend \u2014 for example the display GPU, whose memory Windows already uses.</div>` : ""}
-      <div id="placeMsg" style="font-size:12px;margin-top:8px"></div>
-      <div id="placeResult"></div>
-    </div>`;
-    const sel = placeEl.querySelector("#placeBackend") as HTMLSelectElement | null;
-    const proposeBtn = placeEl.querySelector("#placePropose") as HTMLButtonElement | null;
-    const applyBtn = placeEl.querySelector("#placeApply") as HTMLButtonElement | null;
-    sel?.addEventListener("change", onPlaceSelectionChange);
-    proposeBtn?.addEventListener("click", onPropose);
-    applyBtn?.addEventListener("click", onApply);
-    placeEl.querySelectorAll("[data-place-gpu]").forEach((el) => {
-      el.addEventListener("change", () => {
-        const idx = Number(el.getAttribute("data-place-gpu"));
-        if ((el as HTMLInputElement).checked) placeExcluded.delete(idx);
-        else placeExcluded.add(idx);
-        onPlaceSelectionChange();
-      });
-    });
-  };
-
-  const onPlaceSelectionChange = (): void => {
-    const sel = root.querySelector("#placeBackend") as HTMLSelectElement | null;
-    if (sel) placeBackendId = sel.value;
-    projection = null;
-    placeMsg("");
-    paintProjection();
-    const line = root.querySelector("#placeModelLine");
-    if (line) line.innerHTML = placeModelLineHtml();
-    const proposeBtn = root.querySelector("#placePropose") as HTMLButtonElement | null;
-    if (proposeBtn) proposeBtn.disabled = !placeDerivedModel(placeBackend());
-    const applyBtn = root.querySelector("#placeApply") as HTMLButtonElement | null;
-    if (applyBtn) applyBtn.disabled = true;
-  };
-
-  const onPropose = async (): Promise<void> => {
-    const backend = placeBackend();
-    const backendId = backend?.id ?? "";
-    const model = placeDerivedModel(backend);
-    if (!backendId) { placeMsg("Select a backend first.", true); return; }
-    if (!model) { placeMsg("This backend's model file matches no configured model.", true); return; }
-    const modelId = model.id;
-    if (placeBusy) return;
-    placeBusy = true;
-    const proposeBtn = root.querySelector("#placePropose") as HTMLButtonElement | null;
-    if (proposeBtn) proposeBtn.disabled = true;
-    try {
-      // Propose the backend's configured split when it has one; a fresh
-      // even split across the reported GPUs otherwise.
-      let split: number[] = [];
-      const cfgR = await getBackendConfig(backendId);
-      const flags = cfgR.data?.flags as { tensor_split?: unknown } | undefined;
-      if (Array.isArray(flags?.tensor_split)
-        && flags.tensor_split.length > 0
-        && flags.tensor_split.every((x) => typeof x === "number" && Number.isFinite(x))) {
-        split = flags.tensor_split as number[];
-      }
-      const n = lastGpus.length;
-      if (!n) { placeMsg("No GPU telemetry yet \u2014 a split cannot be proposed until telemetry reports the GPUs.", true); return; }
-      const used = lastGpus.map((_, i) => i).filter((i) => !placeExcluded.has(i));
-      if (!used.length) { placeMsg("Select at least one GPU for the split.", true); return; }
-      if (split.length) {
-        // The backend's configured split applies only when it covers
-        // exactly the selected GPUs; a different selection needs a
-        // fresh composition.
-        const nz = split.map((f, i) => (f > 0 ? i : -1)).filter((i) => i >= 0);
-        const sameSet = split.length === n && nz.length === used.length && nz.every((i) => used.includes(i));
-        if (!sameSet) split = [];
-      }
-      if (!split.length) {
-        // Even split across the selected GPUs; 0 for the rest.
-        split = lastGpus.map((_, i) => (used.includes(i) ? 1 / used.length : 0));
-      }
-      const r = await placementPropose(modelId, split);
-      if (disposed) return;
-      if (r.error || !r.data) {
-        projection = null;
-        paintProjection();
-        placeMsg(`Propose failed: ${r.error ?? "no projection returned"}`, true);
-        return;
-      }
-      projection = { backendId, modelId, data: r.data };
-      placeMsg("");
-      paintProjection();
-      const applyBtn = root.querySelector("#placeApply") as HTMLButtonElement | null;
-      if (applyBtn) applyBtn.disabled = false;
-    } finally {
-      placeBusy = false;
-      const btn = root.querySelector("#placePropose") as HTMLButtonElement | null;
-      if (btn) btn.disabled = false;
-    }
-  };
-
-  const onApply = async (): Promise<void> => {
-    if (!projection || placeBusy) return;
-    placeBusy = true;
-    const applyBtn = root.querySelector("#placeApply") as HTMLButtonElement | null;
-    if (applyBtn) applyBtn.disabled = true;
-    try {
-      const { backendId, modelId } = projection;
-      const split = projection.data.split;
-      // Backend-scoped apply: the split is written to this backend
-      // only. The form never reassigns the backend's model and never
-      // touches other backends serving the same model.
-      const r = await placementApply(modelId, split, backendId);
-      if (disposed) return;
-      if (r.error) {
-        placeMsg(r.error, true);
-        return;
-      }
-      if (r.data.persisted) {
-        placeMsg(`Split saved to ${backendId}. Restart the backend to use it.`);
-      } else {
-        placeMsg("The split was applied to the in-memory configuration only \u2014 it was not saved (persisted: false) and will be lost when the app restarts.", true);
-      }
-    } finally {
-      placeBusy = false;
-      const btn = root.querySelector("#placeApply") as HTMLButtonElement | null;
-      if (btn && projection) btn.disabled = false;
-    }
-  };
-
-  /** (Re)build the placement form's data from fetched rows. */
-  const applyPlacementData = (backs: BackendRow[], models: ModelRow[]): void => {
-    placeBackendRows = backs.filter((b) => b.configured);
-    placeModelRows = models;
-  };
-
-  const placeSignature = (): string =>
-    placeBackendRows.map((b) => `${b.id}:${b.model_file}`).join("|")
-    + `#${placeModelRows.map((mdl) => mdl.id).join("|")}`;
-
-  /** Repaint the placement form after a data refresh, preserving the
-   *  operator's selected backend and any rendered projection. */
-  const repaintPlacementPreserving = (): void => {
-    const bSelBefore = root.querySelector("#placeBackend") as HTMLSelectElement | null;
-    const selBackend = bSelBefore?.value ?? "";
-    if (selBackend) placeBackendId = selBackend;
-    paintPlacement();
-    const bSel = root.querySelector("#placeBackend") as HTMLSelectElement | null;
-    if (bSel && selBackend && Array.from(bSel.options).some((o) => o.value === selBackend)) {
-      bSel.value = selBackend;
-    }
-    paintProjection();
-    const applyBtn = root.querySelector("#placeApply") as HTMLButtonElement | null;
-    if (applyBtn) applyBtn.disabled = !projection;
-  };
-
-  /** Refresh the form's backend/model data on the poll tick: new or
-   *  changed backends appear without a remount, but an unchanged data
-   *  set never repaints (the operator's interaction is untouched). */
-  const refreshPlacement = async (): Promise<void> => {
-    if (!placeEl || placeBusy) return;
-    const [backs, models] = await Promise.all([getBackends(), getModels()]);
-    if (disposed || !backs.live || backs.error) return;
-    const before = placeSignature();
-    applyPlacementData(backs.data, models.data);
-    if (placeSignature() === before) return;
-    repaintPlacementPreserving();
-  };
-
-  const initPlacement = async (): Promise<void> => {
-    if (!placeEl) return;
-    const [backs, models] = await Promise.all([getBackends(), getModels()]);
-    if (disposed) return;
-    if (!backs.live) {
-      placeEl.innerHTML = `<div class="card"><div class="sec-title">${icon("layers")} Placement</div>
-        <div style="font-size:12px;color:var(--text2)">Placement is available in the installed app with live data.</div></div>`;
-      return;
-    }
-    applyPlacementData(backs.data, models.data);
-    paintPlacement();
+    return rows;
   };
 
   /* ---------------- Telemetry controls ---------------- */
@@ -691,13 +455,10 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
   }
 
   await load();
-  void initPlacement();
 
-  // Live refresh: telemetry ages even when the user does nothing. The
-  // placement container is repainted only when its data set changes,
-  // and then with selection + projection preserved.
+  // Live refresh: telemetry ages even when the user does nothing.
   const timer = window.setInterval(() => {
-    if (!disposed) { void load(); void refreshPlacement(); }
+    if (!disposed) { void load(); }
   }, 2000);
 
   return () => {
@@ -708,12 +469,6 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     resetBtn?.removeEventListener("click", onResetPeaks);
     snapshotBtn?.removeEventListener("click", onSnapshot);
     pollSel?.removeEventListener("change", onPollChange);
-    const sel = placeEl?.querySelector("#placeBackend");
-    const proposeBtn = placeEl?.querySelector("#placePropose");
-    const applyBtn = placeEl?.querySelector("#placeApply");
-    sel?.removeEventListener("change", onPlaceSelectionChange);
-    proposeBtn?.removeEventListener("click", onPropose);
-    applyBtn?.removeEventListener("click", onApply);
   };
 }
 
@@ -902,6 +657,22 @@ function ctxShort(n: number): string {
  *  presets beyond the rating. */
 export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null }
 
+/** State for the in-card Placement form (tensor split editing,
+ *  moved here from the GPUs page — Pete's direction, 2026-10-16),
+ *  non-null only for the backend whose form is open. gpus mirrors
+ *  the latest telemetry GPU list for the include/exclude
+ *  checkboxes; excluded holds the unchecked GPU indices;
+ *  projection is the last successful propose result for this
+ *  backend; busy disables the form's buttons while a propose or
+ *  apply invoke is in flight. */
+export interface PlaceCardState {
+  gpus: { index: number; name: string }[];
+  excluded: Set<number>;
+  modelId: string | null;
+  projection: PlacementProjectionData | null;
+  busy: boolean;
+}
+
 function backendCard(
   b: BackendRow,
   openArgv: Set<string>,
@@ -913,6 +684,7 @@ function backendCard(
   confirmRemove: Set<string>,
   residency: Map<string, { gpu: number; name: string; mib: number }[]>,
   flags: FlagsDraft | null,
+  place: PlaceCardState | null,
 ): string {
   const active = b.state === "running" || b.state === "starting";
   // Buttons render disabled while this card's action is in flight.
@@ -1027,9 +799,51 @@ function backendCard(
       </div>
       <div style="font-size:12px;color:var(--text2);margin-top:6px">${flags.modelId && flags.ctxMax
         ? `Model ${esc(flags.modelId)} is rated to ${ctxShort(flags.ctxMax)} context (${flags.ctxMax.toLocaleString()} tokens); larger values are accepted but exceed the rating. `
-        : "Accepted context range: 1,024 to 1,048,576. "}Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Setup wizard's tensor-split step, not here.</div>
+        : "Accepted context range: 1,024 to 1,048,576. "}Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Placement form on this card.</div>
       <div class="card-actions"><button class="btn" data-back-act="flags-save" data-back-id="${esc(b.id)}"${dis}>Save flags</button>
         <button class="btn" data-back-act="flags-cancel" data-back-id="${esc(b.id)}">Cancel</button></div>
+    </div>` : "";
+  // The Placement form renders inside this card (moved from the
+  // GPUs page, Pete's direction, 2026-10-16): the tensor split is a
+  // per-backend setting, so it is edited here like the flags. The
+  // model is derived from the backend's configuration; the
+  // projection renders in the card; Apply is scoped to this
+  // backend. Form state lives in the wire layer (checkbox changes
+  // sync to wire state), so poll repaints keep the form intact.
+  const placeDis = dis || (place && place.busy) ? " disabled" : "";
+  const projHtml = place && place.projection ? (() => {
+    const p = place.projection;
+    const rows = p.split.map((frac, i) => {
+      const gi = p.gpu_indices && p.gpu_indices[i] !== undefined ? p.gpu_indices[i] : i;
+      const gname = place.gpus.find((g) => g.index === gi)?.name ?? `GPU ${gi}`;
+      const free = p.free_mib && p.free_mib[i] !== undefined ? `${p.free_mib[i]} MiB` : "\u2014";
+      const fit = frac === 0 ? "not used" : p.per_gpu_fits[i] ? "fits" : "does not fit";
+      return `<tr><td>${esc(gname)}</td><td>${Math.round(frac * 100)}%</td><td>${p.per_gpu_mib[i]} MiB</td><td>${free}</td><td>${fit}</td></tr>`;
+    }).join("");
+    const ageMs = p.snapshot_age_ms ?? null;
+    return `<div style="margin-top:10px">
+      ${p.down_indices && p.down_indices.length ? `<div style="font-size:12px;color:var(--err);margin-bottom:6px">${p.down_indices.map((i) => `GPU ${i}`).join(", ")} ${p.down_indices.length === 1 ? "is" : "are"} down and ${p.down_indices.length === 1 ? "is" : "are"} treated as having no free VRAM.</div>` : ""}
+      <div style="font-size:12px">${p.fits ? "The model fits the selected GPUs with the projected split." : "The model does not fit the available VRAM with this split."}</div>
+      <table class="dtab" style="margin-top:8px"><thead><tr><th>GPU</th><th>Fraction</th><th>Required</th><th>Free (current)</th><th>Fit</th></tr></thead><tbody>${rows}</tbody></table>
+      <div style="font-size:12px;color:var(--text2);margin-top:6px">Projection uses model weights only; run-time allocations add overhead.</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:2px">Based on ${ageMs === null ? "the latest telemetry snapshot" : `a telemetry snapshot ${Math.round(ageMs / 1000)} seconds old`}.</div></div>`;
+  })() : "";
+  const placeHtml = place ? `<div style="border-top:1px solid var(--border);margin-top:10px;padding-top:10px">
+      <div style="font-size:12px;font-weight:600">${icon("layers")} Placement for ${esc(b.id)}</div>
+      ${place.modelId
+        ? `<div style="font-size:12px;color:var(--text2);margin-top:4px">Model: ${esc(place.modelId)} \u2014 from the backend's configuration</div>`
+        : `<div style="font-size:12px;color:var(--err);margin-top:4px">This backend's model file matches no configured model, so a split cannot be proposed or applied for it.</div>`}
+      ${place.gpus.length ? `<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:8px">
+        <span style="font-size:12px;color:var(--text2)">GPUs in the split:</span>
+        ${place.gpus.map((g) => `<label style="font-size:12px;display:inline-flex;align-items:center;gap:5px"><input type="checkbox" data-place-gpu="${g.index}" data-place-backend="${esc(b.id)}"${place.excluded.has(g.index) ? "" : " checked"}${placeDis}> GPU ${g.index} \u2014 ${esc(g.name)}</label>`).join("")}
+      </div>
+      <div style="font-size:12px;color:var(--text2);margin-top:6px">The split divides the model's weights across the selected GPUs, in nvidia-smi index order. Uncheck a GPU to leave it out \u2014 for example the display GPU, whose memory Windows already uses.</div>`
+      : `<div style="font-size:12px;color:var(--text2);margin-top:6px">No GPU telemetry yet \u2014 a split cannot be proposed until telemetry reports the GPUs.</div>`}
+      ${projHtml}
+      <div class="card-actions"><button class="btn" data-back-act="place-propose" data-back-id="${esc(b.id)}"${placeDis || !place.modelId || !place.gpus.length ? " disabled" : ""}>Propose split</button>
+        <button class="btn" data-back-act="place-apply" data-back-id="${esc(b.id)}"${place.projection && !place.busy && !dis ? "" : " disabled"}>Apply split</button>
+        <button class="btn" data-back-act="place-cancel" data-back-id="${esc(b.id)}">Close</button></div>
+      <div style="font-size:12px;color:var(--text2);margin-top:6px">The split is saved to the backend's configuration and applies on its next start.</div>
     </div>` : "";
   return `<div class="card" id="card-backend-${esc(b.id)}">
       <h3>${stateDot(b.state)} ${esc(b.id)} <span class="port">:${b.port}</span>
@@ -1052,8 +866,10 @@ function backendCard(
           .map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
       </div>
       ${flagsHtml}
+      ${placeHtml}
       <div class="card-actions">${actions}
         ${b.configured ? `<button class="btn" data-back-act="flags" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Edit flags</button>` : ""}
+        ${b.configured ? `<button class="btn" data-back-act="placement" data-back-id="${esc(b.id)}"${dis}>${icon("layers")} Placement</button>` : ""}
         <button class="btn" data-back-act="argv" data-back-id="${esc(b.id)}"${dis}>${icon("logs")} Launch command</button></div>
       <div class="back-msg" style="margin-top:8px;font-size:12px">${msgHtml}</div>
       ${logsBlock}
@@ -1191,7 +1007,17 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         const flagsArg: FlagsDraft | null = flagsFor === row.id
           ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null }
           : null;
-        return backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency, flagsArg);
+        const pmdl = placeFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
+        const placeArg: PlaceCardState | null = placeFor === row.id
+          ? {
+            gpus: lastGpuList.map((g) => ({ index: Number(g.id), name: g.name })),
+            excluded: placeExcluded,
+            modelId: pmdl?.id ?? null,
+            projection: placeProjection && placeProjection.backendId === row.id ? placeProjection.data : null,
+            busy: placeBusy,
+          }
+          : null;
+        return backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency, flagsArg, placeArg);
       }).join("")}</div>
       </div>`).join("");
     if (!viewRows.length && lastRows.length) b.innerHTML = emptyHtml("No backends match the current filter.");
@@ -1233,6 +1059,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     if (disposed || seq !== loadSeq) return; // a newer load supersedes this one
     if (!pr.error && pr.data) { lastPlan = pr.data; paintPlan(); }
     if (!tr.error && tr.data) {
+      lastGpuList = tr.data.gpus;
       const m = new Map<string, { gpu: number; name: string; mib: number }[]>();
       for (const g of tr.data.gpus) {
         for (const p of g.processes ?? []) {
@@ -1321,6 +1148,44 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   };
   root.addEventListener("change", syncFlagsDraft);
   root.addEventListener("input", syncFlagsDraft);
+
+  /* ---------------- Placement form ----------------
+   * Rendered INSIDE the backend's own card (backendCard), like the
+   * flags editor; the GPUs page shows placement read-only. State
+   * lives outside the repainted DOM: which backend's form is open,
+   * the unchecked GPU indices, and the last projection. Checkbox
+   * changes sync into the state and invalidate the projection (it
+   * no longer matches the selection). */
+  let placeFor: string | null = null;
+  const placeExcluded = new Set<number>();
+  let placeProjection: { backendId: string; modelId: string; data: PlacementProjectionData } | null = null;
+  let placeBusy = false;
+  /** Latest telemetry GPU list (checkbox source), refreshed by load(). */
+  let lastGpuList: GpuInfo[] = [];
+  const closePlaceForm = (): void => {
+    placeFor = null;
+    placeProjection = null;
+    placeExcluded.clear();
+    paint();
+  };
+  const openPlaceForm = (row: BackendRow): void => {
+    if (placeFor === row.id) { closePlaceForm(); return; }
+    placeFor = row.id;
+    placeProjection = null;
+    placeExcluded.clear();
+    paint();
+  };
+  const syncPlaceDraft = (ev: Event): void => {
+    const t = ev.target as HTMLElement;
+    if (!t.hasAttribute("data-place-gpu")) return;
+    if (t.getAttribute("data-place-backend") !== placeFor) return;
+    const ix = Number(t.getAttribute("data-place-gpu"));
+    if ((t as HTMLInputElement).checked) placeExcluded.delete(ix);
+    else placeExcluded.add(ix);
+    placeProjection = null;
+    paint();
+  };
+  root.addEventListener("change", syncPlaceDraft);
 
   /* ---------------- Add backend form ----------------
    * Lives in #backAddForm, outside the repainted #backBody, so the
@@ -1421,6 +1286,93 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
 
     if (act === "flags-cancel") {
       closeFlagsForm();
+      return;
+    }
+
+    if (act === "placement") {
+      const row = lastRows.find((r) => r.id === id);
+      if (row) openPlaceForm(row);
+      return;
+    }
+
+    if (act === "place-cancel") {
+      closePlaceForm();
+      return;
+    }
+
+    if (act === "place-propose") {
+      if (placeBusy) return;
+      const row = lastRows.find((r) => r.id === id);
+      const model = lastModels.find((m) => row !== undefined && sameModelFile(row.model_file, m.gguf_path));
+      if (!row || !model) return;
+      if (!lastGpuList.length) {
+        msgs.set(id, { text: "No GPU telemetry yet \u2014 a split cannot be proposed.", err: true });
+        paint();
+        return;
+      }
+      // Compose the split: preserve the backend's configured split
+      // when it covers exactly the selected set of GPUs (the norm
+      // right after loading); otherwise an even split across the
+      // selection. Positions follow the telemetry GPU order, which
+      // is nvidia-smi index order — the same order tensor_split
+      // uses.
+      const usedPos = lastGpuList
+        .map((g, p) => (!placeExcluded.has(Number(g.id)) ? p : -1))
+        .filter((p) => p >= 0);
+      if (!usedPos.length) {
+        msgs.set(id, { text: "Select at least one GPU for the split.", err: true });
+        paint();
+        return;
+      }
+      const cfgSplit = row.tensor_split ?? [];
+      const nz = cfgSplit.map((f, i) => (f > 0 ? i : -1)).filter((i) => i >= 0);
+      const sameSet = cfgSplit.length === lastGpuList.length
+        && nz.length === usedPos.length
+        && nz.every((i) => usedPos.includes(i));
+      const split = sameSet
+        ? [...cfgSplit]
+        : lastGpuList.map((_, p) => (usedPos.includes(p) ? 1 / usedPos.length : 0));
+      placeBusy = true;
+      paint();
+      try {
+        const r = await placementPropose(model.id, split);
+        if (disposed) return;
+        if (r.error || !r.data) {
+          msgs.set(id, { text: `Propose failed: ${r.error ?? "the command returned no projection"}`, err: true });
+          placeProjection = null;
+        } else {
+          placeProjection = { backendId: id, modelId: model.id, data: r.data };
+        }
+      } finally {
+        placeBusy = false;
+        if (!disposed) paint();
+      }
+      return;
+    }
+
+    if (act === "place-apply") {
+      if (placeBusy || !placeProjection || placeProjection.backendId !== id) return;
+      const proj = placeProjection;
+      placeBusy = true;
+      paint();
+      try {
+        const r = await placementApply(proj.modelId, proj.data.split, id);
+        if (disposed) return;
+        if (r.error) {
+          // Keep the form and projection open with the error on the
+          // card — closing would read as if the apply had happened.
+          msgs.set(id, { text: `Split not saved: ${r.error}`, err: true });
+          paint();
+        } else {
+          msgs.set(id, { text: `Split saved to ${id}. Restart the backend to use it.`, err: false });
+          placeFor = null;
+          placeProjection = null;
+          placeExcluded.clear();
+          await load();
+        }
+      } finally {
+        placeBusy = false;
+      }
       return;
     }
 
@@ -1573,6 +1525,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     root.removeEventListener("change", onModelChange);
     root.removeEventListener("change", syncFlagsDraft);
     root.removeEventListener("input", syncFlagsDraft);
+    root.removeEventListener("change", syncPlaceDraft);
     refreshBtn?.removeEventListener("click", onRefresh);
   };
 }
