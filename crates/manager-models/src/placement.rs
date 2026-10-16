@@ -30,6 +30,17 @@ pub struct PlacementProjection {
     pub fits: bool,
     /// The catalog [`FitVerdict`] for the same inputs (recommendation view).
     pub verdict: FitVerdict,
+    /// Weights resident in system RAM under the serving backend's
+    /// expert offload (0 when no backend was in scope or no offload
+    /// applies). The per-GPU figures cover GPU-resident weights
+    /// only in that case.
+    #[serde(default)]
+    pub sys_mib: u64,
+    /// The weight total the per-GPU projection was computed from:
+    /// the model's full size, or its GPU-resident share when expert
+    /// offload applies.
+    #[serde(default)]
+    pub gpu_weights_mib: u64,
 }
 
 /// Validate a tensor split: non-empty, `len == n_gpus`, every fraction in
@@ -73,8 +84,26 @@ pub fn propose_placement(
     split: &[f32],
     free_vram_mib_per_gpu: &[u64],
 ) -> Result<PlacementProjection, ModelError> {
+    propose_placement_resident(spec, split, free_vram_mib_per_gpu, None, 0)
+}
+
+/// Project a split using the model's GPU-resident weight share
+/// instead of its full file size, for a serving backend whose
+/// expert offload keeps part of the weights in system RAM
+/// ([`super::memory`]). `gpu_resident_bytes` is the weight total
+/// that lands on GPUs (the split fractions divide it); `sys_bytes`
+/// is the system-RAM share, carried into the projection so the UI
+/// can show where the rest of the model lives. With
+/// `gpu_resident_bytes: None` this is exactly [`propose_placement`].
+pub fn propose_placement_resident(
+    spec: &ModelSpec,
+    split: &[f32],
+    free_vram_mib_per_gpu: &[u64],
+    gpu_resident_bytes: Option<u64>,
+    sys_bytes: u64,
+) -> Result<PlacementProjection, ModelError> {
     validate_split(split, free_vram_mib_per_gpu.len())?;
-    let needed_mib = spec.size_bytes.div_ceil(MIB);
+    let needed_mib = gpu_resident_bytes.unwrap_or(spec.size_bytes).div_ceil(MIB);
     // f32 fractions carry representation error (e.g. 0.6f32 is
     // 0.60000002384…), so a naive ceil() over-allocates by 1 MiB whenever the
     // true product is an integer. Snap values within 1e-6 of an integer to it;
@@ -96,6 +125,17 @@ pub fn propose_placement(
         .map(|(alloc, free)| alloc <= free)
         .collect();
     let fits = per_gpu_fits.iter().all(|b| *b);
+    // The recommendation verdict judges the same weight total the
+    // projection used: with offload in scope, a model whose file is
+    // larger than any GPU can still fit by its resident share.
+    let verdict = match gpu_resident_bytes {
+        Some(resident) => {
+            let mut resized = spec.clone();
+            resized.size_bytes = resident;
+            fit_check(&resized, free_vram_mib_per_gpu)
+        }
+        None => fit_check(spec, free_vram_mib_per_gpu),
+    };
     Ok(PlacementProjection {
         model_id: spec.id.clone(),
         split: split.to_vec(),
@@ -103,7 +143,9 @@ pub fn propose_placement(
         free_mib: free_vram_mib_per_gpu.to_vec(),
         per_gpu_fits,
         fits,
-        verdict: fit_check(spec, free_vram_mib_per_gpu),
+        verdict,
+        sys_mib: sys_bytes.div_ceil(MIB),
+        gpu_weights_mib: needed_mib,
     })
 }
 
@@ -155,6 +197,7 @@ mod tests {
             params_b: 1.0,
             ctx_max: 0,
             enabled_by_default: true,
+            expert_bytes: None,
         }
     }
 
@@ -181,6 +224,21 @@ mod tests {
         assert!(propose_placement(&spec(), &[0.5, 0.4], &[8, 8]).is_err());
         assert!(propose_placement(&spec(), &[0.6, 1.4], &[8, 8]).is_err());
         assert!(propose_placement(&spec(), &[f32::NAN, 1.0], &[8, 8]).is_err());
+    }
+
+    #[test]
+    fn propose_resident_projects_gpu_share_and_carries_sys() {
+        // 10 MiB file, 8 MiB of it experts in system RAM: the GPUs
+        // split only the 2 MiB resident share.
+        let p = propose_placement_resident(&spec(), &[0.5, 0.5], &[8, 8], Some(2 * MIB), 8 * MIB)
+            .unwrap();
+        assert_eq!(p.per_gpu_mib, vec![1, 1]);
+        assert_eq!(p.sys_mib, 8);
+        assert_eq!(p.gpu_weights_mib, 2);
+        assert!(p.fits);
+        // The verdict judges the resident share too: 2 MiB fits a
+        // single 8 MiB GPU even though the 10 MiB file would not.
+        assert!(matches!(p.verdict, FitVerdict::Fits { .. }));
     }
 
     #[test]

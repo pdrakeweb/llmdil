@@ -230,13 +230,27 @@ path, file_existed, bytes_freed)).
 
 **`placement` module (spec §14 `placement_propose` / `placement_apply`):**
 `PlacementProjection` (model_id, split, per_gpu_mib, per_gpu_fits, fits,
-verdict), `validate_split(split, n_gpus)`,
+verdict, sys_mib, gpu_weights_mib), `validate_split(split, n_gpus)`,
 `propose_placement(spec, split, free_vram_mib_per_gpu)` (explicit-split
 projection; allocation = size × fraction rounded up),
+`propose_placement_resident(spec, split, free_vram_mib_per_gpu,
+gpu_resident_bytes, sys_bytes)` (same projection over the GPU-resident
+weight share under expert offload),
 `apply_placement(backend: &mut BackendConfig, split)` (validates, writes
 `flags.tensor_split`; implies `SplitMode::Layer` only when mode is `None` —
 never clobbers an explicit `Row`). Dependency direction: `manager-models`
 → `manager-config`; `manager-config` never depends back.
+
+**`gguf` module:** `parse_gguf_layout(header_prefix)` — parses a GGUF
+header (metadata + tensor directory) into `GgufLayout` (tensor_bytes,
+expert_bytes, block_count, KV geometry incl. `full_attention_interval`
+folding); `GgufError::Incomplete` tells the caller to read a longer
+prefix. **`memory` module:** `expert_offload(raw_flags)` (detects
+`-ot exps=CPU` / `--n-cpu-moe` in backend raw flags) and
+`memory_requirement(...)` → `MemoryRequirement` (gpu_weights_mib,
+sys_weights_mib, kv_mib, basis Exact/Catalog/Estimate) — the per-backend
+GPU/system RAM requirement the backend cards report and the placement
+projection consumes.
 
 ---
 

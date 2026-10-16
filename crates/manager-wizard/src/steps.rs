@@ -1242,14 +1242,20 @@ impl ConfigureTensorSplit {
     /// estimate is the common case on a first run). Zero when the
     /// backend's model cannot be resolved — the assignment then
     /// falls back to a VRAM-proportional split.
-    async fn model_bytes(&self, ctx: &WizardContext, backend: &BackendConfig) -> u64 {
+    fn model_for<'a>(
+        &self,
+        ctx: &'a WizardContext,
+        backend: &BackendConfig,
+    ) -> Option<&'a manager_config::ModelConfig> {
         let target = resolve_dest(&ctx.data_dir, &backend.model_file);
-        let model = ctx
-            .config
+        ctx.config
             .models
             .iter()
-            .find(|m| resolve_dest(&ctx.data_dir, &m.gguf_path) == target);
-        match model {
+            .find(|m| resolve_dest(&ctx.data_dir, &m.gguf_path) == target)
+    }
+
+    async fn model_bytes(&self, ctx: &WizardContext, backend: &BackendConfig) -> u64 {
+        match self.model_for(ctx, backend) {
             Some(m) => {
                 let path = resolve_dest(&ctx.data_dir, &m.gguf_path);
                 match ctx.ops.file_len(&path).await {
@@ -1258,6 +1264,31 @@ impl ConfigureTensorSplit {
                 }
             }
             None => 0,
+        }
+    }
+
+    /// The share of a backend's model that actually occupies GPU
+    /// memory under expert offload, from the curated catalog's
+    /// pinned expert total (the step runs before downloads, so the
+    /// GGUF itself is usually unavailable; an unpinned split falls
+    /// back to the full size). Non-offload backends return `total`
+    /// unchanged.
+    fn gpu_resident_bytes(&self, ctx: &WizardContext, backend: &BackendConfig, total: u64) -> u64 {
+        if manager_models::expert_offload(backend.raw_flags.as_deref())
+            != manager_models::ExpertOffload::AllExperts
+        {
+            return total;
+        }
+        let Some(model) = self.model_for(ctx, backend) else {
+            return total;
+        };
+        let pin = manager_models::curated_models()
+            .into_iter()
+            .find(|s| s.id == model.id)
+            .and_then(|s| s.expert_bytes);
+        match pin {
+            Some(experts) => total.saturating_sub(experts),
+            None => total,
         }
     }
 
@@ -1284,14 +1315,25 @@ impl ConfigureTensorSplit {
         }
         let mut inputs: Vec<SplitInput> = Vec::new();
         for b in &enabled {
+            let total = self.model_bytes(ctx, b).await;
+            // A backend served by expert offload is not split: its
+            // entry only accounts for the GPU-resident share of its
+            // weights on GPU 0, where llama.cpp places an unsplit
+            // backend.
+            let offload = manager_models::expert_offload(b.raw_flags.as_deref())
+                != manager_models::ExpertOffload::None;
             inputs.push(SplitInput {
-                model_bytes: self.model_bytes(ctx, b).await,
+                model_bytes: if offload {
+                    self.gpu_resident_bytes(ctx, b, total)
+                } else {
+                    total
+                },
                 existing: if b.flags.tensor_split.is_empty() {
                     None
                 } else {
                     Some(b.flags.tensor_split.clone())
                 },
-                assign: true,
+                assign: !offload,
             });
         }
         let assigned = assign_splits(&inputs, vrams);
@@ -1369,7 +1411,8 @@ impl ConfigureTensorSplit {
         ))
     }
 
-    fn run_audit(&self, ctx: &WizardContext, gpu_count: usize) -> StepOutcome {
+    fn run_audit(&self, ctx: &WizardContext, vrams: &[u64]) -> StepOutcome {
+        let gpu_count = vrams.len();
         let mut log: Vec<String> = Vec::new();
         let mut problems: Vec<String> = Vec::new();
         let enabled: Vec<&BackendConfig> =
@@ -1380,6 +1423,37 @@ impl ConfigureTensorSplit {
                 continue;
             }
             if b.flags.tensor_split.is_empty() {
+                // An empty split is a valid placement when the
+                // backend needs no split: expert offload serves it
+                // unsplit by design, and a model whose GPU-resident
+                // weights fit the largest single GPU is placed
+                // whole by llama.cpp.
+                if manager_models::expert_offload(b.raw_flags.as_deref())
+                    != manager_models::ExpertOffload::None
+                {
+                    log.push(format!(
+                        "{}: no split — served by expert offload, experts in system RAM",
+                        b.id
+                    ));
+                    continue;
+                }
+                let total = match self.model_for(ctx, b) {
+                    Some(m) => manager_models::curated_models()
+                        .into_iter()
+                        .find(|s| s.id == m.id)
+                        .map(|s| s.size_bytes)
+                        .unwrap_or_else(|| estimate_model_bytes(m.params_b as f64)),
+                    None => 0,
+                };
+                let resident = self.gpu_resident_bytes(ctx, b, total);
+                let largest = vrams.iter().max().copied().unwrap_or(0) * manager_models::MIB;
+                if resident > 0 && resident <= largest {
+                    log.push(format!(
+                        "{}: no split — GPU-resident weights fit a single GPU",
+                        b.id
+                    ));
+                    continue;
+                }
                 problems.push(format!("{}: no tensor split configured", b.id));
             } else if b.flags.tensor_split.len() != gpu_count {
                 problems.push(format!(
@@ -1464,7 +1538,7 @@ impl WizardStep for ConfigureTensorSplit {
         let vrams: Vec<u64> = gpus.iter().map(|g| g.total_vram_mib).collect();
         match ctx.mode {
             RunMode::Install => self.run_install(ctx, &vrams).await,
-            RunMode::Audit => Ok(self.run_audit(ctx, gpus.len())),
+            RunMode::Audit => Ok(self.run_audit(ctx, &vrams)),
         }
     }
 }
@@ -5662,6 +5736,21 @@ mod tests {
             } else {
                 PathBuf::from("models/qwen3-8b.gguf")
             };
+        }
+        // This test pins the split step's contract for backends that
+        // need a split. Since the memory-requirement work (v0.1.31),
+        // an unsplit backend is valid when its GPU-resident weights
+        // fit a single GPU or it is served by expert offload — so
+        // the fixture neutralizes both escape hatches: no offload
+        // flags, and the shared model carries the coder catalog id
+        // (49 GB — fits no single test GPU).
+        for b in config.backends.iter_mut() {
+            b.raw_flags = None;
+        }
+        for m in config.models.iter_mut() {
+            if m.gguf_path.ends_with("qwen3-8b.gguf") {
+                m.id = "qwen3-coder-30b".to_string();
+            }
         }
         manager_config::save(&config, &config_path).unwrap();
         let ops = Arc::new(FakeSystemOps::new());

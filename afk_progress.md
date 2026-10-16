@@ -346,3 +346,33 @@ established); the GPUs page only reports placement, never edits it.
   Service Map residency rule, so a bare CUDA context under 1 GiB
   does not register as a model presence. The per-process table
   remains as the detail underneath.
+
+## v0.1.30 — planner and coder definitions replaced (catalog revision 2)
+
+- Planner slot (`qwen3-27b-planner`, id unchanged): Qwen3-32B
+  replaced by the real Qwen3.8-27B in ISTA-DASLab's GSQ-RCO IQ3_S
+  quantization (11,771,546,784 B, SHA-256 pinned from the
+  publisher's HF metadata; rated context now 262,144). Dense 27B,
+  fully GPU-resident on a 16 GB card — no tensor split needed.
+- Coder slot (`qwen3-coder-30b`, id unchanged): Qwen3-Coder-30B
+  replaced by Qwen3-Coder-Next-80B (80B total / ~3B active MoE),
+  unsloth UD-Q4_K_M single file (49,301,055,488 B, SHA-256
+  pinned). Qwen's official Q4_K_M ships as four shards, which the
+  single-file download/verify path cannot consume. Served by
+  expert offload: the coder backend's raw flags carry
+  `-ot exps=CPU` (experts in system RAM, attention on GPU).
+- Existing installs migrate on first launch:
+  `refresh_catalog_definition` (manager-config) runs inside the
+  catalog-revision gate in `ensure_catalog_models`. A stored pin
+  that differs from the catalog is refreshed, verification is
+  cleared, and a default backend still pointing at the old file
+  is realigned. Riding serving changes apply only to a backend
+  still serving that model: the old tensor split is cleared for
+  both slots, and the coder gains the offload flags when it has
+  no raw flags of its own. Operator-reassigned backends and
+  operator raw flags are preserved. Fresh seeds get the coder
+  offload flags from `default_config`.
+- Known follow-up: the wizard's configure-tensor-split step can
+  still write a split for the coder on fresh installs; a split
+  combined with `-ot exps=CPU` is legal but not the intended
+  layout.

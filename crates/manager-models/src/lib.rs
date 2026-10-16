@@ -15,9 +15,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
+pub mod gguf;
+pub mod memory;
 pub mod placement;
 
-pub use placement::{apply_placement, propose_placement, validate_split, PlacementProjection};
+pub use gguf::{parse_gguf_layout, GgufError, GgufLayout, KvGeometry};
+pub use memory::{
+    expert_offload, memory_requirement, ExpertOffload, MemoryBasis, MemoryRequirement,
+};
+pub use placement::{
+    apply_placement, propose_placement, propose_placement_resident, validate_split,
+    PlacementProjection,
+};
 
 /// Bytes in one MiB.
 pub const MIB: u64 = 1024 * 1024;
@@ -53,6 +62,15 @@ pub struct ModelSpec {
     /// seed disabled and unassigned — the operator enables one in
     /// the Models view, downloads it, and assigns it to a backend.
     pub enabled_by_default: bool,
+    /// Total bytes of the routed-expert tensors in the GGUF, when
+    /// known (derived from the file's tensor directory; see
+    /// [`gguf`]). The memory-requirement calculation uses it to
+    /// split a backend's requirement between GPU and system RAM
+    /// when expert offload is configured, before the file is
+    /// downloaded. `None` when the split is not pinned; models with
+    /// no routed experts pin `Some(0)`.
+    #[serde(default)]
+    pub expert_bytes: Option<u64>,
 }
 
 /// The curated catalog's revision. Bump whenever
@@ -106,6 +124,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             ctx_max: 262144,
             params_b: 27.0,
             enabled_by_default: true,
+            expert_bytes: Some(0),
             // The real Qwen3.8-27B (Alibaba, August 2026), dense
             // 27B, in ISTA-DASLab's GSQ-RCO quantization at IQ3_S —
             // fully GPU-resident on a 16 GB card. Replaced the
@@ -122,6 +141,11 @@ pub fn curated_models() -> Vec<ModelSpec> {
             ctx_max: 262144,
             params_b: 80.0,
             enabled_by_default: true,
+            // Routed-expert total derived from the file's GGUF
+            // tensor directory 2026-10-16 (the non-expert share is
+            // 2,587,296,768 B; the directory sums reproduce the
+            // pinned file size exactly).
+            expert_bytes: Some(46_707_769_344),
             // Qwen3-Coder-Next (80B total / ~3B active MoE),
             // served by expert offload — the coder backend's raw
             // flags carry `-ot exps=CPU`. Unsloth's single-file
@@ -141,6 +165,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             ctx_max: 131072,
             params_b: 7.0,
             enabled_by_default: true,
+            expert_bytes: Some(0),
             url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
                 .to_string(),
         },
@@ -153,6 +178,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             ctx_max: 131072,
             params_b: 8.0,
             enabled_by_default: true,
+            expert_bytes: Some(0),
             url: "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
                 .to_string(),
         },
@@ -172,6 +198,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             ctx_max: 262144,
             params_b: 31.6,
             enabled_by_default: false,
+            expert_bytes: None,
             url: "https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF/resolve/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf"
                 .to_string(),
         },
@@ -1000,6 +1027,7 @@ mod tests {
             params_b: 8.0,
             ctx_max: 0,
             enabled_by_default: true,
+            expert_bytes: None,
         }
     }
 
@@ -1015,6 +1043,7 @@ mod tests {
             params_b: 8.0,
             ctx_max: 131_072,
             enabled_by_default: true,
+            expert_bytes: None,
         };
         assert_eq!(spec.quant, "Q4_K_M");
         let p = DownloadProgress {
@@ -1213,6 +1242,7 @@ mod tests {
             params_b: 1.0,
             ctx_max: 0,
             enabled_by_default: true,
+            expert_bytes: None,
         }
     }
 
@@ -1613,6 +1643,7 @@ mod tests {
         assert_eq!(coder.params_b, 80.0);
         assert_eq!(coder.size_bytes, 49_301_055_488);
         assert_eq!(coder.ctx_max, 262144);
+        assert_eq!(coder.expert_bytes, Some(46_707_769_344));
         for m in &models {
             // Real pins from the publishers' Hugging Face file metadata:
             // 64 hex chars, never the placeholder.

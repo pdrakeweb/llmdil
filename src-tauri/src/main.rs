@@ -1243,6 +1243,25 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
             })
         })
         .collect();
+    // Memory requirements per configured backend (GPU-resident
+    // weights, system-RAM weights under expert offload, KV at the
+    // configured context, and the derivation basis). Absent when
+    // the backend's model cannot be resolved.
+    {
+        let memory: HashMap<String, manager_models::MemoryRequirement> = cfg
+            .backends
+            .iter()
+            .filter_map(|b| backend_memory_requirement(&cfg, b).map(|r| (b.id.clone(), r)))
+            .collect();
+        for row in backends.iter_mut() {
+            let Some(id) = row["id"].as_str() else { continue };
+            let Some(req) = memory.get(id) else { continue };
+            row["gpu_ram_mib"] = json!(req.gpu_weights_mib);
+            row["sys_ram_mib"] = json!(req.sys_weights_mib);
+            row["kv_ram_mib"] = json!(req.kv_mib);
+            row["memory_basis"] = serde_json::to_value(req.basis).unwrap_or(Value::Null);
+        }
+    }
     // Gateway request statistics (LiteLLM Prometheus snapshots from
     // the background poller): attach the trailing-hour figures where
     // the store has a window for the backend. Absent fields render
@@ -1821,6 +1840,7 @@ fn download_spec_for(cfg: &AppConfig, id: &str) -> Result<manager_models::ModelS
             params_b: m.params_b,
             ctx_max: 0,
             enabled_by_default: m.enabled,
+            expert_bytes: None,
         });
     }
     Err(err(ApiError::NotFound(format!(
@@ -2820,7 +2840,12 @@ async fn backend_add(
                 .iter()
                 .filter(|b| b.enabled)
                 .map(|b| manager_wizard::steps::SplitInput {
-                    model_bytes: size_of(&b.model_file),
+                    // Account for what the backend actually puts on
+                    // GPUs: with expert offload, only the resident
+                    // share occupies VRAM.
+                    model_bytes: backend_memory_requirement(&snap, b)
+                        .map(|r| r.gpu_weights_mib * manager_models::MIB)
+                        .unwrap_or_else(|| size_of(&b.model_file)),
                     existing: if b.flags.tensor_split.is_empty() {
                         None
                     } else {
@@ -3816,6 +3841,128 @@ async fn telemetry_save_snapshot(state: State<'_, AppState>) -> ApiResult {
     Ok(json!({ "path": path }))
 }
 
+/// The configured model a backend serves, resolved by comparing
+/// data-dir-resolved file paths (the same rule placement apply and
+/// the UI's model derivation use).
+fn model_for_backend<'a>(
+    cfg: &'a AppConfig,
+    b: &manager_config::BackendConfig,
+) -> Option<&'a manager_config::ModelConfig> {
+    let target = resolve_under_data_dir(&cfg.data_dir, &b.model_file);
+    cfg.models
+        .iter()
+        .find(|m| resolve_under_data_dir(&cfg.data_dir, &m.gguf_path) == target)
+}
+
+/// Cache of parsed GGUF layouts, keyed by (path, file length,
+/// mtime): a model's header is parsed once per file version, not
+/// once per poll. `None` values cache unparseable files too.
+static GGUF_LAYOUT_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<(PathBuf, u64, i64), Option<manager_models::GgufLayout>>,
+    >,
+> = std::sync::OnceLock::new();
+
+/// Parse a GGUF file's header layout, reading longer prefixes until
+/// the parser stops reporting `Incomplete` (headers run a few MiB;
+/// the tokenizer metadata dominates). Returns None for missing or
+/// unparseable files.
+fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let key = (path.clone(), meta.len(), mtime);
+    let cache = GGUF_LAYOUT_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(&key) {
+            return hit.clone();
+        }
+    }
+    let mut layout = None;
+    for prefix in [8 * 1024 * 1024usize, 64 * 1024 * 1024, 256 * 1024 * 1024] {
+        let want = (meta.len() as usize).min(prefix);
+        let mut buf = vec![0u8; want];
+        let read_ok = std::fs::File::open(path)
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+            .is_ok();
+        if !read_ok {
+            break;
+        }
+        match manager_models::parse_gguf_layout(&buf) {
+            Ok(l) => {
+                layout = Some(l);
+                break;
+            }
+            Err(manager_models::GgufError::Incomplete) if want < meta.len() as usize => continue,
+            Err(_) => break,
+        }
+    }
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, layout.clone());
+    }
+    layout
+}
+
+/// A backend's memory requirement (GPU-resident weights, system-RAM
+/// weights, KV at its configured context) under its current serving
+/// configuration — see [`manager_models::memory_requirement`]. The
+/// weight layout comes from the downloaded GGUF when available
+/// (basis Exact), else the catalog's pins (Catalog), else a
+/// parameter-count estimate (Estimate). None when the backend's
+/// model cannot be resolved.
+fn backend_memory_requirement(
+    cfg: &AppConfig,
+    b: &manager_config::BackendConfig,
+) -> Option<manager_models::MemoryRequirement> {
+    let model = model_for_backend(cfg, b)?;
+    let path = resolve_under_data_dir(&cfg.data_dir, &model.gguf_path);
+    let layout = gguf_layout_cached(&path);
+    let catalog = manager_models::curated_models()
+        .into_iter()
+        .find(|s| s.id == model.id);
+    let file_len = std::fs::metadata(&path)
+        .ok()
+        .filter(|m| m.is_file())
+        .map(|m| m.len());
+    let (total_bytes, mut basis) = match (&catalog, file_len) {
+        (Some(c), _) => (c.size_bytes, manager_models::MemoryBasis::Catalog),
+        (None, Some(len)) => (len, manager_models::MemoryBasis::Estimate),
+        (None, None) => (
+            manager_wizard::steps::estimate_model_bytes(model.params_b as f64),
+            manager_models::MemoryBasis::Estimate,
+        ),
+    };
+    let (expert_bytes, kv_per_token, block_count) = match (&layout, &catalog) {
+        (Some(l), _) => {
+            basis = manager_models::MemoryBasis::Exact;
+            (
+                Some(l.expert_bytes),
+                l.kv.map(|k| k.bytes_per_token()),
+                l.block_count,
+            )
+        }
+        (None, Some(c)) => (c.expert_bytes, None, None),
+        (None, None) => (None, None, None),
+    };
+    let offload = manager_models::expert_offload(b.raw_flags.as_deref());
+    Some(manager_models::memory_requirement(
+        total_bytes,
+        expert_bytes,
+        basis,
+        offload,
+        kv_per_token,
+        block_count,
+        b.flags.n_ctx,
+    ))
+}
+
 /// Project a tensor split onto discovered VRAM (spec §14
 /// `placement_propose`). The model resolves from the curated catalog
 /// first, else from the config (size = the on-disk file when downloaded,
@@ -3833,6 +3980,7 @@ async fn placement_propose(
     state: State<'_, AppState>,
     model_id: String,
     split: Vec<f32>,
+    backend_id: Option<String>,
 ) -> ApiResult {
     let spec = match manager_models::curated_models()
         .into_iter()
@@ -3878,8 +4026,43 @@ async fn placement_propose(
                 params_b: m.params_b,
                 ctx_max: 0,
                 enabled_by_default: m.enabled,
+                expert_bytes: None,
             }
         }
+    };
+    // Backend-scoped residency: when the caller names the serving
+    // backend (the backend card's Placement form does), the
+    // projection uses that backend's memory requirement — with
+    // expert offload, the split divides only the GPU-resident
+    // weights and the system-RAM share rides along in the payload.
+    // The config read finishes before telemetry is touched (the
+    // telemetry accessor reads the config while initializing).
+    let (resident_bytes, sys_bytes) = match &backend_id {
+        Some(bid) => {
+            let cfg = state.config.read().await;
+            let found = cfg
+                .backends
+                .iter()
+                .find(|b| &b.id == bid)
+                .and_then(|b| {
+                    let serves = model_for_backend(&cfg, b)
+                        .map(|m| m.id == model_id)
+                        .unwrap_or(false);
+                    if serves {
+                        backend_memory_requirement(&cfg, b)
+                    } else {
+                        None
+                    }
+                });
+            match found {
+                Some(req) if req.sys_weights_mib > 0 => (
+                    Some(req.gpu_weights_mib * manager_models::MIB),
+                    req.sys_weights_mib * manager_models::MIB,
+                ),
+                _ => (None, 0),
+            }
+        }
+        None => (None, 0),
     };
     let store = state.telemetry().await;
     let guard = lock_telemetry(&store);
@@ -3918,9 +4101,10 @@ async fn placement_propose(
         })
         .collect();
     drop(guard);
-    let projection = manager_models::propose_placement(&spec, &split, &free_mib)
-        .map_err(ApiError::from)
-        .map_err(jerr)?;
+    let projection =
+        manager_models::propose_placement_resident(&spec, &split, &free_mib, resident_bytes, sys_bytes)
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
     let mut payload = serde_json::to_value(&projection).map_err(jerr)?;
     payload["snapshot_age_ms"] = json!(snapshot_age_ms);
     payload["gpu_indices"] = json!(gpu_indices);

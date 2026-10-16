@@ -553,6 +553,15 @@ export interface BackendRow {
   tensor_split?: number[];
   /** Gateway group this backend belongs to, or null when ungrouped. */
   group?: string | null;
+  /** Memory requirement under the backend's current configuration
+   *  (configured rows whose model resolves): GPU-resident weights,
+   *  system-RAM weights (expert offload), and the KV cache at the
+   *  configured context when the model's geometry is known. */
+  gpu_ram_mib?: number;
+  sys_ram_mib?: number;
+  kv_ram_mib?: number | null;
+  /** How the requirement was derived: exact | catalog | estimate. */
+  memory_basis?: string;
 }
 
 /** list_backends — configured backends merged with live supervisor state. */
@@ -1507,14 +1516,24 @@ export interface PlacementProjectionData {
   down_indices?: number[];
   /** Always true: the projection covers model weights only. */
   weights_only?: boolean;
+  /** Weights resident in system RAM under the serving backend's
+   *  expert offload, MiB (0/absent when no backend was in scope);
+   *  the per-GPU figures then cover GPU-resident weights only. */
+  sys_mib?: number;
+  /** The weight total the projection divided: the full model size,
+   *  or its GPU-resident share under expert offload. */
+  gpu_weights_mib?: number;
 }
 
 /** placement_propose — project a tensor split for a catalog model onto
- *  the latest telemetry snapshot's free VRAM. */
-export async function placementPropose(modelId: string, split: number[]): Promise<CallResult<PlacementProjectionData | null>> {
+ *  the latest telemetry snapshot's free VRAM. When `backendId` names
+ *  the serving backend, the projection is scoped to it: with expert
+ *  offload the split divides the GPU-resident weights only and the
+ *  result carries the system-RAM share. */
+export async function placementPropose(modelId: string, split: number[], backendId?: string): Promise<CallResult<PlacementProjectionData | null>> {
   if (!isTauri()) return { data: null, live: false, error: "placement_propose is not available in sample mode" };
   try {
-    const data = await invoke<PlacementProjectionData>("placement_propose", { modelId, split });
+    const data = await invoke<PlacementProjectionData>("placement_propose", { modelId, split, backendId: backendId ?? null });
     return { data, live: true };
   } catch (e) {
     return { data: null, live: true, error: errOf(e) };

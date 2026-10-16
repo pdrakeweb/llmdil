@@ -825,6 +825,7 @@ function backendCard(
       ${p.down_indices && p.down_indices.length ? `<div style="font-size:12px;color:var(--err);margin-bottom:6px">${p.down_indices.map((i) => `GPU ${i}`).join(", ")} ${p.down_indices.length === 1 ? "is" : "are"} down and ${p.down_indices.length === 1 ? "is" : "are"} treated as having no free VRAM.</div>` : ""}
       <div style="font-size:12px">${p.fits ? "The model fits the selected GPUs with the projected split." : "The model does not fit the available VRAM with this split."}</div>
       <table class="dtab" style="margin-top:8px"><thead><tr><th>GPU</th><th>Fraction</th><th>Required</th><th>Free (current)</th><th>Fit</th></tr></thead><tbody>${rows}</tbody></table>
+      ${p.sys_mib ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">System RAM: ${fmtGb(p.sys_mib / 1024)} GiB — routed experts under expert offload. The per-GPU figures cover the GPU-resident weights only.</div>` : ""}
       <div style="font-size:12px;color:var(--text2);margin-top:6px">Projection uses model weights only; run-time allocations add overhead.</div>
       <div style="font-size:12px;color:var(--text2);margin-top:2px">Based on ${ageMs === null ? "the latest telemetry snapshot" : `a telemetry snapshot ${Math.round(ageMs / 1000)} seconds old`}.</div></div>`;
   })() : "";
@@ -858,6 +859,7 @@ function backendCard(
       ${orphanNote}
       ${adoptedNote}
       ${b.configured && b.n_ctx !== undefined ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Context ${b.n_ctx} · Batch ${b.n_batch ?? "—"}</div>` : ""}
+      ${b.configured && b.gpu_ram_mib !== undefined ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">GPU RAM required: ${fmtGb(b.gpu_ram_mib / 1024)} GiB · System RAM required: ${fmtGb((b.sys_ram_mib ?? 0) / 1024)} GiB${b.kv_ram_mib != null ? ` · KV cache ${fmtGb(b.kv_ram_mib / 1024)} GiB at the configured context` : ""}${b.memory_basis === "estimate" ? ` · estimate` : ""}</div>` : ""}
             ${resHtml}
       ${statsHtml}
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0">
@@ -1335,7 +1337,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       placeBusy = true;
       paint();
       try {
-        const r = await placementPropose(model.id, split);
+        const r = await placementPropose(model.id, split, id);
         if (disposed) return;
         if (r.error || !r.data) {
           msgs.set(id, { text: `Propose failed: ${r.error ?? "the command returned no projection"}`, err: true });
