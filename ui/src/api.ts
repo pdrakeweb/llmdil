@@ -539,6 +539,45 @@ export function startBackend(id: string) { return backendAction("start_backend",
 export function stopBackend(id: string) { return backendAction("stop_backend", id); }
 export function restartBackend(id: string) { return backendAction("restart_backend", id); }
 
+/** backend_add — create a backend for a registered model and route it
+ *  through a gateway group (an existing one, or a new one when
+ *  createGroup is true). The gateway routes it after its next restart. */
+export async function addBackend(input: {
+  id: string;
+  modelId: string;
+  port: number;
+  group: string;
+  createGroup: boolean;
+  enabled: boolean;
+}): Promise<CallResult<{ backend_id: string; group: string }>> {
+  if (!isTauri()) return { data: { backend_id: input.id, group: input.group }, live: false };
+  try {
+    const data = await invoke<{ backend_id: string; group: string }>("backend_add", {
+      id: input.id,
+      modelId: input.modelId,
+      port: input.port,
+      group: input.group,
+      createGroup: input.createGroup,
+      enabled: input.enabled,
+    });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { backend_id: input.id, group: input.group }, live: true, error: errOf(e) };
+  }
+}
+
+/** backend_delete — remove a backend and its group memberships.
+ *  Refused while the backend is running. */
+export async function deleteBackend(id: string): Promise<CallResult<{ backend_id: string; deleted: boolean }>> {
+  if (!isTauri()) return { data: { backend_id: id, deleted: true }, live: false };
+  try {
+    const data = await invoke<{ backend_id: string; deleted: boolean }>("backend_delete", { id });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { backend_id: id, deleted: false }, live: true, error: errOf(e) };
+  }
+}
+
 /** backend_get_launch_command — the exact argv the supervisor will run. */
 export async function getBackendLaunchCommand(id: string): Promise<CallResult<{ id: string; argv: string[] }>> {
   if (!isTauri()) return { data: { id, argv: [] }, live: false };

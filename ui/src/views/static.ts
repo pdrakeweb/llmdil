@@ -14,7 +14,7 @@ import {
   getGpuTelemetry, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
   getBackends, startBackend, stopBackend, restartBackend, getBackendLaunchCommand,
   getBackendConfig, applyBackendConfig, testBackend, placementPropose, placementApply,
-  modelAssign,
+  addBackend, deleteBackend, modelAssign,
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
   verifyModel, deleteModel, modelSetEnabled, modelAdd,
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
@@ -22,7 +22,7 @@ import {
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
 } from "../api";
-import type { BackendRow, GatewayConfigData, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
+import type { BackendRow, GatewayConfigData, GatewayGroup, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
 import type { GpuInfo, WizardStepState } from "../types";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
@@ -658,6 +658,7 @@ function backendCard(
   logTails: Map<string, LogRow[]>,
   inFlight: Set<string>,
   models: ModelRow[],
+  confirmRemove: Set<string>,
 ): string {
   const active = b.state === "running" || b.state === "starting";
   // Buttons render disabled while this card's action is in flight.
@@ -670,6 +671,7 @@ function backendCard(
   const testBtn = `<button class="btn" data-back-act="test" data-back-id="${esc(b.id)}"${dis}>${icon("bolt")} Test</button>`;
   const enableBtn = `<button class="btn" data-back-act="enable" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Enable</button>`;
   const disableBtn = `<button class="btn" data-back-act="disable" data-back-id="${esc(b.id)}"${dis}>Disable</button>`;
+  const removeBtn = `<button class="btn" data-back-act="remove" data-back-id="${esc(b.id)}"${dis}>${confirmRemove.has(b.id) ? "Confirm remove" : "Remove"}</button>`;
   // Offer only what the command layer will accept:
   // - Stop whenever a live process exists (pid present, running or
   //   starting), whether the backend is configured, enabled, or an
@@ -686,6 +688,9 @@ function backendCard(
   if (b.configured && !b.enabled) parts.push(enableBtn);
   if (b.configured && b.enabled && (b.state === "stopped" || b.state === "failed")) parts.push(disableBtn);
   if (b.state === "running") parts.push(testBtn);
+  // Removal is refused by the command layer while running; offer it
+  // only for configured backends with no live process.
+  if (b.configured && !active && b.state !== "stopping") parts.push(removeBtn);
   const actions = parts.join("\n        ");
   const argvOpen = openArgv.has(b.id);
   const argv = argvOpen
@@ -749,8 +754,9 @@ function backendCard(
 }
 
 export function renderBackends(): string {
-  return `${topbar("Backends", `<button class="btn" id="backRefresh">${icon("restart")} Refresh</button>`)}
+  return `${topbar("Backends", `<button class="btn" id="backAdd">${icon("server")} Add backend</button> <button class="btn" id="backRefresh">${icon("restart")} Refresh</button>`)}
   <div class="view"><div id="backBanner"></div>
+  <div id="backAddForm"></div>
   <div id="backBody">${loadingHtml("Loading backends\u2026")}</div></div>`;
 }
 
@@ -768,6 +774,11 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   let lastRows: BackendRow[] = [];
   /** Registered models for the per-card model dropdowns. */
   let lastModels: ModelRow[] = [];
+  /** Gateway groups + port, for the add-backend form. */
+  let lastGroups: GatewayGroup[] = [];
+  let gatewayPort = 4000;
+  /** Backend ids whose Remove button is armed for confirmation. */
+  const confirmRemove = new Set<string>();
   let actionInFlight = false;
   let disposed = false;
   /** Load sequence: only the most recently started load may paint. */
@@ -776,7 +787,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const paint = (): void => {
     const b = root.querySelector("#backBody");
     if (!b) return;
-    b.innerHTML = `<div class="grid2">${lastRows.map((row) => backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels)).join("")}</div>`;
+    b.innerHTML = `<div class="grid2">${lastRows.map((row) => backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove)).join("")}</div>`;
   };
 
   /** Lazily fetch the last log lines for failed backends and repaint.
@@ -804,9 +815,13 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
 
   const load = async (): Promise<void> => {
     const seq = ++loadSeq;
-    const [r, mr] = await Promise.all([getBackends(), getModels()]);
+    const [r, mr, gr] = await Promise.all([getBackends(), getModels(), getGatewayConfig()]);
     if (disposed || seq !== loadSeq) return; // a newer load supersedes this one
     if (!mr.error && mr.data) lastModels = mr.data;
+    if (!gr.error && gr.data) {
+      lastGroups = gr.data.groups;
+      if (gr.data.port) gatewayPort = gr.data.port;
+    }
     setBanner(root, "backBanner", bannerHtml(r));
     const b = root.querySelector("#backBody");
     if (!b) return;
@@ -824,7 +839,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       // A note belongs to the state it was produced in; when the
       // backend's state changes, the stale note goes away.
       const prev = prevStates.get(row.id);
-      if (prev !== undefined && prev !== row.state) msgs.delete(row.id);
+      if (prev !== undefined && prev !== row.state) { msgs.delete(row.id); confirmRemove.delete(row.id); }
       // A backend that is no longer failed gets a fresh tail fetch if it
       // fails again.
       if (row.state !== "failed") { logTails.delete(row.id); tailsWanted.delete(row.id); }
@@ -836,6 +851,96 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const refreshBtn = root.querySelector("#backRefresh");
   const onRefresh = (): void => { void load(); };
   refreshBtn?.addEventListener("click", onRefresh);
+
+  /* ---------------- Add backend form ----------------
+   * Lives in #backAddForm, outside the repainted #backBody, so the
+   * 5-second poll never clobbers typed input. */
+  const addHost = root.querySelector("#backAddForm");
+  const closeAddForm = (): void => { if (addHost) addHost.innerHTML = ""; };
+  const nextFreePort = (): number => {
+    const used = new Set<number>(lastRows.map((r) => r.port));
+    used.add(gatewayPort);
+    used.add(8090); // the Windows ML backend's conventional port
+    let p = 8081;
+    while (used.has(p)) p += 1;
+    return p;
+  };
+  const openAddForm = (): void => {
+    if (!addHost) return;
+    if (addHost.innerHTML) { closeAddForm(); return; }
+    const modelOpts = lastModels.map((m) => `<option value="${esc(m.id)}">${esc(m.id)} \u2014 ${esc(baseName(m.gguf_path))}</option>`).join("");
+    const groupOpts = lastGroups.map((g) => `<option value="${esc(g.name)}">${esc(g.name)}</option>`).join("")
+      + `<option value="__new__">New group\u2026</option>`;
+    addHost.innerHTML = `<div class="card"><h3>${icon("server")} Add a backend</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+      <label style="font-size:12px;color:var(--text2)">Name (lowercase, digits, hyphens)<br>
+        <input id="addBackName" type="text" placeholder="nemotron" style="${SELECT_STYLE};width:100%"></label>
+      <label style="font-size:12px;color:var(--text2)">Model<br>
+        <select id="addBackModel" style="${SELECT_STYLE};width:100%">${modelOpts}</select></label>
+      <label style="font-size:12px;color:var(--text2)">Port<br>
+        <input id="addBackPort" type="number" value="${nextFreePort()}" style="${SELECT_STYLE};width:100%"></label>
+      <label style="font-size:12px;color:var(--text2)">Gateway group<br>
+        <select id="addBackGroup" style="${SELECT_STYLE};width:100%">${groupOpts}</select></label>
+    </div>
+    <label id="addBackNewGroupWrap" style="font-size:12px;color:var(--text2);display:none;margin-top:10px">New group name (defaults to the backend name)<br>
+      <input id="addBackNewGroup" type="text" placeholder="nemotron" style="${SELECT_STYLE};width:100%"></label>
+    <label style="font-size:12px;color:var(--text2);display:block;margin-top:10px">
+      <input id="addBackEnabled" type="checkbox" checked> Enabled (the gateway routes enabled backends; it can be started right away)</label>
+    <div class="card-actions"><button class="btn" id="addBackSubmit"${lastModels.length ? "" : " disabled"}>Add backend</button>
+      <button class="btn" id="addBackCancel">Cancel</button></div>
+    <div style="font-size:12px;color:var(--text2);margin-top:6px">${lastModels.length
+      ? "The backend is created with the standard defaults (32K context, no tensor split). Joining an existing group makes the gateway share that group's traffic across its members; a new group gives the backend its own model name."
+      : "No models are registered yet \u2014 add one on the Models page first."}</div>
+    <div id="addBackMsg" style="font-size:12px;margin-top:6px"></div>
+  </div>`;
+    const groupSelEl = addHost.querySelector("#addBackGroup") as HTMLSelectElement | null;
+    const newWrap = addHost.querySelector("#addBackNewGroupWrap") as HTMLElement | null;
+    groupSelEl?.addEventListener("change", () => {
+      if (newWrap) newWrap.style.display = groupSelEl.value === "__new__" ? "block" : "none";
+    });
+    addHost.querySelector("#addBackCancel")?.addEventListener("click", closeAddForm);
+    const submit = addHost.querySelector("#addBackSubmit") as HTMLButtonElement | null;
+    submit?.addEventListener("click", async () => {
+      const val = (sel: string): string => (addHost.querySelector(sel) as HTMLInputElement | null)?.value.trim() ?? "";
+      const name = val("#addBackName").toLowerCase();
+      const modelId = (addHost.querySelector("#addBackModel") as HTMLSelectElement | null)?.value ?? "";
+      const port = Number(val("#addBackPort"));
+      const groupSel = (addHost.querySelector("#addBackGroup") as HTMLSelectElement | null)?.value ?? "";
+      const createGroup = groupSel === "__new__";
+      const group = createGroup ? (val("#addBackNewGroup").toLowerCase() || name) : groupSel;
+      const enabled = (addHost.querySelector("#addBackEnabled") as HTMLInputElement | null)?.checked ?? true;
+      const msg = addHost.querySelector("#addBackMsg") as HTMLElement | null;
+      if (!name || !modelId || !group || !Number.isInteger(port) || port <= 0) {
+        if (msg) msg.innerHTML = `<span style="color:var(--err)">Name, model, port, and group are required.</span>`;
+        return;
+      }
+      submit.disabled = true;
+      const r = await addBackend({ id: name, modelId, port, group, createGroup, enabled });
+      if (disposed) return;
+      if (r.error) {
+        if (msg) msg.innerHTML = `<span style="color:var(--err)">Add failed: ${esc(r.error)}</span>`;
+        submit.disabled = false;
+        return;
+      }
+      addHost.innerHTML = `<div class="card"><h3>${icon("check")} Backend added</h3>
+        <div style="font-size:12px;color:var(--text2);margin-top:6px">Backend <b>${esc(name)}</b> was created in group <b>${esc(group)}</b>. The gateway generates its routes from the configuration when it starts, so the new backend is routed after a gateway restart.</div>
+        <div class="card-actions"><button class="btn" id="addBackRestartGw">Restart gateway now</button> <button class="btn" id="addBackDone">Done</button></div>
+        <div id="addBackGwMsg" style="font-size:12px;margin-top:6px"></div></div>`;
+      addHost.querySelector("#addBackDone")?.addEventListener("click", closeAddForm);
+      addHost.querySelector("#addBackRestartGw")?.addEventListener("click", async () => {
+        const gwMsg = addHost.querySelector("#addBackGwMsg") as HTMLElement | null;
+        if (gwMsg) gwMsg.textContent = "Restarting the gateway\u2026";
+        const rr = await runWizardStep("start-gateway");
+        if (disposed || !gwMsg) return;
+        gwMsg.innerHTML = rr.error
+          ? `<span style="color:var(--err)">Gateway restart failed: ${esc(rr.error)}</span>`
+          : "Gateway restarted \u2014 the new backend is now routed. Start it from its card when you are ready.";
+      });
+      await load();
+    });
+  };
+  const addBtn = root.querySelector("#backAdd");
+  addBtn?.addEventListener("click", openAddForm);
 
   const onClick = async (ev: Event): Promise<void> => {
     const t = (ev.target as HTMLElement).closest("[data-back-act]") as HTMLElement | null;
@@ -875,6 +980,19 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         const r = await applyBackendConfig(id, { enabled: act === "enable" }, "OnNextRestart");
         if (r.error) msgs.set(id, { text: `${act} failed: ${r.error}`, err: true });
         else msgs.delete(id);
+        await load();
+        return;
+      }
+      if (act === "remove") {
+        if (!confirmRemove.has(id)) {
+          confirmRemove.add(id);
+          msgs.set(id, { text: "Click Confirm remove to delete this backend and its group memberships.", err: false });
+          paint();
+          return;
+        }
+        confirmRemove.delete(id);
+        const r = await deleteBackend(id);
+        if (r.error) msgs.set(id, { text: `Remove failed: ${r.error}`, err: true });
         await load();
         return;
       }

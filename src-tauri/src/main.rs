@@ -2460,6 +2460,164 @@ async fn backend_apply_config(
     }))
 }
 
+/// Create a new backend and route it through the gateway (spec §14
+/// `backend_add`). The backend is created with the seeded defaults
+/// (32K context, no tensor split, the standard restart policy) and
+/// the chosen registered model; it joins an existing gateway group
+/// or a new one created for it. The gateway picks the route up when
+/// it next (re)starts — its config is generated from this state.
+#[tauri::command]
+async fn backend_add(
+    state: State<'_, AppState>,
+    id: String,
+    model_id: String,
+    port: u16,
+    group: String,
+    create_group: bool,
+    enabled: bool,
+) -> ApiResult {
+    let id = id.trim().to_string();
+    let group = group.trim().to_string();
+    let valid_slug = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 48
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !s.starts_with('-')
+            && !s.ends_with('-')
+    };
+    if !valid_slug(&id) {
+        return Err(err(ApiError::InvalidInput(
+            "backend name must be lowercase letters, digits, and hyphens".to_string(),
+        )));
+    }
+    if !valid_slug(&group) {
+        return Err(err(ApiError::InvalidInput(
+            "group name must be lowercase letters, digits, and hyphens".to_string(),
+        )));
+    }
+    if port == 0 {
+        return Err(err(ApiError::InvalidInput(
+            "port must be non-zero".to_string(),
+        )));
+    }
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    if new_cfg.backends.iter().any(|b| b.id == id) {
+        return Err(err(ApiError::InvalidInput(format!(
+            "a backend with id '{id}' already exists"
+        ))));
+    }
+    let model = new_cfg
+        .models
+        .iter()
+        .find(|m| m.id == model_id)
+        .ok_or_else(|| err(ApiError::NotFound(format!("model {model_id}"))))?
+        .clone();
+    if create_group {
+        if new_cfg.gateway.groups.iter().any(|g| g.name == group) {
+            return Err(err(ApiError::InvalidInput(format!(
+                "group '{group}' already exists; join it instead of creating it"
+            ))));
+        }
+        new_cfg.gateway.groups.push(manager_config::ModelGroup {
+            name: group.clone(),
+            members: vec![id.clone()],
+            strategy: manager_config::RoutingStrategy::SimpleShuffle,
+            fallbacks: Vec::new(),
+        });
+    } else {
+        let g = new_cfg
+            .gateway
+            .groups
+            .iter_mut()
+            .find(|g| g.name == group)
+            .ok_or_else(|| err(ApiError::NotFound(format!("group {group}"))))?;
+        if !g.members.iter().any(|m| m == &id) {
+            g.members.push(id.clone());
+        }
+    }
+    new_cfg.backends.push(manager_config::BackendConfig {
+        id: id.clone(),
+        enabled,
+        model_file: model.gguf_path.clone(),
+        port,
+        flags: manager_config::ServerFlags {
+            n_ctx: 32768,
+            n_batch: 512,
+            tensor_split: Vec::new(),
+            split_mode: manager_config::SplitMode::None,
+        },
+        raw_flags: None,
+        restart_policy: manager_config::RestartPolicy {
+            max_retries: 5,
+            backoff_base_secs: 2,
+        },
+        overrides_global: false,
+    });
+    if let Some(m) = new_cfg.models.iter_mut().find(|m| m.id == model_id) {
+        if !m.assigned_backends.contains(&id) {
+            m.assigned_backends.push(id.clone());
+        }
+    }
+    manager_config::validate(&new_cfg)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    drop(cfg);
+    ensure_backend_specs(&state).await;
+    Ok(json!({ "backend_id": id, "group": group, "persisted": true }))
+}
+
+/// Remove a backend (spec §14 `backend_delete`). Refused while the
+/// backend is running — stop it first. The id is scrubbed from every
+/// group's member list (the gateway config generator rejects unknown
+/// members) and from models' assignment lists. A group left with no
+/// members stays in the config: it generates no gateway deployments
+/// and can gain members again later.
+#[tauri::command]
+async fn backend_delete(state: State<'_, AppState>, id: String) -> ApiResult {
+    {
+        let sup = state.supervisor().await;
+        let mut sup = sup.lock().await;
+        sup.reap_exited();
+        if let Some(st) = sup.status().iter().find(|s| s.id == id) {
+            if st.pid.is_some() {
+                return Err(err(ApiError::InvalidInput(format!(
+                    "backend {id} is running; stop it before removing it"
+                ))));
+            }
+        }
+    }
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    let pos = new_cfg
+        .backends
+        .iter()
+        .position(|b| b.id == id)
+        .ok_or_else(|| err(ApiError::NotFound(format!("backend {id}"))))?;
+    new_cfg.backends.remove(pos);
+    for g in new_cfg.gateway.groups.iter_mut() {
+        g.members.retain(|m| m != &id);
+    }
+    for m in new_cfg.models.iter_mut() {
+        m.assigned_backends.retain(|b| b != &id);
+    }
+    manager_config::validate(&new_cfg)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    drop(cfg);
+    ensure_backend_specs(&state).await;
+    Ok(json!({ "backend_id": id, "deleted": true, "persisted": true }))
+}
+
 /// Exact argv the supervisor would spawn (must equal the wizard's
 /// planned_commands output per spec).
 #[tauri::command]
@@ -3885,6 +4043,8 @@ fn main() {
             backend_get_config,
             backend_preview_diff,
             backend_apply_config,
+            backend_add,
+            backend_delete,
             backend_get_launch_command,
             // Wizard / audit
             run_wizard_step,

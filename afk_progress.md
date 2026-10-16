@@ -101,3 +101,15 @@ Release run 38734172514 success, CI run 38734172460 success, Install Test run 38
 - MXC CLI contract fixes (found by the SDK research against the real 1.0.0 binary): probe --probe-json -> --probe; self-test --policy/--self-test -> --config <policy> --dry-run -- cmd.exe /c echo llm-manager-mxc-self-test; MxcPolicies resolves <data_dir>/mxc/bin/x64/wxc-exec.exe first with a bare-name PATH fallback (resolve_wxc_exec); planned commands name the canonical installed path.
 - Gateway credentials UI (implemented locally Oct 15, shipped here): gateway_master_key command, master-key reveal/copy in the Gateway view, corrected client-endpoint copy (master key required; extension base URL without /v1), LiteLLM admin UI button with the database caveat stated.
 - v0.1.12 verified fully green this session via API: Release 38819047507, CI 38819035321, dispatched Install Test 38820162615, asset 4,347,670 bytes.
+
+## v0.1.13 verified green (Oct 15, 2026, via API)
+Release 38824432145 success; CI 38824432166 + 38824395129 success; dispatched Install Test 38825335663 success; release published 2026-10-15T23:42:30Z; asset Local.LLM.Service.Manager_0.1.13_x64-setup.exe 4,382,763 bytes. Watchdog llm-release-v0113-watch self-disabled (its consolidated chat report did not surface in the side chat; outcome verified directly via the API instead).
+
+## v0.1.14 shipped (Oct 15, 2026)
+Commit 625d7c88367aeecbf2b9a47ed45e13caafda0b17; tag v0.1.14; watchdog llm-release-v0114-watch armed. Gates at ship: fmt clean, 386 workspace tests, clippy 0, src-tauri check + check --tests clean, UI build clean.
+Content (VS Code step expansion + Continue fix):
+- Extensions: vivswan.litellm-vscode-chat added to the install set (Continue, Cline already there).
+- LiteLLM endpoint: settings.json entry (label "Local", baseUrl without /v1, master key inline auth) merged via jsonc-parser CST — user comments/formatting/other settings survive; own entry replaced by label or baseUrl match.
+- Copilot agents: ~/.copilot/agents/litellm-<group>.md per gateway group; planner text verbatim from Pete; coder/coder-fast/tool-runner authored in the same structure (tools [read, search, edit, execute] / tool-runner [read, search, execute]).
+- Continue: config.yaml + .env per Pete's design, verified against continuedev/continue 1.3.40 (research: ~/workspace/.tmp-assets/continue-litellm-config-research.md). apiBase WITH /v1; apiKey ${{ secrets.LITELLM_API_KEY }}; roles [chat, edit, apply]; capabilities [tool_use] (mandatory — autodetection would deny these model names); existing config.yaml merged by model+apiBase identity, .env merged by key; legacy config.json no longer written and a wizard-written one is moved to config.json.llm-manager.bak; vscode_write_config Tauri command migrated to the same pair with backup-first semantics.
+- Audit verifies the settings entry, agent files, config.yaml models, and the .env key.
