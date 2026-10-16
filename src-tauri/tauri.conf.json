@@ -56,5 +56,5 @@
   },
   "identifier": "com.pdrakeweb.llm-manager",
   "productName": "Local LLM Service Manager",
-  "version": "0.1.26"
+  "version": "0.1.27"
 }

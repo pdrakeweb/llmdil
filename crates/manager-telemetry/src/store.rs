@@ -142,12 +142,18 @@ impl TelemetryStore {
     }
 
     fn update_at(&mut self, samples: Vec<GpuSample>, now: Instant) {
-        // Prune GPUs absent from this snapshot: a physically removed GPU
-        // must leave the snapshot (and the peak marks) instead of being
-        // carried as stale forever and counted by gpu_count().
+        // A GPU absent from this poll is NOT pruned. It stays in the
+        // snapshot, flagged down with its last-known readings: a GPU
+        // that falls off the bus ("GPU is lost") must read as down in
+        // the UI, not silently vanish (operator requirement,
+        // 2026-10-16). Its peak marks and history stay with it. The
+        // first poll that reports it again restores it to live.
         let present: std::collections::HashSet<u32> = samples.iter().map(|s| s.index).collect();
-        self.latest.retain(|idx, _| present.contains(idx));
-        self.peaks.retain(|idx, _| present.contains(idx));
+        for (idx, stored) in self.latest.iter_mut() {
+            if !present.contains(idx) {
+                stored.sample.down = true;
+            }
+        }
         for mut sample in samples {
             sample.stale = false;
             let idx = sample.index;
@@ -659,23 +665,30 @@ mod tests {
     }
 
     #[test]
-    fn update_prunes_vanished_gpus() {
+    fn update_marks_vanished_gpus_down() {
         let mut store = TelemetryStore::new();
         store.update(vec![sample_at(0, 0, 60.0), sample_at(1, 0, 50.0)]);
         assert_eq!(store.gpu_count(), 2);
-        assert!(store.peaks(1).is_some());
-        // GPU 1 disappears from the next snapshot (physically removed):
-        // its sample and peak marks are dropped, not carried as stale.
+        // GPU 1 vanishes from the next poll (fallen off the bus): it
+        // stays in the snapshot, flagged down, with last-known values
+        // and its peak marks — it must not silently disappear.
         store.update(vec![sample_at(0, 0, 61.0)]);
-        assert_eq!(store.gpu_count(), 1);
+        assert_eq!(store.gpu_count(), 2);
         let snap = store.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].index, 0);
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[1].index, 1);
+        assert!(snap[1].down, "vanished GPU is flagged down");
         assert!(
-            store.peaks(1).is_none(),
-            "peaks for a removed GPU are pruned"
+            (snap[1].temp_c - 50.0).abs() < f32::EPSILON,
+            "last-known readings are kept"
         );
-        assert!(store.peaks(0).is_some());
+        assert!(!snap[0].down);
+        assert!(store.peaks(1).is_some(), "peaks stay with the down GPU");
+        // The first poll that reports it again restores it to live.
+        store.update(vec![sample_at(0, 0, 62.0), sample_at(1, 0, 55.0)]);
+        let snap = store.snapshot();
+        assert!(!snap[1].down, "a reported GPU is live again");
+        assert!((snap[1].temp_c - 55.0).abs() < f32::EPSILON);
     }
 
     #[test]

@@ -78,6 +78,16 @@ pub struct GpuSample {
     pub power_w: Option<f32>,
     /// True when no successful poll within [`STALE_AFTER_SECS`].
     pub stale: bool,
+    /// True when this GPU was absent from the latest successful poll
+    /// after having been reported before — the store retains it,
+    /// flagged down with its last-known readings, instead of dropping
+    /// it from the snapshot. This is the "GPU is lost" case (fallen
+    /// off the bus): the card must read as down in the UI, not
+    /// silently vanish (operator requirement, 2026-10-16). Sources
+    /// never set it; only the store does, and the first poll that
+    /// reports the GPU again clears it.
+    #[serde(default)]
+    pub down: bool,
     pub source: TelemetrySourceKind,
     /// Memory-controller utilization %, when reported.
     pub mem_util_pct: Option<f32>,
@@ -124,6 +134,7 @@ impl GpuSample {
             temp_c,
             power_w: Some(power_w),
             stale: false,
+            down: false,
             source,
             mem_util_pct: None,
             fan_pct: None,

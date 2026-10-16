@@ -134,6 +134,10 @@ function gpuCard(g: GpuInfo, expanded: Set<string>): string {
   const peak = g.temp_peak_c !== undefined ? ` \u00b7 peak ${g.temp_peak_c} \u00b0C since last reset or app start` : "";
   const limit = g.power_limit_w !== undefined ? ` / ${g.power_limit_w} W limit` : "";
   const staleChip = g.status === "degraded" ? ` <span class="chip badge-warn">stale</span>` : "";
+  const downChip = g.status === "down" ? ` <span class="chip badge-err">down</span>` : "";
+  // A down GPU's readings are its last known values; say so on the
+  // card, with the recovery fact for the fallen-off-the-bus case.
+  const downNote = g.status === "down" ? `<div style="font-size:12px;color:var(--err);margin-top:8px">Down \u2014 not reported by the telemetry source in recent polls; the readings shown are the last known values. A GPU that has fallen off the bus (nvidia-smi reports it as lost) recovers only on a system reboot.</div>` : "";
   const memUtil = g.mem_util_pct !== undefined
     ? `<div class="mrow"><span class="mlabel">Memory util</span><span class="mval">${g.mem_util_pct}%</span></div>` : "";
   const fan = g.fan_pct !== undefined
@@ -174,8 +178,9 @@ function gpuCard(g: GpuInfo, expanded: Set<string>): string {
         ${g.models.map((m) => `<div>${icon("layers")} ${esc(m.model)} \u00b7 ${esc(m.layers)}</div>`).join("")}
       </div>` : "";
   return `<div class="card" id="card-gpu-${esc(g.id)}">
-      <div class="gpu-head">${dot(g.status)} ${esc(g.name)}${pci}${staleChip}
+      <div class="gpu-head">${dot(g.status === "down" ? "err" : g.status)} ${esc(g.name)}${pci}${staleChip}${downChip}
         <span class="spacer" style="flex:1"></span>${driver}</div>
+      ${downNote}
       <div style="display:flex;gap:18px;justify-content:center;margin:12px 0">
         ${gaugeRing(g.util_pct, 84, C.blue, String(g.util_pct), "UTIL")}
         ${gaugeRing(vramPct, 84, C.purple, fmtGb(g.vram_used_gb), "GiB VRAM")}
@@ -394,6 +399,7 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
       ? `Based on telemetry from ${Math.round(ageMs / 1000)}s ago \u00b7 fractions map to GPUs in nvidia-smi index order.`
       : "Based on the latest telemetry snapshot \u00b7 fractions map to GPUs in nvidia-smi index order.";
     res.innerHTML = `<div style="margin-top:10px">
+      ${p.down_indices && p.down_indices.length ? `<div style="font-size:12px;color:var(--err);margin-bottom:4px">GPU ${p.down_indices.join(", GPU ")} is down and is treated as having no free VRAM.</div>` : ""}
       <div style="font-size:12px;color:var(--text2)">${p.fits
         ? "The proposed split fits the free VRAM on every GPU in the split."
         : "The proposed split does not fit \u2014 at least one GPU in the split lacks the free VRAM."}</div>

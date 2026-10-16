@@ -232,6 +232,7 @@ impl ParsedGpu {
             temp_c: self.temp_c,
             power_w: self.power_w,
             stale: false,
+            down: false,
             source: TelemetrySourceKind::NvidiaSmi,
             mem_util_pct: self.mem_util_pct,
             fan_pct: self.fan_pct,

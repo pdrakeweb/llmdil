@@ -276,3 +276,18 @@ Fix (manager-wizard steps.rs):
   split, or the main GPU when no split is set); stopped/failed
   backends get no GPU edges; node subtitles show only real residency
   figures or "context only"; the legend states the rule.
+
+## v0.1.26 — in-card flags editor with per-model preset options
+- The Edit flags form now renders inside the backend's own card
+  (it previously appeared above the list, where the click looked
+  like a no-op). Draft values live outside the repainted DOM, so
+  the 5 s repaint re-renders the open form without losing input;
+  a rejected save keeps the form open with the error on the card.
+- Context and batch are preset dropdowns, not typed fields:
+  context ladder 8K..1M, batch 128..4096, each with a Custom
+  numeric fallback. The catalog now rates each model's maximum
+  context (ModelSpec.ctx_max, carried by list_models): presets
+  beyond the backend's model rating are annotated "beyond rated"
+  and the form states the model's rated maximum. Ratings: Qwen3-32B
+  128K, Qwen3-Coder-30B 256K, Qwen2.5-Coder-7B 128K, Qwen3-8B 128K,
+  Nemotron 256K (conservative). Custom models report no rating.

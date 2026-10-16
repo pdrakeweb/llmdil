@@ -3866,9 +3866,24 @@ async fn placement_propose(
         .or_else(|| samples.iter().map(|s| s.ts.timestamp_millis()).max())
         .map(|then_ms| now_ms().saturating_sub(then_ms.max(0) as u64));
     let gpu_indices: Vec<u32> = samples.iter().map(|s| s.index).collect();
+    // A down GPU (absent from recent polls, retained by the store
+    // with last-known readings) has no usable capacity: project it as
+    // zero free VRAM so no split fraction is planned onto it, and
+    // name it in the payload so the UI can say why it does not fit.
+    let down_indices: Vec<u32> = samples
+        .iter()
+        .filter(|s| s.down)
+        .map(|s| s.index)
+        .collect();
     let free_mib: Vec<u64> = samples
         .iter()
-        .map(|s| s.vram_total_mib.saturating_sub(s.vram_used_mib))
+        .map(|s| {
+            if s.down {
+                0
+            } else {
+                s.vram_total_mib.saturating_sub(s.vram_used_mib)
+            }
+        })
         .collect();
     drop(guard);
     let projection = manager_models::propose_placement(&spec, &split, &free_mib)
@@ -3877,6 +3892,7 @@ async fn placement_propose(
     let mut payload = serde_json::to_value(&projection).map_err(jerr)?;
     payload["snapshot_age_ms"] = json!(snapshot_age_ms);
     payload["gpu_indices"] = json!(gpu_indices);
+    payload["down_indices"] = json!(down_indices);
     payload["weights_only"] = json!(true);
     Ok(payload)
 }

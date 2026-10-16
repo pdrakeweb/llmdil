@@ -111,6 +111,10 @@ interface GpuSample {
   temp_c: number;
   power_w: number | null;
   stale: boolean;
+  /** True when the GPU was absent from the latest polls after being
+   *  reported before (e.g. fallen off the bus): the store retains it
+   *  flagged down with last-known readings. Absent on older payloads. */
+  down?: boolean;
   source: string;
   mem_util_pct: number | null;
   fan_pct: number | null;
@@ -193,7 +197,7 @@ export async function getGpuTelemetry(): Promise<CallResult<GpuTelemetryData>> {
             vram_mib: p.vram_mib ?? p.used_mib ?? 0,
             backend: p.backend_id ?? "—",
           })),
-        status: s.stale ? "degraded" : "ok",
+        status: s.down ? "down" : s.stale ? "degraded" : "ok",
       }));
       const stale = samples.length > 0 && samples.every((s) => s.stale)
         ? true
@@ -1495,6 +1499,9 @@ export interface PlacementProjectionData {
   snapshot_age_ms?: number;
   /** GPU index for each split entry, in split order. */
   gpu_indices?: number[];
+  /** Indices of GPUs currently down (absent from telemetry polls);
+   *  the projection treats them as having no free VRAM. */
+  down_indices?: number[];
   /** Always true: the projection covers model weights only. */
   weights_only?: boolean;
 }
