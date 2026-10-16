@@ -345,14 +345,31 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
   /* ---------------- Placement ----------------
      Lives in its own container: telemetry repaints never touch it, so
      the poll cannot clobber the form or a rendered projection.
-     The backend<->model pairing is stated by the operator (two
-     selects), never inferred from file names: every configured
-     backend and every configured model is selectable, and Apply
-     aligns the pair through model_assign when the backend does not
-     already serve the chosen model. */
+     Backend-only (Pete's direction, 2026-10-16): the operator picks
+     the backend; the model is derived from the backend's model_file
+     and shown as text, never chosen separately. Apply writes the
+     split to that one backend (placement_apply's backend scope) —
+     it never reassigns the backend's model, and it never touches
+     other backends that happen to serve the same model. */
   const placeEl = root.querySelector("#gpuPlacement");
   let placeBackendRows: BackendRow[] = [];
   let placeModelRows: ModelRow[] = [];
+  /** The operator's selected backend; falls back to the first
+   *  configured backend while unset or no longer present. */
+  let placeBackendId: string | null = null;
+  const placeBackend = (): BackendRow | undefined =>
+    placeBackendRows.find((b) => b.id === placeBackendId) ?? placeBackendRows[0];
+  /** The model a backend serves, derived from its model_file. */
+  const placeDerivedModel = (b: BackendRow | undefined): ModelRow | undefined =>
+    b ? placeModelRows.find((mdl) => sameModelFile(b.model_file, mdl.gguf_path)) : undefined;
+  const placeModelLineHtml = (): string => {
+    const b = placeBackend();
+    if (!b) return "";
+    const mdl = placeDerivedModel(b);
+    return mdl
+      ? `Model: <span style="color:var(--text)">${esc(mdl.id)}</span> \u2014 from the backend's configuration`
+      : `<span style="color:var(--err)">This backend's model file matches no configured model, so a split cannot be proposed or applied for it.</span>`;
+  };
   let projection: { backendId: string; modelId: string; data: PlacementProjectionData } | null = null;
   let placeBusy = false;
   /** GPU indices (nvidia-smi order) the operator has unchecked: the
@@ -414,25 +431,23 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     if (!placeEl) return;
     if (!placeBackendRows.length) {
       placeEl.innerHTML = `<div class="card"><div class="sec-title">${icon("layers")} Placement</div>
-        <div style="font-size:12px;color:var(--text2)">No configured backends. Placement assigns a model to a backend and applies a tensor split to it.</div></div>`;
+        <div style="font-size:12px;color:var(--text2)">No configured backends. Placement applies a tensor split to a backend, for the model it serves.</div></div>`;
       return;
     }
     // Every configured backend is selectable; the label shows the
-    // model it currently serves (the basename of its model_file).
+    // model it currently serves (the basename of its model_file), and
+    // the derived model is restated as text beside the select.
+    const selId = placeBackend()?.id ?? "";
     const backOpts = placeBackendRows.map((b) =>
-      `<option value="${esc(b.id)}">${esc(b.id)} \u2014 ${esc(b.model_file ? baseName(b.model_file) : "no model assigned")}</option>`).join("");
-    const modelOpts = placeModelRows.map((mdl) =>
-      `<option value="${esc(mdl.id)}">${esc(mdl.id)} \u2014 ${esc(baseName(mdl.gguf_path))}</option>`).join("");
+      `<option value="${esc(b.id)}"${b.id === selId ? " selected" : ""}>${esc(b.id)} \u2014 ${esc(b.model_file ? baseName(b.model_file) : "no model assigned")}</option>`).join("");
     placeEl.innerHTML = `<div class="card"><div class="sec-title">${icon("layers")} Placement</div>
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px">Backend
           <select id="placeBackend" style="${SELECT_STYLE}">${backOpts}</select></label>
-        <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px">Model
-          <select id="placeModel" style="${SELECT_STYLE}">${modelOpts}</select></label>
-        <button class="btn" id="placePropose">Propose split</button>
+        <span id="placeModelLine" style="font-size:12px;color:var(--text2)">${placeModelLineHtml()}</span>
+        <button class="btn" id="placePropose"${placeDerivedModel(placeBackend()) ? "" : " disabled"}>Propose split</button>
         <button class="btn" id="placeApply" disabled>Apply split</button>
       </div>
-      ${placeModelRows.length ? "" : `<div style="font-size:12px;color:var(--text2);margin-top:8px">No models are configured \u2014 a model is needed before a split can be proposed or applied.</div>`}
       ${lastGpus.length ? `<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px">
         <span style="font-size:12px;color:var(--text2)">GPUs in the split:</span>
         ${lastGpus.map((g, i) => `<label style="font-size:12px;display:inline-flex;align-items:center;gap:5px"><input type="checkbox" data-place-gpu="${i}"${placeExcluded.has(i) ? "" : " checked"}> ${esc(g.name)}</label>`).join("")}
@@ -442,11 +457,9 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
       <div id="placeResult"></div>
     </div>`;
     const sel = placeEl.querySelector("#placeBackend") as HTMLSelectElement | null;
-    const modelSel = placeEl.querySelector("#placeModel") as HTMLSelectElement | null;
     const proposeBtn = placeEl.querySelector("#placePropose") as HTMLButtonElement | null;
     const applyBtn = placeEl.querySelector("#placeApply") as HTMLButtonElement | null;
     sel?.addEventListener("change", onPlaceSelectionChange);
-    modelSel?.addEventListener("change", onPlaceSelectionChange);
     proposeBtn?.addEventListener("click", onPropose);
     applyBtn?.addEventListener("click", onApply);
     placeEl.querySelectorAll("[data-place-gpu]").forEach((el) => {
@@ -460,20 +473,26 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
   };
 
   const onPlaceSelectionChange = (): void => {
+    const sel = root.querySelector("#placeBackend") as HTMLSelectElement | null;
+    if (sel) placeBackendId = sel.value;
     projection = null;
     placeMsg("");
     paintProjection();
+    const line = root.querySelector("#placeModelLine");
+    if (line) line.innerHTML = placeModelLineHtml();
+    const proposeBtn = root.querySelector("#placePropose") as HTMLButtonElement | null;
+    if (proposeBtn) proposeBtn.disabled = !placeDerivedModel(placeBackend());
     const applyBtn = root.querySelector("#placeApply") as HTMLButtonElement | null;
     if (applyBtn) applyBtn.disabled = true;
   };
 
   const onPropose = async (): Promise<void> => {
-    const sel = root.querySelector("#placeBackend") as HTMLSelectElement | null;
-    const modelSel = root.querySelector("#placeModel") as HTMLSelectElement | null;
-    const backendId = sel?.value ?? "";
-    const modelId = modelSel?.value ?? "";
+    const backend = placeBackend();
+    const backendId = backend?.id ?? "";
+    const model = placeDerivedModel(backend);
     if (!backendId) { placeMsg("Select a backend first.", true); return; }
-    if (!modelId) { placeMsg("Select a model first.", true); return; }
+    if (!model) { placeMsg("This backend's model file matches no configured model.", true); return; }
+    const modelId = model.id;
     if (placeBusy) return;
     placeBusy = true;
     const proposeBtn = root.querySelector("#placePropose") as HTMLButtonElement | null;
@@ -533,44 +552,17 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     try {
       const { backendId, modelId } = projection;
       const split = projection.data.split;
-      const backend = placeBackendRows.find((b) => b.id === backendId);
-      const model = placeModelRows.find((mdl) => mdl.id === modelId);
-      let assignedNow = false;
-      // When the backend does not already resolve to the selected
-      // model, align it first: model_assign sets the backend's
-      // model_file to the model's gguf_path and persists. If the
-      // assignment fails, stop — placement_apply must not run against
-      // a pairing the operator did not get.
-      if (backend && model && !sameModelFile(backend.model_file, model.gguf_path)) {
-        placeMsg(`Assigning ${modelId} to ${backendId}\u2026`);
-        const ar = await modelAssign(backendId, modelId, split);
-        if (disposed) return;
-        if (ar.error) {
-          placeMsg(`Assign failed: ${ar.error}`, true);
-          return;
-        }
-        if (!ar.data.persisted) {
-          placeMsg("The assignment was applied to the in-memory configuration only \u2014 it was not saved (persisted: false) and will be lost when the app restarts.", true);
-          return;
-        }
-        assignedNow = true;
-        // The persisted state changed under the form; the local row
-        // follows it so the backend's "currently assigned" label and
-        // the next signature check agree with the backend.
-        backend.model_file = model.gguf_path;
-      }
-      const r = await placementApply(modelId, split);
+      // Backend-scoped apply: the split is written to this backend
+      // only. The form never reassigns the backend's model and never
+      // touches other backends serving the same model.
+      const r = await placementApply(modelId, split, backendId);
       if (disposed) return;
       if (r.error) {
         placeMsg(r.error, true);
         return;
       }
       if (r.data.persisted) {
-        // Repaint before messaging (the repaint rebuilds #placeMsg).
-        if (assignedNow) repaintPlacementPreserving();
-        placeMsg(assignedNow
-          ? `Assigned ${modelId} to ${backendId} and saved the split. Restart the backend to use it.`
-          : "Split saved to the configuration. Restart the backend to use it.");
+        placeMsg(`Split saved to ${backendId}. Restart the backend to use it.`);
       } else {
         placeMsg("The split was applied to the in-memory configuration only \u2014 it was not saved (persisted: false) and will be lost when the app restarts.", true);
       }
@@ -592,21 +584,15 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     + `#${placeModelRows.map((mdl) => mdl.id).join("|")}`;
 
   /** Repaint the placement form after a data refresh, preserving the
-   *  operator's selected backend and model and any rendered
-   *  projection. */
+   *  operator's selected backend and any rendered projection. */
   const repaintPlacementPreserving = (): void => {
     const bSelBefore = root.querySelector("#placeBackend") as HTMLSelectElement | null;
-    const mSelBefore = root.querySelector("#placeModel") as HTMLSelectElement | null;
     const selBackend = bSelBefore?.value ?? "";
-    const selModel = mSelBefore?.value ?? "";
+    if (selBackend) placeBackendId = selBackend;
     paintPlacement();
     const bSel = root.querySelector("#placeBackend") as HTMLSelectElement | null;
     if (bSel && selBackend && Array.from(bSel.options).some((o) => o.value === selBackend)) {
       bSel.value = selBackend;
-    }
-    const mSel = root.querySelector("#placeModel") as HTMLSelectElement | null;
-    if (mSel && selModel && Array.from(mSel.options).some((o) => o.value === selModel)) {
-      mSel.value = selModel;
     }
     paintProjection();
     const applyBtn = root.querySelector("#placeApply") as HTMLButtonElement | null;
@@ -723,11 +709,9 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     snapshotBtn?.removeEventListener("click", onSnapshot);
     pollSel?.removeEventListener("change", onPollChange);
     const sel = placeEl?.querySelector("#placeBackend");
-    const modelSel = placeEl?.querySelector("#placeModel");
     const proposeBtn = placeEl?.querySelector("#placePropose");
     const applyBtn = placeEl?.querySelector("#placeApply");
     sel?.removeEventListener("change", onPlaceSelectionChange);
-    modelSel?.removeEventListener("change", onPlaceSelectionChange);
     proposeBtn?.removeEventListener("click", onPropose);
     applyBtn?.removeEventListener("click", onApply);
   };

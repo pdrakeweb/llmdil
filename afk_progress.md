@@ -291,3 +291,20 @@ Fix (manager-wizard steps.rs):
   and the form states the model's rated maximum. Ratings: Qwen3-32B
   128K, Qwen3-Coder-30B 256K, Qwen2.5-Coder-7B 128K, Qwen3-8B 128K,
   Nemotron 256K (conservative). Custom models report no rating.
+
+## v0.1.27 — lost GPUs show as down instead of vanishing
+- Root cause of the "P100 missing" report: the P100 fell off the bus
+  (`nvidia-smi -q -i 1`: "GPU is lost. Reboot the system to recover
+  this GPU", PCI 51:00.0), so telemetry polls succeed with a
+  one-GPU document — and the store pruned absent GPUs immediately,
+  making the loss invisible in the UI.
+- The store now retains a GPU that vanishes from polls, flagged
+  down (GpuSample.down) with its last-known readings, peaks, and
+  history; the first poll that reports it again restores it live.
+  The GPUs view renders it with a red dot, a "down" chip, and a
+  note that the readings are last known and that a lost GPU
+  recovers only on reboot; the Service Map dot already had a down
+  state and now receives it. Placement projection treats a down
+  GPU as zero free VRAM and names it in the payload/UI, so no
+  split is planned onto a dead card. Split-length validation
+  still counts it (the split describes the machine's GPU set).

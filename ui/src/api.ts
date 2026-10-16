@@ -1526,14 +1526,16 @@ export interface PlacementApplyResult {
   persisted: boolean;
 }
 
-/** placement_apply — validate a tensor split and write it to every
- *  backend the model is assigned to; `persisted` reports whether the
- *  change was saved (it takes effect on the backends' next restart). */
-export async function placementApply(modelId: string, split: number[]): Promise<CallResult<PlacementApplyResult>> {
+/** placement_apply — validate a tensor split and write it to the
+ *  backends serving the model, or to the single given backend when
+ *  `backendId` is passed (the placement form's per-backend scope);
+ *  `persisted` reports whether the change was saved (it takes effect
+ *  on the backends' next restart). */
+export async function placementApply(modelId: string, split: number[], backendId?: string): Promise<CallResult<PlacementApplyResult>> {
   const fallback: PlacementApplyResult = { persisted: false };
   if (!isTauri()) return { data: fallback, live: false, error: "placement_apply is not available in sample mode" };
   try {
-    const data = await invoke<PlacementApplyResult>("placement_apply", { modelId, split });
+    const data = await invoke<PlacementApplyResult>("placement_apply", { modelId, split, backendId: backendId ?? null });
     return { data, live: true };
   } catch (e) {
     return { data: fallback, live: true, error: errOf(e) };

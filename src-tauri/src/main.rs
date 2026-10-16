@@ -3907,7 +3907,10 @@ async fn placement_propose(
 /// resolves to the model's gguf_path, and the apply records them into
 /// `assigned_backends` — so a model configured by hand (or installed
 /// by the wizard, which never records assignments) is still placeable.
-/// The split takes effect on each backend's next start. All mutation
+/// With `backend_id` given, the apply is scoped to that one backend
+/// (which must serve the model): the GPUs placement form works per
+/// backend, so two backends serving the same model can hold different
+/// splits. The split takes effect on each backend's next start. All mutation
 /// happens on a clone installed in memory only after a successful
 /// save, so a late failure leaves memory and disk in agreement.
 #[tauri::command]
@@ -3915,6 +3918,7 @@ async fn placement_apply(
     state: State<'_, AppState>,
     model_id: String,
     split: Vec<f32>,
+    backend_id: Option<String>,
 ) -> ApiResult {
     // Validate the split length against the telemetry snapshot first.
     // Done before any config lock is taken: the telemetry accessor reads
@@ -3939,20 +3943,43 @@ async fn placement_apply(
         .iter()
         .find(|m| m.id == model_id)
         .ok_or_else(|| err(ApiError::NotFound(format!("model {model_id}"))))?;
-    let mut backend_ids = model.assigned_backends.clone();
-    if backend_ids.is_empty() {
-        // No recorded assignment: derive the targets from the backends
-        // whose model file resolves (under the data dir) to the model's
-        // gguf_path. The apply below records them into
-        // assigned_backends, so later applies take the direct path.
-        let model_path = resolve_under_data_dir(&cfg.data_dir, &model.gguf_path);
-        backend_ids = cfg
+    let backend_ids = if let Some(bid) = backend_id {
+        // Backend-scoped apply (the GPUs placement form): the split
+        // goes to the one selected backend, which must serve the
+        // model — recorded as assigned, or its model file resolving
+        // to the model's gguf_path.
+        let backend = cfg
             .backends
             .iter()
-            .filter(|b| resolve_under_data_dir(&cfg.data_dir, &b.model_file) == model_path)
-            .map(|b| b.id.clone())
-            .collect();
-    }
+            .find(|b| b.id == bid)
+            .ok_or_else(|| err(ApiError::NotFound(format!("backend {bid}"))))?;
+        let model_path = resolve_under_data_dir(&cfg.data_dir, &model.gguf_path);
+        let serves = model.assigned_backends.iter().any(|b| b == &bid)
+            || resolve_under_data_dir(&cfg.data_dir, &backend.model_file) == model_path;
+        if !serves {
+            return Err(err(ApiError::InvalidInput(format!(
+                "backend {bid} does not serve model {model_id}"
+            ))));
+        }
+        vec![bid]
+    } else {
+        let mut ids = model.assigned_backends.clone();
+        if ids.is_empty() {
+            // No recorded assignment: derive the targets from the
+            // backends whose model file resolves (under the data dir)
+            // to the model's gguf_path. The apply below records them
+            // into assigned_backends, so later applies take the direct
+            // path.
+            let model_path = resolve_under_data_dir(&cfg.data_dir, &model.gguf_path);
+            ids = cfg
+                .backends
+                .iter()
+                .filter(|b| resolve_under_data_dir(&cfg.data_dir, &b.model_file) == model_path)
+                .map(|b| b.id.clone())
+                .collect();
+        }
+        ids
+    };
     drop(cfg);
     if backend_ids.is_empty() {
         return Err(err(ApiError::NotFound(format!(
