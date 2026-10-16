@@ -41,6 +41,13 @@ pub struct ModelSpec {
     /// Parameter count in billions. Seeded into the model config,
     /// whose validation requires a positive value.
     pub params_b: f32,
+    /// The model's rated maximum context length in tokens, from the
+    /// publisher's specification. The backend flags editor builds its
+    /// context presets from this: values beyond it are offered but
+    /// annotated as beyond the rating. 0 means no rating is known
+    /// (models defined outside the curated catalog).
+    #[serde(default)]
+    pub ctx_max: u32,
     /// Whether seeding enables this model. The default fleet is
     /// enabled; opt-in candidates (alternative models for a role)
     /// seed disabled and unassigned — the operator enables one in
@@ -91,6 +98,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             quant: "Q4_K_M".to_string(),
             size_bytes: 19_762_149_024,
             sha256: "efd971561896866f0e910cce52761ca77b1b138090c7f15fe284676d57d1f689".to_string(),
+            ctx_max: 131072,
             params_b: 32.0,
             enabled_by_default: true,
             // Closest real artifact for the planner slot: Qwen3-32B dense.
@@ -103,6 +111,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             quant: "Q4_K_M".to_string(),
             size_bytes: 18_556_689_568,
             sha256: "fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad".to_string(),
+            ctx_max: 262144,
             params_b: 30.0,
             enabled_by_default: true,
             url: "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
@@ -114,6 +123,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             quant: "Q4_K_M".to_string(),
             size_bytes: 4_683_073_536,
             sha256: "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c".to_string(),
+            ctx_max: 131072,
             params_b: 7.0,
             enabled_by_default: true,
             url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
@@ -125,6 +135,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             quant: "Q4_K_M".to_string(),
             size_bytes: 5_027_783_488,
             sha256: "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785".to_string(),
+            ctx_max: 131072,
             params_b: 8.0,
             enabled_by_default: true,
             url: "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
@@ -143,6 +154,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             quant: "Q4_K_M".to_string(),
             size_bytes: 25_266_255_936,
             sha256: "edcb5d4650796ed2fb412498de6f83b585862312c747ddb74f0ea04b22206181".to_string(),
+            ctx_max: 262144,
             params_b: 31.6,
             enabled_by_default: false,
             url: "https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF/resolve/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf"
@@ -971,6 +983,7 @@ mod tests {
             sha256: PLACEHOLDER_SHA256.to_string(),
             url: "https://example.com/x.gguf".to_string(),
             params_b: 8.0,
+            ctx_max: 0,
             enabled_by_default: true,
         }
     }
@@ -985,6 +998,7 @@ mod tests {
             sha256: "abc123".to_string(),
             url: "https://example.com/qwen3-8b-q4_k_m.gguf".to_string(),
             params_b: 8.0,
+            ctx_max: 131_072,
             enabled_by_default: true,
         };
         assert_eq!(spec.quant, "Q4_K_M");
@@ -1182,6 +1196,7 @@ mod tests {
             sha256: PLACEHOLDER_SHA256.to_string(),
             url: format!("http://{}{path}", server.addr),
             params_b: 1.0,
+            ctx_max: 0,
             enabled_by_default: true,
         }
     }

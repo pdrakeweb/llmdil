@@ -1714,6 +1714,10 @@ async fn list_models(state: State<'_, AppState>) -> ApiResult {
         .iter()
         .map(|s| (s.id.as_str(), s.size_bytes))
         .collect();
+    let catalog_ctx: HashMap<&str, u32> = catalog
+        .iter()
+        .map(|s| (s.id.as_str(), s.ctx_max))
+        .collect();
     let models: Vec<Value> = cfg
         .models
         .iter()
@@ -1741,6 +1745,7 @@ async fn list_models(state: State<'_, AppState>) -> ApiResult {
                 "paused": downloads.get(&m.id).map(|h| h.is_paused()).unwrap_or(false),
                 "download_error": outcomes.get(&m.id).and_then(|o| o.failed.clone()),
                 "catalog_size_bytes": catalog_sizes.get(m.id.as_str()).copied(),
+                "ctx_max": catalog_ctx.get(m.id.as_str()).copied(),
             })
         })
         .collect();
@@ -1782,6 +1787,7 @@ fn download_spec_for(cfg: &AppConfig, id: &str) -> Result<manager_models::ModelS
             },
             url: m.source_url.clone(),
             params_b: m.params_b,
+            ctx_max: 0,
             enabled_by_default: m.enabled,
         });
     }
@@ -3838,6 +3844,7 @@ async fn placement_propose(
                 url: m.source_url.clone(),
                 size_bytes,
                 params_b: m.params_b,
+                ctx_max: 0,
                 enabled_by_default: m.enabled,
             }
         }

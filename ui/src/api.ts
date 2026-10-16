@@ -747,6 +747,10 @@ export interface ModelRow {
   /** Curated catalog size for this model when known. An ESTIMATE, used
    *  only for display ("~X GB (estimate)"), never for verification. */
   catalog_size_bytes: number | null;
+  /** The model's rated maximum context length in tokens, from the
+   *  curated catalog (null for models outside it). The backend flags
+   *  editor annotates context presets beyond this value. */
+  ctx_max?: number | null;
   fit_check_available: boolean;
 }
 

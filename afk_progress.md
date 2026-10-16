@@ -254,3 +254,25 @@ Fix (manager-wizard steps.rs):
 - Regression tests: working install with the marker lost skips
   download + extraction and rewrites the marker; the extraction
   path issues pg_ctl stop before extracting. 412 workspace tests.
+
+## v0.1.25 — headed overview lists, responsive reflow, topology residency accuracy
+- Overview lists (Backends, GPUs, Models): rebuilt as a shared headed
+  list — column headings, divider lines between rows, and a per-row
+  status/health button (state-colored dot + icon) that scrolls to the
+  item's card and flashes its outline. Models gained its overview list
+  in this release (lifecycle status, serving backends, requests 1h).
+  The Backends overview GPUs column names only GPUs with >= 1 GiB
+  measured residency; context-only presence is labeled as such.
+- Reflow: cards5/cards3 are fluid auto-fit grids; grid2 is two columns
+  when wide and one column at <= 1100px viewport; model cards moved
+  into a fluid grid (view width cap removed); the Service Map wraps
+  under its inspector at <= 1250px; the wizard body stacks at <= 900px.
+- Backend group sections are wrapped in a bordered group box.
+- Service Map: backend->GPU edges no longer drawn from raw
+  per-process attribution (a process holds a CUDA context on every
+  visible GPU, which rendered every backend on every GPU). Solid
+  edges require measured residency >= 1 GiB; live backends without
+  measured residency get dotted configured-placement edges (tensor
+  split, or the main GPU when no split is set); stopped/failed
+  backends get no GPU edges; node subtitles show only real residency
+  figures or "context only"; the legend states the rule.

@@ -896,6 +896,22 @@ async function handlePlanAction(
   }
 }
 
+/** Context-length presets offered by the flags editor (tokens). */
+const CTX_PRESETS = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+/** Batch-size presets offered by the flags editor. */
+const BATCH_PRESETS = [128, 256, 512, 1024, 2048, 4096];
+
+/** 131072 -> "128K"; values under 1024 stay plain. */
+function ctxShort(n: number): string {
+  return n >= 1024 ? `${n / 1024}K` : String(n);
+}
+
+/** Draft state for the in-card flags form, non-null only for the
+ *  backend whose form is open. ctxMax/modelId describe the backend's
+ *  model (its rated context from the catalog), for annotating
+ *  presets beyond the rating. */
+export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null }
+
 function backendCard(
   b: BackendRow,
   openArgv: Set<string>,
@@ -906,6 +922,7 @@ function backendCard(
   models: ModelRow[],
   confirmRemove: Set<string>,
   residency: Map<string, { gpu: number; name: string; mib: number }[]>,
+  flags: FlagsDraft | null,
 ): string {
   const active = b.state === "running" || b.state === "starting";
   // Buttons render disabled while this card's action is in flight.
@@ -993,6 +1010,37 @@ function backendCard(
           .map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
       </div>`
     : (b.configured && b.enabled ? `<div style="font-size:11px;color:var(--text3);margin-top:6px">Gateway stats: no metrics window yet for this backend.</div>` : "");
+  // The flags editor renders inside this card (Pete's request,
+  // 2026-10-16): preset dropdowns built from the model's rated
+  // context, with a Custom numeric input when the value is not a
+  // preset. Field events sync to the wire-level draft state, so the
+  // poll repaint re-renders the form without losing input.
+  const flagsHtml = flags ? `<div style="border-top:1px solid var(--border);margin-top:10px;padding-top:10px">
+      <div style="font-size:12px;font-weight:600">${icon("gear")} Flags for ${esc(b.id)}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px">
+        <label style="font-size:12px;color:var(--text2)">Context length (-c)
+          <span style="display:flex;gap:6px;margin-top:4px">
+            <select data-flags-field="ctx-preset" style="${SELECT_STYLE};flex:1;min-width:0"${dis}>
+              ${CTX_PRESETS.map((v) => `<option value="${v}"${v === flags.ctx ? " selected" : ""}>${v.toLocaleString()} (${ctxShort(v)})${v === 32768 ? " \u2014 default" : ""}${flags.ctxMax && v > flags.ctxMax ? " \u2014 beyond rated" : ""}</option>`).join("")}
+              <option value="custom"${CTX_PRESETS.includes(flags.ctx) ? "" : " selected"}>Custom\u2026</option>
+            </select>
+            ${CTX_PRESETS.includes(flags.ctx) ? "" : `<input data-flags-field="ctx-custom" type="number" value="${flags.ctx}" min="1024" max="1048576" style="${SELECT_STYLE};width:110px"${dis}>`}
+          </span></label>
+        <label style="font-size:12px;color:var(--text2)">Batch size (-b)
+          <span style="display:flex;gap:6px;margin-top:4px">
+            <select data-flags-field="batch-preset" style="${SELECT_STYLE};flex:1;min-width:0"${dis}>
+              ${BATCH_PRESETS.map((v) => `<option value="${v}"${v === flags.batch ? " selected" : ""}>${v.toLocaleString()}${v === 512 ? " \u2014 default" : ""}</option>`).join("")}
+              <option value="custom"${BATCH_PRESETS.includes(flags.batch) ? "" : " selected"}>Custom\u2026</option>
+            </select>
+            ${BATCH_PRESETS.includes(flags.batch) ? "" : `<input data-flags-field="batch-custom" type="number" value="${flags.batch}" min="1" style="${SELECT_STYLE};width:110px"${dis}>`}
+          </span></label>
+      </div>
+      <div style="font-size:12px;color:var(--text2);margin-top:6px">${flags.modelId && flags.ctxMax
+        ? `Model ${esc(flags.modelId)} is rated to ${ctxShort(flags.ctxMax)} context (${flags.ctxMax.toLocaleString()} tokens); larger values are accepted but exceed the rating. `
+        : "Accepted context range: 1,024 to 1,048,576. "}Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Setup wizard's tensor-split step, not here.</div>
+      <div class="card-actions"><button class="btn" data-back-act="flags-save" data-back-id="${esc(b.id)}"${dis}>Save flags</button>
+        <button class="btn" data-back-act="flags-cancel" data-back-id="${esc(b.id)}">Cancel</button></div>
+    </div>` : "";
   return `<div class="card" id="card-backend-${esc(b.id)}">
       <h3>${stateDot(b.state)} ${esc(b.id)} <span class="port">:${b.port}</span>
         <span class="spacer" style="flex:1"></span>
@@ -1013,6 +1061,7 @@ function backendCard(
            ["Uptime", fmtUptime(b.uptime_secs)]]
           .map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
       </div>
+      ${flagsHtml}
       <div class="card-actions">${actions}
         ${b.configured ? `<button class="btn" data-back-act="flags" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Edit flags</button>` : ""}
         <button class="btn" data-back-act="argv" data-back-id="${esc(b.id)}"${dis}>${icon("logs")} Launch command</button></div>
@@ -1046,7 +1095,6 @@ export function renderBackends(): string {
   </div>
   <div id="backPlan"></div>
   <div id="backAddForm"></div>
-  <div id="backFlagsForm"></div>
   <div id="backBody">${loadingHtml("Loading backends\u2026")}</div></div>`;
 }
 
@@ -1148,7 +1196,13 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     b.innerHTML = ordered.map((sec) => `
       <div class="group-box">
       <div class="sec-title" style="margin:0 0 10px">${sec.name !== null ? `Group: ${esc(sec.name)}` : "Ungrouped"} <span style="color:var(--text3);font-weight:400">— ${sec.rows.length} backend${sec.rows.length === 1 ? "" : "s"}</span></div>
-      <div class="grid2">${sorted(sec.rows).map((row) => backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency)).join("")}</div>
+      <div class="grid2">${sorted(sec.rows).map((row) => {
+        const mdl = flagsFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
+        const flagsArg: FlagsDraft | null = flagsFor === row.id
+          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null }
+          : null;
+        return backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency, flagsArg);
+      }).join("")}</div>
       </div>`).join("");
     if (!viewRows.length && lastRows.length) b.innerHTML = emptyHtml("No backends match the current filter.");
   };
@@ -1236,41 +1290,47 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   refreshBtn?.addEventListener("click", onRefresh);
 
   /* ---------------- Flags editor ----------------
-   * Lives in #backFlagsForm, outside the repainted #backBody, for
-   * the same reason as the add form: the poll repaint must not
-   * clobber typed input. */
-  const flagsHost = root.querySelector("#backFlagsForm");
+   * Rendered INSIDE the backend's own card (backendCard, from the
+   * draft state below) — the previous placement above the list read
+   * as if nothing had happened when Edit flags was clicked. The
+   * draft values live outside the repainted DOM, so the poll repaint
+   * cannot clobber an open form: paint() re-renders the form from
+   * this state, and field events sync back into it. */
   let flagsFor: string | null = null;
+  let flagsCtx = 32768;
+  let flagsBatch = 512;
   const closeFlagsForm = (): void => {
     flagsFor = null;
-    if (flagsHost) flagsHost.innerHTML = "";
+    paint();
   };
   const openFlagsForm = (row: BackendRow): void => {
-    if (!flagsHost) return;
     if (flagsFor === row.id) { closeFlagsForm(); return; }
     flagsFor = row.id;
-    flagsHost.innerHTML = `<div class="card"><h3>${icon("gear")} Flags for ${esc(row.id)}</h3>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
-      <label style="font-size:12px;color:var(--text2)">Context length (-c)<br>
-        <input id="flagsCtx" type="number" value="${row.n_ctx ?? 32768}" style="${SELECT_STYLE};width:100%"></label>
-      <label style="font-size:12px;color:var(--text2)">Batch size (-b)<br>
-        <input id="flagsBatch" type="number" value="${row.n_batch ?? 512}" style="${SELECT_STYLE};width:100%"></label>
-    </div>
-    <div class="card-actions"><button class="btn" id="flagsSave">Save flags</button>
-      <button class="btn" id="flagsCancel">Cancel</button></div>
-    <div style="font-size:12px;color:var(--text2);margin-top:6px">Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Setup wizard's tensor-split step, not here.</div></div>`;
-    flagsHost.querySelector("#flagsCancel")?.addEventListener("click", closeFlagsForm);
-    flagsHost.querySelector("#flagsSave")?.addEventListener("click", async () => {
-      const ctxVal = Number((flagsHost.querySelector("#flagsCtx") as HTMLInputElement | null)?.value);
-      const batchVal = Number((flagsHost.querySelector("#flagsBatch") as HTMLInputElement | null)?.value);
-      const r = await updateBackendFlags(row.id, ctxVal, batchVal);
-      if (disposed) return;
-      if (r.error) msgs.set(row.id, { text: `Flags not saved: ${r.error}`, err: true });
-      else msgs.set(row.id, { text: `Flags saved (context ${ctxVal}, batch ${batchVal}) — applies on next start.`, err: false });
-      closeFlagsForm();
-      await load();
-    });
+    flagsCtx = row.n_ctx ?? 32768;
+    flagsBatch = row.n_batch ?? 512;
+    paint();
   };
+  /** Keep the draft in step with the in-card form fields. Preset
+   *  selects repaint (to show or hide the Custom numeric input);
+   *  custom inputs only update the draft. Registered for both
+   *  "change" and "input" so typing is captured before any repaint. */
+  const syncFlagsDraft = (ev: Event): void => {
+    const t = ev.target as HTMLElement;
+    const field = t.getAttribute("data-flags-field");
+    if (!field) return;
+    const val = (t as HTMLInputElement).value;
+    if (field === "ctx-custom") flagsCtx = Number(val);
+    else if (field === "batch-custom") flagsBatch = Number(val);
+    else if (ev.type === "change" && field === "ctx-preset") {
+      if (val !== "custom") flagsCtx = Number(val);
+      paint();
+    } else if (ev.type === "change" && field === "batch-preset") {
+      if (val !== "custom") flagsBatch = Number(val);
+      paint();
+    }
+  };
+  root.addEventListener("change", syncFlagsDraft);
+  root.addEventListener("input", syncFlagsDraft);
 
   /* ---------------- Add backend form ----------------
    * Lives in #backAddForm, outside the repainted #backBody, so the
@@ -1366,6 +1426,27 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     if (act === "flags") {
       const row = lastRows.find((r) => r.id === id);
       if (row) openFlagsForm(row);
+      return;
+    }
+
+    if (act === "flags-cancel") {
+      closeFlagsForm();
+      return;
+    }
+
+    if (act === "flags-save") {
+      const r = await updateBackendFlags(id, flagsCtx, flagsBatch);
+      if (disposed) return;
+      if (r.error) {
+        // Keep the form open with the error on the card — closing on
+        // a rejected value would read as if the save had happened.
+        msgs.set(id, { text: `Flags not saved: ${r.error}`, err: true });
+        paint();
+      } else {
+        msgs.set(id, { text: `Flags saved (context ${flagsCtx.toLocaleString()}, batch ${flagsBatch}) — applies on next start.`, err: false });
+        flagsFor = null;
+        await load();
+      }
       return;
     }
 
@@ -1500,6 +1581,8 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     root.removeEventListener("click", onClick);
     root.removeEventListener("click", onOvGoto);
     root.removeEventListener("change", onModelChange);
+    root.removeEventListener("change", syncFlagsDraft);
+    root.removeEventListener("input", syncFlagsDraft);
     refreshBtn?.removeEventListener("click", onRefresh);
   };
 }
