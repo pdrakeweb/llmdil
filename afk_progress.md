@@ -224,3 +224,33 @@ stat fields rendered as unexplained blanks; and raw floats
   format through it. The UI mirrors the rules in charts.ts
   (trim1/fmtGb) applied to every VRAM/GB figure, throughput rate,
   and step duration — the console view now reads 15.1/16 GB.
+
+## v0.1.24 — install-postgres re-run over a live install (locked DLL)
+
+Pete's report (Oct 16, 2026, 00:09 EDT): re-running the
+install-postgres step failed with "I/O error for
+...\postgres\bin\icudt77.dll: The process cannot access the file
+because it is being used by another process (os error 32)". His
+install was complete and the server running (the gateway uses it);
+the step's skip-extraction guard required the .installed.json
+marker, which was missing on his machine, so the step fell through
+to re-extracting the distribution zip over the running server's
+bin directory and Windows refused the overwrite of a loaded DLL.
+
+Fix (manager-wizard steps.rs):
+- The skip guard now keys on the ground truth: binaries present
+  plus (marker OR initialized cluster). The marker is rewritten at
+  the end of the run, restoring it.
+- postgres_installed accepts the same evidence (binaries + marker
+  or PG_VERSION) everywhere it is consulted — the audit no longer
+  reports a working, marker-less install as "not installed", and
+  start-gateway no longer withholds DATABASE_URL over a lost
+  marker.
+- When re-extraction genuinely is required, the step stops a
+  running server first (pg_isready is the probe; pg_ctl stop -m
+  fast) and restarts it through the existing
+  ensure_postgres_running later in the same run; a failed stop
+  returns a clear instruction instead of the DLL lock error.
+- Regression tests: working install with the marker lost skips
+  download + extraction and rewrites the marker; the extraction
+  path issues pg_ctl stop before extracting. 412 workspace tests.

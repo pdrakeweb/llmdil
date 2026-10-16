@@ -1870,12 +1870,22 @@ pub fn postgres_database_url(config: &AppConfig, password: &str) -> String {
     )
 }
 
-/// Whether the install-postgres step has completed: marker present
-/// and the server binaries in place.
+/// Whether the install-postgres step has completed: the server
+/// binaries in place, and either the install marker or an
+/// initialized cluster. The marker is bookkeeping the step writes
+/// last; a lost marker must not strand a working install (the step
+/// rewrites it on its next run), so the binaries plus the cluster
+/// are accepted as the ground truth.
 pub async fn postgres_installed(ops: &dyn SystemOps, data_dir: &Path) -> bool {
+    if !ops
+        .file_exists(&postgres_bin_dir(data_dir).join("pg_ctl.exe"))
+        .await
+    {
+        return false;
+    }
     ops.file_exists(&postgres_marker_path(data_dir)).await
-        && ops
-            .file_exists(&postgres_bin_dir(data_dir).join("pg_ctl.exe"))
+        || ops
+            .file_exists(&postgres_data_dir(data_dir).join("PG_VERSION"))
             .await
 }
 
@@ -2167,11 +2177,16 @@ impl WizardStep for InstallPostgres {
         }
 
         // Binaries: download + verify + selective extraction.
+        // Skipped when the binaries are in place and either the
+        // marker or an initialized cluster proves the install
+        // completed — re-extracting over an installed tree is what
+        // locked-DLL failures come from (see the stop below).
         if self.binaries_present(ctx).await
-            && ctx
+            && (ctx
                 .ops
                 .file_exists(&postgres_marker_path(&ctx.data_dir))
                 .await
+                || self.cluster_initialized(ctx).await)
         {
             log.push("PostgreSQL binaries already installed".to_string());
         } else {
@@ -2210,6 +2225,34 @@ impl WizardStep for InstallPostgres {
                     "{} already present with matching checksum",
                     pin.asset
                 ));
+            }
+            // A running server holds its DLLs open; extracting over
+            // them fails with a sharing violation (os error 32).
+            // pg_isready is the ground truth for "a server is up" —
+            // stop it first; the flow below restarts it via
+            // ensure_postgres_running.
+            if postgres_ready(ctx.ops.as_ref(), &ctx.config, &ctx.data_dir).await {
+                log.push(
+                    "PostgreSQL is running; stopping it before replacing its binaries (it restarts below)"
+                        .to_string(),
+                );
+                let stop = pg_ctl_command(&ctx.data_dir, &["stop", "-m", "fast"]);
+                match ctx.ops.run_command(&stop).await {
+                    Ok(out) if out.exit_code == 0 => {}
+                    Ok(out) => {
+                        return Ok(StepOutcome::failed(
+                            format!(
+                                "could not stop the running PostgreSQL server before replacing its binaries (pg_ctl exit {}): {} — stop the gateway and re-run this step",
+                                out.exit_code,
+                                out.stderr.trim()
+                            ),
+                            log,
+                        ));
+                    }
+                    Err(e) => {
+                        return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
+                    }
+                }
             }
             if let Err(e) = ctx
                 .ops
@@ -7293,6 +7336,63 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&marker).unwrap();
         assert_eq!(v["database"], "litellm");
         assert_eq!(v["port"], 54329);
+    }
+
+    #[tokio::test]
+    async fn install_postgres_skips_extraction_without_marker_when_cluster_present() {
+        // Pete's machine, 2026-10-16: a working install whose
+        // .installed.json marker was lost. Binaries + initialized
+        // cluster are the ground truth — the step must not
+        // re-extract over the running server's DLLs; it rewrites
+        // the marker and completes.
+        let ops = Arc::new(FakeSystemOps::new());
+        let pin = pg_pin_for(b"unused");
+        for exe in [
+            "pg_ctl.exe",
+            "initdb.exe",
+            "postgres.exe",
+            "psql.exe",
+            "createdb.exe",
+        ] {
+            ops.with_file(PathBuf::from("/data/postgres/bin").join(exe), b"x".to_vec());
+        }
+        ops.with_file(
+            PathBuf::from("/data/postgres/data/PG_VERSION"),
+            b"18\n".to_vec(),
+        );
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = InstallPostgres::with_pin(pin).run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(ops.zip_prefix_extractions().is_empty());
+        assert!(ops.downloaded_to().is_empty());
+        assert!(
+            ops.file_bytes(&PathBuf::from("/data/postgres/.installed.json"))
+                .is_some(),
+            "marker rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_postgres_stops_running_server_before_extract() {
+        // Re-extraction IS required (no cluster yet), and the fake
+        // reports the server ready (its run_command succeeds for
+        // pg_isready): the step must issue pg_ctl stop before
+        // extracting, or the real extraction dies on locked DLLs.
+        let ops = Arc::new(FakeSystemOps::new());
+        let zip = b"fake-pg-zip";
+        let pin = pg_pin_for(zip);
+        ops.with_download(&pin.url(), zip.to_vec());
+        stage_pg_binaries(&ops);
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = InstallPostgres::with_pin(pin).run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert_eq!(ops.zip_prefix_extractions().len(), 1);
+        let executed = ops.executed_commands();
+        let stop = executed
+            .iter()
+            .find(|a| a.iter().any(|x| x.ends_with("pg_ctl.exe")) && a.iter().any(|x| x == "stop"))
+            .expect("pg_ctl stop issued before extraction");
+        assert!(stop.iter().any(|x| x == "fast"), "{stop:?}");
     }
 
     #[tokio::test]
