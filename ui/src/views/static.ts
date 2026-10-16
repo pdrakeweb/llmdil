@@ -1192,7 +1192,7 @@ export function renderModels(): string {
         <input id="addModelQuant" type="text" placeholder="Q4_K_M" style="${SELECT_STYLE};width:100%"></label>
     </div>
     <label style="font-size:12px;color:var(--text2);display:block;margin-top:10px">GGUF source URL (https)<br>
-      <input id="addModelUrl" type="text" placeholder="https://huggingface.co/…/model.gguf" style="${SELECT_STYLE};width:100%"></label>
+      <input id="addModelUrl" type="text" placeholder="Model download URL (.gguf)" style="${SELECT_STYLE};width:100%"></label>
     <label style="font-size:12px;color:var(--text2);display:block;margin-top:10px">File name (optional — defaults to the URL's file name)<br>
       <input id="addModelFile" type="text" placeholder="model.gguf" style="${SELECT_STYLE};width:100%"></label>
     <div class="card-actions"><button class="btn" id="addModelBtn">Add model</button></div>
@@ -2562,6 +2562,15 @@ export function wireWizard(root: HTMLElement): () => void {
     paint();
     try {
       await refresh();
+      // This run skips already-complete steps entirely, so their
+      // state is final rather than stale: seed freshIds with them so
+      // paintWizard keeps rendering them as done instead of blanking
+      // them to "queued" for the whole run (which read as the run
+      // resetting every completed step). Only steps that will
+      // actually execute blank until they produce a result.
+      for (const s of steps) {
+        if (s.state === "done" || s.state === "manual" || s.state === "skipped") freshIds.add(s.id);
+      }
       let paused: string | null = null;
       let busyStop = false;
       for (const s of [...steps]) {
