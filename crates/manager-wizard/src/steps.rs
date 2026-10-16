@@ -518,6 +518,7 @@ pub const STEP_DETECT_HARDWARE: &str = "detect-hardware";
 pub const STEP_INSTALL_LLAMACPP: &str = "install-llamacpp";
 pub const STEP_CONFIGURE_TENSOR_SPLIT: &str = "configure-tensor-split";
 pub const STEP_DOWNLOAD_MODELS: &str = "download-models";
+pub const STEP_INSTALL_POSTGRES: &str = "install-postgres";
 pub const STEP_START_GATEWAY: &str = "start-gateway";
 pub const STEP_VSCODE_EXTENSIONS: &str = "vscode-extensions";
 pub const STEP_MCP_SERVERS: &str = "mcp-servers";
@@ -551,6 +552,7 @@ pub fn default_steps() -> Vec<Box<dyn WizardStep>> {
         Box::new(InstallLlamaCpp::with_pin(LlamaCppPin::default_pin())),
         Box::new(ConfigureTensorSplit),
         Box::new(DownloadModels),
+        Box::new(InstallPostgres::with_pin(PostgresPin::default_pin())),
         Box::new(StartGateway::default()),
         Box::new(VscodeExtensions::default()),
         Box::new(McpServers),
@@ -1557,10 +1559,564 @@ impl DownloadModels {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Start LiteLLM gateway
+// 5. App-managed PostgreSQL
 // ---------------------------------------------------------------------------
 
-/// Step 5: bootstrap the managed Python env (uv), generate `config.yaml`
+/// The pinned PostgreSQL distribution (EnterpriseDB binaries zip).
+/// The hash is self-computed from the downloaded artifact (Oct 15,
+/// 2026): EDB publishes no official SHA-256 for these zips — the
+/// same trust model as the llama.cpp pins.
+#[derive(Debug, Clone)]
+pub struct PostgresPin {
+    pub version: String,
+    pub asset: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+impl PostgresPin {
+    pub fn default_pin() -> Self {
+        Self {
+            version: "18.6-1".to_string(),
+            asset: "postgresql-18.6-1-windows-x64-binaries.zip".to_string(),
+            sha256: "fbe23da234ee31547bf8a36d29dfd81e82b849df2d2b78d2eecb43d360252f8c".to_string(),
+            size: 343_808_005,
+        }
+    }
+
+    pub fn url(&self) -> String {
+        format!("https://get.enterprisedb.com/postgresql/{}", self.asset)
+    }
+}
+
+/// Root of the app-managed PostgreSQL install: `<data_dir>/postgres`.
+pub fn postgres_root(data_dir: &Path) -> PathBuf {
+    data_dir.join("postgres")
+}
+
+/// `<data_dir>/postgres/bin` — the extracted server binaries.
+pub fn postgres_bin_dir(data_dir: &Path) -> PathBuf {
+    postgres_root(data_dir).join("bin")
+}
+
+/// `<data_dir>/postgres/data` — the database cluster directory.
+pub fn postgres_data_dir(data_dir: &Path) -> PathBuf {
+    postgres_root(data_dir).join("data")
+}
+
+fn postgres_marker_path(data_dir: &Path) -> PathBuf {
+    postgres_root(data_dir).join(".installed.json")
+}
+
+fn postgres_zip_path(data_dir: &Path, pin: &PostgresPin) -> PathBuf {
+    postgres_root(data_dir).join("downloads").join(&pin.asset)
+}
+
+/// The server's own log file, in the app's logs directory alongside
+/// the gateway logs (`pg_ctl -l` appends there).
+pub fn postgres_log_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("logs").join("postgres.log")
+}
+
+/// The database the gateway uses.
+pub const POSTGRES_DATABASE: &str = "litellm";
+
+/// The `DATABASE_URL` the gateway receives: the password is
+/// generated hex (URL-safe by construction, no percent-encoding),
+/// the user is the cluster superuser, the database is
+/// [`POSTGRES_DATABASE`].
+pub fn postgres_database_url(config: &AppConfig, password: &str) -> String {
+    format!(
+        "postgresql://postgres:{password}@127.0.0.1:{}/{POSTGRES_DATABASE}",
+        config.postgres.port
+    )
+}
+
+/// Whether the install-postgres step has completed: marker present
+/// and the server binaries in place.
+pub async fn postgres_installed(ops: &dyn SystemOps, data_dir: &Path) -> bool {
+    ops.file_exists(&postgres_marker_path(data_dir)).await
+        && ops
+            .file_exists(&postgres_bin_dir(data_dir).join("pg_ctl.exe"))
+            .await
+}
+
+async fn postgres_ready(ops: &dyn SystemOps, config: &AppConfig, data_dir: &Path) -> bool {
+    let cmd = PlannedCommand::new(vec![
+        postgres_bin_dir(data_dir)
+            .join("pg_isready.exe")
+            .display()
+            .to_string(),
+        "-h".to_string(),
+        "127.0.0.1".to_string(),
+        "-p".to_string(),
+        config.postgres.port.to_string(),
+    ]);
+    matches!(ops.run_command(&cmd).await, Ok(out) if out.exit_code == 0)
+}
+
+async fn postgres_log_tail(ops: &dyn SystemOps, data_dir: &Path) -> String {
+    match ops.read_file(&postgres_log_path(data_dir)).await {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let lines: Vec<&str> = text.lines().collect();
+            let tail = &lines[lines.len().saturating_sub(15)..];
+            tail.join("\n")
+        }
+        Err(_) => "(no server log yet)".to_string(),
+    }
+}
+
+fn pg_ctl_command(data_dir: &Path, args: &[&str]) -> PlannedCommand {
+    let mut argv = vec![
+        postgres_bin_dir(data_dir)
+            .join("pg_ctl.exe")
+            .display()
+            .to_string(),
+        "-D".to_string(),
+        postgres_data_dir(data_dir).display().to_string(),
+    ];
+    argv.extend(args.iter().map(|a| a.to_string()));
+    PlannedCommand::new(argv)
+}
+
+/// Start the app-managed PostgreSQL server if it is not already
+/// accepting connections, and return the gateway's `DATABASE_URL`.
+/// The caller must have established [`postgres_installed`] first.
+/// Failure carries the server log tail: the decisive case is
+/// PostgreSQL's refusal to run under an administrative token, which
+/// is recorded in that log verbatim.
+pub async fn ensure_postgres_running(
+    ops: &dyn SystemOps,
+    config: &AppConfig,
+    data_dir: &Path,
+    log: &mut Vec<String>,
+) -> Result<String, String> {
+    let password = crate::ensure_postgres_password(ops)
+        .await
+        .map_err(|e| format!("could not obtain the PostgreSQL password: {e}"))?;
+    let url = postgres_database_url(config, &password);
+    if postgres_ready(ops, config, data_dir).await {
+        log.push(format!(
+            "PostgreSQL already running on 127.0.0.1:{}",
+            config.postgres.port
+        ));
+        return Ok(url);
+    }
+    let port_opt = format!("-p {} -h 127.0.0.1", config.postgres.port);
+    let log_arg = postgres_log_path(data_dir).display().to_string();
+    let start = pg_ctl_command(data_dir, &["-l", &log_arg, "-o", &port_opt, "start"]);
+    match ops.run_command(&start).await {
+        Ok(out) if out.exit_code == 0 => {
+            log.push(format!(
+                "PostgreSQL started on 127.0.0.1:{} (log: {})",
+                config.postgres.port,
+                postgres_log_path(data_dir).display()
+            ));
+        }
+        Ok(out) => {
+            let tail = postgres_log_tail(ops, data_dir).await;
+            return Err(format!(
+                "PostgreSQL failed to start (pg_ctl exit {}): {} — server log tail:\n{tail}",
+                out.exit_code,
+                out.stderr.trim()
+            ));
+        }
+        Err(e) => return Err(format!("PostgreSQL failed to start: {e}")),
+    }
+    // pg_ctl waits for readiness itself; poll pg_isready briefly for
+    // the definitive signal.
+    for _ in 0..30 {
+        if postgres_ready(ops, config, data_dir).await {
+            return Ok(url);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let tail = postgres_log_tail(ops, data_dir).await;
+    Err(format!(
+        "PostgreSQL did not become ready on 127.0.0.1:{} — server log tail:\n{tail}",
+        config.postgres.port
+    ))
+}
+
+/// Stop the app-managed PostgreSQL server (`pg_ctl stop -m fast`:
+/// rolls back in-flight transactions, disconnects clients,
+/// checkpoints, exits). Best-effort semantics for shutdown paths:
+/// Ok(true) when a running server was stopped, Ok(false) when it was
+/// not installed or not running.
+pub async fn stop_postgres_server(
+    ops: &dyn SystemOps,
+    data_dir: &Path,
+) -> Result<bool, WizardError> {
+    if !postgres_installed(ops, data_dir).await {
+        return Ok(false);
+    }
+    let stop = pg_ctl_command(data_dir, &["stop", "-m", "fast"]);
+    match ops.run_command(&stop).await {
+        Ok(out) if out.exit_code == 0 => Ok(true),
+        // "no server running" exits non-zero: the desired end state.
+        Ok(_) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Step 5: install the pinned PostgreSQL binaries under the app
+/// data dir, initialize the database cluster, and start the server
+/// the LiteLLM gateway uses as its database (Pete's decision,
+/// 2026-10-15: the LiteLLM admin UI cannot be logged into at all
+/// without one — its schema is PostgreSQL-only). Only `bin`, `lib`,
+/// `share`, and `include` are extracted from the distribution zip;
+/// the rest (pgAdmin alone is ~684 MB) is dead weight.
+pub struct InstallPostgres {
+    pub pin: Option<PostgresPin>,
+}
+
+impl InstallPostgres {
+    pub fn unconfigured() -> Self {
+        Self { pin: None }
+    }
+    pub fn with_pin(pin: PostgresPin) -> Self {
+        Self { pin: Some(pin) }
+    }
+
+    async fn binaries_present(&self, ctx: &WizardContext) -> bool {
+        let bin = postgres_bin_dir(&ctx.data_dir);
+        for exe in [
+            "pg_ctl.exe",
+            "initdb.exe",
+            "postgres.exe",
+            "psql.exe",
+            "createdb.exe",
+        ] {
+            if !ctx.ops.file_exists(&bin.join(exe)).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn cluster_initialized(&self, ctx: &WizardContext) -> bool {
+        // PG_VERSION is written by initdb and identifies a cluster.
+        ctx.ops
+            .file_exists(&postgres_data_dir(&ctx.data_dir).join("PG_VERSION"))
+            .await
+    }
+
+    fn initdb_command(&self, ctx: &WizardContext) -> PlannedCommand {
+        PlannedCommand::new(vec![
+            postgres_bin_dir(&ctx.data_dir)
+                .join("initdb.exe")
+                .display()
+                .to_string(),
+            "-D".to_string(),
+            postgres_data_dir(&ctx.data_dir).display().to_string(),
+            "-U".to_string(),
+            "postgres".to_string(),
+            "-A".to_string(),
+            "scram-sha-256".to_string(),
+            "--pwfile".to_string(),
+            postgres_root(&ctx.data_dir)
+                .join("pwfile.tmp")
+                .display()
+                .to_string(),
+            "-E".to_string(),
+            "UTF8".to_string(),
+        ])
+    }
+
+    fn createdb_command(&self, ctx: &WizardContext) -> PlannedCommand {
+        PlannedCommand::new(vec![
+            postgres_bin_dir(&ctx.data_dir)
+                .join("createdb.exe")
+                .display()
+                .to_string(),
+            "-h".to_string(),
+            "127.0.0.1".to_string(),
+            "-p".to_string(),
+            ctx.config.postgres.port.to_string(),
+            "-U".to_string(),
+            "postgres".to_string(),
+            POSTGRES_DATABASE.to_string(),
+        ])
+    }
+}
+
+#[async_trait]
+impl WizardStep for InstallPostgres {
+    fn id(&self) -> &str {
+        STEP_INSTALL_POSTGRES
+    }
+    fn name(&self) -> &str {
+        "Install PostgreSQL (gateway database)"
+    }
+    fn prerequisites(&self) -> Vec<String> {
+        vec![STEP_DETECT_HARDWARE.to_string()]
+    }
+    fn is_check(&self) -> bool {
+        true
+    }
+    fn planned_commands(&self, ctx: &WizardContext) -> Vec<PlannedCommand> {
+        let Some(pin) = self.pin.as_ref() else {
+            return Vec::new();
+        };
+        let port_opt = format!("-p {} -h 127.0.0.1", ctx.config.postgres.port);
+        let log_arg = postgres_log_path(&ctx.data_dir).display().to_string();
+        vec![
+            PlannedCommand::new(vec![
+                "download".to_string(),
+                pin.url(),
+                postgres_zip_path(&ctx.data_dir, pin).display().to_string(),
+            ]),
+            self.initdb_command(ctx),
+            pg_ctl_command(&ctx.data_dir, &["-l", &log_arg, "-o", &port_opt, "start"]),
+            self.createdb_command(ctx),
+        ]
+    }
+    fn remediation_hint(&self) -> Option<&str> {
+        Some("re-run install-postgres; if the server refuses to start, check the PostgreSQL log under the data dir's logs folder (running the manager itself elevated prevents PostgreSQL from starting)")
+    }
+    async fn run(&self, ctx: &WizardContext) -> Result<StepOutcome, WizardError> {
+        let pin = match &self.pin {
+            Some(p) => p.clone(),
+            None => {
+                return Ok(StepOutcome::failed(
+                    "no PostgreSQL build pinned",
+                    vec![
+                        "this build ships without a built-in PostgreSQL pin; that is a packaging error in the app, not a configuration problem".to_string(),
+                        "failing closed: will not download an unpinned database server".to_string(),
+                    ],
+                ))
+            }
+        };
+        let mut log = vec![format!(
+            "pinned PostgreSQL: {} ({})",
+            pin.version, pin.asset
+        )];
+
+        match ctx.mode {
+            RunMode::Audit => {
+                let mut problems = Vec::new();
+                if !ctx
+                    .ops
+                    .file_exists(&postgres_marker_path(&ctx.data_dir))
+                    .await
+                {
+                    problems.push(
+                        "PostgreSQL not installed; run the install-postgres step".to_string(),
+                    );
+                }
+                if !self.binaries_present(ctx).await {
+                    problems.push("PostgreSQL binaries missing or incomplete".to_string());
+                }
+                if !self.cluster_initialized(ctx).await {
+                    problems.push("database cluster not initialized".to_string());
+                }
+                if problems.is_empty() {
+                    return Ok(StepOutcome::done(
+                        format!(
+                            "PostgreSQL {} verified (binaries and cluster present)",
+                            pin.version
+                        ),
+                        log,
+                    ));
+                }
+                return Ok(StepOutcome::failed(
+                    format!("PostgreSQL setup incomplete: {}", problems.join("; ")),
+                    log,
+                ));
+            }
+            RunMode::Install => {}
+        }
+
+        // Binaries: download + verify + selective extraction.
+        if self.binaries_present(ctx).await
+            && ctx
+                .ops
+                .file_exists(&postgres_marker_path(&ctx.data_dir))
+                .await
+        {
+            log.push("PostgreSQL binaries already installed".to_string());
+        } else {
+            let zip = postgres_zip_path(&ctx.data_dir, &pin);
+            let zip_ok = ctx.ops.file_exists(&zip).await
+                && matches!(ctx.ops.sha256_file(&zip).await, Ok(h) if checksums_match(&h, &pin.sha256));
+            if !zip_ok {
+                let url = pin.url();
+                log.push(format!("downloading {url}"));
+                match ctx.ops.download(&url, &zip, &|_, _| {}).await {
+                    Ok(bytes) => log.push(format!("downloaded {bytes} bytes")),
+                    Err(e) => {
+                        return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
+                    }
+                }
+                let actual = match ctx.ops.sha256_file(&zip).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
+                    }
+                };
+                if !checksums_match(&actual, &pin.sha256) {
+                    return Ok(StepOutcome::failed(
+                        format!(
+                            "checksum mismatch for {}: expected {}, got {}",
+                            zip.display(),
+                            pin.sha256,
+                            actual
+                        ),
+                        vec!["distribution rejected; not installed".to_string()],
+                    ));
+                }
+                log.push(format!("SHA-256 verified for {}", pin.asset));
+            } else {
+                log.push(format!(
+                    "{} already present with matching checksum",
+                    pin.asset
+                ));
+            }
+            if let Err(e) = ctx
+                .ops
+                .extract_zip_prefixes(
+                    &zip,
+                    &postgres_root(&ctx.data_dir),
+                    &["pgsql/bin/", "pgsql/lib/", "pgsql/share/", "pgsql/include/"],
+                    "pgsql/",
+                )
+                .await
+            {
+                return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
+            }
+            log.push(format!(
+                "extracted bin/lib/share/include to {}",
+                postgres_root(&ctx.data_dir).display()
+            ));
+            if !self.binaries_present(ctx).await {
+                return Ok(StepOutcome::failed(
+                    "extraction did not produce the pinned PostgreSQL binaries",
+                    vec![
+                        format!("expected pg_ctl.exe, initdb.exe, postgres.exe, psql.exe, createdb.exe under {}", postgres_bin_dir(&ctx.data_dir).display()),
+                        "the distribution verified against its pin, so its layout differs from the pinned build's — failing closed".to_string(),
+                    ],
+                ));
+            }
+        }
+
+        // The database password: generated once, stored in
+        // Credential Manager, reused forever after (the cluster is
+        // initialized with it; rotating it would lock the gateway
+        // out of its own database).
+        let password = match crate::ensure_postgres_password(ctx.ops.as_ref()).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(StepOutcome::failed(
+                    format!(
+                    "could not store the PostgreSQL password in Windows Credential Manager: {e}"
+                ),
+                    vec![format!("{e:?}")],
+                ))
+            }
+        };
+
+        // Cluster initialization (once).
+        if self.cluster_initialized(ctx).await {
+            log.push("database cluster already initialized".to_string());
+        } else {
+            let pwfile = postgres_root(&ctx.data_dir).join("pwfile.tmp");
+            if let Err(e) = ctx
+                .ops
+                .write_file(&pwfile, format!("{password}\n").as_bytes())
+                .await
+            {
+                return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
+            }
+            let initdb = self.initdb_command(ctx);
+            let result = ctx.ops.run_command(&initdb).await;
+            // The password file is single-use: always remove it.
+            let _ = ctx.ops.remove_file(&pwfile).await;
+            match result {
+                Ok(out) if out.exit_code == 0 => {
+                    log.push(
+                        "database cluster initialized (superuser postgres, scram-sha-256, UTF8)"
+                            .to_string(),
+                    );
+                }
+                Ok(out) => {
+                    return Ok(StepOutcome::failed(
+                        format!(
+                            "initdb failed (exit {}): {}",
+                            out.exit_code,
+                            out.stderr.trim()
+                        ),
+                        {
+                            let mut l = log.clone();
+                            l.push(out.stdout.clone());
+                            l
+                        },
+                    ));
+                }
+                Err(e) => return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")])),
+            }
+        }
+
+        // Start the server and create the gateway's database.
+        if let Err(e) =
+            ensure_postgres_running(ctx.ops.as_ref(), &ctx.config, &ctx.data_dir, &mut log).await
+        {
+            return Ok(StepOutcome::failed(e, log));
+        }
+        let mut createdb = self.createdb_command(ctx);
+        createdb.env.insert("PGPASSWORD".to_string(), password);
+        match ctx.ops.run_command(&createdb).await {
+            Ok(out) if out.exit_code == 0 => {
+                log.push(format!("database {POSTGRES_DATABASE} created"));
+            }
+            Ok(out) if out.stderr.contains("already exists") => {
+                log.push(format!("database {POSTGRES_DATABASE} already exists"));
+            }
+            Ok(out) => {
+                return Ok(StepOutcome::failed(
+                    format!(
+                        "createdb failed (exit {}): {}",
+                        out.exit_code,
+                        out.stderr.trim()
+                    ),
+                    log,
+                ));
+            }
+            Err(e) => return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")])),
+        }
+
+        let marker = serde_json::json!({
+            "version": pin.version,
+            "sha256": pin.sha256,
+            "port": ctx.config.postgres.port,
+            "database": POSTGRES_DATABASE,
+            "at": chrono::Utc::now().to_rfc3339(),
+        });
+        if let Err(e) = ctx
+            .ops
+            .write_file(
+                &postgres_marker_path(&ctx.data_dir),
+                json_pretty(&marker).as_bytes(),
+            )
+            .await
+        {
+            return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
+        }
+        Ok(StepOutcome::done(
+            format!(
+                "PostgreSQL {} running on 127.0.0.1:{} (database {POSTGRES_DATABASE})",
+                pin.version, ctx.config.postgres.port
+            ),
+            log,
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. Start LiteLLM gateway
+// ---------------------------------------------------------------------------
+
+/// Step 6: bootstrap the managed Python env (uv), generate `config.yaml`
 /// from the app config, spawn LiteLLM on :4000, health-check.
 pub struct StartGateway {
     pub health_retries: u32,
@@ -1914,6 +2470,7 @@ impl StartGateway {
     async fn spawn_command_with_env(
         &self,
         ctx: &WizardContext,
+        database_url: Option<&str>,
     ) -> Result<(PlannedCommand, Option<String>), StepOutcome> {
         let mut cmd = self.spawn_command(ctx);
         // The master key is unconditional: current LiteLLM refuses
@@ -1921,6 +2478,14 @@ impl StartGateway {
         // here rather than spawning a gateway that exits at startup.
         let master_key = self.ensure_master_key(ctx).await?;
         cmd.env.insert("LITELLM_MASTER_KEY".to_string(), master_key);
+        // The database URL is present exactly when the app-managed
+        // PostgreSQL is installed and running (the caller started
+        // it). With it, LiteLLM migrates its schema at startup and
+        // the admin UI can be logged into; without it the gateway
+        // runs database-free, as before PostgreSQL support.
+        if let Some(url) = database_url {
+            cmd.env.insert("DATABASE_URL".to_string(), url.to_string());
+        }
         let tier = &ctx.config.gateway.openrouter;
         if !tier.enabled {
             return Ok((cmd, None));
@@ -2230,7 +2795,58 @@ impl WizardStep for StartGateway {
                 if let Err(outcome) = self.stop_previous_gateway(ctx, &mut log).await {
                     return Ok(outcome);
                 }
-                let (mut spawn, openrouter_warning) = match self.spawn_command_with_env(ctx).await {
+                // App-managed PostgreSQL: when install-postgres has
+                // run, the server must be up before the gateway
+                // spawns — the gateway receives DATABASE_URL and
+                // migrates against it at startup. Not installed →
+                // no DATABASE_URL, the pre-PostgreSQL behavior.
+                let database_url = if postgres_installed(ctx.ops.as_ref(), &ctx.data_dir).await {
+                    match ensure_postgres_running(
+                        ctx.ops.as_ref(),
+                        &ctx.config,
+                        &ctx.data_dir,
+                        &mut log,
+                    )
+                    .await
+                    {
+                        Ok(url) => {
+                            // Pre-warm the Prisma toolchain: its
+                            // first use downloads a Node runtime, so
+                            // a bootstrap failure should surface
+                            // here in the wizard, not at gateway
+                            // startup. Non-fatal — the gateway start
+                            // itself is the real attempt.
+                            let python = self.venv_python(ctx);
+                            let mut warm = PlannedCommand::new(vec![
+                                python.display().to_string(),
+                                "-m".to_string(),
+                                "prisma".to_string(),
+                                "--version".to_string(),
+                            ]);
+                            warm.env.insert("DATABASE_URL".to_string(), url.clone());
+                            match ctx.ops.run_command(&warm).await {
+                                Ok(out) if out.exit_code == 0 => {
+                                    log.push("Prisma toolchain ready".to_string())
+                                }
+                                Ok(out) => log.push(format!(
+                                    "warning: Prisma toolchain pre-warm exited {}; the gateway's first database migration may be slow or fail — see the gateway log",
+                                    out.exit_code
+                                )),
+                                Err(e) => log.push(format!(
+                                    "warning: Prisma toolchain pre-warm could not run: {e}"
+                                )),
+                            }
+                            Some(url)
+                        }
+                        Err(e) => return Ok(StepOutcome::failed(e, log)),
+                    }
+                } else {
+                    None
+                };
+                let (mut spawn, openrouter_warning) = match self
+                    .spawn_command_with_env(ctx, database_url.as_deref())
+                    .await
+                {
                     Ok(pair) => pair,
                     Err(outcome) => return Ok(outcome),
                 };
@@ -2316,10 +2932,10 @@ impl WizardStep for StartGateway {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Install VS Code extensions
+// 7. Install VS Code extensions
 // ---------------------------------------------------------------------------
 
-/// Step 6: install Continue.dev + Cline, write the Continue config pointing
+/// Step 7: install Continue.dev + Cline, write the Continue config pointing
 /// at the local gateway.
 pub struct VscodeExtensions {
     pub extensions: Vec<String>,
@@ -2778,14 +3394,14 @@ impl WizardStep for VscodeExtensions {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Configure MCP servers
+// 8. Configure MCP servers
 // ---------------------------------------------------------------------------
 
 /// Credential Manager targets. Values are never read — presence only.
 pub const GITHUB_CRED_TARGET: &str = "local-llm-service-manager/github-mcp";
 pub const GDRIVE_CRED_TARGET: &str = "local-llm-service-manager/gdrive-mcp";
 
-/// Step 7: write the MCP server config (GitHub + Google Drive) with
+/// Step 8: write the MCP server config (GitHub + Google Drive) with
 /// credential *references*; verify the credentials exist.
 pub struct McpServers;
 
@@ -2866,10 +3482,10 @@ impl WizardStep for McpServers {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Register Windows ML backend
+// 9. Register Windows ML backend
 // ---------------------------------------------------------------------------
 
-/// Step 8: probe WinMLServer, validate the model class, record the
+/// Step 9: probe WinMLServer, validate the model class, record the
 /// registration with the researched limits verbatim.
 pub struct WinMlRegister;
 
@@ -2985,7 +3601,7 @@ impl WizardStep for WinMlRegister {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Install MXC runtime
+// 10. Install MXC runtime
 // ---------------------------------------------------------------------------
 
 /// Verified pin for the Microsoft MXC SDK distribution the wizard
@@ -3058,7 +3674,7 @@ async fn resolve_wxc_exec(ctx: &WizardContext) -> String {
     }
 }
 
-/// Step 9: install the MXC runtime (pinned `@microsoft/mxc-sdk`
+/// Step 10: install the MXC runtime (pinned `@microsoft/mxc-sdk`
 /// binaries) under the app data dir and run the one-time elevated
 /// host preparation. MXC is installed for setup completeness — Pete's
 /// decision (2026-10-15): nothing in the app routes MCP launches
@@ -3385,10 +4001,10 @@ impl WizardStep for InstallMxc {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Apply MXC policies
+// 11. Apply MXC policies
 // ---------------------------------------------------------------------------
 
-/// Step 10: probe MXC, write the default policy JSON, validate it,
+/// Step 11: probe MXC, write the default policy JSON, validate it,
 /// run a harmless sandboxed self-test.
 pub struct MxcPolicies;
 
@@ -3585,13 +4201,13 @@ impl WizardStep for MxcPolicies {
 }
 
 // ---------------------------------------------------------------------------
-// 11. Smoke-test inference
+// 12. Smoke-test inference
 // ---------------------------------------------------------------------------
 
 /// Sanity bound for a smoke-test request (non-streaming proxy for TTFT).
 pub const SMOKE_MAX_LATENCY_MS: u64 = 120_000;
 
-/// Step 10: tagged test request per gateway group through the gateway;
+/// Step 12: tagged test request per gateway group through the gateway;
 /// assert non-empty completion + sane latency; record baselines.
 pub struct SmokeTest {
     pub max_latency_ms: u64,
@@ -5930,6 +6546,182 @@ mod tests {
         assert!(ops.tar_gz_extractions().is_empty());
     }
 
+    // --- InstallPostgres ---
+
+    fn pg_pin_for(zip: &[u8]) -> PostgresPin {
+        PostgresPin {
+            version: "18.6-1".to_string(),
+            asset: "postgresql-18.6-1-windows-x64-binaries.zip".to_string(),
+            sha256: sha256_hex(zip),
+            size: zip.len() as u64,
+        }
+    }
+
+    fn stage_pg_binaries(ops: &FakeSystemOps) {
+        for exe in [
+            "pg_ctl.exe",
+            "initdb.exe",
+            "postgres.exe",
+            "psql.exe",
+            "createdb.exe",
+        ] {
+            ops.with_extracted_file(
+                PathBuf::from("/data/postgres/bin").join(exe),
+                b"fake-pg-binary".to_vec(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn install_postgres_downloads_extracts_initializes_and_creates_db() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let zip = b"fake-pg-zip";
+        let pin = pg_pin_for(zip);
+        ops.with_download(&pin.url(), zip.to_vec());
+        stage_pg_binaries(&ops);
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = InstallPostgres::with_pin(pin.clone())
+            .run(&ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.message.contains("running on 127.0.0.1:54329"),
+            "{}",
+            out.message
+        );
+        assert_eq!(ops.downloaded_to().len(), 1);
+        let extractions = ops.zip_prefix_extractions();
+        assert_eq!(extractions.len(), 1);
+        assert_eq!(
+            extractions[0].2,
+            vec![
+                "pgsql/bin/".to_string(),
+                "pgsql/lib/".to_string(),
+                "pgsql/share/".to_string(),
+                "pgsql/include/".to_string()
+            ]
+        );
+        assert_eq!(extractions[0].3, "pgsql/");
+        // initdb ran with scram auth; createdb made the litellm db.
+        let executed = ops.executed_commands();
+        let initdb = executed
+            .iter()
+            .find(|a| a.iter().any(|x| x.ends_with("initdb.exe")))
+            .expect("initdb ran");
+        assert!(initdb.iter().any(|x| x == "scram-sha-256"), "{initdb:?}");
+        let createdb = executed
+            .iter()
+            .find(|a| a.iter().any(|x| x.ends_with("createdb.exe")))
+            .expect("createdb ran");
+        assert_eq!(createdb.last().map(String::as_str), Some("litellm"));
+        // The password file never survives the step.
+        assert!(ops
+            .file_bytes(&PathBuf::from("/data/postgres/pwfile.tmp"))
+            .is_none());
+        // The generated password is stored for the gateway spawns.
+        let stored = ops
+            .credential_value(crate::POSTGRES_PASSWORD_CRED_TARGET)
+            .expect("postgres password stored");
+        assert_eq!(stored.len(), 64, "hex password: {stored}");
+        let marker = ops
+            .file_bytes(&PathBuf::from("/data/postgres/.installed.json"))
+            .expect("marker written");
+        let v: serde_json::Value = serde_json::from_slice(&marker).unwrap();
+        assert_eq!(v["database"], "litellm");
+        assert_eq!(v["port"], 54329);
+    }
+
+    #[tokio::test]
+    async fn install_postgres_checksum_mismatch_fails_closed() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let pin = pg_pin_for(b"the-real-zip");
+        ops.with_download(&pin.url(), b"tampered-bytes".to_vec());
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = InstallPostgres::with_pin(pin).run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(out.message.contains("checksum mismatch"), "{}", out.message);
+        assert!(ops.zip_prefix_extractions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn install_postgres_audit_requires_install_and_cluster() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let pin = pg_pin_for(b"unused");
+        let ctx = ctx_with(ops.clone(), RunMode::Audit);
+        let out = InstallPostgres::with_pin(pin.clone())
+            .run(&ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(out.message.contains("not installed"), "{}", out.message);
+        // Fully staged install passes the audit without running
+        // anything.
+        for exe in [
+            "pg_ctl.exe",
+            "initdb.exe",
+            "postgres.exe",
+            "psql.exe",
+            "createdb.exe",
+        ] {
+            ops.with_file(PathBuf::from("/data/postgres/bin").join(exe), b"x".to_vec());
+        }
+        ops.with_file(
+            PathBuf::from("/data/postgres/.installed.json"),
+            b"{}".to_vec(),
+        );
+        ops.with_file(
+            PathBuf::from("/data/postgres/data/PG_VERSION"),
+            b"18\n".to_vec(),
+        );
+        let out = InstallPostgres::with_pin(pin).run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(ops.executed_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_gateway_passes_database_url_when_postgres_installed() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_file(
+            PathBuf::from("/data/postgres/.installed.json"),
+            b"{}".to_vec(),
+        );
+        ops.with_file(
+            PathBuf::from("/data/postgres/bin/pg_ctl.exe"),
+            b"fake".to_vec(),
+        );
+        ops.with_credential_value(crate::POSTGRES_PASSWORD_CRED_TARGET, "deadbeefcafe");
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+        };
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let envs = ops.spawn_envs();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].get("DATABASE_URL").map(String::as_str),
+            Some("postgresql://postgres:deadbeefcafe@127.0.0.1:54329/litellm")
+        );
+        // Without the install, the gateway spawns database-free.
+        let ops2 = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops2);
+        ops2.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let ctx2 = ctx_with(ops2.clone(), RunMode::Install);
+        let out2 = step.run(&ctx2).await.unwrap();
+        assert_eq!(out2.state, StepState::Done, "{out2:?}");
+        assert!(!ops2.spawn_envs()[0].contains_key("DATABASE_URL"));
+    }
+
     #[tokio::test]
     async fn install_mxc_declined_elevation_completes_with_prep_outstanding() {
         let ops = Arc::new(FakeSystemOps::new());
@@ -6104,7 +6896,7 @@ mod tests {
     #[test]
     fn default_steps_have_unique_ids_and_valid_prereq_order() {
         let steps = default_steps();
-        assert_eq!(steps.len(), 11);
+        assert_eq!(steps.len(), 12);
         let ids: Vec<&str> = steps.iter().map(|s| s.id()).collect();
         let mut seen = std::collections::HashSet::new();
         for id in &ids {

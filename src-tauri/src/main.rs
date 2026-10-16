@@ -2690,11 +2690,24 @@ async fn gateway_status(state: State<'_, AppState>) -> ApiResult {
 #[tauri::command]
 async fn gateway_stop(state: State<'_, AppState>) -> ApiResult {
     let data_dir = state.data_dir.clone();
-    let stopped = tokio::task::spawn_blocking(move || manager_wizard::stop_gateway(&data_dir))
+    let stopped = tokio::task::spawn_blocking({
+        let data_dir = data_dir.clone();
+        move || manager_wizard::stop_gateway(&data_dir)
+    })
         .await
         .map_err(|e| err(ApiError::Gateway(format!("gateway stop task failed: {e}"))))?
         .map_err(|e| err(ApiError::Gateway(e)))?;
-    Ok(json!({ "ok": true, "stopped": stopped }))
+    // The app-managed PostgreSQL server exists to serve the
+    // gateway's database; stop it after the gateway so nothing is
+    // left holding pooled connections to a stopping server.
+    // Best-effort: the gateway stop already succeeded, so a
+    // PostgreSQL stop problem is reported in the payload, not as a
+    // command failure.
+    let postgres_stopped =
+        manager_wizard::steps::stop_postgres_server(&RealSystemOps, &data_dir)
+            .await
+            .unwrap_or(false);
+    Ok(json!({ "ok": true, "stopped": stopped, "postgres_stopped": postgres_stopped }))
 }
 
 /// One-shot gateway liveness probe: connect to 127.0.0.1:<port> with a

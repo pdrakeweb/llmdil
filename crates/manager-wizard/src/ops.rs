@@ -654,6 +654,72 @@ impl SystemOps for RealSystemOps {
         })?
     }
 
+    async fn extract_zip_prefixes(
+        &self,
+        archive: &Path,
+        dest: &Path,
+        prefixes: &[&str],
+        strip_prefix: &str,
+    ) -> Result<(), WizardError> {
+        let archive_c = archive.to_path_buf();
+        let dest_c = dest.to_path_buf();
+        let prefixes_c: Vec<String> = prefixes.iter().map(|p| p.to_string()).collect();
+        let strip_c = strip_prefix.to_string();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read as _;
+            let file = std::fs::File::open(&archive_c).map_err(|e| Self::io_err(&archive_c, e))?;
+            let mut zip = zip::ZipArchive::new(file).map_err(|e| Self::io_err(&archive_c, e))?;
+            for i in 0..zip.len() {
+                let mut entry = zip.by_index(i).map_err(|e| Self::io_err(&archive_c, e))?;
+                let name = entry.name().replace('\\', "/");
+                if !prefixes_c.iter().any(|p| name.starts_with(p.as_str())) {
+                    continue;
+                }
+                let Some(rel) = name.strip_prefix(strip_c.as_str()) else {
+                    continue;
+                };
+                if rel.is_empty() {
+                    continue;
+                }
+                let rel_path = Path::new(rel);
+                // Entries are written manually (not via extract) so
+                // a hostile or malformed archive cannot escape `dest`.
+                if rel_path.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                }) {
+                    return Err(WizardError::IoError {
+                        path: archive_c.clone(),
+                        reason: format!("zip entry escapes the destination: {name}"),
+                    });
+                }
+                let target = dest_c.join(rel_path);
+                if entry.is_dir() {
+                    std::fs::create_dir_all(&target).map_err(|e| Self::io_err(&target, e))?;
+                    continue;
+                }
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| Self::io_err(parent, e))?;
+                }
+                let mut bytes = Vec::with_capacity(entry.size() as usize);
+                entry
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| Self::io_err(&archive_c, e))?;
+                std::fs::write(&target, &bytes).map_err(|e| Self::io_err(&target, e))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| WizardError::IoError {
+            path: archive.to_path_buf(),
+            reason: format!("extraction task failed: {e}"),
+        })?
+    }
+
     async fn run_elevated(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError> {
         #[cfg(windows)]
         {

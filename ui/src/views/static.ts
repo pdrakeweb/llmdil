@@ -1621,7 +1621,7 @@ function gatewayPaint(
       <div>Master key: <span style="font-family:var(--mono);color:var(--text)">${masterKey === null ? "not loaded \u2014 Reveal loads it" : keyRevealed ? esc(masterKey) : "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"}</span>
         <button class="btn" id="gwKeyRevealBtn">${keyRevealed ? "Hide" : "Reveal"}</button>
         <button class="btn" id="gwKeyCopyBtn">Copy</button></div>
-      <div>LiteLLM admin UI: sign in as <span style="font-family:var(--mono);color:var(--text)">admin</span> with the master key as the password. The admin UI requires a database, which the gateway does not have configured yet \u2014 its login is unavailable until one is added.</div>
+      <div>LiteLLM admin UI: sign in as <span style="font-family:var(--mono);color:var(--text)">admin</span> with the master key as the password. The admin UI requires a database \u2014 run the setup wizard's Install PostgreSQL step if sign-in reports \"Not connected to DB\".</div>
     </div>
     <div class="card-actions">
       <button class="btn" id="gwStartBtn"${starting || stopping ? " disabled" : ""}>${icon("restart")} ${status.up ? "Restart gateway" : "Start gateway"}</button>

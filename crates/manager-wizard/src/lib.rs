@@ -125,6 +125,38 @@ pub async fn ensure_gateway_master_key(ops: &dyn SystemOps) -> Result<String, Wi
     Ok(key)
 }
 
+/// Credential Manager target for the app-managed PostgreSQL
+/// server's password.
+pub const POSTGRES_PASSWORD_CRED_TARGET: &str = "local-llm-service-manager/postgres-password";
+
+/// Generate a PostgreSQL password: the same digest construction as
+/// the master key, without the `sk-` prefix. Hex output is URL-safe,
+/// so the value can be embedded in `DATABASE_URL` verbatim (no
+/// percent-encoding) and used raw for `initdb --pwfile` and
+/// `PGPASSWORD`.
+pub fn generate_postgres_password() -> String {
+    generate_master_key()
+        .strip_prefix("sk-")
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The app-managed PostgreSQL password from Credential Manager,
+/// generating and storing one when absent. An existing password is
+/// always reused: the database cluster was initialized with it, so
+/// rotating it here would lock the gateway out of its own database.
+pub async fn ensure_postgres_password(ops: &dyn SystemOps) -> Result<String, WizardError> {
+    if let Some(existing) = ops.credential_read(POSTGRES_PASSWORD_CRED_TARGET).await {
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+    }
+    let password = generate_postgres_password();
+    ops.credential_write(POSTGRES_PASSWORD_CRED_TARGET, &password)
+        .await?;
+    Ok(password)
+}
+
 /// Lifecycle state of one wizard step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -426,6 +458,20 @@ pub trait SystemOps: Send + Sync {
     ) -> Result<u64, WizardError>;
     /// Extract a zip archive into `dest`.
     async fn extract_zip(&self, archive: &Path, dest: &Path) -> Result<(), WizardError>;
+    /// Extract a zip archive into `dest`, keeping only entries under
+    /// any of `prefixes` (archive-internal paths such as
+    /// `pgsql/bin/`) and stripping `strip_prefix` from their paths
+    /// (e.g. `pgsql/`, so the kept trees land at `dest/bin/...`,
+    /// `dest/lib/...`). For distributions that ship as one zip with a
+    /// wrapping folder and large parts the app does not need (the
+    /// PostgreSQL binaries zip's pgAdmin subtree).
+    async fn extract_zip_prefixes(
+        &self,
+        archive: &Path,
+        dest: &Path,
+        prefixes: &[&str],
+        strip_prefix: &str,
+    ) -> Result<(), WizardError>;
     /// Extract a `.tar.gz` archive into `dest`, keeping only entries
     /// under `prefix` (a package-internal path such as
     /// `package/bin/x64/`) and stripping `strip_prefix` from their

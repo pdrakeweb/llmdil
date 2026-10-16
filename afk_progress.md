@@ -113,3 +113,13 @@ Content (VS Code step expansion + Continue fix):
 - Copilot agents: ~/.copilot/agents/litellm-<group>.md per gateway group; planner text verbatim from Pete; coder/coder-fast/tool-runner authored in the same structure (tools [read, search, edit, execute] / tool-runner [read, search, execute]).
 - Continue: config.yaml + .env per Pete's design, verified against continuedev/continue 1.3.40 (research: ~/workspace/.tmp-assets/continue-litellm-config-research.md). apiBase WITH /v1; apiKey ${{ secrets.LITELLM_API_KEY }}; roles [chat, edit, apply]; capabilities [tool_use] (mandatory — autodetection would deny these model names); existing config.yaml merged by model+apiBase identity, .env merged by key; legacy config.json no longer written and a wizard-written one is moved to config.json.llm-manager.bak; vscode_write_config Tauri command migrated to the same pair with backup-first semantics.
 - Audit verifies the settings entry, agent files, config.yaml models, and the .env key.
+
+## v0.1.14 verified green (Oct 15, 2026, via API)
+Release 38827831397 success; CI 38827831396 + 38827823193 success; Install Test 38828759239 success; published 2026-10-16T00:14:19Z; asset 4,543,282 bytes.
+
+## v0.1.15 shipped (Oct 15, 2026)
+Commit f58ab4bebd9b3748cbcfbfe97753adf6e59c6c1d; tag v0.1.15; watchdog llm-release-v0115-watch armed. Gates at ship: fmt clean, 386 workspace tests, clippy 0, src-tauri check + check --tests clean, UI build clean.
+Content (requested by Pete Oct 15 — no way existed to give the Nemotron catalog model a backend):
+- backend_add / backend_delete Tauri commands (clone-validate-save; seeded defaults n_ctx 32768 / n_batch 512 / restart 5x2s; group join-or-create; delete refused while running and scrubs group memberships + model assignment lists).
+- Backends page: "Add backend" form (name, model dropdown, next-free port prefilled, existing-or-new group, enabled default) in a poll-safe container outside the repainted grid; post-create card offers an inline gateway restart (routes generate at gateway start). Remove button on stopped/failed configured cards with a two-click confirm.
+- PostgreSQL moves to v0.1.16 (research still running).

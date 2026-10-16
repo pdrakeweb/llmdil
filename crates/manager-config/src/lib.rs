@@ -48,6 +48,13 @@ pub struct AppConfig {
     pub telemetry: TelemetryConfig,
     pub mxc: MxcPolicyRef,
     pub winml: WinMlConfig,
+    /// The app-managed PostgreSQL server backing the LiteLLM
+    /// gateway's database (admin UI, spend logs). Installed by the
+    /// wizard's install-postgres step under the data dir; only its
+    /// port is configuration — the binaries, cluster, and password
+    /// are managed state (the password lives in Credential Manager).
+    #[serde(default)]
+    pub postgres: PostgresConfig,
     /// Per-component pin / auto-update toggles.
     pub updates: UpdatePolicy,
     pub notifications: NotificationConfig,
@@ -255,6 +262,23 @@ pub struct WinMlConfig {
     pub model_id: Option<String>,
 }
 
+/// The app-managed PostgreSQL server's configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostgresConfig {
+    /// Loopback port the server binds when the wizard has installed
+    /// it. 54329 by default — deliberately not the standard 5432,
+    /// which a developer machine may already run its own PostgreSQL
+    /// on. The port is claimed in validation whether or not the
+    /// server is installed, so no backend can take it.
+    pub port: u16,
+}
+
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self { port: 54329 }
+    }
+}
+
 /// Per-component update pins and auto-update toggles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdatePolicy {
@@ -387,6 +411,7 @@ impl AppConfig {
                 port: 8090,
                 model_id: None,
             },
+            postgres: PostgresConfig::default(),
             updates: UpdatePolicy {
                 components: HashMap::new(),
             },
@@ -642,6 +667,7 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
     if config.winml.enabled {
         claim_port(config.winml.port, "winml".to_string());
     }
+    claim_port(config.postgres.port, "postgres".to_string());
 
     // --- model references (enabled backends must point at a registered model) ---
     let known_models: HashSet<String> = config

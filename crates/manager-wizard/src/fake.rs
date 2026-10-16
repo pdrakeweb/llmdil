@@ -51,6 +51,8 @@ struct FakeState {
     extracted: Vec<(PathBuf, PathBuf)>,
     /// (archive, dest, prefix, strip_prefix) tar.gz extraction calls.
     extracted_tar_gz: Vec<(PathBuf, PathBuf, String, String)>,
+    /// (archive, dest, prefixes, strip_prefix) zip-prefix extraction calls.
+    extracted_zip_prefixes: Vec<(PathBuf, PathBuf, Vec<String>, String)>,
     /// Argv of every `run_elevated` call, in order.
     elevated: Vec<Vec<String>>,
     /// Files an extraction materializes: when an extract call's dest
@@ -96,6 +98,7 @@ impl Default for FakeState {
             downloaded_to: Vec::new(),
             extracted: Vec::new(),
             extracted_tar_gz: Vec::new(),
+            extracted_zip_prefixes: Vec::new(),
             elevated: Vec::new(),
             extraction_files: Vec::new(),
             elevated_error: None,
@@ -340,6 +343,11 @@ impl FakeSystemOps {
         self.state.lock().unwrap().extracted_tar_gz.clone()
     }
 
+    /// (archive, dest, prefixes, strip_prefix) zip-prefix extraction calls.
+    pub fn zip_prefix_extractions(&self) -> Vec<(PathBuf, PathBuf, Vec<String>, String)> {
+        self.state.lock().unwrap().extracted_zip_prefixes.clone()
+    }
+
     /// Argv of every `run_elevated` call, in order.
     pub fn elevated_calls(&self) -> Vec<Vec<String>> {
         self.state.lock().unwrap().elevated.clone()
@@ -502,6 +510,24 @@ impl SystemOps for FakeSystemOps {
             archive.to_path_buf(),
             dest.to_path_buf(),
             prefix.to_string(),
+            strip_prefix.to_string(),
+        ));
+        Self::materialize_extraction(&mut st, dest);
+        Ok(())
+    }
+
+    async fn extract_zip_prefixes(
+        &self,
+        archive: &Path,
+        dest: &Path,
+        prefixes: &[&str],
+        strip_prefix: &str,
+    ) -> Result<(), WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.extracted_zip_prefixes.push((
+            archive.to_path_buf(),
+            dest.to_path_buf(),
+            prefixes.iter().map(|p| p.to_string()).collect(),
             strip_prefix.to_string(),
         ));
         Self::materialize_extraction(&mut st, dest);
