@@ -122,9 +122,21 @@ function gpuCard(g: GpuInfo): string {
     ? `<div class="mrow"><span></span>${sparkline(g.temp_spark, 240, 26, C.amber)}</div>` : "";
   const powerSpark = g.power_spark && g.power_spark.length
     ? `<div class="mrow"><span></span>${sparkline(g.power_spark, 240, 26, C.green)}</div>` : "";
+  // A backend process holding under 1 GiB on a GPU holds only its
+  // CUDA context there, not model weights (the smallest catalog model
+  // is ~4.7 GB) — label it as such. Presence in this table is process
+  // attribution, not placement: a split backend legitimately appears
+  // on several GPUs, and an unsplit one appears on every GPU it
+  // initialized a context on while its weights sit on the main GPU.
+  const procRow = (p: { process: string; pid: number; vram_mib: number; backend: string }): string => {
+    const backend = p.backend !== "—" && p.vram_mib < 1024
+      ? `${esc(p.backend)} <span class="chip">context only</span>`
+      : esc(p.backend);
+    return `<tr><td>${esc(p.process)}</td><td>${p.pid}</td><td>${p.vram_mib} MiB</td><td>${backend}</td></tr>`;
+  };
   const procs = g.processes && g.processes.length
     ? `<table class="tbl" style="margin-top:10px"><thead><tr><th>Process</th><th>PID</th><th>VRAM</th><th>Backend</th></tr></thead>
-      <tbody>${g.processes.map((p) => `<tr><td>${esc(p.process)}</td><td>${p.pid}</td><td>${p.vram_mib} MiB</td><td>${esc(p.backend)}</td></tr>`).join("")}</tbody></table>` : "";
+      <tbody>${g.processes.map(procRow).join("")}</tbody></table>` : "";
   const models = g.models && g.models.length
     ? `<div style="margin-top:8px;font-size:11px;color:var(--text3);display:grid;gap:4px">
         ${g.models.map((m) => `<div>${icon("layers")} ${esc(m.model)} \u00b7 ${esc(m.layers)}</div>`).join("")}

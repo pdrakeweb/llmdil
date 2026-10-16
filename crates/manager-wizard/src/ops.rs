@@ -864,6 +864,14 @@ impl SystemOps for RealSystemOps {
         tokio::fs::metadata(path).await.is_ok()
     }
 
+    async fn file_len(&self, path: &Path) -> Option<u64> {
+        tokio::fs::metadata(path)
+            .await
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+    }
+
     async fn sha256_file(&self, path: &Path) -> Result<String, WizardError> {
         let data = self.read_file(path).await?;
         let mut hasher = Sha256::new();

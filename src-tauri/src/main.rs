@@ -581,6 +581,22 @@ impl AppState {
         }
     }
 
+    /// Reload the live config from `<data_dir>/config.json` after a
+    /// wizard step or audit run. Steps receive a snapshot clone and
+    /// persist their writes to the file (tensor-split placement,
+    /// verified_at stamps); without this reload those writes never
+    /// reach the in-memory config, so backend starts later in the
+    /// same session would still use the pre-step values. Best
+    /// effort: a missing or invalid file keeps the current config —
+    /// validity was enforced when the file was saved, and a wedged
+    /// file must not take the session down.
+    async fn reload_config_from_disk(&self) {
+        let path = self.data_dir.join("config.json");
+        if let Ok(cfg) = manager_config::load(&path) {
+            *self.config.write().await = cfg;
+        }
+    }
+
     /// Restore persisted wizard progress at launch, before the
     /// hydration audit fills still-Queued steps from machine checks.
     /// A missing or unreadable file leaves the wizard untouched.
@@ -1518,6 +1534,7 @@ async fn run_wizard_step(app: AppHandle, state: State<'_, AppState>, step_id: St
     *state.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
     drop(guard);
     state.persist_wizard().await;
+    state.reload_config_from_disk().await;
     let payload = WizardProgressPayload {
         task_id: task_id.clone(),
         step_id: Some(step_id.clone()),
@@ -1591,6 +1608,7 @@ async fn run_audit(app: AppHandle, state: State<'_, AppState>) -> ApiResult {
         })
         .collect();
     drop(guard);
+    state.reload_config_from_disk().await;
     let payload = WizardProgressPayload {
         task_id: task_id.clone(),
         step_id: None,
@@ -2494,7 +2512,8 @@ async fn backend_apply_config(
 
 /// Create a new backend and route it through the gateway (spec §14
 /// `backend_add`). The backend is created with the seeded defaults
-/// (32K context, no tensor split, the standard restart policy) and
+/// (32K context, a tensor split assigned from live telemetry when
+/// available, the standard restart policy) and
 /// the chosen registered model; it joins an existing gateway group
 /// or a new one created for it. The gateway picks the route up when
 /// it next (re)starts — its config is generated from this state.
@@ -2533,6 +2552,70 @@ async fn backend_add(
             "port must be non-zero".to_string(),
         )));
     }
+    // Placement for the new backend, computed before the config
+    // write lock is taken (the telemetry accessor reads the config
+    // while initializing, so the two must not nest). Existing enabled
+    // backends are accounted for as they are; the new backend is
+    // assigned a split by the same algorithm the wizard's
+    // tensor-split step uses. No telemetry yet (or a single GPU)
+    // leaves the split unset — the wizard step assigns it later.
+    let new_backend_split: Option<(Vec<f32>, manager_config::SplitMode)> = {
+        let snap = state.config.read().await.clone();
+        let vrams: Vec<u64> = {
+            let store = state.telemetry().await;
+            let guard = lock_telemetry(&store);
+            let mut samples = guard.snapshot();
+            samples.sort_by_key(|s| s.index);
+            samples.iter().map(|s| s.vram_total_mib).collect()
+        };
+        if vrams.len() < 2 {
+            None
+        } else {
+            let size_of = |model_file: &std::path::Path| -> u64 {
+                let target = resolve_under_data_dir(&snap.data_dir, &model_file.to_path_buf());
+                let model = snap.models.iter().find(|m| {
+                    resolve_under_data_dir(&snap.data_dir, &m.gguf_path) == target
+                });
+                match model {
+                    Some(m) => {
+                        let path = resolve_under_data_dir(&snap.data_dir, &m.gguf_path);
+                        match std::fs::metadata(&path) {
+                            Ok(md) if md.is_file() => md.len(),
+                            _ => manager_wizard::steps::estimate_model_bytes(m.params_b as f64),
+                        }
+                    }
+                    None => 0,
+                }
+            };
+            let mut inputs: Vec<manager_wizard::steps::SplitInput> = snap
+                .backends
+                .iter()
+                .filter(|b| b.enabled)
+                .map(|b| manager_wizard::steps::SplitInput {
+                    model_bytes: size_of(&b.model_file),
+                    existing: if b.flags.tensor_split.is_empty() {
+                        None
+                    } else {
+                        Some(b.flags.tensor_split.clone())
+                    },
+                    assign: false,
+                })
+                .collect();
+            let new_model = snap.models.iter().find(|m| m.id == model_id);
+            inputs.push(manager_wizard::steps::SplitInput {
+                model_bytes: match new_model {
+                    Some(m) => size_of(&m.gguf_path),
+                    None => 0,
+                },
+                existing: None,
+                assign: true,
+            });
+            manager_wizard::steps::assign_splits(&inputs, &vrams)
+                .into_iter()
+                .last()
+                .flatten()
+        }
+    };
     let mut cfg = state.config.write().await;
     let mut new_cfg = cfg.clone();
     if new_cfg.backends.iter().any(|b| b.id == id) {
@@ -2569,6 +2652,10 @@ async fn backend_add(
             g.members.push(id.clone());
         }
     }
+    let (tensor_split, split_mode) = match &new_backend_split {
+        Some((split, mode)) => (split.clone(), *mode),
+        None => (Vec::new(), manager_config::SplitMode::None),
+    };
     new_cfg.backends.push(manager_config::BackendConfig {
         id: id.clone(),
         enabled,
@@ -2577,8 +2664,8 @@ async fn backend_add(
         flags: manager_config::ServerFlags {
             n_ctx: 32768,
             n_batch: 512,
-            tensor_split: Vec::new(),
-            split_mode: manager_config::SplitMode::None,
+            tensor_split,
+            split_mode,
         },
         raw_flags: None,
         restart_policy: manager_config::RestartPolicy {

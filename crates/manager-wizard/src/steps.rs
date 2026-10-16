@@ -10,7 +10,7 @@ use crate::{
     WizardContext, WizardError, WizardStep,
 };
 use async_trait::async_trait;
-use manager_config::{AppConfig, ModelConfig};
+use manager_config::{AppConfig, BackendConfig, ModelConfig, SplitMode};
 use std::path::{Path, PathBuf};
 ///
 /// Shared by the [`VscodeExtensions`] wizard step and the Tauri
@@ -1042,10 +1042,23 @@ pub fn compute_splits(vram_mib: &[u64]) -> Result<Vec<f32>, WizardError> {
             "zero total VRAM across discovered GPUs".to_string(),
         ));
     }
+    Ok(hundredths_of(
+        &vram_mib.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+    ))
+}
+
+/// Split weights into hundredths fractions summing to exactly 1.0
+/// (integer arithmetic; the rounding residue goes to the largest
+/// share). Zero or negative total weight yields all-zero fractions.
+fn hundredths_of(weights: &[f64]) -> Vec<f32> {
+    let total: f64 = weights.iter().sum();
+    if total <= 0.0 {
+        return weights.iter().map(|_| 0.0).collect();
+    }
     // Integer hundredths: exact sum, rounding residue goes to the largest share.
-    let mut hundredths: Vec<i64> = vram_mib
+    let mut hundredths: Vec<i64> = weights
         .iter()
-        .map(|v| ((*v as f64 / total as f64) * 100.0).round() as i64)
+        .map(|v| ((*v / total) * 100.0).round() as i64)
         .collect();
     let residue = 100 - hundredths.iter().sum::<i64>();
     if let Some(idx) = hundredths
@@ -1084,16 +1097,324 @@ pub fn compute_splits(vram_mib: &[u64]) -> Result<Vec<f32>, WizardError> {
             "positive shares always cover the deficit (they sum to 100 + deficit)"
         );
     }
-    Ok(hundredths.iter().map(|h| *h as f32 / 100.0).collect())
+    hundredths.iter().map(|h| *h as f32 / 100.0).collect()
+}
+
+/// One backend's input to [`assign_splits`].
+pub struct SplitInput {
+    /// Model size in bytes (the on-disk file when downloaded, else
+    /// the params_b estimate). Zero when unknown — the entry then
+    /// receives a VRAM-proportional split.
+    pub model_bytes: u64,
+    /// The backend's configured tensor split, when one is set.
+    pub existing: Option<Vec<f32>>,
+    /// True when the caller wants this entry (re)assigned if it has
+    /// no valid split. False entries only account for their space.
+    pub assign: bool,
+}
+
+/// Assign tensor splits across the discovered GPUs.
+///
+/// The defect this fixes (found on Pete's Precision, 2026-10-15):
+/// backends shipped with no split at all, so llama.cpp placed every
+/// model on the main GPU and overflowed to system RAM while the
+/// second GPU held nothing but CUDA contexts.
+///
+/// Rules:
+/// - An entry with a valid existing split (one fraction per GPU) is
+///   kept as-is and its shares are deducted from the free pool. The
+///   returned mode for a kept entry is informational only — callers
+///   must not overwrite a kept entry's configured `split_mode`.
+/// - An accounting-only entry (`assign: false`) with no valid split
+///   deducts its whole model from GPU 0 — that is where llama.cpp
+///   actually puts an unset backend today.
+/// - Assignable entries are placed largest first: a model that fits
+///   one GPU's remaining placeable space (90% of VRAM; the rest is
+///   headroom for the KV cache, compute buffers, and the CUDA
+///   context) goes entirely on the GPU with the most room, as a
+///   one-hot split; a larger model is spread across GPUs in
+///   proportion to their remaining room.
+/// - A single-GPU machine gets no assignments: a split there is a
+///   no-op and leaving it unset keeps the configuration honest.
+pub fn assign_splits(
+    inputs: &[SplitInput],
+    gpu_vram_mib: &[u64],
+) -> Vec<Option<(Vec<f32>, SplitMode)>> {
+    let n = gpu_vram_mib.len();
+    let mut out: Vec<Option<(Vec<f32>, SplitMode)>> = vec![None; inputs.len()];
+    if n == 0 {
+        return out;
+    }
+    let mut remaining: Vec<f64> = gpu_vram_mib
+        .iter()
+        .map(|v| *v as f64 * 1_048_576.0 * 0.90)
+        .collect();
+    // Pass 1: account for entries that will not be (re)assigned.
+    for (i, input) in inputs.iter().enumerate() {
+        match &input.existing {
+            Some(split) if split.len() == n => {
+                out[i] = Some((split.clone(), SplitMode::Layer));
+                for (g, share) in split.iter().enumerate() {
+                    remaining[g] =
+                        (remaining[g] - *share as f64 * input.model_bytes as f64).max(0.0);
+                }
+            }
+            _ if !input.assign => {
+                remaining[0] = (remaining[0] - input.model_bytes as f64).max(0.0);
+            }
+            _ => {}
+        }
+    }
+    if n == 1 {
+        return out;
+    }
+    // Pass 2: assign the rest, largest first (stable for ties).
+    let mut order: Vec<usize> = (0..inputs.len())
+        .filter(|&i| out[i].is_none() && inputs[i].assign)
+        .collect();
+    order.sort_by(|&a, &b| inputs[b].model_bytes.cmp(&inputs[a].model_bytes));
+    for i in order {
+        let bytes = inputs[i].model_bytes as f64;
+        // GPU with the most room; lowest index wins ties (GPU 0 is
+        // the main GPU — prefer filling it first, deterministically).
+        let mut g = 0usize;
+        for cand in 1..n {
+            if remaining[cand] > remaining[g] {
+                g = cand;
+            }
+        }
+        let room = remaining[g];
+        if bytes > 0.0 && bytes <= room {
+            let mut split = vec![0.0f32; n];
+            split[g] = 1.0;
+            remaining[g] -= bytes;
+            out[i] = Some((split, SplitMode::Layer));
+            continue;
+        }
+        // Does not fit on one GPU: spread over the room that remains,
+        // falling back to raw capacity proportions when the pool is
+        // exhausted (llama.cpp will spill the excess to system RAM,
+        // as it does today — but distributed, not all on GPU 0).
+        let weights: Vec<f64> = if remaining.iter().sum::<f64>() > 0.0 {
+            remaining.clone()
+        } else {
+            gpu_vram_mib.iter().map(|v| *v as f64).collect()
+        };
+        let split = hundredths_of(&weights);
+        for (g, share) in split.iter().enumerate() {
+            remaining[g] = (remaining[g] - *share as f64 * bytes).max(0.0);
+        }
+        out[i] = Some((split, SplitMode::Layer));
+    }
+    out
+}
+
+/// Estimate a model's on-disk size from its parameter count, using
+/// the catalog's derivation (~4.92 bits per weight for Q4_K_M plus
+/// ~5% overhead) — the same estimate `placement_propose` uses in the
+/// Tauri layer. Used only when the model file is not downloaded yet
+/// (the tensor-split step runs before the download step).
+pub fn estimate_model_bytes(params_b: f64) -> u64 {
+    if params_b > 0.0 {
+        (params_b * 1e9 * 4.92 / 8.0 * 1.05) as u64
+    } else {
+        0
+    }
 }
 
 /// Step 3: compute per-backend tensor splits from discovered VRAM, write the
 /// flag sets, validate sums to 1.0. Audit mode re-validates.
 pub struct ConfigureTensorSplit;
 
+fn fmt_split(split: &[f32]) -> String {
+    split
+        .iter()
+        .map(|v| format!("{v:.2}"))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 impl ConfigureTensorSplit {
-    fn splits_path(&self, ctx: &WizardContext) -> PathBuf {
-        ctx.data_dir.join("wizard").join("tensor-split.json")
+    /// Size of the model a backend serves: the configured model whose
+    /// gguf_path the backend's model_file resolves to. The on-disk
+    /// length when the file is downloaded, else the params_b
+    /// estimate (this step runs before the download step, so the
+    /// estimate is the common case on a first run). Zero when the
+    /// backend's model cannot be resolved — the assignment then
+    /// falls back to a VRAM-proportional split.
+    async fn model_bytes(&self, ctx: &WizardContext, backend: &BackendConfig) -> u64 {
+        let target = resolve_dest(&ctx.data_dir, &backend.model_file);
+        let model = ctx
+            .config
+            .models
+            .iter()
+            .find(|m| resolve_dest(&ctx.data_dir, &m.gguf_path) == target);
+        match model {
+            Some(m) => {
+                let path = resolve_dest(&ctx.data_dir, &m.gguf_path);
+                match ctx.ops.file_len(&path).await {
+                    Some(len) => len,
+                    None => estimate_model_bytes(m.params_b as f64),
+                }
+            }
+            None => 0,
+        }
+    }
+
+    async fn run_install(
+        &self,
+        ctx: &WizardContext,
+        vrams: &[u64],
+    ) -> Result<StepOutcome, WizardError> {
+        let mut log: Vec<String> = Vec::new();
+        let enabled: Vec<&BackendConfig> =
+            ctx.config.backends.iter().filter(|b| b.enabled).collect();
+        if enabled.is_empty() {
+            return Ok(StepOutcome::done(
+                "no enabled backends; nothing to place".to_string(),
+                log,
+            ));
+        }
+        if vrams.len() == 1 {
+            return Ok(StepOutcome::done(
+                "single GPU discovered; no tensor split needed — llama.cpp uses the only GPU"
+                    .to_string(),
+                log,
+            ));
+        }
+        let mut inputs: Vec<SplitInput> = Vec::new();
+        for b in &enabled {
+            inputs.push(SplitInput {
+                model_bytes: self.model_bytes(ctx, b).await,
+                existing: if b.flags.tensor_split.is_empty() {
+                    None
+                } else {
+                    Some(b.flags.tensor_split.clone())
+                },
+                assign: true,
+            });
+        }
+        let assigned = assign_splits(&inputs, vrams);
+        // Persist into the on-disk config (the pattern
+        // DownloadModels::stamp_verified_at documents: steps receive
+        // a snapshot clone, so placement must be written to
+        // <data_dir>/config.json to exist at all; the app reloads the
+        // file after each wizard step). Base: the persisted config
+        // when it loads, else the context snapshot.
+        let config_path = ctx.data_dir.join("config.json");
+        let mut config = match manager_config::load(&config_path) {
+            Ok(cfg) => cfg,
+            Err(_) if ctx.data_dir.is_dir() => ctx.config.clone(),
+            Err(e) => {
+                return Ok(StepOutcome::failed(
+                    format!("could not load the persisted config to write splits: {e}"),
+                    log,
+                ))
+            }
+        };
+        let mut changed = 0usize;
+        for (b, result) in enabled.iter().zip(assigned.iter()) {
+            let Some((split, mode)) = result else {
+                continue;
+            };
+            if b.flags.tensor_split == *split {
+                log.push(format!(
+                    "{}: kept existing split [{}]",
+                    b.id,
+                    fmt_split(split)
+                ));
+                continue;
+            }
+            if let Some(target) = config.backends.iter_mut().find(|x| x.id == b.id) {
+                target.flags.tensor_split = split.clone();
+                target.flags.split_mode = *mode;
+            }
+            changed += 1;
+            log.push(format!(
+                "{}: split [{}] assigned (model ~{:.1} GB)",
+                b.id,
+                fmt_split(split),
+                inputs[enabled.iter().position(|x| x.id == b.id).unwrap_or(0)].model_bytes as f64
+                    / 1_073_741_824.0
+            ));
+        }
+        if changed > 0 {
+            if let Err(e) = manager_config::validate(&config) {
+                return Ok(StepOutcome::failed(
+                    format!("computed splits failed validation: {e}"),
+                    log,
+                ));
+            }
+            if let Err(e) = manager_config::save(&config, &config_path) {
+                return Ok(StepOutcome::failed(
+                    format!("could not save splits to {}: {e}", config_path.display()),
+                    log,
+                ));
+            }
+            log.push(format!(
+                "saved placement for {changed} backend(s) to {}",
+                config_path.display()
+            ));
+        }
+        Ok(StepOutcome::done(
+            format!(
+                "tensor splits set for {} enabled backend(s) across {} GPUs ({changed} updated)",
+                enabled.len(),
+                vrams.len()
+            ),
+            log,
+        ))
+    }
+
+    fn run_audit(&self, ctx: &WizardContext, gpu_count: usize) -> StepOutcome {
+        let mut log: Vec<String> = Vec::new();
+        let mut problems: Vec<String> = Vec::new();
+        let enabled: Vec<&BackendConfig> =
+            ctx.config.backends.iter().filter(|b| b.enabled).collect();
+        for b in &enabled {
+            if gpu_count == 1 {
+                log.push(format!("{}: single GPU, no split required", b.id));
+                continue;
+            }
+            if b.flags.tensor_split.is_empty() {
+                problems.push(format!("{}: no tensor split configured", b.id));
+            } else if b.flags.tensor_split.len() != gpu_count {
+                problems.push(format!(
+                    "{}: split covers {} GPUs, {} discovered",
+                    b.id,
+                    b.flags.tensor_split.len(),
+                    gpu_count
+                ));
+            } else {
+                let sum: f32 = b.flags.tensor_split.iter().sum();
+                if (sum - 1.0).abs() > 1e-3 {
+                    problems.push(format!("{}: splits sum to {sum:.4}, not 1.0", b.id));
+                } else {
+                    log.push(format!(
+                        "{}: split [{}] valid",
+                        b.id,
+                        fmt_split(&b.flags.tensor_split)
+                    ));
+                }
+            }
+        }
+        if problems.is_empty() {
+            StepOutcome::done(
+                format!(
+                    "tensor splits valid for {} enabled backend(s)",
+                    enabled.len()
+                ),
+                log,
+            )
+        } else {
+            for p in &problems {
+                log.push(p.clone());
+            }
+            StepOutcome::failed(
+                format!("tensor-split problems: {}", problems.join("; ")),
+                log,
+            )
+        }
     }
 }
 
@@ -1115,7 +1436,7 @@ impl WizardStep for ConfigureTensorSplit {
         true
     }
     fn planned_commands(&self, _ctx: &WizardContext) -> Vec<PlannedCommand> {
-        // Pure compute + file write; no external commands.
+        // Pure compute + config write; no external commands.
         vec![]
     }
     fn remediation_hint(&self) -> Option<&str> {
@@ -1133,103 +1454,14 @@ impl WizardStep for ConfigureTensorSplit {
         };
         if gpus.is_empty() {
             return Ok(StepOutcome::failed(
-                "no GPUs discovered; cannot compute tensor splits",
+                "no GPUs discovered; cannot compute tensor splits".to_string(),
                 vec![],
             ));
         }
-        let path = self.splits_path(ctx);
+        let vrams: Vec<u64> = gpus.iter().map(|g| g.total_vram_mib).collect();
         match ctx.mode {
-            RunMode::Install => {
-                let vrams: Vec<u64> = gpus.iter().map(|g| g.total_vram_mib).collect();
-                let splits = match compute_splits(&vrams) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
-                    }
-                };
-                let sum: f32 = splits.iter().sum();
-                debug_assert!((sum - 1.0).abs() < 1e-6);
-                let mut map = serde_json::Map::new();
-                let mut n = 0;
-                for backend in ctx.config.backends.iter().filter(|b| b.enabled) {
-                    map.insert(backend.id.clone(), serde_json::json!(splits));
-                    n += 1;
-                }
-                let doc = serde_json::Value::Object(map);
-                if let Err(e) = ctx
-                    .ops
-                    .write_file(&path, json_pretty(&doc).as_bytes())
-                    .await
-                {
-                    return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
-                }
-                let split_str = splits
-                    .iter()
-                    .map(|s| format!("{s:.2}"))
-                    .collect::<Vec<_>>()
-                    .join("/");
-                Ok(StepOutcome::done(
-                    format!(
-                        "tensor-split [{split_str}] written for {n} enabled backend(s) across {} GPU(s)",
-                        gpus.len()
-                    ),
-                    vec![format!("wrote {}", path.display())],
-                ))
-            }
-            RunMode::Audit => {
-                let data = match ctx.ops.read_file(&path).await {
-                    Ok(d) => d,
-                    Err(_) => {
-                        return Ok(StepOutcome::failed(
-                            "tensor-split.json missing; re-run configure-tensor-split".to_string(),
-                            vec![format!("{} not found", path.display())],
-                        ))
-                    }
-                };
-                let doc: serde_json::Value = match serde_json::from_slice(&data) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Ok(StepOutcome::failed(
-                            format!("tensor-split.json unparseable: {e}"),
-                            vec![],
-                        ))
-                    }
-                };
-                let mut log = Vec::new();
-                let obj = doc.as_object().cloned().unwrap_or_default();
-                for (backend_id, splits) in &obj {
-                    let arr: Vec<f32> = splits
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let sum: f32 = arr.iter().sum();
-                    if arr.len() != gpus.len() {
-                        return Ok(StepOutcome::failed(
-                            format!(
-                                "backend '{backend_id}': split covers {} GPUs, {} discovered",
-                                arr.len(),
-                                gpus.len()
-                            ),
-                            log,
-                        ));
-                    }
-                    if (sum - 1.0).abs() > 1e-3 {
-                        return Ok(StepOutcome::failed(
-                            format!("backend '{backend_id}': splits sum to {sum:.4}, not 1.0"),
-                            log,
-                        ));
-                    }
-                    log.push(format!("backend '{backend_id}': splits sum to 1.0 ✓"));
-                }
-                Ok(StepOutcome::done(
-                    format!("tensor-split config valid for {} backend(s)", obj.len()),
-                    log,
-                ))
-            }
+            RunMode::Install => self.run_install(ctx, &vrams).await,
+            RunMode::Audit => Ok(self.run_audit(ctx, gpus.len())),
         }
     }
 }
@@ -5256,32 +5488,181 @@ mod tests {
         assert!(compute_splits(&[]).is_err());
     }
 
+    // --- assign_splits (pure) ---
+
+    fn gi_b(n: f64) -> u64 {
+        (n * 1_073_741_824.0) as u64
+    }
+
+    #[test]
+    fn assign_splits_single_gpu_assigns_nothing() {
+        let inputs = vec![SplitInput {
+            model_bytes: gi_b(5.0),
+            existing: None,
+            assign: true,
+        }];
+        let out = assign_splits(&inputs, &[16384]);
+        assert_eq!(out, vec![None]);
+    }
+
+    #[test]
+    fn assign_splits_fitting_model_goes_to_gpu_with_most_room() {
+        // Accounting-only entry occupies 4 GB of GPU 0 (its unset
+        // split means llama.cpp puts it there today); the assignable
+        // 6 GB model no longer fits GPU 0's remaining placeable space
+        // and must go entirely on GPU 1.
+        let inputs = vec![
+            SplitInput {
+                model_bytes: gi_b(4.0),
+                existing: None,
+                assign: false,
+            },
+            SplitInput {
+                model_bytes: gi_b(6.0),
+                existing: None,
+                assign: true,
+            },
+        ];
+        let out = assign_splits(&inputs, &[8192, 16384]);
+        assert_eq!(out[0], None);
+        assert_eq!(out[1], Some((vec![0.0, 1.0], SplitMode::Layer)));
+    }
+
+    #[test]
+    fn assign_splits_oversized_model_spreads_proportionally() {
+        let inputs = vec![SplitInput {
+            model_bytes: gi_b(40.0),
+            existing: None,
+            assign: true,
+        }];
+        let out = assign_splits(&inputs, &[16384, 16384]);
+        assert_eq!(out[0], Some((vec![0.5, 0.5], SplitMode::Layer)));
+    }
+
+    #[test]
+    fn assign_splits_keeps_valid_existing_and_deducts_it() {
+        // Existing [0.5, 0.5] of a 20 GB model leaves ~5.0 GB
+        // placeable on each 16 GiB GPU; the new 10 GB model fits
+        // neither and spreads over the remaining room evenly.
+        let inputs = vec![
+            SplitInput {
+                model_bytes: gi_b(20.0),
+                existing: Some(vec![0.5, 0.5]),
+                assign: false,
+            },
+            SplitInput {
+                model_bytes: gi_b(10.0),
+                existing: None,
+                assign: true,
+            },
+        ];
+        let out = assign_splits(&inputs, &[16384, 16384]);
+        assert_eq!(out[0], Some((vec![0.5, 0.5], SplitMode::Layer)));
+        assert_eq!(out[1], Some((vec![0.5, 0.5], SplitMode::Layer)));
+    }
+
+    #[test]
+    fn assign_splits_stale_length_existing_is_recomputed() {
+        let inputs = vec![SplitInput {
+            model_bytes: gi_b(5.0),
+            existing: Some(vec![1.0]),
+            assign: true,
+        }];
+        let out = assign_splits(&inputs, &[16384, 16384]);
+        let (split, _) = out[0].clone().expect("assigned");
+        assert_eq!(split.len(), 2);
+        let sum: f32 = split.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn assign_splits_largest_first_packing() {
+        // Two 10 GB models, two 16 GiB GPUs (14.4 GiB placeable
+        // each): each model gets its own GPU rather than the second
+        // being spread around the first's leftovers.
+        let inputs = vec![
+            SplitInput {
+                model_bytes: gi_b(10.0),
+                existing: None,
+                assign: true,
+            },
+            SplitInput {
+                model_bytes: gi_b(10.0),
+                existing: None,
+                assign: true,
+            },
+        ];
+        let out = assign_splits(&inputs, &[16384, 16384]);
+        assert_eq!(out[0], Some((vec![1.0, 0.0], SplitMode::Layer)));
+        assert_eq!(out[1], Some((vec![0.0, 1.0], SplitMode::Layer)));
+    }
+
+    // --- ConfigureTensorSplit step ---
+
     #[tokio::test]
-    async fn tensor_split_writes_and_audit_validates() {
+    async fn tensor_split_install_persists_splits_and_audit_validates() {
+        let data_dir = stamp_test_dir("splits");
+        let config_path = data_dir.join("config.json");
+        let mut config = test_config_with_models();
+        // The shared test config's backend model files do not resolve
+        // to its two registered models (save() would reject it);
+        // point each backend at one of them.
+        for b in config.backends.iter_mut() {
+            b.model_file = if b.id == "coder-fast" {
+                PathBuf::from("models/qwen2.5-coder-7b.gguf")
+            } else {
+                PathBuf::from("models/qwen3-8b.gguf")
+            };
+        }
+        manager_config::save(&config, &config_path).unwrap();
         let ops = Arc::new(FakeSystemOps::new());
         ops.with_gpus(test_gpus());
-        let install_ctx = ctx_with(ops.clone(), RunMode::Install);
         let step = ConfigureTensorSplit;
-        assert!(step.planned_commands(&install_ctx).is_empty());
+        assert!(step
+            .planned_commands(&WizardContext::new(
+                config.clone(),
+                data_dir.clone(),
+                RunMode::Install,
+                ops.clone(),
+            ))
+            .is_empty());
+
+        // Audit against the unsplit config fails: this is the state
+        // Pete's machine was in — backends configured, no placement.
+        let audit_ctx = WizardContext::new(
+            config.clone(),
+            data_dir.clone(),
+            RunMode::Audit,
+            ops.clone(),
+        );
+        let out = step.run(&audit_ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(out.message.contains("no tensor split"), "{}", out.message);
+
+        // Install assigns and persists into config.json.
+        let install_ctx = WizardContext::new(
+            config.clone(),
+            data_dir.clone(),
+            RunMode::Install,
+            ops.clone(),
+        );
         let out = step.run(&install_ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done, "{out:?}");
-        assert!(out.message.contains("[0.33/0.33/0.34]"), "{}", out.message);
+        let saved = manager_config::load(&config_path).unwrap();
+        manager_config::validate(&saved).unwrap();
+        let enabled: Vec<_> = saved.backends.iter().filter(|b| b.enabled).collect();
+        assert!(!enabled.is_empty());
+        for b in &enabled {
+            assert_eq!(b.flags.tensor_split.len(), 3, "{}: {:?}", b.id, b.flags);
+            let sum: f32 = b.flags.tensor_split.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-3, "{} sums to {sum}", b.id);
+        }
 
-        let path = PathBuf::from("/data/wizard/tensor-split.json");
-        let raw = ops.file_bytes(&path).expect("splits file written");
-        let doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(doc.as_object().unwrap().len(), 4, "one entry per backend");
-
-        // Audit passes.
-        let audit_ctx = ctx_with(ops.clone(), RunMode::Audit);
+        // Audit against the persisted config passes.
+        let audit_ctx = WizardContext::new(saved, data_dir.clone(), RunMode::Audit, ops.clone());
         let out = step.run(&audit_ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done, "{out:?}");
-
-        // Corrupt the file: audit fails.
-        ops.with_file(path, b"{\"planner\": [0.5]}".to_vec());
-        let out = step.run(&audit_ctx).await.unwrap();
-        assert_eq!(out.state, StepState::Failed);
-        assert!(out.message.contains("not 1.0") || out.message.contains("GPUs"));
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     // --- DownloadModels ---

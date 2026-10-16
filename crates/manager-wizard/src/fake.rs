@@ -613,6 +613,15 @@ impl SystemOps for FakeSystemOps {
         self.state.lock().unwrap().files.contains_key(path)
     }
 
+    async fn file_len(&self, path: &Path) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap()
+            .files
+            .get(path)
+            .map(|data| data.len() as u64)
+    }
+
     async fn sha256_file(&self, path: &Path) -> Result<String, WizardError> {
         let data = self.read_file(path).await?;
         let mut hasher = Sha256::new();

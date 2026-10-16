@@ -542,6 +542,13 @@ pub trait SystemOps: Send + Sync {
     /// Remove a file; a missing file is not an error.
     async fn remove_file(&self, path: &Path) -> Result<(), WizardError>;
     async fn file_exists(&self, path: &Path) -> bool;
+    /// Length of a file in bytes, or None when it does not exist or
+    /// cannot be stat'ed. Used for model sizes (reading a multi-GB
+    /// GGUF just to measure it is not an option).
+    async fn file_len(&self, path: &Path) -> Option<u64> {
+        let _ = path;
+        None
+    }
     /// Hex-encoded lowercase SHA-256 of a file.
     async fn sha256_file(&self, path: &Path) -> Result<String, WizardError>;
     /// GPU inventory probe (nvidia-smi).
