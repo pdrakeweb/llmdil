@@ -148,6 +148,14 @@ pub struct RestartPolicy {
 pub struct GatewayConfig {
     /// 4000 by convention.
     pub port: u16,
+    /// Address the gateway binds. `0.0.0.0` (all interfaces) by
+    /// default — Pete's decision (2026-10-15) so other machines on
+    /// the local network can use the gateway; `127.0.0.1` restricts
+    /// it to this computer. Authentication is unaffected: the
+    /// master key is required on every interface. Must parse as an
+    /// IP address (validated).
+    #[serde(default = "default_gateway_bind_host")]
+    pub bind_host: String,
     pub groups: Vec<ModelGroup>,
     /// Plain-language rule + LiteLLM fragment + source.
     pub routing_rules: Vec<RoutingRule>,
@@ -385,6 +393,7 @@ impl AppConfig {
             backends,
             gateway: GatewayConfig {
                 port: 4000,
+                bind_host: default_gateway_bind_host(),
                 groups,
                 routing_rules: Vec::new(),
                 openrouter: CloudTierConfig {
@@ -651,6 +660,18 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
         }
     }
 
+    if config
+        .gateway
+        .bind_host
+        .parse::<std::net::IpAddr>()
+        .is_err()
+    {
+        errors.push(format!(
+            "gateway bind_host {:?} is not an IP address",
+            config.gateway.bind_host
+        ));
+    }
+
     // --- ports: gateway, backends, WinML (when enabled) ---
     let mut ports: HashMap<u16, String> = HashMap::new();
     let mut claim_port = |port: u16, owner: String| {
@@ -818,6 +839,11 @@ pub fn migrate(raw: serde_json::Value) -> Result<AppConfig, ConfigError> {
 
 /// Default data directory: `%APPDATA%\local-llm-service-manager`
 /// (falls back to `~/.local-llm-service-manager` off-Windows).
+/// Serde default for [`GatewayConfig::bind_host`]: all interfaces.
+pub fn default_gateway_bind_host() -> String {
+    "0.0.0.0".to_string()
+}
+
 pub fn default_data_dir() -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
         PathBuf::from(appdata).join("local-llm-service-manager")
@@ -1057,6 +1083,32 @@ mod tests {
     #[test]
     fn working_config_is_valid() {
         validate(&working_config()).expect("working config must validate");
+    }
+
+    #[test]
+    fn gateway_bind_host_defaults_to_all_interfaces() {
+        // Pete's 2026-10-15 decision: the gateway is LAN-reachable out
+        // of the box; loopback-only is the opt-in.
+        assert_eq!(AppConfig::default_config().gateway.bind_host, "0.0.0.0");
+        // A config file written before bind_host existed deserializes
+        // to the same default.
+        let cfg: AppConfig = serde_json::from_str(
+            &serde_json::to_string(&AppConfig::default_config())
+                .unwrap()
+                .replace(r#""bind_host":"0.0.0.0","#, ""),
+        )
+        .unwrap();
+        assert_eq!(cfg.gateway.bind_host, "0.0.0.0");
+    }
+
+    #[test]
+    fn gateway_bind_host_must_be_an_ip() {
+        let mut cfg = working_config();
+        cfg.gateway.bind_host = "localhost".to_string();
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("bind_host"), "unexpected: {err}");
+        cfg.gateway.bind_host = "127.0.0.1".to_string();
+        validate(&cfg).expect("loopback bind validates");
     }
 
     #[test]

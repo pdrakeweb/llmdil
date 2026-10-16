@@ -1030,6 +1030,12 @@ export interface GatewayStatusData {
    *  configured (or the backend did not report presence). A presence
    *  check only — the credential value never leaves the backend. */
   openrouter_cred_present: boolean | null;
+  /** The configured bind address (0.0.0.0 = all interfaces,
+   *  127.0.0.1 = this computer only). */
+  bind_host: string;
+  /** The workstation's primary LAN address when bound beyond
+   *  loopback, for the client endpoint shown to other machines. */
+  lan_ip: string | null;
 }
 
 /** gateway_status — probe state (up) + port + group/rule counts + the
@@ -1049,7 +1055,7 @@ export async function getGatewayMasterKey(): Promise<CallResult<{ master_key: st
 }
 
 export async function getGatewayStatus(): Promise<CallResult<GatewayStatusData>> {
-  const fallback: GatewayStatusData = { port: 4000, groups: 0, routing_rules: 0, up: false, routing_log_len: 0, openrouter_cred_present: null };
+  const fallback: GatewayStatusData = { port: 4000, groups: 0, routing_rules: 0, up: false, routing_log_len: 0, openrouter_cred_present: null, bind_host: "0.0.0.0", lan_ip: null };
   if (!isTauri()) return { data: fallback, live: false };
   try {
     const raw = await invoke<Partial<GatewayStatusData>>("gateway_status");
@@ -1061,11 +1067,26 @@ export async function getGatewayStatus(): Promise<CallResult<GatewayStatusData>>
         up: Boolean(raw.up),
         routing_log_len: typeof raw.routing_log_len === "number" ? raw.routing_log_len : 0,
         openrouter_cred_present: typeof raw.openrouter_cred_present === "boolean" ? raw.openrouter_cred_present : null,
+        bind_host: typeof raw.bind_host === "string" ? raw.bind_host : "0.0.0.0",
+        lan_ip: typeof raw.lan_ip === "string" ? raw.lan_ip : null,
       },
       live: true,
     };
   } catch (e) {
     return { data: { ...fallback, port: 0 }, live: true, error: errOf(e) };
+  }
+}
+
+/** gateway_set_bind_host — set the gateway bind address. Applies at
+ *  the next gateway start (restart_required is always true); the
+ *  start-gateway step reconciles the Windows firewall rule then. */
+export async function setGatewayBindHost(host: string): Promise<CallResult<{ bind_host: string; restart_required: boolean }>> {
+  if (!isTauri()) return { data: { bind_host: host, restart_required: true }, live: false };
+  try {
+    const data = await invoke<{ bind_host: string; restart_required: boolean }>("gateway_set_bind_host", { host });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { bind_host: host, restart_required: true }, live: true, error: errOf(e) };
   }
 }
 

@@ -18,7 +18,7 @@ import {
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
   verifyModel, deleteModel, modelSetEnabled, modelAdd,
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
-  getGatewayMasterKey,
+  getGatewayMasterKey, setGatewayBindHost,
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
 } from "../api";
@@ -1616,7 +1616,15 @@ function gatewayPaint(
   const endpoint = `<div class="card" style="margin-bottom:12px"><div class="sec-title">${icon("gateway")} Client endpoint</div>
     <div style="font-size:12px;color:var(--text2);display:grid;gap:4px">
       <div>Base URL: <span style="font-family:var(--mono);color:var(--text)">http://127.0.0.1:${port}/v1</span></div>
-      <div>Bound to loopback (127.0.0.1) only \u2014 reachable from this machine, not from the LAN.</div>
+      <div>Network access: <select id="gwBindSelect" class="input" style="width:auto;display:inline-block;padding:2px 6px">
+          <option value="0.0.0.0"${status.bind_host !== "127.0.0.1" ? " selected" : ""}>Local network (all interfaces)</option>
+          <option value="127.0.0.1"${status.bind_host === "127.0.0.1" ? " selected" : ""}>This computer only (127.0.0.1)</option>
+        </select></div>
+      ${status.bind_host === "127.0.0.1"
+        ? `<div>Reachable from this machine only.</div>`
+        : status.lan_ip
+          ? `<div>LAN base URL: <span style="font-family:var(--mono);color:var(--text)">http://${esc(status.lan_ip)}:${port}/v1</span> \u2014 other machines use this address with the master key. The VS Code LiteLLM extension takes it without /v1.</div>`
+          : `<div>Bound to all interfaces; this machine's LAN address could not be determined.</div>`}
       <div>Clients authenticate with the master key below \u2014 LiteLLM requires one. The VS Code LiteLLM extension takes the base URL without /v1 (<span style="font-family:var(--mono);color:var(--text)">http://127.0.0.1:${port}</span>); it appends /v1 itself.</div>
       <div>Master key: <span style="font-family:var(--mono);color:var(--text)">${masterKey === null ? "not loaded \u2014 Reveal loads it" : keyRevealed ? esc(masterKey) : "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"}</span>
         <button class="btn" id="gwKeyRevealBtn">${keyRevealed ? "Hide" : "Reveal"}</button>
@@ -1629,7 +1637,7 @@ function gatewayPaint(
       <a class="btn" href="#/wizard">${icon("wrench")} Setup Wizard</a>
       <button class="btn" id="gwAdminUiBtn">${icon("gateway")} LiteLLM admin UI</button>
     </div>
-    <div style="font-size:12px;color:var(--text2);margin-top:6px">Runs the Setup Wizard's start-gateway step: LiteLLM binds 127.0.0.1. When the OpenRouter tier is enabled, the fallback is armed from Windows Credential Manager.</div></div>`;
+    <div style="font-size:12px;color:var(--text2);margin-top:6px">Runs the Setup Wizard's start-gateway step: LiteLLM binds the configured address, and the step reconciles the Windows firewall rule with it (one elevation prompt when the rule state changes). When the OpenRouter tier is enabled, the fallback is armed from Windows Credential Manager.</div></div>`;
 
   const or = cfg.openrouter;
   const orRows = or ? [
@@ -1895,7 +1903,20 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
       await load();
     }
   };
+  const onBindChange = async (ev: Event): Promise<void> => {
+    const sel = ev.target as HTMLElement;
+    if (!sel.closest("#gwBindSelect")) return;
+    const host = (sel as HTMLSelectElement).value;
+    const r = await setGatewayBindHost(host);
+    if (r.error) {
+      gwMsg(`Network access not saved: ${r.error}`, true);
+      return;
+    }
+    gwMsg("Network access saved — applies at the next gateway restart; the start-gateway step also reconciles the Windows firewall rule.");
+    await load();
+  };
   root.addEventListener("click", onClick);
+  root.addEventListener("change", onBindChange);
 
   await load();
 
@@ -1909,6 +1930,7 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     disposed = true;
     window.clearInterval(timer);
     root.removeEventListener("click", onClick);
+    root.removeEventListener("change", onBindChange);
   };
 }
 

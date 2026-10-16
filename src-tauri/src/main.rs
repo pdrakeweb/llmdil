@@ -2650,18 +2650,30 @@ async fn backend_get_launch_command(state: State<'_, AppState>, id: String) -> A
 /// read); it is null when no reference is configured.
 #[tauri::command]
 async fn gateway_status(state: State<'_, AppState>) -> ApiResult {
-    let (port, groups, routing_rules, cred_ref) = {
+    let (port, bind_host, probe_host, groups, routing_rules, cred_ref) = {
         let cfg = state.config.read().await;
         (
             cfg.gateway.port,
+            cfg.gateway.bind_host.clone(),
+            manager_wizard::steps::gateway_probe_host(&cfg),
             cfg.gateway.groups.len(),
             cfg.gateway.routing_rules.len(),
             cfg.gateway.openrouter.cred_ref.clone(),
         )
     };
-    let up = tokio::task::spawn_blocking(move || probe_gateway(port))
+    let up = tokio::task::spawn_blocking(move || probe_gateway(&probe_host, port))
         .await
         .unwrap_or(false);
+    // The workstation's primary LAN address, for the client endpoint
+    // shown when the gateway binds beyond loopback. A UDP connect
+    // sends nothing; it selects the egress interface.
+    let lan_ip = if bind_host != "127.0.0.1" {
+        tokio::task::spawn_blocking(primary_lan_ip)
+            .await
+            .unwrap_or(None)
+    } else {
+        None
+    };
     // The cmdkey presence check is a blocking subprocess call; run it
     // off the async worker like the MCP presence checks.
     let openrouter_cred_present: Option<bool> = match cred_ref.filter(|r| !r.is_empty()) {
@@ -2675,6 +2687,8 @@ async fn gateway_status(state: State<'_, AppState>) -> ApiResult {
     let routing_log_len = state.routing_log.lock().await.len();
     Ok(json!({
         "port": port,
+        "bind_host": bind_host,
+        "lan_ip": lan_ip,
         "groups": groups,
         "routing_rules": routing_rules,
         "up": up,
@@ -2710,16 +2724,21 @@ async fn gateway_stop(state: State<'_, AppState>) -> ApiResult {
     Ok(json!({ "ok": true, "stopped": stopped, "postgres_stopped": postgres_stopped }))
 }
 
-/// One-shot gateway liveness probe: connect to 127.0.0.1:<port> with a
+/// One-shot gateway liveness probe: connect to <host>:<port> with a
 /// 500 ms timeout, `GET /v1/models` with a 1 s read timeout, and report
 /// whether the reply's first line is a syntactically valid HTTP status
 /// line. Any status code counts — 200, 401, and 404 all prove a live
 /// HTTP listener, which is all "up" means here. Any error (refused,
 /// timeout, malformed reply) is simply "not up"; runs on a blocking
-/// thread and never fails the caller.
-fn probe_gateway(port: u16) -> bool {
+/// thread and never fails the caller. The host is the app's probe
+/// host for the configured bind address (loopback whenever the bind
+/// covers it).
+fn probe_gateway(host: &str, port: u16) -> bool {
     use std::io::{BufRead, BufReader, Write};
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let addr = std::net::SocketAddr::new(ip, port);
     let Ok(mut stream) =
         std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
     else {
@@ -2746,6 +2765,46 @@ fn probe_gateway(port: u16) -> bool {
             .nth(1)
             .and_then(|code| code.parse::<u16>().ok())
             .is_some()
+}
+
+/// The workstation's primary LAN IPv4 address, or None when it
+/// cannot be determined. A UDP "connect" sends no traffic; it makes
+/// the OS select the egress interface, whose address is the one LAN
+/// clients should use.
+fn primary_lan_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        None
+    } else {
+        Some(ip.to_string())
+    }
+}
+
+/// Set the gateway bind address (spec: Pete's decision 2026-10-15 —
+/// 0.0.0.0 by default so LAN clients can use the gateway, 127.0.0.1
+/// for this computer only; any other value must be an IP address on
+/// this machine). Applies at the next gateway start; the firewall
+/// rule is reconciled by the start-gateway step at that point.
+#[tauri::command]
+async fn gateway_set_bind_host(state: State<'_, AppState>, host: String) -> ApiResult {
+    if host.parse::<std::net::IpAddr>().is_err() {
+        return Err(err(ApiError::InvalidInput(format!(
+            "bind host {host:?} is not an IP address"
+        ))));
+    }
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    new_cfg.gateway.bind_host = host.clone();
+    manager_config::validate(&new_cfg)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    Ok(json!({ "bind_host": host, "restart_required": true }))
 }
 
 /// Preview the generated LiteLLM config.yaml.
@@ -4074,6 +4133,7 @@ fn main() {
             open_url,
             open_folder,
             gateway_master_key,
+            gateway_set_bind_host,
             // Models
             list_models,
             download_model,

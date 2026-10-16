@@ -2112,6 +2112,18 @@ impl WizardStep for InstallPostgres {
     }
 }
 
+/// The address the app itself uses to reach the gateway: loopback
+/// whenever the bind covers it (127.0.0.1 and the all-interfaces
+/// 0.0.0.0 / :: forms), otherwise the configured bind address
+/// itself. Probing through loopback keeps health checks working
+/// regardless of LAN state.
+pub fn gateway_probe_host(config: &AppConfig) -> String {
+    match config.gateway.bind_host.as_str() {
+        "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+        other => other.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 6. Start LiteLLM gateway
 // ---------------------------------------------------------------------------
@@ -2245,7 +2257,11 @@ impl StartGateway {
     }
 
     fn gateway_url(&self, ctx: &WizardContext) -> String {
-        format!("http://127.0.0.1:{}/v1/models", ctx.config.gateway.port)
+        format!(
+            "http://{}:{}/v1/models",
+            gateway_probe_host(&ctx.config),
+            ctx.config.gateway.port
+        )
     }
 
     fn litellm_spec(&self, ctx: &WizardContext) -> String {
@@ -2391,6 +2407,119 @@ impl StartGateway {
     const GATEWAY_BOOTSTRAP: &str =
         "import sys; from litellm import run_server; sys.exit(run_server())";
 
+    /// The Windows firewall rule that admits LAN clients to the
+    /// gateway: inbound TCP on the gateway port, Private profile
+    /// only, remote addresses limited to the local subnet.
+    fn firewall_rule_name(ctx: &WizardContext) -> String {
+        format!("Local LLM Gateway (TCP {})", ctx.config.gateway.port)
+    }
+
+    fn firewall_show_command(&self, ctx: &WizardContext) -> PlannedCommand {
+        PlannedCommand::new(vec![
+            "netsh".to_string(),
+            "advfirewall".to_string(),
+            "firewall".to_string(),
+            "show".to_string(),
+            "rule".to_string(),
+            format!("name={}", Self::firewall_rule_name(ctx)),
+        ])
+    }
+
+    fn firewall_script_path(&self, ctx: &WizardContext) -> PathBuf {
+        ctx.data_dir.join("gateway").join("firewall.cmd")
+    }
+
+    fn firewall_elevated_command(&self, ctx: &WizardContext) -> PlannedCommand {
+        PlannedCommand::new(vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            self.firewall_script_path(ctx).display().to_string(),
+        ])
+    }
+
+    fn firewall_script_contents(&self, ctx: &WizardContext, add: bool) -> String {
+        let name = Self::firewall_rule_name(ctx);
+        if add {
+            format!(
+                "@echo off\r\nnetsh advfirewall firewall delete rule name=\"{name}\" >nul 2>&1\r\nnetsh advfirewall firewall add rule name=\"{name}\" dir=in action=allow protocol=TCP localport={} profile=private remoteip=localsubnet\r\n",
+                ctx.config.gateway.port
+            )
+        } else {
+            format!("@echo off\r\nnetsh advfirewall firewall delete rule name=\"{name}\"\r\n")
+        }
+    }
+
+    async fn firewall_rule_exists(&self, ctx: &WizardContext) -> bool {
+        matches!(
+            ctx.ops.run_command(&self.firewall_show_command(ctx)).await,
+            Ok(out) if out.exit_code == 0
+        )
+    }
+
+    /// Reconcile the firewall rule with the bind configuration: a
+    /// LAN bind needs the rule, a loopback bind removes it. The
+    /// rule query is unprivileged, so a matching state costs no UAC
+    /// prompt; a mismatch runs one elevated script. A declined or
+    /// failed elevation is a warning, never a step failure — the
+    /// gateway itself is already healthy, and loopback clients are
+    /// unaffected by the rule either way.
+    async fn ensure_gateway_firewall(
+        &self,
+        ctx: &WizardContext,
+        log: &mut Vec<String>,
+    ) -> Option<String> {
+        let want_rule = ctx.config.gateway.bind_host != "127.0.0.1";
+        let have_rule = self.firewall_rule_exists(ctx).await;
+        if want_rule == have_rule {
+            log.push(if have_rule {
+                "Windows firewall rule for LAN gateway access already present".to_string()
+            } else {
+                "gateway binds loopback only; no firewall rule needed".to_string()
+            });
+            return None;
+        }
+        let script = self.firewall_script_path(ctx);
+        if let Err(e) = ctx
+            .ops
+            .write_file(
+                &script,
+                self.firewall_script_contents(ctx, want_rule).as_bytes(),
+            )
+            .await
+        {
+            return Some(format!(
+                "could not write the firewall script {}: {e}",
+                script.display()
+            ));
+        }
+        match ctx
+            .ops
+            .run_elevated(&self.firewall_elevated_command(ctx))
+            .await
+        {
+            Ok(_) => {
+                log.push(if want_rule {
+                    format!(
+                        "Windows firewall rule added: inbound TCP {} (Private profile, local subnet)",
+                        ctx.config.gateway.port
+                    )
+                } else {
+                    "Windows firewall rule for LAN gateway access removed".to_string()
+                });
+                None
+            }
+            Err(e) => Some(format!(
+                "the Windows firewall rule was not {} ({e}); {}",
+                if want_rule { "added" } else { "removed" },
+                if want_rule {
+                    "clients on the local network may be unable to connect until the rule exists"
+                } else {
+                    "a stale allow rule for the gateway port remains, inert while the gateway binds loopback"
+                }
+            )),
+        }
+    }
+
     fn spawn_command(&self, ctx: &WizardContext) -> PlannedCommand {
         let cfg = ctx.data_dir.join("gateway").join("config.yaml");
         let mut cmd = PlannedCommand::new(vec![
@@ -2399,10 +2528,13 @@ impl StartGateway {
             Self::GATEWAY_BOOTSTRAP.to_string(),
             "--config".to_string(),
             cfg.display().to_string(),
-            // Loopback only: without --host LiteLLM binds 0.0.0.0 and
-            // exposes the gateway (and its upstream keys) to the LAN.
+            // The configured bind address (default 0.0.0.0 — Pete's
+            // decision 2026-10-15: other machines on the local
+            // network use the gateway; 127.0.0.1 restricts it to this
+            // computer). Authentication is the master key on every
+            // interface.
             "--host".to_string(),
-            "127.0.0.1".to_string(),
+            ctx.config.gateway.bind_host.clone(),
             "--port".to_string(),
             ctx.config.gateway.port.to_string(),
         ]);
@@ -2695,6 +2827,11 @@ impl WizardStep for StartGateway {
                     );
                 }
                 cmds.push(spawn);
+                // Firewall reconciliation for the bind address: a
+                // read-only rule query, plus the elevated script
+                // when the rule state does not match the bind.
+                cmds.push(self.firewall_show_command(ctx));
+                cmds.push(self.firewall_elevated_command(ctx));
                 cmds
             }
             // Audit only re-probes the health endpoint; nothing is spawned.
@@ -2896,13 +3033,20 @@ impl WizardStep for StartGateway {
                         log,
                     ));
                 }
-                let message = match &openrouter_warning {
+                let mut message = match &openrouter_warning {
                     Some(w) => format!(
                         "LiteLLM gateway running on :{} — warning: {w}",
                         ctx.config.gateway.port
                     ),
                     None => format!("LiteLLM gateway running on :{}", ctx.config.gateway.port),
                 };
+                // The gateway is healthy; reconcile the Windows
+                // firewall rule with the bind address so LAN clients
+                // can actually reach a LAN-bound gateway.
+                if let Some(fw) = self.ensure_gateway_firewall(ctx, &mut log).await {
+                    log.push(format!("warning: {fw}"));
+                    message = format!("{message} — warning: {fw}");
+                }
                 Ok(StepOutcome::done(message, log))
             }
             RunMode::Audit => {
@@ -4325,7 +4469,8 @@ impl WizardStep for SmokeTest {
                 PlannedCommand::new(vec![
                     "http-post".to_string(),
                     format!(
-                        "http://127.0.0.1:{}/v1/chat/completions",
+                        "http://{}:{}/v1/chat/completions",
+                        gateway_probe_host(&ctx.config),
                         ctx.config.gateway.port
                     ),
                     Self::probe_body(&g.name, "wizard-smoke"),
@@ -4358,7 +4503,8 @@ impl WizardStep for SmokeTest {
         }
         let tag = format!("wizard-{}", chrono::Utc::now().timestamp());
         let url = format!(
-            "http://127.0.0.1:{}/v1/chat/completions",
+            "http://{}:{}/v1/chat/completions",
+            gateway_probe_host(&ctx.config),
             ctx.config.gateway.port
         );
         // The gateway requires its master key when one is set; it is
@@ -5383,8 +5529,9 @@ mod tests {
             health_interval_ms: 1,
         };
         let planned = step.planned_commands(&ctx);
-        assert_eq!(planned.len(), 5);
-        // Probes first, then the pinned venv creation, pip, and spawn.
+        assert_eq!(planned.len(), 7);
+        // Probes first, then the pinned venv creation, pip, the spawn,
+        // and the firewall reconciliation (show rule, elevated script).
         assert!(planned[2].argv[0].ends_with("uv"));
         assert!(planned[2].argv.contains(&"--python".to_string()));
         assert!(planned[2]
@@ -5708,7 +5855,10 @@ mod tests {
         };
         // The plan records the variable but never the value.
         let planned = step.planned_commands(&ctx);
-        let plan_spawn = planned.last().unwrap();
+        let plan_spawn = planned
+            .iter()
+            .find(|c| c.argv.iter().any(|a| a == "--config"))
+            .expect("gateway spawn planned");
         assert_eq!(
             plan_spawn.env.get("OPENROUTER_API_KEY").map(String::as_str),
             Some("<set from credential manager>")
@@ -5722,19 +5872,137 @@ mod tests {
             envs[0].get("OPENROUTER_API_KEY").map(String::as_str),
             Some("sk-test-value")
         );
-        // Loopback bind on the spawn argv.
+        // The configured bind on the spawn argv: the shipped default
+        // is 0.0.0.0 (LAN-reachable), per Pete's 2026-10-15 decision.
         let spawns = ops.spawns();
         let host = spawns[0]
             .windows(2)
             .find(|w| w[0] == "--host")
             .expect("--host present");
-        assert_eq!(host[1], "127.0.0.1");
+        assert_eq!(host[1], "0.0.0.0");
         // The key never lands in the generated YAML.
         let cfg = ops
             .file_bytes(&PathBuf::from("/data/gateway/config.yaml"))
             .expect("config written");
         let text = String::from_utf8(cfg).unwrap();
         assert!(!text.contains("sk-test-value"), "{text}");
+    }
+
+    /// Firewall reconciliation, add path: LAN-bound (the default)
+    /// with no rule present — the step elevates once to run the add
+    /// script, and a successful add leaves the Done message clean.
+    #[tokio::test]
+    async fn start_gateway_adds_firewall_rule_when_missing() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        ops.with_command_failure(
+            &[
+                "netsh",
+                "advfirewall",
+                "firewall",
+                "show",
+                "rule",
+                "name=Local LLM Gateway (TCP 4000)",
+            ],
+            1,
+            "No rules match the specified criteria.",
+        );
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+        };
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(!out.message.contains("firewall"), "{out:?}");
+        let elevated = ops.elevated_calls();
+        assert_eq!(elevated.len(), 1, "{elevated:?}");
+        let script = ops
+            .file_bytes(&PathBuf::from("/data/gateway/firewall.cmd"))
+            .expect("firewall script written");
+        let text = String::from_utf8(script).unwrap();
+        assert!(
+            text.contains("add rule name=\"Local LLM Gateway (TCP 4000)\""),
+            "{text}"
+        );
+        assert!(text.contains("localport=4000"), "{text}");
+        assert!(text.contains("remoteip=localsubnet"), "{text}");
+    }
+
+    /// Firewall reconciliation, remove path: loopback-bound with the
+    /// rule present (the fake's default command success) — one
+    /// elevated delete.
+    #[tokio::test]
+    async fn start_gateway_removes_firewall_rule_when_loopback() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let mut config = test_config_with_models();
+        config.gateway.bind_host = "127.0.0.1".to_string();
+        let ctx = WizardContext::new(
+            config,
+            PathBuf::from("/data"),
+            RunMode::Install,
+            ops.clone(),
+        );
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+        };
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert_eq!(ops.elevated_calls().len(), 1);
+        let script = ops
+            .file_bytes(&PathBuf::from("/data/gateway/firewall.cmd"))
+            .expect("firewall script written");
+        let text = String::from_utf8(script).unwrap();
+        assert!(
+            text.contains("delete rule name=\"Local LLM Gateway (TCP 4000)\""),
+            "{text}"
+        );
+        assert!(!text.contains("add rule"), "{text}");
+    }
+
+    /// Firewall reconciliation, no-op path: LAN-bound with the rule
+    /// already present — no elevation, no script.
+    #[tokio::test]
+    async fn start_gateway_firewall_noop_when_rule_matches() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+        };
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(ops.elevated_calls().is_empty());
+        assert!(ops
+            .file_bytes(&PathBuf::from("/data/gateway/firewall.cmd"))
+            .is_none());
+    }
+
+    #[test]
+    fn gateway_probe_host_maps_wildcards_to_loopback() {
+        let mut config = test_config_with_models();
+        assert_eq!(gateway_probe_host(&config), "127.0.0.1");
+        config.gateway.bind_host = "::".to_string();
+        assert_eq!(gateway_probe_host(&config), "127.0.0.1");
+        config.gateway.bind_host = "127.0.0.1".to_string();
+        assert_eq!(gateway_probe_host(&config), "127.0.0.1");
+        config.gateway.bind_host = "192.168.1.50".to_string();
+        assert_eq!(gateway_probe_host(&config), "192.168.1.50");
     }
 
     #[tokio::test]
@@ -5846,7 +6114,7 @@ mod tests {
         } else {
             // No auto-bootstrap off Windows: uv path shown, run() fails
             // with install guidance instead.
-            assert_eq!(planned.len(), 5);
+            assert_eq!(planned.len(), 7);
         }
     }
 
@@ -6940,7 +7208,7 @@ mod tests {
             Arc::new(FakeSystemOps::new()),
         );
         let install_cmds = StartGateway::default().planned_commands(&install_ctx);
-        assert_eq!(install_cmds.len(), 5);
+        assert_eq!(install_cmds.len(), 7);
         assert!(install_cmds[2].argv[0].ends_with("uv"));
 
         // ...audit mode shows only the health probe.

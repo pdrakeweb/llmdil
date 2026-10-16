@@ -123,3 +123,17 @@ Content (requested by Pete Oct 15 — no way existed to give the Nemotron catalo
 - backend_add / backend_delete Tauri commands (clone-validate-save; seeded defaults n_ctx 32768 / n_batch 512 / restart 5x2s; group join-or-create; delete refused while running and scrubs group memberships + model assignment lists).
 - Backends page: "Add backend" form (name, model dropdown, next-free port prefilled, existing-or-new group, enabled default) in a poll-safe container outside the repainted grid; post-create card offers an inline gateway restart (routes generate at gateway start). Remove button on stopped/failed configured cards with a two-click confirm.
 - PostgreSQL moves to v0.1.16 (research still running).
+
+## v0.1.15 verified green (Oct 15, 2026, via API)
+Release 38829095077 success; CI 38829095101 + 38829087714 success; Install Test 38830312722 success; published 2026-10-16T00:30:09Z; asset 4,561,723 bytes. Watchdog llm-release-v0115-watch self-disabled.
+
+## v0.1.16 shipped (Oct 15, 2026)
+Commit 914c05246ca8c5710b2fc489375def3f51fcee1f; tag v0.1.16; watchdog llm-release-v0116-watch armed. Gates at ship: fmt clean, 390 workspace tests, clippy 0, src-tauri check + check --tests clean, UI build clean.
+Content (app-managed PostgreSQL, Pete's decision Oct 15 — the LiteLLM admin UI cannot be logged into without a database):
+- Research landed first (~/workspace/.tmp-assets/postgres-litellm-research.md): pin PostgreSQL 18.6-1 EDB binaries zip (343,808,005 B, SHA-256 fbe23da2…, self-computed — EDB publishes none); LiteLLM auto-migrates at startup via proxy-extras prisma migrate deploy (verified empirically: 195 migrations / 91 tables on PG 17.11 and 18.6).
+- manager-config: PostgresConfig { port } (default 54329, serde-default on AppConfig, claimed in validate).
+- New SystemOps::extract_zip_prefixes (Real manual-entry impl with traversal rejection; Fake records + materializes) — the step extracts only pgsql/bin|lib|share|include (155.6 MiB of 871 MiB).
+- install-postgres step (wizard now 12 steps, before start-gateway; prereq detect-hardware; audit = marker + binaries + PG_VERSION): download/verify zip fail-closed, extract, ensure password (Credential Manager local-llm-service-manager/postgres-password; generated hex = URL-safe), initdb (-U postgres -A scram-sha-256 --pwfile, pwfile always deleted), pg_ctl start (-o "-p 54329 -h 127.0.0.1", log to <data_dir>/logs/postgres.log), createdb litellm (already-exists tolerated), marker .installed.json.
+- ensure_postgres_running shared helper (pg_isready poll; failure returns the server log tail — the admin-token refusal surfaces there); stop_postgres_server (pg_ctl stop -m fast).
+- StartGateway: when installed, start PostgreSQL before spawn, pre-warm Prisma toolchain (python -m prisma --version, non-fatal warning), pass DATABASE_URL in the spawn env; not installed → spawns exactly as before. gateway_stop stops PostgreSQL after the gateway (postgres_stopped in payload). Gateway view admin-UI copy updated (run install-postgres if sign-in reports "Not connected to DB").
+- 4 new wizard tests (install happy path incl. initdb/createdb argv + pwfile cleanup, checksum fail-closed, audit, gateway DATABASE_URL present/absent).
