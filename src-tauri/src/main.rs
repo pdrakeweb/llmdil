@@ -37,7 +37,7 @@ use manager_telemetry::{
 };
 use manager_wizard::{
     ops::{prev_log_path, RealSystemOps},
-    steps::{continue_editor_config, default_steps, VscodeExtensions},
+    steps::{continue_config_yaml, default_steps, merge_env_contents, VscodeExtensions},
     RunMode, StepOutcome, StepState, Wizard, WizardContext, WizardReport,
 };
 use serde::{Deserialize, Serialize};
@@ -3489,42 +3489,55 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 /// Write the Continue config pointing at the local gateway (spec §9, §14
-/// `vscode_write_config`). When `backup` is true, an existing
-/// `~/.continue/config.json` is first renamed to a timestamped backup;
-/// when false, the config is only staged under the data dir and the
-/// canonical file is left untouched. Returns old/new model lists so the UI
-/// can show the diff before apply.
+/// `vscode_write_config`): the `config.yaml` + `.env` pair current
+/// Continue loads (the legacy `config.json` write was retired in
+/// v0.1.14 — with a config.yaml present the JSON is inert, and its
+/// stale literal key is a hazard if the YAML is removed). When
+/// `backup` is true, an existing `~/.continue/config.yaml` is first
+/// renamed to a timestamped backup (a legacy `config.json` is backed
+/// up alongside it), and the `.env` key line is merged in place; when
+/// false, the files are only staged under the data dir and the
+/// canonical files are left untouched. Returns old/new model lists
+/// so the UI can show the diff before apply.
 #[tauri::command]
 async fn vscode_write_config(state: State<'_, AppState>, backup: bool) -> ApiResult {
     let cfg = state.config.read().await;
-    // The editor client needs the gateway master key as its apiKey;
+    // The editor client authenticates with the gateway master key;
     // ensure (generate + store on first use) so the written config
-    // works against the key-guarded gateway.
+    // works against the key-guarded gateway. The key itself goes to
+    // ~/.continue/.env — config.yaml references it as
+    // ${{ secrets.LITELLM_API_KEY }} and carries no literal secret.
     let master_key = manager_wizard::ensure_gateway_master_key(&RealSystemOps)
         .await
         .map_err(jerr)?;
-    let new_json = continue_editor_config(&cfg, Some(&master_key));
-    let new_models: Value = serde_json::from_str::<Value>(&new_json)
-        .map_err(jerr)?
+    let new_yaml = continue_config_yaml(&cfg);
+    let new_models: Value = serde_yaml::from_str::<Value>(&new_yaml)
+        .map_err(|e| e.to_string())?
         .get("models")
         .cloned()
         .unwrap_or(Value::Null);
     drop(cfg);
 
-    let staged = state.data_dir.join("vscode").join("continue-config.json");
-    if let Some(parent) = staged.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(ApiError::from)
-            .map_err(jerr)?;
-    }
-    std::fs::write(&staged, new_json.as_bytes())
+    let staged_dir = state.data_dir.join("vscode");
+    std::fs::create_dir_all(&staged_dir)
         .map_err(ApiError::from)
         .map_err(jerr)?;
+    let staged = staged_dir.join("continue-config.yaml");
+    std::fs::write(&staged, new_yaml.as_bytes())
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    std::fs::write(
+        staged_dir.join("continue.env"),
+        format!("LITELLM_API_KEY={master_key}\n"),
+    )
+    .map_err(ApiError::from)
+    .map_err(jerr)?;
 
     let mut out = json!({
         "staged": staged,
         "canonical": Value::Null,
         "backup_path": Value::Null,
+        "legacy_backup_path": Value::Null,
         "old_models": Value::Null,
         "new_models": new_models,
     });
@@ -3534,39 +3547,67 @@ async fn vscode_write_config(state: State<'_, AppState>, backup: bool) -> ApiRes
     let Some(home) = home_dir() else {
         return Ok(out);
     };
-    let canonical = home.join(".continue").join("config.json");
+    let dir = home.join(".continue");
+    std::fs::create_dir_all(&dir)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    let canonical = dir.join("config.yaml");
+    let legacy = dir.join("config.json");
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     let mut old_models = Value::Null;
     let mut backup_path = Value::Null;
     if canonical.exists() {
         let existing = std::fs::read_to_string(&canonical)
             .map_err(ApiError::from)
             .map_err(jerr)?;
-        old_models = serde_json::from_str::<Value>(&existing)
+        old_models = serde_yaml::from_str::<Value>(&existing)
             .ok()
             .and_then(|v| v.get("models").cloned())
             .unwrap_or(Value::Null);
-        let ts_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let bak = home
-            .join(".continue")
-            .join(format!("config.json.bak-{ts_ms}"));
+        let bak = dir.join(format!("config.yaml.bak-{ts_ms}"));
         std::fs::rename(&canonical, &bak)
             .map_err(ApiError::from)
             .map_err(jerr)?;
         backup_path = serde_json::to_value(&bak).map_err(jerr)?;
-    }
-    if let Some(parent) = canonical.parent() {
-        std::fs::create_dir_all(parent)
+    } else if legacy.exists() {
+        // No YAML yet: the diff's old side is the legacy JSON config.
+        let existing = std::fs::read_to_string(&legacy)
             .map_err(ApiError::from)
             .map_err(jerr)?;
+        old_models = serde_json::from_str::<Value>(&existing)
+            .ok()
+            .and_then(|v| v.get("models").cloned())
+            .unwrap_or(Value::Null);
     }
-    std::fs::write(&canonical, new_json.as_bytes())
+    std::fs::write(&canonical, new_yaml.as_bytes())
         .map_err(ApiError::from)
         .map_err(jerr)?;
+    // The .env secret: merged by key, never backed up or replaced.
+    let env_path = dir.join(".env");
+    let existing_env = std::fs::read_to_string(&env_path).unwrap_or_default();
+    std::fs::write(
+        &env_path,
+        merge_env_contents(&existing_env, "LITELLM_API_KEY", &master_key),
+    )
+    .map_err(ApiError::from)
+    .map_err(jerr)?;
+    // A legacy config.json is inert once config.yaml exists, but if
+    // the YAML is ever removed the JSON — with its stale literal
+    // key — becomes live again. Back it aside with the same backup.
+    let mut legacy_backup_path = Value::Null;
+    if legacy.exists() {
+        let bak = dir.join(format!("config.json.bak-{ts_ms}"));
+        std::fs::rename(&legacy, &bak)
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
+        legacy_backup_path = serde_json::to_value(&bak).map_err(jerr)?;
+    }
     out["canonical"] = serde_json::to_value(&canonical).map_err(jerr)?;
     out["backup_path"] = backup_path;
+    out["legacy_backup_path"] = legacy_backup_path;
     out["old_models"] = old_models;
     Ok(out)
 }

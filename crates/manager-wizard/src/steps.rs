@@ -6,15 +6,12 @@
 //! [`FakeSystemOps`](crate::fake::FakeSystemOps).
 
 use crate::{
-    checksums_match, is_pinned_hash, PlannedCommand, RunMode, StepOutcome, WizardContext,
-    WizardError, WizardStep,
+    checksums_match, is_pinned_hash, PlannedCommand, RunMode, StepOutcome, SystemOps,
+    WizardContext, WizardError, WizardStep,
 };
 use async_trait::async_trait;
 use manager_config::{AppConfig, ModelConfig};
 use std::path::{Path, PathBuf};
-
-/// Generate the Continue `config.json` content with every gateway model
-/// group as a model pointing at the local LiteLLM gateway.
 ///
 /// Shared by the [`VscodeExtensions`] wizard step and the Tauri
 /// `vscode_write_config` command so both write byte-identical configs.
@@ -22,25 +19,498 @@ use std::path::{Path, PathBuf};
 /// the gateway requires it, and an editor client config is where such
 /// a key conventionally lives (the user's own profile, on their own
 /// machine).
-pub fn continue_editor_config(config: &AppConfig, master_key: Option<&str>) -> String {
-    let models: Vec<serde_json::Value> = config
+/// The secret name Continue resolves for the gateway master key:
+/// `config.yaml` references `${{ secrets.LITELLM_API_KEY }}` and
+/// Continue's local profile resolves it from `~/.continue/.env`
+/// (first match in its search order), so the key lives in the `.env`
+/// file and never in the YAML.
+pub const CONTINUE_ENV_KEY: &str = "LITELLM_API_KEY";
+
+/// Render a string as a YAML scalar: plain when it is safe (letters,
+/// digits, and the punctuation our generated values use), else a
+/// JSON double-quoted scalar (valid YAML).
+fn yaml_scalar(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || " _().-/:@".contains(c))
+        && !s.starts_with(|c: char| "-?:,[]{}#&*!|>'\"%@`".contains(c));
+    if safe {
+        s.to_string()
+    } else {
+        serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""))
+    }
+}
+
+/// The Continue `config.yaml` document for the local gateway
+/// (Continue 1.x local profile format, verified against
+/// continuedev/continue on 2026-10-15):
+///
+/// - Every gateway group becomes a model with `provider: openai`
+///   (there is no dedicated LiteLLM provider; an unknown provider
+///   name makes Continue silently skip the model), `model:` set to
+///   the bare group name (sent to the gateway unchanged), and
+///   `apiBase` WITH `/v1` (Continue appends `chat/completions`;
+///   the opposite of the LiteLLM extension's no-`/v1` rule).
+/// - `apiKey` references the secret in `~/.continue/.env` — no
+///   literal key in the YAML.
+/// - `roles: [chat, edit, apply]` puts the models in the chat
+///   picker and in Edit/Apply; `capabilities: [tool_use]` is
+///   required for Agent mode because Continue's tool-support
+///   autodetection only recognizes known cloud model names.
+/// - Groups keep config order: with no stored selection, the chat
+///   picker starts at the first chat model (the planner).
+pub fn continue_config_yaml(config: &AppConfig) -> String {
+    let mut out = String::new();
+    out.push_str("name: Local LLM Gateway\nversion: 1.0.0\nschema: v1\nmodels:\n");
+    for g in &config.gateway.groups {
+        out.push_str(&format!(
+            "  - name: {}\n    provider: openai\n    model: {}\n    apiBase: http://127.0.0.1:{}/v1\n    apiKey: ${{{{ secrets.LITELLM_API_KEY }}}}\n    roles:\n      - chat\n      - edit\n      - apply\n    capabilities:\n      - tool_use\n    defaultCompletionOptions:\n      contextLength: 32768\n",
+            yaml_scalar(&format!("{} (local)", g.name)),
+            yaml_scalar(&g.name),
+            config.gateway.port
+        ));
+    }
+    out
+}
+
+/// The gateway models of [`continue_config_yaml`] as YAML values,
+/// for merging into an existing document.
+fn continue_yaml_models(config: &AppConfig) -> Vec<serde_yaml::Value> {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&continue_config_yaml(config)).unwrap_or(serde_yaml::Value::Null);
+    doc.get("models")
+        .and_then(|m| m.as_sequence().cloned())
+        .unwrap_or_default()
+}
+
+/// Merge the gateway models into an existing Continue `config.yaml`:
+/// the wizard's own entries (identified by `model:` + `apiBase`, per
+/// the config research) are replaced with the generated ones; every
+/// other model and every other top-level key is preserved as a
+/// value. The document is re-serialized, so comments and formatting
+/// in the existing file are normalized — the caller logs that.
+/// Errors when the existing text is not a YAML mapping, so the
+/// caller can fall back to a sidecar instead of clobbering it.
+pub fn merge_continue_config_yaml(existing: &str, config: &AppConfig) -> Result<String, String> {
+    let mut doc: serde_yaml::Value =
+        serde_yaml::from_str(existing).map_err(|e| format!("existing config.yaml: {e}"))?;
+    if doc.is_null() {
+        doc = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+    let map = doc
+        .as_mapping_mut()
+        .ok_or_else(|| "existing config.yaml is not a mapping".to_string())?;
+    let api_base = format!("http://127.0.0.1:{}/v1", config.gateway.port);
+    let our_names: Vec<String> = config
         .gateway
         .groups
         .iter()
-        .map(|g| {
-            let mut m = serde_json::json!({
-                "title": format!("{} (local)", g.name),
-                "provider": "openai",
-                "model": g.name,
-                "apiBase": format!("http://127.0.0.1:{}/v1", config.gateway.port),
-            });
-            if let Some(key) = master_key {
-                m["apiKey"] = serde_json::Value::String(key.to_string());
-            }
-            m
-        })
+        .map(|g| g.name.clone())
         .collect();
-    json_pretty(&serde_json::json!({ "models": models }))
+    let mut models: Vec<serde_yaml::Value> = map
+        .get("models")
+        .and_then(|m| m.as_sequence().cloned())
+        .unwrap_or_default();
+    models.retain(|m| {
+        let model = m.get("model").and_then(|v| v.as_str());
+        let base = m.get("apiBase").and_then(|v| v.as_str());
+        !(base == Some(api_base.as_str())
+            && model
+                .map(|n| our_names.iter().any(|o| o == n))
+                .unwrap_or(false))
+    });
+    models.extend(continue_yaml_models(config));
+    map.insert(
+        serde_yaml::Value::String("models".to_string()),
+        serde_yaml::Value::Sequence(models),
+    );
+    for (k, v) in [
+        ("name", "Local LLM Gateway"),
+        ("version", "1.0.0"),
+        ("schema", "v1"),
+    ] {
+        map.entry(serde_yaml::Value::String(k.to_string()))
+            .or_insert_with(|| serde_yaml::Value::String(v.to_string()));
+    }
+    serde_yaml::to_string(&doc).map_err(|e| format!("serialize merged config.yaml: {e}"))
+}
+
+/// Set `KEY=value` in dotenv text: an existing `KEY=` line (with or
+/// without an `export` prefix) is replaced; otherwise the line is
+/// appended. All other lines — comments and other variables —
+/// survive unchanged.
+pub fn merge_env_contents(existing: &str, key: &str, value: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut written = false;
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        let body = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        if body.starts_with(&format!("{key}=")) {
+            if !written {
+                out.push(format!("{key}={value}"));
+                written = true;
+            }
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    if !written {
+        out.push(format!("{key}={value}"));
+    }
+    let mut text = out.join("\n");
+    text.push('\n');
+    text
+}
+
+/// True when a `~/.continue/config.json` is one the wizard itself
+/// wrote: a JSON object whose every model entry points at this
+/// gateway (provider `openai`, our `apiBase`). A config.json with
+/// any other content is the user's own and is left alone.
+pub fn legacy_continue_json_is_ours(text: &str, config: &AppConfig) -> bool {
+    let api_base = format!("http://127.0.0.1:{}/v1", config.gateway.port);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    let Some(models) = v.get("models").and_then(|m| m.as_array()) else {
+        return false;
+    };
+    !models.is_empty()
+        && models.iter().all(|m| {
+            m.get("provider").and_then(|p| p.as_str()) == Some("openai")
+                && m.get("apiBase").and_then(|b| b.as_str()) == Some(api_base.as_str())
+        })
+}
+
+/// Outcome of [`write_continue_files`].
+pub struct ContinueWrite {
+    pub log: Vec<String>,
+    /// True when the canonical files under `~/.continue` were
+    /// written (false for staged-only and sidecar fallback).
+    pub applied: bool,
+}
+
+/// Write Continue's configuration for the local gateway: the
+/// `config.yaml` (models) + `.env` (master key) pair. Always stages
+/// both files under `<data_dir>/vscode/`; with a home directory,
+/// also applies them under `~/.continue`:
+///
+/// - `config.yaml`: merged into an existing file (see
+///   [`merge_continue_config_yaml`]); when the existing file cannot
+///   be parsed as YAML, ours is written to a sidecar
+///   (`config.yaml.llm-manager`) instead of clobbering it.
+/// - `.env`: the `LITELLM_API_KEY` line is merged by key.
+/// - A wizard-written legacy `config.json` is moved aside to
+///   `config.json.llm-manager.bak`: once `config.yaml` exists the
+///   JSON is inert, but if the YAML were later deleted the JSON —
+///   with its stale literal key — would silently become live again.
+pub async fn write_continue_files(
+    ops: &dyn SystemOps,
+    config: &AppConfig,
+    home: Option<&Path>,
+    data_dir: &Path,
+) -> Result<ContinueWrite, WizardError> {
+    let key = crate::ensure_gateway_master_key(ops).await?;
+    let yaml = continue_config_yaml(config);
+    let env_text = format!("{CONTINUE_ENV_KEY}={key}\n");
+    let mut log = Vec::new();
+    let staged_dir = data_dir.join("vscode");
+    ops.write_file(&staged_dir.join("continue-config.yaml"), yaml.as_bytes())
+        .await?;
+    ops.write_file(&staged_dir.join("continue.env"), env_text.as_bytes())
+        .await?;
+    log.push(format!(
+        "staged Continue config at {}",
+        staged_dir.join("continue-config.yaml").display()
+    ));
+    let Some(home) = home else {
+        log.push("home directory unknown; Continue config staged only".to_string());
+        return Ok(ContinueWrite {
+            log,
+            applied: false,
+        });
+    };
+    let dir = home.join(".continue");
+    // config.yaml: write fresh, or merge into the existing file.
+    let yaml_path = dir.join("config.yaml");
+    let mut applied = true;
+    if ops.file_exists(&yaml_path).await {
+        let existing = ops.read_file(&yaml_path).await.unwrap_or_default();
+        let existing = String::from_utf8_lossy(&existing).into_owned();
+        match merge_continue_config_yaml(&existing, config) {
+            Ok(merged) => {
+                ops.write_file(&yaml_path, merged.as_bytes()).await?;
+                log.push(format!(
+                    "merged gateway models into existing {} (comments and formatting normalized)",
+                    yaml_path.display()
+                ));
+            }
+            Err(e) => {
+                let sidecar = dir.join("config.yaml.llm-manager");
+                ops.write_file(&sidecar, yaml.as_bytes()).await?;
+                log.push(format!(
+                    "existing {} could not be merged ({e}); generated config at {}",
+                    yaml_path.display(),
+                    sidecar.display()
+                ));
+                applied = false;
+            }
+        }
+    } else {
+        ops.write_file(&yaml_path, yaml.as_bytes()).await?;
+        log.push(format!("wrote {}", yaml_path.display()));
+    }
+    // .env: merge the key line into whatever is already there.
+    let env_path = dir.join(".env");
+    let existing_env = match ops.read_file(&env_path).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
+    };
+    let merged_env = merge_env_contents(&existing_env, CONTINUE_ENV_KEY, &key);
+    ops.write_file(&env_path, merged_env.as_bytes()).await?;
+    log.push(format!(
+        "Continue secret {CONTINUE_ENV_KEY} set in {}",
+        env_path.display()
+    ));
+    // Retire a wizard-written legacy config.json (see fn docs).
+    let legacy = dir.join("config.json");
+    if ops.file_exists(&legacy).await {
+        let bytes = ops.read_file(&legacy).await.unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        if legacy_continue_json_is_ours(&text, config) {
+            let bak = dir.join("config.json.llm-manager.bak");
+            ops.write_file(&bak, &bytes).await?;
+            ops.remove_file(&legacy).await?;
+            log.push(format!(
+                "retired legacy Continue config.json to {} (config.yaml supersedes it)",
+                bak.display()
+            ));
+        }
+    }
+    Ok(ContinueWrite { log, applied })
+}
+
+/// The label of the manager's own entry in the LiteLLM extension's
+/// `litellm-vscode-chat.servers` setting. Labels are the extension's
+/// server identities: the wizard replaces its entry by label (or by
+/// base URL), never appends a duplicate.
+pub const LITELLM_SERVER_LABEL: &str = "Local";
+
+/// The manager's LiteLLM server entry for the VS Code extension:
+/// base URL WITHOUT `/v1` (the extension appends it; with it, model
+/// discovery doubles the path and 404s) and the gateway master key as
+/// the API key (the extension supports an inline `auth.apiKey` and it
+/// takes precedence over its secret storage).
+pub fn litellm_server_entry(gateway_port: u16, master_key: &str) -> serde_json::Value {
+    serde_json::json!({
+        "label": LITELLM_SERVER_LABEL,
+        "baseUrl": format!("http://127.0.0.1:{gateway_port}"),
+        "auth": { "apiKey": master_key },
+    })
+}
+
+fn cst_input_value(v: &serde_json::Value) -> jsonc_parser::cst::CstInputValue {
+    use jsonc_parser::cst::CstInputValue;
+    match v {
+        serde_json::Value::Null => CstInputValue::Null,
+        serde_json::Value::Bool(b) => CstInputValue::Bool(*b),
+        serde_json::Value::Number(n) => CstInputValue::Number(n.to_string()),
+        serde_json::Value::String(s) => CstInputValue::String(s.clone()),
+        serde_json::Value::Array(items) => {
+            CstInputValue::Array(items.iter().map(cst_input_value).collect())
+        }
+        serde_json::Value::Object(map) => CstInputValue::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), cst_input_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// Merge the manager's LiteLLM server entry into VS Code `settings.json`
+/// text. The file is JSONC (comments, trailing commas): the edit goes
+/// through a concrete syntax tree so the user's comments, formatting,
+/// and unrelated settings survive untouched. Only the
+/// `litellm-vscode-chat.servers` array is rewritten — entries the
+/// wizard does not own are carried over as values; its own entry
+/// (matched by label or base URL) is replaced, never duplicated.
+pub fn merge_litellm_server_setting(
+    settings_text: &str,
+    entry: &serde_json::Value,
+) -> Result<String, String> {
+    use jsonc_parser::cst::CstRootNode;
+    let parse_options = jsonc_parser::ParseOptions::default();
+    let current = jsonc_parser::parse_to_serde_value(settings_text, &parse_options)
+        .map_err(|e| format!("could not parse VS Code settings: {e}"))?;
+    let mut servers: Vec<serde_json::Value> = current
+        .as_ref()
+        .and_then(|v| v.get("litellm-vscode-chat.servers"))
+        .and_then(|s| s.as_array().cloned())
+        .unwrap_or_default();
+    let base = entry
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    servers.retain(|s| {
+        s.get("label").and_then(|v| v.as_str()) != Some(LITELLM_SERVER_LABEL)
+            && s.get("baseUrl").and_then(|v| v.as_str()) != Some(base)
+    });
+    servers.push(entry.clone());
+    let root = CstRootNode::parse(settings_text, &parse_options)
+        .map_err(|e| format!("could not parse VS Code settings: {e}"))?;
+    let obj = root.object_value_or_set();
+    let value = cst_input_value(&serde_json::Value::Array(servers));
+    match obj.get("litellm-vscode-chat.servers") {
+        Some(prop) => prop.set_value(value),
+        None => {
+            obj.append("litellm-vscode-chat.servers", value);
+        }
+    }
+    Ok(root.to_string())
+}
+
+/// The Copilot custom-agent file for one gateway group, written to
+/// `~/.copilot/agents/litellm-<group>.md`. The planner text is Pete's
+/// own (2026-10-15, verbatim); the other roles follow its structure.
+/// Group names are the gateway's model names, exposed by the LiteLLM
+/// extension under the `litellm` vendor id.
+pub fn copilot_agent_markdown(group: &str) -> String {
+    match group {
+        "planner" => r##"---
+name: LiteLLM Planner
+description: "Use for implementation planning, architecture and design planning, technical breakdowns, sequencing work, and evaluating trade-offs. Produces actionable plans without implementing changes."
+model: "litellm/planner"
+tools: [read, search]
+user-invocable: true
+---
+You are a software planning agent. Use the `litellm/planner` model to help turn goals into clear, evidence-based plans. Support implementation planning, architecture and design planning, and general technical planning.
+
+## Boundaries
+- Plan and analyze; do not edit files, run commands, or implement changes.
+- Ground repository-specific recommendations in the files and symbols you inspect. Distinguish verified facts from assumptions.
+- Keep the plan scoped to the request and identify material decisions or missing information instead of silently inventing requirements.
+
+## Approach
+1. Restate the goal and identify constraints, success criteria, and important unknowns.
+2. Inspect relevant project files and existing patterns before proposing changes.
+3. Break the work into ordered, concrete steps; identify dependencies and affected areas.
+4. Include appropriate tests or validation, risks, and alternatives when they matter.
+5. Keep the plan proportionate to the task; avoid speculative or unrelated work.
+
+## Output
+Provide a concise plan with:
+- Goal and assumptions
+- Ordered steps, including dependencies where relevant
+- Files or components likely to be affected, when known
+- Validation and risks or open decisions, when relevant
+"##
+        .to_string(),
+        "coder" => r##"---
+name: LiteLLM Coder
+description: "Use for implementing features, fixing defects, and refactoring code. Writes and edits code, runs builds and tests, and verifies the result."
+model: "litellm/coder"
+tools: [read, search, edit, execute]
+user-invocable: true
+---
+You are a software implementation agent. Use the `litellm/coder` model to turn a defined task or plan into working, verified code.
+
+## Boundaries
+- Implement the requested change; do not expand scope into unrelated refactors or features.
+- Follow the repository's existing patterns, libraries, and style. Inspect before writing.
+- Do not commit, push, or publish unless the user asks.
+
+## Approach
+1. Restate the task and identify the files and components involved.
+2. Inspect the relevant code and existing patterns before editing.
+3. Make the smallest change that fully implements the task.
+4. Run the project's builds, tests, or checks that cover the change; fix failures you introduced.
+5. Report what changed and what was verified, including anything left unverified.
+
+## Output
+Provide a concise summary with:
+- What was implemented
+- Files changed
+- Validation run and its result
+- Open issues or follow-ups, when relevant
+"##
+        .to_string(),
+        "coder-fast" => r##"---
+name: LiteLLM Coder Fast
+description: "Use for small, well-scoped edits: quick fixes, boilerplate, renames, and minor adjustments where turnaround matters more than depth."
+model: "litellm/coder-fast"
+tools: [read, search, edit, execute]
+user-invocable: true
+---
+You are a fast software implementation agent. Use the `litellm/coder-fast` model for small, clearly scoped changes.
+
+## Boundaries
+- Keep the change minimal and local; if the task turns out to be large or ambiguous, stop and say so instead of guessing.
+- Follow existing patterns in the files you touch; do not refactor beyond the requested edit.
+
+## Approach
+1. Locate the exact code involved.
+2. Make the edit.
+3. Run the narrowest available check (build, test, or lint) that covers it.
+4. Report the change and the check result in a few lines.
+
+## Output
+- What changed and where
+- Check run and result
+"##
+        .to_string(),
+        "tool-runner" => r##"---
+name: LiteLLM Tool Runner
+description: "Use for executing defined tasks and command-driven work: running scripts, builds, data gathering, and multi-step operational procedures, reporting observed results."
+model: "litellm/tool-runner"
+tools: [read, search, execute]
+user-invocable: true
+---
+You are a task execution agent. Use the `litellm/tool-runner` model to carry out defined procedures and command-driven work accurately.
+
+## Boundaries
+- Execute the task as specified; do not redesign it. Surface ambiguity instead of inventing steps.
+- Do not edit source files unless the task explicitly calls for it.
+- Report observed output and failures exactly; never report a step as done that did not run.
+
+## Approach
+1. Restate the task as an ordered list of steps before running anything.
+2. Execute each step, checking exit status and output before moving on.
+3. On failure, stop, preserve the error output, and report which step failed and why.
+4. Summarize the final state against the task's success criteria.
+
+## Output
+- Steps run and their results
+- Final state vs. the success criteria
+- Failures or deviations, when any
+"##
+        .to_string(),
+        other => format!(
+            r##"---
+name: LiteLLM {other}
+description: "Use for software implementation work with the {other} model: implementing features, fixing defects, and verifying the result."
+model: "litellm/{other}"
+tools: [read, search, edit, execute]
+user-invocable: true
+---
+You are a software implementation agent. Use the `litellm/{other}` model to turn a defined task into working, verified code.
+
+## Boundaries
+- Implement the requested change; do not expand scope into unrelated work.
+- Follow the repository's existing patterns, libraries, and style. Inspect before writing.
+
+## Approach
+1. Restate the task and identify the files and components involved.
+2. Inspect the relevant code before editing.
+3. Make the smallest change that fully implements the task.
+4. Run the project's builds, tests, or checks that cover the change.
+5. Report what changed and what was verified.
+
+## Output
+- What was implemented
+- Files changed
+- Validation run and its result
+"##
+        ),
+    }
 }
 
 /// Stable step ids.
@@ -1861,6 +2331,10 @@ impl Default for VscodeExtensions {
             extensions: vec![
                 "Continue.continue".to_string(),
                 "saoudrizwan.claude-dev".to_string(),
+                // The LiteLLM provider for Copilot Chat; its endpoint
+                // and API key are configured by this step (see
+                // `write_litellm_endpoint`).
+                "vivswan.litellm-vscode-chat".to_string(),
             ],
         }
     }
@@ -1881,20 +2355,6 @@ fn spawn_failed(e: &WizardError) -> bool {
 }
 
 impl VscodeExtensions {
-    /// Generate a Continue config with every gateway group as a model,
-    /// carrying the gateway master key as each model's apiKey.
-    async fn continue_config_json(&self, ctx: &WizardContext) -> Result<String, StepOutcome> {
-        let key = crate::ensure_gateway_master_key(ctx.ops.as_ref())
-            .await
-            .map_err(|e| {
-                StepOutcome::failed(
-                    format!("could not obtain the gateway master key for the editor config: {e}"),
-                    vec![format!("{e:?}")],
-                )
-            })?;
-        Ok(continue_editor_config(&ctx.config, Some(&key)))
-    }
-
     fn install_commands(&self, cli: &str) -> Vec<PlannedCommand> {
         self.extensions
             .iter()
@@ -1937,6 +2397,103 @@ impl VscodeExtensions {
         } else {
             Self::vscode_missing()
         }
+    }
+
+    /// VS Code user settings on Windows:
+    /// `%APPDATA%\Code\User\settings.json`, resolved from the home
+    /// directory (`%USERPROFILE%\AppData\Roaming\...`).
+    fn vscode_settings_path(home: &Path) -> PathBuf {
+        home.join("AppData")
+            .join("Roaming")
+            .join("Code")
+            .join("User")
+            .join("settings.json")
+    }
+
+    fn copilot_agents_dir(home: &Path) -> PathBuf {
+        home.join(".copilot").join("agents")
+    }
+
+    fn copilot_agent_path(home: &Path, group: &str) -> PathBuf {
+        Self::copilot_agents_dir(home).join(format!("litellm-{group}.md"))
+    }
+
+    /// Write the LiteLLM extension's server entry (endpoint + master
+    /// key) into the VS Code user settings, preserving the rest of
+    /// the file (see [`merge_litellm_server_setting`]). `Ok(false)`
+    /// when no home directory is known and nothing was written.
+    async fn write_litellm_endpoint(
+        &self,
+        ctx: &WizardContext,
+        log: &mut Vec<String>,
+    ) -> Result<bool, StepOutcome> {
+        let Some(home) = ctx.ops.home_dir() else {
+            log.push("home directory unknown; LiteLLM endpoint not configured".to_string());
+            return Ok(false);
+        };
+        let key = crate::ensure_gateway_master_key(ctx.ops.as_ref())
+            .await
+            .map_err(|e| {
+                StepOutcome::failed(
+                    format!(
+                        "could not obtain the gateway master key for the LiteLLM endpoint: {e}"
+                    ),
+                    vec![format!("{e:?}")],
+                )
+            })?;
+        let path = Self::vscode_settings_path(&home);
+        let existing = match ctx.ops.read_file(&path).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(_) => "{}".to_string(),
+        };
+        let entry = litellm_server_entry(ctx.config.gateway.port, &key);
+        let merged = merge_litellm_server_setting(&existing, &entry).map_err(|e| {
+            StepOutcome::failed(
+                format!(
+                    "could not update VS Code settings at {}: {e}",
+                    path.display()
+                ),
+                vec!["the settings file was left unchanged".to_string()],
+            )
+        })?;
+        ctx.ops
+            .write_file(&path, merged.as_bytes())
+            .await
+            .map_err(|e| StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))?;
+        log.push(format!(
+            "LiteLLM endpoint configured in {} (server \"{LITELLM_SERVER_LABEL}\", base URL {})",
+            path.display(),
+            entry["baseUrl"].as_str().unwrap_or_default()
+        ));
+        Ok(true)
+    }
+
+    /// Write one Copilot custom-agent file per gateway group into
+    /// `~/.copilot/agents/`. These files are manager-owned (Pete's
+    /// requirement, 2026-10-15): every run rewrites them for the
+    /// currently configured groups. Returns the number written (0
+    /// when no home directory is known).
+    async fn write_copilot_agents(
+        &self,
+        ctx: &WizardContext,
+        log: &mut Vec<String>,
+    ) -> Result<usize, StepOutcome> {
+        let Some(home) = ctx.ops.home_dir() else {
+            log.push("home directory unknown; Copilot agents not written".to_string());
+            return Ok(0);
+        };
+        let mut written = 0;
+        for group in &ctx.config.gateway.groups {
+            let path = Self::copilot_agent_path(&home, &group.name);
+            let body = copilot_agent_markdown(&group.name);
+            ctx.ops
+                .write_file(&path, body.as_bytes())
+                .await
+                .map_err(|e| StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))?;
+            log.push(format!("wrote Copilot agent {}", path.display()));
+            written += 1;
+        }
+        Ok(written)
     }
 }
 
@@ -2023,49 +2580,44 @@ impl WizardStep for VscodeExtensions {
                         }
                     }
                 }
-                let config_json = match self.continue_config_json(ctx).await {
-                    Ok(json) => json,
+                // Continue: the config.yaml + .env pair (the legacy
+                // config.json write is retired — see write_continue_files).
+                let home = ctx.ops.home_dir();
+                let continue_write = match write_continue_files(
+                    ctx.ops.as_ref(),
+                    &ctx.config,
+                    home.as_deref(),
+                    &ctx.data_dir,
+                )
+                .await
+                {
+                    Ok(w) => w,
+                    Err(e) => {
+                        return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
+                    }
+                };
+                log.extend(continue_write.log);
+                let continue_configured = continue_write.applied;
+                let endpoint_configured = match self.write_litellm_endpoint(ctx, &mut log).await {
+                    Ok(done) => done,
                     Err(outcome) => return Ok(outcome),
                 };
-                // Never clobber an existing Continue config: write ours to the
-                // data dir always, and to the canonical location only when
-                // nothing is there yet.
-                let staged = ctx.data_dir.join("vscode").join("continue-config.json");
-                if let Err(e) = ctx.ops.write_file(&staged, config_json.as_bytes()).await {
-                    return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
+                let agents_written = match self.write_copilot_agents(ctx, &mut log).await {
+                    Ok(n) => n,
+                    Err(outcome) => return Ok(outcome),
+                };
+                let mut message =
+                    format!("{} VS Code extension(s) installed", self.extensions.len());
+                if continue_configured {
+                    message.push_str("; Continue configured");
                 }
-                log.push(format!("staged Continue config at {}", staged.display()));
-                match ctx.ops.home_dir() {
-                    Some(home) => {
-                        let canonical = home.join(".continue").join("config.json");
-                        if ctx.ops.file_exists(&canonical).await {
-                            let sidecar = home.join(".continue").join("config.json.llm-manager");
-                            if let Err(e) =
-                                ctx.ops.write_file(&sidecar, config_json.as_bytes()).await
-                            {
-                                return Ok(StepOutcome::failed(
-                                    format!("{e}"),
-                                    vec![format!("{e:?}")],
-                                ));
-                            }
-                            log.push(format!(
-                                "existing Continue config left untouched; generated config at {}",
-                                sidecar.display()
-                            ));
-                        } else if let Err(e) =
-                            ctx.ops.write_file(&canonical, config_json.as_bytes()).await
-                        {
-                            return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
-                        } else {
-                            log.push(format!("wrote {}", canonical.display()));
-                        }
-                    }
-                    None => log.push("home directory unknown; config staged only".to_string()),
+                if endpoint_configured {
+                    message.push_str("; LiteLLM endpoint configured");
                 }
-                Ok(StepOutcome::done(
-                    format!("{} VS Code extension(s) installed", self.extensions.len()),
-                    log,
-                ))
+                if agents_written > 0 {
+                    message.push_str(&format!("; {agents_written} Copilot agent(s) written"));
+                }
+                Ok(StepOutcome::done(message, log))
             }
             RunMode::Audit => {
                 let cmd = PlannedCommand::new(vec![cli.clone(), "--list-extensions".to_string()]);
@@ -2085,14 +2637,138 @@ impl WizardStep for VscodeExtensions {
                     .map(String::as_str)
                     .filter(|ext| !listed.contains(&ext.to_lowercase()))
                     .collect();
-                if missing.is_empty() {
+                if !missing.is_empty() {
+                    return Ok(StepOutcome::failed(
+                        format!("missing VS Code extensions: {}", missing.join(", ")),
+                        vec![],
+                    ));
+                }
+                // Extensions are present; also verify the pieces the
+                // install run writes: the LiteLLM endpoint entry in
+                // the user settings and one Copilot agent file per
+                // gateway group. Only checked when a home directory
+                // is known — the audit verifies what it can reach.
+                let mut problems: Vec<String> = Vec::new();
+                if let Some(home) = ctx.ops.home_dir() {
+                    let expected_base = format!("http://127.0.0.1:{}", ctx.config.gateway.port);
+                    let settings_path = Self::vscode_settings_path(&home);
+                    let entry_ok = match ctx.ops.read_file(&settings_path).await {
+                        Ok(bytes) => {
+                            let text = String::from_utf8_lossy(&bytes);
+                            jsonc_parser::parse_to_serde_value(
+                                &text,
+                                &jsonc_parser::ParseOptions::default(),
+                            )
+                            .ok()
+                            .flatten()
+                            .and_then(|v| {
+                                v.get("litellm-vscode-chat.servers")
+                                    .and_then(|s| s.as_array().cloned())
+                            })
+                            .map(|servers| {
+                                servers.iter().any(|s| {
+                                    s.get("label").and_then(|v| v.as_str())
+                                        == Some(LITELLM_SERVER_LABEL)
+                                        && s.get("baseUrl").and_then(|v| v.as_str())
+                                            == Some(expected_base.as_str())
+                                        && s.get("auth")
+                                            .and_then(|a| a.get("apiKey"))
+                                            .and_then(|k| k.as_str())
+                                            .map(|k| !k.is_empty())
+                                            == Some(true)
+                                })
+                            })
+                            .unwrap_or(false)
+                        }
+                        Err(_) => false,
+                    };
+                    if !entry_ok {
+                        problems.push(
+                            "LiteLLM endpoint not configured in VS Code settings".to_string(),
+                        );
+                    }
+                    let mut missing_agents: Vec<String> = Vec::new();
+                    for group in &ctx.config.gateway.groups {
+                        let path = Self::copilot_agent_path(&home, &group.name);
+                        if !ctx.ops.file_exists(&path).await {
+                            missing_agents.push(group.name.clone());
+                        }
+                    }
+                    if !missing_agents.is_empty() {
+                        problems.push(format!(
+                            "missing Copilot agent file(s): {}",
+                            missing_agents.join(", ")
+                        ));
+                    }
+                    // Continue: config.yaml must carry every gateway
+                    // group with the env-referenced key, and .env
+                    // must hold the key that reference resolves.
+                    let cont_dir = home.join(".continue");
+                    // Continue's apiBase carries /v1 (unlike the
+                    // extension endpoint above, which must not).
+                    let expected_api_base = format!("{expected_base}/v1");
+                    let expected_key_ref = "${{ secrets.LITELLM_API_KEY }}";
+                    let yaml_models: Vec<serde_yaml::Value> =
+                        match ctx.ops.read_file(&cont_dir.join("config.yaml")).await {
+                            Ok(bytes) => {
+                                let text = String::from_utf8_lossy(&bytes).into_owned();
+                                serde_yaml::from_str::<serde_yaml::Value>(&text)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v.get("models").and_then(|m| m.as_sequence().cloned())
+                                    })
+                                    .unwrap_or_default()
+                            }
+                            Err(_) => Vec::new(),
+                        };
+                    let missing_models: Vec<String> = ctx
+                        .config
+                        .gateway
+                        .groups
+                        .iter()
+                        .filter(|g| {
+                            !yaml_models.iter().any(|m| {
+                                m.get("model").and_then(|v| v.as_str()) == Some(g.name.as_str())
+                                    && m.get("apiBase").and_then(|v| v.as_str())
+                                        == Some(expected_api_base.as_str())
+                                    && m.get("apiKey").and_then(|v| v.as_str())
+                                        == Some(expected_key_ref)
+                            })
+                        })
+                        .map(|g| g.name.clone())
+                        .collect();
+                    if !missing_models.is_empty() {
+                        problems.push(format!(
+                            "Continue config.yaml missing gateway model(s): {}",
+                            missing_models.join(", ")
+                        ));
+                    }
+                    let env_ok = match ctx.ops.read_file(&cont_dir.join(".env")).await {
+                        Ok(bytes) => {
+                            let text = String::from_utf8_lossy(&bytes);
+                            text.lines().any(|line| {
+                                line.trim_start()
+                                    .strip_prefix("export ")
+                                    .unwrap_or(line.trim_start())
+                                    .strip_prefix("LITELLM_API_KEY=")
+                                    .map(|v| !v.trim().is_empty())
+                                    .unwrap_or(false)
+                            })
+                        }
+                        Err(_) => false,
+                    };
+                    if !env_ok {
+                        problems.push("Continue .env missing LITELLM_API_KEY".to_string());
+                    }
+                }
+                if problems.is_empty() {
                     Ok(StepOutcome::done(
                         format!("{} extension(s) present", self.extensions.len()),
                         vec![],
                     ))
                 } else {
                     Ok(StepOutcome::failed(
-                        format!("missing VS Code extensions: {}", missing.join(", ")),
+                        format!("VS Code setup incomplete: {}", problems.join("; ")),
                         vec![],
                     ))
                 }
@@ -4633,27 +5309,127 @@ mod tests {
         ops.with_home(PathBuf::from("/home/test"));
         let ctx = ctx_with(ops.clone(), RunMode::Install);
         let step = VscodeExtensions::default();
-        assert_eq!(step.planned_commands(&ctx).len(), 2);
+        assert_eq!(step.planned_commands(&ctx).len(), 3);
         let out = step.run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done, "{out:?}");
-        // The `code --version` probe plus two extension installs ran.
-        assert_eq!(ops.executed_commands().len(), 3);
-        // Canonical config written (nothing existed).
+        assert!(
+            out.message.contains("Continue configured"),
+            "{}",
+            out.message
+        );
+        // The `code --version` probe plus three extension installs ran.
+        assert_eq!(ops.executed_commands().len(), 4);
+        // Canonical config.yaml + .env written (nothing existed).
         let canonical = ops
-            .file_bytes(&PathBuf::from("/home/test/.continue/config.json"))
-            .expect("canonical config written");
+            .file_bytes(&PathBuf::from("/home/test/.continue/config.yaml"))
+            .expect("canonical config.yaml written");
         let text = String::from_utf8(canonical).unwrap();
         assert!(text.contains("http://127.0.0.1:4000/v1"), "{text}");
         assert!(text.contains("planner"), "{text}");
+        assert!(text.contains("${{ secrets.LITELLM_API_KEY }}"), "{text}");
+        let env = ops
+            .file_bytes(&PathBuf::from("/home/test/.continue/.env"))
+            .expect(".env written");
+        let env_text = String::from_utf8(env).unwrap();
+        assert!(env_text.contains("LITELLM_API_KEY=sk-"), "{env_text}");
+        // No legacy JSON is created.
+        assert!(ops
+            .file_bytes(&PathBuf::from("/home/test/.continue/config.json"))
+            .is_none());
 
-        // Second run: existing config is left alone, sidecar written instead.
+        // Second run: the YAML is merged in place — still exactly
+        // one entry per gateway group, no sidecar.
         let out2 = step.run(&ctx).await.unwrap();
         assert_eq!(out2.state, StepState::Done);
+        let canonical = ops
+            .file_bytes(&PathBuf::from("/home/test/.continue/config.yaml"))
+            .unwrap();
+        let v: serde_yaml::Value =
+            serde_yaml::from_str(&String::from_utf8(canonical).unwrap()).unwrap();
+        assert_eq!(v["models"].as_sequence().unwrap().len(), 4);
         assert!(ops
             .file_bytes(&PathBuf::from(
-                "/home/test/.continue/config.json.llm-manager"
+                "/home/test/.continue/config.yaml.llm-manager"
+            ))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn vscode_install_merges_existing_continue_yaml_and_env() {
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_home(PathBuf::from("/home/test"));
+        // Pete's own config.yaml: another model and top-level content.
+        ops.with_file(
+            PathBuf::from("/home/test/.continue/config.yaml"),
+            b"name: My Config\nversion: 1.0.0\nschema: v1\nmodels:\n  - name: cloud (work)\n    provider: openai\n    model: gpt-5\n    apiBase: https://api.openai.com/v1\n    apiKey: literal\n".to_vec(),
+        );
+        ops.with_file(
+            PathBuf::from("/home/test/.continue/.env"),
+            b"# my secrets\nOTHER_KEY=keep-me\nLITELLM_API_KEY=sk-stale\n".to_vec(),
+        );
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = VscodeExtensions::default().run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let canonical = ops
+            .file_bytes(&PathBuf::from("/home/test/.continue/config.yaml"))
+            .unwrap();
+        let v: serde_yaml::Value =
+            serde_yaml::from_str(&String::from_utf8(canonical).unwrap()).unwrap();
+        assert_eq!(v["name"].as_str().unwrap(), "My Config");
+        let models = v["models"].as_sequence().unwrap();
+        assert_eq!(models.len(), 5, "his model plus the four gateway models");
+        assert!(models.iter().any(|m| m["model"].as_str() == Some("gpt-5")));
+        assert!(models
+            .iter()
+            .any(|m| m["model"].as_str() == Some("planner")));
+        // .env: our key rotated, his other variable preserved.
+        let env = ops
+            .file_bytes(&PathBuf::from("/home/test/.continue/.env"))
+            .unwrap();
+        let env_text = String::from_utf8(env).unwrap();
+        assert!(env_text.contains("OTHER_KEY=keep-me"), "{env_text}");
+        assert!(!env_text.contains("sk-stale"), "{env_text}");
+        assert_eq!(env_text.matches("LITELLM_API_KEY=").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn vscode_install_retires_wizard_written_legacy_json() {
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_home(PathBuf::from("/home/test"));
+        // A config.json in exactly the shape older wizard versions wrote.
+        let legacy = serde_json::json!({"models": [{
+            "title": "planner (local)", "provider": "openai", "model": "planner",
+            "apiBase": "http://127.0.0.1:4000/v1", "apiKey": "sk-old"
+        }]});
+        ops.with_file(
+            PathBuf::from("/home/test/.continue/config.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        );
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = VscodeExtensions::default().run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(ops
+            .file_bytes(&PathBuf::from("/home/test/.continue/config.json"))
+            .is_none());
+        assert!(ops
+            .file_bytes(&PathBuf::from(
+                "/home/test/.continue/config.json.llm-manager.bak"
             ))
             .is_some());
+        assert!(ops
+            .file_bytes(&PathBuf::from("/home/test/.continue/config.yaml"))
+            .is_some());
+    }
+
+    #[test]
+    fn env_merge_replaces_and_appends_by_key() {
+        let merged =
+            merge_env_contents("A=1\nLITELLM_API_KEY=old\nB=2\n", "LITELLM_API_KEY", "new");
+        assert_eq!(merged, "A=1\nLITELLM_API_KEY=new\nB=2\n");
+        let appended = merge_env_contents("A=1\n", "LITELLM_API_KEY", "new");
+        assert_eq!(appended, "A=1\nLITELLM_API_KEY=new\n");
+        let exported = merge_env_contents("export LITELLM_API_KEY=old\n", "LITELLM_API_KEY", "new");
+        assert_eq!(exported, "LITELLM_API_KEY=new\n");
     }
 
     #[tokio::test]
@@ -4669,7 +5445,7 @@ mod tests {
         let out = step.run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done, "{out:?}");
         let executed = ops.executed_commands();
-        assert_eq!(executed.len(), 3);
+        assert_eq!(executed.len(), 4);
         assert!(
             executed
                 .iter()
@@ -4710,7 +5486,12 @@ mod tests {
     #[tokio::test]
     async fn vscode_audit_checks_presence() {
         let ops = Arc::new(FakeSystemOps::new());
-        ops.with_listed_extensions(&["continue.continue", "saoudrizwan.claude-dev", "other"]);
+        ops.with_listed_extensions(&[
+            "continue.continue",
+            "saoudrizwan.claude-dev",
+            "vivswan.litellm-vscode-chat",
+            "other",
+        ]);
         let ctx = ctx_with(ops, RunMode::Audit);
         let out = VscodeExtensions::default().run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done);
@@ -4721,6 +5502,156 @@ mod tests {
         let out2 = VscodeExtensions::default().run(&ctx2).await.unwrap();
         assert_eq!(out2.state, StepState::Failed);
         assert!(out2.message.contains("saoudrizwan.claude-dev"));
+    }
+
+    #[test]
+    fn litellm_settings_merge_preserves_user_content_and_replaces_own_entry() {
+        let existing = "{\n    // Pete's settings\n    \"editor.fontSize\": 14,\n    \"litellm-vscode-chat.servers\": [\n        { \"label\": \"Work\", \"baseUrl\": \"http://example:4000\" },\n        { \"label\": \"Local\", \"baseUrl\": \"http://127.0.0.1:4000\", \"auth\": { \"apiKey\": \"sk-stale\" } }\n    ]\n}\n";
+        let entry = litellm_server_entry(4000, "sk-fresh");
+        let merged = merge_litellm_server_setting(existing, &entry).unwrap();
+        // The user's comment and unrelated setting survive.
+        assert!(merged.contains("// Pete's settings"), "{merged}");
+        assert!(merged.contains("\"editor.fontSize\": 14"), "{merged}");
+        // Exactly one Local entry, carrying the fresh key; the other
+        // server is untouched; no stale key remains.
+        let v = jsonc_parser::parse_to_serde_value(&merged, &Default::default())
+            .unwrap()
+            .unwrap();
+        let servers = v["litellm-vscode-chat.servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+        let locals: Vec<_> = servers.iter().filter(|s| s["label"] == "Local").collect();
+        assert_eq!(locals.len(), 1);
+        assert_eq!(locals[0]["auth"]["apiKey"], "sk-fresh");
+        assert!(servers.iter().any(|s| s["label"] == "Work"));
+        assert!(!merged.contains("sk-stale"), "{merged}");
+        // Merging again is a no-op (no duplicate append).
+        let merged2 = merge_litellm_server_setting(&merged, &entry).unwrap();
+        let v2 = jsonc_parser::parse_to_serde_value(&merged2, &Default::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            v2["litellm-vscode-chat.servers"].as_array().unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn litellm_settings_merge_into_empty_settings() {
+        let merged =
+            merge_litellm_server_setting("{}", &litellm_server_entry(4000, "sk-k")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["litellm-vscode-chat.servers"][0]["label"], "Local");
+        assert_eq!(
+            v["litellm-vscode-chat.servers"][0]["baseUrl"],
+            "http://127.0.0.1:4000"
+        );
+    }
+
+    #[tokio::test]
+    async fn vscode_install_configures_litellm_endpoint_and_agents() {
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_home(PathBuf::from("/home/test"));
+        ops.with_credential_value(crate::LITELLM_MASTER_KEY_CRED_TARGET, "sk-test-master");
+        // Pre-existing settings with an unrelated key.
+        ops.with_file(
+            PathBuf::from("/home/test/AppData/Roaming/Code/User/settings.json"),
+            b"{\n    \"editor.fontSize\": 13\n}\n".to_vec(),
+        );
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = VscodeExtensions::default().run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.message.contains("LiteLLM endpoint configured"),
+            "{}",
+            out.message
+        );
+        assert!(
+            out.message.contains("Copilot agent(s) written"),
+            "{}",
+            out.message
+        );
+        // The extension itself was installed.
+        assert!(ops
+            .executed_commands()
+            .iter()
+            .any(|a| a.iter().any(|x| x == "vivswan.litellm-vscode-chat")));
+        // Settings: entry present with the master key, unrelated key kept.
+        let settings = ops
+            .file_bytes(&PathBuf::from(
+                "/home/test/AppData/Roaming/Code/User/settings.json",
+            ))
+            .expect("settings written");
+        let text = String::from_utf8(settings).unwrap();
+        assert!(text.contains("\"editor.fontSize\": 13"), "{text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let servers = v["litellm-vscode-chat.servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["baseUrl"], "http://127.0.0.1:4000");
+        assert_eq!(servers[0]["auth"]["apiKey"], "sk-test-master");
+        // Agent files: planner carries Pete's text; coder carries
+        // edit/execute; every configured group got a file.
+        let planner = ops
+            .file_bytes(&PathBuf::from(
+                "/home/test/.copilot/agents/litellm-planner.md",
+            ))
+            .expect("planner agent written");
+        let planner_text = String::from_utf8(planner).unwrap();
+        assert!(
+            planner_text.contains("name: LiteLLM Planner"),
+            "{planner_text}"
+        );
+        assert!(planner_text.contains("model: \"litellm/planner\""));
+        assert!(planner_text.contains("tools: [read, search]"));
+        assert!(planner_text.contains("software planning agent"));
+        let coder = ops
+            .file_bytes(&PathBuf::from(
+                "/home/test/.copilot/agents/litellm-coder.md",
+            ))
+            .expect("coder agent written");
+        let coder_text = String::from_utf8(coder).unwrap();
+        assert!(coder_text.contains("tools: [read, search, edit, execute]"));
+        for group in ["coder-fast", "tool-runner"] {
+            assert!(
+                ops.file_bytes(&PathBuf::from(format!(
+                    "/home/test/.copilot/agents/litellm-{group}.md"
+                )))
+                .is_some(),
+                "agent for {group}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vscode_audit_verifies_endpoint_and_agents_after_install() {
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_home(PathBuf::from("/home/test"));
+        ops.with_listed_extensions(&[
+            "continue.continue",
+            "saoudrizwan.claude-dev",
+            "vivswan.litellm-vscode-chat",
+        ]);
+        let install_ctx = ctx_with(ops.clone(), RunMode::Install);
+        assert_eq!(
+            VscodeExtensions::default()
+                .run(&install_ctx)
+                .await
+                .unwrap()
+                .state,
+            StepState::Done
+        );
+        let audit_ctx = ctx_with(ops.clone(), RunMode::Audit);
+        let out = VscodeExtensions::default().run(&audit_ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        // Remove one agent file: the audit must now fail and name it.
+        crate::SystemOps::remove_file(
+            ops.as_ref(),
+            &PathBuf::from("/home/test/.copilot/agents/litellm-coder.md"),
+        )
+        .await
+        .unwrap();
+        let out = VscodeExtensions::default().run(&audit_ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(out.message.contains("coder"), "{}", out.message);
     }
 
     #[tokio::test]

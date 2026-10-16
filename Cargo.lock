@@ -755,6 +755,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonc-parser"
+version = "0.26.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d6d80e6d70e7911a29f3cf3f44f452df85d06f73572b494ca99a2cad3fcf8f4"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -816,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "manager-config"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "chrono",
  "serde",
@@ -827,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "manager-gateway"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "chrono",
  "manager-config",
@@ -839,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "manager-mcp"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "manager-supervisor",
  "serde",
@@ -850,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "manager-models"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "chrono",
  "manager-config",
@@ -863,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "manager-mxc"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "chrono",
  "serde",
@@ -873,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "manager-supervisor"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "chrono",
@@ -889,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "manager-telemetry"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "chrono",
@@ -901,7 +910,7 @@ dependencies = [
 
 [[package]]
 name = "manager-winml"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "chrono",
@@ -915,11 +924,12 @@ dependencies = [
 
 [[package]]
 name = "manager-wizard"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "chrono",
  "flate2",
+ "jsonc-parser",
  "libc",
  "manager-config",
  "manager-gateway",
@@ -929,6 +939,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "tar",
  "thiserror",

@@ -1420,26 +1420,42 @@ mod tests {
     }
 
     #[test]
-    fn continue_editor_config_points_at_gateway() {
+    fn continue_config_yaml_points_at_gateway() {
         let cfg = manager_config::AppConfig::default_config();
-        let json = crate::steps::continue_editor_config(&cfg, None);
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let models = v["models"].as_array().unwrap();
+        let yaml = crate::steps::continue_config_yaml(&cfg);
+        let v: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(v["schema"].as_str().unwrap(), "v1");
+        let models = v["models"].as_sequence().unwrap();
         assert_eq!(models.len(), cfg.gateway.groups.len());
-        for m in models {
-            assert!(m["apiBase"]
-                .as_str()
+        for (m, g) in models.iter().zip(cfg.gateway.groups.iter()) {
+            assert_eq!(m["provider"].as_str().unwrap(), "openai");
+            assert_eq!(m["model"].as_str().unwrap(), g.name);
+            assert_eq!(
+                m["apiBase"].as_str().unwrap(),
+                format!("http://127.0.0.1:{}/v1", cfg.gateway.port)
+            );
+            assert!(m["name"].as_str().unwrap().ends_with("(local)"));
+            // The key is an env reference, never a literal secret:
+            // Continue resolves it from ~/.continue/.env.
+            assert_eq!(
+                m["apiKey"].as_str().unwrap(),
+                "${{ secrets.LITELLM_API_KEY }}"
+            );
+            let roles: Vec<&str> = m["roles"]
+                .as_sequence()
                 .unwrap()
-                .contains(&cfg.gateway.port.to_string()));
-            assert!(m["title"].as_str().unwrap().ends_with("(local)"));
-            assert!(m.get("apiKey").is_none(), "no key without one given: {m}");
+                .iter()
+                .filter_map(|r| r.as_str())
+                .collect();
+            assert_eq!(roles, ["chat", "edit", "apply"]);
+            let caps: Vec<&str> = m["capabilities"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r.as_str())
+                .collect();
+            assert_eq!(caps, ["tool_use"]);
         }
-        // With a master key, every model carries it as its apiKey —
-        // the gateway refuses unauthenticated calls.
-        let json = crate::steps::continue_editor_config(&cfg, Some("sk-test-key"));
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        for m in v["models"].as_array().unwrap() {
-            assert_eq!(m["apiKey"], "sk-test-key");
-        }
+        assert!(!yaml.contains("sk-"), "no literal key material: {yaml}");
     }
 }

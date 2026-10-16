@@ -1,6 +1,6 @@
 [package]
 name = "manager-wizard"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 
 [dependencies]
@@ -18,10 +18,15 @@ sha2 = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
 zip = "2.2"
+serde_yaml = { workspace = true }
 libc = "0.2"
 # .tar.gz extraction for the MXC SDK install step (npm tarball layout).
 flate2 = "1"
 tar = "0.4"
+# JSONC (comments/trailing commas) parsing with a concrete syntax
+# tree, so the VS Code step can edit settings.json without dropping
+# the user's comments or formatting.
+jsonc-parser = { version = "0.26", features = ["cst", "serde"] }
 
 # Credential Manager reads (CredReadW) for injecting stored secrets into
 # a spawned process's environment. Windows-only; minimal feature set

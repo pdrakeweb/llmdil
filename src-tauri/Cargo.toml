@@ -1,6 +1,6 @@
 [package]
 name = "local-llm-service-manager"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 
 # NOTE: excluded from the Cargo workspace (see root Cargo.toml `exclude`).
@@ -14,6 +14,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 manager-config = { path = "../crates/manager-config" }
