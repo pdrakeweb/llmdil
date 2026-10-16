@@ -2212,6 +2212,44 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn adopt_then_restart_captures_new_process_logs() {
+        // The exact sequence from Pete's machine (2026-10-15): a
+        // backend adopted from a previous session is restarted from
+        // the Backends page; the NEW process's startup output must
+        // land in logs_query under the backend's scope.
+        let mut ext = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = ext.id();
+        let mut sup = Supervisor::new(test_policy());
+        sup.register_spec(sh_spec(
+            "svc",
+            "echo 'svc startup: model loaded'; exec sleep 60",
+        ));
+        sup.adopt("svc", pid).unwrap();
+        // The adopted process produced no captured output.
+        assert!(sup.logs_query("svc", None, None, 10).records.is_empty());
+        sup.restart("svc", false).await.unwrap();
+        let _ = ext.wait();
+        wait_for(
+            || {
+                sup.logs_query("svc", None, None, 10)
+                    .records
+                    .iter()
+                    .any(|r| r.line.contains("model loaded"))
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        let st = sup.status().into_iter().find(|s| s.id == "svc").unwrap();
+        assert_eq!(st.state, ProcessState::Running);
+        assert!(!st.adopted);
+        sup.stop("svc", false).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn logs_query_filters_search_limits_and_retains_after_stop() {
         let mut sup = Supervisor::new(test_policy());
         sup.register_spec(sh_spec(
