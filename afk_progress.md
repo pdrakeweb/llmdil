@@ -320,3 +320,29 @@ Fix (manager-wizard steps.rs):
   no longer reassigns the backend's model via model_assign, and no
   longer writes the split to every backend serving the model.
   The model-wide apply remains when no backend id is passed.
+
+## v0.1.29 (Oct 16, 2026) — placement editing on the backend cards
+
+Pete's direction: the tensor split is a per-backend setting, so it
+is edited on the backend's card (the pattern the Edit flags form
+established); the GPUs page only reports placement, never edits it.
+
+- `list_backends` rows now carry `tensor_split` (the backend's
+  configured fractions), so both the card form and the GPUs
+  listing read placement from one payload.
+- Backend card: a Placement button opens an in-card form — model
+  derived from the backend's configuration, GPU include/exclude
+  checkboxes from the live telemetry list, Propose renders the
+  projection table inside the card (down GPUs treated as zero free
+  VRAM, as on the old form), Apply writes the split to that
+  backend only (v0.1.28's scoped `placement_apply`). Draft state
+  lives outside the repainted DOM; changing the GPU selection
+  invalidates the projection. The flags form's help text now
+  points here instead of at the wizard's tensor-split step.
+- GPUs page: the editable Placement section is removed. Each GPU
+  card lists the models resident on it, read-only: model, serving
+  backend, the configured percentage from the backend's split
+  (100% when unsplit), and the measured VRAM held — with the
+  Service Map residency rule, so a bare CUDA context under 1 GiB
+  does not register as a model presence. The per-process table
+  remains as the detail underneath.

@@ -378,7 +378,14 @@ impl AppConfig {
                     tensor_split: Vec::new(),
                     split_mode: SplitMode::None,
                 },
-                raw_flags: None,
+                raw_flags: if id == "coder" {
+                    // The coder model (Qwen3-Coder-Next) is served
+                    // by expert offload: expert tensors stay in
+                    // system RAM, the rest runs on the GPU.
+                    Some("-ot exps=CPU".to_string())
+                } else {
+                    None
+                },
                 restart_policy: RestartPolicy {
                     max_retries: 5,
                     backoff_base_secs: 2,
@@ -502,6 +509,7 @@ pub fn repair_catalog_defaults(
 
 /// One catalog entry for [`append_missing_catalog_models`]: a model
 /// a configuration may predate.
+#[derive(Debug, Clone)]
 pub struct CatalogModelEntry {
     pub model_id: String,
     pub gguf_file_name: String,
@@ -541,6 +549,76 @@ pub fn append_missing_catalog_models(cfg: &mut AppConfig, entries: &[CatalogMode
         changed = true;
     }
     changed
+}
+
+/// One catalog definition replacement for
+/// [`refresh_catalog_definition`]: the catalog's current entry for a
+/// default-fleet model, the backend it serves, and the serving
+/// change that rides the replacement.
+pub struct CatalogDefinitionRefresh {
+    pub entry: CatalogModelEntry,
+    pub backend_id: String,
+    /// Clear the backend's tensor split: the replacement model is
+    /// served unsplit (planner) or by expert offload (coder), not
+    /// by the split the previous definition needed.
+    pub clear_split: bool,
+    /// Raw llama-server flags the replacement model requires (for
+    /// the coder, expert offload: `-ot exps=CPU`). Applied only
+    /// when the backend has no raw flags of its own.
+    pub raw_flags: Option<String>,
+}
+
+/// Apply a catalog definition replacement to an existing
+/// configuration (catalog revision 2 replaced the planner and coder
+/// models). When the stored pin differs from the catalog's, the
+/// model entry takes the catalog's fields and its verification is
+/// cleared — the replacement file has not been downloaded — and a
+/// default backend still pointing at the model's previous file is
+/// realigned to the new one. The riding serving change applies in
+/// the same case: the backend's tensor split is cleared when
+/// requested, and the required raw flags are set when the backend
+/// has none. A backend the operator reassigned to another model,
+/// or gave raw flags, keeps them. The caller gates this on
+/// [`AppConfig::catalog_revision`] so it runs once per catalog
+/// revision. Returns true when the definition was replaced.
+pub fn refresh_catalog_definition(cfg: &mut AppConfig, refresh: &CatalogDefinitionRefresh) -> bool {
+    let entry = &refresh.entry;
+    let Some(model) = cfg.models.iter_mut().find(|m| m.id == entry.model_id) else {
+        return false;
+    };
+    if model.sha256 == entry.sha256 {
+        return false;
+    }
+    let old_path = model.gguf_path.clone();
+    model.gguf_path = PathBuf::from("models").join(&entry.gguf_file_name);
+    model.quant = entry.quant.clone();
+    model.params_b = entry.params_b;
+    model.sha256 = entry.sha256.clone();
+    model.source_url = entry.source_url.clone();
+    model.verified_at = None;
+    let new_path = model.gguf_path.clone();
+    if let Some(backend) = cfg.backends.iter_mut().find(|b| b.id == refresh.backend_id) {
+        // The serving change applies only to a backend still
+        // serving this model; a backend the operator reassigned to
+        // another model's file keeps its file, split, and flags.
+        let serving = backend.model_file == old_path;
+        if serving {
+            backend.model_file = new_path;
+            if refresh.clear_split
+                && (!backend.flags.tensor_split.is_empty()
+                    || backend.flags.split_mode != SplitMode::None)
+            {
+                backend.flags.tensor_split = Vec::new();
+                backend.flags.split_mode = SplitMode::None;
+            }
+            if let Some(raw) = &refresh.raw_flags {
+                if backend.raw_flags.is_none() {
+                    backend.raw_flags = Some(raw.clone());
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Load, migrate, and validate the config at `path`.
@@ -1003,6 +1081,120 @@ mod tests {
             &mut cfg,
             &[entry("new-opt-in", false)]
         ));
+    }
+
+    #[test]
+    fn refresh_catalog_definition_replaces_pin_and_serving() {
+        let mut cfg = AppConfig::default_config();
+        // Stored state as seeded under the old definitions: the
+        // planner model carries the old pin and is verified; the
+        // planner backend points at the old file and carries a
+        // tensor split from the old model's serving mode.
+        cfg.models.push(ModelConfig {
+            id: "qwen3-27b-planner".to_string(),
+            gguf_path: PathBuf::from("models/OldPlanner.gguf"),
+            quant: "Q4_K_M".to_string(),
+            params_b: 32.0,
+            sha256: "b".repeat(64),
+            verified_at: Some(Utc::now()),
+            source_url: "https://example.com/OldPlanner.gguf".to_string(),
+            assigned_backends: vec!["planner".to_string()],
+            enabled: true,
+        });
+        let planner = cfg.backends.iter_mut().find(|b| b.id == "planner").unwrap();
+        planner.model_file = PathBuf::from("models/OldPlanner.gguf");
+        planner.flags.tensor_split = vec![0.5, 0.5];
+        planner.flags.split_mode = SplitMode::Layer;
+        let refresh = CatalogDefinitionRefresh {
+            entry: CatalogModelEntry {
+                model_id: "qwen3-27b-planner".to_string(),
+                gguf_file_name: "NewPlanner.gguf".to_string(),
+                quant: "IQ3_S".to_string(),
+                params_b: 27.0,
+                sha256: "c".repeat(64),
+                source_url: "https://example.com/NewPlanner.gguf".to_string(),
+                assigned_backends: vec!["planner".to_string()],
+                enabled: true,
+            },
+            backend_id: "planner".to_string(),
+            clear_split: true,
+            raw_flags: None,
+        };
+        assert!(refresh_catalog_definition(&mut cfg, &refresh));
+        let model = cfg
+            .models
+            .iter()
+            .find(|m| m.id == "qwen3-27b-planner")
+            .unwrap();
+        assert_eq!(model.gguf_path, PathBuf::from("models/NewPlanner.gguf"));
+        assert_eq!(model.sha256, "c".repeat(64));
+        assert_eq!(model.quant, "IQ3_S");
+        assert!(model.verified_at.is_none());
+        let planner = cfg.backends.iter().find(|b| b.id == "planner").unwrap();
+        assert_eq!(planner.model_file, PathBuf::from("models/NewPlanner.gguf"));
+        assert!(planner.flags.tensor_split.is_empty());
+        assert_eq!(planner.flags.split_mode, SplitMode::None);
+        // Same pin again: no-op.
+        assert!(!refresh_catalog_definition(&mut cfg, &refresh));
+    }
+
+    #[test]
+    fn refresh_catalog_definition_preserves_operator_changes() {
+        let mut cfg = AppConfig::default_config();
+        cfg.models.push(ModelConfig {
+            id: "qwen3-coder-30b".to_string(),
+            gguf_path: PathBuf::from("models/OldCoder.gguf"),
+            quant: "Q4_K_M".to_string(),
+            params_b: 30.0,
+            sha256: "b".repeat(64),
+            verified_at: Some(Utc::now()),
+            source_url: "https://example.com/OldCoder.gguf".to_string(),
+            assigned_backends: vec!["coder".to_string()],
+            enabled: true,
+        });
+        // The operator moved the coder backend to another model's
+        // file and set their own raw flags.
+        let coder = cfg.backends.iter_mut().find(|b| b.id == "coder").unwrap();
+        coder.model_file = PathBuf::from("models/SomethingElse.gguf");
+        coder.raw_flags = Some("--threads 8".to_string());
+        let refresh = CatalogDefinitionRefresh {
+            entry: CatalogModelEntry {
+                model_id: "qwen3-coder-30b".to_string(),
+                gguf_file_name: "NewCoder.gguf".to_string(),
+                quant: "UD-Q4_K_M".to_string(),
+                params_b: 80.0,
+                sha256: "c".repeat(64),
+                source_url: "https://example.com/NewCoder.gguf".to_string(),
+                assigned_backends: vec!["coder".to_string()],
+                enabled: true,
+            },
+            backend_id: "coder".to_string(),
+            clear_split: true,
+            raw_flags: Some("-ot exps=CPU".to_string()),
+        };
+        assert!(refresh_catalog_definition(&mut cfg, &refresh));
+        let coder = cfg.backends.iter().find(|b| b.id == "coder").unwrap();
+        // Not realigned and no serving change (operator's assignment
+        // stands): the file and the operator's raw flags are kept.
+        assert_eq!(coder.model_file, PathBuf::from("models/SomethingElse.gguf"));
+        assert_eq!(coder.raw_flags.as_deref(), Some("--threads 8"));
+        // A model the configuration does not have is a no-op.
+        let missing = CatalogDefinitionRefresh {
+            entry: CatalogModelEntry {
+                model_id: "not-present".to_string(),
+                gguf_file_name: "X.gguf".to_string(),
+                quant: "Q4_K_M".to_string(),
+                params_b: 1.0,
+                sha256: "d".repeat(64),
+                source_url: String::new(),
+                assigned_backends: Vec::new(),
+                enabled: true,
+            },
+            backend_id: "coder".to_string(),
+            clear_split: false,
+            raw_flags: None,
+        };
+        assert!(!refresh_catalog_definition(&mut cfg, &missing));
     }
 
     use super::*;

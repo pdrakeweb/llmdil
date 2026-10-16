@@ -768,6 +768,37 @@ async fn ensure_catalog_models(state: &AppState) {
                     }
                 })
                 .collect();
+        // Definition replacements ride the same revision gate:
+        // when a default model's catalog pin changed, the stored
+        // definition is refreshed and the serving change that goes
+        // with it is applied (see
+        // manager_config::refresh_catalog_definition). Revision 2:
+        // the planner's Qwen3.8-27B is GPU-resident, so the split
+        // the Qwen3-32B needed is cleared; the coder's
+        // Qwen3-Coder-Next is served by expert offload instead of
+        // a tensor split.
+        for entry in &entries {
+            let Some(backend_id) = backend_for(&entry.model_id) else {
+                continue;
+            };
+            let (clear_split, raw_flags) = match entry.model_id.as_str() {
+                "qwen3-27b-planner" => (true, None),
+                "qwen3-coder-30b" => (true, Some("-ot exps=CPU".to_string())),
+                _ => (false, None),
+            };
+            if !clear_split && raw_flags.is_none() {
+                continue;
+            }
+            manager_config::refresh_catalog_definition(
+                &mut cfg,
+                &manager_config::CatalogDefinitionRefresh {
+                    entry: entry.clone(),
+                    backend_id: backend_id.to_string(),
+                    clear_split,
+                    raw_flags,
+                },
+            );
+        }
         manager_config::append_missing_catalog_models(&mut cfg, &entries);
         cfg.catalog_revision = manager_models::CATALOG_REVISION;
         dirty = true;

@@ -61,7 +61,7 @@ pub struct ModelSpec {
 /// `append_missing_catalog_models` in manager-config), so catalog
 /// additions reach installed systems without resurrecting models
 /// an operator deliberately deleted.
-pub const CATALOG_REVISION: u32 = 1;
+pub const CATALOG_REVISION: u32 = 2;
 
 /// Download progress snapshot for the progress callback.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -80,41 +80,56 @@ impl DownloadProgress {
     }
 }
 
-/// The four curated models from the plan (spec §4.6).
+/// The curated model catalog (spec §4.6, extended since).
 ///
 /// SHA-256 values and sizes are the real values from the publisher's
 /// Hugging Face file metadata (the LFS object hash and size for each
-/// file, pinned 2026-10-15), so [`verify_sha256`] runs against a real
-/// pin from the first download. The planner slot keeps the spec's
-/// "Qwen3.8-27B" display name and points at the closest real artifact,
-/// Qwen3-32B (dense 32B-class). Qwen publishes no official GGUF repo
-/// for Qwen3-Coder-30B-A3B-Instruct, so the coder slot uses unsloth's
-/// GGUF conversion of the official weights.
+/// file, pinned 2026-10-15; the planner and coder replacements
+/// 2026-10-16), so [`verify_sha256`] runs against a real pin from
+/// the first download. Catalog revision 2 replaced two default
+/// definitions: the planner slot — which carried the spec's
+/// "Qwen3.8-27B" name over a Qwen3-32B artifact before that model
+/// existed — now points at the real Qwen3.8-27B, and the coder slot
+/// at Qwen3-Coder-Next. Existing configurations pick the
+/// replacements up through
+/// `manager_config::refresh_catalog_definition`. Qwen publishes no
+/// official GGUF repo for Qwen3-Coder-30B-A3B-Instruct, so the coder
+/// slot uses unsloth's GGUF conversion of the official weights.
 pub fn curated_models() -> Vec<ModelSpec> {
     vec![
         ModelSpec {
             id: "qwen3-27b-planner".to_string(),
             name: "Qwen3.8-27B".to_string(),
-            quant: "Q4_K_M".to_string(),
-            size_bytes: 19_762_149_024,
-            sha256: "efd971561896866f0e910cce52761ca77b1b138090c7f15fe284676d57d1f689".to_string(),
-            ctx_max: 131072,
-            params_b: 32.0,
+            quant: "IQ3_S".to_string(),
+            size_bytes: 11_771_546_784,
+            sha256: "64b53b64c7aa39f20a7e54bd80582fe595b1d745624ee8a72e92508c0326d810".to_string(),
+            ctx_max: 262144,
+            params_b: 27.0,
             enabled_by_default: true,
-            // Closest real artifact for the planner slot: Qwen3-32B dense.
-            url: "https://huggingface.co/Qwen/Qwen3-32B-GGUF/resolve/main/Qwen3-32B-Q4_K_M.gguf"
+            // The real Qwen3.8-27B (Alibaba, August 2026), dense
+            // 27B, in ISTA-DASLab's GSQ-RCO quantization at IQ3_S —
+            // fully GPU-resident on a 16 GB card. Replaced the
+            // Qwen3-32B that filled this slot at revision 2.
+            url: "https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/resolve/main/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf"
                 .to_string(),
         },
         ModelSpec {
             id: "qwen3-coder-30b".to_string(),
-            name: "Qwen3-Coder-30B".to_string(),
-            quant: "Q4_K_M".to_string(),
-            size_bytes: 18_556_689_568,
-            sha256: "fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad".to_string(),
+            name: "Qwen3-Coder-Next-80B".to_string(),
+            quant: "UD-Q4_K_M".to_string(),
+            size_bytes: 49_301_055_488,
+            sha256: "3a47167ad1bf9e9a79f233f799588d54f85bc65644e72c19251165823e7ae612".to_string(),
             ctx_max: 262144,
-            params_b: 30.0,
+            params_b: 80.0,
             enabled_by_default: true,
-            url: "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+            // Qwen3-Coder-Next (80B total / ~3B active MoE),
+            // served by expert offload — the coder backend's raw
+            // flags carry `-ot exps=CPU`. Unsloth's single-file
+            // UD-Q4_K_M: Qwen's official Q4_K_M ships as four
+            // shards, which the single-file download/verify path
+            // cannot consume. Replaced Qwen3-Coder-30B-A3B at
+            // revision 2.
+            url: "https://huggingface.co/unsloth/Qwen3-Coder-Next-GGUF/resolve/main/Qwen3-Coder-Next-UD-Q4_K_M.gguf"
                 .to_string(),
         },
         ModelSpec {
@@ -1587,6 +1602,17 @@ mod tests {
         let nemotron = &models[4];
         assert_eq!(nemotron.params_b, 31.6);
         assert_eq!(nemotron.size_bytes, 25_266_255_936);
+        // The revision-2 replacements: real Qwen3.8-27B planner,
+        // Qwen3-Coder-Next coder (pins from the publishers' file
+        // metadata, 2026-10-16).
+        let planner = &models[0];
+        assert_eq!(planner.params_b, 27.0);
+        assert_eq!(planner.size_bytes, 11_771_546_784);
+        assert_eq!(planner.ctx_max, 262144);
+        let coder = &models[1];
+        assert_eq!(coder.params_b, 80.0);
+        assert_eq!(coder.size_bytes, 49_301_055_488);
+        assert_eq!(coder.ctx_max, 262144);
         for m in &models {
             // Real pins from the publishers' Hugging Face file metadata:
             // 64 hex chars, never the placeholder.
