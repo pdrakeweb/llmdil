@@ -560,6 +560,10 @@ impl SupervisedProcess {
                     }
                     if pid_alive(pid) {
                         kill_pid_tree(pid);
+                        // Confirm the exit before reporting the stop:
+                        // the process holds its listening port until
+                        // it is actually gone.
+                        wait_pid_gone(pid, Duration::from_secs(5)).await;
                     }
                     self.adopted_pid = None;
                     self.state = ProcessState::Stopped;
@@ -636,6 +640,7 @@ impl SupervisedProcess {
             None => {
                 if let Some(pid) = self.adopted_pid.take() {
                     kill_pid_tree(pid);
+                    wait_pid_gone(pid, Duration::from_secs(5)).await;
                 }
                 self.state = ProcessState::Stopped;
                 self.abort_readers();
@@ -752,6 +757,41 @@ impl SupervisedProcess {
 
 fn port_free(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Wait until `pid` no longer exists, polling briefly (false on
+/// timeout). `kill_pid_tree` only issues the kill — taskkill on
+/// Windows is fire-and-forget — so callers that stop an adopted
+/// process confirm its exit here before reporting the stop complete.
+async fn wait_pid_gone(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while pid_alive(pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    true
+}
+
+/// Wait until `port` can be bound, polling briefly. A process that
+/// was just killed — an adopted backend especially, whose kill is
+/// fire-and-forget — can hold its listener for a short while after
+/// the stop returns; a restart that probes the port once in that
+/// window fails with PortInUse even though nothing is wrong (Pete's
+/// restart failures, 2026-10-15). Returns as soon as the port is
+/// free; false when the timeout expires with it still held.
+async fn wait_port_free(port: u16, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if port_free(port) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Whether a process with `pid` currently exists.
@@ -1002,7 +1042,12 @@ impl Supervisor {
             .ok_or_else(|| SupervisorError::NotFound(id.to_string()))?
             .clone();
         if let Some(port) = spec.port {
-            if !port_free(port) {
+            // Bounded wait, not a single probe: a just-stopped
+            // process (above all an adopted one) may still be
+            // releasing this port. A port held by something that is
+            // not going away fails after the wait, with the same
+            // PortInUse error as before.
+            if !wait_port_free(port, Duration::from_secs(10)).await {
                 return Err(SupervisorError::PortInUse(port));
             }
         }
@@ -2208,6 +2253,25 @@ mod tests {
             sup.probe("ghost").await,
             Err(SupervisorError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn wait_port_free_waits_for_release_and_times_out_while_held() {
+        // Hold a port, then release it shortly after: the wait must
+        // observe the release instead of failing on the first probe
+        // (the restart-after-adopt race this helper exists for).
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(!port_free(port));
+        assert!(!wait_port_free(port, Duration::from_millis(200)).await);
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(listener);
+        });
+        assert!(wait_port_free(port, Duration::from_secs(5)).await);
+        releaser.await.unwrap();
+        // A free port returns immediately.
+        assert!(wait_port_free(port, Duration::from_secs(5)).await);
     }
 
     #[tokio::test]

@@ -552,6 +552,19 @@ impl AppState {
             let mut guard = audit.lock().await;
             guard.run_all(&ctx).await
         };
+        for s in &report.steps {
+            append_wizard_log(
+                &self.data_dir,
+                &wizard_log_block(
+                    "hydration audit",
+                    &s.id,
+                    &format!("{:?}", s.state).to_lowercase(),
+                    &s.message,
+                    s.duration_ms,
+                    &s.log_tail,
+                ),
+            );
+        }
         let install = self.wizard(RunMode::Install).await;
         let mut guard = install.lock().await;
         guard.hydrate(&report);
@@ -1184,6 +1197,11 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
                 "port": b.port,
                 "model_file": b.model_file,
                 "configured": true,
+                "n_ctx": b.flags.n_ctx,
+                "n_batch": b.flags.n_batch,
+                "group": cfg.gateway.groups.iter()
+                    .find(|g| g.members.iter().any(|m| m == &b.id))
+                    .map(|g| g.name.clone()),
                 "state": st.map(|s| process_state_str(s.state)).unwrap_or("stopped"),
                 "pid": st.and_then(|s| s.pid),
                 "adopted": st.map(|s| s.adopted).unwrap_or(false),
@@ -1525,11 +1543,32 @@ async fn run_wizard_step(app: AppHandle, state: State<'_, AppState>, step_id: St
         }
     };
     let (_done_before, total) = guard.progress();
+    // A start marker lands in the wizard log before the step runs:
+    // a step that hangs (the install-postgres case) then leaves a
+    // timestamped "started, never finished" record instead of nothing.
+    append_wizard_log(
+        &state.data_dir,
+        &[format!(
+            "[{}] === step {step_id} (install): started ===",
+            chrono::Utc::now().to_rfc3339()
+        )],
+    );
     let outcome: StepOutcome = guard
         .run_step(&ctx, &step_id)
         .await
         .map_err(ApiError::from)
         .map_err(jerr)?;
+    append_wizard_log(
+        &state.data_dir,
+        &wizard_log_block(
+            "install",
+            &step_id,
+            &format!("{:?}", outcome.state).to_lowercase(),
+            &outcome.message,
+            outcome.duration_ms,
+            &outcome.log_tail,
+        ),
+    );
     let (done, _) = guard.progress();
     *state.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
     drop(guard);
@@ -1585,6 +1624,19 @@ async fn run_audit(app: AppHandle, state: State<'_, AppState>) -> ApiResult {
         }
     };
     let report: WizardReport = guard.run_all(&ctx).await;
+    for s in &report.steps {
+        append_wizard_log(
+            &state.data_dir,
+            &wizard_log_block(
+                "audit",
+                &s.id,
+                &format!("{:?}", s.state).to_lowercase(),
+                &s.message,
+                s.duration_ms,
+                &s.log_tail,
+            ),
+        );
+    }
     let (done, total) = report.progress();
     // The per-step results ride along in the response: the checklist is
     // painted from the install wizard's state (setup_get_steps), which
@@ -2010,6 +2062,93 @@ fn gateway_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord>, bool) {
     (records, has_previous)
 }
 
+/// Wizard step output, persisted to `<data_dir>/logs/wizard.log` and
+/// served by `get_logs` as the `wizard` scope. Step outcomes otherwise
+/// live only in the in-memory wizard report: a step that hangs or an
+/// app restart loses them entirely, leaving nothing to inspect (the
+/// install-postgres hang, 2026-10-15). Appends are best-effort —
+/// logging must never fail the step it describes. Rotation mirrors
+/// the gateway logs: past ~1 MiB the file becomes `wizard.prev.log`.
+fn append_wizard_log(data_dir: &std::path::Path, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let logs = data_dir.join("logs");
+    if std::fs::create_dir_all(&logs).is_err() {
+        return;
+    }
+    let path = logs.join("wizard.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 1_048_576 {
+            let _ = std::fs::rename(&path, prev_log_path(&path));
+        }
+    }
+    let mut text = String::new();
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
+/// One step's block in the wizard log: an outcome header plus the
+/// step's own log lines, each stamped so the file stays readable on
+/// its own (the reader stamps records with the file mtime, like the
+/// gateway files).
+fn wizard_log_block(
+    label: &str,
+    step_id: &str,
+    state: &str,
+    message: &str,
+    duration_ms: u64,
+    log_tail: &[String],
+) -> Vec<String> {
+    let ts = chrono::Utc::now().to_rfc3339();
+    let mut out = vec![format!(
+        "[{ts}] === step {step_id} ({label}): {state} — {message} ({duration_ms} ms) ==="
+    )];
+    for line in log_tail {
+        out.push(format!("[{ts}] {line}"));
+    }
+    out
+}
+
+/// File-backed wizard records for `get_logs` (mirrors
+/// `gateway_log_records`): newest last-2000 lines per file.
+fn wizard_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord>, bool) {
+    let logs = data_dir.join("logs");
+    let mut records = Vec::new();
+    let mut has_previous = false;
+    for archived in [true, false] {
+        let base = logs.join("wizard.log");
+        let path = if archived { prev_log_path(&base) } else { base };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if archived {
+            has_previous = true;
+        }
+        let ts = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map(chrono::DateTime::<chrono::Utc>::from)
+            .unwrap_or_else(|_| chrono::Utc::now());
+        let text = String::from_utf8_lossy(&bytes);
+        for line in text.lines().rev().take(2000) {
+            records.push(LogRecord {
+                ts,
+                stream: LogStream::Stdout,
+                line: line.to_string(),
+                source: "wizard".to_string(),
+                archived,
+            });
+        }
+    }
+    (records, has_previous)
+}
+
 /// Query captured logs. `scope` is a process id — live, stopped, or an
 /// id that also has an archived previous-run ring; querying the id
 /// returns current and archived lines merged — `"gateway"`, the
@@ -2040,7 +2179,7 @@ async fn get_logs(
     // Unfiltered fetch: filtering, merging with the file-backed
     // gateway records, ordering, and pagination happen here so every
     // source is treated identically.
-    let mut records: Vec<LogRecord> = if scope == "gateway" {
+    let mut records: Vec<LogRecord> = if scope == "gateway" || scope == "wizard" {
         Vec::new()
     } else {
         sup.logs_query(&scope, None, None, usize::MAX).records
@@ -2055,6 +2194,13 @@ async fn get_logs(
         scopes.push(json!({ "id": "gateway", "previous": gateway_previous }));
         if scope == "all" || scope == "gateway" {
             records.extend(gateway_records);
+        }
+    }
+    let (wizard_records, wizard_previous) = wizard_log_records(&state.data_dir);
+    if !wizard_records.is_empty() {
+        scopes.push(json!({ "id": "wizard", "previous": wizard_previous }));
+        if scope == "all" || scope == "wizard" {
+            records.extend(wizard_records);
         }
     }
     if let Some(filter) = level.as_deref().and_then(LogLevelFilter::parse) {
@@ -2689,6 +2835,50 @@ async fn backend_add(
     drop(cfg);
     ensure_backend_specs(&state).await;
     Ok(json!({ "backend_id": id, "group": group, "persisted": true }))
+}
+
+/// Update a backend's llama-server sizing flags: context length
+/// (`-c`) and batch size (`-b`). This is the supported way to change
+/// them after a backend is created — before this command the only
+/// paths were hand-editing config.json or removing and re-adding the
+/// backend. Takes effect on the backend's next start; a running
+/// backend keeps its current values until it is restarted.
+#[tauri::command]
+async fn backend_update_flags(
+    state: State<'_, AppState>,
+    id: String,
+    n_ctx: u32,
+    n_batch: u32,
+) -> ApiResult {
+    if !(1024..=1_048_576).contains(&n_ctx) {
+        return Err(err(ApiError::InvalidInput(
+            "context length must be between 1024 and 1048576".to_string(),
+        )));
+    }
+    if n_batch == 0 || n_batch > n_ctx {
+        return Err(err(ApiError::InvalidInput(
+            "batch size must be between 1 and the context length".to_string(),
+        )));
+    }
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    let b = new_cfg
+        .backends
+        .iter_mut()
+        .find(|b| b.id == id)
+        .ok_or_else(|| err(ApiError::NotFound(format!("backend {id}"))))?;
+    b.flags.n_ctx = n_ctx;
+    b.flags.n_batch = n_batch;
+    manager_config::validate(&new_cfg)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    drop(cfg);
+    ensure_backend_specs(&state).await;
+    Ok(json!({ "backend_id": id, "persisted": true, "applies": "next start" }))
 }
 
 /// Remove a backend (spec §14 `backend_delete`). Refused while the
@@ -4325,6 +4515,7 @@ fn main() {
             backend_preview_diff,
             backend_apply_config,
             backend_add,
+            backend_update_flags,
             backend_delete,
             backend_get_launch_command,
             // Wizard / audit

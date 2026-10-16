@@ -528,6 +528,11 @@ export interface BackendRow {
   requests_1h?: number;
   errors_1h?: number;
   throughput_toks?: number;
+  /** Configured llama-server sizing flags (configured rows only). */
+  n_ctx?: number;
+  n_batch?: number;
+  /** Gateway group this backend belongs to, or null when ungrouped. */
+  group?: string | null;
 }
 
 /** list_backends — configured backends merged with live supervisor state. */
@@ -558,6 +563,18 @@ async function backendAction(
 export function startBackend(id: string) { return backendAction("start_backend", id); }
 export function stopBackend(id: string) { return backendAction("stop_backend", id); }
 export function restartBackend(id: string) { return backendAction("restart_backend", id); }
+
+/** backend_update_flags — change a backend's context length and
+ *  batch size. Persisted immediately; applies on the next start. */
+export async function updateBackendFlags(id: string, nCtx: number, nBatch: number): Promise<CallResult<{ backend_id: string; persisted: boolean }>> {
+  if (!isTauri()) return { data: { backend_id: id, persisted: false }, live: false };
+  try {
+    const data = await invoke<{ backend_id: string; persisted: boolean }>("backend_update_flags", { id, nCtx, nBatch });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { backend_id: id, persisted: false }, live: true, error: errOf(e) };
+  }
+}
 
 /** backend_add — create a backend for a registered model and route it
  *  through a gateway group (an existing one, or a new one when

@@ -18,6 +18,9 @@ use std::time::Duration;
 
 /// Fail fast when the server cannot be reached at all.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum gap between body chunks on a download before the
+/// connection is treated as stalled (see the download loop).
+const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Health probes must answer quickly; the retry loop handles slowness.
 const HTTP_GET_TIMEOUT: Duration = Duration::from_secs(15);
 /// Above `SMOKE_MAX_LATENCY_MS` (120 s) so the smoke step — not the client —
@@ -553,13 +556,26 @@ impl SystemOps for RealSystemOps {
             .map_err(|e| Self::io_err(dest, e))?;
         let mut downloaded: u64 = 0;
         loop {
-            let chunk = resp
-                .chunk()
-                .await
-                .map_err(|e| WizardError::DownloadFailed {
+            // No-data timeout: the client has a connect timeout but a
+            // connection that stalls mid-body would otherwise block
+            // the step (and the wizard lock) forever with no output —
+            // the install-postgres hang Pete hit on 2026-10-15. A
+            // slow but progressing download never trips this.
+            let chunk = match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, resp.chunk()).await {
+                Ok(r) => r.map_err(|e| WizardError::DownloadFailed {
                     url: url.to_string(),
                     reason: e.to_string(),
-                })?;
+                })?,
+                Err(_) => {
+                    return Err(WizardError::DownloadFailed {
+                        url: url.to_string(),
+                        reason: format!(
+                            "no data received for {} s; the connection appears stalled",
+                            CHUNK_IDLE_TIMEOUT.as_secs()
+                        ),
+                    })
+                }
+            };
             let Some(bytes) = chunk else { break };
             tokio::io::AsyncWriteExt::write_all(&mut file, &bytes)
                 .await

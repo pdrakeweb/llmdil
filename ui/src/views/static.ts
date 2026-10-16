@@ -12,7 +12,7 @@ import {
   runWizardStep, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit,
   getWizardCommands,
   getGpuTelemetry, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
-  getBackends, startBackend, stopBackend, restartBackend, getBackendLaunchCommand,
+  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, getBackendLaunchCommand,
   getBackendConfig, applyBackendConfig, testBackend, placementPropose, placementApply,
   addBackend, deleteBackend, modelAssign,
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
@@ -752,12 +752,14 @@ function backendCard(
       : `<div style="font-size:12px;color:var(--text2);margin-top:6px">Model: <span style="font-family:var(--mono)">${esc(b.model_file)}</span></div>`}
       ${orphanNote}
       ${adoptedNote}
+      ${b.configured && b.n_ctx !== undefined ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Context ${b.n_ctx} · Batch ${b.n_batch ?? "—"}</div>` : ""}
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0">
         ${[["State", b.state], ["PID", b.pid !== null ? String(b.pid) : "\u2014"],
            ["Uptime", fmtUptime(b.uptime_secs)]]
           .map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
       </div>
       <div class="card-actions">${actions}
+        ${b.configured ? `<button class="btn" data-back-act="flags" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Edit flags</button>` : ""}
         <button class="btn" data-back-act="argv" data-back-id="${esc(b.id)}"${dis}>${icon("logs")} Launch command</button></div>
       <div class="back-msg" style="margin-top:8px;font-size:12px">${msgHtml}</div>
       ${logsBlock}
@@ -769,6 +771,7 @@ export function renderBackends(): string {
   return `${topbar("Backends", `<button class="btn" id="backAdd">${icon("server")} Add backend</button> <button class="btn" id="backRefresh">${icon("restart")} Refresh</button>`)}
   <div class="view"><div id="backBanner"></div>
   <div id="backAddForm"></div>
+  <div id="backFlagsForm"></div>
   <div id="backBody">${loadingHtml("Loading backends\u2026")}</div></div>`;
 }
 
@@ -799,7 +802,29 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const paint = (): void => {
     const b = root.querySelector("#backBody");
     if (!b) return;
-    b.innerHTML = `<div class="grid2">${lastRows.map((row) => backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove)).join("")}</div>`;
+    // Cards are grouped by gateway group (Pete's request, 2026-10-15):
+    // a section per group in the order groups first appear across
+    // the rows (backend config order), ungrouped rows and orphans
+    // last under "Ungrouped".
+    const sections: { name: string | null; rows: BackendRow[] }[] = [];
+    const byKey = new Map<string, { name: string | null; rows: BackendRow[] }>();
+    for (const row of lastRows) {
+      const key = row.group ?? "";
+      let sec = byKey.get(key);
+      if (!sec) {
+        sec = { name: row.group ?? null, rows: [] };
+        byKey.set(key, sec);
+        sections.push(sec);
+      }
+      sec.rows.push(row);
+    }
+    const ordered = [
+      ...sections.filter((s) => s.name !== null),
+      ...sections.filter((s) => s.name === null),
+    ];
+    b.innerHTML = ordered.map((sec) => `
+      <div class="sec-title" style="margin:18px 0 10px">${sec.name !== null ? `Group: ${esc(sec.name)}` : "Ungrouped"} <span style="color:var(--text3);font-weight:400">— ${sec.rows.length} backend${sec.rows.length === 1 ? "" : "s"}</span></div>
+      <div class="grid2">${sec.rows.map((row) => backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove)).join("")}</div>`).join("");
   };
 
   /** Lazily fetch the last log lines for failed backends and repaint.
@@ -864,6 +889,43 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const onRefresh = (): void => { void load(); };
   refreshBtn?.addEventListener("click", onRefresh);
 
+  /* ---------------- Flags editor ----------------
+   * Lives in #backFlagsForm, outside the repainted #backBody, for
+   * the same reason as the add form: the poll repaint must not
+   * clobber typed input. */
+  const flagsHost = root.querySelector("#backFlagsForm");
+  let flagsFor: string | null = null;
+  const closeFlagsForm = (): void => {
+    flagsFor = null;
+    if (flagsHost) flagsHost.innerHTML = "";
+  };
+  const openFlagsForm = (row: BackendRow): void => {
+    if (!flagsHost) return;
+    if (flagsFor === row.id) { closeFlagsForm(); return; }
+    flagsFor = row.id;
+    flagsHost.innerHTML = `<div class="card"><h3>${icon("gear")} Flags for ${esc(row.id)}</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+      <label style="font-size:12px;color:var(--text2)">Context length (-c)<br>
+        <input id="flagsCtx" type="number" value="${row.n_ctx ?? 32768}" style="${SELECT_STYLE};width:100%"></label>
+      <label style="font-size:12px;color:var(--text2)">Batch size (-b)<br>
+        <input id="flagsBatch" type="number" value="${row.n_batch ?? 512}" style="${SELECT_STYLE};width:100%"></label>
+    </div>
+    <div class="card-actions"><button class="btn" id="flagsSave">Save flags</button>
+      <button class="btn" id="flagsCancel">Cancel</button></div>
+    <div style="font-size:12px;color:var(--text2);margin-top:6px">Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Setup wizard's tensor-split step, not here.</div></div>`;
+    flagsHost.querySelector("#flagsCancel")?.addEventListener("click", closeFlagsForm);
+    flagsHost.querySelector("#flagsSave")?.addEventListener("click", async () => {
+      const ctxVal = Number((flagsHost.querySelector("#flagsCtx") as HTMLInputElement | null)?.value);
+      const batchVal = Number((flagsHost.querySelector("#flagsBatch") as HTMLInputElement | null)?.value);
+      const r = await updateBackendFlags(row.id, ctxVal, batchVal);
+      if (disposed) return;
+      if (r.error) msgs.set(row.id, { text: `Flags not saved: ${r.error}`, err: true });
+      else msgs.set(row.id, { text: `Flags saved (context ${ctxVal}, batch ${batchVal}) — applies on next start.`, err: false });
+      closeFlagsForm();
+      await load();
+    });
+  };
+
   /* ---------------- Add backend form ----------------
    * Lives in #backAddForm, outside the repainted #backBody, so the
    * 5-second poll never clobbers typed input. */
@@ -901,7 +963,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     <div class="card-actions"><button class="btn" id="addBackSubmit"${lastModels.length ? "" : " disabled"}>Add backend</button>
       <button class="btn" id="addBackCancel">Cancel</button></div>
     <div style="font-size:12px;color:var(--text2);margin-top:6px">${lastModels.length
-      ? "The backend is created with the standard defaults (32K context, no tensor split). Joining an existing group makes the gateway share that group's traffic across its members; a new group gives the backend its own model name."
+      ? "The backend is created with the standard defaults (32K context; a tensor split is assigned from live GPU telemetry when available). Joining an existing group makes the gateway share that group's traffic across its members; a new group gives the backend its own model name."
       : "No models are registered yet \u2014 add one on the Models page first."}</div>
     <div id="addBackMsg" style="font-size:12px;margin-top:6px"></div>
   </div>`;
@@ -959,6 +1021,12 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     if (!t) return;
     const id = t.getAttribute("data-back-id") ?? "";
     const act = t.getAttribute("data-back-act") ?? "";
+
+    if (act === "flags") {
+      const row = lastRows.find((r) => r.id === id);
+      if (row) openFlagsForm(row);
+      return;
+    }
 
     if (act === "argv") {
       if (openArgv.has(id)) { openArgv.delete(id); paint(); return; }
