@@ -53,6 +53,11 @@ export const icons = {
   ban: () => svg(`<circle cx="8" cy="8" r="6.2"/><path d="m3.9 3.9 8.2 8.2"/>`),
   trash: () =>
     svg(`<path d="M3 4h10M6.5 4V2.8h3V4M4.5 4l.7 9.2h5.6L11.5 4M6.8 6.8v4M9.2 6.8v4"/>`),
+  x: () => svg(`<path d="M4 4l8 8M12 4l-8 8"/>`),
+  target: () =>
+    svg(`<circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="2.4"/>`),
+  copy: () =>
+    svg(`<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3.5v5A1.5 1.5 0 0 0 4 10h1.5"/>`),
 };
 
 export type IconName = keyof typeof icons;

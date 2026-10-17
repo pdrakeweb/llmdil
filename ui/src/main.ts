@@ -9,6 +9,7 @@ import { stackedBar } from "./charts";
 import { esc } from "./html";
 import { icon, type IconName } from "./icons";
 import { mountDashboard } from "./views/dashboard";
+import { renderOptimize, wireOptimize } from "./views/optimize";
 import { renderServiceMap, wireServiceMap } from "./views/serviceMap";
 import {
   applyActivationPlan, planApplyLine,
@@ -29,6 +30,7 @@ const ROUTES: Route[] = [
   { hash: "#/models", label: "Models", icon: "box", title: "Models" },
   { hash: "#/logs", label: "Logs", icon: "logs", title: "Logs" },
   { hash: "#/gateway", label: "Gateway", icon: "gateway", title: "Gateway" },
+  { hash: "#/optimize", label: "Optimize", icon: "target", title: "Optimize" },
   { hash: "#/activation-plan", label: "Activation Plan", icon: "warn", title: "Activation Plan" },
   { hash: "#/settings", label: "Settings", icon: "gear", title: "Settings" },
   { hash: "#/wizard", label: "Setup Wizard", icon: "wrench", title: "Setup Wizard" },
@@ -275,6 +277,14 @@ async function render(): Promise<void> {
       view.innerHTML = renderGateway();
       {
         const c = await wireGateway(view);
+        if (gen !== renderGen) { c(); return; }
+        cleanup = c;
+      }
+      break;
+    case "#/optimize":
+      view.innerHTML = renderOptimize();
+      {
+        const c = await wireOptimize(view);
         if (gen !== renderGen) { c(); return; }
         cleanup = c;
       }

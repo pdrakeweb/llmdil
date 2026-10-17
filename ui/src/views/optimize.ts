@@ -1,0 +1,650 @@
+/* Optimize view (docs/optimize-design.md §1).
+   renderOptimize() returns the shell; wireOptimize(root) loads the
+   page state from optimize_get_state, paints, and attaches handlers.
+   The page never invents data: every figure on a plan row comes
+   from the item's normalized change payload or the Rust-side
+   validation (expected effects are app-computed, §1.3).
+
+   Apply (Phase 4) is orchestrated here through the existing
+   mutation commands only: non-destructive accepted items in plan
+   order, then destructive items behind their own confirm —
+   halt on first failure, outcomes recorded per item through
+   optimize_set_item_outcome. Apply saves configuration; it never
+   restarts anything — activation stays with the banner /
+   Activation Plan flow (§5.3). */
+
+import {
+  addBackend, applyBackendConfig, deleteBackend, getAppConfig, getBackends,
+  getBackendConfig, getOptimizeState, modelAdd, modelAssign,
+  optimizeCancelConsult, optimizeChangeSummary, optimizeConsult,
+  optimizeDiscardPlan, optimizeIsDestructive, optimizeKindLabel,
+  optimizeSavePurpose, optimizeSetItemOutcome, optimizeSetItemState,
+  setBackendOffload, stopBackend, updateBackendFlags, updateGatewayConfig,
+} from "../api";
+import type {
+  CallResult, OptimizePlanItem, OptimizeState,
+} from "../api";
+import { trim1 } from "../charts";
+import { esc } from "../html";
+import { icon } from "../icons";
+
+export function renderOptimize(): string {
+  return `<div class="topbar"><h1>Optimize</h1></div>
+  <div id="optRoot"><div class="card" style="color:var(--text2)">${icon("clock")} Loading…</div></div>`;
+}
+
+const SELECT_STYLE = "background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:6px 8px;font-size:12px";
+
+function fmtGiB(mib: number): string {
+  return `${trim1(mib / 1024)} GiB`;
+}
+
+function fmtTime(ts: string): string {
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" });
+}
+
+function fmtElapsed(secs: number): string {
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return m > 0 ? `${m} min ${s} s` : `${s} s`;
+}
+
+/** Unwrap a CallResult or throw its error as an Error. */
+function unwrap<T>(r: CallResult<T>): T {
+  if (r.error) throw new Error(r.error);
+  return r.data;
+}
+
+interface CfgBackend {
+  id: string;
+  enabled: boolean;
+  model_file: string;
+  port: number;
+  flags: { n_ctx: number; n_batch: number; tensor_split: number[]; split_mode: string };
+  group?: string | null;
+}
+interface CfgGroup { name: string; members: string[]; strategy: string; fallbacks: string[]; purpose?: string }
+interface CfgModel { id: string; gguf_path: string }
+
+export async function wireOptimize(root: HTMLElement): Promise<() => void> {
+  const host = root.querySelector<HTMLElement>("#optRoot");
+  if (!host) return () => {};
+  const hostEl: HTMLElement = host;
+
+  let state: OptimizeState | null = null;
+  let loadError: string | null = null;
+  let disposed = false;
+  let elapsedTimer: number | null = null;
+  let consultStart = 0;
+  /** Armed two-step confirms, by key ("consult", "discard", "destructive"). */
+  const armed = new Set<string>();
+  /** Purpose editor drafts, keyed "deployment" | "backend:<id>" | "group:<name>". */
+  const drafts = new Map<string, string>();
+  const openEditors = new Set<string>();
+  let statusLine = "";
+  let applyRunning = false;
+
+  const shortName = (modelId: string): string => {
+    if (!state) return modelId;
+    const b = state.backends.find((x) => x.model_id === modelId);
+    return b?.short_name ?? modelId;
+  };
+
+  function expectedLine(item: OptimizePlanItem, st: OptimizeState): string {
+    const v = st.plan?.validations[item.id - 1];
+    if (!v) return "";
+    if (v.status === "invalid") {
+      return `<span class="opt-invalid">${icon("err")} Invalid — ${esc(v.reason ?? "")}</span>`;
+    }
+    const parts: string[] = [];
+    if (v.expected.gpu_ram_mib) {
+      parts.push(`GPU RAM: ${fmtGiB(v.expected.gpu_ram_mib[0])} → ${fmtGiB(v.expected.gpu_ram_mib[1])}`);
+    }
+    if (v.expected.sys_ram_mib) {
+      parts.push(`System RAM: ${fmtGiB(v.expected.sys_ram_mib[0])} → ${fmtGiB(v.expected.sys_ram_mib[1])}`);
+    }
+    if (v.expected.note) parts.push(esc(v.expected.note));
+    let html = parts.length ? `<span class="opt-expected">${parts.join(" · ")}</span>` : "";
+    if (v.status === "warning") {
+      html += `<span class="opt-warning">${icon("warn")} ${esc(v.reason ?? "")}</span>`;
+    }
+    return html;
+  }
+
+  function outcomeChip(item: OptimizePlanItem): string {
+    if (item.apply_outcome === "applied") {
+      return `<span class="opt-outcome ok">${icon("check")} Applied</span>`;
+    }
+    if (item.apply_outcome === "failed") {
+      return `<span class="opt-outcome err">${icon("err")} Failed — ${esc(item.apply_error ?? "")}</span>`;
+    }
+    if (item.apply_outcome === "not_attempted") {
+      return `<span class="opt-outcome idle">Not attempted</span>`;
+    }
+    return "";
+  }
+
+  function triState(item: OptimizePlanItem): string {
+    if (item.kind === "advice") return "";
+    const btn = (d: string, label: string) =>
+      `<button class="opt-tri-btn ${item.decision === d ? `on ${d}` : ""}" data-opt-tri="${item.id}:${d}">${label}</button>`;
+    return `<span class="opt-tri" role="group" aria-label="Decision for item ${item.id}">
+      ${btn("accepted", "Accept")}${btn("undecided", "Undecided")}${btn("denied", "Deny")}
+    </span>${item.previously_denied ? `<span class="opt-prev-denied">Denied last time</span>` : ""}`;
+  }
+
+  function planRow(item: OptimizePlanItem, st: OptimizeState): string {
+    const v = st.plan?.validations[item.id - 1];
+    const invalid = v?.status === "invalid";
+    if (item.kind === "advice") {
+      return `<div class="opt-row advice">
+        <div class="opt-row-main">
+          <span class="opt-num">${item.id}.</span>
+          <span class="chip">${optimizeKindLabel(item.kind)}</span>
+          <span class="opt-advice">${esc(item.advice_text ?? "")}</span>
+        </div>
+      </div>`;
+    }
+    const targetLabel = item.kind.startsWith("group.")
+      ? `Group: ${esc(item.target ?? "")}`
+      : item.kind === "model.add"
+        ? `Model: ${esc(item.target ?? "")}`
+        : `${esc(item.target ?? "")}${item.target && shortNameForBackend(item.target, st) ? ` · ${esc(shortNameForBackend(item.target, st) ?? "")}` : ""}`;
+    return `<div class="opt-row ${invalid ? "invalid" : ""}">
+      <div class="opt-row-main">
+        <span class="opt-num">${item.id}.</span>
+        <span class="chip">${optimizeKindLabel(item.kind)}</span>
+        <span class="opt-target">${targetLabel}</span>
+        <span class="opt-change">${esc(optimizeChangeSummary(item, shortName))}</span>
+        ${expectedLine(item, st)}
+        <span class="opt-conf">Confidence: ${esc(item.confidence)}</span>
+        ${triState(item)}
+        ${outcomeChip(item)}
+      </div>
+      ${optimizeIsDestructive(item.kind) && item.kind === "backend.delete"
+        ? `<div class="opt-note">Applying this item stops the backend first, then deletes it.</div>` : ""}
+      ${item.rationale || item.expected_effect
+        ? `<details class="opt-why"><summary>Why</summary>
+             ${item.rationale ? `<p>${esc(item.rationale)}</p>` : ""}
+             ${item.expected_effect ? `<p><em>Model's expected effect:</em> ${esc(item.expected_effect)}</p>` : ""}
+           </details>` : ""}
+    </div>`;
+  }
+
+  function shortNameForBackend(backendId: string, st: OptimizeState): string | null {
+    return st.backends.find((b) => b.id === backendId)?.short_name ?? null;
+  }
+
+  function planHtml(st: OptimizeState): string {
+    const plan = st.plan;
+    if (!plan) {
+      return `<div class="card"><div class="empty">No plan yet — run a consultation.</div></div>`;
+    }
+    const accepted = plan.items.filter((i) => i.decision === "accepted");
+    const denied = plan.items.filter((i) => i.decision === "denied").length;
+    const undecided = plan.items.filter((i) => i.decision === "undecided").length;
+    const eligible = (i: OptimizePlanItem) =>
+      i.decision === "accepted"
+      && plan.validations[i.id - 1]?.status !== "invalid"
+      && i.apply_outcome !== "applied";
+    const nonDestructive = accepted.filter((i) => eligible(i) && !optimizeIsDestructive(i.kind));
+    const destructive = accepted.filter((i) => eligible(i) && optimizeIsDestructive(i.kind));
+    const notes: string[] = [];
+    if (plan.dropped_invalid > 0) notes.push(`${plan.dropped_invalid} item${plan.dropped_invalid === 1 ? " was" : "s were"} dropped as invalid`);
+    if (plan.truncated > 0) notes.push(`${plan.truncated} item${plan.truncated === 1 ? "" : "s"} cut by the 25-item cap`);
+    return `<div class="card">
+      <div class="opt-plan-head">
+        <strong>Plan</strong>
+        <span class="opt-plan-meta">from ${esc(plan.consulted_backend)} · ${esc(fmtTime(plan.created_at))}</span>
+        ${plan.sample ? `<span class="chip">Sample plan</span>` : ""}
+        ${plan.config_stale ? `<span class="stale-tag">Configuration changed since this plan</span>
+          <button class="btn" data-opt-act="revalidate">${icon("restart")} Re-validate</button>` : ""}
+        <span class="grow"></span>
+        <button class="btn icon-only" data-opt-act="discard" title="Discard plan">${icon("x")}</button>
+      </div>
+      <details class="opt-why"><summary>Summary and raw response</summary>
+        ${plan.summary ? `<p>${esc(plan.summary)}</p>` : ""}
+        <pre class="opt-pre">${esc(plan.raw_response)}</pre>
+        ${plan.dropped_fragments.length
+          ? `<p class="opt-note">Dropped items:</p>${plan.dropped_fragments.map((f) => `<pre class="opt-pre">${esc(f)}</pre>`).join("")}` : ""}
+      </details>
+      <div class="opt-counts">${plan.items.length} items · ${accepted.length} accepted · ${denied} denied · ${undecided} undecided${notes.length ? ` · ${notes.join(" · ")}` : ""}</div>
+      <div class="opt-rows">${plan.items.map((i) => planRow(i, st)).join("")}</div>
+      ${nonDestructive.length || destructive.length ? `<div class="opt-applybar">
+        ${nonDestructive.length ? `<button class="btn primary" data-opt-act="apply" ${applyRunning ? "disabled" : ""}>${icon("check")} Apply accepted (${nonDestructive.length})</button>` : ""}
+        ${destructive.length ? `<button class="btn danger ${armed.has("destructive") ? "armed" : ""}" data-opt-act="apply-destructive" ${applyRunning ? "disabled" : ""}>${icon("trash")} ${armed.has("destructive") ? `Confirm deletes (${destructive.length})` : `Apply destructive (${destructive.length})`}</button>` : ""}
+        <span class="opt-note">Apply saves the configuration only — nothing restarts. Activation stays with the banner / Activation Plan flow.</span>
+      </div>` : ""}
+      ${statusLine ? `<div class="opt-status">${esc(statusLine)}</div>` : ""}
+    </div>`;
+  }
+
+  function purposeEditor(key: string, label: string, current: string, isSeed = false): string {
+    const open = openEditors.has(key);
+    const draft = drafts.get(key) ?? current;
+    if (!open) {
+      return `<div class="opt-purpose-row">
+        <span class="opt-purpose-label">${esc(label)}</span>
+        <span class="opt-purpose-text">${current.trim() ? esc(current) : `<em>No purpose set${isSeed ? " — a generated description is used" : ""}</em>`}</span>
+        <button class="btn" data-opt-purpose-edit="${esc(key)}">Edit</button>
+      </div>`;
+    }
+    return `<div class="opt-purpose-row edit">
+      <span class="opt-purpose-label">${esc(label)}</span>
+      <textarea class="opt-purpose-input" data-opt-purpose-input="${esc(key)}" rows="3">${esc(draft)}</textarea>
+      <button class="btn primary" data-opt-purpose-save="${esc(key)}">Save purpose</button>
+      <button class="btn" data-opt-purpose-cancel="${esc(key)}">Cancel</button>
+    </div>`;
+  }
+
+  function paint(): void {
+    if (disposed || !host) return;
+    if (loadError) {
+      host.innerHTML = `<div class="banner">${icon("err")} Backend error — ${esc(loadError)}</div>`;
+      return;
+    }
+    if (!state) {
+      host.innerHTML = `<div class="card" style="color:var(--text2)">${icon("clock")} Loading…</div>`;
+      return;
+    }
+    const st = state;
+    const running = st.backends.filter((b) => b.running);
+    const purposeShown = st.purpose_is_seed ? st.purpose_seed : st.purpose;
+    const summary = st.context_summary;
+    const contextLine = `GPUs: ${summary.gpus} · Backends: ${summary.backends} · Groups: ${summary.groups} · Models: ${summary.models}${summary.traffic_window_label ? ` · Traffic window: ${esc(summary.traffic_window_label)}` : ""}`;
+    const consulting = st.consulting;
+    host.innerHTML = `
+    <div class="card" id="optConsultCard">
+      <div class="opt-consult-grid">
+        <div>
+          <div class="opt-field-label">Deployment purpose</div>
+          ${purposeEditor("deployment", "", purposeShown, st.purpose_is_seed)}
+          ${st.purpose_is_seed ? `<div class="opt-note">This description was generated from your setup. Edit it to make it yours — every consultation uses it.</div>` : ""}
+        </div>
+        <div>
+          <div class="opt-field-label">Consulting</div>
+          <div class="opt-consult-row">
+            ${running.length
+              ? `<select id="optBackendSel" style="${SELECT_STYLE}">${running.map((b) => `<option value="${esc(b.id)}" ${b.id === st.default_backend ? "selected" : ""}>${esc(b.id)}${b.short_name ? ` · ${esc(b.short_name)}` : ""}</option>`).join("")}</select>`
+              : `<span class="opt-note">No backend is running — start one to consult it, or generate a sample plan.</span>`}
+          </div>
+          ${st.better_backend ? `<div class="opt-note">${esc(st.better_backend.short_name ?? st.better_backend.id)} (${esc(st.better_backend.id)}) would be the stronger consultant but is stopped — start it to consult it.</div>` : ""}
+          <div class="opt-field-label" style="margin-top:10px">Context</div>
+          <div class="opt-context-line">${esc(contextLine)}</div>
+          <details class="opt-why"><summary>View context</summary>
+            <pre class="opt-pre">${esc(JSON.stringify(st.context, null, 2))}</pre>
+          </details>
+        </div>
+      </div>
+      <div class="opt-consult-actions">
+        ${consulting
+          ? `<span class="opt-consulting">${icon("clock")} Consulting <span id="optElapsed">${fmtElapsed(Math.floor((Date.now() - consultStart) / 1000))}</span> — a large model on local hardware can take several minutes.</span>
+             <button class="btn danger" data-opt-act="cancel-consult">${icon("x")} Cancel</button>`
+          : `<button class="btn primary" data-opt-act="consult" ${running.length ? "" : "disabled"}>${icon("target")} ${armed.has("consult") ? "Replace the current plan?" : st.plan ? "Consult again" : "Consult"}</button>
+             <button class="btn" data-opt-act="sample">${icon("layers")} Sample plan</button>
+             ${armed.has("consult") ? `<span class="opt-note">A new consultation replaces the plan and its decisions. Click again to confirm.</span>` : ""}`}
+      </div>
+      ${statusLine && !st.plan ? `<div class="opt-status">${esc(statusLine)}</div>` : ""}
+    </div>
+    <div id="optPlanHost">${planHtml(st)}</div>
+    <details class="card opt-purposes">
+      <summary>Per-group and per-backend purposes</summary>
+      <p class="opt-note">Optional. A purpose tells the consulted model what a group or backend is for; without one it infers cautiously from names.</p>
+      ${st.groups.map((g) => purposeEditor(`group:${g.name}`, `Group: ${g.name}`, g.purpose)).join("")}
+      ${st.backends.map((b) => purposeEditor(`backend:${b.id}`, `Backend: ${b.id}`, b.purpose)).join("")}
+    </details>`;
+  }
+
+  async function refresh(): Promise<void> {
+    const r = await getOptimizeState();
+    if (disposed) return;
+    if (r.error) {
+      loadError = r.error;
+    } else if (r.data) {
+      state = r.data;
+      loadError = null;
+    }
+    paint();
+  }
+
+  async function runConsult(sample: boolean): Promise<void> {
+    const sel = hostEl.querySelector<HTMLSelectElement>("#optBackendSel");
+    const backendId = sample ? undefined : sel?.value || undefined;
+    consultStart = Date.now();
+    if (state) state.consulting = true;
+    paint();
+    if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
+    elapsedTimer = window.setInterval(() => {
+      const el = hostEl.querySelector("#optElapsed");
+      if (el) el.textContent = fmtElapsed(Math.floor((Date.now() - consultStart) / 1000));
+    }, 1000);
+    const r = await optimizeConsult(backendId, sample);
+    if (elapsedTimer !== null) { window.clearInterval(elapsedTimer); elapsedTimer = null; }
+    if (disposed) return;
+    if (r.error) {
+      if (state) state.consulting = false;
+      statusLine = r.error === "consultation cancelled"
+        ? "Consultation cancelled."
+        : `Consultation failed — ${r.error}`;
+      if (state) paint(); else { loadError = r.error; paint(); }
+      return;
+    }
+    if (r.data) {
+      state = r.data;
+      statusLine = "";
+    }
+    paint();
+  }
+
+  /* ---------------- Phase 4: apply orchestration ---------------- */
+
+  async function cfgGroups(): Promise<CfgGroup[]> {
+    const cfg = unwrap(await getAppConfig());
+    const groups = (cfg?.gateway as { groups?: CfgGroup[] } | undefined)?.groups;
+    return Array.isArray(groups) ? groups : [];
+  }
+
+  async function cfgBackends(): Promise<CfgBackend[]> {
+    const cfg = unwrap(await getAppConfig());
+    const backends = cfg?.backends as CfgBackend[] | undefined;
+    return Array.isArray(backends) ? backends : [];
+  }
+
+  /** Execute one accepted item through the existing commands.
+   *  Throws an Error with the failure message. */
+  async function executeItem(item: OptimizePlanItem): Promise<void> {
+    const c = item.change ?? {};
+    const target = item.target ?? "";
+    const str = (k: string): string => String(c[k] ?? "");
+    const numOrUndef = (k: string): number | undefined => typeof c[k] === "number" ? (c[k] as number) : undefined;
+    switch (item.kind) {
+      case "backend.create": {
+        const backends = await cfgBackends();
+        const groups = await cfgGroups();
+        const cfg = unwrap(await getAppConfig());
+        const models = (cfg?.models as CfgModel[] | undefined) ?? [];
+        const model = models.find((m) => m.id === str("model_id"));
+        if (!model) throw new Error(`model '${str("model_id")}' is not registered`);
+        let group = str("group");
+        if (!group) {
+          const sibling = backends.find((b) => b.model_file === model.gguf_path);
+          const siblingGroup = sibling ? groups.find((g) => g.members.includes(sibling.id)) : undefined;
+          group = siblingGroup?.name ?? target;
+        }
+        unwrap(await addBackend({
+          id: target, modelId: model.id, port: numOrUndef("port") ?? 0,
+          group, createGroup: !groups.some((g) => g.name === group), enabled: true,
+        }));
+        const nCtx = numOrUndef("n_ctx");
+        const nBatch = numOrUndef("n_batch");
+        if (nCtx !== undefined || nBatch !== undefined) {
+          unwrap(await updateBackendFlags(target, nCtx ?? 32768, nBatch ?? 512));
+        }
+        const offload = numOrUndef("offload_layers");
+        if (offload !== undefined) unwrap(await setBackendOffload(target, offload));
+        if (Array.isArray(c.tensor_split)) {
+          unwrap(await applyBackendConfig(target, {
+            tensor_split: c.tensor_split, split_mode: "layer",
+          }, "OnNextRestart"));
+        }
+        return;
+      }
+      case "backend.delete": {
+        const rows = unwrap(await getBackends());
+        const row = rows.find((b) => b.id === target);
+        if (row && row.state === "running") {
+          unwrap(await stopBackend(target));
+          const deadline = Date.now() + 30000;
+          for (;;) {
+            const now = unwrap(await getBackends());
+            const s = now.find((b) => b.id === target)?.state;
+            if (s === "stopped" || s === undefined) break;
+            if (Date.now() > deadline) throw new Error(`backend '${target}' did not stop within 30 s`);
+            await new Promise((r) => window.setTimeout(r, 1000));
+          }
+        }
+        unwrap(await deleteBackend(target));
+        return;
+      }
+      case "backend.set_context":
+      case "backend.set_flags": {
+        const cfgB = unwrap(await getBackendConfig(target));
+        if (!cfgB) throw new Error(`backend '${target}' not found`);
+        const flags = cfgB.flags as { n_ctx?: number; n_batch?: number };
+        unwrap(await updateBackendFlags(
+          target,
+          numOrUndef("n_ctx") ?? flags.n_ctx ?? 32768,
+          numOrUndef("n_batch") ?? flags.n_batch ?? 512,
+        ));
+        return;
+      }
+      case "backend.set_offload": {
+        unwrap(await setBackendOffload(target, numOrUndef("offload_layers") ?? 0));
+        return;
+      }
+      case "backend.set_placement": {
+        const patch: Record<string, unknown> = { tensor_split: c.tensor_split };
+        if (typeof c.split_mode === "string") patch.split_mode = c.split_mode;
+        unwrap(await applyBackendConfig(target, patch, "OnNextRestart"));
+        return;
+      }
+      case "backend.set_model": {
+        const backends = await cfgBackends();
+        const b = backends.find((x) => x.id === target);
+        unwrap(await modelAssign(target, str("model_id"), b?.flags.tensor_split ?? []));
+        return;
+      }
+      case "backend.set_enabled": {
+        unwrap(await applyBackendConfig(target, { enabled: c.enabled === true }, "OnNextRestart"));
+        return;
+      }
+      case "group.set_members":
+      case "group.set_strategy":
+      case "group.set_fallbacks": {
+        const groups = (await cfgGroups()).map((g) => {
+          if (g.name !== target) return g;
+          const next = { ...g };
+          if (item.kind === "group.set_members") next.members = (c.members as string[]) ?? [];
+          if (item.kind === "group.set_strategy") next.strategy = str("strategy");
+          if (item.kind === "group.set_fallbacks") next.fallbacks = (c.fallbacks as string[]) ?? [];
+          return next;
+        });
+        unwrap(await updateGatewayConfig({ groups }));
+        return;
+      }
+      case "group.create": {
+        const groups = await cfgGroups();
+        groups.push({
+          name: target,
+          members: (c.members as string[]) ?? [],
+          strategy: str("strategy") || "simple-shuffle",
+          fallbacks: (c.fallbacks as string[]) ?? [],
+          purpose: "",
+        });
+        unwrap(await updateGatewayConfig({ groups }));
+        return;
+      }
+      case "group.delete": {
+        const groups = (await cfgGroups()).filter((g) => g.name !== target);
+        unwrap(await updateGatewayConfig({ groups }));
+        return;
+      }
+      case "model.add": {
+        unwrap(await modelAdd(target, str("source_url"), undefined, typeof c.quant === "string" ? (c.quant as string) : undefined));
+        return;
+      }
+      default:
+        throw new Error(`kind ${item.kind} has no executor`);
+    }
+  }
+
+  async function runApplyPhase(destructivePhase: boolean): Promise<void> {
+    if (!state?.plan || applyRunning) return;
+    const plan = state.plan;
+    const queue = plan.items.filter((i) =>
+      i.decision === "accepted"
+      && plan.validations[i.id - 1]?.status !== "invalid"
+      && i.apply_outcome !== "applied"
+      && optimizeIsDestructive(i.kind) === destructivePhase);
+    if (!queue.length) return;
+    applyRunning = true;
+    statusLine = "";
+    paint();
+    let failed = false;
+    for (const item of queue) {
+      if (disposed) break;
+      if (failed) {
+        const r = await optimizeSetItemOutcome(item.id, "not_attempted");
+        if (r.data) state = r.data;
+        continue;
+      }
+      try {
+        await executeItem(item);
+        const r = await optimizeSetItemOutcome(item.id, "applied");
+        if (r.data) state = r.data;
+      } catch (e) {
+        failed = true;
+        const msg = e instanceof Error ? e.message : String(e);
+        const r = await optimizeSetItemOutcome(item.id, "failed", msg);
+        if (r.data) state = r.data;
+        statusLine = `Apply stopped at item ${item.id} — ${msg}. Items after it were not attempted. Applied changes are saved, not live: activate them from the banner or the Activation Plan page.`;
+      }
+      paint();
+    }
+    if (!failed && !disposed) {
+      statusLine = "Applied. The changes are saved, not live — activate them from the banner or the Activation Plan page.";
+    }
+    applyRunning = false;
+    armed.delete("destructive");
+    await refresh();
+    if (statusLine) paint();
+  }
+
+  /* ---------------- events ---------------- */
+
+  hostEl.addEventListener("click", (ev) => {
+    const t = ev.target as HTMLElement;
+    const tri = t.closest<HTMLElement>("[data-opt-tri]");
+    if (tri && state?.plan) {
+      const [idStr, decision] = (tri.dataset.optTri ?? "").split(":");
+      const id = Number(idStr);
+      if (id && (decision === "accepted" || decision === "denied" || decision === "undecided")) {
+        void (async () => {
+          const r = await optimizeSetItemState(id, decision);
+          if (disposed) return;
+          if (r.error) { statusLine = r.error; paint(); return; }
+          if (r.data) state = r.data;
+          paint();
+        })();
+      }
+      return;
+    }
+    const purposeEdit = t.closest<HTMLElement>("[data-opt-purpose-edit]");
+    if (purposeEdit) {
+      const key = purposeEdit.dataset.optPurposeEdit ?? "";
+      openEditors.add(key);
+      paint();
+      return;
+    }
+    const purposeCancel = t.closest<HTMLElement>("[data-opt-purpose-cancel]");
+    if (purposeCancel) {
+      const key = purposeCancel.dataset.optPurposeCancel ?? "";
+      openEditors.delete(key);
+      drafts.delete(key);
+      paint();
+      return;
+    }
+    const purposeSave = t.closest<HTMLElement>("[data-opt-purpose-save]");
+    if (purposeSave) {
+      const key = purposeSave.dataset.optPurposeSave ?? "";
+      const input = hostEl.querySelector<HTMLTextAreaElement>(`[data-opt-purpose-input="${CSS.escape(key)}"]`);
+      const text = input?.value ?? "";
+      let scope: "deployment" | "group" | "backend" = "deployment";
+      let target: string | undefined;
+      if (key.startsWith("backend:")) { scope = "backend"; target = key.slice("backend:".length); }
+      if (key.startsWith("group:")) { scope = "group"; target = key.slice("group:".length); }
+      void (async () => {
+        const r = await optimizeSavePurpose(scope, text, target);
+        if (disposed) return;
+        if (r.error) { statusLine = r.error; paint(); return; }
+        openEditors.delete(key);
+        drafts.delete(key);
+        if (r.data) state = r.data;
+        paint();
+      })();
+      return;
+    }
+    const act = t.closest<HTMLElement>("[data-opt-act]")?.dataset.optAct;
+    if (!act) return;
+    switch (act) {
+      case "consult": {
+        const hasDecisions = state?.plan?.items.some((i) => i.decision !== "undecided" || i.apply_outcome);
+        if (state?.plan && hasDecisions && !armed.has("consult")) {
+          armed.add("consult");
+          paint();
+          window.setTimeout(() => { armed.delete("consult"); if (!disposed) paint(); }, 5000);
+          return;
+        }
+        armed.delete("consult");
+        void runConsult(false);
+        return;
+      }
+      case "sample":
+        void runConsult(true);
+        return;
+      case "cancel-consult":
+        void optimizeCancelConsult();
+        return;
+      case "discard": {
+        // Discarding deletes the operator's decisions along with
+        // the plan, so it takes the same two-step confirm as the
+        // other destructive actions.
+        if (!armed.has("discard")) {
+          armed.add("discard");
+          statusLine = "Click the X again to discard the plan and its decisions.";
+          paint();
+          window.setTimeout(() => { armed.delete("discard"); if (!disposed) paint(); }, 5000);
+          return;
+        }
+        armed.delete("discard");
+        void (async () => {
+          const r = await optimizeDiscardPlan();
+          if (disposed) return;
+          if (r.data) state = r.data;
+          statusLine = "";
+          paint();
+        })();
+        return;
+      }
+      case "revalidate":
+        void refresh();
+        return;
+      case "apply":
+        void runApplyPhase(false);
+        return;
+      case "apply-destructive": {
+        if (!armed.has("destructive")) {
+          armed.add("destructive");
+          paint();
+          window.setTimeout(() => { armed.delete("destructive"); if (!disposed) paint(); }, 5000);
+          return;
+        }
+        void runApplyPhase(true);
+        return;
+      }
+    }
+  });
+
+  hostEl.addEventListener("input", (ev) => {
+    const t = ev.target as HTMLElement;
+    const key = t.dataset?.optPurposeInput;
+    if (key && t instanceof HTMLTextAreaElement) drafts.set(key, t.value);
+  });
+
+  await refresh();
+  return () => {
+    disposed = true;
+    if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
+  };
+}

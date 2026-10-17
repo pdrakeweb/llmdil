@@ -3,6 +3,7 @@
    layout can be evaluated without a backend. */
 
 import { walk } from "./charts";
+import type { OptimizePlanItem, OptimizeState, OptimizeValidation } from "./api";
 import type { BackendInfo, DashboardModel, GpuInfo, WizardStepState } from "./types";
 
 export function mockBackends(): BackendInfo[] {
@@ -100,3 +101,95 @@ export const GPU_COLORS: Record<string, string> = {
   "p100-0": "#a371f7",
   "p100-1": "#39c5cf",
 };
+
+/** Sample Optimize page state for browser mode: the consult card
+ *  figures and a stored sample plan exercising the row states
+ *  (valid / warning / invalid, a denied delete, an advice row). */
+export function mockOptimizeState(): OptimizeState {
+  const item = (
+    id: number, kind: string, target: string | null,
+    change: Record<string, unknown>, extra: Partial<OptimizePlanItem> = {},
+  ): OptimizePlanItem => ({
+    id, fingerprint: `sample-${id}`, kind, target, change,
+    advice_text: null, rationale: "", expected_effect: "", confidence: "medium",
+    decision: "undecided", previously_denied: false, apply_outcome: null, apply_error: null,
+    ...extra,
+  });
+  const validation = (status: "valid" | "warning" | "invalid", reason: string | null = null,
+    gpu: [number, number] | null = null, sys: [number, number] | null = null, note: string | null = null): OptimizeValidation => ({
+    status, reason, expected: { gpu_ram_mib: gpu, sys_ram_mib: sys, note },
+  });
+  return {
+    purpose: "",
+    purpose_is_seed: true,
+    purpose_seed: "Local inference served to the LAN through one gateway. Groups: planner (Qwen3.8-27B Planner); coder (Qwen3-Coder-Next-80B).",
+    groups: [
+      { name: "planner", purpose: "" },
+      { name: "coder", purpose: "" },
+      { name: "coder-fast", purpose: "" },
+      { name: "tool-runner", purpose: "" },
+    ],
+    backends: [
+      { id: "planner", purpose: "", running: true, enabled: true, model_id: "qwen3-27b-planner", short_name: "Qwen3.8-27B Planner" },
+      { id: "coder", purpose: "", running: true, enabled: true, model_id: "qwen3-coder-30b", short_name: "Qwen3-Coder-Next-80B" },
+      { id: "coder-fast", purpose: "", running: false, enabled: false, model_id: null, short_name: null },
+      { id: "tool-runner", purpose: "", running: false, enabled: false, model_id: null, short_name: null },
+    ],
+    context_summary: {
+      gpus: 2, backends: 4, groups: 4, models: 3,
+      measured_blocks: ["backend running state and per-process VRAM", "gateway traffic"],
+      traffic_window_label: "1 h",
+    },
+    context: { sample: true },
+    default_backend: "planner",
+    better_backend: null,
+    consulting: false,
+    plan: {
+      summary: "Sample plan — generated locally; no backend was consulted.",
+      consulted_backend: "planner",
+      created_at: new Date().toISOString(),
+      config_hash: "sample",
+      dropped_invalid: 1,
+      truncated: 0,
+      dropped_fragments: ["{\"kind\":\"backend.set_offload\",\"target\":\"coder\",\"change\":{\"offload_layers\":\"most\"}}"],
+      raw_response: "{\"summary\": \"Sample plan\", \"items\": [ ... ]}",
+      context: { sample: true },
+      config_stale: false,
+      sample: true,
+      items: [
+        item(1, "backend.set_context", "planner", { n_ctx: 65536 }, {
+          rationale: "Planner requests regularly approach the current 32K context; doubling it doubles the KV cache, which the A4000 has room for.",
+          confidence: "high",
+        }),
+        item(2, "backend.set_offload", "coder", { offload_layers: 48 }, {
+          rationale: "Moving all MoE layers to system RAM frees the P100 entirely; system RAM is plentiful on this machine.",
+          confidence: "medium",
+        }),
+        item(3, "group.set_strategy", "coder", { strategy: "least-busy" }, {
+          rationale: "Least-busy spreads requests across group members instead of shuffling.",
+          confidence: "medium",
+        }),
+        item(4, "model.add", "sample-model", { source_url: "sample/sample-model-Q4_K_M.gguf", quant: "Q4_K_M" }, {
+          rationale: "Registers a model for later evaluation; nothing is downloaded.",
+          confidence: "low",
+        }),
+        item(5, "backend.delete", "coder-fast", {}, {
+          rationale: "The coder-fast backend has never run; removing it simplifies the layout.",
+          decision: "denied",
+          confidence: "low",
+        }),
+        item(6, "advice", null, {}, {
+          advice_text: "Consider enabling the tool-runner backend before routing tool calls through the coder group; the seat exists in the layout but is disabled.",
+        }),
+      ],
+      validations: [
+        validation("valid", null, [9216, 17408], null),
+        validation("warning", "fits now, but not alongside every configured backend when all are running", [44032, 2048], [40960, 45056]),
+        validation("valid"),
+        validation("warning", "registers the model only — the source URL and any hash are model-supplied and unverified; confirm the pinned hash in the Models view before downloading"),
+        validation("valid", null, null, null, "Backend will be stopped and removed"),
+        validation("valid"),
+      ],
+    },
+  };
+}

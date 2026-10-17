@@ -9,7 +9,7 @@
 */
 
 import { trim1 } from "./charts";
-import { mockBackends, mockDashboard, mockGpus, mockWizardSteps } from "./mock";
+import { mockBackends, mockDashboard, mockGpus, mockOptimizeState, mockWizardSteps } from "./mock";
 import type { BackendInfo, DashboardModel, GpuInfo, Status, StatusResponse, WizardStepState } from "./types";
 
 export {}; // module marker
@@ -1764,5 +1764,212 @@ export async function placementApply(modelId: string, split: number[], backendId
     return { data, live: true };
   } catch (e) {
     return { data: fallback, live: true, error: errOf(e) };
+  }
+}
+
+/* ---------------- Optimize (docs/optimize-design.md) ---------------- */
+
+export type OptimizeDecision = "undecided" | "accepted" | "denied";
+
+export interface OptimizeExpected {
+  gpu_ram_mib: [number, number] | null;
+  sys_ram_mib: [number, number] | null;
+  note: string | null;
+}
+
+export interface OptimizeValidation {
+  status: "valid" | "warning" | "invalid";
+  reason: string | null;
+  expected: OptimizeExpected;
+}
+
+export interface OptimizePlanItem {
+  id: number;
+  fingerprint: string;
+  kind: string;
+  target: string | null;
+  change: Record<string, unknown>;
+  advice_text: string | null;
+  rationale: string;
+  expected_effect: string;
+  confidence: "high" | "medium" | "low";
+  decision: OptimizeDecision;
+  previously_denied: boolean;
+  apply_outcome: "applied" | "failed" | "not_attempted" | null;
+  apply_error: string | null;
+}
+
+export interface OptimizePlan {
+  summary: string;
+  items: OptimizePlanItem[];
+  consulted_backend: string;
+  created_at: string;
+  config_hash: string;
+  dropped_invalid: number;
+  truncated: number;
+  dropped_fragments: string[];
+  raw_response: string;
+  context: unknown;
+  validations: OptimizeValidation[];
+  config_stale: boolean;
+  sample: boolean;
+}
+
+export interface OptimizeBackendInfo {
+  id: string;
+  purpose: string;
+  running: boolean;
+  enabled: boolean;
+  model_id: string | null;
+  short_name: string | null;
+}
+
+export interface OptimizeState {
+  purpose: string;
+  purpose_is_seed: boolean;
+  purpose_seed: string;
+  groups: { name: string; purpose: string }[];
+  backends: OptimizeBackendInfo[];
+  context_summary: {
+    gpus: number;
+    backends: number;
+    groups: number;
+    models: number;
+    measured_blocks: string[];
+    traffic_window_label: string | null;
+  };
+  context: unknown;
+  default_backend: string | null;
+  better_backend: { id: string; short_name: string | null } | null;
+  plan: OptimizePlan | null;
+  consulting: boolean;
+}
+
+/** optimize_get_state — the page's full state: purposes, context
+ *  summary + document, and the stored plan with live validation. */
+export async function getOptimizeState(): Promise<CallResult<OptimizeState | null>> {
+  if (!isTauri()) return { data: mockOptimizeState(), live: false };
+  try {
+    const data = await invoke<OptimizeState>("optimize_get_state");
+    return { data, live: true };
+  } catch (e) {
+    return { data: null, live: true, error: errOf(e) };
+  }
+}
+
+async function optimizeStateCmd<T>(cmd: string, args?: Record<string, unknown>): Promise<CallResult<OptimizeState | null>> {
+  if (!isTauri()) return { data: mockOptimizeState(), live: false };
+  try {
+    const data = await invoke<OptimizeState>(cmd, args);
+    return { data, live: true };
+  } catch (e) {
+    return { data: null, live: true, error: errOf(e) };
+  }
+}
+
+/** optimize_save_purpose — persist purpose text (deployment scope,
+ *  or one group's / backend's). */
+export function optimizeSavePurpose(scope: "deployment" | "group" | "backend", text: string, target?: string) {
+  return optimizeStateCmd("optimize_save_purpose", { scope, target: target ?? null, text });
+}
+
+/** optimize_consult — run a consultation (or a local sample plan)
+ *  and return the refreshed state with the new plan. Long-running:
+ *  up to the 900 s task budget for a live consultation. */
+export function optimizeConsult(backendId?: string, sample = false) {
+  return optimizeStateCmd("optimize_consult", { backendId: backendId ?? null, sample });
+}
+
+/** optimize_cancel_consult — fire the scoped cancellation handle. */
+export async function optimizeCancelConsult(): Promise<CallResult<{ cancelled: boolean }>> {
+  if (!isTauri()) return { data: { cancelled: false }, live: false };
+  try {
+    const data = await invoke<{ cancelled: boolean }>("optimize_cancel_consult");
+    return { data, live: true };
+  } catch (e) {
+    return { data: { cancelled: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** optimize_set_item_state — set one plan item's tri-state decision. */
+export function optimizeSetItemState(itemId: number, decision: OptimizeDecision) {
+  return optimizeStateCmd("optimize_set_item_state", { itemId, decision });
+}
+
+/** optimize_set_item_outcome — record an apply outcome on one item
+ *  (the Phase 4 orchestrator reports progress through this). */
+export function optimizeSetItemOutcome(itemId: number, outcome: "applied" | "failed" | "not_attempted", error?: string) {
+  return optimizeStateCmd("optimize_set_item_outcome", { itemId, outcome, error: error ?? null });
+}
+
+/** optimize_discard_plan — drop the stored plan and its decisions. */
+export function optimizeDiscardPlan() {
+  return optimizeStateCmd("optimize_discard_plan");
+}
+
+/** Short chip label per plan kind (mirrors manager-optimize's
+ *  PlanKind::short_label). */
+export function optimizeKindLabel(kind: string): string {
+  switch (kind) {
+    case "backend.create": return "New backend";
+    case "backend.delete": return "Delete";
+    case "backend.set_context": return "Context";
+    case "backend.set_flags": return "Flags";
+    case "backend.set_offload": return "Offload";
+    case "backend.set_placement": return "Placement";
+    case "backend.set_model": return "Model";
+    case "backend.set_enabled": return "Enabled";
+    case "group.set_members":
+    case "group.set_strategy":
+    case "group.set_fallbacks": return "Routing";
+    case "group.create": return "New group";
+    case "group.delete": return "Delete";
+    case "model.add": return "New model";
+    default: return "Advice";
+  }
+}
+
+export function optimizeIsDestructive(kind: string): boolean {
+  return kind === "backend.delete" || kind === "group.delete";
+}
+
+/** One-line summary of an item's target + change, from the
+ *  normalized change payload (design §1.3 row anatomy). Rendered
+ *  from data only — never model prose. */
+export function optimizeChangeSummary(item: OptimizePlanItem, shortName: (modelId: string) => string): string {
+  const c = item.change ?? {};
+  const t = item.target ?? "";
+  const num = (v: unknown): string => typeof v === "number" ? v.toLocaleString("en-US") : "?";
+  const split = Array.isArray(c.tensor_split)
+    ? (c.tensor_split as number[]).map((f) => `${Math.round(f * 100)}`).join(" / ") + " %"
+    : "";
+  switch (item.kind) {
+    case "backend.create": {
+      const parts = [`Model: ${shortName(String(c.model_id ?? ""))}`, `Port: ${num(c.port)}`];
+      if (typeof c.group === "string") parts.push(`Group: ${c.group}`);
+      if (typeof c.n_ctx === "number") parts.push(`Context: ${num(c.n_ctx)}`);
+      if (typeof c.offload_layers === "number") parts.push(`Offload: ${num(c.offload_layers)} layers`);
+      if (split) parts.push(`Split: ${split}`);
+      return parts.join(" · ");
+    }
+    case "backend.delete": return `Backend: ${t}`;
+    case "backend.set_context": return `Context: ${num(c.n_ctx)} tokens`;
+    case "backend.set_flags": {
+      const parts: string[] = [];
+      if (typeof c.n_ctx === "number") parts.push(`Context: ${num(c.n_ctx)}`);
+      if (typeof c.n_batch === "number") parts.push(`Batch: ${num(c.n_batch)}`);
+      return parts.join(" · ");
+    }
+    case "backend.set_offload": return `Offload: ${num(c.offload_layers)} layers to system RAM`;
+    case "backend.set_placement": return `Split: ${split}${typeof c.split_mode === "string" ? ` · Mode: ${c.split_mode}` : ""}`;
+    case "backend.set_model": return `Model: ${shortName(String(c.model_id ?? ""))}`;
+    case "backend.set_enabled": return c.enabled === true ? "Enable backend" : "Disable backend";
+    case "group.set_members": return `Members: ${Array.isArray(c.members) ? (c.members as string[]).join(", ") : ""}`;
+    case "group.set_strategy": return `Strategy: ${String(c.strategy ?? "")}`;
+    case "group.set_fallbacks": return `Fallbacks: ${Array.isArray(c.fallbacks) && c.fallbacks.length ? (c.fallbacks as string[]).join(", ") : "none"}`;
+    case "group.create": return `Members: ${Array.isArray(c.members) ? (c.members as string[]).join(", ") : ""} · Strategy: ${String(c.strategy ?? "simple-shuffle")}`;
+    case "group.delete": return `Group: ${t}`;
+    case "model.add": return `Source: ${String(c.source_url ?? "")}`;
+    default: return "";
   }
 }
