@@ -81,6 +81,20 @@ pub fn ensure_cert(data_dir: &Path, sans: &CertSans) -> io::Result<TlsMaterial> 
     Ok(material)
 }
 
+/// Replace the stored certificate with a fresh one covering
+/// `sans` (certificate rotation from the desktop settings). The
+/// fingerprint changes, so paired clients must re-pair.
+pub fn regenerate(data_dir: &Path, sans: &CertSans) -> io::Result<TlsMaterial> {
+    let dir = tls_dir(data_dir);
+    let material = generate_with_sans(sans)?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("server.crt"), &material.cert_pem)?;
+    std::fs::write(dir.join("server.key"), &material.key_pem)?;
+    std::fs::write(dir.join("fingerprint.txt"), &material.fingerprint_sha256)?;
+    std::fs::write(dir.join("sans.txt"), sans.encode())?;
+    Ok(material)
+}
+
 fn generate_with_sans(sans: &CertSans) -> io::Result<TlsMaterial> {
     let mut params =
         rcgen::CertificateParams::new(sans.dns.clone()).map_err(io::Error::other)?;

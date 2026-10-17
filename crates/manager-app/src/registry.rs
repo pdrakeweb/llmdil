@@ -504,6 +504,8 @@ mod tests {
             "admin_api_reset_password",
             "admin_api_get_pairing",
             "admin_api_create_enrollment",
+            "admin_api_regenerate_cert",
+            "admin_api_get_audit",
         ];
         let shell_src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),

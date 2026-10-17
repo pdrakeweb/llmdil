@@ -24,8 +24,9 @@ import {
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
   adminApiGetStatus, adminApiSetEnabled, adminApiListUsers, adminApiCreateUser,
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
+  adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationPlanData, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
+import type { ActivationChange, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
 import type { GpuInfo, WizardStepState } from "../types";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
@@ -4299,6 +4300,7 @@ function remoteAccessHtml(
   users: AdminApiUser[],
   temp: { user: string; password: string } | null,
   enroll: (AdminApiPairing & { user: string }) | null,
+  audit: AdminApiAuditEntry[] = [],
 ): string {
   if (!status) return loadingHtml("Loading remote access\u2026");
   const stateText = status.running
@@ -4334,7 +4336,8 @@ function remoteAccessHtml(
     <div style="display:flex;justify-content:space-between;gap:16px;margin:6px 0"><span class="k">Status</span><span class="v" style="font-size:12px">${stateText}</span></div>
     ${settingsRows(rows)}
     ${status.note ? `<div style="font-size:12px;color:var(--err);margin-top:6px">${esc(status.note)}</div>` : ""}
-    <div class="card-actions" style="margin-top:10px"><button class="btn${status.enabled ? "" : " primary"}" data-ra-toggle>${status.enabled ? "Disable API" : "Enable API"}</button></div>
+    <div class="card-actions" style="margin-top:10px"><button class="btn${status.enabled ? "" : " primary"}" data-ra-toggle>${status.enabled ? "Disable API" : "Enable API"}</button>
+    <button class="btn" data-ra-regen>Regenerate certificate</button></div>
     <div style="font-size:12px;color:var(--text2);margin-top:16px">${users.length === 0 ? "First administrator" : "Users"}<span class="info-tip" title="Roles: viewer reads status; operator runs backends and the gateway; configurator also edits configuration; admin manages users and the API itself. Passwords need at least 12 characters.">${icon("info")}</span></div>
     ${userRows}
     <div style="display:flex;gap:6px;align-items:center;margin-top:8px;flex-wrap:wrap">
@@ -4343,6 +4346,8 @@ function remoteAccessHtml(
       <select id="raRole" style="font-size:12px">${roles.map((r) => `<option value="${r}"${r === "admin" && users.length === 0 ? " selected" : ""}>${r}</option>`).join("")}</select>
       <button class="btn" data-ra-create style="padding:1px 7px;font-size:11px">Create user</button>
     </div>
+    ${audit.length ? `<div style="font-size:12px;color:var(--text2);margin-top:16px">Audit log<span class="info-tip" title="Every API mutation and sign-in event, newest first. Full log: logs/admin-api-audit.jsonl in the data directory.">${icon("info")}</span></div>
+    <div style="font-size:12px">${audit.map((e) => `<div style="display:flex;justify-content:space-between;gap:16px;padding:2px 0"><span>${esc(new Date(e.ts_ms).toLocaleString())} \u00b7 ${esc(e.actor)} \u00b7 ${esc(e.action)}${e.target ? ` \u00b7 ${esc(e.target)}` : ""}</span><span style="color:${e.result.startsWith("2") ? "var(--ok)" : "var(--err)"}">${esc(e.result)}</span></div>`).join("")}</div>` : ""}
     ${temp ? `<div style="margin-top:12px">${settingsRows([{ key: `Temporary password \u00b7 ${temp.user}`, value: temp.password, copy: temp.password, tip: "Shown once. The user must change it at first sign-in." }])}</div>` : ""}
     ${enroll ? `<div style="margin-top:12px"><div style="font-size:12px;color:var(--text2)">Pairing \u00b7 ${esc(enroll.user)}<span class="info-tip" title="Enter these values in the LLMdil app to pair this device. The code is single-use and expires in 10 minutes.">${icon("info")}</span></div>${settingsRows([
       { key: "Base URL", value: enroll.base_url, copy: enroll.base_url },
@@ -4372,11 +4377,13 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
   let raUsers: AdminApiUser[] = [];
   let raTemp: { user: string; password: string } | null = null;
   let raEnroll: (AdminApiPairing & { user: string }) | null = null;
+  let raAudit: AdminApiAuditEntry[] = [];
   const loadRemote = async (): Promise<void> => {
-    const [st, us] = await Promise.all([adminApiGetStatus(), adminApiListUsers()]);
+    const [st, us, au] = await Promise.all([adminApiGetStatus(), adminApiListUsers(), adminApiGetAudit(20)]);
     if (disposed) return;
     raStatus = st.data;
     raUsers = us.data;
+    raAudit = au.data;
   };
   const setMsg = (text: string, isErr = false): void => {
     const m = root.querySelector("#setMsg");
@@ -4401,7 +4408,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     if (setUi.tab === "remote") await loadRemote();
     if (disposed) return;
     b.innerHTML = settingsPaint(cfgR.data, polR, actR, selfTestHtml, setUi,
-      remoteAccessHtml(raStatus, raUsers, raTemp, raEnroll));
+      remoteAccessHtml(raStatus, raUsers, raTemp, raEnroll, raAudit));
   };
 
   const onClick = async (ev: Event): Promise<void> => {
@@ -4435,6 +4442,18 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       return;
     }
 
+
+    const raRegen = t.closest("[data-ra-regen]") as HTMLButtonElement | null;
+    if (raRegen) {
+      if (!confirm("Regenerate the API certificate? The fingerprint changes and every paired device must pair again.")) return;
+      raRegen.disabled = true;
+      const r = await adminApiRegenerateCert();
+      if (disposed) return;
+      if (r.error) setMsg(`Certificate regeneration failed: ${r.error}`, true);
+      else setMsg("Certificate regenerated. Paired devices must pair again.");
+      await load();
+      return;
+    }
 
     const raToggle = t.closest("[data-ra-toggle]") as HTMLButtonElement | null;
     if (raToggle && raStatus) {

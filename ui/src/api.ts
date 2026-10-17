@@ -1886,3 +1886,34 @@ export async function adminApiCreateEnrollment(userId: string): Promise<CallResu
     return { data: null, live: true, error: errOf(e) };
   }
 }
+
+export interface AdminApiAuditEntry {
+  ts_ms: number;
+  actor: string;
+  auth_type: string;
+  source_ip: string;
+  action: string;
+  target: string | null;
+  result: string;
+  request_id: string;
+}
+
+export async function adminApiRegenerateCert(): Promise<CallResult<AdminApiStatus>> {
+  if (!isTauri()) return { data: emptyStatus, live: false, error: "admin_api_regenerate_cert is not available in sample mode" };
+  try {
+    const data = await invoke<AdminApiStatus>("admin_api_regenerate_cert");
+    return { data, live: true };
+  } catch (e) {
+    return { data: emptyStatus, live: true, error: errOf(e) };
+  }
+}
+
+export async function adminApiGetAudit(limit = 20): Promise<CallResult<AdminApiAuditEntry[]>> {
+  if (!isTauri()) return { data: [], live: false };
+  try {
+    const data = await invoke<{ entries: AdminApiAuditEntry[] }>("admin_api_get_audit", { limit });
+    return { data: data.entries, live: true };
+  } catch (e) {
+    return { data: [], live: true, error: errOf(e) };
+  }
+}

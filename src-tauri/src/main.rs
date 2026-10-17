@@ -32,7 +32,9 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
 use manager_api::auth::{AuthService, CredentialStore, WizardCredentialStore};
 use manager_api::users::RoleName;
@@ -100,13 +102,29 @@ macro_rules! tauri_handler {
             admin_api_delete_user,
             admin_api_reset_password,
             admin_api_get_pairing,
-            admin_api_create_enrollment
+            admin_api_create_enrollment,
+            admin_api_regenerate_cert,
+            admin_api_get_audit
         ]
     };
 }
 
 fn main() {
     tauri::Builder::default()
+        // Close-to-tray while the API serves (plan decision 13):
+        // closing the window hides it and the API keeps serving;
+        // Quit lives on the tray menu. With the API disabled the
+        // window closes (and the app exits) as before.
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                let slot = app.state::<ApiServerSlot>();
+                if slot.inner().server.lock().map(|s| s.is_some()).unwrap_or(false) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             // Load the persisted config; `manager_config::load` falls back
             // to the `.bak` last-known-good copy on parse/validation
@@ -194,6 +212,35 @@ fn main() {
                         }
                     }
                 });
+            }
+            // System tray: the way back in (and the way out) when
+            // the window is hidden by close-to-tray.
+            {
+                let show = MenuItem::with_id(app, "tray-show", "Show LLMdil", true, None::<&str>);
+                let quit = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>);
+                if let (Ok(show), Ok(quit)) = (show, quit) {
+                    if let Ok(menu) = Menu::with_items(app, &[&show, &quit]) {
+                        let mut tray = TrayIconBuilder::with_id("main-tray")
+                            .menu(&menu)
+                            .tooltip("LLMdil")
+                            .on_menu_event(|app, event| match event.id().as_ref() {
+                                "tray-show" => {
+                                    if let Some(w) = app.get_window("main") {
+                                        let _ = w.show();
+                                        let _ = w.set_focus();
+                                    }
+                                }
+                                "tray-quit" => app.exit(0),
+                                _ => {}
+                            });
+                        if let Some(icon) = app.handle().default_window_icon() {
+                            tray = tray.icon(icon.clone());
+                        }
+                        if let Err(e) = tray.build(app) {
+                            eprintln!("tray icon failed: {e}");
+                        }
+                    }
+                }
             }
             Ok(())
         })
@@ -527,4 +574,52 @@ async fn admin_api_create_enrollment(
         "cert_sha256": manager_api::tls::stored_fingerprint(&data_dir),
         "enrollment_code": code,
     }))
+}
+
+/// Rotate the API's TLS certificate: generate a fresh one and,
+/// when the server is running, restart it onto the new
+/// certificate. Paired clients must re-pair (the fingerprint
+/// changes) — the settings page confirms before calling this.
+#[tauri::command]
+async fn admin_api_regenerate_cert(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    slot: State<'_, ApiServerSlot>,
+    auth: State<'_, AdminAuth>,
+) -> Result<Value, String> {
+    let st = state.inner().clone();
+    let (_, port) = admin_api_settings(&st, &app).await?;
+    let data_dir = st.data_dir().to_path_buf();
+    manager_api::tls::regenerate(&data_dir, &cert_sans())
+        .map_err(|e| format!("certificate regeneration failed: {e}"))?;
+    let running = slot.inner().server.lock().unwrap().is_some();
+    if running {
+        let old = slot.inner().server.lock().unwrap().take();
+        if let Some(old) = old {
+            old.shutdown().await;
+        }
+        match start_admin_api(st, data_dir, auth.inner().0.clone(), port).await {
+            Ok(server) => {
+                *slot.inner().server.lock().unwrap() = Some(server);
+            }
+            Err(e) => {
+                *slot.inner().note.lock().unwrap() = Some(e.clone());
+                return Err(e);
+            }
+        }
+    }
+    admin_api_get_status(app, state, slot, auth).await
+}
+
+/// The newest audit-log entries for the settings page's review
+/// section (newest first).
+#[tauri::command]
+async fn admin_api_get_audit(
+    state: State<'_, Arc<AppState>>,
+    limit: Option<usize>,
+) -> Result<Value, String> {
+    let data_dir = state.inner().data_dir().to_path_buf();
+    let audit = manager_api::AuditLog::new(&data_dir);
+    let entries = audit.read_recent(0, limit.unwrap_or(20).min(200));
+    Ok(json!({ "entries": entries }))
 }

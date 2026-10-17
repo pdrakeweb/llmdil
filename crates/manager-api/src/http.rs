@@ -174,6 +174,16 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
             "/api/v1/admin/audit",
             get(crate::auth_routes::handle_admin_audit),
         );
+    // Unknown paths under the API answer with the standard error
+    // envelope, not the framework's bare 404.
+    let router = router.fallback(|state: State<Arc<ApiCtx>>| async move {
+        let State(ctx) = state;
+        error_response(
+            &ctx,
+            &ApiError::NotFound("no such route".to_string()),
+            None,
+        )
+    });
     let mw_state = crate::auth_routes::AuthMwState {
         ctx: ctx.clone(),
         table: Arc::new(crate::auth_routes::route_class_table()),

@@ -611,7 +611,7 @@ generated LiteLLM `config.yaml` exactly as the gateway will read it
 at its next start. (The desktop returns it wrapped as
 `{ "yaml": "…" }`; the API returns the document itself.)
 
-#### `GET /api/v1/gateway/master-key` — `secret`
+#### `GET /api/v1/gateway/master-key` — `secret` — NOT IMPLEMENTED in v1 (decision 4: the master key is never mirrored over REST; the operation is routeless)
 `gateway_master_key` → `{ "master_key": "…" }`. The LiteLLM master
 key: the API key local clients present to the gateway and the admin
 UI password. **Highest-sensitivity endpoint in the API** — the only
@@ -620,7 +620,7 @@ from general read. Note the app command generates and stores the key
 in Windows Credential Manager on first use, so this GET can have a
 one-time side effect.
 
-#### `POST /api/v1/gateway/start` — `control` — **Op**
+#### `POST /api/v1/gateway/start` — `control` — **Op** (authorization class D, inherited from the start-gateway step it aliases)
 The app has no standalone gateway-start command: starting is the
 wizard's `start-gateway` step. This endpoint is
 `POST /setup/steps/start-gateway/run` under a domain name (same
@@ -829,7 +829,7 @@ password lives in Credential Manager and never appears), `updates`,
 this payload; the one credential-adjacent field is the OpenRouter
 `cred_ref` (a Credential Manager target *name*, not a value).
 
-#### `PATCH /api/v1/config` — `config`
+#### `PATCH /api/v1/config` — `config` — NOT IMPLEMENTED in v1 (decision 11: raw config writes are excluded; section-scoped writes go through their domain endpoints)
 `update_config`. Body: a JSON merge patch over the §6.12 shape. The
 server merges, validates, and persists atomically, installing the
 new config in memory only when the save succeeds — the app's exact
