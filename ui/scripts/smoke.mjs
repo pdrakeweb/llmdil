@@ -35,6 +35,54 @@ const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join
 for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval"]) {
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
+// Cross-check: every Tauri command name the UI invokes must be
+// registered in src-tauri's generate_handler! list. A mismatch is
+// silent at build time and only fails at runtime in the installed app
+// (this is how the UI once invoked "backend_test_request" while the
+// registered command was "test_backend"). Extraction covers the two
+// dispatch idioms used in ui/src: direct invoke<...>("name", ...) and
+// the backendAction cmd-union forwarding to invoke(cmd, ...).
+const mainRsPath = join(root, "..", "src-tauri", "src", "main.rs");
+let registered = new Set();
+try {
+  const mainRs = readFileSync(mainRsPath, "utf8");
+  const block = mainRs.split("generate_handler![")[1].split("])")[0].replace(/\/\/.*/g, "");
+  registered = new Set(block.split(",").map((s) => s.trim()).filter(Boolean));
+} catch { /* empty set fails the check below */ }
+check(registered.size > 0, `parsed registered Tauri commands from generate_handler! (${registered.size})`);
+
+function walkTs(dir) {
+  const out = [];
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) out.push(...walkTs(p));
+    else if (e.name.endsWith(".ts")) out.push(p);
+  }
+  return out;
+}
+const invokedAt = new Map(); // name -> first "file:line" site
+for (const file of walkTs(join(root, "src"))) {
+  const src = readFileSync(file, "utf8");
+  const rel = file.slice(root.length + 1);
+  const lineOf = (idx) => src.slice(0, idx).split("\n").length;
+  for (const m of src.matchAll(/\binvoke\b/g)) {
+    const mm = /\(\s*"([a-z][a-z0-9_]*)"/.exec(src.slice(m.index, m.index + 500));
+    if (mm && !invokedAt.has(mm[1])) invokedAt.set(mm[1], `${rel}:${lineOf(m.index)}`);
+  }
+  for (const m of src.matchAll(/cmd:\s*((?:"[a-z0-9_]+"(?:\s*\|\s*)?)+)/g)) {
+    for (const q of m[1].matchAll(/"([a-z0-9_]+)"/g)) {
+      if (!invokedAt.has(q[1])) invokedAt.set(q[1], `${rel}:${lineOf(m.index)}`);
+    }
+  }
+  for (const m of src.matchAll(/backendAction\("([a-z0-9_]+)"/g)) {
+    if (!invokedAt.has(m[1])) invokedAt.set(m[1], `${rel}:${lineOf(m.index)}`);
+  }
+}
+const unregistered = [...invokedAt].filter(([name]) => !registered.has(name));
+check(unregistered.length === 0,
+  `every invoked command name is registered (${invokedAt.size} invoked, ${registered.size} registered)` +
+  (unregistered.length ? ` — unregistered: ${unregistered.map(([n, s]) => `${n} at ${s}`).join(", ")}` : ""));
+
 check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
 check(bundle.includes("__TAURI__"), "bundle contains the Tauri detection hook");
