@@ -450,22 +450,30 @@ pub fn temp_backend_id(experiment_id: usize) -> String {
 /// context 32768, batch 512; a named tensor split implies
 /// `SplitMode::Layer` (the create simulation's rule); offload
 /// layers become the raw-flags text a configured backend would
-/// carry for `ExpertOffload::CpuMoeLayers(N)`.
+/// carry, resolved through the canonical translation
+/// (`manager_models::offload_for_layers`, the same one the
+/// backend offload slider and the create simulation use): 0
+/// layers writes no offload tokens, the model's full MoE layer
+/// count writes the all-experts form (`-ot exps=CPU`, never
+/// `--n-cpu-moe <max>`), and anything between writes
+/// `--n-cpu-moe N`. When the model's MoE layer count is
+/// unknown (`moe_layers` is `None`) the count cannot be
+/// resolved canonically, so the proposal's layer count is
+/// written directly as `ExpertOffload::CpuMoeLayers(N)`.
 pub fn temp_backend_config(
     proposal: &ExperimentProposal,
     model_file: PathBuf,
     port: u16,
+    moe_layers: Option<u32>,
 ) -> BackendConfig {
     let split = proposal.flags.tensor_split.clone().unwrap_or_default();
-    let raw_flags = proposal
-        .flags
-        .offload_layers
-        .and_then(|n| {
-            manager_models::set_expert_offload(
-                None,
-                manager_models::ExpertOffload::CpuMoeLayers(n),
-            )
-        });
+    let raw_flags = proposal.flags.offload_layers.and_then(|n| {
+        let offload = match moe_layers {
+            Some(moe) => manager_models::offload_for_layers(n, moe),
+            None => manager_models::ExpertOffload::CpuMoeLayers(n),
+        };
+        manager_models::set_expert_offload(None, offload)
+    });
     BackendConfig {
         id: temp_backend_id(proposal.id),
         enabled: true,
@@ -847,7 +855,7 @@ mod tests {
     fn temp_backend_config_applies_create_defaults_and_offload_text() {
         let mut p = proposal("cand");
         p.id = 2;
-        let b = temp_backend_config(&p, PathBuf::from("models/cand.gguf"), 8090);
+        let b = temp_backend_config(&p, PathBuf::from("models/cand.gguf"), 8090, Some(24));
         assert_eq!(b.id, "opt-exp-2");
         assert_eq!(b.port, 8090);
         assert_eq!(b.flags.n_ctx, 32768);
@@ -859,10 +867,24 @@ mod tests {
         p.flags.n_ctx = Some(65536);
         p.flags.tensor_split = Some(vec![0.5, 0.5]);
         p.flags.offload_layers = Some(12);
-        let b = temp_backend_config(&p, PathBuf::from("models/cand.gguf"), 8090);
+        let b = temp_backend_config(&p, PathBuf::from("models/cand.gguf"), 8090, Some(24));
         assert_eq!(b.flags.n_ctx, 65536);
         assert_eq!(b.flags.tensor_split, vec![0.5, 0.5]);
         assert_eq!(b.flags.split_mode, SplitMode::Layer);
+        assert_eq!(b.raw_flags.as_deref(), Some("--n-cpu-moe 12"));
+        // The full MoE layer count resolves canonically to the
+        // all-experts form, never `--n-cpu-moe <max>`.
+        p.flags.offload_layers = Some(24);
+        let b = temp_backend_config(&p, PathBuf::from("models/cand.gguf"), 8090, Some(24));
+        assert_eq!(b.raw_flags.as_deref(), Some("-ot exps=CPU"));
+        // Zero layers writes no offload tokens.
+        p.flags.offload_layers = Some(0);
+        let b = temp_backend_config(&p, PathBuf::from("models/cand.gguf"), 8090, Some(24));
+        assert_eq!(b.raw_flags, None);
+        // Unknown MoE layer count: fall back to writing the
+        // proposal's layer count directly.
+        p.flags.offload_layers = Some(12);
+        let b = temp_backend_config(&p, PathBuf::from("models/cand.gguf"), 8090, None);
         assert_eq!(b.raw_flags.as_deref(), Some("--n-cpu-moe 12"));
     }
 

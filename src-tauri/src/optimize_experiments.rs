@@ -425,7 +425,16 @@ async fn run_experiment_inner(
     used_ports.extend(ctx.used_ports.iter().copied());
     let port = lowest_free_port(&used_ports, cfg.gateway.port, cfg.postgres.port);
     ctx.used_ports.insert(port);
-    let temp = temp_backend_config(proposal, model_file.clone(), port);
+    // The candidate's MoE layer count from the gathered layout
+    // facts (GGUF layout or catalog pin, as resolved by
+    // `crate::optimize::gather`) — the same source the fit
+    // preflight below prices from. `None` when unknown.
+    let moe_layers = gathered
+        .live
+        .layouts
+        .get(&model_id)
+        .and_then(|f| f.moe_layers);
+    let temp = temp_backend_config(proposal, model_file.clone(), port, moe_layers);
     // A cloned config carrying the temp backend (and, for an
     // unregistered HF candidate, a synthetic model entry so
     // the existing resolution machinery can price it). Never
