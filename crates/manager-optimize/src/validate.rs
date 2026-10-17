@@ -827,6 +827,9 @@ mod tests {
         Plan {
             summary: String::new(),
             directive: String::new(),
+            experiments: Vec::new(),
+            experiments_dropped_invalid: 0,
+            experiments_truncated: 0,
             items,
             consulted_backend: "planner".to_string(),
             created_at: String::new(),

@@ -32,6 +32,7 @@
 pub mod context;
 pub mod discover;
 pub mod eval;
+pub mod experiment;
 pub mod fit;
 pub mod measure;
 pub mod parse;
@@ -41,8 +42,17 @@ pub mod validate;
 
 pub use context::{
     build_context, build_prompts, consult_default, default_purpose_seed, estimate_tokens,
-    model_short_name, resolve_model, BackendMeasured, ConsultCandidate, ContextMeta, GpuContext,
-    HardwareContext, MeasureInputs, ThroughputFact, TrafficWindow,
+    model_short_name, resolve_model, BackendMeasured, ConsultCandidate, ContextMeta,
+    ExperimentResultFact, GpuContext, HardwareContext, MeasureInputs, ThroughputFact,
+    TrafficWindow,
+};
+pub use experiment::{
+    experiment_fingerprint, experiment_result_fact, fit_verdict_text, is_hf_form, lowest_free_port,
+    resolve_candidate, temp_backend_config, temp_backend_id, validate_experiment, ActiveExperiment,
+    CandidateResolution, ExperimentFlags, ExperimentJournal, ExperimentMeasured,
+    ExperimentPredicted, ExperimentProposal, ExperimentResult, ExperimentStatus,
+    ExperimentValidation, RegisteredModelFile, BATCH_TIMEOUT_SECS, EXPERIMENT_TIMEOUT_SECS,
+    MAX_EXPERIMENTS,
 };
 pub use discover::{
     candidates_from_model, fit_verdict, parse_model_record, parse_search_results, quant_files,

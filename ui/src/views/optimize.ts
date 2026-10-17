@@ -18,11 +18,11 @@ import {
   getBackendConfig, getOptimizeState, modelAdd, modelAssign,
   optimizeCancelConsult, optimizeCancelJob, optimizeChangeSummary, optimizeConsult,
   optimizeDiscardPlan, optimizeDiscover, optimizeIsDestructive, optimizeKindLabel,
-  optimizeMeasureBackend, optimizeRunBaseline, optimizeSavePurpose, optimizeSetItemOutcome, optimizeSetItemState,
+  optimizeMeasureBackend, optimizeRunBaseline, optimizeRunExperiments, optimizeSavePurpose, optimizeSetExperimentState, optimizeSetItemOutcome, optimizeSetItemState,
   setBackendOffload, stopBackend, updateBackendFlags, updateGatewayConfig,
 } from "../api";
 import type {
-  CallResult, OptimizeCandidate, OptimizePlanItem, OptimizeState,
+  CallResult, OptimizeCandidate, OptimizeExperiment, OptimizePlanItem, OptimizeState,
 } from "../api";
 import { trim1 } from "../charts";
 import { esc } from "../html";
@@ -115,6 +115,13 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   let evalBackend: string | null = null;
   let evalStart = 0;
   let evalTimer: number | null = null;
+  /** Experiment batch (Phase 5e): a run is in flight from this
+   *  page instance, and its progress timer. The batch shares
+   *  the GPU-job slot, so the server payload's `measuring`
+   *  flag covers it too. */
+  let experimentsRunning = false;
+  let expStart = 0;
+  let expTimer: number | null = null;
   const candidateRemoved = new Set<string>();
   const candidateKey = (c: OptimizeCandidate): string => `${c.repo_id}\n${c.file}`;
 
@@ -209,6 +216,100 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     return st.backends.find((b) => b.id === backendId)?.short_name ?? null;
   }
 
+  function expTriState(e: OptimizeExperiment): string {
+    const btn = (d: string, label: string) =>
+      `<button class="opt-tri-btn ${e.decision === d ? `on ${d}` : ""}" data-opt-exp-tri="${e.id}:${d}">${label}</button>`;
+    return `<span class="opt-tri" role="group" aria-label="Decision for experiment ${e.id}">
+      ${btn("accepted", "Accept")}${btn("undecided", "Undecided")}${btn("denied", "Deny")}
+    </span>${e.previously_denied ? `<span class="opt-prev-denied">Denied last time</span>` : ""}`;
+  }
+
+  function expFlagsSummary(e: OptimizeExperiment): string {
+    const parts: string[] = [];
+    if (typeof e.flags.n_ctx === "number") parts.push(`Context: ${e.flags.n_ctx.toLocaleString("en-US")}`);
+    if (typeof e.flags.offload_layers === "number") parts.push(`Offload: ${e.flags.offload_layers} layers`);
+    if (Array.isArray(e.flags.tensor_split) && e.flags.tensor_split.length) {
+      parts.push(`Split: ${e.flags.tensor_split.map((f) => `${Math.round(f * 100)}`).join(" / ")} %`);
+    }
+    return parts.length ? parts.join(" · ") : "Default flags";
+  }
+
+  /** The experiments section (Phase 5e, §A.3): proposal rows
+   *  with tri-state controls under the plan items, the Run
+   *  experiments action, and — once results exist — the §A.4
+   *  results table with the verbatim screening caveat and the
+   *  Consult-with-results action. Rendered only when the plan
+   *  carries experiments. */
+  function experimentsHtml(st: OptimizeState): string {
+    const plan = st.plan;
+    const exps = plan?.experiments ?? [];
+    if (!plan || !exps.length) return "";
+    const busy = st.measuring || experimentsRunning;
+    const accepted = exps.filter((e) => e.decision === "accepted").length;
+    const withResults = exps.filter((e) => e.result);
+    const notes: string[] = [];
+    if (plan.experiments_dropped_invalid) notes.push(`${plan.experiments_dropped_invalid} experiment${plan.experiments_dropped_invalid === 1 ? " was" : "s were"} dropped as invalid`);
+    if (plan.experiments_truncated) notes.push(`${plan.experiments_truncated} experiment${plan.experiments_truncated === 1 ? "" : "s"} cut by the 3-experiment cap`);
+    const rows = exps.map((e) => {
+      const v = plan.experiment_validations?.[e.id - 1];
+      const invalid = v?.status === "invalid";
+      return `<div class="opt-row ${invalid ? "invalid" : ""}">
+      <div class="opt-row-main">
+        <span class="opt-num">E${e.id}.</span>
+        <span class="chip">Experiment</span>
+        <span class="opt-target">Candidate: ${esc(e.candidate_model_id)}</span>
+        <span class="opt-change">${esc(expFlagsSummary(e))}</span>
+        ${invalid ? `<span class="opt-invalid">${icon("err")} Invalid — ${esc(v?.reason ?? "")}</span>` : ""}
+        ${expTriState(e)}
+      </div>
+      <div class="opt-note">Serves: ${esc(e.serves)}</div>
+      ${e.requires_stopping.length ? `<div class="opt-note">Requires stopping: ${esc(e.requires_stopping.join(", "))} — this proposal starts denied; accepting it allows the run to stop ${e.requires_stopping.length === 1 ? "that backend" : "those backends"} (restarted after the batch).</div>` : ""}
+      ${e.predicted.predicted_per_second != null || e.predicted.fit ? `<div class="opt-note">Predicted: ${e.predicted.predicted_per_second != null ? `${trim1(e.predicted.predicted_per_second)} tok/s` : ""}${e.predicted.fit ? ` · Fit: ${esc(e.predicted.fit)}` : ""}</div>` : ""}
+      ${e.hypothesis ? `<details class="opt-why"><summary>Why</summary><p>${esc(e.hypothesis)}</p></details>` : ""}
+      ${e.result ? `<div class="opt-note">Result: ${esc(e.result.status)} — ${esc(e.result.detail)}</div>
+      ${e.result.preflight ? `<div class="opt-note">Preflight: ${esc(e.result.preflight)}</div>` : ""}` : ""}
+    </div>`;
+    }).join("");
+    const resultsTable = withResults.length ? `<div class="opt-exp-results">
+      <div class="opt-field-label" style="margin-top:10px">Experiment results</div>
+      ${withResults.map((e) => {
+        const r = e.result!;
+        const m = r.measured;
+        const genShort = m?.short.predicted_per_second;
+        const genLong = m?.long.predicted_per_second;
+        const prompt = m?.long.prompt_per_second ?? m?.short.prompt_per_second;
+        const ttft = m?.short.ttft_ms ?? m?.long.ttft_ms;
+        const num = (x: number | null | undefined): string => x == null ? "—" : trim1(x);
+        const cats = r.eval ? Object.entries(r.eval.scores.per_category).map(([k, s]) => `${esc(evalCategoryLabel(k))}: ${s.passed}/${s.total}`).join(" · ") : "";
+        const delta = r.comparison
+          ? `Overall delta: ${r.comparison.overall.delta_passed >= 0 ? "+" : ""}${r.comparison.overall.delta_passed} passed · Screen at/above baseline: ${r.comparison.screen_at_or_above_baseline ? "yes" : "no"}${r.comparison.any_category_zero_that_baseline_passes ? ` · Categories at zero the baseline passes: ${esc(r.comparison.zero_categories_that_baseline_passes.map(evalCategoryLabel).join(", "))}` : ""}`
+          : "No baseline comparison";
+        return `<div class="opt-measure-row">
+          <span class="opt-target">${esc(e.candidate_model_id)}</span>
+          <span class="opt-measure-figs">Generation tok/s (short/long): ${num(genShort)} / ${num(genLong)} · Prompt tok/s: ${num(prompt)} · TTFT: ${ttft == null ? "—" : `${trim1(ttft)} ms`} · Screen overall: ${r.eval ? `${r.eval.scores.overall.passed}/${r.eval.scores.overall.total}` : "not run"}${cats ? ` · ${cats}` : ""} · Delta vs baseline: ${esc(delta)}</span>
+        </div>`;
+      }).join("")}
+      ${withResults.some((e) => e.result?.eval) ? `<div class="opt-note">${esc(SCREENING_CAVEAT)}</div>` : ""}
+      <div class="opt-consult-actions">
+        <button class="btn" data-opt-act="consult-results">${icon("target")} Consult with results</button>
+        <span class="opt-note">A follow-up consultation carrying these measurements and scores, under the plan's directive.</span>
+      </div>
+    </div>` : "";
+    return `<div class="opt-experiments">
+      <div class="opt-field-label" style="margin-top:14px">Experiments</div>
+      <div class="opt-counts">${exps.length} experiment${exps.length === 1 ? "" : "s"} · ${accepted} accepted${notes.length ? ` · ${notes.join(" · ")}` : ""}</div>
+      <div class="opt-rows">${rows}</div>
+      <div class="opt-consult-actions">
+        ${experimentsRunning
+          ? `<span class="opt-consulting">${icon("clock")} Running experiments <span id="optExpElapsed">${fmtElapsed(Math.floor((Date.now() - expStart) / 1000))}</span> — one at a time, up to 30 min each, 60 min per batch. Temp backends are cleaned up on every outcome.</span>
+             <button class="btn danger" data-opt-act="cancel-job">${icon("x")} Cancel</button>`
+          : `<button class="btn primary" data-opt-act="run-experiments" ${accepted && !busy ? "" : "disabled"}>${icon("bolt")} Run experiments (${accepted})</button>
+             <span class="opt-note">Accepted experiments run one at a time on a temporary backend outside every gateway group; it is stopped and removed afterwards, on every outcome.</span>`}
+      </div>
+      ${resultsTable}
+    </div>`;
+  }
+
   function planHtml(st: OptimizeState): string {
     const plan = st.plan;
     if (!plan) {
@@ -245,6 +346,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       </details>
       <div class="opt-counts">${plan.items.length} items · ${accepted.length} accepted · ${denied} denied · ${undecided} undecided${notes.length ? ` · ${notes.join(" · ")}` : ""}</div>
       <div class="opt-rows">${plan.items.map((i) => planRow(i, st)).join("")}</div>
+      ${experimentsHtml(st)}
       ${nonDestructive.length || destructive.length ? `<div class="opt-applybar">
         ${nonDestructive.length ? `<button class="btn primary" data-opt-act="apply" ${applyRunning ? "disabled" : ""}>${icon("check")} Apply accepted (${nonDestructive.length})</button>` : ""}
         ${destructive.length ? `<button class="btn danger ${armed.has("destructive") ? "armed" : ""}" data-opt-act="apply-destructive" ${applyRunning ? "disabled" : ""}>${icon("trash")} ${armed.has("destructive") ? `Confirm deletes (${destructive.length})` : `Apply destructive (${destructive.length})`}</button>` : ""}
@@ -471,13 +573,20 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     paint();
   }
 
-  async function runConsult(sample: boolean): Promise<void> {
+  async function runConsult(sample: boolean, directiveOverride?: string): Promise<void> {
     const sel = hostEl.querySelector<HTMLSelectElement>("#optBackendSel");
     const backendId = sample ? undefined : sel?.value || undefined;
     // Capture the directive before paint() rebuilds the card (and
-    // the field with it); the draft survives the re-render.
-    const directiveField = hostEl.querySelector<HTMLTextAreaElement>("#optDirective");
-    if (directiveField) directiveDraft = directiveField.value;
+    // the field with it); the draft survives the re-render. A
+    // caller-supplied directive (Consult with results, Phase 5e)
+    // wins over the field: that action consults under the
+    // plan's own directive.
+    if (directiveOverride !== undefined) {
+      directiveDraft = directiveOverride;
+    } else {
+      const directiveField = hostEl.querySelector<HTMLTextAreaElement>("#optDirective");
+      if (directiveField) directiveDraft = directiveField.value;
+    }
     const directive = directiveDraft ?? state?.last_directive ?? "";
     consultStart = Date.now();
     if (state) state.consulting = true;
@@ -563,6 +672,38 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       state = r.data;
       statusLine = r.data.eval_baseline
         ? `Baseline recorded for ${r.data.eval_baseline.backend_id} — Overall: ${r.data.eval_baseline.overall.passed}/${r.data.eval_baseline.overall.total}.`
+        : "";
+    }
+    paint();
+  }
+
+  async function runExperiments(): Promise<void> {
+    experimentsRunning = true;
+    expStart = Date.now();
+    paint();
+    if (expTimer !== null) window.clearInterval(expTimer);
+    expTimer = window.setInterval(() => {
+      const el = hostEl.querySelector("#optExpElapsed");
+      if (el) el.textContent = fmtElapsed(Math.floor((Date.now() - expStart) / 1000));
+    }, 1000);
+    const r = await optimizeRunExperiments();
+    if (expTimer !== null) { window.clearInterval(expTimer); expTimer = null; }
+    experimentsRunning = false;
+    expStart = 0;
+    if (disposed) return;
+    if (r.error) {
+      if (state) state.measuring = false;
+      statusLine = r.error === "experiment batch cancelled"
+        ? "Experiment batch cancelled — temp backends were cleaned up and any stopped backends restarted."
+        : `Experiment batch failed — ${r.error}`;
+      paint();
+      return;
+    }
+    if (r.data) {
+      state = r.data;
+      const results = (r.data.plan?.experiments ?? []).filter((e) => e.result);
+      statusLine = results.length
+        ? `Experiments finished — ${results.filter((e) => e.result?.status === "completed").length} of ${results.length} completed. Results are in the Experiments section.`
         : "";
     }
     paint();
@@ -786,6 +927,21 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
 
   hostEl.addEventListener("click", (ev) => {
     const t = ev.target as HTMLElement;
+    const expTri = t.closest<HTMLElement>("[data-opt-exp-tri]");
+    if (expTri && state?.plan) {
+      const [idStr, decision] = (expTri.dataset.optExpTri ?? "").split(":");
+      const id = Number(idStr);
+      if (id && (decision === "accepted" || decision === "denied" || decision === "undecided")) {
+        void (async () => {
+          const r = await optimizeSetExperimentState(id, decision);
+          if (disposed) return;
+          if (r.error) { statusLine = r.error; paint(); return; }
+          if (r.data) state = r.data;
+          paint();
+        })();
+      }
+      return;
+    }
     const tri = t.closest<HTMLElement>("[data-opt-tri]");
     if (tri && state?.plan) {
       const [idStr, decision] = (tri.dataset.optTri ?? "").split(":");
@@ -879,6 +1035,12 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       case "discover":
         void runDiscover();
         return;
+      case "run-experiments":
+        void runExperiments();
+        return;
+      case "consult-results":
+        void runConsult(false, state?.plan?.directive ?? "");
+        return;
       case "cancel-consult":
         void optimizeCancelConsult();
         return;
@@ -945,5 +1107,6 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
     if (measureTimer !== null) window.clearInterval(measureTimer);
     if (evalTimer !== null) window.clearInterval(evalTimer);
+    if (expTimer !== null) window.clearInterval(expTimer);
   };
 }

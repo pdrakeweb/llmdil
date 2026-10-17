@@ -224,6 +224,22 @@ pub struct Plan {
     #[serde(default)]
     pub directive: String,
     pub items: Vec<PlanItem>,
+    /// Experiment proposals (addendum A.3): a sibling array,
+    /// NOT plan items — experiments are ephemeral, measured,
+    /// and self-cleaning, while items mutate configuration.
+    /// Serde-defaulted so plan files written before Phase 5e
+    /// stay readable.
+    #[serde(default)]
+    pub experiments: Vec<crate::experiment::ExperimentProposal>,
+    /// Experiment entries dropped at parse for schema failures
+    /// (including an empty `serves` — a proposal serving
+    /// neither the directive nor a purpose need is advice, not
+    /// an experiment; the parser drops it and counts it here).
+    #[serde(default)]
+    pub experiments_dropped_invalid: usize,
+    /// Experiment entries cut by the 3-proposal cap (§A.3).
+    #[serde(default)]
+    pub experiments_truncated: usize,
     /// Id of the backend that was consulted.
     pub consulted_backend: String,
     /// Consultation completion time (RFC 3339).
@@ -332,6 +348,7 @@ mod tests {
         });
         let plan: Plan = serde_json::from_value(old).unwrap();
         assert_eq!(plan.directive, "");
+        assert!(plan.experiments.is_empty());
         assert_eq!(plan.consulted_backend, "planner");
         // And a plan carrying a directive round-trips verbatim.
         let mut with = plan.clone();

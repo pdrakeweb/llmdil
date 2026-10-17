@@ -1799,12 +1799,101 @@ export interface OptimizePlanItem {
   apply_error: string | null;
 }
 
+/** One experiment proposal's structured flags (Phase 5e,
+ *  addendum A.3). Every field optional: absent is the temp
+ *  backend's default, never an inherited value. */
+export interface OptimizeExperimentFlags {
+  n_ctx?: number | null;
+  offload_layers?: number | null;
+  tensor_split?: number[] | null;
+}
+
+export interface OptimizeExperimentPredicted {
+  predicted_per_second?: number | null;
+  fit?: string | null;
+}
+
+/** One benchmark prompt's stored result: median rates plus
+ *  every per-run sample. Mirrors manager-optimize's
+ *  BenchResult. */
+export interface OptimizeBenchResult {
+  prompt_per_second: number | null;
+  predicted_per_second: number | null;
+  ttft_ms: number | null;
+  runs: { prompt_per_second: number | null; predicted_per_second: number | null; ttft_ms: number | null; latency_ms: number }[];
+}
+
+export interface OptimizeEvalRunRecord {
+  backend_id: string;
+  suite_version: number;
+  run_at: string;
+  results: unknown[];
+  scores: { overall: OptimizeEvalScore; per_category: Record<string, OptimizeEvalScore> };
+}
+
+export interface OptimizeScoreDelta {
+  baseline: OptimizeEvalScore;
+  candidate: OptimizeEvalScore;
+  delta_passed: number;
+  delta_fraction: number;
+}
+
+export interface OptimizeEvalComparison {
+  overall: OptimizeScoreDelta;
+  per_category: Record<string, OptimizeScoreDelta>;
+  screen_at_or_above_baseline: boolean;
+  any_category_zero_that_baseline_passes: boolean;
+  zero_categories_that_baseline_passes: string[];
+}
+
+/** One experiment run's recorded outcome (Phase 5e): survives
+ *  cleanup and plan replacement via the experiment journal. */
+export interface OptimizeExperimentResult {
+  experiment_id: number;
+  candidate_model_id: string;
+  batch_id: string;
+  status: "completed" | "failed" | "timeout" | "cancelled";
+  detail: string;
+  measured: { short: OptimizeBenchResult; long: OptimizeBenchResult } | null;
+  eval: OptimizeEvalRunRecord | null;
+  comparison: OptimizeEvalComparison | null;
+  preflight: string;
+  started_at: string;
+  finished_at: string;
+}
+
+/** One experiment proposal (Phase 5e, addendum A.3): a sibling
+ *  of the plan items, not one of them. `requires_stopping`
+ *  proposals start denied; undecided never runs. */
+export interface OptimizeExperiment {
+  id: number;
+  fingerprint: string;
+  candidate_model_id: string;
+  flags: OptimizeExperimentFlags;
+  serves: string;
+  hypothesis: string;
+  predicted: OptimizeExperimentPredicted;
+  requires_stopping: string[];
+  run_eval: boolean;
+  decision: OptimizeDecision;
+  previously_denied: boolean;
+  result: OptimizeExperimentResult | null;
+}
+
 export interface OptimizePlan {
   summary: string;
   /** Operator directive that scoped this consultation (addendum
    *  A.2), stored verbatim on the plan; "" when none. */
   directive: string;
   items: OptimizePlanItem[];
+  /** Experiment proposals (Phase 5e); absent on plans written
+   *  before 5e, hence optional in the type. */
+  experiments?: OptimizeExperiment[];
+  experiments_dropped_invalid?: number;
+  experiments_truncated?: number;
+  /** Light validations aligned with `experiments` (same shape
+   *  as the item validations). */
+  experiment_validations?: OptimizeValidation[];
   consulted_backend: string;
   created_at: string;
   config_hash: string;
@@ -2018,6 +2107,24 @@ export async function optimizeCancelJob(): Promise<CallResult<{ cancelled: boole
 /** optimize_set_item_state — set one plan item's tri-state decision. */
 export function optimizeSetItemState(itemId: number, decision: OptimizeDecision) {
   return optimizeStateCmd("optimize_set_item_state", { itemId, decision });
+}
+
+/** optimize_set_experiment_state — set one experiment
+ *  proposal's tri-state decision (Phase 5e). */
+export function optimizeSetExperimentState(experimentId: number, decision: OptimizeDecision) {
+  return optimizeStateCmd("optimize_set_experiment_state", { experimentId, decision });
+}
+
+/** optimize_run_experiments — run the plan's accepted
+ *  experiments as one batch (Phase 5e): per-experiment
+ *  preflight, temp backend outside every gateway group,
+ *  standardized benchmark, screening eval when the proposal
+ *  asks, guaranteed cleanup. Long-running: budgets are
+ *  30 min per experiment, 60 min per batch, enforced
+ *  server-side. Runs under the shared GPU-job slot, so
+ *  optimizeCancelJob cancels it. */
+export function optimizeRunExperiments() {
+  return optimizeStateCmd("optimize_run_experiments");
 }
 
 /** optimize_set_item_outcome — record an apply outcome on one item

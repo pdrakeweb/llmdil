@@ -3,7 +3,7 @@
    layout can be evaluated without a backend. */
 
 import { walk } from "./charts";
-import type { OptimizePlanItem, OptimizeState, OptimizeValidation } from "./api";
+import type { OptimizeExperiment, OptimizePlanItem, OptimizeState, OptimizeValidation } from "./api";
 import type { BackendInfo, DashboardModel, GpuInfo, WizardStepState } from "./types";
 
 export function mockBackends(): BackendInfo[] {
@@ -219,6 +219,62 @@ export function mockOptimizeState(): OptimizeState {
         validation("valid", null, null, null, "Backend will be stopped and removed"),
         validation("valid"),
       ],
+      experiments: [
+        {
+          id: 1, fingerprint: "sample-exp-1", candidate_model_id: "Qwen/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf",
+          flags: { n_ctx: 32768, tensor_split: [0.5, 0.5] },
+          serves: "Explore better MoE capable models for the planner",
+          hypothesis: "A 30B MoE with 3B active parameters should generate faster than the dense 27B at similar quality.",
+          predicted: { predicted_per_second: 35, fit: "alongside running backends" },
+          requires_stopping: [], run_eval: true, decision: "accepted", previously_denied: false,
+          result: {
+            experiment_id: 1, candidate_model_id: "Qwen/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf", batch_id: "sample-batch",
+            status: "completed",
+            detail: "Measured on opt-exp-1: generation 34.6 tok/s (short), 32.9 tok/s (long). Screen: 11/12 overall. Delta vs baseline: +0 passed overall; screen at/above baseline: true.",
+            measured: {
+              short: { prompt_per_second: 640, predicted_per_second: 34.6, ttft_ms: 190, runs: [] },
+              long: { prompt_per_second: 905, predicted_per_second: 32.9, ttft_ms: 840, runs: [] },
+            },
+            eval: {
+              backend_id: "opt-exp-1", suite_version: 1, run_at: new Date().toISOString(), results: [],
+              scores: {
+                overall: { passed: 11, total: 12 },
+                per_category: {
+                  instruction_following: { passed: 3, total: 3 },
+                  factual_recall: { passed: 2, total: 2 },
+                  arithmetic_reasoning: { passed: 2, total: 2 },
+                  code_adjacent: { passed: 1, total: 2 },
+                  summarization: { passed: 1, total: 1 },
+                  tool_call_formatting: { passed: 1, total: 1 },
+                  long_context_retrieval: { passed: 1, total: 1 },
+                },
+              },
+            },
+            comparison: {
+              overall: { baseline: { passed: 11, total: 12 }, candidate: { passed: 11, total: 12 }, delta_passed: 0, delta_fraction: 0 },
+              per_category: {},
+              screen_at_or_above_baseline: true,
+              any_category_zero_that_baseline_passes: false,
+              zero_categories_that_baseline_passes: [],
+            },
+            preflight: "fits alongside the backends staying running: needs 18432 MiB GPU RAM, 24576 MiB free after their residency",
+            started_at: new Date(Date.now() - 600_000).toISOString(),
+            finished_at: new Date(Date.now() - 300_000).toISOString(),
+          },
+        } as OptimizeExperiment,
+        {
+          id: 2, fingerprint: "sample-exp-2", candidate_model_id: "qwen3-coder-30b",
+          flags: { n_ctx: 65536, offload_layers: 24 },
+          serves: "Explore better MoE capable models for the planner",
+          hypothesis: "The catalog coder model with half its MoE layers offloaded may beat the planner's rates.",
+          predicted: { predicted_per_second: 28, fit: "only after stopping coder" },
+          requires_stopping: ["coder"], run_eval: false, decision: "denied", previously_denied: false,
+          result: null,
+        } as OptimizeExperiment,
+      ],
+      experiment_validations: [validation("valid"), validation("valid")],
+      experiments_dropped_invalid: 1,
+      experiments_truncated: 0,
     },
   };
 }

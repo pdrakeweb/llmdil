@@ -45,36 +45,36 @@ const MEASURE_RUN_TIMEOUT: Duration = Duration::from_secs(600);
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct PlanFile {
+pub(crate) struct PlanFile {
     #[serde(default)]
-    plan: Option<Plan>,
+    pub(crate) plan: Option<Plan>,
     /// The stored plan came from sample mode, not a consultation.
     #[serde(default)]
-    sample: bool,
+    pub(crate) sample: bool,
     /// Denial memory (design §6): fingerprints the operator has
     /// denied, accumulated across plans. Kept when a plan is
     /// discarded — the denials were explicit decisions.
     #[serde(default)]
-    denied_fingerprints: Vec<String>,
+    pub(crate) denied_fingerprints: Vec<String>,
 }
 
 fn plan_path(state: &AppState) -> PathBuf {
     state.data_dir.join("optimize-plan.json")
 }
 
-fn load_plan_file(state: &AppState) -> PlanFile {
+pub(crate) fn load_plan_file(state: &AppState) -> PlanFile {
     std::fs::read_to_string(plan_path(state))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-fn save_plan_file(state: &AppState, file: &PlanFile) -> Result<(), String> {
+pub(crate) fn save_plan_file(state: &AppState, file: &PlanFile) -> Result<(), String> {
     let text = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
     std::fs::write(plan_path(state), text).map_err(|e| e.to_string())
 }
 
-fn measurements_path(state: &AppState) -> PathBuf {
+pub(crate) fn measurements_path(state: &AppState) -> PathBuf {
     state.data_dir.join("optimize-measurements.json")
 }
 
@@ -190,8 +190,8 @@ fn fingerprint_inputs(
 // ---------------------------------------------------------------------------
 
 pub(crate) struct Gathered {
-    measure: MeasureInputs,
-    live: LiveSnapshot,
+    pub(crate) measure: MeasureInputs,
+    pub(crate) live: LiveSnapshot,
     candidates: Vec<ConsultCandidate>,
     pub(crate) running: HashMap<String, bool>,
     /// Each configured backend's current measurement
@@ -338,6 +338,17 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
     let store = MeasurementStore::load(&measurements_path(state));
     measure.throughput = measurement_facts(&store, &fingerprints, chrono::Utc::now());
 
+    // Experiment results (§A.3 iteration): the journal's latest
+    // batch, as context facts for a follow-up consultation.
+    let journal = manager_optimize::ExperimentJournal::load(
+        &state.data_dir.join("optimize-experiments.json"),
+    );
+    measure.experiment_results = journal
+        .latest_batch()
+        .into_iter()
+        .map(manager_optimize::experiment_result_fact)
+        .collect();
+
     // Layout facts per model: from serving backends' resolved
     // layouts; catalog-only facts for models no backend serves.
     let mut layouts: HashMap<String, LayoutFacts> = HashMap::new();
@@ -456,6 +467,47 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
         let validations = validate_plan(plan, &cfg, &gathered.live);
         let mut v = serde_json::to_value(plan).unwrap_or(Value::Null);
         v["validations"] = Value::Array(validations.iter().map(validation_json).collect());
+        // Experiment validations (Phase 5e), aligned with
+        // `plan.experiments`: light checks (candidate
+        // resolvable, flags sane, stopping ids exist), in the
+        // same validation shape as the items'. The candidates
+        // block this plan's consultation carried supplies the
+        // extra resolvable ids (`repo_id/file` forms).
+        let extra_candidates: Vec<String> = plan
+            .context
+            .get("candidates")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        let repo = c.get("repo_id").and_then(|x| x.as_str())?;
+                        let file = c.get("file").and_then(|x| x.as_str())?;
+                        Some(format!("{repo}/{file}"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        v["experiment_validations"] = Value::Array(
+            plan.experiments
+                .iter()
+                .map(|e| {
+                    let ev = manager_optimize::validate_experiment(e, &cfg, &extra_candidates);
+                    json!({
+                        "status": match ev.status {
+                            ValidationStatus::Valid => "valid",
+                            ValidationStatus::Warning => "warning",
+                            ValidationStatus::Invalid => "invalid",
+                        },
+                        "reason": ev.reason,
+                        "expected": {
+                            "gpu_ram_mib": Value::Null,
+                            "sys_ram_mib": Value::Null,
+                            "note": Value::Null,
+                        },
+                    })
+                })
+                .collect(),
+        );
         v["config_stale"] = json!(plan.config_hash != current_hash);
         v["sample"] = json!(file.sample);
         v
@@ -1244,9 +1296,26 @@ fn sample_response(cfg: &AppConfig) -> String {
         "change": { "text": "Sample advice item: advice renders as text only and never executes. Items whose payload the app cannot validate are demoted to advice with their reasoning preserved." },
         "rationale": "", "expected_effect": "", "confidence": "low",
     }));
+    let experiments: Vec<Value> = cfg
+        .backends
+        .first()
+        .and_then(|b| crate::model_for_backend(cfg, b))
+        .map(|m| {
+            vec![json!({
+                "candidate_model_id": m.id,
+                "flags": { "n_ctx": 32768 },
+                "serves": "Sample experiment: re-measure the consulted backend's own model under a temporary backend to show the experiment flow.",
+                "hypothesis": "Sample hypothesis: the temporary backend should measure close to the serving backend's rates.",
+                "predicted": { "predicted_per_second": 20.0, "fit": "alongside running backends" },
+                "requires_stopping": [],
+                "run_eval": true,
+            })]
+        })
+        .unwrap_or_default();
     json!({
         "summary": "Sample plan — generated locally; no backend was consulted.",
         "items": items,
+        "experiments": experiments,
     })
     .to_string()
 }

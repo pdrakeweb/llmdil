@@ -14,6 +14,10 @@ use chrono::{DateTime, Utc};
 use manager_config::AppConfig;
 use serde_json::{json, Map, Value};
 
+use crate::experiment::{
+    experiment_fingerprint, ExperimentFlags, ExperimentPredicted, ExperimentProposal,
+    MAX_EXPERIMENTS,
+};
 use crate::plan::{fingerprint, Confidence, Decision, Plan, PlanItem, PlanKind};
 
 /// Hard cap on plan items after parsing (design §4).
@@ -401,6 +405,158 @@ fn assign_create_port(cfg: &AppConfig, assigned: &HashSet<u16>) -> u16 {
         .unwrap_or(8999)
 }
 
+/// Parse the sibling `experiments` array (addendum A.3) with
+/// the same salvage discipline as items: per-entry drop
+/// (counted, fragments kept in the plan's dropped fragments),
+/// cap [`MAX_EXPERIMENTS`]. An entry whose `serves` is empty
+/// or missing is dropped under the same counting — a proposal
+/// serving neither the directive nor a purpose need is advice,
+/// not an experiment, and an experiment-shaped entry carries
+/// no advice text worth demoting it into. Proposals naming
+/// backends in `requires_stopping` start denied (the deletes'
+/// precedent); a proposal whose fingerprint was denied before
+/// also starts denied.
+fn parse_experiments(
+    root: &Value,
+    denied_fingerprints: &HashSet<String>,
+    dropped_fragments: &mut Vec<String>,
+) -> (Vec<ExperimentProposal>, usize, usize) {
+    let Some(raw_items) = root.get("experiments").and_then(|v| v.as_array()) else {
+        return (Vec::new(), 0, 0);
+    };
+    let mut out: Vec<ExperimentProposal> = Vec::new();
+    let mut dropped = 0usize;
+    for raw in raw_items {
+        let fragment = serde_json::to_string(raw).unwrap_or_default();
+        let mut drop_entry = |dropped: &mut usize| {
+            *dropped += 1;
+            dropped_fragments.push(fragment.clone());
+        };
+        let Some(obj) = raw.as_object() else {
+            drop_entry(&mut dropped);
+            continue;
+        };
+        let Some(candidate) = req_str(obj, "candidate_model_id") else {
+            drop_entry(&mut dropped);
+            continue;
+        };
+        // `serves` is required (§A.2/A.3): empty or missing
+        // drops the entry under salvage counting.
+        let Some(serves) = req_str(obj, "serves") else {
+            drop_entry(&mut dropped);
+            continue;
+        };
+        // Flags: an absent block is all-defaults; a present
+        // block with a malformed field drops the entry.
+        let mut flags = ExperimentFlags::default();
+        let mut flags_ok = true;
+        if let Some(fv) = obj.get("flags") {
+            let Some(fo) = fv.as_object() else {
+                drop_entry(&mut dropped);
+                continue;
+            };
+            if fo.contains_key("n_ctx") {
+                match fo.get("n_ctx").and_then(as_u32) {
+                    Some(n) => flags.n_ctx = Some(n),
+                    None => flags_ok = false,
+                }
+            }
+            if fo.contains_key("offload_layers") {
+                match fo.get("offload_layers").and_then(as_u32) {
+                    Some(n) => flags.offload_layers = Some(n),
+                    None => flags_ok = false,
+                }
+            }
+            if fo.contains_key("tensor_split") {
+                match req_f32_vec(fo, "tensor_split") {
+                    Some(v) => {
+                        flags.tensor_split = Some(
+                            v.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect(),
+                        );
+                    }
+                    None => flags_ok = false,
+                }
+            }
+        }
+        if !flags_ok {
+            drop_entry(&mut dropped);
+            continue;
+        }
+        // requires_stopping: absent = []; a present non-array
+        // (or non-string entries) drops the entry — the stop
+        // claim must be exact.
+        let mut requires_stopping: Vec<String> = Vec::new();
+        if let Some(rs) = obj.get("requires_stopping") {
+            match rs.as_array() {
+                Some(arr) => {
+                    let mut ok = true;
+                    for v in arr {
+                        match v.as_str() {
+                            Some(s) if !s.trim().is_empty() => {
+                                requires_stopping.push(s.trim().to_string())
+                            }
+                            _ => ok = false,
+                        }
+                    }
+                    if !ok {
+                        drop_entry(&mut dropped);
+                        continue;
+                    }
+                }
+                None => {
+                    drop_entry(&mut dropped);
+                    continue;
+                }
+            }
+        }
+        let predicted = ExperimentPredicted {
+            predicted_per_second: obj
+                .get("predicted")
+                .and_then(|p| p.get("predicted_per_second"))
+                .and_then(|v| v.as_f64()),
+            fit: obj
+                .get("predicted")
+                .and_then(|p| p.get("fit"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        };
+        let fp = experiment_fingerprint(&candidate, &flags, &serves);
+        let previously_denied = denied_fingerprints.contains(&fp);
+        let decision = if !requires_stopping.is_empty() || previously_denied {
+            Decision::Denied
+        } else {
+            Decision::Undecided
+        };
+        out.push(ExperimentProposal {
+            id: 0,
+            fingerprint: fp,
+            candidate_model_id: candidate,
+            flags,
+            serves,
+            hypothesis: obj
+                .get("hypothesis")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            predicted,
+            requires_stopping,
+            run_eval: obj
+                .get("run_eval")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            decision,
+            previously_denied,
+            result: None,
+        });
+    }
+    let truncated = out.len().saturating_sub(MAX_EXPERIMENTS);
+    out.truncate(MAX_EXPERIMENTS);
+    for (i, e) in out.iter_mut().enumerate() {
+        e.id = i + 1;
+    }
+    (out, dropped, truncated)
+}
+
 /// Parse a consultation response into a plan (design §4).
 ///
 /// `cfg` is the configuration the consultation ran against (used
@@ -617,9 +773,17 @@ pub fn parse_plan(
         item.id = i + 1;
     }
 
+    // Experiments (§A.3): the sibling array, parsed after the
+    // items so its dropped fragments append to the same list.
+    let (experiments, experiments_dropped_invalid, experiments_truncated) =
+        parse_experiments(&root, denied_fingerprints, &mut dropped_fragments);
+
     Ok(Plan {
         summary,
         directive: directive.to_string(),
+        experiments,
+        experiments_dropped_invalid,
+        experiments_truncated,
         items,
         consulted_backend: consulted_backend.to_string(),
         created_at: now.to_rfc3339(),
@@ -769,6 +933,97 @@ mod tests {
         // The no-directive path stays empty, not absent.
         let plain = parse("{\"items\":[]}").unwrap();
         assert_eq!(plain.directive, "");
+    }
+
+    #[test]
+    fn experiments_parse_with_flags_and_undecided_default() {
+        let r = parse(
+            "{\"items\":[],\"experiments\":[{\"candidate_model_id\":\"qwen3-coder-30b\",\"flags\":{\"n_ctx\":32768,\"offload_layers\":40,\"tensor_split\":[0.5,0.5]},\"serves\":\"the directive\",\"hypothesis\":\"faster\",\"predicted\":{\"predicted_per_second\":35.0,\"fit\":\"alongside\"},\"requires_stopping\":[],\"run_eval\":true}]}",
+        )
+        .unwrap();
+        assert_eq!(r.experiments.len(), 1);
+        let e = &r.experiments[0];
+        assert_eq!(e.id, 1);
+        assert_eq!(e.candidate_model_id, "qwen3-coder-30b");
+        assert_eq!(e.flags.n_ctx, Some(32768));
+        assert_eq!(e.flags.offload_layers, Some(40));
+        assert_eq!(e.flags.tensor_split, Some(vec![0.5, 0.5]));
+        assert_eq!(e.predicted.predicted_per_second, Some(35.0));
+        assert!(e.run_eval);
+        assert_eq!(e.decision, Decision::Undecided);
+        assert!(!e.fingerprint.is_empty());
+        assert_eq!(r.experiments_dropped_invalid, 0);
+    }
+
+    #[test]
+    fn experiments_with_requires_stopping_start_denied() {
+        let r = parse(
+            "{\"items\":[],\"experiments\":[{\"candidate_model_id\":\"m1\",\"serves\":\"need\",\"requires_stopping\":[\"coder\"]}]}",
+        )
+        .unwrap();
+        assert_eq!(r.experiments[0].decision, Decision::Denied);
+        assert_eq!(r.experiments[0].requires_stopping, vec!["coder"]);
+    }
+
+    #[test]
+    fn experiments_empty_serves_and_malformed_entries_drop_and_count() {
+        let r = parse(
+            "{\"items\":[],\"experiments\":[{\"candidate_model_id\":\"m1\",\"serves\":\"\"},{\"candidate_model_id\":\"m2\"},{\"serves\":\"x\"},{\"candidate_model_id\":\"m3\",\"serves\":\"ok\",\"flags\":{\"n_ctx\":\"wide\"}},{\"candidate_model_id\":\"m4\",\"serves\":\"ok\"}]}",
+        )
+        .unwrap();
+        // Empty serves, missing serves, missing candidate, and a
+        // malformed flag each drop; only the well-formed entry
+        // survives (§A.3 salvage; empty-serves drops, it does
+        // not demote).
+        assert_eq!(r.experiments.len(), 1);
+        assert_eq!(r.experiments[0].candidate_model_id, "m4");
+        assert_eq!(r.experiments_dropped_invalid, 4);
+        assert_eq!(r.dropped_fragments.len(), 4);
+        // Item salvage counting is untouched by experiment drops.
+        assert_eq!(r.dropped_invalid, 0);
+    }
+
+    #[test]
+    fn experiments_cap_at_three() {
+        let mut exps = String::new();
+        for i in 0..5 {
+            if i > 0 {
+                exps.push(',');
+            }
+            exps.push_str(&format!(
+                "{{\"candidate_model_id\":\"m{i}\",\"serves\":\"need {i}\"}}"
+            ));
+        }
+        let r = parse(&format!("{{\"items\":[],\"experiments\":[{exps}]}}")).unwrap();
+        assert_eq!(r.experiments.len(), 3);
+        assert_eq!(r.experiments_truncated, 2);
+        assert_eq!(r.experiments[2].id, 3);
+    }
+
+    #[test]
+    fn experiments_absent_array_and_previously_denied() {
+        let plain = parse("{\"items\":[]}").unwrap();
+        assert!(plain.experiments.is_empty());
+        let first = parse(
+            "{\"items\":[],\"experiments\":[{\"candidate_model_id\":\"m1\",\"serves\":\"need\"}]}",
+        )
+        .unwrap();
+        let fp = first.experiments[0].fingerprint.clone();
+        let mut denied = HashSet::new();
+        denied.insert(fp);
+        let second = parse_plan(
+            "{\"items\":[],\"experiments\":[{\"candidate_model_id\":\"m1\",\"serves\":\"need\"}]}",
+            &AppConfig::default_config(),
+            "planner",
+            "hash",
+            json!({}),
+            &denied,
+            "",
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(second.experiments[0].decision, Decision::Denied);
+        assert!(second.experiments[0].previously_denied);
     }
 
     #[test]

@@ -86,6 +86,31 @@ pub struct ThroughputFact {
     pub superseded: bool,
 }
 
+/// One finished experiment's results, for the follow-up
+/// consultation (§A.3 iteration): the candidate, its measured
+/// rates (headline composition as in [`ThroughputFact`], plus
+/// the short/long generation split the §A.4 table reports), and
+/// its screening scores with the delta-vs-baseline summary.
+/// Built from the experiment journal's latest batch by the
+/// caller; absent (empty) until an experiment has run.
+#[derive(Debug, Clone)]
+pub struct ExperimentResultFact {
+    pub candidate_model_id: String,
+    /// "completed" | "failed" | "timeout" | "cancelled".
+    pub status: String,
+    pub prompt_per_second: Option<f64>,
+    pub predicted_per_second: Option<f64>,
+    pub short_predicted_per_second: Option<f64>,
+    pub long_predicted_per_second: Option<f64>,
+    pub ttft_ms: Option<f64>,
+    pub screen_overall: Option<crate::eval::Score>,
+    pub screen_per_category: std::collections::BTreeMap<String, crate::eval::Score>,
+    /// One-line delta-vs-baseline summary (screen movement and
+    /// the §A.4 replacement predicates), or `None` when the run
+    /// had no baseline to compare against.
+    pub delta_vs_baseline: Option<String>,
+}
+
 /// Everything measured or computed that the builder cannot derive
 /// from the config alone, gathered by the caller (src-tauri).
 #[derive(Debug, Clone, Default)]
@@ -114,6 +139,11 @@ pub struct MeasureInputs {
     /// block absent — for directive-less consultations and
     /// whenever no discovery has run.
     pub candidates: Vec<CandidateFact>,
+    /// Finished experiment results from the journal's latest
+    /// batch (addendum A.3 iteration, Phase 5e), capped at 3 by
+    /// the caller. Empty — and the `experiment_results` block
+    /// absent — until an experiment batch has run.
+    pub experiment_results: Vec<ExperimentResultFact>,
 }
 
 /// Counts and provenance for the page's context summary line and
@@ -467,6 +497,45 @@ pub fn build_context(
                 .collect(),
         );
     }
+    // Experiment results (addendum A.3 iteration): the latest
+    // batch's measured outcomes, so a follow-up consultation
+    // reasons over what actually ran on this machine — it can
+    // propose adopting a winner as a real plan item, or the
+    // next experiment. Absent until a batch has run.
+    if !measure.experiment_results.is_empty() {
+        doc["experiment_results"] = Value::Array(
+            measure
+                .experiment_results
+                .iter()
+                .map(|r| {
+                    let mut v = json!({
+                        "candidate_model_id": r.candidate_model_id,
+                        "status": r.status,
+                        "basis": "measured",
+                        "prompt_per_second": r.prompt_per_second,
+                        "predicted_per_second": r.predicted_per_second,
+                        "generation_per_second": {
+                            "short": r.short_predicted_per_second,
+                            "long": r.long_predicted_per_second,
+                        },
+                        "ttft_ms": r.ttft_ms,
+                    });
+                    if let Some(overall) = &r.screen_overall {
+                        v["screen"] = json!({
+                            "overall": overall,
+                            "per_category": r.screen_per_category,
+                        });
+                    }
+                    if let Some(delta) = &r.delta_vs_baseline {
+                        v["delta_vs_baseline"] = json!(delta);
+                    }
+                    v
+                })
+                .collect(),
+        );
+        meta.measured_blocks
+            .push("experiment results".to_string());
+    }
     if measured
         .as_object()
         .map(|o| !o.is_empty())
@@ -527,7 +596,11 @@ exactly one JSON object and no other text:
 
 {\"summary\": \"one line\", \"items\": [{\"kind\": \"...\", \"target\": \"...\", \
 \"change\": {...}, \"rationale\": \"...\", \"expected_effect\": \"...\", \
-\"confidence\": \"high|medium|low\"}]}
+\"confidence\": \"high|medium|low\"}], \"experiments\": [{\"candidate_model_id\": \"...\", \
+\"flags\": {\"n_ctx\": N, \"offload_layers\": N, \"tensor_split\": [fractions]}, \
+\"serves\": \"the directive or purpose need this serves\", \"hypothesis\": \"...\", \
+\"predicted\": {\"predicted_per_second\": N, \"fit\": \"...\"}, \
+\"requires_stopping\": [\"backend-id\", ...], \"run_eval\": true|false}]}
 
 Allowed kinds and their change payloads:
 - backend.create — target: the new backend's id. change: {\"model_id\": \"...\", optional \"group\", \"port\", \"n_ctx\", \"n_batch\", \"tensor_split\", \"offload_layers\"}
@@ -556,7 +629,9 @@ Constraints:
 - Per-group and per-backend purpose text, when present, states what that entity is for. When purpose is absent, infer cautiously from names rather than assuming.
 - A \"measurements\" section, when present, carries speeds actually measured on this machine for the named backend's current configuration, with their age. Prefer measured figures over any estimate when both bear on a proposal.
 - A \"candidates\" section, when present, carries models discovered on Hugging Face for this consultation's directive, gathered and fit-checked by the app before the consultation: the sizes, parameter counts, and rated contexts are the real figures Hugging Face reports, and each entry's fit verdict was computed by the app against this machine's free VRAM. These candidates are distinct from the curated catalog candidates, and each carries its Hugging Face repo id and retrieval time as provenance.
-- Gateway port and bind address, downloads, installs, and updates are out of scope; use advice if they matter.";
+- Gateway port and bind address, downloads, installs, and updates are out of scope; use advice if they matter.
+- Experiments are a sibling top-level \"experiments\" array, never plan items: an experiment tests a candidate model/configuration on this machine ephemerally and is cleaned up afterwards. At most 3 experiments. Each experiment's candidate_model_id must be a registered model id, a catalog model id, or an HF repo/file from the \"candidates\" section. Experiments never download: propose only candidates whose file could already be on disk. Every experiment must name, in \"serves\", the operator directive (or the purpose need) it serves; an experiment serving neither is advice, not an experiment. \"requires_stopping\" names backend ids the run may need stopped to fit; naming one is a consequential claim the operator must explicitly accept. Set \"run_eval\" when the candidate should also run the screening suite against the incumbent baseline.
+- An \"experiment_results\" section, when present, carries results measured on this machine in a previous experiment batch: the candidate's measured speeds and screening scores. Experiment results are measured on this machine; a replacement claim requires screen at/above baseline, no baseline-passing category at zero, and higher measured speed.";
 
 /// Rough token estimate for the pre-send fit check (§3): ~4
 /// characters per token, rounded up. An estimate, and the refusal
@@ -823,6 +898,44 @@ mod tests {
         let t = &doc["measurements"]["throughput"][0];
         assert_eq!(t["superseded"], json!(true));
         assert_eq!(t["basis"], json!("measured"));
+    }
+
+    #[test]
+    fn experiment_results_block_present_only_with_facts() {
+        // Addendum A.3 iteration: finished experiment results
+        // ride as their own block for the follow-up consultation.
+        let cfg = AppConfig::default_config();
+        let (doc, _) = build_context(&cfg, &MeasureInputs::default(), "1", "planner");
+        assert!(doc.get("experiment_results").is_none());
+        let mut measure = MeasureInputs::default();
+        measure.experiment_results.push(ExperimentResultFact {
+            candidate_model_id: "qwen3-coder-30b".to_string(),
+            status: "completed".to_string(),
+            prompt_per_second: Some(900.0),
+            predicted_per_second: Some(35.0),
+            short_predicted_per_second: Some(35.0),
+            long_predicted_per_second: Some(33.0),
+            ttft_ms: Some(180.0),
+            screen_overall: Some(crate::eval::Score {
+                passed: 11,
+                total: 12,
+            }),
+            screen_per_category: Default::default(),
+            delta_vs_baseline: Some("screen overall 10 -> 11 (delta +1 passed)".to_string()),
+        });
+        let (doc, meta) = build_context(&cfg, &measure, "1", "planner");
+        let r = &doc["experiment_results"][0];
+        assert_eq!(r["candidate_model_id"], json!("qwen3-coder-30b"));
+        assert_eq!(r["basis"], json!("measured"));
+        assert_eq!(r["generation_per_second"]["short"], json!(35.0));
+        assert_eq!(r["screen"]["overall"]["passed"], json!(11));
+        assert!(meta.measured_blocks.iter().any(|b| b == "experiment results"));
+        // The system prompt states the experiments contract and
+        // the §A.4 replacement-claim instruction verbatim-ish.
+        let (system, _user) = build_prompts("P", "", &doc, &meta);
+        assert!(system.contains("\"experiments\" array"), "{system}");
+        assert!(system.contains("Experiments never download"), "{system}");
+        assert!(system.contains("screen at/above baseline, no baseline-passing category at zero, and higher measured speed"), "{system}");
     }
 
     #[test]

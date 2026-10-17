@@ -1,0 +1,1072 @@
+//! Optimize experiment runner (design addendum A.3, tracker
+//! #28 Phase 5e): proposals, tri-state decisions, and the
+//! dedicated batch runner.
+//!
+//! The runner is deliberately NOT built on `backend_add`: the
+//! stock add always joins a gateway group, while a temp
+//! experiment backend must live outside every group. The
+//! runner therefore registers the temp backend and its
+//! supervisor spec directly. The temp backend exists only in
+//! an in-memory cloned configuration (for the existing
+//! fit / memory-requirement machinery) and in the supervisor's
+//! spec table — it never enters `config.json`, gateway config,
+//! fallbacks, or routing.
+//!
+//! Cleanup is guaranteed structurally: the per-experiment work
+//! runs as a future that cancellation (the shared job slot) or
+//! the per-experiment timeout may drop at any await point, and
+//! the cleanup step — stop, unregister the spec, remove the
+//! journal's active record — runs AFTER that future completes
+//! or is dropped, owned by the batch loop, which is never
+//! itself selected against the abort handle. A startup sweep
+//! (below) removes leftovers from an app crash mid-experiment.
+//!
+//! Budgets (§A.3, enforced here server-side): at most 3
+//! experiments per batch, 30 minutes per experiment, 60
+//! minutes per batch. Experiments never download: a candidate
+//! whose file is not already on disk fails preflight with
+//! "download in Models first".
+//!
+//! Backends named in an accepted proposal's
+//! `requires_stopping` are stopped only when the fit verdict
+//! needs them stopped; those that were running when the batch
+//! started are restarted after the batch, whatever its
+//! outcome, and that is stated in each result's detail.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use serde_json::json;
+use tauri::State;
+
+use manager_config::AppConfig;
+use manager_optimize::{
+    benchmark_prompts, compare, evaluate_fit, fit_verdict_text, lowest_free_port,
+    resolve_candidate, temp_backend_config, temp_backend_id, ActiveExperiment, BenchResult,
+    BenchRun, CandidateResolution, Decision, ExperimentJournal,
+    ExperimentMeasured, ExperimentProposal, ExperimentResult, ExperimentStatus,
+    MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, RegisteredModelFile,
+    BATCH_TIMEOUT_SECS, BENCHMARK_TEMPERATURE, EXPERIMENT_TIMEOUT_SECS, MEASURED_RUNS,
+};
+use manager_supervisor::{HealthProbe, HttpHealthProbe, ProcessState};
+
+use crate::{err, ApiError, ApiResult, AppState, TaskStatus};
+
+/// Per-run benchmark timeout, mirroring the measure command's
+/// (the long prompt on a heavily offloaded backend is slow).
+const EXP_RUN_TIMEOUT: Duration = Duration::from_secs(600);
+/// Bounded wait for a temp backend to report healthy on its
+/// `/health` probe after spawn. Model loads are minutes-scale;
+/// the per-experiment budget caps the total anyway.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(600);
+
+// ---------------------------------------------------------------------------
+// Journal (<data_dir>/optimize-experiments.json)
+// ---------------------------------------------------------------------------
+
+fn journal_path(state: &AppState) -> PathBuf {
+    state.data_dir.join("optimize-experiments.json")
+}
+
+fn load_journal(state: &AppState) -> ExperimentJournal {
+    ExperimentJournal::load(&journal_path(state))
+}
+
+fn save_journal(state: &AppState, journal: &ExperimentJournal) {
+    if let Err(e) = journal.save(&journal_path(state)) {
+        eprintln!("optimize-experiments: journal save failed: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup sweep
+// ---------------------------------------------------------------------------
+
+/// Remove leftovers of experiments interrupted by an app
+/// crash (design §A.3 step 5): for each active journal record,
+/// terminate the recorded pid when it is alive and its image
+/// is llama-server, following the gateway precedent —
+/// `manager_wizard::ops::kill_process`, the same function
+/// `stop_gateway` uses to terminate the pid recorded in
+/// `gateway.pid`. Also defensively removes any `opt-exp-*`
+/// entries from `config.backends` (they should never be
+/// there: temp backends are never written to the config) and
+/// clears the journal's active records. History is retained.
+pub(crate) async fn startup_sweep(state: &AppState) {
+    // Defensive config scrub first, so a leftover temp entry
+    // can never be started or routed as a real backend.
+    {
+        let cfg = state.config.read().await.clone();
+        if cfg.backends.iter().any(|b| b.id.starts_with("opt-exp-")) {
+            let mut new_cfg = cfg.clone();
+            let removed: Vec<String> = new_cfg
+                .backends
+                .iter()
+                .filter(|b| b.id.starts_with("opt-exp-"))
+                .map(|b| b.id.clone())
+                .collect();
+            new_cfg.backends.retain(|b| !b.id.starts_with("opt-exp-"));
+            for g in new_cfg.gateway.groups.iter_mut() {
+                g.members.retain(|m| !removed.contains(m));
+            }
+            for m in new_cfg.models.iter_mut() {
+                m.assigned_backends.retain(|b| !removed.contains(b));
+            }
+            if manager_config::save(&new_cfg, &state.config_path).is_ok() {
+                *state.config.write().await = new_cfg;
+                eprintln!(
+                    "optimize-experiments: startup sweep removed leftover temp backends from config: {}",
+                    removed.join(", ")
+                );
+            }
+        }
+    }
+    let mut journal = load_journal(state);
+    let active = std::mem::take(&mut journal.active);
+    for record in &active {
+        if let Some(pid) = record.pid {
+            let alive = manager_supervisor::pid_alive(pid);
+            let image = manager_supervisor::process_image_is(pid, "llama-server.exe")
+                || manager_supervisor::process_image_is(pid, "llama-server");
+            if alive && image {
+                match manager_wizard::ops::kill_process(pid) {
+                    Ok(()) => eprintln!(
+                        "optimize-experiments: startup sweep terminated leftover {} (pid {pid})",
+                        record.temp_id
+                    ),
+                    Err(e) => eprintln!(
+                        "optimize-experiments: startup sweep could not terminate {} (pid {pid}): {e}",
+                        record.temp_id
+                    ),
+                }
+            }
+        }
+        // Belt and braces for an in-session leftover: if a spec
+        // somehow exists under the temp id, stop + unregister.
+        let mut sup = state.supervisor().await.lock().await;
+        sup.reap_exited();
+        if sup.spec(&record.temp_id).is_some() {
+            let _ = sup.stop(&record.temp_id, false).await;
+            sup.unregister_spec(&record.temp_id);
+        }
+    }
+    if !active.is_empty() {
+        save_journal(state, &journal);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decisions
+// ---------------------------------------------------------------------------
+
+/// Set one experiment proposal's tri-state decision (§A.3),
+/// mirroring `optimize_set_item_state`. Denials accumulate
+/// into the plan file's denial memory, keyed by the
+/// experiment fingerprint, so an identical re-proposal in a
+/// later consultation arrives pre-denied.
+#[tauri::command]
+pub async fn optimize_set_experiment_state(
+    state: State<'_, AppState>,
+    experiment_id: usize,
+    decision: String,
+) -> ApiResult {
+    let decision = match decision.as_str() {
+        "accepted" => Decision::Accepted,
+        "denied" => Decision::Denied,
+        "undecided" => Decision::Undecided,
+        other => {
+            return Err(err(ApiError::InvalidInput(format!(
+                "unknown decision '{other}'"
+            ))))
+        }
+    };
+    let mut file = crate::optimize::load_plan_file(&state);
+    let plan = file
+        .plan
+        .as_mut()
+        .ok_or_else(|| err(ApiError::NotFound("no plan".to_string())))?;
+    let experiment = plan
+        .experiments
+        .iter_mut()
+        .find(|e| e.id == experiment_id)
+        .ok_or_else(|| {
+            err(ApiError::NotFound(format!(
+                "experiment {experiment_id}"
+            )))
+        })?;
+    experiment.decision = decision;
+    if decision == Decision::Denied {
+        let fp = experiment.fingerprint.clone();
+        if !file.denied_fingerprints.contains(&fp) {
+            file.denied_fingerprints.push(fp);
+        }
+    }
+    crate::optimize::save_plan_file(&state, &file)?;
+    crate::optimize::state_payload(&state).await
+}
+
+// ---------------------------------------------------------------------------
+// The batch runner
+// ---------------------------------------------------------------------------
+
+/// Per-batch mutable context the experiment runs share.
+struct BatchCtx {
+    consulted_backend: String,
+    /// Backends running when the batch started.
+    batch_running: HashSet<String>,
+    /// requires_stopping backends this batch actually stopped
+    /// and therefore owes a restart afterwards.
+    stopped_to_restart: Vec<String>,
+    /// Ports already handed to temp backends in this batch.
+    used_ports: HashSet<u16>,
+}
+
+/// One experiment's outcome, before the batch loop wraps it in
+/// an `ExperimentResult` (timestamps + identity are the loop's).
+struct InnerOutcome {
+    status: ExperimentStatus,
+    detail: String,
+    measured: Option<ExperimentMeasured>,
+    eval: Option<manager_optimize::EvalRunRecord>,
+    comparison: Option<manager_optimize::EvalComparison>,
+    preflight: String,
+}
+
+impl InnerOutcome {
+    fn failed(detail: String, preflight: String) -> Self {
+        InnerOutcome {
+            status: ExperimentStatus::Failed,
+            detail,
+            measured: None,
+            eval: None,
+            comparison: None,
+            preflight,
+        }
+    }
+}
+
+fn fmt_rate(v: Option<f64>) -> String {
+    v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "—".to_string())
+}
+
+/// Guaranteed cleanup for one temp backend: stop it (when
+/// live), unregister its spec, and remove its journal active
+/// record. This runs outside the experiment future, so neither
+/// cancellation nor timeout can skip it; the temp id is owned
+/// here, independently of that future.
+async fn cleanup_temp(state: &AppState, temp_id: &str) {
+    {
+        let mut sup = state.supervisor().await.lock().await;
+        sup.reap_exited();
+        let live = sup
+            .status()
+            .iter()
+            .any(|s| s.id == temp_id && s.pid.is_some());
+        if live {
+            let _ = sup.stop(temp_id, false).await;
+        }
+        sup.unregister_spec(temp_id);
+    }
+    let mut journal = load_journal(state);
+    if journal.remove_active(temp_id) {
+        save_journal(state, &journal);
+    }
+}
+
+/// Wait for a spawned temp backend to answer Healthy on the
+/// existing health probe. No backend probes are registered
+/// anywhere in the app (the supervisor's probe registry is
+/// unused for backends), so — exactly as `mcp_test_connection`
+/// does — the wait uses a local `HttpHealthProbe` against the
+/// backend's loopback `/health`, polled until healthy, until
+/// the supervisor reports the process gone/failed, or until
+/// the bounded wait expires.
+async fn wait_healthy(state: &AppState, temp_id: &str, port: u16) -> Result<(), String> {
+    let probe = HttpHealthProbe::new(
+        format!("http://127.0.0.1:{port}/health"),
+        Duration::from_secs(5),
+    );
+    let deadline = Instant::now() + HEALTH_TIMEOUT;
+    loop {
+        if let Ok(manager_supervisor::HealthStatus::Healthy) = probe.probe().await {
+            return Ok(());
+        }
+        {
+            let mut sup = state.supervisor().await.lock().await;
+            sup.reap_exited();
+            let status = sup.status().into_iter().find(|s| s.id == temp_id);
+            match status {
+                Some(s) if s.state == ProcessState::Failed => {
+                    return Err(format!(
+                        "temp backend {temp_id} exited before becoming healthy"
+                    ));
+                }
+                Some(s) if s.pid.is_none() => {
+                    return Err(format!(
+                        "temp backend {temp_id} is not running (state {:?})",
+                        s.state
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "temp backend {temp_id} did not become healthy within {} s",
+                HEALTH_TIMEOUT.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// The measurement fingerprint inputs for a temp backend,
+/// built directly from its in-memory configuration (the
+/// `fingerprint_inputs` helper in optimize.rs is shaped for
+/// configured backends; §A.3's note applies).
+fn temp_fingerprint_inputs(
+    temp: &manager_config::BackendConfig,
+    model: Option<&manager_config::ModelConfig>,
+    file_size_bytes: Option<u64>,
+    gpus: &[(u32, String)],
+) -> MeasurementFingerprintInputs {
+    let gpu_set: Vec<(u32, String)> = match crate::backend_gpu_visibility(temp) {
+        crate::GpuVisibility::CpuOnly => Vec::new(),
+        crate::GpuVisibility::Gpus(indices) => indices
+            .iter()
+            .map(|i| {
+                (
+                    *i,
+                    gpus.iter()
+                        .find(|(idx, _)| idx == i)
+                        .map(|(_, name)| name.clone())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect(),
+        crate::GpuVisibility::Undetermined => gpus.to_vec(),
+    };
+    MeasurementFingerprintInputs {
+        verified_sha256: model.and_then(|m| m.verified_sha256.clone()),
+        file_size_bytes,
+        quant: model.map(|m| m.quant.clone()).unwrap_or_default(),
+        n_ctx: temp.flags.n_ctx,
+        n_batch: temp.flags.n_batch,
+        offload: manager_models::expert_offload(temp.raw_flags.as_deref()),
+        tensor_split: temp.flags.tensor_split.clone(),
+        split_mode: temp.flags.split_mode,
+        raw_flags: temp.raw_flags.clone(),
+        gpus: gpu_set,
+    }
+}
+
+/// Run one experiment end to end (preflight → baseline if
+/// needed → temp backend → benchmark → eval). Every failure
+/// is an `InnerOutcome`, not an Err: the batch loop records it
+/// and moves on. Cleanup is NOT done here — the loop owns it,
+/// so a dropped (cancelled / timed-out) inner future cannot
+/// skip it.
+async fn run_experiment_inner(
+    state: &AppState,
+    cfg: &AppConfig,
+    proposal: &ExperimentProposal,
+    ctx: &mut BatchCtx,
+) -> InnerOutcome {
+    let temp_id = temp_backend_id(proposal.id);
+
+    // -- Candidate resolution: the file must already be on
+    // disk; experiments never download (§A.3 step 1).
+    let registered: Vec<RegisteredModelFile> = cfg
+        .models
+        .iter()
+        .map(|m| RegisteredModelFile {
+            id: m.id.clone(),
+            path: crate::resolve_under_data_dir(&cfg.data_dir, &m.gguf_path),
+        })
+        .collect();
+    let catalog_ids: Vec<String> = manager_models::curated_models()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    let models_dir = cfg.data_dir.join("models");
+    let (model_id, gguf_abs) = match resolve_candidate(
+        &proposal.candidate_model_id,
+        &registered,
+        &catalog_ids,
+        &models_dir,
+        |p| std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false),
+    ) {
+        CandidateResolution::OnDisk { model_id, path } => (model_id, path),
+        CandidateResolution::NotOnDisk { message } => {
+            return InnerOutcome::failed(message.clone(), message);
+        }
+    };
+    // The temp backend's model_file in the form the config
+    // stores: the registered model's configured path when the
+    // candidate resolved through one, else `models/<file>`.
+    let registered_model = cfg.models.iter().find(|m| m.id == model_id).cloned();
+    let model_file: PathBuf = match &registered_model {
+        Some(m) => m.gguf_path.clone(),
+        None => PathBuf::from("models").join(
+            gguf_abs
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ),
+    };
+
+    // -- Gather live state for preflight and the baseline
+    // decision.
+    let gathered = crate::optimize::gather(state, cfg).await;
+
+    // -- Temp backend configuration (in-memory only).
+    let mut used_ports: HashSet<u16> = cfg.backends.iter().map(|b| b.port).collect();
+    used_ports.extend(ctx.used_ports.iter().copied());
+    let port = lowest_free_port(&used_ports, cfg.gateway.port, cfg.postgres.port);
+    ctx.used_ports.insert(port);
+    let temp = temp_backend_config(proposal, model_file.clone(), port);
+    // A cloned config carrying the temp backend (and, for an
+    // unregistered HF candidate, a synthetic model entry so
+    // the existing resolution machinery can price it). Never
+    // saved, never routed.
+    let mut temp_cfg: AppConfig = cfg.clone();
+    if registered_model.is_none() {
+        temp_cfg.models.push(manager_config::ModelConfig {
+            id: model_id.clone(),
+            gguf_path: model_file.clone(),
+            quant: "unknown".to_string(),
+            params_b: 1.0,
+            sha256: String::new(),
+            verified_at: None,
+            verified_sha256: None,
+            source_url: String::new(),
+            assigned_backends: vec![temp_id.clone()],
+            enabled: true,
+            display_name: None,
+        });
+    }
+    temp_cfg.backends.push(temp.clone());
+
+    // -- Fit preflight, stated in numbers (§A.3 step 1).
+    let n_gpus = gathered.live.free_vram_mib_per_gpu.len();
+    let mut to_stop: Vec<String> = Vec::new();
+    let preflight = match crate::backend_memory_requirement(&temp_cfg, &temp) {
+        None => format!(
+            "fit unchecked: the candidate's memory requirement could not be computed (no layout facts for '{model_id}'); proceeding without a fit verdict"
+        ),
+        Some(req) => {
+            let needs = manager_optimize::fit::gpu_total_mib(&req);
+            if n_gpus == 0 {
+                format!(
+                    "fit unchecked: no GPU telemetry snapshot; the candidate needs {needs} MiB GPU RAM"
+                )
+            } else {
+                let free = gathered.live.free_vram_mib_per_gpu.clone();
+                let (run_res, acct_res) = manager_optimize::fit::others_residency(
+                    &temp_cfg,
+                    &gathered.live.layouts,
+                    &gathered.live.backend_running,
+                    &temp_id,
+                    n_gpus,
+                );
+                let free_after: u64 = free
+                    .iter()
+                    .zip(run_res.iter())
+                    .map(|(f, o)| f.saturating_sub(*o))
+                    .sum();
+                let outcome =
+                    evaluate_fit(&req, &temp.flags.tensor_split, &free, &run_res, &acct_res);
+                if outcome.placeable {
+                    fit_verdict_text(needs, free_after, true, false, &[])
+                } else {
+                    // Hypothetically stop the accepted
+                    // requires_stopping ids and re-evaluate.
+                    let mut running2 = gathered.live.backend_running.clone();
+                    for id in &proposal.requires_stopping {
+                        running2.insert(id.clone(), false);
+                    }
+                    let (run2, acct2) = manager_optimize::fit::others_residency(
+                        &temp_cfg,
+                        &gathered.live.layouts,
+                        &running2,
+                        &temp_id,
+                        n_gpus,
+                    );
+                    let free_after2: u64 = free
+                        .iter()
+                        .zip(run2.iter())
+                        .map(|(f, o)| f.saturating_sub(*o))
+                        .sum();
+                    let outcome2 =
+                        evaluate_fit(&req, &temp.flags.tensor_split, &free, &run2, &acct2);
+                    if outcome2.placeable {
+                        to_stop = proposal
+                            .requires_stopping
+                            .iter()
+                            .filter(|id| {
+                                gathered
+                                    .live
+                                    .backend_running
+                                    .get(*id)
+                                    .copied()
+                                    .unwrap_or(false)
+                            })
+                            .cloned()
+                            .collect();
+                        fit_verdict_text(needs, free_after2, false, true, &proposal.requires_stopping)
+                    } else {
+                        let text =
+                            fit_verdict_text(needs, free_after2, false, false, &proposal.requires_stopping);
+                        return InnerOutcome::failed(
+                            format!("preflight failed: {text}"),
+                            text,
+                        );
+                    }
+                }
+            }
+        }
+    };
+
+    // -- Baseline (only when this experiment runs the eval):
+    // use the stored baseline when fresh for its backend;
+    // else, when the plan's consulted backend is running, run
+    // the baseline against it first and store it; else the
+    // eval runs without a comparison. This happens after the
+    // fit verdict (a failed preflight burns no eval time) but
+    // BEFORE any requires_stopping stops: the consulted
+    // backend may be one of the backends the fit needs stopped.
+    let mut baseline: Option<manager_optimize::BaselineRecord> = None;
+    if proposal.run_eval {
+        let stored = crate::optimize_eval::load_baseline(state);
+        let fresh = stored.as_ref().and_then(|b| {
+            let is_fresh = b.suite_version == manager_optimize::EVAL_SUITE_VERSION
+                && gathered.fingerprints.get(&b.backend_id)
+                    == Some(&b.config_fingerprint);
+            if is_fresh {
+                Some(b.clone())
+            } else {
+                None
+            }
+        });
+        baseline = match fresh {
+            Some(b) => Some(b),
+            None => {
+                let consulted = ctx.consulted_backend.clone();
+                let can_run = !consulted.is_empty()
+                    && gathered.running.get(&consulted).copied() == Some(true);
+                if can_run {
+                    if let (Some(b), Some(fp)) = (
+                        cfg.backends.iter().find(|b| b.id == consulted),
+                        gathered.fingerprints.get(&consulted).cloned(),
+                    ) {
+                        let bmodel = crate::model_for_backend(cfg, b)
+                            .map(|m| m.id.clone())
+                            .unwrap_or_else(|| consulted.clone());
+                        let run = crate::optimize_eval::run_eval_suite(
+                            &consulted,
+                            &format!("http://127.0.0.1:{}", b.port),
+                            &bmodel,
+                        )
+                        .await;
+                        let record =
+                            manager_optimize::BaselineRecord::from_run(&run, fp);
+                        let _ = crate::optimize_eval::save_baseline(state, record.clone());
+                        Some(record)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+    }
+
+    // -- Stop exactly the accepted requires_stopping ids the
+    // fit verdict needs stopped.
+    for id in &to_stop {
+        let outcome = state.supervisor().await.lock().await.stop(id, false).await;
+        if let Err(e) = outcome {
+            return InnerOutcome::failed(
+                format!("preflight fit needed backend '{id}' stopped, but stopping it failed: {e:?}"),
+                preflight,
+            );
+        }
+        if ctx.batch_running.contains(id) && !ctx.stopped_to_restart.contains(id) {
+            ctx.stopped_to_restart.push(id.clone());
+        }
+    }
+
+    // -- Journal the in-flight experiment BEFORE the spawn, so
+    // a crash from here on leaves a sweep record.
+    {
+        let mut journal = load_journal(state);
+        journal.add_active(ActiveExperiment {
+            temp_id: temp_id.clone(),
+            pid: None,
+            port,
+            experiment_id: proposal.id,
+            started_at: chrono::Utc::now().to_rfc3339(),
+        });
+        save_journal(state, &journal);
+    }
+
+    // -- Register the spec directly and spawn. No probe is
+    // registered (backends never register probes in this app);
+    // the health wait uses a local HttpHealthProbe.
+    {
+        let store = state.telemetry().await;
+        let gpus = crate::lock_telemetry(&store).inventory();
+        let spec = crate::backend_spec(cfg, &temp, &gpus);
+        let mut sup = state.supervisor().await.lock().await;
+        sup.register_spec(spec);
+        if let Err(e) = sup.spawn_backend(&temp_id).await {
+            return InnerOutcome::failed(
+                format!("temp backend {temp_id} failed to start: {e:?}"),
+                preflight,
+            );
+        }
+        let pid = sup
+            .status()
+            .into_iter()
+            .find(|s| s.id == temp_id)
+            .and_then(|s| s.pid);
+        drop(sup);
+        if let Some(pid) = pid {
+            let mut journal = load_journal(state);
+            journal.set_active_pid(&temp_id, pid);
+            save_journal(state, &journal);
+        }
+    }
+
+    // -- Wait healthy on the existing probe.
+    if let Err(e) = wait_healthy(state, &temp_id, port).await {
+        return InnerOutcome::failed(e, preflight);
+    }
+
+    // -- Standardized benchmark (§A.1), mirroring the measure
+    // command's run sequence.
+    let base_url = format!("http://127.0.0.1:{port}");
+    let mut results: Vec<BenchResult> = Vec::new();
+    for prompt in benchmark_prompts() {
+        let messages = vec![manager_supervisor::ChatMessage {
+            role: "user".to_string(),
+            content: prompt.text.to_string(),
+        }];
+        if let Err(e) = manager_supervisor::benchmark_completion(
+            &base_url,
+            &model_id,
+            &messages,
+            BENCHMARK_TEMPERATURE,
+            prompt.max_tokens,
+            EXP_RUN_TIMEOUT,
+        )
+        .await
+        {
+            return InnerOutcome::failed(format!("benchmark warm-up failed: {e}"), preflight);
+        }
+        let mut runs: Vec<BenchRun> = Vec::new();
+        for _ in 0..MEASURED_RUNS {
+            match manager_supervisor::benchmark_completion(
+                &base_url,
+                &model_id,
+                &messages,
+                BENCHMARK_TEMPERATURE,
+                prompt.max_tokens,
+                EXP_RUN_TIMEOUT,
+            )
+            .await
+            {
+                Ok(sample) => runs.push(BenchRun {
+                    prompt_per_second: sample.prompt_per_second,
+                    predicted_per_second: sample.predicted_per_second,
+                    ttft_ms: sample.ttft_ms,
+                    latency_ms: sample.latency_ms,
+                }),
+                Err(e) => {
+                    return InnerOutcome::failed(
+                        format!("benchmark run failed: {e}"),
+                        preflight,
+                    );
+                }
+            }
+        }
+        results.push(BenchResult::from_runs(runs));
+    }
+    let mut iter = results.into_iter();
+    let short = iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
+    let long = iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
+    let measured = ExperimentMeasured {
+        short: short.clone(),
+        long: long.clone(),
+    };
+
+    // Record the benchmark in the measurement store under the
+    // temp configuration's fingerprint (§A.3 step 4): it
+    // survives cleanup, keyed to a configuration, with the
+    // temp backend id as its provenance.
+    {
+        let gpu_pairs: Vec<(u32, String)> = gathered
+            .measure
+            .hardware
+            .gpus
+            .iter()
+            .map(|g| (g.index, g.name.clone()))
+            .collect();
+        let file_size = std::fs::metadata(&gguf_abs)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len());
+        let model_for_fp = registered_model.as_ref().or_else(|| {
+            temp_cfg.models.iter().find(|m| m.id == model_id)
+        });
+        let fp = manager_optimize::measurement_fingerprint(&temp_fingerprint_inputs(
+            &temp,
+            model_for_fp,
+            file_size,
+            &gpu_pairs,
+        ));
+        let entry = MeasurementEntry {
+            fingerprint: fp,
+            backend_id: temp_id.clone(),
+            model_id: model_id.clone(),
+            measured_at: chrono::Utc::now().to_rfc3339(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            short,
+            long,
+        };
+        let mut store = MeasurementStore::load(&crate::optimize::measurements_path(state));
+        store.upsert(entry);
+        if let Err(e) = store.save(&crate::optimize::measurements_path(state)) {
+            return InnerOutcome {
+                status: ExperimentStatus::Failed,
+                detail: format!("benchmark completed but recording it failed: {e}"),
+                measured: Some(measured),
+                eval: None,
+                comparison: None,
+                preflight,
+            };
+        }
+    }
+
+    // -- Screening eval (§A.4) when the proposal asks for it.
+    let (eval, comparison) = if proposal.run_eval {
+        let record = crate::optimize_eval::run_eval_suite(&temp_id, &base_url, &model_id).await;
+        let comparison = baseline
+            .as_ref()
+            .map(|b| compare(&record.scores, &b.scores));
+        (Some(record), comparison)
+    } else {
+        (None, None)
+    };
+
+    let detail = format!(
+        "Measured {model_id} on {temp_id}: generation {} tok/s (short), {} tok/s (long); prompt {} tok/s; TTFT {} ms.{}{}",
+        fmt_rate(measured.short.predicted_per_second),
+        fmt_rate(measured.long.predicted_per_second),
+        fmt_rate(measured.long.prompt_per_second.or(measured.short.prompt_per_second)),
+        fmt_rate(measured.short.ttft_ms.or(measured.long.ttft_ms)),
+        match &eval {
+            Some(e) => format!(
+                " Screen: {}/{} overall.",
+                e.scores.overall.passed, e.scores.overall.total
+            ),
+            None => String::new(),
+        },
+        match &comparison {
+            Some(c) => format!(
+                " Delta vs baseline: {:+} passed overall; screen at/above baseline: {}.",
+                c.overall.delta_passed, c.screen_at_or_above_baseline
+            ),
+            None => String::new(),
+        },
+    );
+    InnerOutcome {
+        status: ExperimentStatus::Completed,
+        detail,
+        measured: Some(measured),
+        eval,
+        comparison,
+        preflight,
+    }
+}
+
+/// Record one finished result in both durable places: the
+/// journal history and the plan's proposal (when the plan is
+/// still the one that proposed it).
+fn record_result(state: &AppState, result: &ExperimentResult) {
+    let mut journal = load_journal(state);
+    journal.record_result(result.clone());
+    save_journal(state, &journal);
+    let mut file = crate::optimize::load_plan_file(state);
+    if let Some(plan) = file.plan.as_mut() {
+        if let Some(exp) = plan
+            .experiments
+            .iter_mut()
+            .find(|e| e.id == result.experiment_id)
+        {
+            exp.result = Some(result.clone());
+            let _ = crate::optimize::save_plan_file(state, &file);
+        }
+    }
+}
+
+/// Restart the requires_stopping backends the batch stopped
+/// (those running at batch start, still stopped now), via the
+/// ordinary spec registration + supervisor spawn. Returns the
+/// note stated in each of the batch's result details.
+async fn restart_stopped(state: &AppState, ids: &[String]) -> String {
+    if ids.is_empty() {
+        return String::new();
+    }
+    crate::ensure_backend_specs(state).await;
+    let mut restarted: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    for id in ids {
+        let mut sup = state.supervisor().await.lock().await;
+        sup.reap_exited();
+        let running = sup
+            .status()
+            .iter()
+            .any(|s| &s.id == id && s.pid.is_some());
+        if running {
+            restarted.push(id.clone());
+            continue;
+        }
+        match sup.spawn_backend(id).await {
+            Ok(()) => restarted.push(id.clone()),
+            Err(e) => failed.push(format!("{id} ({e:?})")),
+        }
+    }
+    let mut note = format!(
+        "Backends stopped for this batch and restarted afterwards: {}.",
+        if restarted.is_empty() {
+            "none".to_string()
+        } else {
+            restarted.join(", ")
+        }
+    );
+    if !failed.is_empty() {
+        note.push_str(&format!(
+            " Restart failed for: {}.",
+            failed.join(", ")
+        ));
+    }
+    note
+}
+
+/// Run the plan's accepted experiments as one batch (§A.3):
+/// one tracked task (`optimize-experiments`) under the shared
+/// GPU-job slot, one experiment at a time, budgets enforced
+/// server-side. Undecided and denied proposals never run.
+#[tauri::command]
+pub async fn optimize_run_experiments(state: State<'_, AppState>) -> ApiResult {
+    {
+        let slot = state.optimize_job_abort.lock().await;
+        if slot.is_some() {
+            return Err(err(ApiError::InvalidInput(
+                "a measurement or experiment job is already running".to_string(),
+            )));
+        }
+    }
+    let file = crate::optimize::load_plan_file(&state);
+    let plan = file
+        .plan
+        .clone()
+        .ok_or_else(|| err(ApiError::NotFound("no plan".to_string())))?;
+    let batch: Vec<ExperimentProposal> = plan
+        .experiments
+        .iter()
+        .filter(|e| e.decision == Decision::Accepted)
+        .cloned()
+        .collect();
+    if batch.is_empty() {
+        return Err(err(ApiError::InvalidInput(
+            "no accepted experiments in the current plan; accept at least one proposal to run it".to_string(),
+        )));
+    }
+    if batch.len() > manager_optimize::MAX_EXPERIMENTS {
+        return Err(err(ApiError::InvalidInput(format!(
+            "at most {} experiments per batch",
+            manager_optimize::MAX_EXPERIMENTS
+        ))));
+    }
+    let cfg = state.config.read().await.clone();
+    let gathered0 = crate::optimize::gather(&state, &cfg).await;
+    let task_id = state
+        .record_task(
+            "optimize-experiments",
+            json!({
+                "experiments": batch.iter().map(|e| e.id).collect::<Vec<_>>(),
+                "candidates": batch.iter().map(|e| e.candidate_model_id.clone()).collect::<Vec<_>>(),
+            }),
+        )
+        .await;
+    let batch_id = task_id.clone();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut slot = state.optimize_job_abort.lock().await;
+        if slot.is_some() {
+            state
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Failed,
+                    json!({ "error": "a measurement or experiment job is already running" }),
+                )
+                .await;
+            return Err(err(ApiError::InvalidInput(
+                "a measurement or experiment job is already running".to_string(),
+            )));
+        }
+        *slot = Some(tx);
+    }
+    let mut ctx = BatchCtx {
+        consulted_backend: plan.consulted_backend.clone(),
+        batch_running: gathered0
+            .running
+            .iter()
+            .filter(|(_, r)| **r)
+            .map(|(id, _)| id.clone())
+            .collect(),
+        stopped_to_restart: Vec::new(),
+        used_ports: HashSet::new(),
+    };
+    let batch_start = Instant::now();
+    let mut cancelled = false;
+    let mut completed = 0usize;
+    let mut failed = 0usize;
+    let mut idx = 0usize;
+    while idx < batch.len() {
+        let proposal = &batch[idx];
+        // Batch deadline: everything not yet run is recorded
+        // as a timeout that states why it never ran.
+        if batch_start.elapsed() >= Duration::from_secs(BATCH_TIMEOUT_SECS) {
+            for rest in &batch[idx..] {
+                let now = chrono::Utc::now().to_rfc3339();
+                record_result(
+                    &state,
+                    &ExperimentResult {
+                        experiment_id: rest.id,
+                        candidate_model_id: rest.candidate_model_id.clone(),
+                        batch_id: batch_id.clone(),
+                        status: ExperimentStatus::Timeout,
+                        detail: "not run: the 60-minute batch deadline was exceeded"
+                            .to_string(),
+                        measured: None,
+                        eval: None,
+                        comparison: None,
+                        preflight: String::new(),
+                        started_at: now.clone(),
+                        finished_at: now,
+                    },
+                );
+                failed += 1;
+            }
+            break;
+        }
+        let started_at = chrono::Utc::now().to_rfc3339();
+        let temp_id = temp_backend_id(proposal.id);
+        let remaining_batch = Duration::from_secs(BATCH_TIMEOUT_SECS)
+            .saturating_sub(batch_start.elapsed());
+        let budget = Duration::from_secs(EXPERIMENT_TIMEOUT_SECS).min(remaining_batch);
+        let inner = run_experiment_inner(&state, &cfg, proposal, &mut ctx);
+        // Cancellation and timeout drop the inner future; the
+        // cleanup below is outside it and always runs.
+        let outcome = tokio::select! {
+            _ = &mut rx => {
+                cancelled = true;
+                InnerOutcome {
+                    status: ExperimentStatus::Cancelled,
+                    detail: "experiment cancelled by the operator".to_string(),
+                    measured: None,
+                    eval: None,
+                    comparison: None,
+                    preflight: String::new(),
+                }
+            }
+            res = tokio::time::timeout(budget, inner) => match res {
+                Ok(o) => o,
+                Err(_) => InnerOutcome {
+                    status: ExperimentStatus::Timeout,
+                    detail: format!(
+                        "experiment exceeded its {}-minute budget",
+                        budget.as_secs() / 60
+                    ),
+                    measured: None,
+                    eval: None,
+                    comparison: None,
+                    preflight: String::new(),
+                },
+            },
+        };
+        cleanup_temp(&state, &temp_id).await;
+        match outcome.status {
+            ExperimentStatus::Completed => completed += 1,
+            _ => failed += 1,
+        }
+        record_result(
+            &state,
+            &ExperimentResult {
+                experiment_id: proposal.id,
+                candidate_model_id: proposal.candidate_model_id.clone(),
+                batch_id: batch_id.clone(),
+                status: outcome.status,
+                detail: outcome.detail,
+                measured: outcome.measured,
+                eval: outcome.eval,
+                comparison: outcome.comparison,
+                preflight: outcome.preflight,
+                started_at,
+                finished_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+        idx += 1;
+        if cancelled {
+            break;
+        }
+    }
+    // Restart what the batch stopped (any outcome, including
+    // cancellation and deadline), and state it in every result
+    // this batch recorded — journal history and plan alike.
+    let note = restart_stopped(&state, &ctx.stopped_to_restart.clone()).await;
+    if !note.is_empty() {
+        let mut journal = load_journal(&state);
+        journal.append_batch_detail(&batch_id, &note);
+        save_journal(&state, &journal);
+        let mut file = crate::optimize::load_plan_file(&state);
+        if let Some(plan) = file.plan.as_mut() {
+            for exp in plan.experiments.iter_mut() {
+                if let Some(result) = exp.result.as_mut() {
+                    if result.batch_id == batch_id {
+                        if !result.detail.is_empty() {
+                            result.detail.push(' ');
+                        }
+                        result.detail.push_str(&note);
+                    }
+                }
+            }
+            let _ = crate::optimize::save_plan_file(&state, &file);
+        }
+    }
+    {
+        let mut slot = state.optimize_job_abort.lock().await;
+        *slot = None;
+    }
+    let (status, detail) = if cancelled {
+        (
+            TaskStatus::Aborted,
+            json!({ "batch": batch_id, "completed": completed, "failed": failed, "cancelled": true }),
+        )
+    } else {
+        (
+            TaskStatus::Done,
+            json!({ "batch": batch_id, "completed": completed, "failed": failed }),
+        )
+    };
+    state.finish_task(&task_id, status, detail).await;
+    if cancelled {
+        return Err("experiment batch cancelled".to_string());
+    }
+    crate::optimize::state_payload(&state).await
+}

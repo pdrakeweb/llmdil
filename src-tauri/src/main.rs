@@ -48,6 +48,7 @@ mod activation;
 mod gateway_stats;
 mod optimize;
 mod optimize_eval;
+mod optimize_experiments;
 
 // ---------------------------------------------------------------------------
 // Events (Rust -> UI, spec §14)
@@ -6257,6 +6258,14 @@ fn main() {
                 state.hydrate_wizard().await;
                 state.persist_wizard().await;
             });
+            // Optimize experiment startup sweep (Phase 5e):
+            // terminate leftover temp backends from an app crash
+            // mid-experiment and clear their journal records.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<AppState>();
+                optimize_experiments::startup_sweep(&state).await;
+            });
             // Gateway metrics poller: scrape LiteLLM's Prometheus
             // endpoint every 15 s into the stats store that feeds
             // the Dashboard's request/error/throughput figures.
@@ -6355,6 +6364,8 @@ fn main() {
             optimize::optimize_cancel_job,
             optimize::optimize_discover,
             optimize_eval::optimize_run_baseline,
+            optimize_experiments::optimize_set_experiment_state,
+            optimize_experiments::optimize_run_experiments,
             diagnostics_export_bundle,
             // MCP / VS Code
             mcp_list,

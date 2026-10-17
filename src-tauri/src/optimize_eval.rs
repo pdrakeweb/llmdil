@@ -62,6 +62,25 @@ fn save_eval_file(state: &AppState, file: &EvalFile) -> Result<(), String> {
     std::fs::write(eval_path(state), text).map_err(|e| e.to_string())
 }
 
+/// The stored baseline, if any (Phase 5e: the experiment
+/// runner compares candidate runs against it).
+pub(crate) fn load_baseline(state: &AppState) -> Option<BaselineRecord> {
+    load_eval_file(state).baseline
+}
+
+/// Store a baseline record (Phase 5e: a batch that had to run
+/// the baseline itself, because none was stored or the stored
+/// one was stale, stores it through the same path as the
+/// standalone command).
+pub(crate) fn save_baseline(state: &AppState, baseline: BaselineRecord) -> Result<(), String> {
+    save_eval_file(
+        state,
+        &EvalFile {
+            baseline: Some(baseline),
+        },
+    )
+}
+
 /// The `eval_baseline` payload field (consumed by the Optimize
 /// page and, for delta rendering, by Phase 5e): the stored
 /// baseline's headline scores beside its provenance, or `null`
