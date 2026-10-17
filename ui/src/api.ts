@@ -1801,6 +1801,9 @@ export interface OptimizePlanItem {
 
 export interface OptimizePlan {
   summary: string;
+  /** Operator directive that scoped this consultation (addendum
+   *  A.2), stored verbatim on the plan; "" when none. */
+  directive: string;
   items: OptimizePlanItem[];
   consulted_backend: string;
   created_at: string;
@@ -1837,6 +1840,10 @@ export interface OptimizeBackendInfo {
 
 export interface OptimizeState {
   purpose: string;
+  /** The stored plan's directive (addendum A.2): the consult
+   *  field's default text for the next consultation; "" when
+   *  no plan carries one. */
+  last_directive: string;
   purpose_is_seed: boolean;
   purpose_seed: string;
   groups: { name: string; purpose: string }[];
@@ -1889,9 +1896,11 @@ export function optimizeSavePurpose(scope: "deployment" | "group" | "backend", t
 
 /** optimize_consult — run a consultation (or a local sample plan)
  *  and return the refreshed state with the new plan. Long-running:
- *  up to the 900 s task budget for a live consultation. */
-export function optimizeConsult(backendId?: string, sample = false) {
-  return optimizeStateCmd("optimize_consult", { backendId: backendId ?? null, sample });
+ *  up to the 900 s task budget for a live consultation. `directive`
+ *  is the optional operator directive scoping this consultation
+ *  (addendum A.2); it is recorded verbatim on the produced plan. */
+export function optimizeConsult(backendId?: string, sample = false, directive?: string) {
+  return optimizeStateCmd("optimize_consult", { backendId: backendId ?? null, sample, directive: directive ?? null });
 }
 
 /** optimize_cancel_consult — fire the scoped cancellation handle. */

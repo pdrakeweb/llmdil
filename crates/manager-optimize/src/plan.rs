@@ -215,6 +215,14 @@ pub struct PlanItem {
 pub struct Plan {
     /// The model's one-line summary (rendered only in an expandable).
     pub summary: String,
+    /// The operator directive that scoped this consultation
+    /// (addendum A.2): stored verbatim on the plan it produced,
+    /// shown on the plan header, and offered as the next
+    /// consultation's default directive. Empty when the
+    /// consultation had none. Serde-defaulted so plan files
+    /// written before Phase 5 stay readable.
+    #[serde(default)]
+    pub directive: String,
     pub items: Vec<PlanItem>,
     /// Id of the backend that was consulted.
     pub consulted_backend: String,
@@ -303,6 +311,35 @@ mod tests {
             fingerprint(PlanKind::BackendSetFlags, Some("coder"), &a),
             fingerprint(PlanKind::BackendSetFlags, Some("coder"), &c)
         );
+    }
+
+    #[test]
+    fn plan_without_directive_loads_with_empty_directive() {
+        // Back-compat (addendum A.2): a plan file written before
+        // Phase 5 has no `directive` key; it must still load, with
+        // the directive empty.
+        let old = json!({
+            "summary": "s",
+            "items": [],
+            "consulted_backend": "planner",
+            "created_at": "2026-10-17T00:00:00+00:00",
+            "config_hash": "hash",
+            "dropped_invalid": 0,
+            "truncated": 0,
+            "dropped_fragments": [],
+            "raw_response": "{}",
+            "context": {},
+        });
+        let plan: Plan = serde_json::from_value(old).unwrap();
+        assert_eq!(plan.directive, "");
+        assert_eq!(plan.consulted_backend, "planner");
+        // And a plan carrying a directive round-trips verbatim.
+        let mut with = plan.clone();
+        with.directive = "reduce coder latency".to_string();
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(text.contains("\"directive\":\"reduce coder latency\""));
+        let back: Plan = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.directive, "reduce coder latency");
     }
 
     #[test]

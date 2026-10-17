@@ -405,7 +405,9 @@ fn assign_create_port(cfg: &AppConfig, assigned: &HashSet<u16>) -> u16 {
 ///
 /// `cfg` is the configuration the consultation ran against (used
 /// for create-port assignment); `denied_fingerprints` carries the
-/// denial memory from previous plans (§6).
+/// denial memory from previous plans (§6); `directive` is the
+/// operator directive that scoped this consultation (addendum
+/// A.2), recorded verbatim on the produced plan.
 #[allow(clippy::too_many_arguments)]
 pub fn parse_plan(
     response: &str,
@@ -414,6 +416,7 @@ pub fn parse_plan(
     config_hash: &str,
     context: Value,
     denied_fingerprints: &HashSet<String>,
+    directive: &str,
     now: DateTime<Utc>,
 ) -> Result<Plan, ParseError> {
     let object_text = extract_json_object(response).ok_or(ParseError::NoJsonObject)?;
@@ -616,6 +619,7 @@ pub fn parse_plan(
 
     Ok(Plan {
         summary,
+        directive: directive.to_string(),
         items,
         consulted_backend: consulted_backend.to_string(),
         created_at: now.to_rfc3339(),
@@ -641,6 +645,7 @@ mod tests {
             "hash",
             json!({}),
             &HashSet::new(),
+            "",
             Utc::now(),
         )
     }
@@ -737,11 +742,33 @@ mod tests {
             "hash",
             json!({}),
             &denied,
+            "",
             Utc::now(),
         )
         .unwrap();
         assert_eq!(second.items[0].decision, Decision::Denied);
         assert!(second.items[0].previously_denied);
+    }
+
+    #[test]
+    fn parse_plan_carries_the_directive_onto_the_plan() {
+        // Addendum A.2: the directive that produced the plan is
+        // stored verbatim on it.
+        let r = parse_plan(
+            "{\"items\":[{\"kind\":\"backend.set_enabled\",\"target\":\"coder\",\"change\":{\"enabled\":true}}]}",
+            &AppConfig::default_config(),
+            "planner",
+            "hash",
+            json!({}),
+            &HashSet::new(),
+            "the tool-runner feels slow",
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(r.directive, "the tool-runner feels slow");
+        // The no-directive path stays empty, not absent.
+        let plain = parse("{\"items\":[]}").unwrap();
+        assert_eq!(plain.directive, "");
     }
 
     #[test]

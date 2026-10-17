@@ -88,6 +88,11 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   const armed = new Set<string>();
   /** Purpose editor drafts, keyed "deployment" | "backend:<id>" | "group:<name>". */
   const drafts = new Map<string, string>();
+  /** Directive field draft (addendum A.2). Null until the operator
+   *  edits the field; the field's text otherwise comes from the
+   *  stored plan's directive (`state.last_directive`). Editing it
+   *  never touches the persisted purpose fields. */
+  let directiveDraft: string | null = null;
   const openEditors = new Set<string>();
   let statusLine = "";
   let applyRunning = false;
@@ -210,6 +215,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       <div class="opt-plan-head">
         <strong>Plan</strong>
         <span class="opt-plan-meta">from ${esc(plan.consulted_backend)} · ${esc(fmtTime(plan.created_at))}</span>
+        ${plan.directive?.trim() ? `<span class="opt-plan-meta">Directive: ${esc(plan.directive)}</span>` : ""}
         ${plan.sample ? `<span class="chip">Sample plan</span>` : ""}
         ${plan.config_stale ? `<span class="stale-tag">Configuration changed since this plan</span>
           <button class="btn" data-opt-act="revalidate">${icon("restart")} Re-validate</button>` : ""}
@@ -293,6 +299,8 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
           <div class="opt-field-label">Deployment purpose</div>
           ${purposeEditor("deployment", "", purposeShown, st.purpose_is_seed)}
           ${st.purpose_is_seed ? `<div class="opt-note">This description was generated from your setup. Edit it to make it yours — every consultation uses it.</div>` : ""}
+          <div class="opt-field-label" style="margin-top:10px">Directive (optional)</div>
+          <textarea id="optDirective" class="opt-directive-input" rows="2" placeholder="Scope this consultation — e.g. reduce coder latency">${esc(directiveDraft ?? st.last_directive ?? "")}</textarea>
         </div>
         <div>
           <div class="opt-field-label">Consulting</div>
@@ -351,6 +359,11 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   async function runConsult(sample: boolean): Promise<void> {
     const sel = hostEl.querySelector<HTMLSelectElement>("#optBackendSel");
     const backendId = sample ? undefined : sel?.value || undefined;
+    // Capture the directive before paint() rebuilds the card (and
+    // the field with it); the draft survives the re-render.
+    const directiveField = hostEl.querySelector<HTMLTextAreaElement>("#optDirective");
+    if (directiveField) directiveDraft = directiveField.value;
+    const directive = directiveDraft ?? state?.last_directive ?? "";
     consultStart = Date.now();
     if (state) state.consulting = true;
     paint();
@@ -359,7 +372,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       const el = hostEl.querySelector("#optElapsed");
       if (el) el.textContent = fmtElapsed(Math.floor((Date.now() - consultStart) / 1000));
     }, 1000);
-    const r = await optimizeConsult(backendId, sample);
+    const r = await optimizeConsult(backendId, sample, directive);
     if (elapsedTimer !== null) { window.clearInterval(elapsedTimer); elapsedTimer = null; }
     if (disposed) return;
     if (r.error) {
@@ -372,6 +385,9 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     }
     if (r.data) {
       state = r.data;
+      // The field now defaults to the directive the new plan
+      // recorded (the server's trimmed verbatim text).
+      directiveDraft = r.data.last_directive ?? "";
       statusLine = "";
     }
     paint();
@@ -689,7 +705,10 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         void (async () => {
           const r = await optimizeDiscardPlan();
           if (disposed) return;
-          if (r.data) state = r.data;
+          if (r.data) {
+            state = r.data;
+            directiveDraft = r.data.last_directive ?? "";
+          }
           statusLine = "";
           paint();
         })();
@@ -716,6 +735,10 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
 
   hostEl.addEventListener("input", (ev) => {
     const t = ev.target as HTMLElement;
+    if (t.id === "optDirective" && t instanceof HTMLTextAreaElement) {
+      directiveDraft = t.value;
+      return;
+    }
     const key = t.dataset?.optPurposeInput;
     if (key && t instanceof HTMLTextAreaElement) drafts.set(key, t.value);
   });

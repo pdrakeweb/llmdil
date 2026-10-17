@@ -121,6 +121,7 @@ export function mockOptimizeState(): OptimizeState {
   });
   return {
     purpose: "",
+    last_directive: "Explore better MoE capable models for the planner",
     purpose_is_seed: true,
     purpose_seed: "Local inference served to the LAN through one gateway. Groups: planner (Qwen3.8-27B Planner); coder (Qwen3-Coder-Next-80B).",
     groups: [
@@ -147,6 +148,7 @@ export function mockOptimizeState(): OptimizeState {
     measuring: false,
     plan: {
       summary: "Sample plan — generated locally; no backend was consulted.",
+      directive: "Explore better MoE capable models for the planner",
       consulted_backend: "planner",
       created_at: new Date().toISOString(),
       config_hash: "sample",

@@ -444,9 +444,17 @@ pub fn build_context(
 
 /// The consultation prompts (§3). The system prompt states the
 /// output contract exactly; the user prompt carries the purpose
-/// verbatim at its head, then which blocks are measured, then the
-/// context document in a fenced block.
-pub fn build_prompts(purpose: &str, context: &Value, meta: &ContextMeta) -> (String, String) {
+/// verbatim at its head, then — when one is present — the
+/// operator directive verbatim under its own label (addendum
+/// A.2), then which blocks are measured, then the context
+/// document in a fenced block. A directive that is empty after
+/// trimming produces no block at all.
+pub fn build_prompts(
+    purpose: &str,
+    directive: &str,
+    context: &Value,
+    meta: &ContextMeta,
+) -> (String, String) {
     let system = SYSTEM_PROMPT.to_string();
     let measured_line = if meta.measured_blocks.is_empty() {
         "Measured state: none — everything in the document is configuration, not measurement."
@@ -457,8 +465,13 @@ pub fn build_prompts(purpose: &str, context: &Value, meta: &ContextMeta) -> (Str
             meta.measured_blocks.join(", ")
         )
     };
+    let directive_block = if directive.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\nOperator directive for this consultation:\n{directive}")
+    };
     let user = format!(
-        "{purpose}\n\n{measured_line}\n\nContext:\n```json\n{}\n```",
+        "{purpose}{directive_block}\n\n{measured_line}\n\nContext:\n```json\n{}\n```",
         serde_json::to_string_pretty(context).unwrap_or_default()
     );
     (system, user)
@@ -498,6 +511,7 @@ Allowed kinds and their change payloads:
 - advice — change: {\"text\": \"...\"} for anything worth saying that the kinds above cannot express
 
 Constraints:
+- When the user prompt carries an operator directive for this consultation, proposals must serve that directive; layout changes unrelated to it belong in an advice item at most, not as executable changes.
 - Only these kinds. Only ids, group names, and model ids that appear in the context document (catalog candidates appear there too). A model that is neither registered nor in the catalog can only be proposed via model.add.
 - Never propose raw llama-server flags. Flag changes are expressed only through the structured fields above; anything that needs a raw flag belongs in an advice item.
 - tensor_split fractions must sum to 1.0 and have one entry per GPU.
@@ -816,10 +830,45 @@ mod tests {
     fn prompts_carry_purpose_and_measured_statement() {
         let cfg = AppConfig::default_config();
         let (doc, meta) = build_context(&cfg, &MeasureInputs::default(), "1", "planner");
-        let (system, user) = build_prompts("MY PURPOSE", &doc, &meta);
+        let (system, user) = build_prompts("MY PURPOSE", "", &doc, &meta);
         assert!(system.contains("backend.set_context"));
         assert!(user.starts_with("MY PURPOSE"));
         assert!(user.contains("configuration, not measurement"));
         assert!(user.contains("```json"));
+        // No directive: no directive block anywhere (addendum A.2).
+        assert!(!user.contains("Operator directive"));
+    }
+
+    #[test]
+    fn prompts_carry_directive_verbatim_after_purpose() {
+        let cfg = AppConfig::default_config();
+        let (doc, meta) = build_context(&cfg, &MeasureInputs::default(), "1", "planner");
+        let directive = "Explore better MoE capable models for the planner";
+        let (system, user) = build_prompts("MY PURPOSE", directive, &doc, &meta);
+        // The block is present, labeled, and carries the text verbatim.
+        assert!(user.contains(&format!(
+            "Operator directive for this consultation:\n{directive}"
+        )));
+        // Positioned directly after the purpose, before the
+        // measured-state line and the context document.
+        let purpose_at = user.find("MY PURPOSE").unwrap();
+        let directive_at = user.find("Operator directive").unwrap();
+        let measured_at = user.find("Measured state").unwrap();
+        let context_at = user.find("Context:").unwrap();
+        assert!(purpose_at < directive_at);
+        assert!(directive_at < measured_at);
+        assert!(measured_at < context_at);
+        // The system prompt narrows its framing to the directive.
+        assert!(system.contains("operator directive"));
+        assert!(system.contains("advice item at most"));
+    }
+
+    #[test]
+    fn prompts_omit_whitespace_only_directive() {
+        let cfg = AppConfig::default_config();
+        let (doc, meta) = build_context(&cfg, &MeasureInputs::default(), "1", "planner");
+        let (_system, user) = build_prompts("MY PURPOSE", "  \n  ", &doc, &meta);
+        assert!(!user.contains("Operator directive"));
+        assert!(user.starts_with("MY PURPOSE\n\nMeasured state"));
     }
 }

@@ -410,8 +410,17 @@ async fn state_payload(state: &AppState) -> ApiResult {
         v
     });
     let purpose = cfg.optimize_purpose.clone();
+    // The stored plan's directive (addendum A.2), offered as the
+    // next consultation field's default text; "" when no plan (or
+    // a plan produced without a directive) exists.
+    let last_directive = file
+        .plan
+        .as_ref()
+        .map(|p| p.directive.clone())
+        .unwrap_or_default();
     Ok(json!({
         "purpose": purpose,
+        "last_directive": last_directive,
         "purpose_is_seed": purpose.trim().is_empty(),
         "purpose_seed": if purpose.trim().is_empty() {
             default_purpose_seed(&cfg)
@@ -539,8 +548,17 @@ pub async fn optimize_consult(
     state: State<'_, AppState>,
     backend_id: Option<String>,
     sample: Option<bool>,
+    directive: Option<String>,
 ) -> ApiResult {
     let sample = sample.unwrap_or(false);
+    // The operator directive for this consultation (addendum
+    // A.2): trimmed; empty (or absent) means no directive. Sample
+    // consultations record it the same way live ones do — the
+    // plan records what produced it.
+    let directive = directive
+        .as_deref()
+        .map(|d| d.trim().to_string())
+        .unwrap_or_default();
     {
         let slot = state.optimize_abort.lock().await;
         if slot.is_some() {
@@ -584,7 +602,7 @@ pub async fn optimize_consult(
     } else {
         cfg.optimize_purpose.clone()
     };
-    let (system_prompt, user_prompt) = build_prompts(&purpose, &context, &meta);
+    let (system_prompt, user_prompt) = build_prompts(&purpose, &directive, &context, &meta);
 
     // Context-fit pre-check (design §3): the assembled prompt plus
     // the response budget must fit the consulted model's context.
@@ -706,6 +724,7 @@ pub async fn optimize_consult(
         &config_hash,
         context,
         &denied,
+        &directive,
         chrono::Utc::now(),
     ) {
         Ok(p) => p,

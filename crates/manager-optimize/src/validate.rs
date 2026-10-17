@@ -826,6 +826,7 @@ mod tests {
     fn plan(items: Vec<PlanItem>) -> Plan {
         Plan {
             summary: String::new(),
+            directive: String::new(),
             items,
             consulted_backend: "planner".to_string(),
             created_at: String::new(),

@@ -438,6 +438,7 @@ table.tbl tr:last-child td { border-bottom: 0; }
 .opt-purpose-label { font-family: var(--mono); font-size: 12px; color: var(--text2); min-width: 130px; padding-top: 4px; }
 .opt-purpose-text { flex: 1; font-size: 13px; line-height: 1.45; }
 .opt-purpose-input { flex: 1; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px; font-size: 13px; font-family: inherit; resize: vertical; }
+.opt-directive-input { width: 100%; box-sizing: border-box; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px; font-size: 13px; font-family: inherit; resize: vertical; }
 .opt-note { color: var(--text3); font-size: 12px; margin-top: 6px; }
 .opt-context-line { font-family: var(--mono); font-size: 12px; color: var(--text2); }
 .opt-consult-row { display: flex; gap: 8px; align-items: center; }
