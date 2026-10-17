@@ -824,6 +824,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "manager-app"
+version = "0.1.33"
+dependencies = [
+ "chrono",
+ "manager-config",
+ "manager-gateway",
+ "manager-mcp",
+ "manager-models",
+ "manager-mxc",
+ "manager-supervisor",
+ "manager-telemetry",
+ "manager-winml",
+ "manager-wizard",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+]
+
+[[package]]
 name = "manager-config"
 version = "0.1.33"
 dependencies = [

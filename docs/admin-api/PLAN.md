@@ -331,6 +331,36 @@ from the workspace and nothing can import from it:
   through both the Tauri adapter and the REST handler and compare
   (§3.9, phase 0).
 
+**The operation registry (Pete's drift-prevention requirement, as
+implemented in phase 0).** Every capability is declared exactly
+once, in `manager_app::registry`'s `for_each_operation!` macro: one
+entry per operation carrying its canonical name (the Tauri command
+name), its capability class (§3.5), its handler, its typed
+parameter list, and its REST route (`None` only for the explicit
+exclusions — desktop-only actions, the master-key value, the raw
+config patch, and the peripheral MCP/VS Code/WinML surface). From
+that single declaration, code generation produces:
+
+- the `Op` enum, the `OP_SPECS` table, and `dispatch()` in
+  manager-app — an exhaustive `match` with no wildcard arm, so a
+  registered operation without a dispatch arm does not compile;
+- the `#[tauri::command]` adapters and the `generate_handler!`
+  list in src-tauri;
+- the axum router in manager-api (phase 1), which registers each
+  spec's route with an authorization guard driven by the spec's
+  class through `role_allows` — itself an exhaustive `match` over
+  the class enum with no wildcard arm, so a new class cannot ship
+  without decided grants.
+
+Adding an operation is one registry line; the build then fails at
+every unhandled site until it is wired on all surfaces. Contract
+tests are the second line of defense: the registry enumerates
+itself (82 operations, unique names, unique routes, the §3.5
+matrix row by row), the frontend's invoked command names are
+checked against the registry (the `backend_test_request` defect
+class), and phase 1 adds a registry-vs-live-route-table test in
+manager-api.
+
 ### 3.2 Hosting: `manager-api`
 
 - New workspace crate **`manager-api`**: **axum** on the existing

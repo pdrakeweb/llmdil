@@ -1,6 +1,6 @@
 # Crate map — implementation contract
 
-Rust workspace scaffold for the Local LLM Service Manager. Ten library
+Rust workspace scaffold for the Local LLM Service Manager. Eleven library
 crates under `crates/` (workspace members) plus the Tauri shell in
 `src-tauri/` (excluded from the workspace; path-deps to the crates).
 The UI shell is in `ui/` (Vite + plain TypeScript; framework-independent
@@ -325,6 +325,19 @@ GTK/WebKit); kept syntactically valid.
 Vite + plain TypeScript scaffold (no framework lock-in). `npm run build`
 emits `ui/dist`. `src/main.ts` renders the scaffold page and calls the
 `get_status` Tauri command when running under Tauri.
+
+## manager-app — admin API plan §3.1
+
+Service core extracted from the Tauri shell (admin API plan, phase 0):
+`AppState` and its task/download registries, all 82 operation
+implementations (`op_*`, framework-free, typed `ApiError`), the
+activation journal (`activation`), and the gateway stats sampler
+(`gateway_stats`). `registry` holds the single operation
+declaration (`for_each_operation!`) from which the `Op` enum,
+`OP_SPECS`, `dispatch()`, the Tauri command adapters, and the REST
+router are all generated — see `docs/admin-api/PLAN.md` §3.1.
+Events leave through the `EventSink` trait (Tauri sink in the
+shell, broadcast sink in manager-api).
 
 ## manager-present
 
