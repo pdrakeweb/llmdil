@@ -18,6 +18,7 @@ serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 manager-app = { path = "../crates/manager-app" }
+manager-api = { path = "../crates/manager-api" }
 manager-config = { path = "../crates/manager-config" }
 manager-wizard = { path = "../crates/manager-wizard" }
 manager-supervisor = { path = "../crates/manager-supervisor" }

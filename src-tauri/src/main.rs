@@ -28,6 +28,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use manager_app::{registry::Op, AppState, EventSink};
 
+/// Holds the running admin API server, if enabled, for the app's
+/// lifetime (dropping it does not stop the server; the Phase-2
+/// settings flow owns start/stop through this slot).
+pub struct ApiServerSlot(pub std::sync::Mutex<Option<manager_api::ApiServer>>);
+
 /// Forwards operation events into the webview, preserving the event
 /// names and payload shapes the frontend listens for.
 pub struct TauriSink(AppHandle);
@@ -90,7 +95,45 @@ fn main() {
                     manager_config::AppConfig::default_config()
                 }
             };
-            app.manage(Arc::new(AppState::new(config, config_path, data_dir)));
+            let admin_api = config.admin_api.clone();
+            let api_data_dir = data_dir.clone();
+            let app_state = Arc::new(AppState::new(config, config_path, data_dir));
+            app.manage(app_state.clone());
+            app.manage(ApiServerSlot(std::sync::Mutex::new(None)));
+            // Admin REST API (phase 1 wiring): when enabled in the
+            // config, serve on loopback with the self-signed
+            // certificate. The LAN bind, firewall rule, and auth
+            // arrive with the phase-2 enablement flow; until then
+            // this is the loopback development surface.
+            if admin_api.enabled {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let tls = match manager_api::tls::load_or_generate(&api_data_dir) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("admin api: TLS setup failed: {e}");
+                            return;
+                        }
+                    };
+                    match manager_api::ApiServer::start(
+                        app_state,
+                        api_data_dir,
+                        manager_api::ApiOptions {
+                            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                            port: admin_api.port,
+                            tls: Some(tls),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(server) => {
+                            let slot = handle.state::<ApiServerSlot>();
+                            *slot.inner().0.lock().unwrap() = Some(server);
+                        }
+                        Err(e) => eprintln!("admin api: failed to start: {e}"),
+                    }
+                });
+            }
             // Hydrate the wizard checklist from the machine's actual
             // state in the background (audit checks adopted into the
             // install wizard), so a relaunched app does not present

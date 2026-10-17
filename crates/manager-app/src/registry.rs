@@ -85,14 +85,73 @@ pub enum HttpMethod {
     Delete,
 }
 
-/// One operation's declared REST route: method, path template (path
-/// placeholders are named after the operation's arguments — the API
-/// layer merges them into the argument object by name), and an
-/// optional argument name the whole request body is wrapped under
-/// (for operations whose single argument is the body document
-/// itself: `patch`, `request`, `report`, `policy`). `None` in the
-/// wrap slot means body fields merge into the argument object.
-pub type RouteSpec = (HttpMethod, &'static str, Option<&'static str>);
+/// How a route's response is produced (rest-api.md §2/§6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteMode {
+    /// Run the operation and return its result (200).
+    Sync,
+    /// Long-running: the operation runs as a task; the route answers
+    /// 202 with the operation resource (phase 4; synchronous until
+    /// then).
+    AsyncOp,
+    /// Creates a resource: 201 with the operation result.
+    Created,
+}
+
+/// One operation's declared REST route. Path placeholders are named
+/// after the operation's arguments — the API layer merges them into
+/// the argument object by name. `body_wrap` names an argument the
+/// whole request body is wrapped under (for operations whose single
+/// argument is the body document itself: `patch`, `request`,
+/// `report`, `policy`); `None` means body fields merge into the
+/// argument object.
+#[derive(Debug, Clone, Copy)]
+pub struct RouteSpec {
+    pub method: HttpMethod,
+    pub path: &'static str,
+    pub body_wrap: Option<&'static str>,
+    pub mode: RouteMode,
+}
+
+/// A plain synchronous route.
+pub const fn route(method: HttpMethod, path: &'static str) -> RouteSpec {
+    RouteSpec {
+        method,
+        path,
+        body_wrap: None,
+        mode: RouteMode::Sync,
+    }
+}
+
+/// A synchronous route whose body is one named argument's value.
+pub const fn route_wrap(method: HttpMethod, path: &'static str, wrap: &'static str) -> RouteSpec {
+    RouteSpec {
+        method,
+        path,
+        body_wrap: Some(wrap),
+        mode: RouteMode::Sync,
+    }
+}
+
+/// A long-running route (202 + operation resource).
+pub const fn route_async(method: HttpMethod, path: &'static str) -> RouteSpec {
+    RouteSpec {
+        method,
+        path,
+        body_wrap: None,
+        mode: RouteMode::AsyncOp,
+    }
+}
+
+/// A resource-creating route (201).
+pub const fn route_created(method: HttpMethod, path: &'static str) -> RouteSpec {
+    RouteSpec {
+        method,
+        path,
+        body_wrap: None,
+        mode: RouteMode::Created,
+    }
+}
 
 /// The static description of one registered operation.
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +160,10 @@ pub struct OpSpec {
     /// The Tauri command name (also the operation's canonical name).
     pub name: &'static str,
     pub class: CapClass,
+    /// The operation's argument names. The REST layer treats request
+    /// bodies as closed objects: fields outside this list are
+    /// rejected (rest-api.md §2).
+    pub params: &'static [&'static str],
     /// REST route, or `None` for an explicit exclusion (see module docs).
     pub route: Option<RouteSpec>,
 }
@@ -122,37 +185,37 @@ macro_rules! for_each_operation {
     ($m:ident) => {
         $m! {
             // Status / config
-            (GetStatus, get_status, R, op_get_status, [], Some((HttpMethod::Get, "/api/v1/status", None))),
-            (GetConfig, get_config, SConfig, op_get_config, [], Some((HttpMethod::Get, "/api/v1/config", None))),
+            (GetStatus, get_status, R, op_get_status, [], Some(route(HttpMethod::Get, "/api/v1/status"))),
+            (GetConfig, get_config, SConfig, op_get_config, [], Some(route(HttpMethod::Get, "/api/v1/config"))),
             // Excluded from REST v1 (PLAN.md decision 11: the broad raw
             // config patch; domain endpoints cover the same ground).
             (UpdateConfig, update_config, C, op_update_config, [patch: Value], None),
             // Backends
-            (ListBackends, list_backends, R, op_list_backends, [], Some((HttpMethod::Get, "/api/v1/backends", None))),
-            (StartBackend, start_backend, L, op_start_backend, [id: String], Some((HttpMethod::Post, "/api/v1/backends/{id}/start", None))),
-            (StopBackend, stop_backend, L, op_stop_backend, [id: String, graceful: bool], Some((HttpMethod::Post, "/api/v1/backends/{id}/stop", None))),
-            (RestartBackend, restart_backend, L, op_restart_backend, [id: String, graceful: bool], Some((HttpMethod::Post, "/api/v1/backends/{id}/restart", None))),
-            (TestBackend, test_backend, L, op_test_backend, [id: String, prompt: String], Some((HttpMethod::Post, "/api/v1/backends/{id}/test", None))),
-            (BackendGetConfig, backend_get_config, SConfig, op_backend_get_config, [id: String], Some((HttpMethod::Get, "/api/v1/backends/{id}/config", None))),
-            (BackendPreviewDiff, backend_preview_diff, R, op_backend_preview_diff, [id: String, patch: Value], Some((HttpMethod::Post, "/api/v1/backends/{id}/config/preview-diff", None))),
-            (BackendApplyConfig, backend_apply_config, C, op_backend_apply_config, [id: String, patch: Value, apply_mode: String], Some((HttpMethod::Patch, "/api/v1/backends/{id}/config", None))),
-            (BackendAdd, backend_add, C, op_backend_add, [id: String, model_id: String, port: u16, group: String, create_group: bool, enabled: bool], Some((HttpMethod::Post, "/api/v1/backends", None))),
-            (BackendUpdateFlags, backend_update_flags, C, op_backend_update_flags, [id: String, n_ctx: u32, n_batch: u32], Some((HttpMethod::Put, "/api/v1/backends/{id}/flags", None))),
-            (BackendSetOffload, backend_set_offload, C, op_backend_set_offload, [id: String, layers: u32], Some((HttpMethod::Put, "/api/v1/backends/{id}/offload", None))),
-            (BackendDelete, backend_delete, D, op_backend_delete, [id: String], Some((HttpMethod::Delete, "/api/v1/backends/{id}", None))),
-            (BackendGetLaunchCommand, backend_get_launch_command, SDisclosure, op_backend_get_launch_command, [id: String], Some((HttpMethod::Get, "/api/v1/backends/{id}/launch-command", None))),
+            (ListBackends, list_backends, R, op_list_backends, [], Some(route(HttpMethod::Get, "/api/v1/backends"))),
+            (StartBackend, start_backend, L, op_start_backend, [id: String], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/start"))),
+            (StopBackend, stop_backend, L, op_stop_backend, [id: String, graceful: bool], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/stop"))),
+            (RestartBackend, restart_backend, L, op_restart_backend, [id: String, graceful: bool], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/restart"))),
+            (TestBackend, test_backend, L, op_test_backend, [id: String, prompt: String], Some(route(HttpMethod::Post, "/api/v1/backends/{id}/test"))),
+            (BackendGetConfig, backend_get_config, SConfig, op_backend_get_config, [id: String], Some(route(HttpMethod::Get, "/api/v1/backends/{id}/config"))),
+            (BackendPreviewDiff, backend_preview_diff, R, op_backend_preview_diff, [id: String, patch: Value], Some(route(HttpMethod::Post, "/api/v1/backends/{id}/config/preview-diff"))),
+            (BackendApplyConfig, backend_apply_config, C, op_backend_apply_config, [id: String, patch: Value, apply_mode: String], Some(route(HttpMethod::Patch, "/api/v1/backends/{id}/config"))),
+            (BackendAdd, backend_add, C, op_backend_add, [id: String, model_id: String, port: u16, group: String, create_group: bool, enabled: bool], Some(route_created(HttpMethod::Post, "/api/v1/backends"))),
+            (BackendUpdateFlags, backend_update_flags, C, op_backend_update_flags, [id: String, n_ctx: u32, n_batch: u32], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/flags"))),
+            (BackendSetOffload, backend_set_offload, C, op_backend_set_offload, [id: String, layers: u32], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/offload"))),
+            (BackendDelete, backend_delete, D, op_backend_delete, [id: String], Some(route(HttpMethod::Delete, "/api/v1/backends/{id}"))),
+            (BackendGetLaunchCommand, backend_get_launch_command, SDisclosure, op_backend_get_launch_command, [id: String], Some(route(HttpMethod::Get, "/api/v1/backends/{id}/launch-command"))),
             // Wizard / setup
-            (RunWizardStep, run_wizard_step, D, op_run_wizard_step, [step_id: String], Some((HttpMethod::Post, "/api/v1/setup/steps/{step_id}/run", None))),
-            (RunAudit, run_audit, L, op_run_audit, [], Some((HttpMethod::Post, "/api/v1/setup/audit", None))),
-            (SetupGetPrerequisites, setup_get_prerequisites, R, op_setup_get_prerequisites, [], Some((HttpMethod::Get, "/api/v1/setup/prerequisites", None))),
-            (SetupRetryStep, setup_retry_step, D, op_setup_retry_step, [step_id: String], Some((HttpMethod::Post, "/api/v1/setup/steps/{step_id}/retry", None))),
-            (SetupSkipStep, setup_skip_step, C, op_setup_skip_step, [step_id: String, note: String], Some((HttpMethod::Post, "/api/v1/setup/steps/{step_id}/skip", None))),
-            (SetupGetCommands, setup_get_commands, R, op_setup_get_commands, [step_id: String], Some((HttpMethod::Get, "/api/v1/setup/steps/{step_id}/commands", None))),
-            (SetupMarkManual, setup_mark_manual, C, op_setup_mark_manual, [step_id: String, path: String, version: String], Some((HttpMethod::Post, "/api/v1/setup/steps/{step_id}/mark-manual", None))),
-            (SetupGetSteps, setup_get_steps, R, op_setup_get_steps, [], Some((HttpMethod::Get, "/api/v1/setup/steps", None))),
-            (SetupStatus, setup_status, R, op_setup_status, [], Some((HttpMethod::Get, "/api/v1/setup/status", None))),
-            (SetupMarkComplete, setup_mark_complete, C, op_setup_mark_complete, [], Some((HttpMethod::Post, "/api/v1/setup/complete", None))),
-            (SetupStepHelpUrl, setup_step_help_url, R, op_setup_step_help_url, [step_id: String], Some((HttpMethod::Get, "/api/v1/setup/steps/{step_id}/help-url", None))),
+            (RunWizardStep, run_wizard_step, D, op_run_wizard_step, [step_id: String], Some(route_async(HttpMethod::Post, "/api/v1/setup/steps/{step_id}/run"))),
+            (RunAudit, run_audit, L, op_run_audit, [], Some(route_async(HttpMethod::Post, "/api/v1/setup/audit"))),
+            (SetupGetPrerequisites, setup_get_prerequisites, R, op_setup_get_prerequisites, [], Some(route(HttpMethod::Get, "/api/v1/setup/prerequisites"))),
+            (SetupRetryStep, setup_retry_step, D, op_setup_retry_step, [step_id: String], Some(route_async(HttpMethod::Post, "/api/v1/setup/steps/{step_id}/retry"))),
+            (SetupSkipStep, setup_skip_step, C, op_setup_skip_step, [step_id: String, note: String], Some(route(HttpMethod::Post, "/api/v1/setup/steps/{step_id}/skip"))),
+            (SetupGetCommands, setup_get_commands, R, op_setup_get_commands, [step_id: String], Some(route(HttpMethod::Get, "/api/v1/setup/steps/{step_id}/commands"))),
+            (SetupMarkManual, setup_mark_manual, C, op_setup_mark_manual, [step_id: String, path: String, version: String], Some(route(HttpMethod::Post, "/api/v1/setup/steps/{step_id}/mark-manual"))),
+            (SetupGetSteps, setup_get_steps, R, op_setup_get_steps, [], Some(route(HttpMethod::Get, "/api/v1/setup/steps"))),
+            (SetupStatus, setup_status, R, op_setup_status, [], Some(route(HttpMethod::Get, "/api/v1/setup/status"))),
+            (SetupMarkComplete, setup_mark_complete, C, op_setup_mark_complete, [], Some(route(HttpMethod::Post, "/api/v1/setup/complete"))),
+            (SetupStepHelpUrl, setup_step_help_url, R, op_setup_step_help_url, [step_id: String], Some(route(HttpMethod::Get, "/api/v1/setup/steps/{step_id}/help-url"))),
             // Desktop-only actions: no REST equivalent (rest-api.md §7).
             (OpenUrl, open_url, L, op_open_url, [url: String], None),
             (OpenFolder, open_folder, L, op_open_folder, [path: String], None),
@@ -163,46 +226,46 @@ macro_rules! for_each_operation {
             // composition (rest-api.md §6.5), not as its own route.
             (GatewaySetBindHost, gateway_set_bind_host, C, op_gateway_set_bind_host, [host: String], None),
             // Models
-            (ListModels, list_models, R, op_list_models, [], Some((HttpMethod::Get, "/api/v1/models", None))),
-            (DownloadModel, download_model, L, op_download_model, [id: String], Some((HttpMethod::Post, "/api/v1/models/{id}/download", None))),
-            (CancelDownload, cancel_download, L, op_cancel_download, [id: String], Some((HttpMethod::Post, "/api/v1/models/{id}/download/cancel", None))),
-            (ModelPauseDownload, model_pause_download, L, op_model_pause_download, [id: String], Some((HttpMethod::Post, "/api/v1/models/{id}/download/pause", None))),
-            (ModelResumeDownload, model_resume_download, L, op_model_resume_download, [id: String], Some((HttpMethod::Post, "/api/v1/models/{id}/download/resume", None))),
-            (ModelVerifyChecksum, model_verify_checksum, L, op_model_verify_checksum, [id: String], Some((HttpMethod::Post, "/api/v1/models/{id}/verify", None))),
+            (ListModels, list_models, R, op_list_models, [], Some(route(HttpMethod::Get, "/api/v1/models"))),
+            (DownloadModel, download_model, L, op_download_model, [id: String], Some(route_async(HttpMethod::Post, "/api/v1/models/{id}/download"))),
+            (CancelDownload, cancel_download, L, op_cancel_download, [id: String], Some(route(HttpMethod::Post, "/api/v1/models/{id}/download/cancel"))),
+            (ModelPauseDownload, model_pause_download, L, op_model_pause_download, [id: String], Some(route(HttpMethod::Post, "/api/v1/models/{id}/download/pause"))),
+            (ModelResumeDownload, model_resume_download, L, op_model_resume_download, [id: String], Some(route_async(HttpMethod::Post, "/api/v1/models/{id}/download/resume"))),
+            (ModelVerifyChecksum, model_verify_checksum, L, op_model_verify_checksum, [id: String], Some(route_async(HttpMethod::Post, "/api/v1/models/{id}/verify"))),
             // PATCH /models/{id} is a composite over this and
             // model_set_enabled (rest-api.md §6.3); no 1:1 route.
             (ModelSetShortName, model_set_short_name, C, op_model_set_short_name, [id: String, name: String], None),
-            (ModelDelete, model_delete, D, op_model_delete, [id: String], Some((HttpMethod::Delete, "/api/v1/models/{id}", None))),
-            (ModelAssign, model_assign, C, op_model_assign, [id: String, backend_id: String, split: Vec<f32>], Some((HttpMethod::Post, "/api/v1/models/{id}/assign", None))),
-            (ModelAdd, model_add, C, op_model_add, [id: String, source_url: String, file_name: Option<String>, quant: Option<String>, params_b: Option<f32>], Some((HttpMethod::Post, "/api/v1/models", None))),
+            (ModelDelete, model_delete, D, op_model_delete, [id: String], Some(route(HttpMethod::Delete, "/api/v1/models/{id}"))),
+            (ModelAssign, model_assign, C, op_model_assign, [id: String, backend_id: String, split: Vec<f32>], Some(route(HttpMethod::Post, "/api/v1/models/{id}/assign"))),
+            (ModelAdd, model_add, C, op_model_add, [id: String, source_url: String, file_name: Option<String>, quant: Option<String>, params_b: Option<f32>], Some(route_created(HttpMethod::Post, "/api/v1/models"))),
             (ModelSetEnabled, model_set_enabled, C, op_model_set_enabled, [id: String, enabled: bool], None),
             // Logs
-            (GetLogs, get_logs, R, op_get_logs, [scope: String, level: Option<String>, search: Option<String>, query: Option<String>, since_ms: Option<i64>, until_ms: Option<i64>, order: Option<String>, offset: Option<u64>, limit: Option<u64>], Some((HttpMethod::Get, "/api/v1/logs", None))),
+            (GetLogs, get_logs, R, op_get_logs, [scope: String, level: Option<String>, search: Option<String>, query: Option<String>, since_ms: Option<i64>, until_ms: Option<i64>, order: Option<String>, offset: Option<u64>, limit: Option<u64>], Some(route(HttpMethod::Get, "/api/v1/logs"))),
             // Gateway
-            (GetGatewayConfig, get_gateway_config, SConfig, op_get_gateway_config, [], Some((HttpMethod::Get, "/api/v1/gateway/config", None))),
-            (UpdateGatewayConfig, update_gateway_config, C, op_update_gateway_config, [patch: Value], Some((HttpMethod::Patch, "/api/v1/gateway/config", Some("patch")))),
-            (GatewayStatus, gateway_status, R, op_gateway_status, [], Some((HttpMethod::Get, "/api/v1/gateway/status", None))),
-            (GatewayStop, gateway_stop, L, op_gateway_stop, [], Some((HttpMethod::Post, "/api/v1/gateway/stop", None))),
-            (GatewayActivationPlan, gateway_activation_plan, R, op_gateway_activation_plan, [], Some((HttpMethod::Get, "/api/v1/activation-plan", None))),
-            (GatewayActivationCancel, gateway_activation_cancel, D, op_gateway_activation_cancel, [], Some((HttpMethod::Post, "/api/v1/activation-plan/cancel", None))),
+            (GetGatewayConfig, get_gateway_config, SConfig, op_get_gateway_config, [], Some(route(HttpMethod::Get, "/api/v1/gateway/config"))),
+            (UpdateGatewayConfig, update_gateway_config, C, op_update_gateway_config, [patch: Value], Some(route_wrap(HttpMethod::Patch, "/api/v1/gateway/config", "patch"))),
+            (GatewayStatus, gateway_status, R, op_gateway_status, [], Some(route(HttpMethod::Get, "/api/v1/gateway/status"))),
+            (GatewayStop, gateway_stop, L, op_gateway_stop, [], Some(route(HttpMethod::Post, "/api/v1/gateway/stop"))),
+            (GatewayActivationPlan, gateway_activation_plan, R, op_gateway_activation_plan, [], Some(route(HttpMethod::Get, "/api/v1/activation-plan"))),
+            (GatewayActivationCancel, gateway_activation_cancel, D, op_gateway_activation_cancel, [], Some(route(HttpMethod::Post, "/api/v1/activation-plan/cancel"))),
             // Internal bookkeeping: performed by the server after a
             // successful apply or gateway (re)start, not a client route.
             (GatewayActivationComplete, gateway_activation_complete, L, op_gateway_activation_complete, [], None),
-            (GatewayQuiesceWait, gateway_quiesce_wait, L, op_gateway_quiesce_wait, [timeout_secs: u64], Some((HttpMethod::Post, "/api/v1/activation-plan/quiesce-wait", None))),
-            (GatewayPreviewYaml, gateway_preview_yaml, R, op_gateway_preview_yaml, [], Some((HttpMethod::Get, "/api/v1/gateway/generated-config", None))),
-            (GatewayTestRouting, gateway_test_routing, R, op_gateway_test_routing, [request: Value], Some((HttpMethod::Post, "/api/v1/gateway/routing/test", Some("request")))),
-            (GatewayRecentRequests, gateway_recent_requests, R, op_gateway_recent_requests, [], Some((HttpMethod::Get, "/api/v1/gateway/routing/recent", None))),
+            (GatewayQuiesceWait, gateway_quiesce_wait, L, op_gateway_quiesce_wait, [timeout_secs: u64], Some(route(HttpMethod::Post, "/api/v1/activation-plan/quiesce-wait"))),
+            (GatewayPreviewYaml, gateway_preview_yaml, R, op_gateway_preview_yaml, [], Some(route(HttpMethod::Get, "/api/v1/gateway/generated-config"))),
+            (GatewayTestRouting, gateway_test_routing, R, op_gateway_test_routing, [request: Value], Some(route_wrap(HttpMethod::Post, "/api/v1/gateway/routing/test", "request"))),
+            (GatewayRecentRequests, gateway_recent_requests, R, op_gateway_recent_requests, [], Some(route(HttpMethod::Get, "/api/v1/gateway/routing/recent"))),
             // Telemetry / placement
-            (GetGpuTelemetry, get_gpu_telemetry, R, op_get_gpu_telemetry, [], Some((HttpMethod::Get, "/api/v1/telemetry/gpus", None))),
-            (TelemetrySetInterval, telemetry_set_interval, C, op_telemetry_set_interval, [ms: u64], Some((HttpMethod::Put, "/api/v1/telemetry/interval", None))),
-            (TelemetryResetPeaks, telemetry_reset_peaks, L, op_telemetry_reset_peaks, [], Some((HttpMethod::Post, "/api/v1/telemetry/reset-peaks", None))),
-            (TelemetrySaveSnapshot, telemetry_save_snapshot, L, op_telemetry_save_snapshot, [], Some((HttpMethod::Post, "/api/v1/telemetry/snapshots", None))),
-            (PlacementPropose, placement_propose, R, op_placement_propose, [model_id: String, split: Vec<f32>, backend_id: Option<String>], Some((HttpMethod::Post, "/api/v1/placement/propose", None))),
-            (PlacementApply, placement_apply, C, op_placement_apply, [model_id: String, split: Vec<f32>, backend_id: Option<String>], Some((HttpMethod::Post, "/api/v1/placement/apply", None))),
+            (GetGpuTelemetry, get_gpu_telemetry, R, op_get_gpu_telemetry, [], Some(route(HttpMethod::Get, "/api/v1/telemetry/gpus"))),
+            (TelemetrySetInterval, telemetry_set_interval, C, op_telemetry_set_interval, [ms: u64], Some(route(HttpMethod::Put, "/api/v1/telemetry/interval"))),
+            (TelemetryResetPeaks, telemetry_reset_peaks, L, op_telemetry_reset_peaks, [], Some(route(HttpMethod::Post, "/api/v1/telemetry/reset-peaks"))),
+            (TelemetrySaveSnapshot, telemetry_save_snapshot, L, op_telemetry_save_snapshot, [], Some(route(HttpMethod::Post, "/api/v1/telemetry/snapshots"))),
+            (PlacementPropose, placement_propose, R, op_placement_propose, [model_id: String, split: Vec<f32>, backend_id: Option<String>], Some(route(HttpMethod::Post, "/api/v1/placement/propose"))),
+            (PlacementApply, placement_apply, C, op_placement_apply, [model_id: String, split: Vec<f32>, backend_id: Option<String>], Some(route(HttpMethod::Post, "/api/v1/placement/apply"))),
             // Tasks / diagnostics
-            (TaskAbort, task_abort, L, op_task_abort, [task_id: String], Some((HttpMethod::Post, "/api/v1/operations/{task_id}/abort", None))),
-            (TasksList, tasks_list, R, op_tasks_list, [], Some((HttpMethod::Get, "/api/v1/operations", None))),
-            (DiagnosticsExportBundle, diagnostics_export_bundle, SDisclosure, op_diagnostics_export_bundle, [], Some((HttpMethod::Post, "/api/v1/diagnostics/bundles", None))),
+            (TaskAbort, task_abort, L, op_task_abort, [task_id: String], Some(route(HttpMethod::Post, "/api/v1/operations/{task_id}/abort"))),
+            (TasksList, tasks_list, R, op_tasks_list, [], Some(route(HttpMethod::Get, "/api/v1/operations"))),
+            (DiagnosticsExportBundle, diagnostics_export_bundle, SDisclosure, op_diagnostics_export_bundle, [], Some(route_async(HttpMethod::Post, "/api/v1/diagnostics/bundles"))),
             // MCP / VS Code — peripheral, excluded from REST v1
             // (PLAN.md decision 10); Tauri surface unchanged.
             (McpList, mcp_list, R, op_mcp_list, [], None),
@@ -211,22 +274,22 @@ macro_rules! for_each_operation {
             (VscodeInstallExtensions, vscode_install_extensions, X, op_vscode_install_extensions, [], None),
             (VscodeWriteConfig, vscode_write_config, X, op_vscode_write_config, [backup: bool], None),
             // MXC
-            (GetMxcPolicy, get_mxc_policy, SConfig, op_get_mxc_policy, [], Some((HttpMethod::Get, "/api/v1/mxc/policy", None))),
-            (UpdateMxcPolicy, update_mxc_policy, X, op_update_mxc_policy, [policy: Value], Some((HttpMethod::Put, "/api/v1/mxc/policy", Some("policy")))),
-            (MxcSetMode, mxc_set_mode, X, op_mxc_set_mode, [mode: manager_config::MxcMode], Some((HttpMethod::Put, "/api/v1/mxc/mode", None))),
-            (MxcRunSelfTest, mxc_run_self_test, R, op_mxc_run_self_test, [], Some((HttpMethod::Post, "/api/v1/mxc/self-test", None))),
-            (MxcGetActivityReport, mxc_get_activity_report, R, op_mxc_get_activity_report, [since_ms: Option<u64>], Some((HttpMethod::Get, "/api/v1/mxc/activity", None))),
-            (MxcProposeTightening, mxc_propose_tightening, R, op_mxc_propose_tightening, [report: Value], Some((HttpMethod::Post, "/api/v1/mxc/tightening-proposals", Some("report")))),
+            (GetMxcPolicy, get_mxc_policy, SConfig, op_get_mxc_policy, [], Some(route(HttpMethod::Get, "/api/v1/mxc/policy"))),
+            (UpdateMxcPolicy, update_mxc_policy, X, op_update_mxc_policy, [policy: Value], Some(route_wrap(HttpMethod::Put, "/api/v1/mxc/policy", "policy"))),
+            (MxcSetMode, mxc_set_mode, X, op_mxc_set_mode, [mode: manager_config::MxcMode], Some(route(HttpMethod::Put, "/api/v1/mxc/mode"))),
+            (MxcRunSelfTest, mxc_run_self_test, R, op_mxc_run_self_test, [], Some(route(HttpMethod::Post, "/api/v1/mxc/self-test"))),
+            (MxcGetActivityReport, mxc_get_activity_report, R, op_mxc_get_activity_report, [since_ms: Option<u64>], Some(route(HttpMethod::Get, "/api/v1/mxc/activity"))),
+            (MxcProposeTightening, mxc_propose_tightening, R, op_mxc_propose_tightening, [report: Value], Some(route_wrap(HttpMethod::Post, "/api/v1/mxc/tightening-proposals", "report"))),
             // Windows ML — peripheral, excluded from REST v1 (decision 10).
             (WinmlProbe, winml_probe, R, op_winml_probe, [], None),
             (WinmlRegister, winml_register, D, op_winml_register, [model_id: String], None),
             (WinmlUnregister, winml_unregister, D, op_winml_unregister, [], None),
             (WinmlStatus, winml_status, R, op_winml_status, [], None),
             // Updates
-            (UpdatesCheckAll, updates_check_all, R, op_updates_check_all, [], Some((HttpMethod::Post, "/api/v1/updates/check", None))),
-            (UpdatesApply, updates_apply, D, op_updates_apply, [component_id: String], Some((HttpMethod::Post, "/api/v1/updates/components/{component_id}/apply", None))),
-            (UpdatesPin, updates_pin, C, op_updates_pin, [component_id: String, version: Option<String>], Some((HttpMethod::Put, "/api/v1/updates/components/{component_id}/pin", None))),
-            (UpdatesSetAuto, updates_set_auto, C, op_updates_set_auto, [component_id: String, enabled: bool], Some((HttpMethod::Put, "/api/v1/updates/components/{component_id}/auto", None)))
+            (UpdatesCheckAll, updates_check_all, R, op_updates_check_all, [], Some(route(HttpMethod::Post, "/api/v1/updates/check"))),
+            (UpdatesApply, updates_apply, D, op_updates_apply, [component_id: String], Some(route(HttpMethod::Post, "/api/v1/updates/components/{component_id}/apply"))),
+            (UpdatesPin, updates_pin, C, op_updates_pin, [component_id: String, version: Option<String>], Some(route(HttpMethod::Put, "/api/v1/updates/components/{component_id}/pin"))),
+            (UpdatesSetAuto, updates_set_auto, C, op_updates_set_auto, [component_id: String, enabled: bool], Some(route(HttpMethod::Put, "/api/v1/updates/components/{component_id}/auto")))
         }
     };
 }
@@ -253,6 +316,7 @@ macro_rules! gen_op_specs {
                 op: Op::$variant,
                 name: stringify!($name),
                 class: CapClass::$class,
+                params: &[$(stringify!($pname)),*],
                 route: $route,
             }),*
         ];
@@ -314,7 +378,7 @@ mod tests {
         let mut routes: Vec<String> = OP_SPECS
             .iter()
             .filter_map(|s| s.route)
-            .map(|(m, p, _)| format!("{m:?} {p}"))
+            .map(|r| format!("{:?} {}", r.method, r.path))
             .collect();
         routes.sort();
         routes.dedup();

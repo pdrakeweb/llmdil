@@ -55,6 +55,15 @@ pub struct AppConfig {
     /// are managed state (the password lives in Credential Manager).
     #[serde(default)]
     pub postgres: PostgresConfig,
+    /// Admin REST API (admin-api plan): opt-in remote administration.
+    /// Disabled by default; when enabled the API binds all interfaces
+    /// on `port` with a firewall rule scoped to the local subnet and
+    /// the Tailscale range. Only enablement and the port are
+    /// configuration — users, sessions, and tokens live in the
+    /// dedicated `admin-users.json` store, never here, so a config
+    /// write can never mint or elevate an API user.
+    #[serde(default)]
+    pub admin_api: AdminApiConfig,
     /// Per-component pin / auto-update toggles.
     pub updates: UpdatePolicy,
     pub notifications: NotificationConfig,
@@ -327,6 +336,26 @@ impl Default for PostgresConfig {
     }
 }
 
+/// Admin REST API settings (see [`AppConfig::admin_api`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminApiConfig {
+    /// Master switch. The listener exists only while this is true
+    /// (persistent across restarts once enabled).
+    pub enabled: bool,
+    /// TCP port for the API listener (47821 per the plan; chosen to
+    /// sit clear of the gateway and backend port ranges).
+    pub port: u16,
+}
+
+impl Default for AdminApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 47821,
+        }
+    }
+}
+
 /// Per-component update pins and auto-update toggles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdatePolicy {
@@ -468,6 +497,7 @@ impl AppConfig {
                 model_id: None,
             },
             postgres: PostgresConfig::default(),
+            admin_api: AdminApiConfig::default(),
             updates: UpdatePolicy {
                 components: HashMap::new(),
             },
