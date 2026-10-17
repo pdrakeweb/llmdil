@@ -114,6 +114,9 @@ fn derived_class(method: &str, path: &str) -> AuthClass {
         ("PATCH", "/api/v1/models/{id}") => op_class("model_set_enabled"),
         ("POST", "/api/v1/gateway/start") => op_class("run_wizard_step"),
         ("POST", "/api/v1/activation-plan/apply") => AuthClass::Class(CapClass::L),
+        ("GET", "/api/v1/diagnostics/bundles/{bundle_id}/content") => {
+            op_class("diagnostics_export_bundle")
+        }
         _ => AuthClass::Class(CapClass::R),
     }
 }

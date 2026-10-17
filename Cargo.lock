@@ -981,6 +981,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "axum",
+ "futures-core",
  "hmac",
  "manager-app",
  "manager-config",

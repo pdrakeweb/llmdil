@@ -342,6 +342,8 @@ async fn activation_apply_on_empty_plan_and_role_gate() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "apply is class L");
 
+    // Since phase 4 the apply runs as an operation: 202, then the
+    // record's detail carries the composition's outcome.
     let (status, body) = call(
         &ctx,
         Method::POST,
@@ -350,9 +352,28 @@ async fn activation_apply_on_empty_plan_and_role_gate() {
         Some(json!({ "mode": "now" })),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["applied"], true);
-    assert_eq!(body["restarted_backends"], json!([]));
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let op_id = body["id"].as_str().unwrap().to_string();
+    let mut detail = Value::Null;
+    for _ in 0..100 {
+        let (status, record) = call(
+            &ctx,
+            Method::GET,
+            &format!("/api/v1/operations/{op_id}"),
+            Some(&operator),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        if record["status"] != "running" {
+            assert_eq!(record["status"], "done", "{record}");
+            detail = record["detail"].clone();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(detail["applied"], true);
+    assert_eq!(detail["restarted_backends"], json!([]));
 
     let (status, _) = call(
         &ctx,

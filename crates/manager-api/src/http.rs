@@ -51,6 +51,9 @@ pub const DERIVED_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/api/v1/gateway/groups/{name}"),
     ("POST", "/api/v1/gateway/start"),
     ("POST", "/api/v1/activation-plan/apply"),
+    // Phase 4: retained diagnostics bundle content + the event stream.
+    ("GET", "/api/v1/diagnostics/bundles/{bundle_id}/content"),
+    ("GET", "/api/v1/events"),
 ];
 
 /// Build the full router from the registry plus the derived routes.
@@ -107,6 +110,11 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
             "/api/v1/activation-plan/apply",
             axum::routing::post(handle_activation_apply),
         )
+        .route(
+            "/api/v1/diagnostics/bundles/{bundle_id}/content",
+            get(handle_bundle_content),
+        )
+        .route("/api/v1/events", get(handle_events))
         .route("/api/v1/updates", get(handle_updates));
     for (method, path, _class) in crate::auth_routes::AUTH_ROUTES {
         records.push(RouteRecord { method, path });
@@ -205,6 +213,74 @@ async fn handle_op(
         Ok(a) => a,
         Err(resp) => return *resp,
     };
+    // Asynchronous operations (rest-api.md §3.1): create the
+    // operation record, spawn the dispatch, answer 202. The
+    // record's detail carries the outcome the synchronous call
+    // would have returned.
+    if spec.route.map(|r| r.mode) == Some(RouteMode::AsyncOp) {
+        let (id, record) = ctx.operations.begin(spec.name);
+        let spawn_ctx = ctx.clone();
+        tokio::spawn(async move {
+            match manager_app::registry::dispatch(&spawn_ctx.app, &spawn_ctx.sink, spec.op, args)
+                .await
+            {
+                Ok(value) => {
+                    if spec.op == Op::RunWizardStep
+                        && value.get("busy") == Some(&json!(true))
+                    {
+                        spawn_ctx.operations.fail_with_detail(
+                            &id,
+                            "a wizard step is already running",
+                            value,
+                        );
+                    } else {
+                        spawn_ctx
+                            .operations
+                            .complete(&id, spec.name, Ok(value));
+                    }
+                }
+                Err(e) => {
+                    let message = sanitize(&e.to_string(), &spawn_ctx.data_dir);
+                    spawn_ctx
+                        .operations
+                        .complete(&id, spec.name, Err(message));
+                }
+            }
+        });
+        return (axum::http::StatusCode::ACCEPTED, axum::Json(record)).into_response();
+    }
+    // The operations list merges the app's task records with the
+    // API-side operation records.
+    if spec.op == Op::TasksList {
+        return match manager_app::registry::dispatch(&ctx.app, &ctx.sink, spec.op, args).await {
+            Ok(mut value) => {
+                if let Some(arr) = value.as_array_mut() {
+                    let known: std::collections::HashSet<String> = arr
+                        .iter()
+                        .filter_map(|t| t["id"].as_str().map(str::to_string))
+                        .collect();
+                    for record in ctx.operations.list() {
+                        if !known.contains(record["id"].as_str().unwrap_or("")) {
+                            arr.push(record);
+                        }
+                    }
+                }
+                (axum::http::StatusCode::OK, axum::Json(value)).into_response()
+            }
+            Err(e) => error_response(&ctx, &e, None),
+        };
+    }
+    // Abort: API-side records flip in the API store (bookkeeping
+    // parity with the app); anything else is an app task.
+    if spec.op == Op::TaskAbort {
+        if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
+            if ctx.operations.get(task_id).is_some() {
+                ctx.operations.abort(task_id);
+                return axum::Json(json!({ "ok": true, "task_id": task_id }))
+                    .into_response();
+            }
+        }
+    }
     // PATCH /gateway/config composition: a bind_host field routes
     // through the dedicated bind operation (composites module).
     if spec.op == Op::UpdateGatewayConfig {
@@ -434,7 +510,7 @@ async fn handle_server_identity(State(ctx): State<Arc<ApiCtx>>) -> Response {
         "api_version": "1",
         "features": {
             "operations": true,
-            "events_sse": false,
+            "events_sse": true,
             "auth": true
         }
     }))
@@ -462,6 +538,9 @@ async fn handle_model_one(State(ctx): State<Arc<ApiCtx>>, Path(id): Path<String>
 }
 
 async fn handle_operation_one(State(ctx): State<Arc<ApiCtx>>, Path(id): Path<String>) -> Response {
+    if let Some(record) = ctx.operations.get(&id) {
+        return axum::Json(record).into_response();
+    }
     match dispatch_read(&ctx, Op::TasksList, json!({})).await {
         Ok(list) => match find_by_id(&list, "tasks", &id) {
             Some(t) => axum::Json(t).into_response(),
@@ -580,10 +659,34 @@ async fn handle_group_delete(
 }
 
 async fn handle_gateway_start(State(ctx): State<Arc<ApiCtx>>) -> Response {
-    match composites::gateway_start(&ctx).await {
-        Ok(v) => axum::Json(v).into_response(),
-        Err(e) => error_response(&ctx, &e, None),
-    }
+    // The start-gateway step is minutes-scale: it runs as an
+    // operation like its registry route does.
+    let (id, record) = ctx.operations.begin("gateway_start");
+    let spawn_ctx = ctx.clone();
+    tokio::spawn(async move {
+        match composites::gateway_start(&spawn_ctx).await {
+            Ok(value) => {
+                if value.get("busy") == Some(&json!(true)) {
+                    spawn_ctx.operations.fail_with_detail(
+                        &id,
+                        "a wizard step is already running",
+                        value,
+                    );
+                } else {
+                    spawn_ctx
+                        .operations
+                        .complete(&id, "gateway_start", Ok(value));
+                }
+            }
+            Err(e) => {
+                let message = sanitize(&e.to_string(), &spawn_ctx.data_dir);
+                spawn_ctx
+                    .operations
+                    .complete(&id, "gateway_start", Err(message));
+            }
+        }
+    });
+    (axum::http::StatusCode::ACCEPTED, axum::Json(record)).into_response()
 }
 
 async fn handle_activation_apply(
@@ -594,10 +697,116 @@ async fn handle_activation_apply(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    match composites::activation_apply(&ctx, parsed).await {
-        Ok(v) => axum::Json(v).into_response(),
-        Err(e) => error_response(&ctx, &e, None),
+    // The apply is the longest composition (drain + gateway
+    // restart): it runs as an operation. Body shape errors are
+    // refused synchronously, before queueing.
+    if let Err(e) = composites::validate_apply_body(&parsed) {
+        return error_response(&ctx, &e, None);
     }
+    let (id, record) = ctx.operations.begin("activation_apply");
+    let spawn_ctx = ctx.clone();
+    tokio::spawn(async move {
+        match composites::activation_apply(&spawn_ctx, parsed).await {
+            Ok(value) => spawn_ctx
+                .operations
+                .complete(&id, "activation_apply", Ok(value)),
+            Err(e) => {
+                let message = sanitize(&e.to_string(), &spawn_ctx.data_dir);
+                spawn_ctx
+                    .operations
+                    .complete(&id, "activation_apply", Err(message));
+            }
+        }
+    });
+    (axum::http::StatusCode::ACCEPTED, axum::Json(record)).into_response()
+}
+
+async fn handle_bundle_content(
+    State(ctx): State<Arc<ApiCtx>>,
+    Path(bundle_id): Path<String>,
+) -> Response {
+    let Some(path) = ctx.operations.bundle_path(&bundle_id) else {
+        return not_found(&ctx, "bundle", &bundle_id);
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "diagnostics.zip".to_string());
+            (
+                axum::http::StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{name}\""),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => error_response(
+            &ctx,
+            &ApiError::Io(format!("bundle file unreadable: {e}")),
+            None,
+        ),
+    }
+}
+
+/// Process-global SSE event sequence: ids keep increasing across
+/// reconnects, so a client can tell what it missed (events are not
+/// replayed; the stream is live-only).
+static EVENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+struct MpscEventStream {
+    rx: tokio::sync::mpsc::Receiver<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >,
+}
+
+impl futures_core::Stream for MpscEventStream {
+    type Item = Result<axum::response::sse::Event, std::convert::Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+async fn handle_events(State(ctx): State<Arc<ApiCtx>>) -> Response {
+    let mut events = ctx.events.subscribe();
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(env) => {
+                    let id = EVENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let event = axum::response::sse::Event::default()
+                        .id(id.to_string())
+                        .event(env.event)
+                        .data(env.payload.to_string());
+                    if tx.send(Ok(event)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    let event = axum::response::sse::Event::default()
+                        .comment(format!("lagged: {n} event(s) dropped"));
+                    if tx.send(Ok(event)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    axum::response::sse::Sse::new(MpscEventStream { rx })
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 #[cfg(test)]

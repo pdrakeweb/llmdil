@@ -230,8 +230,12 @@ pub async fn gateway_start(ctx: &ApiCtx) -> Result<Value, ApiError> {
 /// then — when the gateway has pending changes — optionally drains,
 /// stops the gateway, runs the start-gateway step, and performs
 /// the completion bookkeeping server-side.
-pub async fn activation_apply(ctx: &ApiCtx, body: Value) -> Result<Value, ApiError> {
-    let obj = closed_object(&body)?;
+/// Validate an apply body (closed object, mode in {drain, now})
+/// and return the mode. Split out so the HTTP handler can refuse
+/// a malformed request synchronously, before the operation is
+/// queued (the composition re-validates on entry).
+pub fn validate_apply_body(body: &Value) -> Result<String, ApiError> {
+    let obj = closed_object(body)?;
     reject_unknown(obj, &["mode"])?;
     let mode = obj
         .get("mode")
@@ -240,6 +244,12 @@ pub async fn activation_apply(ctx: &ApiCtx, body: Value) -> Result<Value, ApiErr
     if mode != "now" && mode != "drain" {
         return Err(invalid("`mode` must be \"drain\" or \"now\""));
     }
+    Ok(mode.to_string())
+}
+
+pub async fn activation_apply(ctx: &ApiCtx, body: Value) -> Result<Value, ApiError> {
+    let mode = validate_apply_body(&body)?;
+    let mode = mode.as_str();
     let plan = call(ctx, Op::GatewayActivationPlan, json!({})).await?;
     let restart_ids: Vec<String> = plan
         .get("backend_restart_ids")

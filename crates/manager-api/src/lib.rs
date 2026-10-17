@@ -16,10 +16,13 @@ use tokio::sync::{broadcast, oneshot};
 
 use manager_app::{AppState, EventSink};
 
+use crate::operations::OperationStore;
+
 pub mod audit;
 pub mod firewall;
 pub mod auth_routes;
 pub mod composites;
+pub mod operations;
 pub mod auth;
 pub mod http;
 pub mod tls;
@@ -89,6 +92,9 @@ pub struct ApiCtx {
     pub auth: Arc<AuthService>,
     /// The mutation/auth audit log.
     pub audit: Arc<AuditLog>,
+    /// API-side operation records for the asynchronous endpoints,
+    /// plus retained diagnostics bundle locations (phase 4).
+    pub operations: Arc<OperationStore>,
     /// Serializes composite read-modify-write sequences (gateway
     /// group CRUD, gateway-config patch) so concurrent API writers
     /// cannot lose each other's updates; single operations are
@@ -140,6 +146,7 @@ impl ApiCtx {
             users,
             auth,
             audit,
+            operations: Arc::new(OperationStore::new()),
             config_write_lock: tokio::sync::Mutex::new(()),
         })
     }
