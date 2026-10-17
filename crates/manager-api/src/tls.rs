@@ -28,6 +28,89 @@ fn tls_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("admin-api").join("tls")
 }
 
+/// The names a certificate should cover: DNS names (hostname,
+/// `localhost`) and IP addresses (loopback, the LAN address, the
+/// Tailscale address when present). Clients pin the fingerprint,
+/// so SAN changes force a re-pair — regeneration is an explicit
+/// enable-time decision, not a silent drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertSans {
+    pub dns: Vec<String>,
+    pub ips: Vec<std::net::IpAddr>,
+}
+
+impl CertSans {
+    /// Loopback development set (phase 1).
+    pub fn loopback() -> Self {
+        Self {
+            dns: vec!["localhost".to_string()],
+            ips: vec![
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            ],
+        }
+    }
+
+    fn encode(&self) -> String {
+        let mut parts: Vec<String> = self.dns.iter().map(|d| format!("dns:{d}")).collect();
+        parts.extend(self.ips.iter().map(|i| format!("ip:{i}")));
+        parts.sort();
+        parts.join(",")
+    }
+}
+
+/// Load the stored certificate if it covers `sans`, otherwise
+/// generate a fresh one covering them (fingerprint changes, so
+/// paired clients must re-pair — the intended consequence).
+pub fn ensure_cert(data_dir: &Path, sans: &CertSans) -> io::Result<TlsMaterial> {
+    let dir = tls_dir(data_dir);
+    let sans_path = dir.join("sans.txt");
+    if sans_path.exists()
+        && std::fs::read_to_string(&sans_path)
+            .map(|t| t.trim() == sans.encode())
+            .unwrap_or(false)
+    {
+        return load_or_generate(data_dir);
+    }
+    let material = generate_with_sans(sans)?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("server.crt"), &material.cert_pem)?;
+    std::fs::write(dir.join("server.key"), &material.key_pem)?;
+    std::fs::write(dir.join("fingerprint.txt"), &material.fingerprint_sha256)?;
+    std::fs::write(&sans_path, sans.encode())?;
+    Ok(material)
+}
+
+fn generate_with_sans(sans: &CertSans) -> io::Result<TlsMaterial> {
+    let mut params =
+        rcgen::CertificateParams::new(sans.dns.clone()).map_err(io::Error::other)?;
+    for ip in &sans.ips {
+        params.subject_alt_names.push(rcgen::SanType::IpAddress(*ip));
+    }
+    params.distinguished_name = {
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, "LLMdil Admin API");
+        dn
+    };
+    let key_pair = rcgen::KeyPair::generate().map_err(io::Error::other)?;
+    let cert = params.self_signed(&key_pair).map_err(io::Error::other)?;
+    Ok(TlsMaterial {
+        cert_pem: cert.pem(),
+        key_pem: key_pair.serialize_pem(),
+        fingerprint_sha256: hex_sha256(cert.der()),
+    })
+}
+
+/// The stored certificate's fingerprint, if a certificate exists.
+/// Never generates (status display must not create state).
+pub fn stored_fingerprint(data_dir: &Path) -> Option<String> {
+    let path = tls_dir(data_dir).join("fingerprint.txt");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
 /// Load the stored certificate, generating a fresh self-signed one
 /// on first use.
 pub fn load_or_generate(data_dir: &Path) -> io::Result<TlsMaterial> {
@@ -51,31 +134,7 @@ pub fn load_or_generate(data_dir: &Path) -> io::Result<TlsMaterial> {
 }
 
 fn generate() -> io::Result<TlsMaterial> {
-    let mut params =
-        rcgen::CertificateParams::new(vec!["localhost".to_string()]).map_err(io::Error::other)?;
-    params
-        .subject_alt_names
-        .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
-            std::net::Ipv4Addr::LOCALHOST,
-        )));
-    params
-        .subject_alt_names
-        .push(rcgen::SanType::IpAddress(std::net::IpAddr::V6(
-            std::net::Ipv6Addr::LOCALHOST,
-        )));
-    params.distinguished_name = {
-        let mut dn = rcgen::DistinguishedName::new();
-        dn.push(rcgen::DnType::CommonName, "LLMdil Admin API");
-        dn
-    };
-    let key_pair = rcgen::KeyPair::generate().map_err(io::Error::other)?;
-    let cert = params.self_signed(&key_pair).map_err(io::Error::other)?;
-    let fingerprint = hex_sha256(cert.der());
-    Ok(TlsMaterial {
-        cert_pem: cert.pem(),
-        key_pem: key_pair.serialize_pem(),
-        fingerprint_sha256: fingerprint,
-    })
+    generate_with_sans(&CertSans::loopback())
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {

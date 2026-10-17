@@ -20,10 +20,15 @@ tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
 thiserror = { workspace = true }
+argon2 = { workspace = true }
+async-trait = { workspace = true }
+hmac = { workspace = true }
+sha1 = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
 manager-app = { path = "../manager-app" }
 manager-config = { path = "../manager-config" }
+manager-wizard = { path = "../manager-wizard" }
 
 [dev-dependencies]
 reqwest = { workspace = true }

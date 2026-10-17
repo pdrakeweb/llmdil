@@ -80,8 +80,70 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
         .route("/api/v1/logs/scopes", get(handle_log_scopes))
         .route("/api/v1/gateway/groups", get(handle_gateway_groups))
         .route("/api/v1/updates", get(handle_updates));
+    for (method, path, _class) in crate::auth_routes::AUTH_ROUTES {
+        records.push(RouteRecord { method, path });
+    }
+    router = router
+        .route("/api/v1/auth/login", axum::routing::post(crate::auth_routes::handle_login))
+        .route("/api/v1/auth/totp", axum::routing::post(crate::auth_routes::handle_totp))
+        .route("/api/v1/auth/refresh", axum::routing::post(crate::auth_routes::handle_refresh))
+        .route("/api/v1/enroll", axum::routing::post(crate::auth_routes::handle_enroll))
+        .route("/api/v1/auth/me", get(crate::auth_routes::handle_me))
+        .route("/api/v1/auth/logout", axum::routing::post(crate::auth_routes::handle_logout))
+        .route("/api/v1/auth/password", axum::routing::post(crate::auth_routes::handle_change_password))
+        .route("/api/v1/auth/sessions", get(crate::auth_routes::handle_list_sessions))
+        .route(
+            "/api/v1/auth/sessions/{id}",
+            axum::routing::delete(crate::auth_routes::handle_revoke_session),
+        )
+        .route("/api/v1/auth/totp/enroll", axum::routing::post(crate::auth_routes::handle_totp_enroll))
+        .route("/api/v1/auth/totp/verify", axum::routing::post(crate::auth_routes::handle_totp_verify))
+        .route("/api/v1/auth/totp/disable", axum::routing::post(crate::auth_routes::handle_totp_disable))
+        .route(
+            "/api/v1/admin/users",
+            get(crate::auth_routes::handle_admin_list_users)
+                .post(crate::auth_routes::handle_admin_create_user),
+        )
+        .route(
+            "/api/v1/admin/users/{id}",
+            axum::routing::patch(crate::auth_routes::handle_admin_update_user)
+                .delete(crate::auth_routes::handle_admin_delete_user),
+        )
+        .route(
+            "/api/v1/admin/users/{id}/reset-password",
+            axum::routing::post(crate::auth_routes::handle_admin_reset_password),
+        )
+        .route(
+            "/api/v1/admin/users/{id}/sessions",
+            get(crate::auth_routes::handle_admin_list_user_sessions),
+        )
+        .route(
+            "/api/v1/admin/users/{id}/sessions/{session_id}",
+            axum::routing::delete(crate::auth_routes::handle_admin_revoke_user_session),
+        )
+        .route(
+            "/api/v1/admin/api-tokens",
+            get(crate::auth_routes::handle_admin_list_tokens)
+                .post(crate::auth_routes::handle_admin_create_token),
+        )
+        .route(
+            "/api/v1/admin/api-tokens/{id}",
+            axum::routing::delete(crate::auth_routes::handle_admin_revoke_token),
+        )
+        .route(
+            "/api/v1/admin/enrollment-codes",
+            axum::routing::post(crate::auth_routes::handle_admin_create_enrollment),
+        );
+    let mw_state = crate::auth_routes::AuthMwState {
+        ctx: ctx.clone(),
+        table: Arc::new(crate::auth_routes::route_class_table()),
+    };
     let router = router
         .layer(axum::extract::DefaultBodyLimit::max(1 << 20))
+        .layer(axum::middleware::from_fn_with_state(
+            mw_state,
+            crate::auth_routes::auth_middleware,
+        ))
         .with_state(ctx);
     (router, records)
 }
@@ -332,7 +394,7 @@ async fn handle_server_identity(State(ctx): State<Arc<ApiCtx>>) -> Response {
         "features": {
             "operations": true,
             "events_sse": false,
-            "auth": false
+            "auth": true
         }
     }))
     .into_response()

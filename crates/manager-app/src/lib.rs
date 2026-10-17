@@ -383,6 +383,13 @@ struct PersistedWizard {
 }
 
 impl AppState {
+    /// The app's data directory (config, logs, and the API's
+    /// stores live under it). Exposed for the desktop shell's
+    /// server-lifecycle commands.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
     pub fn new(config: AppConfig, config_path: PathBuf, data_dir: PathBuf) -> Self {
         Self {
             config: RwLock::new(config),

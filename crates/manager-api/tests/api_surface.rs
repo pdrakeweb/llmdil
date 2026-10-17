@@ -7,10 +7,55 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use manager_api::{build_router, ApiCtx, ApiOptions, ApiServer, DERIVED_ROUTES};
+use manager_api::auth::MemoryCredentialStore;
+use manager_api::users::{RoleName, UserStore};
+use manager_api::{build_router, ApiCtx, ApiOptions, ApiServer, AUTH_ROUTES, DERIVED_ROUTES};
 use manager_app::registry::OP_SPECS;
 use manager_app::AppState;
 use tower::ServiceExt;
+
+async fn admin_token(ctx: &Arc<ApiCtx>) -> String {
+    // Seed an admin directly and mint a session (password login has
+    // its own flow tests; argon2 at plan parameters is seconds per
+    // call and would dominate this suite).
+    static TEST_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let hash = TEST_HASH
+        .get_or_init(|| manager_api::users::hash_password("a-unique-passphrase").unwrap())
+        .clone();
+    let user_id = format!("u-{}", manager_api::users::generate_token());
+    let user = manager_api::users::User {
+        id: user_id.clone(),
+        username: "root".into(),
+        password_hash: hash,
+        role: RoleName::Admin,
+        disabled: false,
+        must_change_password: false,
+        totp_enabled: false,
+        recovery_code_hashes: vec![],
+        created_ms: manager_api::users::now_ms(),
+        updated_ms: manager_api::users::now_ms(),
+    };
+    ctx.users
+        .mutate::<_, manager_api::users::StoreError>(|f| {
+            f.users.push(user);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    ctx.auth
+        .create_session(&user_id, "test")
+        .await
+        .unwrap()
+        .access_token
+}
+
+fn get_auth(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
 
 fn test_ctx(tag: &str) -> (Arc<ApiCtx>, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("manager-api-test-{tag}-{}", std::process::id()));
@@ -19,7 +64,15 @@ fn test_ctx(tag: &str) -> (Arc<ApiCtx>, std::path::PathBuf) {
     let mut cfg = manager_config::AppConfig::default_config();
     cfg.data_dir = dir.clone();
     let app = Arc::new(AppState::new(cfg, dir.join("config.json"), dir.clone()));
-    (ApiCtx::new(app, dir.clone()).unwrap(), dir)
+    (
+        ApiCtx::with_services(
+            app,
+            dir.clone(),
+            UserStore::in_memory(),
+            Arc::new(MemoryCredentialStore::default()),
+        ),
+        dir,
+    )
 }
 
 async fn body_json(resp: axum::response::Response) -> (StatusCode, serde_json::Value) {
@@ -59,6 +112,9 @@ fn router_matches_registry() {
     for (m, p) in DERIVED_ROUTES {
         expected.push((m.to_string(), p.to_string()));
     }
+    for (m, p, _c) in AUTH_ROUTES {
+        expected.push((m.to_string(), p.to_string()));
+    }
     let mut actual: Vec<(String, String)> = records
         .iter()
         .map(|r| (r.method.to_string(), r.path.to_string()))
@@ -76,13 +132,17 @@ fn router_matches_registry() {
 #[tokio::test]
 async fn identity_and_status() {
     let (ctx, dir) = test_ctx("identity");
-    let (router, _) = build_router(ctx);
+    let (router, _) = build_router(ctx.clone());
     let (status, v) = body_json(router.clone().oneshot(get("/api/v1/server")).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["api_version"], "1");
     assert!(v["deployment_id"].as_str().is_some_and(|s| !s.is_empty()));
 
-    let (status, v) = body_json(router.oneshot(get("/api/v1/status")).await.unwrap()).await;
+    // /status without a credential is refused by the guard.
+    let (status, _) = body_json(router.clone().oneshot(get("/api/v1/status")).await.unwrap()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let token = admin_token(&ctx).await;
+    let (status, v) = body_json(router.oneshot(get_auth("/api/v1/status", &token)).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK);
     assert!(v.is_object());
     let _ = std::fs::remove_dir_all(&dir);
@@ -91,7 +151,8 @@ async fn identity_and_status() {
 #[tokio::test]
 async fn read_endpoints_respond() {
     let (ctx, dir) = test_ctx("reads");
-    let (router, _) = build_router(ctx);
+    let (router, _) = build_router(ctx.clone());
+    let token = admin_token(&ctx).await;
     for uri in [
         "/api/v1/config",
         "/api/v1/backends",
@@ -107,7 +168,7 @@ async fn read_endpoints_respond() {
         "/api/v1/mxc/policy",
         "/api/v1/logs/scopes",
     ] {
-        let (status, _) = body_json(router.clone().oneshot(get(uri)).await.unwrap()).await;
+        let (status, _) = body_json(router.clone().oneshot(get_auth(uri, &token)).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK, "GET {uri}");
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -116,12 +177,13 @@ async fn read_endpoints_respond() {
 #[tokio::test]
 async fn get_one_and_not_found_envelope() {
     let (ctx, dir) = test_ctx("getone");
-    let (router, _) = build_router(ctx);
+    let (router, _) = build_router(ctx.clone());
+    let token = admin_token(&ctx).await;
     // The default config seeds four backends; planner must resolve.
     let (status, v) = body_json(
         router
             .clone()
-            .oneshot(get("/api/v1/backends/planner"))
+            .oneshot(get_auth("/api/v1/backends/planner", &token))
             .await
             .unwrap(),
     )
@@ -129,7 +191,7 @@ async fn get_one_and_not_found_envelope() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["id"], "planner");
 
-    let (status, v) = body_json(router.oneshot(get("/api/v1/backends/nope")).await.unwrap()).await;
+    let (status, v) = body_json(router.oneshot(get_auth("/api/v1/backends/nope", &token)).await.unwrap()).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(v["error"]["code"], "NOT_FOUND");
     assert_eq!(v["error"]["kind"], "NotFound");
@@ -139,10 +201,11 @@ async fn get_one_and_not_found_envelope() {
 #[tokio::test]
 async fn logs_query_params_coerce() {
     let (ctx, dir) = test_ctx("logs");
-    let (router, _) = build_router(ctx);
+    let (router, _) = build_router(ctx.clone());
+    let token = admin_token(&ctx).await;
     let (status, v) = body_json(
         router
-            .oneshot(get("/api/v1/logs?scope=gateway&limit=5"))
+            .oneshot(get_auth("/api/v1/logs?scope=gateway&limit=5", &token))
             .await
             .unwrap(),
     )
@@ -159,10 +222,12 @@ async fn logs_query_params_coerce() {
 #[tokio::test]
 async fn unknown_body_field_rejected() {
     let (ctx, dir) = test_ctx("closed");
-    let (router, _) = build_router(ctx);
+    let (router, _) = build_router(ctx.clone());
+    let token = admin_token(&ctx).await;
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/backends/planner/test")
+        .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
         .body(Body::from(r#"{"prompt": "hi", "bogus": 1}"#))
         .unwrap();
@@ -175,10 +240,12 @@ async fn unknown_body_field_rejected() {
 #[tokio::test]
 async fn malformed_json_rejected() {
     let (ctx, dir) = test_ctx("badjson");
-    let (router, _) = build_router(ctx);
+    let (router, _) = build_router(ctx.clone());
+    let token = admin_token(&ctx).await;
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/backends/planner/test")
+        .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
         .body(Body::from("{not json"))
         .unwrap();
@@ -219,9 +286,10 @@ async fn redaction_structure() {
     assert!(update_config.route.is_none());
 
     let (ctx, dir) = test_ctx("redact");
-    let (router, _) = build_router(ctx);
+    let (router, _) = build_router(ctx.clone());
+    let token = admin_token(&ctx).await;
     for uri in ["/api/v1/config", "/api/v1/gateway/config", "/api/v1/status"] {
-        let (status, v) = body_json(router.clone().oneshot(get(uri)).await.unwrap()).await;
+        let (status, v) = body_json(router.clone().oneshot(get_auth(uri, &token)).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK, "GET {uri}");
         let text = v.to_string();
         assert!(!text.contains("PRIVATE KEY"), "key material in {uri}");

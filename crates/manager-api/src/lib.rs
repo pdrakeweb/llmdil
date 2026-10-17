@@ -16,11 +16,20 @@ use tokio::sync::{broadcast, oneshot};
 
 use manager_app::{AppState, EventSink};
 
+pub mod audit;
+pub mod firewall;
+pub mod auth_routes;
+pub mod auth;
 pub mod http;
 pub mod tls;
+pub mod users;
 
+pub use audit::AuditLog;
+pub use auth::{AuthService, CredentialStore, Principal};
+pub use auth_routes::AUTH_ROUTES;
 pub use http::{build_router, RouteRecord, DERIVED_ROUTES};
 pub use tls::TlsMaterial;
+pub use users::UserStore;
 
 /// One event emitted by an operation, as published to API
 /// subscribers (the phase-4 SSE stream consumes this channel).
@@ -73,20 +82,59 @@ pub struct ApiCtx {
     pub events: Arc<BroadcastSink>,
     pub deployment_id: String,
     pub data_dir: PathBuf,
+    /// Users, sessions, and API tokens (`admin-users.json`).
+    pub users: Arc<UserStore>,
+    /// Authentication service over `users`.
+    pub auth: Arc<AuthService>,
+    /// The mutation/auth audit log.
+    pub audit: Arc<AuditLog>,
 }
 
 impl ApiCtx {
-    pub fn new(app: Arc<AppState>, data_dir: PathBuf) -> std::io::Result<Arc<Self>> {
-        let deployment_id = load_or_create_deployment_id(&data_dir)?;
+    /// Build the context, loading the user store from the data dir
+    /// and using the OS credential store for TOTP secrets.
+    pub async fn new(app: Arc<AppState>, data_dir: PathBuf) -> std::io::Result<Arc<Self>> {
+        let users = UserStore::load(&data_dir)
+            .await
+            .map_err(std::io::Error::other)?;
+        let creds: Arc<dyn CredentialStore> = Arc::new(auth::WizardCredentialStore);
+        Ok(Self::with_services(app, data_dir, users, creds))
+    }
+
+    /// Build the context from explicit services (tests inject
+    /// in-memory services).
+    pub fn with_services(
+        app: Arc<AppState>,
+        data_dir: PathBuf,
+        users: Arc<UserStore>,
+        creds: Arc<dyn CredentialStore>,
+    ) -> Arc<Self> {
+        let auth = AuthService::new(users, creds);
+        Self::with_auth(app, data_dir, auth)
+    }
+
+    /// Build the context around a prepared auth service. The
+    /// desktop shell uses this so its settings commands and the
+    /// HTTP server share ONE auth service instance — enrollment
+    /// codes, challenges, and lockout state live in memory per
+    /// instance, so a second instance would silently split them.
+    pub fn with_auth(app: Arc<AppState>, data_dir: PathBuf, auth: Arc<AuthService>) -> Arc<Self> {
+        let users = auth.store().clone();
+        let deployment_id = load_or_create_deployment_id(&data_dir)
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
         let events = Arc::new(BroadcastSink::new());
         let sink: Arc<dyn EventSink> = events.clone();
-        Ok(Arc::new(Self {
+        let audit = Arc::new(AuditLog::new(&data_dir));
+        Arc::new(Self {
             app,
             sink,
             events,
             deployment_id,
             data_dir,
-        }))
+            users,
+            auth,
+            audit,
+        })
     }
 }
 
@@ -125,11 +173,34 @@ pub enum ApiStartError {
     Io(#[from] std::io::Error),
 }
 
+/// The connect-info type for both listener kinds (a local wrapper:
+/// `Connected` cannot be implemented for `SocketAddr` directly).
+#[derive(Debug, Clone, Copy)]
+pub struct PeerAddr(pub SocketAddr);
+
+impl axum::extract::connect_info::Connected<
+    axum::serve::IncomingStream<'_, tokio::net::TcpListener>,
+> for PeerAddr
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        PeerAddr(*stream.remote_addr())
+    }
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tls::TlsListener>>
+    for PeerAddr
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, tls::TlsListener>) -> Self {
+        PeerAddr(*stream.remote_addr())
+    }
+}
+
 /// A running API listener with an explicit shutdown.
 pub struct ApiServer {
     addr: SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
+    ctx: Arc<ApiCtx>,
 }
 
 impl ApiServer {
@@ -143,8 +214,21 @@ impl ApiServer {
         if options.tls.is_none() && !options.bind.is_loopback() {
             return Err(ApiStartError::PlaintextNotLoopback(options.bind));
         }
-        let ctx = ApiCtx::new(app, data_dir)?;
-        let (router, _records) = build_router(ctx);
+        let ctx = ApiCtx::new(app, data_dir).await?;
+        Self::start_ctx(ctx, options).await
+    }
+
+    /// Start from a prepared context (shared user store with the
+    /// desktop shell).
+    pub async fn start_ctx(
+        ctx: Arc<ApiCtx>,
+        options: ApiOptions,
+    ) -> Result<Self, ApiStartError> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        if options.tls.is_none() && !options.bind.is_loopback() {
+            return Err(ApiStartError::PlaintextNotLoopback(options.bind));
+        }
+        let (router, _records) = build_router(ctx.clone());
         let tcp =
             tokio::net::TcpListener::bind(SocketAddr::new(options.bind, options.port)).await?;
         let addr = tcp.local_addr()?;
@@ -157,22 +241,35 @@ impl ApiServer {
                 let config = tls::server_config(material)?;
                 let listener = tls::TlsListener::new(tcp, config);
                 tokio::spawn(async move {
-                    let _ = axum::serve(listener, router)
-                        .with_graceful_shutdown(shutdown_fut)
-                        .await;
+                    let _ = axum::serve(
+                        listener,
+                        router.into_make_service_with_connect_info::<PeerAddr>(),
+                    )
+                    .with_graceful_shutdown(shutdown_fut)
+                    .await;
                 })
             }
             None => tokio::spawn(async move {
-                let _ = axum::serve(tcp, router)
-                    .with_graceful_shutdown(shutdown_fut)
-                    .await;
+                let _ = axum::serve(
+                    tcp,
+                    router.into_make_service_with_connect_info::<PeerAddr>(),
+                )
+                .with_graceful_shutdown(shutdown_fut)
+                .await;
             }),
         };
         Ok(Self {
             addr,
             shutdown: Some(tx),
             task,
+            ctx,
         })
+    }
+
+    /// The server's context (the desktop shell reaches the shared
+    /// auth service and user store through it).
+    pub fn ctx(&self) -> &Arc<ApiCtx> {
+        &self.ctx
     }
 
     /// The address the listener actually bound (port 0 resolves).

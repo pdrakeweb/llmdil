@@ -488,10 +488,39 @@ mod tests {
             "scan found only {} invokes",
             invoked.len()
         );
+        // Desktop-local shell commands (admin API lifecycle and
+        // user administration) are not registry operations — they
+        // manage the server itself, not app capabilities. They are
+        // allowlisted here AND must exist in the shell source, so a
+        // frontend invocation still cannot drift onto a surface
+        // that does not provide it.
+        const SHELL_LOCAL: &[&str] = &[
+            "admin_api_get_status",
+            "admin_api_set_enabled",
+            "admin_api_list_users",
+            "admin_api_create_user",
+            "admin_api_update_user",
+            "admin_api_delete_user",
+            "admin_api_reset_password",
+            "admin_api_get_pairing",
+            "admin_api_create_enrollment",
+        ];
+        let shell_src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../src-tauri/src/main.rs"
+        ))
+        .expect("shell source readable");
         for name in &invoked {
+            if op_by_name(name).is_some() {
+                continue;
+            }
             assert!(
-                op_by_name(name).is_some(),
+                SHELL_LOCAL.contains(&name.as_str()),
                 "ui/src/api.ts invokes unregistered command `{name}`"
+            );
+            assert!(
+                shell_src.contains(name),
+                "shell-local command `{name}` is allowlisted but absent from src-tauri/src/main.rs"
             );
         }
     }
