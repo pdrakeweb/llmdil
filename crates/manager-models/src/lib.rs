@@ -1900,6 +1900,7 @@ mod tests {
                 backoff_base_secs: 2,
             },
             overrides_global: false,
+            purpose: String::new(),
         }
     }
 

@@ -946,6 +946,7 @@ mod tests {
                 backoff_base_secs: 2,
             },
             overrides_global: false,
+            purpose: String::new(),
         }
     }
 
@@ -977,6 +978,7 @@ mod tests {
             members: members.iter().map(|s| s.to_string()).collect(),
             strategy,
             fallbacks: vec![],
+            purpose: String::new(),
         }
     }
 
@@ -998,6 +1000,7 @@ mod tests {
             members: vec!["planner".to_string()],
             strategy: RoutingStrategy::LatencyBased,
             fallbacks: vec!["coder".to_string(), "openrouter".to_string()],
+            purpose: String::new(),
         };
         assert_eq!(g.strategy, RoutingStrategy::LatencyBased);
         assert_eq!(g.fallbacks.len(), 2);
@@ -1150,6 +1153,7 @@ mod tests {
             members: vec!["coder".to_string(), "coder-b".to_string()],
             strategy: RoutingStrategy::LeastBusy,
             fallbacks: vec![],
+            purpose: String::new(),
         });
         let pair = cfg
             .gateway
@@ -1218,6 +1222,7 @@ mod tests {
             members: vec!["127.0.0.1:8099".to_string()],
             strategy: RoutingStrategy::SimpleShuffle,
             fallbacks: vec![],
+            purpose: String::new(),
         });
         let yaml = generate_config_yaml(&cfg).expect("generate");
         assert!(yaml.contains("http://127.0.0.1:8099/v1"));
@@ -1258,6 +1263,7 @@ mod tests {
             members: vec!["coder".to_string()],
             strategy: RoutingStrategy::SimpleShuffle,
             fallbacks: vec!["openrouter".to_string()],
+            purpose: String::new(),
         }];
         let yaml = generate_config_yaml(&cfg).expect("generate");
         assert!(yaml.contains("openrouter.ai"), "{yaml}");
@@ -1282,12 +1288,14 @@ mod tests {
                 members: vec!["planner".to_string(), "coder-fast".to_string()],
                 strategy: RoutingStrategy::LeastBusy,
                 fallbacks: vec![],
+                purpose: String::new(),
             },
             ModelGroup {
                 name: "pair".to_string(),
                 members: vec!["coder".to_string(), "tool-runner".to_string()],
                 strategy: RoutingStrategy::LatencyBased,
                 fallbacks: vec![],
+                purpose: String::new(),
             },
         ];
         for b in cfg.backends.iter_mut() {

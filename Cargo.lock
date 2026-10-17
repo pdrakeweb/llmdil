@@ -881,6 +881,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "manager-optimize"
+version = "0.1.33"
+dependencies = [
+ "chrono",
+ "manager-config",
+ "manager-models",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "manager-present"
 version = "0.1.33"
 

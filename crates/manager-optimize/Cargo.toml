@@ -1,0 +1,13 @@
+[package]
+name = "manager-optimize"
+version = "0.1.33"
+edition = "2021"
+
+[dependencies]
+manager-config = { path = "../manager-config" }
+manager-models = { path = "../manager-models" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }

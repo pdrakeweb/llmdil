@@ -1,0 +1,40 @@
+//! Core logic for the Optimize page (design: docs/optimize-design.md).
+//!
+//! Everything in this crate is Tauri-free and pure over its inputs, so
+//! it is unit-tested on Linux CI — deliberately unlike the logic that
+//! lives in the src-tauri binary crate. Contents:
+//!
+//! - [`plan`]: the plan document types (items, tri-state decisions,
+//!   apply outcomes) and the item fingerprint.
+//! - [`parse`]: the salvage parser turning a backend's raw response
+//!   into a [`plan::Plan`] (§4 of the design).
+//! - [`context`]: the allowlist context builder (§2) — the document
+//!   sent to the consulted backend, assembled field by field so no
+//!   secret can enter it by construction — plus the prompt builder
+//!   (§3) and the default consultation-candidate ranking.
+//! - [`fit`]: the fit evaluator (§5): memory-requirement
+//!   recomputation and per-GPU residency accounting over a telemetry
+//!   free-VRAM snapshot.
+//! - [`validate`]: the validation simulation (§5): items applied in
+//!   plan order to a cloned `AppConfig`, checked with
+//!   `manager_config::validate` plus the fit evaluator.
+//! - [`probe`]: the CPU / system-RAM inventory probe (§2.1) — data
+//!   that exists nowhere else in the app.
+
+pub mod context;
+pub mod fit;
+pub mod parse;
+pub mod plan;
+pub mod probe;
+pub mod validate;
+
+pub use context::{
+    build_context, build_prompts, consult_default, default_purpose_seed, estimate_tokens,
+    model_short_name, resolve_model, BackendMeasured, ConsultCandidate, ContextMeta, GpuContext,
+    HardwareContext, MeasureInputs, ThroughputFact, TrafficWindow,
+};
+pub use fit::{evaluate_fit, layout_requirement, residency_per_gpu, FitOutcome, LayoutFacts};
+pub use parse::{parse_plan, ParseError};
+pub use plan::{config_fingerprint, ApplyOutcome, Confidence, Decision, Plan, PlanItem, PlanKind};
+pub use probe::{probe_hardware, HardwareProbe};
+pub use validate::{validate_plan, ItemValidation, LiveSnapshot, ValidationStatus};
