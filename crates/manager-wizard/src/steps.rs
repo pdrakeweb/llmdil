@@ -2724,6 +2724,37 @@ impl StartGateway {
                 ));
             }
         }
+        // MCP gateway servers (design section 4.2): a manual start must
+        // behave like an app start -- the stdio flag when any
+        // Gateway-exposed stdio server is configured (the manual
+        // block is config-derived, like the plan; a server whose
+        // credential is missing will simply not load, as at an app
+        // start where it is not armed), plus a credential note per
+        // Gateway server naming each env key it feeds. Values are
+        // never shown, mirroring the master-key/OpenRouter lines.
+        let gateway_mcp: Vec<&manager_config::McpServerConfig> = ctx
+            .config
+            .mcp
+            .servers
+            .iter()
+            .filter(|s| s.exposure == manager_config::McpExposure::Gateway)
+            .collect();
+        if gateway_mcp
+            .iter()
+            .any(|s| s.transport == manager_config::McpTransport::Stdio)
+        {
+            lines.push("$env:LITELLM_ENABLE_MCP_STDIO = \"true\"".to_string());
+        }
+        for server in &gateway_mcp {
+            if let Some(cred_ref) = server.cred_ref.as_deref().filter(|r| !r.is_empty()) {
+                for key in &server.env_keys {
+                    lines.push(format!(
+                        "$env:{key} = \"<value from Windows Credential Manager: '{cred_ref}'>\"  # MCP server '{}'",
+                        server.id
+                    ));
+                }
+            }
+        }
         let spawn = self.spawn_command(ctx);
         // The spawn's own environment is not secret (UTF-8 stdio
         // forcing); emit it exactly as the step sets it.
@@ -3219,6 +3250,8 @@ impl StartGateway {
         &self,
         ctx: &WizardContext,
         database_url: Option<&str>,
+        mcp_env: &[(String, String)],
+        mcp_stdio_enabled: bool,
     ) -> Result<(PlannedCommand, Option<String>), StepOutcome> {
         let mut cmd = self.spawn_command(ctx);
         // The master key is unconditional: current LiteLLM refuses
@@ -3226,6 +3259,21 @@ impl StartGateway {
         // here rather than spawning a gateway that exits at startup.
         let master_key = self.ensure_master_key(ctx).await?;
         cmd.env.insert("LITELLM_MASTER_KEY".to_string(), master_key);
+        // MCP gateway servers (design §4.2): the stdio opt-in flag
+        // when at least one armed stdio Gateway server exists, and
+        // each armed server's credential under each of its env-key
+        // names (the generated YAML references them as
+        // os.environ/<NAME>). The values were read once by the
+        // arming pass in run(); they are never logged.
+        if mcp_stdio_enabled {
+            cmd.env.insert(
+                "LITELLM_ENABLE_MCP_STDIO".to_string(),
+                "true".to_string(),
+            );
+        }
+        for (key, value) in mcp_env {
+            cmd.env.insert(key.clone(), value.clone());
+        }
         // The database URL is present exactly when the app-managed
         // PostgreSQL is installed and running (the caller started
         // it). With it, LiteLLM migrates its schema at startup and
@@ -3963,6 +4011,85 @@ impl StartGateway {
         }
     }
 
+    /// Post-start MCP load check (design §8, §11, §14.6): with the
+    /// master key, ask the running gateway which MCP servers it
+    /// registered (`GET /v1/mcp/server`) and list each armed
+    /// server's tools (`GET /mcp-rest/tools/list?server_id=<id>`).
+    /// A server passes when it appears in the registered list AND
+    /// its tools list returns without error. Servers the gateway
+    /// reports that are NOT in the generated set — possible
+    /// DB-registered extras the manager does not own (§14.6) — are
+    /// logged as a warning naming them. Returns the ids that
+    /// failed; the caller logs and notes them but does not fail the
+    /// step. No state is persisted: the MCP view re-queries the
+    /// gateway live (Phase 4).
+    async fn mcp_load_check(
+        &self,
+        ctx: &WizardContext,
+        armed_ids: &[String],
+        log: &mut Vec<String>,
+    ) -> Vec<String> {
+        let base = format!(
+            "http://{}:{}",
+            gateway_probe_host(&ctx.config),
+            ctx.config.gateway.port
+        );
+        let headers = self.gateway_auth_headers(ctx).await;
+        let mut registered: Vec<String> = Vec::new();
+        match ctx
+            .ops
+            .http_get_with_headers(&format!("{base}/v1/mcp/server"), &headers)
+            .await
+        {
+            Ok(resp) if resp.status == 200 => {
+                registered = crate::parse_mcp_registered_server_ids(&resp.body_str());
+            }
+            Ok(resp) => log.push(format!(
+                "MCP load check: GET /v1/mcp/server returned HTTP {} — cannot confirm which MCP servers the gateway registered",
+                resp.status
+            )),
+            Err(e) => log.push(format!("MCP load check: GET /v1/mcp/server failed: {e}")),
+        }
+        for extra in registered.iter().filter(|id| !armed_ids.contains(id)) {
+            log.push(format!(
+                "warning: the gateway reports MCP server '{extra}' which is not in the generated configuration (registered outside the manager, e.g. in the LiteLLM database); it is not managed by this app"
+            ));
+        }
+        let mut failed: Vec<String> = Vec::new();
+        for id in armed_ids {
+            let mut problems: Vec<String> = Vec::new();
+            if !registered.iter().any(|r| r == id) {
+                problems.push("not in the gateway's registered MCP server list".to_string());
+            }
+            let url = format!("{base}/mcp-rest/tools/list?server_id={id}");
+            match ctx.ops.http_get_with_headers(&url, &headers).await {
+                Ok(resp) if resp.status == 200 => {
+                    if let Some(err) = crate::mcp_response_error(&resp.body_str()) {
+                        problems.push(format!("tools list returned an error: {err}"));
+                    }
+                }
+                Ok(resp) => {
+                    let detail = crate::mcp_response_error(&resp.body_str())
+                        .unwrap_or_else(|| format!("HTTP {}", resp.status));
+                    problems.push(format!("tools list failed: {detail}"));
+                }
+                Err(e) => problems.push(format!("tools list request failed: {e}")),
+            }
+            if problems.is_empty() {
+                log.push(format!(
+                    "MCP load check passed for '{id}' (registered; tools list OK)"
+                ));
+            } else {
+                log.push(format!(
+                    "MCP load check failed for '{id}': {}",
+                    problems.join("; ")
+                ));
+                failed.push(id.clone());
+            }
+        }
+        failed
+    }
+
     async fn wait_healthy(&self, ctx: &WizardContext, pid: u32, log: &mut Vec<String>) -> bool {
         let url = self.gateway_url(ctx);
         let headers = self.gateway_auth_headers(ctx).await;
@@ -4145,6 +4272,40 @@ impl WizardStep for StartGateway {
                         "<set from credential manager>".to_string(),
                     );
                 }
+                // MCP gateway servers (design §4.2): planned parity
+                // with the spawned env, following the OpenRouter
+                // precedent exactly — decided from the config alone
+                // (a plan performs no credential reads), placeholders
+                // never values. The stdio flag is planned when any
+                // Gateway-exposed stdio server is configured; if its
+                // credential cannot be read at run time the server
+                // is not armed and the spawned env omits its entries.
+                let gateway_mcp: Vec<&manager_config::McpServerConfig> = ctx
+                    .config
+                    .mcp
+                    .servers
+                    .iter()
+                    .filter(|s| s.exposure == manager_config::McpExposure::Gateway)
+                    .collect();
+                if gateway_mcp
+                    .iter()
+                    .any(|s| s.transport == manager_config::McpTransport::Stdio)
+                {
+                    spawn.env.insert(
+                        "LITELLM_ENABLE_MCP_STDIO".to_string(),
+                        "true".to_string(),
+                    );
+                }
+                for server in &gateway_mcp {
+                    if server.cred_ref.as_deref().is_some_and(|r| !r.is_empty()) {
+                        for key in &server.env_keys {
+                            spawn.env.insert(
+                                key.clone(),
+                                "<set from credential manager>".to_string(),
+                            );
+                        }
+                    }
+                }
                 cmds.push(spawn);
                 // Firewall reconciliation for the bind address: a
                 // read-only rule query, plus the elevated script
@@ -4257,11 +4418,8 @@ impl WizardStep for StartGateway {
                 }
                 // Probe the installed LiteLLM version before the
                 // spawn (MCP design §4.3): the result is recorded in
-                // the spawn state below. No floor enforcement yet —
-                // failing closed below
-                // `crate::LITELLM_MCP_FLOOR_VERSION` applies only
-                // when a stdio server is gateway-registered, which
-                // arrives in Phase 2.
+                // the spawn state below and drives the MCP floor
+                // check in the arming pass that follows.
                 let litellm_version = self.installed_litellm_version(ctx).await;
                 match &litellm_version {
                     Some(v) => log.push(format!("detected LiteLLM version: {v}")),
@@ -4270,12 +4428,93 @@ impl WizardStep for StartGateway {
                             .to_string(),
                     ),
                 }
+                // MCP gateway arming (design §4.2), resolved BEFORE
+                // the YAML is generated: the generated config, the
+                // spawn environment and the spawn fingerprint all key
+                // off this one armed set (the single rule lives in
+                // crate::armed_gateway_mcp_servers). Each Gateway
+                // server's credential is read once here; a server
+                // whose credential cannot be read is NOT armed — it
+                // is omitted from this start with a warning and the
+                // gateway start proceeds: a missing MCP credential
+                // never fails the gateway.
+                let mut mcp_cred_values: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                for server in ctx.config.mcp.servers.iter().filter(|s| {
+                    s.exposure == manager_config::McpExposure::Gateway && !s.env_keys.is_empty()
+                }) {
+                    let Some(cred_ref) = server.cred_ref.as_deref().filter(|r| !r.is_empty())
+                    else {
+                        log.push(format!(
+                            "warning: MCP server '{}' is not armed: it declares env keys but no credential reference — the server is omitted from this gateway start",
+                            server.id
+                        ));
+                        continue;
+                    };
+                    if mcp_cred_values.contains_key(cred_ref) {
+                        continue;
+                    }
+                    match ctx
+                        .ops
+                        .credential_read(cred_ref)
+                        .await
+                        .filter(|v| !v.is_empty())
+                    {
+                        Some(value) => {
+                            mcp_cred_values.insert(cred_ref.to_string(), value);
+                        }
+                        None => log.push(format!(
+                            "warning: MCP server '{}' is not armed: credential '{cred_ref}' could not be read from Windows Credential Manager — the server is omitted from this gateway start",
+                            server.id
+                        )),
+                    }
+                }
+                let mcp_armed: Vec<&manager_config::McpServerConfig> =
+                    crate::armed_gateway_mcp_servers(&ctx.config, |t| {
+                        mcp_cred_values.contains_key(t)
+                    });
+                let mcp_stdio_armed = crate::mcp_armed_set_has_stdio(&mcp_armed);
+                // Floor enforcement (design §4.3), fail-closed BEFORE
+                // any spawn: with an armed stdio Gateway server, the
+                // installed LiteLLM must be at or above
+                // LITELLM_MCP_FLOOR_VERSION (the release carrying the
+                // stdio command/args allowlist fix). An UNDETERMINED
+                // version also fails: the allowlist state would be
+                // unverifiable, and the CVE surface is exactly that
+                // allowlist — a deliberate conservative reading.
+                if mcp_stdio_armed {
+                    let meets_floor = litellm_version
+                        .as_deref()
+                        .and_then(crate::litellm_version_meets_mcp_floor);
+                    if meets_floor != Some(true) {
+                        return Ok(StepOutcome::failed(
+                            format!(
+                                "MCP stdio gateway servers require LiteLLM >= {} (the stdio allowlist fix), but the installed version is {}. Remediation: set updates.components[\"litellm\"].pinned_version to a version at or above {} (or clear a stale pin) and re-run this step",
+                                crate::LITELLM_MCP_FLOOR_VERSION,
+                                litellm_version
+                                    .as_deref()
+                                    .unwrap_or("unknown — the version probe could not determine it"),
+                                crate::LITELLM_MCP_FLOOR_VERSION
+                            ),
+                            log,
+                        )
+                        .with_manual_command(manual));
+                    }
+                }
                 // config.yaml is generated from app state, never hand-edited.
                 // Both failure paths carry the manual block and the
                 // accumulated step log, like every other failure in
                 // this step — they previously returned a one-line
                 // debug outcome with neither (code-review 2.8).
-                let yaml = match manager_gateway::generate_config_yaml(&ctx.config) {
+                // Generate from the armed-only view of the config:
+                // unarmed Gateway servers are omitted from this
+                // start's YAML (the generator itself stays a pure
+                // function of the config it is handed).
+                let generation_config = crate::config_with_armed_gateway_mcp_servers(
+                    &ctx.config,
+                    |t| mcp_cred_values.contains_key(t),
+                );
+                let yaml = match manager_gateway::generate_config_yaml(&generation_config) {
                     Ok(y) => y,
                     Err(e) => {
                         return Ok(StepOutcome::failed(
@@ -4348,8 +4587,24 @@ impl WizardStep for StartGateway {
                 } else {
                     None
                 };
+                // The spawn env's MCP entries: each armed server's
+                // credential value (read once in the arming pass)
+                // under each of its env-key names.
+                let mcp_env: Vec<(String, String)> = mcp_armed
+                    .iter()
+                    .flat_map(|s| {
+                        let value = s
+                            .cred_ref
+                            .as_deref()
+                            .and_then(|r| mcp_cred_values.get(r))
+                            .cloned();
+                        s.env_keys.iter().filter_map(move |k| {
+                            value.clone().map(|v| (k.clone(), v))
+                        })
+                    })
+                    .collect();
                 let (mut spawn, openrouter_warning) = match self
-                    .spawn_command_with_env(ctx, database_url.as_deref())
+                    .spawn_command_with_env(ctx, database_url.as_deref(), &mcp_env, mcp_stdio_armed)
                     .await
                 {
                     Ok(pair) => pair,
@@ -4427,6 +4682,21 @@ impl WizardStep for StartGateway {
                     )
                     .with_manual_command(manual));
                 }
+                // Post-start MCP load check (design §8, §11, §14.6):
+                // every armed server must appear in the gateway's
+                // registered list and answer its tools list. A
+                // failure is logged with the gateway's own error
+                // text and noted in the outcome message, but never
+                // fails the step — the gateway itself is healthy.
+                // Nothing is persisted: the MCP view re-queries the
+                // gateway live (Phase 4).
+                let mcp_load_failed: Vec<String> = if mcp_armed.is_empty() {
+                    Vec::new()
+                } else {
+                    let armed_ids: Vec<String> =
+                        mcp_armed.iter().map(|s| s.id.clone()).collect();
+                    self.mcp_load_check(ctx, &armed_ids, &mut log).await
+                };
                 // Record what this gateway was actually spawned
                 // with (config fingerprint + the YAML): the drift
                 // check at the next launch compares the record
@@ -4438,6 +4708,7 @@ impl WizardStep for StartGateway {
                         database_url.is_some(),
                         spawn.env.get("LITELLM_MASTER_KEY").map(String::as_str),
                         spawn.env.get("OPENROUTER_API_KEY").map(String::as_str),
+                        &mcp_armed,
                     );
                     let state_json = crate::gateway_spawn_state_json(
                         &fingerprint,
@@ -4475,6 +4746,12 @@ impl WizardStep for StartGateway {
                 if let Some(fw) = self.ensure_gateway_firewall(ctx, &mut log).await {
                     log.push(format!("warning: {fw}"));
                     message = format!("{message} — warning: {fw}");
+                }
+                if !mcp_load_failed.is_empty() {
+                    message = format!(
+                        "{message} — warning: MCP load check failed for: {}",
+                        mcp_load_failed.join(", ")
+                    );
                 }
                 Ok(StepOutcome::done(message, log))
             }
@@ -8229,6 +8506,304 @@ mod tests {
             .expect("spawn state recorded");
         let state: serde_json::Value = serde_json::from_slice(&state).unwrap();
         assert_eq!(state["litellm_version"], serde_json::Value::Null);
+    }
+
+    // --- StartGateway: MCP gateway servers (Phase 2) ---
+
+    fn mcp_stdio_gateway_server() -> manager_config::McpServerConfig {
+        manager_config::McpServerConfig {
+            id: "brave_search".to_string(),
+            display_name: "Brave Search".to_string(),
+            transport: manager_config::McpTransport::Stdio,
+            exposure: manager_config::McpExposure::Gateway,
+            command: Some("npx".to_string()),
+            args: vec![
+                "-y".to_string(),
+                "@brave/brave-search-mcp-server".to_string(),
+            ],
+            url: None,
+            env_keys: vec!["BRAVE_API_KEY".to_string()],
+            cred_ref: Some("local-llm-service-manager/brave-search-mcp".to_string()),
+            allowed_tools: None,
+            metered: false,
+            rpm_limit: None,
+        }
+    }
+
+    fn gateway_ctx_with_mcp(
+        ops: Arc<FakeSystemOps>,
+        servers: Vec<manager_config::McpServerConfig>,
+    ) -> WizardContext {
+        let mut cfg = test_config_with_models();
+        cfg.mcp.servers = servers;
+        WizardContext::new(cfg, PathBuf::from("/data"), RunMode::Install, ops)
+    }
+
+    fn script_litellm_version(
+        ops: &FakeSystemOps,
+        step: &StartGateway,
+        ctx: &WizardContext,
+        version: &str,
+    ) {
+        let argv = litellm_version_argv(step, ctx);
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        ops.with_command(&refs, FakeSystemOps::ok_output(&format!("{version}\n")));
+    }
+
+    fn fast_step() -> StartGateway {
+        StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+            db_sustain_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn start_gateway_arms_stdio_mcp_server_with_credential() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_credential_value("local-llm-service-manager/brave-search-mcp", "brave-secret");
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/mcp/server",
+            FakeSystemOps::http_ok(r#"[{"server_id":"brave_search"}]"#),
+        );
+        ops.with_http_get(
+            "http://127.0.0.1:4000/mcp-rest/tools/list?server_id=brave_search",
+            FakeSystemOps::http_ok(r#"{"tools":[{"name":"brave_web_search"}]}"#),
+        );
+        let step = fast_step();
+        let ctx = gateway_ctx_with_mcp(ops.clone(), vec![mcp_stdio_gateway_server()]);
+        script_litellm_version(&ops, &step, &ctx, "1.105.1");
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        // Spawn env: stdio flag + the credential under its env key.
+        let envs = ops.spawn_envs();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].get("LITELLM_ENABLE_MCP_STDIO").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            envs[0].get("BRAVE_API_KEY").map(String::as_str),
+            Some("brave-secret")
+        );
+        // YAML registers the server with an env REFERENCE, never the value.
+        let cfg = ops
+            .file_bytes(&PathBuf::from("/data/gateway/config.yaml"))
+            .expect("config written");
+        let text = String::from_utf8(cfg).unwrap();
+        assert!(text.contains("mcp_servers:"), "{text}");
+        assert!(text.contains("brave_search"), "{text}");
+        assert!(text.contains("require_key_mcp_access_defined: true"), "{text}");
+        assert!(!text.contains("brave-secret"), "{text}");
+        // Load check passed and is logged.
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("MCP load check passed for 'brave_search'")),
+            "{out:?}"
+        );
+        // Fingerprint records the armed set.
+        let state = ops
+            .file_bytes(&crate::gateway_spawn_state_path(&ctx.data_dir))
+            .expect("spawn state recorded");
+        let state: serde_json::Value = serde_json::from_slice(&state).unwrap();
+        assert_eq!(state["fingerprint"]["mcp_stdio_enabled"], true);
+        assert!(
+            !state["fingerprint"]["mcp_servers_hash"]
+                .as_str()
+                .unwrap()
+                .is_empty(),
+            "{state}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_gateway_unarmed_mcp_server_is_omitted_and_gateway_still_starts() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        // No credential scripted: the arming read fails.
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = fast_step();
+        let ctx = gateway_ctx_with_mcp(ops.clone(), vec![mcp_stdio_gateway_server()]);
+        // No LiteLLM version scripted either: with no armed stdio
+        // server the floor check must not fire.
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("'brave_search' is not armed")),
+            "{out:?}"
+        );
+        let envs = ops.spawn_envs();
+        assert_eq!(envs.len(), 1);
+        assert!(!envs[0].contains_key("LITELLM_ENABLE_MCP_STDIO"));
+        assert!(!envs[0].contains_key("BRAVE_API_KEY"));
+        let cfg = ops
+            .file_bytes(&PathBuf::from("/data/gateway/config.yaml"))
+            .expect("config written");
+        let text = String::from_utf8(cfg).unwrap();
+        assert!(!text.contains("mcp_servers"), "{text}");
+        assert!(!text.contains("brave_search"), "{text}");
+        let state = ops
+            .file_bytes(&crate::gateway_spawn_state_path(&ctx.data_dir))
+            .expect("spawn state recorded");
+        let state: serde_json::Value = serde_json::from_slice(&state).unwrap();
+        assert_eq!(state["fingerprint"]["mcp_stdio_enabled"], false);
+        assert_eq!(state["fingerprint"]["mcp_servers_hash"], "");
+    }
+
+    #[tokio::test]
+    async fn start_gateway_fails_closed_below_mcp_floor_with_armed_stdio() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_credential_value("local-llm-service-manager/brave-search-mcp", "brave-secret");
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = fast_step();
+        let ctx = gateway_ctx_with_mcp(ops.clone(), vec![mcp_stdio_gateway_server()]);
+        script_litellm_version(&ops, &step, &ctx, "1.80.0");
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(out.message.contains("1.83.7"), "{}", out.message);
+        assert!(out.message.contains("pinned_version"), "{}", out.message);
+        assert!(ops.spawns().is_empty(), "floor failure precedes any spawn");
+    }
+
+    #[tokio::test]
+    async fn start_gateway_fails_closed_when_version_undetermined_with_armed_stdio() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_credential_value("local-llm-service-manager/brave-search-mcp", "brave-secret");
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = fast_step();
+        let ctx = gateway_ctx_with_mcp(ops.clone(), vec![mcp_stdio_gateway_server()]);
+        // Version probe unscripted → undetermined → fail-closed.
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(out.message.contains("unknown"), "{}", out.message);
+        assert!(ops.spawns().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_gateway_mcp_load_check_failure_is_noted_not_fatal() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_credential_value("local-llm-service-manager/brave-search-mcp", "brave-secret");
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        // The gateway registered nothing, and the tools list errors.
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/mcp/server",
+            FakeSystemOps::http_ok("[]"),
+        );
+        ops.with_http_get(
+            "http://127.0.0.1:4000/mcp-rest/tools/list?server_id=brave_search",
+            crate::HttpResponse {
+                status: 500,
+                body: br#"{"error":{"message":"server failed to start"}}"#.to_vec(),
+                elapsed_ms: 1,
+            },
+        );
+        let step = fast_step();
+        let ctx = gateway_ctx_with_mcp(ops.clone(), vec![mcp_stdio_gateway_server()]);
+        script_litellm_version(&ops, &step, &ctx, "1.105.1");
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.message.contains("MCP load check failed for: brave_search"),
+            "{out:?}"
+        );
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("server failed to start")),
+            "{out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_gateway_mcp_load_check_warns_on_unmanaged_registered_servers() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_credential_value("local-llm-service-manager/brave-search-mcp", "brave-secret");
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/mcp/server",
+            FakeSystemOps::http_ok(
+                r#"[{"server_id":"brave_search"},{"server_id":"db_extra"}]"#,
+            ),
+        );
+        ops.with_http_get(
+            "http://127.0.0.1:4000/mcp-rest/tools/list?server_id=brave_search",
+            FakeSystemOps::http_ok(r#"{"tools":[{"name":"brave_web_search"}]}"#),
+        );
+        let step = fast_step();
+        let ctx = gateway_ctx_with_mcp(ops.clone(), vec![mcp_stdio_gateway_server()]);
+        script_litellm_version(&ops, &step, &ctx, "1.105.1");
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("'db_extra'") && l.contains("not in the generated configuration")),
+            "{out:?}"
+        );
+        assert!(!out.message.contains("MCP load check failed"), "{out:?}");
+    }
+
+    #[test]
+    fn start_gateway_planned_spawn_carries_mcp_env_placeholders() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let step = fast_step();
+        let ctx = gateway_ctx_with_mcp(ops.clone(), vec![mcp_stdio_gateway_server()]);
+        let planned = step.planned_commands(&ctx);
+        let plan_spawn = planned
+            .iter()
+            .find(|c| c.argv.iter().any(|a| a == "--config"))
+            .expect("gateway spawn planned");
+        assert_eq!(
+            plan_spawn.env.get("LITELLM_ENABLE_MCP_STDIO").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            plan_spawn.env.get("BRAVE_API_KEY").map(String::as_str),
+            Some("<set from credential manager>")
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_start_block_carries_mcp_stdio_flag_and_credential_notes() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let ctx = gateway_ctx_with_mcp(ops.clone(), vec![mcp_stdio_gateway_server()]);
+        let block = StartGateway::default().manual_start_block(&ctx).await;
+        assert!(
+            block.contains("$env:LITELLM_ENABLE_MCP_STDIO = \"true\""),
+            "{block}"
+        );
+        assert!(block.contains("$env:BRAVE_API_KEY"), "{block}");
+        assert!(
+            block.contains("local-llm-service-manager/brave-search-mcp"),
+            "{block}"
+        );
     }
 
     /// (g) The installed prisma already matches the pin: no

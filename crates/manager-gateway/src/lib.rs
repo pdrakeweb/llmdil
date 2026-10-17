@@ -29,7 +29,7 @@
 //!   rule via [`OverflowSignal`] against [`OverflowThresholds`].
 
 use chrono::{DateTime, Utc};
-use manager_config::{AppConfig, ModelGroup, RoutingStrategy};
+use manager_config::{AppConfig, McpExposure, McpTransport, ModelGroup, RoutingStrategy};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
@@ -758,6 +758,83 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
     // os.environ/ reference at startup.
     out.push_str("general_settings:\n");
     out.push_str("  master_key: os.environ/LITELLM_MASTER_KEY\n");
+    // MCP gateway servers registered in this config (design §4.1/§5.3).
+    // This function is a pure function of the config it is given: the
+    // caller (the start-gateway step) passes a filtered clone holding
+    // only the ARMED Gateway servers, so every Gateway-exposed entry
+    // present here is emitted. Local/Disabled entries never affect
+    // generation. With no Gateway servers, nothing below is emitted
+    // and the output is byte-identical to the pre-feature generator.
+    let gateway_mcp: Vec<&manager_config::McpServerConfig> = config
+        .mcp
+        .servers
+        .iter()
+        .filter(|s| s.exposure == McpExposure::Gateway)
+        .collect();
+    if !gateway_mcp.is_empty() {
+        // §5.3: a virtual key with no explicit MCP grant then gets no
+        // MCP servers, instead of LiteLLM's open-by-default behaviour.
+        out.push_str("  require_key_mcp_access_defined: true\n");
+    }
+
+    // --- mcp_servers (after general_settings, design §4.1) ---
+    if !gateway_mcp.is_empty() {
+        out.push_str("mcp_servers:\n");
+        for s in &gateway_mcp {
+            out.push_str(&format!("  {}:\n", yaml_scalar(&s.id)));
+            let transport = match s.transport {
+                McpTransport::Stdio => "stdio",
+                McpTransport::Http => "http",
+            };
+            // Transport is always explicit: LiteLLM's YAML default is
+            // http and its API default is sse, so omitting it is a
+            // latent bug (§4.1).
+            out.push_str(&format!("    transport: {}\n", yaml_scalar(transport)));
+            match s.transport {
+                McpTransport::Stdio => {
+                    if let Some(command) = &s.command {
+                        out.push_str(&format!("    command: {}\n", yaml_scalar(command)));
+                    }
+                    let args = s
+                        .args
+                        .iter()
+                        .map(|a| yaml_scalar(a))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!("    args: [{args}]\n"));
+                }
+                McpTransport::Http => {
+                    if let Some(url) = &s.url {
+                        out.push_str(&format!("    url: {}\n", yaml_scalar(url)));
+                    }
+                }
+            }
+            if !s.env_keys.is_empty() {
+                out.push_str("    env:\n");
+                for key in &s.env_keys {
+                    // Secret values are always os.environ/ references,
+                    // never literals (§4.1/§5.4): the real values are
+                    // resolved into the gateway spawn environment.
+                    out.push_str(&format!(
+                        "      {}: {}\n",
+                        yaml_scalar(key),
+                        yaml_scalar(&format!("os.environ/{key}"))
+                    ));
+                }
+            }
+            // Not read from config at all (§4.1): every gateway MCP
+            // server is private to this deployment.
+            out.push_str("    available_on_public_internet: false\n");
+            if let Some(tools) = &s.allowed_tools {
+                let rendered = tools
+                    .iter()
+                    .map(|t| yaml_scalar(t))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("    allowed_tools: [{rendered}]\n"));
+            }
+        }
+    }
 
     Ok(out)
 }
@@ -1011,6 +1088,143 @@ mod tests {
         let expected =
             std::fs::read_to_string("tests/expected-config.yaml").expect("read snapshot");
         assert_eq!(yaml, expected, "generated YAML drifted from snapshot");
+    }
+
+    fn mcp_stdio_server() -> manager_config::McpServerConfig {
+        manager_config::McpServerConfig {
+            id: "brave_search".to_string(),
+            display_name: "Brave Search".to_string(),
+            transport: McpTransport::Stdio,
+            exposure: McpExposure::Gateway,
+            command: Some("npx".to_string()),
+            args: vec![
+                "-y".to_string(),
+                "@brave/brave-search-mcp-server@2.0.0".to_string(),
+                "--transport".to_string(),
+                "stdio".to_string(),
+            ],
+            url: None,
+            env_keys: vec!["BRAVE_API_KEY".to_string()],
+            cred_ref: Some("local-llm-service-manager/brave-search-mcp".to_string()),
+            allowed_tools: Some(vec![
+                "brave_web_search".to_string(),
+                "brave_llm_context".to_string(),
+            ]),
+            metered: true,
+            rpm_limit: Some(20),
+        }
+    }
+
+    fn mcp_http_server() -> manager_config::McpServerConfig {
+        manager_config::McpServerConfig {
+            id: "remote_tools".to_string(),
+            display_name: "Remote Tools".to_string(),
+            transport: McpTransport::Http,
+            exposure: McpExposure::Gateway,
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example.com/mcp".to_string()),
+            env_keys: vec![],
+            cred_ref: None,
+            allowed_tools: None,
+            metered: false,
+            rpm_limit: None,
+        }
+    }
+
+    #[test]
+    fn yaml_with_no_gateway_mcp_servers_is_unchanged() {
+        // The default/four-backend fixture's registry holds only the
+        // seeded Local servers: no mcp_servers block, no require-key
+        // flag (the snapshot test above pins the exact bytes).
+        let cfg = four_backend_config();
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(!yaml.contains("mcp_servers"), "{yaml}");
+        assert!(!yaml.contains("require_key_mcp_access_defined"), "{yaml}");
+        // A Disabled gateway-shaped entry likewise emits nothing.
+        let mut cfg = four_backend_config();
+        let mut disabled = mcp_stdio_server();
+        disabled.exposure = McpExposure::Disabled;
+        cfg.mcp.servers.push(disabled);
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(!yaml.contains("mcp_servers"), "{yaml}");
+    }
+
+    #[test]
+    fn yaml_emits_mcp_stdio_server_with_env_refs_and_allowed_tools() {
+        let mut cfg = four_backend_config();
+        cfg.mcp.servers.push(mcp_stdio_server());
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        // require_key flag inside general_settings (§5.3).
+        assert!(
+            yaml.contains("  require_key_mcp_access_defined: true\n"),
+            "{yaml}"
+        );
+        // The block comes after general_settings.
+        let general_at = yaml.find("general_settings:").unwrap();
+        let mcp_at = yaml.find("mcp_servers:").unwrap();
+        assert!(general_at < mcp_at, "{yaml}");
+        assert!(yaml.contains("  brave_search:\n"), "{yaml}");
+        assert!(yaml.contains("    transport: stdio\n"), "{yaml}");
+        assert!(yaml.contains("    command: npx\n"), "{yaml}");
+        assert!(
+            yaml.contains(
+                "    args: [\"-y\", \"@brave/brave-search-mcp-server@2.0.0\", \"--transport\", stdio]\n"
+            ),
+            "{yaml}"
+        );
+        // Env values are os.environ/ references, never literals, and
+        // the credential target name never appears in the YAML.
+        assert!(
+            yaml.contains("      BRAVE_API_KEY: os.environ/BRAVE_API_KEY\n"),
+            "{yaml}"
+        );
+        assert!(!yaml.contains("brave-search-mcp\""), "{yaml}");
+        assert!(
+            yaml.contains("    available_on_public_internet: false\n"),
+            "{yaml}"
+        );
+        assert!(
+            yaml.contains(
+                "    allowed_tools: [brave_web_search, brave_llm_context]\n"
+            ),
+            "{yaml}"
+        );
+    }
+
+    #[test]
+    fn yaml_emits_mcp_http_server_with_url_and_no_command() {
+        let mut cfg = four_backend_config();
+        cfg.mcp.servers.push(mcp_http_server());
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(yaml.contains("  remote_tools:\n"), "{yaml}");
+        assert!(yaml.contains("    transport: http\n"), "{yaml}");
+        assert!(
+            yaml.contains("    url: \"https://mcp.example.com/mcp\"\n"),
+            "{yaml}"
+        );
+        // No stdio fields, no env block, no allowed_tools for this entry.
+        let section = yaml.split("  remote_tools:\n").nth(1).unwrap();
+        assert!(!section.contains("command:"), "{section}");
+        assert!(!section.contains("allowed_tools:"), "{section}");
+        assert!(section.contains("available_on_public_internet: false"), "{section}");
+    }
+
+    #[test]
+    fn yaml_emits_mixed_gateway_servers_in_config_order() {
+        let mut cfg = four_backend_config();
+        cfg.mcp.servers.push(mcp_http_server());
+        cfg.mcp.servers.push(mcp_stdio_server());
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        let http_at = yaml.find("  remote_tools:\n").unwrap();
+        let stdio_at = yaml.find("  brave_search:\n").unwrap();
+        assert!(http_at < stdio_at, "config order preserved:\n{yaml}");
+        // Exactly one require_key flag for the whole set.
+        assert_eq!(
+            yaml.matches("require_key_mcp_access_defined").count(),
+            1,
+            "{yaml}"
+        );
     }
 
     #[test]

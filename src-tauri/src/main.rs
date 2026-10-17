@@ -643,13 +643,40 @@ impl AppState {
         } else {
             None
         };
+        // MCP arming for the drift path (MCP design §4.2, Phase 2):
+        // resolved by credential PRESENCE (credential_exists), not
+        // by reading values — the one arming rule in manager-wizard
+        // documents this accepted gap (the fingerprint hash covers
+        // the cred_ref name, never the value, so presence determines
+        // set membership unless a credential exists but is
+        // unreadable). Presence results are gathered async here and
+        // handed to the sync helpers as a lookup set.
+        let mut mcp_present: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for server in cfg
+            .mcp
+            .servers
+            .iter()
+            .filter(|s| s.exposure == manager_config::McpExposure::Gateway)
+        {
+            if let Some(target) = server.cred_ref.as_deref().filter(|r| !r.is_empty()) {
+                if ops.credential_exists(target).await.unwrap_or(false) {
+                    mcp_present.insert(target.to_string());
+                }
+            }
+        }
+        let mcp_armed = manager_wizard::armed_gateway_mcp_servers(cfg, |t| {
+            mcp_present.contains(t)
+        });
         let fingerprint = manager_wizard::gateway_spawn_fingerprint(
             cfg,
             postgres,
             master.as_deref(),
             openrouter.as_deref(),
+            &mcp_armed,
         );
-        manager_wizard::gateway_config_is_current(cfg, &self.data_dir, &fingerprint)
+        manager_wizard::gateway_config_is_current(cfg, &self.data_dir, &fingerprint, |t| {
+            mcp_present.contains(t)
+        })
     }
 
     /// Seed the install wizard's checklist from the machine's actual
@@ -4236,11 +4263,36 @@ async fn gateway_activation_cancel(state: State<'_, AppState>) -> ApiResult {
     manager_config::save(&restored, &state.config_path)
         .map_err(ApiError::from)
         .map_err(jerr)?;
-    *cfg = restored;
+    *cfg = restored.clone();
     drop(cfg);
+    // Regenerate the gateway YAML from the restored config and
+    // write it immediately (MCP design §10.2): the on-disk YAML is
+    // what the running gateway serves and what the drift check
+    // compares against, so leaving the cancelled changes' YAML in
+    // place would leave disk, config, and gateway disagreeing
+    // until the next start. A regeneration failure does NOT fail
+    // the cancel — the config restore already succeeded, and the
+    // next gateway start regenerates the YAML from the restored
+    // config anyway — so the failure is reported in the result
+    // payload instead of as a command error.
+    let yaml_path = state.data_dir.join("gateway").join("config.yaml");
+    let yaml_error: Option<String> = match manager_gateway::generate_config_yaml(&restored) {
+        Ok(yaml) => {
+            let write = std::fs::create_dir_all(
+                yaml_path.parent().expect("the YAML path has a parent"),
+            )
+            .and_then(|_| std::fs::write(&yaml_path, yaml));
+            write.err().map(|e| format!("could not write {}: {e}", yaml_path.display()))
+        }
+        Err(e) => Some(format!("could not regenerate the gateway config: {e}")),
+    };
     activation::clear_journal(&state.data_dir).map_err(|e| jerr(ApiError::InvalidInput(e)))?;
     ensure_backend_specs(&state).await;
-    Ok(json!({ "cancelled": true }))
+    Ok(json!({
+        "cancelled": true,
+        "yaml_regenerated": yaml_error.is_none(),
+        "yaml_error": yaml_error,
+    }))
 }
 
 /// Mark the gateway side of the activation plan complete after a
@@ -5891,11 +5943,189 @@ fn cmdkey_target_exists(target: &str) -> bool {
     }
 }
 
-/// Connection test for one MCP server (spec §14 `mcp_test_connection`).
-/// Local: supervised process running. Remote (http): HTTP probe of the URL.
-/// Disabled servers report not-ok.
+/// One raw HTTP GET against the gateway, returning (status, body)
+/// — the transport for the gateway-exposure MCP test below.
+/// src-tauri has no HTTP-client dependency; `fetch_gateway_metrics`
+/// is the in-repo precedent for hand-rolled gateway HTTP over a
+/// TcpStream. `None` on any transport failure (gateway down,
+/// malformed reply, chunked body — the metrics precedent's
+/// conservative reading).
+fn gateway_http_get(host: &str, port: u16, path: &str, master_key: &str) -> Option<(u16, String)> {
+    use std::io::{Read, Write};
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    let addr = std::net::SocketAddr::new(ip, port);
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800)).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {master_key}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > 8 * 1024 * 1024 {
+                    return None;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let mut parts = text.splitn(2, "\r\n\r\n");
+    let head = parts.next()?;
+    let status: u16 = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return None;
+    }
+    Some((status, parts.next()?.to_string()))
+}
+
+/// The Gateway-exposure connection test (MCP design §8): the same
+/// two calls the start-gateway step's post-start load check makes —
+/// `GET /v1/mcp/server` (is the server registered with the
+/// gateway?) and `GET /mcp-rest/tools/list?server_id=<id>` (does
+/// its tools list answer without error?) — against the running
+/// gateway, authenticated with the stored master key. Pass
+/// requires both. The result carries the tool names when listed.
+async fn mcp_test_gateway_connection(
+    state: &AppState,
+    entry: &manager_config::McpServerConfig,
+) -> ApiResult {
+    let id = entry.id.clone();
+    let (host, port) = {
+        let cfg = state.config.read().await;
+        (
+            manager_wizard::steps::gateway_probe_host(&cfg),
+            cfg.gateway.port,
+        )
+    };
+    let master = RealSystemOps::default()
+        .credential_read(manager_wizard::LITELLM_MASTER_KEY_CRED_TARGET)
+        .await
+        .filter(|k| !k.is_empty());
+    let Some(master) = master else {
+        return Ok(json!({
+            "id": id,
+            "ok": false,
+            "registered": false,
+            "tools": [],
+            "detail": "gateway master key not available in Windows Credential Manager; start the gateway once so the app stores one",
+        }));
+    };
+    let (list, tools) = {
+        let host = host.clone();
+        let server_id = id.clone();
+        tokio::task::spawn_blocking(move || {
+            let list = gateway_http_get(&host, port, "/v1/mcp/server", &master);
+            let tools = gateway_http_get(
+                &host,
+                port,
+                &format!("/mcp-rest/tools/list?server_id={server_id}"),
+                &master,
+            );
+            (list, tools)
+        })
+        .await
+        .unwrap_or((None, None))
+    };
+    let mut problems: Vec<String> = Vec::new();
+    let registered = match &list {
+        Some((200, body)) => {
+            if manager_wizard::parse_mcp_registered_server_ids(body)
+                .iter()
+                .any(|r| r == &id)
+            {
+                true
+            } else {
+                problems.push("not in the gateway's registered MCP server list".to_string());
+                false
+            }
+        }
+        Some((status, body)) => {
+            let detail = manager_wizard::mcp_response_error(body)
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            problems.push(format!("GET /v1/mcp/server failed: {detail}"));
+            false
+        }
+        None => {
+            problems.push(format!("gateway unreachable at http://{host}:{port}"));
+            false
+        }
+    };
+    let mut tool_names: Vec<String> = Vec::new();
+    let tools_ok = match &tools {
+        Some((200, body)) => match manager_wizard::mcp_response_error(body) {
+            Some(e) => {
+                problems.push(format!("tools list returned an error: {e}"));
+                false
+            }
+            None => {
+                tool_names = manager_wizard::parse_mcp_tool_names(body);
+                true
+            }
+        },
+        Some((status, body)) => {
+            let detail = manager_wizard::mcp_response_error(body)
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            problems.push(format!("tools list failed: {detail}"));
+            false
+        }
+        None => {
+            if list.is_some() {
+                problems.push("tools list request failed: gateway unreachable".to_string());
+            }
+            false
+        }
+    };
+    let ok = registered && tools_ok;
+    let detail = if ok {
+        format!(
+            "registered with the gateway; {} tool(s) listed",
+            tool_names.len()
+        )
+    } else {
+        problems.join("; ")
+    };
+    Ok(json!({
+        "id": id,
+        "ok": ok,
+        "registered": registered,
+        "tools": tool_names,
+        "detail": detail,
+    }))
+}
+
+/// Connection test for one MCP server (spec §14 `mcp_test_connection`),
+/// keyed on the server's persisted EXPOSURE (MCP design §8):
+/// Gateway servers are tested against the running gateway (see
+/// [`mcp_test_gateway_connection`]); Local keeps the supervised-
+/// process liveness check and http servers the URL probe; Disabled
+/// servers report not-ok.
 #[tauri::command]
 async fn mcp_test_connection(state: State<'_, AppState>, id: String) -> ApiResult {
+    let registry = state.mcp_registry().await;
+    let entry = registry
+        .iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| err(ApiError::NotFound(format!("mcp server {id}"))))?;
+    if entry.exposure == manager_config::McpExposure::Gateway {
+        return mcp_test_gateway_connection(&state, entry).await;
+    }
     let servers = state.mcp_servers().await;
     let server = servers
         .iter()

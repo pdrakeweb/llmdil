@@ -12,7 +12,7 @@
 //! [`steps::default_steps`].
 
 use async_trait::async_trait;
-use manager_config::AppConfig;
+use manager_config::{AppConfig, McpExposure, McpServerConfig, McpTransport};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -91,12 +91,11 @@ pub const PRISMA_PINNED_VERSION: &str = "0.11.0";
 /// the CVE-2026-30623 command allowlist and runtime re-validation
 /// are present from LiteLLM v1.83.7-stable. This is a floor, not a
 /// pin — the repo does not pin LiteLLM in code, and any installed
-/// version at or above the floor is acceptable. Enforcement (failing
-/// the start-gateway step closed when a gateway-registered stdio
-/// server exists and the installed version is below the floor)
-/// arrives with the gateway registration in Phase 2; Phase 0 only
-/// probes the installed version, records it, and provides this
-/// comparison.
+/// version at or above the floor is acceptable. Enforcement lives
+/// in the start-gateway step (Phase 2): when an armed stdio Gateway
+/// server exists and the probed version is below the floor — or
+/// could not be determined at all — the step fails closed before
+/// spawning.
 pub const LITELLM_MCP_FLOOR_VERSION: &str = "1.83.7";
 
 /// Parse a dotted version string tolerantly: a leading `v`/`V` is
@@ -709,6 +708,234 @@ pub trait SystemOps: Send + Sync {
     fn home_dir(&self) -> Option<PathBuf>;
 }
 
+/// ---------------------------------------------------------------------------
+/// MCP gateway arming (MCP design §4.2) — THE armed-set rule.
+///
+/// A Gateway-exposed server is ARMED for a start when every secret
+/// it needs can be resolved: it has no `env_keys`, OR its `cred_ref`
+/// credential can be resolved by the caller-supplied predicate.
+/// The predicate is over the Credential Manager TARGET NAME: the
+/// start-gateway step resolves it by actually reading the credential
+/// (`credential_read` via the ops layer), while the drift path
+/// (src-tauri's audit) may resolve it by presence
+/// (`credential_exists`) — an accepted semantic gap, documented at
+/// [`gateway_config_is_current`]: the fingerprint hash below covers
+/// the `cred_ref` NAME, never the value, so presence is enough to
+/// determine set membership unless a credential exists but is
+/// unreadable (corrupt blob), in which case drift reads as current
+/// while a real start would omit the server and record a different
+/// fingerprint on its next successful run.
+///
+/// This is the ONE definition of arming. YAML generation (through
+/// [`config_with_armed_gateway_mcp_servers`]), the spawn
+/// environment, the spawn fingerprint, and the drift check all
+/// derive from it; no caller re-derives the rule.
+pub fn armed_gateway_mcp_servers(
+    config: &AppConfig,
+    mut can_resolve: impl FnMut(&str) -> bool,
+) -> Vec<&McpServerConfig> {
+    config
+        .mcp
+        .servers
+        .iter()
+        .filter(|s| s.exposure == McpExposure::Gateway)
+        .filter(|s| {
+            s.env_keys.is_empty()
+                || match s.cred_ref.as_deref().filter(|r| !r.is_empty()) {
+                    Some(target) => can_resolve(target),
+                    None => false,
+                }
+        })
+        .collect()
+}
+
+/// A clone of `config` whose MCP registry holds ONLY the armed
+/// Gateway servers (see [`armed_gateway_mcp_servers`]), in config
+/// order. This is the config the gateway YAML is generated from for
+/// a start: `manager_gateway::generate_config_yaml` stays a pure
+/// function of the config it is given, Local/Disabled entries never
+/// affect generation, and an unarmed Gateway server is omitted for
+/// that start without touching the persisted registry.
+pub fn config_with_armed_gateway_mcp_servers(
+    config: &AppConfig,
+    can_resolve: impl FnMut(&str) -> bool,
+) -> AppConfig {
+    let armed: Vec<McpServerConfig> = armed_gateway_mcp_servers(config, can_resolve)
+        .into_iter()
+        .cloned()
+        .collect();
+    let mut filtered = config.clone();
+    filtered.mcp.servers = armed;
+    filtered
+}
+
+/// Whether any server in an armed set is a stdio server — the
+/// condition for setting `LITELLM_ENABLE_MCP_STDIO=true` in the
+/// gateway spawn environment and for enforcing the §4.3 LiteLLM
+/// version floor.
+pub fn mcp_armed_set_has_stdio(servers: &[&McpServerConfig]) -> bool {
+    servers.iter().any(|s| s.transport == McpTransport::Stdio)
+}
+
+/// SHA-256 hash of an armed registered set, covering the
+/// generation-relevant fields of each server (id, transport,
+/// command, args, url, env_keys, cred_ref, allowed_tools) in the
+/// order given (callers pass config order — deterministic). Fields
+/// are length-prefixed so concatenation cannot alias two different
+/// sets to one byte stream. The hash of the EMPTY set is the empty
+/// string, so pre-feature spawn-state records (which carry the
+/// serde default `""`) still compare current for configurations
+/// with no Gateway servers. Secret VALUES are never hashed here —
+/// only the `cred_ref` target name.
+pub fn mcp_armed_servers_hash(servers: &[&McpServerConfig]) -> String {
+    use sha2::Digest as _;
+    if servers.is_empty() {
+        return String::new();
+    }
+    let mut hasher = sha2::Sha256::new();
+    let field = |h: &mut sha2::Sha256, value: &str| {
+        h.update((value.len() as u64).to_le_bytes());
+        h.update(value.as_bytes());
+    };
+    for s in servers {
+        field(&mut hasher, &s.id);
+        field(
+            &mut hasher,
+            match s.transport {
+                McpTransport::Stdio => "stdio",
+                McpTransport::Http => "http",
+            },
+        );
+        field(&mut hasher, s.command.as_deref().unwrap_or(""));
+        // Distinguish "no command" from an empty command.
+        field(&mut hasher, if s.command.is_some() { "1" } else { "0" });
+        for arg in &s.args {
+            field(&mut hasher, arg);
+        }
+        field(&mut hasher, "\u{1}args-end");
+        field(&mut hasher, s.url.as_deref().unwrap_or(""));
+        field(&mut hasher, if s.url.is_some() { "1" } else { "0" });
+        for key in &s.env_keys {
+            field(&mut hasher, key);
+        }
+        field(&mut hasher, "\u{1}env-end");
+        field(&mut hasher, s.cred_ref.as_deref().unwrap_or(""));
+        field(&mut hasher, if s.cred_ref.is_some() { "1" } else { "0" });
+        match &s.allowed_tools {
+            Some(tools) => {
+                field(&mut hasher, "some");
+                for t in tools {
+                    field(&mut hasher, t);
+                }
+            }
+            None => field(&mut hasher, "none"),
+        }
+        field(&mut hasher, "\u{1}server-end");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Server ids in a LiteLLM `GET /v1/mcp/server` response body
+/// (MCP design §8). Tolerant by design: LiteLLM's exact envelope
+/// for this endpoint is a §14 residual unknown, so the parser
+/// accepts a bare array of ids, an array of objects (id under
+/// `server_id` / `id` / `name` / `mcp_server_id`), an object with a
+/// `servers` (or `data`) array, and an object whose keys are the
+/// ids. An unparseable body yields an empty list — callers treat
+/// that as "no server is registered", which is the failing
+/// direction for the load check.
+pub fn parse_mcp_registered_server_ids(body: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    fn id_of(entry: &serde_json::Value) -> Option<String> {
+        match entry {
+            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+            serde_json::Value::Object(map) => ["server_id", "id", "name", "mcp_server_id"]
+                .iter()
+                .find_map(|k| map.get(*k).and_then(|v| v.as_str()))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            _ => None,
+        }
+    }
+    match &value {
+        serde_json::Value::Array(entries) => entries.iter().filter_map(id_of).collect(),
+        serde_json::Value::Object(map) => {
+            for key in ["servers", "data", "mcp_servers"] {
+                if let Some(serde_json::Value::Array(entries)) = map.get(key) {
+                    return entries.iter().filter_map(id_of).collect();
+                }
+            }
+            // Object keyed by server id.
+            map.keys().cloned().collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Tool names in a LiteLLM `GET /mcp-rest/tools/list` response
+/// body (§8). Accepts an array of tool objects, or an object with a
+/// `tools` (or `data`, or `result.tools`) array; a tool's name is
+/// its `name` field (a bare string entry also counts).
+pub fn parse_mcp_tool_names(body: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    fn names(entries: &[serde_json::Value]) -> Vec<String> {
+        entries
+            .iter()
+            .filter_map(|e| match e {
+                serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+                serde_json::Value::Object(map) => map
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+                _ => None,
+            })
+            .collect()
+    }
+    match &value {
+        serde_json::Value::Array(entries) => names(entries),
+        serde_json::Value::Object(map) => {
+            for key in ["tools", "data"] {
+                if let Some(serde_json::Value::Array(entries)) = map.get(key) {
+                    return names(entries);
+                }
+            }
+            if let Some(result) = map.get("result") {
+                if let Some(serde_json::Value::Array(entries)) = result.get("tools") {
+                    return names(entries);
+                }
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The gateway's own error text in an MCP REST response body, when
+/// it carries one: a top-level `error` (string, or object with a
+/// `message`) — LiteLLM's error envelope for these endpoints.
+/// `None` when the body carries no error (including unparseable
+/// bodies; HTTP status is the caller's primary signal).
+pub fn mcp_response_error(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let error = value.get("error")?;
+    match error {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Object(map) => map
+            .get("message")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| Some(error.to_string())),
+        serde_json::Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
 /// The gateway inputs that travel to the spawned process via argv
 /// and environment rather than through `config.yaml` — invisible to
 /// a YAML-only comparison. The start-gateway step records the
@@ -731,6 +958,21 @@ pub struct GatewaySpawnFingerprint {
     /// SHA-256 of the OpenRouter API key the gateway was spawned
     /// with (empty when the tier was off or unarmed).
     pub openrouter_key_hash: String,
+    /// Whether the gateway was spawned with
+    /// `LITELLM_ENABLE_MCP_STDIO=true` (MCP design §4.2): true
+    /// exactly when the armed set for that start contained a stdio
+    /// server. Serde-defaulted (false) so spawn-state records
+    /// written before the MCP feature still parse — and still
+    /// compare current for configurations with no Gateway servers,
+    /// whose armed set is empty (see `mcp_servers_hash`).
+    #[serde(default)]
+    pub mcp_stdio_enabled: bool,
+    /// Hash of the ARMED registered MCP server set the gateway was
+    /// spawned with ([`mcp_armed_servers_hash`]); empty for an
+    /// empty armed set. Serde-defaulted ("") like
+    /// `mcp_stdio_enabled`, for the same pre-feature compatibility.
+    #[serde(default)]
+    pub mcp_servers_hash: String,
 }
 
 fn secret_fingerprint(secret: Option<&str>) -> String {
@@ -746,12 +988,17 @@ fn secret_fingerprint(secret: Option<&str>) -> String {
 /// caller resolved (the wizard reads Credential Manager; the app
 /// layer passes what it read). `postgres_installed` is the ground
 /// truth the step itself uses to decide whether DATABASE_URL is in
-/// play.
+/// play. `mcp_armed` is the armed Gateway MCP server set for the
+/// spawn being fingerprinted (from [`armed_gateway_mcp_servers`] —
+/// the one arming rule): it contributes the stdio-flag state and
+/// the registered-set hash, so toggling or editing a server, or a
+/// credential becoming unreadable, registers as drift.
 pub fn gateway_spawn_fingerprint(
     config: &AppConfig,
     postgres_installed: bool,
     master_key: Option<&str>,
     openrouter_key: Option<&str>,
+    mcp_armed: &[&McpServerConfig],
 ) -> GatewaySpawnFingerprint {
     GatewaySpawnFingerprint {
         port: config.gateway.port,
@@ -759,6 +1006,8 @@ pub fn gateway_spawn_fingerprint(
         postgres_port: postgres_installed.then_some(config.postgres.port),
         master_key_hash: secret_fingerprint(master_key),
         openrouter_key_hash: secret_fingerprint(openrouter_key),
+        mcp_stdio_enabled: mcp_armed_set_has_stdio(mcp_armed),
+        mcp_servers_hash: mcp_armed_servers_hash(mcp_armed),
     }
 }
 
@@ -791,6 +1040,15 @@ fn yaml_fingerprint(yaml: &str) -> String {
         "{:x}",
         sha2::Sha256::digest(normalize_gateway_yaml(yaml).as_bytes())
     )
+}
+
+/// The SHA-256 hash of a generated gateway YAML document, with the
+/// same CRLF/trailing-newline normalisation the drift check uses.
+/// Public for the activation journal (design §10.2), which records
+/// the pre-change YAML hash for drift visibility in the same terms
+/// the spawn state uses.
+pub fn gateway_yaml_hash(yaml: &str) -> String {
+    yaml_fingerprint(yaml)
 }
 
 /// Serialize a successful spawn's state (the drift check's
@@ -832,12 +1090,23 @@ pub fn gateway_spawn_state_json(
 /// A missing record (a gateway started by an older build), drifted
 /// contents, or a configuration that no longer generates (e.g. no
 /// enabled groups) all count as NOT current.
+/// `mcp_can_resolve` is the arming predicate for the drift path
+/// (see [`armed_gateway_mcp_servers`]): the YAML this check
+/// regenerates must be the YAML a start would write NOW, which is
+/// generated from the armed-only filtered config — an unarmed
+/// Gateway server omitted at the last start must not read as drift
+/// forever, and a server that has become armed since must. The
+/// app layer resolves this predicate by credential PRESENCE
+/// (`credential_exists`), not by reading values: the accepted
+/// semantic gap documented on [`armed_gateway_mcp_servers`].
 pub fn gateway_config_is_current(
     config: &AppConfig,
     data_dir: &Path,
     current: &GatewaySpawnFingerprint,
+    mcp_can_resolve: impl FnMut(&str) -> bool,
 ) -> bool {
-    let Ok(generated) = manager_gateway::generate_config_yaml(config) else {
+    let filtered = config_with_armed_gateway_mcp_servers(config, mcp_can_resolve);
+    let Ok(generated) = manager_gateway::generate_config_yaml(&filtered) else {
         return false;
     };
     let Ok(on_disk) = std::fs::read_to_string(data_dir.join("gateway").join("config.yaml")) else {
@@ -1752,7 +2021,7 @@ mod tests {
     #[test]
     fn gateway_spawn_state_records_litellm_version_and_parses_legacy() {
         let cfg = manager_config::AppConfig::default_config();
-        let fp = gateway_spawn_fingerprint(&cfg, false, None, None);
+        let fp = gateway_spawn_fingerprint(&cfg, false, None, None, &[]);
         let json = gateway_spawn_state_json(&fp, "yaml: true\n", Some("1.105.1"));
         let state: GatewaySpawnState = serde_json::from_str(&json).unwrap();
         assert_eq!(state.litellm_version.as_deref(), Some("1.105.1"));
@@ -1771,6 +2040,180 @@ mod tests {
         assert_eq!(state.yaml_sha256, "abc");
     }
 
+    fn mcp_cfg_server(
+        id: &str,
+        exposure: McpExposure,
+        env_keys: &[&str],
+        cred_ref: Option<&str>,
+    ) -> McpServerConfig {
+        McpServerConfig {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            transport: McpTransport::Stdio,
+            exposure,
+            command: Some("npx".to_string()),
+            args: vec!["-y".to_string(), format!("@example/{id}@1.0.0")],
+            url: None,
+            env_keys: env_keys.iter().map(|s| s.to_string()).collect(),
+            cred_ref: cred_ref.map(str::to_string),
+            allowed_tools: None,
+            metered: false,
+            rpm_limit: None,
+        }
+    }
+
+    #[test]
+    fn mcp_arming_rule_covers_no_env_resolvable_and_unresolvable() {
+        let mut cfg = manager_config::AppConfig::default_config();
+        cfg.mcp.servers = vec![
+            // No env keys: armed without any credential.
+            mcp_cfg_server("no_env", McpExposure::Gateway, &[], None),
+            // Env keys + resolvable credential: armed.
+            mcp_cfg_server("armed", McpExposure::Gateway, &["K"], Some("t/armed")),
+            // Env keys + unresolvable credential: NOT armed.
+            mcp_cfg_server("unarmed", McpExposure::Gateway, &["K"], Some("t/missing")),
+            // Env keys but no cred_ref named: NOT armed.
+            mcp_cfg_server("no_ref", McpExposure::Gateway, &["K"], None),
+            // Local servers are never in the gateway armed set.
+            mcp_cfg_server("local_one", McpExposure::Local, &[], None),
+        ];
+        let armed = armed_gateway_mcp_servers(&cfg, |t| t == "t/armed");
+        let ids: Vec<&str> = armed.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["no_env", "armed"]);
+        assert!(mcp_armed_set_has_stdio(&armed));
+        // The filtered config holds ONLY the armed Gateway servers,
+        // and generation from it emits exactly that set (the mixed
+        // armed-set generation case, design §4.1/§4.2).
+        let mut full = manager_config::AppConfig::default_config();
+        for b in full.backends.iter_mut() {
+            b.enabled = true;
+        }
+        full.mcp.servers.clone_from(&cfg.mcp.servers);
+        let filtered = config_with_armed_gateway_mcp_servers(&full, |t| t == "t/armed");
+        assert_eq!(filtered.mcp.servers.len(), 2);
+        let yaml = manager_gateway::generate_config_yaml(&filtered).unwrap();
+        assert!(yaml.contains("  no_env:\n"), "{yaml}");
+        assert!(yaml.contains("  armed:\n"), "{yaml}");
+        assert!(!yaml.contains("unarmed"), "{yaml}");
+        assert!(!yaml.contains("no_ref"), "{yaml}");
+        assert!(!yaml.contains("local_one"), "{yaml}");
+    }
+
+    #[test]
+    fn mcp_fingerprint_fields_and_legacy_record_compatibility() {
+        // Empty armed set: hash is "" and stdio is false — equal to
+        // the serde defaults of a pre-feature spawn-state record.
+        let cfg = manager_config::AppConfig::default_config();
+        let fp_empty = gateway_spawn_fingerprint(&cfg, false, None, None, &[]);
+        assert_eq!(fp_empty.mcp_servers_hash, "");
+        assert!(!fp_empty.mcp_stdio_enabled);
+        assert_eq!(mcp_armed_servers_hash(&[]), "");
+        // A legacy fingerprint JSON (no MCP fields at all) parses
+        // with those defaults and equals the empty-set fingerprint.
+        let legacy = r#"{"port":4000,"bind_host":"0.0.0.0","postgres_port":null,"master_key_hash":"","openrouter_key_hash":""}"#;
+        let parsed: GatewaySpawnFingerprint = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.mcp_servers_hash, "");
+        assert!(!parsed.mcp_stdio_enabled);
+        let mut cfg2 = manager_config::AppConfig::default_config();
+        cfg2.gateway.port = parsed.port;
+        assert_eq!(
+            gateway_spawn_fingerprint(&cfg2, false, None, None, &[]),
+            parsed
+        );
+
+        // An armed stdio server changes both fields; editing a
+        // generation-relevant field changes the hash; an http-only
+        // set does not set the stdio flag.
+        let server = mcp_cfg_server("srv", McpExposure::Gateway, &["K"], Some("t/srv"));
+        let fp = gateway_spawn_fingerprint(&cfg, false, None, None, &[&server]);
+        assert!(fp.mcp_stdio_enabled);
+        assert_eq!(fp.mcp_servers_hash.len(), 64);
+        let mut edited = server.clone();
+        edited.args.push("--extra".to_string());
+        assert_ne!(
+            mcp_armed_servers_hash(&[&server]),
+            mcp_armed_servers_hash(&[&edited])
+        );
+        let mut http = server.clone();
+        http.transport = McpTransport::Http;
+        http.command = None;
+        http.url = Some("https://example.com/mcp".to_string());
+        assert!(!mcp_armed_set_has_stdio(&[&http]));
+        assert_ne!(mcp_armed_servers_hash(&[&http]), fp.mcp_servers_hash);
+    }
+
+    #[test]
+    fn mcp_gateway_config_is_current_uses_arming_for_yaml() {
+        // A gateway spawned with an armed server stays current
+        // while the credential resolves, and reads as drift when it
+        // stops resolving (a start now would omit the server).
+        let dir = std::env::temp_dir().join(format!("wizard-gw-mcp-{}", std::process::id()));
+        let gw_dir = dir.join("gateway");
+        std::fs::create_dir_all(&gw_dir).unwrap();
+        let mut cfg = manager_config::AppConfig::default_config();
+        for b in cfg.backends.iter_mut() {
+            b.enabled = true;
+        }
+        let server = mcp_cfg_server("srv", McpExposure::Gateway, &["K"], Some("t/srv"));
+        cfg.mcp.servers.push(server.clone());
+        let armed = armed_gateway_mcp_servers(&cfg, |_| true);
+        let filtered = config_with_armed_gateway_mcp_servers(&cfg, |_| true);
+        let yaml = manager_gateway::generate_config_yaml(&filtered).unwrap();
+        assert!(yaml.contains("mcp_servers:"), "{yaml}");
+        std::fs::write(gw_dir.join("config.yaml"), &yaml).unwrap();
+        let fp = gateway_spawn_fingerprint(&cfg, true, Some("sk-master"), None, &armed);
+        std::fs::write(
+            gateway_spawn_state_path(&dir),
+            gateway_spawn_state_json(&fp, &yaml, None),
+        )
+        .unwrap();
+        assert!(gateway_config_is_current(&cfg, &dir, &fp, |_| true));
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp, |_| false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_response_parsers_accept_the_documented_shapes() {
+        // Registered list: array of objects, array of strings,
+        // envelope object.
+        assert_eq!(
+            parse_mcp_registered_server_ids(
+                r#"[{"server_id":"brave_search"},{"id":"web_fetch"}]"#
+            ),
+            vec!["brave_search", "web_fetch"]
+        );
+        assert_eq!(
+            parse_mcp_registered_server_ids(r#"["a","b"]"#),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            parse_mcp_registered_server_ids(r#"{"servers":[{"name":"x"}]}"#),
+            vec!["x"]
+        );
+        assert!(parse_mcp_registered_server_ids("not json").is_empty());
+        // Tools list: {tools:[{name}]} and bare arrays.
+        assert_eq!(
+            parse_mcp_tool_names(r#"{"tools":[{"name":"brave_web_search"}]}"#),
+            vec!["brave_web_search"]
+        );
+        assert_eq!(
+            parse_mcp_tool_names(r#"[{"name":"fetch"}]"#),
+            vec!["fetch"]
+        );
+        assert!(parse_mcp_tool_names(r#"{"tools":[]}"#).is_empty());
+        // Error envelope.
+        assert_eq!(
+            mcp_response_error(r#"{"error":{"message":"boom"}}"#).as_deref(),
+            Some("boom")
+        );
+        assert_eq!(
+            mcp_response_error(r#"{"error":"nope"}"#).as_deref(),
+            Some("nope")
+        );
+        assert_eq!(mcp_response_error(r#"{"tools":[]}"#), None);
+        assert_eq!(mcp_response_error("not json"), None);
+    }
+
     #[test]
     fn gateway_config_is_current_compares_generated_yaml_to_disk() {
         let dir = std::env::temp_dir().join(format!("wizard-gw-current-{}", std::process::id()));
@@ -1783,35 +2226,35 @@ mod tests {
         for b in cfg.backends.iter_mut() {
             b.enabled = true;
         }
-        let fp = gateway_spawn_fingerprint(&cfg, true, Some("sk-master"), None);
+        let fp = gateway_spawn_fingerprint(&cfg, true, Some("sk-master"), None, &[]);
         // Missing file: not current (the step must run to write it).
-        assert!(!gateway_config_is_current(&cfg, &dir, &fp));
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp, |_| true));
         let yaml = manager_gateway::generate_config_yaml(&cfg).unwrap();
         std::fs::write(gw_dir.join("config.yaml"), &yaml).unwrap();
         // YAML alone is not enough: no spawn-state record means the
         // running gateway's argv/env inputs are unknown.
-        assert!(!gateway_config_is_current(&cfg, &dir, &fp));
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp, |_| true));
         std::fs::write(
             gateway_spawn_state_path(&dir),
             gateway_spawn_state_json(&fp, &yaml, Some("1.105.1")),
         )
         .unwrap();
-        assert!(gateway_config_is_current(&cfg, &dir, &fp));
+        assert!(gateway_config_is_current(&cfg, &dir, &fp, |_| true));
         // CRLF line endings and trailing blank lines are not drift.
         std::fs::write(
             gw_dir.join("config.yaml"),
             format!("{}\r\n\r\n", yaml.replace('\n', "\r\n")),
         )
         .unwrap();
-        assert!(gateway_config_is_current(&cfg, &dir, &fp));
+        assert!(gateway_config_is_current(&cfg, &dir, &fp, |_| true));
         // A hand edit is drift.
         std::fs::write(gw_dir.join("config.yaml"), format!("{yaml}# hand edit\n")).unwrap();
-        assert!(!gateway_config_is_current(&cfg, &dir, &fp));
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp, |_| true));
         // A configuration that no longer generates is not current.
         let mut no_groups = cfg.clone();
         no_groups.gateway.groups.clear();
         std::fs::write(gw_dir.join("config.yaml"), &yaml).unwrap();
-        assert!(!gateway_config_is_current(&no_groups, &dir, &fp));
+        assert!(!gateway_config_is_current(&no_groups, &dir, &fp, |_| true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1829,38 +2272,38 @@ mod tests {
         }
         let yaml = manager_gateway::generate_config_yaml(&cfg).unwrap();
         std::fs::write(gw_dir.join("config.yaml"), &yaml).unwrap();
-        let spawned = gateway_spawn_fingerprint(&cfg, true, Some("sk-master"), None);
+        let spawned = gateway_spawn_fingerprint(&cfg, true, Some("sk-master"), None, &[]);
         std::fs::write(
             gateway_spawn_state_path(&dir),
             gateway_spawn_state_json(&spawned, &yaml, None),
         )
         .unwrap();
-        assert!(gateway_config_is_current(&cfg, &dir, &spawned));
+        assert!(gateway_config_is_current(&cfg, &dir, &spawned, |_| true));
 
         // Gateway port moved.
         let mut moved = cfg.clone();
         moved.gateway.port += 1;
-        let fp = gateway_spawn_fingerprint(&moved, true, Some("sk-master"), None);
-        assert!(!gateway_config_is_current(&moved, &dir, &fp));
+        let fp = gateway_spawn_fingerprint(&moved, true, Some("sk-master"), None, &[]);
+        assert!(!gateway_config_is_current(&moved, &dir, &fp, |_| true));
         // Bind host changed.
         let mut rebound = cfg.clone();
         rebound.gateway.bind_host = "127.0.0.1".to_string();
-        let fp = gateway_spawn_fingerprint(&rebound, true, Some("sk-master"), None);
-        assert!(!gateway_config_is_current(&rebound, &dir, &fp));
+        let fp = gateway_spawn_fingerprint(&rebound, true, Some("sk-master"), None, &[]);
+        assert!(!gateway_config_is_current(&rebound, &dir, &fp, |_| true));
         // PostgreSQL appeared since the spawn (DATABASE_URL now in
         // play) — and, symmetrically, disappeared.
-        let fp = gateway_spawn_fingerprint(&cfg, false, Some("sk-master"), None);
-        assert!(!gateway_config_is_current(&cfg, &dir, &fp));
+        let fp = gateway_spawn_fingerprint(&cfg, false, Some("sk-master"), None, &[]);
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp, |_| true));
         // Master key rotated.
-        let fp = gateway_spawn_fingerprint(&cfg, true, Some("sk-rotated"), None);
-        assert!(!gateway_config_is_current(&cfg, &dir, &fp));
+        let fp = gateway_spawn_fingerprint(&cfg, true, Some("sk-rotated"), None, &[]);
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp, |_| true));
         // OpenRouter key appeared.
-        let fp = gateway_spawn_fingerprint(&cfg, true, Some("sk-master"), Some("or-key"));
-        assert!(!gateway_config_is_current(&cfg, &dir, &fp));
+        let fp = gateway_spawn_fingerprint(&cfg, true, Some("sk-master"), Some("or-key"), &[]);
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp, |_| true));
         // The stored YAML hash no longer matching the file on disk
         // (replaced after the spawn) is drift too.
         std::fs::write(gw_dir.join("config.yaml"), "# replaced\n").unwrap();
-        assert!(!gateway_config_is_current(&cfg, &dir, &spawned));
+        assert!(!gateway_config_is_current(&cfg, &dir, &spawned, |_| true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
