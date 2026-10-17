@@ -86,31 +86,6 @@ export function meter(pct: number, width: number, height: number, color: string)
   </svg>`;
 }
 
-/** Multi-series line chart with area fills (throughput history). */
-export function multiLine(
-  series: { name: string; color: string; values: number[] }[],
-  w: number,
-  h: number,
-): string {
-  const all = series.flatMap((s) => s.values);
-  const min = Math.min(...all, 0);
-  const max = Math.max(...all, 1);
-  const span = max - min || 1;
-  const n = Math.max(...series.map((s) => s.values.length));
-  const stepX = n > 1 ? (w - 4) / (n - 1) : 0;
-  const xy = (v: number, i: number) =>
-    `${(2 + i * stepX).toFixed(1)},${(h - 4 - ((v - min) / span) * (h - 8)).toFixed(1)}`;
-  const paths = series
-    .map((s) => {
-      const pts = s.values.map(xy).join(" ");
-      const area = `2,${h} ${pts} ${(w - 2).toFixed(1)},${h}`;
-      return `<polygon points="${area}" fill="${s.color}" opacity="0.10"/>
-              <polyline points="${pts}" fill="none" stroke="${s.color}" stroke-width="1.5"/>`;
-    })
-    .join("");
-  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="display:block;width:100%" preserveAspectRatio="none" aria-hidden="true">${paths}</svg>`;
-}
-
 /** Small deterministic pseudo-random walk for mock history series. */
 export function walk(n: number, base: number, amp: number, seed: number): number[] {
   let s = seed;
@@ -139,4 +114,18 @@ export function trim1(v: number): string {
 /** A GB/GiB quantity under the trim1 rule: fmtGb(15.9921875) is "16". */
 export function fmtGb(v: number): string {
   return trim1(v);
+}
+
+/** A count: integer with thousands separators (1,234). Counts are
+ *  never decimal — this is the one formatter for request/error/group
+ *  counts everywhere (principle 14). */
+export function fmtCount(v: number): string {
+  return Math.round(v).toLocaleString("en-US");
+}
+
+/** A percentage from a 0-1 fraction: integer when whole, one decimal
+ *  otherwise (trim1 rule). Chart widths and their tooltip values are
+ *  computed from the same fraction so they can never disagree. */
+export function fmtPct(frac: number): string {
+  return trim1(frac * 100);
 }

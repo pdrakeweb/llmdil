@@ -17,6 +17,11 @@
   --purple: #a371f7;
   --teal: #39c5cf;
   --mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  /* The sans stack (same as body's) as a variable: `.place-row
+     .eventual-tag` referenced var(--sans), which was never defined
+     and silently fell back to the inherited font (code-review
+     5.13). */
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -200,6 +205,20 @@ body {
 .backend-gpu-configured { font-size: 12px; color: var(--text2); margin-top: 4px; }
 .backend-gpus .split-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: #2a313c; margin: 2px 0 6px; }
 .backend-gpus .split-bar i { display: block; height: 100%; }
+
+/* Backend-card GPU residency bars: fill = the backend's share of
+   the GPU's total VRAM (measured) or its configured split share
+   (ghost, stopped backend). Context-only residency is a striped
+   sliver; the explanation rides the row's tooltip. */
+.res-bar-row { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-top: 4px; }
+.res-bar-name { flex: 0 1 40%; min-width: 0; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.res-bar-track { flex: 1; display: block; height: 8px; background: var(--panel2); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+.res-bar-track.ghost { border-style: dashed; }
+.res-bar-track i { display: block; height: 100%; }
+.res-bar-track i.ctx { background-image: repeating-linear-gradient(45deg, rgba(255, 255, 255, .45) 0 3px, transparent 3px, transparent 6px); min-width: 3px; }
+.res-bar-track i.ghost { opacity: .35; }
+.res-bar-val { flex: 0 0 62px; text-align: right; font-family: var(--mono); white-space: nowrap; }
+.backend-details { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
 .status-tag { font-weight: 600; }
 .status-tag.status-on { color: #7ee787; border-color: rgba(63, 185, 80, 0.6); background: rgba(63, 185, 80, 0.14); }
 .status-tag.status-off { color: var(--text2); border-color: #4b5563; background: rgba(109, 118, 134, 0.14); }
@@ -252,6 +271,21 @@ body {
 .gpu-chip-name { font-size: 11px; color: var(--text2); white-space: nowrap; margin-left: 19px; }
 .info-tip { display: inline-flex; vertical-align: -2px; margin-left: 4px; color: var(--text3); cursor: help; }
 .info-tip:hover { color: var(--text2); }
+
+/* Hand-rolled date/time picker popup (Logs From/To filters).
+   Fixed-positioned by the wiring code so no panel can clip it. */
+.dt-pop { position: fixed; z-index: 80; width: 236px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px; box-shadow: 0 10px 28px rgba(0, 0, 0, .5); }
+.dt-head { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+.dt-nav { padding: 2px 9px; }
+.dt-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+.dt-wd { font-size: 10px; color: var(--text3); text-align: center; padding: 2px 0; }
+.dt-day { background: none; border: 1px solid transparent; border-radius: 6px; color: var(--text); font: inherit; font-size: 12px; padding: 3px 0; cursor: pointer; text-align: center; }
+.dt-day:hover { background: var(--panel2); }
+.dt-day.other { color: var(--text3); }
+.dt-day.today { border-color: var(--amber); }
+.dt-day.sel { background: var(--amber); color: #14171c; font-weight: 600; }
+.dt-time { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: var(--text2); }
+.dt-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 
 /* GPU strip cards */
 .gpu-head { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }
@@ -313,11 +347,6 @@ table.tbl tr:last-child td { border-bottom: 0; }
 .sec-title { font-size: 13px; font-weight: 700; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
 .sec-title .ic { width: 14px; height: 14px; }
 
-/* Event list */
-.events { display: grid; gap: 8px; font-size: 12px; }
-.events .ev { display: flex; gap: 10px; align-items: baseline; }
-.events .ev time { color: var(--text3); font-family: var(--mono); font-size: 11px; flex: 0 0 64px; }
-
 /* Log stream */
 .logstream {
   font-family: var(--mono); font-size: 12px; line-height: 1.7;
@@ -338,12 +367,12 @@ table.tbl tr:last-child td { border-bottom: 0; }
 .segbar { display: flex; gap: 4px; flex: 1; }
 .segbar i { height: 8px; flex: 1; border-radius: 4px; background: #2a313c; }
 .segbar i.done { background: var(--ok); }
-.segbar i.run { background: var(--accent); }
+.segbar i.run { background: var(--warn); }
 .wiz-body { display: grid; grid-template-columns: 240px 1fr; }
 .wiz-side { padding: 18px; border-right: 1px solid var(--border); color: var(--text2); font-size: 12px; line-height: 1.6; }
 .wiz-steps { padding: 14px 18px; display: grid; gap: 8px; }
 .step {
-  display: grid; grid-template-columns: 28px 28px 1fr auto; gap: 10px; align-items: center;
+  display: grid; grid-template-columns: 28px 1fr auto auto; gap: 10px; align-items: center;
   border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
   background: var(--bg2);
 }
@@ -351,11 +380,13 @@ table.tbl tr:last-child td { border-bottom: 0; }
 .step .sdetail { color: var(--text3); font-size: 11px; font-family: var(--mono); }
 .step .sstate { font-size: 11px; font-family: var(--mono); }
 .step.done .sstate { color: var(--ok); }
-.step.running { border-color: var(--accent); background: rgba(74, 158, 255, 0.08); }
-.step.running .sstate { color: var(--accent); }
+.step.running { border-color: var(--warn); background: rgba(210, 153, 34, 0.08); }
+.step.running .sstate { color: var(--warn); }
 .step.queued { opacity: 0.55; }
-.step.failed { border-color: var(--err); }
+.step.failed { border-color: var(--err); background: rgba(248, 81, 73, 0.07); }
 .step.failed .sstate { color: var(--err); }
+.step .sdetails { grid-column: 1 / -1; border-top: 1px solid var(--border); padding-top: 8px; display: grid; gap: 6px; font-size: 12px; color: var(--text2); }
+.step .sdetails .k { color: var(--text3); }
 .wiz-foot { padding: 14px 20px; border-top: 1px solid var(--border); display: flex; gap: 10px; }
 .wiz-foot .spacer { flex: 1; }
 

@@ -251,7 +251,13 @@ impl std::fmt::Debug for WizardContext {
 pub struct StepOutcome {
     pub state: StepState,
     pub message: String,
-    /// Last [`LOG_TAIL_LINES`] log lines for inline display on failure.
+    /// The step's full log. The [`StepReport`] the runner derives
+    /// from an outcome carries only the last [`LOG_TAIL_LINES`]
+    /// lines (inline display); the outcome itself keeps everything,
+    /// so the caller can persist the complete log — truncating the
+    /// outcome discarded exactly the lines that diagnose a failure
+    /// (a start-gateway failure's own pin/probe/generate lines were
+    /// displaced by the gateway's banner tail, 2026-10-16).
     pub log_tail: Vec<String>,
     pub duration_ms: u64,
     /// Ready-to-run commands for doing the step's work by hand when
@@ -476,15 +482,30 @@ impl GpuDescriptor {
 pub trait SystemOps: Send + Sync {
     /// Run a command to completion, capturing output.
     async fn run_command(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError>;
+    /// Note that a step execution is starting. The real
+    /// implementation clears any cancellation left over from a
+    /// previous step (see [`Self::request_cancellation`]); the
+    /// default does nothing.
+    fn note_step_started(&self) {}
+    /// Ask in-flight blocking work (archive extraction running on a
+    /// blocking thread, which a dropped future cannot cancel) to
+    /// stop at its next checkpoint and fail with
+    /// [`WizardError::Cancelled`]. The step runner calls this when a
+    /// step's budget expires: without it, a timed-out extraction
+    /// kept writing in the background and raced the step's retry.
+    /// The default does nothing.
+    fn request_cancellation(&self) {}
     /// Run a command under a caller-chosen timeout, for work whose
     /// legitimate duration exceeds the implementation's default
-    /// command budget (package installs). The default wraps
-    /// [`Self::run_command`] in `tokio::time::timeout`: expiring the
-    /// budget drops the command future, and the real implementation
-    /// builds its child with kill-on-drop, so a timed-out command is
-    /// killed rather than left running detached from the wizard. The
-    /// implementation's own default budget may fire first; the error
-    /// is the same shape either way.
+    /// command budget (package installs). The real implementation
+    /// honors the caller's budget exactly — its own default cap
+    /// applies only to [`Self::run_command`] — and a timed-out
+    /// command's whole process tree is killed, not just the direct
+    /// child. The default implementation wraps [`Self::run_command`]
+    /// in `tokio::time::timeout`: expiring the budget drops the
+    /// command future, and the real implementation kills the tree
+    /// when its command future is dropped, so a timed-out command
+    /// is never left running detached from the wizard.
     async fn run_command_with_timeout(
         &self,
         cmd: &PlannedCommand,
@@ -635,26 +656,139 @@ pub trait SystemOps: Send + Sync {
     fn home_dir(&self) -> Option<PathBuf>;
 }
 
-/// Whether the gateway YAML on disk is exactly what the current
-/// configuration generates. The start-gateway step rewrites
-/// `<data_dir>/gateway/config.yaml` from the live config on every
-/// start, so an audit "gateway healthy" result (or a persisted Done
-/// for the step) only proves the step complete while the file still
-/// matches the current configuration — a stale gateway answering
-/// the health probe says nothing about the saved configuration.
-/// A missing or unreadable file, drifted contents, or a
-/// configuration that no longer generates (e.g. no enabled groups)
-/// all count as NOT current. The comparison itself mirrors the
-/// activation journal's drift check in the app layer:
-/// CRLF/trailing-newline-insensitive string equality.
-pub fn gateway_config_is_current(config: &AppConfig, data_dir: &Path) -> bool {
+/// The gateway inputs that travel to the spawned process via argv
+/// and environment rather than through `config.yaml` — invisible to
+/// a YAML-only comparison. The start-gateway step records the
+/// fingerprint it actually spawned with (see
+/// [`gateway_spawn_state_json`]); the drift check compares that
+/// record against the fingerprint of the current configuration.
+/// Secret values are never stored: credentials contribute only
+/// their SHA-256 hashes, enough to detect a rotation.
+/// (Serialized via [`gateway_spawn_state_json`].)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewaySpawnFingerprint {
+    pub port: u16,
+    pub bind_host: String,
+    /// The app-managed PostgreSQL port when the gateway was spawned
+    /// with a DATABASE_URL; `None` when it ran database-free.
+    pub postgres_port: Option<u16>,
+    /// SHA-256 of the LiteLLM master key the gateway was spawned
+    /// with (empty when no key was in play).
+    pub master_key_hash: String,
+    /// SHA-256 of the OpenRouter API key the gateway was spawned
+    /// with (empty when the tier was off or unarmed).
+    pub openrouter_key_hash: String,
+}
+
+fn secret_fingerprint(secret: Option<&str>) -> String {
+    use sha2::Digest as _;
+    match secret {
+        Some(s) if !s.is_empty() => format!("{:x}", sha2::Sha256::digest(s.as_bytes())),
+        _ => String::new(),
+    }
+}
+
+/// The spawn fingerprint of the current configuration: argv/env
+/// inputs from `config`, credential hashes from the values the
+/// caller resolved (the wizard reads Credential Manager; the app
+/// layer passes what it read). `postgres_installed` is the ground
+/// truth the step itself uses to decide whether DATABASE_URL is in
+/// play.
+pub fn gateway_spawn_fingerprint(
+    config: &AppConfig,
+    postgres_installed: bool,
+    master_key: Option<&str>,
+    openrouter_key: Option<&str>,
+) -> GatewaySpawnFingerprint {
+    GatewaySpawnFingerprint {
+        port: config.gateway.port,
+        bind_host: config.gateway.bind_host.clone(),
+        postgres_port: postgres_installed.then_some(config.postgres.port),
+        master_key_hash: secret_fingerprint(master_key),
+        openrouter_key_hash: secret_fingerprint(openrouter_key),
+    }
+}
+
+/// What a successful gateway spawn records, at
+/// `<data_dir>/gateway/spawn-state.json`: the spawn fingerprint and
+/// the hash of the generated YAML it spawned with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GatewaySpawnState {
+    fingerprint: GatewaySpawnFingerprint,
+    yaml_sha256: String,
+}
+
+/// Path of the spawn-state record: `<data_dir>/gateway/spawn-state.json`.
+pub fn gateway_spawn_state_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("gateway").join("spawn-state.json")
+}
+
+fn yaml_fingerprint(yaml: &str) -> String {
+    use sha2::Digest as _;
+    format!(
+        "{:x}",
+        sha2::Sha256::digest(normalize_gateway_yaml(yaml).as_bytes())
+    )
+}
+
+/// Serialize a successful spawn's state (the drift check's
+/// baseline) for the caller to persist at
+/// [`gateway_spawn_state_path`] — through the ops layer, so step
+/// tests stay hermetic. Written by the start-gateway step after
+/// the gateway is healthy.
+pub fn gateway_spawn_state_json(
+    fingerprint: &GatewaySpawnFingerprint,
+    generated_yaml: &str,
+) -> String {
+    let state = GatewaySpawnState {
+        fingerprint: fingerprint.clone(),
+        yaml_sha256: yaml_fingerprint(generated_yaml),
+    };
+    serde_json::to_string_pretty(&state).unwrap()
+}
+
+/// Whether the running gateway's recorded spawn state still matches
+/// the current configuration — the full drift check. The
+/// start-gateway step rewrites `<data_dir>/gateway/config.yaml`
+/// from the live config on every start, so an audit "gateway
+/// healthy" result (or a persisted Done for the step) only proves
+/// the step complete while the gateway was spawned from the current
+/// configuration — a stale gateway answering the health probe says
+/// nothing about the saved configuration.
+///
+/// The YAML alone does not carry every spawn input: the port and
+/// bind host travel via argv, the database URL and the credential
+/// values via the environment. Comparing only the file adopted a
+/// stale `Done` after a port change, a bind change, a credential
+/// rotation, or a PostgreSQL install — the gateway kept serving the
+/// old configuration while the checklist said complete. So this
+/// requires, in addition to the YAML matching what the current
+/// configuration generates, a spawn-state record whose fingerprint
+/// equals `current` and whose YAML hash equals the YAML on disk.
+/// A missing record (a gateway started by an older build), drifted
+/// contents, or a configuration that no longer generates (e.g. no
+/// enabled groups) all count as NOT current.
+pub fn gateway_config_is_current(
+    config: &AppConfig,
+    data_dir: &Path,
+    current: &GatewaySpawnFingerprint,
+) -> bool {
     let Ok(generated) = manager_gateway::generate_config_yaml(config) else {
         return false;
     };
     let Ok(on_disk) = std::fs::read_to_string(data_dir.join("gateway").join("config.yaml")) else {
         return false;
     };
-    normalize_gateway_yaml(&generated) == normalize_gateway_yaml(&on_disk)
+    if normalize_gateway_yaml(&generated) != normalize_gateway_yaml(&on_disk) {
+        return false;
+    }
+    let Ok(state_text) = std::fs::read_to_string(gateway_spawn_state_path(data_dir)) else {
+        return false;
+    };
+    let Ok(state) = serde_json::from_str::<GatewaySpawnState>(&state_text) else {
+        return false;
+    };
+    state.fingerprint == *current && state.yaml_sha256 == yaml_fingerprint(&on_disk)
 }
 
 fn normalize_gateway_yaml(text: &str) -> String {
@@ -807,14 +941,20 @@ impl Wizard {
             if !matches!(step.state, StepState::Done | StepState::Manual) {
                 continue;
             }
+            let current = self.states.get(&step.id).copied();
             if step.id == steps::STEP_START_GATEWAY && !gateway_config_current {
-                self.notes.insert(
-                    step.id.clone(),
-                    "gateway configuration changed since the gateway was started".to_string(),
-                );
+                // The drift note explains why the step is not
+                // adopted — but only when it is not adopted. If this
+                // instance already holds Done for the step, the note
+                // would contradict the displayed state.
+                if !matches!(current, Some(StepState::Done | StepState::Manual)) {
+                    self.notes.insert(
+                        step.id.clone(),
+                        "gateway configuration changed since the gateway was started".to_string(),
+                    );
+                }
                 continue;
             }
-            let current = self.states.get(&step.id).copied();
             if matches!(current, None | Some(StepState::Queued)) {
                 self.states.insert(step.id.clone(), step.state);
                 self.reports.insert(step.id.clone(), step.clone());
@@ -1066,27 +1206,33 @@ impl Wizard {
             .map(|s| s.name().to_string())
             .unwrap_or_default();
         self.states.insert(id.to_string(), StepState::Running);
+        ctx.ops.note_step_started();
         let started = Instant::now();
         // The borrow from the finds above has ended; re-resolve for the run.
         // The None arm is unreachable (checked above) but handled anyway.
         // The timeout drops the step's future on expiry: any command
-        // it was awaiting is dropped with it (and killed — see
-        // `run_command`), so a timed-out step frees the wizard instead
-        // of wedging it for the rest of the session.
+        // it was awaiting is dropped with it (and its process tree
+        // killed — see `run_command`), and blocking work that a
+        // dropped future cannot cancel (archive extraction) is asked
+        // to stop via request_cancellation, so a timed-out step frees
+        // the wizard instead of wedging it for the rest of the session.
         let raw = match self.find(id) {
             Some(step) => match tokio::time::timeout(budget, step.run(ctx)).await {
                 Ok(r) => r,
-                Err(_) => Ok(StepOutcome::failed(
-                    format!(
-                        "step '{step_name}' timed out after {} and was stopped",
-                        budget_label(budget)
-                    ),
-                    vec![format!(
-                        "the step exceeded its {} budget and was aborted; \
-                         re-run the step to retry",
-                        budget_label(budget)
-                    )],
-                )),
+                Err(_) => {
+                    ctx.ops.request_cancellation();
+                    Ok(StepOutcome::failed(
+                        format!(
+                            "step '{step_name}' timed out after {} and was stopped",
+                            budget_label(budget)
+                        ),
+                        vec![format!(
+                            "the step exceeded its {} budget and was aborted; \
+                             re-run the step to retry",
+                            budget_label(budget)
+                        )],
+                    ))
+                }
             },
             None => {
                 return StepOutcome::failed(
@@ -1101,10 +1247,15 @@ impl Wizard {
         };
         // Runner-measured wall time is authoritative.
         outcome.duration_ms = started.elapsed().as_millis() as u64;
-        if outcome.log_tail.len() > LOG_TAIL_LINES {
+        // The report (UI display, persisted wizard state) carries
+        // only the display tail; the outcome keeps the full log for
+        // the caller's log persistence.
+        let report_tail = if outcome.log_tail.len() > LOG_TAIL_LINES {
             let drop = outcome.log_tail.len() - LOG_TAIL_LINES;
-            outcome.log_tail = outcome.log_tail.into_iter().skip(drop).collect();
-        }
+            outcome.log_tail.iter().skip(drop).cloned().collect()
+        } else {
+            outcome.log_tail.clone()
+        };
         self.states.insert(id.to_string(), outcome.state);
         self.reports.insert(
             id.to_string(),
@@ -1114,7 +1265,7 @@ impl Wizard {
                 state: outcome.state,
                 message: outcome.message.clone(),
                 duration_ms: outcome.duration_ms,
-                log_tail: outcome.log_tail.clone(),
+                log_tail: report_tail,
                 note: self.notes.get(id).cloned(),
                 manual_command: outcome.manual_command.clone(),
             },
@@ -1128,12 +1279,23 @@ impl Wizard {
 /// a Prisma pre-warm that never returned) held the wizard lock for
 /// the rest of the session, and every later step run reported
 /// "busy" with no recovery short of restarting the app.
+///
+/// Coherence rule: a step's budget must exceed the worst-case
+/// sequential sum of its sub-budgets — a budget smaller than the
+/// work it bounds kills legitimate runs mid-flight and misreports
+/// them as stalls. v0.1.32 violated this for start-gateway (600 s
+/// total against 900 s sub-budgets for the pin install, the
+/// generate, and the package setup, each of which the command
+/// runner also capped at 600 s), so a legitimate cold repair chain
+/// could not finish in one run (field evidence 2026-10-16: a run
+/// died at exactly 600003 ms mid-repair). The start-gateway figure
+/// covers the cold chain end to end: venv create (900) + package
+/// install (900) + Prisma pin install (900) + generate (900) +
+/// probes and the health window (~600).
 fn step_budget(id: &str) -> Duration {
     match id {
-        // The gateway step installs packages, starts PostgreSQL,
-        // spawns LiteLLM, and waits out its health-check budget.
-        steps::STEP_START_GATEWAY => Duration::from_secs(600),
-        _ => Duration::from_secs(300),
+        steps::STEP_START_GATEWAY => Duration::from_secs(4200),
+        _ => Duration::from_secs(1200),
     }
 }
 
@@ -1509,26 +1671,84 @@ mod tests {
         for b in cfg.backends.iter_mut() {
             b.enabled = true;
         }
+        let fp = gateway_spawn_fingerprint(&cfg, true, Some("sk-master"), None);
         // Missing file: not current (the step must run to write it).
-        assert!(!gateway_config_is_current(&cfg, &dir));
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp));
         let yaml = manager_gateway::generate_config_yaml(&cfg).unwrap();
         std::fs::write(gw_dir.join("config.yaml"), &yaml).unwrap();
-        assert!(gateway_config_is_current(&cfg, &dir));
+        // YAML alone is not enough: no spawn-state record means the
+        // running gateway's argv/env inputs are unknown.
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp));
+        std::fs::write(
+            gateway_spawn_state_path(&dir),
+            gateway_spawn_state_json(&fp, &yaml),
+        )
+        .unwrap();
+        assert!(gateway_config_is_current(&cfg, &dir, &fp));
         // CRLF line endings and trailing blank lines are not drift.
         std::fs::write(
             gw_dir.join("config.yaml"),
             format!("{}\r\n\r\n", yaml.replace('\n', "\r\n")),
         )
         .unwrap();
-        assert!(gateway_config_is_current(&cfg, &dir));
+        assert!(gateway_config_is_current(&cfg, &dir, &fp));
         // A hand edit is drift.
         std::fs::write(gw_dir.join("config.yaml"), format!("{yaml}# hand edit\n")).unwrap();
-        assert!(!gateway_config_is_current(&cfg, &dir));
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp));
         // A configuration that no longer generates is not current.
         let mut no_groups = cfg.clone();
         no_groups.gateway.groups.clear();
         std::fs::write(gw_dir.join("config.yaml"), &yaml).unwrap();
-        assert!(!gateway_config_is_current(&no_groups, &dir));
+        assert!(!gateway_config_is_current(&no_groups, &dir, &fp));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gateway_config_is_current_detects_spawn_input_drift() {
+        // The YAML does not carry the spawn port, the bind host, the
+        // database port, or the credential values — a drift in any
+        // of them must still read as NOT current.
+        let dir = std::env::temp_dir().join(format!("wizard-gw-drift-{}", std::process::id()));
+        let gw_dir = dir.join("gateway");
+        std::fs::create_dir_all(&gw_dir).unwrap();
+        let mut cfg = manager_config::AppConfig::default_config();
+        for b in cfg.backends.iter_mut() {
+            b.enabled = true;
+        }
+        let yaml = manager_gateway::generate_config_yaml(&cfg).unwrap();
+        std::fs::write(gw_dir.join("config.yaml"), &yaml).unwrap();
+        let spawned = gateway_spawn_fingerprint(&cfg, true, Some("sk-master"), None);
+        std::fs::write(
+            gateway_spawn_state_path(&dir),
+            gateway_spawn_state_json(&spawned, &yaml),
+        )
+        .unwrap();
+        assert!(gateway_config_is_current(&cfg, &dir, &spawned));
+
+        // Gateway port moved.
+        let mut moved = cfg.clone();
+        moved.gateway.port += 1;
+        let fp = gateway_spawn_fingerprint(&moved, true, Some("sk-master"), None);
+        assert!(!gateway_config_is_current(&moved, &dir, &fp));
+        // Bind host changed.
+        let mut rebound = cfg.clone();
+        rebound.gateway.bind_host = "127.0.0.1".to_string();
+        let fp = gateway_spawn_fingerprint(&rebound, true, Some("sk-master"), None);
+        assert!(!gateway_config_is_current(&rebound, &dir, &fp));
+        // PostgreSQL appeared since the spawn (DATABASE_URL now in
+        // play) — and, symmetrically, disappeared.
+        let fp = gateway_spawn_fingerprint(&cfg, false, Some("sk-master"), None);
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp));
+        // Master key rotated.
+        let fp = gateway_spawn_fingerprint(&cfg, true, Some("sk-rotated"), None);
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp));
+        // OpenRouter key appeared.
+        let fp = gateway_spawn_fingerprint(&cfg, true, Some("sk-master"), Some("or-key"));
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp));
+        // The stored YAML hash no longer matching the file on disk
+        // (replaced after the spawn) is drift too.
+        std::fs::write(gw_dir.join("config.yaml"), "# replaced\n").unwrap();
+        assert!(!gateway_config_is_current(&cfg, &dir, &spawned));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

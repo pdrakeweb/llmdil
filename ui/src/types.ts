@@ -72,7 +72,11 @@ export interface GpuInfo {
 
 export interface PlacementSegment {
   gpu: string; // gpu label (telemetry GPU name live; gpu id in sample data)
-  pct: number; // 0-100
+  pct: number; // 0-100, rounded — display legacy (topology sublabels)
+  /** The unrounded configured fraction (0-1). Bar widths and tooltip
+   *  percentages are both computed from this, so the chart and its
+   *  stated values are the same number (principle 5). */
+  frac: number;
   /** Position of this segment's GPU in the GPU list / split order,
    *  when the derivation knows it (live rows). Used to match segments
    *  to GPU nodes and to pick palette colors by GPU position. */
@@ -95,12 +99,11 @@ export interface PlacementRow {
    *  per backend, and disabled backends still show where they
    *  WOULD place). */
   backendEnabled?: boolean;
-}
-
-export interface MapEvent {
-  time: string;
-  level: string; // "ok" | "warn" | "error" | "idle" | Status
-  text: string;
+  /** True when the row exists only because of the no-split fallback
+   *  (no tensor split configured): the bar renders ghosted and is
+   *  excluded from the legend, so a default never reads as an
+   *  operator's configuration. */
+  defaulted?: boolean;
 }
 
 export interface DashboardModel {
@@ -108,7 +111,6 @@ export interface DashboardModel {
   backends: BackendInfo[];
   gpus: GpuInfo[];
   placement: PlacementRow[];
-  throughputSeries: { name: string; color: string; values: number[] }[];
   /** Gateway probe result (gateway_status.up); feeds the shared
    *  system verdict. False when the probe failed or reported down. */
   gatewayUp: boolean;
@@ -120,7 +122,6 @@ export interface DashboardModel {
    *  the gateway card is absent and this message is shown as its own
    *  banner, while backends/telemetry data stays fresh. */
   gatewayError?: string;
-  events: MapEvent[];
   stale: boolean;
   updatedAt: number;
 }

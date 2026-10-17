@@ -602,16 +602,19 @@ fn strategy_to_litellm(s: RoutingStrategy) -> &'static str {
 /// order for the snapshot test). It is written to disk by the Setup
 /// Wizard's start-gateway step each time the gateway is (re)started.
 /// LiteLLM applies `router_settings.routing_strategy` globally; the
-/// emitted value comes from the first multi-member group's strategy,
-/// else the planner group's, else the first group's. Per-group
-/// strategies are recorded in the YAML for reference only — LiteLLM
-/// routes live traffic under the one global strategy, and
-/// [`pick_backend`] serves only the routing-trace explainer.
+/// emitted value comes from the first group with more than one
+/// enabled member's strategy, else the planner group's, else the
+/// first group's. Per-group strategies are recorded in the YAML for
+/// reference only — LiteLLM routes live traffic under the one global
+/// strategy, and [`pick_backend`] serves only the routing-trace
+/// explainer.
 ///
-/// Only enabled groups are included: a group's enabled state is
-/// derived from its member backends ([`group_enabled`]), never
-/// stored, and a group with no enabled member is omitted entirely —
-/// its deployments and its router fallback rows alike.
+/// Groups are included when they produce deployments: enabled
+/// groups (a group's enabled state is derived from its member
+/// backends — [`group_enabled`] — never stored), plus groups whose
+/// only deployments come from WinML or the OpenRouter fallback.
+/// A group with no deployments at all is omitted entirely — its
+/// (empty) deployment list and its router fallback rows alike.
 pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> {
     if config.gateway.groups.is_empty() {
         return Err(GatewayError::ConfigInvalid(
@@ -620,11 +623,21 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
     }
 
     // Collect entries per group (validates member references for
-    // every group, enabled or not), then keep enabled groups only.
+    // every group, enabled or not), then keep the groups that
+    // produce deployments. That is the enabled groups — plus the
+    // two deployment sources that do not come from members: the
+    // WinML deployment (registered on the tool-runner group
+    // whenever WinML is enabled) and a group's OpenRouter fallback
+    // deployments. A group whose members are all disabled but
+    // which still yields one of those deployments stays in the
+    // config; member-derived enablement alone would omit it and
+    // make the deployment unreachable (a v0.1.32 regression — the
+    // pre-derivation generator emitted any group whose entries
+    // were non-empty).
     let mut group_entries: Vec<(&ModelGroup, Vec<LiteLlmModelEntry>)> = Vec::new();
     for group in &config.gateway.groups {
         let entries = model_entries_for_group(group, config)?;
-        if group_enabled(group, config) {
+        if group_enabled(group, config) || !entries.is_empty() {
             group_entries.push((group, entries));
         }
     }
@@ -688,7 +701,7 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
 
     // --- router_settings (global; see module docs for the resolution rule) ---
     let included_groups: Vec<&ModelGroup> = group_entries.iter().map(|(g, _)| *g).collect();
-    let global_strategy = resolve_global_strategy(&included_groups);
+    let global_strategy = resolve_global_strategy(&included_groups, config);
     out.push_str("router_settings:\n");
     out.push_str(&format!(
         "  routing_strategy: {}\n",
@@ -750,12 +763,19 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
 }
 
 /// Resolve the single global `routing_strategy` for `router_settings`
-/// over the groups included in the generated config (enabled groups
-/// only): first multi-member group's strategy, else the planner
-/// group's, else the first group's. The caller guarantees `groups`
-/// is non-empty.
-fn resolve_global_strategy(groups: &[&ModelGroup]) -> RoutingStrategy {
-    if let Some(g) = groups.iter().find(|g| g.members.len() > 1) {
+/// over the groups included in the generated config: first group
+/// with more than one *enabled* member's strategy, else the planner
+/// group's, else the first group's. "Multi-member" counts enabled
+/// members only — a group with one enabled and one disabled member
+/// generates a single deployment, and letting it win strategy
+/// priority over a genuinely multi-deployment group would take the
+/// global strategy from a group that does not have it. The caller
+/// guarantees `groups` is non-empty.
+fn resolve_global_strategy(groups: &[&ModelGroup], config: &AppConfig) -> RoutingStrategy {
+    if let Some(g) = groups
+        .iter()
+        .find(|g| group_enabled_member_count(g, config) > 1)
+    {
         return g.strategy;
     }
     if let Some(g) = groups.iter().find(|g| g.name == "planner") {
@@ -1089,6 +1109,16 @@ mod tests {
             .find(|b| b.id == "coder")
             .unwrap()
             .enabled = false;
+        // The coder group must have no deployments at all to be
+        // omitted: strip its OpenRouter fallback (a group whose
+        // fallback deployments survive is kept — see
+        // yaml_keeps_openrouter_only_group_when_members_disabled).
+        cfg.gateway
+            .groups
+            .iter_mut()
+            .find(|g| g.name == "coder")
+            .unwrap()
+            .fallbacks = vec![];
         let yaml = generate_config_yaml(&cfg).expect("generate");
         // No deployment and no fallback row for the disabled group.
         assert!(
@@ -1142,6 +1172,10 @@ mod tests {
         for b in &mut cfg.backends {
             b.enabled = false;
         }
+        // The cloud tier off as well: with it on, the groups'
+        // OpenRouter fallback deployments would still generate
+        // (yaml_keeps_openrouter_only_group_when_members_disabled).
+        cfg.gateway.openrouter.enabled = false;
         let err = generate_config_yaml(&cfg).unwrap_err();
         assert!(matches!(err, GatewayError::ConfigInvalid(_)));
         assert!(err.to_string().contains("no enabled model groups"), "{err}");
@@ -1187,6 +1221,85 @@ mod tests {
         });
         let yaml = generate_config_yaml(&cfg).expect("generate");
         assert!(yaml.contains("http://127.0.0.1:8099/v1"));
+    }
+
+    #[test]
+    fn yaml_keeps_winml_group_when_its_member_backend_is_disabled() {
+        // WinML registers under tool-runner whenever WinML is
+        // enabled; the deployment does not come from the group's
+        // member backend, so disabling that backend must not drop
+        // the group (and WinML with it) from the generated config.
+        let mut cfg = four_backend_config();
+        for b in cfg.backends.iter_mut() {
+            if b.id == "tool-runner" {
+                b.enabled = false;
+            }
+        }
+        cfg.winml.enabled = true;
+        cfg.winml.port = 8090;
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(
+            yaml.contains("http://127.0.0.1:8090/v1"),
+            "winml deployment survives its group having no enabled member:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn yaml_keeps_openrouter_only_group_when_members_disabled() {
+        // A group whose only deployments are its OpenRouter
+        // fallback entries is the only group: generation must not
+        // fail ConfigInvalid just because no member is enabled.
+        let mut cfg = four_backend_config();
+        for b in cfg.backends.iter_mut() {
+            b.enabled = false;
+        }
+        cfg.gateway.groups = vec![ModelGroup {
+            name: "cloud".to_string(),
+            members: vec!["coder".to_string()],
+            strategy: RoutingStrategy::SimpleShuffle,
+            fallbacks: vec!["openrouter".to_string()],
+        }];
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(yaml.contains("openrouter.ai"), "{yaml}");
+        // With the cloud tier off too, the group has no deployments
+        // at all and generation fails closed, as before.
+        cfg.gateway.openrouter.enabled = false;
+        assert!(matches!(
+            generate_config_yaml(&cfg),
+            Err(GatewayError::ConfigInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn global_strategy_counts_enabled_members_only() {
+        // Group "mixed" has two members but only one enabled; group
+        // "pair" has two enabled. The global strategy must come
+        // from "pair" — "mixed" generates a single deployment.
+        let mut cfg = four_backend_config();
+        cfg.gateway.groups = vec![
+            ModelGroup {
+                name: "mixed".to_string(),
+                members: vec!["planner".to_string(), "coder-fast".to_string()],
+                strategy: RoutingStrategy::LeastBusy,
+                fallbacks: vec![],
+            },
+            ModelGroup {
+                name: "pair".to_string(),
+                members: vec!["coder".to_string(), "tool-runner".to_string()],
+                strategy: RoutingStrategy::LatencyBased,
+                fallbacks: vec![],
+            },
+        ];
+        for b in cfg.backends.iter_mut() {
+            if b.id == "coder-fast" {
+                b.enabled = false;
+            }
+        }
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(
+            yaml.contains("routing_strategy: latency-based-routing"),
+            "{yaml}"
+        );
     }
 
     #[test]

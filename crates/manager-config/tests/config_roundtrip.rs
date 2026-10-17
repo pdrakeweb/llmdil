@@ -30,10 +30,11 @@ fn rich_config() -> AppConfig {
         params_b: 8.0,
         sha256: "cd".repeat(32),
         verified_at: None,
+        verified_sha256: None,
         source_url: "https://example.com/qwen3-8b.gguf".to_string(),
         assigned_backends: vec!["tool-runner".to_string()],
         enabled: true,
-        display_name: None,
+        display_name: Some("Tool Runner 8B".to_string()),
     });
     let backend = cfg
         .backends

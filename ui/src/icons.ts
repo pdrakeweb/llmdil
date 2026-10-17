@@ -42,6 +42,8 @@ export const icons = {
     svg(`<path d="M8 1.5v8M4.8 6.8 8 10l3.2-3.2M2.5 12.5h11"/>`),
   clock: () =>
     svg(`<circle cx="8" cy="8" r="6.5"/><path d="M8 4.5V8l2.5 1.5"/>`),
+  calendar: () =>
+    svg(`<rect x="2" y="3" width="12" height="11" rx="1.5"/><path d="M2 6.5h12M5.5 1.8V4M10.5 1.8V4"/>`),
   wrench: () =>
     svg(`<path d="M10.5 2.5a3.2 3.2 0 0 0-4.3 4L2 10.7 5.3 14l4.2-4.2a3.2 3.2 0 0 0 4-4.3l-2 2-2.2-.6-.6-2.2z"/>`),
   pause: () => svg(`<path d="M6 3.5v9M10 3.5v9"/>`),

@@ -149,9 +149,16 @@ pub fn propose_placement_resident(
     // The current allocation, on the same projection basis. A
     // current split whose length does not match the GPU set is
     // stale (GPUs added or removed since it was configured) and
-    // earns no credit rather than an invented one.
+    // earns no credit rather than an invented one. A current split
+    // that is not itself a valid split (entry outside [0, 1], or
+    // fractions not summing to 1) is stale by the same rule: an
+    // out-of-range entry would otherwise project more credit than
+    // the model has bytes (e.g. [1.5, -0.5] crediting 150% of the
+    // model on GPU 0).
     let current_mib: Vec<u64> = match current_split {
-        Some(cur) if cur.len() == split.len() => project(cur),
+        Some(cur) if cur.len() == split.len() && validate_split(cur, cur.len()).is_ok() => {
+            project(cur)
+        }
         _ => vec![0; split.len()],
     };
     let additional_mib: Vec<u64> = per_gpu_mib
@@ -358,6 +365,19 @@ mod tests {
             Some(&[0.8, 0.1, 0.1]),
         )
         .unwrap();
+        assert_eq!(p.current_mib, vec![0, 0]);
+        assert_eq!(p.additional_mib, vec![10, 0]);
+        assert!(!p.fits);
+    }
+
+    #[test]
+    fn propose_out_of_range_current_split_earns_no_credit() {
+        // [1.5, -0.5] is not a split of anything: projected
+        // naively it would credit 15 MiB of a 10 MiB model on
+        // GPU 0 and report a fit against zero free VRAM.
+        let p =
+            propose_placement_resident(&spec(), &[1.0, 0.0], &[0, 8], None, 0, Some(&[1.5, -0.5]))
+                .unwrap();
         assert_eq!(p.current_mib, vec![0, 0]);
         assert_eq!(p.additional_mib, vec![10, 0]);
         assert!(!p.fits);

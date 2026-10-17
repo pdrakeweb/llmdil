@@ -34,9 +34,10 @@ pub enum ExpertOffload {
     /// tensor split).
     None,
     /// All routed experts on the CPU (`-ot exps=CPU` and spellings
-    /// of the same override).
+    /// of the same override, or `--cpu-moe` / `-cmoe`).
     AllExperts,
-    /// Experts of the first N layers on the CPU (`--n-cpu-moe N`).
+    /// Experts of the first N layers on the CPU (`--n-cpu-moe N`,
+    /// `-ncmoe N`).
     CpuMoeLayers(u32),
 }
 
@@ -106,18 +107,19 @@ fn override_part_is_expert(part: &str) -> bool {
 
 /// Rewrite the expert-offload tokens in raw llama-server flags,
 /// leaving every other flag untouched and in order. All existing
-/// offload spellings are removed first (`--n-cpu-moe` in both
-/// forms, and any `-ot` / `--override-tensor` assignment whose
-/// pattern mentions `exps` — sibling assignments in the same
-/// `-ot` list keep their flag), then the canonical tokens for
-/// `offload` are appended. Returns `None` when nothing remains.
+/// offload spellings are removed first (`--n-cpu-moe` / `-ncmoe`
+/// in both forms, `--cpu-moe` / `-cmoe`, and any `-ot` /
+/// `--override-tensor` assignment whose pattern mentions `exps` —
+/// sibling assignments in the same `-ot` list keep their flag),
+/// then the canonical tokens for `offload` are appended. Returns
+/// `None` when nothing remains.
 pub fn set_expert_offload(raw_flags: Option<&str>, offload: ExpertOffload) -> Option<String> {
     let tokens: Vec<&str> = raw_flags.unwrap_or("").split_whitespace().collect();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
         let t = tokens[i];
-        if t == "--n-cpu-moe" {
+        if t == "--n-cpu-moe" || t == "-ncmoe" {
             // Skip the value token too when it parses as a count;
             // a malformed value is left for the main walk.
             let has_value = tokens
@@ -127,7 +129,12 @@ pub fn set_expert_offload(raw_flags: Option<&str>, offload: ExpertOffload) -> Op
             i += if has_value { 2 } else { 1 };
             continue;
         }
-        if t.starts_with("--n-cpu-moe=") {
+        if t.starts_with("--n-cpu-moe=") || t.starts_with("-ncmoe=") {
+            i += 1;
+            continue;
+        }
+        if t == "--cpu-moe" || t == "-cmoe" {
+            // Valueless all-experts spelling: drop the token alone.
             i += 1;
             continue;
         }
@@ -189,15 +196,27 @@ pub fn set_expert_offload(raw_flags: Option<&str>, offload: ExpertOffload) -> Op
 /// Detect expert offload in raw llama-server flags. Recognizes
 /// `--override-tensor` / `-ot` assignments whose pattern mentions
 /// `exps` with a CPU buffer (the `-ot exps=CPU` form the app itself
-/// writes, plus `=` spellings), and `--n-cpu-moe N`.
+/// writes, plus `=` spellings), `--cpu-moe` / `-cmoe` (all experts
+/// on the CPU), and `--n-cpu-moe N` / `-ncmoe N` (first N layers).
+///
+/// When both an all-experts spelling and a layer count are present
+/// the all-experts setting wins regardless of order: llama.cpp
+/// applies both, and `-ot exps=CPU` / `--cpu-moe` already put every
+/// expert tensor on the CPU, leaving nothing for the layer count
+/// to move. A repeated layer count resolves to the last one, the
+/// same sequential-parse rule llama.cpp follows.
 pub fn expert_offload(raw_flags: Option<&str>) -> ExpertOffload {
     let Some(raw) = raw_flags else {
         return ExpertOffload::None;
     };
     let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let mut layers: Option<u32> = None;
     let mut i = 0;
     while i < tokens.len() {
         let t = tokens[i];
+        if t == "--cpu-moe" || t == "-cmoe" {
+            return ExpertOffload::AllExperts;
+        }
         let assignment = if t == "-ot" || t == "--override-tensor" {
             i += 1;
             tokens.get(i).copied()
@@ -214,24 +233,30 @@ pub fn expert_offload(raw_flags: Option<&str>) -> ExpertOffload {
                 }
             }
         }
-        if t == "--n-cpu-moe" {
+        if t == "--n-cpu-moe" || t == "-ncmoe" {
             if let Some(v) = tokens.get(i + 1) {
                 if let Ok(n) = v.parse::<u32>() {
                     if n > 0 {
-                        return ExpertOffload::CpuMoeLayers(n);
+                        layers = Some(n);
                     }
                 }
             }
-        } else if let Some(v) = t.strip_prefix("--n-cpu-moe=") {
+        } else if let Some(v) = t
+            .strip_prefix("--n-cpu-moe=")
+            .or_else(|| t.strip_prefix("-ncmoe="))
+        {
             if let Ok(n) = v.parse::<u32>() {
                 if n > 0 {
-                    return ExpertOffload::CpuMoeLayers(n);
+                    layers = Some(n);
                 }
             }
         }
         i += 1;
     }
-    ExpertOffload::None
+    match layers {
+        Some(n) => ExpertOffload::CpuMoeLayers(n),
+        None => ExpertOffload::None,
+    }
 }
 
 /// One backend's memory requirement under its current configuration.
@@ -264,15 +289,34 @@ fn mib(bytes: u64) -> u64 {
 /// (Nemotron: 24 of 53).
 /// `kv_bytes_per_token` comes from the GGUF KV geometry.
 ///
+/// `expert_bytes_by_block` carries the per-MoE-block expert sums
+/// from the GGUF layout (in block order), when available. A partial
+/// layer offload moves the *first* N MoE blocks, whose byte total
+/// is generally not the uniform `N / layers` share — Unsloth
+/// Dynamic quants deliberately quantize different layers at
+/// different rates. With per-block sums the partial share is the
+/// true sum of the first N blocks and an [`MemoryBasis::Exact`]
+/// input stays exact; without them the share falls back to the
+/// uniform proportion and an `Exact` input is downgraded to
+/// [`MemoryBasis::Estimate`] rather than asserting precision the
+/// numbers do not have (a [`MemoryBasis::Catalog`] input stays
+/// `Catalog` — the catalog pins only aggregates by design).
+///
 /// Degradation rule: when offload is configured but the expert
 /// share cannot be resolved (unknown expert bytes, or a partial
 /// layer offload without a MoE layer count), the split is
 /// unresolvable and the requirement falls back to
 /// all-weights-on-GPU with basis [`MemoryBasis::Estimate`] — never
 /// a silently invented split.
+// The parameter list is the layout itself (totals, expert shares,
+// basis, offload, KV geometry, context) — callers pass a resolved
+// layout's fields positionally, as the other multi-argument entry
+// points in this crate do.
+#[allow(clippy::too_many_arguments)]
 pub fn memory_requirement(
     total_bytes: u64,
     expert_bytes: Option<u64>,
+    expert_bytes_by_block: Option<&[u64]>,
     basis: MemoryBasis,
     offload: ExpertOffload,
     kv_bytes_per_token: Option<u64>,
@@ -280,6 +324,7 @@ pub fn memory_requirement(
     n_ctx: u32,
 ) -> MemoryRequirement {
     let kv_mib = kv_bytes_per_token.map(|per| mib(per.saturating_mul(n_ctx as u64)));
+    let mut basis = basis;
     let sys_bytes: u64 = match offload {
         ExpertOffload::None => 0,
         ExpertOffload::AllExperts => match expert_bytes {
@@ -295,8 +340,23 @@ pub fn memory_requirement(
         },
         ExpertOffload::CpuMoeLayers(n) => match (expert_bytes, moe_layers) {
             (Some(e), Some(layers)) if layers > 0 => {
-                let share = n.min(layers) as u64;
-                (e.min(total_bytes) * share) / layers as u64
+                let share = n.min(layers);
+                match expert_bytes_by_block {
+                    // The first `share` MoE blocks' true byte sum.
+                    Some(blocks) if blocks.len() == layers as usize => {
+                        blocks[..share as usize].iter().sum::<u64>()
+                    }
+                    _ => {
+                        // Uniform-share approximation: exact only
+                        // at the endpoints (nothing or everything
+                        // offloaded); a genuinely partial share
+                        // cannot carry an Exact basis.
+                        if share > 0 && share < layers && basis == MemoryBasis::Exact {
+                            basis = MemoryBasis::Estimate;
+                        }
+                        (e.min(total_bytes) * share as u64) / layers as u64
+                    }
+                }
             }
             _ => {
                 return MemoryRequirement {
@@ -350,11 +410,91 @@ mod tests {
     }
 
     #[test]
+    fn detects_cpu_moe_spellings() {
+        // llama.cpp's other spellings: --cpu-moe / -cmoe put ALL
+        // experts on the CPU; -ncmoe is --n-cpu-moe's short form.
+        assert_eq!(expert_offload(Some("--cpu-moe")), ExpertOffload::AllExperts);
+        assert_eq!(expert_offload(Some("-cmoe")), ExpertOffload::AllExperts);
+        assert_eq!(
+            expert_offload(Some("--threads 8 --cpu-moe")),
+            ExpertOffload::AllExperts
+        );
+        assert_eq!(
+            expert_offload(Some("-ncmoe 12")),
+            ExpertOffload::CpuMoeLayers(12)
+        );
+        assert_eq!(
+            expert_offload(Some("-ncmoe=12")),
+            ExpertOffload::CpuMoeLayers(12)
+        );
+        // Both spellings present: all-experts wins in either order,
+        // because the process applies both and -ot/--cpu-moe leave
+        // nothing for the layer count to move.
+        assert_eq!(
+            expert_offload(Some("--n-cpu-moe 3 -ot exps=CPU")),
+            ExpertOffload::AllExperts
+        );
+        assert_eq!(
+            expert_offload(Some("-ot exps=CPU --n-cpu-moe 3")),
+            ExpertOffload::AllExperts
+        );
+        assert_eq!(
+            expert_offload(Some("--n-cpu-moe 3 --cpu-moe")),
+            ExpertOffload::AllExperts
+        );
+        // A repeated layer count resolves to the last one.
+        assert_eq!(
+            expert_offload(Some("--n-cpu-moe 3 --n-cpu-moe 9")),
+            ExpertOffload::CpuMoeLayers(9)
+        );
+    }
+
+    #[test]
+    fn rewrite_strips_cpu_moe_spellings() {
+        // The surviving --cpu-moe would win in llama.cpp over the
+        // slider's --n-cpu-moe, so every spelling must be removed
+        // by the rewrite, in both directions.
+        assert_eq!(
+            set_expert_offload(Some("--cpu-moe"), ExpertOffload::CpuMoeLayers(8)).as_deref(),
+            Some("--n-cpu-moe 8")
+        );
+        assert_eq!(
+            set_expert_offload(Some("-cmoe --threads 4"), ExpertOffload::None).as_deref(),
+            Some("--threads 4")
+        );
+        assert_eq!(
+            set_expert_offload(Some("-ncmoe 5"), ExpertOffload::AllExperts).as_deref(),
+            Some("-ot exps=CPU")
+        );
+        assert_eq!(
+            set_expert_offload(Some("-ncmoe=5"), ExpertOffload::CpuMoeLayers(2)).as_deref(),
+            Some("--n-cpu-moe 2")
+        );
+        // Round-trip: the detector reads back the target for
+        // starts written in the new spellings too.
+        for start in [Some("--cpu-moe"), Some("-ncmoe 7"), Some("-cmoe")] {
+            for target in [
+                ExpertOffload::None,
+                ExpertOffload::CpuMoeLayers(13),
+                ExpertOffload::AllExperts,
+            ] {
+                let out = set_expert_offload(start, target);
+                assert_eq!(
+                    expert_offload(out.as_deref()),
+                    target,
+                    "start {start:?} -> {target:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn all_experts_offload_splits_weights() {
         // Coder-Next's real layout, rounded: 49 GB total, 46.7 GB experts.
         let r = memory_requirement(
             49 * GIB,
             Some(46 * GIB),
+            None,
             MemoryBasis::Exact,
             ExpertOffload::AllExperts,
             Some(24_576),
@@ -373,6 +513,7 @@ mod tests {
         let r = memory_requirement(
             12 * GIB,
             Some(0),
+            None,
             MemoryBasis::Exact,
             ExpertOffload::None,
             None,
@@ -386,9 +527,13 @@ mod tests {
 
     #[test]
     fn partial_cpu_moe_uses_layer_share() {
+        // Without per-block sums the uniform share is an
+        // approximation, so an Exact input is downgraded rather
+        // than asserted.
         let r = memory_requirement(
             49 * GIB,
             Some(48 * GIB),
+            None,
             MemoryBasis::Exact,
             ExpertOffload::CpuMoeLayers(24),
             None,
@@ -397,6 +542,57 @@ mod tests {
         );
         assert_eq!(r.sys_weights_mib, 24 * 1024);
         assert_eq!(r.gpu_weights_mib, 25 * 1024);
+        assert_eq!(r.basis, MemoryBasis::Estimate);
+        // A Catalog input keeps its basis under the same fallback:
+        // the catalog pins aggregates by design.
+        let r = memory_requirement(
+            49 * GIB,
+            Some(48 * GIB),
+            None,
+            MemoryBasis::Catalog,
+            ExpertOffload::CpuMoeLayers(24),
+            None,
+            Some(48),
+            32_768,
+        );
+        assert_eq!(r.basis, MemoryBasis::Catalog);
+    }
+
+    #[test]
+    fn partial_cpu_moe_prices_first_blocks_from_per_block_sums() {
+        // Non-uniform per-block sizes (the Unsloth Dynamic case):
+        // the first two of four MoE blocks hold 30 of the 40 GiB of
+        // experts, so --n-cpu-moe 2 moves 30 GiB, not the uniform
+        // 20 GiB — and the basis stays Exact.
+        let blocks: [u64; 4] = [20 * GIB, 10 * GIB, 6 * GIB, 4 * GIB];
+        let r = memory_requirement(
+            49 * GIB,
+            Some(40 * GIB),
+            Some(&blocks),
+            MemoryBasis::Exact,
+            ExpertOffload::CpuMoeLayers(2),
+            None,
+            Some(4),
+            32_768,
+        );
+        assert_eq!(r.sys_weights_mib, 30 * 1024);
+        assert_eq!(r.gpu_weights_mib, 19 * 1024);
+        assert_eq!(r.basis, MemoryBasis::Exact);
+        // A block list that does not match the MoE layer count is
+        // not the layout's own data: fall back to the uniform share
+        // (and its downgrade).
+        let r = memory_requirement(
+            49 * GIB,
+            Some(40 * GIB),
+            Some(&blocks[..3]),
+            MemoryBasis::Exact,
+            ExpertOffload::CpuMoeLayers(2),
+            None,
+            Some(4),
+            32_768,
+        );
+        assert_eq!(r.sys_weights_mib, 20 * 1024);
+        assert_eq!(r.basis, MemoryBasis::Estimate);
     }
 
     #[test]
@@ -410,6 +606,7 @@ mod tests {
         let r = memory_requirement(
             25_258_358_528,
             Some(22_829_334_528),
+            None,
             MemoryBasis::Exact,
             ExpertOffload::CpuMoeLayers(16),
             None,
@@ -418,6 +615,9 @@ mod tests {
         );
         assert_eq!(r.sys_weights_mib, 14_515);
         assert_eq!(r.gpu_weights_mib, 9_574);
+        // No per-block sums were passed, so the uniform share is an
+        // approximation of the real first-16 sum: not Exact.
+        assert_eq!(r.basis, MemoryBasis::Estimate);
     }
 
     #[test]
@@ -608,6 +808,7 @@ mod tests {
     fn unresolvable_offload_degrades_to_estimate() {
         let r = memory_requirement(
             49 * GIB,
+            None,
             None,
             MemoryBasis::Catalog,
             ExpertOffload::AllExperts,

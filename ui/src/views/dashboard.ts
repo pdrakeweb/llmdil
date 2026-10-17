@@ -10,7 +10,7 @@
 import { getDashboard, isTauri, restartBackend, systemVerdict } from "../api";
 import type { SystemVerdict } from "../api";
 import { esc } from "../html";
-import { fmtGb, gaugeRing, meter, multiLine, sparkline, stackedBar, trim1 } from "../charts";
+import { fmtCount, fmtGb, fmtPct, gaugeRing, meter, sparkline, stackedBar, trim1 } from "../charts";
 import { icon } from "../icons";
 import type { BackendInfo, DashboardModel, GpuInfo, PlacementSegment } from "../types";
 
@@ -53,48 +53,72 @@ function statusDot(s: string): string {
   return `<span class="dot ${cls}"></span>`;
 }
 
+/** The one status->color map for the whole dashboard (dots, rings,
+ *  topology nodes): ok green, degraded/starting amber, down red,
+ *  anything else gray. */
+function statusColor(s: string): string {
+  return s === "ok" ? C.green : s === "degraded" || s === "starting" ? C.amber : s === "down" ? C.red : "#6d7686";
+}
+
+/** GPU strip cards whose Trends expandable is open, by GPU id —
+ *  module state so the 5 s poll repaint cannot collapse it. */
+const openTrends = new Set<string>();
+
 /** All services including the gateway when the backend reported one. */
 function allServices(m: DashboardModel): BackendInfo[] {
   return m.gateway ? [m.gateway, ...m.backends] : [...m.backends];
 }
 
+/** Stable per-backend sparkline color: a hash of the backend id into
+ *  the palette, so a card's color never changes with list order and
+ *  is never keyed to a specific backend's name. */
+function backendSparkColor(id: string): string {
+  const palette = [C.blue, C.purple, C.teal, C.amber, C.green];
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  return palette[h % palette.length];
+}
+
 function serviceCard(b: BackendInfo, isGateway: boolean): string {
-  const ringColor = b.status === "ok" ? C.green : b.status === "starting" ? C.amber : C.red;
+  const ringColor = statusColor(b.status);
   // requests_1h / errors_1h / throughput_toks come from LiteLLM's
   // Prometheus counters via the app's metrics poller (live since
   // v0.1.18); health / vram_held_gb still have no live source. Render
   // "—" when absent instead of crashing on .toFixed or presenting a
   // fabricated measurement.
-  const ringVal = isGateway
-    ? (b.requests_1h !== undefined ? String(b.requests_1h) : "—")
-    : (b.health !== undefined ? b.health.toFixed(0) : "—");
-  const ringSub = isGateway ? "req/1h" : "health";
   const m1k = isGateway ? "REQUESTS / 1H" : "THROUGHPUT";
   const m1v = isGateway
-    ? (b.requests_1h !== undefined ? b.requests_1h.toLocaleString() : "—")
+    ? (b.requests_1h !== undefined ? fmtCount(b.requests_1h) : "—")
     : (b.throughput_toks !== undefined ? trim1(b.throughput_toks) : "—");
   const m1u = isGateway || b.throughput_toks === undefined ? "" : " tok/s";
   const m2k = isGateway ? "ERRORS / 1H" : "VRAM HELD";
   const m2v = isGateway
-    ? (b.errors_1h !== undefined ? String(b.errors_1h) : "—")
+    ? (b.errors_1h !== undefined ? fmtCount(b.errors_1h) : "—")
     : (b.vram_held_gb !== undefined ? fmtGb(b.vram_held_gb) : "—");
   const m2u = isGateway || b.vram_held_gb === undefined ? "" : " GB";
-  // The ring's arc is the metric itself: when the metric is absent the
-  // arc must not assert a value — draw the neutral track only. The
-  // gateway's requests_1h is a count, not a percentage, so its ring is
-  // always the neutral track (the count shows as the center value and
-  // in the REQUESTS / 1H row); a backend's health IS a percentage and
-  // drives its arc when present.
-  const ringMetric = isGateway ? undefined : b.health;
-  const ring = ringMetric === undefined
-    ? gaugeRing(0, 64, "var(--line)", esc(ringVal), ringSub)
-    : gaugeRing(ringMetric, 64, ringColor, esc(ringVal), ringSub);
+  // The ring's arc encodes a share, never a raw count. The gateway's
+  // arc is its trailing-hour success share (1 - errors/requests)
+  // with the integer percent centered; with no requests the share is
+  // undefined and the ring is the neutral track. A backend's health
+  // IS a percentage and drives its arc when present; when health is
+  // absent the ring is omitted entirely and the rows take the width.
+  let ring = "";
+  if (isGateway) {
+    const share = b.requests_1h !== undefined && b.requests_1h > 0
+      ? 100 * (1 - (b.errors_1h ?? 0) / b.requests_1h)
+      : undefined;
+    ring = share === undefined
+      ? gaugeRing(0, 64, "var(--line)", "—", "success / 1h")
+      : gaugeRing(share, 64, ringColor, `${Math.round(share)}%`, "success / 1h");
+  } else if (b.health !== undefined) {
+    ring = gaugeRing(b.health, 64, ringColor, b.health.toFixed(0), "health");
+  }
   // Sparkline captions render only when a series exists — live
   // services carry no series, so the whole strip is omitted rather
   // than captioning an empty chart.
   const sparkHtml = b.spark && b.spark.length
     ? `<div class="spark-wrap"><div class="cap">${isGateway ? "Requests per minute" : "Tokens/s"}</div>
-      ${sparkline(b.spark, 220, 34, isGateway ? C.blue : b.id === "coder-30b" ? C.purple : b.id === "coder-7b" ? C.teal : C.blue)}
+      ${sparkline(b.spark, 220, 34, isGateway ? C.blue : backendSparkColor(b.id))}
     </div>`
     : "";
   // The gateway card is the probe summary, not a supervised backend:
@@ -121,30 +145,78 @@ function serviceCard(b: BackendInfo, isGateway: boolean): string {
 }
 
 function gpuStripCard(g: GpuInfo): string {
-  const vramPct = Math.round((g.vram_used_gb / g.vram_total_gb) * 100);
-  // Sparkline history and peak/limit values are not in the telemetry
-  // payload; omit those rows/figures when absent instead of crashing
-  // sparkline() on undefined or printing "undefined".
-  const utilSpark = g.util_spark && g.util_spark.length
-    ? `<div class="mrow"><span></span>${sparkline(g.util_spark, 220, 26, C.blue)}</div>` : "";
-  const tempSpark = g.temp_spark && g.temp_spark.length
-    ? `<div class="mrow"><span></span>${sparkline(g.temp_spark, 220, 26, C.amber)}</div>` : "";
-  const powerSpark = g.power_spark && g.power_spark.length
-    ? `<div class="mrow"><span></span>${sparkline(g.power_spark, 220, 26, C.green)}</div>` : "";
-  const peak = g.temp_peak_c !== undefined ? ` · peak ${g.temp_peak_c}` : "";
-  const limit = g.power_limit_w !== undefined ? ` / ${g.power_limit_w}` : "";
+  // The lead visual is the attributed VRAM bar: one segment per
+  // resident process, sized by its measured share of the GPU's total
+  // VRAM, with any unattributed remainder as a neutral "other"
+  // segment and free space as the track. A process whose VRAM was
+  // not measured (WDDM) collapses the whole bar to one neutral
+  // segment — a breakdown the payload does not carry is never drawn.
+  const totalMib = g.vram_total_gb * 1024;
+  const procs = g.processes ?? [];
+  const procLabel = (p: { process: string; backend: string }): string => (p.backend !== "—" ? p.backend : p.process);
+  let vramHtml: string;
+  if (!(g.vram_total_gb > 0)) {
+    vramHtml = `<div class="mrow"><span class="mlabel">VRAM</span><span class="mval">not measured</span></div>`;
+  } else {
+    const usedPct = (g.vram_used_gb / g.vram_total_gb) * 100;
+    const vramVal = `${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GB · ${trim1(usedPct)}%`;
+    let segments: { pct: number; color: string; label?: string }[];
+    let keyHtml = "";
+    if (procs.length && procs.some((p) => p.vram_mib === null)) {
+      const unmeasured = procs.filter((p) => p.vram_mib === null).map(procLabel).join(", ");
+      segments = [{ pct: usedPct, color: "#6d7686", label: `VRAM used — per-process breakdown not measured (not measured: ${unmeasured})` }];
+    } else if (procs.length) {
+      const palette = [C.blue, C.purple, C.teal, C.amber, C.green];
+      segments = procs.map((p, i) => ({
+        pct: ((p.vram_mib ?? 0) / totalMib) * 100,
+        color: palette[i % palette.length],
+        label: `${procLabel(p)} — ${fmtGb((p.vram_mib ?? 0) / 1024)} GB`,
+      }));
+      const attributed = procs.reduce((a, p) => a + (p.vram_mib ?? 0), 0);
+      const otherMib = g.vram_used_gb * 1024 - attributed;
+      if (otherMib > 0) {
+        segments.push({ pct: (otherMib / totalMib) * 100, color: "#6d7686", label: `other — ${fmtGb(otherMib / 1024)} GB` });
+      }
+      keyHtml = `<div class="legend" style="margin-top:4px">${segments.map((s) => `<span><span class="sw" style="background:${s.color}"></span>${esc((s.label ?? "").split(" — ")[0])}</span>`).join("")}</div>`;
+    } else {
+      segments = [{ pct: usedPct, color: C.purple, label: `VRAM used — ${fmtGb(g.vram_used_gb)} GB` }];
+    }
+    vramHtml = `<div class="mrow"><span class="mlabel">VRAM</span><span class="mval">${vramVal}</span></div>
+      <div class="mrow"><span></span><span>${stackedBar(segments, 220, 8)}</span></div>
+      ${keyHtml ? `<div class="mrow"><span></span><span>${keyHtml}</span></div>` : ""}`;
+  }
+  // Peak temperature rides the value's tooltip, never inline text.
+  const peakTip = g.temp_peak_c !== undefined ? ` title="Peak ${trim1(g.temp_peak_c)} °C"` : "";
+  // Power: a thin meter of draw against the limit when both exist;
+  // draw alone renders as a value only; unmeasured power is
+  // "not measured" (never "N/A") and gets no sparkline either.
+  const powerMeter = g.power_w != null && g.power_limit_w !== undefined && g.power_limit_w > 0
+    ? `<div class="mrow"><span></span>${meter((g.power_w / g.power_limit_w) * 100, 220, 6, C.green)}</div>` : "";
+  const powerVal = g.power_w == null
+    ? "not measured"
+    : g.power_limit_w !== undefined ? `${trim1(g.power_w)}/${trim1(g.power_limit_w)} W` : `${trim1(g.power_w)} W`;
+  // Sparklines collapse into one labeled Trends expandable (each
+  // series keyed by its metric name); open state is module-level so
+  // the poll repaint preserves it.
+  const trendRows: string[] = [];
+  if (g.util_spark && g.util_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Utilization</span>${sparkline(g.util_spark, 220, 26, C.blue)}</div>`);
+  if (g.temp_spark && g.temp_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Temperature</span>${sparkline(g.temp_spark, 220, 26, C.amber)}</div>`);
+  if (g.power_w != null && g.power_spark && g.power_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Power</span>${sparkline(g.power_spark, 220, 26, C.green)}</div>`);
+  const trendsOpen = openTrends.has(g.id);
+  const trends = trendRows.length
+    ? `<div style="margin-top:8px"><button class="btn" data-trends="${esc(g.id)}" aria-expanded="${trendsOpen}" style="padding:2px 8px;font-size:11px">${trendsOpen ? "▾" : "▸"} Trends</button>
+      ${trendsOpen ? `<div class="gpu-metrics" style="margin-top:6px">${trendRows.join("")}</div>` : ""}</div>`
+    : "";
   return `<div class="card">
     <div class="gpu-head">${statusDot(g.status)} ${icon("gpu")} ${esc(g.name)}</div>
     <div class="gpu-metrics">
-      <div class="mrow"><span class="mlabel">Utilization</span><span class="mval">${g.util_pct}%</span></div>
-      ${utilSpark}
-      <div class="mrow"><span class="mlabel">VRAM ${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GB</span><span class="mval">${vramPct}%</span></div>
-      <div class="mrow"><span></span>${meter(vramPct, 220, 8, C.purple)}</div>
-      <div class="mrow"><span class="mlabel">Temperature</span><span class="mval">${g.temp_c} °C${peak}</span></div>
-      ${tempSpark}
-      <div class="mrow"><span class="mlabel">Power</span><span class="mval">${g.power_w == null ? "N/A" : `${g.power_w}${limit} W`}</span></div>
-      ${powerSpark}
+      ${vramHtml}
+      <div class="mrow"><span class="mlabel">Utilization</span><span class="mval">${trim1(g.util_pct)}%</span></div>
+      <div class="mrow"><span class="mlabel">Temperature</span><span class="mval"${peakTip}>${trim1(g.temp_c)} °C</span></div>
+      <div class="mrow"><span class="mlabel">Power</span><span class="mval">${powerVal}</span></div>
+      ${powerMeter}
     </div>
+    ${trends}
   </div>`;
 }
 
@@ -172,45 +244,54 @@ function applianceView(m: DashboardModel, live: boolean): string {
   const cards = svcs.map((b, i) => serviceCard(b, i === 0 && m.gateway !== null)).join("");
   const gpus = m.gpus.map(gpuStripCard).join("");
   // Placement rows are per BACKEND (placements belong to backends,
-  // not models). A disabled backend's row is grayed out and tagged:
-  // that placement is eventual, not actual — it takes effect only if
-  // the backend is enabled and started.
+  // not models). Eventual treatment keys off actuality: a disabled
+  // backend's placement, and an enabled-but-not-running backend's,
+  // are both not in effect — gray segments, reduced opacity, an
+  // "eventual" tag. Bar widths and tooltip percentages both come
+  // from the segment's unrounded fraction, so the chart and its
+  // stated values are the same number; sub-1% shares render as a
+  // minimum-width sliver with the true value in the tooltip. A
+  // defaulted row (no split configured) renders ghosted and stays
+  // out of the legend — a default is not a configuration.
+  const EVENTUAL_TIP = "Placement takes effect when the backend is enabled and started.";
   const placeHtml = m.placement.map((p) => {
-    const total = p.segments.reduce((a, s) => a + s.pct, 0) || 1;
     const disabled = p.backendEnabled === false;
+    const stopped = !disabled && p.backendStatus !== undefined && p.backendStatus !== "ok" && p.backendStatus !== "starting";
+    const eventual = disabled || stopped;
     const label = p.backendId ?? p.model;
-    return `<div class="place-row${disabled ? " eventual" : ""}"><span class="mname">${esc(label)}${p.backendId ? ` <span class="place-model">${esc(p.model)}</span>` : ""}${disabled ? ` <span class="eventual-tag">disabled · eventual</span>` : ""}</span>
-      <div>${stackedBar(p.segments.map((s, k) => ({ pct: (s.pct / total) * 100, color: disabled ? "#6d7686" : gpuColor(segmentGpuPos(s, k, m.gpus)), label: `${s.gpu} ${s.pct}%` })))}</div></div>`;
+    const tag = disabled
+      ? ` <span class="eventual-tag" title="${EVENTUAL_TIP}">disabled · eventual</span>`
+      : stopped
+        ? ` <span class="eventual-tag" title="${EVENTUAL_TIP}">stopped · eventual</span>`
+        : "";
+    const barTip = p.defaulted ? ` title="No split configured — an unsplit launch loads on GPU 0."` : "";
+    const segs = p.segments.map((s, k) => ({
+      pct: Math.max(s.frac * 100, s.frac > 0 ? 2 : 0),
+      color: eventual || p.defaulted ? "#6d7686" : gpuColor(segmentGpuPos(s, k, m.gpus)),
+      label: `${s.gpu} ${fmtPct(s.frac)}%`,
+    }));
+    return `<div class="place-row${eventual ? " eventual" : ""}"${p.defaulted && !eventual ? ` style="opacity:.55"` : ""}><span class="mname">${esc(label)}${p.backendId ? ` <span class="place-model">${esc(p.model)}</span>` : ""}${tag}</span>
+      <div${barTip}>${stackedBar(segs)}</div></div>`;
   }).join("");
-  // The legend is built from the enabled rows actually rendered:
+  // The legend is built from the RUNNING rows actually rendered:
   // each distinct segment label with the palette color its GPU
-  // position produced. Disabled rows render gray and stay out of
-  // the legend — their colors assert nothing.
+  // position produced. Eventual and defaulted rows render gray or
+  // ghosted and stay out of the legend — their colors assert nothing.
   const legendByLabel = new Map<string, string>();
   for (const p of m.placement) {
-    if (p.backendEnabled === false) continue;
+    if (p.backendEnabled === false || p.defaulted) continue;
+    if (p.backendStatus !== undefined && p.backendStatus !== "ok" && p.backendStatus !== "starting") continue;
     p.segments.forEach((s, k) => {
       if (!legendByLabel.has(s.gpu)) legendByLabel.set(s.gpu, gpuColor(segmentGpuPos(s, k, m.gpus)));
     });
   }
   const legend = [...legendByLabel.entries()]
     .map(([label, color]) => `<span><span class="sw" style="background:${color}"></span>${esc(label)}</span>`).join("");
-  const legendHtml = m.placement.length ? `<div class="legend">${legend}</div>` : "";
-  // Empty state: rows exist whenever a backend is configured, so an
-  // empty card means no backends at all — say so, never render a
-  // blank titled card.
-  const placeEmpty = m.placement.length ? ""
-    : `<div style="font-size:12px;color:var(--text2)">No backends configured — placements appear here once backends exist. Set a split from a backend's Placement form.</div>`;
-  // A series exists only in sample data (the live path reports none);
-  // the title must not claim a measured window for it.
-  const chart = m.throughputSeries.length
-    ? `<div class="card"><div class="sec-title">${icon("bolt")} Throughput \u2014 all backends \u00b7 ${live ? "1h" : "sample data"}</div>
-       <div class="legend" style="margin:0 0 8px">${m.throughputSeries.map((s) => `<span><span class="sw" style="background:${esc(s.color)}"></span>${esc(s.name)}</span>`).join("")}</div>
-       ${multiLine(m.throughputSeries, 560, 220)}</div>`
-    : "";
-  const events = m.events.length
-    ? `<div class="card"><div class="sec-title">${icon("clock")} Recent activity</div>
-       <div class="events">${m.events.map((e) => `<div class="ev"><span class="dot ${e.level === "ok" ? "ok" : e.level === "warn" ? "warn" : e.level === "error" ? "err" : "idle"}"></span><time>${esc(e.time)}</time><span>${esc(e.text)}</span></div>`).join("")}</div></div>`
+  const legendHtml = legend ? `<div class="legend">${legend}</div>` : "";
+  // No placements -> the card is omitted entirely (principle 13);
+  // the page-level empty card below covers the no-backends case.
+  const placeCard = m.placement.length
+    ? `<div class="card" style="margin-top:12px"><div class="sec-title">${icon("layers")} Backend placements</div>${placeHtml}${legendHtml}</div>`
     : "";
   const empty = !svcs.length && !m.gpus.length
     ? `<div class="card"><div class="empty">No backends or GPUs reported. Run the setup wizard to install and configure the stack.</div></div>` : "";
@@ -223,11 +304,7 @@ function applianceView(m: DashboardModel, live: boolean): string {
     ${noWindow}
     <div class="group-box"><div class="sec-title">${icon("gpu")} GPUs</div><div class="cards3">${gpus}</div></div>
     <div class="group-box"><div class="sec-title">${icon("server")} Backends</div><div class="cards5">${cards}</div></div>
-    <div class="grid2">
-      <div class="card"><div class="sec-title">${icon("layers")} Backend placements</div>${placeHtml}${placeEmpty}${legendHtml}</div>
-      ${chart}
-    </div>
-    ${events ? `<div style="margin-top:12px">${events}</div>` : ""}`;
+    ${placeCard}`;
 }
 
 function consoleView(m: DashboardModel): string {
@@ -273,10 +350,14 @@ function topologyView(m: DashboardModel): string {
   const gpus = m.gpus;
   const models = m.placement;
 
-  const statusColor = (s: string): string =>
-    s === "ok" ? C.green : s === "degraded" || s === "starting" ? C.amber : s === "down" ? C.red : "#6d7686";
   /** Edge class follows the backend's state: hot only while running. */
   const edgeCls = (s: string): string => (s === "ok" ? "hot" : s === "starting" || s === "degraded" ? "warn" : "");
+  /** A backend is linked in the topology only while it is actually
+   *  running (code-review 5.3): an edge asserts a live connection,
+   *  and a stopped or disabled backend has none. Its NODE still
+   *  draws — the map shows what is configured — but unconnected. */
+  const running = (s: string | undefined): boolean =>
+    s === "ok" || s === "starting" || s === "degraded";
 
   const cy = (i: number, n: number) => 60 + (i * (H - 120)) / Math.max(1, n - 1 || 1);
   let svg = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="display:block;width:100%" role="img" aria-label="Cluster topology mini map">`;
@@ -298,7 +379,9 @@ function topologyView(m: DashboardModel): string {
   backs.forEach((b, i) => {
     const y = cy(i, backs.length);
     node(colX[1], y, b.name, `:${b.port}${b.throughput_toks !== undefined ? ` \u00b7 ${trim1(b.throughput_toks)} tok/s` : ""}`, statusColor(b.status));
-    edge(colX[0] + nodeW, H / 2, colX[1], y, "", edgeCls(b.status));
+    if (running(b.status)) {
+      edge(colX[0] + nodeW, H / 2, colX[1], y, "", edgeCls(b.status));
+    }
   });
   gpus.forEach((g, i) => {
     node(colX[2], cy(i, gpus.length), g.name, `${g.util_pct}% util`, statusColor(g.status));
@@ -315,8 +398,18 @@ function topologyView(m: DashboardModel): string {
     if (seg.gpuIndex !== undefined && gpus[seg.gpuIndex]) return seg.gpuIndex;
     return gpus.findIndex((g) => g.name === seg.gpu || g.id === seg.gpu);
   };
+  // Placement edges assert a configured split actually loaded on
+  // the GPUs, so they draw only for rows that are real placements
+  // of live backends (code-review 5.3): a `defaulted` row's single
+  // 100% segment is the no-split fallback, not a configuration; a
+  // disabled backend's placement is eventual; a stopped backend
+  // holds nothing. The Appliance view keeps every row (grayed /
+  // ghosted per those flags) — the Topology filters to what is
+  // actually connected. Model nodes follow the same filter.
+  const linked = (p: (typeof models)[number]): boolean =>
+    !p.defaulted && p.backendEnabled !== false && running(rowStatus(p));
   for (const p of models) {
-    if (!p.backendId) continue;
+    if (!p.backendId || !linked(p)) continue;
     const bi = backendIdxById.get(p.backendId);
     if (bi === undefined) continue;
     p.segments.forEach((seg) => {
@@ -328,8 +421,9 @@ function topologyView(m: DashboardModel): string {
   // Model nodes key to their owning backend's measured state: the dot
   // is the backend's status color, and the sublabel is the split
   // summary — configuration alone never asserts a model is "loaded".
-  models.slice(0, 4).forEach((p, i) => {
-    const y = cy(i, Math.min(4, models.length));
+  const linkedModels = models.filter(linked);
+  linkedModels.slice(0, 4).forEach((p, i) => {
+    const y = cy(i, Math.min(4, linkedModels.length));
     const st = rowStatus(p);
     const sub = p.segments.length ? p.segments.map((s) => `${s.pct}%`).join(" \u00b7 ") : "\u2014";
     node(colX[3], y, p.model, sub, st ? statusColor(st) : "#6d7686");
@@ -410,6 +504,12 @@ function render(): void {
   el.innerHTML = headerHtml(lastLive, staleNow, ago(m.updatedAt), verdict) + `<div class="view">${body}</div>`;
   el.querySelectorAll("[data-view]").forEach((b) =>
     b.addEventListener("click", () => { setMode((b as HTMLElement).dataset.view as ViewMode); render(); }));
+  el.querySelectorAll("[data-trends]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const id = (b as HTMLElement).dataset.trends ?? "";
+      if (openTrends.has(id)) openTrends.delete(id); else openTrends.add(id);
+      render();
+    }));
   const pb = el.querySelector("#pauseBtn");
   pb?.addEventListener("click", () => { paused = !paused; render(); });
   el.querySelectorAll("[data-act]").forEach((b) =>

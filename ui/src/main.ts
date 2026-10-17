@@ -5,12 +5,13 @@
 import "./styles.css";
 import { getActivationPlan, getAppConfig, getBackends, getGatewayStatus, getSetupStatus, getStatus, isTauri } from "./api";
 import type { ActivationPlanData } from "./api";
+import { stackedBar } from "./charts";
 import { esc } from "./html";
 import { icon, type IconName } from "./icons";
 import { mountDashboard } from "./views/dashboard";
 import { renderServiceMap, wireServiceMap } from "./views/serviceMap";
 import {
-  applyActivationPlan,
+  applyActivationPlan, planApplyLine,
   renderActivationPlan, renderBackends, renderGateway, renderGpus, renderLogs,
   renderModels, renderSettings, renderWizard,
   wireActivationPlan, wireBackends, wireGateway, wireGpus, wireLogs, wireModels, wireSettings, wireWizard,
@@ -78,20 +79,40 @@ function paintActivationBanner(): void {
   if (!el) return;
   const plan = bannerPlan;
   if (!plan || !plan.pending) { el.innerHTML = ""; return; }
+  // The banner renders the plan card's summary variant (one line:
+  // warn icon, the pending count as Label: Value, the scope
+  // segmented bar, Review + Apply) with the shell's own state; the
+  // execution path is the shared applyActivationPlan.
   const n = plan.changes.length;
-  const kinds = [...new Set(plan.changes.map((c) => (c.scope === "backend" ? "backend" : "gateway")))];
-  const summary = n
-    ? `${n} saved change${n === 1 ? "" : "s"} (${kinds.join(", ")}) not live yet`
-    : "Saved gateway configuration differs from the running one";
+  const backend = plan.changes.filter((c) => c.scope === "backend").length;
+  const gateway = n - backend;
+  const bar = !n
+    ? `${stackedBar([{ pct: 100, color: "#6d7686", label: "Gateway drift" }], 260, 8)}<span style="font-size:11px;color:var(--text3);white-space:nowrap">Gateway drift</span>`
+    : `${stackedBar([
+        ...(backend ? [{ pct: (backend / n) * 100, color: "#4a9eff", label: `Backend: ${backend}` }] : []),
+        ...(gateway ? [{ pct: (gateway / n) * 100, color: "#a371f7", label: `Gateway: ${gateway}` }] : []),
+      ], 340, 8)}<span style="font-size:11px;color:var(--text3);white-space:nowrap">${[backend ? "Backend" : "", gateway ? "Gateway" : ""].filter(Boolean).join(" · ")}</span>`;
   const dis = bannerActing ? " disabled" : "";
+  // The same actions the plan card offers, under the same labels and
+  // modes: drain-or-restart when the gateway is up with a gateway
+  // change pending, otherwise the single Apply plan (start) action.
+  // The composed consequence line rides the Apply buttons' tooltip.
+  const tip = esc(planApplyLine(plan));
+  const applyBtns = !plan.actionable
+    ? ""
+    : plan.gateway_pending && plan.gateway_up
+      ? `<button class="btn" data-ab-act="drain" title="${tip}"${dis}>Drain Requests and Apply</button>
+      <button class="btn" data-ab-act="apply-now" title="${tip}"${dis}>Apply now</button>`
+      : `<button class="btn" data-ab-act="apply" title="${tip}"${dis}>Apply plan</button>`;
   el.innerHTML = `<div class="activation-banner">
-    <span class="ab-text">${icon("warn")} <b>Activation Plan pending</b> — ${esc(summary)}</span>
+    <span class="ab-text">${icon("warn")} <b>Activation Plan pending</b> — Pending changes: ${n}</span>
+    <span style="display:inline-flex;align-items:center;gap:8px;flex:0 1 340px;min-width:160px">${bar}</span>
     ${bannerStatus ? `<span class="ab-status${bannerStatusErr ? " err" : ""}">${esc(bannerStatus)}</span>` : ""}
     <span class="ab-actions">
       <button class="btn" data-ab-act="review"${dis}>Review</button>
-      ${plan.actionable ? `<button class="btn" data-ab-act="apply"${dis}>Apply</button>` : ""}
+      ${applyBtns}
     </span></div>`
-    + (bannerManual ? `<pre style="margin:0 12px 8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px;text-align:left">${esc(bannerManual)}</pre>` : "");
+    + (bannerManual ? `<pre style="margin:0 12px 8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px;text-align:left">${esc(bannerManual)}</pre><div style="padding:0 12px 8px"><button class="btn" data-ab-act="copy-manual">Copy commands</button></div>` : "");
 }
 
 async function refreshActivationBanner(): Promise<void> {
@@ -108,7 +129,27 @@ async function onBannerClick(ev: Event): Promise<void> {
   if (!t) return;
   const act = t.getAttribute("data-ab-act");
   if (act === "review") { location.hash = "#/activation-plan"; return; }
-  if (act !== "apply" || bannerActing || !bannerPlan) return;
+  if (act === "copy-manual") {
+    if (!bannerManual) return;
+    try {
+      await navigator.clipboard.writeText(bannerManual);
+      bannerStatus = "Manual commands copied to the clipboard.";
+      bannerStatusErr = false;
+    } catch {
+      bannerStatus = "Copy failed — select the commands in the block and copy them manually.";
+      bannerStatusErr = true;
+    }
+    paintActivationBanner();
+    return;
+  }
+  // Banner action -> the plan card's execution mode for the same
+  // label: drain = quiesce wait then restart, Apply now = restart,
+  // Apply plan = start (no stop; starts a down gateway).
+  const modes: Record<string, "quiesce" | "restart" | "start"> = {
+    drain: "quiesce", "apply-now": "restart", apply: "start",
+  };
+  const mode = act ? modes[act] : undefined;
+  if (!mode || bannerActing || !bannerPlan) return;
   bannerActing = true;
   const setStatus = (text: string, err = false): void => {
     bannerStatus = text;
@@ -121,7 +162,6 @@ async function onBannerClick(ev: Event): Promise<void> {
   };
   setStatus("Applying the activation plan…");
   const plan = bannerPlan;
-  const mode = plan.gateway_pending && plan.gateway_up ? "restart" : "start";
   const ok = await applyActivationPlan(plan, mode, setStatus, setManual);
   bannerActing = false;
   if (ok) bannerStatus = "Activation plan applied — the saved changes are live.";

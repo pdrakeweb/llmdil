@@ -478,7 +478,7 @@ impl AppState {
             config: self.config.read().await.clone(),
             data_dir: self.data_dir.clone(),
             mode,
-            ops: Arc::new(RealSystemOps),
+            ops: Arc::new(RealSystemOps::default()),
         }
     }
 
@@ -516,18 +516,79 @@ impl AppState {
                 let _ = self.telemetry_poller.set(std::sync::Mutex::new(handle));
                 // Static GPU inventory (index, UUID, driver model)
                 // for launch construction: CUDA_VISIBLE_DEVICES is
-                // expressed in GPU UUIDs (see backend_spec). One
-                // nvidia-smi query at startup; failure leaves the
-                // inventory empty, and spec building then leaves
-                // launches unrestricted because the placed GPUs'
-                // UUIDs cannot be determined.
+                // expressed in GPU UUIDs (see backend_spec). The
+                // query is BOUNDED and retried: it previously ran
+                // unbounded inside this OnceCell init, so a hung
+                // nvidia-smi (a wedged driver call is exactly when
+                // inventory matters) stalled every telemetry caller
+                // for the whole session, and a transient failure
+                // cached an empty inventory forever — launches then
+                // stayed unrestricted with no signal anywhere
+                // (code-review 4.2). Spec building treats an empty
+                // inventory as "cannot determine" and leaves
+                // launches unrestricted, so a late-arriving
+                // inventory only improves later launches.
                 let smi = NvidiaSmiSource::default();
-                if let Ok(xml) = smi.run_query().await {
-                    if let Ok(inventory) = NvidiaSmiSource::parse_inventory(&xml) {
-                        if !inventory.is_empty() {
+                let attempt = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    smi.run_query(),
+                )
+                .await;
+                let loaded = match attempt {
+                    Ok(Ok(xml)) => match NvidiaSmiSource::parse_inventory(&xml) {
+                        Ok(inventory) if !inventory.is_empty() => {
                             lock_telemetry(&store).set_inventory(inventory);
+                            true
                         }
+                        Ok(_) => {
+                            eprintln!("gpu inventory: nvidia-smi reported no GPUs");
+                            false
+                        }
+                        Err(e) => {
+                            eprintln!("gpu inventory: could not parse nvidia-smi output: {e}");
+                            false
+                        }
+                    },
+                    Ok(Err(e)) => {
+                        eprintln!("gpu inventory: nvidia-smi query failed: {e}");
+                        false
                     }
+                    Err(_) => {
+                        eprintln!("gpu inventory: nvidia-smi query timed out after 10s");
+                        false
+                    }
+                };
+                if !loaded {
+                    let store_retry = store.clone();
+                    tokio::spawn(async move {
+                        for delay_secs in [5u64, 15, 45] {
+                            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                            let smi = NvidiaSmiSource::default();
+                            let attempt = tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                smi.run_query(),
+                            )
+                            .await;
+                            if let Ok(Ok(xml)) = attempt {
+                                if let Ok(inventory) = NvidiaSmiSource::parse_inventory(&xml) {
+                                    if !inventory.is_empty() {
+                                        lock_telemetry(&store_retry)
+                                            .set_inventory(inventory);
+                                        eprintln!(
+                                            "gpu inventory: loaded on retry after {delay_secs}s"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            eprintln!(
+                                "gpu inventory: retry after {delay_secs}s did not load an inventory"
+                            );
+                        }
+                        eprintln!(
+                            "gpu inventory: giving up after retries; launches stay unrestricted until the next app start"
+                        );
+                    });
                 }
                 store
             })
@@ -563,6 +624,39 @@ impl AppState {
         .await
     }
 
+    /// The full gateway drift check for hydration/restore: the
+    /// on-disk YAML matches the current configuration AND the
+    /// recorded spawn fingerprint matches the current spawn inputs
+    /// (port, bind, PostgreSQL presence, credential hashes —
+    /// code-review 2.3). The fingerprint is computed from the
+    /// credentials as read NOW; a credential that cannot be read
+    /// hashes as absent, which cannot match a recorded spawn that
+    /// had one — unreadable therefore reads as drifted, the safe
+    /// direction.
+    async fn gateway_config_current(&self, cfg: &AppConfig) -> bool {
+        let ops = RealSystemOps::default();
+        let postgres = manager_wizard::steps::postgres_installed(&ops, &self.data_dir).await;
+        let master = ops
+            .credential_read(manager_wizard::LITELLM_MASTER_KEY_CRED_TARGET)
+            .await;
+        let tier = &cfg.gateway.openrouter;
+        let openrouter = if tier.enabled {
+            match tier.cred_ref.as_deref().filter(|r| !r.is_empty()) {
+                Some(r) => ops.credential_read(r).await,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let fingerprint = manager_wizard::gateway_spawn_fingerprint(
+            cfg,
+            postgres,
+            master.as_deref(),
+            openrouter.as_deref(),
+        );
+        manager_wizard::gateway_config_is_current(cfg, &self.data_dir, &fingerprint)
+    }
+
     /// Seed the install wizard's checklist from the machine's actual
     /// state: run the audit wizard's checks once and adopt the passing
     /// outcomes, so the checklist does not reset to all-Queued on
@@ -594,7 +688,7 @@ impl AppState {
         // answers; it is adopted as the install step's completion
         // only while the on-disk gateway config still matches the
         // current configuration (see Wizard::hydrate).
-        let gateway_current = manager_wizard::gateway_config_is_current(&ctx.config, &ctx.data_dir);
+        let gateway_current = self.gateway_config_current(&ctx.config).await;
         guard.hydrate(&report, gateway_current);
         *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
@@ -645,13 +739,31 @@ impl AppState {
         let Ok(persisted) = serde_json::from_str::<PersistedWizard>(&text) else {
             return;
         };
+        // A step persisted as Running was in flight when the app
+        // closed: its outcome was never written (outcomes land on
+        // completion). Mark the interruption in the wizard log so
+        // the log shows why there is a "started" with no outcome —
+        // the gap that made the 2026-10-16 half-repaired gateway
+        // undiagnosable from the bundle alone.
+        for s in &persisted.report.steps {
+            if s.state == StepState::Running {
+                append_wizard_log(
+                    &self.data_dir,
+                    &[format!(
+                        "[{}] === step {} (install): interrupted — the app closed while this step was running; re-run it to complete ===",
+                        chrono::Utc::now().to_rfc3339(),
+                        s.id
+                    )],
+                );
+            }
+        }
         let wizard = self.wizard(RunMode::Install).await;
         let mut guard = wizard.lock().await;
         // Same drift rule as hydration: a persisted start-gateway
         // Done is adopted only while the gateway config on disk
         // still matches the current configuration.
         let cfg = self.config.read().await.clone();
-        let gateway_current = manager_wizard::gateway_config_is_current(&cfg, &self.data_dir);
+        let gateway_current = self.gateway_config_current(&cfg).await;
         guard.restore(&persisted.report, gateway_current);
         *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
@@ -867,6 +979,7 @@ async fn ensure_catalog_models(state: &AppState) {
                 params_b: spec.params_b,
                 sha256: spec.sha256,
                 verified_at: None,
+                verified_sha256: None,
                 source_url: spec.url,
                 assigned_backends,
                 enabled: spec.enabled_by_default,
@@ -998,6 +1111,87 @@ enum GpuVisibility {
     Undetermined,
 }
 
+/// The device set a backend's raw flags select, when they carry
+/// device selection at all (`--main-gpu`, `--device`/`-dev`,
+/// `--tensor-split`/`-ts`, in either spelling). `Unparseable`
+/// covers a selection the parser cannot fully resolve (a device
+/// entry that is not `CUDA<n>`, a non-numeric main GPU, a split
+/// entry that is not a number): the selection exists but its set
+/// cannot be determined.
+enum RawDeviceSelection {
+    None,
+    Set(std::collections::BTreeSet<u32>),
+    Unparseable,
+}
+
+fn raw_device_selection(raw: Option<&str>) -> RawDeviceSelection {
+    let Some(raw) = raw else {
+        return RawDeviceSelection::None;
+    };
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let mut set = std::collections::BTreeSet::new();
+    let mut any = false;
+    let mut i = 0;
+    while i < tokens.len() {
+        let (flag, inline) = match tokens[i].split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (tokens[i], None),
+        };
+        let value = inline.or_else(|| tokens.get(i + 1).copied());
+        match flag {
+            "--main-gpu" | "-mg" => {
+                any = true;
+                match value.and_then(|v| v.parse::<u32>().ok()) {
+                    Some(n) => {
+                        set.insert(n);
+                    }
+                    None => return RawDeviceSelection::Unparseable,
+                }
+            }
+            "--device" | "-dev" => {
+                any = true;
+                let Some(v) = value else {
+                    return RawDeviceSelection::Unparseable;
+                };
+                for entry in v.split(',') {
+                    match entry
+                        .trim()
+                        .strip_prefix("CUDA")
+                        .and_then(|n| n.parse::<u32>().ok())
+                    {
+                        Some(n) => {
+                            set.insert(n);
+                        }
+                        None => return RawDeviceSelection::Unparseable,
+                    }
+                }
+            }
+            "--tensor-split" | "-ts" => {
+                any = true;
+                let Some(v) = value else {
+                    return RawDeviceSelection::Unparseable;
+                };
+                for (idx, entry) in v.split(',').enumerate() {
+                    match entry.trim().parse::<f32>() {
+                        Ok(f) if f > 0.0 => {
+                            set.insert(idx as u32);
+                        }
+                        Ok(_) => {}
+                        Err(_) => return RawDeviceSelection::Unparseable,
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if any {
+        RawDeviceSelection::Set(set)
+    } else {
+        RawDeviceSelection::None
+    }
+}
+
 /// The backend's GPU placement, from its configuration alone: the
 /// configured tensor split's positive entries (placement_apply is
 /// what writes splits, so the split IS the placement record); an
@@ -1008,6 +1202,22 @@ fn backend_gpu_visibility(b: &manager_config::BackendConfig) -> GpuVisibility {
         return GpuVisibility::CpuOnly;
     }
     if b.flags.tensor_split.is_empty() {
+        // The GPU 0 default is an assumption about an unsplit
+        // launch — void when the operator's raw flags carry their
+        // own device selection. Remapping such a selection into
+        // the assumed {0} silently moved the backend to GPU 0
+        // (the raw --main-gpu/--device was dropped and visibility
+        // restricted to GPU 0's UUID), so a selection that is not
+        // exactly {0} makes the placement indeterminable and the
+        // launch goes out unrestricted, raw flags verbatim
+        // (code-review 4.4). A structured split, when present,
+        // remains the source of truth and raw selection yields to
+        // it, as before.
+        match raw_device_selection(b.raw_flags.as_deref()) {
+            RawDeviceSelection::None => {}
+            RawDeviceSelection::Set(set) if set.len() == 1 && set.contains(&0) => {}
+            _ => return GpuVisibility::Undetermined,
+        }
         return GpuVisibility::Gpus(vec![0]);
     }
     let placed: Vec<u32> = b
@@ -1029,9 +1239,16 @@ fn backend_gpu_visibility(b: &manager_config::BackendConfig) -> GpuVisibility {
 /// `--gpu-layers 0`, `--n-gpu-layers=0`, ...): the backend is
 /// CPU-only. Expert offload (`-ot exps=CPU`) is NOT this — the
 /// non-expert weights still load on the GPU.
+///
+/// llama.cpp applies the LAST occurrence of a repeated flag, so
+/// the last `-ngl`-family value decides: `-ngl 99 -ngl 0` is
+/// CPU-only and `-ngl 0 -ngl 99` is not. The first-match reading
+/// this replaces classified the second form CPU-only and launched
+/// it with an empty CUDA_VISIBLE_DEVICES (code-review 4.7).
 fn raw_flags_pin_cpu_only(raw: Option<&str>) -> bool {
     let Some(raw) = raw else { return false };
     let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let mut last: Option<&str> = None;
     let mut i = 0;
     while i < tokens.len() {
         let (flag, inline) = match tokens[i].split_once('=') {
@@ -1039,14 +1256,13 @@ fn raw_flags_pin_cpu_only(raw: Option<&str>) -> bool {
             None => (tokens[i], None),
         };
         if matches!(flag, "-ngl" | "--gpu-layers" | "--n-gpu-layers") {
-            let value = inline.or_else(|| tokens.get(i + 1).copied());
-            if value == Some("0") {
-                return true;
+            if let Some(value) = inline.or_else(|| tokens.get(i + 1).copied()) {
+                last = Some(value);
             }
         }
         i += 1;
     }
-    false
+    last == Some("0")
 }
 
 /// Position of global GPU index `v` within the visible list, if the
@@ -2275,6 +2491,7 @@ async fn download_model(app: AppHandle, state: State<'_, AppState>, id: String) 
         let mut cfg = state.config.write().await;
         if let Some(m) = cfg.models.iter_mut().find(|m| m.id == id) {
             m.verified_at = None;
+            m.verified_sha256 = None;
         }
     }
     // Mark verification-pending BEFORE the watcher spawns; the watcher
@@ -2319,6 +2536,7 @@ async fn download_model(app: AppHandle, state: State<'_, AppState>, id: String) 
                                 if let Some(m) = cfg.models.iter_mut().find(|m| m.id == watcher_id)
                                 {
                                     m.verified_at = Some(chrono::Utc::now());
+                                    m.verified_sha256 = Some(sha.clone());
                                 }
                                 let _ = manager_config::save(&cfg, &st.config_path);
                                 (None, false)
@@ -2333,6 +2551,7 @@ async fn download_model(app: AppHandle, state: State<'_, AppState>, id: String) 
                                             cfg.models.iter_mut().find(|m| m.id == watcher_id)
                                         {
                                             m.verified_at = None;
+                                            m.verified_sha256 = None;
                                         }
                                         let _ = manager_config::save(&cfg, &st.config_path);
                                         (
@@ -2646,8 +2865,17 @@ async fn get_logs(
     // flipping within the group, and page boundaries mirror between
     // the two orders.
     records.sort_by(|a, b| b.ts.cmp(&a.ts));
-    if order.as_deref() == Some("asc") {
-        records.reverse();
+    // `order` is strict: an unrecognized value is a caller bug and
+    // is refused, not silently treated as the default (code-review
+    // 4.17).
+    match order.as_deref() {
+        None | Some("desc") => {}
+        Some("asc") => records.reverse(),
+        Some(other) => {
+            return Err(err(ApiError::InvalidInput(format!(
+                "unknown log order {other:?}; expected \"asc\" or \"desc\""
+            ))))
+        }
     }
     let total_matching = records.len();
     let offset = offset.unwrap_or(0) as usize;
@@ -2656,7 +2884,11 @@ async fn get_logs(
         "lines": serde_json::to_value(&page).map_err(jerr)?,
         "total_matching": total_matching,
         "total": total_matching,
-        "truncated": total_matching > offset + page.len(),
+        // Paging cut records when any matched record sits outside
+        // the page — before it (a nonzero offset into a non-empty
+        // result) or after it (code-review 4.9: the offset side was
+        // previously not reported).
+        "truncated": (offset > 0 && total_matching > 0) || total_matching > offset + page.len(),
         "scopes": scopes,
     }))
 }
@@ -2701,69 +2933,98 @@ async fn update_gateway_config(state: State<'_, AppState>, patch: Value) -> ApiR
     let mut v = serde_json::to_value(&new_cfg.gateway).map_err(jerr)?;
     merge_json(&mut v, patch);
     new_cfg.gateway = serde_json::from_value(v).map_err(jerr)?;
+    record_gateway_change(
+        &state,
+        &pre_cfg,
+        &new_cfg,
+        "gateway_config",
+        "Gateway configuration changed".to_string(),
+        false,
+    )
+    .await
+    .map_err(|e| jerr(ApiError::InvalidInput(e)))?;
     manager_config::save(&new_cfg, &state.config_path)
         .map_err(ApiError::from)
         .map_err(jerr)?;
     *cfg = new_cfg;
-    record_gateway_change(
-        &state.data_dir,
-        &pre_cfg,
-        &cfg,
-        "gateway_config",
-        "Gateway configuration changed".to_string(),
-        false,
-    );
     Ok(json!({ "ok": true, "persisted": true }))
 }
 
-/// Journal a saved change for the gateway activation plan when it
+/// Journal a change for the gateway activation plan when it
 /// affects what the running gateway serves: the generated gateway
 /// configuration differs between `pre` and `post`, or `force` is set
 /// for changes the YAML does not carry (the bind address). Saves
 /// that leave the gateway configuration identical (a backend's
 /// context length, a tensor split) are backend-process concerns and
 /// create no gateway plan.
-fn record_gateway_change(
-    data_dir: &std::path::Path,
+///
+/// Callers invoke this BEFORE persisting the configuration and
+/// propagate the error: a journal write failure then aborts the
+/// change with the configuration untouched, instead of stranding a
+/// saved change no plan will ever show (code-review 4.3). The
+/// journal's own resolution uses the running backends' real start
+/// times, so already-live backend-scope entries prune correctly
+/// (4.1).
+async fn record_gateway_change(
+    state: &AppState,
     pre: &AppConfig,
     post: &AppConfig,
     kind: &str,
     summary: String,
     force: bool,
-) {
+) -> Result<(), String> {
     if !force {
         let before = manager_gateway::generate_config_yaml(pre).unwrap_or_default();
         let after = manager_gateway::generate_config_yaml(post).unwrap_or_default();
         if before == after {
-            return;
+            return Ok(());
         }
     }
-    activation::record_change(data_dir, pre, post, kind, summary, "gateway", Vec::new());
+    let started_at = backend_start_times(state).await;
+    let configured: std::collections::HashSet<String> =
+        post.backends.iter().map(|b| b.id.clone()).collect();
+    activation::record_change(
+        &state.data_dir,
+        pre,
+        post,
+        kind,
+        summary,
+        "gateway",
+        Vec::new(),
+        &started_at,
+        &configured,
+    )
 }
 
-/// Journal a saved change that only the target backend's next
+/// Journal a change that only the target backend's next
 /// (re)start activates — its flags, tensor split, or model
 /// assignment. These never appear in the gateway YAML, so the
 /// gateway rule in [`record_gateway_change`] cannot see them; the
 /// activation plan carries them as backend-scope entries that
 /// resolve when the backend (re)starts (or is deleted).
-fn record_backend_change(
-    data_dir: &std::path::Path,
+/// Same record-before-save contract as [`record_gateway_change`].
+async fn record_backend_change(
+    state: &AppState,
     pre: &AppConfig,
     post: &AppConfig,
     kind: &str,
     summary: String,
     backend_id: &str,
-) {
+) -> Result<(), String> {
+    let started_at = backend_start_times(state).await;
+    let configured: std::collections::HashSet<String> =
+        post.backends.iter().map(|b| b.id.clone()).collect();
     activation::record_change(
-        data_dir,
+        &state.data_dir,
         pre,
         post,
         kind,
         summary,
         "backend",
         vec![backend_id.to_string()],
-    );
+        &started_at,
+        &configured,
+    )
 }
 
 /// Running backends' start instants (now minus supervisor uptime),
@@ -3052,7 +3313,7 @@ async fn open_url(url: String) -> ApiResult {
 /// so the value shown is the value in force.
 #[tauri::command]
 async fn gateway_master_key() -> ApiResult {
-    let key = manager_wizard::ensure_gateway_master_key(&RealSystemOps)
+    let key = manager_wizard::ensure_gateway_master_key(&RealSystemOps::default())
         .await
         .map_err(jerr)?;
     Ok(json!({ "master_key": key }))
@@ -3178,31 +3439,35 @@ async fn backend_apply_config(
         let diff = manager_config::apply_config_diff(&mut new_cfg, &id, &patch)
             .map_err(ApiError::from)
             .map_err(jerr)?;
-        manager_config::save(&new_cfg, &state.config_path)
-            .map_err(ApiError::from)
-            .map_err(jerr)?;
-        *cfg = new_cfg;
         record_gateway_change(
-            &state.data_dir,
+            &state,
             &pre_cfg,
-            &cfg,
+            &new_cfg,
             "backend_apply_config",
             format!("Backend `{id}` settings changed"),
             false,
-        );
+        )
+        .await
+        .map_err(|e| jerr(ApiError::InvalidInput(e)))?;
         // The same save is also a backend activation: whatever the
         // gateway does with it, the backend process itself only
         // picks its settings up at its next (re)start.
         if !diff.changes.is_empty() {
             record_backend_change(
-                &state.data_dir,
+                &state,
                 &pre_cfg,
-                &cfg,
+                &new_cfg,
                 "backend_apply_config",
                 format!("Backend `{id}` settings changed"),
                 &id,
-            );
+            )
+            .await
+            .map_err(|e| jerr(ApiError::InvalidInput(e)))?;
         }
+        manager_config::save(&new_cfg, &state.config_path)
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
+        *cfg = new_cfg;
         diff
     };
     let restart_task = if apply_mode == "RestartNow" {
@@ -3406,18 +3671,20 @@ async fn backend_add(
     manager_config::validate(&new_cfg)
         .map_err(ApiError::from)
         .map_err(jerr)?;
+    record_gateway_change(
+        &state,
+        &pre_cfg,
+        &new_cfg,
+        "backend_add",
+        format!("Backend `{id}` added to group `{group}`"),
+        false,
+    )
+    .await
+    .map_err(|e| jerr(ApiError::InvalidInput(e)))?;
     manager_config::save(&new_cfg, &state.config_path)
         .map_err(ApiError::from)
         .map_err(jerr)?;
     *cfg = new_cfg;
-    record_gateway_change(
-        &state.data_dir,
-        &pre_cfg,
-        &cfg,
-        "backend_add",
-        format!("Backend `{id}` added to group `{group}`"),
-        false,
-    );
     drop(cfg);
     ensure_backend_specs(&state).await;
     Ok(json!({ "backend_id": id, "group": group, "persisted": true }))
@@ -3460,20 +3727,22 @@ async fn backend_update_flags(
     manager_config::validate(&new_cfg)
         .map_err(ApiError::from)
         .map_err(jerr)?;
+    if changed {
+        record_backend_change(
+            &state,
+            &pre_cfg,
+            &new_cfg,
+            "backend_flags",
+            format!("Backend `{id}` context/batch changed"),
+            &id,
+        )
+        .await
+        .map_err(|e| jerr(ApiError::InvalidInput(e)))?;
+    }
     manager_config::save(&new_cfg, &state.config_path)
         .map_err(ApiError::from)
         .map_err(jerr)?;
     *cfg = new_cfg;
-    if changed {
-        record_backend_change(
-            &state.data_dir,
-            &pre_cfg,
-            &cfg,
-            "backend_flags",
-            format!("Backend `{id}` context/batch changed"),
-            &id,
-        );
-    }
     drop(cfg);
     ensure_backend_specs(&state).await;
     Ok(json!({ "backend_id": id, "persisted": true, "applies": "next start" }))
@@ -3529,15 +3798,41 @@ async fn backend_set_offload(state: State<'_, AppState>, id: String, layers: u32
             "offload of {layers} layers exceeds the model's {moe_layers} MoE layers"
         ))));
     }
-    let target = manager_models::offload_for_layers(layers, moe_layers);
     let mut cfg = state.config.write().await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
+    // Re-resolve and re-validate UNDER the write lock (code-review
+    // 4.8): the pre-lock resolution can be stale — a concurrent
+    // model assignment changes which model this backend serves,
+    // and with it the MoE layer count the request was validated
+    // against. Computed before the mutable borrow is taken, and it
+    // shadows the pre-lock value: everything below uses the
+    // under-lock count.
+    let moe_layers = {
+        let b_ref = new_cfg
+            .backends
+            .iter()
+            .find(|x| x.id == id)
+            .ok_or_else(|| err(ApiError::NotFound(format!("backend {id}"))))?;
+        backend_offload_info(&new_cfg, b_ref)
+            .map(|o| o.moe_layers)
+            .ok_or_else(|| {
+                err(ApiError::InvalidInput(format!(
+                    "backend {id}'s model does not support expert offload"
+                )))
+            })?
+    };
     let b = new_cfg
         .backends
         .iter_mut()
         .find(|b| b.id == id)
         .ok_or_else(|| err(ApiError::NotFound(format!("backend {id}"))))?;
+    if layers > moe_layers {
+        return Err(err(ApiError::InvalidInput(format!(
+            "offload of {layers} layers exceeds the model's {moe_layers} MoE layers"
+        ))));
+    }
+    let target = manager_models::offload_for_layers(layers, moe_layers);
     let new_raw = manager_models::set_expert_offload(b.raw_flags.as_deref(), target);
     let changed = new_raw != b.raw_flags;
     b.raw_flags = new_raw.clone();
@@ -3545,10 +3840,6 @@ async fn backend_set_offload(state: State<'_, AppState>, id: String, layers: u32
         manager_config::validate(&new_cfg)
             .map_err(ApiError::from)
             .map_err(jerr)?;
-        manager_config::save(&new_cfg, &state.config_path)
-            .map_err(ApiError::from)
-            .map_err(jerr)?;
-        *cfg = new_cfg;
         let summary = match target {
             manager_models::ExpertOffload::None => {
                 format!("Backend `{id}` expert offload turned off")
@@ -3561,13 +3852,19 @@ async fn backend_set_offload(state: State<'_, AppState>, id: String, layers: u32
             }
         };
         record_backend_change(
-            &state.data_dir,
+            &state,
             &pre_cfg,
-            &cfg,
+            &new_cfg,
             "backend_set_offload",
             summary,
             &id,
-        );
+        )
+        .await
+        .map_err(|e| jerr(ApiError::InvalidInput(e)))?;
+        manager_config::save(&new_cfg, &state.config_path)
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
+        *cfg = new_cfg;
     }
     drop(cfg);
     if changed {
@@ -3578,7 +3875,12 @@ async fn backend_set_offload(state: State<'_, AppState>, id: String, layers: u32
         "layers": layers,
         "raw_flags": new_raw,
         "changed": changed,
-        "persisted": changed,
+        // `persisted` is about the desired state being on disk:
+        // after a successful save it is, and when nothing changed
+        // it already was (code-review 4.16 — reporting false for
+        // the already-correct state made the UI warn about a loss
+        // that never happened).
+        "persisted": true,
         "applies": "next start",
     }))
 }
@@ -3621,18 +3923,20 @@ async fn backend_delete(state: State<'_, AppState>, id: String) -> ApiResult {
     manager_config::validate(&new_cfg)
         .map_err(ApiError::from)
         .map_err(jerr)?;
+    record_gateway_change(
+        &state,
+        &pre_cfg,
+        &new_cfg,
+        "backend_delete",
+        format!("Backend `{id}` removed"),
+        false,
+    )
+    .await
+    .map_err(|e| jerr(ApiError::InvalidInput(e)))?;
     manager_config::save(&new_cfg, &state.config_path)
         .map_err(ApiError::from)
         .map_err(jerr)?;
     *cfg = new_cfg;
-    record_gateway_change(
-        &state.data_dir,
-        &pre_cfg,
-        &cfg,
-        "backend_delete",
-        format!("Backend `{id}` removed"),
-        false,
-    );
     drop(cfg);
     ensure_backend_specs(&state).await;
     Ok(json!({ "backend_id": id, "deleted": true, "persisted": true }))
@@ -3834,7 +4138,14 @@ async fn gateway_activation_plan(state: State<'_, AppState>) -> ApiResult {
 #[tauri::command]
 async fn gateway_activation_cancel(state: State<'_, AppState>) -> ApiResult {
     let mut cfg = state.config.write().await;
-    let restored = match activation::cancel_target(&state.data_dir, &cfg) {
+    // Scoped resolution with the real start times: entries whose
+    // changes are already live (their backends restarted) are not
+    // pending and must not be "cancelled" (code-review 4.1).
+    let started_at = backend_start_times(&state).await;
+    let configured: std::collections::HashSet<String> =
+        cfg.backends.iter().map(|b| b.id.clone()).collect();
+    let restored = match activation::cancel_target(&state.data_dir, &cfg, &started_at, &configured)
+    {
         Ok(Some(restored)) => restored,
         Ok(None) => return Ok(json!({ "cancelled": false, "reason": "no pending changes" })),
         Err(msg) => return Err(err(ApiError::InvalidInput(msg))),
@@ -3847,7 +4158,7 @@ async fn gateway_activation_cancel(state: State<'_, AppState>) -> ApiResult {
         .map_err(jerr)?;
     *cfg = restored;
     drop(cfg);
-    activation::clear_journal(&state.data_dir);
+    activation::clear_journal(&state.data_dir).map_err(|e| jerr(ApiError::InvalidInput(e)))?;
     ensure_backend_specs(&state).await;
     Ok(json!({ "cancelled": true }))
 }
@@ -3862,7 +4173,8 @@ async fn gateway_activation_cancel(state: State<'_, AppState>) -> ApiResult {
 /// the scoped resolution rule observes directly.
 #[tauri::command]
 async fn gateway_activation_complete(state: State<'_, AppState>) -> ApiResult {
-    activation::clear_gateway_scope(&state.data_dir);
+    activation::clear_gateway_scope(&state.data_dir)
+        .map_err(|e| jerr(ApiError::InvalidInput(e)))?;
     Ok(json!({ "cleared": true }))
 }
 
@@ -3885,7 +4197,7 @@ async fn gateway_quiesce_wait(state: State<'_, AppState>, timeout_secs: u64) -> 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
     let mut last_in_flight: Option<f64> = None;
     loop {
-        let key = RealSystemOps
+        let key = RealSystemOps::default()
             .credential_read(manager_wizard::LITELLM_MASTER_KEY_CRED_TARGET)
             .await
             .unwrap_or_default();
@@ -3938,21 +4250,28 @@ async fn gateway_stop(state: State<'_, AppState>) -> ApiResult {
     // Best-effort: the gateway stop already succeeded, so a
     // PostgreSQL stop problem is reported in the payload, not as a
     // command failure.
-    let postgres_stopped = manager_wizard::steps::stop_postgres_server(&RealSystemOps, &data_dir)
-        .await
-        .unwrap_or(false);
+    let postgres_stopped =
+        manager_wizard::steps::stop_postgres_server(&RealSystemOps::default(), &data_dir)
+            .await
+            .unwrap_or(false);
     Ok(json!({ "ok": true, "stopped": stopped, "postgres_stopped": postgres_stopped }))
 }
 
 /// One-shot gateway liveness probe: connect to <host>:<port> with a
-/// 500 ms timeout, `GET /v1/models` with a 1 s read timeout, and report
-/// whether the reply's first line is a syntactically valid HTTP status
-/// line. Any status code counts — 200, 401, and 404 all prove a live
-/// HTTP listener, which is all "up" means here. Any error (refused,
-/// timeout, malformed reply) is simply "not up"; runs on a blocking
-/// thread and never fails the caller. The host is the app's probe
-/// host for the configured bind address (loopback whenever the bind
-/// covers it).
+/// 500 ms timeout, `GET /health/liveliness` with a 1 s read timeout,
+/// and report whether the reply's first line is a syntactically valid
+/// HTTP status line. Any status code counts — 200, 401, and 404 all
+/// prove a live HTTP listener, which is all "up" means here. Any
+/// error (refused, timeout, malformed reply) is simply "not up";
+/// runs on a blocking thread and never fails the caller. The host is
+/// the app's probe host for the configured bind address (loopback
+/// whenever the bind covers it).
+///
+/// The path is LiteLLM's unauthenticated liveliness endpoint, not
+/// `/v1/models`: this probe fires on every gateway_status poll
+/// (~15 s), and the keyless `/v1/models` requests filled the gateway
+/// log with "No api key passed in" auth rejections — noise that was
+/// later mistaken for a startup failure's cause (2026-10-16).
 fn probe_gateway(host: &str, port: u16) -> bool {
     use std::io::{BufRead, BufReader, Write};
     let Ok(ip) = host.parse::<std::net::IpAddr>() else {
@@ -3967,7 +4286,9 @@ fn probe_gateway(host: &str, port: u16) -> bool {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(1)));
     if stream
-        .write_all(b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .write_all(
+            b"GET /health/liveliness HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
         .is_err()
     {
         return false;
@@ -4021,18 +4342,20 @@ async fn gateway_set_bind_host(state: State<'_, AppState>, host: String) -> ApiR
     manager_config::validate(&new_cfg)
         .map_err(ApiError::from)
         .map_err(jerr)?;
+    record_gateway_change(
+        &state,
+        &pre_cfg,
+        &new_cfg,
+        "gateway_bind",
+        format!("Gateway network access changed to {host}"),
+        true,
+    )
+    .await
+    .map_err(|e| jerr(ApiError::InvalidInput(e)))?;
     manager_config::save(&new_cfg, &state.config_path)
         .map_err(ApiError::from)
         .map_err(jerr)?;
     *cfg = new_cfg;
-    record_gateway_change(
-        &state.data_dir,
-        &pre_cfg,
-        &cfg,
-        "gateway_bind",
-        format!("Gateway network access changed to {host}"),
-        true,
-    );
     Ok(json!({ "bind_host": host, "restart_required": true }))
 }
 
@@ -4097,7 +4420,7 @@ async fn poll_gateway_metrics_once(state: &AppState) {
             cfg.gateway.port,
         )
     };
-    let Some(key) = RealSystemOps
+    let Some(key) = RealSystemOps::default()
         .credential_read(manager_wizard::LITELLM_MASTER_KEY_CRED_TARGET)
         .await
     else {
@@ -4254,7 +4577,15 @@ async fn model_verify_checksum(state: State<'_, AppState>, id: String) -> ApiRes
     {
         let mut cfg = state.config.write().await;
         if let Some(m) = cfg.models.iter_mut().find(|m| m.id == id) {
-            m.verified_at = if ok { Some(chrono::Utc::now()) } else { None };
+            // The stamp and the hash it verified against move
+            // together (code-review 2.4).
+            if ok {
+                m.verified_at = Some(chrono::Utc::now());
+                m.verified_sha256 = Some(sha.clone());
+            } else {
+                m.verified_at = None;
+                m.verified_sha256 = None;
+            }
         }
         manager_config::save(&cfg, &state.config_path).map_err(jerr)?;
     }
@@ -4289,8 +4620,6 @@ async fn model_verify_checksum(state: State<'_, AppState>, id: String) -> ApiRes
 /// failed save leaves memory and disk in agreement.
 #[tauri::command]
 async fn model_set_short_name(state: State<'_, AppState>, id: String, name: String) -> ApiResult {
-    let validated =
-        manager_config::validate_display_name(&name).map_err(|e| err(ApiError::InvalidInput(e)))?;
     let mut cfg = state.config.write().await;
     let mut new_cfg = cfg.clone();
     let m = new_cfg
@@ -4298,6 +4627,18 @@ async fn model_set_short_name(state: State<'_, AppState>, id: String, name: Stri
         .iter_mut()
         .find(|m| m.id == id)
         .ok_or_else(|| err(ApiError::NotFound(format!("model {id}"))))?;
+    // An empty name CLEARS the override (the effective name falls
+    // back to the catalog name / id): there was previously no way
+    // to undo a rename — empty input failed validation like any
+    // other bad name (code-review 4.14).
+    if name.trim().is_empty() {
+        m.display_name = None;
+        manager_config::save(&new_cfg, &state.config_path).map_err(jerr)?;
+        *cfg = new_cfg;
+        return Ok(json!({ "id": id, "name": Value::Null }));
+    }
+    let validated =
+        manager_config::validate_display_name(&name).map_err(|e| err(ApiError::InvalidInput(e)))?;
     m.display_name = Some(validated.clone());
     manager_config::save(&new_cfg, &state.config_path).map_err(jerr)?;
     *cfg = new_cfg;
@@ -4421,6 +4762,7 @@ async fn model_add(
         params_b: params_b.filter(|p| *p > 0.0).unwrap_or(0.0),
         sha256: String::new(),
         verified_at: None,
+        verified_sha256: None,
         source_url,
         assigned_backends: Vec::new(),
         enabled: true,
@@ -4499,27 +4841,32 @@ async fn model_assign(
     manager_config::validate(&*cfg)
         .map_err(ApiError::from)
         .map_err(jerr)?;
-    manager_config::save(&cfg, &state.config_path).map_err(jerr)?;
     // The assignment activates twice over: the gateway's routes
     // change with the backend's model (gateway scope, recorded only
     // when the generated YAML actually differs), and the backend
     // loads the new model at its next (re)start (backend scope).
+    // Recorded before the save, per the journal ordering rule.
     record_gateway_change(
-        &state.data_dir,
+        &state,
         &pre_cfg,
         &cfg,
         "model_assign",
         format!("Backend `{backend_id}` now serves model `{id}`"),
         false,
-    );
+    )
+    .await
+    .map_err(|e| jerr(ApiError::InvalidInput(e)))?;
     record_backend_change(
-        &state.data_dir,
+        &state,
         &pre_cfg,
         &cfg,
         "model_assign",
         format!("Backend `{backend_id}` now serves model `{id}`"),
         &backend_id,
-    );
+    )
+    .await
+    .map_err(|e| jerr(ApiError::InvalidInput(e)))?;
+    manager_config::save(&cfg, &state.config_path).map_err(jerr)?;
     drop(cfg);
     let task_id = state
         .record_task(
@@ -4662,6 +5009,10 @@ fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
 struct WeightLayout {
     total_bytes: u64,
     expert_bytes: Option<u64>,
+    /// Per-MoE-block expert bytes from the GGUF parse, when the
+    /// layout came from one — partial offload is priced from the
+    /// true first-N block sums, not a uniform share.
+    expert_bytes_by_block: Option<Vec<u64>>,
     moe_layers: Option<u32>,
     kv_per_token: Option<u64>,
     basis: manager_models::MemoryBasis,
@@ -4685,29 +5036,46 @@ fn resolve_weight_layout(
         .ok()
         .filter(|m| m.is_file())
         .map(|m| m.len());
-    let (total_bytes, mut basis) = match (&catalog, file_len) {
-        (Some(c), _) => (c.size_bytes, manager_models::MemoryBasis::Catalog),
-        (None, Some(len)) => (len, manager_models::MemoryBasis::Estimate),
-        (None, None) => (
-            manager_wizard::steps::estimate_model_bytes(model.params_b as f64),
-            manager_models::MemoryBasis::Estimate,
-        ),
-    };
-    let (expert_bytes, kv_per_token, moe_layers) = match (&layout, &catalog) {
-        (Some(l), _) => {
-            basis = manager_models::MemoryBasis::Exact;
-            (
+    // One source per figure set, and the basis labels THAT source:
+    // when the GGUF parses, the total is the parse's own tensor
+    // sum — the previous version paired the catalog's (or the file
+    // length's) total with the parse's expert bytes and labeled
+    // the mixture Exact, a label neither source earned
+    // (code-review 4.12). Without a parse, the catalog's pins are
+    // Catalog; anything else is an Estimate.
+    let (total_bytes, expert_bytes, expert_bytes_by_block, kv_per_token, moe_layers, basis) =
+        match (&layout, &catalog) {
+            (Some(l), _) => (
+                l.tensor_bytes,
                 Some(l.expert_bytes),
+                Some(l.expert_bytes_by_block.clone()),
                 l.kv.map(|k| k.bytes_per_token()),
                 l.moe_block_count,
-            )
-        }
-        (None, Some(c)) => (c.expert_bytes, None, c.moe_layers),
-        (None, None) => (None, None, None),
-    };
+                manager_models::MemoryBasis::Exact,
+            ),
+            (None, Some(c)) => (
+                c.size_bytes,
+                c.expert_bytes,
+                None,
+                None,
+                c.moe_layers,
+                manager_models::MemoryBasis::Catalog,
+            ),
+            (None, None) => (
+                file_len.unwrap_or_else(|| {
+                    manager_wizard::steps::estimate_model_bytes(model.params_b as f64)
+                }),
+                None,
+                None,
+                None,
+                None,
+                manager_models::MemoryBasis::Estimate,
+            ),
+        };
     Some(WeightLayout {
         total_bytes,
         expert_bytes,
+        expert_bytes_by_block,
         moe_layers,
         kv_per_token,
         basis,
@@ -4728,6 +5096,7 @@ fn backend_memory_requirement(
     Some(manager_models::memory_requirement(
         layout.total_bytes,
         layout.expert_bytes,
+        layout.expert_bytes_by_block.as_deref(),
         layout.basis,
         offload,
         layout.kv_per_token,
@@ -4757,10 +5126,7 @@ struct OffloadInfo {
     yellow_end: f64,
 }
 
-fn backend_offload_info(
-    cfg: &AppConfig,
-    b: &manager_config::BackendConfig,
-) -> Option<OffloadInfo> {
+fn backend_offload_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> Option<OffloadInfo> {
     let layout = resolve_weight_layout(cfg, b)?;
     let expert_bytes = layout.expert_bytes?;
     let moe_layers = layout.moe_layers?;
@@ -5076,7 +5442,7 @@ async fn placement_apply(
         )
         .await;
     let mut cfg = state.config.write().await;
-    let outcome: Result<(), String> = (|| {
+    let outcome: Result<(), String> = (async {
         let mut new_cfg = cfg.clone();
         // Existence first: a missing backend must not leave earlier
         // backends mutated while the command reports failure.
@@ -5106,32 +5472,33 @@ async fn placement_apply(
         manager_config::validate(&new_cfg)
             .map_err(ApiError::from)
             .map_err(jerr)?;
+        // Journal before the save (ordering rule): each target
+        // backend activates the split at its next (re)start — a
+        // backend-scope plan entry per target (the gateway YAML
+        // does not carry splits, so no gateway entry is created
+        // for this change).
+        for bid in &backend_ids {
+            record_backend_change(
+                &state,
+                &pre_cfg,
+                &new_cfg,
+                "backend_placement",
+                format!("Backend `{bid}` tensor split changed"),
+                bid,
+            )
+            .await
+            .map_err(|e| jerr(ApiError::InvalidInput(e)))?;
+        }
         // Persist — without the save, the applied split silently
         // vanished on app restart while the command reported success.
         manager_config::save(&new_cfg, &state.config_path).map_err(jerr)?;
         *cfg = new_cfg;
         Ok(())
-    })();
+    })
+    .await;
     drop(cfg);
     match outcome {
         Ok(()) => {
-            // The split is saved; each target backend activates it
-            // at its next (re)start — a backend-scope plan entry
-            // per target (the gateway YAML does not carry splits,
-            // so no gateway entry is created for this change).
-            {
-                let cfg = state.config.read().await;
-                for bid in &backend_ids {
-                    record_backend_change(
-                        &state.data_dir,
-                        &pre_cfg,
-                        &cfg,
-                        "backend_placement",
-                        format!("Backend `{bid}` tensor split changed"),
-                        bid,
-                    );
-                }
-            }
             state
                 .finish_task(
                     &task_id,
@@ -5455,7 +5822,12 @@ async fn vscode_install_extensions(state: State<'_, AppState>) -> ApiResult {
         .await;
     let cfg = state.config.read().await.clone();
     let data_dir = state.data_dir.clone();
-    let ctx = WizardContext::new(cfg, data_dir, RunMode::Install, Arc::new(RealSystemOps));
+    let ctx = WizardContext::new(
+        cfg,
+        data_dir,
+        RunMode::Install,
+        Arc::new(RealSystemOps::default()),
+    );
     let mut wizard = Wizard::new(
         vec![Box::new(VscodeExtensions::default())],
         RunMode::Install,
@@ -5499,7 +5871,7 @@ async fn vscode_write_config(state: State<'_, AppState>, backup: bool) -> ApiRes
     // works against the key-guarded gateway. The key itself goes to
     // ~/.continue/.env — config.yaml references it as
     // ${{ secrets.LITELLM_API_KEY }} and carries no literal secret.
-    let master_key = manager_wizard::ensure_gateway_master_key(&RealSystemOps)
+    let master_key = manager_wizard::ensure_gateway_master_key(&RealSystemOps::default())
         .await
         .map_err(jerr)?;
     let new_yaml = continue_config_yaml(&cfg);
@@ -6177,6 +6549,49 @@ mod tests {
     }
 
     #[test]
+    fn backend_spec_unsplit_raw_device_selection_is_not_remapped_to_gpu0() {
+        // Code-review 4.4: an unsplit backend whose raw flags carry
+        // the placement must launch unrestricted with the flags
+        // verbatim — not restricted to GPU 0 with the selection
+        // dropped.
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        assert!(b.flags.tensor_split.is_empty());
+        b.raw_flags = Some("--main-gpu 1".into());
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert_eq!(cuda_visible_devices(&spec), None);
+        let pos = spec.args.iter().position(|a| a == "--main-gpu").unwrap();
+        assert_eq!(spec.args[pos + 1], "1");
+
+        b.raw_flags = Some("--device CUDA1,CUDA2".into());
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert_eq!(cuda_visible_devices(&spec), None);
+        assert!(spec.args.iter().any(|a| a == "CUDA1,CUDA2"));
+
+        b.raw_flags = Some("--tensor-split 0,1".into());
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert_eq!(cuda_visible_devices(&spec), None);
+
+        // A raw selection of exactly GPU 0 agrees with the unsplit
+        // default: the launch restricts as usual.
+        b.raw_flags = Some("--main-gpu 0".into());
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert_eq!(cuda_visible_devices(&spec), Some("GPU-uuid-0"));
+    }
+
+    #[test]
+    fn raw_flags_pin_cpu_only_is_last_wins() {
+        // Code-review 4.7: llama.cpp applies the last occurrence.
+        assert!(raw_flags_pin_cpu_only(Some("-ngl 99 -ngl 0")));
+        assert!(!raw_flags_pin_cpu_only(Some("-ngl 0 -ngl 99")));
+        assert!(raw_flags_pin_cpu_only(Some("-ngl 99 --gpu-layers=0")));
+        assert!(!raw_flags_pin_cpu_only(Some("--gpu-layers 0 -ngl 12")));
+        assert!(raw_flags_pin_cpu_only(Some("--n-gpu-layers=0")));
+        assert!(!raw_flags_pin_cpu_only(Some("-ot exps=CPU")));
+        assert!(!raw_flags_pin_cpu_only(None));
+    }
+
+    #[test]
     fn backend_spec_remaps_raw_main_gpu_and_drops_conflicts() {
         let cfg = test_cfg();
         let mut b = backend(&cfg, "planner");
@@ -6253,6 +6668,7 @@ mod tests {
             params_b: 30.0,
             sha256: "a".repeat(64),
             verified_at: None,
+            verified_sha256: None,
             source_url: String::new(),
             assigned_backends: vec![backend_id.to_string()],
             enabled: true,
@@ -6371,14 +6787,25 @@ mod tests {
             .find(|b| b.id == "coder")
             .unwrap()
             .raw_flags = Some("--n-cpu-moe 24".to_string());
-        record_backend_change(
+        // record_backend_change (the producer backend_set_offload
+        // journals through) is a thin wrapper over
+        // activation::record_change with backend scope; exercise
+        // that directly — building an AppState for the wrapper is
+        // all supervisor and locks, no journal behavior.
+        let configured: std::collections::HashSet<String> =
+            post.backends.iter().map(|b| b.id.clone()).collect();
+        activation::record_change(
             &dir,
             &pre,
             &post,
             "backend_set_offload",
             "Backend `coder` expert offload set to 24 of 48 MoE layers".to_string(),
-            "coder",
-        );
+            "backend",
+            vec!["coder".to_string()],
+            &std::collections::HashMap::new(),
+            &configured,
+        )
+        .unwrap();
         let journal = activation::load_journal(&dir);
         let entry = journal
             .entries

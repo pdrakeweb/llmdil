@@ -84,6 +84,22 @@ fn gateway_yaml_path(data_dir: &Path) -> PathBuf {
     data_dir.join("gateway").join("config.yaml")
 }
 
+/// Serializes every journal load-modify-save in this process.
+/// Commands run concurrently (a config save in one, an activation
+/// completion in another), and an unsynchronized load-modify-save
+/// loses entries silently — one writer's save overwrites the
+/// other's just-recorded change (code-review 4.5). Every mutating
+/// function below holds this lock across its whole sequence.
+/// Poisoning is recovered: a panicked holder must not wedge the
+/// journal for the rest of the session.
+static JOURNAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn journal_lock() -> std::sync::MutexGuard<'static, ()> {
+    JOURNAL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub fn load_journal(data_dir: &Path) -> ActivationJournal {
     match std::fs::read_to_string(journal_path(data_dir)) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
@@ -91,15 +107,20 @@ pub fn load_journal(data_dir: &Path) -> ActivationJournal {
     }
 }
 
-fn save_journal(data_dir: &Path, journal: &ActivationJournal) {
-    let Ok(text) = serde_json::to_string_pretty(journal) else {
-        return;
-    };
+/// Persist the journal, surfacing failure: a swallowed write here
+/// used to strand a saved configuration change with no pending
+/// plan anywhere (code-review 4.3). The write itself is
+/// tmp-file + rename, so a failure leaves the previous journal
+/// intact on disk.
+fn save_journal(data_dir: &Path, journal: &ActivationJournal) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(journal)
+        .map_err(|e| format!("the activation journal is not serializable: {e}"))?;
     let path = journal_path(data_dir);
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    std::fs::write(&tmp, text).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| format!("could not replace {}: {e}", path.display()))?;
+    Ok(())
 }
 
 /// When the running gateway's configuration was generated: the
@@ -115,24 +136,6 @@ fn entry_ts(entry: &ActivationEntry) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(&entry.ts)
         .ok()
         .map(|t| t.with_timezone(&chrono::Utc))
-}
-
-/// The entries nothing has resolved yet, under gateway-only
-/// resolution (the YAML mtime rule). Backend-scope entries count
-/// as unresolved here: callers that know backend start times use
-/// [`unresolved_entries_scoped`] for the full rule.
-pub fn unresolved_entries(data_dir: &Path, journal: &ActivationJournal) -> Vec<ActivationEntry> {
-    let all_targets: std::collections::HashSet<String> = journal
-        .entries
-        .iter()
-        .flat_map(|e| e.targets.iter().cloned())
-        .collect();
-    unresolved_entries_scoped(
-        data_dir,
-        journal,
-        &std::collections::HashMap::new(),
-        &all_targets,
-    )
 }
 
 /// The entries nothing has resolved yet, with per-scope resolution:
@@ -196,6 +199,21 @@ fn normalize_yaml(text: &str) -> String {
 /// the snapshot always matches the oldest unresolved change.
 /// `scope`/`targets` say what activates the change (see
 /// [`ActivationEntry::scope`]).
+///
+/// Resolution of the EXISTING entries uses the full scoped rule —
+/// the caller passes the running backends' real start times
+/// (`started_at`) and the configured backend ids. The gateway-only
+/// approximation this used before treated every backend-scope
+/// entry as unresolved forever (its start-time map was empty), so
+/// the prune never fired for them: entries accumulated past their
+/// activation, and a later cancel could restore a snapshot over
+/// changes that were already live (code-review 4.1).
+///
+/// Callers record the change BEFORE persisting the configuration
+/// and propagate the `Err`: a journal write failure then aborts
+/// the change with the configuration untouched, instead of
+/// stranding a saved change no plan will ever show (4.3).
+#[allow(clippy::too_many_arguments)]
 pub fn record_change(
     data_dir: &Path,
     pre: &AppConfig,
@@ -204,12 +222,14 @@ pub fn record_change(
     summary: String,
     scope: &str,
     targets: Vec<String>,
-) {
+    started_at: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    configured: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    let _guard = journal_lock();
     let mut journal = load_journal(data_dir);
-    if unresolved_entries(data_dir, &journal).len() != journal.entries.len()
-        || journal.entries.is_empty()
-    {
-        journal.entries = unresolved_entries(data_dir, &journal);
+    let unresolved = unresolved_entries_scoped(data_dir, &journal, started_at, configured);
+    if unresolved.len() != journal.entries.len() || journal.entries.is_empty() {
+        journal.entries = unresolved;
         if journal.entries.is_empty() {
             journal.snapshot = serde_json::to_value(pre).ok();
         }
@@ -222,12 +242,13 @@ pub fn record_change(
         scope: scope.to_string(),
         targets,
     });
-    save_journal(data_dir, &journal);
+    save_journal(data_dir, &journal)
 }
 
 /// Clear the journal (activation completed, or changes cancelled).
-pub fn clear_journal(data_dir: &Path) {
-    save_journal(data_dir, &ActivationJournal::default());
+pub fn clear_journal(data_dir: &Path) -> Result<(), String> {
+    let _guard = journal_lock();
+    save_journal(data_dir, &ActivationJournal::default())
 }
 
 /// Clear only the gateway-scope entries (a gateway (re)start made
@@ -235,21 +256,33 @@ pub fn clear_journal(data_dir: &Path) {
 /// their backends' (re)starts, which the scoped rule observes. When
 /// no entries remain the snapshot goes too — it is the cancel
 /// target for pending entries only.
-pub fn clear_gateway_scope(data_dir: &Path) {
+pub fn clear_gateway_scope(data_dir: &Path) -> Result<(), String> {
+    let _guard = journal_lock();
     let mut journal = load_journal(data_dir);
     journal.entries.retain(|e| e.scope != "gateway");
     if journal.entries.is_empty() {
         journal.snapshot = None;
     }
-    save_journal(data_dir, &journal);
+    save_journal(data_dir, &journal)
 }
 
 /// The cancel target and its guard: the snapshot to restore, when
 /// the live configuration still matches the newest unresolved
 /// entry's post-change state. `Err` explains why cancel is refused.
-pub fn cancel_target(data_dir: &Path, current: &AppConfig) -> Result<Option<AppConfig>, String> {
+///
+/// Unresolved is computed with the full scoped rule (the caller
+/// passes real backend start times): a backend-scope entry whose
+/// backends already restarted is LIVE, not pending — cancelling
+/// must not "restore" over it (code-review 4.1).
+pub fn cancel_target(
+    data_dir: &Path,
+    current: &AppConfig,
+    started_at: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    configured: &std::collections::HashSet<String>,
+) -> Result<Option<AppConfig>, String> {
+    let _guard = journal_lock();
     let journal = load_journal(data_dir);
-    let unresolved = unresolved_entries(data_dir, &journal);
+    let unresolved = unresolved_entries_scoped(data_dir, &journal, started_at, configured);
     let Some(last) = unresolved.last() else {
         return Ok(None);
     };
@@ -408,6 +441,57 @@ litellm_deployment_success_responses_total 9.0
             &configured,
         );
         assert_eq!(un.len(), 1);
+    }
+
+    #[test]
+    fn record_and_cancel_use_scoped_resolution() {
+        // Regression (code-review 4.1): record_change's prune and
+        // cancel_target previously resolved with the gateway-only
+        // rule, under which a backend-scope entry NEVER resolved —
+        // a change already live via a backend restart stayed
+        // "pending", and cancel would restore the snapshot over it.
+        let dir = std::env::temp_dir().join(format!("activation-scoped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = AppConfig::default_config();
+        let journal = ActivationJournal {
+            snapshot: Some(serde_json::to_value(&cfg).unwrap()),
+            entries: vec![entry("backend", &["a"])],
+        };
+        save_journal(&dir, &journal).unwrap();
+        let configured: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+        // Backend "a" restarted at 13:00, after the 12:00 entry.
+        let started: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
+            [("a".to_string(), at("2026-10-16T13:00:00+00:00"))]
+                .into_iter()
+                .collect();
+        // The entry is live: nothing to cancel.
+        assert!(cancel_target(&dir, &cfg, &started, &configured)
+            .unwrap()
+            .is_none());
+        // Recording a new change prunes the resolved entry and
+        // restarts the snapshot from the new change's `pre`.
+        let pre = cfg.clone();
+        let mut post = cfg.clone();
+        post.gateway.port += 1;
+        record_change(
+            &dir,
+            &pre,
+            &post,
+            "gateway_config",
+            "port".to_string(),
+            "gateway",
+            Vec::new(),
+            &started,
+            &configured,
+        )
+        .unwrap();
+        let journal = load_journal(&dir);
+        assert_eq!(journal.entries.len(), 1);
+        assert_eq!(journal.entries[0].kind, "gateway_config");
+        let snap: AppConfig =
+            serde_json::from_value(journal.snapshot.expect("snapshot restarted")).unwrap();
+        assert_eq!(snap.gateway.port, cfg.gateway.port);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -31,13 +31,19 @@
 //! The LUID → GPU-index mapping enumerates DXGI adapters (the only
 //! user-mode source of adapter LUIDs) and matches them to the poll's
 //! GPUs by name (normalized; DXGI prefixes "NVIDIA " where nvidia-smi
-//! strips it on some cards), with enumeration order as the fallback
-//! for leftovers. That matching and every other decision here is pure
-//! and unit-tested; only the two acquisitions (PDH query, DXGI
-//! enumeration) sit behind the [`ProcessMemorySource`] seam, the same
-//! pattern [`crate::nvml`] uses for its runtime load. Off Windows the
-//! system source reports unavailable and the fixup never engages
-//! (no GPU reports WDDM there).
+//! strips it on some cards). A name pairs only when it is unique on
+//! both sides: two identical cards carry no identifying information
+//! in a name (or in the PCI device id — identical twins share it),
+//! and a crossed pairing would report one GPU's memory on the other
+//! as a confident measurement, which is worse than the `None` this
+//! module otherwise prefers. Leftovers pair only when exactly one
+//! GPU and one adapter remain unmatched, the one case where order
+//! cannot cross anything. That matching and every other decision
+//! here is pure and unit-tested; only the two acquisitions (PDH
+//! query, DXGI enumeration) sit behind the [`ProcessMemorySource`]
+//! seam, the same pattern [`crate::nvml`] uses for its runtime
+//! load. Off Windows the system source reports unavailable and the
+//! fixup never engages (no GPU reports WDDM there).
 
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
@@ -48,12 +54,13 @@ use crate::{
 };
 
 /// One DXGI adapter: its LUID (as a comparable key, see [`luid_key`]),
-/// description, and PCI vendor id.
+/// description, and PCI vendor/device ids.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterLuid {
     pub luid: u64,
     pub name: String,
     pub vendor_id: u32,
+    pub device_id: u32,
 }
 
 /// One `GPU Process Memory\Dedicated Usage` reading.
@@ -120,12 +127,17 @@ fn normalize_name(name: &str) -> String {
 /// Map DXGI adapter LUIDs to telemetry GPU indices.
 ///
 /// Primary rule: NVIDIA adapters matched to GPUs by normalized name,
-/// in GPU-index order (identical names consume adapters in enumeration
-/// order). Leftover GPUs and leftover NVIDIA adapters are then paired
-/// in order — DXGI and NVML enumerate the same devices in the same
-/// order on the single-vendor machines this app runs on. If no adapter
-/// reports the NVIDIA vendor at all (a source that cannot see vendor
-/// ids), all adapters participate rather than none.
+/// but only when the name is unique on both sides. Identical twin
+/// cards share their name *and* their PCI device id, so nothing in
+/// the available data says which adapter is which GPU — pairing
+/// them by enumeration order can cross the two, reporting each
+/// backend's memory on the other GPU as a confident `Some(...)`.
+/// Unmatched is the honest result there: the fixup renders those
+/// rows unknown. Leftover GPUs and adapters pair only when exactly
+/// one of each remains — the single case a positional pairing
+/// cannot cross. If no adapter reports the NVIDIA vendor at all (a
+/// source that cannot see vendor ids), all adapters participate
+/// rather than none.
 pub fn map_adapters_to_gpus(adapters: &[AdapterLuid], gpus: &[(u32, &str)]) -> HashMap<u64, u32> {
     let nvidia: Vec<&AdapterLuid> = adapters
         .iter()
@@ -139,27 +151,41 @@ pub fn map_adapters_to_gpus(adapters: &[AdapterLuid], gpus: &[(u32, &str)]) -> H
 
     let mut out: HashMap<u64, u32> = HashMap::new();
     let mut used: HashSet<u64> = HashSet::new();
-    let mut unmatched_gpus: Vec<(u32, &str)> = Vec::new();
+    let mut matched: HashSet<u32> = HashSet::new();
+
+    // Occurrences of each normalized name on the GPU side: a name
+    // carried by two GPUs identifies neither.
+    let mut gpu_name_counts: HashMap<String, usize> = HashMap::new();
+    for (_, name) in gpus {
+        *gpu_name_counts.entry(normalize_name(name)).or_insert(0) += 1;
+    }
 
     let mut sorted_gpus: Vec<(u32, &str)> = gpus.to_vec();
     sorted_gpus.sort_by_key(|(index, _)| *index);
     for (index, name) in &sorted_gpus {
         let want = normalize_name(name);
-        let hit = pool
-            .iter()
-            .find(|a| !used.contains(&a.luid) && normalize_name(&a.name) == want);
-        match hit {
-            Some(adapter) => {
-                used.insert(adapter.luid);
-                out.insert(adapter.luid, *index);
-            }
-            None => unmatched_gpus.push((*index, name)),
+        if gpu_name_counts.get(&want).copied().unwrap_or(0) != 1 {
+            continue; // twin GPUs: this name cannot identify one
         }
-    }
-    // Positional fallback for whatever the name pass could not pair.
-    let remaining: Vec<&&AdapterLuid> = pool.iter().filter(|a| !used.contains(&a.luid)).collect();
-    for ((index, _), adapter) in unmatched_gpus.iter().zip(remaining.iter()) {
+        let mut candidates = pool
+            .iter()
+            .filter(|a| !used.contains(&a.luid) && normalize_name(&a.name) == want);
+        let (Some(adapter), None) = (candidates.next(), candidates.next()) else {
+            continue; // zero or twin adapters under this name
+        };
+        used.insert(adapter.luid);
+        matched.insert(*index);
         out.insert(adapter.luid, *index);
+    }
+    // Leftover pairing, only when it cannot cross anything: exactly
+    // one unmatched GPU and exactly one unused adapter.
+    let unmatched: Vec<&(u32, &str)> = sorted_gpus
+        .iter()
+        .filter(|(index, _)| !matched.contains(index))
+        .collect();
+    let remaining: Vec<&&AdapterLuid> = pool.iter().filter(|a| !used.contains(&a.luid)).collect();
+    if unmatched.len() == 1 && remaining.len() == 1 {
+        out.insert(remaining[0].luid, unmatched[0].0);
     }
     out
 }
@@ -194,7 +220,13 @@ pub fn fixup_wddm_processes(
         let mut by_pid_gpu: HashMap<(u32, u32), u64> = HashMap::new();
         for reading in source.readings().ok()? {
             if let Some(gpu_index) = luid_by_gpu.get(&reading.luid) {
-                by_pid_gpu.insert((reading.pid, *gpu_index), reading.dedicated_mib);
+                // A pid can hold several counter instances for one
+                // adapter (`..._phys_0`, `..._phys_1` on linked /
+                // multi-adapter setups); parse_instance_name drops
+                // the suffix, so the readings for one (pid, GPU)
+                // SUM — a later instance must not overwrite an
+                // earlier one.
+                *by_pid_gpu.entry((reading.pid, *gpu_index)).or_insert(0) += reading.dedicated_mib;
             }
         }
         Some(by_pid_gpu)
@@ -224,6 +256,24 @@ impl<S> ProcessMemoryFixupSource<S> {
             counters: Arc::new(counters),
         }
     }
+
+    /// Run the fixup off the async runtime: the production counter
+    /// source is synchronous FFI (DXGI enumeration plus a full PDH
+    /// open/collect/close) that can block for hundreds of
+    /// milliseconds on first load — at the 1 s poll cadence that
+    /// would stall the Tokio worker running the poller every tick.
+    async fn fixup_blocking(
+        &self,
+        samples: Vec<GpuSample>,
+        processes: Vec<ProcessSample>,
+    ) -> Result<Vec<ProcessSample>, TelemetryError> {
+        let counters = self.counters.clone();
+        tokio::task::spawn_blocking(move || fixup_wddm_processes(&samples, processes, &*counters))
+            .await
+            .map_err(|e| {
+                TelemetryError::ProcessMemoryUnavailable(format!("PDH fixup task failed: {e}"))
+            })
+    }
 }
 
 #[async_trait]
@@ -245,15 +295,32 @@ impl<S: TelemetrySource> TelemetrySource for ProcessMemoryFixupSource<S> {
         if processes.is_empty() {
             return Ok(processes);
         }
-        let samples = self.inner.sample().await.unwrap_or_default();
-        Ok(fixup_wddm_processes(&samples, processes, &*self.counters))
+        let samples = match self.inner.sample().await {
+            Ok(samples) => samples,
+            Err(_) => {
+                // Without the samples the driver models are
+                // unknown, so no row's provenance can be verified:
+                // the decorator's invariant is that an unverifiable
+                // per-process figure is never trusted, so every row
+                // degrades to unknown for this poll rather than
+                // passing an un-fixed WDDM figure through.
+                return Ok(processes
+                    .into_iter()
+                    .map(|mut p| {
+                        p.vram_mib = None;
+                        p
+                    })
+                    .collect());
+            }
+        };
+        self.fixup_blocking(samples, processes).await
     }
 
     async fn sample_with_processes(
         &self,
     ) -> Result<(Vec<GpuSample>, Vec<ProcessSample>), TelemetryError> {
         let (samples, processes) = self.inner.sample_with_processes().await?;
-        let processes = fixup_wddm_processes(&samples, processes, &*self.counters);
+        let processes = self.fixup_blocking(samples.clone(), processes).await?;
         Ok((samples, processes))
     }
 }
@@ -327,7 +394,19 @@ mod imp {
             dedicated_system_memory: usize,
             shared_system_memory: usize,
             adapter_luid: LUID,
+            // DXGI_ADAPTER_DESC1's trailing field — the one DESC1
+            // added over DESC. Omitting it makes this struct 304
+            // bytes against the real 312, and GetDesc1 writes the
+            // full descriptor through the pointer: a stack buffer
+            // overflow on every enumeration.
+            flags: u32,
         }
+
+        // The real DXGI_ADAPTER_DESC1 is 312 bytes on x86_64
+        // (256 description + 16 ids + 24 memory + 8 LUID + 4 flags
+        // + 4 tail padding). Pin the layout so a field edit can
+        // never silently shrink it again.
+        const _: () = assert!(std::mem::size_of::<DxgiAdapterDesc1>() == 312);
 
         /// One COM interface pointer plus the vtable slots this
         /// module calls. Unused slots are opaque addresses — only
@@ -412,6 +491,7 @@ mod imp {
                             LowPart: 0,
                             HighPart: 0,
                         },
+                        flags: 0,
                     };
                     let hr = get_desc1(adapter.0, &mut desc);
                     adapter.release();
@@ -431,6 +511,7 @@ mod imp {
                         ),
                         name: String::from_utf16_lossy(&desc.description[..name_len]),
                         vendor_id: desc.vendor_id,
+                        device_id: desc.device_id,
                     });
                 }
                 factory.release();
@@ -481,28 +562,54 @@ mod imp {
                     return Err(status_err("PdhCollectQueryData", status));
                 }
 
+                // Size, then fill — with one re-size retry: a
+                // process can spawn between the two calls, growing
+                // the array and making the fill answer PDH_MORE_DATA;
+                // that must re-size, not fail the whole poll.
+                // The backing store is u64 words, not bytes: the item
+                // array holds pointers and needs 8-byte alignment a
+                // Vec<u8> does not guarantee.
+                let mut buffer: Vec<u64> = Vec::new();
                 let mut size: u32 = 0;
                 let mut count: u32 = 0;
-                let status = perf::PdhGetFormattedCounterArrayW(
-                    counter,
-                    perf::PDH_FMT_LARGE,
-                    &mut size,
-                    &mut count,
-                    std::ptr::null_mut(),
-                );
-                if status != perf::PDH_MORE_DATA || size == 0 {
-                    return Err(status_err("PdhGetFormattedCounterArrayW (sizing)", status));
+                for attempt in 0..2 {
+                    size = 0;
+                    count = 0;
+                    let status = perf::PdhGetFormattedCounterArrayW(
+                        counter,
+                        perf::PDH_FMT_LARGE,
+                        &mut size,
+                        &mut count,
+                        std::ptr::null_mut(),
+                    );
+                    if status != perf::PDH_MORE_DATA || size == 0 {
+                        return Err(status_err("PdhGetFormattedCounterArrayW (sizing)", status));
+                    }
+                    buffer = vec![0u64; (size as usize).div_ceil(8)];
+                    let mut fill_size = size;
+                    let status = perf::PdhGetFormattedCounterArrayW(
+                        counter,
+                        perf::PDH_FMT_LARGE,
+                        &mut fill_size,
+                        &mut count,
+                        buffer.as_mut_ptr() as *mut perf::PDH_FMT_COUNTERVALUE_ITEM_W,
+                    );
+                    if status == 0 {
+                        size = fill_size;
+                        break;
+                    }
+                    if status != perf::PDH_MORE_DATA || attempt == 1 {
+                        return Err(status_err("PdhGetFormattedCounterArrayW", status));
+                    }
                 }
-                let mut buffer = vec![0u8; size as usize];
-                let status = perf::PdhGetFormattedCounterArrayW(
-                    counter,
-                    perf::PDH_FMT_LARGE,
-                    &mut size,
-                    &mut count,
-                    buffer.as_mut_ptr() as *mut perf::PDH_FMT_COUNTERVALUE_ITEM_W,
-                );
-                if status != 0 {
-                    return Err(status_err("PdhGetFormattedCounterArrayW", status));
+                // Never trust count past the buffer actually filled.
+                let item_size = std::mem::size_of::<perf::PDH_FMT_COUNTERVALUE_ITEM_W>();
+                let capacity = (buffer.len() * 8) / item_size;
+                if (count as usize) > capacity {
+                    return Err(status_err(
+                        "PdhGetFormattedCounterArrayW (count)",
+                        perf::PDH_MORE_DATA,
+                    ));
                 }
 
                 let items = std::slice::from_raw_parts(
@@ -511,15 +618,28 @@ mod imp {
                 );
                 let mut out = Vec::with_capacity(items.len());
                 for item in items {
-                    if item.FmtValue.CStatus != perf::PDH_CSTATUS_VALID_DATA {
+                    // VALID_DATA ("unchanged since last read") and
+                    // NEW_DATA ("changed since last read") are both
+                    // success statuses. This query is opened fresh
+                    // on every call, so there is no meaningful last
+                    // read: an actively-changing allocation (model
+                    // loading, KV growth) reports NEW_DATA, and
+                    // accepting only VALID_DATA discards exactly
+                    // those readings.
+                    if item.FmtValue.CStatus != perf::PDH_CSTATUS_VALID_DATA
+                        && item.FmtValue.CStatus != perf::PDH_CSTATUS_NEW_DATA
+                    {
                         continue;
                     }
                     if item.szName.is_null() {
                         continue;
                     }
                     let name = {
+                        // Bounded scan: instance names are short
+                        // (`pid_.._luid_.._phys_..`); never walk the
+                        // buffer looking for a NUL without a limit.
                         let mut len = 0;
-                        while *item.szName.add(len) != 0 {
+                        while len < 1024 && *item.szName.add(len) != 0 {
                             len += 1;
                         }
                         String::from_utf16_lossy(std::slice::from_raw_parts(item.szName, len))
@@ -528,13 +648,18 @@ mod imp {
                         continue;
                     };
                     let bytes = item.FmtValue.Anonymous.largeValue.max(0) as u64;
+                    // Round to nearest MiB: the sub-1 GiB range
+                    // carries the context-only distinction, so a
+                    // 256 MiB context must not floor to 0. A real
+                    // non-zero allocation below the rounding floor
+                    // still reports 1, never a measured-looking
+                    // Some(0) — 0 is reserved for a genuinely
+                    // measured zero.
+                    let rounded = (bytes + 512 * 1024) / (1024 * 1024);
                     out.push(ProcessMemoryReading {
                         pid,
                         luid,
-                        // Round to nearest MiB: the sub-1 GiB range
-                        // carries the context-only distinction, so a
-                        // 256 MiB context must not floor to 0.
-                        dedicated_mib: (bytes + 512 * 1024) / (1024 * 1024),
+                        dedicated_mib: if bytes > 0 { rounded.max(1) } else { 0 },
                     });
                 }
                 Ok(out)
@@ -597,11 +722,13 @@ mod tests {
                 luid: 0x1111,
                 name: "NVIDIA RTX A4000".to_string(),
                 vendor_id: NVIDIA_VENDOR_ID,
+                device_id: 0x2486,
             },
             AdapterLuid {
                 luid: 0x2222,
                 name: "NVIDIA Tesla P100-PCIE-16GB".to_string(),
                 vendor_id: NVIDIA_VENDOR_ID,
+                device_id: 0x15F9,
             },
         ]
     }
@@ -633,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_mapping_ignores_non_nvidia_and_falls_back_positionally() {
+    fn adapter_mapping_ignores_non_nvidia_and_never_pairs_ambiguously() {
         let mut adapters = a4000_p100_adapters();
         adapters.insert(
             0,
@@ -641,15 +768,135 @@ mod tests {
                 luid: 0x9999,
                 name: "Microsoft Basic Render Driver".to_string(),
                 vendor_id: 0x1414,
+                device_id: 0,
             },
         );
-        // Names unmatchable on purpose: positional order must pair the
-        // two NVIDIA adapters with GPUs 0 and 1, skipping the renderer.
+        // Names unmatchable on purpose, with two GPUs and two
+        // NVIDIA adapters left over: a positional pairing could
+        // cross them, so nothing pairs. The non-NVIDIA renderer is
+        // never in the pool.
         let gpus = vec![(0, "Card A"), (1, "Card B")];
+        let map = map_adapters_to_gpus(&adapters, &gpus);
+        assert!(map.is_empty());
+        assert!(!map.contains_key(&0x9999));
+        // One unmatched GPU and one unused NVIDIA adapter is the
+        // only leftover case that cannot cross: it pairs.
+        let gpus = vec![(0, "NVIDIA RTX A4000"), (1, "Card B")];
         let map = map_adapters_to_gpus(&adapters, &gpus);
         assert_eq!(map.get(&0x1111), Some(&0));
         assert_eq!(map.get(&0x2222), Some(&1));
-        assert!(!map.contains_key(&0x9999));
+    }
+
+    #[test]
+    fn adapter_mapping_leaves_identical_twins_unmapped() {
+        // Two RTX A4000s: the name (and the PCI device id) is the
+        // same for both, so no pairing is identifiable. Enumeration
+        // order must NOT decide — a crossed pairing reports each
+        // backend's memory on the other GPU as fact.
+        let adapters = vec![
+            AdapterLuid {
+                luid: 0x1111,
+                name: "NVIDIA RTX A4000".to_string(),
+                vendor_id: NVIDIA_VENDOR_ID,
+                device_id: 0x2486,
+            },
+            AdapterLuid {
+                luid: 0x3333,
+                name: "NVIDIA RTX A4000".to_string(),
+                vendor_id: NVIDIA_VENDOR_ID,
+                device_id: 0x2486,
+            },
+        ];
+        let gpus = vec![(0, "NVIDIA RTX A4000"), (1, "NVIDIA RTX A4000")];
+        let map = map_adapters_to_gpus(&adapters, &gpus);
+        assert!(map.is_empty(), "twins stay unmapped, got {map:?}");
+    }
+
+    #[test]
+    fn adapter_mapping_partial_match_does_not_cross_leftovers() {
+        // GPU 1 matches by name; GPUs 0 and 2 fail name matching
+        // (suffix variants). DXGI enumerates the leftovers in the
+        // opposite order — the old positional zip assigned
+        // adapter-of-2 to GPU 0 and adapter-of-0 to GPU 2.
+        let adapters = vec![
+            AdapterLuid {
+                luid: 0xAAAA,
+                name: "NVIDIA RTX A4000".to_string(),
+                vendor_id: NVIDIA_VENDOR_ID,
+                device_id: 0x2486,
+            },
+            AdapterLuid {
+                luid: 0xBBBB,
+                name: "NVIDIA GeForce RTX 4070".to_string(),
+                vendor_id: NVIDIA_VENDOR_ID,
+                device_id: 0x2786,
+            },
+            AdapterLuid {
+                luid: 0xCCCC,
+                name: "NVIDIA RTX A4000 GA104".to_string(),
+                vendor_id: NVIDIA_VENDOR_ID,
+                device_id: 0x2486,
+            },
+        ];
+        let gpus = vec![
+            (0, "RTX A4000 (OEM)"),
+            (1, "NVIDIA GeForce RTX 4070"),
+            (2, "RTX A4000 rev2"),
+        ];
+        let map = map_adapters_to_gpus(&adapters, &gpus);
+        assert_eq!(map.get(&0xBBBB), Some(&1), "the one name match pairs");
+        assert_eq!(map.len(), 1, "the two leftovers stay unmapped: {map:?}");
+    }
+
+    #[test]
+    fn instance_name_high_bit_luid_and_uppercase_prefix() {
+        // A LUID whose high half has the sign bit set must survive
+        // as raw bits (the DXGI side builds the key the same way).
+        assert_eq!(
+            parse_instance_name("pid_9_luid_0x80000000_0x00000001_phys_0"),
+            Some((9, 0x8000_0000_0000_0001))
+        );
+        assert_eq!(
+            parse_instance_name("pid_9_luid_0X00000001_0X00000002_phys_0"),
+            Some((9, (1u64 << 32) | 2))
+        );
+    }
+
+    #[test]
+    fn fixup_sums_phys_instances_for_one_pid_and_gpu() {
+        // Two counter instances for one (pid, adapter) — the phys_0
+        // and phys_1 of a linked adapter — sum into one reading.
+        let samples = vec![sample(0, "NVIDIA RTX A4000", Some(DriverModel::Wddm))];
+        let processes = vec![proc(4321, 0, None)];
+        let counters = FakeCounters {
+            adapters: Ok(a4000_p100_adapters()),
+            readings: Ok(vec![
+                ProcessMemoryReading {
+                    pid: 4321,
+                    luid: 0x1111,
+                    dedicated_mib: 3000,
+                },
+                ProcessMemoryReading {
+                    pid: 4321,
+                    luid: 0x1111,
+                    dedicated_mib: 2500,
+                },
+            ]),
+        };
+        let out = fixup_wddm_processes(&samples, processes, &counters);
+        assert_eq!(out[0].vram_mib, Some(5500));
+    }
+
+    #[test]
+    fn pre_0132_process_sample_payload_still_deserializes() {
+        // Pre-0.1.32 payloads carried vram_mib as a bare number
+        // (the u64 -> Option<u64> change); the shape must keep
+        // deserializing.
+        let p: ProcessSample = serde_json::from_str(
+            r#"{"pid":4321,"name":"llama-server","vram_mib":11264,"gpu_index":1,"backend_id":null}"#,
+        )
+        .unwrap();
+        assert_eq!(p.vram_mib, Some(11264));
     }
 
     #[test]

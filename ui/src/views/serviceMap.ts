@@ -398,7 +398,18 @@ export async function wireServiceMap(root: HTMLElement): Promise<() => void> {
         for (const p of gpu.processes ?? []) {
           if (p.backend === "\u2014") continue;
           const gm = residency.get(p.backend) ?? new Map<number, number | null>();
-          gm.set(Number(gpu.id), p.vram_mib);
+          // A backend can hold several processes on one GPU: its
+          // residency there is their SUM (code-review 5.10 — the
+          // plain set() kept only the last process's figure). A
+          // null (not measured) contributes nothing; the entry is
+          // null only when every process on that GPU is unmeasured.
+          const key = Number(gpu.id);
+          const prev = gm.get(key);
+          if (p.vram_mib === null) {
+            if (!gm.has(key)) gm.set(key, null);
+          } else {
+            gm.set(key, (prev ?? 0) + p.vram_mib);
+          }
           residency.set(p.backend, gm);
         }
       }

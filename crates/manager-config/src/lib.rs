@@ -220,6 +220,19 @@ pub struct ModelConfig {
     pub params_b: f32,
     pub sha256: String,
     pub verified_at: Option<DateTime<Utc>>,
+    /// The pinned SHA-256 the file was verified against when
+    /// `verified_at` was stamped. The launch-time audit's
+    /// verified-by-stamp shortcut is valid only while this still
+    /// equals the current pin (`sha256` above): a stamp alone does
+    /// not say WHAT was verified, and a catalog refresh that
+    /// replaces the pin must invalidate stamps taken against the
+    /// old one (code-review 2.4 — previously the shortcut trusted
+    /// the timestamp plus the file length, so a same-length
+    /// replacement file, or a re-pin, inherited trust it never
+    /// earned). Absent in configurations written before the field
+    /// existed; those models are re-hashed once and re-stamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_sha256: Option<String>,
     /// Where the file came from (spec §10). Empty for locally-added files.
     #[serde(default)]
     pub source_url: String,
@@ -243,6 +256,9 @@ pub struct ModelConfig {
 /// Validate an operator-chosen model display name for
 /// [`ModelConfig::display_name`]: trims surrounding whitespace,
 /// rejects empty and over-long names, and returns the name to store.
+/// Embedded control characters (newlines included) are rejected:
+/// the name renders in single-line UI labels and log lines, which
+/// inherit whatever it carries.
 pub fn validate_display_name(raw: &str) -> Result<String, String> {
     let name = raw.trim();
     if name.is_empty() {
@@ -250,6 +266,9 @@ pub fn validate_display_name(raw: &str) -> Result<String, String> {
     }
     if name.chars().count() > 64 {
         return Err("display name must be at most 64 characters".to_string());
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return Err("display name must not contain control characters".to_string());
     }
     Ok(name.to_string())
 }
@@ -563,6 +582,7 @@ pub fn append_missing_catalog_models(cfg: &mut AppConfig, entries: &[CatalogMode
             params_b: entry.params_b,
             sha256: entry.sha256.clone(),
             verified_at: None,
+            verified_sha256: None,
             source_url: entry.source_url.clone(),
             assigned_backends: entry.assigned_backends.clone(),
             enabled: entry.enabled,
@@ -618,6 +638,7 @@ pub fn refresh_catalog_definition(cfg: &mut AppConfig, refresh: &CatalogDefiniti
     model.sha256 = entry.sha256.clone();
     model.source_url = entry.source_url.clone();
     model.verified_at = None;
+    model.verified_sha256 = None;
     let new_path = model.gguf_path.clone();
     if let Some(backend) = cfg.backends.iter_mut().find(|b| b.id == refresh.backend_id) {
         // The serving change applies only to a backend still
@@ -824,6 +845,11 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
                 "model {:?}: sha256 must be empty or 64 hex characters",
                 m.id
             ));
+        }
+        if let Some(name) = &m.display_name {
+            if let Err(e) = validate_display_name(name) {
+                errors.push(format!("model {:?}: display_name: {e}", m.id));
+            }
         }
     }
 
@@ -1072,6 +1098,10 @@ mod tests {
         assert!(validate_display_name("   ").is_err());
         assert!(validate_display_name(&"x".repeat(65)).is_err());
         assert_eq!(validate_display_name(&"x".repeat(64)).unwrap().len(), 64);
+        // Embedded control characters (a newline would break out
+        // of single-line labels and log lines) are rejected.
+        assert!(validate_display_name("two\nlines").is_err());
+        assert!(validate_display_name("tab\tinside").is_err());
         // A config written before the field existed loads with no
         // override (serde default), and the field stays out of the
         // serialized form while unset.
@@ -1084,6 +1114,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(renamed.display_name.as_deref(), Some("Coder"));
+        // And validate() enforces the same rule on a loaded config:
+        // an invalid stored name must not load and re-save cleanly.
+        let mut m: ModelConfig = serde_json::from_str(legacy).unwrap();
+        let mut cfg = AppConfig::default_config();
+        m.display_name = Some("bad\nname".to_string());
+        cfg.models = vec![m.clone()];
+        assert!(validate(&cfg).is_err());
+        m.display_name = Some(String::new());
+        cfg.models = vec![m.clone()];
+        assert!(validate(&cfg).is_err());
+        m.display_name = Some("Fine Name".to_string());
+        cfg.models = vec![m];
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]
@@ -1096,6 +1139,7 @@ mod tests {
             params_b: 8.0,
             sha256: String::new(),
             verified_at: None,
+            verified_sha256: None,
             source_url: String::new(),
             assigned_backends: Vec::new(),
             enabled: true,
@@ -1143,6 +1187,7 @@ mod tests {
             params_b: 32.0,
             sha256: "b".repeat(64),
             verified_at: Some(Utc::now()),
+            verified_sha256: None,
             source_url: "https://example.com/OldPlanner.gguf".to_string(),
             assigned_backends: vec!["planner".to_string()],
             enabled: true,
@@ -1195,6 +1240,7 @@ mod tests {
             params_b: 30.0,
             sha256: "b".repeat(64),
             verified_at: Some(Utc::now()),
+            verified_sha256: None,
             source_url: "https://example.com/OldCoder.gguf".to_string(),
             assigned_backends: vec!["coder".to_string()],
             enabled: true,
@@ -1260,6 +1306,7 @@ mod tests {
                 params_b: 30.0,
                 sha256: "b".repeat(64),
                 verified_at: Some(Utc::now()),
+                verified_sha256: None,
                 source_url: "https://example.com/OldNemotron.gguf".to_string(),
                 assigned_backends: vec!["coder".to_string()],
                 enabled: true,
@@ -1324,6 +1371,7 @@ mod tests {
             params_b: 8.0,
             sha256: "ab".repeat(32),
             verified_at: None,
+            verified_sha256: None,
             source_url: "https://example.com/qwen3-8b.gguf".to_string(),
             assigned_backends: vec!["tool-runner".to_string()],
             enabled: true,
@@ -1561,6 +1609,7 @@ mod tests {
             params_b: 0.0,
             sha256: "PLACEHOLDER-pin".to_string(),
             verified_at: None,
+            verified_sha256: None,
             source_url: "https://example.com/q.gguf".to_string(),
             assigned_backends: Vec::new(),
             enabled: true,
@@ -1603,6 +1652,7 @@ mod tests {
             params_b: 8.0,
             sha256: String::new(), // deliberately unpinned
             verified_at: None,
+            verified_sha256: None,
             source_url: "https://example.com/q.gguf".to_string(),
             assigned_backends: vec!["tool-runner".to_string()],
             enabled: true,

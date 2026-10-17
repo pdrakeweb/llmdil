@@ -5,8 +5,6 @@
 import { walk } from "./charts";
 import type { BackendInfo, DashboardModel, GpuInfo, WizardStepState } from "./types";
 
-const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", grey: "#6d7686" };
-
 export function mockBackends(): BackendInfo[] {
   return [
     { id: "gateway", name: "gateway", port: 4000, status: "ok", health: 100, model: "", quant: "",
@@ -70,26 +68,13 @@ export function mockDashboard(): DashboardModel {
     backends,
     gpus: mockGpus(),
     placement: [
-      { model: "qwen3.8-27b", backendId: "planner", segments: [{ gpu: "a4000", pct: 60 }, { gpu: "p100-0", pct: 40 }] },
-      { model: "qwen3-coder-30b", backendId: "coder-30b", segments: [{ gpu: "a4000", pct: 45 }, { gpu: "p100-0", pct: 35 }, { gpu: "p100-1", pct: 20 }] },
-      { model: "qwen2.5-coder-7b", backendId: "coder-7b", segments: [{ gpu: "p100-0", pct: 100 }] },
-      { model: "qwen3-8b", backendId: "tool-runner", segments: [{ gpu: "p100-1", pct: 100 }] },
-    ],
-    throughputSeries: [
-      { name: "planner", color: C.blue, values: walk(48, 8.4, 2.5, 201) },
-      { name: "coder-30b", color: C.purple, values: walk(48, 22.6, 5, 202) },
-      { name: "coder-7b", color: C.teal, values: walk(48, 41.2, 7, 203) },
-      { name: "tool-runner", color: C.grey, values: walk(48, 1, 1, 204) },
+      { model: "qwen3.8-27b", backendId: "planner", backendStatus: "ok", segments: [{ gpu: "a4000", pct: 60, frac: 0.6 }, { gpu: "p100-0", pct: 40, frac: 0.4 }] },
+      { model: "qwen3-coder-30b", backendId: "coder-30b", backendStatus: "ok", segments: [{ gpu: "a4000", pct: 45, frac: 0.45 }, { gpu: "p100-0", pct: 35, frac: 0.35 }, { gpu: "p100-1", pct: 20, frac: 0.2 }] },
+      { model: "qwen2.5-coder-7b", backendId: "coder-7b", backendStatus: "ok", segments: [{ gpu: "p100-0", pct: 100, frac: 1 }] },
+      { model: "qwen3-8b", backendId: "tool-runner", backendStatus: "starting", segments: [{ gpu: "p100-1", pct: 100, frac: 1 }] },
     ],
     gatewayUp: true,
     gatewayStrategy: "least-busy",
-    events: [
-      { time: "06:13:52", level: "warn", text: "mcp-gdrive reconnect 3 · backoff 30s" },
-      { time: "06:12:10", level: "ok", text: "coder-7b queue normalized" },
-      { time: "06:05:44", level: "ok", text: "download resumed qwen2.5-coder-7b · 62%" },
-      { time: "06:01:19", level: "ok", text: "planner · 1,204 requests done" },
-      { time: "05:30:00", level: "idle", text: "health sweep · all responding" },
-    ],
     stale: false,
     updatedAt: Date.now(),
   };

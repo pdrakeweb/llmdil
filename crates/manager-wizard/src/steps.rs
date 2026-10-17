@@ -1426,8 +1426,7 @@ impl ConfigureTensorSplit {
                 // An empty split is a valid placement when the
                 // backend needs no split: expert offload serves it
                 // unsplit by design, and a model whose GPU-resident
-                // weights fit the largest single GPU is placed
-                // whole by llama.cpp.
+                // weights fit GPU 0 is placed whole by llama.cpp.
                 if manager_models::expert_offload(b.raw_flags.as_deref())
                     != manager_models::ExpertOffload::None
                 {
@@ -1446,10 +1445,15 @@ impl ConfigureTensorSplit {
                     None => 0,
                 };
                 let resident = self.gpu_resident_bytes(ctx, b, total);
-                let largest = vrams.iter().max().copied().unwrap_or(0) * manager_models::MIB;
-                if resident > 0 && resident <= largest {
+                // An unsplit backend launches on the DEFAULT
+                // device, GPU 0 — not whichever GPU is largest.
+                // Crediting the largest GPU's capacity cleared
+                // models that then failed to start on a smaller
+                // GPU 0 (code-review 2.14).
+                let gpu0 = vrams.first().copied().unwrap_or(0) * manager_models::MIB;
+                if resident > 0 && resident <= gpu0 {
                     log.push(format!(
-                        "{}: no split — GPU-resident weights fit a single GPU",
+                        "{}: no split — GPU-resident weights fit GPU 0",
                         b.id
                     ));
                     continue;
@@ -1688,7 +1692,7 @@ impl WizardStep for DownloadModels {
                         }
                     }
                     if pinned {
-                        Self::stamp_verified_at(ctx, &model.id, &mut log);
+                        Self::stamp_verified_at(ctx, &model.id, &model.sha256, &mut log);
                         verified += 1;
                     } else {
                         unverified += 1;
@@ -1711,15 +1715,30 @@ impl WizardStep for DownloadModels {
                     }
                     // Verified-by-stamp shortcut: `verified_at` is
                     // stamped only after a hash match (a download
-                    // verification or an earlier audit), so a stamped
-                    // model whose file still has exactly the catalog
-                    // size is not re-hashed. Without this, the
-                    // launch-time audit re-reads every multi-GiB GGUF
-                    // on every start for no new information. Any
-                    // doubt — no stamp, no catalog entry to pin the
-                    // size, a failed stat, a length mismatch — falls
-                    // through to the full hash below.
-                    if model.verified_at.is_some() {
+                    // verification or an earlier audit) — but the
+                    // stamp alone does not say WHAT was verified.
+                    // The skip therefore also requires the stamp's
+                    // recorded hash (`verified_sha256`) to equal the
+                    // CURRENT pin and the file to still have exactly
+                    // the catalog size; then the model is not
+                    // re-hashed. Without this, the launch-time audit
+                    // re-reads every multi-GiB GGUF on every start
+                    // for no new information — but with only the
+                    // timestamp and the length checked, a
+                    // same-length replacement file, or a catalog
+                    // re-pin, inherited trust it never earned
+                    // (code-review 2.4). Any doubt — no stamp, a
+                    // stamp from before hash binding existed, a
+                    // stamp against a different pin, no catalog
+                    // entry to pin the size, a failed stat, a length
+                    // mismatch — falls through to the full hash
+                    // below.
+                    if model.verified_at.is_some()
+                        && model
+                            .verified_sha256
+                            .as_deref()
+                            .is_some_and(|s| checksums_match(s, &model.sha256))
+                    {
                         let expected = manager_models::curated_models()
                             .iter()
                             .find(|s| s.id == model.id)
@@ -1729,7 +1748,7 @@ impl WizardStep for DownloadModels {
                         {
                             if actual == expected {
                                 log.push(format!(
-                                    "{}: checksum verified (verified-by-stamp — file length matches the pinned size; hash skipped)",
+                                    "{}: verified by an earlier checksum pass against the current pin (stamp + file length match; not re-hashed this run)",
                                     model.id
                                 ));
                                 verified += 1;
@@ -1740,7 +1759,7 @@ impl WizardStep for DownloadModels {
                     match ctx.ops.sha256_file(&dest).await {
                         Ok(h) if verify(&h) => {
                             log.push(format!("{}: checksum verified", model.id));
-                            Self::stamp_verified_at(ctx, &model.id, &mut log);
+                            Self::stamp_verified_at(ctx, &model.id, &model.sha256, &mut log);
                             verified += 1;
                         }
                         Ok(h) => {
@@ -1794,7 +1813,12 @@ impl DownloadModels {
     /// outcome. The verification itself already succeeded; an
     /// unstamped model simply stays gated until something else
     /// verifies it.
-    fn stamp_verified_at(ctx: &WizardContext, model_id: &str, log: &mut Vec<String>) {
+    fn stamp_verified_at(
+        ctx: &WizardContext,
+        model_id: &str,
+        verified_sha256: &str,
+        log: &mut Vec<String>,
+    ) {
         let config_path = ctx.data_dir.join("config.json");
         let mut config = match manager_config::load(&config_path) {
             Ok(cfg) => cfg,
@@ -1805,6 +1829,10 @@ impl DownloadModels {
             return;
         };
         model.verified_at = Some(chrono::Utc::now());
+        // The stamp records WHICH pinned hash the file was verified
+        // against; the audit's verified-by-stamp shortcut trusts a
+        // stamp only while that still equals the current pin.
+        model.verified_sha256 = Some(verified_sha256.to_string());
         match manager_config::save(&config, &config_path) {
             Ok(()) => log.push(format!(
                 "{model_id}: verified_at stamped in {}",
@@ -1961,13 +1989,32 @@ pub fn postgres_log_path(data_dir: &Path) -> PathBuf {
 /// The database the gateway uses.
 pub const POSTGRES_DATABASE: &str = "litellm";
 
+/// Percent-encode a URL userinfo component (RFC 3986): everything
+/// outside the unreserved set is `%XX`-escaped. App-generated
+/// passwords are hex and pass through unchanged; a password a user
+/// sets by hand may contain `@`, `:`, `/`, or spaces, which raw
+/// would corrupt the URL's authority parsing (code-review 2.9).
+fn encode_userinfo(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// The `DATABASE_URL` the gateway receives: the password is
-/// generated hex (URL-safe by construction, no percent-encoding),
-/// the user is the cluster superuser, the database is
-/// [`POSTGRES_DATABASE`].
+/// percent-encoded for the userinfo slot (app-generated passwords
+/// are hex, hence unchanged), the user is the cluster superuser,
+/// the database is [`POSTGRES_DATABASE`].
 pub fn postgres_database_url(config: &AppConfig, password: &str) -> String {
     format!(
-        "postgresql://postgres:{password}@127.0.0.1:{}/{POSTGRES_DATABASE}",
+        "postgresql://postgres:{}@127.0.0.1:{}/{POSTGRES_DATABASE}",
+        encode_userinfo(password),
         config.postgres.port
     )
 }
@@ -2117,6 +2164,23 @@ pub async fn stop_postgres_server(
 /// without one — its schema is PostgreSQL-only). Only `bin`, `lib`,
 /// `share`, and `include` are extracted from the distribution zip;
 /// the rest (pgAdmin alone is ~684 MB) is dead weight.
+/// Remove-on-drop guard for the initdb password file: the file
+/// holds the cluster superuser password in plaintext and must not
+/// outlive the initdb run — including when the step future is
+/// dropped mid-run (app closed, step timeout), which no awaited
+/// cleanup line can cover. Removal is synchronous `std::fs`
+/// because `Drop` cannot await the ops trait; the step also removes
+/// the file through the ops on its normal paths (under the fake
+/// ops the file exists only in the fake filesystem, where the
+/// ops removal is the one that lands).
+struct PwFileGuard(PathBuf);
+
+impl Drop for PwFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 pub struct InstallPostgres {
     pub pin: Option<PostgresPin>,
 }
@@ -2411,6 +2475,14 @@ impl WizardStep for InstallPostgres {
             {
                 return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
             }
+            // The password file holds the cluster superuser
+            // password in plaintext; it must not outlive initdb.
+            // The explicit removal below covers the normal paths —
+            // this guard covers the step future being DROPPED
+            // mid-initdb (app closed, step timeout), which skipped
+            // the removal entirely (code-review 2.10). Synchronous
+            // std::fs removal: Drop cannot await the ops trait.
+            let _pwfile_guard = PwFileGuard(pwfile.clone());
             let initdb = self.initdb_command(ctx);
             let result = ctx.ops.run_command(&initdb).await;
             // The password file is single-use: always remove it.
@@ -2544,18 +2616,40 @@ impl Default for StartGateway {
     }
 }
 
+/// Escape a value for interpolation inside a PowerShell
+/// double-quoted string. PowerShell's escape character is the
+/// backtick: `` ` `` doubles itself, and backtick before `"` or `$`
+/// stops the quote ending the string and the dollar starting a
+/// variable/subexpression expansion. A backslash escapes nothing
+/// in PowerShell — the previous `\"` rendering of an embedded
+/// quote actually TERMINATED the string (code-review 2.7).
+fn ps_dq(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '`' => out.push_str("``"),
+            '"' => out.push_str("`\""),
+            '$' => out.push_str("`$"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Join an argv into one paste-able PowerShell command line:
-/// arguments containing whitespace or a quote are double-quoted
-/// (embedded quotes backslash-escaped), everything else passes
-/// through bare. Good enough for the paths and flags the manual
-/// start block carries — none of them contain a double quote.
+/// arguments containing whitespace, a quote, a backtick, or a `$`
+/// are double-quoted with their contents escaped via [`ps_dq`];
+/// everything else passes through bare.
 fn ps_join(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
             if a.is_empty() {
                 "\"\"".to_string()
-            } else if a.chars().any(|c| c.is_whitespace() || c == '"') {
-                format!("\"{}\"", a.replace('"', "\\\""))
+            } else if a
+                .chars()
+                .any(|c| c.is_whitespace() || c == '"' || c == '`' || c == '$')
+            {
+                format!("\"{}\"", ps_dq(a))
             } else {
                 a.clone()
             }
@@ -2604,10 +2698,13 @@ impl StartGateway {
             let log_arg = postgres_log_path(&ctx.data_dir).display().to_string();
             let pg = pg_ctl_command(&ctx.data_dir, &["-l", &log_arg, "-o", &port_opt, "start"]);
             lines.push(ps_command_line(&pg.argv));
+            // The REAL port, not a placeholder: a block that says
+            // "paste this and it works" must not hand the operator a
+            // <port> token to hunt down (code-review 2.6).
             lines.push(format!(
-                "$env:DATABASE_URL = \"postgresql://postgres:<password>@127.0.0.1:<port>/{POSTGRES_DATABASE}\"  # <password>: Credential Manager '{}'; <port>: {}",
-                crate::POSTGRES_PASSWORD_CRED_TARGET,
-                ctx.config.postgres.port
+                "$env:DATABASE_URL = \"postgresql://postgres:<password>@127.0.0.1:{}/{POSTGRES_DATABASE}\"  # <password>: Credential Manager '{}'",
+                ctx.config.postgres.port,
+                crate::POSTGRES_PASSWORD_CRED_TARGET
             ));
             // Same watchdog disable the app spawn sets (see
             // StartGateway::prisma_watchdog_must_be_disabled): a
@@ -3666,6 +3763,59 @@ impl StartGateway {
         }
     }
 
+    /// The generated client's entry point inside the prisma
+    /// package: `prisma generate` writes `client.py` into the
+    /// package directory, and the bare wheel does not contain one —
+    /// its absence is exactly what makes the package raise "The
+    /// Client hasn't been generated yet" (verified against the
+    /// pinned 0.11.0 wheel: `prisma/__init__.py` imports
+    /// `.client`, which only generation creates). Presence of this
+    /// file is therefore the generation check — no process spawn
+    /// needed.
+    fn generated_client_path(&self, ctx: &WizardContext) -> PathBuf {
+        self.prisma_package_dir(ctx).join("client.py")
+    }
+
+    /// Durable record of an in-progress Prisma repair:
+    /// `<data_dir>/gateway/prisma-repair.json`. Written BEFORE the
+    /// repair's first mutation and updated per phase; removed only
+    /// when the repair verifies complete. Its presence at the start
+    /// of a run means the previous repair was interrupted (app
+    /// closed, step timeout) and is being resumed — the failure
+    /// mode behind the 2026-10-16 half-repaired venv: the pin
+    /// reinstall had deleted the generated client, the generate
+    /// never ran, and nothing on disk said so.
+    fn prisma_repair_state_path(ctx: &WizardContext) -> PathBuf {
+        ctx.data_dir.join("gateway").join("prisma-repair.json")
+    }
+
+    async fn write_prisma_repair_state(
+        &self,
+        ctx: &WizardContext,
+        phase: &str,
+        log: &mut Vec<String>,
+    ) {
+        let body = serde_json::json!({
+            "pin": crate::PRISMA_PINNED_VERSION,
+            "phase": phase,
+            "at": chrono::Utc::now().to_rfc3339(),
+        });
+        if let Err(e) = ctx
+            .ops
+            .write_file(
+                &Self::prisma_repair_state_path(ctx),
+                json_pretty(&body).as_bytes(),
+            )
+            .await
+        {
+            // Best-effort: the repair itself still runs; only the
+            // resume bookkeeping is lost.
+            log.push(format!(
+                "warning: could not record the Prisma repair state ({phase}): {e}"
+            ));
+        }
+    }
+
     /// Ensure the venv's Prisma client is generated AND connects
     /// before the gateway spawns with DATABASE_URL. LiteLLM imports
     /// `prisma.Prisma` while starting; with no generated client the
@@ -3675,14 +3825,22 @@ impl StartGateway {
     /// 2026-10-16: the step's only Prisma touch was a `--version`
     /// pre-warm, which generates nothing). Without a database the
     /// gateway never imports Prisma, so this runs only on the
-    /// DATABASE_URL path. Idempotent: the connect probe is the fast
-    /// path on every later start.
+    /// DATABASE_URL path.
     ///
-    /// Sequence: pin check ([`Self::ensure_prisma_pin`]) → probe →
-    /// generate → re-probe. A client that still does not connect
-    /// standalone after a successful generate fails the step with
-    /// the probe output instead of spawning a gateway that cannot
-    /// use its database.
+    /// VERIFY-FIRST: the overwhelmingly common start — the install
+    /// was healthy last time — must cost seconds and mutate
+    /// nothing. Verification is three checks: the installed version
+    /// equals the pin (package metadata, no reinstall), the
+    /// generated client is present ([`Self::generated_client_path`]),
+    /// and the standalone connect probe passes. Only when a check
+    /// fails does the repair machinery run: pin reinstall
+    /// ([`Self::ensure_prisma_pin`]) → probe → generate → re-probe,
+    /// bracketed by the durable repair state
+    /// ([`Self::prisma_repair_state_path`]) so an interrupted repair
+    /// is resumed by the next run instead of inherited half-done.
+    /// A client that still does not connect standalone after a
+    /// successful generate fails the step with the probe output
+    /// instead of spawning a gateway that cannot use its database.
     async fn ensure_prisma_client_generated(
         &self,
         ctx: &WizardContext,
@@ -3690,15 +3848,62 @@ impl StartGateway {
         database_url: &str,
         log: &mut Vec<String>,
     ) -> Result<(), StepOutcome> {
+        if ctx
+            .ops
+            .file_exists(&Self::prisma_repair_state_path(ctx))
+            .await
+        {
+            log.push(
+                "a previous Prisma repair did not complete (the app closed or the step timed out mid-repair) — resuming it"
+                    .to_string(),
+            );
+        }
+        // --- Verification (no mutation) ---
+        let installed = self.installed_prisma_version(ctx).await;
+        let version_ok = installed.as_deref() == Some(crate::PRISMA_PINNED_VERSION);
+        let client_present = ctx.ops.file_exists(&self.generated_client_path(ctx)).await;
+        if version_ok && client_present {
+            if self.prisma_probe_failure(ctx, database_url).await.is_none() {
+                log.push(
+                    "Prisma install verified (pinned version, generated client present, connect probe passed) — no changes made"
+                        .to_string(),
+                );
+                // A verified install supersedes any interrupted
+                // repair record.
+                let _ = ctx
+                    .ops
+                    .remove_file(&Self::prisma_repair_state_path(ctx))
+                    .await;
+                return Ok(());
+            }
+            log.push(
+                "Prisma verification failed at the connect probe — repairing the install"
+                    .to_string(),
+            );
+        } else {
+            log.push(format!(
+                "Prisma verification failed (installed version: {}, generated client: {}) — repairing the install",
+                installed.as_deref().unwrap_or("unknown"),
+                if client_present { "present" } else { "missing" }
+            ));
+        }
+        // --- Repair (durable state first, then mutations) ---
+        self.write_prisma_repair_state(ctx, "pin", log).await;
         self.ensure_prisma_pin(ctx, uv, log).await?;
+        self.write_prisma_repair_state(ctx, "probe", log).await;
         if self.prisma_probe_failure(ctx, database_url).await.is_none() {
-            log.push("Prisma client verified (import + connect probe passed)".to_string());
+            log.push("Prisma client verified after the pin repair".to_string());
+            let _ = ctx
+                .ops
+                .remove_file(&Self::prisma_repair_state_path(ctx))
+                .await;
             return Ok(());
         }
         log.push(
             "Prisma client probe failed — generating the client before the gateway starts"
                 .to_string(),
         );
+        self.write_prisma_repair_state(ctx, "generate", log).await;
         let schema = self.resolve_prisma_schema(ctx, database_url, log).await?;
         log.push(format!(
             "generating the Prisma client from {}",
@@ -3706,9 +3911,14 @@ impl StartGateway {
         ));
         self.run_prisma_generate(ctx, database_url, &schema, log)
             .await?;
+        self.write_prisma_repair_state(ctx, "verify", log).await;
         match self.prisma_probe_failure(ctx, database_url).await {
             None => {
                 log.push("Prisma client verified after generation".to_string());
+                let _ = ctx
+                    .ops
+                    .remove_file(&Self::prisma_repair_state_path(ctx))
+                    .await;
                 Ok(())
             }
             Some(detail) => Err(StepOutcome::failed(
@@ -3716,51 +3926,6 @@ impl StartGateway {
                 log.clone(),
             )),
         }
-    }
-
-    /// The failure-message form of the spawned gateway's stderr:
-    /// the last ~30 non-empty lines, bounded to ~4 KB, labeled
-    /// "gateway stderr (last lines)". The process's own explanation
-    /// — an ungenerated Prisma client, a bad config, a port
-    /// conflict — is in this file, and a bare "did not become
-    /// healthy" is undiagnosable from inside the app without it.
-    /// A missing or empty file is stated in one line, not omitted.
-    async fn gateway_stderr_tail(&self, ctx: &WizardContext) -> String {
-        let path = self.gateway_stderr_log(ctx);
-        let missing = |path: &Path| {
-            format!(
-                "gateway stderr (last lines): {} is missing or empty — the gateway wrote no error output",
-                path.display()
-            )
-        };
-        let Ok(bytes) = ctx.ops.read_file(&path).await else {
-            return missing(&path);
-        };
-        if bytes.is_empty() {
-            return missing(&path);
-        }
-        let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        if lines.is_empty() {
-            return missing(&path);
-        }
-        let tail: Vec<&str> = lines.iter().rev().take(30).rev().copied().collect();
-        let mut joined = tail.join("\n");
-        // Bound the block, keeping the newest bytes — the error is
-        // at the end — and drop the partial first line the cut
-        // leaves behind.
-        const MAX_TAIL_BYTES: usize = 4096;
-        if joined.len() > MAX_TAIL_BYTES {
-            let mut start = joined.len() - MAX_TAIL_BYTES;
-            while start < joined.len() && !joined.is_char_boundary(start) {
-                start += 1;
-            }
-            joined = joined[start..].to_string();
-            if let Some(nl) = joined.find('\n') {
-                joined = joined[nl + 1..].to_string();
-            }
-        }
-        format!("gateway stderr (last lines):\n{joined}")
     }
 
     async fn wait_healthy(&self, ctx: &WizardContext, pid: u32, log: &mut Vec<String>) -> bool {
@@ -3800,18 +3965,20 @@ impl StartGateway {
     /// Sustained-health confirmation for the DATABASE_URL path:
     /// after the first healthy probe, keep probing for
     /// `db_sustain_ms` and require the gateway to stay alive and
-    /// answering the whole window. Both known gateway-with-database
+    /// answering the whole window, then close with the standalone
+    /// Prisma connect probe. Both known gateway-with-database
     /// defects strike about a second AFTER a plain connect (and a
-    /// first health probe) succeeds — the PrismaWrapper connect
-    /// exception leaves the database dead while the process serves,
-    /// and the Windows watchdog kill takes the whole process down —
-    /// so a single successful probe cannot distinguish a healthy
-    /// gateway from one that is about to die. A zero window
+    /// first health probe) succeeds — the Windows watchdog kill
+    /// takes the whole process down (the window catches that), and
+    /// the PrismaWrapper connect exception leaves the database dead
+    /// while the process keeps serving (only the closing standalone
+    /// probe catches that — HTTP health cannot). A zero window
     /// disables the confirmation (tests).
     async fn confirm_sustained_health(
         &self,
         ctx: &WizardContext,
         pid: u32,
+        database_url: &str,
         log: &mut Vec<String>,
     ) -> bool {
         if self.db_sustain_ms == 0 {
@@ -3821,6 +3988,7 @@ impl StartGateway {
         let headers = self.gateway_auth_headers(ctx).await;
         let window = std::time::Duration::from_millis(self.db_sustain_ms);
         let deadline = std::time::Instant::now() + window;
+        let mut successes = 0u32;
         loop {
             if !ctx.ops.process_alive(pid) {
                 log.push(format!(
@@ -3829,7 +3997,9 @@ impl StartGateway {
                 return false;
             }
             match ctx.ops.http_get_with_headers(&url, &headers).await {
-                Ok(resp) if resp.status == 200 => {}
+                Ok(resp) if resp.status == 200 => {
+                    successes += 1;
+                }
                 Ok(resp) => {
                     log.push(format!(
                         "gateway stopped answering during the database-path confirmation window: HTTP {}",
@@ -3852,9 +4022,30 @@ impl StartGateway {
             let step = std::time::Duration::from_millis(self.health_interval_ms.max(1));
             tokio::time::sleep(step.min(remaining)).await;
         }
+        // A single lucky 200 at the window's start proves nothing
+        // about the span: require at least two successful probes
+        // across it.
+        if successes < 2 {
+            log.push(format!(
+                "gateway answered only {successes} health probe(s) during the {} s confirmation window — not a sustained confirmation",
+                window.as_secs()
+            ));
+            return false;
+        }
+        // Close with the standalone probe: the gateway process can
+        // be serving while its database client is dead (the
+        // PrismaWrapper connect failure), which no HTTP health
+        // probe distinguishes.
+        if let Some(detail) = self.prisma_probe_failure(ctx, database_url).await {
+            log.push(format!(
+                "standalone Prisma probe failed at the end of the confirmation window: {detail} — the gateway is serving but its database client is not connected"
+            ));
+            return false;
+        }
         log.push(format!(
-            "gateway still healthy after the {} s database-path confirmation window",
-            window.as_secs()
+            "gateway still healthy after the {} s database-path confirmation window ({} probes, standalone Prisma probe passed)",
+            window.as_secs(),
+            successes
         ));
         true
     }
@@ -3954,21 +4145,34 @@ impl WizardStep for StartGateway {
                 };
                 // Reuse a healthy existing venv: one already on the
                 // pinned Python with litellm importable needs no venv
-                // creation and no package install. Anything else is
-                // (re)created — `uv venv --clear` replaces a venv left
-                // behind by a failed install or built with an unpinned
-                // (too new) Python, which previously made every retry
-                // fail with "already exists" before the real error.
+                // creation and no package install. A venv on the
+                // pinned Python whose packages are missing or broken
+                // needs only the package install — recreating the
+                // venv (`uv venv --clear`) for a package-level
+                // problem threw away a sound interpreter and redid
+                // minutes of work on every retry. Only a venv on the
+                // WRONG Python (or no venv at all) is (re)created;
+                // --clear replaces a venv left behind by a failed
+                // install or built with an unpinned (too new)
+                // Python, which previously made every retry fail
+                // with "already exists" before the real error.
                 let existing_version = self.venv_python_version(ctx).await;
                 let venv_current =
                     existing_version.as_deref() == Some(crate::GATEWAY_PYTHON_VERSION);
-                let reuse = venv_current && self.litellm_importable(ctx).await;
-                if reuse {
+                let litellm_ok = venv_current && self.litellm_importable(ctx).await;
+                let setup_cmds: Vec<PlannedCommand> = if litellm_ok {
                     log.push(format!(
                         "reusing existing venv (Python {}) — litellm already installed",
                         crate::GATEWAY_PYTHON_VERSION
                     ));
-                } else if !venv_current {
+                    Vec::new()
+                } else if venv_current {
+                    log.push(format!(
+                        "venv is on Python {} but litellm is not importable — installing packages only (the venv itself is kept)",
+                        crate::GATEWAY_PYTHON_VERSION
+                    ));
+                    vec![self.pip_command(ctx, &uv)]
+                } else {
                     match &existing_version {
                         Some(v) => log.push(format!(
                             "existing venv uses Python {v}; recreating it with Python {}",
@@ -3979,10 +4183,6 @@ impl WizardStep for StartGateway {
                             crate::GATEWAY_PYTHON_VERSION
                         )),
                     }
-                }
-                let setup_cmds: Vec<PlannedCommand> = if reuse {
-                    Vec::new()
-                } else {
                     vec![self.venv_command(ctx, &uv), self.pip_command(ctx, &uv)]
                 };
                 // Package installs get a longer command budget than
@@ -4021,18 +4221,30 @@ impl WizardStep for StartGateway {
                     }
                 }
                 // config.yaml is generated from app state, never hand-edited.
+                // Both failure paths carry the manual block and the
+                // accumulated step log, like every other failure in
+                // this step — they previously returned a one-line
+                // debug outcome with neither (code-review 2.8).
                 let yaml = match manager_gateway::generate_config_yaml(&ctx.config) {
                     Ok(y) => y,
                     Err(e) => {
                         return Ok(StepOutcome::failed(
                             format!("gateway config generation failed: {e}"),
-                            vec![format!("{e:?}")],
-                        ))
+                            log,
+                        )
+                        .with_manual_command(manual))
                     }
                 };
                 let cfg_path = ctx.data_dir.join("gateway").join("config.yaml");
                 if let Err(e) = ctx.ops.write_file(&cfg_path, yaml.as_bytes()).await {
-                    return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
+                    return Ok(StepOutcome::failed(
+                        format!(
+                            "could not write the gateway configuration {}: {e}",
+                            cfg_path.display()
+                        ),
+                        log,
+                    )
+                    .with_manual_command(manual));
                 }
                 log.push(format!("wrote {}", cfg_path.display()));
                 // Restart = stop the recorded gateway first; without
@@ -4056,39 +4268,21 @@ impl WizardStep for StartGateway {
                     .await
                     {
                         Ok(url) => {
-                            // Pre-warm the Prisma toolchain: its
-                            // first use downloads a Node runtime, so
-                            // a bootstrap failure should surface
-                            // here in the wizard, not at gateway
-                            // startup. Non-fatal — the gateway start
-                            // itself is the real attempt.
-                            let python = self.venv_python(ctx);
-                            let mut warm = PlannedCommand::new(vec![
-                                python.display().to_string(),
-                                "-m".to_string(),
-                                "prisma".to_string(),
-                                "--version".to_string(),
-                            ]);
-                            warm.env.insert("DATABASE_URL".to_string(), url.clone());
-                            match ctx.ops.run_command(&warm).await {
-                                Ok(out) if out.exit_code == 0 => {
-                                    log.push("Prisma toolchain ready".to_string())
-                                }
-                                Ok(out) => log.push(format!(
-                                    "warning: Prisma toolchain pre-warm exited {}; the gateway's first database migration may be slow or fail — see the gateway log",
-                                    out.exit_code
-                                )),
-                                Err(e) => log.push(format!(
-                                    "warning: Prisma toolchain pre-warm could not run: {e}"
-                                )),
-                            }
-                            // The pre-warm only proves the toolchain
-                            // answers; it generates nothing. The
-                            // gateway imports the Prisma client at
-                            // startup and dies if it was never
-                            // generated, so generation happens here,
+                            // Verify (and only if needed, repair)
+                            // the Prisma install before the spawn:
+                            // the gateway imports the Prisma client
+                            // at startup and dies if the install is
+                            // broken, so that work happens here,
                             // where its failure is reported as this
                             // step's failure — not as a dead gateway.
+                            // On a healthy install this is three
+                            // checks and no mutation (see
+                            // ensure_prisma_client_generated); the
+                            // old `--version` pre-warm is gone — it
+                            // generated nothing, proved nothing the
+                            // connect probe does not prove better,
+                            // and cost a process spawn on every
+                            // start.
                             if let Err(outcome) = self
                                 .ensure_prisma_client_generated(ctx, &uv, &url, &mut log)
                                 .await
@@ -4153,29 +4347,66 @@ impl WizardStep for StartGateway {
                 // has to survive the confirmation window.
                 let health_failure = if !self.wait_healthy(ctx, pid, &mut log).await {
                     Some("did not become healthy")
-                } else if database_url.is_some()
-                    && !self.confirm_sustained_health(ctx, pid, &mut log).await
-                {
-                    Some("became healthy but did not stay up")
+                } else if let Some(url) = &database_url {
+                    if self.confirm_sustained_health(ctx, pid, url, &mut log).await {
+                        None
+                    } else {
+                        Some("became healthy but did not stay up")
+                    }
                 } else {
                     None
                 };
                 if let Some(health_failure) = health_failure {
+                    // The gateway's own output is the diagnosis —
+                    // appended to the step log above its tail,
+                    // LABELED as gateway output. The failure MESSAGE
+                    // is the step's own verdict only: embedding the
+                    // raw stderr tail in the message presented it as
+                    // the step's error, and unrelated gateway log
+                    // noise (auth rejections from the app's own
+                    // status polling) reached the operator labeled
+                    // as the cause of the failure (2026-10-16).
                     self.append_gateway_log_tail(ctx, &mut log).await;
-                    // The gateway's own stderr is the diagnosis;
-                    // carry its tail in the failure message itself,
-                    // not only in the step log, so it is visible
-                    // wherever the failure is reported.
-                    let stderr_tail = self.gateway_stderr_tail(ctx).await;
                     return Ok(StepOutcome::failed(
                         format!(
-                            "gateway {health_failure} on :{} — full logs in {}\n{stderr_tail}",
+                            "gateway {health_failure} on :{} — the gateway's output is in the step log and in {}",
                             ctx.config.gateway.port,
                             ctx.data_dir.join("logs").display()
                         ),
                         log,
                     )
                     .with_manual_command(manual));
+                }
+                // Record what this gateway was actually spawned
+                // with (config fingerprint + the YAML): the drift
+                // check at the next launch compares the record
+                // against the then-current configuration, YAML and
+                // spawn-only inputs alike (code-review 2.3).
+                {
+                    let fingerprint = crate::gateway_spawn_fingerprint(
+                        &ctx.config,
+                        database_url.is_some(),
+                        spawn.env.get("LITELLM_MASTER_KEY").map(String::as_str),
+                        spawn.env.get("OPENROUTER_API_KEY").map(String::as_str),
+                    );
+                    let state_json = crate::gateway_spawn_state_json(&fingerprint, &yaml);
+                    match ctx
+                        .ops
+                        .write_file(
+                            &crate::gateway_spawn_state_path(&ctx.data_dir),
+                            state_json.as_bytes(),
+                        )
+                        .await
+                    {
+                        Ok(()) => log.push(
+                            "recorded the gateway spawn state for the next launch's drift check"
+                                .to_string(),
+                        ),
+                        Err(e) => log.push(format!(
+                            "warning: could not record the gateway spawn state: {e}; \
+                             the next launch will treat this start as drifted and re-run this step"
+                        )),
+                    }
                 }
                 let mut message = match &openrouter_warning {
                     Some(w) => format!(
@@ -5848,6 +6079,7 @@ mod tests {
                 params_b: 8.0,
                 sha256: sha256_hex(b"gguf-8b-bytes"),
                 verified_at: None,
+                verified_sha256: None,
                 source_url: "https://example.com/qwen3-8b.gguf".to_string(),
                 assigned_backends: vec!["tool-runner".to_string()],
                 enabled: true,
@@ -5860,6 +6092,7 @@ mod tests {
                 params_b: 7.0,
                 sha256: sha256_hex(b"gguf-7b-bytes"),
                 verified_at: None,
+                verified_sha256: None,
                 source_url: "https://example.com/qwen2.5-coder-7b.gguf".to_string(),
                 assigned_backends: vec!["coder-fast".to_string()],
                 enabled: true,
@@ -6523,7 +6756,7 @@ mod tests {
         // This test pins the split step's contract for backends that
         // need a split. Since the memory-requirement work (v0.1.31),
         // an unsplit backend is valid when its GPU-resident weights
-        // fit a single GPU or it is served by expert offload — so
+        // fit GPU 0 or it is served by expert offload — so
         // the fixture neutralizes both escape hatches: no offload
         // flags, and the shared model carries the coder catalog id
         // (49 GB — fits no single test GPU).
@@ -6846,6 +7079,9 @@ mod tests {
         config.models[1].enabled = false;
         if stamped {
             config.models[0].verified_at = Some(chrono::Utc::now());
+            // The stamp is bound to the pin it verified against
+            // (code-review 2.4): without this the skip cannot fire.
+            config.models[0].verified_sha256 = Some(config.models[0].sha256.clone());
         }
         let dest = resolve_dest(&PathBuf::from("/data"), &config.models[0].gguf_path);
         ops.with_file(dest.clone(), b"not-the-pinned-bytes".to_vec());
@@ -6862,7 +7098,9 @@ mod tests {
         let out = DownloadModels.run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done, "{out:?}");
         assert!(
-            out.log_tail.iter().any(|l| l.contains("verified-by-stamp")),
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("verified by an earlier checksum pass")),
             "{out:?}"
         );
     }
@@ -6886,6 +7124,20 @@ mod tests {
             out2.message.contains("checksum mismatch"),
             "{}",
             out2.message
+        );
+
+        // Stamp against a DIFFERENT pin than the current one (the
+        // catalog was re-pinned after the stamp): the skip must not
+        // fire — the hash runs and fails (code-review 2.4).
+        let ops3 = Arc::new(FakeSystemOps::new());
+        let mut ctx3 = audit_ctx_stamped(&ops3, true, Some(catalog_size("qwen3-8b")));
+        ctx3.config.models[0].verified_sha256 = Some("0".repeat(64));
+        let out3 = DownloadModels.run(&ctx3).await.unwrap();
+        assert_eq!(out3.state, StepState::Failed, "{out3:?}");
+        assert!(
+            out3.message.contains("checksum mismatch"),
+            "{}",
+            out3.message
         );
     }
 
@@ -7502,9 +7754,13 @@ mod tests {
         let block = StartGateway::default().manual_start_block(&ctx).await;
         assert!(block.contains("pg_ctl"), "{block}");
         assert!(
-            block.contains("postgresql://postgres:<password>@127.0.0.1:<port>/litellm"),
+            block.contains(&format!(
+                "postgresql://postgres:<password>@127.0.0.1:{}/litellm",
+                ctx.config.postgres.port
+            )),
             "{block}"
         );
+        assert!(!block.contains("<port>"), "no placeholder port: {block}");
         assert!(
             block.contains(crate::POSTGRES_PASSWORD_CRED_TARGET),
             "{block}"
@@ -7885,6 +8141,132 @@ mod tests {
         );
     }
 
+    /// (g2) Verify-first fast path: pinned version + generated
+    /// client present + connect probe passing means the start
+    /// mutates NOTHING — no reinstall, no generation, no repair
+    /// state — and records the spawn state for the drift check.
+    /// This is the previously-running-state start: seconds, not
+    /// minutes.
+    #[tokio::test]
+    async fn start_gateway_verifies_healthy_prisma_without_mutating() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+            db_sustain_ms: 0,
+        };
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        with_postgres_installed(&ops, &ctx);
+        // The generated client's marker file is in place.
+        ops.with_file(step.generated_client_path(&ctx), b"# generated".to_vec());
+        let version_argv = prisma_version_argv(&step, &ctx);
+        let version_refs: Vec<&str> = version_argv.iter().map(String::as_str).collect();
+        ops.with_command(&version_refs, FakeSystemOps::ok_output("0.11.0\n"));
+        let probe_argv = prisma_probe_argv(&step, &ctx);
+        let probe_refs: Vec<&str> = probe_argv.iter().map(String::as_str).collect();
+        ops.with_command(&probe_refs, FakeSystemOps::ok_output(""));
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.log_tail.iter().any(|l| l.contains("no changes made")),
+            "{out:?}"
+        );
+        let executed = ops.executed_commands();
+        assert!(
+            !executed.iter().any(|argv| argv
+                .iter()
+                .any(|a| a == "--reinstall-package" || a == "generate")),
+            "verification performed mutation: {executed:?}"
+        );
+        assert!(ops.removed_dirs().is_empty(), "{:?}", ops.removed_dirs());
+        // No repair state was written (or left) on the fast path.
+        assert!(ops
+            .file_bytes(&StartGateway::prisma_repair_state_path(&ctx))
+            .is_none());
+        // The spawn state WAS recorded for the next drift check.
+        let state = ops
+            .file_bytes(&crate::gateway_spawn_state_path(&ctx.data_dir))
+            .expect("spawn state recorded");
+        let state: serde_json::Value = serde_json::from_slice(&state).unwrap();
+        assert_eq!(state["fingerprint"]["port"], 4000);
+        assert_eq!(state["fingerprint"]["postgres_port"], 54329);
+        assert!(
+            !state["fingerprint"]["master_key_hash"]
+                .as_str()
+                .unwrap()
+                .is_empty(),
+            "the spawned master key is fingerprinted: {state}"
+        );
+    }
+
+    /// (g3) An interrupted repair (repair-state file present) is
+    /// resumed and completed: the log says so, generation runs,
+    /// and the state file is gone at the end.
+    #[tokio::test]
+    async fn start_gateway_resumes_interrupted_prisma_repair() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+            db_sustain_ms: 0,
+        };
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        with_postgres_installed(&ops, &ctx);
+        // The leftover of an interrupted repair.
+        ops.with_file(
+            StartGateway::prisma_repair_state_path(&ctx),
+            br#"{"pin":"0.11.0","phase":"pin"}"#.to_vec(),
+        );
+        let py = step.venv_python(&ctx).display().to_string();
+        let schema = prisma_test_schema(&ctx);
+        ops.with_file(schema.clone(), b"// schema".to_vec());
+        let version_argv = prisma_version_argv(&step, &ctx);
+        let version_refs: Vec<&str> = version_argv.iter().map(String::as_str).collect();
+        ops.with_command(&version_refs, FakeSystemOps::ok_output("0.11.0\n"));
+        ops.with_command(
+            &[py.as_str(), "-c", PRISMA_SCHEMA_SCRIPT],
+            FakeSystemOps::ok_output(&format!("{}\n", schema.display())),
+        );
+        // The client was never generated (the interruption): the
+        // probe fails, generation runs, the re-probe passes.
+        let probe_argv = prisma_probe_argv(&step, &ctx);
+        let probe_refs: Vec<&str> = probe_argv.iter().map(String::as_str).collect();
+        ops.with_command_sequence(
+            &probe_refs,
+            vec![prisma_not_generated_output(), FakeSystemOps::ok_output("")],
+        );
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.log_tail.iter().any(|l| l.contains("did not complete")),
+            "the resume is logged: {out:?}"
+        );
+        let executed = ops.executed_commands();
+        assert_eq!(
+            executed
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "generate"))
+                .count(),
+            1,
+            "{executed:?}"
+        );
+        assert!(
+            ops.file_bytes(&StartGateway::prisma_repair_state_path(&ctx))
+                .is_none(),
+            "a completed repair clears its state"
+        );
+    }
+
     /// (h) The installed prisma is 0.15.0 — the state that passes a
     /// standalone connect but breaks LiteLLM's wrapper. The step
     /// must not trust the probe: it clears the stale generated
@@ -8123,9 +8505,11 @@ mod tests {
         );
     }
 
-    /// (e) Health-check failure: the failure message carries the
-    /// spawned gateway's stderr tail — the Prisma error that the
-    /// health probe alone cannot explain.
+    /// (e) Health-check failure: the failure MESSAGE is the step's
+    /// own verdict; the spawned gateway's stderr tail rides in the
+    /// step LOG, labeled as gateway output. (It previously sat in
+    /// the message itself, presenting gateway log noise as the
+    /// step's error.)
     #[tokio::test]
     async fn start_gateway_health_failure_includes_gateway_stderr_tail() {
         let ops = Arc::new(FakeSystemOps::new());
@@ -8148,12 +8532,20 @@ mod tests {
         assert_eq!(out.state, StepState::Failed, "{out:?}");
         assert!(out.message.contains("did not become healthy"), "{out:?}");
         assert!(
-            out.message.contains("gateway stderr (last lines)"),
-            "{out:?}"
+            !out.message.contains("hasn't been generated"),
+            "gateway output leaked into the step's verdict: {out:?}"
         );
         assert!(
-            out.message.contains("The Client hasn't been generated yet"),
-            "{out:?}"
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("gateway stderr") && l.contains("last lines")),
+            "log carries the labeled gateway tail: {out:?}"
+        );
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("The Client hasn't been generated yet")),
+            "log carries the gateway's own diagnosis: {out:?}"
         );
     }
 

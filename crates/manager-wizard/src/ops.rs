@@ -13,6 +13,9 @@
 use crate::{CommandOutput, GpuDescriptor, HttpResponse, PlannedCommand, SystemOps, WizardError};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Fail fast when the server cannot be reached at all.
@@ -41,7 +44,13 @@ const ELEVATED_WAIT_TIMEOUT_MS: u32 = 120_000;
 const HTTP_POST_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Production system effects.
-pub struct RealSystemOps;
+#[derive(Debug, Default)]
+pub struct RealSystemOps {
+    /// Set by the step runner when a step's budget expires; checked
+    /// by the blocking extraction loops, which run on threads a
+    /// dropped future cannot cancel. Cleared when a step starts.
+    step_cancel: Arc<AtomicBool>,
+}
 
 impl RealSystemOps {
     fn io_err(path: &Path, e: impl std::fmt::Display) -> WizardError {
@@ -235,6 +244,63 @@ pub fn stop_gateway(data_dir: &Path) -> Result<bool, String> {
     Ok(stopped)
 }
 
+/// Kill the whole process tree rooted at `pid`, best-effort.
+///
+/// Windows: `kill_process` is already `taskkill /T /F` (tree
+/// semantics). Unix: commands spawned by [`RealSystemOps::run_child`]
+/// lead their own process group, so SIGKILL to the group takes the
+/// children with the parent; if the group signal fails (the child
+/// was not a group leader), fall back to killing the bare pid.
+fn kill_process_tree(pid: u32) {
+    if !pid_is_signalable(pid) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let _ = kill_process(pid);
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: killpg with a validated positive pid signals only
+        // that process group.
+        let rc = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+        if rc != 0 {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+    }
+}
+
+/// RAII guard that kills a spawned command's process tree when
+/// dropped while still armed. `run_child` arms it at spawn and
+/// disarms it only after the child has been reaped, so every exit
+/// path that loses track of the child — a budget timeout (the wait
+/// future is dropped), a dropped step future (the step itself timed
+/// out), a wait error — kills the tree instead of leaving a
+/// half-finished installer or toolchain running detached.
+struct TreeKillGuard {
+    pid: Option<u32>,
+}
+
+impl TreeKillGuard {
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for TreeKillGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            kill_process_tree(pid);
+        }
+    }
+}
+
 /// Shared GET implementation behind the trait's plain and
 /// header-carrying variants.
 /// Quote one argument for a ShellExecuteExW parameter string: wrap in
@@ -307,6 +373,7 @@ fn run_elevated_windows(cmd: &PlannedCommand) -> Result<CommandOutput, WizardErr
     // left to finish — the only caller (the gateway firewall rule)
     // treats this failure as warning-only.
     const WAIT_TIMEOUT_CODE: u32 = 0x0000_0102;
+    const WAIT_OBJECT_0: u32 = 0;
     let wait_result = unsafe { WaitForSingleObject(info.hProcess, ELEVATED_WAIT_TIMEOUT_MS) };
     if wait_result == WAIT_TIMEOUT_CODE {
         unsafe { CloseHandle(info.hProcess) };
@@ -318,10 +385,26 @@ fn run_elevated_windows(cmd: &PlannedCommand) -> Result<CommandOutput, WizardErr
             ),
         });
     }
+    // Anything other than "signaled" (WAIT_FAILED, an abandoned
+    // mutex, ...) means the wait itself broke down; falling through
+    // used to read an uninitialized exit code and report success.
+    if wait_result != WAIT_OBJECT_0 {
+        unsafe { CloseHandle(info.hProcess) };
+        return Err(WizardError::IoError {
+            path: PathBuf::from(&program),
+            reason: format!(
+                "waiting for the elevated command failed (wait result {wait_result:#x})"
+            ),
+        });
+    }
     let mut exit_code: u32 = 0;
-    unsafe {
-        GetExitCodeProcess(info.hProcess, &mut exit_code);
-        CloseHandle(info.hProcess);
+    let got = unsafe { GetExitCodeProcess(info.hProcess, &mut exit_code) };
+    unsafe { CloseHandle(info.hProcess) };
+    if got == 0 {
+        return Err(WizardError::IoError {
+            path: PathBuf::from(&program),
+            reason: "could not read the elevated command's exit code".to_string(),
+        });
     }
     Ok(CommandOutput {
         exit_code: exit_code as i32,
@@ -426,9 +509,30 @@ fn open_rotated_log(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-#[async_trait]
-impl SystemOps for RealSystemOps {
-    async fn run_command(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError> {
+impl RealSystemOps {
+    /// Spawn `cmd` and wait for it under `budget`, capturing output.
+    ///
+    /// The budget is the ONLY timeout applied: `run_command` passes
+    /// the default [`COMMAND_TIMEOUT`], `run_command_with_timeout`
+    /// passes the caller's figure through untouched. Before this
+    /// split, the with-timeout variant inherited the trait default,
+    /// which wrapped `run_command` — whose own 600 s cap fired first
+    /// and made the callers' 900 s install budgets unreachable
+    /// (code-review 2.1).
+    ///
+    /// On expiry the whole process TREE is killed, not just the
+    /// direct child: installers spawn children of their own (uv →
+    /// pip → compiler), and killing only the parent left a
+    /// half-finished toolchain writing into the tree the step's
+    /// retry was about to reuse. The [`TreeKillGuard`] also covers
+    /// the future itself being dropped (the step-level timeout):
+    /// the child leads its own process group on Unix and is a
+    /// taskkill tree root on Windows either way.
+    async fn run_child(
+        &self,
+        cmd: &PlannedCommand,
+        budget: Duration,
+    ) -> Result<CommandOutput, WizardError> {
         let (prog, args) = cmd
             .argv
             .split_first()
@@ -454,36 +558,85 @@ impl SystemOps for RealSystemOps {
             // CREATE_NO_WINDOW
             c.creation_flags(0x08000000);
         }
-        // kill_on_drop is what makes the timeout below a kill, not
-        // just an abandoned wait: expiring the budget drops the
-        // output future, and dropping it terminates the child
-        // instead of leaving it running detached from the wizard.
-        c.kill_on_drop(true);
-        let out = match tokio::time::timeout(COMMAND_TIMEOUT, c.output()).await {
+        // Own process group on Unix, so the tree kill can signal the
+        // group the child leads (kill_process_tree).
+        #[cfg(unix)]
+        c.process_group(0);
+        // The guard, not kill_on_drop, owns termination: it kills
+        // the TREE. kill_on_drop stays off so a timeout cannot kill
+        // the parent a moment before the tree walk needs it as the
+        // root. Every path out of this function either reaps the
+        // child (guard disarmed) or drops the guard (tree killed).
+        c.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(false);
+        let child = c.spawn().map_err(|e| WizardError::CommandFailed {
+            argv: cmd.argv.clone(),
+            code: -1,
+            stderr: format!("spawn failed: {e}"),
+        })?;
+        let mut guard = TreeKillGuard {
+            pid: child.id().filter(|p| pid_is_signalable(*p)),
+        };
+        let out = match tokio::time::timeout(budget, child.wait_with_output()).await {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => {
                 return Err(WizardError::CommandFailed {
                     argv: cmd.argv.clone(),
                     code: -1,
-                    stderr: format!("spawn failed: {e}"),
+                    stderr: format!("wait failed: {e}"),
                 })
             }
             Err(_) => {
+                // The wait future is dropped with the child handle;
+                // the armed guard kills the tree.
                 return Err(WizardError::CommandFailed {
                     argv: cmd.argv.clone(),
                     code: -1,
-                    stderr: format!(
-                        "timed out after {}s and was stopped",
-                        COMMAND_TIMEOUT.as_secs()
-                    ),
-                })
+                    stderr: format!("timed out after {}s and was stopped", budget.as_secs()),
+                });
             }
         };
+        guard.disarm();
         Ok(CommandOutput {
             exit_code: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
+    }
+
+    /// The step-cancellation flag, cloned into blocking work (the
+    /// extractors run on `spawn_blocking` threads where `self` is
+    /// unavailable): they check it per entry and fail with
+    /// `WizardError::Cancelled`.
+    fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.step_cancel.clone()
+    }
+}
+
+#[async_trait]
+impl SystemOps for RealSystemOps {
+    fn note_step_started(&self) {
+        self.step_cancel.store(false, Ordering::SeqCst);
+    }
+
+    fn request_cancellation(&self) {
+        self.step_cancel.store(true, Ordering::SeqCst);
+    }
+
+    async fn run_command(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError> {
+        self.run_child(cmd, COMMAND_TIMEOUT).await
+    }
+
+    async fn run_command_with_timeout(
+        &self,
+        cmd: &PlannedCommand,
+        timeout: Duration,
+    ) -> Result<CommandOutput, WizardError> {
+        // The caller's budget is honored exactly — no inner default
+        // cap underneath it (code-review 2.1).
+        self.run_child(cmd, timeout).await
     }
 
     async fn spawn_detached(&self, cmd: &PlannedCommand) -> Result<u32, WizardError> {
@@ -637,10 +790,53 @@ impl SystemOps for RealSystemOps {
     async fn extract_zip(&self, archive: &Path, dest: &Path) -> Result<(), WizardError> {
         let archive_c = archive.to_path_buf();
         let dest_c = dest.to_path_buf();
+        let cancel = self.cancel_flag();
         tokio::task::spawn_blocking(move || {
+            use std::io::Read as _;
             let file = std::fs::File::open(&archive_c).map_err(|e| Self::io_err(&archive_c, e))?;
             let mut zip = zip::ZipArchive::new(file).map_err(|e| Self::io_err(&archive_c, e))?;
-            zip.extract(&dest_c).map_err(|e| Self::io_err(&dest_c, e))
+            // Manual per-entry loop (not `zip.extract`) so a step
+            // cancellation lands between entries: extraction runs on
+            // a blocking thread the step's dropped future cannot
+            // cancel, and a timed-out extraction otherwise kept
+            // writing into the tree the retry was extracting into.
+            // `enclosed_name` gives the same escape protection
+            // `extract` applies internally.
+            for i in 0..zip.len() {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(WizardError::Cancelled);
+                }
+                let mut entry = zip.by_index(i).map_err(|e| Self::io_err(&archive_c, e))?;
+                let Some(rel_path) = entry.enclosed_name() else {
+                    return Err(WizardError::IoError {
+                        path: archive_c.clone(),
+                        reason: format!("zip entry escapes the destination: {}", entry.name()),
+                    });
+                };
+                let target = dest_c.join(&rel_path);
+                if entry.is_dir() {
+                    std::fs::create_dir_all(&target).map_err(|e| Self::io_err(&target, e))?;
+                    continue;
+                }
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| Self::io_err(parent, e))?;
+                }
+                let mut bytes = Vec::with_capacity(entry.size() as usize);
+                entry
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| Self::io_err(&archive_c, e))?;
+                std::fs::write(&target, &bytes).map_err(|e| Self::io_err(&target, e))?;
+                // `zip.extract` applied the entry's Unix mode; the
+                // manual loop must too — the extracted uv binary is
+                // not runnable without its executable bit.
+                #[cfg(unix)]
+                if let Some(mode) = entry.unix_mode() {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ =
+                        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
+                }
+            }
+            Ok(())
         })
         .await
         .map_err(|e| WizardError::IoError {
@@ -660,6 +856,7 @@ impl SystemOps for RealSystemOps {
         let dest_c = dest.to_path_buf();
         let prefix_c = prefix.to_string();
         let strip_c = strip_prefix.to_string();
+        let cancel = self.cancel_flag();
         tokio::task::spawn_blocking(move || {
             use std::io::Read as _;
             let file = std::fs::File::open(&archive_c).map_err(|e| Self::io_err(&archive_c, e))?;
@@ -667,6 +864,9 @@ impl SystemOps for RealSystemOps {
             let mut tar = tar::Archive::new(gz);
             let entries = tar.entries().map_err(|e| Self::io_err(&archive_c, e))?;
             for entry in entries {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(WizardError::Cancelled);
+                }
                 let mut entry = entry.map_err(|e| Self::io_err(&archive_c, e))?;
                 let path = entry.path().map_err(|e| Self::io_err(&archive_c, e))?;
                 let path_str = path.to_string_lossy().replace('\\', "/");
@@ -729,11 +929,15 @@ impl SystemOps for RealSystemOps {
         let dest_c = dest.to_path_buf();
         let prefixes_c: Vec<String> = prefixes.iter().map(|p| p.to_string()).collect();
         let strip_c = strip_prefix.to_string();
+        let cancel = self.cancel_flag();
         tokio::task::spawn_blocking(move || {
             use std::io::Read as _;
             let file = std::fs::File::open(&archive_c).map_err(|e| Self::io_err(&archive_c, e))?;
             let mut zip = zip::ZipArchive::new(file).map_err(|e| Self::io_err(&archive_c, e))?;
             for i in 0..zip.len() {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(WizardError::Cancelled);
+                }
                 let mut entry = zip.by_index(i).map_err(|e| Self::io_err(&archive_c, e))?;
                 let name = entry.name().replace('\\', "/");
                 if !prefixes_c.iter().any(|p| name.starts_with(p.as_str())) {
@@ -1297,7 +1501,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_empty_argv_errors() {
-        let ops = RealSystemOps;
+        let ops = RealSystemOps::default();
         let err = ops
             .run_command(&PlannedCommand::new(vec![]))
             .await
@@ -1314,7 +1518,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_command_with_timeout_bounds_stalled_child() {
-        let ops = RealSystemOps;
+        let ops = RealSystemOps::default();
         let cmd = PlannedCommand::new(vec!["sleep".to_string(), "30".to_string()]);
         let started = std::time::Instant::now();
         let err = ops
@@ -1330,9 +1534,77 @@ mod tests {
         );
     }
 
+    /// A timed-out command's whole TREE dies, not just the direct
+    /// child (code-review 2.2/2.15): the shell records its own pid
+    /// and its background child's pid, then sleeps; the caller's
+    /// budget expires, and both pids must be gone afterwards.
+    /// (The previous coverage asserted only that the call returned.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_command_timeout_kills_the_process_tree() {
+        let ops = RealSystemOps::default();
+        let dir = std::env::temp_dir().join(format!("wizard-tree-kill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pids");
+        let script = format!(
+            "echo $$ > {}; sleep 60 & echo $! >> {}; wait",
+            pid_file.display(),
+            pid_file.display()
+        );
+        let cmd = PlannedCommand::new(vec!["sh".to_string(), "-c".to_string(), script]);
+        let err = ops
+            .run_command_with_timeout(&cmd, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("timed out"), "{err}");
+        let text = std::fs::read_to_string(&pid_file).unwrap();
+        let pids: Vec<u32> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+        assert_eq!(pids.len(), 2, "shell + grandchild pids recorded: {text:?}");
+        // The tree kill is asynchronous to the error return; poll
+        // briefly for both pids to disappear.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && pids.iter().any(|p| process_alive(*p)) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for pid in &pids {
+            assert!(!process_alive(*pid), "pid {pid} survived the tree kill");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cancelled step's extraction stops instead of writing the
+    /// whole archive in the background (code-review 2.2).
+    #[tokio::test]
+    async fn extract_zip_honors_cancellation() {
+        use std::io::Write as _;
+        let ops = RealSystemOps::default();
+        let dir =
+            std::env::temp_dir().join(format!("wizard-extract-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("a.zip");
+        {
+            let mut zw = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            let opts = zip::write::SimpleFileOptions::default();
+            for name in ["one.txt", "two.txt", "three.txt"] {
+                zw.start_file(name, opts).unwrap();
+                zw.write_all(b"payload").unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        ops.request_cancellation();
+        let dest = dir.join("out");
+        let err = ops.extract_zip(&archive, &dest).await.unwrap_err();
+        assert!(matches!(err, WizardError::Cancelled), "{err}");
+        assert!(
+            !dest.join("one.txt").exists(),
+            "cancelled extraction wrote files"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn sha256_roundtrip_on_temp_file() {
-        let ops = RealSystemOps;
+        let ops = RealSystemOps::default();
         let path = std::env::temp_dir().join("wizard-sha256-test.bin");
         ops.write_file(&path, b"hello").await.unwrap();
         let hex = ops.sha256_file(&path).await.unwrap();
@@ -1353,7 +1625,7 @@ mod tests {
         // the >RAM case is covered by manager-models' ignored
         // multi-GiB test for the shared implementation).
         use sha2::{Digest, Sha256};
-        let ops = RealSystemOps;
+        let ops = RealSystemOps::default();
         let path = std::env::temp_dir().join("wizard-sha256-stream-test.bin");
         let total = 3 * (1usize << 20) + 17;
         let pattern: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
@@ -1372,7 +1644,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_detached_delivers_env_to_child() {
-        let ops = RealSystemOps;
+        let ops = RealSystemOps::default();
         let out_path =
             std::env::temp_dir().join(format!("wizard-spawn-env-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&out_path);
@@ -1403,7 +1675,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_detached_captures_output_to_log_files() {
-        let ops = RealSystemOps;
+        let ops = RealSystemOps::default();
         let dir = std::env::temp_dir().join(format!("wizard-spawn-log-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let out_log = dir.join("gateway.stdout.log");
@@ -1487,7 +1759,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn kill_process_terminates_spawned_process() {
-        let ops = RealSystemOps;
+        let ops = RealSystemOps::default();
         let cmd = PlannedCommand::new(vec![
             "/bin/sh".to_string(),
             "-c".to_string(),

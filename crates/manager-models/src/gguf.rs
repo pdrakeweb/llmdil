@@ -28,12 +28,14 @@ pub struct KvGeometry {
 impl KvGeometry {
     /// Bytes of KV cache per token, assuming F16 cache elements —
     /// llama.cpp's default cache type when no `--cache-type-k/v`
-    /// flag overrides it.
+    /// flag overrides it. Saturating: the geometry fields come
+    /// from the file header, and a header claiming u32-maximum
+    /// geometry must saturate to "enormous", never wrap small.
     pub fn bytes_per_token(&self) -> u64 {
-        self.kv_layers as u64
-            * self.head_count_kv as u64
-            * (self.key_length as u64 + self.value_length as u64)
-            * 2
+        (self.kv_layers as u64)
+            .saturating_mul(self.head_count_kv as u64)
+            .saturating_mul((self.key_length as u64).saturating_add(self.value_length as u64))
+            .saturating_mul(2)
     }
 }
 
@@ -45,6 +47,14 @@ pub struct GgufLayout {
     /// Sum of the routed-expert tensors (the tensors expert offload
     /// moves to the CPU buffer). Zero for dense models.
     pub expert_bytes: u64,
+    /// Routed-expert bytes per MoE block, in ascending block order
+    /// — one entry per block that carries expert tensors (the same
+    /// blocks [`GgufLayout::moe_block_count`] counts). Partial
+    /// `--n-cpu-moe N` offload moves the first N of these blocks;
+    /// their true sum is what [`super::memory::memory_requirement`]
+    /// prices from this, since per-block sizes are not uniform in
+    /// dynamically-quantized files. Empty for dense models.
+    pub expert_bytes_by_block: Vec<u64>,
     /// `<arch>.block_count` when present.
     pub block_count: Option<u32>,
     /// Number of blocks that carry routed-expert tensors, when any
@@ -109,12 +119,25 @@ enum MetaValue {
     Other,
 }
 
+/// Deepest metadata-array nesting the parser will follow. Real
+/// GGUF metadata nests at most a level or two (arrays of scalars);
+/// each nesting level costs only ~12 bytes of input, so an
+/// unbounded walk lets a crafted header recurse tens of thousands
+/// of frames inside the prefix parse and abort the process
+/// (a stack overflow is not a catchable panic).
+const MAX_META_DEPTH: u32 = 32;
+
 /// Read one metadata value of GGUF value type `ty`, consuming exactly
 /// its encoded bytes (arrays are walked element by element — the
 /// tokenizer arrays are large but length-prefixed, so skipping them
 /// is linear in the header size, not the vocabulary's byte total
 /// beyond the stored strings themselves).
-fn read_meta_value(r: &mut Reader<'_>, ty: u32, keep_string: bool) -> Result<MetaValue, GgufError> {
+fn read_meta_value(
+    r: &mut Reader<'_>,
+    ty: u32,
+    keep_string: bool,
+    depth: u32,
+) -> Result<MetaValue, GgufError> {
     match ty {
         0 => Ok(MetaValue::Int(r.u8()? as u64)), // UINT8
         1 => Ok(MetaValue::Int(r.u8()? as u64)), // INT8 (sign irrelevant here)
@@ -152,10 +175,13 @@ fn read_meta_value(r: &mut Reader<'_>, ty: u32, keep_string: bool) -> Result<Met
         }
         9 => {
             // ARRAY
+            if depth >= MAX_META_DEPTH {
+                return Err(GgufError::Invalid("metadata array nested too deeply"));
+            }
             let elem_ty = r.u32()?;
             let n = r.u64()?;
             for _ in 0..n {
-                read_meta_value(r, elem_ty, false)?;
+                read_meta_value(r, elem_ty, false, depth + 1)?;
             }
             Ok(MetaValue::Other)
         }
@@ -251,7 +277,7 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
         let key = r.string()?;
         let ty = r.u32()?;
         let keep = key == "general.architecture";
-        match read_meta_value(&mut r, ty, keep)? {
+        match read_meta_value(&mut r, ty, keep, 0)? {
             MetaValue::Int(v) => {
                 ints.insert(key, v);
             }
@@ -267,7 +293,13 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
         if arch.is_empty() {
             return None;
         }
-        ints.get(&format!("{arch}.{suffix}")).map(|v| *v as u32)
+        // A UINT64 metadata value above u32::MAX is not a plausible
+        // geometry field; truncating it (`as u32`) would silently
+        // understate the KV cache by orders of magnitude. Treat it
+        // as absent — the geometry is then unknown, which every
+        // consumer degrades conservatively.
+        ints.get(&format!("{arch}.{suffix}"))
+            .and_then(|v| u32::try_from(*v).ok())
     };
     let block_count = get("block_count");
     let kv = match (
@@ -295,13 +327,21 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
 
     let mut tensor_bytes: u64 = 0;
     let mut expert_bytes: u64 = 0;
-    let mut moe_blocks: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut expert_by_block: std::collections::BTreeMap<u32, u64> =
+        std::collections::BTreeMap::new();
     for _ in 0..tensor_count {
         let name = r.string()?;
         let n_dims = r.u32()?;
+        // Checked: a header claiming dimensions whose product
+        // overflows u64 (or whose byte size does) is not a real
+        // file — release builds have no overflow checks, so
+        // wrapping arithmetic would report a near-zero size and an
+        // "exact" requirement that fits anywhere.
         let mut elements: u64 = 1;
         for _ in 0..n_dims {
-            elements = elements.saturating_mul(r.u64()?);
+            elements = elements
+                .checked_mul(r.u64()?)
+                .ok_or(GgufError::Invalid("tensor element count overflow"))?;
         }
         let ty = r.u32()?;
         let _offset = r.u64()?;
@@ -309,7 +349,9 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
         if !elements.is_multiple_of(block) {
             return Err(GgufError::Invalid("tensor element count not block-aligned"));
         }
-        let size = elements / block * block_bytes;
+        let size = (elements / block)
+            .checked_mul(block_bytes)
+            .ok_or(GgufError::Invalid("tensor size overflow"))?;
         tensor_bytes = tensor_bytes.saturating_add(size);
         if is_expert_tensor(&name) {
             expert_bytes = expert_bytes.saturating_add(size);
@@ -318,20 +360,24 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
                 .and_then(|rest| rest.split('.').next())
                 .and_then(|s| s.parse::<u32>().ok())
             {
-                moe_blocks.insert(idx);
+                let entry = expert_by_block.entry(idx).or_insert(0);
+                *entry = entry.saturating_add(size);
             }
         }
     }
+    let moe_block_count = if expert_by_block.is_empty() {
+        None
+    } else {
+        Some(expert_by_block.len() as u32)
+    };
+    let expert_bytes_by_block: Vec<u64> = expert_by_block.into_values().collect();
 
     Ok(GgufLayout {
         tensor_bytes,
         expert_bytes,
+        expert_bytes_by_block,
         block_count,
-        moe_block_count: if moe_blocks.is_empty() {
-            None
-        } else {
-            Some(moe_blocks.len() as u32)
-        },
+        moe_block_count,
         kv,
     })
 }
@@ -387,6 +433,8 @@ mod tests {
         let layout = parse_gguf_layout(&sample_header()).unwrap();
         assert_eq!(layout.tensor_bytes, 400 + 144 + 34 + 32);
         assert_eq!(layout.expert_bytes, 144 + 34);
+        // Both expert tensors are in blk.0.
+        assert_eq!(layout.expert_bytes_by_block, vec![144 + 34]);
         assert_eq!(layout.block_count, Some(4));
         // Both expert tensors live in blk.0 — one MoE block.
         assert_eq!(layout.moe_block_count, Some(1));
@@ -429,6 +477,88 @@ mod tests {
             parse_gguf_layout(b"NOPE................"),
             Err(GgufError::Invalid("bad magic"))
         );
+    }
+
+    #[test]
+    fn deeply_nested_metadata_array_is_invalid_not_a_stack_overflow() {
+        // ARRAY-of-ARRAY nesting, one element per level: ~12 bytes
+        // of input per recursion level. Past the depth cap the
+        // parse must fail cleanly instead of recursing to abort.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // tensors
+        b.extend_from_slice(&1u64.to_le_bytes()); // metadata kvs
+        w_str(&mut b, "tokenizer.ggml.tokens");
+        b.extend_from_slice(&9u32.to_le_bytes()); // value type ARRAY
+        for _ in 0..64 {
+            b.extend_from_slice(&9u32.to_le_bytes()); // element type ARRAY
+            b.extend_from_slice(&1u64.to_le_bytes()); // count 1
+        }
+        b.extend_from_slice(&0u32.to_le_bytes()); // innermost: UINT8
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.push(0u8);
+        assert_eq!(
+            parse_gguf_layout(&b),
+            Err(GgufError::Invalid("metadata array nested too deeply"))
+        );
+    }
+
+    #[test]
+    fn absurd_tensor_dimensions_are_invalid_not_wrapped() {
+        // One F64 tensor claiming dims [2^61]: byte size 2^64.
+        // Wrapping arithmetic would report a 0-byte tensor; the
+        // parse must reject the header instead.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); // tensors
+        b.extend_from_slice(&0u64.to_le_bytes()); // metadata kvs
+        w_tensor(&mut b, "huge.weight", &[1u64 << 61], 28); // F64
+        assert_eq!(
+            parse_gguf_layout(&b),
+            Err(GgufError::Invalid("tensor size overflow"))
+        );
+        // The dimension product itself overflowing is rejected too.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        w_tensor(&mut b, "huge.weight", &[1u64 << 40, 1u64 << 40], 0); // F32
+        assert_eq!(
+            parse_gguf_layout(&b),
+            Err(GgufError::Invalid("tensor element count overflow"))
+        );
+    }
+
+    #[test]
+    fn oversized_geometry_metadata_is_absent_not_truncated() {
+        // key_length as a UINT64 of 2^32 + 256: truncating to u32
+        // would claim 256 and understate the KV cache ~16x. The
+        // geometry must come back unknown instead.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&5u64.to_le_bytes());
+        w_kv_str(&mut b, "general.architecture", "testarch");
+        w_kv_u32(&mut b, "testarch.block_count", 4);
+        w_kv_u32(&mut b, "testarch.attention.head_count_kv", 2);
+        w_str(&mut b, "testarch.attention.key_length");
+        b.extend_from_slice(&10u32.to_le_bytes()); // UINT64
+        b.extend_from_slice(&(2u64.pow(32) + 256).to_le_bytes());
+        w_kv_u32(&mut b, "testarch.attention.value_length", 64);
+        let layout = parse_gguf_layout(&b).unwrap();
+        assert_eq!(layout.kv, None);
+        // And KvGeometry's own math saturates rather than wraps.
+        let geo = KvGeometry {
+            kv_layers: u32::MAX,
+            head_count_kv: u32::MAX,
+            key_length: u32::MAX,
+            value_length: u32::MAX,
+        };
+        assert_eq!(geo.bytes_per_token(), u64::MAX);
     }
 
     #[test]

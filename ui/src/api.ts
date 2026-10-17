@@ -228,20 +228,24 @@ export async function getGpuTelemetry(): Promise<CallResult<GpuTelemetryData>> {
 
 /** Placement rows derived from the app config: one row per configured
  *  backend — placements belong to backends, not models (Pete,
- *  2026-10-16). Segments are the backend's tensor-split fractions as
- *  percentages, labeled with the telemetry GPU names in index order
- *  and carrying their GPU index; zero-fraction entries are dropped
- *  (the GPU holds none of the model). A backend with no split gets a
- *  single 100% segment on the first GPU — an unsplit launch loads
- *  there — and a split with no positive entry likewise falls back to
- *  that single-GPU row, so every backend's placement is listed.
- *  Disabled backends are included and flagged (`backendEnabled:
- *  false`): their placement is eventual, and the dashboard grays the
- *  row out. Model = file stem of the backend's model_file. Each row
- *  also carries its owning backend's id and (when the caller
- *  supplies the live backend list) its runtime status, so views can
- *  key presentation to the backend's measured state instead of
- *  asserting one from configuration alone. */
+ *  2026-10-16). Segments carry the backend's tensor-split fractions
+ *  UNROUNDED (`frac`), labeled with the telemetry GPU names in index
+ *  order and carrying their GPU index; zero-fraction entries are
+ *  dropped (the GPU holds none of the model), but a sub-1% share is
+ *  kept — the view renders it as a minimum-width sliver with its true
+ *  value in the tooltip. A backend with no split gets a single 100%
+ *  segment on the first GPU — an unsplit launch loads there — and a
+ *  split with no positive entry likewise falls back to that
+ *  single-GPU row, so every backend's placement is listed; such rows
+ *  are flagged `defaulted` so the view can ghost them instead of
+ *  presenting a default as an operator's configuration. Disabled
+ *  backends are included and flagged (`backendEnabled: false`):
+ *  their placement is eventual, and the dashboard grays the row out.
+ *  Model = file stem of the backend's model_file. Each row also
+ *  carries its owning backend's id and (when the caller supplies the
+ *  live backend list) its runtime status, so views can key
+ *  presentation to the backend's measured state instead of asserting
+ *  one from configuration alone. */
 function placementFromConfig(
   cfg: Record<string, unknown> | null,
   gpus: GpuInfo[],
@@ -256,14 +260,20 @@ function placementFromConfig(
       ? (rec.flags as Record<string, unknown>) : null;
     const split = Array.isArray(flags?.tensor_split) ? flags.tensor_split : null;
     let segments = (split ?? [])
-      .map((f, i) => ({
-        gpu: gpus[i]?.name ?? `GPU ${i}`,
-        gpuIndex: i,
-        pct: typeof f === "number" && Number.isFinite(f) ? Math.round(f * 100) : 0,
-      }))
-      .filter((s) => s.pct > 0);
+      .map((f, i) => {
+        const frac = typeof f === "number" && Number.isFinite(f) ? f : 0;
+        return {
+          gpu: gpus[i]?.name ?? `GPU ${i}`,
+          gpuIndex: i,
+          frac,
+          pct: Math.round(frac * 100),
+        };
+      })
+      .filter((s) => s.frac > 0);
+    let defaulted = false;
     if (!segments.length) {
-      segments = [{ gpu: gpus[0]?.name ?? "GPU 0", gpuIndex: 0, pct: 100 }];
+      segments = [{ gpu: gpus[0]?.name ?? "GPU 0", gpuIndex: 0, frac: 1, pct: 100 }];
+      defaulted = true;
     }
     const modelFile = typeof rec.model_file === "string" ? rec.model_file : "";
     const base = modelFile.split(/[\\/]/).pop() || modelFile || (typeof rec.id === "string" ? rec.id : "");
@@ -275,6 +285,7 @@ function placementFromConfig(
       backendId,
       backendStatus: backendId ? backends?.find((x) => x.id === backendId)?.status : undefined,
       backendEnabled: rec.enabled !== false,
+      defaulted,
     });
   }
   return rows;
@@ -376,11 +387,11 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
   const cfg = await getAppConfig();
   const gwCfg = await getGatewayConfig();
   const data: DashboardModel = {
-    gateway, backends, gpus: g.data.gpus, placement: placementFromConfig(cfg.data, g.data.gpus, backends), throughputSeries: [],
+    gateway, backends, gpus: g.data.gpus, placement: placementFromConfig(cfg.data, g.data.gpus, backends),
     gatewayUp: !gw.error && gw.data.up,
     gatewayStrategy: gwCfg.data ? effectiveGatewayStrategy(gwCfg.data) : null,
     gatewayError: gw.error,
-    events: [], stale: g.data.stale, updatedAt: Date.now(),
+    stale: g.data.stale, updatedAt: Date.now(),
   };
   return errors.length ? { data, live: true, error: errors.join("; ") } : { data, live: true };
 }
@@ -801,7 +812,7 @@ export async function applyBackendConfig(
   }
 }
 
-/** Result of backend_test_request (manager-supervisor's TestResult). A
+/** Result of test_backend (manager-supervisor's TestResult). A
  *  non-2xx HTTP status is reported here, not thrown: content is then
  *  usually null. */
 export interface BackendTestResult {
@@ -812,13 +823,13 @@ export interface BackendTestResult {
   latency_ms: number;
 }
 
-/** backend_test_request — one prompt against a running backend's
+/** test_backend — one prompt against a running backend's
  *  /v1/chat/completions; returns the first choice's content plus usage. */
 export async function testBackend(id: string, prompt: string): Promise<CallResult<BackendTestResult>> {
   const fallback: BackendTestResult = { status: 0, content: null, prompt_tokens: null, completion_tokens: null, latency_ms: 0 };
-  if (!isTauri()) return { data: fallback, live: false, error: "backend_test_request is not available in sample mode" };
+  if (!isTauri()) return { data: fallback, live: false, error: "test_backend is not available in sample mode" };
   try {
-    const data = await invoke<BackendTestResult>("backend_test_request", { id, prompt });
+    const data = await invoke<BackendTestResult>("test_backend", { id, prompt });
     return { data, live: true };
   } catch (e) {
     return { data: fallback, live: true, error: errOf(e) };
@@ -1149,6 +1160,10 @@ export interface GatewayRule {
   id: string;
   description: string;
   source: string;
+  /** The LiteLLM config fragment this rule injects, carried by the
+   *  get_gateway_config payload; shown in the rule's Fragment
+   *  expandable. Absent on payloads that predate the field. */
+  litellm_fragment?: string;
 }
 
 export interface GatewayGroup {
@@ -1168,6 +1183,10 @@ export interface GatewayRule {
   id: string;
   description: string;
   source: string;
+  /** The LiteLLM config fragment this rule injects, carried by the
+   *  get_gateway_config payload; shown in the rule's Fragment
+   *  expandable. Absent on payloads that predate the field. */
+  litellm_fragment?: string;
 }
 
 /** The OpenRouter cloud fallback tier (manager-config's

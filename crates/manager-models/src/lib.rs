@@ -1874,6 +1874,7 @@ mod tests {
             params_b: 8.0,
             sha256: "00".repeat(32),
             verified_at: None,
+            verified_sha256: None,
             source_url: String::new(),
             assigned_backends: Vec::new(),
             enabled: true,
