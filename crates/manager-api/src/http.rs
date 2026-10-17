@@ -22,6 +22,7 @@ use serde_json::{json, Map, Value};
 use manager_app::registry::{HttpMethod, Op, OpSpec, RouteMode, OP_SPECS};
 use manager_app::ApiError;
 
+use crate::composites;
 use crate::ApiCtx;
 
 /// One registered route, recorded during construction so tests can
@@ -42,6 +43,14 @@ pub const DERIVED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/v1/logs/scopes"),
     ("GET", "/api/v1/gateway/groups"),
     ("GET", "/api/v1/updates"),
+    // Phase 3 composites (composites.rs): read-modify-write and
+    // orchestration endpoints with no single backing operation.
+    ("PATCH", "/api/v1/models/{id}"),
+    ("POST", "/api/v1/gateway/groups"),
+    ("PATCH", "/api/v1/gateway/groups/{name}"),
+    ("DELETE", "/api/v1/gateway/groups/{name}"),
+    ("POST", "/api/v1/gateway/start"),
+    ("POST", "/api/v1/activation-plan/apply"),
 ];
 
 /// Build the full router from the registry plus the derived routes.
@@ -75,10 +84,29 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
     router = router
         .route("/api/v1/server", get(handle_server_identity))
         .route("/api/v1/backends/{id}", get(handle_backend_one))
-        .route("/api/v1/models/{id}", get(handle_model_one))
+        .route(
+            "/api/v1/models/{id}",
+            get(handle_model_one).patch(handle_model_patch),
+        )
         .route("/api/v1/operations/{id}", get(handle_operation_one))
         .route("/api/v1/logs/scopes", get(handle_log_scopes))
-        .route("/api/v1/gateway/groups", get(handle_gateway_groups))
+        .route(
+            "/api/v1/gateway/groups",
+            get(handle_gateway_groups).post(handle_group_create),
+        )
+        .route(
+            "/api/v1/gateway/groups/{name}",
+            axum::routing::patch(handle_group_patch)
+                .delete(handle_group_delete),
+        )
+        .route(
+            "/api/v1/gateway/start",
+            axum::routing::post(handle_gateway_start),
+        )
+        .route(
+            "/api/v1/activation-plan/apply",
+            axum::routing::post(handle_activation_apply),
+        )
         .route("/api/v1/updates", get(handle_updates));
     for (method, path, _class) in crate::auth_routes::AUTH_ROUTES {
         records.push(RouteRecord { method, path });
@@ -133,6 +161,10 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
         .route(
             "/api/v1/admin/enrollment-codes",
             axum::routing::post(crate::auth_routes::handle_admin_create_enrollment),
+        )
+        .route(
+            "/api/v1/admin/audit",
+            get(crate::auth_routes::handle_admin_audit),
         );
     let mw_state = crate::auth_routes::AuthMwState {
         ctx: ctx.clone(),
@@ -173,6 +205,15 @@ async fn handle_op(
         Ok(a) => a,
         Err(resp) => return *resp,
     };
+    // PATCH /gateway/config composition: a bind_host field routes
+    // through the dedicated bind operation (composites module).
+    if spec.op == Op::UpdateGatewayConfig {
+        let patch = args.get("patch").cloned().unwrap_or_else(|| json!({}));
+        return match composites::update_gateway_config(&ctx, patch).await {
+            Ok(value) => (axum::http::StatusCode::OK, axum::Json(value)).into_response(),
+            Err(e) => error_response(&ctx, &e, None),
+        };
+    }
     match manager_app::registry::dispatch(&ctx.app, &ctx.sink, spec.op, args).await {
         Ok(value) => shape_success(&ctx, spec, value),
         Err(e) => error_response(&ctx, &e, None),
@@ -463,6 +504,99 @@ async fn handle_updates(State(ctx): State<Arc<ApiCtx>>) -> Response {
             axum::Json(json!({ "updates": updates })).into_response()
         }
         Err(r) => *r,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Composite handlers (phase 3): thin HTTP adapters over
+// composites.rs, sharing the op handlers' error envelope.
+// ---------------------------------------------------------------------------
+
+fn parse_body(ctx: &ApiCtx, body: &axum::body::Bytes) -> Result<Value, Box<Response>> {
+    if body.is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_slice(body).map_err(|e| {
+        Box::new(error_response(
+            ctx,
+            &ApiError::InvalidInput(format!("malformed JSON body: {e}")),
+            None,
+        ))
+    })
+}
+
+async fn handle_model_patch(
+    State(ctx): State<Arc<ApiCtx>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let parsed = match parse_body(&ctx, &body) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    match composites::patch_model(&ctx, &id, parsed).await {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => error_response(&ctx, &e, None),
+    }
+}
+
+async fn handle_group_create(
+    State(ctx): State<Arc<ApiCtx>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let parsed = match parse_body(&ctx, &body) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    match composites::create_group(&ctx, parsed).await {
+        Ok(v) => (axum::http::StatusCode::CREATED, axum::Json(v)).into_response(),
+        Err(e) => error_response(&ctx, &e, None),
+    }
+}
+
+async fn handle_group_patch(
+    State(ctx): State<Arc<ApiCtx>>,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let parsed = match parse_body(&ctx, &body) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    match composites::patch_group(&ctx, &name, parsed).await {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => error_response(&ctx, &e, None),
+    }
+}
+
+async fn handle_group_delete(
+    State(ctx): State<Arc<ApiCtx>>,
+    Path(name): Path<String>,
+) -> Response {
+    match composites::delete_group(&ctx, &name).await {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => error_response(&ctx, &e, None),
+    }
+}
+
+async fn handle_gateway_start(State(ctx): State<Arc<ApiCtx>>) -> Response {
+    match composites::gateway_start(&ctx).await {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => error_response(&ctx, &e, None),
+    }
+}
+
+async fn handle_activation_apply(
+    State(ctx): State<Arc<ApiCtx>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let parsed = match parse_body(&ctx, &body) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    match composites::activation_apply(&ctx, parsed).await {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => error_response(&ctx, &e, None),
     }
 }
 

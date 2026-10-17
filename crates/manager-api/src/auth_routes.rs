@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -86,14 +86,34 @@ pub const AUTH_ROUTES: &[(&str, &str, AuthClass)] = &[
         "/api/v1/admin/enrollment-codes",
         AuthClass::Class(CapClass::UserAdmin),
     ),
+    (
+        "GET",
+        "/api/v1/admin/audit",
+        AuthClass::Class(CapClass::ApiSettings),
+    ),
 ];
 
-/// Classes for the derived read endpoints, from their source ops.
+/// Classes for the derived endpoints. Composites inherit the
+/// class of the operations they compose, looked up in the
+/// registry so a spec change moves the guard with it; the
+/// activation apply is the plan's declared exception at L
+/// (decision 5). Falls back to R for derived reads.
 fn derived_class(method: &str, path: &str) -> AuthClass {
+    let op_class = |name: &str| {
+        manager_app::registry::op_by_name(name)
+            .map(|op| AuthClass::Class(manager_app::registry::spec(op).class))
+            .unwrap_or(AuthClass::Class(CapClass::R))
+    };
     match (method, path) {
         ("GET", "/api/v1/server") => AuthClass::Public,
         ("GET", "/api/v1/gateway/groups") => AuthClass::Class(CapClass::SConfig),
         ("GET", "/api/v1/updates") => AuthClass::Class(CapClass::SConfig),
+        ("POST", "/api/v1/gateway/groups")
+        | ("PATCH", "/api/v1/gateway/groups/{name}")
+        | ("DELETE", "/api/v1/gateway/groups/{name}") => op_class("update_gateway_config"),
+        ("PATCH", "/api/v1/models/{id}") => op_class("model_set_enabled"),
+        ("POST", "/api/v1/gateway/start") => op_class("run_wizard_step"),
+        ("POST", "/api/v1/activation-plan/apply") => AuthClass::Class(CapClass::L),
         _ => AuthClass::Class(CapClass::R),
     }
 }
@@ -901,6 +921,24 @@ pub async fn handle_admin_revoke_token(
 #[serde(deny_unknown_fields)]
 pub struct CreateEnrollmentBody {
     pub user_id: String,
+}
+
+/// GET /api/v1/admin/audit?offset=&limit= — the API audit log,
+/// newest first (admin only; reads are unaudited except
+/// S-disclosure per the plan, and this is an ApiSettings route).
+pub async fn handle_admin_audit(
+    State(ctx): State<Arc<ApiCtx>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let offset: usize = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let limit: usize = q
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+        .min(1000);
+    let entries = ctx.audit.read_recent(offset, limit);
+    axum::Json(json!({ "entries": entries, "offset": offset, "limit": limit }))
+        .into_response()
 }
 
 pub async fn handle_admin_create_enrollment(

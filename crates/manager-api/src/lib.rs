@@ -19,6 +19,7 @@ use manager_app::{AppState, EventSink};
 pub mod audit;
 pub mod firewall;
 pub mod auth_routes;
+pub mod composites;
 pub mod auth;
 pub mod http;
 pub mod tls;
@@ -88,6 +89,11 @@ pub struct ApiCtx {
     pub auth: Arc<AuthService>,
     /// The mutation/auth audit log.
     pub audit: Arc<AuditLog>,
+    /// Serializes composite read-modify-write sequences (gateway
+    /// group CRUD, gateway-config patch) so concurrent API writers
+    /// cannot lose each other's updates; single operations are
+    /// already serialized inside the app core.
+    pub config_write_lock: tokio::sync::Mutex<()>,
 }
 
 impl ApiCtx {
@@ -134,6 +140,7 @@ impl ApiCtx {
             users,
             auth,
             audit,
+            config_write_lock: tokio::sync::Mutex::new(()),
         })
     }
 }
