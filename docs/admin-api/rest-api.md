@@ -498,7 +498,12 @@ download-progress channel (§3.1).
 ```
 
 `file_name`, `quant`, `params_b` optional (file name defaults to the
-URL's last segment). → `201` `{ "model_id" }`. The model starts
+URL's last segment). When `params_b` is omitted or non-positive, the
+count resolves from the curated catalog (exact id match, then exact
+source-URL match); when no source yields a count the call fails with
+a validation error naming the missing count — a model is never
+registered with an unknown or placeholder parameter count. →
+`201` `{ "model_id" }`. The model starts
 enabled with no pinned hash (unverified until a pin exists — the app
 treats a missing pin as "no verification possible", never as verified).
 

@@ -5250,30 +5250,36 @@ async fn model_set_enabled(state: State<'_, AppState>, id: String, enabled: bool
     Ok(json!({ "model_id": id, "enabled": enabled }))
 }
 
-/// Add a model to the registry: an id, the https URL of its GGUF file,
-/// and optionally an explicit file name, quant label, and parameter
-/// count. The model starts enabled with no pinned SHA-256 — its
-/// downloads run unverified (the Models view shows "hash not pinned")
-/// until a hash is recorded in the configuration.
-#[tauri::command]
-async fn model_add(
-    state: State<'_, AppState>,
-    id: String,
-    source_url: String,
+/// Build the registry entry for [`model_add`]: every input rule and
+/// the parameter-count resolution, decided before the config is
+/// touched, so a rejected add leaves the in-memory config and the
+/// file on disk exactly as they were. Pure — unit-tested without
+/// Tauri state.
+///
+/// `params_b` (total parameters, in billions) resolves from the
+/// caller's explicit value when positive, else from the curated
+/// catalog ([`manager_models::catalog_params_b`]: id match, then
+/// exact source-URL match). When no source yields a count the add
+/// fails: config validation requires a positive `params_b`, and the
+/// value feeds memory-fit estimation that nothing re-derives later,
+/// so storing a placeholder would silently corrupt fit decisions.
+fn model_add_entry(
+    id: &str,
+    source_url: &str,
     file_name: Option<String>,
     quant: Option<String>,
     params_b: Option<f32>,
-) -> ApiResult {
+) -> Result<manager_config::ModelConfig, ApiError> {
     let id = id.trim().to_string();
     if id.is_empty() {
-        return Err(err(ApiError::InvalidInput(
+        return Err(ApiError::InvalidInput(
             "model id is required".to_string(),
-        )));
+        ));
     }
     if !source_url.starts_with("https://") {
-        return Err(err(ApiError::InvalidInput(
+        return Err(ApiError::InvalidInput(
             "source URL must be an https:// URL for a GGUF file".to_string(),
-        )));
+        ));
     }
     let file_name = file_name
         .map(|f| f.trim().to_string())
@@ -5289,33 +5295,72 @@ async fn model_add(
         || file_name.contains('/')
         || file_name.contains('\\')
     {
-        return Err(err(ApiError::InvalidInput(
+        return Err(ApiError::InvalidInput(
             "file name must be a plain .gguf file name".to_string(),
-        )));
+        ));
     }
+    let params_b = params_b
+        .filter(|p| *p > 0.0)
+        .or_else(|| manager_models::catalog_params_b(&id, source_url))
+        .ok_or_else(|| {
+            ApiError::InvalidInput(format!(
+                "parameter count (params_b) is unknown for model '{id}': no value was supplied and the model is not in the curated catalog — supply the model's total parameter count in billions (e.g. 80 for an 80B model)"
+            ))
+        })?;
+    Ok(manager_config::ModelConfig {
+        gguf_path: PathBuf::from("models").join(&file_name),
+        id,
+        quant: quant
+            .map(|q| q.trim().to_string())
+            .filter(|q| !q.is_empty())
+            .unwrap_or_else(|| "unknown".to_string()),
+        params_b,
+        sha256: String::new(),
+        verified_at: None,
+        verified_sha256: None,
+        source_url: source_url.to_string(),
+        assigned_backends: Vec::new(),
+        enabled: true,
+        display_name: None,
+    })
+}
+
+/// Add a model to the registry: an id, the https URL of its GGUF file,
+/// and optionally an explicit file name, quant label, and parameter
+/// count (see [`model_add_entry`] for how the count is resolved and
+/// when the add is refused). The model starts enabled with no pinned
+/// SHA-256 — its downloads run unverified (the Models view shows
+/// "hash not pinned") until a hash is recorded in the configuration.
+#[tauri::command]
+async fn model_add(
+    state: State<'_, AppState>,
+    id: String,
+    source_url: String,
+    file_name: Option<String>,
+    quant: Option<String>,
+    params_b: Option<f32>,
+) -> ApiResult {
+    // Resolve everything before taking the config lock: a rejected
+    // add must leave the in-memory config and the saved file
+    // untouched. (The previous code pushed the entry into the live
+    // config first, so when the save then failed validation the
+    // invalid entry stayed in memory and poisoned every later save
+    // in the session.)
+    let entry = model_add_entry(&id, &source_url, file_name, quant, params_b).map_err(err)?;
+    let id = entry.id.clone();
     let mut cfg = state.config.write().await;
     if cfg.models.iter().any(|m| m.id == id) {
         return Err(err(ApiError::InvalidInput(format!(
             "a model with id '{id}' already exists"
         ))));
     }
-    cfg.models.push(manager_config::ModelConfig {
-        gguf_path: PathBuf::from("models").join(&file_name),
-        id: id.clone(),
-        quant: quant
-            .map(|q| q.trim().to_string())
-            .filter(|q| !q.is_empty())
-            .unwrap_or_else(|| "unknown".to_string()),
-        params_b: params_b.filter(|p| *p > 0.0).unwrap_or(0.0),
-        sha256: String::new(),
-        verified_at: None,
-        verified_sha256: None,
-        source_url,
-        assigned_backends: Vec::new(),
-        enabled: true,
-        display_name: None,
-    });
-    manager_config::save(&cfg, &state.config_path).map_err(jerr)?;
+    // Save a clone and swap it in only on success — the pattern the
+    // other config-mutating commands use. save() validates before
+    // writing, so a failure here also leaves state untouched.
+    let mut new_cfg = cfg.clone();
+    new_cfg.models.push(entry);
+    manager_config::save(&new_cfg, &state.config_path).map_err(jerr)?;
+    *cfg = new_cfg;
     drop(cfg);
     Ok(json!({ "model_id": id }))
 }
@@ -7486,5 +7531,146 @@ mod tests {
         ] {
             assert_eq!(process_state_str(v), want);
         }
+    }
+
+    #[test]
+    fn model_add_entry_unknown_size_is_a_clean_error() {
+        // Tracker #32: an unknown-size model used to be stored with
+        // params_b 0.0, which fails config validation. The add must
+        // now refuse up front, naming what is missing.
+        let r = model_add_entry(
+            "obscure-1b",
+            "https://example.com/obscure.gguf",
+            None,
+            None,
+            None,
+        );
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("params_b"), "error names the gap: {msg}");
+                assert!(msg.contains("obscure-1b"), "error names the model: {msg}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        // A non-positive explicit value counts as "not supplied".
+        let r = model_add_entry(
+            "obscure-1b",
+            "https://example.com/obscure.gguf",
+            None,
+            None,
+            Some(0.0),
+        );
+        assert!(matches!(r, Err(ApiError::InvalidInput(_))), "{r:?}");
+    }
+
+    #[test]
+    fn model_add_entry_uses_explicit_params() {
+        // Known-size add: behavior unchanged from before the fix —
+        // enabled, unpinned hash, file name from the URL, quant
+        // defaulting to "unknown".
+        let e = model_add_entry(
+            "my-7b",
+            "https://example.com/my-7b-q4.gguf",
+            None,
+            None,
+            Some(7.5),
+        )
+        .expect("explicit params resolve");
+        assert_eq!(e.id, "my-7b");
+        assert_eq!(e.params_b, 7.5);
+        assert_eq!(e.gguf_path, PathBuf::from("models").join("my-7b-q4.gguf"));
+        assert_eq!(e.quant, "unknown");
+        assert!(e.enabled);
+        assert!(e.sha256.is_empty());
+        // The built entry passes config validation (the defect was
+        // an entry that could not).
+        let mut cfg = test_cfg();
+        cfg.models.push(e);
+        manager_config::validate(&cfg).expect("added entry validates");
+        // An explicit value wins over the catalog.
+        let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, Some(9.0))
+            .expect("explicit params resolve");
+        assert_eq!(e.params_b, 9.0);
+    }
+
+    #[test]
+    fn model_add_entry_resolves_params_from_catalog() {
+        // By id.
+        let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, None)
+            .expect("catalog id resolves");
+        assert_eq!(e.params_b, 8.0);
+        // By exact source URL under an operator-chosen id.
+        let e = model_add_entry(
+            "my-qwen3-8b",
+            "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
+            None,
+            None,
+            None,
+        )
+        .expect("catalog URL resolves");
+        assert_eq!(e.params_b, 8.0);
+    }
+
+    #[test]
+    fn model_add_entry_keeps_the_existing_input_rules() {
+        assert!(matches!(
+            model_add_entry("  ", "https://example.com/x.gguf", None, None, Some(1.0)),
+            Err(ApiError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            model_add_entry("m", "http://example.com/x.gguf", None, None, Some(1.0)),
+            Err(ApiError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            model_add_entry(
+                "m",
+                "https://example.com/x.gguf",
+                Some("sub/dir.gguf".to_string()),
+                None,
+                Some(1.0)
+            ),
+            Err(ApiError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn model_add_save_step_never_persists_an_invalid_config() {
+        // The command's persistence shape: push onto a CLONE, save
+        // (which validates first), swap into state only on success.
+        // With a hand-built invalid entry (params_b 0.0 — what the
+        // old code produced), the save must fail and both the file
+        // on disk and the live config must stay exactly as they were.
+        let dir = std::env::temp_dir().join(format!(
+            "model-add-save-step-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let cfg = test_cfg();
+        manager_config::save(&cfg, &path).expect("baseline config saves");
+        let before = std::fs::read(&path).unwrap();
+
+        let mut new_cfg = cfg.clone();
+        new_cfg.models.push(manager_config::ModelConfig {
+            id: "bad-0b".to_string(),
+            gguf_path: PathBuf::from("models").join("bad.gguf"),
+            quant: "unknown".to_string(),
+            params_b: 0.0,
+            sha256: String::new(),
+            verified_at: None,
+            verified_sha256: None,
+            source_url: "https://example.com/bad.gguf".to_string(),
+            assigned_backends: Vec::new(),
+            enabled: true,
+            display_name: None,
+        });
+        assert!(manager_config::save(&new_cfg, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before, "file untouched");
+        assert!(
+            !cfg.models.iter().any(|m| m.id == "bad-0b"),
+            "live config untouched (the entry only ever existed on the clone)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

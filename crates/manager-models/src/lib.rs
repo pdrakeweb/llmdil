@@ -102,6 +102,25 @@ pub fn catalog_default_offload(spec: &ModelSpec) -> ExpertOffload {
     }
 }
 
+/// The curated catalog's parameter count for a model being
+/// registered (`model_add`): an exact id match wins; otherwise an
+/// exact source-URL match — the same catalog file registered under
+/// an operator-chosen id. `None` when the catalog knows neither the
+/// id nor the URL, in which case registration must ask the caller
+/// for the count rather than store a placeholder (config validation
+/// requires a positive `params_b`, and the value feeds memory-fit
+/// estimation that nothing re-derives later).
+pub fn catalog_params_b(id: &str, source_url: &str) -> Option<f32> {
+    let models = curated_models();
+    if let Some(spec) = models.iter().find(|s| s.id == id) {
+        return Some(spec.params_b);
+    }
+    models
+        .iter()
+        .find(|s| s.url == source_url)
+        .map(|s| s.params_b)
+}
+
 /// The curated catalog's revision. Bump whenever
 /// [`curated_models`] changes: existing configurations append
 /// newly added models exactly once per revision (see
@@ -1798,6 +1817,37 @@ mod tests {
             assert!(!m.url.is_empty() && !m.quant.is_empty());
             assert!(m.size_bytes > 0);
         }
+    }
+
+    #[test]
+    fn catalog_params_b_resolves_by_id_then_url() {
+        // Exact id match.
+        assert_eq!(
+            catalog_params_b("qwen3-8b", "https://example.com/other.gguf"),
+            Some(8.0)
+        );
+        // Exact source-URL match under an operator-chosen id: the
+        // same catalog file, so the catalog count applies.
+        assert_eq!(
+            catalog_params_b(
+                "my-qwen3-8b",
+                "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
+            ),
+            Some(8.0)
+        );
+        // An id match wins over a URL that names a different model.
+        assert_eq!(
+            catalog_params_b(
+                "qwen3-8b",
+                "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+            ),
+            Some(8.0)
+        );
+        // Neither known: no count to offer.
+        assert_eq!(
+            catalog_params_b("obscure-model", "https://example.com/obscure.gguf"),
+            None
+        );
     }
 
     #[test]
