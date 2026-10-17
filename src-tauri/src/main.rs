@@ -1784,18 +1784,34 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
             .iter()
             .map(|b| (b.id.clone(), b.port))
             .collect();
-        if let Some(windows) = state.gateway_stats.lock().await.window_stats(&pairs) {
-            for row in backends.iter_mut() {
-                let Some(id) = row["id"].as_str().map(str::to_string) else {
-                    continue;
-                };
-                let Some(w) = windows.get(&id) else {
-                    continue;
-                };
+        let stats = state.gateway_stats.lock().await;
+        let windows = stats.window_stats(&pairs);
+        let series = stats.series_stats(&pairs);
+        for row in backends.iter_mut() {
+            let Some(id) = row["id"].as_str().map(str::to_string) else {
+                continue;
+            };
+            if let Some(w) = windows.as_ref().and_then(|m| m.get(&id)) {
                 row["requests_1h"] = json!(w.requests);
                 row["errors_1h"] = json!(w.errors);
                 row["throughput_toks"] =
                     json!((w.tokens as f64 / w.window_secs * 10.0).round() / 10.0);
+                // Health is the trailing-hour success share — the
+                // one per-backend percentage the app actually
+                // measures (the gateway card's ring uses the same
+                // derivation). Absent when the window holds no
+                // requests: no traffic is no basis for a score.
+                if w.requests > 0 {
+                    let share = (w.requests - w.errors) as f64 / w.requests as f64;
+                    row["health"] = json!((share * 1000.0).round() / 10.0);
+                }
+            }
+            if let Some(s) = series.as_ref().and_then(|m| m.get(&id)) {
+                // Dashboard sparklines: tok/s for backend rows,
+                // requests/min for the gateway row the UI sums
+                // these into.
+                row["spark"] = json!(s.toks_per_sec);
+                row["req_spark"] = json!(s.req_per_min);
             }
         }
     }
@@ -2053,7 +2069,10 @@ async fn get_gpu_telemetry(app: AppHandle, state: State<'_, AppState>) -> ApiRes
         })
         .collect::<Result<_, String>>()?;
     // The command return enriches each sample with the store's peak
-    // temperature mark (the event payload keeps the crate shape).
+    // temperature mark (the event payload keeps the crate shape) and
+    // the store's per-GPU history as sparkline arrays — the history
+    // rings exist for exactly this (dashboard Trends), and without
+    // this wiring the live payload never carried a series.
     let enriched: Vec<Value> = {
         let guard = lock_telemetry(&store);
         samples
@@ -2062,6 +2081,18 @@ async fn get_gpu_telemetry(app: AppHandle, state: State<'_, AppState>) -> ApiRes
                 let mut v = serde_json::to_value(s).map_err(jerr)?;
                 let peak = guard.peaks(s.index).and_then(|p| p.temp_c).map(|m| m.value);
                 v["temp_peak_c"] = json!(peak);
+                let history = guard.history(s.index);
+                if history.len() >= 2 {
+                    v["util_spark"] =
+                        json!(history.iter().map(|h| h.utilization_pct).collect::<Vec<_>>());
+                    v["temp_spark"] =
+                        json!(history.iter().map(|h| h.temp_c).collect::<Vec<_>>());
+                    let power: Vec<f32> =
+                        history.iter().filter_map(|h| h.power_w).collect();
+                    if power.len() >= 2 {
+                        v["power_spark"] = json!(power);
+                    }
+                }
                 Ok(v)
             })
             .collect::<Result<_, String>>()?

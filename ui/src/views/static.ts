@@ -4004,9 +4004,16 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
   await load();
 
   // Status poll: a gateway that dies while the view is open must show
-  // as down without a manual refresh.
+  // as down without a manual refresh. The repaint replaces #gwBody's
+  // innerHTML wholesale, which destroys the node under the pointer —
+  // a native title tooltip on an info-tip inside the body is
+  // cancelled before it shows or dismissed while it is read (the
+  // Routing test traces tip was reported exactly this way: cursor
+  // changes, no tooltip). While the pointer hovers the body the
+  // user is reading it, so the periodic repaint waits for the next
+  // cycle; click-driven loads are unaffected.
   const timer = window.setInterval(() => {
-    if (!disposed && !starting && !stopping) void load();
+    if (!disposed && !starting && !stopping && !root.querySelector("#gwBody:hover")) void load();
   }, 5000);
 
   return () => {

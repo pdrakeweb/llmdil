@@ -17,7 +17,10 @@
 //!   current drivers) report `N/A` for power readings while every
 //!   other field is valid. It degrades to `None` like the other
 //!   optional metrics — requiring it took the whole source down on
-//!   real hardware (2026-10-15).
+//!   real hardware (2026-10-15). Separately, nvidia-smi v570+ renamed
+//!   the power elements outright (`power_draw`/`power_limit` are
+//!   gone; instantaneous/average draw and current/requested limit
+//!   elements replaced them), so the parser accepts both schemas.
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -519,8 +522,18 @@ fn finalize_gpu(
         get("temperature/gpu_temp").and_then(|s| parse_celsius(&s)),
     )?;
     // Optional: N/A or missing on cards whose power sensor the driver
-    // does not expose in XML (see module docs).
-    let power_w = get("gpu_power_readings/power_draw").and_then(|s| parse_watts(&s));
+    // does not expose in XML (see module docs). Element names changed
+    // at nvidia-smi v570: `power_draw`/`power_limit` were replaced by
+    // instantaneous/average draw and current/requested limit elements,
+    // so read the old names first, then the new ones (driver 582.78
+    // on the reference machine emits only the new names, which left
+    // power blank on every GPU until this fallback landed).
+    let power_w = ["power_draw", "instantaneous_power_draw", "instant_power_draw", "average_power_draw"]
+        .iter()
+        .find_map(|el| get(&format!("gpu_power_readings/{el}")).and_then(|s| parse_watts(&s)));
+    let power_limit_w = ["power_limit", "current_power_limit", "requested_power_limit", "enforced_power_limit"]
+        .iter()
+        .find_map(|el| get(&format!("gpu_power_readings/{el}")).and_then(|s| parse_watts(&s)));
 
     let pci_bus_id = get("pci/pci_bus").unwrap_or_else(|| id_attr.to_string());
 
@@ -547,7 +560,7 @@ fn finalize_gpu(
         mem_util_pct: get("utilization/memory_util").and_then(|s| parse_percent(&s)),
         temp_c,
         power_w,
-        power_limit_w: get("gpu_power_readings/power_limit").and_then(|s| parse_watts(&s)),
+        power_limit_w,
         fan_pct: get("fan_speed").and_then(|s| parse_percent(&s)),
         clocks_graphics_mhz: get("clocks/graphics_clock").and_then(|s| parse_mhz(&s)),
         clocks_mem_mhz: get("clocks/mem_clock").and_then(|s| parse_mhz(&s)),
@@ -703,6 +716,37 @@ mod tests {
         assert_eq!(s.power_limit_w, Some(140.0));
         assert_eq!(s.vram_total_mib, 16384);
         assert!((s.temp_c - 41.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn v570_power_elements_parse() {
+        // nvidia-smi v570+ (Pete's driver is 582.78) dropped
+        // <power_draw>/<power_limit> from <gpu_power_readings> in
+        // favor of instantaneous/average draw and current/requested
+        // limit elements. Reading only the old names yielded
+        // power_w = None on every GPU (field evidence: the
+        // 2026-10-17 diagnostics bundle's telemetry.json).
+        let xml = r#"<?xml version="1.0" ?><nvidia_smi_log>
+<driver_version>582.78</driver_version><attached_gpus>1</attached_gpus>
+<gpu id="00000000:01:00.0">
+<product_name>NVIDIA RTX A4000</product_name>
+<uuid>GPU-cccc</uuid><minor_number>0</minor_number>
+<pci><pci_bus>00000000:01:00.0</pci_bus></pci>
+<fan_speed>41 %</fan_speed>
+<fb_memory_usage><total>16376 MiB</total><used>14929 MiB</used></fb_memory_usage>
+<utilization><gpu_util>0 %</gpu_util><memory_util>0 %</memory_util></utilization>
+<temperature><gpu_temp>31 C</gpu_temp></temperature>
+<gpu_power_readings><power_state>P0</power_state><power_management>Supported</power_management><average_power_draw>35.10 W</average_power_draw><instantaneous_power_draw>42.50 W</instantaneous_power_draw><current_power_limit>140.00 W</current_power_limit><requested_power_limit>140.00 W</requested_power_limit><default_power_limit>140.00 W</default_power_limit><enforced_power_limit>140.00 W</enforced_power_limit></gpu_power_readings>
+<processes></processes>
+</gpu></nvidia_smi_log>"#;
+        let samples = NvidiaSmiSource::parse_xml(xml).expect("v570 power schema must parse");
+        assert_eq!(samples.len(), 1);
+        let s = &samples[0];
+        assert!(
+            (s.power_w.expect("power reported under the v570 names") - 42.50).abs() < 0.01,
+            "instantaneous draw is the power_draw successor"
+        );
+        assert_eq!(s.power_limit_w, Some(140.0));
     }
 
     #[test]

@@ -41,6 +41,13 @@ pub struct MetricsSnapshot {
 /// Trailing-window figures for one backend.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BackendWindow {
+    /// Total completed requests in the window (successes +
+    /// failures). Every consumer treats this as the total: the
+    /// dashboard's success share is `1 - errors / requests`, the
+    /// model card's succeeded count is `requests - errors`. (This
+    /// field originally carried successes only, which made both
+    /// derivations wrong — the share understated and the succeeded
+    /// count could go negative.)
     pub requests: u64,
     pub errors: u64,
     /// Total tokens over the window (0 when the token series is
@@ -122,7 +129,9 @@ impl GatewayStatsStore {
             out.insert(
                 id.clone(),
                 BackendWindow {
-                    requests: delta(ls, bs),
+                    // Total = success delta + failure delta (each
+                    // counter's restart handling is independent).
+                    requests: delta(ls, bs) + delta(lf, bf),
                     errors: delta(lf, bf),
                     tokens: delta(lt, bt),
                     window_secs,
@@ -131,7 +140,85 @@ impl GatewayStatsStore {
         }
         Some(out)
     }
+
+    /// Per-backend rate series for the dashboard sparklines,
+    /// derived from consecutive snapshot pairs: for each interval,
+    /// requests per minute (total counter delta, rate-normalized)
+    /// and tokens per second. Capped at the most recent
+    /// [`SERIES_POINTS`] intervals. Returns None until two
+    /// snapshots exist (same condition as [`Self::window_stats`]).
+    pub fn series_stats(
+        &self,
+        backends: &[(String, u16)],
+    ) -> Option<HashMap<String, BackendSeries>> {
+        if self.snapshots.len() < 2 {
+            return None;
+        }
+        let delta = |now: u64, then: u64| -> u64 {
+            if now >= then {
+                now - then
+            } else {
+                now
+            }
+        };
+        let mut out: HashMap<String, BackendSeries> = backends
+            .iter()
+            .map(|(id, _)| {
+                (
+                    id.clone(),
+                    BackendSeries {
+                        req_per_min: Vec::new(),
+                        toks_per_sec: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        let snaps: Vec<&MetricsSnapshot> = self.snapshots.iter().collect();
+        for pair in snaps.windows(2) {
+            let (prev, cur) = (pair[0], pair[1]);
+            let dt = cur.at.duration_since(prev.at).as_secs_f64();
+            if dt <= 0.0 {
+                continue;
+            }
+            for (id, port) in backends {
+                let api_base = format!("http://127.0.0.1:{port}/v1");
+                let model = format!("openai/{id}");
+                let (cs, cf) = cur.deployments.get(&api_base).copied().unwrap_or((0, 0));
+                let (ps, pf) = prev.deployments.get(&api_base).copied().unwrap_or((0, 0));
+                let reqs = delta(cs, ps) + delta(cf, pf);
+                let toks = delta(
+                    cur.tokens.get(&model).copied().unwrap_or(0),
+                    prev.tokens.get(&model).copied().unwrap_or(0),
+                );
+                let series = out.get_mut(id).expect("seeded above");
+                series.req_per_min.push(reqs as f64 * 60.0 / dt);
+                series.toks_per_sec.push(toks as f64 / dt);
+            }
+        }
+        for series in out.values_mut() {
+            for v in [&mut series.req_per_min, &mut series.toks_per_sec] {
+                if v.len() > SERIES_POINTS {
+                    v.drain(..v.len() - SERIES_POINTS);
+                }
+            }
+        }
+        Some(out)
+    }
 }
+
+/// Sparkline series for one backend (see
+/// [`GatewayStatsStore::series_stats`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendSeries {
+    /// Requests per minute per poll interval, oldest first.
+    pub req_per_min: Vec<f64>,
+    /// Tokens per second per poll interval, oldest first.
+    pub toks_per_sec: Vec<f64>,
+}
+
+/// Sparkline points retained per backend (~12 minutes at the
+/// 15 s poll cadence).
+const SERIES_POINTS: usize = 48;
 
 /// Parse Prometheus text exposition into a snapshot (timestamp left
 /// at the epoch placeholder; the caller stamps it). Unknown series
@@ -291,7 +378,8 @@ litellm_in_flight_requests{model=\"planner\"} 2.0
             .window_stats(&[("planner".into(), 8081)])
             .expect("two snapshots");
         let w = stats["planner"];
-        assert_eq!(w.requests, 15);
+        // Requests is the TOTAL: +15 successes and +1 failure.
+        assert_eq!(w.requests, 16);
         assert_eq!(w.errors, 1);
         assert_eq!(w.tokens, 3600);
         assert_eq!(w.window_secs, 1800.0);
@@ -333,6 +421,28 @@ litellm_in_flight_requests{model=\"planner\"} 2.0
             .window_stats(&[("planner".into(), 8081)])
             .expect("snapshots");
         assert_eq!(stats["planner"].requests, 7);
+    }
+
+    #[test]
+    fn series_rates_come_from_consecutive_deltas() {
+        let t0 = Instant::now();
+        let mut store = GatewayStatsStore::default();
+        let mk = |at: Instant, success: u64, failure: u64, tokens: u64| MetricsSnapshot {
+            at,
+            deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (success, failure))]),
+            tokens: HashMap::from([("openai/planner".into(), tokens)]),
+        };
+        store.record(mk(t0, 10, 0, 600));
+        // 60 s later: +30 successes, +6 failures, +3600 tokens.
+        store.record(mk(t0 + Duration::from_secs(60), 40, 6, 4200));
+        // 30 s later: no further traffic.
+        store.record(mk(t0 + Duration::from_secs(90), 40, 6, 4200));
+        let series = store
+            .series_stats(&[("planner".into(), 8081)])
+            .expect("three snapshots");
+        let s = &series["planner"];
+        assert_eq!(s.req_per_min, vec![36.0, 0.0]);
+        assert_eq!(s.toks_per_sec, vec![60.0, 0.0]);
     }
 
     #[test]

@@ -83,9 +83,10 @@ function serviceCard(b: BackendInfo, isGateway: boolean): string {
   const ringColor = statusColor(b.status);
   // requests_1h / errors_1h / throughput_toks come from LiteLLM's
   // Prometheus counters via the app's metrics poller (live since
-  // v0.1.18); health / vram_held_gb still have no live source. Render
-  // "—" when absent instead of crashing on .toFixed or presenting a
-  // fabricated measurement.
+  // v0.1.18); health is the same window's success share and
+  // vram_held_gb is joined from telemetry attribution in
+  // getDashboard. Render "—" when absent instead of crashing on
+  // .toFixed or presenting a fabricated measurement.
   const m1k = isGateway ? "REQUESTS / 1H" : "THROUGHPUT";
   const m1v = isGateway
     ? (b.requests_1h !== undefined ? fmtCount(b.requests_1h) : "—")
@@ -309,8 +310,9 @@ function applianceView(m: DashboardModel, live: boolean): string {
 
 function consoleView(m: DashboardModel): string {
   const svcRows = allServices(m).map((b) => {
-    // health/throughput/requests have no live source; show "—" when absent
-    // (the old expression printed "undefined req/h" and could not render).
+    // health/throughput/requests ride the metrics poller; show "—"
+    // when absent (the old expression printed "undefined req/h"
+    // and could not render).
     const rate = b.throughput_toks
       ? `${trim1(b.throughput_toks)} tok/s`
       : b.requests_1h !== undefined ? `${b.requests_1h} req/h` : "—";
@@ -325,7 +327,7 @@ function consoleView(m: DashboardModel): string {
       <td>${meter(g.util_pct, 120, 8, C.blue)}</td>
       <td>${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GB</td>
       <td>${meter(vramPct, 120, 8, C.purple)}</td>
-      <td>${g.temp_c}°C</td><td>${g.power_w == null ? "N/A" : `${g.power_w}W`}</td></tr>`;
+      <td>${g.temp_c}°C</td><td>${g.power_w == null ? "not measured" : `${trim1(g.power_w)} W`}</td></tr>`;
   }).join("");
   return `<div class="card" style="margin-bottom:12px"><div class="sec-title">Services</div>
     <table class="tbl"><thead><tr><th>Service</th><th>Port</th><th>Model</th><th>Health</th><th>Rate</th><th>Trend</th></tr></thead>

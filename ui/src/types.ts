@@ -21,16 +21,22 @@ export interface BackendInfo {
   /** True when the running process was adopted by this session (it was
    *  started by a previous launch and survived the app closing). */
   adopted?: boolean;
-  /* The fields below have no backend source in the list_backends payload;
-     they are only populated by the sample data. Live code must treat them
-     as possibly absent and never render them as measurements when unset. */
+  /* The metric fields below ARE populated live by the list_backends
+     payload once the gateway metrics poller has snapshots (health =
+     trailing-hour success share; spark = tok/s series), and by the
+     sample data otherwise. Live code must treat them as possibly
+     absent and never render them as measurements when unset.
+     `quant` has no live source. */
   health?: number; // 0-100
   quant?: string;
-  throughput_toks?: number; // tok/s, 1m avg
+  throughput_toks?: number; // tok/s over the trailing window
   vram_held_gb?: number;
   requests_1h?: number;
   errors_1h?: number;
   spark?: number[];
+  /** Requests/min series per backend; the dashboard sums these
+   *  into the gateway row's spark. Not rendered directly. */
+  reqSpark?: number[];
 }
 
 export interface GpuInfo {
@@ -47,9 +53,10 @@ export interface GpuInfo {
      are fan_pct / mem_util_pct (nullable per GPU — e.g. fanless P100s
      report no fan) and the per-sample source kind. The payload's
      per-process VRAM attribution is mapped into `processes` (empty when
-     the backend reports none). pci/driver/sparklines and `models` are
-     not carried by the payload and are only populated by the sample
-     data; live code must treat them as absent. */
+     the backend reports none), and its history sparkline arrays into
+     the *_spark fields. pci/driver and `models` are not carried by
+     the payload and are only populated by the sample data; live code
+     must treat them as absent. */
   temp_peak_c?: number;
   power_limit_w?: number;
   fan_pct?: number;

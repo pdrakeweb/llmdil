@@ -91,6 +91,9 @@ export async function listBackends(): Promise<CallResult<BackendInfo[]>> {
         requests_1h: typeof b.requests_1h === "number" ? b.requests_1h : undefined,
         errors_1h: typeof b.errors_1h === "number" ? b.errors_1h : undefined,
         throughput_toks: typeof b.throughput_toks === "number" ? b.throughput_toks : undefined,
+        health: typeof b.health === "number" ? b.health : undefined,
+        spark: Array.isArray(b.spark) ? b.spark : undefined,
+        reqSpark: Array.isArray(b.req_spark) ? b.req_spark : undefined,
       }));
       return { data, live: true };
     } catch (e) {
@@ -120,6 +123,11 @@ interface GpuSample {
   fan_pct: number | null;
   power_limit_w: number | null;
   temp_peak_c: number | null;
+  /** History sparkline arrays from the telemetry store, attached
+   *  by get_gpu_telemetry when at least two samples exist. */
+  util_spark?: number[];
+  temp_spark?: number[];
+  power_spark?: number[];
 }
 
 /** One per-process VRAM attribution entry as sent by get_gpu_telemetry.
@@ -170,8 +178,9 @@ export interface GpuTelemetryData {
  *  fan_pct / mem_util_pct become optional fields (undefined when the
  *  payload carries null), and the payload's per-process attribution is
  *  attached to its GPU (backend "—" when unattributed). The payload has
- *  no pci/driver/sparkline data, so those GpuInfo fields stay undefined
- *  on the live path. Overall stale is true when any sample is stale. */
+ *  no pci/driver data, so those GpuInfo fields stay undefined on the
+ *  live path; sparkline arrays ride the samples from the telemetry
+ *  store's history. Overall stale is true when any sample is stale. */
 export async function getGpuTelemetry(): Promise<CallResult<GpuTelemetryData>> {
   if (isTauri()) {
     try {
@@ -187,6 +196,9 @@ export async function getGpuTelemetry(): Promise<CallResult<GpuTelemetryData>> {
         temp_c: s.temp_c,
         temp_peak_c: s.temp_peak_c ?? undefined,
         power_w: s.power_w,
+        util_spark: Array.isArray(s.util_spark) && s.util_spark.length >= 2 ? s.util_spark : undefined,
+        temp_spark: Array.isArray(s.temp_spark) && s.temp_spark.length >= 2 ? s.temp_spark : undefined,
+        power_spark: Array.isArray(s.power_spark) && s.power_spark.length >= 2 ? s.power_spark : undefined,
         power_limit_w: s.power_limit_w ?? undefined,
         fan_pct: s.fan_pct ?? undefined,
         mem_util_pct: s.mem_util_pct ?? undefined,
@@ -355,6 +367,14 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
   const statRows = b.data.filter((x) => x.requests_1h !== undefined);
   const sumStat = (pick: (x: BackendInfo) => number | undefined): number | undefined =>
     statRows.length ? statRows.reduce((a, x) => a + (pick(x) ?? 0), 0) : undefined;
+  // Gateway sparkline: requests/min summed across the backends
+  // that carry a series (the card captions it "Requests per
+  // minute"); absent when no backend has one yet.
+  const sparkRows = b.data.filter((x) => x.reqSpark !== undefined);
+  const gatewaySpark: number[] | undefined = sparkRows.length
+    ? sparkRows[0].reqSpark!.map((_, i) =>
+        sparkRows.reduce((a, x) => a + (x.reqSpark![i] ?? 0), 0))
+    : undefined;
   const gateway: BackendInfo | null = gw.error
     ? null
     : {
@@ -366,6 +386,7 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
         requests_1h: sumStat((x) => x.requests_1h),
         errors_1h: sumStat((x) => x.errors_1h),
         throughput_toks: sumStat((x) => x.throughput_toks),
+        spark: gatewaySpark,
       };
   // VRAM held per backend, measured from telemetry's per-process
   // attribution (the dashboard card's "VRAM HELD" figure previously
@@ -614,6 +635,14 @@ export interface BackendRow {
   requests_1h?: number;
   errors_1h?: number;
   throughput_toks?: number;
+  /** Trailing-hour success share (0–100), derived from the window
+   *  in list_backends; absent when the window holds no requests. */
+  health?: number;
+  /** Sparkline series from the metrics snapshots: tokens/s for
+   *  this backend's rows, requests/min for the gateway total the
+   *  dashboard sums them into. Absent until two snapshots exist. */
+  spark?: number[];
+  req_spark?: number[];
   /** Configured llama-server sizing flags (configured rows only). */
   n_ctx?: number;
   n_batch?: number;
