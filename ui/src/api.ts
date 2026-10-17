@@ -88,6 +88,9 @@ export async function listBackends(): Promise<CallResult<BackendInfo[]>> {
         model: b.model_file,
         status: BACKEND_STATUS[b.state] ?? "idle",
         adopted: b.adopted,
+        enabled: b.enabled,
+        configured: b.configured,
+        service_managed: b.service_managed,
         requests_1h: typeof b.requests_1h === "number" ? b.requests_1h : undefined,
         errors_1h: typeof b.errors_1h === "number" ? b.errors_1h : undefined,
         throughput_toks: typeof b.throughput_toks === "number" ? b.throughput_toks : undefined,
@@ -588,6 +591,8 @@ export interface BackendRow {
   model_file: string;
   /** Supervisor process state: stopped | starting | running | stopping | failed. */
   state: string;
+  /** True when the row's state was merged from the SCM (service mode). */
+  service_managed?: boolean;
   pid: number | null;
   /** True when this session adopted the process (started by a previous
    *  launch; the app tracks it by pid rather than as its own child). */
@@ -1459,6 +1464,74 @@ export async function getGatewayYaml(): Promise<CallResult<{ yaml: string }>> {
 /* ---------------- Settings ---------------- */
 
 /** get_config — the full AppConfig JSON (data_dir, telemetry, mxc, updates, ...). */
+/* ---------------- Windows service supervision ---------------- */
+
+/** One managed service's row in the services_list payload. */
+export interface ServiceRow {
+  /** A backend id, or "gateway". */
+  target: string;
+  service_name: string;
+  registered: boolean;
+  /** SCM state (snake_case), null when not registered. */
+  state: string | null;
+  pid: number | null;
+}
+
+/** services_list payload: mode, resolved account, shim presence, rows. */
+export interface ServicesInfo {
+  mode: string;
+  account: string | null;
+  host_path: string;
+  host_present: boolean;
+  services: ServiceRow[];
+}
+
+export async function servicesList(): Promise<CallResult<ServicesInfo>> {
+  if (!isTauri()) {
+    return { data: { mode: "process", account: null, host_path: "", host_present: false, services: [] }, live: false };
+  }
+  try {
+    const data = await invoke<ServicesInfo>("services_list");
+    return { data, live: true };
+  } catch (e) {
+    return { data: { mode: "process", account: null, host_path: "", host_present: false, services: [] }, live: true, error: errOf(e) };
+  }
+}
+
+/** Persist the supervision mode through the generic config patch. */
+export async function setSupervisionMode(mode: string): Promise<CallResult<{ ok: boolean; persisted?: boolean }>> {
+  if (!isTauri()) return { data: { ok: false }, live: false, error: "update_config is not available in sample mode" };
+  try {
+    const data = await invoke<{ ok: boolean; persisted?: boolean }>("update_config", { patch: { supervision: { mode } } });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { ok: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** Register one service (backend id or "gateway") via the elevated
+ *  helper. The account password is handed over through a transient
+ *  credential the helper deletes; it is never persisted by the app. */
+export async function servicesRegister(target: string, password: string): Promise<CallResult<{ ok: boolean; service_name: string; account: string }>> {
+  if (!isTauri()) return { data: { ok: false, service_name: "", account: "" }, live: false, error: "services_register is not available in sample mode" };
+  try {
+    const data = await invoke<{ ok: boolean; service_name: string; account: string }>("services_register", { target, password });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { ok: false, service_name: "", account: "" }, live: true, error: errOf(e) };
+  }
+}
+
+export async function servicesUnregister(target: string): Promise<CallResult<{ ok: boolean; service_name: string }>> {
+  if (!isTauri()) return { data: { ok: false, service_name: "" }, live: false, error: "services_unregister is not available in sample mode" };
+  try {
+    const data = await invoke<{ ok: boolean; service_name: string }>("services_unregister", { target });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { ok: false, service_name: "" }, live: true, error: errOf(e) };
+  }
+}
+
 export async function getAppConfig(): Promise<CallResult<Record<string, unknown> | null>> {
   if (!isTauri()) return { data: null, live: false };
   try {

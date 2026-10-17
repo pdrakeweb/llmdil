@@ -21,6 +21,13 @@ export interface BackendInfo {
   /** True when the running process was adopted by this session (it was
    *  started by a previous launch and survived the app closing). */
   adopted?: boolean;
+  /** Operator switch from the configuration (list_backends rows):
+   *  a disabled backend is never a start target. */
+  enabled?: boolean;
+  /** False for a supervisor-only orphan row (id no longer in config). */
+  configured?: boolean;
+  /** True when the row's state comes from the SCM (service mode). */
+  service_managed?: boolean;
   /* The fields below have no backend source in the list_backends payload;
      they are only populated by the sample data. Live code must treat them
      as possibly absent and never render them as measurements when unset. */

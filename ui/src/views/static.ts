@@ -22,8 +22,9 @@ import {
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
   getActivationPlan, activationCancelChanges, activationComplete, quiesceWait,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
+  servicesList, servicesRegister, servicesUnregister, setSupervisionMode,
 } from "../api";
-import type { ActivationPlanData, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
+import type { ActivationPlanData, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, ServicesInfo } from "../api";
 import type { GpuInfo, WizardStepState } from "../types";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
@@ -3080,7 +3081,7 @@ function settingsRows(rows: { key: string; value: string }[]): string {
   return `<div class="kv" style="gap:10px">${rows.map((r) => `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">${esc(r.key)}</span><span class="v" style="font-size:12px;text-align:right">${esc(r.value)}</span></div>`).join("")}</div>`;
 }
 
-function settingsCard(title: string, iconName: "gear" | "shield" | "wrench", inner: string): string {
+function settingsCard(title: string, iconName: "gear" | "shield" | "wrench" | "server", inner: string): string {
   return `<div class="card" style="margin-bottom:12px"><div class="sec-title">${icon(iconName)} ${esc(title)}</div>${inner}</div>`;
 }
 
@@ -3174,11 +3175,56 @@ function mxcActivityInner(activityR: { data: MxcActivityData | null; error?: str
   return `<div style="font-size:12px;color:var(--text2);margin:10px 0 6px">Recent activity</div>${rows}`;
 }
 
+/** The Supervision card body: mode toggle, shim/account state, and
+ *  one row per managed service with its registration + SCM state and
+ *  Register/Unregister actions. Registration is the per-service
+ *  opt-in; the mode alone changes nothing until a service is
+ *  registered (docs/windows-services-design.md). */
+function supervisionInner(svcR: { data: ServicesInfo; error?: string; live: boolean }): string {
+  if (svcR.error) {
+    return `<div style="font-size:12px;color:var(--err)">Supervision unavailable — ${esc(svcR.error)}</div>`;
+  }
+  if (!svcR.live) {
+    return `<div style="font-size:12px;color:var(--text2)">Service supervision is available in the installed app.</div>`;
+  }
+  const info = svcR.data;
+  const mode = info.mode === "service" ? "service" : "process";
+  const rows: { key: string; value: string }[] = [
+    { key: "Service account", value: info.account ?? "—" },
+    { key: "Service host (llm-service-host.exe)", value: info.host_present ? info.host_path : `missing — expected at ${info.host_path}` },
+  ];
+  const svcRows = info.services.map((s) => {
+    const state = s.registered
+      ? (typeof s.state === "string" ? s.state : "unknown")
+      : "not registered";
+    const btn = s.registered
+      ? `<button class="btn" data-svc-unregister="${esc(s.target)}">Unregister</button>`
+      : `<button class="btn" data-svc-register="${esc(s.target)}" ${info.host_present ? "" : "disabled"}>Register</button>`;
+    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px">
+      <span>${esc(s.target === "gateway" ? "Gateway" : s.target)} <span style="color:var(--text3)">${esc(s.service_name)}</span></span>
+      <span style="display:flex;align-items:center;gap:10px"><span>${esc(state)}</span>${btn}</span></div>`;
+  }).join("");
+  const anyUnregistered = info.services.some((s) => !s.registered);
+  const pwdRow = anyUnregistered
+    ? `<div style="display:flex;align-items:center;gap:10px;margin-top:10px;font-size:12px">
+        <span class="k">Account password</span>
+        <input type="password" id="svcPwd" autocomplete="off" style="flex:1" placeholder="Windows password for ${esc(info.account ?? "the service account")}">
+      </div>
+      <div style="font-size:11px;color:var(--text3);margin-top:4px">Registration runs elevated (one UAC prompt per service). Windows stores the password as the service's logon credential; the app does not keep it.</div>`
+    : "";
+  return `${settingsRows(rows)}
+    <div class="card-actions">${["process", "service"].map((m) =>
+      `<button class="btn${mode === m ? " primary" : ""}" data-sup-mode="${m}">${m === "process" ? "Process" : "Service"}</button>`).join("")}</div>
+    <div style="margin-top:10px">${svcRows}</div>
+    ${pwdRow}`;
+}
+
 function settingsPaint(
   cfg: Record<string, unknown>,
   policyR: { data: MxcPolicyData | null; error?: string; live: boolean },
   activityR: { data: MxcActivityData | null; error?: string; live: boolean },
   selfTestHtml: string,
+  svcR: { data: ServicesInfo; error?: string; live: boolean },
 ): string {
   // --- General ---
   const generalRows: { key: string; value: string }[] = [];
@@ -3273,7 +3319,9 @@ function settingsPaint(
   const mxcCard = settingsCard("MXC sandbox", "shield",
     `${settingsRows(mxcRows)}${policyInner}${activityInner}${modeBtns}${selfTest}`);
 
-  return general + updatesCard + notifCard + mxcCard;
+  const supervisionCard = settingsCard("Supervision", "server", supervisionInner(svcR));
+
+  return general + supervisionCard + updatesCard + notifCard + mxcCard;
 }
 
 export function renderSettings(): string {
@@ -3295,7 +3343,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
   };
 
   const load = async (): Promise<void> => {
-    const [cfgR, polR, actR] = await Promise.all([getAppConfig(), getMxcPolicy(), getMxcActivity()]);
+    const [cfgR, polR, actR, svcR] = await Promise.all([getAppConfig(), getMxcPolicy(), getMxcActivity(), servicesList()]);
     if (disposed) return;
     setBanner(root, "setBanner", bannerHtml(cfgR));
     const b = root.querySelector("#setBody");
@@ -3309,7 +3357,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     }
     // Policy/activity CallResults go in whole: their .error renders as
     // "unavailable — <error>", distinct from genuine absence.
-    b.innerHTML = settingsPaint(cfgR.data, polR, actR, selfTestHtml);
+    b.innerHTML = settingsPaint(cfgR.data, polR, actR, selfTestHtml, svcR);
   };
 
   const onClick = async (ev: Event): Promise<void> => {
@@ -3355,6 +3403,61 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
           ${failed.length ? `<div style="color:var(--text2);margin-top:4px">To fix a failing case, edit the policy file at the Policy file path shown above and restart the app to apply it.</div>` : ""}
         </div>`;
       }
+      await load();
+      return;
+    }
+
+    const supBtn = t.closest("[data-sup-mode]") as HTMLButtonElement | null;
+    if (supBtn) {
+      const m = supBtn.getAttribute("data-sup-mode") ?? "process";
+      supBtn.disabled = true;
+      const r = await setSupervisionMode(m);
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`Supervision mode change failed: ${r.error}`, true);
+        supBtn.disabled = false;
+        return;
+      }
+      setMsg(`Supervision mode set to ${m}.`);
+      await load();
+      return;
+    }
+
+    const regBtn = t.closest("[data-svc-register]") as HTMLButtonElement | null;
+    if (regBtn) {
+      const target = regBtn.getAttribute("data-svc-register") ?? "";
+      const pwd = (root.querySelector("#svcPwd") as HTMLInputElement | null)?.value ?? "";
+      if (!pwd) {
+        setMsg("Enter the account password before registering.", true);
+        return;
+      }
+      regBtn.disabled = true;
+      setMsg(`Registering ${target} — approve the elevation prompt…`);
+      const r = await servicesRegister(target, pwd);
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`Registration of ${target} failed: ${r.error}`, true);
+        regBtn.disabled = false;
+        return;
+      }
+      setMsg(`Registered ${r.data.service_name} as ${r.data.account}.`);
+      await load();
+      return;
+    }
+
+    const unregBtn = t.closest("[data-svc-unregister]") as HTMLButtonElement | null;
+    if (unregBtn) {
+      const target = unregBtn.getAttribute("data-svc-unregister") ?? "";
+      unregBtn.disabled = true;
+      setMsg(`Unregistering ${target} — approve the elevation prompt…`);
+      const r = await servicesUnregister(target);
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`Unregister of ${target} failed: ${r.error}`, true);
+        unregBtn.disabled = false;
+        return;
+      }
+      setMsg(`Unregistered ${r.data.service_name}; it returns to process supervision.`);
       await load();
       return;
     }

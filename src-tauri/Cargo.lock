@@ -1946,6 +1946,7 @@ dependencies = [
  "manager-mcp",
  "manager-models",
  "manager-mxc",
+ "manager-services",
  "manager-supervisor",
  "manager-telemetry",
  "manager-winml",
@@ -2062,6 +2063,17 @@ name = "manager-present"
 version = "0.1.32"
 
 [[package]]
+name = "manager-services"
+version = "0.1.32"
+dependencies = [
+ "manager-supervisor",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "manager-supervisor"
 version = "0.1.32"
 dependencies = [
@@ -2118,6 +2130,7 @@ dependencies = [
  "manager-models",
  "manager-mxc",
  "manager-present",
+ "manager-services",
  "manager-telemetry",
  "manager-winml",
  "reqwest 0.12.28",

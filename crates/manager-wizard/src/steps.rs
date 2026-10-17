@@ -10,7 +10,7 @@ use crate::{
     WizardContext, WizardError, WizardStep,
 };
 use async_trait::async_trait;
-use manager_config::{AppConfig, BackendConfig, ModelConfig, SplitMode};
+use manager_config::{AppConfig, BackendConfig, ModelConfig, SplitMode, SupervisionMode};
 use std::path::{Path, PathBuf};
 ///
 /// Shared by the [`VscodeExtensions`] wizard step and the Tauri
@@ -1952,6 +1952,122 @@ fn postgres_zip_path(data_dir: &Path, pin: &PostgresPin) -> PathBuf {
     postgres_root(data_dir).join("downloads").join(&pin.asset)
 }
 
+/// Transform a fully built gateway spawn command into the service
+/// launch spec for its definition. The argv and non-secret env carry
+/// over verbatim; the three secret-bearing values become credential
+/// references the service host resolves at start, so a secret value
+/// is never written into the definition file: the master key and the
+/// OpenRouter key by their Credential Manager targets, `DATABASE_URL`
+/// as the composable Postgres form (password credential + port).
+fn gateway_launch_spec(
+    cmd: &PlannedCommand,
+    config: &AppConfig,
+) -> manager_services::LaunchSpec {
+    let mut env: Vec<manager_services::EnvEntry> = cmd
+        .env
+        .iter()
+        .map(|(name, value)| match name.as_str() {
+            "LITELLM_MASTER_KEY" => manager_services::EnvEntry::credential_ref(
+                name,
+                crate::LITELLM_MASTER_KEY_CRED_TARGET,
+            ),
+            "DATABASE_URL" => manager_services::EnvEntry {
+                name: name.clone(),
+                value: manager_services::EnvValue::DatabaseUrl {
+                    password_credential: crate::POSTGRES_PASSWORD_CRED_TARGET.to_string(),
+                    port: config.postgres.port,
+                },
+            },
+            "OPENROUTER_API_KEY" => match &config.gateway.openrouter.cred_ref {
+                Some(target) => manager_services::EnvEntry::credential_ref(name, target),
+                None => manager_services::EnvEntry::literal(name, value.clone()),
+            },
+            _ => manager_services::EnvEntry::literal(name, value.clone()),
+        })
+        .collect();
+    env.sort_by(|a, b| a.name.cmp(&b.name));
+    let (program, args) = match cmd.argv.split_first() {
+        Some((program, rest)) => (PathBuf::from(program), rest.to_vec()),
+        None => (PathBuf::new(), Vec::new()),
+    };
+    manager_services::LaunchSpec {
+        program,
+        args,
+        env,
+        workdir: cmd.cwd.clone(),
+    }
+}
+
+/// The gateway's service launch spec built from configuration alone,
+/// without a wizard context: the Settings register action needs a
+/// definition before any start-gateway run exists. This mirrors
+/// `StartGateway::spawn_command` + `spawn_command_with_env` with the
+/// same secret-as-reference transform. It is a starting point, not a
+/// second source of truth: the start-gateway step regenerates the
+/// definition from its fully resolved spawn command on every run in
+/// service mode.
+pub fn gateway_service_launch(config: &AppConfig, data_dir: &Path) -> manager_services::LaunchSpec {
+    let venv = data_dir.join("python").join("venv");
+    let python = if cfg!(windows) {
+        let windowless = venv.join("Scripts").join("pythonw.exe");
+        if windowless.exists() {
+            windowless
+        } else {
+            venv.join("Scripts").join("python.exe")
+        }
+    } else {
+        venv.join("bin").join("python")
+    };
+    let cfg_path = data_dir.join("gateway").join("config.yaml");
+    let args = vec![
+        "-c".to_string(),
+        StartGateway::GATEWAY_BOOTSTRAP.to_string(),
+        "--config".to_string(),
+        cfg_path.display().to_string(),
+        "--host".to_string(),
+        config.gateway.bind_host.clone(),
+        "--port".to_string(),
+        config.gateway.port.to_string(),
+    ];
+    let mut env = vec![
+        manager_services::EnvEntry::literal("PYTHONIOENCODING", "utf-8".to_string()),
+        manager_services::EnvEntry::literal("PYTHONUTF8", "1".to_string()),
+        manager_services::EnvEntry::credential_ref(
+            "LITELLM_MASTER_KEY",
+            crate::LITELLM_MASTER_KEY_CRED_TARGET,
+        ),
+    ];
+    // PostgreSQL installed (binaries plus cluster or marker — the
+    // same ground truth `postgres_installed` uses) → the gateway
+    // receives a DATABASE_URL composed at service start.
+    let postgres_present = postgres_bin_dir(data_dir).join("pg_ctl.exe").exists()
+        && (postgres_marker_path(data_dir).exists()
+            || postgres_data_dir(data_dir).join("PG_VERSION").exists());
+    if postgres_present {
+        env.push(manager_services::EnvEntry {
+            name: "DATABASE_URL".to_string(),
+            value: manager_services::EnvValue::DatabaseUrl {
+                password_credential: crate::POSTGRES_PASSWORD_CRED_TARGET.to_string(),
+                port: config.postgres.port,
+            },
+        });
+    }
+    if config.gateway.openrouter.enabled {
+        if let Some(target) = &config.gateway.openrouter.cred_ref {
+            env.push(manager_services::EnvEntry::credential_ref(
+                "OPENROUTER_API_KEY",
+                target,
+            ));
+        }
+    }
+    manager_services::LaunchSpec {
+        program: python,
+        args,
+        env,
+        workdir: None,
+    }
+}
+
 /// The server's own log file, in the app's logs directory alongside
 /// the gateway logs (`pg_ctl -l` appends there).
 pub fn postgres_log_path(data_dir: &Path) -> PathBuf {
@@ -3189,6 +3305,33 @@ impl StartGateway {
         log: &mut Vec<String>,
     ) -> Result<(), StepOutcome> {
         let pid_path = crate::gateway_pid_path(&ctx.data_dir);
+        if ctx.config.supervision.mode == SupervisionMode::Service {
+            // The SCM owns the previous gateway process; killing the
+            // recorded pid would kill the service host's child out
+            // from under it and leave the service state lying. Stop
+            // the service instead — its host removes the pid file.
+            match ctx
+                .ops
+                .service_stop(manager_services::GATEWAY_SERVICE_NAME)
+                .await
+            {
+                Ok(()) => {
+                    log.push("stopped previous gateway service".to_string());
+                    let _ = ctx.ops.remove_file(&pid_path).await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(StepOutcome::failed(
+                        format!(
+                            "could not stop the previous gateway service: {e}; \
+                             refusing to start a duplicate on :{}",
+                            ctx.config.gateway.port
+                        ),
+                        log.clone(),
+                    ));
+                }
+            }
+        }
         let recorded = match ctx.ops.read_file(&pid_path).await {
             Ok(bytes) => String::from_utf8_lossy(&bytes).trim().parse::<u32>().ok(),
             Err(_) => None,
@@ -3229,6 +3372,45 @@ impl StartGateway {
         }
         let _ = ctx.ops.remove_file(&pid_path).await;
         Ok(())
+    }
+
+    /// Service-mode start: regenerate the gateway service definition
+    /// from the fully built spawn command and start the service,
+    /// returning the gateway child's pid (recorded by the service
+    /// host in the gateway pid file) for the health checks.
+    async fn spawn_gateway_as_service(
+        &self,
+        ctx: &WizardContext,
+        spawn: &PlannedCommand,
+        log: &mut Vec<String>,
+    ) -> Result<u32, StepOutcome> {
+        let def = manager_services::gateway_definition(
+            gateway_launch_spec(spawn, &ctx.config),
+            self.gateway_stdout_log(ctx),
+            self.gateway_stderr_log(ctx),
+            crate::gateway_pid_path(&ctx.data_dir),
+        );
+        match manager_services::write_definition(&ctx.data_dir, &def) {
+            Ok(path) => log.push(format!(
+                "wrote gateway service definition {}",
+                path.display()
+            )),
+            Err(e) => {
+                return Err(StepOutcome::failed(
+                    format!("could not write the gateway service definition: {e}"),
+                    log.clone(),
+                ))
+            }
+        }
+        ctx.ops
+            .service_start_gateway(&def)
+            .await
+            .map_err(|e| {
+                StepOutcome::failed(
+                    format!("gateway service start failed: {e}"),
+                    log.clone(),
+                )
+            })
     }
 
     /// Files the gateway child's stdout/stderr are captured to.
@@ -4123,11 +4305,32 @@ impl WizardStep for StartGateway {
                     self.gateway_stdout_log(ctx).display(),
                     self.gateway_stderr_log(ctx).display()
                 ));
-                let pid = match ctx.ops.spawn_detached(&spawn).await {
-                    Ok(pid) => pid,
-                    Err(e) => {
-                        return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")])
+                let pid = if ctx.config.supervision.mode == SupervisionMode::Service {
+                    // Service mode: regenerate the gateway's service
+                    // definition from this spawn (secret values become
+                    // credential references — never written to the
+                    // definition file) and start the service. The
+                    // health checks below run unchanged against the
+                    // child pid the service host recorded.
+                    match self
+                        .spawn_gateway_as_service(ctx, &spawn, &mut log)
+                        .await
+                    {
+                        Ok(pid) => pid,
+                        Err(outcome) => {
+                            return Ok(outcome.with_manual_command(manual))
+                        }
+                    }
+                } else {
+                    match ctx.ops.spawn_detached(&spawn).await {
+                        Ok(pid) => pid,
+                        Err(e) => {
+                            return Ok(StepOutcome::failed(
+                                format!("{e}"),
+                                vec![format!("{e:?}")],
+                            )
                             .with_manual_command(manual))
+                        }
                     }
                 };
                 log.push(format!("LiteLLM spawned (pid {pid})"));
