@@ -63,7 +63,7 @@ function shell(): string {
  * GPU placement). Review navigates to the dedicated Activation
  * Plan view; Apply executes the plan directly through the same
  * routine the plan card uses. It polls independently of the
- * current view, and a view-level "Decide later" dismissal never
+ * current view, and a view-level dismissal (the plan card's X) never
  * hides it: saved-but-not-live changes stay visible here until
  * they are applied or cancelled. */
 let bannerPlan: ActivationPlanData | null = null;
@@ -101,18 +101,18 @@ function paintActivationBanner(): void {
   const applyBtns = !plan.actionable
     ? ""
     : plan.gateway_pending && plan.gateway_up
-      ? `<button class="btn" data-ab-act="drain" title="${tip}"${dis}>Drain Requests and Apply</button>
-      <button class="btn" data-ab-act="apply-now" title="${tip}"${dis}>Apply now</button>`
-      : `<button class="btn" data-ab-act="apply" title="${tip}"${dis}>Apply plan</button>`;
+      ? `<button class="btn" data-ab-act="drain" title="${tip}"${dis}>${icon("pause")} Drain Requests and Apply</button>
+      <button class="btn" data-ab-act="apply-now" title="${tip}"${dis}>${icon("restart")} Apply now</button>`
+      : `<button class="btn" data-ab-act="apply" title="${tip}"${dis}>${icon("play")} Apply plan</button>`;
   el.innerHTML = `<div class="activation-banner">
     <span class="ab-text">${icon("warn")} <b>Activation Plan pending</b> — Pending changes: ${n}</span>
     <span style="display:inline-flex;align-items:center;gap:8px;flex:0 1 340px;min-width:160px">${bar}</span>
     ${bannerStatus ? `<span class="ab-status${bannerStatusErr ? " err" : ""}">${esc(bannerStatus)}</span>` : ""}
     <span class="ab-actions">
-      <button class="btn" data-ab-act="review"${dis}>Review</button>
+      <button class="btn" data-ab-act="review" title="Review activation plan"${dis}>${icon("eye")} Review</button>
       ${applyBtns}
     </span></div>`
-    + (bannerManual ? `<pre style="margin:0 12px 8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px;text-align:left">${esc(bannerManual)}</pre><div style="padding:0 12px 8px"><button class="btn" data-ab-act="copy-manual">Copy commands</button></div>` : "");
+    + (bannerManual ? `<pre style="margin:0 12px 8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px;text-align:left">${esc(bannerManual)}</pre><div style="padding:0 12px 8px"><button class="btn icon-only" data-ab-act="copy-manual" title="Copy commands" aria-label="Copy commands">${icon("copy")}</button></div>` : "");
 }
 
 async function refreshActivationBanner(): Promise<void> {

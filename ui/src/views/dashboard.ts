@@ -129,7 +129,7 @@ function serviceCard(b: BackendInfo, isGateway: boolean): string {
     ? `<div class="card-actions"><a class="btn" href="#/gateway">${icon("gateway")} Open Gateway view</a></div>`
     : `<div class="card-actions">
       <button class="btn" data-act="restart" data-id="${esc(b.id)}">${icon("restart")} Restart</button>
-      <button class="btn" data-act="logs" data-id="${esc(b.id)}">${icon("logs")} Logs</button>
+      <button class="btn icon-only" data-act="logs" data-id="${esc(b.id)}" title="Logs" aria-label="Logs for ${esc(b.id)}">${icon("logs")}</button>
     </div>`;
   return `<div class="card">
     <h3>${statusDot(b.status)} ${esc(b.name)} <span class="port">:${b.port}</span></h3>
@@ -205,7 +205,7 @@ function gpuStripCard(g: GpuInfo): string {
   if (g.power_w != null && g.power_spark && g.power_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Power</span>${sparkline(g.power_spark, 220, 26, C.green)}</div>`);
   const trendsOpen = openTrends.has(g.id);
   const trends = trendRows.length
-    ? `<div style="margin-top:8px"><button class="btn" data-trends="${esc(g.id)}" aria-expanded="${trendsOpen}" style="padding:2px 8px;font-size:11px">${trendsOpen ? "▾" : "▸"} Trends</button>
+    ? `<div style="margin-top:8px"><button class="btn" data-trends="${esc(g.id)}" aria-expanded="${trendsOpen}" title="Trends" aria-label="Trends" style="padding:2px 8px;font-size:11px">${icon(trendsOpen ? "chevD" : "chevR")}</button>
       ${trendsOpen ? `<div class="gpu-metrics" style="margin-top:6px">${trendRows.join("")}</div>` : ""}</div>`
     : "";
   return `<div class="card">
@@ -461,7 +461,7 @@ function headerHtml(live: boolean, stale: boolean, updatedAgo: string, verdict: 
     <span class="spacer"></span>
     ${stale ? `<span class="stale-tag">STALE</span>` : ""}
     <span class="updated" id="updatedAgo">Last updated ${esc(updatedAgo)}</span>
-    <button class="btn" id="pauseBtn">${icon(paused ? "play" : "pause")} ${paused ? "Resume live" : "Pause live"}</button>
+    <button class="btn icon-only" id="pauseBtn" title="${paused ? "Resume live" : "Pause live"}" aria-label="${paused ? "Resume live" : "Pause live"}">${icon(paused ? "play" : "pause")}</button>
     <a class="btn" href="#/wizard">Setup wizard</a>
   </div>
   ${lastError ? `<div style="padding:12px 20px 0"><div class="banner">${icon("warn")} backend error — showing last known data: ${esc(lastError)}</div></div>` : ""}

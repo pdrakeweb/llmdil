@@ -281,9 +281,9 @@ export function renderGpus(): string {
         <option value="1000">1s</option>
         <option value="5000">5s</option>
       </select></label>
-    <button class="btn" id="gpuRefresh">${icon("restart")} Refresh</button>
-    <button class="btn" id="gpuResetPeaks">Reset peaks</button>
-    <button class="btn" id="gpuSnapshot">${icon("download")} Snapshot</button>`)}
+    <button class="btn icon-only" id="gpuRefresh" title="Refresh" aria-label="Refresh">${icon("restart")}</button>
+    <button class="btn icon-only" id="gpuResetPeaks" title="Reset peaks" aria-label="Reset peaks">${icon("peak")}</button>
+    <button class="btn icon-only" id="gpuSnapshot" title="Snapshot" aria-label="Save telemetry snapshot">${icon("download")}</button>`)}
   <div class="view"><div id="gpuBanner"></div>
   <div id="gpuMeta" style="font-size:12px;color:var(--text3);margin-bottom:8px"></div>
   <div style="font-size:11px;color:var(--text3);margin-bottom:8px">This view refreshes every 2 s. The Telemetry poll control sets the sampler cadence and applies on restart.</div>
@@ -620,7 +620,7 @@ function newPlanUi(): PlanUiState {
  * plan surfaces' shared click handling (data-plan-act). */
 function manualCommandHtml(cmd: string): string {
   return `<pre style="margin:6px 0;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px;text-align:left">${esc(cmd)}</pre>
-  <div><button class="btn" data-plan-act="copy-manual">Copy commands</button></div>`;
+  <div><button class="btn icon-only" data-plan-act="copy-manual" title="Copy commands" aria-label="Copy commands">${icon("copy")}</button></div>`;
 }
 
 /** Scope + activation label for one plan change, e.g.
@@ -760,7 +760,7 @@ function activationPlanHtml(plan: ActivationPlanData | null, ui: PlanUiState, va
       ${planScopeBarHtml(plan)}
       <span class="spacer" style="flex:1"></span>
       ${ui.dismissed
-        ? `<button class="btn" data-plan-act="review"${dis}>Review</button>`
+        ? `<button class="btn" data-plan-act="review" title="Review activation plan"${dis}>${icon("eye")} Review</button>`
         : `<a class="btn" href="#/activation-plan">Review</a>`}
       ${planApplyButtons(plan, ui)}
     </div>
@@ -775,20 +775,19 @@ function activationPlanHtml(plan: ActivationPlanData | null, ui: PlanUiState, va
   ];
   const cancelBtn = plan.snapshot_available
     ? (ui.confirmCancel
-      ? `<button class="btn" data-plan-act="cancel-confirm" title="Cancelling restores the configuration from before these changes and clears the plan."${dis}>Confirm cancel changes</button>`
-      : `<button class="btn" data-plan-act="cancel"${dis}>Cancel changes</button>`)
+      ? `<button class="btn" data-plan-act="cancel-confirm" title="Cancelling restores the configuration from before these changes and clears the plan."${dis}>${icon("ban")} Confirm cancel changes</button>`
+      : `<button class="btn" data-plan-act="cancel"${dis}>${icon("ban")} Cancel changes</button>`)
     : "";
   return `<div class="card" style="margin-bottom:12px;border-color:var(--amber)">
-    <h3>${icon("warn")} Activation plan</h3>
+    <h3>${icon("warn")} Activation plan <span class="spacer" style="flex:1"></span><button class="btn icon-only" data-plan-act="later" title="Dismiss" aria-label="Dismiss"${dis}>${icon("x")}</button></h3>
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:10px">
       ${tiles.map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
     </div>
     <div style="margin-top:10px">${planScopeBarHtml(plan)}</div>
     ${plan.drift ? `<div style="font-size:12px;color:var(--text2);margin-top:8px">Gateway config: <b style="color:var(--text)">drifted</b><span class="info-tip" title="The running gateway's configuration differs from the saved configuration.">${icon("info")}</span></div>` : ""}
     <div class="card-actions">${planApplyButtons(plan, ui)}
-      <button class="btn" data-plan-act="later"${dis}>Decide later</button>
       ${cancelBtn}
-      <button class="btn" data-plan-refresh>Refresh</button></div>
+      <button class="btn icon-only" data-plan-refresh title="Refresh" aria-label="Refresh">${icon("restart")}</button></div>
     ${planStatusHtml(ui)}
   </div>`;
 }
@@ -937,7 +936,7 @@ async function handlePlanAction(
 
 /** The dedicated Activation Plan view: one section — the shared
  * plan card in its full variant (count tiles, scope bar, Apply /
- * Decide later / Cancel actions) over the Pending changes detail
+ * Cancel actions, dismiss X) over the Pending changes detail
  * (gateway/drift chips, activation-class bar, and the changes
  * table). The global banner's Review button navigates here. */
 export function renderActivationPlan(): string {
@@ -1010,14 +1009,14 @@ export async function wireActivationPlan(root: HTMLElement): Promise<() => void>
       b.innerHTML = `<div class="card"><h3>${icon("warn")} Activation plan: unavailable</h3>
         <div style="font-size:12px;color:var(--err);margin-top:6px">${esc(lastError)}</div>
         ${planStatusHtml(planUi)}
-        <div class="card-actions"><button class="btn" data-plan-refresh>Refresh</button></div></div>`;
+        <div class="card-actions"><button class="btn icon-only" data-plan-refresh title="Refresh" aria-label="Refresh">${icon("restart")}</button></div></div>`;
       return;
     }
     if (!lastPlan || !lastPlan.pending) {
       b.innerHTML = `<div class="card"><h3>${icon("check")} No activation plan pending<span class="info-tip" title="Every saved configuration change is live. A change that needs a restart to take effect — gateway routes, a backend's flags, tensor split, or model assignment — appears here, and in the banner at the top of the window, until it is applied.">${icon("info")}</span></h3>
         <div style="font-size:12px;color:var(--text2);margin-top:6px">Pending changes: <b style="color:var(--text)">0</b></div>
         ${planStatusHtml(planUi)}
-        <div class="card-actions"><button class="btn" data-plan-refresh>Refresh</button></div></div>`;
+        <div class="card-actions"><button class="btn icon-only" data-plan-refresh title="Refresh" aria-label="Refresh">${icon("restart")}</button></div></div>`;
       return;
     }
     const p = lastPlan;
@@ -1179,8 +1178,8 @@ function backendCard(
   const stopBtn = `<button class="btn" data-back-act="stop" data-back-id="${esc(b.id)}"${dis}>${icon("pause")} Stop</button>`;
   const restartBtn = `<button class="btn" data-back-act="restart" data-back-id="${esc(b.id)}"${dis}>${icon("restart")} Restart</button>`;
   const startBtn = `<button class="btn" data-back-act="start" data-back-id="${esc(b.id)}"${dis}>${icon("play")} Start</button>`;
-  const testBtn = `<button class="btn" data-back-act="test" data-back-id="${esc(b.id)}"${dis}>${icon("bolt")} Test</button>`;
-  const enableBtn = `<button class="btn" data-back-act="enable" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Enable</button>`;
+  const testBtn = `<button class="btn icon-only" data-back-act="test" data-back-id="${esc(b.id)}" title="Test backend" aria-label="Test ${esc(b.id)}"${dis}>${icon("bolt")}</button>`;
+  const enableBtn = `<button class="btn" data-back-act="enable" data-back-id="${esc(b.id)}" title="Enable backend"${dis}>${icon("check")} Enable</button>`;
   const disableBtn = `<button class="btn icon-only" data-back-act="disable" data-back-id="${esc(b.id)}" title="Disable backend" aria-label="Disable ${esc(b.id)}"${dis}>${icon("ban")}</button>`;
   const removeBtn = `<button class="btn icon-only danger${confirmRemove.has(b.id) ? " armed" : ""}" data-back-act="remove" data-back-id="${esc(b.id)}" title="${confirmRemove.has(b.id) ? "Confirm remove" : "Remove backend"}" aria-label="${confirmRemove.has(b.id) ? "Confirm remove" : "Remove"} ${esc(b.id)}"${dis}>${icon("trash")}</button>`;
   // Offer only what the command layer will accept:
@@ -1378,8 +1377,8 @@ function backendCard(
       <div style="font-size:12px;color:var(--text2);margin-top:6px">${flags.modelId && flags.ctxMax
         ? `Rated context: ${flags.ctxMax.toLocaleString()}<span class="info-tip" title="${esc(`Model ${flags.modelId} is rated to ${ctxShort(flags.ctxMax)} context (${flags.ctxMax.toLocaleString()} tokens); larger values are accepted but exceed the rating. Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Placement form on this card.`)}">${icon("info")}</span>`
         : `Context range: 1,024–1,048,576<span class="info-tip" title="Accepted context range: 1,024 to 1,048,576. Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Placement form on this card.">${icon("info")}</span>`}</div>
-      <div class="card-actions"><button class="btn" data-back-act="flags-save" data-back-id="${esc(b.id)}"${dis}>Save flags</button>
-        <button class="btn" data-back-act="flags-cancel" data-back-id="${esc(b.id)}">Cancel</button></div>
+      <div class="card-actions"><button class="btn" data-back-act="flags-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save flags</button>
+        <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
     </div>` : "";
   // The Placement form renders inside this card (moved from the
   // GPUs page, Pete's direction, 2026-10-16): the tensor split is a
@@ -1427,9 +1426,9 @@ function backendCard(
       </div>`
       : `<div style="font-size:12px;color:var(--text2);margin-top:6px">GPUs: none reported<span class="info-tip" title="No GPU telemetry yet \u2014 a split cannot be proposed until telemetry reports the GPUs.">${icon("info")}</span></div>`}
       ${projHtml}
-      <div class="card-actions"><button class="btn" data-back-act="place-propose" data-back-id="${esc(b.id)}"${placeDis || !place.modelId || !place.gpus.length ? " disabled" : ""}>Propose split</button>
-        <button class="btn" data-back-act="place-apply" data-back-id="${esc(b.id)}"${place.projection && !place.busy && !dis ? "" : " disabled"}>Apply split</button>
-        <button class="btn" data-back-act="place-cancel" data-back-id="${esc(b.id)}">Close</button></div>
+      <div class="card-actions"><button class="btn" data-back-act="place-propose" data-back-id="${esc(b.id)}" title="Propose split"${placeDis || !place.modelId || !place.gpus.length ? " disabled" : ""}>${icon("search")} Propose split</button>
+        <button class="btn" data-back-act="place-apply" data-back-id="${esc(b.id)}"${place.projection && !place.busy && !dis ? "" : " disabled"}>${icon("check")} Apply split</button>
+        <button class="btn icon-only" data-back-act="place-cancel" data-back-id="${esc(b.id)}" title="Close" aria-label="Close">${icon("x")}</button></div>
     </div>` : "";
   // Basis of the memory figures (exact | catalog | estimate): the
   // explanation lives in a tooltip on the RAM line; the word itself
@@ -1478,7 +1477,7 @@ function backendCard(
       ${splitEntries.length ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Configured split: ${splitSummary}</div>` : ""}
       ${basisTip ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Basis: ${esc(b.memory_basis ?? "")}<span class="info-tip" title="${esc(basisTip)}">${icon("info")}</span></div>` : ""}
     </div>` : "";
-  const detailsBtn = `<button class="btn" data-back-act="details" data-back-id="${esc(b.id)}" aria-expanded="${detailsOpen}">${detailsOpen ? "▾" : "▸"} Details</button>`;
+  const detailsBtn = `<button class="btn icon-only" data-back-act="details" data-back-id="${esc(b.id)}" aria-expanded="${detailsOpen}" title="Details" aria-label="Details">${icon(detailsOpen ? "chevD" : "chevR")}</button>`;
   return `<div class="card backend-card" id="card-backend-${esc(b.id)}">
       <h3 class="backend-card-head">${stateDot(b.state)} ${esc(b.id)} <span class="port">:${b.port}</span>
         <span class="spacer" style="flex:1"></span>
@@ -1502,7 +1501,7 @@ function backendCard(
 }
 
 export function renderBackends(): string {
-  return `${topbar("Backends", `<button class="btn" id="backAdd">${icon("server")} Add backend</button> <button class="btn" id="backRefresh">${icon("restart")} Refresh</button>`)}
+  return `${topbar("Backends", `<button class="btn" id="backAdd" title="Add backend">${icon("plus")} Add backend</button> <button class="btn icon-only" id="backRefresh" title="Refresh" aria-label="Refresh">${icon("restart")}</button>`)}
   <div class="view"><div id="backBanner"></div>
   <div id="backOverview"></div>
   <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
@@ -1952,7 +1951,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       addHost.innerHTML = `<div class="card"><h3>${icon("server")} Add a backend</h3>
         <div class="kv" style="margin-top:10px"><span class="k">Models</span><span class="v" style="font-size:12px">none registered</span></div>
         <div class="card-actions"><a class="btn" href="#/models">Add a model</a>
-          <button class="btn" id="addBackCancel">Cancel</button></div></div>`;
+          <button class="btn icon-only" id="addBackCancel" title="Cancel" aria-label="Cancel">${icon("x")}</button></div></div>`;
       addHost.querySelector("#addBackCancel")?.addEventListener("click", closeAddForm);
       return;
     }
@@ -1975,8 +1974,8 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     <label style="font-size:12px;color:var(--text2);display:block;margin-top:10px" title="The gateway routes enabled backends; it can be started right away.">
       <input id="addBackEnabled" type="checkbox" checked> Enabled</label>
     <div id="addBackStrip"></div>
-    <div class="card-actions"><button class="btn" id="addBackSubmit">Add backend</button>
-      <button class="btn" id="addBackCancel">Cancel</button></div>
+    <div class="card-actions"><button class="btn" id="addBackSubmit">${icon("plus")} Add backend</button>
+      <button class="btn icon-only" id="addBackCancel" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
     <div id="addBackMsg" style="font-size:12px;margin-top:6px"></div>
   </div>`;
     // Model summary strip: the creation consequences the payload
@@ -2039,7 +2038,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
           <div><span style="color:var(--text2)">Enabled:</span> ${enabled ? "yes" : "no"}</div>
           <div><span style="color:var(--text2)">Activation plan:</span> recorded<span class="info-tip" title="The change is recorded in the activation plan at the top of this page — the gateway routes the new backend after the plan is executed.">${icon("info")}</span></div>
         </div>
-        <div class="card-actions"><button class="btn" id="addBackDone">Done</button></div></div>`;
+        <div class="card-actions"><button class="btn icon-only" id="addBackDone" title="Done" aria-label="Done">${icon("check")}</button></div></div>`;
       addHost.querySelector("#addBackDone")?.addEventListener("click", closeAddForm);
       await load();
     });
@@ -2469,40 +2468,40 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
     : "";
   let actions: string;
   if (inFlight && m.downloading && m.paused) {
-    actions = `<button class="btn" data-model-act="resume" data-model-id="${esc(m.id)}">${icon("play")} Resume</button>
-      <button class="btn" data-model-act="cancel" data-model-id="${esc(m.id)}">Cancel</button>`;
+    actions = `<button class="btn icon-only" data-model-act="resume" data-model-id="${esc(m.id)}" title="Resume download" aria-label="Resume download of ${esc(m.id)}">${icon("play")}</button>
+      <button class="btn" data-model-act="cancel" data-model-id="${esc(m.id)}">${icon("x")} Cancel</button>`;
   } else if (inFlight) {
-    actions = `<button class="btn" data-model-act="pause" data-model-id="${esc(m.id)}"${spawnDis}>${icon("pause")} Pause</button>
-      <button class="btn" data-model-act="cancel" data-model-id="${esc(m.id)}"${spawnDis}>Cancel</button>`;
+    actions = `<button class="btn icon-only" data-model-act="pause" data-model-id="${esc(m.id)}" title="Pause download" aria-label="Pause download of ${esc(m.id)}"${spawnDis}>${icon("pause")}</button>
+      <button class="btn" data-model-act="cancel" data-model-id="${esc(m.id)}"${spawnDis}>${icon("x")} Cancel</button>`;
   } else if (m.verifying) {
     // The transfer finished; the backend watcher is hashing the file
     // against the pinned SHA-256. Not a plain complete state yet —
     // the state chip above carries it; no actions apply.
     actions = "";
   } else if (partial > 0) {
-    actions = `<button class="btn" data-model-act="download" data-model-id="${esc(m.id)}">${icon("play")} Resume</button>
+    actions = `<button class="btn icon-only" data-model-act="download" data-model-id="${esc(m.id)}" title="Resume download" aria-label="Resume download of ${esc(m.id)}">${icon("play")}</button>
       <button class="btn" data-model-act="delete" data-model-id="${esc(m.id)}">${icon("err")} Delete</button>`;
   } else if (!m.on_disk) {
     actions = `<button class="btn" data-model-act="download" data-model-id="${esc(m.id)}">${icon("download")} Download</button>`;
   } else {
     // Verify is only offered with a pinned hash — against an unpinned
     // placeholder it could never succeed (the badge explains the state).
-    actions = `${hashPinned(m) ? `<button class="btn" data-model-act="verify" data-model-id="${esc(m.id)}">${icon("shield")} Verify checksum</button>` : ""}
+    actions = `${hashPinned(m) ? `<button class="btn icon-only" data-model-act="verify" data-model-id="${esc(m.id)}" title="Verify checksum" aria-label="Verify checksum of ${esc(m.id)}">${icon("shield")}</button>` : ""}
       <button class="btn" data-model-act="delete" data-model-id="${esc(m.id)}">${icon("err")} Delete</button>`;
   }
   // Enable/disable is always offered: it controls whether the setup
   // wizard's download step includes this model.
-  actions += ` <button class="btn" data-model-act="toggle-enabled" data-model-id="${esc(m.id)}">${m.enabled ? "Disable" : "Enable"}</button>`;
+  actions += ` <button class="btn icon-only" data-model-act="toggle-enabled" data-model-id="${esc(m.id)}" title="${m.enabled ? "Disable model" : "Enable model"}" aria-label="${m.enabled ? "Disable" : "Enable"} ${esc(m.id)}">${icon(m.enabled ? "ban" : "check")}</button>`;
   // Rename is always offered: the short name is the operator's own
   // label for the model, independent of its download state.
-  actions += ` <button class="btn" data-model-act="rename" data-model-id="${esc(m.id)}">${icon("wrench")} Rename</button>`;
+  actions += ` <button class="btn icon-only" data-model-act="rename" data-model-id="${esc(m.id)}" title="Rename short name" aria-label="Rename short name of ${esc(m.id)}">${icon("pencil")}</button>`;
   const renameHtml = rename ? `<div class="backend-form-panel flags-panel">
       <div style="font-size:12px;font-weight:600">Rename short name</div>
       <div style="display:flex;gap:6px;margin-top:6px;min-width:0">
         <input data-model-rename-input="${esc(m.id)}" type="text" value="${esc(rename.draft)}" maxlength="64" style="${SELECT_STYLE};flex:1;min-width:0">
       </div>
-      <div class="card-actions"><button class="btn" data-model-act="rename-save" data-model-id="${esc(m.id)}">Save name</button>
-        <button class="btn" data-model-act="rename-cancel" data-model-id="${esc(m.id)}">Cancel</button></div>
+      <div class="card-actions"><button class="btn" data-model-act="rename-save" data-model-id="${esc(m.id)}">${icon("check")} Save name</button>
+        <button class="btn icon-only" data-model-act="rename-cancel" data-model-id="${esc(m.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
     </div>` : "";
   // Size carries the final size only when the file is on disk; in
   // download states the progress value carries the partial figure,
@@ -2531,9 +2530,9 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
    * the hash is printed once, here, in full. No hash: no SHA-256
    * row. */
   const detailsHtml = `<div style="margin-top:8px">
-      <button class="btn" data-model-act="details" data-model-id="${esc(m.id)}" aria-expanded="${detailsOpen}" style="padding:2px 8px;font-size:11px">${detailsOpen ? "▾" : "▸"} Details</button>
+      <button class="btn" data-model-act="details" data-model-id="${esc(m.id)}" aria-expanded="${detailsOpen}" title="Details" aria-label="Details" style="padding:2px 8px;font-size:11px">${icon(detailsOpen ? "chevD" : "chevR")}</button>
       ${detailsOpen ? `<div style="display:grid;gap:4px;margin-top:8px;font-size:12px">
-        ${m.sha256 ? `<div style="display:flex;gap:8px;align-items:center;min-width:0"><span style="color:var(--text2)">SHA-256:</span><span style="font-family:var(--mono);font-size:11px;word-break:break-all">${esc(m.sha256)}</span><button class="btn" data-model-act="copy-hash" data-model-id="${esc(m.id)}" style="padding:1px 7px;font-size:11px">Copy</button></div>` : ""}
+        ${m.sha256 ? `<div style="display:flex;gap:8px;align-items:center;min-width:0"><span style="color:var(--text2)">SHA-256:</span><span style="font-family:var(--mono);font-size:11px;word-break:break-all">${esc(m.sha256)}</span><button class="btn" data-model-act="copy-hash" data-model-id="${esc(m.id)}" title="Copy SHA-256" aria-label="Copy SHA-256" style="padding:1px 7px;font-size:11px">${icon("copy")}</button></div>` : ""}
         ${m.verified_at ? `<div><span style="color:var(--text2)">Verified:</span> ${esc(fmtDate(m.verified_at))}</div>` : ""}
         <div style="min-width:0"><span style="color:var(--text2)">File:</span> <span style="font-family:var(--mono);font-size:11px;word-break:break-all">${esc(m.gguf_path)}</span></div>
         <div><span style="color:var(--text2)">Model ID:</span> <span style="font-family:var(--mono)">${esc(m.id)}</span></div>
@@ -2542,11 +2541,11 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
   return `<div class="card" id="card-model-${esc(m.id)}">
     <h3>${icon("box")} ${esc(modelShortName(m))} <span class="chip">${esc(m.quant)}</span>${m.enabled ? "" : ` <span class="chip">disabled</span>`}
       <span class="spacer" style="flex:1"></span>
-      ${modelShaBadge(m)}${hashPinned(m) ? ` <button class="btn" data-model-act="copy-hash" data-model-id="${esc(m.id)}" title="Copy the full SHA-256" style="padding:2px 8px;font-size:11px">Copy hash</button>` : ""}</h3>
+      ${modelShaBadge(m)}${hashPinned(m) ? ` <button class="btn" data-model-act="copy-hash" data-model-id="${esc(m.id)}" title="Copy the full SHA-256" aria-label="Copy SHA-256" style="padding:2px 8px;font-size:11px">${icon("copy")}</button>` : ""}</h3>
     ${modelShortName(m) !== m.id ? `<div style="font-size:11px;color:var(--text3);font-family:var(--mono);margin-top:2px">${esc(m.id)}</div>` : ""}
     ${stateChip || progressHtml ? `<div style="margin-top:8px">${stateChip}${progressHtml}</div>` : ""}
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin:12px 0;align-items:center">
-      <div class="kv"><span class="k">File</span><span class="v" style="font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(m.gguf_path)}">${esc(m.gguf_path)}</span> <button class="btn" data-model-act="copy-path" data-model-id="${esc(m.id)}" style="padding:1px 7px;font-size:11px">Copy</button></div>
+      <div class="kv"><span class="k">File</span><span class="v" style="font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(m.gguf_path)}">${esc(m.gguf_path)}</span> <button class="btn" data-model-act="copy-path" data-model-id="${esc(m.id)}" title="Copy file path" aria-label="Copy file path" style="padding:1px 7px;font-size:11px">${icon("copy")}</button></div>
       <div class="kv"><span class="k">Size</span><span class="v" style="font-size:12px">${sizeText}</span></div>
       ${m.params_b > 0 ? `<div class="kv"><span class="k">Parameters</span><span class="v" style="font-size:12px">${trim1(m.params_b)}B</span></div>` : ""}
       ${m.ctx_max != null ? `<div class="kv"><span class="k">Context</span><span class="v" style="font-size:12px">${m.ctx_max.toLocaleString()}</span></div>` : ""}
@@ -2572,7 +2571,7 @@ export function renderModels(): string {
       <label style="font-size:12px;color:var(--text2)">Source URL<br>
         <input id="addModelUrl" type="text" placeholder="Model download URL (.gguf)" style="${SELECT_STYLE};width:100%"></label>
     </div>
-    <div style="margin-top:10px"><button class="btn" id="addModelOptToggle" aria-expanded="false" style="padding:2px 8px;font-size:11px">▸ Optional fields</button></div>
+    <div style="margin-top:10px"><button class="btn" id="addModelOptToggle" aria-expanded="false" title="Optional fields" aria-label="Optional fields" style="padding:2px 8px;font-size:11px">${icon("chevR")}</button></div>
     <div id="addModelOptional" style="display:none">
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
         <label style="font-size:12px;color:var(--text2)">Quant<br>
@@ -2581,7 +2580,7 @@ export function renderModels(): string {
           <input id="addModelFile" type="text" placeholder="model.gguf" style="${SELECT_STYLE};width:100%"></label>
       </div>
     </div>
-    <div class="card-actions"><button class="btn" id="addModelBtn">Add model</button></div>
+    <div class="card-actions"><button class="btn" id="addModelBtn">${icon("plus")} Add model</button></div>
     <div id="addModelMsg" style="font-size:12px;margin-top:6px;display:none"></div>
   </div></div>`;
 }
@@ -2842,7 +2841,7 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     const open = box.style.display === "none";
     box.style.display = open ? "" : "none";
     optToggle.setAttribute("aria-expanded", String(open));
-    optToggle.textContent = `${open ? "▾" : "▸"} Optional fields`;
+    optToggle.innerHTML = icon(open ? "chevD" : "chevR");
   });
 
   const addBtn = root.querySelector("#addModelBtn") as HTMLButtonElement | null;
@@ -2914,10 +2913,10 @@ export function renderLogs(): string {
       <input id="logSearch" type="text" placeholder="substring\u2026" style="${SELECT_STYLE};min-width:160px"/></label>
     <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px">From
       <input id="logFrom" type="datetime-local" style="${SELECT_STYLE}"/></label>
-    <button class="btn" id="logFromCal" type="button" title="Pick a date and time" style="padding:4px 7px">${icon("calendar")}</button>
+    <button class="btn" id="logFromCal" type="button" title="Pick a date and time" aria-label="Pick a date and time" style="padding:4px 7px">${icon("calendar")}</button>
     <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px">To
       <input id="logTo" type="datetime-local" style="${SELECT_STYLE}"/></label>
-    <button class="btn" id="logToCal" type="button" title="Pick a date and time" style="padding:4px 7px">${icon("calendar")}</button>
+    <button class="btn" id="logToCal" type="button" title="Pick a date and time" aria-label="Pick a date and time" style="padding:4px 7px">${icon("calendar")}</button>
     <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px">Sort
       <select id="logSort" style="${SELECT_STYLE}">
         <option value="desc" selected>Newest first</option>
@@ -2928,8 +2927,8 @@ export function renderLogs(): string {
   </div>
   <div id="logMsg" style="font-size:12px;margin-top:6px"></div>
   <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;border-top:1px solid var(--border);margin-top:10px;padding-top:10px">
-    <button class="btn" id="logPrev">Prev</button>
-    <button class="btn" id="logNext">Next</button>
+    <button class="btn icon-only" id="logPrev" title="Previous page" aria-label="Previous page">${icon("chevL")}</button>
+    <button class="btn icon-only" id="logNext" title="Next page" aria-label="Next page">${icon("chevR")}</button>
     <span id="logPageInfo" style="font-size:12px;color:var(--text2)"></span>
     <span id="logPosBar" style="display:inline-block;width:64px"></span>
     <span id="logMatchInfo" style="font-size:12px;color:var(--text2)"></span>
@@ -2940,9 +2939,9 @@ export function renderLogs(): string {
         <option value="200" selected>200</option>
         <option value="500">500</option>
       </select></label>
-    <button class="btn" id="logRefresh">${icon("restart")} Refresh</button>
-    <button class="btn" id="logExport" title="The bundle contains raw, unredacted process logs. Review it before sharing.">${icon("download")} Export diagnostics bundle</button>
-    <button class="btn" id="logOpenFolder" style="display:none">Open folder</button>
+    <button class="btn icon-only" id="logRefresh" title="Refresh" aria-label="Refresh">${icon("restart")}</button>
+    <button class="btn icon-only" id="logExport" title="Export diagnostics bundle — the bundle contains raw, unredacted process logs. Review it before sharing." aria-label="Export diagnostics bundle">${icon("download")}</button>
+    <button class="btn icon-only" id="logOpenFolder" title="Open folder" aria-label="Open folder" style="display:none">${icon("folder")}</button>
   </div></div>
   <div id="logBody">${loadingHtml("Loading logs\u2026")}</div></div>`;
 }
@@ -3073,9 +3072,9 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
     }
     pickerEl.innerHTML = `
       <div class="dt-head">
-        <button type="button" class="btn dt-nav" data-nav="-1" title="Previous month">‹</button>
+        <button type="button" class="btn dt-nav" data-nav="-1" title="Previous month" aria-label="Previous month">${icon("chevL")}</button>
         <span>${esc(monthName)}</span>
-        <button type="button" class="btn dt-nav" data-nav="1" title="Next month">›</button>
+        <button type="button" class="btn dt-nav" data-nav="1" title="Next month" aria-label="Next month">${icon("chevR")}</button>
       </div>
       <div class="dt-grid">${["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"].map((w) => `<span class="dt-wd">${w}</span>`).join("")}${cells}</div>
       <div class="dt-time">Time
@@ -3083,8 +3082,8 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
         <input id="dtMinute" type="number" min="0" max="59" value="${pad2(pickerTimeState.mm)}" style="${SELECT_STYLE};width:58px"/>
       </div>
       <div class="dt-actions">
-        <button type="button" class="btn" data-act="clear">Clear</button>
-        <button type="button" class="btn" data-act="apply">Apply</button>
+        <button type="button" class="btn icon-only" data-act="clear" title="Clear" aria-label="Clear">${icon("x")}</button>
+        <button type="button" class="btn" data-act="apply">${icon("check")} Apply</button>
       </div>`;
   };
 
@@ -3444,23 +3443,23 @@ function gatewayPaint(
       <button class="btn" id="gwStartBtn"${starting || stopping ? " disabled" : ""}>${icon("restart")} ${status.up ? "Restart gateway" : "Start gateway"}</button><span class="info-tip" title="Runs the Setup Wizard's start-gateway step: LiteLLM binds the configured address, and the step reconciles the Windows firewall rule with it (one elevation prompt when the rule state changes). When the OpenRouter tier is enabled, the fallback is armed from Windows Credential Manager.">${icon("info")}</span>
       <button class="btn" id="gwStopBtn"${status.up && !starting && !stopping ? "" : " disabled"}>${icon("pause")} Stop gateway</button>
       <a class="btn" href="#/wizard">${icon("wrench")} Setup Wizard</a>
-      <button class="btn" id="gwAdminUiBtn">${icon("gateway")} LiteLLM admin UI</button><span class="info-tip" title="Sign in as admin with the master key as the password. The admin UI requires a database — run the setup wizard's Install PostgreSQL step if sign-in reports &quot;Not connected to DB&quot;.">${icon("info")}</span>
+      <button class="btn icon-only" id="gwAdminUiBtn" title="LiteLLM admin UI" aria-label="LiteLLM admin UI">${icon("gateway")}</button><span class="info-tip" title="Sign in as admin with the master key as the password. The admin UI requires a database — run the setup wizard's Install PostgreSQL step if sign-in reports &quot;Not connected to DB&quot;.">${icon("info")}</span>
     </div>`;
   const endpoint = `<div class="card" style="margin-bottom:12px"><div class="sec-title">${icon("gateway")} Client endpoint</div>
     <div style="font-size:12px;color:var(--text2);display:grid;gap:4px">
       <div>Base URL: <span style="font-family:var(--mono);color:var(--text)">http://127.0.0.1:${port}/v1</span>
-        <button class="btn" id="gwBaseUrlCopyBtn">Copy</button></div>
+        <button class="btn icon-only" id="gwBaseUrlCopyBtn" title="Copy base URL" aria-label="Copy base URL">${icon("copy")}</button></div>
       <div>Network access:${bindTip ? `<span class="info-tip" title="${esc(bindTip)}">${icon("info")}</span>` : ""} <select id="gwBindSelect" class="input" style="width:auto;display:inline-block;padding:2px 6px">
           <option value="0.0.0.0"${status.bind_host !== "127.0.0.1" ? " selected" : ""}>Local network (all interfaces)</option>
           <option value="127.0.0.1"${status.bind_host === "127.0.0.1" ? " selected" : ""}>This computer only (127.0.0.1)</option>
         </select></div>
       ${status.bind_host !== "127.0.0.1" && status.lan_ip
         ? `<div>LAN base URL: <span style="font-family:var(--mono);color:var(--text)">http://${esc(status.lan_ip)}:${port}/v1</span><span class="info-tip" title="Other machines use this address with the master key. The VS Code LiteLLM extension takes it without /v1.">${icon("info")}</span>
-        <button class="btn" id="gwLanUrlCopyBtn">Copy</button></div>`
+        <button class="btn icon-only" id="gwLanUrlCopyBtn" title="Copy LAN base URL" aria-label="Copy LAN base URL">${icon("copy")}</button></div>`
         : ""}
       <div>Master key:<span class="info-tip" title="${esc(masterKeyTip)}">${icon("info")}</span> <span style="font-family:var(--mono);color:var(--text)">${masterKey === null ? "not loaded" : keyRevealed ? esc(masterKey) : "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"}</span>
-        <button class="btn" id="gwKeyRevealBtn">${keyRevealed ? "Hide" : "Reveal"}</button>
-        <button class="btn" id="gwKeyCopyBtn">Copy</button></div>
+        <button class="btn icon-only" id="gwKeyRevealBtn" title="${keyRevealed ? "Hide master key" : "Reveal master key"}" aria-label="${keyRevealed ? "Hide master key" : "Reveal master key"}">${icon(keyRevealed ? "eyeOff" : "eye")}</button>
+        <button class="btn icon-only" id="gwKeyCopyBtn" title="Copy master key" aria-label="Copy master key">${icon("copy")}</button></div>
     </div></div>`;
 
   const or = cfg.openrouter;
@@ -3485,7 +3484,7 @@ function gatewayPaint(
     const credStatusRow = or.cred_ref || or.enabled
       ? `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">Credential status</span><span>${credChip}</span></div>`
       : "";
-    const allowRow = `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">Model allowlist</span><span class="v" style="font-size:12px;text-align:right">${or.model_allowlist.length ? `${or.model_allowlist.length} model${or.model_allowlist.length === 1 ? "" : "s"}` : "none"}${or.model_allowlist.length ? ` <button class="btn" data-or-models aria-expanded="${orModelsOpen}" style="padding:1px 7px;font-size:11px">${orModelsOpen ? "▾" : "▸"}</button>` : ""}</span></div>
+    const allowRow = `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">Model allowlist</span><span class="v" style="font-size:12px;text-align:right">${or.model_allowlist.length ? `${or.model_allowlist.length} model${or.model_allowlist.length === 1 ? "" : "s"}` : "none"}${or.model_allowlist.length ? ` <button class="btn" data-or-models aria-expanded="${orModelsOpen}" title="Model allowlist" aria-label="Model allowlist" style="padding:1px 7px;font-size:11px">${icon(orModelsOpen ? "chevD" : "chevR")}</button>` : ""}</span></div>
       ${orModelsOpen && or.model_allowlist.length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">${or.model_allowlist.map((m) => `<span class="chip">${esc(m)}</span>`).join("")}</div>` : ""}`;
     return `<div class="card" style="margin-bottom:12px${or.enabled ? "" : ";opacity:.65"}"><div class="sec-title">${icon("gateway")} OpenRouter fallback tier
       <span class="spacer" style="flex:1"></span>
@@ -3494,12 +3493,12 @@ function gatewayPaint(
         : `<span class="chip status-tag status-off" title="The tier is disabled — fallback entries naming openrouter are dropped when the gateway config is generated, and no traffic is sent to OpenRouter.">disabled</span>`}
     </div>
     <div class="kv" style="gap:10px">
-      ${or.cred_ref ? `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">Credential<span class="info-tip" title="When the gateway starts, the key is read from Windows Credential Manager (reference above) and passed to LiteLLM as OPENROUTER_API_KEY. The key itself is never stored in the configuration.">${icon("info")}</span></span><span class="v" style="font-size:12px;text-align:right">${esc(or.cred_ref)} <button class="btn" id="gwOrCredCopyBtn" style="padding:1px 7px;font-size:11px">Copy</button></span></div>` : ""}
+      ${or.cred_ref ? `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">Credential<span class="info-tip" title="When the gateway starts, the key is read from Windows Credential Manager (reference above) and passed to LiteLLM as OPENROUTER_API_KEY. The key itself is never stored in the configuration.">${icon("info")}</span></span><span class="v" style="font-size:12px;text-align:right">${esc(or.cred_ref)} <button class="btn" id="gwOrCredCopyBtn" title="Copy credential reference" aria-label="Copy credential reference" style="padding:1px 7px;font-size:11px">${icon("copy")}</button></span></div>` : ""}
       ${credStatusRow}
       <div style="display:flex;justify-content:space-between;gap:16px"><span class="k">Daily cap<span class="info-tip" title="Spending cap per day.">${icon("info")}</span></span><span class="v" style="font-size:12px;text-align:right">$${trim1(or.daily_cap_usd)}</span></div>
       ${allowRow}
     </div>
-    <div class="card-actions"><button class="btn" id="gwOrToggle">${or.enabled ? "Disable tier" : "Enable tier"}</button></div>
+    <div class="card-actions"><button class="btn icon-only" id="gwOrToggle" title="${or.enabled ? "Disable tier" : "Enable tier"}" aria-label="${or.enabled ? "Disable tier" : "Enable tier"}">${icon(or.enabled ? "ban" : "check")}</button></div>
   </div>`;
   })();
 
@@ -3628,7 +3627,7 @@ function gatewayPaint(
             <span style="font-size:12px">Rule: <span style="font-family:var(--mono)">${esc(r.id)}</span></span>
             <span class="info-tip" title="${esc(r.description)}">${icon("info")}</span>
             <span class="spacer" style="flex:1"></span>
-            ${r.litellm_fragment ? `<button class="btn" data-fragment="${esc(r.id)}" aria-expanded="${open}" style="padding:2px 8px;font-size:11px">${open ? "▾" : "▸"} Fragment</button>` : ""}
+            ${r.litellm_fragment ? `<button class="btn" data-fragment="${esc(r.id)}" aria-expanded="${open}" title="Fragment" aria-label="Fragment" style="padding:2px 8px;font-size:11px">${icon(open ? "chevD" : "chevR")}</button>` : ""}
             <span class="chip">${esc(r.source)}</span></div>
             ${open && r.litellm_fragment ? `<pre style="margin:6px 0;padding:10px 12px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-word">${esc(r.litellm_fragment)}</pre>` : ""}`;
         }).join("");
@@ -3656,9 +3655,9 @@ function gatewayPaint(
       <span class="sec-title" style="margin:0">Generated config (preview)</span>
       ${yamlErr ? `<span style="font-size:12px;color:var(--err)" title="${esc(yamlErr)}">Preview: failed to load</span>` : yamlSummary}
       <span class="spacer" style="flex:1"></span>
-      <button class="btn" id="gwYamlCopyBtn">Copy</button>
-      <button class="btn" id="gwYamlDownloadBtn">Download</button>
-      <button class="btn" id="gwYamlBtn">${yamlOpen ? "Hide YAML" : "Preview LiteLLM YAML"}</button>
+      <button class="btn icon-only" id="gwYamlCopyBtn" title="Copy generated config" aria-label="Copy generated config">${icon("copy")}</button>
+      <button class="btn icon-only" id="gwYamlDownloadBtn" title="Download config.yaml" aria-label="Download config.yaml">${icon("download")}</button>
+      <button class="btn icon-only" id="gwYamlBtn" title="${yamlOpen ? "Hide YAML" : "Preview LiteLLM YAML"}" aria-label="${yamlOpen ? "Hide YAML" : "Preview LiteLLM YAML"}">${icon(yamlOpen ? "eyeOff" : "eye")}</button>
     </div>
     ${yamlOpen && !yamlErr ? (yamlText === null
       ? `<pre style="margin-top:10px;padding:12px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:11px">Loading\u2026</pre>`
@@ -4074,7 +4073,7 @@ type SettingsRow = { key: string; value: string; tip?: string; copy?: string };
  *  (narrative) and a Copy button (addresses: paths). */
 function settingsRows(rows: SettingsRow[]): string {
   if (!rows.length) return "";
-  return `<div class="kv" style="gap:10px">${rows.map((r) => `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">${esc(r.key)}${r.tip ? `<span class="info-tip" title="${esc(r.tip)}">${icon("info")}</span>` : ""}</span><span class="v" style="font-size:12px;text-align:right">${esc(r.value)}${r.copy !== undefined ? ` <button class="btn" data-copy-value="${esc(r.copy)}" style="padding:1px 7px;font-size:11px">Copy</button>` : ""}</span></div>`).join("")}</div>`;
+  return `<div class="kv" style="gap:10px">${rows.map((r) => `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">${esc(r.key)}${r.tip ? `<span class="info-tip" title="${esc(r.tip)}">${icon("info")}</span>` : ""}</span><span class="v" style="font-size:12px;text-align:right">${esc(r.value)}${r.copy !== undefined ? ` <button class="btn" data-copy-value="${esc(r.copy)}" title="Copy" aria-label="Copy value" style="padding:1px 7px;font-size:11px">${icon("copy")}</button>` : ""}</span></div>`).join("")}</div>`;
 }
 
 const MXC_MODES: { mode: string; label: string; def: string }[] = [
@@ -4124,8 +4123,8 @@ function mxcPolicyInner(
   const active = lists.find((l) => l.id === rulesFilter) ?? lists[0];
   const LONG = 12;
   const listHtml = active.rows.length > LONG && !rulesOpen.has(active.id)
-    ? `<button class="btn" data-rules-toggle="${active.id}" style="padding:2px 8px;font-size:11px">▸ Show all ${active.rows.length} rules</button>`
-    : `${active.rows.length > LONG ? `<button class="btn" data-rules-toggle="${active.id}" style="padding:2px 8px;font-size:11px;margin-bottom:6px">▾ Hide rules</button>` : ""}${settingsRows(active.rows)}`;
+    ? `<button class="btn" data-rules-toggle="${active.id}" title="Show all ${active.rows.length} rules" aria-label="Show all ${active.rows.length} rules" style="padding:2px 8px;font-size:11px">${icon("chevR")}</button>`
+    : `${active.rows.length > LONG ? `<button class="btn" data-rules-toggle="${active.id}" title="Hide rules" aria-label="Hide rules" style="padding:2px 8px;font-size:11px;margin-bottom:6px">${icon("chevD")}</button>` : ""}${settingsRows(active.rows)}`;
   return `<div style="font-size:12px;color:var(--text2);margin:14px 0 6px">Active policy<span class="info-tip" title="${esc(srcLine)}">${icon("info")}</span></div>
     ${settingsRows(basics)}
     <div style="font-size:12px;color:var(--text2);margin:12px 0 6px">Policy rules</div>
@@ -4230,7 +4229,7 @@ function settingsPaint(
     extraRows.push({ key: humanLabel(k), value: summarizeValue(v) });
   }
   const generalPanel = `${settingsRows(generalRows)}
-    ${extraRows.length ? `<div style="margin-top:12px"><button class="btn" data-all-toggle aria-expanded="${ui.allOpen}" style="padding:2px 8px;font-size:11px">${ui.allOpen ? "▾" : "▸"} All configuration values</button>
+    ${extraRows.length ? `<div style="margin-top:12px"><button class="btn" data-all-toggle aria-expanded="${ui.allOpen}" title="All configuration values" aria-label="All configuration values" style="padding:2px 8px;font-size:11px">${icon(ui.allOpen ? "chevD" : "chevR")}</button>
       ${ui.allOpen ? `<div style="margin-top:8px">${settingsRows(extraRows)}</div>` : ""}</div>` : ""}`;
 
   // --- Updates & diagnostics ---
@@ -4259,8 +4258,8 @@ function settingsPaint(
     ${policyBlock}
     <div style="font-size:12px;color:var(--text2);margin-top:14px">Diagnostics</div>
     <div class="card-actions"><a class="btn" href="#/wizard">${icon("search")} Open Setup Wizard</a>
-    <button class="btn" id="setExportBtn">${icon("download")} Export diagnostics bundle</button><span class="info-tip" title="The bundle contains raw, unredacted process logs. Review it before sharing.">${icon("info")}</span>
-    <button class="btn" id="setOpenFolder" style="display:none">Open folder</button></div>`;
+    <button class="btn icon-only" id="setExportBtn" title="Export diagnostics bundle" aria-label="Export diagnostics bundle">${icon("download")}</button><span class="info-tip" title="The bundle contains raw, unredacted process logs. Review it before sharing.">${icon("info")}</span>
+    <button class="btn icon-only" id="setOpenFolder" title="Open folder" aria-label="Open folder" style="display:none">${icon("folder")}</button></div>`;
 
   // --- Notifications: master switch + one toggle per category,
   // each persisted through notifications_set_config. A missing key
@@ -4296,7 +4295,7 @@ function settingsPaint(
     <div class="card-actions" style="margin-top:6px">${MXC_MODES.map((m) =>
       `<button class="btn${modeLc === m.mode ? " primary" : ""}" data-mxc-mode="${m.mode}" title="${esc(m.def)}">${m.label}</button>`).join("")}</div>`;
   const selfTest = `<div style="font-size:12px;color:var(--text2);margin-top:14px">Self-test</div>
-    <div class="card-actions"><button class="btn" data-mxc-selftest>Run self-test</button></div>
+    <div class="card-actions"><button class="btn icon-only" data-mxc-selftest title="Run self-test" aria-label="Run self-test">${icon("shield")}</button></div>
     <div id="mxcSelfTest">${selfTestHtml}</div>`;
   const mxcPanel = `${modeBlock}${mxcPolicyInner(policyR, ui.rulesFilter, ui.rulesOpen, policyFile)}${mxcActivityInner(activityR)}${selfTest}`;
 
@@ -4564,9 +4563,9 @@ function wizardStepRow(s: WizardStepState, live: boolean, open: boolean): string
     : s.state === "running" ? esc(s.note ?? "running\u2026")
     : esc(s.state);
   const helpBtn = s.state === "failed" && s.helpUrl
-    ? `<button class="btn" data-help-url="${esc(s.helpUrl)}">Open driver download</button>` : "";
+    ? `<button class="btn icon-only" data-help-url="${esc(s.helpUrl)}" title="Open driver download" aria-label="Open driver download">${icon("external")}</button>` : "";
   const runBtn = live && (s.state === "queued" || s.state === "failed")
-    ? `<button class="btn" data-run-step="${esc(s.id)}">${s.state === "failed" ? "Retry" : "Run"}</button>` : "";
+    ? `<button class="btn" data-run-step="${esc(s.id)}">${s.state === "failed" ? `${icon("restart")} Retry` : `${icon("play")} Run`}</button>` : "";
   const actions = helpBtn || runBtn ? `<div style="margin-top:6px;display:flex;gap:6px">${helpBtn}${runBtn}</div>` : "";
   // The outcome's own manual block wins over the generic planned
   // commands: it is built for this install and this failure (real
@@ -4589,7 +4588,7 @@ function wizardStepRow(s: WizardStepState, live: boolean, open: boolean): string
       ${s.note && s.state !== "running" ? `<div><span class="k">Note:</span> ${esc(s.note)}</div>` : ""}
       ${fixText ? `<div><span class="k">Fix:</span> ${esc(fixText)}</div>` : ""}
       ${s.state === "failed" && s.logTail && s.logTail.length ? `<div><span class="k">Log (last 3 lines):</span> <a href="#/logs" style="font-size:11px">Open in Logs view</a><div style="margin-top:2px;font-family:var(--mono);font-size:11px;color:var(--text3)">${s.logTail.slice(-3).map((l) => esc(l)).join("<br>")}</div></div>` : ""}
-      ${manualText ? `<div><div style="display:flex;gap:8px;align-items:center">${s.manualCommand ? `<span></span>` : `<span class="k">Manual commands (PowerShell):</span>`}<span style="flex:1"></span><button class="btn" data-copy-step="${esc(s.id)}" style="padding:2px 8px;font-size:11px">Copy commands</button></div>
+      ${manualText ? `<div><div style="display:flex;gap:8px;align-items:center">${s.manualCommand ? `<span></span>` : `<span class="k">Manual commands (PowerShell):</span>`}<span style="flex:1"></span><button class="btn" data-copy-step="${esc(s.id)}" title="Copy commands" aria-label="Copy commands" style="padding:2px 8px;font-size:11px">${icon("copy")}</button></div>
         <pre style="margin:4px 0;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px">${esc(manualText)}</pre></div>` : ""}
     </div>`;
   }
@@ -4597,7 +4596,7 @@ function wizardStepRow(s: WizardStepState, live: boolean, open: boolean): string
   // the row — the note text itself lives in the expandable.
   const noteIcon = s.note && s.state === "done" ? `<span class="info-tip" style="color:var(--warn)" title="${esc(s.note)}">${icon("info")}</span> ` : "";
   const chevron = hasDetails
-    ? `<button class="btn" data-wiz-details="${esc(s.id)}" aria-expanded="${open}" title="Details" style="padding:2px 8px;font-size:11px">${open ? "▾" : "▸"}</button>`
+    ? `<button class="btn" data-wiz-details="${esc(s.id)}" aria-expanded="${open}" title="Details" aria-label="Details" style="padding:2px 8px;font-size:11px">${icon(open ? "chevD" : "chevR")}</button>`
     : "<span></span>";
   return `<div class="step ${s.state}">${stIcon}
     <div><div class="sname">${esc(s.name)}</div>${actions}</div>
@@ -4684,8 +4683,8 @@ export function renderWizard(): string {
   <div class="view"><div class="banner" id="wizBanner">${icon("clock")} Loading setup state\u2026</div>
   <div class="wiz">
     <div class="wiz-head">${icon("wrench")}<h2>Set up Local LLM Service</h2><span class="spacer" style="flex:1"></span>
-      <button class="btn" id="auditBtn">${icon("search")} Re-run audit</button>
-      <button class="btn primary" id="runBtn">Run setup</button></div>
+      <button class="btn icon-only" id="auditBtn" title="Re-run audit" aria-label="Re-run audit">${icon("search")}</button>
+      <button class="btn primary" id="runBtn">${icon("play")} Run setup</button></div>
     <div class="wiz-progress" id="wizProgress"></div>
     <div class="wiz-body">
       <div class="wiz-side"><p>Steps run in order. A failed step pauses the run \u2014 retry it to continue.</p>
@@ -4694,8 +4693,8 @@ export function renderWizard(): string {
           <div>${icon("server")} the gateway starts at its step; backends start before the smoke test</div></div></div>
       <div class="wiz-steps" id="wizSteps"></div>
     </div>
-    <div class="wiz-foot"><button class="btn" disabled>Back</button><span class="spacer"></span>
-      <button class="btn primary" id="finishBtn">Finish</button></div>
+    <div class="wiz-foot"><button class="btn icon-only" title="Back" aria-label="Back" disabled>${icon("chevL")}</button><span class="spacer"></span>
+      <button class="btn primary" id="finishBtn">${icon("check")} Finish</button></div>
     <div class="logstream" id="wizLog" style="border:0;border-top:1px solid var(--border);border-radius:0"></div>
   </div></div>`;
 }

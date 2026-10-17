@@ -27,6 +27,10 @@ The durable reference for this app's UI. Every card and view is designed against
 13. **Empty states render nothing.** When a data block has no data, the block is omitted rather than showing placeholder prose.
 14. **Number formatting.** At most one decimal place; a trailing `.0` is dropped; whole numbers at magnitude ≥100, with thousands separators where the value is a count.
 
+### Controls
+
+15. **Icons over words for safe actions.** For non-destructive actions that are not critical to operations, buttons with icons are preferred over buttons with words — the button is icon-only (copy, reveal). One carve-out: the standard workflow action of a surface — the action the user most likely wants to take next on it — keeps its words AND carries an icon even when it is non-destructive (the activation banner's Review); icon-only is for secondary safe actions. Destructive and operation-critical actions keep their words AND carry an icon (Restart Service, Apply Changes). An icon-only button always retains an accessible name (aria-label) and a tooltip carrying the action's name, per rule 5.
+
 ## Part 2 — Card inventory
 
 Every distinct card type in the UI, where it renders, and its source.
@@ -76,3 +80,4 @@ Apply to one card type. Every answer must be "no" unless noted.
 12. **Unknown is not zero** — Does any unmeasured value render as 0, or with a qualifier that implies it was measured?
 13. **Empty states** — Does any block render placeholder prose when it has no data, instead of being omitted?
 14. **Number formatting** — Does any number exceed one decimal, keep a trailing `.0`, or show decimals at magnitude ≥100?
+15. **Button form** — Does any non-destructive, non-critical action other than the surface's standard workflow action (its most likely next action) carry a word label instead of an icon only, or any destructive, operation-critical, or standard-workflow action lack its words or its icon? Does any icon-only button lack an aria-label or a tooltip naming the action? (Must be no.)
