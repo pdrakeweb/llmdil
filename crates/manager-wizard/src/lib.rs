@@ -1168,6 +1168,18 @@ pub fn gateway_spawn_state_json(
     serde_json::to_string_pretty(&state).unwrap()
 }
 
+/// The LiteLLM version recorded in the gateway spawn-state record
+/// at `<data_dir>/gateway/spawn-state.json` (MCP design §4.3), or
+/// `None` when the record is absent, unparseable, or carries no
+/// version (a spawn recorded before the field existed, or whose
+/// probe could not determine one). Callers render `None` as
+/// "not measured" — never as a guess (design principle 12).
+pub fn recorded_litellm_version(data_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(gateway_spawn_state_path(data_dir)).ok()?;
+    let state: GatewaySpawnState = serde_json::from_str(&text).ok()?;
+    state.litellm_version.filter(|v| !v.trim().is_empty())
+}
+
 /// Whether the running gateway's recorded spawn state still matches
 /// the current configuration — the full drift check. The
 /// start-gateway step rewrites `<data_dir>/gateway/config.yaml`
@@ -2137,6 +2149,39 @@ mod tests {
         let state: GatewaySpawnState = serde_json::from_str(&legacy).unwrap();
         assert_eq!(state.litellm_version, None);
         assert_eq!(state.yaml_sha256, "abc");
+    }
+
+    #[test]
+    fn recorded_litellm_version_reads_spawn_state() {
+        let dir =
+            std::env::temp_dir().join(format!("wizard-litellm-version-{}", std::process::id()));
+        let gw_dir = dir.join("gateway");
+        std::fs::create_dir_all(&gw_dir).unwrap();
+        // No record at all -> None (not measured).
+        assert_eq!(recorded_litellm_version(&dir), None);
+        let cfg = manager_config::AppConfig::default_config();
+        let fp = gateway_spawn_fingerprint(&cfg, false, None, None, &[]);
+        // A record with a probed version returns it.
+        std::fs::write(
+            gateway_spawn_state_path(&dir),
+            gateway_spawn_state_json(&fp, "yaml: true\n", Some("1.105.1")),
+        )
+        .unwrap();
+        assert_eq!(
+            recorded_litellm_version(&dir).as_deref(),
+            Some("1.105.1")
+        );
+        // A record whose probe found nothing returns None.
+        std::fs::write(
+            gateway_spawn_state_path(&dir),
+            gateway_spawn_state_json(&fp, "yaml: true\n", None),
+        )
+        .unwrap();
+        assert_eq!(recorded_litellm_version(&dir), None);
+        // A corrupt record returns None rather than failing.
+        std::fs::write(gateway_spawn_state_path(&dir), "not json").unwrap();
+        assert_eq!(recorded_litellm_version(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn mcp_cfg_server(

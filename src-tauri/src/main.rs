@@ -1776,6 +1776,11 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
                 "adopted": st.map(|s| s.adopted).unwrap_or(false),
                 "restarts": st.map(|s| s.restarts).unwrap_or(0),
                 "uptime_secs": st.and_then(|s| s.uptime).map(|u| u.as_secs()),
+                // The persisted tool-call probe (MCP design §7.2):
+                // {outcome: verified|unparsed|failed, at_ms} or null
+                // when the backend has never been probed — the UI
+                // renders null as "not measured", never as a state.
+                "tool_call_probe": serde_json::to_value(b.tool_call_probe).unwrap_or(Value::Null),
             })
         })
         .collect();
@@ -4147,6 +4152,10 @@ async fn gateway_status(state: State<'_, AppState>) -> ApiResult {
         "openrouter_cred_present": openrouter_cred_present,
         "activation_pending": activation_pending,
         "activation_changes": activation_changes,
+        // The LiteLLM version recorded by the last gateway spawn
+        // (MCP design §4.3); null when no spawn state has recorded
+        // one — the UI renders that as "not measured".
+        "litellm_version": manager_wizard::recorded_litellm_version(&state.data_dir),
     }))
 }
 
@@ -6388,6 +6397,45 @@ async fn mcp_delete_server(state: State<'_, AppState>, id: String) -> ApiResult 
     Ok(json!({ "id": id, "deleted": true, "persisted": true }))
 }
 
+/// Store an MCP server's credential in Windows Credential Manager
+/// under the server's declared `cred_ref` target (MCP design §9:
+/// the MCP view's credential Store action). The value goes straight
+/// to the ops-layer `credential_write` — the same mechanism the
+/// stored gateway master key uses — and is never logged, returned,
+/// or persisted anywhere else.
+#[tauri::command]
+async fn mcp_store_credential(state: State<'_, AppState>, id: String, value: String) -> ApiResult {
+    if value.trim().is_empty() {
+        return Err(err(ApiError::InvalidInput(
+            "credential value must not be empty".to_string(),
+        )));
+    }
+    let target = {
+        let cfg = state.config.read().await;
+        let server = cfg
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| err(ApiError::NotFound(format!("mcp server {id}"))))?;
+        server
+            .cred_ref
+            .clone()
+            .filter(|r| !r.trim().is_empty())
+            .ok_or_else(|| {
+                err(ApiError::InvalidInput(format!(
+                    "mcp server {id} declares no credential target"
+                )))
+            })?
+    };
+    RealSystemOps::default()
+        .credential_write(&target, &value)
+        .await
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    Ok(json!({ "id": id, "stored": true }))
+}
+
 /// Install Continue.dev + Cline via the wizard's `vscode-extensions` step
 /// (spec §9, §14 `vscode_install_extensions`). Runs `code
 /// --install-extension` for the pinned extensions through the real system
@@ -6907,6 +6955,7 @@ fn main() {
             mcp_set_exposure,
             mcp_save_server,
             mcp_delete_server,
+            mcp_store_credential,
             vscode_install_extensions,
             vscode_write_config,
             // MXC

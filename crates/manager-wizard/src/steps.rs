@@ -10,7 +10,7 @@ use crate::{
     WizardContext, WizardError, WizardStep,
 };
 use async_trait::async_trait;
-use manager_config::{AppConfig, BackendConfig, ModelConfig, SplitMode};
+use manager_config::{AppConfig, BackendConfig, McpExposure, ModelConfig, SplitMode};
 use std::path::{Path, PathBuf};
 ///
 /// Shared by the [`VscodeExtensions`] wizard step and the Tauri
@@ -5286,17 +5286,23 @@ impl WizardStep for VscodeExtensions {
 pub const GITHUB_CRED_TARGET: &str = "local-llm-service-manager/github-mcp";
 pub const GDRIVE_CRED_TARGET: &str = "local-llm-service-manager/gdrive-mcp";
 
-/// Step 8: verify the legacy MCP servers' credentials exist
-/// (GitHub + Google Drive). Presence only — values are never read.
+/// Step 8: verify MCP server credentials exist.
 ///
 /// MCP Phase 1 (design §10.1): this step no longer writes
 /// `<data_dir>/mcp/mcp-servers.json`. The persisted registry in
 /// `AppConfig.mcp` is the source of truth now; the old file is
 /// retired as a store, left in place if present (deleting user files
 /// is not the migration's job), and noted as inert in the step log.
-/// The registry-wide credential-presence rework is Phase 4; for now
-/// this step remains credential-presence only for the two legacy
-/// targets.
+///
+/// MCP Phase 4 (design §9): the presence check covers EVERY
+/// registry server whose exposure is not `Disabled` and that names
+/// a `cred_ref` — not only the two legacy servers. Presence only —
+/// values are never read. A consequence, by design: a fresh wizard
+/// run now fails this step while the seeded `brave_search` server
+/// (Gateway-exposed, credential target
+/// `local-llm-service-manager/brave-search-mcp`) has no stored
+/// credential, until the operator stores one or sets the server
+/// Disabled.
 pub struct McpServers;
 
 impl McpServers {
@@ -5327,25 +5333,65 @@ impl WizardStep for McpServers {
         vec![]
     }
     fn remediation_hint(&self) -> Option<&str> {
-        Some("add the missing credential to Windows Credential Manager, then re-run mcp-servers")
+        Some("store the missing credential (MCP Servers view) or set the server Disabled, then re-run mcp-servers")
     }
     async fn run(&self, ctx: &WizardContext) -> Result<StepOutcome, WizardError> {
         let mut log = Vec::new();
-        // Credential presence check first: values are never shown.
-        for target in [GITHUB_CRED_TARGET, GDRIVE_CRED_TARGET] {
+        // Credential presence check (design §9): every registry
+        // server that is not Disabled and names a cred_ref. Values
+        // are never read or shown — presence only. All missing
+        // servers are collected (and logged) before failing, so one
+        // run names every gap instead of only the first.
+        let checked: Vec<&manager_config::McpServerConfig> = ctx
+            .config
+            .mcp
+            .servers
+            .iter()
+            .filter(|s| {
+                s.exposure != McpExposure::Disabled
+                    && s.cred_ref
+                        .as_deref()
+                        .map(str::trim)
+                        .map(|r| !r.is_empty())
+                        .unwrap_or(false)
+            })
+            .collect();
+        let mut missing: Vec<(&str, &str)> = Vec::new();
+        for server in &checked {
+            let target = server.cred_ref.as_deref().unwrap_or_default();
             match ctx.ops.credential_exists(target).await {
-                Ok(true) => log.push(format!("credential '{target}' present")),
+                Ok(true) => log.push(format!(
+                    "mcp server '{}': credential '{target}' present",
+                    server.id
+                )),
                 Ok(false) => {
-                    return Ok(StepOutcome::failed(
-                        format!("credential '{target}' not found in Windows Credential Manager"),
-                        vec![
-                            "add the credential, then retry this step".to_string(),
-                            "credential values are never displayed or stored".to_string(),
-                        ],
-                    ))
+                    log.push(format!(
+                        "mcp server '{}': credential '{target}' missing",
+                        server.id
+                    ));
+                    missing.push((server.id.as_str(), target));
                 }
                 Err(e) => return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")])),
             }
+        }
+        if !missing.is_empty() {
+            let named = missing
+                .iter()
+                .map(|(id, target)| format!("{id} ('{target}')"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // The per-server present/missing log lines ride the
+            // failure's log tail, ahead of the remediation.
+            log.push(format!(
+                "missing MCP server credential(s): {named} — store the credential (MCP Servers view), or set the server Disabled, then retry this step"
+            ));
+            log.push("credential values are never displayed or stored".to_string());
+            return Ok(StepOutcome::failed(
+                format!(
+                    "MCP server credential(s) not found in Windows Credential Manager: {named}"
+                ),
+                log,
+            ));
         }
         // Retired store (design §10.1): the step writes nothing. If a
         // pre-Phase-1 mcp-servers.json is still on disk, say plainly
@@ -5363,8 +5409,13 @@ impl WizardStep for McpServers {
                     .to_string(),
             );
         }
+        let checked_ids = checked
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         Ok(StepOutcome::done(
-            "MCP server credentials present (github, gdrive)".to_string(),
+            format!("MCP server credentials present ({checked_ids})"),
             log,
         ))
     }
@@ -9917,6 +9968,39 @@ mod tests {
 
     // --- McpServers ---
 
+    /// A context whose MCP registry is exactly `servers` (the
+    /// default test config seeds the full registry, curated
+    /// servers included; the Phase 4 step checks them all).
+    fn ctx_with_mcp_servers(
+        ops: Arc<FakeSystemOps>,
+        servers: Vec<manager_config::McpServerConfig>,
+    ) -> WizardContext {
+        let mut config = test_config_with_models();
+        config.mcp.servers = servers;
+        WizardContext::new(config, PathBuf::from("/data"), RunMode::Install, ops)
+    }
+
+    fn mcp_test_server(
+        id: &str,
+        exposure: McpExposure,
+        cred_ref: Option<&str>,
+    ) -> manager_config::McpServerConfig {
+        manager_config::McpServerConfig {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            transport: manager_config::McpTransport::Stdio,
+            exposure,
+            command: Some("npx".to_string()),
+            args: vec!["-y".to_string(), format!("@example/{id}@1.0.0")],
+            url: None,
+            env_keys: vec!["EXAMPLE_API_KEY".to_string()],
+            cred_ref: cred_ref.map(str::to_string),
+            allowed_tools: None,
+            metered: false,
+            rpm_limit: None,
+        }
+    }
+
     #[tokio::test]
     async fn mcp_servers_requires_credentials() {
         let ops = Arc::new(FakeSystemOps::new());
@@ -9926,9 +10010,13 @@ mod tests {
         // Target name shown; values never shown (there are none to show).
         assert!(out.message.contains(GITHUB_CRED_TARGET), "{}", out.message);
 
+        // Phase 4: the check is registry-wide, so the pass case
+        // needs the curated brave_search credential too (the
+        // default test config's registry seeds it Gateway-exposed).
         let ops2 = Arc::new(FakeSystemOps::new());
         ops2.with_credential(GITHUB_CRED_TARGET);
         ops2.with_credential(GDRIVE_CRED_TARGET);
+        ops2.with_credential(manager_config::BRAVE_SEARCH_MCP_CRED_REF);
         let ctx2 = ctx_with(ops2.clone(), RunMode::Install);
         let out2 = McpServers.run(&ctx2).await.unwrap();
         assert_eq!(out2.state, StepState::Done, "{out2:?}");
@@ -9948,10 +10036,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_servers_brave_search_missing_credential_fails() {
+        // Phase 4 (§9): brave_search is Gateway-exposed with a
+        // cred_ref, so its missing credential fails the step and
+        // the failure names the server and its target.
+        let brave = manager_config::BRAVE_SEARCH_MCP_CRED_REF;
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_credential(GITHUB_CRED_TARGET);
+        ops.with_credential(GDRIVE_CRED_TARGET);
+        let ctx = ctx_with(ops, RunMode::Install);
+        let out = McpServers.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(out.message.contains("brave_search"), "{}", out.message);
+        assert!(out.message.contains(brave), "{}", out.message);
+        // The remediation names both ways out.
+        let log_text = out.log_tail.join("\n");
+        assert!(
+            log_text.contains("store the credential") && log_text.contains("Disabled"),
+            "{log_text}"
+        );
+        // Per-server log lines cover present and missing alike.
+        assert!(
+            log_text.contains("credential 'local-llm-service-manager/github-mcp' present"),
+            "{log_text}"
+        );
+        assert!(
+            log_text.contains(&format!("credential '{brave}' missing")),
+            "{log_text}"
+        );
+
+        // With the Brave credential stored, the same registry passes.
+        let ops2 = Arc::new(FakeSystemOps::new());
+        ops2.with_credential(GITHUB_CRED_TARGET);
+        ops2.with_credential(GDRIVE_CRED_TARGET);
+        ops2.with_credential(brave);
+        let ctx2 = ctx_with(ops2, RunMode::Install);
+        let out2 = McpServers.run(&ctx2).await.unwrap();
+        assert_eq!(out2.state, StepState::Done, "{out2:?}");
+        assert!(out2.message.contains("brave_search"), "{}", out2.message);
+    }
+
+    #[tokio::test]
+    async fn mcp_servers_disabled_server_credential_not_checked() {
+        // A Disabled server is not checked at all: its missing
+        // credential cannot fail the step (design §9).
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_credential("local-llm-service-manager/github-mcp");
+        let ctx = ctx_with_mcp_servers(
+            ops,
+            vec![
+                mcp_test_server(
+                    "github",
+                    McpExposure::Local,
+                    Some("local-llm-service-manager/github-mcp"),
+                ),
+                mcp_test_server(
+                    "web_fetch",
+                    McpExposure::Disabled,
+                    Some("local-llm-service-manager/web-fetch"),
+                ),
+            ],
+        );
+        let out = McpServers.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(out.message.contains("github"), "{}", out.message);
+        assert!(!out.message.contains("web_fetch"), "{}", out.message);
+    }
+
+    #[tokio::test]
     async fn mcp_servers_notes_retired_file_inert_when_present() {
         let ops = Arc::new(FakeSystemOps::new());
         ops.with_credential(GITHUB_CRED_TARGET);
         ops.with_credential(GDRIVE_CRED_TARGET);
+        ops.with_credential(manager_config::BRAVE_SEARCH_MCP_CRED_REF);
         // A pre-Phase-1 file left on disk.
         ops.with_file(PathBuf::from("/data/mcp/mcp-servers.json"), b"{}".to_vec());
         let ctx = ctx_with(ops.clone(), RunMode::Install);
