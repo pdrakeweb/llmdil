@@ -4359,12 +4359,26 @@ async fn gateway_set_bind_host(state: State<'_, AppState>, host: String) -> ApiR
     Ok(json!({ "bind_host": host, "restart_required": true }))
 }
 
-/// Fetch the gateway's Prometheus exposition (`GET /metrics`, the
-/// master key as Bearer). Returns the body only on an HTTP 200;
-/// anything else — gateway down, the metrics callback not active
-/// (config predates v0.1.18 until the next gateway start), an auth
-/// failure — is None and the poll cycle is skipped.
-fn fetch_gateway_metrics(host: &str, port: u16, master_key: &str) -> Option<String> {
+/// One raw HTTP response from the gateway: status code, the
+/// `Location` header when present, whether the body is chunked, and
+/// the body text.
+struct MetricsHttpResponse {
+    status: u16,
+    location: Option<String>,
+    chunked: bool,
+    body: String,
+}
+
+/// One `GET` against the gateway over a raw socket. The metrics
+/// fetcher is hand-rolled to stay dependency-free, so it must handle
+/// response parsing — and redirects (see `fetch_gateway_metrics`) —
+/// itself. None on any transport or parse failure.
+fn metrics_http_get(
+    host: &str,
+    port: u16,
+    path: &str,
+    master_key: &str,
+) -> Option<MetricsHttpResponse> {
     use std::io::{Read, Write};
     let ip: std::net::IpAddr = host.parse().ok()?;
     let addr = std::net::SocketAddr::new(ip, port);
@@ -4373,7 +4387,7 @@ fn fetch_gateway_metrics(host: &str, port: u16, master_key: &str) -> Option<Stri
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
     let req = format!(
-        "GET /metrics HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {master_key}\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {master_key}\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(req.as_bytes()).ok()?;
     let mut raw: Vec<u8> = Vec::new();
@@ -4393,19 +4407,92 @@ fn fetch_gateway_metrics(host: &str, port: u16, master_key: &str) -> Option<Stri
     let text = String::from_utf8_lossy(&raw);
     let mut parts = text.splitn(2, "\r\n\r\n");
     let head = parts.next()?;
-    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+    let status: u16 = head.split_whitespace().nth(1)?.parse().ok()?;
+    let header = |name: &str| -> Option<String> {
+        head.lines().skip(1).find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case(name) {
+                Some(v.trim().to_string())
+            } else {
+                None
+            }
+        })
+    };
+    Some(MetricsHttpResponse {
+        status,
+        location: header("location"),
+        chunked: head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked"),
+        body: parts.next()?.to_string(),
+    })
+}
+
+/// Resolve a redirect `Location` against the path just requested,
+/// returning the next path (with query) to GET on the same gateway
+/// origin. Handles absolute URLs (only the path is kept — the
+/// fetcher never leaves the origin it dialed), absolute paths, and
+/// relative references.
+fn metrics_redirect_path(current_path: &str, location: &str) -> Option<String> {
+    let location = location.trim();
+    if location.is_empty() {
         return None;
     }
-    // A chunked body would corrupt the exposition parse. LiteLLM's
-    // /metrics answers with a content-length body, but skip the cycle
-    // rather than misread if that ever changes.
-    if head
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
+    if let Some(rest) = location
+        .strip_prefix("http://")
+        .or_else(|| location.strip_prefix("https://"))
     {
-        return None;
+        return Some(match rest.find('/') {
+            Some(i) => rest[i..].to_string(),
+            None => "/".to_string(),
+        });
     }
-    Some(parts.next()?.to_string())
+    if location.starts_with('/') {
+        return Some(location.to_string());
+    }
+    // Relative reference: resolve against the current path's
+    // directory.
+    let base = current_path.split('?').next().unwrap_or(current_path);
+    let dir = base.rfind('/').map(|i| &base[..=i]).unwrap_or("/");
+    Some(format!("{dir}{location}"))
+}
+
+/// Fetch the gateway's Prometheus exposition (`GET /metrics`, the
+/// master key as Bearer), following redirects. Redirect following
+/// is load-bearing, not a nicety: LiteLLM's prometheus route is
+/// registered with a trailing slash on current versions, so
+/// `GET /metrics` answers 307 to `/metrics/` — a fetcher that does
+/// not follow the redirect never receives a body. That defect left
+/// the Dashboard's gateway statistics permanently empty in the
+/// field (every poll 307'd and was silently skipped) while the
+/// banner blamed a gateway restart that could not help. Returns
+/// the body only on a final HTTP 200; anything else — gateway
+/// down, the metrics callback not active (config predates v0.1.18
+/// until the next gateway start), an auth failure, a redirect
+/// loop — is None and the poll cycle is skipped.
+fn fetch_gateway_metrics(host: &str, port: u16, master_key: &str) -> Option<String> {
+    const MAX_REDIRECTS: usize = 3;
+    let mut path = "/metrics".to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let resp = metrics_http_get(host, port, &path, master_key)?;
+        match resp.status {
+            200 => {
+                // A chunked body would corrupt the exposition parse.
+                // LiteLLM's /metrics answers with a content-length
+                // body, but skip the cycle rather than misread if
+                // that ever changes.
+                if resp.chunked {
+                    return None;
+                }
+                return Some(resp.body);
+            }
+            301 | 302 | 303 | 307 | 308 => {
+                path = metrics_redirect_path(&path, resp.location.as_deref()?)?;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// One gateway-metrics poll cycle: resolve the probe host and port,
@@ -6363,6 +6450,99 @@ mod tests {
 
     fn backend(cfg: &AppConfig, id: &str) -> manager_config::BackendConfig {
         cfg.backends.iter().find(|b| b.id == id).unwrap().clone()
+    }
+
+    /// Loopback HTTP server for the metrics-fetcher tests: answers
+    /// each accepted connection with the canned response mapped to
+    /// the request's path (404 when unmapped), then closes.
+    /// Returns the bound port.
+    fn metrics_test_server(
+        responses: std::collections::HashMap<String, String>,
+        connections: usize,
+    ) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                let resp = responses.get(&path).cloned().unwrap_or_else(|| {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()
+                });
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn metrics_redirect_resolution() {
+        // The field case: FastAPI's trailing-slash redirect.
+        assert_eq!(
+            metrics_redirect_path("/metrics", "/metrics/").as_deref(),
+            Some("/metrics/")
+        );
+        // Absolute URL: keep only path+query, stay on the dialed origin.
+        assert_eq!(
+            metrics_redirect_path("/metrics", "http://127.0.0.1:4000/metrics/?x=1").as_deref(),
+            Some("/metrics/?x=1")
+        );
+        assert_eq!(
+            metrics_redirect_path("/metrics", "https://example.test").as_deref(),
+            Some("/")
+        );
+        // Relative reference resolves against the current directory.
+        assert_eq!(
+            metrics_redirect_path("/a/b", "c").as_deref(),
+            Some("/a/c")
+        );
+        assert_eq!(metrics_redirect_path("/metrics", "  "), None);
+    }
+
+    #[test]
+    fn metrics_fetch_follows_trailing_slash_redirect() {
+        let body = "litellm_deployment_success_responses_total 3.0\n";
+        let responses = std::collections::HashMap::from([
+            (
+                "/metrics".to_string(),
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: /metrics/\r\nContent-Length: 0\r\n\r\n"
+                    .to_string(),
+            ),
+            (
+                "/metrics/".to_string(),
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                ),
+            ),
+        ]);
+        let port = metrics_test_server(responses, 2);
+        let got =
+            fetch_gateway_metrics("127.0.0.1", port, "test-key").expect("body after redirect");
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn metrics_fetch_direct_200_and_error_status() {
+        let responses = std::collections::HashMap::from([(
+            "/metrics".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody".to_string(),
+        )]);
+        let port = metrics_test_server(responses, 1);
+        assert_eq!(
+            fetch_gateway_metrics("127.0.0.1", port, "k").as_deref(),
+            Some("body")
+        );
+        // No path mapped -> the server's 404 -> None, no panic.
+        let port = metrics_test_server(std::collections::HashMap::new(), 1);
+        assert_eq!(fetch_gateway_metrics("127.0.0.1", port, "k"), None);
     }
 
     #[test]

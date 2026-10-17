@@ -298,7 +298,7 @@ function applianceView(m: DashboardModel, live: boolean): string {
   // Blank stat fields were reported as a defect (Oct 15, 2026): when
   // no metrics window exists, state why instead of rendering dashes.
   const noWindow = live && m.gateway !== null && svcs.every((b) => b.requests_1h === undefined)
-    ? `<div class="card" style="margin-bottom:12px;font-size:12px;color:var(--text2)">${icon("warn")} Gateway statistics are not available yet. They appear after the gateway has been restarted through the app (metrics are enabled at gateway start) and about 30 s of polling.</div>`
+    ? `<div class="card" style="margin-bottom:12px;font-size:12px;color:var(--text2)">${icon("warn")} Gateway statistics are not available yet. They appear after the gateway has been running about 30 s with the app polling it (the generated config enables its metrics at gateway start).</div>`
     : "";
   return `${empty}
     ${noWindow}
