@@ -144,6 +144,14 @@ export function mockOptimizeState(): OptimizeState {
     context: { sample: true },
     default_backend: "planner",
     better_backend: null,
+    candidates: {
+      directive: "Explore better MoE capable models for the planner",
+      retrieved_at: new Date().toISOString(),
+      items: [
+        { repo_id: "Qwen/Qwen3-30B-A3B-GGUF", file: "Qwen3-30B-A3B-Q4_K_M.gguf", architecture: "qwen3moe", params_b: 30.5, ctx_max: 40960, size_bytes: 18600000000, downloads: 812345, fit: "fits_with_split", retrieved_at: new Date().toISOString() },
+        { repo_id: "unsloth/Qwen3-Coder-Next-GGUF", file: "Qwen3-Coder-Next-UD-Q4_K_M.gguf", architecture: "qwen3moe", params_b: 80, ctx_max: 262144, size_bytes: 49301055488, downloads: 456789, fit: "does_not_fit", retrieved_at: new Date().toISOString() },
+      ],
+    },
     consulting: false,
     measuring: false,
     plan: {

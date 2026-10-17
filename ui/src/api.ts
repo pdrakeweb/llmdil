@@ -1838,6 +1838,32 @@ export interface OptimizeBackendInfo {
   measured: OptimizeMeasured | null;
 }
 
+/** One discovered Hugging Face candidate (Phase 5c): one quant
+ *  file of one repo, with HF-reported facts, the app's fit
+ *  verdict ("fits" | "fits_with_split" | "does_not_fit" |
+ *  "unchecked"), and its retrieval provenance. Mirrors
+ *  manager-optimize's CandidateFact. */
+export interface OptimizeCandidate {
+  repo_id: string;
+  file: string;
+  architecture: string;
+  params_b: number;
+  ctx_max: number;
+  size_bytes: number;
+  downloads: number;
+  fit: string;
+  retrieved_at: string;
+}
+
+/** The stored discovery set: the candidates plus the directive
+ *  they were gathered for (a consultation only receives them
+ *  when its directive matches). */
+export interface OptimizeCandidates {
+  directive: string;
+  retrieved_at: string;
+  items: OptimizeCandidate[];
+}
+
 export interface OptimizeState {
   purpose: string;
   /** The stored plan's directive (addendum A.2): the consult
@@ -1860,6 +1886,9 @@ export interface OptimizeState {
   default_backend: string | null;
   better_backend: { id: string; short_name: string | null } | null;
   plan: OptimizePlan | null;
+  /** The stored discovery pre-pass set (Phase 5c), or null when
+   *  no discovery has run. */
+  candidates: OptimizeCandidates | null;
   consulting: boolean;
   /** A GPU-bound Optimize job (measurement, later an
    *  experiment batch) is currently running. */
@@ -1899,8 +1928,17 @@ export function optimizeSavePurpose(scope: "deployment" | "group" | "backend", t
  *  up to the 900 s task budget for a live consultation. `directive`
  *  is the optional operator directive scoping this consultation
  *  (addendum A.2); it is recorded verbatim on the produced plan. */
-export function optimizeConsult(backendId?: string, sample = false, directive?: string) {
-  return optimizeStateCmd("optimize_consult", { backendId: backendId ?? null, sample, directive: directive ?? null });
+export function optimizeConsult(backendId?: string, sample = false, directive?: string, candidateRepos?: string[]) {
+  return optimizeStateCmd("optimize_consult", { backendId: backendId ?? null, sample, directive: directive ?? null, candidateRepos: candidateRepos ?? null });
+}
+
+/** optimize_discover — run the Hugging Face discovery pre-pass
+ *  (Phase 5c) for a directive: HF search seeded from the
+ *  directive, per-repo records, and app-computed fit verdicts.
+ *  Stores the result server-side and returns the refreshed
+ *  state with the candidate set. */
+export function optimizeDiscover(directive: string) {
+  return optimizeStateCmd("optimize_discover", { directive });
 }
 
 /** optimize_cancel_consult — fire the scoped cancellation handle. */

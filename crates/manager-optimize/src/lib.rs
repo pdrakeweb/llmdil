@@ -20,8 +20,13 @@
 //!   `manager_config::validate` plus the fit evaluator.
 //! - [`probe`]: the CPU / system-RAM inventory probe (§2.1) — data
 //!   that exists nowhere else in the app.
+//! - [`discover`]: the Hugging Face discovery pre-pass (addendum
+//!   A.5 option (b)): directive-seeded HF search, per-quant facts
+//!   from the model record, and local fit verdicts, assembled as
+//!   the context document's `candidates` block.
 
 pub mod context;
+pub mod discover;
 pub mod fit;
 pub mod measure;
 pub mod parse;
@@ -33,6 +38,12 @@ pub use context::{
     build_context, build_prompts, consult_default, default_purpose_seed, estimate_tokens,
     model_short_name, resolve_model, BackendMeasured, ConsultCandidate, ContextMeta, GpuContext,
     HardwareContext, MeasureInputs, ThroughputFact, TrafficWindow,
+};
+pub use discover::{
+    candidates_from_model, fit_verdict, parse_model_record, parse_search_results, quant_files,
+    search_query_for_directive, seat_for_directive, CandidateFact, DiscoverError, HfClient,
+    HfModelFacts, HfSearchHit, HfSibling, QuantFile, FIT_DOES_NOT_FIT, FIT_FITS,
+    FIT_FITS_WITH_SPLIT, FIT_UNCHECKED, HF_DEFAULT_BASE_URL, MAX_QUERY_TERMS, MAX_SEARCH_REPOS,
 };
 pub use fit::{evaluate_fit, layout_requirement, residency_per_gpu, FitOutcome, LayoutFacts};
 pub use measure::{

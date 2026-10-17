@@ -6352,6 +6352,7 @@ fn main() {
             optimize::optimize_discard_plan,
             optimize::optimize_measure_backend,
             optimize::optimize_cancel_job,
+            optimize::optimize_discover,
             diagnostics_export_bundle,
             // MCP / VS Code
             mcp_list,

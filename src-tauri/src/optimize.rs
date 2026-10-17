@@ -21,10 +21,10 @@ use manager_config::AppConfig;
 use manager_optimize::{
     benchmark_prompts, build_context, build_prompts, config_fingerprint, consult_default,
     default_purpose_seed, estimate_tokens, measurement_facts, measurement_fingerprint, parse_plan,
-    probe_hardware, validate_plan, BackendMeasured, BenchResult, BenchRun, ConsultCandidate,
-    Decision, HardwareContext, ItemValidation, LayoutFacts, LiveSnapshot, MeasureInputs,
-    MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, Plan, TrafficWindow,
-    ValidationStatus, BENCHMARK_TEMPERATURE, MEASURED_RUNS,
+    probe_hardware, validate_plan, BackendMeasured, BenchResult, BenchRun, CandidateFact,
+    ConsultCandidate, Decision, HardwareContext, HfClient, ItemValidation, LayoutFacts,
+    LiveSnapshot, MeasureInputs, MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore,
+    Plan, TrafficWindow, ValidationStatus, BENCHMARK_TEMPERATURE, MEASURED_RUNS,
 };
 use manager_supervisor::ProcessState;
 
@@ -76,6 +76,57 @@ fn save_plan_file(state: &AppState, file: &PlanFile) -> Result<(), String> {
 
 fn measurements_path(state: &AppState) -> PathBuf {
     state.data_dir.join("optimize-measurements.json")
+}
+
+// ---------------------------------------------------------------------------
+// Discovery persistence (<data_dir>/optimize-candidates.json)
+// ---------------------------------------------------------------------------
+
+/// The stored discovery pre-pass (Phase 5c, §A.5): the candidate
+/// facts from one `optimize_discover` run, the directive text
+/// they were gathered for, and when they were retrieved. A
+/// consultation only receives candidates whose stored directive
+/// matches its own (see `optimize_consult`) — facts gathered
+/// for a different question are not evidence for this one.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CandidatesFile {
+    #[serde(default)]
+    directive: String,
+    #[serde(default)]
+    retrieved_at: String,
+    #[serde(default)]
+    candidates: Vec<CandidateFact>,
+}
+
+fn candidates_path(state: &AppState) -> PathBuf {
+    state.data_dir.join("optimize-candidates.json")
+}
+
+fn load_candidates_file(state: &AppState) -> CandidatesFile {
+    std::fs::read_to_string(candidates_path(state))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_candidates_file(state: &AppState, file: &CandidatesFile) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
+    std::fs::write(candidates_path(state), text).map_err(|e| e.to_string())
+}
+
+/// The payload form of the stored candidates: the list with the
+/// directive it belongs to and its retrieval time, or `null`
+/// when no discovery has run (or a run found nothing).
+fn candidates_json(file: &CandidatesFile) -> Value {
+    if file.candidates.is_empty() {
+        Value::Null
+    } else {
+        json!({
+            "directive": file.directive,
+            "retrieved_at": file.retrieved_at,
+            "items": file.candidates,
+        })
+    }
 }
 
 /// The measurement-fingerprint inputs for one backend (§A.1),
@@ -477,6 +528,7 @@ async fn state_payload(state: &AppState) -> ApiResult {
             _ => None,
         },
         "plan": plan_json,
+        "candidates": candidates_json(&load_candidates_file(state)),
         "consulting": state.optimize_abort.lock().await.is_some(),
         "measuring": state.optimize_job_abort.lock().await.is_some(),
     }))
@@ -549,6 +601,7 @@ pub async fn optimize_consult(
     backend_id: Option<String>,
     sample: Option<bool>,
     directive: Option<String>,
+    candidate_repos: Option<Vec<String>>,
 ) -> ApiResult {
     let sample = sample.unwrap_or(false);
     // The operator directive for this consultation (addendum
@@ -568,7 +621,29 @@ pub async fn optimize_consult(
         }
     }
     let cfg = state.config.read().await.clone();
-    let gathered = gather(&state, &cfg).await;
+    let mut gathered = gather(&state, &cfg).await;
+    // Discovery pre-pass carriage (Phase 5c, §A.5): only a
+    // consultation WITH a directive receives a candidates block,
+    // and only the stored candidates gathered for that same
+    // directive — the consult never re-runs discovery itself;
+    // the block comes from the stored, operator-visible set,
+    // intersected with the repos the operator left un-pruned
+    // (`candidate_repos`; absent = all stored).
+    if !directive.is_empty() {
+        let stored = load_candidates_file(&state);
+        if stored.directive == directive {
+            gathered.measure.candidates = stored
+                .candidates
+                .into_iter()
+                .filter(|c| {
+                    candidate_repos
+                        .as_ref()
+                        .map(|repos| repos.iter().any(|r| r == &c.repo_id))
+                        .unwrap_or(true)
+                })
+                .collect();
+        }
+    }
     let (default_running, best_overall) = consult_default(&gathered.candidates);
     let target = backend_id
         .clone()
@@ -758,6 +833,47 @@ pub async fn optimize_consult(
             json!({ "backend": target, "items": item_count }),
         )
         .await;
+    state_payload(&state).await
+}
+
+/// Run the discovery pre-pass for a directive (Phase 5c,
+/// §A.5 option (b)): HF API search seeded from the directive,
+/// per-repo model records, and fit verdicts computed against
+/// the live telemetry free-VRAM snapshot from `gather()`.
+/// The result replaces the stored candidate set in
+/// `<data_dir>/optimize-candidates.json`; nothing is consulted
+/// and no configuration changes. A later consultation with
+/// the same directive receives the (operator-pruned) set as
+/// its context's `candidates` block.
+#[tauri::command]
+pub async fn optimize_discover(
+    state: State<'_, AppState>,
+    directive: String,
+) -> ApiResult {
+    let directive = directive.trim().to_string();
+    if directive.is_empty() {
+        return Err(err(ApiError::InvalidInput(
+            "candidate discovery needs a directive: enter one to seed the search".to_string(),
+        )));
+    }
+    let cfg = state.config.read().await.clone();
+    let gathered = gather(&state, &cfg).await;
+    let free_vram = gathered.live.free_vram_mib_per_gpu.clone();
+    let retrieved_at = chrono::Utc::now().to_rfc3339();
+    let client = HfClient::with_default_base()
+        .map_err(|e| err(ApiError::InvalidInput(format!("candidate discovery failed: {e}"))))?;
+    let candidates = client
+        .discover(&directive, &free_vram, &retrieved_at)
+        .await
+        .map_err(|e| err(ApiError::InvalidInput(format!("candidate discovery failed: {e}"))))?;
+    save_candidates_file(
+        &state,
+        &CandidatesFile {
+            directive,
+            retrieved_at,
+            candidates,
+        },
+    )?;
     state_payload(&state).await
 }
 

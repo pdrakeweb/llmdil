@@ -15,6 +15,8 @@ use manager_config::{AppConfig, BackendConfig, ModelConfig};
 use manager_models::MemoryRequirement;
 use serde_json::{json, Value};
 
+use crate::discover::CandidateFact;
+
 /// One GPU's inventory + latest readings, from the telemetry
 /// snapshot (the same data `get_gpu_telemetry` returns).
 #[derive(Debug, Clone)]
@@ -105,6 +107,13 @@ pub struct MeasureInputs {
     /// Measured throughput facts whose config fingerprint matches
     /// the backend's current configuration (addendum A.1).
     pub throughput: Vec<ThroughputFact>,
+    /// Discovered Hugging Face candidates from the discovery
+    /// pre-pass (addendum A.5 option (b), Phase 5c), gathered by
+    /// the caller for the consultation's directive and already
+    /// pruned by the operator. Empty — and the `candidates`
+    /// block absent — for directive-less consultations and
+    /// whenever no discovery has run.
+    pub candidates: Vec<CandidateFact>,
 }
 
 /// Counts and provenance for the page's context summary line and
@@ -316,7 +325,7 @@ pub fn build_context(
         })
         .collect();
 
-    let candidates: Vec<Value> = catalog
+    let catalog_candidates: Vec<Value> = catalog
         .iter()
         .filter(|s| !cfg.models.iter().any(|m| m.id == s.id))
         .map(|s| {
@@ -337,7 +346,7 @@ pub fn build_context(
         "backends": backends,
         "groups": groups,
         "models": models,
-        "catalog_candidates": candidates,
+        "catalog_candidates": catalog_candidates,
         "gateway": {
             "port": cfg.gateway.port,
             "bind_host": cfg.gateway.bind_host,
@@ -431,6 +440,33 @@ pub fn build_context(
         meta.measured_blocks
             .push("measured throughput".to_string());
     }
+    // Discovered candidates (addendum A.5, Phase 5c): the
+    // pre-pass's vetted, fit-checked HF facts, distinct from
+    // `catalog_candidates` (curated, local). Provenance rides
+    // per entry — the HF repo id and the retrieved-at
+    // timestamp. Absent when no discovery ran for this
+    // consultation's directive; never fabricated.
+    if !measure.candidates.is_empty() {
+        doc["candidates"] = Value::Array(
+            measure
+                .candidates
+                .iter()
+                .map(|c| {
+                    json!({
+                        "repo_id": c.repo_id,
+                        "file": c.file,
+                        "architecture": c.architecture,
+                        "params_b": c.params_b,
+                        "ctx_max": c.ctx_max,
+                        "size_bytes": c.size_bytes,
+                        "downloads": c.downloads,
+                        "fit": c.fit,
+                        "retrieved_at": c.retrieved_at,
+                    })
+                })
+                .collect(),
+        );
+    }
     if measured
         .as_object()
         .map(|o| !o.is_empty())
@@ -519,6 +555,7 @@ Constraints:
 - Every item carries a rationale and an expected_effect. confidence is your honest self-assessment: high, medium, or low.
 - Per-group and per-backend purpose text, when present, states what that entity is for. When purpose is absent, infer cautiously from names rather than assuming.
 - A \"measurements\" section, when present, carries speeds actually measured on this machine for the named backend's current configuration, with their age. Prefer measured figures over any estimate when both bear on a proposal.
+- A \"candidates\" section, when present, carries models discovered on Hugging Face for this consultation's directive, gathered and fit-checked by the app before the consultation: the sizes, parameter counts, and rated contexts are the real figures Hugging Face reports, and each entry's fit verdict was computed by the app against this machine's free VRAM. These candidates are distinct from the curated catalog candidates, and each carries its Hugging Face repo id and retrieval time as provenance.
 - Gateway port and bind address, downloads, installs, and updates are out of scope; use advice if they matter.";
 
 /// Rough token estimate for the pre-send fit check (§3): ~4
@@ -786,6 +823,61 @@ mod tests {
         let t = &doc["measurements"]["throughput"][0];
         assert_eq!(t["superseded"], json!(true));
         assert_eq!(t["basis"], json!("measured"));
+    }
+
+    #[test]
+    fn candidates_block_present_only_with_facts_and_distinct_from_catalog() {
+        // Addendum A.5 (Phase 5c): discovered HF candidates ride
+        // as their own top-level block with per-entry provenance,
+        // separate from the curated catalog_candidates.
+        let cfg = AppConfig::default_config();
+        let (doc, _) = build_context(&cfg, &MeasureInputs::default(), "1", "planner");
+        assert!(doc.get("candidates").is_none());
+        assert!(doc.get("catalog_candidates").is_some());
+
+        let mut measure = MeasureInputs::default();
+        measure.candidates.push(CandidateFact {
+            repo_id: "Qwen/Qwen3-30B-A3B-GGUF".to_string(),
+            file: "Qwen3-30B-A3B-Q4_K_M.gguf".to_string(),
+            architecture: "qwen3moe".to_string(),
+            params_b: 30.5,
+            ctx_max: 40960,
+            size_bytes: 18_600_000_000,
+            downloads: 123456,
+            fit: "fits_with_split".to_string(),
+            retrieved_at: "2026-10-17T12:00:00+00:00".to_string(),
+        });
+        let (doc, _meta) = build_context(&cfg, &measure, "1", "planner");
+        let c = &doc["candidates"][0];
+        assert_eq!(c["repo_id"], json!("Qwen/Qwen3-30B-A3B-GGUF"));
+        assert_eq!(c["file"], json!("Qwen3-30B-A3B-Q4_K_M.gguf"));
+        assert_eq!(c["architecture"], json!("qwen3moe"));
+        assert_eq!(c["ctx_max"], json!(40960));
+        assert_eq!(c["size_bytes"], json!(18_600_000_000u64));
+        assert_eq!(c["fit"], json!("fits_with_split"));
+        // Provenance: the retrieval timestamp rides per entry.
+        assert_eq!(c["retrieved_at"], json!("2026-10-17T12:00:00+00:00"));
+        // Distinct from the catalog block: different entries,
+        // different key, and the catalog side is untouched.
+        let catalog_ids: Vec<&str> = doc["catalog_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["id"].as_str())
+            .collect();
+        assert!(!catalog_ids.contains(&"Qwen/Qwen3-30B-A3B-GGUF"));
+        assert!(catalog_ids.contains(&"qwen3-coder-30b"));
+    }
+
+    #[test]
+    fn system_prompt_explains_the_candidates_block() {
+        let cfg = AppConfig::default_config();
+        let (doc, meta) = build_context(&cfg, &MeasureInputs::default(), "1", "planner");
+        let (system, _user) = build_prompts("MY PURPOSE", "", &doc, &meta);
+        assert!(system.contains("\"candidates\" section"), "{system}");
+        assert!(system.contains("Hugging Face"), "{system}");
+        assert!(system.contains("distinct from the curated catalog"), "{system}");
+        assert!(system.contains("fit verdict"), "{system}");
     }
 
     #[test]

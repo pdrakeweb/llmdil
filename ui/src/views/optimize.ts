@@ -17,12 +17,12 @@ import {
   addBackend, applyBackendConfig, deleteBackend, getAppConfig, getBackends,
   getBackendConfig, getOptimizeState, modelAdd, modelAssign,
   optimizeCancelConsult, optimizeCancelJob, optimizeChangeSummary, optimizeConsult,
-  optimizeDiscardPlan, optimizeIsDestructive, optimizeKindLabel,
+  optimizeDiscardPlan, optimizeDiscover, optimizeIsDestructive, optimizeKindLabel,
   optimizeMeasureBackend, optimizeSavePurpose, optimizeSetItemOutcome, optimizeSetItemState,
   setBackendOffload, stopBackend, updateBackendFlags, updateGatewayConfig,
 } from "../api";
 import type {
-  CallResult, OptimizePlanItem, OptimizeState,
+  CallResult, OptimizeCandidate, OptimizePlanItem, OptimizeState,
 } from "../api";
 import { trim1 } from "../charts";
 import { esc } from "../html";
@@ -102,6 +102,14 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   let measuringBackend: string | null = null;
   let measureStart = 0;
   let measureTimer: number | null = null;
+  /** Discovery pre-pass (Phase 5c): a run is in flight, and the
+   *  candidate entries the operator has pruned from the stored
+   *  set (keys "repo_id\nfile"). Pruning is local until consult:
+   *  the consult invoke passes the remaining entries' repo ids
+   *  as candidateRepos and the server intersects. */
+  let discovering = false;
+  const candidateRemoved = new Set<string>();
+  const candidateKey = (c: OptimizeCandidate): string => `${c.repo_id}\n${c.file}`;
 
   const shortName = (modelId: string): string => {
     if (!state) return modelId;
@@ -275,6 +283,53 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     </div>`;
   }
 
+  function candidateFitLabel(fit: string): string {
+    switch (fit) {
+      case "fits": return "Fits";
+      case "fits_with_split": return "Fits with tensor split";
+      case "does_not_fit": return "Does not fit";
+      default: return "Not checked";
+    }
+  }
+
+  /** The discovery block under the directive field: the Find
+   *  candidates action (shown when a directive is present) and
+   *  the stored, operator-prunable candidate list. The list is
+   *  the exact set a consultation with the same directive draws
+   *  from, minus the pruned entries. */
+  function candidatesHtml(st: OptimizeState): string {
+    const directiveText = (directiveDraft ?? st.last_directive ?? "").trim();
+    const stored = st.candidates;
+    const visible = stored?.items.filter((c) => !candidateRemoved.has(candidateKey(c))) ?? [];
+    const rows = visible.map((c) => `<div class="opt-candidate-row">
+        <span class="opt-candidate-figs">Repo: ${esc(c.repo_id)} · File: ${esc(c.file)} · Size: ${fmtGiB(c.size_bytes / 1048576)} · Params: ${trim1(c.params_b)} B · Fit: ${esc(candidateFitLabel(c.fit))}</span>
+        <button class="btn icon-only" data-opt-candidate-remove="${esc(candidateKey(c))}" title="Remove candidate ${esc(c.repo_id)}" aria-label="Remove candidate ${esc(c.repo_id)} ${esc(c.file)}">${icon("x")}</button>
+      </div>`).join("");
+    return `<div class="opt-candidates">
+      <div class="opt-consult-row" id="optDiscoverRow" style="margin-top:8px${directiveText ? "" : ";display:none"}">
+        <button class="btn" id="optDiscoverBtn" data-opt-act="discover" ${discovering ? "disabled" : ""}>${icon("search")} ${discovering ? "Finding candidates…" : "Find candidates"}</button>
+      </div>
+      ${stored ? `<div class="opt-field-label" style="margin-top:10px">Candidates</div>
+        <div class="opt-note">Directive: ${esc(stored.directive)} · Retrieved: ${esc(fmtTime(stored.retrieved_at))} · Shown: ${visible.length} of ${stored.items.length}</div>
+        ${stored.directive !== directiveText ? `<div class="opt-note">These candidates were gathered for a different directive — a consultation only receives candidates gathered for its own directive.</div>` : ""}
+        ${rows || `<div class="opt-note">All candidates pruned — the consultation will carry no candidates block.</div>`}` : ""}
+    </div>`;
+  }
+
+  /** The repo ids a consultation should receive: the stored
+   *  candidates' repos after pruning, deduplicated. Undefined
+   *  when no discovery set is stored (the server then has
+   *  nothing to intersect). */
+  function candidateReposForConsult(): string[] | undefined {
+    if (!state?.candidates) return undefined;
+    const repos: string[] = [];
+    for (const c of state.candidates.items) {
+      if (candidateRemoved.has(candidateKey(c))) continue;
+      if (!repos.includes(c.repo_id)) repos.push(c.repo_id);
+    }
+    return repos;
+  }
+
   function paint(): void {
     if (disposed || !host) return;
     if (loadError) {
@@ -301,6 +356,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
           ${st.purpose_is_seed ? `<div class="opt-note">This description was generated from your setup. Edit it to make it yours — every consultation uses it.</div>` : ""}
           <div class="opt-field-label" style="margin-top:10px">Directive (optional)</div>
           <textarea id="optDirective" class="opt-directive-input" rows="2" placeholder="Scope this consultation — e.g. reduce coder latency">${esc(directiveDraft ?? st.last_directive ?? "")}</textarea>
+          ${candidatesHtml(st)}
         </div>
         <div>
           <div class="opt-field-label">Consulting</div>
@@ -372,7 +428,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       const el = hostEl.querySelector("#optElapsed");
       if (el) el.textContent = fmtElapsed(Math.floor((Date.now() - consultStart) / 1000));
     }, 1000);
-    const r = await optimizeConsult(backendId, sample, directive);
+    const r = await optimizeConsult(backendId, sample, directive, candidateReposForConsult());
     if (elapsedTimer !== null) { window.clearInterval(elapsedTimer); elapsedTimer = null; }
     if (disposed) return;
     if (r.error) {
@@ -418,6 +474,36 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     if (r.data) {
       state = r.data;
       statusLine = "";
+    }
+    paint();
+  }
+
+  async function runDiscover(): Promise<void> {
+    const directiveField = hostEl.querySelector<HTMLTextAreaElement>("#optDirective");
+    if (directiveField) directiveDraft = directiveField.value;
+    const directive = (directiveDraft ?? "").trim();
+    if (!directive) {
+      statusLine = "Candidate discovery needs a directive — enter one first.";
+      paint();
+      return;
+    }
+    discovering = true;
+    paint();
+    const r = await optimizeDiscover(directive);
+    discovering = false;
+    if (disposed) return;
+    if (r.error) {
+      statusLine = `Candidate discovery failed — ${r.error}`;
+      paint();
+      return;
+    }
+    if (r.data) {
+      state = r.data;
+      // A fresh stored set replaces the pruned view of the old one.
+      candidateRemoved.clear();
+      statusLine = r.data.candidates
+        ? `Found ${r.data.candidates.items.length} candidate${r.data.candidates.items.length === 1 ? "" : "s"} for this directive.`
+        : "Discovery found no candidates for this directive.";
     }
     paint();
   }
@@ -666,6 +752,13 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       if (backendId) void runMeasure(backendId);
       return;
     }
+    const candidateRemove = t.closest<HTMLElement>("[data-opt-candidate-remove]");
+    if (candidateRemove) {
+      const key = candidateRemove.dataset.optCandidateRemove ?? "";
+      if (key) candidateRemoved.add(key);
+      paint();
+      return;
+    }
     const act = t.closest<HTMLElement>("[data-opt-act]")?.dataset.optAct;
     if (!act) return;
     switch (act) {
@@ -686,6 +779,9 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       }
       case "sample":
         void runConsult(true);
+        return;
+      case "discover":
+        void runDiscover();
         return;
       case "cancel-consult":
         void optimizeCancelConsult();
@@ -737,6 +833,10 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     const t = ev.target as HTMLElement;
     if (t.id === "optDirective" && t instanceof HTMLTextAreaElement) {
       directiveDraft = t.value;
+      // Toggle the Find candidates action with the field's
+      // content, without a repaint (which would drop the caret).
+      const row = hostEl.querySelector<HTMLElement>("#optDiscoverRow");
+      if (row) row.style.display = t.value.trim() ? "" : "none";
       return;
     }
     const key = t.dataset?.optPurposeInput;

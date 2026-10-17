@@ -887,10 +887,12 @@ dependencies = [
  "chrono",
  "manager-config",
  "manager-models",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
