@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Download installer from release
-        run: gh release download ${{ github.event.release.tag_name || inputs.tag }} --repo pdrakeweb/local-llm-service-manager --pattern "*-setup.exe" --dir installer
+        run: gh release download ${{ github.event.release.tag_name || inputs.tag }} --repo pdrakeweb/llmdil --pattern "*-setup.exe" --dir installer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -40,7 +40,7 @@ jobs:
 
       - name: Verify installation
         run: |
-          $dir = "$env:LOCALAPPDATA\Local LLM Service Manager"
+          $dir = "$env:LOCALAPPDATA\LLMdil"
           if (-not (Test-Path $dir)) {
             Write-Host "Expected dir missing; LOCALAPPDATA contains:"
             Get-ChildItem $env:LOCALAPPDATA | Select-Object Name
@@ -61,9 +61,9 @@ jobs:
 
       - name: Silent uninstall
         run: |
-          $un = Get-ChildItem "$env:LOCALAPPDATA\Local LLM Service Manager\uninstall.exe" -Recurse | Select-Object -First 1
+          $un = Get-ChildItem "$env:LOCALAPPDATA\LLMdil\uninstall.exe" -Recurse | Select-Object -First 1
           if (-not $un) { throw "uninstaller not found" }
           $p = Start-Process -FilePath $un.FullName -ArgumentList "/S" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "uninstaller exited with code $($p.ExitCode)" }
-          if (Test-Path "$env:LOCALAPPDATA\Local LLM Service Manager") { throw "install dir still present after uninstall" }
+          if (Test-Path "$env:LOCALAPPDATA\LLMdil") { throw "install dir still present after uninstall" }
           Write-Host "Uninstall clean"
