@@ -666,6 +666,32 @@ export interface BackendRow {
    *  counts let the form price any slider position with the same
    *  arithmetic as the backend memory requirement. */
   offload?: BackendOffload;
+  /** Transient offload-probe state for this backend, or null when
+   *  no probe is running or has reported. */
+  offload_probe?: BackendOffloadProbe | null;
+}
+
+/** Guardrail for a backend's expert-offload positions, derived from
+ *  the GPU's compute capability. `status` describes the SAVED slider
+ *  position; `overridden` means the status is blocked but a journaled
+ *  override covers it, so starts proceed. */
+export interface BackendOffloadGuardrail {
+  /** GPU compute capability, e.g. "6.0". */
+  compute_capability: string;
+  allowed: "endpoints_only";
+  status: "verified" | "untested" | "blocked";
+  /** Closest verified slider position to the saved position. */
+  nearest_verified_layers: number;
+  has_override: boolean;
+  overridden: boolean;
+}
+
+/** A backend's offload-probe state (list_backends payload). */
+export interface BackendOffloadProbe {
+  state: "probing" | "passed" | "failed";
+  /** Slider position the probe covers. */
+  layers: number;
+  detail: string | null;
 }
 
 /** A backend's expert-offload slider state (list_backends payload). */
@@ -683,6 +709,16 @@ export interface BackendOffload {
   /** Slider band boundaries as fractions of the range. */
   green_end: number;
   yellow_end: number;
+  /** System-RAM weight bytes at each slider position 0..=moe_layers,
+   *  priced by the backend with true per-block sums. May be absent in
+   *  older payloads — callers fall back to a uniform expert share. */
+  sys_bytes_by_position?: number[];
+  /** True when the saved offload spelling in raw flags is not the
+   *  canonical slider form for its position (hand-written, e.g.
+   *  --cpu-moe or -ncmoe). */
+  custom: boolean;
+  /** Offload guardrail for this backend's GPU, or null when none applies. */
+  guardrail: BackendOffloadGuardrail | null;
 }
 
 /** list_backends — configured backends merged with live supervisor state. */
@@ -730,11 +766,17 @@ export async function updateBackendFlags(id: string, nCtx: number, nBatch: numbe
  *  Flags slider): `layers` MoE layers move to system RAM (0 = none,
  *  the model's full MoE layer count = the `-ot exps=CPU` form).
  *  Only the offload tokens in the backend's raw flags change.
- *  Persisted immediately; applies on the next start. */
-export async function setBackendOffload(id: string, layers: number): Promise<CallResult<{ backend_id: string; layers: number; raw_flags: string | null; changed: boolean }>> {
+ *  Persisted immediately; applies on the next start. When
+ *  `allowOverride` is true it is sent as `allow_override`, recording
+ *  an explicit override for a guardrail-blocked position; the
+ *  argument is omitted entirely when falsy, preserving the previous
+ *  invoke shape for other callers. */
+export async function setBackendOffload(id: string, layers: number, allowOverride?: boolean): Promise<CallResult<{ backend_id: string; layers: number; raw_flags: string | null; changed: boolean }>> {
   if (!isTauri()) return { data: { backend_id: id, layers, raw_flags: null, changed: false }, live: false };
   try {
-    const data = await invoke<{ backend_id: string; layers: number; raw_flags: string | null; changed: boolean }>("backend_set_offload", { id, layers });
+    const args: Record<string, unknown> = { id, layers };
+    if (allowOverride) args.allow_override = true;
+    const data = await invoke<{ backend_id: string; layers: number; raw_flags: string | null; changed: boolean }>("backend_set_offload", args);
     return { data, live: true };
   } catch (e) {
     return { data: { backend_id: id, layers, raw_flags: null, changed: false }, live: true, error: errOf(e) };
