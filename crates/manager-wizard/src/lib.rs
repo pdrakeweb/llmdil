@@ -73,6 +73,20 @@ pub const UV_INSTALL_DOCS_URL: &str = "https://docs.astral.sh/uv/getting-started
 /// the gateway on a stock Windows machine.
 pub const GATEWAY_PYTHON_VERSION: &str = "3.12";
 
+/// prisma-client-py version the gateway venv is pinned to, exactly.
+///
+/// LiteLLM 1.104/1.105's PrismaWrapper (`litellm/proxy/db/prisma_client.py`)
+/// reads and writes the generated client's name-mangled `_Prisma__engine`
+/// attribute. prisma-client-py PRs #873/#876 moved engine storage into a
+/// new `BasePrisma` base class, so from 0.13.0 on the generated `Prisma`
+/// class no longer defines that attribute and LiteLLM's connect raises
+/// `AttributeError: 'Prisma' object has no attribute '_Prisma__engine'`
+/// (field-reproduced on 0.15.0, 2026-10-16; 0.11.0 is clean). 0.11.0 is
+/// also LiteLLM's own pyproject/lockfile pin for the proxy, which is why
+/// the pin is exact rather than a range cap: 0.12/0.13 are untested
+/// against LiteLLM. See docs/debugging/gateway-start-troubleshooting.md.
+pub const PRISMA_PINNED_VERSION: &str = "0.11.0";
+
 /// Credential Manager target holding the LiteLLM gateway's master
 /// key. Current LiteLLM refuses to boot without one. The key is
 /// generated on first gateway start and stored here; the generated
@@ -240,6 +254,14 @@ pub struct StepOutcome {
     /// Last [`LOG_TAIL_LINES`] log lines for inline display on failure.
     pub log_tail: Vec<String>,
     pub duration_ms: u64,
+    /// Ready-to-run commands for doing the step's work by hand when
+    /// the step itself failed (the start-gateway step sets this: the
+    /// exact gateway start commands, secrets named but never valued).
+    /// Rendered as a code block under the failure message. Absent on
+    /// outcomes that carry no manual path — including every outcome
+    /// persisted by older builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_command: Option<String>,
 }
 
 impl StepOutcome {
@@ -249,6 +271,7 @@ impl StepOutcome {
             message: message.into(),
             log_tail,
             duration_ms: 0,
+            manual_command: None,
         }
     }
 
@@ -258,6 +281,7 @@ impl StepOutcome {
             message: message.into(),
             log_tail,
             duration_ms: 0,
+            manual_command: None,
         }
     }
 
@@ -267,7 +291,15 @@ impl StepOutcome {
             message: message.into(),
             log_tail: Vec::new(),
             duration_ms: 0,
+            manual_command: None,
         }
+    }
+
+    /// Attach the manual-command block (see
+    /// [`StepOutcome::manual_command`]) to this outcome.
+    pub fn with_manual_command(mut self, manual_command: impl Into<String>) -> Self {
+        self.manual_command = Some(manual_command.into());
+        self
     }
 }
 
@@ -352,6 +384,11 @@ pub struct StepReport {
     pub log_tail: Vec<String>,
     /// Skip note or "path @ version" for manual overrides.
     pub note: Option<String>,
+    /// Manual-command block carried over from the step outcome (see
+    /// [`StepOutcome::manual_command`]). Persisted with the report so
+    /// a failure's manual path survives an app restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_command: Option<String>,
 }
 
 /// Aggregate result of a wizard run.
@@ -439,6 +476,29 @@ impl GpuDescriptor {
 pub trait SystemOps: Send + Sync {
     /// Run a command to completion, capturing output.
     async fn run_command(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError>;
+    /// Run a command under a caller-chosen timeout, for work whose
+    /// legitimate duration exceeds the implementation's default
+    /// command budget (package installs). The default wraps
+    /// [`Self::run_command`] in `tokio::time::timeout`: expiring the
+    /// budget drops the command future, and the real implementation
+    /// builds its child with kill-on-drop, so a timed-out command is
+    /// killed rather than left running detached from the wizard. The
+    /// implementation's own default budget may fire first; the error
+    /// is the same shape either way.
+    async fn run_command_with_timeout(
+        &self,
+        cmd: &PlannedCommand,
+        timeout: Duration,
+    ) -> Result<CommandOutput, WizardError> {
+        match tokio::time::timeout(timeout, self.run_command(cmd)).await {
+            Ok(result) => result,
+            Err(_) => Err(WizardError::CommandFailed {
+                argv: cmd.argv.clone(),
+                code: -1,
+                stderr: format!("timed out after {}s and was stopped", timeout.as_secs()),
+            }),
+        }
+    }
     /// Spawn a long-lived process (gateway); returns the pid.
     async fn spawn_detached(&self, cmd: &PlannedCommand) -> Result<u32, WizardError>;
     /// Whether a process with `pid` is currently alive.
@@ -541,6 +601,9 @@ pub trait SystemOps: Send + Sync {
     async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), WizardError>;
     /// Remove a file; a missing file is not an error.
     async fn remove_file(&self, path: &Path) -> Result<(), WizardError>;
+    /// Remove a directory and everything under it; a missing
+    /// directory is not an error.
+    async fn remove_dir_all(&self, path: &Path) -> Result<(), WizardError>;
     async fn file_exists(&self, path: &Path) -> bool;
     /// Length of a file in bytes, or None when it does not exist or
     /// cannot be stat'ed. Used for model sizes (reading a multi-GB
@@ -570,6 +633,32 @@ pub trait SystemOps: Send + Sync {
     async fn credential_write(&self, target: &str, secret: &str) -> Result<(), WizardError>;
     /// User home directory, if known.
     fn home_dir(&self) -> Option<PathBuf>;
+}
+
+/// Whether the gateway YAML on disk is exactly what the current
+/// configuration generates. The start-gateway step rewrites
+/// `<data_dir>/gateway/config.yaml` from the live config on every
+/// start, so an audit "gateway healthy" result (or a persisted Done
+/// for the step) only proves the step complete while the file still
+/// matches the current configuration — a stale gateway answering
+/// the health probe says nothing about the saved configuration.
+/// A missing or unreadable file, drifted contents, or a
+/// configuration that no longer generates (e.g. no enabled groups)
+/// all count as NOT current. The comparison itself mirrors the
+/// activation journal's drift check in the app layer:
+/// CRLF/trailing-newline-insensitive string equality.
+pub fn gateway_config_is_current(config: &AppConfig, data_dir: &Path) -> bool {
+    let Ok(generated) = manager_gateway::generate_config_yaml(config) else {
+        return false;
+    };
+    let Ok(on_disk) = std::fs::read_to_string(data_dir.join("gateway").join("config.yaml")) else {
+        return false;
+    };
+    normalize_gateway_yaml(&generated) == normalize_gateway_yaml(&on_disk)
+}
+
+fn normalize_gateway_yaml(text: &str) -> String {
+    text.replace("\r\n", "\n").trim_end().to_string()
 }
 
 /// Ordered auto-runner for the wizard steps.
@@ -703,9 +792,26 @@ impl Wizard {
     /// overwritten. A failing check is not adopted: an unsatisfied
     /// check means "not in place yet", which the checklist correctly
     /// shows as Queued rather than as a failed install attempt.
-    pub fn hydrate(&mut self, report: &WizardReport) {
+    ///
+    /// One exception, gated on `gateway_config_current` (see
+    /// [`gateway_config_is_current`]): the start-gateway audit check
+    /// passes whenever *any* gateway answers the health probe,
+    /// including a stale one started from an older configuration.
+    /// Adopting that Done would mark the step complete without the
+    /// config being regenerated or the gateway restarted, so when the
+    /// on-disk gateway config has drifted from the current
+    /// configuration the audit result for start-gateway is not
+    /// adopted and the step stays Queued until it actually runs.
+    pub fn hydrate(&mut self, report: &WizardReport, gateway_config_current: bool) {
         for step in &report.steps {
             if !matches!(step.state, StepState::Done | StepState::Manual) {
+                continue;
+            }
+            if step.id == steps::STEP_START_GATEWAY && !gateway_config_current {
+                self.notes.insert(
+                    step.id.clone(),
+                    "gateway configuration changed since the gateway was started".to_string(),
+                );
                 continue;
             }
             let current = self.states.get(&step.id).copied();
@@ -728,8 +834,13 @@ impl Wizard {
     /// Queued with a note saying so. Only steps still Queued here
     /// are adopted, unknown ids are ignored, and a report from the
     /// other mode is rejected wholesale (audit outcomes must go
-    /// through `hydrate`, never restore).
-    pub fn restore(&mut self, report: &WizardReport) {
+    /// through `hydrate`, never restore). The one outcome restore
+    /// does not adopt verbatim is a completed start-gateway when
+    /// `gateway_config_current` is false: the persisted Done records
+    /// the configuration the gateway was started with, and drift
+    /// since then means the step has to run again (same rule as
+    /// [`Self::hydrate`]), so it comes back Queued with a note.
+    pub fn restore(&mut self, report: &WizardReport, gateway_config_current: bool) {
         if report.mode != self.mode {
             return;
         }
@@ -741,12 +852,23 @@ impl Wizard {
             if !matches!(current, None | Some(StepState::Queued)) {
                 continue;
             }
+            if step.id == steps::STEP_START_GATEWAY
+                && !gateway_config_current
+                && matches!(step.state, StepState::Done | StepState::Manual)
+            {
+                self.notes.insert(
+                    step.id.clone(),
+                    "gateway configuration changed since the gateway was started".to_string(),
+                );
+                continue;
+            }
             if step.state == StepState::Running {
                 let mut r = step.clone();
                 r.state = StepState::Queued;
                 r.message = String::new();
                 r.duration_ms = 0;
                 r.log_tail = Vec::new();
+                r.manual_command = None;
                 r.note =
                     Some("interrupted — the app closed while this step was running".to_string());
                 self.states.insert(step.id.clone(), StepState::Queued);
@@ -784,6 +906,7 @@ impl Wizard {
                         duration_ms: 0,
                         log_tail: Vec::new(),
                         note: self.notes.get(s.id()).cloned(),
+                        manual_command: None,
                     }
                 }
             })
@@ -885,6 +1008,7 @@ impl Wizard {
                     duration_ms: 0,
                     log_tail: Vec::new(),
                     note: Some(note),
+                    manual_command: None,
                 },
             );
         }
@@ -911,12 +1035,23 @@ impl Wizard {
                     duration_ms: 0,
                     log_tail: Vec::new(),
                     note: Some(note),
+                    manual_command: None,
                 },
             );
         }
     }
 
     async fn execute_step(&mut self, ctx: &WizardContext, id: &str) -> StepOutcome {
+        self.execute_step_with_budget(ctx, id, step_budget(id))
+            .await
+    }
+
+    async fn execute_step_with_budget(
+        &mut self,
+        ctx: &WizardContext,
+        id: &str,
+        budget: Duration,
+    ) -> StepOutcome {
         // Defensive: both callers resolve the step via find() first, so this
         // is unreachable in practice — but an unknown id must fail closed,
         // not panic.
@@ -934,8 +1069,25 @@ impl Wizard {
         let started = Instant::now();
         // The borrow from the finds above has ended; re-resolve for the run.
         // The None arm is unreachable (checked above) but handled anyway.
+        // The timeout drops the step's future on expiry: any command
+        // it was awaiting is dropped with it (and killed — see
+        // `run_command`), so a timed-out step frees the wizard instead
+        // of wedging it for the rest of the session.
         let raw = match self.find(id) {
-            Some(step) => step.run(ctx).await,
+            Some(step) => match tokio::time::timeout(budget, step.run(ctx)).await {
+                Ok(r) => r,
+                Err(_) => Ok(StepOutcome::failed(
+                    format!(
+                        "step '{step_name}' timed out after {} and was stopped",
+                        budget_label(budget)
+                    ),
+                    vec![format!(
+                        "the step exceeded its {} budget and was aborted; \
+                         re-run the step to retry",
+                        budget_label(budget)
+                    )],
+                )),
+            },
             None => {
                 return StepOutcome::failed(
                     format!("unknown step: {id}"),
@@ -964,9 +1116,39 @@ impl Wizard {
                 duration_ms: outcome.duration_ms,
                 log_tail: outcome.log_tail.clone(),
                 note: self.notes.get(id).cloned(),
+                manual_command: outcome.manual_command.clone(),
             },
         );
         outcome
+    }
+}
+
+/// Wall-clock budget for one step execution. Before this bound
+/// existed, a single stalled child process (a hung `uv pip install`,
+/// a Prisma pre-warm that never returned) held the wizard lock for
+/// the rest of the session, and every later step run reported
+/// "busy" with no recovery short of restarting the app.
+fn step_budget(id: &str) -> Duration {
+    match id {
+        // The gateway step installs packages, starts PostgreSQL,
+        // spawns LiteLLM, and waits out its health-check budget.
+        steps::STEP_START_GATEWAY => Duration::from_secs(600),
+        _ => Duration::from_secs(300),
+    }
+}
+
+/// "10 minutes" / "45 seconds" for timeout messages.
+fn budget_label(budget: Duration) -> String {
+    let secs = budget.as_secs();
+    if secs != 0 && secs.is_multiple_of(60) {
+        let mins = secs / 60;
+        if mins == 1 {
+            "1 minute".to_string()
+        } else {
+            format!("{mins} minutes")
+        }
+    } else {
+        format!("{secs} seconds")
     }
 }
 
@@ -1140,6 +1322,7 @@ mod tests {
             duration_ms: 1,
             log_tail: Vec::new(),
             note: None,
+            manual_command: None,
         };
         let audit_report = WizardReport {
             mode: RunMode::Audit,
@@ -1151,7 +1334,7 @@ mod tests {
         // Fresh wizard: the passing check is adopted; the failing one
         // stays Queued (not a failed install attempt).
         let mut w = wizard(&[("a", false), ("b", false)]);
-        w.hydrate(&audit_report);
+        w.hydrate(&audit_report, true);
         let after = w.report();
         let a = after.steps.iter().find(|s| s.id == "a").unwrap();
         assert_eq!(a.state, StepState::Done);
@@ -1164,7 +1347,7 @@ mod tests {
         let mut w2 = wizard(&[("a", false), ("b", false)]);
         let session = w2.run_step(&c, "a").await.unwrap();
         assert_eq!(session.state, StepState::Done);
-        w2.hydrate(&audit_report);
+        w2.hydrate(&audit_report, true);
         let a2 = w2.report().steps.into_iter().find(|s| s.id == "a").unwrap();
         assert_eq!(a2.state, StepState::Done);
         assert_ne!(a2.message, "verified by audit");
@@ -1180,6 +1363,7 @@ mod tests {
             duration_ms: 42,
             log_tail: vec!["line".to_string()],
             note: None,
+            manual_command: None,
         };
         let persisted = WizardReport {
             mode: RunMode::Install,
@@ -1191,7 +1375,7 @@ mod tests {
             ],
         };
         let mut w = wizard(&[("a", false), ("b", false), ("c", false)]);
-        w.restore(&persisted);
+        w.restore(&persisted, true);
         let after = w.report();
         let get = |id: &str| after.steps.iter().find(|s| s.id == id).unwrap();
         // Done and Failed are adopted verbatim — progress and the
@@ -1221,15 +1405,172 @@ mod tests {
             duration_ms: 1,
             log_tail: Vec::new(),
             note: None,
+            manual_command: None,
         };
         // An audit report must not be restored into the install
         // wizard (its failures are checks, not install outcomes).
         let mut w = wizard(&[("a", false)]);
-        w.restore(&WizardReport {
-            mode: RunMode::Audit,
-            steps: vec![step_report("a", StepState::Failed)],
-        });
+        w.restore(
+            &WizardReport {
+                mode: RunMode::Audit,
+                steps: vec![step_report("a", StepState::Failed)],
+            },
+            true,
+        );
         assert_eq!(w.report().steps[0].state, StepState::Queued);
+    }
+
+    fn gateway_step_report(state: StepState) -> StepReport {
+        StepReport {
+            id: steps::STEP_START_GATEWAY.to_string(),
+            name: "Start LiteLLM gateway".to_string(),
+            state,
+            message: "gateway healthy".to_string(),
+            duration_ms: 1,
+            log_tail: Vec::new(),
+            note: None,
+            manual_command: None,
+        }
+    }
+
+    #[test]
+    fn hydrate_does_not_adopt_start_gateway_done_when_config_drifted() {
+        // A stale gateway answering the audit probe must not mark
+        // start-gateway complete when the saved configuration has
+        // moved on: the step stays Queued so Apply/Start runs it.
+        let mut w = wizard(&[(steps::STEP_START_GATEWAY, false), ("a", false)]);
+        let audit_report = WizardReport {
+            mode: RunMode::Audit,
+            steps: vec![
+                gateway_step_report(StepState::Done),
+                StepReport {
+                    id: "a".to_string(),
+                    name: "a".to_string(),
+                    state: StepState::Done,
+                    message: "verified by audit".to_string(),
+                    duration_ms: 1,
+                    log_tail: Vec::new(),
+                    note: None,
+                    manual_command: None,
+                },
+            ],
+        };
+        w.hydrate(&audit_report, false);
+        let after = w.report();
+        let gw = after
+            .steps
+            .iter()
+            .find(|s| s.id == steps::STEP_START_GATEWAY)
+            .unwrap();
+        assert_eq!(gw.state, StepState::Queued);
+        assert!(gw.note.as_deref().unwrap_or("").contains("changed"));
+        // Other steps are unaffected by the gateway rule.
+        let a = after.steps.iter().find(|s| s.id == "a").unwrap();
+        assert_eq!(a.state, StepState::Done);
+
+        // With the config current, the same audit result is adopted.
+        let mut w2 = wizard(&[(steps::STEP_START_GATEWAY, false)]);
+        w2.hydrate(&audit_report, true);
+        assert_eq!(w2.state(steps::STEP_START_GATEWAY), Some(StepState::Done));
+    }
+
+    #[test]
+    fn restore_does_not_adopt_start_gateway_done_when_config_drifted() {
+        let persisted = WizardReport {
+            mode: RunMode::Install,
+            steps: vec![gateway_step_report(StepState::Done)],
+        };
+        let mut w = wizard(&[(steps::STEP_START_GATEWAY, false)]);
+        w.restore(&persisted, false);
+        assert_eq!(w.state(steps::STEP_START_GATEWAY), Some(StepState::Queued));
+        // Failures are the user's progress and still restore under drift.
+        let persisted_failed = WizardReport {
+            mode: RunMode::Install,
+            steps: vec![gateway_step_report(StepState::Failed)],
+        };
+        let mut w2 = wizard(&[(steps::STEP_START_GATEWAY, false)]);
+        w2.restore(&persisted_failed, false);
+        assert_eq!(w2.state(steps::STEP_START_GATEWAY), Some(StepState::Failed));
+        // Current config: the persisted Done restores as before.
+        let mut w3 = wizard(&[(steps::STEP_START_GATEWAY, false)]);
+        w3.restore(&persisted, true);
+        assert_eq!(w3.state(steps::STEP_START_GATEWAY), Some(StepState::Done));
+    }
+
+    #[test]
+    fn gateway_config_is_current_compares_generated_yaml_to_disk() {
+        let dir = std::env::temp_dir().join(format!("wizard-gw-current-{}", std::process::id()));
+        let gw_dir = dir.join("gateway");
+        std::fs::create_dir_all(&gw_dir).unwrap();
+        // The default config ships with backends disabled (a fresh
+        // install), which generates no YAML at all; enable them so
+        // generation succeeds.
+        let mut cfg = manager_config::AppConfig::default_config();
+        for b in cfg.backends.iter_mut() {
+            b.enabled = true;
+        }
+        // Missing file: not current (the step must run to write it).
+        assert!(!gateway_config_is_current(&cfg, &dir));
+        let yaml = manager_gateway::generate_config_yaml(&cfg).unwrap();
+        std::fs::write(gw_dir.join("config.yaml"), &yaml).unwrap();
+        assert!(gateway_config_is_current(&cfg, &dir));
+        // CRLF line endings and trailing blank lines are not drift.
+        std::fs::write(
+            gw_dir.join("config.yaml"),
+            format!("{}\r\n\r\n", yaml.replace('\n', "\r\n")),
+        )
+        .unwrap();
+        assert!(gateway_config_is_current(&cfg, &dir));
+        // A hand edit is drift.
+        std::fs::write(gw_dir.join("config.yaml"), format!("{yaml}# hand edit\n")).unwrap();
+        assert!(!gateway_config_is_current(&cfg, &dir));
+        // A configuration that no longer generates is not current.
+        let mut no_groups = cfg.clone();
+        no_groups.gateway.groups.clear();
+        std::fs::write(gw_dir.join("config.yaml"), &yaml).unwrap();
+        assert!(!gateway_config_is_current(&no_groups, &dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Step that never finishes on its own; the execution budget
+    /// must cut it off.
+    struct HangStep;
+
+    #[async_trait]
+    impl WizardStep for HangStep {
+        fn id(&self) -> &str {
+            "hang"
+        }
+        fn name(&self) -> &str {
+            "Hang step"
+        }
+        fn prerequisites(&self) -> Vec<String> {
+            vec![]
+        }
+        fn planned_commands(&self, _ctx: &WizardContext) -> Vec<PlannedCommand> {
+            vec![]
+        }
+        async fn run(&self, _ctx: &WizardContext) -> Result<StepOutcome, WizardError> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(StepOutcome::done("never reached", vec![]))
+        }
+    }
+
+    #[tokio::test]
+    async fn step_execution_times_out_and_records_failure() {
+        let c = ctx();
+        let mut w =
+            Wizard::new(vec![Box::new(HangStep)], RunMode::Install).expect("unique step ids");
+        let outcome = w
+            .execute_step_with_budget(&c, "hang", Duration::from_millis(50))
+            .await;
+        assert_eq!(outcome.state, StepState::Failed);
+        assert!(outcome.message.contains("timed out"), "{}", outcome.message);
+        assert!(outcome.message.contains("Hang step"), "{}", outcome.message);
+        // The failure is recorded like any other, so the checklist
+        // shows it and a retry is possible.
+        assert_eq!(w.state("hang"), Some(StepState::Failed));
+        assert_eq!(w.report().steps[0].state, StepState::Failed);
     }
 
     #[tokio::test]

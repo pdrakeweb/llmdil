@@ -8,15 +8,24 @@
 use crate::{CommandOutput, GpuDescriptor, HttpResponse, PlannedCommand, SystemOps, WizardError};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Scripted behavior for one command invocation.
 #[derive(Debug, Clone)]
 pub enum FakeCommandBehavior {
     Output(CommandOutput),
-    Fail { code: i32, stderr: String },
+    Fail {
+        code: i32,
+        stderr: String,
+    },
+    /// Successive invocations of the same argv yield successive
+    /// queued behaviors; once one behavior remains it repeats for
+    /// every later invocation. For commands whose result changes
+    /// because the step itself changed the world between calls
+    /// (a probe that fails, a repair, the same probe passing).
+    Sequence(Arc<Mutex<VecDeque<FakeCommandBehavior>>>),
 }
 
 impl FakeCommandBehavior {
@@ -28,6 +37,26 @@ impl FakeCommandBehavior {
                 code,
                 stderr,
             }),
+            FakeCommandBehavior::Sequence(queue) => {
+                let next = {
+                    let mut q = queue.lock().unwrap();
+                    if q.len() > 1 {
+                        q.pop_front()
+                    } else {
+                        q.front().cloned()
+                    }
+                };
+                match next {
+                    Some(behavior) => behavior.into_result(argv),
+                    // An empty sequence behaves like an unscripted
+                    // command: succeed quietly.
+                    None => Ok(CommandOutput {
+                        exit_code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    }),
+                }
+            }
         }
     }
 }
@@ -36,6 +65,10 @@ impl FakeCommandBehavior {
 struct FakeState {
     commands: HashMap<String, FakeCommandBehavior>,
     executed: Vec<Vec<String>>,
+    /// Full command (argv + env + cwd) of every `run_command` call,
+    /// parallel to `executed`: lets tests assert on the environment
+    /// a step ran a command with (e.g. a PATH prepend).
+    executed_cmds: Vec<PlannedCommand>,
     spawns: Vec<Vec<String>>,
     /// Env map of each `spawn_detached` call, parallel to `spawns`.
     spawn_envs: Vec<HashMap<String, String>>,
@@ -45,6 +78,10 @@ struct FakeState {
     /// a process that exits immediately after spawn.
     spawn_dies: bool,
     files: HashMap<PathBuf, Vec<u8>>,
+    /// Scripted `file_len` results, consulted before the files map:
+    /// lets a test give a file a length (e.g. a multi-GiB catalog
+    /// size) without storing that many bytes.
+    file_lens: HashMap<PathBuf, u64>,
     downloads: HashMap<String, Vec<u8>>,
     progress_calls: Vec<(u64, u64)>,
     downloaded_to: Vec<(String, PathBuf)>,
@@ -62,7 +99,13 @@ struct FakeState {
     /// declined the UAC prompt).
     elevated_error: Option<String>,
     http_get: HashMap<String, HttpResponse>,
+    /// Successive GET responses for one URL (the last repeats),
+    /// consulted before the static `http_get` map: scripts a server
+    /// whose answers change over time (e.g. healthy, then gone).
+    http_get_seq: HashMap<String, Vec<HttpResponse>>,
     http_post: HashMap<String, HttpResponse>,
+    /// Every directory passed to `remove_dir_all`, in order.
+    removed_dirs: Vec<PathBuf>,
     posts: Vec<(String, String)>,
     gets: Vec<String>,
     gpus: Vec<GpuDescriptor>,
@@ -88,11 +131,13 @@ impl Default for FakeState {
         Self {
             commands: HashMap::new(),
             executed: Vec::new(),
+            executed_cmds: Vec::new(),
             spawns: Vec::new(),
             spawn_envs: Vec::new(),
             spawn_cmds: Vec::new(),
             spawn_dies: false,
             files: HashMap::new(),
+            file_lens: HashMap::new(),
             downloads: HashMap::new(),
             progress_calls: Vec::new(),
             downloaded_to: Vec::new(),
@@ -103,7 +148,9 @@ impl Default for FakeState {
             extraction_files: Vec::new(),
             elevated_error: None,
             http_get: HashMap::new(),
+            http_get_seq: HashMap::new(),
             http_post: HashMap::new(),
+            removed_dirs: Vec::new(),
             posts: Vec::new(),
             gets: Vec::new(),
             gpus: Vec::new(),
@@ -153,6 +200,24 @@ impl FakeSystemOps {
         self
     }
 
+    /// Script successive responses for one argv, matched exactly:
+    /// invocations yield the queued outputs in order, and the last
+    /// one repeats once the queue drains. For a probe whose answer
+    /// changes because the step changed the world between calls
+    /// (import fails → generate → import passes).
+    pub fn with_command_sequence(&self, argv: &[&str], outputs: Vec<CommandOutput>) -> &Self {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let queue: VecDeque<FakeCommandBehavior> = outputs
+            .into_iter()
+            .map(FakeCommandBehavior::Output)
+            .collect();
+        self.state.lock().unwrap().commands.insert(
+            key(&argv),
+            FakeCommandBehavior::Sequence(Arc::new(Mutex::new(queue))),
+        );
+        self
+    }
+
     /// Script a command failure, matched on exact argv.
     pub fn with_command_failure(&self, argv: &[&str], code: i32, stderr: &str) -> &Self {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
@@ -183,6 +248,13 @@ impl FakeSystemOps {
         self
     }
 
+    /// Script the length `file_len` reports for `path`, independent
+    /// of any stored bytes (see `FakeState::file_lens`).
+    pub fn with_file_len(&self, path: PathBuf, len: u64) -> &Self {
+        self.state.lock().unwrap().file_lens.insert(path, len);
+        self
+    }
+
     pub fn with_download(&self, url: &str, bytes: Vec<u8>) -> &Self {
         self.state
             .lock()
@@ -206,6 +278,23 @@ impl FakeSystemOps {
             .http_get
             .insert(url.to_string(), resp);
         self
+    }
+
+    /// Script successive GET responses for one URL: each call takes
+    /// the next response, and the last one repeats — the GET
+    /// analogue of [`Self::with_command_sequence`].
+    pub fn with_http_get_sequence(&self, url: &str, resps: Vec<HttpResponse>) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .http_get_seq
+            .insert(url.to_string(), resps);
+        self
+    }
+
+    /// Directories removed via `remove_dir_all`, in order.
+    pub fn removed_dirs(&self) -> Vec<PathBuf> {
+        self.state.lock().unwrap().removed_dirs.clone()
     }
 
     pub fn with_http_post(&self, url: &str, resp: HttpResponse) -> &Self {
@@ -288,6 +377,12 @@ impl FakeSystemOps {
     /// Every argv passed to `run_command`, in order.
     pub fn executed_commands(&self) -> Vec<Vec<String>> {
         self.state.lock().unwrap().executed.clone()
+    }
+
+    /// Every full command passed to `run_command`, in order
+    /// (parallel to [`Self::executed_commands`]), env included.
+    pub fn executed_cmds(&self) -> Vec<PlannedCommand> {
+        self.state.lock().unwrap().executed_cmds.clone()
     }
 
     /// Every argv passed to `spawn_detached`, in order.
@@ -427,6 +522,7 @@ impl SystemOps for FakeSystemOps {
     async fn run_command(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError> {
         let mut st = self.state.lock().unwrap();
         st.executed.push(cmd.argv.clone());
+        st.executed_cmds.push(cmd.clone());
         match st.commands.get(&key(&cmd.argv)).cloned() {
             Some(behavior) => behavior.into_result(&cmd.argv),
             // Default: succeed quietly so tests only script what they assert on.
@@ -553,6 +649,14 @@ impl SystemOps for FakeSystemOps {
     async fn http_get(&self, url: &str) -> Result<HttpResponse, WizardError> {
         let mut st = self.state.lock().unwrap();
         st.gets.push(url.to_string());
+        if let Some(seq) = st.http_get_seq.get_mut(url) {
+            if seq.len() > 1 {
+                return Ok(seq.remove(0));
+            }
+            if let Some(resp) = seq.first() {
+                return Ok(resp.clone());
+            }
+        }
         st.http_get
             .get(url)
             .cloned()
@@ -609,17 +713,23 @@ impl SystemOps for FakeSystemOps {
         Ok(())
     }
 
+    async fn remove_dir_all(&self, path: &Path) -> Result<(), WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.removed_dirs.push(path.to_path_buf());
+        st.files.retain(|p, _| !p.starts_with(path));
+        Ok(())
+    }
+
     async fn file_exists(&self, path: &Path) -> bool {
         self.state.lock().unwrap().files.contains_key(path)
     }
 
     async fn file_len(&self, path: &Path) -> Option<u64> {
-        self.state
-            .lock()
-            .unwrap()
-            .files
-            .get(path)
-            .map(|data| data.len() as u64)
+        let st = self.state.lock().unwrap();
+        if let Some(len) = st.file_lens.get(path) {
+            return Some(*len);
+        }
+        st.files.get(path).map(|data| data.len() as u64)
     }
 
     async fn sha256_file(&self, path: &Path) -> Result<String, WizardError> {

@@ -376,3 +376,32 @@ established); the GPUs page only reports placement, never edits it.
   still write a split for the coder on fresh installs; a split
   combined with `-ot exps=CPU` is legal but not the intended
   layout.
+
+## v0.1.31 — per-backend memory requirements, offload-aware placement
+
+- Each backend now calculates and reports its GPU RAM requirement
+  and system RAM requirement under its own serving configuration
+  (split, expert offload, context size), with the derivation basis
+  (exact / catalog / estimate) carried alongside.
+- New `gguf` module in manager-models parses a GGUF header prefix:
+  tensor-directory sums give exact total and routed-expert bytes
+  (stacked `_exps` and per-expert naming; shared experts stay
+  GPU-resident, matching `-ot exps=CPU`), and metadata gives KV
+  geometry with hybrid `full_attention_interval` folding. New
+  `memory` module detects expert offload in raw flags (`-ot`
+  spellings, `--n-cpu-moe`) and computes the requirement; an
+  offload split that cannot be resolved degrades to
+  all-on-GPU with basis Estimate rather than inventing a split.
+- Qwen3-Coder-Next's catalog entry pins `expert_bytes`
+  (46,707,769,344 of 49,301,055,488 — derived from the file's
+  tensor directory; the directory sums reproduce the pinned file
+  size exactly). Its GPU requirement at the default 32K context
+  is ~2.4 GiB weights + 768 MiB KV; the experts' ~43.5 GiB is
+  reported against system RAM.
+- The placement projection accepts a serving backend scope: the
+  split divides GPU-resident weights only and the payload carries
+  the system-RAM share. Backend cards show the requirement lines;
+  the wizard's tensor-split step accounts offload backends by
+  resident bytes without assigning them a split, and its audit
+  accepts an empty split for offload backends and for models
+  whose resident weights fit a single GPU.

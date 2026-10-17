@@ -704,6 +704,7 @@ mod tests {
                 total_vram_mib: 16384,
                 pci_bus_id: "00000000:65:00.0".into(),
                 driver_version: "581.57".into(),
+                driver_model: None,
                 source: TelemetrySourceKind::NvidiaSmi,
             },
             crate::GpuInfo {
@@ -714,6 +715,7 @@ mod tests {
                 total_vram_mib: 16384,
                 pci_bus_id: "00000000:01:00.0".into(),
                 driver_version: "581.57".into(),
+                driver_model: None,
                 source: TelemetrySourceKind::NvidiaSmi,
             },
         ]);

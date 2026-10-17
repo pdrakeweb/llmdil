@@ -155,8 +155,7 @@ pub fn parse_metrics(text: &str, at: Instant) -> MetricsSnapshot {
             continue;
         }
         match base {
-            "litellm_deployment_success_responses"
-            | "litellm_deployment_failure_responses" => {
+            "litellm_deployment_success_responses" | "litellm_deployment_failure_responses" => {
                 let Some(api_base) = label_value(&labels, "api_base") else {
                     continue;
                 };

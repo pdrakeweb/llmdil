@@ -62,7 +62,11 @@ export interface GpuInfo {
   util_spark?: number[];
   temp_spark?: number[];
   power_spark?: number[];
-  processes?: { process: string; pid: number; vram_mib: number; backend: string }[];
+  /** Per-process VRAM attribution. `vram_mib` is null when the
+   *  figure was not measured (a WDDM GPU whose Windows counter data
+   *  was unavailable) — unknown, not zero: consumers must not render
+   *  it as 0 MiB, "context only", or measured residency. */
+  processes?: { process: string; pid: number; vram_mib: number | null; backend: string }[];
   models?: { model: string; layers: string }[];
 }
 
@@ -85,6 +89,12 @@ export interface PlacementRow {
    *  at model assembly time; views may also resolve it live from the
    *  model's backend list via backendId. */
   backendStatus?: Status;
+  /** Whether the owning backend is enabled in the configuration.
+   *  A disabled backend's placement is eventual, not actual — the
+   *  dashboard grays its row out (Pete, 2026-10-16: placements are
+   *  per backend, and disabled backends still show where they
+   *  WOULD place). */
+  backendEnabled?: boolean;
 }
 
 export interface MapEvent {
@@ -130,4 +140,10 @@ export interface WizardStepState {
    * only), rendered with a copy button. Filled in by the wizard view
    * from setup_get_commands. */
   manualCommands?: string;
+  /** Manual-command block the failed step's own outcome carried
+   * (start-gateway: the exact start commands for this install,
+   * secrets named but never valued). Preferred over
+   * `manualCommands` when present — it is specific to the failure,
+   * where the planned commands are generic. */
+  manualCommand?: string;
 }

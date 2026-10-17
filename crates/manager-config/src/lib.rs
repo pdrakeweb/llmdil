@@ -231,6 +231,27 @@ pub struct ModelConfig {
     /// its file and configuration but excludes it from wizard downloads.
     #[serde(default = "default_model_enabled")]
     pub enabled: bool,
+    /// Operator-chosen short display name (renaming in the Models
+    /// view). Wins over the curated catalog name wherever a short
+    /// name is shown; `None` falls back to the catalog name, then
+    /// the model id. Catalog definition refreshes never touch it —
+    /// it is the operator's own label, not catalog data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// Validate an operator-chosen model display name for
+/// [`ModelConfig::display_name`]: trims surrounding whitespace,
+/// rejects empty and over-long names, and returns the name to store.
+pub fn validate_display_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("display name must not be empty".to_string());
+    }
+    if name.chars().count() > 64 {
+        return Err("display name must be at most 64 characters".to_string());
+    }
+    Ok(name.to_string())
 }
 
 /// Telemetry polling configuration (spec §5).
@@ -545,6 +566,7 @@ pub fn append_missing_catalog_models(cfg: &mut AppConfig, entries: &[CatalogMode
             source_url: entry.source_url.clone(),
             assigned_backends: entry.assigned_backends.clone(),
             enabled: entry.enabled,
+            display_name: None,
         });
         changed = true;
     }
@@ -1042,6 +1064,29 @@ fn replace_file(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn display_name_validates_and_defaults() {
+        assert_eq!(
+            validate_display_name("  Coder Next  ").unwrap(),
+            "Coder Next"
+        );
+        assert!(validate_display_name("   ").is_err());
+        assert!(validate_display_name(&"x".repeat(65)).is_err());
+        assert_eq!(validate_display_name(&"x".repeat(64)).unwrap().len(), 64);
+        // A config written before the field existed loads with no
+        // override (serde default), and the field stays out of the
+        // serialized form while unset.
+        let legacy = r#"{"id":"m","gguf_path":"models/m.gguf","quant":"Q4_K_M","params_b":1.0,"sha256":"","verified_at":null,"enabled":true}"#;
+        let m: ModelConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(m.display_name, None);
+        assert!(!serde_json::to_string(&m).unwrap().contains("display_name"));
+        let renamed: ModelConfig = serde_json::from_str(
+            r#"{"id":"m","gguf_path":"models/m.gguf","quant":"Q4_K_M","params_b":1.0,"sha256":"","verified_at":null,"enabled":true,"display_name":"Coder"}"#,
+        )
+        .unwrap();
+        assert_eq!(renamed.display_name.as_deref(), Some("Coder"));
+    }
+
+    #[test]
     fn append_missing_catalog_models_appends_only_missing() {
         let mut cfg = AppConfig::default_config();
         cfg.models.push(ModelConfig {
@@ -1054,6 +1099,7 @@ mod tests {
             source_url: String::new(),
             assigned_backends: Vec::new(),
             enabled: true,
+            display_name: None,
         });
         let entry = |id: &str, enabled: bool| CatalogModelEntry {
             model_id: id.to_string(),
@@ -1100,6 +1146,7 @@ mod tests {
             source_url: "https://example.com/OldPlanner.gguf".to_string(),
             assigned_backends: vec!["planner".to_string()],
             enabled: true,
+            display_name: None,
         });
         let planner = cfg.backends.iter_mut().find(|b| b.id == "planner").unwrap();
         planner.model_file = PathBuf::from("models/OldPlanner.gguf");
@@ -1151,6 +1198,7 @@ mod tests {
             source_url: "https://example.com/OldCoder.gguf".to_string(),
             assigned_backends: vec!["coder".to_string()],
             enabled: true,
+            display_name: None,
         });
         // The operator moved the coder backend to another model's
         // file and set their own raw flags.
@@ -1197,6 +1245,58 @@ mod tests {
         assert!(!refresh_catalog_definition(&mut cfg, &missing));
     }
 
+    #[test]
+    fn refresh_applies_catalog_offload_only_without_operator_flags() {
+        // The catalog default offload rides a definition refresh
+        // as raw_flags (e.g. Nemotron's --n-cpu-moe 16): it lands
+        // on a serving backend that has no raw flags of its own,
+        // and never replaces an operator-changed offload.
+        let build = |backend_raw: Option<&str>| {
+            let mut cfg = AppConfig::default_config();
+            cfg.models.push(ModelConfig {
+                id: "nemotron-3.5-lightning-30b".to_string(),
+                gguf_path: PathBuf::from("models/OldNemotron.gguf"),
+                quant: "Q4_K_M".to_string(),
+                params_b: 30.0,
+                sha256: "b".repeat(64),
+                verified_at: Some(Utc::now()),
+                source_url: "https://example.com/OldNemotron.gguf".to_string(),
+                assigned_backends: vec!["coder".to_string()],
+                enabled: true,
+                display_name: None,
+            });
+            let coder = cfg.backends.iter_mut().find(|b| b.id == "coder").unwrap();
+            coder.model_file = PathBuf::from("models/OldNemotron.gguf");
+            coder.raw_flags = backend_raw.map(str::to_string);
+            cfg
+        };
+        let refresh = CatalogDefinitionRefresh {
+            entry: CatalogModelEntry {
+                model_id: "nemotron-3.5-lightning-30b".to_string(),
+                gguf_file_name: "NewNemotron.gguf".to_string(),
+                quant: "Q4_K_M".to_string(),
+                params_b: 31.6,
+                sha256: "c".repeat(64),
+                source_url: "https://example.com/NewNemotron.gguf".to_string(),
+                assigned_backends: vec!["coder".to_string()],
+                enabled: true,
+            },
+            backend_id: "coder".to_string(),
+            clear_split: false,
+            raw_flags: Some("--n-cpu-moe 16".to_string()),
+        };
+        // No operator flags: the catalog default offload applies.
+        let mut cfg = build(None);
+        assert!(refresh_catalog_definition(&mut cfg, &refresh));
+        let coder = cfg.backends.iter().find(|b| b.id == "coder").unwrap();
+        assert_eq!(coder.raw_flags.as_deref(), Some("--n-cpu-moe 16"));
+        // Operator-changed offload: preserved verbatim.
+        let mut cfg = build(Some("--n-cpu-moe 4"));
+        assert!(refresh_catalog_definition(&mut cfg, &refresh));
+        let coder = cfg.backends.iter().find(|b| b.id == "coder").unwrap();
+        assert_eq!(coder.raw_flags.as_deref(), Some("--n-cpu-moe 4"));
+    }
+
     use super::*;
 
     fn unique_tmpdir(name: &str) -> PathBuf {
@@ -1227,6 +1327,7 @@ mod tests {
             source_url: "https://example.com/qwen3-8b.gguf".to_string(),
             assigned_backends: vec!["tool-runner".to_string()],
             enabled: true,
+            display_name: None,
         });
         let backend = cfg
             .backends
@@ -1463,6 +1564,7 @@ mod tests {
             source_url: "https://example.com/q.gguf".to_string(),
             assigned_backends: Vec::new(),
             enabled: true,
+            display_name: None,
         });
         let catalog = vec![CatalogModelDefaults {
             model_id: "qwen3-8b".to_string(),
@@ -1504,6 +1606,7 @@ mod tests {
             source_url: "https://example.com/q.gguf".to_string(),
             assigned_backends: vec!["tool-runner".to_string()],
             enabled: true,
+            display_name: None,
         });
         // The operator pointed the backend at a custom file; neither
         // the file nor the model's hash/params may be rewritten. (The

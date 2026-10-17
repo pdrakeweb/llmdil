@@ -27,7 +27,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    GpuInfo, GpuSample, ProcessSample, TelemetryError, TelemetrySource, TelemetrySourceKind,
+    DriverModel, GpuInfo, GpuSample, ProcessSample, TelemetryError, TelemetrySource,
+    TelemetrySourceKind,
 };
 
 /// `nvidia-smi --query --xml-format` source (load-bearing fallback).
@@ -51,8 +52,8 @@ impl NvidiaSmiSource {
         // visible console window each time (focus-stealing flash).
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW
+            // CREATE_NO_WINDOW (tokio's Command carries the method
+            // inherently on Windows; no trait import needed).
             cmd.creation_flags(0x08000000);
         }
         let output = cmd.output().await.map_err(|e| {
@@ -131,6 +132,7 @@ impl NvidiaSmiSource {
                 total_vram_mib: g.mem_total_mib,
                 pci_bus_id: g.pci_bus_id.clone(),
                 driver_version: doc.driver_version.clone(),
+                driver_model: g.driver_model,
                 source: TelemetrySourceKind::NvidiaSmi,
             })
             .collect())
@@ -217,6 +219,7 @@ struct ParsedGpu {
     fan_pct: Option<f32>,
     clocks_graphics_mhz: Option<u32>,
     clocks_mem_mhz: Option<u32>,
+    driver_model: Option<DriverModel>,
     processes: Vec<ProcessSample>,
 }
 
@@ -239,6 +242,7 @@ impl ParsedGpu {
             power_limit_w: self.power_limit_w,
             clocks_graphics_mhz: self.clocks_graphics_mhz,
             clocks_mem_mhz: self.clocks_mem_mhz,
+            driver_model: self.driver_model,
         }
     }
 }
@@ -391,10 +395,14 @@ fn parse_document(xml: &str) -> Result<ParsedDoc, TelemetryError> {
                             .ok_or_else(|| {
                                 TelemetryError::ParseError(format!("{label}: missing pid"))
                             })?;
-                        let vram_mib = pf
-                            .get("used_memory")
-                            .and_then(|s| parse_mib(s))
-                            .unwrap_or(0);
+                        // `used_memory` is `N/A` for every process
+                        // under the WDDM driver model: per-process
+                        // accounting does not exist there, and the
+                        // value is UNKNOWN (None) — never 0. The PDH
+                        // fixup source (see `crate::pdh`) fills WDDM
+                        // rows in from the Windows GPU Process Memory
+                        // counters; TCC rows carry real figures here.
+                        let vram_mib = pf.get("used_memory").and_then(|s| parse_mib(s));
                         proc_list.push(ProcessSample {
                             pid,
                             name: pf
@@ -516,11 +524,23 @@ fn finalize_gpu(
 
     let pci_bus_id = get("pci/pci_bus").unwrap_or_else(|| id_attr.to_string());
 
+    // <driver_model><current_dm>WDDM|TCC</current_dm>: decides whether
+    // this GPU's per-process figures are trustworthy (see module docs
+    // in `crate::pdh`). Absent or unrecognized -> None (unknown): the
+    // figures are then treated as-is, the pre-driver-model behavior.
+    let driver_model =
+        get("driver_model/current_dm").and_then(|s| match s.trim().to_ascii_uppercase().as_str() {
+            "WDDM" => Some(DriverModel::Wddm),
+            "TCC" => Some(DriverModel::Tcc),
+            _ => None,
+        });
+
     Ok(ParsedGpu {
         index,
         name,
         uuid,
         pci_bus_id,
+        driver_model,
         mem_total_mib,
         mem_used_mib,
         gpu_util_pct,
@@ -587,12 +607,12 @@ mod tests {
         let procs = NvidiaSmiSource::parse_processes(FIXTURE).expect("fixture must parse");
         assert_eq!(procs.len(), 3, "2 on A4000 + 1 on P100-0 + 0 on P100-1");
         assert_eq!(procs[0].pid, 4321);
-        assert_eq!(procs[0].vram_mib, 6144);
+        assert_eq!(procs[0].vram_mib, Some(6144));
         assert!(procs[0].name.contains("llama-server"));
         assert_eq!(procs[1].pid, 9876);
-        assert_eq!(procs[1].vram_mib, 2048);
+        assert_eq!(procs[1].vram_mib, Some(2048));
         assert_eq!(procs[2].pid, 4321);
-        assert_eq!(procs[2].vram_mib, 11264);
+        assert_eq!(procs[2].vram_mib, Some(11264));
         // Each process carries the index of its enclosing <gpu> — the same
         // index that GPU's sample carries. pid 4321 appears on both GPU 0
         // and GPU 1 (a tensor split); the two rows must not be conflated.
@@ -803,6 +823,59 @@ mod tests {
         assert_eq!(samples[0].index, 5);
         assert_eq!(procs.len(), 1);
         assert_eq!(procs[0].gpu_index, samples[0].index);
+    }
+
+    #[test]
+    fn wddm_process_memory_is_unknown_not_zero() {
+        // Real WDDM behavior: the driver reports <driver_model> WDDM
+        // and every process's used_memory as N/A, while device totals
+        // stay real. The process figure is unknown (None) — flattening
+        // it to 0 made a resident model read as "context only".
+        let xml = r#"<?xml version="1.0" ?><nvidia_smi_log>
+<driver_version>581.57</driver_version><attached_gpus>1</attached_gpus>
+<gpu id="00000000:01:00.0">
+<product_name>NVIDIA RTX A4000</product_name>
+<uuid>GPU-cccc</uuid><minor_number>0</minor_number>
+<pci><pci_bus>00000000:01:00.0</pci_bus></pci>
+<driver_model><current_dm>WDDM</current_dm><pending_dm>WDDM</pending_dm></driver_model>
+<fan_speed>30 %</fan_speed>
+<fb_memory_usage><total>16384 MiB</total><used>11264 MiB</used></fb_memory_usage>
+<utilization><gpu_util>62 %</gpu_util></utilization>
+<temperature><gpu_temp>67 C</gpu_temp></temperature>
+<gpu_power_readings><power_draw>95.30 W</power_draw><power_limit>140.00 W</power_limit></gpu_power_readings>
+<processes><process_info><pid>4321</pid><process_name>llama-server.exe</process_name><used_memory>N/A</used_memory></process_info></processes>
+</gpu></nvidia_smi_log>"#;
+        let (samples, procs) = NvidiaSmiSource::parse_xml_with_processes(xml).expect("must parse");
+        assert_eq!(samples[0].driver_model, Some(DriverModel::Wddm));
+        assert_eq!(samples[0].vram_used_mib, 11264, "device totals stay real");
+        assert_eq!(procs.len(), 1);
+        assert_eq!(
+            procs[0].vram_mib, None,
+            "WDDM per-process figure is unknown"
+        );
+        let infos = NvidiaSmiSource::parse_inventory(xml).expect("must parse");
+        assert_eq!(infos[0].driver_model, Some(DriverModel::Wddm));
+    }
+
+    #[test]
+    fn tcc_driver_model_and_real_process_memory() {
+        let xml = r#"<?xml version="1.0" ?><nvidia_smi_log>
+<driver_version>581.57</driver_version><attached_gpus>1</attached_gpus>
+<gpu id="00000000:65:00.0">
+<product_name>Tesla P100-PCIE-16GB</product_name>
+<uuid>GPU-dddd</uuid><minor_number>0</minor_number>
+<pci><pci_bus>00000000:65:00.0</pci_bus></pci>
+<driver_model><current_dm>TCC</current_dm><pending_dm>TCC</pending_dm></driver_model>
+<fan_speed>N/A</fan_speed>
+<fb_memory_usage><total>16384 MiB</total><used>12288 MiB</used></fb_memory_usage>
+<utilization><gpu_util>45 %</gpu_util></utilization>
+<temperature><gpu_temp>61 C</gpu_temp></temperature>
+<gpu_power_readings><power_draw>118.75 W</power_draw><power_limit>250.00 W</power_limit></gpu_power_readings>
+<processes><process_info><pid>4321</pid><process_name>llama-server.exe</process_name><used_memory>11264 MiB</used_memory></process_info></processes>
+</gpu></nvidia_smi_log>"#;
+        let (samples, procs) = NvidiaSmiSource::parse_xml_with_processes(xml).expect("must parse");
+        assert_eq!(samples[0].driver_model, Some(DriverModel::Tcc));
+        assert_eq!(procs[0].vram_mib, Some(11264));
     }
 
     #[tokio::test]

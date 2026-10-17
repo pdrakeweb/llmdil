@@ -13,10 +13,15 @@
 //! synthesized (spec global UI rules).
 
 pub mod nvml;
+pub mod pdh;
 pub mod smi;
 pub mod store;
 
 pub use nvml::NvmlSource;
+pub use pdh::{
+    AdapterLuid, ProcessMemoryFixupSource, ProcessMemoryReading, ProcessMemorySource,
+    SystemProcessMemorySource,
+};
 pub use smi::{default_smi_path, NvidiaSmiSource};
 pub use store::{
     FallbackSource, PeakMark, PeakMarks, PollCadence, PollError, Poller, TelemetryStore,
@@ -43,6 +48,19 @@ pub enum TelemetrySourceKind {
     NvidiaSmi,
 }
 
+/// The Windows driver model a GPU's driver is running, when the
+/// telemetry source reports it (nvidia-smi's `driver_model/current_dm`,
+/// NVML's `nvmlDeviceGetDriverModel` equivalent). Load-bearing for
+/// per-process accounting: NVML/nvidia-smi per-process memory figures
+/// are real under TCC but read 0 under WDDM (see [`pdh`]), so consumers
+/// must know which model produced a process row before trusting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DriverModel {
+    Wddm,
+    Tcc,
+}
+
 /// Static inventory for one GPU.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuInfo {
@@ -58,6 +76,10 @@ pub struct GpuInfo {
     pub pci_bus_id: String,
     /// Driver version string, e.g. "581.57".
     pub driver_version: String,
+    /// Windows driver model (WDDM/TCC) when reported; `None` when the
+    /// source did not say (older payloads, non-Windows).
+    #[serde(default)]
+    pub driver_model: Option<DriverModel>,
     pub source: TelemetrySourceKind,
 }
 
@@ -99,6 +121,11 @@ pub struct GpuSample {
     pub clocks_graphics_mhz: Option<u32>,
     /// Memory clock MHz, when reported.
     pub clocks_mem_mhz: Option<u32>,
+    /// Windows driver model (WDDM/TCC) when the source reports it;
+    /// decides whether this GPU's per-process rows are trustworthy
+    /// (see [`pdh`]). `None` when not reported.
+    #[serde(default)]
+    pub driver_model: Option<DriverModel>,
 }
 
 impl GpuSample {
@@ -141,6 +168,7 @@ impl GpuSample {
             power_limit_w: None,
             clocks_graphics_mhz: None,
             clocks_mem_mhz: None,
+            driver_model: None,
         }
     }
 }
@@ -150,7 +178,16 @@ impl GpuSample {
 pub struct ProcessSample {
     pub pid: u32,
     pub name: String,
-    pub vram_mib: u64,
+    /// VRAM this process holds on `gpu_index`, in MiB — or `None` when
+    /// the figure was **not measured**. Unknown is a real state, not a
+    /// zero: under the WDDM driver model NVML/nvidia-smi per-process
+    /// accounting reports nothing usable (the XML says `N/A`), and on
+    /// Windows the value is filled in from the GPU Process Memory
+    /// performance counters instead (see [`pdh`]). When even those are
+    /// unavailable the row stays `None`, and consumers must render it
+    /// as unmeasured — never as 0 MiB, never as "context only", and
+    /// never as measured residency.
+    pub vram_mib: Option<u64>,
     /// Index of the GPU this process was collected under — the same index
     /// assigned to that GPU's [`GpuSample`]. Processes are reported per GPU
     /// by both sources (nested per-GPU in the nvidia-smi XML), and one pid
@@ -182,7 +219,8 @@ pub trait TelemetrySource: Send + Sync {
     }
 }
 
-/// The production telemetry stack: NVML primary, `nvidia-smi` fallback.
+/// The production telemetry stack: NVML primary, `nvidia-smi` fallback,
+/// with the WDDM per-process fixup (see [`pdh`]) applied on top.
 ///
 /// The fallback is load-bearing, not decorative: on machines where NVML is
 /// unavailable at all — or where per-GPU handles fail, the documented
@@ -191,8 +229,12 @@ pub trait TelemetrySource: Send + Sync {
 /// the per-GPU "nvidia-smi fallback" label (spec §5). This is the default
 /// wiring the app boots with; NVML being unwired on non-Windows builds
 /// (see [`nvml`]) is precisely the case the fallback exists for.
-pub fn default_telemetry_stack() -> FallbackSource<NvmlSource, NvidiaSmiSource> {
-    FallbackSource::new(NvmlSource::new(), NvidiaSmiSource::default())
+pub fn default_telemetry_stack(
+) -> ProcessMemoryFixupSource<FallbackSource<NvmlSource, NvidiaSmiSource>> {
+    ProcessMemoryFixupSource::new(
+        FallbackSource::new(NvmlSource::new(), NvidiaSmiSource::default()),
+        SystemProcessMemorySource,
+    )
 }
 
 /// Telemetry errors.
@@ -204,4 +246,6 @@ pub enum TelemetryError {
     SmiFailed(String),
     #[error("XML parse error: {0}")]
     ParseError(String),
+    #[error("per-process GPU memory counters unavailable: {0}")]
+    ProcessMemoryUnavailable(String),
 }

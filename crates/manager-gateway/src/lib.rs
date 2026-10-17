@@ -457,6 +457,44 @@ pub fn should_fallback(
 }
 
 // ---------------------------------------------------------------------------
+// Derived group enablement
+// ---------------------------------------------------------------------------
+
+/// Whether one group member counts toward the group's derived enabled
+/// state: a member naming a configured backend counts when that backend
+/// is enabled; a `host:port` member names an endpoint outside the app's
+/// backend list — generation includes it unconditionally, so it always
+/// counts. A member naming neither counts for nothing (and, when the
+/// group is otherwise enabled, generation rejects it as unknown).
+fn member_counts_enabled(member: &str, config: &AppConfig) -> bool {
+    match config.backends.iter().find(|b| b.id == member) {
+        Some(backend) => backend.enabled,
+        None => parse_host_port(member).is_some(),
+    }
+}
+
+/// How many of the group's members are enabled — the basis of the
+/// group's derived state. A group's enabled state is never stored:
+/// it is enabled exactly when at least one member backend is enabled
+/// (Pete, 2026-10-16), and the generated gateway config includes
+/// enabled groups only. This is the one place the rule is computed;
+/// the Tauri layer reports these values to the UI rather than
+/// re-deriving them.
+pub fn group_enabled_member_count(group: &ModelGroup, config: &AppConfig) -> usize {
+    group
+        .members
+        .iter()
+        .filter(|m| member_counts_enabled(m, config))
+        .count()
+}
+
+/// The group's derived enabled state: enabled iff at least one member
+/// backend is enabled. See [`group_enabled_member_count`].
+pub fn group_enabled(group: &ModelGroup, config: &AppConfig) -> bool {
+    group_enabled_member_count(group, config) > 0
+}
+
+// ---------------------------------------------------------------------------
 // config.yaml generation
 // ---------------------------------------------------------------------------
 
@@ -569,6 +607,11 @@ fn strategy_to_litellm(s: RoutingStrategy) -> &'static str {
 /// strategies are recorded in the YAML for reference only — LiteLLM
 /// routes live traffic under the one global strategy, and
 /// [`pick_backend`] serves only the routing-trace explainer.
+///
+/// Only enabled groups are included: a group's enabled state is
+/// derived from its member backends ([`group_enabled`]), never
+/// stored, and a group with no enabled member is omitted entirely —
+/// its deployments and its router fallback rows alike.
 pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> {
     if config.gateway.groups.is_empty() {
         return Err(GatewayError::ConfigInvalid(
@@ -576,11 +619,19 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
         ));
     }
 
-    // Collect entries per group (validates member references).
+    // Collect entries per group (validates member references for
+    // every group, enabled or not), then keep enabled groups only.
     let mut group_entries: Vec<(&ModelGroup, Vec<LiteLlmModelEntry>)> = Vec::new();
     for group in &config.gateway.groups {
         let entries = model_entries_for_group(group, config)?;
-        group_entries.push((group, entries));
+        if group_enabled(group, config) {
+            group_entries.push((group, entries));
+        }
+    }
+    if group_entries.is_empty() {
+        return Err(GatewayError::ConfigInvalid(
+            "no enabled model groups (every group's member backends are disabled)".to_string(),
+        ));
     }
 
     let mut out = String::new();
@@ -636,7 +687,8 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
     }
 
     // --- router_settings (global; see module docs for the resolution rule) ---
-    let global_strategy = resolve_global_strategy(config);
+    let included_groups: Vec<&ModelGroup> = group_entries.iter().map(|(g, _)| *g).collect();
+    let global_strategy = resolve_global_strategy(&included_groups);
     out.push_str("router_settings:\n");
     out.push_str(&format!(
         "  routing_strategy: {}\n",
@@ -697,17 +749,19 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
     Ok(out)
 }
 
-/// Resolve the single global `routing_strategy` for `router_settings`:
-/// first multi-member group's strategy, else the planner group's, else the
-/// first group's.
-fn resolve_global_strategy(config: &AppConfig) -> RoutingStrategy {
-    if let Some(g) = config.gateway.groups.iter().find(|g| g.members.len() > 1) {
+/// Resolve the single global `routing_strategy` for `router_settings`
+/// over the groups included in the generated config (enabled groups
+/// only): first multi-member group's strategy, else the planner
+/// group's, else the first group's. The caller guarantees `groups`
+/// is non-empty.
+fn resolve_global_strategy(groups: &[&ModelGroup]) -> RoutingStrategy {
+    if let Some(g) = groups.iter().find(|g| g.members.len() > 1) {
         return g.strategy;
     }
-    if let Some(g) = config.gateway.groups.iter().find(|g| g.name == "planner") {
+    if let Some(g) = groups.iter().find(|g| g.name == "planner") {
         return g.strategy;
     }
-    config.gateway.groups[0].strategy
+    groups[0].strategy
 }
 
 /// Minimal YAML scalar quoting: bare when safe, double-quoted otherwise.
@@ -993,6 +1047,104 @@ mod tests {
         // Fallback chains must not dangle.
         assert!(!yaml.contains("openrouter]"));
         assert!(!yaml.contains(", openrouter"));
+    }
+
+    #[test]
+    fn group_enablement_is_derived_from_member_backends() {
+        let mut cfg = four_backend_config();
+        // All members enabled by construction.
+        for g in &cfg.gateway.groups {
+            assert!(group_enabled(g, &cfg), "group '{}'", g.name);
+            assert_eq!(group_enabled_member_count(g, &cfg), 1);
+        }
+        // Disabling the only member disables the group.
+        cfg.backends
+            .iter_mut()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .enabled = false;
+        let coder = cfg
+            .gateway
+            .groups
+            .iter()
+            .find(|g| g.name == "coder")
+            .unwrap();
+        assert!(!group_enabled(coder, &cfg));
+        assert_eq!(group_enabled_member_count(coder, &cfg), 0);
+        // Other groups are unaffected.
+        let planner = cfg
+            .gateway
+            .groups
+            .iter()
+            .find(|g| g.name == "planner")
+            .unwrap();
+        assert!(group_enabled(planner, &cfg));
+    }
+
+    #[test]
+    fn yaml_omits_group_with_all_members_disabled() {
+        let mut cfg = four_backend_config();
+        cfg.backends
+            .iter_mut()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .enabled = false;
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        // No deployment and no fallback row for the disabled group.
+        assert!(
+            !yaml.lines().any(|l| l.trim() == "- model_name: coder"),
+            "yaml:\n{yaml}"
+        );
+        assert!(!yaml.contains("127.0.0.1:8082"), "yaml:\n{yaml}");
+        assert!(
+            !yaml.lines().any(|l| l.trim().starts_with("- coder:")),
+            "yaml:\n{yaml}"
+        );
+        // Fallback chains naming it drop the reference instead of
+        // leaving it dangling.
+        assert!(yaml.contains("- planner: [openrouter]"), "yaml:\n{yaml}");
+        assert!(yaml.contains("- coder-fast: [openrouter]"), "yaml:\n{yaml}");
+        // Remaining groups are generated as before.
+        assert!(yaml.contains("model_name: planner"));
+        assert!(yaml.contains("http://127.0.0.1:8081/v1"));
+    }
+
+    #[test]
+    fn yaml_mixed_group_includes_only_enabled_members() {
+        let mut cfg = four_backend_config();
+        let mut coder_b = backend("coder-b", 8086);
+        coder_b.enabled = false;
+        cfg.backends.push(coder_b);
+        cfg.gateway.groups.push(ModelGroup {
+            name: "pair".to_string(),
+            members: vec!["coder".to_string(), "coder-b".to_string()],
+            strategy: RoutingStrategy::LeastBusy,
+            fallbacks: vec![],
+        });
+        let pair = cfg
+            .gateway
+            .groups
+            .iter()
+            .find(|g| g.name == "pair")
+            .unwrap();
+        assert!(group_enabled(pair, &cfg));
+        assert_eq!(group_enabled_member_count(pair, &cfg), 1);
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        // The group is enabled through its one enabled member: present,
+        // with only that member's deployment.
+        assert!(yaml.contains("model_name: pair"), "yaml:\n{yaml}");
+        assert!(!yaml.contains("8086"), "disabled member leaked:\n{yaml}");
+    }
+
+    #[test]
+    fn yaml_errors_when_every_group_is_disabled() {
+        let mut cfg = four_backend_config();
+        for b in &mut cfg.backends {
+            b.enabled = false;
+        }
+        let err = generate_config_yaml(&cfg).unwrap_err();
+        assert!(matches!(err, GatewayError::ConfigInvalid(_)));
+        assert!(err.to_string().contains("no enabled model groups"), "{err}");
     }
 
     #[test]

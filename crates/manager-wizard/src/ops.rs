@@ -12,7 +12,6 @@
 
 use crate::{CommandOutput, GpuDescriptor, HttpResponse, PlannedCommand, SystemOps, WizardError};
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -23,6 +22,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Health probes must answer quickly; the retry loop handles slowness.
 const HTTP_GET_TIMEOUT: Duration = Duration::from_secs(15);
+/// Default budget for one planned command. Package installs
+/// (`uv pip install`) and Prisma's first-run toolchain download are
+/// the slow legitimate cases; anything past this is a stall. Before
+/// this bound existed, a single stalled child held the wizard lock
+/// for the rest of the session and every later step run reported
+/// "busy" (2026-10-16). Callers with a genuinely longer job use
+/// [`SystemOps::run_command_with_timeout`].
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+/// Budget for an elevated (UAC) command: the firewall script is a
+/// few `netsh` calls. The process is not killed on expiry — the
+/// caller treats this failure as warning-only and the script is
+/// left to finish on its own.
+#[cfg(windows)]
+const ELEVATED_WAIT_TIMEOUT_MS: u32 = 120_000;
 /// Above `SMOKE_MAX_LATENCY_MS` (120 s) so the smoke step — not the client —
 /// decides what "too slow" means.
 const HTTP_POST_TIMEOUT: Duration = Duration::from_secs(180);
@@ -255,9 +268,7 @@ fn shell_quote_arg(arg: &str) -> String {
 #[cfg(windows)]
 fn run_elevated_windows(cmd: &PlannedCommand) -> Result<CommandOutput, WizardError> {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, WaitForSingleObject, INFINITE,
-    };
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
     use windows_sys::Win32::UI::Shell::{
         ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     };
@@ -289,9 +300,26 @@ fn run_elevated_windows(cmd: &PlannedCommand) -> Result<CommandOutput, WizardErr
             reason: format!("elevation failed or was declined (ShellExecuteEx error {code})"),
         });
     }
+    // Bounded wait (this was INFINITE): a stalled elevated script
+    // must not hang the calling step for the rest of the session.
+    // WAIT_TIMEOUT (0x102) means the budget expired; the handle is
+    // closed and an error returned, and the elevated process is
+    // left to finish — the only caller (the gateway firewall rule)
+    // treats this failure as warning-only.
+    const WAIT_TIMEOUT_CODE: u32 = 0x0000_0102;
+    let wait_result = unsafe { WaitForSingleObject(info.hProcess, ELEVATED_WAIT_TIMEOUT_MS) };
+    if wait_result == WAIT_TIMEOUT_CODE {
+        unsafe { CloseHandle(info.hProcess) };
+        return Err(WizardError::IoError {
+            path: PathBuf::from(&program),
+            reason: format!(
+                "elevated command did not finish within {} seconds",
+                ELEVATED_WAIT_TIMEOUT_MS / 1000
+            ),
+        });
+    }
     let mut exit_code: u32 = 0;
     unsafe {
-        WaitForSingleObject(info.hProcess, INFINITE);
         GetExitCodeProcess(info.hProcess, &mut exit_code);
         CloseHandle(info.hProcess);
     }
@@ -426,11 +454,31 @@ impl SystemOps for RealSystemOps {
             // CREATE_NO_WINDOW
             c.creation_flags(0x08000000);
         }
-        let out = c.output().await.map_err(|e| WizardError::CommandFailed {
-            argv: cmd.argv.clone(),
-            code: -1,
-            stderr: format!("spawn failed: {e}"),
-        })?;
+        // kill_on_drop is what makes the timeout below a kill, not
+        // just an abandoned wait: expiring the budget drops the
+        // output future, and dropping it terminates the child
+        // instead of leaving it running detached from the wizard.
+        c.kill_on_drop(true);
+        let out = match tokio::time::timeout(COMMAND_TIMEOUT, c.output()).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                return Err(WizardError::CommandFailed {
+                    argv: cmd.argv.clone(),
+                    code: -1,
+                    stderr: format!("spawn failed: {e}"),
+                })
+            }
+            Err(_) => {
+                return Err(WizardError::CommandFailed {
+                    argv: cmd.argv.clone(),
+                    code: -1,
+                    stderr: format!(
+                        "timed out after {}s and was stopped",
+                        COMMAND_TIMEOUT.as_secs()
+                    ),
+                })
+            }
+        };
         Ok(CommandOutput {
             exit_code: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -876,6 +924,14 @@ impl SystemOps for RealSystemOps {
         }
     }
 
+    async fn remove_dir_all(&self, path: &Path) -> Result<(), WizardError> {
+        match tokio::fs::remove_dir_all(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Self::io_err(path, e)),
+        }
+    }
+
     async fn file_exists(&self, path: &Path) -> bool {
         tokio::fs::metadata(path).await.is_ok()
     }
@@ -889,10 +945,24 @@ impl SystemOps for RealSystemOps {
     }
 
     async fn sha256_file(&self, path: &Path) -> Result<String, WizardError> {
-        let data = self.read_file(path).await?;
-        let mut hasher = Sha256::new();
-        hasher.update(&data);
-        Ok(format!("{:x}", hasher.finalize()))
+        // Streamed hashing via the shared implementation: the
+        // previous read-the-whole-file-then-hash version
+        // materialized the entire GGUF in memory, and the failed
+        // allocation on a multi-GiB file aborted the whole process
+        // (the v0.1.31 crash on the 45.9 GiB Coder-Next file, hit
+        // by the launch-time wizard audit).
+        let owned = path.to_path_buf();
+        match tokio::task::spawn_blocking(move || manager_models::sha256_hex(&owned)).await {
+            Ok(Ok(hex)) => Ok(hex),
+            Ok(Err(e)) => Err(WizardError::IoError {
+                path: path.to_path_buf(),
+                reason: e.to_string(),
+            }),
+            Err(e) => Err(WizardError::IoError {
+                path: path.to_path_buf(),
+                reason: format!("hash task failed: {e}"),
+            }),
+        }
     }
 
     async fn gpu_inventory(&self) -> Result<Vec<GpuDescriptor>, WizardError> {
@@ -1235,6 +1305,31 @@ mod tests {
         assert!(matches!(err, WizardError::CommandFailed { .. }));
     }
 
+    /// A stalled child must not hold the caller past the budget:
+    /// `run_command_with_timeout` returns a timeout error promptly
+    /// (and, via kill-on-drop in the real run_command, the child is
+    /// killed rather than left running). Unix-only: `sleep` is the
+    /// portable stalled child there; the Windows CI path exercises
+    /// the same code through the default 600 s budget constant.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_command_with_timeout_bounds_stalled_child() {
+        let ops = RealSystemOps;
+        let cmd = PlannedCommand::new(vec!["sleep".to_string(), "30".to_string()]);
+        let started = std::time::Instant::now();
+        let err = ops
+            .run_command_with_timeout(&cmd, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WizardError::CommandFailed { .. }));
+        assert!(format!("{err}").contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "returned after {:?}",
+            started.elapsed()
+        );
+    }
+
     #[tokio::test]
     async fn sha256_roundtrip_on_temp_file() {
         let ops = RealSystemOps;
@@ -1246,6 +1341,27 @@ mod tests {
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
         assert!(ops.file_exists(&path).await);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn sha256_streams_multi_chunk_file() {
+        // Regression for the v0.1.31 crash: sha256_file must stream,
+        // not materialize the file. A patterned file spanning
+        // several hash buffers, checked against an independently
+        // computed digest (the digest itself is size-independent;
+        // the >RAM case is covered by manager-models' ignored
+        // multi-GiB test for the shared implementation).
+        use sha2::{Digest, Sha256};
+        let ops = RealSystemOps;
+        let path = std::env::temp_dir().join("wizard-sha256-stream-test.bin");
+        let total = 3 * (1usize << 20) + 17;
+        let pattern: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        ops.write_file(&path, &pattern).await.unwrap();
+        let mut reference = Sha256::new();
+        reference.update(&pattern);
+        let expected = format!("{:x}", reference.finalize());
+        assert_eq!(ops.sha256_file(&path).await.unwrap(), expected);
         std::fs::remove_file(&path).ok();
     }
 

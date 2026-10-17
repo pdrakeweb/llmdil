@@ -21,7 +21,8 @@ pub mod placement;
 
 pub use gguf::{parse_gguf_layout, GgufError, GgufLayout, KvGeometry};
 pub use memory::{
-    expert_offload, memory_requirement, ExpertOffload, MemoryBasis, MemoryRequirement,
+    expert_offload, memory_requirement, offload_bands, offload_flag_string, offload_for_layers,
+    set_expert_offload, ExpertOffload, MemoryBasis, MemoryRequirement,
 };
 pub use placement::{
     apply_placement, propose_placement, propose_placement_resident, validate_split,
@@ -71,6 +72,34 @@ pub struct ModelSpec {
     /// no routed experts pin `Some(0)`.
     #[serde(default)]
     pub expert_bytes: Option<u64>,
+    /// Number of blocks that carry routed-expert tensors, when the
+    /// model is a mixture-of-experts model and the count is pinned
+    /// (derived from the GGUF tensor directory, like
+    /// `expert_bytes`). `--n-cpu-moe` counts these layers, not
+    /// total blocks. `None` for dense models and when unpinned.
+    #[serde(default)]
+    pub moe_layers: Option<u32>,
+    /// The catalog's default expert offload for a backend serving
+    /// this model, in MoE layers: the most offload that is still
+    /// "green" (fast) for the model. It is both the Edit Flags
+    /// offload slider's green limit and the offload a newly
+    /// created or newly assigned backend starts with (applied only
+    /// where the backend carries no raw flags of its own — an
+    /// operator-changed offload is never clobbered). `None` when
+    /// the model has no expert offload to default.
+    #[serde(default)]
+    pub default_offload_layers: Option<u32>,
+}
+
+/// The curated catalog's default expert offload for a model: the
+/// offload a new backend serving it starts with, from
+/// [`ModelSpec::default_offload_layers`]. [`ExpertOffload::None`]
+/// when the model pins no default.
+pub fn catalog_default_offload(spec: &ModelSpec) -> ExpertOffload {
+    match (spec.default_offload_layers, spec.moe_layers) {
+        (Some(d), Some(l)) if l > 0 => memory::offload_for_layers(d.min(l), l),
+        _ => ExpertOffload::None,
+    }
 }
 
 /// The curated catalog's revision. Bump whenever
@@ -125,6 +154,8 @@ pub fn curated_models() -> Vec<ModelSpec> {
             params_b: 27.0,
             enabled_by_default: true,
             expert_bytes: Some(0),
+            moe_layers: None,
+            default_offload_layers: None,
             // The real Qwen3.8-27B (Alibaba, August 2026), dense
             // 27B, in ISTA-DASLab's GSQ-RCO quantization at IQ3_S —
             // fully GPU-resident on a 16 GB card. Replaced the
@@ -146,6 +177,13 @@ pub fn curated_models() -> Vec<ModelSpec> {
             // 2,587,296,768 B; the directory sums reproduce the
             // pinned file size exactly).
             expert_bytes: Some(46_707_769_344),
+            // 48 MoE layers (every block carries routed experts),
+            // derived from the same tensor directory. The default
+            // offload is all of them: full expert offload is this
+            // model's shipped design point, so the green limit is
+            // the whole range.
+            moe_layers: Some(48),
+            default_offload_layers: Some(48),
             // Qwen3-Coder-Next (80B total / ~3B active MoE),
             // served by expert offload — the coder backend's raw
             // flags carry `-ot exps=CPU`. Unsloth's single-file
@@ -166,6 +204,8 @@ pub fn curated_models() -> Vec<ModelSpec> {
             params_b: 7.0,
             enabled_by_default: true,
             expert_bytes: Some(0),
+            moe_layers: None,
+            default_offload_layers: None,
             url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
                 .to_string(),
         },
@@ -179,6 +219,8 @@ pub fn curated_models() -> Vec<ModelSpec> {
             params_b: 8.0,
             enabled_by_default: true,
             expert_bytes: Some(0),
+            moe_layers: None,
+            default_offload_layers: None,
             url: "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
                 .to_string(),
         },
@@ -198,7 +240,18 @@ pub fn curated_models() -> Vec<ModelSpec> {
             ctx_max: 262144,
             params_b: 31.6,
             enabled_by_default: false,
-            expert_bytes: None,
+            // Routed experts are 22,829,334,528 of the pinned file's
+            // 25,258,358,528 tensor bytes (24 MoE blocks of 53),
+            // derived from the GGUF tensor directory 2026-10-16 —
+            // expert offload (`--n-cpu-moe`, `--cpu-moe`) is this
+            // model's fit path on 16 GiB GPUs.
+            expert_bytes: Some(22_829_334_528),
+            // 24 MoE blocks of 53 total. The default offload is 16
+            // of the 24: the most offload that stays green — the
+            // GPU-resident remainder (~9.3 GiB of weights) fits a
+            // single 16 GiB GPU alongside the non-expert weights.
+            moe_layers: Some(24),
+            default_offload_layers: Some(16),
             url: "https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF/resolve/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf"
                 .to_string(),
         },
@@ -273,40 +326,52 @@ pub fn fit_check(spec: &ModelSpec, free_vram_mib_per_gpu: &[u64]) -> FitVerdict 
     FitVerdict::FitsWithSplit { split }
 }
 
-/// SHA-256-verify a downloaded file against the catalog hash.
-///
-/// Returns `Ok(true)` on match, `Ok(false)` on mismatch (callers decide
-/// whether to block "installed" / offer re-download). Malformed expected
-/// hashes and I/O failures are errors.
-pub async fn verify_sha256(path: &Path, expected_hex: &str) -> Result<bool, ModelError> {
-    use tokio::io::AsyncReadExt;
+/// Stream a file's SHA-256 hex digest with a bounded 1 MiB buffer,
+/// regardless of file size. This is the one hashing implementation
+/// for the whole app — the model verifier and the setup wizard both
+/// use it. A whole-file read of a multi-GiB GGUF materializes the
+/// file in memory, and a failed allocation aborts the process: the
+/// wizard's former read-then-hash implementation did exactly that
+/// on the 45.9 GiB Coder-Next file (the v0.1.31 "Verify checksum"
+/// crash).
+pub fn sha256_hex(path: &Path) -> Result<String, ModelError> {
+    use std::io::Read;
 
-    let expected = expected_hex.trim().to_lowercase();
-    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(ModelError::InvalidChecksum(format!(
-            "expected 64 hex chars, got {expected_hex:?}"
-        )));
-    }
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| ModelError::Io(e.to_string()))?;
+    let mut file = std::fs::File::open(path).map_err(|e| ModelError::Io(e.to_string()))?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
+    let mut buf = [0u8; 1 << 20];
     loop {
         let n = file
             .read(&mut buf)
-            .await
             .map_err(|e| ModelError::Io(e.to_string()))?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
     }
-    let actual: String = hasher
+    Ok(hasher
         .finalize()
         .iter()
         .map(|b| format!("{b:02x}"))
-        .collect();
+        .collect())
+}
+
+/// SHA-256-verify a downloaded file against the catalog hash.
+///
+/// Returns `Ok(true)` on match, `Ok(false)` on mismatch (callers decide
+/// whether to block "installed" / offer re-download). Malformed expected
+/// hashes and I/O failures are errors.
+pub async fn verify_sha256(path: &Path, expected_hex: &str) -> Result<bool, ModelError> {
+    let expected = expected_hex.trim().to_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ModelError::InvalidChecksum(format!(
+            "expected 64 hex chars, got {expected_hex:?}"
+        )));
+    }
+    let owned = path.to_path_buf();
+    let actual = tokio::task::spawn_blocking(move || sha256_hex(&owned))
+        .await
+        .map_err(|e| ModelError::Io(format!("hash task failed: {e}")))??;
     Ok(actual == expected)
 }
 
@@ -1028,6 +1093,8 @@ mod tests {
             ctx_max: 0,
             enabled_by_default: true,
             expert_bytes: None,
+            moe_layers: None,
+            default_offload_layers: None,
         }
     }
 
@@ -1044,6 +1111,8 @@ mod tests {
             ctx_max: 131_072,
             enabled_by_default: true,
             expert_bytes: None,
+            moe_layers: None,
+            default_offload_layers: None,
         };
         assert_eq!(spec.quant, "Q4_K_M");
         let p = DownloadProgress {
@@ -1243,6 +1312,8 @@ mod tests {
             ctx_max: 0,
             enabled_by_default: true,
             expert_bytes: None,
+            moe_layers: None,
+            default_offload_layers: None,
         }
     }
 
@@ -1531,6 +1602,61 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn sha256_hex_matches_incremental_reference_across_chunks() {
+        // 3 full 1 MiB buffers + a 17-byte tail, patterned so a
+        // chunk-boundary or length bug changes the digest. The
+        // reference digest is computed incrementally over odd-sized
+        // slices of the same pattern.
+        let dir = test_temp_dir("sha256hex");
+        let file = dir.join("pattern.bin");
+        let total = 3 * (1usize << 20) + 17;
+        let pattern: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&file, &pattern).unwrap();
+        let mut reference = Sha256::new();
+        for chunk in pattern.chunks(65_537) {
+            reference.update(chunk);
+        }
+        let expected: String = reference
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(sha256_hex(&file).unwrap(), expected);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The direct regression guard for the v0.1.31 crash class: the
+    /// digest of a multi-GiB file must be computable with bounded
+    /// memory. Writes ~5 GiB, so it is ignored by default; run it
+    /// explicitly in release gates (`cargo test -p manager-models
+    /// -- --ignored sha256_hex_streams`).
+    #[test]
+    #[ignore = "writes ~5 GiB; run explicitly in release gates"]
+    fn sha256_hex_streams_multi_gib_file() {
+        use std::io::Write;
+        let dir = test_temp_dir("sha256big");
+        let file = dir.join("big.bin");
+        // One 1 MiB pattern block, repeated 5,120 times (~5 GiB).
+        let block: Vec<u8> = (0..(1usize << 20)).map(|i| (i % 251) as u8).collect();
+        let mut reference = Sha256::new();
+        {
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&file).unwrap());
+            for _ in 0..5_120 {
+                w.write_all(&block).unwrap();
+                reference.update(&block);
+            }
+            w.flush().unwrap();
+        }
+        let expected: String = reference
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(sha256_hex(&file).unwrap(), expected);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // -- fit-check tests ------------------------------------------------------
 
     #[test]
@@ -1632,6 +1758,11 @@ mod tests {
         let nemotron = &models[4];
         assert_eq!(nemotron.params_b, 31.6);
         assert_eq!(nemotron.size_bytes, 25_266_255_936);
+        assert_eq!(nemotron.expert_bytes, Some(22_829_334_528));
+        // 24 MoE blocks; the catalog default offload is 16 of them
+        // (the green limit the offload slider renders).
+        assert_eq!(nemotron.moe_layers, Some(24));
+        assert_eq!(nemotron.default_offload_layers, Some(16));
         // The revision-2 replacements: real Qwen3.8-27B planner,
         // Qwen3-Coder-Next coder (pins from the publishers' file
         // metadata, 2026-10-16).
@@ -1644,6 +1775,16 @@ mod tests {
         assert_eq!(coder.size_bytes, 49_301_055_488);
         assert_eq!(coder.ctx_max, 262144);
         assert_eq!(coder.expert_bytes, Some(46_707_769_344));
+        // 48 MoE layers; the default offload is all of them (the
+        // shipped design point), so its green limit is the range.
+        assert_eq!(coder.moe_layers, Some(48));
+        assert_eq!(coder.default_offload_layers, Some(48));
+        // The dense models carry no offload data.
+        for m in [&models[0], &models[2], &models[3]] {
+            assert_eq!(m.expert_bytes, Some(0), "{}", m.id);
+            assert_eq!(m.moe_layers, None, "{}", m.id);
+            assert_eq!(m.default_offload_layers, None, "{}", m.id);
+        }
         for m in &models {
             // Real pins from the publishers' Hugging Face file metadata:
             // 64 hex chars, never the placeholder.
@@ -1656,6 +1797,44 @@ mod tests {
             assert_ne!(m.sha256, PLACEHOLDER_SHA256, "hash for {}", m.id);
             assert!(!m.url.is_empty() && !m.quant.is_empty());
             assert!(m.size_bytes > 0);
+        }
+    }
+
+    #[test]
+    fn catalog_default_offloads_match_the_design_points() {
+        let models = curated_models();
+        let get = |id: &str| models.iter().find(|m| m.id == id).unwrap();
+        // Coder-Next: all experts — its default backend's shipped
+        // `-ot exps=CPU` form.
+        let coder = get("qwen3-coder-30b");
+        assert_eq!(catalog_default_offload(coder), ExpertOffload::AllExperts);
+        assert_eq!(
+            offload_flag_string(catalog_default_offload(coder)).as_deref(),
+            Some("-ot exps=CPU")
+        );
+        // Nemotron: 16 of 24 MoE layers.
+        let nemotron = get("nemotron-3.5-lightning-30b");
+        assert_eq!(
+            catalog_default_offload(nemotron),
+            ExpertOffload::CpuMoeLayers(16)
+        );
+        assert_eq!(
+            offload_flag_string(catalog_default_offload(nemotron)).as_deref(),
+            Some("--n-cpu-moe 16")
+        );
+        // Dense models default to no offload.
+        assert_eq!(
+            catalog_default_offload(get("qwen3-27b-planner")),
+            ExpertOffload::None
+        );
+        // The default sits exactly at the slider's green limit for
+        // both MoE models: green_end == default / layers.
+        for spec in [coder, nemotron] {
+            let layers = spec.moe_layers.unwrap();
+            let (green, _) = offload_bands(layers, spec.default_offload_layers.unwrap());
+            let pos = catalog_default_offload(spec).layers(layers);
+            assert_eq!(pos, spec.default_offload_layers.unwrap());
+            assert!((green - pos as f64 / layers as f64).abs() < 1e-9);
         }
     }
 
@@ -1698,6 +1877,7 @@ mod tests {
             source_url: String::new(),
             assigned_backends: Vec::new(),
             enabled: true,
+            display_name: None,
         }
     }
 

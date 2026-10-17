@@ -124,12 +124,14 @@ interface GpuSample {
 
 /** One per-process VRAM attribution entry as sent by get_gpu_telemetry.
  *  The Rust ProcessSample names the VRAM field `vram_mib`; `used_mib` is
- *  accepted as a fallback in case the field is renamed on the Rust side. */
+ *  accepted as a fallback in case the field is renamed on the Rust side.
+ *  `vram_mib` is null when the figure was not measured (WDDM GPU,
+ *  counter data unavailable) — unknown, never to be coerced to 0. */
 interface GpuProcess {
   gpu_index: number;
   pid: number;
   name?: string;
-  vram_mib?: number;
+  vram_mib?: number | null;
   used_mib?: number;
   backend_id: string | null;
 }
@@ -194,7 +196,11 @@ export async function getGpuTelemetry(): Promise<CallResult<GpuTelemetryData>> {
           .map((p) => ({
             process: p.name ? p.name : "—",
             pid: p.pid,
-            vram_mib: p.vram_mib ?? p.used_mib ?? 0,
+            // Unmeasured stays null end to end: coercing it to 0
+            // here is how a resident model on a WDDM GPU used to be
+            // rendered as "context only".
+            vram_mib: typeof p.vram_mib === "number" ? p.vram_mib
+              : typeof p.used_mib === "number" ? p.used_mib : null,
             backend: p.backend_id ?? "—",
           })),
         status: s.down ? "down" : s.stale ? "degraded" : "ok",
@@ -221,14 +227,20 @@ export async function getGpuTelemetry(): Promise<CallResult<GpuTelemetryData>> {
 }
 
 /** Placement rows derived from the app config: one row per configured
- *  backend with a non-empty flags.tensor_split. Model = basename of the
- *  backend's model_file; segments are the split fractions as percentages,
- *  labeled with the telemetry GPU names in index order and carrying
- *  their GPU index. Zero-fraction entries are dropped (the GPU holds
- *  none of the model); a split with no positive entry yields no row.
- *  Each row also carries its owning backend's id and (when the caller
+ *  backend — placements belong to backends, not models (Pete,
+ *  2026-10-16). Segments are the backend's tensor-split fractions as
+ *  percentages, labeled with the telemetry GPU names in index order
+ *  and carrying their GPU index; zero-fraction entries are dropped
+ *  (the GPU holds none of the model). A backend with no split gets a
+ *  single 100% segment on the first GPU — an unsplit launch loads
+ *  there — and a split with no positive entry likewise falls back to
+ *  that single-GPU row, so every backend's placement is listed.
+ *  Disabled backends are included and flagged (`backendEnabled:
+ *  false`): their placement is eventual, and the dashboard grays the
+ *  row out. Model = file stem of the backend's model_file. Each row
+ *  also carries its owning backend's id and (when the caller
  *  supplies the live backend list) its runtime status, so views can
- *  key model presentation to the backend's measured state instead of
+ *  key presentation to the backend's measured state instead of
  *  asserting one from configuration alone. */
 function placementFromConfig(
   cfg: Record<string, unknown> | null,
@@ -243,23 +255,26 @@ function placementFromConfig(
     const flags = rec.flags && typeof rec.flags === "object" && !Array.isArray(rec.flags)
       ? (rec.flags as Record<string, unknown>) : null;
     const split = Array.isArray(flags?.tensor_split) ? flags.tensor_split : null;
-    if (!split || !split.length) continue;
-    const segments = split
+    let segments = (split ?? [])
       .map((f, i) => ({
         gpu: gpus[i]?.name ?? `GPU ${i}`,
         gpuIndex: i,
         pct: typeof f === "number" && Number.isFinite(f) ? Math.round(f * 100) : 0,
       }))
       .filter((s) => s.pct > 0);
-    if (!segments.length) continue;
+    if (!segments.length) {
+      segments = [{ gpu: gpus[0]?.name ?? "GPU 0", gpuIndex: 0, pct: 100 }];
+    }
     const modelFile = typeof rec.model_file === "string" ? rec.model_file : "";
-    const model = modelFile.split(/[\\/]/).pop() || modelFile || (typeof rec.id === "string" ? rec.id : "");
+    const base = modelFile.split(/[\\/]/).pop() || modelFile || (typeof rec.id === "string" ? rec.id : "");
+    const model = base.replace(/\.gguf$/i, "");
     const backendId = typeof rec.id === "string" ? rec.id : undefined;
     rows.push({
       model,
       segments,
       backendId,
       backendStatus: backendId ? backends?.find((x) => x.id === backendId)?.status : undefined,
+      backendEnabled: rec.enabled !== false,
     });
   }
   return rows;
@@ -343,11 +358,15 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
       };
   // VRAM held per backend, measured from telemetry's per-process
   // attribution (the dashboard card's "VRAM HELD" figure previously
-  // had no live source and always rendered absent).
+  // had no live source and always rendered absent). Unmeasured rows
+  // (vram_mib null) are skipped, and a backend with no measured row
+  // gets no figure at all — absent, not zero.
   const heldMib = new Map<string, number>();
   for (const gpu of g.data.gpus) {
     for (const p of gpu.processes ?? []) {
-      if (p.backend !== "—") heldMib.set(p.backend, (heldMib.get(p.backend) ?? 0) + p.vram_mib);
+      if (p.backend !== "—" && p.vram_mib !== null) {
+        heldMib.set(p.backend, (heldMib.get(p.backend) ?? 0) + p.vram_mib);
+      }
     }
   }
   const backends = b.data.map((x) => {
@@ -371,17 +390,54 @@ export interface WizardStepOutcome {
   message: string;
   log_tail: string[];
   duration_ms: number;
+  /** Ready-to-run manual commands attached to a failure (the
+   * start-gateway step sets this): rendered as a code block under
+   * the failure message. */
+  manual_command?: string | null;
+}
+
+/** The run_wizard_step result. `busy` is true when another step
+ * already holds the wizard lock: a running state to report, not a
+ * failure, with `outcome` null. When the backend knows which step
+ * is in flight, `running_step`/`elapsed_secs` say what and for how
+ * long. */
+export interface WizardStepRun {
+  task_id: string;
+  busy: boolean;
+  running_step?: string;
+  elapsed_secs?: number;
+  outcome: WizardStepOutcome | null;
+}
+
+/** Human elapsed for a busy report: "45s", "12 min", "1 h 5 min". */
+function fmtElapsedSecs(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins} min`;
+  const rem = mins % 60;
+  return rem ? `${Math.floor(mins / 60)} h ${rem} min` : `${Math.floor(mins / 60)} h`;
+}
+
+/** The message for a busy run_wizard_step result: names the
+ * in-flight step and its elapsed time when the backend reported
+ * them, else the caller's fallback text. */
+export function wizardBusyMessage(data: { running_step?: string; elapsed_secs?: number }, fallback: string): string {
+  if (data.running_step) {
+    const elapsed = typeof data.elapsed_secs === "number" ? ` for ${fmtElapsedSecs(data.elapsed_secs)}` : "";
+    return `${data.running_step} has been running${elapsed} — a setup step is still running; wait for it to finish, then try again.`;
+  }
+  return fallback;
 }
 
 /** run_wizard_step — runs one step to completion; the outcome is in the
  * result. `busy` is true when another step already holds the wizard
  * lock: that is a running state to report, not a failure, and
  * `outcome` is null. */
-export async function runWizardStep(stepId: string): Promise<CallResult<{ task_id: string; busy: boolean; outcome: WizardStepOutcome | null }>> {
+export async function runWizardStep(stepId: string): Promise<CallResult<WizardStepRun>> {
   if (isTauri()) {
     try {
-      const data = await invoke<{ task_id: string; busy?: boolean; outcome: WizardStepOutcome | null }>("run_wizard_step", { stepId });
-      return { data: { task_id: data.task_id, busy: Boolean(data.busy), outcome: data.outcome ?? null }, live: true };
+      const data = await invoke<{ task_id: string; busy?: boolean; running_step?: string; elapsed_secs?: number; outcome: WizardStepOutcome | null }>("run_wizard_step", { stepId });
+      return { data: { task_id: data.task_id, busy: Boolean(data.busy), running_step: data.running_step, elapsed_secs: data.elapsed_secs, outcome: data.outcome ?? null }, live: true };
     } catch (e) {
       return { data: { task_id: "", busy: false, outcome: { state: "failed", message: String(e), log_tail: [], duration_ms: 0 } }, live: true, error: errOf(e) };
     }
@@ -446,6 +502,7 @@ interface BackendStep {
   duration_ms: number;
   log_tail: string[];
   note: string | null;
+  manual_command: string | null;
   remediation: string | null;
   help_url: string | null;
 }
@@ -464,6 +521,7 @@ function mapBackendStep(s: BackendStep): WizardStepState {
     helpUrl: s.help_url ?? undefined,
     message: s.message,
     logTail: s.log_tail,
+    manualCommand: s.manual_command ?? undefined,
     remediation: s.remediation ?? undefined,
   };
 }
@@ -562,6 +620,29 @@ export interface BackendRow {
   kv_ram_mib?: number | null;
   /** How the requirement was derived: exact | catalog | estimate. */
   memory_basis?: string;
+  /** Expert-offload slider state (configured rows whose model is
+   *  offload-capable — MoE with a known expert share, MoE layer
+   *  count, and a catalog green limit); absent otherwise. Byte
+   *  counts let the form price any slider position with the same
+   *  arithmetic as the backend memory requirement. */
+  offload?: BackendOffload;
+}
+
+/** A backend's expert-offload slider state (list_backends payload). */
+export interface BackendOffload {
+  /** MoE layers in total (the slider's maximum). */
+  moe_layers: number;
+  /** Current position: MoE layers on system RAM. */
+  layers: number;
+  /** Routed-expert weight bytes (all MoE layers). */
+  expert_bytes: number;
+  /** Total model weight bytes. */
+  total_bytes: number;
+  /** The green limit in layers (the catalog default offload). */
+  green_limit_layers: number;
+  /** Slider band boundaries as fractions of the range. */
+  green_end: number;
+  yellow_end: number;
 }
 
 /** list_backends — configured backends merged with live supervisor state. */
@@ -602,6 +683,21 @@ export async function updateBackendFlags(id: string, nCtx: number, nBatch: numbe
     return { data, live: true };
   } catch (e) {
     return { data: { backend_id: id, persisted: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** backend_set_offload — set a backend's expert offload (the Edit
+ *  Flags slider): `layers` MoE layers move to system RAM (0 = none,
+ *  the model's full MoE layer count = the `-ot exps=CPU` form).
+ *  Only the offload tokens in the backend's raw flags change.
+ *  Persisted immediately; applies on the next start. */
+export async function setBackendOffload(id: string, layers: number): Promise<CallResult<{ backend_id: string; layers: number; raw_flags: string | null; changed: boolean }>> {
+  if (!isTauri()) return { data: { backend_id: id, layers, raw_flags: null, changed: false }, live: false };
+  try {
+    const data = await invoke<{ backend_id: string; layers: number; raw_flags: string | null; changed: boolean }>("backend_set_offload", { id, layers });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { backend_id: id, layers, raw_flags: null, changed: false }, live: true, error: errOf(e) };
   }
 }
 
@@ -733,6 +829,9 @@ export async function testBackend(id: string, prompt: string): Promise<CallResul
 
 export interface ModelRow {
   id: string;
+  /** Short display name for compact controls (the curated catalog
+   *  name when the model has one; the id otherwise). */
+  name: string;
   gguf_path: string;
   quant: string;
   params_b: number;
@@ -845,6 +944,19 @@ export async function verifyModel(id: string): Promise<CallResult<{ id: string; 
   }
 }
 
+/** model_set_short_name — set the model's operator-chosen short
+ *  display name (persisted override; wins over the catalog name in
+ *  every short-name display). The model id never changes. */
+export async function modelSetShortName(id: string, name: string): Promise<CallResult<{ id: string; name: string }>> {
+  if (!isTauri()) return { data: { id, name }, live: false };
+  try {
+    const data = await invoke<{ id: string; name: string }>("model_set_short_name", { id, name });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { id, name }, live: true, error: errOf(e) };
+  }
+}
+
 /** model_set_enabled — include/exclude a model from wizard downloads.
  *  The model's file and configuration are kept either way. */
 export async function modelSetEnabled(id: string, enabled: boolean): Promise<CallResult<{ model_id: string; enabled: boolean }>> {
@@ -911,9 +1023,11 @@ export interface LogScopeInfo {
 
 export interface LogPage {
   lines: LogRow[];
-  /** Lines matching scope + filters before the limit was applied. */
+  /** Lines matching scope + filters before paging was applied. */
   total_matching: number;
-  /** True when the limit cut the result — lines is the newest slice. */
+  /** Alias of total_matching, returned by current backends. */
+  total: number;
+  /** True when paging cut the result on either side of the page. */
   truncated: boolean;
   scopes: LogScopeInfo[];
 }
@@ -922,24 +1036,42 @@ export interface GetLogsOptions {
   limit?: number;
   /** Heuristic level filter: error | warn | info | debug. */
   level?: string;
-  /** Case-insensitive substring filter. */
+  /** Case-insensitive substring filter over line text. */
   search?: string;
+  /** Case-insensitive substring filter over line text and source. */
+  query?: string;
+  /** Epoch-ms lower bound (inclusive) on record timestamps. */
+  sinceMs?: number;
+  /** Epoch-ms upper bound (inclusive) on record timestamps. */
+  untilMs?: number;
+  /** Timestamp sort direction; default "desc" (newest first). */
+  order?: "asc" | "desc";
+  /** Filtered, ordered records to skip before the page (paging). */
+  offset?: number;
 }
 
 /** get_logs — captured supervisor logs. `scope` is a process id or
  *  "all"; archived (previous-run) scope ids from the payload's scopes
  *  list are accepted as scopes too. `level` is an optional error/warn/
- *  info/debug heuristic filter and `search` an optional case-insensitive
- *  substring; results are newest-first, capped at `limit`. The payload
- *  is { lines, total_matching, truncated, scopes }; a bare-array reply
- *  (older backend) is normalized into the same shape. */
+ *  info/debug heuristic filter; `search` and `query` are optional
+ *  case-insensitive substrings (line text only / line text + source);
+ *  `sinceMs`/`untilMs` bound record timestamps; results sort by
+ *  timestamp per `order` (default "desc", newest first) and page via
+ *  `offset` + `limit`. The payload is { lines, total_matching, total,
+ *  truncated, scopes }; a bare-array reply (older backend) is
+ *  normalized into the same shape. */
 export async function getLogs(scope: string, opts: GetLogsOptions = {}): Promise<CallResult<LogPage>> {
-  const empty: LogPage = { lines: [], total_matching: 0, truncated: false, scopes: [] };
+  const empty: LogPage = { lines: [], total_matching: 0, total: 0, truncated: false, scopes: [] };
   if (!isTauri()) return { data: empty, live: false };
   try {
     const args: Record<string, unknown> = { scope, limit: opts.limit ?? 200 };
     if (opts.level) args.level = opts.level;
     if (opts.search) args.search = opts.search;
+    if (opts.query) args.query = opts.query;
+    if (opts.sinceMs !== undefined) args.sinceMs = opts.sinceMs;
+    if (opts.untilMs !== undefined) args.untilMs = opts.untilMs;
+    if (opts.order) args.order = opts.order;
+    if (opts.offset !== undefined) args.offset = opts.offset;
     const raw = await invoke<unknown>("get_logs", args);
     if (Array.isArray(raw)) {
       // Pre-envelope backend: rows carry no source/archived markers.
@@ -947,7 +1079,7 @@ export async function getLogs(scope: string, opts: GetLogsOptions = {}): Promise
         ts: r.ts, stream: r.stream, line: r.line,
         source: scope === "all" ? "" : scope, archived: false,
       }));
-      return { data: { lines, total_matching: lines.length, truncated: false, scopes: [] }, live: true };
+      return { data: { lines, total_matching: lines.length, total: lines.length, truncated: false, scopes: [] }, live: true };
     }
     const page = (raw ?? {}) as Partial<LogPage>;
     const lines = (Array.isArray(page.lines) ? page.lines : []).map((r) => ({
@@ -955,10 +1087,12 @@ export async function getLogs(scope: string, opts: GetLogsOptions = {}): Promise
       source: typeof r.source === "string" ? r.source : "",
       archived: Boolean(r.archived),
     }));
+    const totalMatching = typeof page.total_matching === "number" ? page.total_matching : lines.length;
     return {
       data: {
         lines,
-        total_matching: typeof page.total_matching === "number" ? page.total_matching : lines.length,
+        total_matching: totalMatching,
+        total: typeof page.total === "number" ? page.total : totalMatching,
         truncated: Boolean(page.truncated),
         scopes: Array.isArray(page.scopes) ? page.scopes : [],
       },
@@ -1003,6 +1137,12 @@ export interface GatewayGroup {
   members: string[];
   strategy: string;
   fallbacks: string[];
+  /** Derived by the backend (manager-gateway), never stored: the
+   *  group is enabled iff at least one member backend is enabled,
+   *  and only enabled groups reach the generated gateway config. */
+  enabled: boolean;
+  /** How many member backends are enabled — the basis of `enabled`. */
+  enabled_members: number;
 }
 
 export interface GatewayRule {
@@ -1016,6 +1156,12 @@ export interface GatewayGroup {
   members: string[];
   strategy: string;
   fallbacks: string[];
+  /** Derived by the backend (manager-gateway), never stored: the
+   *  group is enabled iff at least one member backend is enabled,
+   *  and only enabled groups reach the generated gateway config. */
+  enabled: boolean;
+  /** How many member backends are enabled — the basis of `enabled`. */
+  enabled_members: number;
 }
 
 export interface GatewayRule {
@@ -1053,7 +1199,16 @@ export async function getGatewayConfig(): Promise<CallResult<GatewayConfigData |
     const or = raw.openrouter as Partial<GatewayOpenRouter> | null | undefined;
     const data: GatewayConfigData = {
       port: typeof raw.port === "number" ? raw.port : 0,
-      groups: Array.isArray(raw.groups) ? (raw.groups as GatewayGroup[]) : [],
+      groups: Array.isArray(raw.groups) ? (raw.groups as Array<Partial<GatewayGroup>>).map((g) => ({
+        name: typeof g.name === "string" ? g.name : "",
+        members: Array.isArray(g.members) ? g.members : [],
+        strategy: typeof g.strategy === "string" ? g.strategy : "",
+        fallbacks: Array.isArray(g.fallbacks) ? g.fallbacks : [],
+        enabled: typeof g.enabled === "boolean" ? g.enabled : true,
+        enabled_members: typeof g.enabled_members === "number"
+          ? g.enabled_members
+          : (Array.isArray(g.members) ? g.members.length : 0),
+      })) : [],
       routing_rules: Array.isArray(raw.routing_rules) ? (raw.routing_rules as GatewayRule[]) : [],
       request_log_len: typeof raw.request_log_len === "number" ? raw.request_log_len : 0,
       openrouter: or && typeof or === "object"
@@ -1071,18 +1226,20 @@ export async function getGatewayConfig(): Promise<CallResult<GatewayConfigData |
   }
 }
 
-/** The one global routing strategy LiteLLM will apply, resolved from
- *  the groups with the same rule the config generator uses
- *  (manager-gateway's resolve_global_strategy): the first multi-member
- *  group's strategy, else the planner group's, else the first group's.
- *  Null when no group exists. */
+/** The one global routing strategy LiteLLM will apply, resolved with
+ *  the same rule the config generator uses (manager-gateway's
+ *  resolve_global_strategy) over the groups the generator includes
+ *  — enabled groups only: the first multi-member group's strategy,
+ *  else the planner group's, else the first group's. Null when no
+ *  enabled group exists. */
 export function effectiveGatewayStrategy(cfg: GatewayConfigData): string | null {
-  if (!cfg.groups.length) return null;
-  const multi = cfg.groups.find((g) => g.members.length > 1);
+  const included = cfg.groups.filter((g) => g.enabled);
+  if (!included.length) return null;
+  const multi = included.find((g) => g.members.length > 1);
   if (multi) return multi.strategy;
-  const planner = cfg.groups.find((g) => g.name === "planner");
+  const planner = included.find((g) => g.name === "planner");
   if (planner) return planner.strategy;
-  return cfg.groups[0].strategy;
+  return included[0].strategy;
 }
 
 export interface GatewayStatusData {
@@ -1186,20 +1343,37 @@ export interface ActivationChange {
   ts: string;
   kind: string;
   summary: string;
+  /** What activates the change: "gateway" (a gateway restart) or
+   *  "backend" (the target backends' next (re)start). */
+  scope?: string;
+  /** Backend ids a backend-scope change applies to. */
+  targets?: string[];
+  /** How the change goes live: "gateway_restart" or "restart"
+   *  (a running process must restart), or "next_start" (nothing
+   *  running holds the old state). */
+  activation?: string;
 }
 
-/** gateway_activation_plan — saved configuration changes the
- *  running gateway has not picked up yet. The gateway generates its
- *  routes at start, so these changes are inert until the operator
- *  executes the plan (restart, with or without a quiesce wait),
- *  defers it, or cancels the changes. */
+/** gateway_activation_plan — every saved configuration change that
+ *  is not live yet, across scopes: gateway changes wait on a
+ *  gateway restart, backend changes (flags, tensor split, model
+ *  assignment) wait on their backend's (re)start. The plan is inert
+ *  until the operator applies it, defers it, or cancels the
+ *  changes. */
 export interface ActivationPlanData {
   pending: boolean;
   gateway_up: boolean;
+  /** A gateway-side change is pending (journal entry or drift). */
+  gateway_pending?: boolean;
   drift: boolean;
   /** Pending while the gateway is down: the changes take effect at
    *  the next start rather than needing a restart. */
   applies_at_next_start: boolean;
+  /** Something Apply can do right now: restart the gateway (or
+   *  start it) or restart a running backend. */
+  actionable?: boolean;
+  /** Running backends a plan application restarts. */
+  backend_restart_ids?: string[];
   changes: ActivationChange[];
   /** A pre-change config snapshot exists, so cancel can restore it. */
   snapshot_available: boolean;
@@ -1503,7 +1677,17 @@ export interface PlacementProjectionData {
   /** Free VRAM per GPU at snapshot time, MiB, in split order — from
    *  the server's snapshot, the same basis the fit verdict used. */
   free_mib?: number[];
-  /** Per-GPU fit: allocation <= free VRAM at snapshot time. */
+  /** The serving backend's current weight allocation per GPU, MiB,
+   *  in split order — credited toward the proposed allocation
+   *  because applying a split restarts the backend and frees these
+   *  weights first. Absent/zero when no backend was in scope or the
+   *  backend is not running. */
+  current_mib?: number[];
+  /** Additional allocation each GPU must find in free VRAM, MiB:
+   *  per_gpu_mib minus current_mib, floored at 0. */
+  additional_mib?: number[];
+  /** Per-GPU fit: additional allocation <= free VRAM at snapshot
+   *  time (the backend's current allocation on that GPU credited). */
   per_gpu_fits: boolean[];
   /** True when every GPU's allocation fits. */
   fits: boolean;

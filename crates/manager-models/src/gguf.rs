@@ -47,6 +47,11 @@ pub struct GgufLayout {
     pub expert_bytes: u64,
     /// `<arch>.block_count` when present.
     pub block_count: Option<u32>,
+    /// Number of blocks that carry routed-expert tensors, when any
+    /// do. Partial CPU-MoE offload (`--n-cpu-moe N`) counts MoE
+    /// layers, not total blocks — hybrid models (Nemotron: 24 MoE
+    /// blocks of 53) need this count to price a partial offload.
+    pub moe_block_count: Option<u32>,
     /// KV geometry when the metadata carries it completely.
     pub kv: Option<KvGeometry>,
 }
@@ -290,6 +295,7 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
 
     let mut tensor_bytes: u64 = 0;
     let mut expert_bytes: u64 = 0;
+    let mut moe_blocks: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for _ in 0..tensor_count {
         let name = r.string()?;
         let n_dims = r.u32()?;
@@ -307,6 +313,13 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
         tensor_bytes = tensor_bytes.saturating_add(size);
         if is_expert_tensor(&name) {
             expert_bytes = expert_bytes.saturating_add(size);
+            if let Some(idx) = name
+                .strip_prefix("blk.")
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                moe_blocks.insert(idx);
+            }
         }
     }
 
@@ -314,6 +327,11 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
         tensor_bytes,
         expert_bytes,
         block_count,
+        moe_block_count: if moe_blocks.is_empty() {
+            None
+        } else {
+            Some(moe_blocks.len() as u32)
+        },
         kv,
     })
 }
@@ -370,6 +388,8 @@ mod tests {
         assert_eq!(layout.tensor_bytes, 400 + 144 + 34 + 32);
         assert_eq!(layout.expert_bytes, 144 + 34);
         assert_eq!(layout.block_count, Some(4));
+        // Both expert tensors live in blk.0 — one MoE block.
+        assert_eq!(layout.moe_block_count, Some(1));
         let kv = layout.kv.unwrap();
         assert_eq!(kv.kv_layers, 4);
         assert_eq!(kv.bytes_per_token(), 4 * 2 * (64 + 64) * 2);

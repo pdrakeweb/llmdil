@@ -1,17 +1,19 @@
 /* Local LLM Service Manager — UI shell (plain TypeScript, no framework).
-   Hash router over 9 views; the Tauri command boundary stays in api.ts so a
+   Hash router over 10 views; the Tauri command boundary stays in api.ts so a
    framework can replace this file later without changing command contracts. */
 
 import "./styles.css";
-import { getAppConfig, getBackends, getGatewayStatus, getSetupStatus, getStatus, isTauri } from "./api";
+import { getActivationPlan, getAppConfig, getBackends, getGatewayStatus, getSetupStatus, getStatus, isTauri } from "./api";
+import type { ActivationPlanData } from "./api";
 import { esc } from "./html";
 import { icon, type IconName } from "./icons";
 import { mountDashboard } from "./views/dashboard";
 import { renderServiceMap, wireServiceMap } from "./views/serviceMap";
 import {
-  renderBackends, renderGateway, renderGpus, renderLogs,
+  applyActivationPlan,
+  renderActivationPlan, renderBackends, renderGateway, renderGpus, renderLogs,
   renderModels, renderSettings, renderWizard,
-  wireBackends, wireGateway, wireGpus, wireLogs, wireModels, wireSettings, wireWizard,
+  wireActivationPlan, wireBackends, wireGateway, wireGpus, wireLogs, wireModels, wireSettings, wireWizard,
 } from "./views/static";
 
 export {}; // module marker
@@ -26,6 +28,7 @@ const ROUTES: Route[] = [
   { hash: "#/models", label: "Models", icon: "box", title: "Models" },
   { hash: "#/logs", label: "Logs", icon: "logs", title: "Logs" },
   { hash: "#/gateway", label: "Gateway", icon: "gateway", title: "Gateway" },
+  { hash: "#/activation-plan", label: "Activation Plan", icon: "warn", title: "Activation Plan" },
   { hash: "#/settings", label: "Settings", icon: "gear", title: "Settings" },
   { hash: "#/wizard", label: "Setup Wizard", icon: "wrench", title: "Setup Wizard" },
 ];
@@ -46,9 +49,85 @@ function shell(): string {
       <div class="side-foot" id="sideFoot"><div class="row"><span class="dot idle"></span> status…</div></div>
     </aside>
     <div class="main">
+      <div id="activationBanner"></div>
       <div id="view" style="display:flex;flex-direction:column;flex:1;min-height:0"></div>
       <div class="taskbar" id="taskbar"></div>
     </div>`;
+}
+
+/* ---------------- Global activation-plan banner ----------------
+ * A header at the very top of the main column, above every view's
+ * title, shown whenever an activation plan is pending — across
+ * scopes (gateway routes, backend flags/splits, model assignment,
+ * GPU placement). Review navigates to the dedicated Activation
+ * Plan view; Apply executes the plan directly through the same
+ * routine the plan card uses. It polls independently of the
+ * current view, and a view-level "Decide later" dismissal never
+ * hides it: saved-but-not-live changes stay visible here until
+ * they are applied or cancelled. */
+let bannerPlan: ActivationPlanData | null = null;
+let bannerActing = false;
+let bannerStatus = "";
+let bannerStatusErr = false;
+/** Manual-command block from a failed start-gateway outcome during
+ * a banner Apply, rendered under the banner. */
+let bannerManual = "";
+
+function paintActivationBanner(): void {
+  const el = document.getElementById("activationBanner");
+  if (!el) return;
+  const plan = bannerPlan;
+  if (!plan || !plan.pending) { el.innerHTML = ""; return; }
+  const n = plan.changes.length;
+  const kinds = [...new Set(plan.changes.map((c) => (c.scope === "backend" ? "backend" : "gateway")))];
+  const summary = n
+    ? `${n} saved change${n === 1 ? "" : "s"} (${kinds.join(", ")}) not live yet`
+    : "Saved gateway configuration differs from the running one";
+  const dis = bannerActing ? " disabled" : "";
+  el.innerHTML = `<div class="activation-banner">
+    <span class="ab-text">${icon("warn")} <b>Activation Plan pending</b> — ${esc(summary)}</span>
+    ${bannerStatus ? `<span class="ab-status${bannerStatusErr ? " err" : ""}">${esc(bannerStatus)}</span>` : ""}
+    <span class="ab-actions">
+      <button class="btn" data-ab-act="review"${dis}>Review</button>
+      ${plan.actionable ? `<button class="btn" data-ab-act="apply"${dis}>Apply</button>` : ""}
+    </span></div>`
+    + (bannerManual ? `<pre style="margin:0 12px 8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px;text-align:left">${esc(bannerManual)}</pre>` : "");
+}
+
+async function refreshActivationBanner(): Promise<void> {
+  if (!isTauri()) { bannerPlan = null; paintActivationBanner(); return; }
+  const r = await getActivationPlan();
+  if (r.error) return; // keep the last known state on a failed poll
+  bannerPlan = r.data;
+  if (!r.data.pending) { bannerStatus = ""; bannerStatusErr = false; bannerManual = ""; }
+  paintActivationBanner();
+}
+
+async function onBannerClick(ev: Event): Promise<void> {
+  const t = (ev.target as HTMLElement).closest("[data-ab-act]") as HTMLElement | null;
+  if (!t) return;
+  const act = t.getAttribute("data-ab-act");
+  if (act === "review") { location.hash = "#/activation-plan"; return; }
+  if (act !== "apply" || bannerActing || !bannerPlan) return;
+  bannerActing = true;
+  const setStatus = (text: string, err = false): void => {
+    bannerStatus = text;
+    bannerStatusErr = err;
+    paintActivationBanner();
+  };
+  const setManual = (cmd: string | null): void => {
+    bannerManual = cmd ?? "";
+    paintActivationBanner();
+  };
+  setStatus("Applying the activation plan…");
+  const plan = bannerPlan;
+  const mode = plan.gateway_pending && plan.gateway_up ? "restart" : "start";
+  const ok = await applyActivationPlan(plan, mode, setStatus, setManual);
+  bannerActing = false;
+  if (ok) bannerStatus = "Activation plan applied — the saved changes are live.";
+  paintActivationBanner();
+  await refreshActivationBanner();
+  void render();
 }
 
 /** Sidebar status footer, driven by live data when available. */
@@ -160,6 +239,14 @@ async function render(): Promise<void> {
         cleanup = c;
       }
       break;
+    case "#/activation-plan":
+      view.innerHTML = renderActivationPlan();
+      {
+        const c = await wireActivationPlan(view);
+        if (gen !== renderGen) { c(); return; }
+        cleanup = c;
+      }
+      break;
     case "#/settings":
       view.innerHTML = renderSettings();
       {
@@ -177,6 +264,7 @@ async function render(): Promise<void> {
   }
   if (gen !== renderGen) return; // a newer render took over mid-flight
   renderTaskbar();
+  void refreshActivationBanner();
   void renderSideFoot();
   if (sideFootTimer === null) {
     sideFootTimer = window.setInterval(() => { void renderSideFoot(); }, 15000);
@@ -188,6 +276,9 @@ async function main(): Promise<void> {
   if (!app) return;
   app.innerHTML = shell();
   window.addEventListener("hashchange", () => void render());
+  document.getElementById("activationBanner")?.addEventListener("click", (ev) => void onBannerClick(ev));
+  void refreshActivationBanner();
+  window.setInterval(() => { void refreshActivationBanner(); }, 10000);
   // First launch: open the setup wizard until it is marked complete.
   if (isTauri() && !location.hash) {
     try {

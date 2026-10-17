@@ -171,15 +171,24 @@ function applianceView(m: DashboardModel, live: boolean): string {
   const svcs = allServices(m);
   const cards = svcs.map((b, i) => serviceCard(b, i === 0 && m.gateway !== null)).join("");
   const gpus = m.gpus.map(gpuStripCard).join("");
+  // Placement rows are per BACKEND (placements belong to backends,
+  // not models). A disabled backend's row is grayed out and tagged:
+  // that placement is eventual, not actual — it takes effect only if
+  // the backend is enabled and started.
   const placeHtml = m.placement.map((p) => {
     const total = p.segments.reduce((a, s) => a + s.pct, 0) || 1;
-    return `<div class="place-row"><span class="mname">${esc(p.model)}</span>
-      <div>${stackedBar(p.segments.map((s, k) => ({ pct: (s.pct / total) * 100, color: gpuColor(segmentGpuPos(s, k, m.gpus)), label: `${s.gpu} ${s.pct}%` })))}</div></div>`;
+    const disabled = p.backendEnabled === false;
+    const label = p.backendId ?? p.model;
+    return `<div class="place-row${disabled ? " eventual" : ""}"><span class="mname">${esc(label)}${p.backendId ? ` <span class="place-model">${esc(p.model)}</span>` : ""}${disabled ? ` <span class="eventual-tag">disabled · eventual</span>` : ""}</span>
+      <div>${stackedBar(p.segments.map((s, k) => ({ pct: (s.pct / total) * 100, color: disabled ? "#6d7686" : gpuColor(segmentGpuPos(s, k, m.gpus)), label: `${s.gpu} ${s.pct}%` })))}</div></div>`;
   }).join("");
-  // The legend is built from the rows actually rendered: each distinct
-  // segment label with the palette color its GPU position produced.
+  // The legend is built from the enabled rows actually rendered:
+  // each distinct segment label with the palette color its GPU
+  // position produced. Disabled rows render gray and stay out of
+  // the legend — their colors assert nothing.
   const legendByLabel = new Map<string, string>();
   for (const p of m.placement) {
+    if (p.backendEnabled === false) continue;
     p.segments.forEach((s, k) => {
       if (!legendByLabel.has(s.gpu)) legendByLabel.set(s.gpu, gpuColor(segmentGpuPos(s, k, m.gpus)));
     });
@@ -187,10 +196,11 @@ function applianceView(m: DashboardModel, live: boolean): string {
   const legend = [...legendByLabel.entries()]
     .map(([label, color]) => `<span><span class="sw" style="background:${color}"></span>${esc(label)}</span>`).join("");
   const legendHtml = m.placement.length ? `<div class="legend">${legend}</div>` : "";
-  // Live (and sample) empty state: a placement card with no splits must
-  // say so and point at the control, never render as a blank titled card.
+  // Empty state: rows exist whenever a backend is configured, so an
+  // empty card means no backends at all — say so, never render a
+  // blank titled card.
   const placeEmpty = m.placement.length ? ""
-    : `<div style="font-size:12px;color:var(--text2)">No tensor splits configured. Set one under GPUs \u2192 Placement.</div>`;
+    : `<div style="font-size:12px;color:var(--text2)">No backends configured — placements appear here once backends exist. Set a split from a backend's Placement form.</div>`;
   // A series exists only in sample data (the live path reports none);
   // the title must not claim a measured window for it.
   const chart = m.throughputSeries.length
@@ -211,10 +221,10 @@ function applianceView(m: DashboardModel, live: boolean): string {
     : "";
   return `${empty}
     ${noWindow}
-    <div class="cards5">${cards}</div>
-    <div class="cards3" style="margin-top:12px">${gpus}</div>
+    <div class="group-box"><div class="sec-title">${icon("gpu")} GPUs</div><div class="cards3">${gpus}</div></div>
+    <div class="group-box"><div class="sec-title">${icon("server")} Backends</div><div class="cards5">${cards}</div></div>
     <div class="grid2">
-      <div class="card"><div class="sec-title">${icon("layers")} Model placement</div>${placeHtml}${placeEmpty}${legendHtml}</div>
+      <div class="card"><div class="sec-title">${icon("layers")} Backend placements</div>${placeHtml}${placeEmpty}${legendHtml}</div>
       ${chart}
     </div>
     ${events ? `<div style="margin-top:12px">${events}</div>` : ""}`;

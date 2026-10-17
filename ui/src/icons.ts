@@ -46,6 +46,11 @@ export const icons = {
     svg(`<path d="M10.5 2.5a3.2 3.2 0 0 0-4.3 4L2 10.7 5.3 14l4.2-4.2a3.2 3.2 0 0 0 4-4.3l-2 2-2.2-.6-.6-2.2z"/>`),
   pause: () => svg(`<path d="M6 3.5v9M10 3.5v9"/>`),
   play: () => svg(`<path d="M5 3.5v9l7-4.5z"/>`),
+  menu: () => svg(`<path d="M2.5 4h11M2.5 8h11M2.5 12h11"/>`),
+  info: () => svg(`<circle cx="8" cy="8" r="6.5"/><path d="M8 7.4v3.4M8 4.8v.2"/>`),
+  ban: () => svg(`<circle cx="8" cy="8" r="6.2"/><path d="m3.9 3.9 8.2 8.2"/>`),
+  trash: () =>
+    svg(`<path d="M3 4h10M6.5 4V2.8h3V4M4.5 4l.7 9.2h5.6L11.5 4M6.8 6.8v4M9.2 6.8v4"/>`),
 };
 
 export type IconName = keyof typeof icons;

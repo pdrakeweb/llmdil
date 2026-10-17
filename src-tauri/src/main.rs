@@ -32,9 +32,7 @@ use manager_supervisor::{
     test_request, BackoffPolicy, HealthProbe, HttpHealthProbe, LogLevelFilter, LogRecord,
     LogStream, ProcessSpec, ProcessState, Supervisor,
 };
-use manager_telemetry::{
-    FallbackSource, GpuSample, NvidiaSmiSource, NvmlSource, PollCadence, Poller, TelemetryStore,
-};
+use manager_telemetry::{GpuInfo, GpuSample, NvidiaSmiSource, PollCadence, Poller, TelemetryStore};
 use manager_wizard::{
     ops::{prev_log_path, RealSystemOps},
     steps::{continue_config_yaml, default_steps, merge_env_contents, VscodeExtensions},
@@ -309,6 +307,14 @@ pub struct AppState {
     /// the wizard lock is held by a running step, so the checklist
     /// never sits blank for the duration of a step.
     wizard_steps_cache: RwLock<Option<Value>>,
+    /// The install-wizard step currently executing (id + start
+    /// instant), set by `run_wizard_step` just before the step runs
+    /// and cleared when it returns. A caller that finds the wizard
+    /// lock held reads this to report *what* is running and for how
+    /// long instead of a bare "busy" — and the rejection is written
+    /// to the wizard log, so the state is diagnosable afterwards.
+    /// std Mutex: only synchronous set/clear/read.
+    wizard_step_running: std::sync::Mutex<Option<(String, std::time::Instant)>>,
     tasks: Mutex<HashMap<String, TaskRecord>>,
     task_counter: AtomicU64,
     /// Live model-download handles by model id (spec §14 download commands).
@@ -375,6 +381,7 @@ impl AppState {
             wizard_install: OnceCell::new(),
             wizard_audit: OnceCell::new(),
             wizard_steps_cache: RwLock::new(None),
+            wizard_step_running: std::sync::Mutex::new(None),
             tasks: Mutex::new(HashMap::new()),
             task_counter: AtomicU64::new(1),
             downloads: Mutex::new(HashMap::new()),
@@ -503,10 +510,25 @@ impl AppState {
                 } else {
                     PollCadence::Every5s
                 };
-                let source = FallbackSource::new(NvmlSource::new(), NvidiaSmiSource::default());
+                let source = manager_telemetry::default_telemetry_stack();
                 let (poller, store) = Poller::new(source, cadence);
                 let handle = poller.start();
                 let _ = self.telemetry_poller.set(std::sync::Mutex::new(handle));
+                // Static GPU inventory (index, UUID, driver model)
+                // for launch construction: CUDA_VISIBLE_DEVICES is
+                // expressed in GPU UUIDs (see backend_spec). One
+                // nvidia-smi query at startup; failure leaves the
+                // inventory empty, and spec building then leaves
+                // launches unrestricted because the placed GPUs'
+                // UUIDs cannot be determined.
+                let smi = NvidiaSmiSource::default();
+                if let Ok(xml) = smi.run_query().await {
+                    if let Ok(inventory) = NvidiaSmiSource::parse_inventory(&xml) {
+                        if !inventory.is_empty() {
+                            lock_telemetry(&store).set_inventory(inventory);
+                        }
+                    }
+                }
                 store
             })
             .await
@@ -568,7 +590,12 @@ impl AppState {
         }
         let install = self.wizard(RunMode::Install).await;
         let mut guard = install.lock().await;
-        guard.hydrate(&report);
+        // The audit's start-gateway pass only proves a gateway
+        // answers; it is adopted as the install step's completion
+        // only while the on-disk gateway config still matches the
+        // current configuration (see Wizard::hydrate).
+        let gateway_current = manager_wizard::gateway_config_is_current(&ctx.config, &ctx.data_dir);
+        guard.hydrate(&report, gateway_current);
         *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
 
@@ -581,10 +608,7 @@ impl AppState {
             let guard = wizard.lock().await;
             guard.report()
         };
-        let persisted = PersistedWizard {
-            version: 1,
-            report,
-        };
+        let persisted = PersistedWizard { version: 1, report };
         let Ok(text) = serde_json::to_string(&persisted) else {
             return;
         };
@@ -623,7 +647,12 @@ impl AppState {
         };
         let wizard = self.wizard(RunMode::Install).await;
         let mut guard = wizard.lock().await;
-        guard.restore(&persisted.report);
+        // Same drift rule as hydration: a persisted start-gateway
+        // Done is adopted only while the gateway config on disk
+        // still matches the current configuration.
+        let cfg = self.config.read().await.clone();
+        let gateway_current = manager_wizard::gateway_config_is_current(&cfg, &self.data_dir);
+        guard.restore(&persisted.report, gateway_current);
         *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
 
@@ -744,30 +773,29 @@ async fn ensure_catalog_models(state: &AppState) {
     // revision, so a model the operator deleted is not resurrected
     // until the catalog next changes.
     if cfg.catalog_seeded && cfg.catalog_revision < manager_models::CATALOG_REVISION {
-        let entries: Vec<manager_config::CatalogModelEntry> =
-            manager_models::curated_models()
-                .into_iter()
-                .map(|spec| {
-                    let file_name = spec
-                        .url
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("model.gguf")
-                        .to_string();
-                    manager_config::CatalogModelEntry {
-                        model_id: spec.id.clone(),
-                        gguf_file_name: file_name,
-                        quant: spec.quant.clone(),
-                        params_b: spec.params_b,
-                        sha256: spec.sha256.clone(),
-                        source_url: spec.url.clone(),
-                        assigned_backends: backend_for(&spec.id)
-                            .map(|b| vec![b.to_string()])
-                            .unwrap_or_default(),
-                        enabled: spec.enabled_by_default,
-                    }
-                })
-                .collect();
+        let entries: Vec<manager_config::CatalogModelEntry> = manager_models::curated_models()
+            .into_iter()
+            .map(|spec| {
+                let file_name = spec
+                    .url
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("model.gguf")
+                    .to_string();
+                manager_config::CatalogModelEntry {
+                    model_id: spec.id.clone(),
+                    gguf_file_name: file_name,
+                    quant: spec.quant.clone(),
+                    params_b: spec.params_b,
+                    sha256: spec.sha256.clone(),
+                    source_url: spec.url.clone(),
+                    assigned_backends: backend_for(&spec.id)
+                        .map(|b| vec![b.to_string()])
+                        .unwrap_or_default(),
+                    enabled: spec.enabled_by_default,
+                }
+            })
+            .collect();
         // Definition replacements ride the same revision gate:
         // when a default model's catalog pin changed, the stored
         // definition is refreshed and the serving change that goes
@@ -783,7 +811,9 @@ async fn ensure_catalog_models(state: &AppState) {
             };
             let (clear_split, raw_flags) = match entry.model_id.as_str() {
                 "qwen3-27b-planner" => (true, None),
-                "qwen3-coder-30b" => (true, Some("-ot exps=CPU".to_string())),
+                // The coder's riding serving change is its catalog
+                // default offload (all experts) in canonical form.
+                "qwen3-coder-30b" => (true, catalog_default_raw_flags(&entry.model_id)),
                 _ => (false, None),
             };
             if !clear_split && raw_flags.is_none() {
@@ -840,6 +870,7 @@ async fn ensure_catalog_models(state: &AppState) {
                 source_url: spec.url,
                 assigned_backends,
                 enabled: spec.enabled_by_default,
+                display_name: None,
             }
         })
         .collect();
@@ -943,10 +974,138 @@ async fn update_config(state: State<'_, AppState>, patch: Value) -> ApiResult {
 // Backends
 // ---------------------------------------------------------------------------
 
+/// GPU visibility for one backend launch.
+///
+/// llama.cpp's CUDA backend creates a context on **every visible GPU**
+/// at startup (~256 MiB each on Windows), so a backend placed on one
+/// GPU permanently wastes that much VRAM on every other GPU — VRAM
+/// the placed models cannot use (Pete's machines: GPU memory is the
+/// scarce resource, system RAM is not). Launches are therefore
+/// restricted with `CUDA_VISIBLE_DEVICES` to exactly the placement's
+/// GPUs, expressed as UUIDs (stable across index shifts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GpuVisibility {
+    /// Raw flags pin GPU layers to 0: the backend loads nothing on
+    /// any GPU. `CUDA_VISIBLE_DEVICES` is set empty, so no context
+    /// is created anywhere.
+    CpuOnly,
+    /// Restrict to these GPU indices (the placement's GPUs, in order).
+    Gpus(Vec<u32>),
+    /// Placement cannot be determined from the config (a configured
+    /// split with no positive entry — possible only in a hand-edited
+    /// config, validation requires sum 1.0). The launch is left
+    /// exactly as it was: no env restriction, no flag remapping.
+    Undetermined,
+}
+
+/// The backend's GPU placement, from its configuration alone: the
+/// configured tensor split's positive entries (placement_apply is
+/// what writes splits, so the split IS the placement record); an
+/// unsplit backend loads on the main GPU (index 0), llama.cpp's
+/// default; raw flags pinning GPU layers to 0 mean no GPU placement.
+fn backend_gpu_visibility(b: &manager_config::BackendConfig) -> GpuVisibility {
+    if raw_flags_pin_cpu_only(b.raw_flags.as_deref()) {
+        return GpuVisibility::CpuOnly;
+    }
+    if b.flags.tensor_split.is_empty() {
+        return GpuVisibility::Gpus(vec![0]);
+    }
+    let placed: Vec<u32> = b
+        .flags
+        .tensor_split
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| **f > 0.0)
+        .map(|(i, _)| i as u32)
+        .collect();
+    if placed.is_empty() {
+        GpuVisibility::Undetermined
+    } else {
+        GpuVisibility::Gpus(placed)
+    }
+}
+
+/// True when raw flags set GPU layers to 0 (`-ngl 0`,
+/// `--gpu-layers 0`, `--n-gpu-layers=0`, ...): the backend is
+/// CPU-only. Expert offload (`-ot exps=CPU`) is NOT this — the
+/// non-expert weights still load on the GPU.
+fn raw_flags_pin_cpu_only(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else { return false };
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        let (flag, inline) = match tokens[i].split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (tokens[i], None),
+        };
+        if matches!(flag, "-ngl" | "--gpu-layers" | "--n-gpu-layers") {
+            let value = inline.or_else(|| tokens.get(i + 1).copied());
+            if value == Some("0") {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Position of global GPU index `v` within the visible list, if the
+/// GPU is placed there.
+fn visible_position(v: &str, placed: &[u32]) -> Option<usize> {
+    let idx: u32 = v.parse().ok()?;
+    placed.iter().position(|p| *p == idx)
+}
+
+/// Remap a llama.cpp `--device` list (`CUDA0,CUDA2`) onto the visible
+/// subset: entries naming placed GPUs become their visible positions;
+/// entries naming other GPUs are dropped; entries that do not parse
+/// as `CUDA<n>` pass through unchanged. `None` when nothing survives.
+fn remap_device_list(v: &str, placed: &[u32]) -> Option<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in v.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        match entry
+            .strip_prefix("CUDA")
+            .and_then(|n| n.parse::<u32>().ok())
+        {
+            Some(num) => {
+                if let Some(pos) = placed.iter().position(|p| *p == num) {
+                    out.push(format!("CUDA{pos}"));
+                }
+            }
+            None => out.push(entry.to_string()),
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join(","))
+    }
+}
+
 /// Build the supervisor process spec for one configured backend: the
 /// wizard-installed llama-server binary, the configured model (relative
 /// paths resolve under the data dir), port, and structured flags.
-fn backend_spec(cfg: &AppConfig, b: &manager_config::BackendConfig) -> ProcessSpec {
+///
+/// The launch is GPU-restricted (see [`GpuVisibility`]): when the
+/// placement resolves and every placed GPU's UUID is known from
+/// `gpus` (the telemetry inventory), `CUDA_VISIBLE_DEVICES` carries
+/// exactly the placed GPUs' UUIDs and the device-selection flags are
+/// remapped onto the visible subset — the structured `--tensor-split`
+/// keeps only the placed GPUs' proportions in placement order, and
+/// operator-supplied `--tensor-split` / `--main-gpu` / `--device` in
+/// raw flags are remapped or dropped against the same placement
+/// (placement is the source of truth; placement_apply writes splits).
+/// When a placed GPU's UUID is unknown (GPU absent from the
+/// inventory), the launch is left unrestricted rather than guessing.
+fn backend_spec(
+    cfg: &AppConfig,
+    b: &manager_config::BackendConfig,
+    gpus: &[GpuInfo],
+) -> ProcessSpec {
     let program = cfg.data_dir.join("llamacpp").join(if cfg!(windows) {
         "llama-server.exe"
     } else {
@@ -967,16 +1126,65 @@ fn backend_spec(cfg: &AppConfig, b: &manager_config::BackendConfig) -> ProcessSp
         "-b".into(),
         b.flags.n_batch.to_string(),
     ];
-    if !b.flags.tensor_split.is_empty() {
-        args.push("--tensor-split".into());
-        args.push(
-            b.flags
-                .tensor_split
+
+    // The visible GPU indices (empty for CPU-only) when the launch is
+    // restricted; None when it is not (undetermined placement, or a
+    // placed GPU missing from the inventory).
+    let visible: Option<Vec<u32>> = match backend_gpu_visibility(b) {
+        GpuVisibility::CpuOnly => Some(Vec::new()),
+        GpuVisibility::Gpus(indices)
+            if indices
                 .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
-        );
+                .all(|i| gpus.iter().any(|g| g.index == *i && !g.uuid.is_empty())) =>
+        {
+            Some(indices)
+        }
+        _ => None,
+    };
+    let mut env: Vec<(String, String)> = Vec::new();
+    if let Some(placed) = &visible {
+        let uuids = placed
+            .iter()
+            .map(|i| {
+                gpus.iter()
+                    .find(|g| g.index == *i)
+                    .map(|g| g.uuid.clone())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        env.push(("CUDA_VISIBLE_DEVICES".into(), uuids));
+    }
+
+    // Structured tensor split: remapped onto the visible subset when
+    // restricted (placed GPUs' proportions only, in placement order);
+    // dropped for a CPU-only launch (a split over no visible devices
+    // is meaningless); verbatim when unrestricted.
+    let split_arg: Option<String> = if b.flags.tensor_split.is_empty() {
+        None
+    } else {
+        match &visible {
+            Some(placed) if !placed.is_empty() => Some(
+                placed
+                    .iter()
+                    .map(|i| b.flags.tensor_split[*i as usize].to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            Some(_) => None,
+            None => Some(
+                b.flags
+                    .tensor_split
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        }
+    };
+    if let Some(split) = split_arg {
+        args.push("--tensor-split".into());
+        args.push(split);
     }
     args.push("--split-mode".into());
     args.push(
@@ -988,11 +1196,15 @@ fn backend_spec(cfg: &AppConfig, b: &manager_config::BackendConfig) -> ProcessSp
         .into(),
     );
     if let Some(raw) = &b.raw_flags {
-        // raw_flags are operator-supplied llama-server arguments, with one
-        // reservation: --host is filtered out (both "--host X" and
-        // "--host=X"). Backends bind loopback; the LiteLLM gateway is the
-        // only network entry point, and an unauthenticated llama-server
-        // bound to the LAN by a stray flag would bypass it.
+        // raw_flags are operator-supplied llama-server arguments, with
+        // two reservations:
+        // - --host is filtered out (both "--host X" and "--host=X").
+        //   Backends bind loopback; the LiteLLM gateway is the only
+        //   network entry point, and an unauthenticated llama-server
+        //   bound to the LAN by a stray flag would bypass it.
+        // - When the launch is GPU-restricted, device-selection flags
+        //   are remapped onto the visible subset (placement is the
+        //   source of truth — see the fn docs).
         let tokens: Vec<&str> = raw.split_whitespace().collect();
         let mut i = 0;
         while i < tokens.len() {
@@ -1005,6 +1217,53 @@ fn backend_spec(cfg: &AppConfig, b: &manager_config::BackendConfig) -> ProcessSp
                 i += 1;
                 continue;
             }
+            if let Some(placed) = &visible {
+                if t == "--tensor-split" {
+                    i += 2; // the structured split above is authoritative
+                    continue;
+                }
+                if t.starts_with("--tensor-split=") {
+                    i += 1;
+                    continue;
+                }
+                if t == "--main-gpu" {
+                    if let Some(pos) = tokens.get(i + 1).and_then(|v| visible_position(v, placed)) {
+                        args.push("--main-gpu".into());
+                        args.push(pos.to_string());
+                    }
+                    i += 2;
+                    continue;
+                }
+                if let Some(v) = t.strip_prefix("--main-gpu=") {
+                    if let Some(pos) = visible_position(v, placed) {
+                        args.push("--main-gpu".into());
+                        args.push(pos.to_string());
+                    }
+                    i += 1;
+                    continue;
+                }
+                if t == "--device" || t == "-dev" {
+                    if let Some(mapped) =
+                        tokens.get(i + 1).and_then(|v| remap_device_list(v, placed))
+                    {
+                        args.push(t.to_string());
+                        args.push(mapped);
+                    }
+                    i += 2;
+                    continue;
+                }
+                if let Some((flag, v)) = t
+                    .split_once('=')
+                    .filter(|(f, _)| *f == "--device" || *f == "-dev")
+                {
+                    if let Some(mapped) = remap_device_list(v, placed) {
+                        args.push(flag.to_string());
+                        args.push(mapped);
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
             args.push(t.to_string());
             i += 1;
         }
@@ -1013,7 +1272,7 @@ fn backend_spec(cfg: &AppConfig, b: &manager_config::BackendConfig) -> ProcessSp
         id: b.id.clone(),
         program,
         args,
-        env: Vec::new(),
+        env,
         workdir: None,
         port: Some(b.port),
     }
@@ -1028,9 +1287,16 @@ fn backend_spec(cfg: &AppConfig, b: &manager_config::BackendConfig) -> ProcessSp
 /// and stoppable until it exits.
 async fn ensure_backend_specs(state: &AppState) {
     let cfg = state.config.read().await.clone();
+    // GPU inventory (index -> UUID) for launch construction. The
+    // config read above has completed and dropped its guard, so
+    // touching the telemetry accessor here cannot nest (it reads the
+    // config while initializing) — the same rule placement_propose
+    // follows. Inventory is populated once at telemetry init.
+    let store = state.telemetry().await;
+    let gpus = lock_telemetry(&store).inventory();
     let mut sup = state.supervisor().await.lock().await;
     for b in &cfg.backends {
-        sup.register_spec(backend_spec(&cfg, b));
+        sup.register_spec(backend_spec(&cfg, b, &gpus));
     }
     let configured: std::collections::HashSet<&str> =
         cfg.backends.iter().map(|b| b.id.as_str()).collect();
@@ -1177,7 +1443,9 @@ async fn backend_start_preflight(state: &AppState, id: &str) -> Result<(), Strin
             ))));
         }
     }
-    let spec = backend_spec(&cfg, b);
+    // Only the program path is consumed here, so the spec is built
+    // without GPU inventory (its env/args are discarded).
+    let spec = backend_spec(&cfg, b, &[]);
     if !spec.program.exists() {
         return Err(err(ApiError::InvalidInput(format!(
             "llama-server is not installed (missing {}) — run the setup wizard to install llama.cpp",
@@ -1254,12 +1522,40 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
             .filter_map(|b| backend_memory_requirement(&cfg, b).map(|r| (b.id.clone(), r)))
             .collect();
         for row in backends.iter_mut() {
-            let Some(id) = row["id"].as_str() else { continue };
+            let Some(id) = row["id"].as_str() else {
+                continue;
+            };
             let Some(req) = memory.get(id) else { continue };
             row["gpu_ram_mib"] = json!(req.gpu_weights_mib);
             row["sys_ram_mib"] = json!(req.sys_weights_mib);
             row["kv_ram_mib"] = json!(req.kv_mib);
             row["memory_basis"] = serde_json::to_value(req.basis).unwrap_or(Value::Null);
+        }
+    }
+    // Expert-offload slider state per configured backend whose
+    // model is offload-capable (see backend_offload_info). Absent
+    // for every other backend — the Edit Flags form shows the
+    // slider only when this is present.
+    {
+        let offload: HashMap<String, OffloadInfo> = cfg
+            .backends
+            .iter()
+            .filter_map(|b| backend_offload_info(&cfg, b).map(|o| (b.id.clone(), o)))
+            .collect();
+        for row in backends.iter_mut() {
+            let Some(id) = row["id"].as_str() else {
+                continue;
+            };
+            let Some(o) = offload.get(id) else { continue };
+            row["offload"] = json!({
+                "moe_layers": o.moe_layers,
+                "layers": o.layers,
+                "expert_bytes": o.expert_bytes,
+                "total_bytes": o.total_bytes,
+                "green_limit_layers": o.green_limit_layers,
+                "green_end": o.green_end,
+                "yellow_end": o.yellow_end,
+            });
         }
     }
     // Gateway request statistics (LiteLLM Prometheus snapshots from
@@ -1282,7 +1578,8 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
                 };
                 row["requests_1h"] = json!(w.requests);
                 row["errors_1h"] = json!(w.errors);
-                row["throughput_toks"] = json!((w.tokens as f64 / w.window_secs * 10.0).round() / 10.0);
+                row["throughput_toks"] =
+                    json!((w.tokens as f64 / w.window_secs * 10.0).round() / 10.0);
             }
         }
     }
@@ -1584,14 +1881,42 @@ async fn run_wizard_step(app: AppHandle, state: State<'_, AppState>, step_id: St
     // try_lock, not lock: a second invocation (e.g. a stray double
     // click while a step runs) must not queue on the mutex and execute
     // a step again after the current run finishes. Like the audit, it
-    // reports the running state instead of failing.
+    // reports the running state instead of failing. The report names
+    // the in-flight step and how long it has been running, and the
+    // rejection is written to the wizard log: a bare "busy" with no
+    // record was undiagnosable when a step wedged the lock
+    // (2026-10-16).
     let mut guard = match wizard.try_lock() {
         Ok(guard) => guard,
         Err(_) => {
-            state
-                .finish_task(&task_id, TaskStatus::Done, json!({ "busy": true }))
-                .await;
-            return Ok(json!({ "task_id": task_id, "busy": true, "outcome": null }));
+            let running = state
+                .wizard_step_running
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|(id, since)| (id.clone(), since.elapsed().as_secs()));
+            append_wizard_log(
+                &state.data_dir,
+                &[format!(
+                    "[{}] === step {step_id} (install): rejected — {} ===",
+                    chrono::Utc::now().to_rfc3339(),
+                    match &running {
+                        Some((id, secs)) =>
+                            format!("step {id} is already running (started {secs}s ago)"),
+                        None => "another setup step is already running".to_string(),
+                    }
+                )],
+            );
+            let mut detail = json!({ "busy": true });
+            let mut payload = json!({ "task_id": task_id, "busy": true, "outcome": null });
+            if let Some((id, secs)) = &running {
+                detail["running_step"] = json!(id);
+                detail["elapsed_secs"] = json!(secs);
+                payload["running_step"] = json!(id);
+                payload["elapsed_secs"] = json!(secs);
+            }
+            state.finish_task(&task_id, TaskStatus::Done, detail).await;
+            return Ok(payload);
         }
     };
     let (_done_before, total) = guard.progress();
@@ -1605,11 +1930,18 @@ async fn run_wizard_step(app: AppHandle, state: State<'_, AppState>, step_id: St
             chrono::Utc::now().to_rfc3339()
         )],
     );
-    let outcome: StepOutcome = guard
-        .run_step(&ctx, &step_id)
-        .await
-        .map_err(ApiError::from)
-        .map_err(jerr)?;
+    // Track the in-flight step for the busy arm above; cleared on
+    // every path out of the run, including a step error.
+    *state
+        .wizard_step_running
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some((step_id.clone(), std::time::Instant::now()));
+    let outcome_result = guard.run_step(&ctx, &step_id).await;
+    *state
+        .wizard_step_running
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    let outcome: StepOutcome = outcome_result.map_err(ApiError::from).map_err(jerr)?;
     append_wizard_log(
         &state.data_dir,
         &wizard_log_block(
@@ -1706,6 +2038,7 @@ async fn run_audit(app: AppHandle, state: State<'_, AppState>) -> ApiResult {
                 "duration_ms": s.duration_ms,
                 "log_tail": s.log_tail,
                 "note": s.note,
+                "manual_command": s.manual_command,
                 "remediation": guard.remediation_hint(&s.id),
                 "help_url": guard.help_url(&s.id),
             })
@@ -1765,9 +2098,11 @@ async fn list_models(state: State<'_, AppState>) -> ApiResult {
         .iter()
         .map(|s| (s.id.as_str(), s.size_bytes))
         .collect();
-    let catalog_ctx: HashMap<&str, u32> = catalog
+    let catalog_ctx: HashMap<&str, u32> =
+        catalog.iter().map(|s| (s.id.as_str(), s.ctx_max)).collect();
+    let catalog_names: HashMap<&str, &str> = catalog
         .iter()
-        .map(|s| (s.id.as_str(), s.ctx_max))
+        .map(|s| (s.id.as_str(), s.name.as_str()))
         .collect();
     let models: Vec<Value> = cfg
         .models
@@ -1781,6 +2116,9 @@ async fn list_models(state: State<'_, AppState>) -> ApiResult {
             let is_verifying = verifying.contains(&m.id);
             json!({
                 "id": m.id,
+                "name": m.display_name.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                    .or_else(|| catalog_names.get(m.id.as_str()).copied())
+                    .unwrap_or(m.id.as_str()),
                 "gguf_path": m.gguf_path,
                 "quant": m.quant,
                 "params_b": m.params_b,
@@ -1841,6 +2179,8 @@ fn download_spec_for(cfg: &AppConfig, id: &str) -> Result<manager_models::ModelS
             ctx_max: 0,
             enabled_by_default: m.enabled,
             expert_bytes: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
     }
     Err(err(ApiError::NotFound(format!(
@@ -2091,11 +2431,7 @@ fn gateway_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord>, bool) {
     ] {
         for archived in [false, true] {
             let base = logs.join(name);
-            let path = if archived {
-                prev_log_path(&base)
-            } else {
-                base
-            };
+            let path = if archived { prev_log_path(&base) } else { base };
             let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
@@ -2148,7 +2484,11 @@ fn append_wizard_log(data_dir: &std::path::Path, lines: &[String]) {
         text.push('\n');
     }
     use std::io::Write as _;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = f.write_all(text.as_bytes());
     }
 }
@@ -2214,23 +2554,37 @@ fn wizard_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord>, bool) {
 /// file-backed gateway log (also merged into `"all"`) — or `"all"`,
 /// which merges every source's records into one stream. `level` is an
 /// optional error/warn/info/debug heuristic filter; `search` is an
-/// optional case-insensitive substring. Ordering is newest-first in
-/// every scope, archives included.
+/// optional case-insensitive substring over line text; `query` is an
+/// optional case-insensitive substring over line text and source.
+/// `since_ms`/`until_ms` optionally bound record timestamps (epoch
+/// milliseconds, both inclusive). All filters apply before counting
+/// and paging, so the reported total is the filtered total.
 ///
-/// Returns `{lines, total_matching, truncated, scopes}`: `lines` is the
-/// page capped at `limit` (default 200), each record stamped with its
-/// `source` process id and an `archived` flag for previous-run records;
-/// `total_matching` counts every record that matched before the cap and
-/// `truncated` says whether the cap cut the page, so the UI can signal
-/// omission. `scopes` lists every retained scope as `{id, previous}`,
-/// where `previous` means the id also has an archived previous-run
-/// ring (incl. previous run).
+/// Ordering is by timestamp: newest-first (`order` absent or
+/// `"desc"`, the default in every scope, archives included) or the
+/// exact mirror, oldest-first (`order = "asc"`). `offset` skips that
+/// many filtered, ordered records before the page.
+///
+/// Returns `{lines, total_matching, total, truncated, scopes}`:
+/// `lines` is the page (`limit` records from `offset`, default limit
+/// 200), each record stamped with its `source` process id and an
+/// `archived` flag for previous-run records; `total_matching` — and
+/// its alias `total` — counts every record that matched before
+/// paging, and `truncated` says whether paging cut records on either
+/// side of the page. `scopes` lists every retained scope as
+/// `{id, previous}`, where `previous` means the id also has an
+/// archived previous-run ring (incl. previous run).
 #[tauri::command]
 async fn get_logs(
     state: State<'_, AppState>,
     scope: String,
     level: Option<String>,
     search: Option<String>,
+    query: Option<String>,
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    order: Option<String>,
+    offset: Option<u64>,
     limit: Option<u64>,
 ) -> ApiResult {
     let limit = limit.unwrap_or(200) as usize;
@@ -2269,15 +2623,40 @@ async fn get_logs(
         let needle = search.to_lowercase();
         records.retain(|r| r.line.to_lowercase().contains(&needle));
     }
+    if let Some(query) = &query {
+        let needle = query.to_lowercase();
+        records.retain(|r| {
+            r.line.to_lowercase().contains(&needle) || r.source.to_lowercase().contains(&needle)
+        });
+    }
+    // Time window, both bounds inclusive. Every record carries a
+    // capture timestamp (file-backed gateway/wizard records are
+    // stamped with their file's mtime), so the comparison is direct.
+    if since_ms.is_some() || until_ms.is_some() {
+        records.retain(|r| {
+            let ms = r.ts.timestamp_millis();
+            since_ms.is_none_or(|s| ms >= s) && until_ms.is_none_or(|u| ms <= u)
+        });
+    }
     // Newest first; the sort is stable, so records sharing a timestamp
     // keep their source order (gateway files emit newest-first).
+    // "asc" is the exact mirror — the sorted vec reversed — so
+    // same-timestamp groups (file-backed lines share one mtime) keep
+    // their source order in the oldest-first view too, instead of
+    // flipping within the group, and page boundaries mirror between
+    // the two orders.
     records.sort_by(|a, b| b.ts.cmp(&a.ts));
+    if order.as_deref() == Some("asc") {
+        records.reverse();
+    }
     let total_matching = records.len();
-    records.truncate(limit);
+    let offset = offset.unwrap_or(0) as usize;
+    let page: Vec<LogRecord> = records.into_iter().skip(offset).take(limit).collect();
     Ok(json!({
-        "lines": serde_json::to_value(&records).map_err(jerr)?,
+        "lines": serde_json::to_value(&page).map_err(jerr)?,
         "total_matching": total_matching,
-        "truncated": total_matching > records.len(),
+        "total": total_matching,
+        "truncated": total_matching > offset + page.len(),
         "scopes": scopes,
     }))
 }
@@ -2286,12 +2665,26 @@ async fn get_logs(
 // Gateway
 // ---------------------------------------------------------------------------
 
-/// Current gateway configuration (from AppConfig).
+/// Current gateway configuration (from AppConfig). Each group object
+/// additionally carries its derived enabled state — `enabled` and
+/// `enabled_members`, computed by manager-gateway (the one place the
+/// rule lives): a group is enabled exactly when at least one member
+/// backend is enabled, and only enabled groups reach the generated
+/// gateway config. The state is derived, never stored, so the stored
+/// `GatewayConfig` serialization is unchanged.
 #[tauri::command]
 async fn get_gateway_config(state: State<'_, AppState>) -> ApiResult {
     let cfg = state.config.read().await;
     let gw: &GatewayConfig = &cfg.gateway;
-    Ok(serde_json::to_value(gw).map_err(jerr)?)
+    let mut v = serde_json::to_value(gw).map_err(jerr)?;
+    if let Some(groups) = v.get_mut("groups").and_then(Value::as_array_mut) {
+        for (group, group_json) in cfg.gateway.groups.iter().zip(groups.iter_mut()) {
+            let enabled_members = manager_gateway::group_enabled_member_count(group, &cfg);
+            group_json["enabled"] = json!(enabled_members > 0);
+            group_json["enabled_members"] = json!(enabled_members);
+        }
+    }
+    Ok(v)
 }
 
 /// Merge a JSON patch into the gateway config and persist: the patch is
@@ -2345,7 +2738,65 @@ fn record_gateway_change(
             return;
         }
     }
-    activation::record_change(data_dir, pre, post, kind, summary);
+    activation::record_change(data_dir, pre, post, kind, summary, "gateway", Vec::new());
+}
+
+/// Journal a saved change that only the target backend's next
+/// (re)start activates — its flags, tensor split, or model
+/// assignment. These never appear in the gateway YAML, so the
+/// gateway rule in [`record_gateway_change`] cannot see them; the
+/// activation plan carries them as backend-scope entries that
+/// resolve when the backend (re)starts (or is deleted).
+fn record_backend_change(
+    data_dir: &std::path::Path,
+    pre: &AppConfig,
+    post: &AppConfig,
+    kind: &str,
+    summary: String,
+    backend_id: &str,
+) {
+    activation::record_change(
+        data_dir,
+        pre,
+        post,
+        kind,
+        summary,
+        "backend",
+        vec![backend_id.to_string()],
+    );
+}
+
+/// Running backends' start instants (now minus supervisor uptime),
+/// for activation-plan resolution: a backend-scope entry resolves
+/// once every target has (re)started at or after it. Adopted
+/// processes report no uptime and are absent here — their entries
+/// stay unresolved and the plan classifies them from live state.
+async fn backend_start_times(
+    state: &AppState,
+) -> std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> {
+    let sup = state.supervisor().await.lock().await;
+    let now = chrono::Utc::now();
+    sup.status()
+        .iter()
+        .filter_map(|s| {
+            s.uptime.map(|u| {
+                (
+                    s.id.clone(),
+                    now - chrono::Duration::from_std(u).unwrap_or_default(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Ids of backends whose supervisor process is running or starting.
+async fn backend_running_ids(state: &AppState) -> std::collections::HashSet<String> {
+    let sup = state.supervisor().await.lock().await;
+    sup.status()
+        .iter()
+        .filter(|s| matches!(s.state, ProcessState::Running | ProcessState::Starting))
+        .map(|s| s.id.clone())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2485,6 +2936,7 @@ fn wizard_steps_payload(guard: &Wizard) -> Value {
                 "duration_ms": s.duration_ms,
                 "log_tail": s.log_tail,
                 "note": s.note,
+                "manual_command": s.manual_command,
                 "remediation": guard.remediation_hint(&s.id),
                 "help_url": guard.help_url(&s.id),
             })
@@ -2738,6 +3190,19 @@ async fn backend_apply_config(
             format!("Backend `{id}` settings changed"),
             false,
         );
+        // The same save is also a backend activation: whatever the
+        // gateway does with it, the backend process itself only
+        // picks its settings up at its next (re)start.
+        if !diff.changes.is_empty() {
+            record_backend_change(
+                &state.data_dir,
+                &pre_cfg,
+                &cfg,
+                "backend_apply_config",
+                format!("Backend `{id}` settings changed"),
+                &id,
+            );
+        }
         diff
     };
     let restart_task = if apply_mode == "RestartNow" {
@@ -2821,9 +3286,10 @@ async fn backend_add(
         } else {
             let size_of = |model_file: &std::path::Path| -> u64 {
                 let target = resolve_under_data_dir(&snap.data_dir, &model_file.to_path_buf());
-                let model = snap.models.iter().find(|m| {
-                    resolve_under_data_dir(&snap.data_dir, &m.gguf_path) == target
-                });
+                let model = snap
+                    .models
+                    .iter()
+                    .find(|m| resolve_under_data_dir(&snap.data_dir, &m.gguf_path) == target);
                 match model {
                     Some(m) => {
                         let path = resolve_under_data_dir(&snap.data_dir, &m.gguf_path);
@@ -2921,7 +3387,11 @@ async fn backend_add(
             tensor_split,
             split_mode,
         },
-        raw_flags: None,
+        // A new backend starts with its model's catalog default
+        // expert offload (the green limit), when the model pins
+        // one — e.g. a backend created for Nemotron starts at
+        // --n-cpu-moe 16 rather than with no offload at all.
+        raw_flags: catalog_default_raw_flags(&model.id),
         restart_policy: manager_config::RestartPolicy {
             max_retries: 5,
             backoff_base_secs: 2,
@@ -2977,12 +3447,14 @@ async fn backend_update_flags(
         )));
     }
     let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     let b = new_cfg
         .backends
         .iter_mut()
         .find(|b| b.id == id)
         .ok_or_else(|| err(ApiError::NotFound(format!("backend {id}"))))?;
+    let changed = b.flags.n_ctx != n_ctx || b.flags.n_batch != n_batch;
     b.flags.n_ctx = n_ctx;
     b.flags.n_batch = n_batch;
     manager_config::validate(&new_cfg)
@@ -2992,9 +3464,123 @@ async fn backend_update_flags(
         .map_err(ApiError::from)
         .map_err(jerr)?;
     *cfg = new_cfg;
+    if changed {
+        record_backend_change(
+            &state.data_dir,
+            &pre_cfg,
+            &cfg,
+            "backend_flags",
+            format!("Backend `{id}` context/batch changed"),
+            &id,
+        );
+    }
     drop(cfg);
     ensure_backend_specs(&state).await;
     Ok(json!({ "backend_id": id, "persisted": true, "applies": "next start" }))
+}
+
+/// The raw flags a backend serving `model_id` starts with: the
+/// model's catalog default expert offload (its green limit — see
+/// [`manager_models::catalog_default_offload`]) in canonical form,
+/// when the catalog pins one. Used where a backend gains a model
+/// without operator flags of its own: backend creation, model
+/// assignment, and the catalog definition refresh.
+fn catalog_default_raw_flags(model_id: &str) -> Option<String> {
+    manager_models::curated_models()
+        .into_iter()
+        .find(|s| s.id == model_id)
+        .and_then(|s| {
+            manager_models::offload_flag_string(manager_models::catalog_default_offload(&s))
+        })
+}
+
+/// Set a backend's expert offload (the Edit Flags form's offload
+/// slider): rewrite only the offload tokens in the backend's raw
+/// flags to the canonical form for `layers` MoE layers on system
+/// RAM — 0 is no offload, the full MoE layer count is the
+/// `-ot exps=CPU` form, anything between is `--n-cpu-moe N` —
+/// leaving every other flag untouched. The model must be
+/// offload-capable (see [`backend_offload_info`]). Saved through
+/// the same clone-validate-save path as the other backend
+/// mutations and journaled as a backend-scope activation change;
+/// applies on the backend's next start.
+#[tauri::command]
+async fn backend_set_offload(state: State<'_, AppState>, id: String, layers: u32) -> ApiResult {
+    // Capability is resolved before the write lock (resolution can
+    // parse a GGUF header); the layer count is validated against
+    // it here and the flags are rewritten under the lock.
+    let moe_layers = {
+        let cfg = state.config.read().await;
+        let b = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .ok_or_else(|| err(ApiError::NotFound(format!("backend {id}"))))?;
+        backend_offload_info(&cfg, b)
+            .map(|o| o.moe_layers)
+            .ok_or_else(|| {
+                err(ApiError::InvalidInput(format!(
+                    "backend {id}'s model does not support expert offload"
+                )))
+            })?
+    };
+    if layers > moe_layers {
+        return Err(err(ApiError::InvalidInput(format!(
+            "offload of {layers} layers exceeds the model's {moe_layers} MoE layers"
+        ))));
+    }
+    let target = manager_models::offload_for_layers(layers, moe_layers);
+    let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
+    let mut new_cfg = cfg.clone();
+    let b = new_cfg
+        .backends
+        .iter_mut()
+        .find(|b| b.id == id)
+        .ok_or_else(|| err(ApiError::NotFound(format!("backend {id}"))))?;
+    let new_raw = manager_models::set_expert_offload(b.raw_flags.as_deref(), target);
+    let changed = new_raw != b.raw_flags;
+    b.raw_flags = new_raw.clone();
+    if changed {
+        manager_config::validate(&new_cfg)
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
+        manager_config::save(&new_cfg, &state.config_path)
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
+        *cfg = new_cfg;
+        let summary = match target {
+            manager_models::ExpertOffload::None => {
+                format!("Backend `{id}` expert offload turned off")
+            }
+            manager_models::ExpertOffload::AllExperts => {
+                format!("Backend `{id}` expert offload set to all {moe_layers} MoE layers")
+            }
+            manager_models::ExpertOffload::CpuMoeLayers(n) => {
+                format!("Backend `{id}` expert offload set to {n} of {moe_layers} MoE layers")
+            }
+        };
+        record_backend_change(
+            &state.data_dir,
+            &pre_cfg,
+            &cfg,
+            "backend_set_offload",
+            summary,
+            &id,
+        );
+    }
+    drop(cfg);
+    if changed {
+        ensure_backend_specs(&state).await;
+    }
+    Ok(json!({
+        "backend_id": id,
+        "layers": layers,
+        "raw_flags": new_raw,
+        "changed": changed,
+        "persisted": changed,
+        "applies": "next start",
+    }))
 }
 
 /// Remove a backend (spec §14 `backend_delete`). Refused while the
@@ -3120,12 +3706,20 @@ async fn gateway_status(state: State<'_, AppState>) -> ApiResult {
     };
     let routing_log_len = state.routing_log.lock().await.len();
     // Activation-plan state for the status surfaces: saved changes
-    // the running gateway has not picked up (journal entries no
-    // gateway start has resolved, or live config drift).
+    // nothing has activated yet (journal entries no gateway start
+    // or backend (re)start has resolved, or live config drift).
     let (activation_pending, activation_changes) = {
         let cfg = state.config.read().await;
         let journal = activation::load_journal(&state.data_dir);
-        let unresolved = activation::unresolved_entries(&state.data_dir, &journal);
+        let started_at = backend_start_times(&state).await;
+        let configured: std::collections::HashSet<String> =
+            cfg.backends.iter().map(|b| b.id.clone()).collect();
+        let unresolved = activation::unresolved_entries_scoped(
+            &state.data_dir,
+            &journal,
+            &started_at,
+            &configured,
+        );
         (
             !unresolved.is_empty() || activation::config_drift(&cfg, &state.data_dir),
             unresolved.len(),
@@ -3145,13 +3739,24 @@ async fn gateway_status(state: State<'_, AppState>) -> ApiResult {
     }))
 }
 
-/// The gateway activation plan: saved changes waiting on a gateway
-/// restart, with the state the operator's decision depends on.
+/// The activation plan: every saved change that is not live yet,
+/// across scopes — gateway changes waiting on a gateway restart and
+/// backend changes (flags, tensor split, model assignment) waiting
+/// on their backend's (re)start — with the state the operator's
+/// decision depends on. Each change carries its `activation`:
+/// `gateway_restart`, `restart` (a running backend must restart),
+/// or `next_start` (nothing running holds the old state; the change
+/// takes effect when the relevant process next starts).
 #[tauri::command]
 async fn gateway_activation_plan(state: State<'_, AppState>) -> ApiResult {
     let cfg = state.config.read().await.clone();
     let journal = activation::load_journal(&state.data_dir);
-    let unresolved = activation::unresolved_entries(&state.data_dir, &journal);
+    let started_at = backend_start_times(&state).await;
+    let running = backend_running_ids(&state).await;
+    let configured: std::collections::HashSet<String> =
+        cfg.backends.iter().map(|b| b.id.clone()).collect();
+    let unresolved =
+        activation::unresolved_entries_scoped(&state.data_dir, &journal, &started_at, &configured);
     let drift = activation::config_drift(&cfg, &state.data_dir);
     let pending = !unresolved.is_empty() || drift;
     let probe_host = manager_wizard::steps::gateway_probe_host(&cfg);
@@ -3159,15 +3764,64 @@ async fn gateway_activation_plan(state: State<'_, AppState>) -> ApiResult {
     let up = tokio::task::spawn_blocking(move || probe_gateway(&probe_host, port))
         .await
         .unwrap_or(false);
+    let entry_ts = |e: &activation::ActivationEntry| {
+        chrono::DateTime::parse_from_rfc3339(&e.ts)
+            .ok()
+            .map(|t| t.with_timezone(&chrono::Utc))
+    };
+    let mut backend_restart_ids: Vec<String> = Vec::new();
     let changes: Vec<Value> = unresolved
         .iter()
-        .map(|e| json!({ "ts": e.ts, "kind": e.kind, "summary": e.summary }))
+        .map(|e| {
+            let activation_kind = if e.scope == "backend" {
+                // Needs a restart when a target is running a process
+                // started before the change (or with unknown start —
+                // an adopted process: restarting is the safe call).
+                let ts = entry_ts(e);
+                let stale = |t: &String| {
+                    running.contains(t)
+                        && started_at
+                            .get(t)
+                            .map(|s| ts.map(|ts| *s < ts).unwrap_or(true))
+                            .unwrap_or(true)
+                };
+                if e.targets.iter().any(stale) {
+                    for t in &e.targets {
+                        if stale(t) && !backend_restart_ids.contains(t) {
+                            backend_restart_ids.push(t.clone());
+                        }
+                    }
+                    "restart"
+                } else {
+                    "next_start"
+                }
+            } else if up {
+                "gateway_restart"
+            } else {
+                "next_start"
+            };
+            json!({
+                "ts": e.ts,
+                "kind": e.kind,
+                "summary": e.summary,
+                "scope": e.scope,
+                "targets": e.targets,
+                "activation": activation_kind,
+            })
+        })
         .collect();
+    let gateway_pending = drift
+        || unresolved.iter().any(|e| e.scope != "backend")
+        || changes.iter().any(|c| c["activation"] == "gateway_restart");
+    let actionable = gateway_pending || changes.iter().any(|c| c["activation"] == "restart");
     Ok(json!({
         "pending": pending,
         "gateway_up": up,
+        "gateway_pending": gateway_pending,
         "drift": drift,
         "applies_at_next_start": pending && !up,
+        "actionable": actionable,
+        "backend_restart_ids": backend_restart_ids,
         "changes": changes,
         "snapshot_available": journal.snapshot.is_some() && !unresolved.is_empty(),
     }))
@@ -3198,14 +3852,17 @@ async fn gateway_activation_cancel(state: State<'_, AppState>) -> ApiResult {
     Ok(json!({ "cancelled": true }))
 }
 
-/// Mark the activation plan complete after a successful gateway
-/// (re)start. The start-gateway step regenerates everything from
-/// the live configuration, so journaled changes are live by
-/// definition at that point; the plan also self-resolves through
-/// the journal's mtime rule, this just clears the files promptly.
+/// Mark the gateway side of the activation plan complete after a
+/// successful gateway (re)start. The start-gateway step regenerates
+/// everything from the live configuration, so gateway-scope
+/// journaled changes are live by definition at that point (the
+/// plan also self-resolves through the journal's mtime rule; this
+/// just clears promptly). Backend-scope entries are NOT cleared
+/// here: they resolve through their backends' (re)starts, which
+/// the scoped resolution rule observes directly.
 #[tauri::command]
 async fn gateway_activation_complete(state: State<'_, AppState>) -> ApiResult {
-    activation::clear_journal(&state.data_dir);
+    activation::clear_gateway_scope(&state.data_dir);
     Ok(json!({ "cleared": true }))
 }
 
@@ -3248,9 +3905,7 @@ async fn gateway_quiesce_wait(state: State<'_, AppState>, timeout_secs: u64) -> 
                 }
                 Some(n) => last_in_flight = Some(n),
             },
-            None => {
-                return Ok(json!({ "drained": true, "in_flight": 0, "timed_out": false }))
-            }
+            None => return Ok(json!({ "drained": true, "in_flight": 0, "timed_out": false })),
         }
         if std::time::Instant::now() >= deadline {
             return Ok(json!({
@@ -3274,19 +3929,18 @@ async fn gateway_stop(state: State<'_, AppState>) -> ApiResult {
         let data_dir = data_dir.clone();
         move || manager_wizard::stop_gateway(&data_dir)
     })
-        .await
-        .map_err(|e| err(ApiError::Gateway(format!("gateway stop task failed: {e}"))))?
-        .map_err(|e| err(ApiError::Gateway(e)))?;
+    .await
+    .map_err(|e| err(ApiError::Gateway(format!("gateway stop task failed: {e}"))))?
+    .map_err(|e| err(ApiError::Gateway(e)))?;
     // The app-managed PostgreSQL server exists to serve the
     // gateway's database; stop it after the gateway so nothing is
     // left holding pooled connections to a stopping server.
     // Best-effort: the gateway stop already succeeded, so a
     // PostgreSQL stop problem is reported in the payload, not as a
     // command failure.
-    let postgres_stopped =
-        manager_wizard::steps::stop_postgres_server(&RealSystemOps, &data_dir)
-            .await
-            .unwrap_or(false);
+    let postgres_stopped = manager_wizard::steps::stop_postgres_server(&RealSystemOps, &data_dir)
+        .await
+        .unwrap_or(false);
     Ok(json!({ "ok": true, "stopped": stopped, "postgres_stopped": postgres_stopped }))
 }
 
@@ -3392,8 +4046,7 @@ fn fetch_gateway_metrics(host: &str, port: u16, master_key: &str) -> Option<Stri
     let ip: std::net::IpAddr = host.parse().ok()?;
     let addr = std::net::SocketAddr::new(ip, port);
     let mut stream =
-        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800))
-            .ok()?;
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800)).ok()?;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
     let req = format!(
@@ -3423,7 +4076,10 @@ fn fetch_gateway_metrics(host: &str, port: u16, master_key: &str) -> Option<Stri
     // A chunked body would corrupt the exposition parse. LiteLLM's
     // /metrics answers with a content-length body, but skip the cycle
     // rather than misread if that ever changes.
-    if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
         return None;
     }
     Some(parts.next()?.to_string())
@@ -3571,10 +4227,30 @@ async fn model_verify_checksum(state: State<'_, AppState>, id: String) -> ApiRes
             m.sha256.clone(),
         )
     };
-    let ok = manager_models::verify_sha256(&path, &sha)
-        .await
-        .map_err(ApiError::from)
-        .map_err(jerr)?;
+    // Track the manual verify in the same set the download watcher
+    // uses: list_models then reports the model as verifying (the
+    // hash of a multi-GiB file takes minutes and the card must not
+    // look idle or re-offer the button), and the start preflight
+    // refuses to launch on a file whose verification is in flight.
+    // The mark is removed on every exit path below.
+    {
+        let mut verifying = state
+            .verifying_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !verifying.insert(id.clone()) {
+            return Err(err(ApiError::InvalidInput(format!(
+                "verification already in progress for model {id}"
+            ))));
+        }
+    }
+    let verify_result = manager_models::verify_sha256(&path, &sha).await;
+    state
+        .verifying_downloads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&id);
+    let ok = verify_result.map_err(ApiError::from).map_err(jerr)?;
     {
         let mut cfg = state.config.write().await;
         if let Some(m) = cfg.models.iter_mut().find(|m| m.id == id) {
@@ -3602,6 +4278,30 @@ async fn model_verify_checksum(state: State<'_, AppState>, id: String) -> ApiRes
         );
     }
     Ok(json!({ "id": id, "ok": ok }))
+}
+
+/// Rename a model's short display name (the operator's own label,
+/// stored as `display_name` on the model config). The effective
+/// short name — this override, else the catalog name, else the id —
+/// is what `list_models` reports and every short-name control
+/// shows. The model id itself never changes. Mutation happens on a
+/// clone installed in memory only after a successful save, so a
+/// failed save leaves memory and disk in agreement.
+#[tauri::command]
+async fn model_set_short_name(state: State<'_, AppState>, id: String, name: String) -> ApiResult {
+    let validated =
+        manager_config::validate_display_name(&name).map_err(|e| err(ApiError::InvalidInput(e)))?;
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    let m = new_cfg
+        .models
+        .iter_mut()
+        .find(|m| m.id == id)
+        .ok_or_else(|| err(ApiError::NotFound(format!("model {id}"))))?;
+    m.display_name = Some(validated.clone());
+    manager_config::save(&new_cfg, &state.config_path).map_err(jerr)?;
+    *cfg = new_cfg;
+    Ok(json!({ "id": id, "name": validated }))
 }
 
 /// Delete a model file (guarded): refuses while any backend references
@@ -3724,6 +4424,7 @@ async fn model_add(
         source_url,
         assigned_backends: Vec::new(),
         enabled: true,
+        display_name: None,
     });
     manager_config::save(&cfg, &state.config_path).map_err(jerr)?;
     drop(cfg);
@@ -3755,6 +4456,7 @@ async fn model_assign(
         ))));
     }
     let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
     let model = cfg
         .models
         .iter()
@@ -3768,6 +4470,23 @@ async fn model_assign(
             .find(|b| b.id == backend_id)
             .ok_or_else(|| err(ApiError::NotFound(format!("backend {backend_id}"))))?;
         backend.model_file = gguf_path;
+        // A backend with no raw flags of its own takes the newly
+        // assigned model's catalog default offload (e.g. Nemotron's
+        // --n-cpu-moe 16) — the same preservation rule as the
+        // catalog definition refresh: backends carrying operator
+        // flags keep them, and the offload slider adjusts from
+        // there.
+        if backend
+            .raw_flags
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            if let Some(flags) = catalog_default_raw_flags(&id) {
+                backend.raw_flags = Some(flags);
+            }
+        }
         manager_models::apply_placement(backend, &split)
             .map_err(ApiError::from)
             .map_err(jerr)?;
@@ -3781,6 +4500,26 @@ async fn model_assign(
         .map_err(ApiError::from)
         .map_err(jerr)?;
     manager_config::save(&cfg, &state.config_path).map_err(jerr)?;
+    // The assignment activates twice over: the gateway's routes
+    // change with the backend's model (gateway scope, recorded only
+    // when the generated YAML actually differs), and the backend
+    // loads the new model at its next (re)start (backend scope).
+    record_gateway_change(
+        &state.data_dir,
+        &pre_cfg,
+        &cfg,
+        "model_assign",
+        format!("Backend `{backend_id}` now serves model `{id}`"),
+        false,
+    );
+    record_backend_change(
+        &state.data_dir,
+        &pre_cfg,
+        &cfg,
+        "model_assign",
+        format!("Backend `{backend_id}` now serves model `{id}`"),
+        &backend_id,
+    );
     drop(cfg);
     let task_id = state
         .record_task(
@@ -3879,7 +4618,8 @@ fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let key = (path.clone(), meta.len(), mtime);
-    let cache = GGUF_LAYOUT_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache =
+        GGUF_LAYOUT_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Ok(guard) = cache.lock() {
         if let Some(hit) = guard.get(&key) {
             return hit.clone();
@@ -3910,17 +4650,31 @@ fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
     layout
 }
 
-/// A backend's memory requirement (GPU-resident weights, system-RAM
-/// weights, KV at its configured context) under its current serving
-/// configuration — see [`manager_models::memory_requirement`]. The
-/// weight layout comes from the downloaded GGUF when available
-/// (basis Exact), else the catalog's pins (Catalog), else a
+/// A backend's model weight layout, resolved once for the memory
+/// requirement and the offload slider: total weight bytes, the
+/// routed-expert share, the MoE layer count, KV bytes per token,
+/// and the derivation basis. The layout comes from the downloaded
+/// GGUF when available (basis Exact), else the catalog's pins
+/// (Catalog — expert bytes and MoE layer count are both pinned, so
+/// a partial offload resolves before download), else a
 /// parameter-count estimate (Estimate). None when the backend's
 /// model cannot be resolved.
-fn backend_memory_requirement(
+struct WeightLayout {
+    total_bytes: u64,
+    expert_bytes: Option<u64>,
+    moe_layers: Option<u32>,
+    kv_per_token: Option<u64>,
+    basis: manager_models::MemoryBasis,
+    /// The curated catalog entry for the backend's model, when it
+    /// is a catalog model (the offload slider's green limit and
+    /// default live there).
+    catalog: Option<manager_models::ModelSpec>,
+}
+
+fn resolve_weight_layout(
     cfg: &AppConfig,
     b: &manager_config::BackendConfig,
-) -> Option<manager_models::MemoryRequirement> {
+) -> Option<WeightLayout> {
     let model = model_for_backend(cfg, b)?;
     let path = resolve_under_data_dir(&cfg.data_dir, &model.gguf_path);
     let layout = gguf_layout_cached(&path);
@@ -3939,28 +4693,95 @@ fn backend_memory_requirement(
             manager_models::MemoryBasis::Estimate,
         ),
     };
-    let (expert_bytes, kv_per_token, block_count) = match (&layout, &catalog) {
+    let (expert_bytes, kv_per_token, moe_layers) = match (&layout, &catalog) {
         (Some(l), _) => {
             basis = manager_models::MemoryBasis::Exact;
             (
                 Some(l.expert_bytes),
                 l.kv.map(|k| k.bytes_per_token()),
-                l.block_count,
+                l.moe_block_count,
             )
         }
-        (None, Some(c)) => (c.expert_bytes, None, None),
+        (None, Some(c)) => (c.expert_bytes, None, c.moe_layers),
         (None, None) => (None, None, None),
     };
-    let offload = manager_models::expert_offload(b.raw_flags.as_deref());
-    Some(manager_models::memory_requirement(
+    Some(WeightLayout {
         total_bytes,
         expert_bytes,
-        basis,
-        offload,
+        moe_layers,
         kv_per_token,
-        block_count,
+        basis,
+        catalog,
+    })
+}
+
+/// A backend's memory requirement (GPU-resident weights, system-RAM
+/// weights, KV at its configured context) under its current serving
+/// configuration — see [`manager_models::memory_requirement`]. None
+/// when the backend's model cannot be resolved.
+fn backend_memory_requirement(
+    cfg: &AppConfig,
+    b: &manager_config::BackendConfig,
+) -> Option<manager_models::MemoryRequirement> {
+    let layout = resolve_weight_layout(cfg, b)?;
+    let offload = manager_models::expert_offload(b.raw_flags.as_deref());
+    Some(manager_models::memory_requirement(
+        layout.total_bytes,
+        layout.expert_bytes,
+        layout.basis,
+        offload,
+        layout.kv_per_token,
+        layout.moe_layers,
         b.flags.n_ctx,
     ))
+}
+
+/// A backend's expert-offload slider state, present only when the
+/// backend's model is offload-capable: a mixture-of-experts model
+/// with a known routed-expert share, a known MoE layer count, and
+/// a catalog green limit (the default offload). The Edit Flags
+/// form renders the slider from this payload and prices positions
+/// with the same byte arithmetic as [`backend_memory_requirement`].
+struct OffloadInfo {
+    /// MoE layers in total (the slider's maximum).
+    moe_layers: u32,
+    /// Current slider position: MoE layers on system RAM.
+    layers: u32,
+    expert_bytes: u64,
+    total_bytes: u64,
+    /// The green limit in layers (the catalog default offload).
+    green_limit_layers: u32,
+    /// Slider band boundaries as fractions (see
+    /// [`manager_models::offload_bands`]).
+    green_end: f64,
+    yellow_end: f64,
+}
+
+fn backend_offload_info(
+    cfg: &AppConfig,
+    b: &manager_config::BackendConfig,
+) -> Option<OffloadInfo> {
+    let layout = resolve_weight_layout(cfg, b)?;
+    let expert_bytes = layout.expert_bytes?;
+    let moe_layers = layout.moe_layers?;
+    // The bands derive from the catalog's green limit, so a model
+    // without one (dense, or outside the curated catalog) gets no
+    // slider rather than invented band boundaries.
+    let green_limit_layers = layout.catalog.as_ref()?.default_offload_layers?;
+    if expert_bytes == 0 || moe_layers == 0 {
+        return None;
+    }
+    let (green_end, yellow_end) = manager_models::offload_bands(moe_layers, green_limit_layers);
+    let offload = manager_models::expert_offload(b.raw_flags.as_deref());
+    Some(OffloadInfo {
+        moe_layers,
+        layers: offload.layers(moe_layers),
+        expert_bytes,
+        total_bytes: layout.total_bytes,
+        green_limit_layers,
+        green_end,
+        yellow_end,
+    })
 }
 
 /// Project a tensor split onto discovered VRAM (spec §14
@@ -3975,6 +4796,17 @@ fn backend_memory_requirement(
 /// `gpu_indices` (the GPU index each split fraction maps to), and
 /// `weights_only` — the projection covers model weights only, with no
 /// KV-cache or compute allowance, so "fits" is not a load guarantee.
+///
+/// When a backend is in scope and its process is running, the fit
+/// check credits the weights that process already holds on each GPU
+/// (its configured split applied to the GPU-resident weight total;
+/// an empty split means the whole model on the first GPU): applying
+/// the new split restarts the backend, freeing its current weights
+/// first, so only the additional allocation per GPU must fit in free
+/// VRAM. A stopped backend holds nothing and earns no credit. The
+/// architecture records no launched-split separate from the
+/// configured one, so the configured split is the credit basis —
+/// the same basis the Placement form's default selection uses.
 #[tauri::command]
 async fn placement_propose(
     state: State<'_, AppState>,
@@ -4027,6 +4859,8 @@ async fn placement_propose(
                 ctx_max: 0,
                 enabled_by_default: m.enabled,
                 expert_bytes: None,
+                moe_layers: None,
+                default_offload_layers: None,
             }
         }
     };
@@ -4037,32 +4871,44 @@ async fn placement_propose(
     // weights and the system-RAM share rides along in the payload.
     // The config read finishes before telemetry is touched (the
     // telemetry accessor reads the config while initializing).
-    let (resident_bytes, sys_bytes) = match &backend_id {
+    let (resident_bytes, sys_bytes, credit_cfg_split) = match &backend_id {
         Some(bid) => {
             let cfg = state.config.read().await;
-            let found = cfg
-                .backends
-                .iter()
-                .find(|b| &b.id == bid)
-                .and_then(|b| {
-                    let serves = model_for_backend(&cfg, b)
-                        .map(|m| m.id == model_id)
-                        .unwrap_or(false);
-                    if serves {
-                        backend_memory_requirement(&cfg, b)
-                    } else {
-                        None
-                    }
-                });
+            let found = cfg.backends.iter().find(|b| &b.id == bid).and_then(|b| {
+                let serves = model_for_backend(&cfg, b)
+                    .map(|m| m.id == model_id)
+                    .unwrap_or(false);
+                if serves {
+                    backend_memory_requirement(&cfg, b)
+                        .map(|req| (req, b.flags.tensor_split.clone()))
+                } else {
+                    None
+                }
+            });
             match found {
-                Some(req) if req.sys_weights_mib > 0 => (
+                Some((req, split_cfg)) if req.sys_weights_mib > 0 => (
                     Some(req.gpu_weights_mib * manager_models::MIB),
                     req.sys_weights_mib * manager_models::MIB,
+                    Some(split_cfg),
                 ),
-                _ => (None, 0),
+                Some((_, split_cfg)) => (None, 0, Some(split_cfg)),
+                None => (None, 0, None),
             }
         }
-        None => (None, 0),
+        None => (None, 0, None),
+    };
+    // The current-allocation credit applies only while the backend's
+    // process actually holds the weights: running or starting. A
+    // stopped backend's weights are already absent from VRAM, so the
+    // telemetry free figures need no adjustment for it.
+    let credit_active = match (&backend_id, &credit_cfg_split) {
+        (Some(bid), Some(_)) => {
+            let sup = state.supervisor().await.lock().await;
+            sup.status().iter().any(|s| {
+                &s.id == bid && matches!(s.state, ProcessState::Running | ProcessState::Starting)
+            })
+        }
+        _ => false,
     };
     let store = state.telemetry().await;
     let guard = lock_telemetry(&store);
@@ -4085,11 +4931,7 @@ async fn placement_propose(
     // with last-known readings) has no usable capacity: project it as
     // zero free VRAM so no split fraction is planned onto it, and
     // name it in the payload so the UI can say why it does not fit.
-    let down_indices: Vec<u32> = samples
-        .iter()
-        .filter(|s| s.down)
-        .map(|s| s.index)
-        .collect();
+    let down_indices: Vec<u32> = samples.iter().filter(|s| s.down).map(|s| s.index).collect();
     let free_mib: Vec<u64> = samples
         .iter()
         .map(|s| {
@@ -4101,10 +4943,34 @@ async fn placement_propose(
         })
         .collect();
     drop(guard);
-    let projection =
-        manager_models::propose_placement_resident(&spec, &split, &free_mib, resident_bytes, sys_bytes)
-            .map_err(ApiError::from)
-            .map_err(jerr)?;
+    // The credit basis, aligned to the snapshot's GPU order: the
+    // backend's configured split when it covers the current GPU set;
+    // an empty configured split means an unsplit launch, which loads
+    // the whole model on the first GPU. A configured split recorded
+    // against a different GPU count is stale and earns no credit.
+    let current_split: Option<Vec<f32>> = match (&credit_cfg_split, credit_active) {
+        (Some(cfg_split), true)
+            if cfg_split.len() == free_mib.len() && cfg_split.iter().any(|f| *f > 0.0) =>
+        {
+            Some(cfg_split.clone())
+        }
+        (Some(cfg_split), true) if cfg_split.is_empty() && !free_mib.is_empty() => {
+            let mut v = vec![0.0; free_mib.len()];
+            v[0] = 1.0;
+            Some(v)
+        }
+        _ => None,
+    };
+    let projection = manager_models::propose_placement_resident(
+        &spec,
+        &split,
+        &free_mib,
+        resident_bytes,
+        sys_bytes,
+        current_split.as_deref(),
+    )
+    .map_err(ApiError::from)
+    .map_err(jerr)?;
     let mut payload = serde_json::to_value(&projection).map_err(jerr)?;
     payload["snapshot_age_ms"] = json!(snapshot_age_ms);
     payload["gpu_indices"] = json!(gpu_indices);
@@ -4154,6 +5020,7 @@ async fn placement_apply(
         ))));
     }
     let cfg = state.config.read().await;
+    let pre_cfg = cfg.clone();
     let model = cfg
         .models
         .iter()
@@ -4248,6 +5115,23 @@ async fn placement_apply(
     drop(cfg);
     match outcome {
         Ok(()) => {
+            // The split is saved; each target backend activates it
+            // at its next (re)start — a backend-scope plan entry
+            // per target (the gateway YAML does not carry splits,
+            // so no gateway entry is created for this change).
+            {
+                let cfg = state.config.read().await;
+                for bid in &backend_ids {
+                    record_backend_change(
+                        &state.data_dir,
+                        &pre_cfg,
+                        &cfg,
+                        "backend_placement",
+                        format!("Backend `{bid}` tensor split changed"),
+                        bid,
+                    );
+                }
+            }
             state
                 .finish_task(
                     &task_id,
@@ -4372,6 +5256,28 @@ async fn diagnostics_export_bundle(state: State<'_, AppState>) -> ApiResult {
             })
             .collect();
         log_scopes.push(("gateway".to_string(), lines));
+    }
+    // The wizard log joins as the "wizard" scope: step outcomes,
+    // start markers for steps that never finished, and busy
+    // rejections live only in that file — a bundle without it
+    // cannot show why a setup step blocked or stalled.
+    let (wizard_records, _) = wizard_log_records(&state.data_dir);
+    if !wizard_records.is_empty() {
+        let lines: Vec<String> = wizard_records
+            .iter()
+            .rev()
+            .map(|r| {
+                let archived = if r.archived { " [archived]" } else { "" };
+                format!(
+                    "[{}] [{:?}]{} {}",
+                    r.ts.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+                    r.stream,
+                    archived,
+                    r.line
+                )
+            })
+            .collect();
+        log_scopes.push(("wizard".to_string(), lines));
     }
     let versions = vec![
         ("app".to_string(), env!("CARGO_PKG_VERSION").to_string()),
@@ -4890,7 +5796,9 @@ async fn updates_pin(
         .map_err(ApiError::from)
         .map_err(jerr)?;
     *cfg = new_cfg;
-    Ok(json!({ "ok": true, "persisted": true, "component_id": component_id, "pinned_version": version }))
+    Ok(
+        json!({ "ok": true, "persisted": true, "component_id": component_id, "pinned_version": version }),
+    )
 }
 
 /// Toggle auto-update for a component and persist it: same
@@ -4917,7 +5825,9 @@ async fn updates_set_auto(
         .map_err(ApiError::from)
         .map_err(jerr)?;
     *cfg = new_cfg;
-    Ok(json!({ "ok": true, "persisted": true, "component_id": component_id, "auto_update": enabled }))
+    Ok(
+        json!({ "ok": true, "persisted": true, "component_id": component_id, "auto_update": enabled }),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4985,6 +5895,7 @@ fn main() {
             backend_apply_config,
             backend_add,
             backend_update_flags,
+            backend_set_offload,
             backend_delete,
             backend_get_launch_command,
             // Wizard / audit
@@ -5010,6 +5921,7 @@ fn main() {
             model_pause_download,
             model_resume_download,
             model_verify_checksum,
+            model_set_short_name,
             model_delete,
             model_assign,
             model_add,
@@ -5085,7 +5997,7 @@ mod tests {
     fn backend_spec_uses_wizard_binary_and_resolves_model() {
         let cfg = test_cfg();
         let b = backend(&cfg, "planner");
-        let spec = backend_spec(&cfg, &b);
+        let spec = backend_spec(&cfg, &b, &[]);
         let expected_prog = PathBuf::from("/data")
             .join("llamacpp")
             .join(if cfg!(windows) {
@@ -5116,7 +6028,7 @@ mod tests {
         ] {
             let mut b = backend(&cfg, "planner");
             b.flags.split_mode = mode;
-            let spec = backend_spec(&cfg, &b);
+            let spec = backend_spec(&cfg, &b, &[]);
             let pos = spec.args.iter().position(|a| a == "--split-mode").unwrap();
             assert_eq!(spec.args[pos + 1], want);
         }
@@ -5127,7 +6039,7 @@ mod tests {
         let cfg = test_cfg();
         let mut b = backend(&cfg, "planner");
         b.flags.tensor_split = vec![0.5, 0.3, 0.2];
-        let spec = backend_spec(&cfg, &b);
+        let spec = backend_spec(&cfg, &b, &[]);
         let pos = spec
             .args
             .iter()
@@ -5136,18 +6048,347 @@ mod tests {
         assert_eq!(spec.args[pos + 1], "0.5,0.3,0.2");
     }
 
+    /// Three fake inventory GPUs with stable UUIDs.
+    fn test_gpus() -> Vec<GpuInfo> {
+        (0..3)
+            .map(|i| GpuInfo {
+                index: i,
+                name: format!("GPU {i}"),
+                uuid: format!("GPU-uuid-{i}"),
+                compute_capability: (8, 6),
+                total_vram_mib: 16384,
+                pci_bus_id: format!("00000000:0{}:00.0", i + 1),
+                driver_version: "581.57".into(),
+                driver_model: None,
+                source: manager_telemetry::TelemetrySourceKind::NvidiaSmi,
+            })
+            .collect()
+    }
+
+    fn cuda_visible_devices(spec: &ProcessSpec) -> Option<&str> {
+        spec.env
+            .iter()
+            .find(|(k, _)| k == "CUDA_VISIBLE_DEVICES")
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn tensor_split_arg(spec: &ProcessSpec) -> Option<&str> {
+        spec.args
+            .iter()
+            .position(|a| a == "--tensor-split")
+            .map(|pos| spec.args[pos + 1].as_str())
+    }
+
+    #[test]
+    fn backend_spec_unsplit_restricts_to_gpu0() {
+        let cfg = test_cfg();
+        let b = backend(&cfg, "planner");
+        assert!(b.flags.tensor_split.is_empty());
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert_eq!(cuda_visible_devices(&spec), Some("GPU-uuid-0"));
+        assert_eq!(tensor_split_arg(&spec), None);
+    }
+
+    #[test]
+    fn backend_spec_single_gpu_on_second_gpu() {
+        // Coder's placement: the whole model on GPU 1. The visible
+        // set is GPU 1 only (by UUID), and the remapped tensor split
+        // is just its proportion — the zero entry for GPU 0 is gone,
+        // so llama.cpp never creates its wasted context there.
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        b.flags.tensor_split = vec![0.0, 1.0];
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert_eq!(cuda_visible_devices(&spec), Some("GPU-uuid-1"));
+        assert_eq!(tensor_split_arg(&spec), Some("1"));
+    }
+
+    #[test]
+    fn backend_spec_split_across_subset_of_gpus() {
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        b.flags.tensor_split = vec![0.5, 0.0, 0.5];
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert_eq!(cuda_visible_devices(&spec), Some("GPU-uuid-0,GPU-uuid-2"));
+        assert_eq!(tensor_split_arg(&spec), Some("0.5,0.5"));
+    }
+
+    #[test]
+    fn backend_spec_cpu_only_gets_empty_visible_devices() {
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        b.flags.tensor_split = vec![0.5, 0.5];
+        b.raw_flags = Some("-ngl 0 --threads 4".into());
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert_eq!(cuda_visible_devices(&spec), Some(""));
+        assert_eq!(
+            tensor_split_arg(&spec),
+            None,
+            "a split over no visible devices is dropped"
+        );
+        assert!(spec.args.iter().any(|a| a == "--threads"));
+    }
+
+    #[test]
+    fn backend_spec_cpu_only_via_gpu_layers_equals() {
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        b.raw_flags = Some("--n-gpu-layers=0".into());
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert_eq!(cuda_visible_devices(&spec), Some(""));
+    }
+
+    #[test]
+    fn backend_spec_expert_offload_is_not_cpu_only() {
+        // Coder's `-ot exps=CPU` offloads experts only; the rest of
+        // the model still loads on the GPU, so the launch restricts
+        // to the placement GPU as usual.
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        b.flags.tensor_split = vec![0.0, 1.0];
+        b.raw_flags = Some("-ot exps=CPU".into());
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert_eq!(cuda_visible_devices(&spec), Some("GPU-uuid-1"));
+        assert!(spec.args.iter().any(|a| a == "exps=CPU"));
+    }
+
+    #[test]
+    fn backend_spec_missing_inventory_gpu_leaves_launch_unrestricted() {
+        // GPU 1 fell off the bus before the inventory was taken: its
+        // UUID is unknown, so no restriction is guessed at and the
+        // configured split passes through verbatim.
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        b.flags.tensor_split = vec![0.0, 1.0];
+        let gpus = vec![test_gpus().remove(0)];
+        let spec = backend_spec(&cfg, &b, &gpus);
+        assert_eq!(cuda_visible_devices(&spec), None);
+        assert_eq!(tensor_split_arg(&spec), Some("0,1"));
+    }
+
+    #[test]
+    fn backend_spec_undetermined_split_leaves_launch_unrestricted() {
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        b.flags.tensor_split = vec![0.0, 0.0];
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert_eq!(cuda_visible_devices(&spec), None);
+        assert_eq!(tensor_split_arg(&spec), Some("0,0"));
+    }
+
+    #[test]
+    fn backend_spec_remaps_raw_main_gpu_and_drops_conflicts() {
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        b.flags.tensor_split = vec![0.5, 0.0, 0.5];
+        // GPU 2 is placed at visible position 1.
+        b.raw_flags = Some("--main-gpu 2".into());
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        let pos = spec.args.iter().position(|a| a == "--main-gpu").unwrap();
+        assert_eq!(spec.args[pos + 1], "1");
+        // GPU 1 is not placed: the flag naming it is dropped.
+        b.raw_flags = Some("--main-gpu=1".into());
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert!(!spec.args.iter().any(|a| a.starts_with("--main-gpu")));
+    }
+
+    #[test]
+    fn backend_spec_raw_tensor_split_yields_to_placement() {
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        b.flags.tensor_split = vec![0.0, 1.0];
+        b.raw_flags = Some("--tensor-split 0.5,0.5 --threads 4".into());
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert_eq!(
+            spec.args.iter().filter(|a| *a == "--tensor-split").count(),
+            1,
+            "only the placement's remapped split survives"
+        );
+        assert_eq!(tensor_split_arg(&spec), Some("1"));
+        assert!(spec.args.iter().any(|a| a == "--threads"));
+    }
+
+    #[test]
+    fn backend_spec_remaps_raw_device_list() {
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        b.flags.tensor_split = vec![0.5, 0.0, 0.5];
+        b.raw_flags = Some("--device CUDA0,CUDA2".into());
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        let pos = spec.args.iter().position(|a| a == "--device").unwrap();
+        assert_eq!(spec.args[pos + 1], "CUDA0,CUDA1");
+        // A device outside the placement leaves nothing behind.
+        b.raw_flags = Some("--device CUDA1".into());
+        let spec = backend_spec(&cfg, &b, &test_gpus());
+        assert!(!spec.args.iter().any(|a| a == "--device"));
+    }
+
     #[test]
     fn backend_spec_filters_host_from_raw_flags() {
         let cfg = test_cfg();
         let mut b = backend(&cfg, "planner");
         b.raw_flags = Some("--host 0.0.0.0 --threads 4".into());
-        let spec = backend_spec(&cfg, &b);
+        let spec = backend_spec(&cfg, &b, &[]);
         assert!(!spec.args.iter().any(|a| a == "--host" || a == "0.0.0.0"));
         assert!(spec.args.iter().any(|a| a == "--threads"));
         b.raw_flags = Some("--host=0.0.0.0 --threads 4".into());
-        let spec = backend_spec(&cfg, &b);
+        let spec = backend_spec(&cfg, &b, &[]);
         assert!(!spec.args.iter().any(|a| a.starts_with("--host")));
         assert!(spec.args.iter().any(|a| a == "--threads"));
+    }
+
+    /// Register a catalog model in a test config and point a
+    /// backend at its file, so model resolution finds it.
+    fn serve_model(
+        cfg: &mut AppConfig,
+        backend_id: &str,
+        model_id: &str,
+        file: &str,
+        raw_flags: Option<&str>,
+    ) -> manager_config::BackendConfig {
+        cfg.models.push(manager_config::ModelConfig {
+            id: model_id.to_string(),
+            gguf_path: PathBuf::from(file),
+            quant: "Q4_K_M".to_string(),
+            params_b: 30.0,
+            sha256: "a".repeat(64),
+            verified_at: None,
+            source_url: String::new(),
+            assigned_backends: vec![backend_id.to_string()],
+            enabled: true,
+            display_name: None,
+        });
+        let b = cfg
+            .backends
+            .iter_mut()
+            .find(|b| b.id == backend_id)
+            .unwrap();
+        b.model_file = PathBuf::from(file);
+        b.raw_flags = raw_flags.map(str::to_string);
+        b.clone()
+    }
+
+    #[test]
+    fn catalog_default_raw_flags_render_the_design_points() {
+        assert_eq!(
+            catalog_default_raw_flags("qwen3-coder-30b").as_deref(),
+            Some("-ot exps=CPU")
+        );
+        assert_eq!(
+            catalog_default_raw_flags("nemotron-3.5-lightning-30b").as_deref(),
+            Some("--n-cpu-moe 16")
+        );
+        assert_eq!(catalog_default_raw_flags("qwen3-27b-planner"), None);
+        assert_eq!(catalog_default_raw_flags("not-a-model"), None);
+        // The seeded default fleet agrees with the catalog: the
+        // coder backend's built-in raw flags are the catalog
+        // default for its model.
+        let cfg = test_cfg();
+        let coder = backend(&cfg, "coder");
+        assert_eq!(
+            coder.raw_flags.as_deref(),
+            catalog_default_raw_flags("qwen3-coder-30b").as_deref()
+        );
+    }
+
+    #[test]
+    fn offload_info_for_nemotron_backend_uses_catalog_pins() {
+        let mut cfg = test_cfg();
+        // No file on disk in the test config: the payload resolves
+        // from the catalog pins (Catalog basis arithmetic).
+        let b = serve_model(
+            &mut cfg,
+            "coder-fast",
+            "nemotron-3.5-lightning-30b",
+            "models/Nemotron.gguf",
+            Some("--n-cpu-moe 16"),
+        );
+        let info = backend_offload_info(&cfg, &b).expect("nemotron is offload-capable");
+        assert_eq!(info.moe_layers, 24);
+        assert_eq!(info.layers, 16);
+        assert_eq!(info.green_limit_layers, 16);
+        assert_eq!(info.expert_bytes, 22_829_334_528);
+        assert_eq!(info.total_bytes, 25_266_255_936);
+        assert!((info.green_end - 16.0 / 24.0).abs() < 1e-9);
+        assert!(info.yellow_end > info.green_end && info.yellow_end < 1.0);
+        // The requirement under the same flags prices the partial
+        // offload from the catalog pins: 16 of 24 MoE layers of
+        // experts to system RAM (14,515 MiB), the rest of the
+        // catalog's file size on the GPU (9,582 MiB).
+        let req = backend_memory_requirement(&cfg, &b).unwrap();
+        assert_eq!(req.sys_weights_mib, 14_515);
+        assert_eq!(req.gpu_weights_mib, 9_582);
+        assert_eq!(req.basis, manager_models::MemoryBasis::Catalog);
+    }
+
+    #[test]
+    fn offload_info_for_coder_backend_is_all_layers() {
+        let mut cfg = test_cfg();
+        let b = serve_model(
+            &mut cfg,
+            "coder",
+            "qwen3-coder-30b",
+            "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
+            Some("-ot exps=CPU"),
+        );
+        let info = backend_offload_info(&cfg, &b).expect("coder is offload-capable");
+        assert_eq!(info.moe_layers, 48);
+        assert_eq!(info.layers, 48);
+        assert_eq!(info.green_end, 1.0);
+        assert_eq!(info.yellow_end, 1.0);
+    }
+
+    #[test]
+    fn offload_info_absent_for_dense_model() {
+        let mut cfg = test_cfg();
+        let b = serve_model(
+            &mut cfg,
+            "planner",
+            "qwen3-27b-planner",
+            "models/Qwen3.8-27B.gguf",
+            None,
+        );
+        assert!(backend_offload_info(&cfg, &b).is_none());
+    }
+
+    #[test]
+    fn backend_set_offload_journals_a_backend_scope_entry() {
+        // record_backend_change is the producer backend_set_offload
+        // journals through: the entry lands in the activation
+        // journal with backend scope and the backend as its target.
+        let dir = std::env::temp_dir().join(format!(
+            "llm-mgr-offload-journal-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pre = test_cfg();
+        let mut post = pre.clone();
+        post.backends
+            .iter_mut()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .raw_flags = Some("--n-cpu-moe 24".to_string());
+        record_backend_change(
+            &dir,
+            &pre,
+            &post,
+            "backend_set_offload",
+            "Backend `coder` expert offload set to 24 of 48 MoE layers".to_string(),
+            "coder",
+        );
+        let journal = activation::load_journal(&dir);
+        let entry = journal
+            .entries
+            .iter()
+            .find(|e| e.kind == "backend_set_offload")
+            .expect("journal carries the offload entry");
+        assert_eq!(entry.scope, "backend");
+        assert_eq!(entry.targets, vec!["coder".to_string()]);
+        assert!(entry.summary.contains("24 of 48"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

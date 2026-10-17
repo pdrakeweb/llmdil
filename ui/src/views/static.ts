@@ -9,21 +9,21 @@ import { fmtGb, gaugeRing, sparkline, trim1 } from "../charts";
 import { icon, type IconName } from "../icons";
 import { esc } from "../html";
 import {
-  runWizardStep, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit,
+  runWizardStep, wizardBusyMessage, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit,
   getWizardCommands,
   getGpuTelemetry, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
-  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, getBackendLaunchCommand,
+  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, getBackendLaunchCommand,
   getBackendConfig, applyBackendConfig, testBackend, placementPropose, placementApply,
   addBackend, deleteBackend, modelAssign,
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
-  verifyModel, deleteModel, modelSetEnabled, modelAdd,
+  verifyModel, deleteModel, modelSetEnabled, modelAdd, modelSetShortName,
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
   getGatewayMasterKey, setGatewayBindHost,
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
   getActivationPlan, activationCancelChanges, activationComplete, quiesceWait,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
 } from "../api";
-import type { ActivationPlanData, BackendRow, GatewayConfigData, GatewayGroup, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
+import type { ActivationPlanData, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
 import type { GpuInfo, WizardStepState } from "../types";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
@@ -125,7 +125,11 @@ function fmtDate(ts: string): string {
 /** One model resident on a GPU, for the card's read-only listing:
  *  the configured share of the model on this GPU and the measured
  *  VRAM the serving backend holds here. */
-export interface GpuModelRow { model: string; backend: string; pct: number; mib: number }
+/** One resident-model row on a GPU card. `mib` is the measured VRAM
+ *  held, or null when per-process usage was not measured (WDDM GPU,
+ *  counter data unavailable) — the row's presence then comes from the
+ *  configured split alone and the held figure renders as unmeasured. */
+export interface GpuModelRow { model: string; backend: string; pct: number; mib: number | null }
 
 function gpuCard(g: GpuInfo, expanded: Set<string>, modelRows: GpuModelRow[] = []): string {
   const vramPct = g.vram_total_gb > 0 ? Math.round((g.vram_used_gb / g.vram_total_gb) * 100) : 0;
@@ -157,21 +161,25 @@ function gpuCard(g: GpuInfo, expanded: Set<string>, modelRows: GpuModelRow[] = [
   // attribution, not placement: a split backend legitimately appears
   // on several GPUs, and an unsplit one appears on every GPU it
   // initialized a context on while its weights sit on the main GPU.
-  const procRow = (p: { process: string; pid: number; vram_mib: number; backend: string }): string => {
+  // A null vram_mib is unmeasured (WDDM GPU, counter data
+  // unavailable): it renders as "not measured" and never earns the
+  // context-only label — unknown is not a small number.
+  const procRow = (p: { process: string; pid: number; vram_mib: number | null; backend: string }): string => {
     const key = `${g.id}:${p.pid}`;
     const open = expanded.has(key);
     const label = p.backend !== "—" ? p.backend : baseName(p.process);
-    const ctx = p.backend !== "—" && p.vram_mib < 1024 ? ` <span class="chip">context only</span>` : "";
+    const measured = p.vram_mib !== null;
+    const ctx = p.backend !== "—" && p.vram_mib !== null && p.vram_mib < 1024 ? ` <span class="chip">context only</span>` : "";
     const head = `<div data-proc-toggle="${esc(key)}" role="button" tabindex="0" style="display:flex;gap:8px;align-items:center;padding:5px 6px;cursor:pointer;border-bottom:1px solid #232a34">
       <span style="color:var(--text3);font-size:10px">${open ? "\u25be" : "\u25b8"}</span>
       <span style="flex:1;min-width:0;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(label)}${ctx}</span>
-      <span style="font-size:12px;font-family:var(--mono)">${p.vram_mib} MiB</span></div>`;
+      <span style="font-size:12px;font-family:var(--mono)">${measured ? `${p.vram_mib} MiB` : "not measured"}</span></div>`;
     const detail = open ? `<div style="padding:6px 6px 8px 24px;font-size:11px;color:var(--text2);display:grid;gap:2px;border-bottom:1px solid #232a34">
       <div>Process: ${esc(p.process)}</div>
       <div>PID: ${p.pid}</div>
-      <div>VRAM on GPU ${esc(g.id)}: ${p.vram_mib} MiB</div>
+      <div>VRAM on GPU ${esc(g.id)}: ${measured ? `${p.vram_mib} MiB` : "not measured — per-process accounting is unavailable for this GPU"}</div>
       <div>Backend: ${p.backend !== "—" ? esc(p.backend) : "not attributed to a backend"}</div>
-      ${p.backend !== "—" && p.vram_mib < 1024 ? `<div>Under 1 GiB: this process holds only its CUDA context on this GPU, not model weights.</div>` : ""}
+      ${p.backend !== "—" && p.vram_mib !== null && p.vram_mib < 1024 ? `<div>Under 1 GiB: this process holds only its CUDA context on this GPU, not model weights.</div>` : ""}
     </div>` : "";
     return head + detail;
   };
@@ -183,7 +191,7 @@ function gpuCard(g: GpuInfo, expanded: Set<string>, modelRows: GpuModelRow[] = [
   // Sample mode keeps the mock placement lines.
   const models = modelRows.length
     ? `<div style="margin-top:10px"><div style="font-size:11px;color:var(--text3);margin-bottom:4px">MODELS ON THIS GPU</div>
-        <div style="display:grid;gap:4px">${modelRows.map((r) => `<div style="font-size:12px">${icon("layers")} ${esc(r.model)} <span style="color:var(--text3)">via ${esc(r.backend)} \u00b7 ${r.pct}% of the model \u00b7 ${fmtGb(r.mib / 1024)} GiB held</span></div>`).join("")}</div></div>`
+        <div style="display:grid;gap:4px">${modelRows.map((r) => `<div style="font-size:12px">${icon("layers")} ${esc(r.model)} <span style="color:var(--text3)">via ${esc(r.backend)} \u00b7 ${r.pct}% of the model \u00b7 ${r.mib === null ? "VRAM held not measured" : `${fmtGb(r.mib / 1024)} GiB held`}</span></div>`).join("")}</div></div>`
     : g.models && g.models.length
     ? `<div style="margin-top:8px;font-size:11px;color:var(--text3);display:grid;gap:4px">
         ${g.models.map((m) => `<div>${icon("layers")} ${esc(m.model)} \u00b7 ${esc(m.layers)}</div>`).join("")}
@@ -375,14 +383,21 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     for (const b of gpuBackends) {
       if (!b.configured || (b.state !== "running" && b.state !== "starting")) continue;
       const mdl = gpuModels.find((m) => sameModelFile(b.model_file, m.gguf_path));
-      const measured = (g.processes ?? [])
-        .filter((p) => p.backend === b.id)
-        .reduce((s, p) => s + p.vram_mib, 0);
+      // Sum of the measured rows for this backend on this GPU; null
+      // when no row was measured (WDDM, counters unavailable) — an
+      // unmeasured backend must not read as holding 0, and must not
+      // create a presence claim from measurement it does not have.
+      const heldRows = (g.processes ?? [])
+        .filter((p) => p.backend === b.id && p.vram_mib !== null)
+        .map((p) => p.vram_mib as number);
+      const measured: number | null = heldRows.length
+        ? heldRows.reduce((s, v) => s + v, 0)
+        : null;
       const split = b.tensor_split ?? [];
       const frac = pos >= 0 && split.length ? split[pos] : undefined;
       if (frac !== undefined && frac > 0) {
         rows.push({ model: mdl?.id ?? baseName(b.model_file), backend: b.id, pct: Math.round(frac * 100), mib: measured });
-      } else if (!split.length && measured >= 1024) {
+      } else if (!split.length && measured !== null && measured >= 1024) {
         rows.push({ model: mdl?.id ?? baseName(b.model_file), backend: b.id, pct: 100, mib: measured });
       }
     }
@@ -482,26 +497,51 @@ function quoteArg(a: string): string {
   return /[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a;
 }
 
+/** Short label for model controls: the catalog display name when
+ *  known, otherwise the model id. The GGUF filename is deliberately
+ *  omitted — it duplicates the identity at much greater width. */
+function modelShortName(m: ModelRow): string {
+  return m.name?.trim() || m.id;
+}
+
+/** Compact GPU name for the Placement split chips: the vendor
+ *  prefix is dropped ("NVIDIA RTX A4000" -> "RTX A4000") so the
+ *  name fits on the chip's second line. The full telemetry name
+ *  stays available as the chip's tooltip. */
+function gpuShortName(name: string): string {
+  return name.replace(/^nvidia\s+/i, "").trim() || name;
+}
+
+/** Short label for an unregistered model file: its filename stem,
+ *  without the directory or the .gguf suffix. */
+function modelFileShortName(path: string): string {
+  return path ? baseName(path).replace(/\.gguf$/i, "") : "no model assigned";
+}
+
 /** Options for a backend card's model dropdown: every registered
- *  model, with the one the backend currently serves selected. When
- *  the backend's model_file matches no registered model (a custom
- *  path), a leading option carries the current file so the control
- *  shows the true state; choosing it is a no-op. */
+ *  model, labeled by short name only, with the one the backend
+ *  currently serves selected. When the backend's model_file matches
+ *  no registered model (a custom path), a leading option carries the
+ *  current file's short name so the control shows the true state;
+ *  choosing it is a no-op. */
 function modelOptions(b: BackendRow, models: ModelRow[]): string {
   const matched = models.some((m) => sameModelFile(b.model_file, m.gguf_path));
-  const lead = matched ? "" : `<option value="" selected>${esc(b.model_file ? baseName(b.model_file) : "no model assigned")} (current)</option>`;
+  const lead = matched ? "" : `<option value="" selected>${esc(modelFileShortName(b.model_file))} (current)</option>`;
   return lead + models.map((m) =>
-    `<option value="${esc(m.id)}"${sameModelFile(b.model_file, m.gguf_path) ? " selected" : ""}>${esc(m.id)} \u2014 ${esc(baseName(m.gguf_path))}</option>`).join("");
+    `<option value="${esc(m.id)}"${sameModelFile(b.model_file, m.gguf_path) ? " selected" : ""}>${esc(modelShortName(m))}</option>`).join("");
 }
 
 /* ---------------- Gateway activation plan ----------------
- * Saved configuration changes the running gateway has not picked
- * up. The card renders from the server-side plan (a persisted
- * journal plus live config drift), so it survives navigation and
- * app restarts until the operator executes, defers, or cancels it —
- * the pre-v0.1.22 behavior (a transient card on the add-backend
- * form, nothing after dismissal) is what Pete reported on
- * 2026-10-15. */
+ * Saved configuration changes that are not live yet — gateway
+ * changes waiting on a gateway restart, backend changes (flags,
+ * tensor split, model assignment) waiting on that backend's
+ * (re)start. The card renders from the server-side plan (a
+ * persisted journal plus live config drift), so it survives
+ * navigation and app restarts until the operator executes, defers,
+ * or cancels it — the pre-v0.1.22 behavior (a transient card on
+ * the add-backend form, nothing after dismissal) is what Pete
+ * reported on 2026-10-15. The same plan drives the app shell's
+ * global banner and the dedicated Activation Plan view. */
 
 interface PlanUiState {
   dismissed: boolean;
@@ -509,10 +549,31 @@ interface PlanUiState {
   statusErr: boolean;
   confirmCancel: boolean;
   acting: boolean;
+  /** Manual-command block from the last failed start-gateway
+   * outcome, rendered under the status line. */
+  manualCommand: string;
 }
 
 function newPlanUi(): PlanUiState {
-  return { dismissed: false, status: "", statusErr: false, confirmCancel: false, acting: false };
+  return { dismissed: false, status: "", statusErr: false, confirmCancel: false, acting: false, manualCommand: "" };
+}
+
+/** The manual-command code block shared by the plan card surfaces:
+ * the block's own first line says what it is, so it renders bare. */
+function manualCommandHtml(cmd: string): string {
+  return `<pre style="margin:6px 0;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px;text-align:left">${esc(cmd)}</pre>`;
+}
+
+/** Scope + activation label for one plan change, e.g.
+ *  "Backend: coder-fast · restart required". */
+function planChangeMeta(c: ActivationPlanData["changes"][number]): string {
+  const scope = c.scope === "backend"
+    ? `Backend${c.targets && c.targets.length ? `: ${c.targets.join(", ")}` : ""}`
+    : "Gateway";
+  const act = c.activation === "restart" || c.activation === "gateway_restart"
+    ? "restart required"
+    : "applies at next start";
+  return `${scope} · ${act}`;
 }
 
 function activationPlanHtml(plan: ActivationPlanData | null, ui: PlanUiState): string {
@@ -521,24 +582,26 @@ function activationPlanHtml(plan: ActivationPlanData | null, ui: PlanUiState): s
   const dis = ui.acting ? " disabled" : "";
   if (ui.dismissed) {
     return `<div class="card" style="margin-bottom:12px;border-color:var(--amber)">
-      <div style="font-size:12px">${icon("warn")} <b>Activation pending</b> — ${n ? `${n} saved change${n === 1 ? "" : "s"}` : "Saved changes"} not live in the gateway yet.
+      <div style="font-size:12px">${icon("warn")} <b>Activation pending</b> — ${n ? `${n} saved change${n === 1 ? "" : "s"}` : "Saved changes"} not live yet.
       <button class="btn" data-plan-act="review"${dis}>Review plan</button></div></div>`;
   }
   const changeList = n
-    ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">${plan.changes.map((c) => `<div>${esc(c.summary)} <span style="color:var(--text3)">${esc(fmtTime(c.ts))}</span></div>`).join("")}</div>`
+    ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">${plan.changes.map((c) => `<div>${esc(c.summary)} <span style="color:var(--text3)">${esc(planChangeMeta(c))} · ${esc(fmtTime(c.ts))}</span></div>`).join("")}</div>`
     : `<div style="font-size:12px;color:var(--text2);margin-top:6px">The running gateway's configuration differs from the saved configuration.</div>`;
-  const stateLine = plan.applies_at_next_start
-    ? "The gateway is not running — these changes take effect at its next start. No restart is needed."
-    : "The gateway generates its routes when it starts, so these changes take effect only after a gateway restart.";
+  const stateLine = plan.actionable
+    ? "Apply restarts what is running (backends first, then the gateway); changes whose process is stopped take effect at its next start."
+    : "Nothing running holds the old state — these changes take effect at the next start of the listed backends or the gateway.";
   const cancelBtn = plan.snapshot_available
     ? (ui.confirmCancel
       ? `<button class="btn" data-plan-act="cancel-confirm"${dis}>Confirm cancel changes</button>`
       : `<button class="btn" data-plan-act="cancel"${dis}>Cancel changes</button>`)
     : "";
-  const restartBtns = plan.applies_at_next_start
-    ? `<button class="btn" data-plan-act="start"${dis}>${icon("play")} Start gateway</button>`
-    : `<button class="btn" data-plan-act="quiesce"${dis}>${icon("pause")} Quiesce, then restart</button>
-       <button class="btn" data-plan-act="restart"${dis}>${icon("restart")} Restart gateway now</button>`;
+  const restartBtns = !plan.actionable
+    ? ""
+    : plan.gateway_pending && plan.gateway_up
+      ? `<button class="btn" data-plan-act="quiesce"${dis}>${icon("pause")} Quiesce, then apply</button>
+       <button class="btn" data-plan-act="restart"${dis}>${icon("restart")} Apply now</button>`
+      : `<button class="btn" data-plan-act="start"${dis}>${icon("play")} Apply plan</button>`;
   return `<div class="card" style="margin-bottom:12px;border-color:var(--amber)">
     <h3>${icon("warn")} Activation plan — saved changes are not live</h3>
     ${changeList}
@@ -548,16 +611,22 @@ function activationPlanHtml(plan: ActivationPlanData | null, ui: PlanUiState): s
       ${cancelBtn}</div>
     ${ui.confirmCancel && !ui.status ? `<div style="font-size:12px;margin-top:6px;color:var(--text2)">Cancelling restores the configuration from before these changes and clears the plan.</div>` : ""}
     ${ui.status ? `<div style="font-size:12px;margin-top:6px;color:${ui.statusErr ? "var(--err)" : "var(--text2)"}">${esc(ui.status)}</div>` : ""}
+    ${ui.manualCommand ? manualCommandHtml(ui.manualCommand) : ""}
   </div>`;
 }
 
 /** Execute the restart side of an activation plan with the
  *  existing primitives: the quiesce wait (optional), gateway stop,
- *  the start-gateway wizard step, then mark the plan complete. */
+ *  the start-gateway wizard step, then mark the plan complete.
+ *  `setManual` receives the failed start-gateway outcome's
+ *  manual-command block (or null to clear a previous one), rendered
+ *  as a code block under the failure message. */
 async function executeActivationRestart(
   mode: "quiesce" | "restart" | "start",
   setStatus: (text: string, err?: boolean) => void,
+  setManual?: (cmd: string | null) => void,
 ): Promise<boolean> {
+  setManual?.(null);
   if (mode === "quiesce") {
     setStatus("Waiting for in-flight gateway requests to finish (up to 120 seconds)…");
     const q = await quiesceWait(120);
@@ -578,15 +647,43 @@ async function executeActivationRestart(
   const r = await runWizardStep("start-gateway");
   if (r.error) { setStatus(`Gateway start failed: ${r.error}`, true); return false; }
   if (r.data.busy || !r.data.outcome) {
-    setStatus("A setup step is already running — wait for it to finish, then execute the plan again.", true);
+    setStatus(wizardBusyMessage(r.data, "A setup step is already running — wait for it to finish, then execute the plan again."), true);
     return false;
   }
   if (r.data.outcome.state === "failed") {
     setStatus(`Start-gateway step failed — ${r.data.outcome.message}`, true);
+    if (r.data.outcome.manual_command) setManual?.(r.data.outcome.manual_command);
     return false;
   }
   await activationComplete();
   setStatus("Gateway restarted — the saved changes are live.");
+  return true;
+}
+
+/** Apply a whole activation plan across scopes: restart each
+ *  running backend the plan names (its saved flags, split, or
+ *  model take effect), then the gateway side when a gateway change
+ *  is pending (quiesce wait, stop, start-gateway step, mark the
+ *  gateway scope complete). Backend entries for stopped backends
+ *  are left alone — they apply at that backend's next start and
+ *  resolve in the plan on their own. Exported for the app shell's
+ *  global activation banner, whose Apply button runs the same
+ *  execution as the plan card and the Activation Plan view. */
+export async function applyActivationPlan(
+  plan: ActivationPlanData,
+  mode: "quiesce" | "restart" | "start",
+  setStatus: (text: string, err?: boolean) => void,
+  setManual?: (cmd: string | null) => void,
+): Promise<boolean> {
+  for (const id of plan.backend_restart_ids ?? []) {
+    setStatus(`Restarting backend ${id}…`);
+    const r = await restartBackend(id);
+    if (r.error) { setStatus(`Backend ${id} restart failed: ${r.error}`, true); return false; }
+  }
+  if (plan.gateway_pending) {
+    return executeActivationRestart(mode, setStatus, setManual);
+  }
+  setStatus("Backends restarted — the saved changes are live.");
   return true;
 }
 
@@ -598,6 +695,7 @@ async function handlePlanAction(
   ui: PlanUiState,
   repaint: () => void,
   reload: () => Promise<void>,
+  plan: ActivationPlanData | null,
 ): Promise<void> {
   if (act === "review") { ui.dismissed = false; repaint(); return; }
   if (act === "later") {
@@ -628,17 +726,83 @@ async function handlePlanAction(
     return;
   }
   if (act === "quiesce" || act === "restart" || act === "start") {
+    if (!plan) return;
     ui.acting = true;
     const setStatus = (text: string, err = false): void => {
       ui.status = text;
       ui.statusErr = err;
       repaint();
     };
-    await executeActivationRestart(act, setStatus);
+    const setManual = (cmd: string | null): void => {
+      ui.manualCommand = cmd ?? "";
+      repaint();
+    };
+    await applyActivationPlan(plan, act, setStatus, setManual);
     ui.acting = false;
     repaint();
     await reload();
   }
+}
+
+/** The dedicated Activation Plan view: the shared plan card (with
+ *  its Apply / Decide later / Cancel actions) over the full
+ *  pending-changes table — every change with its scope, targets,
+ *  and how it goes live — plus the live gateway state. The global
+ *  banner's Review button navigates here. */
+export function renderActivationPlan(): string {
+  return `${topbar("Activation Plan")}
+  <div class="view"><div id="activationBody">${loadingHtml("Loading activation plan…")}</div></div>`;
+}
+
+export async function wireActivationPlan(root: HTMLElement): Promise<() => void> {
+  const planUi = newPlanUi();
+  let lastPlan: ActivationPlanData | null = null;
+  let disposed = false;
+  let timer: number | null = null;
+
+  const paint = (): void => {
+    const b = root.querySelector("#activationBody");
+    if (!b) return;
+    if (!lastPlan || !lastPlan.pending) {
+      b.innerHTML = `<div class="card"><h3>${icon("check")} No activation plan pending</h3>
+        <div style="font-size:12px;color:var(--text2);margin-top:6px">Every saved configuration change is live. A change that needs a restart to take effect — gateway routes, a backend's flags, tensor split, or model assignment — appears here, and in the banner at the top of the window, until it is applied.</div>
+        ${planUi.status ? `<div style="font-size:12px;margin-top:6px;color:${planUi.statusErr ? "var(--err)" : "var(--text2)"}">${esc(planUi.status)}</div>` : ""}
+        ${planUi.manualCommand ? manualCommandHtml(planUi.manualCommand) : ""}
+        <div class="card-actions"><button class="btn" data-plan-refresh>Refresh</button></div></div>`;
+      return;
+    }
+    const p = lastPlan;
+    const rows = p.changes.map((c) => `<tr><td>${esc(fmtTime(c.ts))}</td><td>${esc(c.summary)}</td><td>${c.scope === "backend" ? "Backend" : "Gateway"}</td><td>${esc((c.targets ?? []).join(", ") || "\u2014")}</td><td>${c.activation === "next_start" ? "Next start" : "Restart"}</td></tr>`).join("");
+    const detail = `<div class="card"><h3>${icon("logs")} Pending changes</h3>
+      <table class="dtab" style="margin-top:8px"><thead><tr><th>Saved</th><th>Change</th><th>Scope</th><th>Targets</th><th>Activation</th></tr></thead><tbody>${rows || `<tr><td colspan="5">The running gateway's configuration differs from the saved configuration (drift).</td></tr>`}</tbody></table>
+      <div style="font-size:12px;color:var(--text2);margin-top:8px">Gateway: ${p.gateway_up ? "running" : "not running"}${p.drift ? " · the saved gateway configuration differs from the running one (drift)" : ""}</div>
+      <div class="card-actions"><button class="btn" data-plan-refresh>Refresh</button></div></div>`;
+    b.innerHTML = activationPlanHtml(p, planUi) + detail;
+  };
+
+  const load = async (): Promise<void> => {
+    const r = await getActivationPlan();
+    if (disposed) return;
+    lastPlan = r.data;
+    paint();
+  };
+
+  const onClick = async (ev: Event): Promise<void> => {
+    const t = ev.target as HTMLElement;
+    if (t.closest("[data-plan-refresh]")) { await load(); return; }
+    const pt = t.closest("[data-plan-act]") as HTMLElement | null;
+    if (!pt) return;
+    await handlePlanAction(pt.getAttribute("data-plan-act") ?? "", planUi, paint, load, lastPlan);
+  };
+  root.addEventListener("click", onClick);
+  timer = window.setInterval(() => { void load(); }, 10000);
+  await load();
+
+  return () => {
+    disposed = true;
+    if (timer !== null) window.clearInterval(timer);
+    root.removeEventListener("click", onClick);
+  };
 }
 
 /** Context-length presets offered by the flags editor (tokens). */
@@ -651,11 +815,41 @@ function ctxShort(n: number): string {
   return n >= 1024 ? `${n / 1024}K` : String(n);
 }
 
+/** Expert-offload weight figures for a slider position, priced
+ *  with the same byte arithmetic as the backend memory requirement
+ *  (manager_models::memory_requirement): the offloaded share of
+ *  the routed experts sits in system RAM, the remaining weights
+ *  on the GPU. Weights only — the KV cache is offload-independent
+ *  and shown on the card. */
+function offloadFigures(o: BackendOffload, layers: number): { gpuMib: number; sysMib: number } {
+  const sysBytes = Math.floor((o.expert_bytes * layers) / o.moe_layers);
+  const mib = (bytes: number): number => Math.ceil(bytes / 1048576);
+  return { gpuMib: mib(o.total_bytes - sysBytes), sysMib: mib(sysBytes) };
+}
+
+/** The flag tokens a slider position writes — the canonical forms
+ *  the app itself writes (backend_set_offload). */
+function offloadTokenText(o: BackendOffload, layers: number): string {
+  if (layers <= 0) return "no offload tokens";
+  if (layers >= o.moe_layers) return "-ot exps=CPU";
+  return `--n-cpu-moe ${layers}`;
+}
+
+/** The offload slider track's green-to-yellow-to-red gradient for
+ *  a model's band boundaries (fractions of the offloaded range,
+ *  computed by the backend from the catalog green limit). */
+function offloadGradient(o: BackendOffload): string {
+  const pct = (f: number): string => `${(f * 100).toFixed(1)}%`;
+  return `linear-gradient(90deg, ${C.green} 0%, ${C.green} ${pct(o.green_end)}, ${C.amber} ${pct(o.green_end)}, ${C.amber} ${pct(o.yellow_end)}, ${C.red} ${pct(o.yellow_end)}, ${C.red} 100%)`;
+}
+
 /** Draft state for the in-card flags form, non-null only for the
  *  backend whose form is open. ctxMax/modelId describe the backend's
  *  model (its rated context from the catalog), for annotating
- *  presets beyond the rating. */
-export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null }
+ *  presets beyond the rating. offloadLayers is the offload slider's
+ *  draft position (MoE layers on system RAM), null when the
+ *  backend's model is not offload-capable. */
+export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null }
 
 /** State for the in-card Placement form (tensor split editing,
  *  moved here from the GPUs page — Pete's direction, 2026-10-16),
@@ -673,16 +867,28 @@ export interface PlaceCardState {
   busy: boolean;
 }
 
+/** Color class for a backend state tag: green while running, red
+ *  when stopped or failed, amber while changing state, grey for
+ *  any other state. */
+function stateTagClass(state: string): string {
+  if (state === "running") return "status-on";
+  if (state === "stopped" || state === "failed") return "status-bad";
+  if (state === "starting" || state === "stopping") return "status-transition";
+  return "status-off";
+}
+
 function backendCard(
   b: BackendRow,
   openArgv: Set<string>,
+  openMenus: Set<string>,
   argvCache: Map<string, string[]>,
   msgs: Map<string, CardNote>,
   logTails: Map<string, LogRow[]>,
   inFlight: Set<string>,
   models: ModelRow[],
   confirmRemove: Set<string>,
-  residency: Map<string, { gpu: number; name: string; mib: number }[]>,
+  residency: Map<string, { gpu: number; name: string; mib: number | null }[]>,
+  gpuNames: Map<number, string>,
   flags: FlagsDraft | null,
   place: PlaceCardState | null,
 ): string {
@@ -696,8 +902,8 @@ function backendCard(
   const startBtn = `<button class="btn" data-back-act="start" data-back-id="${esc(b.id)}"${dis}>${icon("play")} Start</button>`;
   const testBtn = `<button class="btn" data-back-act="test" data-back-id="${esc(b.id)}"${dis}>${icon("bolt")} Test</button>`;
   const enableBtn = `<button class="btn" data-back-act="enable" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Enable</button>`;
-  const disableBtn = `<button class="btn" data-back-act="disable" data-back-id="${esc(b.id)}"${dis}>Disable</button>`;
-  const removeBtn = `<button class="btn" data-back-act="remove" data-back-id="${esc(b.id)}"${dis}>${confirmRemove.has(b.id) ? "Confirm remove" : "Remove"}</button>`;
+  const disableBtn = `<button class="btn icon-only" data-back-act="disable" data-back-id="${esc(b.id)}" title="Disable backend" aria-label="Disable ${esc(b.id)}"${dis}>${icon("ban")}</button>`;
+  const removeBtn = `<button class="btn icon-only danger${confirmRemove.has(b.id) ? " armed" : ""}" data-back-act="remove" data-back-id="${esc(b.id)}" title="${confirmRemove.has(b.id) ? "Confirm remove" : "Remove backend"}" aria-label="${confirmRemove.has(b.id) ? "Confirm remove" : "Remove"} ${esc(b.id)}"${dis}>${icon("trash")}</button>`;
   // Offer only what the command layer will accept:
   // - Stop whenever a live process exists (pid present, running or
   //   starting), whether the backend is configured, enabled, or an
@@ -718,6 +924,19 @@ function backendCard(
   // only for configured backends with no live process.
   if (b.configured && !active && b.state !== "stopping") parts.push(removeBtn);
   const actions = parts.join("\n        ");
+  // Advanced, infrequently used options live behind one hamburger
+  // menu so the card's primary action row stays within the card.
+  // Menu-open state lives outside the repainted DOM, like the other
+  // card state, so a poll repaint cannot close an open menu.
+  const menuOpen = openMenus.has(b.id);
+  const advancedMenu = `<div class="advanced-menu-wrap" data-back-menu-wrap>
+      <button class="btn icon-only" data-back-menu="${esc(b.id)}" aria-haspopup="menu" aria-expanded="${menuOpen}" title="Advanced options" aria-label="Advanced options for ${esc(b.id)}"${dis}>${icon("menu")}</button>
+      ${menuOpen ? `<div class="advanced-menu" role="menu" aria-label="Advanced options for ${esc(b.id)}">
+        ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="flags" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Edit flags</button>
+        <button class="menu-item" role="menuitem" data-back-menu-item data-back-act="placement" data-back-id="${esc(b.id)}"${dis}>${icon("layers")} Placement</button>` : ""}
+        <button class="menu-item" role="menuitem" data-back-menu-item data-back-act="argv" data-back-id="${esc(b.id)}"${dis}>${icon("logs")} Launch command</button>
+      </div>` : ""}
+    </div>`;
   const argvOpen = openArgv.has(b.id);
   const argv = argvOpen
     ? `<div style="margin-top:10px;font-size:11px;color:var(--text3)">Launch command (next start)</div>
@@ -754,14 +973,59 @@ function backendCard(
       ? `<div style="margin-top:8px;font-size:11px;color:var(--text3)">Latest output (stderr preferred)</div>` : "";
     logsBlock = `${caption}${lines}<div style="margin-top:6px;font-size:12px"><a href="#/logs?scope=${esc(encodeURIComponent(b.id))}" style="color:var(--accent)">Open in Logs</a></div>`;
   }
-  // Measured GPU residency (telemetry per-process attribution): which
-  // GPUs this backend's process actually holds memory on. Under 1 GiB
-  // on a GPU is a CUDA context only, labeled as such.
+  // GPU residency for this backend. Measured per-process telemetry
+  // is authoritative while the backend is active: which GPUs its
+  // process actually holds memory on (under 1 GiB is a CUDA context
+  // only, labeled as such). When the backend is inactive there is no
+  // measured residency, so the list falls back to the configured
+  // tensor split — where the model will load at its next start —
+  // with a segmented bar of the split fractions.
   const res = residency.get(b.id) ?? [];
-  const resHtml = res.length
-    ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Loaded on: ${res.map((r) => `GPU ${r.gpu} (${esc(r.name)}) — ${fmtGb(r.mib / 1024)} GiB${r.mib < 1024 ? " · context only" : ""}`).join(" · ")}</div>`
-    : (b.configured && active
-      ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Loaded on: not measured — no process attributed in the latest telemetry sample</div>` : "");
+  const gpuColors = ["#4a9eff", "#a371f7", "#39c5cf", "#d29922", "#3fb950", "#f85149"];
+  const splitEntries = (b.tensor_split ?? [])
+    .map((frac, index) => ({ index, frac }))
+    .filter((e) => e.frac > 0);
+  const gpuLabel = (index: number): string => {
+    const measured = res.find((r) => r.gpu === index);
+    return `GPU ${index}${(measured?.name ?? gpuNames.get(index)) ? ` · ${esc(measured?.name ?? gpuNames.get(index) ?? "")}` : ""}`;
+  };
+  const splitSummary = splitEntries.length
+    ? splitEntries.map((e) => `${gpuLabel(e.index)} — ${Math.round(e.frac * 100)}%`).join(" · ")
+    : "";
+  const splitBar = splitEntries.length > 1
+    ? `<div class="split-bar" aria-hidden="true">${splitEntries.map((e) => `<i style="width:${e.frac * 100}%;background:${gpuColors[e.index % gpuColors.length]}"></i>`).join("")}</div>`
+    : "";
+  let gpuRows: string;
+  let gpuBasis: string;
+  // Measured rows carry a figure; unmeasured rows (mib null — WDDM
+  // GPU, counter data unavailable) prove presence only. They render
+  // as "not measured": no figure, no context-only label, and they do
+  // not make the section claim a measured basis on their own.
+  const knownRes = res.filter((r) => r.mib !== null);
+  if (knownRes.length) {
+    gpuBasis = "measured";
+    gpuRows = res.map((r) => r.mib !== null
+      ? `<div class="backend-gpu-row"><span>${gpuLabel(r.gpu)}</span><span>${fmtGb(r.mib / 1024)} GiB${r.mib < 1024 ? " · context only" : ""}</span></div>`
+      : `<div class="backend-gpu-row"><span>${gpuLabel(r.gpu)}</span><span>not measured</span></div>`).join("");
+  } else if (res.length) {
+    gpuBasis = "not measured";
+    gpuRows = res.map((r) => `<div class="backend-gpu-row"><span>${gpuLabel(r.gpu)}</span><span>not measured</span></div>`).join("")
+      + `<div class="backend-gpu-empty">Per-process usage is not measured on this GPU — placement follows the configured split.</div>`;
+  } else if (active) {
+    gpuBasis = "measured";
+    gpuRows = `<div class="backend-gpu-empty">Not measured — no process attributed in the latest telemetry sample</div>`;
+  } else if (splitEntries.length) {
+    gpuBasis = "configured split";
+    gpuRows = splitBar + splitEntries.map((e) => `<div class="backend-gpu-row"><span>${gpuLabel(e.index)}</span><span>${Math.round(e.frac * 100)}%</span></div>`).join("");
+  } else {
+    gpuBasis = "";
+    gpuRows = `<div class="backend-gpu-empty">Not loaded</div>`;
+  }
+  const gpuHtml = b.configured ? `<div class="backend-gpus">
+      <div class="backend-gpus-title">GPUs${gpuBasis ? ` (${gpuBasis})` : ""}</div>
+      ${gpuRows}
+      ${res.length && splitEntries.length ? `<div class="backend-gpu-configured">Configured split: ${splitSummary}</div>` : ""}
+    </div>` : "";
   // Gateway statistics for this backend (trailing hour, from the
   // LiteLLM metrics window store). Absent until a window exists.
   const statsHtml = b.requests_1h !== undefined || b.errors_1h !== undefined || b.throughput_toks !== undefined
@@ -777,7 +1041,26 @@ function backendCard(
   // context, with a Custom numeric input when the value is not a
   // preset. Field events sync to the wire-level draft state, so the
   // poll repaint re-renders the form without losing input.
-  const flagsHtml = flags ? `<div style="border-top:1px solid var(--border);margin-top:10px;padding-top:10px">
+  // The expert-offload slider rides the same panel when the
+  // backend's model is offload-capable: its position is the number
+  // of MoE layers whose routed experts sit in system RAM. The
+  // track's green band ends at the model's green limit (its
+  // catalog default offload — the most offload that stays fast);
+  // yellow and red split the range past it. Sliding updates the
+  // readout in place; releasing the slider saves through
+  // backend_set_offload, which rewrites only the offload tokens in
+  // the backend's raw flags.
+  const offloadHtml = flags && b.offload ? (() => {
+    const o = b.offload;
+    const n = flags.offloadLayers ?? o.layers;
+    const figs = offloadFigures(o, n);
+    return `<div style="margin-top:12px">
+      <label style="font-size:12px;color:var(--text2);display:block">Expert offload to system RAM — <span data-offload-layers-label>${n} of ${o.moe_layers} MoE layers</span><span class="info-tip" title="Routed-expert weights for the first N MoE layers run from system RAM instead of the GPU, freeing GPU memory at some speed cost. Green is this model's catalog default — the most offload that stays fast; past it, CPU expert computation increasingly dominates generation speed. Figures are weights only; the KV cache stays on the GPU. The slider saves when released and applies on the backend's next start.">${icon("info")}</span></label>
+      <input type="range" class="offload-range" min="0" max="${o.moe_layers}" step="1" value="${n}" data-offload-slider data-offload-backend="${esc(b.id)}" style="background:${offloadGradient(o)}" aria-label="Expert offload layers for ${esc(b.id)}"${dis}>
+      <div style="font-size:12px;color:var(--text2);margin-top:4px"><span data-offload-token style="font-family:var(--mono)">${esc(offloadTokenText(o, n))}</span> · GPU weights <span data-offload-gpu>${fmtGb(figs.gpuMib / 1024)}</span> GiB · System RAM <span data-offload-sys>${fmtGb(figs.sysMib / 1024)}</span> GiB</div>
+    </div>`;
+  })() : "";
+  const flagsHtml = flags ? `<div class="backend-form-panel flags-panel">
       <div style="font-size:12px;font-weight:600">${icon("gear")} Flags for ${esc(b.id)}</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px">
         <label style="font-size:12px;color:var(--text2)">Context length (-c)
@@ -797,6 +1080,7 @@ function backendCard(
             ${BATCH_PRESETS.includes(flags.batch) ? "" : `<input data-flags-field="batch-custom" type="number" value="${flags.batch}" min="1" style="${SELECT_STYLE};width:110px"${dis}>`}
           </span></label>
       </div>
+      ${offloadHtml}
       <div style="font-size:12px;color:var(--text2);margin-top:6px">${flags.modelId && flags.ctxMax
         ? `Model ${esc(flags.modelId)} is rated to ${ctxShort(flags.ctxMax)} context (${flags.ctxMax.toLocaleString()} tokens); larger values are accepted but exceed the rating. `
         : "Accepted context range: 1,024 to 1,048,576. "}Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Placement form on this card.</div>
@@ -813,54 +1097,62 @@ function backendCard(
   const placeDis = dis || (place && place.busy) ? " disabled" : "";
   const projHtml = place && place.projection ? (() => {
     const p = place.projection;
+    // When the running backend's current allocation is credited,
+    // the table shows the credit basis: what it already holds on
+    // each GPU and the additional allocation that must fit in free
+    // VRAM. Without a credit the two extra columns carry no
+    // information and are omitted.
+    const credited = (p.current_mib ?? []).some((v) => v > 0);
     const rows = p.split.map((frac, i) => {
       const gi = p.gpu_indices && p.gpu_indices[i] !== undefined ? p.gpu_indices[i] : i;
       const gname = place.gpus.find((g) => g.index === gi)?.name ?? `GPU ${gi}`;
       const free = p.free_mib && p.free_mib[i] !== undefined ? `${p.free_mib[i]} MiB` : "\u2014";
       const fit = frac === 0 ? "not used" : p.per_gpu_fits[i] ? "fits" : "does not fit";
-      return `<tr><td>${esc(gname)}</td><td>${Math.round(frac * 100)}%</td><td>${p.per_gpu_mib[i]} MiB</td><td>${free}</td><td>${fit}</td></tr>`;
+      const creditCells = credited ? `<td>${p.current_mib?.[i] ?? 0} MiB</td><td>${p.additional_mib?.[i] ?? p.per_gpu_mib[i]} MiB</td>` : "";
+      return `<tr><td>${esc(gname)}</td><td>${Math.round(frac * 100)}%</td><td>${p.per_gpu_mib[i]} MiB</td>${creditCells}<td>${free}</td><td>${fit}</td></tr>`;
     }).join("");
     const ageMs = p.snapshot_age_ms ?? null;
     return `<div style="margin-top:10px">
       ${p.down_indices && p.down_indices.length ? `<div style="font-size:12px;color:var(--err);margin-bottom:6px">${p.down_indices.map((i) => `GPU ${i}`).join(", ")} ${p.down_indices.length === 1 ? "is" : "are"} down and ${p.down_indices.length === 1 ? "is" : "are"} treated as having no free VRAM.</div>` : ""}
       <div style="font-size:12px">${p.fits ? "The model fits the selected GPUs with the projected split." : "The model does not fit the available VRAM with this split."}</div>
-      <table class="dtab" style="margin-top:8px"><thead><tr><th>GPU</th><th>Fraction</th><th>Required</th><th>Free (current)</th><th>Fit</th></tr></thead><tbody>${rows}</tbody></table>
+      <table class="dtab" style="margin-top:8px"><thead><tr><th>GPU</th><th>Fraction</th><th>Required</th>${credited ? `<th title="The weight allocation this backend already holds on the GPU. Applying the split restarts the backend, freeing it first.">Current</th><th title="Required minus current: what must fit in free VRAM.">Additional</th>` : ""}<th>Free (current)</th><th>Fit</th></tr></thead><tbody>${rows}</tbody></table>
       ${p.sys_mib ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">System RAM: ${fmtGb(p.sys_mib / 1024)} GiB — routed experts under expert offload. The per-GPU figures cover the GPU-resident weights only.</div>` : ""}
       <div style="font-size:12px;color:var(--text2);margin-top:6px">Projection uses model weights only; run-time allocations add overhead.</div>
       <div style="font-size:12px;color:var(--text2);margin-top:2px">Based on ${ageMs === null ? "the latest telemetry snapshot" : `a telemetry snapshot ${Math.round(ageMs / 1000)} seconds old`}.</div></div>`;
   })() : "";
-  const placeHtml = place ? `<div style="border-top:1px solid var(--border);margin-top:10px;padding-top:10px">
+  const placeHtml = place ? `<div class="backend-form-panel placement-panel">
       <div style="font-size:12px;font-weight:600">${icon("layers")} Placement for ${esc(b.id)}</div>
       ${place.modelId
-        ? `<div style="font-size:12px;color:var(--text2);margin-top:4px">Model: ${esc(place.modelId)} \u2014 from the backend's configuration</div>`
+        ? ""
         : `<div style="font-size:12px;color:var(--err);margin-top:4px">This backend's model file matches no configured model, so a split cannot be proposed or applied for it.</div>`}
-      ${place.gpus.length ? `<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:8px">
-        <span style="font-size:12px;color:var(--text2)">GPUs in the split:</span>
-        ${place.gpus.map((g) => `<label style="font-size:12px;display:inline-flex;align-items:center;gap:5px"><input type="checkbox" data-place-gpu="${g.index}" data-place-backend="${esc(b.id)}"${place.excluded.has(g.index) ? "" : " checked"}${placeDis}> GPU ${g.index} \u2014 ${esc(g.name)}</label>`).join("")}
-      </div>
-      <div style="font-size:12px;color:var(--text2);margin-top:6px">The split divides the model's weights across the selected GPUs, in nvidia-smi index order. Uncheck a GPU to leave it out \u2014 for example the display GPU, whose memory Windows already uses.</div>`
+      ${place.gpus.length ? `<div style="margin-top:8px">
+        <span style="font-size:12px;color:var(--text2)">GPUs in the split:</span><span class="info-tip" title="The split divides the model's weights across the selected GPUs, in nvidia-smi index order. Uncheck a GPU to leave it out \u2014 for example the display GPU, whose memory Windows already uses. The split is saved to the backend's configuration and applies on its next start.">${icon("info")}</span>
+        <div class="gpu-chip-row">${place.gpus.map((g) => {
+          const on = !place.excluded.has(g.index);
+          return `<label class="gpu-chip${on ? " on" : ""}${placeDis ? " is-disabled" : ""}" title="${esc(g.name)}"><span class="gpu-chip-top"><input type="checkbox" data-place-gpu="${g.index}" data-place-backend="${esc(b.id)}"${on ? " checked" : ""}${placeDis}> GPU ${g.index}</span><span class="gpu-chip-name">${esc(gpuShortName(g.name))}</span></label>`;
+        }).join("")}</div>
+      </div>`
       : `<div style="font-size:12px;color:var(--text2);margin-top:6px">No GPU telemetry yet \u2014 a split cannot be proposed until telemetry reports the GPUs.</div>`}
       ${projHtml}
       <div class="card-actions"><button class="btn" data-back-act="place-propose" data-back-id="${esc(b.id)}"${placeDis || !place.modelId || !place.gpus.length ? " disabled" : ""}>Propose split</button>
         <button class="btn" data-back-act="place-apply" data-back-id="${esc(b.id)}"${place.projection && !place.busy && !dis ? "" : " disabled"}>Apply split</button>
         <button class="btn" data-back-act="place-cancel" data-back-id="${esc(b.id)}">Close</button></div>
-      <div style="font-size:12px;color:var(--text2);margin-top:6px">The split is saved to the backend's configuration and applies on its next start.</div>
     </div>` : "";
-  return `<div class="card" id="card-backend-${esc(b.id)}">
-      <h3>${stateDot(b.state)} ${esc(b.id)} <span class="port">:${b.port}</span>
+  return `<div class="card backend-card" id="card-backend-${esc(b.id)}">
+      <h3 class="backend-card-head">${stateDot(b.state)} ${esc(b.id)} <span class="port">:${b.port}</span>
         <span class="spacer" style="flex:1"></span>
         ${b.configured ? "" : `<span class="chip badge-warn">not in config</span>`}
-        ${b.configured ? `<span class="chip">${b.enabled ? "enabled" : "disabled"}</span>` : ""}
+        ${b.configured ? `<span class="chip status-tag ${b.enabled ? "status-on" : "status-off"}">${b.enabled ? "enabled" : "disabled"}</span>` : ""}
         ${b.adopted ? `<span class="chip">adopted</span>` : ""}
-        <span class="chip">${esc(b.state)}</span></h3>
-      ${b.configured ? `<div style="font-size:12px;color:var(--text2);margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">Model:
-        <select data-back-model="${esc(b.id)}" style="${SELECT_STYLE}"${dis}>${modelOptions(b, models)}</select></div>`
-      : `<div style="font-size:12px;color:var(--text2);margin-top:6px">Model: <span style="font-family:var(--mono)">${esc(b.model_file)}</span></div>`}
+        <span class="chip status-tag ${stateTagClass(b.state)}">${esc(b.state)}</span></h3>
+      ${b.configured ? `<div class="backend-model-row">Model:
+        <select class="backend-model-select" data-back-model="${esc(b.id)}" style="${SELECT_STYLE}"${dis}>${modelOptions(b, models)}</select></div>`
+      : `<div class="backend-model-row">Model: <span class="backend-model-file" title="${esc(b.model_file)}">${esc(b.model_file)}</span></div>`}
       ${orphanNote}
       ${adoptedNote}
       ${b.configured && b.n_ctx !== undefined ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Context ${b.n_ctx} · Batch ${b.n_batch ?? "—"}</div>` : ""}
       ${b.configured && b.gpu_ram_mib !== undefined ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">GPU RAM required: ${fmtGb(b.gpu_ram_mib / 1024)} GiB · System RAM required: ${fmtGb((b.sys_ram_mib ?? 0) / 1024)} GiB${b.kv_ram_mib != null ? ` · KV cache ${fmtGb(b.kv_ram_mib / 1024)} GiB at the configured context` : ""}${b.memory_basis === "estimate" ? ` · estimate` : ""}</div>` : ""}
-            ${resHtml}
+            ${gpuHtml}
       ${statsHtml}
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0">
         ${[["State", b.state], ["PID", b.pid !== null ? String(b.pid) : "\u2014"],
@@ -869,10 +1161,8 @@ function backendCard(
       </div>
       ${flagsHtml}
       ${placeHtml}
-      <div class="card-actions">${actions}
-        ${b.configured ? `<button class="btn" data-back-act="flags" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Edit flags</button>` : ""}
-        ${b.configured ? `<button class="btn" data-back-act="placement" data-back-id="${esc(b.id)}"${dis}>${icon("layers")} Placement</button>` : ""}
-        <button class="btn" data-back-act="argv" data-back-id="${esc(b.id)}"${dis}>${icon("logs")} Launch command</button></div>
+      <div class="card-actions backend-actions">${actions}
+        ${advancedMenu}</div>
       <div class="back-msg" style="margin-top:8px;font-size:12px">${msgHtml}</div>
       ${logsBlock}
       ${argv}
@@ -908,6 +1198,8 @@ export function renderBackends(): string {
 
 export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const openArgv = new Set<string>();
+  /** Backend whose advanced-options menu is open (at most one). */
+  const openMenus = new Set<string>();
   const argvCache = new Map<string, string[]>();
   const msgs = new Map<string, CardNote>();
   /** Recent log lines for failed backends, fetched lazily after paint. */
@@ -919,7 +1211,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const inFlight = new Set<string>();
   let lastRows: BackendRow[] = [];
   /** Measured GPU residency by backend id (telemetry attribution). */
-  let residency = new Map<string, { gpu: number; name: string; mib: number }[]>();
+  let residency = new Map<string, { gpu: number; name: string; mib: number | null }[]>();
   /** Backends list controls (sort / state filter / text filter),
    *  held outside the repainted DOM. */
   let backSort = "name";
@@ -967,9 +1259,13 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         <div class="ov-head"><span></span><span>Backend</span><span>State</span><span>Group</span><span>Port</span><span>GPUs (measured)</span><span>Requests (1h)</span><span>Errors (1h)</span></div>
         ${sorted(lastRows).map((row) => {
           const res = residency.get(row.id) ?? [];
-          const resident = res.filter((r) => r.mib >= 1024);
+          // Unmeasured rows (mib null) are neither residency nor
+          // context: the column says "not measured" rather than
+          // claiming either.
+          const resident = res.filter((r) => r.mib !== null && r.mib >= 1024);
           const gpuTxt = resident.length ? resident.map((r) => `GPU ${r.gpu}`).join(", ")
-            : res.length ? "context only" : "\u2014";
+            : res.some((r) => r.mib !== null) ? "context only"
+            : res.length ? "not measured" : "\u2014";
           const btn = row.state === "running" ? ovStatusBtn("ok", "check", `card-backend-${row.id}`, `${row.id}: running — go to card`)
             : row.state === "failed" ? ovStatusBtn("err", "err", `card-backend-${row.id}`, `${row.id}: failed — go to card`)
             : row.state === "starting" || row.state === "stopping" ? ovStatusBtn("warn", "clock", `card-backend-${row.id}`, `${row.id}: ${row.state} — go to card`)
@@ -1007,7 +1303,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       <div class="grid2">${sorted(sec.rows).map((row) => {
         const mdl = flagsFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const flagsArg: FlagsDraft | null = flagsFor === row.id
-          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null }
+          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers }
           : null;
         const pmdl = placeFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const placeArg: PlaceCardState | null = placeFor === row.id
@@ -1019,7 +1315,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
             busy: placeBusy,
           }
           : null;
-        return backendCard(row, openArgv, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency, flagsArg, placeArg);
+        return backendCard(row, openArgv, openMenus, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency, new Map(lastGpuList.map((g) => [Number(g.id), g.name])), flagsArg, placeArg);
       }).join("")}</div>
       </div>`).join("");
     if (!viewRows.length && lastRows.length) b.innerHTML = emptyHtml("No backends match the current filter.");
@@ -1062,7 +1358,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     if (!pr.error && pr.data) { lastPlan = pr.data; paintPlan(); }
     if (!tr.error && tr.data) {
       lastGpuList = tr.data.gpus;
-      const m = new Map<string, { gpu: number; name: string; mib: number }[]>();
+      const m = new Map<string, { gpu: number; name: string; mib: number | null }[]>();
       for (const g of tr.data.gpus) {
         for (const p of g.processes ?? []) {
           if (p.backend === "\u2014") continue;
@@ -1100,7 +1396,13 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       // fails again.
       if (row.state !== "failed") { logTails.delete(row.id); tailsWanted.delete(row.id); }
     }
-    paint();
+    // While the offload slider is focused (mid-drag), a repaint
+    // would recreate the range input and break the drag; the
+    // draft is synced to wire state, so skipping one repaint
+    // loses nothing (same rule as the model rename input).
+    const sliderFocused = flagsFor !== null
+      && (document.activeElement as HTMLElement | null)?.hasAttribute?.("data-offload-slider");
+    if (!sliderFocused) paint();
     void fetchLogTails();
   };
 
@@ -1118,6 +1420,13 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   let flagsFor: string | null = null;
   let flagsCtx = 32768;
   let flagsBatch = 512;
+  /** Offload slider draft position for the open flags form (MoE
+   *  layers on system RAM); null when the backend's model is not
+   *  offload-capable. */
+  let flagsOffloadLayers: number | null = null;
+  /** True while a slider commit (backend_set_offload) is in
+   *  flight; the slider ignores further commits until it lands. */
+  let offloadCommitting = false;
   const closeFlagsForm = (): void => {
     flagsFor = null;
     paint();
@@ -1127,6 +1436,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     flagsFor = row.id;
     flagsCtx = row.n_ctx ?? 32768;
     flagsBatch = row.n_batch ?? 512;
+    flagsOffloadLayers = row.offload ? row.offload.layers : null;
     paint();
   };
   /** Keep the draft in step with the in-card form fields. Preset
@@ -1150,6 +1460,66 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   };
   root.addEventListener("change", syncFlagsDraft);
   root.addEventListener("input", syncFlagsDraft);
+
+  /* ---------------- Offload slider ----------------
+   * Part of the flags form when the backend's model is
+   * offload-capable. "input" events move the draft and update the
+   * readout in place — no repaint, so the drag is never disturbed;
+   * the "change" event (slider release) commits through
+   * backend_set_offload, which rewrites only the offload tokens
+   * in the backend's raw flags. A rejected commit reverts the
+   * draft to the saved position and keeps the form open with the
+   * error on the card. */
+  const syncOffloadDraft = (ev: Event): void => {
+    const t = ev.target as HTMLInputElement;
+    if (!t.hasAttribute("data-offload-slider")) return;
+    const id = t.getAttribute("data-offload-backend") ?? "";
+    if (id !== flagsFor) return;
+    const row = lastRows.find((r) => r.id === id);
+    if (!row?.offload) return;
+    const n = Number(t.value);
+    flagsOffloadLayers = n;
+    const card = t.closest(".backend-card");
+    if (!card) return;
+    const o = row.offload;
+    const figs = offloadFigures(o, n);
+    const setText = (sel: string, txt: string): void => {
+      const el = card.querySelector(sel);
+      if (el) el.textContent = txt;
+    };
+    setText("[data-offload-layers-label]", `${n} of ${o.moe_layers} MoE layers`);
+    setText("[data-offload-token]", offloadTokenText(o, n));
+    setText("[data-offload-gpu]", fmtGb(figs.gpuMib / 1024));
+    setText("[data-offload-sys]", fmtGb(figs.sysMib / 1024));
+  };
+  const commitOffload = async (ev: Event): Promise<void> => {
+    const t = ev.target as HTMLInputElement;
+    if (!t.hasAttribute("data-offload-slider")) return;
+    const id = t.getAttribute("data-offload-backend") ?? "";
+    const row = lastRows.find((r) => r.id === id);
+    if (!row?.offload || offloadCommitting) return;
+    const n = Number(t.value);
+    flagsOffloadLayers = n;
+    if (n === row.offload.layers) return; // released where it started
+    offloadCommitting = true;
+    try {
+      const r = await setBackendOffload(id, n);
+      if (disposed) return;
+      if (r.error) {
+        msgs.set(id, { text: `Offload not saved: ${r.error}`, err: true });
+        flagsOffloadLayers = row.offload.layers;
+        paint();
+      } else {
+        msgs.set(id, { text: `Offload saved (${offloadTokenText(row.offload, n)}) — applies on next start.`, err: false });
+        await load();
+      }
+    } finally {
+      offloadCommitting = false;
+      if (!disposed) paint();
+    }
+  };
+  root.addEventListener("input", syncOffloadDraft);
+  root.addEventListener("change", commitOffload);
 
   /* ---------------- Placement form ----------------
    * Rendered INSIDE the backend's own card (backendCard), like the
@@ -1175,6 +1545,28 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     placeFor = row.id;
     placeProjection = null;
     placeExcluded.clear();
+    // Default the selection to the backend's CURRENT placement, not
+    // every GPU: the configured tensor split's positive entries when
+    // a split is configured; otherwise the GPUs the loaded process
+    // measurably holds weights on (>= 1 GiB — under that is a bare
+    // CUDA context); otherwise, for an unsplit backend that is not
+    // loaded, the first GPU, which is where an unsplit launch loads.
+    const allIdx = lastGpuList.map((g) => Number(g.id));
+    const cfgIdx = (row.tensor_split ?? [])
+      .map((f, p) => (f > 0 && p < allIdx.length ? allIdx[p] : -1))
+      .filter((i) => i >= 0);
+    let current = cfgIdx;
+    if (!current.length) {
+      // Unmeasured rows (mib null) never select a GPU: unknown usage
+      // is not residency. The default then falls back to the first
+      // GPU, as for an unloaded backend.
+      const resIdx = (residency.get(row.id) ?? [])
+        .filter((r) => r.mib !== null && r.mib >= 1024)
+        .map((r) => r.gpu)
+        .filter((i) => allIdx.includes(i));
+      current = resIdx.length ? resIdx : allIdx.slice(0, 1);
+    }
+    for (const ix of allIdx) if (!current.includes(ix)) placeExcluded.add(ix);
     paint();
   };
   const syncPlaceDraft = (ev: Event): void => {
@@ -1205,7 +1597,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const openAddForm = (): void => {
     if (!addHost) return;
     if (addHost.innerHTML) { closeAddForm(); return; }
-    const modelOpts = lastModels.map((m) => `<option value="${esc(m.id)}">${esc(m.id)} \u2014 ${esc(baseName(m.gguf_path))}</option>`).join("");
+    const modelOpts = lastModels.map((m) => `<option value="${esc(m.id)}">${esc(modelShortName(m))}</option>`).join("");
     const groupOpts = lastGroups.map((g) => `<option value="${esc(g.name)}">${esc(g.name)}</option>`).join("")
       + `<option value="__new__">New group\u2026</option>`;
     addHost.innerHTML = `<div class="card"><h3>${icon("server")} Add a backend</h3>
@@ -1270,13 +1662,33 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   addBtn?.addEventListener("click", openAddForm);
 
   const onClick = async (ev: Event): Promise<void> => {
-    const pt = (ev.target as HTMLElement).closest("[data-plan-act]") as HTMLElement | null;
-    if (pt) {
-      await handlePlanAction(pt.getAttribute("data-plan-act") ?? "", planUi, paintPlan, load);
+    const target = ev.target as HTMLElement;
+    const menuToggle = target.closest("[data-back-menu]") as HTMLElement | null;
+    if (menuToggle) {
+      const menuId = menuToggle.getAttribute("data-back-menu") ?? "";
+      const wasOpen = openMenus.has(menuId);
+      openMenus.clear();
+      if (!wasOpen && menuId) openMenus.add(menuId);
+      paint();
       return;
     }
-    const t = (ev.target as HTMLElement).closest("[data-back-act]") as HTMLElement | null;
-    if (!t) return;
+    const menuItem = target.closest("[data-back-menu-item]") as HTMLElement | null;
+    if (menuItem) openMenus.delete(menuItem.getAttribute("data-back-id") ?? "");
+    const hadOpenMenu = openMenus.size > 0;
+    if (!menuItem && !target.closest("[data-back-menu-wrap]") && hadOpenMenu) {
+      openMenus.clear();
+    }
+    const pt = target.closest("[data-plan-act]") as HTMLElement | null;
+    if (pt) {
+      if (hadOpenMenu) paint();
+      await handlePlanAction(pt.getAttribute("data-plan-act") ?? "", planUi, paintPlan, load, lastPlan);
+      return;
+    }
+    const t = target.closest("[data-back-act]") as HTMLElement | null;
+    if (!t) {
+      if (hadOpenMenu && !target.closest("[data-back-menu-wrap]")) paint();
+      return;
+    }
     const id = t.getAttribute("data-back-id") ?? "";
     const act = t.getAttribute("data-back-act") ?? "";
 
@@ -1432,7 +1844,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       if (act === "remove") {
         if (!confirmRemove.has(id)) {
           confirmRemove.add(id);
-          msgs.set(id, { text: "Click Confirm remove to delete this backend and its group memberships.", err: false });
+          msgs.set(id, { text: "Click the highlighted remove icon again to delete this backend and its group memberships.", err: false });
           paint();
           return;
         }
@@ -1507,9 +1919,16 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       if (!disposed) await load();
     }
   };
+  const onKeyDown = (ev: KeyboardEvent): void => {
+    if (ev.key === "Escape" && openMenus.size) {
+      openMenus.clear();
+      paint();
+    }
+  };
   root.addEventListener("click", onClick);
   root.addEventListener("click", onOvGoto);
   root.addEventListener("change", onModelChange);
+  root.addEventListener("keydown", onKeyDown);
 
   await load();
 
@@ -1525,8 +1944,11 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     root.removeEventListener("click", onClick);
     root.removeEventListener("click", onOvGoto);
     root.removeEventListener("change", onModelChange);
+    root.removeEventListener("keydown", onKeyDown);
     root.removeEventListener("change", syncFlagsDraft);
     root.removeEventListener("input", syncFlagsDraft);
+    root.removeEventListener("input", syncOffloadDraft);
+    root.removeEventListener("change", commitOffload);
     root.removeEventListener("change", syncPlaceDraft);
     refreshBtn?.removeEventListener("click", onRefresh);
   };
@@ -1576,12 +1998,12 @@ function modelOverviewHtml(rows: ModelRow[], stats: Map<string, { backends: numb
     else if ((m.partial_bytes ?? 0) > 0) { btn = ovStatusBtn("warn", "warn", `card-model-${m.id}`, `${m.id}: partial download — go to card`); stateTxt = "partial download"; }
     else { btn = ovStatusBtn("idle", "download", `card-model-${m.id}`, `${m.id}: not downloaded — go to card`); stateTxt = "not downloaded"; }
     const size = m.on_disk ? fmtBytes(m.size_bytes) : (m.partial_bytes ? `${fmtBytes(m.partial_bytes)} partial` : "\u2014");
-    return `<div class="ov-row">${btn}<span class="ov-name">${esc(m.id)}</span><span class="ov-dim">${esc(m.quant)}</span><span class="ov-dim">${esc(size)}</span><span class="ov-dim">${esc(stateTxt)}</span><span class="ov-dim">${st ? String(st.backends) : "0"}</span><span class="ov-dim">${st?.req !== undefined ? st.req.toLocaleString() : "\u2014"}</span></div>`;
+    return `<div class="ov-row">${btn}<span class="ov-name" title="${esc(m.id)}">${esc(modelShortName(m))}</span><span class="ov-dim">${esc(m.quant)}</span><span class="ov-dim">${esc(size)}</span><span class="ov-dim">${esc(stateTxt)}</span><span class="ov-dim">${st ? String(st.backends) : "0"}</span><span class="ov-dim">${st?.req !== undefined ? st.req.toLocaleString() : "\u2014"}</span></div>`;
   }).join("");
   return `<div class="ovlist ov-m"><div class="ov-head"><span></span><span>Model</span><span>Quant</span><span>Size</span><span>State</span><span>Serving backends</span><span>Requests (1h)</span></div>${body}</div>`;
 }
 
-function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }): string {
+function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }, rename?: { draft: string } | null): string {
   const note = notes.get(m.id);
   const noteHtml = note
     ? `<div style="margin-top:8px;font-size:12px;color:${note.err ? "var(--err)" : "var(--text2)"}">${esc(note.text)}</div>` : "";
@@ -1626,13 +2048,25 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
   // Enable/disable is always offered: it controls whether the setup
   // wizard's download step includes this model.
   actions += ` <button class="btn" data-model-act="toggle-enabled" data-model-id="${esc(m.id)}">${m.enabled ? "Disable" : "Enable"}</button>`;
+  // Rename is always offered: the short name is the operator's own
+  // label for the model, independent of its download state.
+  actions += ` <button class="btn" data-model-act="rename" data-model-id="${esc(m.id)}">${icon("wrench")} Rename</button>`;
+  const renameHtml = rename ? `<div class="backend-form-panel flags-panel">
+      <div style="font-size:12px;font-weight:600">Rename short name</div>
+      <div style="display:flex;gap:6px;margin-top:6px;min-width:0">
+        <input data-model-rename-input="${esc(m.id)}" type="text" value="${esc(rename.draft)}" maxlength="64" style="${SELECT_STYLE};flex:1;min-width:0">
+      </div>
+      <div class="card-actions"><button class="btn" data-model-act="rename-save" data-model-id="${esc(m.id)}">Save name</button>
+        <button class="btn" data-model-act="rename-cancel" data-model-id="${esc(m.id)}">Cancel</button></div>
+    </div>` : "";
   const sizeText = m.on_disk
     ? esc(fmtBytes(m.size_bytes))
     : partial > 0 ? `${esc(fmtBytes(partial))} (partial)` : "not downloaded";
   return `<div class="card" id="card-model-${esc(m.id)}">
-    <h3>${icon("box")} ${esc(m.id)} <span class="chip">${esc(m.quant)}</span>${m.enabled ? "" : ` <span class="chip badge-warn">disabled</span>`}
+    <h3>${icon("box")} ${esc(modelShortName(m))} <span class="chip">${esc(m.quant)}</span>${m.enabled ? "" : ` <span class="chip badge-warn">disabled</span>`}
       <span class="spacer" style="flex:1"></span>
       ${modelShaBadge(m)}</h3>
+    ${modelShortName(m) !== m.id ? `<div style="font-size:11px;color:var(--text3);font-family:var(--mono);margin-top:2px">${esc(m.id)}</div>` : ""}
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin:12px 0;align-items:center">
       <div class="kv"><span class="k">File</span><span class="v" style="font-size:12px">${esc(m.gguf_path)}</span></div>
       <div class="kv"><span class="k">Size</span><span class="v" style="font-size:12px">${sizeText}</span></div>
@@ -1641,6 +2075,7 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
     <div style="font-size:11px;color:var(--text3);font-family:var(--mono)">sha256: ${esc(m.sha256 ? `${m.sha256.slice(0, 16)}…` : "—")}</div>
     ${stats && stats.backends > 0 ? `<div style="font-size:12px;color:var(--text2);margin-bottom:8px">Gateway (1h, ${stats.backends} backend${stats.backends === 1 ? "" : "s"}): ${stats.req !== undefined ? `${stats.req.toLocaleString()} requests · ${stats.err ?? 0} errors · ${trim1(stats.toks ?? 0)} tok/s` : "no metrics window yet"}</div>` : ""}
     <div class="card-actions">${actions}</div>
+    ${renameHtml}
     ${dlErrHtml}
     ${noteHtml}
   </div>`;
@@ -1674,6 +2109,27 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
   const downloading = new Set<string>();
   const notes = new Map<string, ModelNote>();
   let lastRows: ModelRow[] = [];
+  /** Rename form state: the model whose inline rename form is open,
+   *  and its draft text. Kept outside the repainted DOM (synced on
+   *  input) so poll repaints never lose typed text. */
+  let renameFor: string | null = null;
+  let renameDraft = "";
+  const syncRenameDraft = (ev: Event): void => {
+    const t = ev.target as HTMLElement;
+    if (!t.hasAttribute("data-model-rename-input")) return;
+    if (t.getAttribute("data-model-rename-input") !== renameFor) return;
+    renameDraft = (t as HTMLInputElement).value;
+  };
+  root.addEventListener("input", syncRenameDraft);
+  /** Enter in the rename input saves, like a form submit. */
+  const onRenameKey = (ev: KeyboardEvent): void => {
+    const t = ev.target as HTMLElement;
+    if (!t.hasAttribute("data-model-rename-input") || ev.key !== "Enter") return;
+    ev.preventDefault();
+    const btn = root.querySelector(`[data-model-act="rename-save"][data-model-id="${CSS.escape(renameFor ?? "")}"]`) as HTMLButtonElement | null;
+    btn?.click();
+  };
+  root.addEventListener("keydown", onRenameKey);
   /** Per-model gateway statistics, aggregated over the backends whose
    *  model_file matches the model's gguf_path. */
   let modelStats = new Map<string, { backends: number; req?: number; err?: number; toks?: number }>();
@@ -1729,8 +2185,15 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       return;
     }
     lastRows = r.data;
-    if (mov) mov.innerHTML = modelOverviewHtml(lastRows, modelStats);
-    b.innerHTML = `<div class="cards-fluid">${lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id))).join("")}</div>`;
+    // While the rename input has focus, a poll repaint would drop
+    // the caret mid-word; the draft is synced to wire state, so
+    // skipping one repaint loses nothing.
+    const renameFocused = renameFor !== null
+      && (document.activeElement as HTMLElement | null)?.hasAttribute?.("data-model-rename-input");
+    if (!renameFocused) {
+      if (mov) mov.innerHTML = modelOverviewHtml(lastRows, modelStats);
+      b.innerHTML = `<div class="cards-fluid">${lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id), renameFor === m.id ? { draft: renameDraft } : null)).join("")}</div>`;
+    }
     syncPoll();
   };
 
@@ -1806,6 +2269,37 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       return;
     }
 
+    if (act === "rename") {
+      if (renameFor === id) { renameFor = null; await load(); return; }
+      const row = lastRows.find((m) => m.id === id);
+      renameFor = id;
+      renameDraft = row ? modelShortName(row) : id;
+      await load();
+      const input = root.querySelector(`[data-model-rename-input="${CSS.escape(id)}"]`) as HTMLInputElement | null;
+      input?.focus();
+      input?.select();
+      return;
+    }
+
+    if (act === "rename-cancel") {
+      renameFor = null;
+      await load();
+      return;
+    }
+
+    if (act === "rename-save") {
+      (t as HTMLButtonElement).disabled = true;
+      const r = await modelSetShortName(id, renameDraft);
+      if (r.error) {
+        notes.set(id, { text: `Rename failed: ${r.error}`, err: true });
+      } else {
+        renameFor = null;
+        notes.set(id, { text: `Short name saved: ${r.data.name}`, err: false });
+      }
+      await load();
+      return;
+    }
+
     if (act === "verify") {
       const btn = t as HTMLButtonElement;
       btn.disabled = true;
@@ -1863,6 +2357,8 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     if (pollTimer !== null) window.clearInterval(pollTimer);
     root.removeEventListener("click", onClick);
     root.removeEventListener("click", onOvGoto);
+    root.removeEventListener("input", syncRenameDraft);
+    root.removeEventListener("keydown", onRenameKey);
   };
 }
 
@@ -1898,6 +2394,15 @@ export function renderLogs(): string {
       </select></label>
     <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px">Search
       <input id="logSearch" type="text" placeholder="substring\u2026" style="${SELECT_STYLE};min-width:160px"/></label>
+    <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px">From
+      <input id="logFrom" type="datetime-local" style="${SELECT_STYLE}"/></label>
+    <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px">To
+      <input id="logTo" type="datetime-local" style="${SELECT_STYLE}"/></label>
+    <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px">Sort
+      <select id="logSort" style="${SELECT_STYLE}">
+        <option value="desc" selected>Newest first</option>
+        <option value="asc">Oldest first</option>
+      </select></label>
     <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px">Limit
       <select id="logLimit" style="${SELECT_STYLE}">
         <option value="50">50</option>
@@ -1914,6 +2419,11 @@ export function renderLogs(): string {
   <div style="font-size:11px;color:var(--text3);margin-top:8px">The bundle contains raw, unredacted process logs. Review it before sharing.</div>
   <div id="logMsg" style="font-size:12px;margin-top:6px"></div></div>
   <div id="logMeta" style="font-size:12px;color:var(--text2);margin-bottom:8px"></div>
+  <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px">
+    <button class="btn" id="logPrev">Prev</button>
+    <button class="btn" id="logNext">Next</button>
+    <span id="logPageInfo" style="font-size:12px;color:var(--text2)"></span>
+  </div>
   <div id="logBody">${loadingHtml("Loading logs\u2026")}</div></div>`;
 }
 
@@ -1922,13 +2432,31 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
   let loading = false;
   let followTimer: number | null = null;
   let searchTimer: number | null = null;
+  /** 1-based page into the filtered result set; the limit select is
+   *  the page size. Any filter change resets this to 1; Refresh and
+   *  the Follow re-poll preserve it. */
+  let page = 1;
   const scopeSel = root.querySelector("#logScope") as HTMLSelectElement | null;
   const levelSel = root.querySelector("#logLevel") as HTMLSelectElement | null;
   const searchInput = root.querySelector("#logSearch") as HTMLInputElement | null;
+  const fromInput = root.querySelector("#logFrom") as HTMLInputElement | null;
+  const toInput = root.querySelector("#logTo") as HTMLInputElement | null;
+  const sortSel = root.querySelector("#logSort") as HTMLSelectElement | null;
   const limitSel = root.querySelector("#logLimit") as HTMLSelectElement | null;
   const followChk = root.querySelector("#logFollow") as HTMLInputElement | null;
   const refreshBtn = root.querySelector("#logRefresh");
+  const prevBtn = root.querySelector("#logPrev") as HTMLButtonElement | null;
+  const nextBtn = root.querySelector("#logNext") as HTMLButtonElement | null;
+  const pageInfo = root.querySelector("#logPageInfo");
   const exportBtn = root.querySelector("#logExport") as HTMLButtonElement | null;
+
+  /** A datetime-local value as epoch ms (local time); empty or
+   *  unparseable means unbounded. */
+  const msOf = (v: string | undefined): number | undefined => {
+    if (!v) return undefined;
+    const ms = new Date(v).getTime();
+    return Number.isNaN(ms) ? undefined : ms;
+  };
 
   const msg = (text: string, isErr = false): void => {
     const m = root.querySelector("#logMsg");
@@ -1954,7 +2482,9 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
     }
   };
 
-  const filtersActive = (): boolean => Boolean(levelSel?.value || searchInput?.value.trim());
+  const filtersActive = (): boolean => Boolean(
+    levelSel?.value || searchInput?.value.trim() || fromInput?.value || toInput?.value,
+  );
 
   const load = async (): Promise<void> => {
     if (loading) return;
@@ -1963,19 +2493,39 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
       const scope = scopeSel?.value ?? "all";
       const limit = Number(limitSel?.value ?? 200);
       const level = levelSel?.value || undefined;
-      const search = searchInput?.value.trim() || undefined;
-      const r = await getLogs(scope, { limit, level, search });
+      const query = searchInput?.value.trim() || undefined;
+      const fetchPage = () => getLogs(scope, {
+        limit,
+        level,
+        query,
+        sinceMs: msOf(fromInput?.value),
+        untilMs: msOf(toInput?.value),
+        order: sortSel?.value === "asc" ? "asc" : "desc",
+        offset: (page - 1) * limit,
+      });
+      let r = await fetchPage();
       if (disposed) return;
+      // The filtered set may have shrunk below the current page
+      // (e.g. a Follow refresh after lines aged out): clamp to the
+      // last page and refetch once, so the page shown is real.
+      const lastPage = Math.max(1, Math.ceil(r.data.total / limit));
+      if (page > lastPage) {
+        page = lastPage;
+        r = await fetchPage();
+        if (disposed) return;
+      }
       setBanner(root, "logBanner", bannerHtml(r));
       mergeScopeOptions(r.data.scopes.map((s) => ({
         value: s.id,
         label: s.previous ? `${s.id} (incl. previous run)` : s.id,
       })));
+      const pages = Math.max(1, Math.ceil(r.data.total / limit));
+      if (pageInfo) pageInfo.textContent = `Page ${page} of ${pages} \u00b7 ${r.data.total} matching records`;
+      if (prevBtn) prevBtn.disabled = page <= 1;
+      if (nextBtn) nextBtn.disabled = page >= pages;
       const meta = root.querySelector("#logMeta");
       if (meta) {
-        const trunc = r.data.truncated
-          ? `Showing the latest ${r.data.lines.length} of ${r.data.total_matching} matching lines. ` : "";
-        meta.textContent = `${trunc}Backend logs are kept in memory for this session only \u2014 up to 10,000 lines per process; one previous run per process is kept. The gateway log is file-backed (under the data directory's logs folder) and survives restarts.`;
+        meta.textContent = `Backend logs are kept in memory for this session only \u2014 up to 10,000 lines per process; one previous run per process is kept. The gateway log is file-backed (under the data directory's logs folder) and survives restarts.`;
       }
       const b = root.querySelector("#logBody");
       if (!b) return;
@@ -2005,11 +2555,17 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
     scopeSel.value = initialScope;
   }
 
-  const onChange = (): void => { void load(); };
+  /** Any filter change (scope, level, text, time bounds, sort, page
+   *  size) restarts paging at page 1. */
+  const onFilterChange = (): void => { page = 1; void load(); };
+  /** Manual Refresh reloads the current page as-is. */
+  const onRefresh = (): void => { void load(); };
   const onSearch = (): void => {
     if (searchTimer !== null) window.clearTimeout(searchTimer);
-    searchTimer = window.setTimeout(() => { searchTimer = null; void load(); }, 300);
+    searchTimer = window.setTimeout(() => { searchTimer = null; page = 1; void load(); }, 300);
   };
+  const onPrev = (): void => { if (page > 1) { page -= 1; void load(); } };
+  const onNext = (): void => { page += 1; void load(); };
   const onFollow = (): void => {
     if (followTimer !== null) { window.clearInterval(followTimer); followTimer = null; }
     if (followChk?.checked) {
@@ -2032,12 +2588,17 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
     }
   };
   openFolderBtn?.addEventListener("click", () => { if (lastExportPath) void openFolder(lastExportPath); });
-  scopeSel?.addEventListener("change", onChange);
-  levelSel?.addEventListener("change", onChange);
-  limitSel?.addEventListener("change", onChange);
+  scopeSel?.addEventListener("change", onFilterChange);
+  levelSel?.addEventListener("change", onFilterChange);
+  fromInput?.addEventListener("change", onFilterChange);
+  toInput?.addEventListener("change", onFilterChange);
+  sortSel?.addEventListener("change", onFilterChange);
+  limitSel?.addEventListener("change", onFilterChange);
   searchInput?.addEventListener("input", onSearch);
   followChk?.addEventListener("change", onFollow);
-  refreshBtn?.addEventListener("click", onChange);
+  refreshBtn?.addEventListener("click", onRefresh);
+  prevBtn?.addEventListener("click", onPrev);
+  nextBtn?.addEventListener("click", onNext);
   exportBtn?.addEventListener("click", onExport);
 
   await load();
@@ -2046,12 +2607,17 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
     disposed = true;
     if (followTimer !== null) window.clearInterval(followTimer);
     if (searchTimer !== null) window.clearTimeout(searchTimer);
-    scopeSel?.removeEventListener("change", onChange);
-    levelSel?.removeEventListener("change", onChange);
-    limitSel?.removeEventListener("change", onChange);
+    scopeSel?.removeEventListener("change", onFilterChange);
+    levelSel?.removeEventListener("change", onFilterChange);
+    fromInput?.removeEventListener("change", onFilterChange);
+    toInput?.removeEventListener("change", onFilterChange);
+    sortSel?.removeEventListener("change", onFilterChange);
+    limitSel?.removeEventListener("change", onFilterChange);
     searchInput?.removeEventListener("input", onSearch);
     followChk?.removeEventListener("change", onFollow);
-    refreshBtn?.removeEventListener("click", onChange);
+    refreshBtn?.removeEventListener("click", onRefresh);
+    prevBtn?.removeEventListener("click", onPrev);
+    nextBtn?.removeEventListener("click", onNext);
     exportBtn?.removeEventListener("click", onExport);
   };
 }
@@ -2195,14 +2761,18 @@ function gatewayPaint(
   const flow = cfg.groups.length
     ? `<div class="card" style="margin-bottom:12px"><div class="sec-title">${icon("gateway")} Routing flow</div>
       <div style="font-family:var(--mono);font-size:12px;color:var(--text2);line-height:2">
-        ${cfg.groups.map((g) => `<span class="chip">${esc(g.name)}</span> <span style="color:var(--text3)">\u2192</span> ${g.members.map(memberHtml).join(", ") || "\u2014"}${g.fallbacks.length ? `<br/><span style="color:var(--text3)">fallback - - \u2192</span> ${g.fallbacks.map(fallbackHtml).join(", ")}` : ""}`).join("<br/>")}
+        ${cfg.groups.map((g) => `<span class="chip">${esc(g.name)}</span>${g.enabled ? "" : ` <span class="chip status-tag status-off">disabled</span>`} <span style="color:var(--text3)">\u2192</span> ${g.members.map(memberHtml).join(", ") || "\u2014"}${g.fallbacks.length ? `<br/><span style="color:var(--text3)">fallback - - \u2192</span> ${g.fallbacks.map(fallbackHtml).join(", ")}` : ""}`).join("<br/>")}
       </div>${strategyNote}</div>`
     : "";
 
   const groups = cfg.groups.length
-    ? `<div class="grid2">${cfg.groups.map((g) => `<div class="card">
+    ? `<div class="grid2">${cfg.groups.map((g) => `<div class="card"${g.enabled ? "" : ` style="opacity:.65"`}>
       <h3><span class="chip" style="border-color:var(--accent)">${esc(g.name)}</span>
+        <span class="chip status-tag ${g.enabled ? "status-on" : "status-off"}">${g.enabled ? "enabled" : "disabled"}</span>
         <span class="spacer" style="flex:1"></span><span class="chip">${esc(g.strategy)}</span></h3>
+      <div style="font-size:12px;color:var(--text2);margin-top:8px">${g.enabled
+        ? `${g.enabled_members} of ${g.members.length} member backend${g.members.length === 1 ? "" : "s"} enabled`
+        : "No enabled backends \u2014 omitted from the generated gateway config"}</div>
       <div style="font-size:12px;color:var(--text2);margin-top:8px">Members</div>
       <div style="font-family:var(--mono);font-size:12px">${g.members.map(memberHtml).join(", ") || "\u2014"}</div>
       <div style="font-size:12px;color:var(--text2);margin-top:8px">Fallbacks</div>
@@ -2266,6 +2836,15 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     if (m) m.innerHTML = text ? `<span style="color:${isErr ? "var(--err)" : "var(--text2)"}">${esc(text)}</span>` : "";
   };
 
+  /** Append a manual-command block under the gateway message (a
+   * failed start-gateway outcome carries one: the exact commands
+   * to start the gateway by hand). #gwMsg lives outside #gwBody,
+   * so the block survives the load() repaint that follows. */
+  const gwShowManual = (cmd: string): void => {
+    const m = root.querySelector("#gwMsg");
+    if (m) m.insertAdjacentHTML("beforeend", manualCommandHtml(cmd));
+  };
+
   /** Fetch the master key on first use and cache it in the closure. */
   const ensureMasterKey = async (): Promise<string | null> => {
     if (masterKey !== null) return masterKey;
@@ -2304,7 +2883,7 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
 
     const pt = t.closest("[data-plan-act]") as HTMLElement | null;
     if (pt) {
-      await handlePlanAction(pt.getAttribute("data-plan-act") ?? "", planUi, () => { void load(); }, load);
+      await handlePlanAction(pt.getAttribute("data-plan-act") ?? "", planUi, () => { void load(); }, load, lastPlan);
       return;
     }
 
@@ -2401,7 +2980,7 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
         if (r.error) {
           gwMsg(`Gateway start failed: ${r.error}`, true);
         } else if (r.data.busy || !r.data.outcome) {
-          gwMsg("A setup step is already running \u2014 wait for it to finish, then start the gateway again.", true);
+          gwMsg(wizardBusyMessage(r.data, "A setup step is already running \u2014 wait for it to finish, then start the gateway again."), true);
         } else {
           const o = r.data.outcome;
           const tail = o.log_tail.length ? ` ${o.log_tail[o.log_tail.length - 1]}` : "";
@@ -2410,6 +2989,7 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
           // journal's mtime resolution.
           if (o.state !== "failed") await activationComplete();
           gwMsg(`Start-gateway step ${o.state} \u2014 ${o.message}${tail}`, o.state === "failed");
+          if (o.state === "failed" && o.manual_command) gwShowManual(o.manual_command);
         }
       } finally {
         starting = false;
@@ -2878,9 +3458,14 @@ function wizardStepRow(s: WizardStepState, live: boolean): string {
     ? `<div style="margin-top:4px;color:var(--text2)">${esc(s.remediation)}</div>` : "";
   const logTail = s.state === "failed" && s.logTail && s.logTail.length
     ? `<div style="margin-top:4px;font-family:var(--mono);font-size:11px;color:var(--text3)">${s.logTail.slice(-3).map((l) => esc(l)).join("<br>")}</div>` : "";
-  const manual = s.state === "failed" && s.manualCommands
-    ? `<div style="margin-top:8px"><div style="font-size:11px;color:var(--text3)">Run this step manually (PowerShell):</div>
-      <pre style="margin:4px 0;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px">${esc(s.manualCommands)}</pre>
+  // The outcome's own manual block wins over the generic planned
+  // commands: it is built for this install and this failure (real
+  // paths, the PostgreSQL pre-step when installed, the secret env
+  // named), and its first line already says what it is.
+  const manualText = s.state === "failed" ? (s.manualCommand ?? s.manualCommands) : undefined;
+  const manual = manualText
+    ? `<div style="margin-top:8px">${s.manualCommand ? "" : `<div style="font-size:11px;color:var(--text3)">Run this step manually (PowerShell):</div>`}
+      <pre style="margin:4px 0;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px">${esc(manualText)}</pre>
       <button class="btn" data-copy-step="${esc(s.id)}">Copy commands</button></div>` : "";
   return `<div class="step ${s.state}">${stIcon}${icon("wrench")}
     <div><div class="sname">${esc(s.name)}</div><div class="sdetail">${esc(s.detail)}</div>${remediation}${logTail}${manual}${actions}</div>
@@ -2911,7 +3496,7 @@ function paintWizard(root: HTMLElement, steps: WizardStepState[], live: boolean,
   // progress.
   const blank = (s: WizardStepState, state: WizardStepState["state"]): WizardStepState => ({
     ...s, state, detail: "", note: undefined, duration: undefined,
-    remediation: undefined, logTail: undefined, manualCommands: undefined,
+    remediation: undefined, logTail: undefined, manualCommands: undefined, manualCommand: undefined,
   });
   const eff = steps.map((s) => {
     if (opts.runningStepId && s.id === opts.runningStepId) return blank(s, "running");
@@ -2988,6 +3573,9 @@ export function wireWizard(root: HTMLElement): () => void {
   let busy = false;
   let runningStepId: string | null = null;
   let statusLine: string | null = null;
+  /** The most recent busy report's message (which step is running
+   * and for how long), for the status line after a busy stop. */
+  let busyMsg = "";
   /** While a setup run or audit is in progress, steps that have not
    *  produced a result in this run render blank (paintWizard's
    *  hideStale); freshIds collects the steps that have. */
@@ -3006,6 +3594,9 @@ export function wireWizard(root: HTMLElement): () => void {
     let changed = false;
     for (const s of steps) {
       if (s.state !== "failed") continue;
+      // The outcome's own manual block (start-gateway) is specific
+      // to the failure; the planned commands would only duplicate it.
+      if (s.manualCommand) continue;
       const cached = manualCmds.get(s.id);
       if (cached !== undefined) {
         if (cached && s.manualCommands !== cached) { s.manualCommands = cached; changed = true; }
@@ -3061,7 +3652,8 @@ export function wireWizard(root: HTMLElement): () => void {
     const r = await runWizardStep(stepId);
     if (r.error) { freshIds.add(stepId); logLine(`step ${stepId} error: ${r.error}`, "lvl-err"); await refresh(); return "failed"; }
     if (r.data.busy || !r.data.outcome) {
-      logLine("a setup step is already running", "lvl-warn");
+      busyMsg = wizardBusyMessage(r.data, "A setup step is already running — wait for it to finish.");
+      logLine(busyMsg, "lvl-warn");
       await refresh();
       return "busy";
     }
@@ -3104,7 +3696,7 @@ export function wireWizard(root: HTMLElement): () => void {
         if (res !== "ok") { paused = s.name; break; }
       }
       if (busyStop) {
-        statusLine = "A setup step is already running \u2014 wait for it to finish.";
+        statusLine = busyMsg || "A setup step is already running \u2014 wait for it to finish.";
       } else if (paused) {
         statusLine = `Setup paused \u2014 ${paused} failed. Fix the cause and retry.`;
         logLine("setup paused \u2014 fix the failed step and retry", "lvl-warn");
@@ -3184,7 +3776,8 @@ export function wireWizard(root: HTMLElement): () => void {
     const copyBtn = t.closest("[data-copy-step]") as HTMLElement | null;
     if (copyBtn) {
       const id = copyBtn.getAttribute("data-copy-step") ?? "";
-      const text = steps.find((s) => s.id === id)?.manualCommands ?? "";
+      const step = steps.find((s) => s.id === id);
+      const text = step?.manualCommand ?? step?.manualCommands ?? "";
       if (text) {
         try {
           await navigator.clipboard.writeText(text);
@@ -3217,7 +3810,7 @@ export function wireWizard(root: HTMLElement): () => void {
       } finally {
         busy = false;
         runningStepId = null;
-        statusLine = res === "busy" ? "A setup step is already running \u2014 wait for it to finish." : null;
+        statusLine = res === "busy" ? (busyMsg || "A setup step is already running \u2014 wait for it to finish.") : null;
         paint();
       }
     }

@@ -91,8 +91,10 @@ interface MapData {
    *  from telemetry's per-process attribution. Raw attribution: a
    *  backend appears on every GPU where its process holds even a
    *  bare CUDA context, so consumers must apply RESIDENCY_MIN_MIB
-   *  before treating an entry as model residency. */
-  residency: Map<string, Map<number, number>>;
+   *  before treating an entry as model residency. A null value is
+   *  presence without a measurement (WDDM GPU, counter data
+   *  unavailable): it is neither residency nor context. */
+  residency: Map<string, Map<number, number | null>>;
   live: boolean;
   errors: string[];
   /** When this paint's data was fetched (epoch ms). */
@@ -170,7 +172,7 @@ function topologySvg(d: MapData): string {
     edge(COL.gateway + NW, H / 2, COL.backends, ys[i], e.cls, e.stroke);
     const measured = d.residency.get(b.id);
     const resident = measured
-      ? [...measured.entries()].filter(([, mib]) => mib >= RESIDENCY_MIN_MIB)
+      ? [...measured.entries()].filter((e): e is [number, number] => e[1] !== null && e[1] >= RESIDENCY_MIN_MIB)
       : [];
     if (resident.length) {
       for (const [j] of resident) {
@@ -206,10 +208,13 @@ function topologySvg(d: MapData): string {
     const up = b.state === "running" && b.uptime_secs != null ? ` \u00b7 up ${fmtUptime(b.uptime_secs)}` : "";
     const model = b.model_file ? ` \u00b7 ${b.model_file.split(/[\\/]/).pop()}` : "";
     const res = d.residency.get(b.id);
-    const resident = res ? [...res.entries()].filter(([, mib]) => mib >= RESIDENCY_MIN_MIB) : [];
+    const resident = res ? [...res.entries()].filter((e): e is [number, number] => e[1] !== null && e[1] >= RESIDENCY_MIN_MIB) : [];
+    const anyMeasured = res ? [...res.values()].some((v) => v !== null) : false;
     const resTxt = resident.length
       ? ` \u00b7 ${resident.map(([j, mib]) => `GPU${j} ${fmtGb(mib / 1024)}G`).join(" ")}`
-      : res && res.size ? " \u00b7 context only" : "";
+      : res && res.size
+        ? anyMeasured ? " \u00b7 context only" : " \u00b7 residency not measured"
+        : "";
     node(COL.backends, ys[i], b.id, `:${b.port} \u00b7 ${b.state}${up}${model}${resTxt}`, stateColor(b.state), stateStroke(b.state), undefined, "#/backends");
   });
 
@@ -306,7 +311,7 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
 
   const resEl = root.querySelector("#mapResidency");
   if (resEl) {
-    const byGpu = new Map<number, [string, number][]>();
+    const byGpu = new Map<number, [string, number | null][]>();
     for (const [bid, gm] of d.residency) {
       for (const [j, mib] of gm) {
         const a = byGpu.get(j) ?? [];
@@ -317,7 +322,7 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
     resEl.innerHTML = d.gpus.length
       ? d.gpus.map((g) => {
           const rows = byGpu.get(Number(g.id)) ?? [];
-          return `<div style="margin-bottom:8px"><div style="font-size:12px">${esc(g.name)}</div>${rows.length ? rows.map(([bid, mib]) => `<div style="display:flex;justify-content:space-between;font-size:12px;padding:2px 0"><span>${esc(bid)}${mib < 1024 ? ` <span class="chip">context only</span>` : ""}</span><span>${fmtGb(mib / 1024)} GiB</span></div>`).join("") : `<div style="font-size:12px;color:var(--text3)">no backend processes measured</div>`}</div>`;
+          return `<div style="margin-bottom:8px"><div style="font-size:12px">${esc(g.name)}</div>${rows.length ? rows.map(([bid, mib]) => `<div style="display:flex;justify-content:space-between;font-size:12px;padding:2px 0"><span>${esc(bid)}${mib !== null && mib < 1024 ? ` <span class="chip">context only</span>` : ""}</span><span>${mib === null ? "not measured" : `${fmtGb(mib / 1024)} GiB`}</span></div>`).join("") : `<div style="font-size:12px;color:var(--text3)">no backend processes measured</div>`}</div>`;
         }).join("")
       : `<div class="empty">no GPUs reported</div>`;
   }
@@ -388,11 +393,11 @@ export async function wireServiceMap(root: HTMLElement): Promise<() => void> {
       // labels fall back and the tensor-split edges vanish silently.
       const errors = [b.error, g.error, gw.error, cfg.error].filter((e): e is string => Boolean(e));
       const mxc = cfg.data?.mxc as { mode?: unknown } | undefined;
-      const residency = new Map<string, Map<number, number>>();
+      const residency = new Map<string, Map<number, number | null>>();
       for (const gpu of g.data.gpus) {
         for (const p of gpu.processes ?? []) {
           if (p.backend === "\u2014") continue;
-          const gm = residency.get(p.backend) ?? new Map<number, number>();
+          const gm = residency.get(p.backend) ?? new Map<number, number | null>();
           gm.set(Number(gpu.id), p.vram_mib);
           residency.set(p.backend, gm);
         }
