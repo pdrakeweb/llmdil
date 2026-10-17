@@ -256,6 +256,7 @@ mod tests {
             expert_bytes: None,
             moe_layers: None,
             default_offload_layers: None,
+            offload_restrictions: Vec::new(),
         }
     }
 

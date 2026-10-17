@@ -16,13 +16,18 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 pub mod gguf;
+pub mod guardrails;
 pub mod memory;
 pub mod placement;
 
 pub use gguf::{parse_gguf_layout, GgufError, GgufLayout, KvGeometry};
+pub use guardrails::{
+    nearest_allowed, offload_status, restriction_for, AllowedOffload, OffloadRestriction,
+    OffloadStatus,
+};
 pub use memory::{
     expert_offload, memory_requirement, offload_bands, offload_flag_string, offload_for_layers,
-    set_expert_offload, ExpertOffload, MemoryBasis, MemoryRequirement,
+    set_expert_offload, sys_bytes_by_position, ExpertOffload, MemoryBasis, MemoryRequirement,
 };
 pub use placement::{
     apply_placement, propose_placement, propose_placement_resident, validate_split,
@@ -89,6 +94,16 @@ pub struct ModelSpec {
     /// the model has no expert offload to default.
     #[serde(default)]
     pub default_offload_layers: Option<u32>,
+    /// Per-architecture expert-offload guardrails for this model
+    /// (see [`guardrails`]): positions a restriction does not
+    /// allow are blocked on GPUs with its compute capability,
+    /// regardless of the slider's color bands. Empty when every
+    /// position is allowed on every architecture. Resolved from
+    /// the live catalog by model id, like the slider's green
+    /// limit, so catalog pins reach existing configurations
+    /// without a catalog-revision bump.
+    #[serde(default)]
+    pub offload_restrictions: Vec<OffloadRestriction>,
 }
 
 /// The curated catalog's default expert offload for a model: the
@@ -175,6 +190,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             expert_bytes: Some(0),
             moe_layers: None,
             default_offload_layers: None,
+            offload_restrictions: Vec::new(),
             // The real Qwen3.8-27B (Alibaba, August 2026), dense
             // 27B, in ISTA-DASLab's GSQ-RCO quantization at IQ3_S —
             // fully GPU-resident on a 16 GB card. Replaced the
@@ -203,6 +219,15 @@ pub fn curated_models() -> Vec<ModelSpec> {
             // the whole range.
             moe_layers: Some(48),
             default_offload_layers: Some(48),
+            // Pascal guardrail (tracker #37): at --n-cpu-moe 46 on
+            // a Tesla P100 (compute capability (6, 0)) the coder
+            // died with a CUDA invalid-argument launch error; full
+            // offload fixed it. Endpoints only on (6, 0) until
+            // partial positions are verified per architecture.
+            offload_restrictions: vec![OffloadRestriction {
+                compute_capability: (6, 0),
+                allowed: AllowedOffload::EndpointsOnly,
+            }],
             // Qwen3-Coder-Next (80B total / ~3B active MoE),
             // served by expert offload — the coder backend's raw
             // flags carry `-ot exps=CPU`. Unsloth's single-file
@@ -225,6 +250,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             expert_bytes: Some(0),
             moe_layers: None,
             default_offload_layers: None,
+            offload_restrictions: Vec::new(),
             url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
                 .to_string(),
         },
@@ -240,6 +266,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             expert_bytes: Some(0),
             moe_layers: None,
             default_offload_layers: None,
+            offload_restrictions: Vec::new(),
             url: "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
                 .to_string(),
         },
@@ -271,6 +298,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             // single 16 GiB GPU alongside the non-expert weights.
             moe_layers: Some(24),
             default_offload_layers: Some(16),
+            offload_restrictions: Vec::new(),
             url: "https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF/resolve/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf"
                 .to_string(),
         },
@@ -1114,6 +1142,7 @@ mod tests {
             expert_bytes: None,
             moe_layers: None,
             default_offload_layers: None,
+            offload_restrictions: Vec::new(),
         }
     }
 
@@ -1132,6 +1161,7 @@ mod tests {
             expert_bytes: None,
             moe_layers: None,
             default_offload_layers: None,
+            offload_restrictions: Vec::new(),
         };
         assert_eq!(spec.quant, "Q4_K_M");
         let p = DownloadProgress {
@@ -1333,6 +1363,7 @@ mod tests {
             expert_bytes: None,
             moe_layers: None,
             default_offload_layers: None,
+            offload_restrictions: Vec::new(),
         }
     }
 
@@ -1885,6 +1916,33 @@ mod tests {
             let pos = catalog_default_offload(spec).layers(layers);
             assert_eq!(pos, spec.default_offload_layers.unwrap());
             assert!((green - pos as f64 / layers as f64).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn catalog_offload_restrictions_pin_coder_next_pascal_only() {
+        // Tracker #37: exactly one curated restriction — the
+        // coder's (6, 0) EndpointsOnly pin from the Pascal CUDA
+        // invalid-argument incident at --n-cpu-moe 46. Every other
+        // curated entry carries none; in particular Nemotron's
+        // 16-of-24 partial design point stays unrestricted.
+        let models = curated_models();
+        let coder = models.iter().find(|m| m.id == "qwen3-coder-30b").unwrap();
+        assert_eq!(
+            coder.offload_restrictions,
+            vec![OffloadRestriction {
+                compute_capability: (6, 0),
+                allowed: AllowedOffload::EndpointsOnly,
+            }]
+        );
+        assert_eq!(
+            restriction_for(coder, (6, 0)),
+            Some(&coder.offload_restrictions[0])
+        );
+        for m in &models {
+            if m.id != "qwen3-coder-30b" {
+                assert!(m.offload_restrictions.is_empty(), "{}", m.id);
+            }
         }
     }
 
