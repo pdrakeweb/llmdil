@@ -80,6 +80,25 @@ pub struct ActivationEntry {
     pub targets: Vec<String>,
 }
 
+/// A standing operator override for one backend's expert-offload
+/// position: the operator explicitly saved a guardrail-blocked
+/// position, so starts at exactly that position on exactly that GPU
+/// placement are allowed. A placement change (a different placed
+/// compute-capability set) invalidates the record — the position
+/// was authorized for the GPUs it was saved against, not in the
+/// abstract. Overrides are NOT pending changes: they survive
+/// [`clear_journal`] and journal resolution, and are removed only
+/// by an explicit clear (a verified save superseding them) or by
+/// recording a replacement for the same backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffloadOverride {
+    pub backend_id: String,
+    pub layers: u32,
+    pub placed_ccs: Vec<(u32, u32)>,
+    /// RFC 3339 UTC timestamp of the save that recorded it.
+    pub ts: String,
+}
+
 /// The persisted journal: unresolved-change snapshot plus entries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActivationJournal {
@@ -87,6 +106,11 @@ pub struct ActivationJournal {
     /// target. `None` when no change is pending.
     pub snapshot: Option<serde_json::Value>,
     pub entries: Vec<ActivationEntry>,
+    /// Standing offload overrides (see [`OffloadOverride`]).
+    /// Defaulted so journal files written before overrides existed
+    /// load with none.
+    #[serde(default)]
+    pub offload_overrides: Vec<OffloadOverride>,
 }
 
 fn journal_path(data_dir: &Path) -> PathBuf {
@@ -321,10 +345,72 @@ pub fn record_change(
     save_journal(data_dir, &journal)
 }
 
+/// Record a standing offload override for `backend_id`, replacing
+/// any existing records for that backend (one standing override per
+/// backend: the newest explicit save is the authorization in force).
+pub fn record_offload_override(
+    data_dir: &Path,
+    backend_id: &str,
+    layers: u32,
+    placed_ccs: Vec<(u32, u32)>,
+) -> Result<(), String> {
+    let _guard = journal_lock();
+    let mut journal = load_journal(data_dir);
+    journal
+        .offload_overrides
+        .retain(|o| o.backend_id != backend_id);
+    journal.offload_overrides.push(OffloadOverride {
+        backend_id: backend_id.to_string(),
+        layers,
+        placed_ccs,
+        ts: chrono::Utc::now().to_rfc3339(),
+    });
+    save_journal(data_dir, &journal)
+}
+
+/// Drop `backend_id`'s standing offload overrides, if any. Called
+/// when a verified (non-blocked) save supersedes the override.
+pub fn clear_offload_overrides(data_dir: &Path, backend_id: &str) -> Result<(), String> {
+    let _guard = journal_lock();
+    let mut journal = load_journal(data_dir);
+    journal
+        .offload_overrides
+        .retain(|o| o.backend_id != backend_id);
+    save_journal(data_dir, &journal)
+}
+
+/// Whether a journaled override covers exactly this position on
+/// exactly this placement: same backend, same layer count, and the
+/// same placed compute-capability set (order-insensitive).
+pub fn offload_override_covers(
+    journal: &ActivationJournal,
+    backend_id: &str,
+    layers: u32,
+    placed_ccs: &[(u32, u32)],
+) -> bool {
+    let want: std::collections::BTreeSet<(u32, u32)> = placed_ccs.iter().copied().collect();
+    journal.offload_overrides.iter().any(|o| {
+        o.backend_id == backend_id
+            && o.layers == layers
+            && o.placed_ccs.iter().copied().collect::<std::collections::BTreeSet<_>>() == want
+    })
+}
+
 /// Clear the journal (activation completed, or changes cancelled).
+/// Offload overrides are PRESERVED: an override is a standing
+/// operator decision about a value, not a pending change, so
+/// resolving or cancelling the plan must not silently revoke it.
 pub fn clear_journal(data_dir: &Path) -> Result<(), String> {
     let _guard = journal_lock();
-    save_journal(data_dir, &ActivationJournal::default())
+    let journal = load_journal(data_dir);
+    save_journal(
+        data_dir,
+        &ActivationJournal {
+            snapshot: None,
+            entries: Vec::new(),
+            offload_overrides: journal.offload_overrides,
+        },
+    )
 }
 
 /// Clear only the gateway-scope entries (a gateway (re)start made
@@ -479,6 +565,7 @@ litellm_deployment_success_responses_total 9.0
         let journal = ActivationJournal {
             snapshot: None,
             entries: vec![entry("backend", &["a", "b"])],
+            ..Default::default()
         };
         let configured: std::collections::HashSet<String> =
             ["a".to_string(), "b".to_string()].into_iter().collect();
@@ -532,6 +619,7 @@ litellm_deployment_success_responses_total 9.0
         let journal = ActivationJournal {
             snapshot: None,
             entries: vec![entry("gateway", &[])],
+            ..Default::default()
         };
         let un = unresolved_entries_scoped(
             dir,
@@ -555,6 +643,7 @@ litellm_deployment_success_responses_total 9.0
         let journal = ActivationJournal {
             snapshot: Some(serde_json::to_value(&cfg).unwrap()),
             entries: vec![entry("backend", &["a"])],
+            ..Default::default()
         };
         save_journal(&dir, &journal).unwrap();
         let configured: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
@@ -626,6 +715,7 @@ litellm_deployment_success_responses_total 9.0
         let journal = ActivationJournal {
             snapshot: None,
             entries: vec![entry("backend", &["coder-nvidia"])],
+            ..Default::default()
         };
         let configured = ids(&["coder-nvidia"]);
         let pending = pending_entries(dir, &journal, &starts(&[]), &configured, &ids(&[]), false);
@@ -636,6 +726,7 @@ litellm_deployment_success_responses_total 9.0
         let journal = ActivationJournal {
             snapshot: None,
             entries: vec![entry("gateway", &[])],
+            ..Default::default()
         };
         let pending = pending_entries(dir, &journal, &starts(&[]), &configured, &ids(&[]), false);
         assert!(pending.is_empty());
@@ -650,6 +741,7 @@ litellm_deployment_success_responses_total 9.0
         let journal = ActivationJournal {
             snapshot: None,
             entries: vec![entry("backend", &["coder"])],
+            ..Default::default()
         };
         let configured = ids(&["coder"]);
         // Running, started BEFORE the 12:00 entry: the process
@@ -696,6 +788,7 @@ litellm_deployment_success_responses_total 9.0
                 entry("backend", &["coder-nvidia"]),
                 entry("backend", &["coder"]),
             ],
+            ..Default::default()
         };
         let configured = ids(&["coder-nvidia", "coder"]);
         let pending = pending_entries(
@@ -728,6 +821,7 @@ litellm_deployment_success_responses_total 9.0
         let journal = ActivationJournal {
             snapshot: Some(serde_json::to_value(&cfg).unwrap()),
             entries: vec![entry("backend", &["coder"])],
+            ..Default::default()
         };
         save_journal(&dir, &journal).unwrap();
         let configured = ids(&["coder"]);
@@ -842,6 +936,7 @@ litellm_deployment_success_responses_total 9.0
         let journal = ActivationJournal {
             snapshot: Some(serde_json::to_value(&cfg0).unwrap()),
             entries: vec![with_after("backend", &["coder-nvidia"], &cfg1)],
+            ..Default::default()
         };
         save_journal(&dir, &journal).unwrap();
         assert!(
@@ -854,6 +949,7 @@ litellm_deployment_success_responses_total 9.0
         let journal = ActivationJournal {
             snapshot: Some(serde_json::to_value(&cfg0).unwrap()),
             entries: vec![with_after("backend", &["coder"], &cfg1)],
+            ..Default::default()
         };
         save_journal(&dir, &journal).unwrap();
         let started = starts(&[("coder", "2026-10-16T11:00:00+00:00")]);
@@ -872,6 +968,7 @@ litellm_deployment_success_responses_total 9.0
                 with_after("backend", &["coder"], &cfg1),
                 with_after("backend", &["coder-nvidia"], &cfg2),
             ],
+            ..Default::default()
         };
         save_journal(&dir, &journal).unwrap();
         let err = cancel_target(&dir, &cfg2, &started, &configured, &ids(&["coder"]), false)
@@ -880,6 +977,98 @@ litellm_deployment_success_responses_total 9.0
             err.contains("already in effect"),
             "unexpected refusal: {err}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn override_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "activation-offload-override-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn offload_override_record_covers_round_trip() {
+        let dir = override_test_dir("round-trip");
+        record_offload_override(&dir, "coder", 46, vec![(6, 0)]).unwrap();
+        let journal = load_journal(&dir);
+        assert!(offload_override_covers(&journal, "coder", 46, &[(6, 0)]));
+        // Another backend at the same position is not covered.
+        assert!(!offload_override_covers(&journal, "planner", 46, &[(6, 0)]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offload_override_wrong_layers_does_not_cover() {
+        let dir = override_test_dir("wrong-layers");
+        record_offload_override(&dir, "coder", 46, vec![(6, 0)]).unwrap();
+        let journal = load_journal(&dir);
+        assert!(!offload_override_covers(&journal, "coder", 45, &[(6, 0)]));
+        assert!(!offload_override_covers(&journal, "coder", 48, &[(6, 0)]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offload_override_different_placed_cc_set_does_not_cover() {
+        // A placement change invalidates the override: the position
+        // was authorized against the placed GPUs it was saved on.
+        let dir = override_test_dir("different-ccs");
+        record_offload_override(&dir, "coder", 46, vec![(6, 0), (8, 6)]).unwrap();
+        let journal = load_journal(&dir);
+        // Order does not matter: the same set reversed still covers.
+        assert!(offload_override_covers(&journal, "coder", 46, &[(8, 6), (6, 0)]));
+        assert!(!offload_override_covers(&journal, "coder", 46, &[(6, 0)]));
+        assert!(!offload_override_covers(&journal, "coder", 46, &[(8, 6)]));
+        assert!(!offload_override_covers(&journal, "coder", 46, &[]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offload_override_rerecord_replaces() {
+        let dir = override_test_dir("rerecord");
+        record_offload_override(&dir, "coder", 46, vec![(6, 0)]).unwrap();
+        record_offload_override(&dir, "coder", 24, vec![(6, 0)]).unwrap();
+        let journal = load_journal(&dir);
+        assert_eq!(journal.offload_overrides.len(), 1);
+        assert!(!offload_override_covers(&journal, "coder", 46, &[(6, 0)]));
+        assert!(offload_override_covers(&journal, "coder", 24, &[(6, 0)]));
+        // Clearing drops only that backend's records.
+        record_offload_override(&dir, "planner", 10, vec![(6, 0)]).unwrap();
+        clear_offload_overrides(&dir, "coder").unwrap();
+        let journal = load_journal(&dir);
+        assert!(!offload_override_covers(&journal, "coder", 24, &[(6, 0)]));
+        assert!(offload_override_covers(&journal, "planner", 10, &[(6, 0)]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_journal_preserves_offload_overrides() {
+        let dir = override_test_dir("clear-preserves");
+        record_offload_override(&dir, "coder", 46, vec![(6, 0)]).unwrap();
+        clear_journal(&dir).unwrap();
+        let journal = load_journal(&dir);
+        assert!(journal.entries.is_empty());
+        assert!(journal.snapshot.is_none());
+        assert!(offload_override_covers(&journal, "coder", 46, &[(6, 0)]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_journal_without_overrides_field_loads_empty() {
+        let dir = override_test_dir("legacy");
+        std::fs::write(
+            dir.join("activation-journal.json"),
+            r#"{"snapshot":null,"entries":[]}"#,
+        )
+        .unwrap();
+        let journal = load_journal(&dir);
+        assert!(journal.offload_overrides.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
