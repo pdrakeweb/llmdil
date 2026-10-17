@@ -304,7 +304,7 @@ function applianceView(m: DashboardModel, live: boolean): string {
   return `${empty}
     ${noWindow}
     <div class="group-box"><div class="sec-title">${icon("gpu")} GPUs</div><div class="cards3">${gpus}</div></div>
-    <div class="group-box"><div class="sec-title">${icon("server")} Backends</div><div class="cards5">${cards}</div></div>
+    <div class="group-box"><div class="sec-title">${icon("server")} Services</div><div class="cards5">${cards}</div></div>
     ${placeCard}`;
 }
 
