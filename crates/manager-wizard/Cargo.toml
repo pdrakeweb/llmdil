@@ -1,0 +1,39 @@
+[package]
+name = "manager-wizard"
+version = "0.1.33"
+edition = "2021"
+
+[dependencies]
+manager-config = { path = "../manager-config" }
+manager-models = { path = "../manager-models" }
+manager-present = { path = "../manager-present" }
+manager-gateway = { path = "../manager-gateway" }
+manager-mxc = { path = "../manager-mxc" }
+manager-telemetry = { path = "../manager-telemetry" }
+manager-winml = { path = "../manager-winml" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+zip = "2.2"
+serde_yaml = { workspace = true }
+libc = "0.2"
+# .tar.gz extraction for the MXC SDK install step (npm tarball layout).
+flate2 = "1"
+tar = "0.4"
+# JSONC (comments/trailing commas) parsing with a concrete syntax
+# tree, so the VS Code step can edit settings.json without dropping
+# the user's comments or formatting.
+jsonc-parser = { version = "0.26", features = ["cst", "serde"] }
+
+# Credential Manager reads (CredReadW) for injecting stored secrets into
+# a spawned process's environment. Windows-only; minimal feature set
+# (Foundation is required by the CREDENTIALW struct's FILETIME field).
+# Win32_UI_Shell + Win32_System_Threading are for the elevated host-prep
+# launch (ShellExecuteExW "runas") in ops::run_elevated.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

@@ -1,0 +1,22 @@
+[package]
+name = "manager-telemetry"
+version = "0.1.33"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+quick-xml = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+# PDH (per-process GPU memory counters) bindings for the WDDM fixup
+# source in `pdh.rs`. DXGI is declared locally there (the windows-sys
+# build in this workspace carries no Dxgi module); only the PDH
+# surface comes from windows-sys.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Performance"] }

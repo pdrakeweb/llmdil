@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Design C — Graphic Mockups</title>
+<style>
+:root{--bg:#0a0d12;--panel:#10151d;--border:#1f2733;--text:#d5dce5;--sec:#8b95a5;--mut:#5d6773;
+  --mono:ui-monospace,"Cascadia Mono",Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);padding:28px 32px}
+h1{font-size:20px;font-weight:650;margin-bottom:6px}
+.sub{color:var(--sec);font-size:13px;margin-bottom:24px;max-width:900px}
+.sub .mono{font-family:var(--mono);font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(560px,1fr));gap:22px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.card .cap{padding:10px 14px;font-size:13px;font-weight:600;border-bottom:1px solid var(--border);
+  display:flex;justify-content:space-between;align-items:center}
+.card .cap .n{font-family:var(--mono);font-size:11px;color:var(--mut);font-weight:400}
+.card a{display:block}
+.card img{width:100%;height:auto;display:block;border-top:1px solid var(--border)}
+.note{margin-top:24px;color:var(--mut);font-size:12px;max-width:900px}
+</style></head>
+<body>
+<h1>Design C — Cluster Service Map · Graphic Mockups</h1>
+<div class="sub">Visual mockups for the NOC-style direction of the Local LLM Service Manager UI brainstorm.
+Rendered at 1600×1000. Sources: <span class="mono">graphics/src/design-c/</span> (HTML + shared.css).
+Full window specs in <span class="mono">design-c.md</span>.</div>
+<div class="grid">
+  <div class="card"><div class="cap">M1 — Setup Wizard: First-Run Provisioning <span class="n">bring-up stage</span></div>
+    <a href="01-setup-wizard.png"><img src="01-setup-wizard.png" alt="M1 Setup Wizard"></a></div>
+  <div class="card"><div class="cap">M2 — Service Map <span class="n">home view</span></div>
+    <a href="02-service-map.png"><img src="02-service-map.png" alt="M2 Service Map"></a></div>
+  <div class="card"><div class="cap">M3 — GPU Detail <span class="n">Tesla P100</span></div>
+    <a href="03-gpu-detail.png"><img src="03-gpu-detail.png" alt="M3 GPU Detail"></a></div>
+  <div class="card"><div class="cap">M4 — Backend Detail <span class="n">coder-30b</span></div>
+    <a href="04-backend-detail.png"><img src="04-backend-detail.png" alt="M4 Backend Detail"></a></div>
+  <div class="card"><div class="cap">M5 — Model Library</div>
+    <a href="05-model-library.png"><img src="05-model-library.png" alt="M5 Model Library"></a></div>
+  <div class="card"><div class="cap">M6 — Logs</div>
+    <a href="06-logs.png"><img src="06-logs.png" alt="M6 Logs"></a></div>
+  <div class="card"><div class="cap">M7 — Alerts &amp; Rules</div>
+    <a href="07-alerts-rules.png"><img src="07-alerts-rules.png" alt="M7 Alerts and Rules"></a></div>
+  <div class="card"><div class="cap">M8 — Settings <span class="n">MXC policies section</span></div>
+    <a href="08-settings.png"><img src="08-settings.png" alt="M8 Settings"></a></div>
+</div>
+<div class="note">Mockup data reflects the actual planned stack: Dell Precision 7865, RTX A4000 16GB + 2× Tesla P100 16GB,
+Qwen3.8-27B / Qwen3-Coder-30B / Qwen2.5-Coder-7B / Qwen3-8B, LiteLLM gateway on :4000, backends on :8081–:8084,
+MXC deny-by-default policy. Click any mockup for the full-size render.</div>
+</body></html>

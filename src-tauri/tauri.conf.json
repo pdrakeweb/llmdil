@@ -1,0 +1,60 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: https://asset.localhost; style-src 'self' 'unsafe-inline'"
+    },
+    "windows": [
+      {
+        "height": 800,
+        "label": "main",
+        "minHeight": 640,
+        "minWidth": 1024,
+        "title": "Local LLM Service Manager",
+        "width": 1280
+      }
+    ]
+  },
+  "build": {
+    "beforeBuildCommand": "",
+    "beforeDevCommand": "npm run dev --prefix ../ui",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../ui/dist"
+  },
+  "bundle": {
+    "active": true,
+    "category": "DeveloperTool",
+    "copyright": "Copyright 2026 pdrakeweb",
+    "longDescription": "Local LLM Service Manager installs, configures, supervises and monitors a local LLM serving stack (llama.cpp backends, LiteLLM gateway, GPU telemetry, model library, MXC sandbox policies) on a Windows workstation.",
+    "publisher": "pdrakeweb",
+    "shortDescription": "Installs, configures, supervises and monitors a local LLM serving stack.",
+    "targets": [
+      "nsis"
+    ],
+    "windows": {
+      "nsis": {
+        "displayLanguageSelector": false,
+        "installMode": "currentUser",
+        "installerHooks": "installer-hooks.nsi",
+        "template": "installer-template.nsi",
+        "languages": [
+          "English"
+        ],
+        "minimumWebview2Version": "120.0.2210.61",
+        "startMenuFolder": "Local LLM Service Manager"
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "licenseFile": "../LICENSE"
+  },
+  "identifier": "com.pdrakeweb.llm-manager",
+  "productName": "Local LLM Service Manager",
+  "version": "0.1.33"
+}

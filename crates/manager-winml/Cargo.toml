@@ -1,0 +1,14 @@
+[package]
+name = "manager-winml"
+version = "0.1.33"
+edition = "2021"
+
+[dependencies]
+manager-config = { path = "../manager-config" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }

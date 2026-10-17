@@ -1,0 +1,11 @@
+[package]
+name = "manager-config"
+version = "0.1.33"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+zip = { workspace = true }

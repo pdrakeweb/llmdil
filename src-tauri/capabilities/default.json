@@ -1,0 +1,1 @@
+{"$schema":"../gen/schemas/desktop-schema.json","description":"Default capability: main window with core Tauri APIs","identifier":"default","permissions":["core:default"],"windows":["main"]}

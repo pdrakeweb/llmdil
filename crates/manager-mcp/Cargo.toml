@@ -1,0 +1,11 @@
+[package]
+name = "manager-mcp"
+version = "0.1.33"
+edition = "2021"
+
+[dependencies]
+manager-supervisor = { path = "../manager-supervisor" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,825 @@
+//! Hermetic [`SystemOps`](crate::SystemOps) test harness.
+//!
+//! [`FakeSystemOps`] records every effect (commands, spawns, downloads,
+//! HTTP, file writes) and serves scripted responses, so step tests run
+//! without GPUs, networks, or installers. Other crates may reuse it for
+//! their own wizard-adjacent tests.
+
+use crate::{CommandOutput, GpuDescriptor, HttpResponse, PlannedCommand, SystemOps, WizardError};
+use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// Scripted behavior for one command invocation.
+#[derive(Debug, Clone)]
+pub enum FakeCommandBehavior {
+    Output(CommandOutput),
+    Fail {
+        code: i32,
+        stderr: String,
+    },
+    /// Successive invocations of the same argv yield successive
+    /// queued behaviors; once one behavior remains it repeats for
+    /// every later invocation. For commands whose result changes
+    /// because the step itself changed the world between calls
+    /// (a probe that fails, a repair, the same probe passing).
+    Sequence(Arc<Mutex<VecDeque<FakeCommandBehavior>>>),
+}
+
+impl FakeCommandBehavior {
+    fn into_result(self, argv: &[String]) -> Result<CommandOutput, WizardError> {
+        match self {
+            FakeCommandBehavior::Output(o) => Ok(o),
+            FakeCommandBehavior::Fail { code, stderr } => Err(WizardError::CommandFailed {
+                argv: argv.to_vec(),
+                code,
+                stderr,
+            }),
+            FakeCommandBehavior::Sequence(queue) => {
+                let next = {
+                    let mut q = queue.lock().unwrap();
+                    if q.len() > 1 {
+                        q.pop_front()
+                    } else {
+                        q.front().cloned()
+                    }
+                };
+                match next {
+                    Some(behavior) => behavior.into_result(argv),
+                    // An empty sequence behaves like an unscripted
+                    // command: succeed quietly.
+                    None => Ok(CommandOutput {
+                        exit_code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    }),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FakeState {
+    commands: HashMap<String, FakeCommandBehavior>,
+    executed: Vec<Vec<String>>,
+    /// Full command (argv + env + cwd) of every `run_command` call,
+    /// parallel to `executed`: lets tests assert on the environment
+    /// a step ran a command with (e.g. a PATH prepend).
+    executed_cmds: Vec<PlannedCommand>,
+    spawns: Vec<Vec<String>>,
+    /// Env map of each `spawn_detached` call, parallel to `spawns`.
+    spawn_envs: Vec<HashMap<String, String>>,
+    /// Full command of each `spawn_detached` call, parallel to `spawns`.
+    spawn_cmds: Vec<PlannedCommand>,
+    /// When true, a spawned pid is NOT registered as live, simulating
+    /// a process that exits immediately after spawn.
+    spawn_dies: bool,
+    files: HashMap<PathBuf, Vec<u8>>,
+    /// Scripted `file_len` results, consulted before the files map:
+    /// lets a test give a file a length (e.g. a multi-GiB catalog
+    /// size) without storing that many bytes.
+    file_lens: HashMap<PathBuf, u64>,
+    downloads: HashMap<String, Vec<u8>>,
+    progress_calls: Vec<(u64, u64)>,
+    downloaded_to: Vec<(String, PathBuf)>,
+    extracted: Vec<(PathBuf, PathBuf)>,
+    /// (archive, dest, prefix, strip_prefix) tar.gz extraction calls.
+    extracted_tar_gz: Vec<(PathBuf, PathBuf, String, String)>,
+    /// (archive, dest, prefixes, strip_prefix) zip-prefix extraction calls.
+    extracted_zip_prefixes: Vec<(PathBuf, PathBuf, Vec<String>, String)>,
+    /// Argv of every `run_elevated` call, in order.
+    elevated: Vec<Vec<String>>,
+    /// Files an extraction materializes: when an extract call's dest
+    /// is a prefix of a staged path, the file appears in the fake fs.
+    extraction_files: Vec<(PathBuf, Vec<u8>)>,
+    /// When set, `run_elevated` fails with this reason (e.g. the user
+    /// declined the UAC prompt).
+    elevated_error: Option<String>,
+    http_get: HashMap<String, HttpResponse>,
+    /// Successive GET responses for one URL (the last repeats),
+    /// consulted before the static `http_get` map: scripts a server
+    /// whose answers change over time (e.g. healthy, then gone).
+    http_get_seq: HashMap<String, Vec<HttpResponse>>,
+    http_post: HashMap<String, HttpResponse>,
+    /// Every directory passed to `remove_dir_all`, in order.
+    removed_dirs: Vec<PathBuf>,
+    posts: Vec<(String, String)>,
+    gets: Vec<String>,
+    gpus: Vec<GpuDescriptor>,
+    gpu_error: Option<String>,
+    credentials: HashSet<String>,
+    /// Scripted credential values served by `credential_read`.
+    credential_values: HashMap<String, String>,
+    /// Pids `process_alive` reports as running.
+    live_pids: HashSet<u32>,
+    /// Every pid passed to a successful `kill_process`, in order.
+    killed_pids: Vec<u32>,
+    /// When true, `kill_process` fails (and the pid stays live).
+    kill_fails: bool,
+    home: Option<PathBuf>,
+    /// Scripted VS Code CLI resolution (`vscode_cli`).
+    vscode_cli: Option<String>,
+    free_space: u64,
+    head_lengths: HashMap<String, u64>,
+}
+
+impl Default for FakeState {
+    fn default() -> Self {
+        Self {
+            commands: HashMap::new(),
+            executed: Vec::new(),
+            executed_cmds: Vec::new(),
+            spawns: Vec::new(),
+            spawn_envs: Vec::new(),
+            spawn_cmds: Vec::new(),
+            spawn_dies: false,
+            files: HashMap::new(),
+            file_lens: HashMap::new(),
+            downloads: HashMap::new(),
+            progress_calls: Vec::new(),
+            downloaded_to: Vec::new(),
+            extracted: Vec::new(),
+            extracted_tar_gz: Vec::new(),
+            extracted_zip_prefixes: Vec::new(),
+            elevated: Vec::new(),
+            extraction_files: Vec::new(),
+            elevated_error: None,
+            http_get: HashMap::new(),
+            http_get_seq: HashMap::new(),
+            http_post: HashMap::new(),
+            removed_dirs: Vec::new(),
+            posts: Vec::new(),
+            gets: Vec::new(),
+            gpus: Vec::new(),
+            gpu_error: None,
+            credentials: HashSet::new(),
+            credential_values: HashMap::new(),
+            live_pids: HashSet::new(),
+            killed_pids: Vec::new(),
+            kill_fails: false,
+            home: None,
+            vscode_cli: None,
+            // Default: effectively unlimited, so existing tests never trip
+            // the disk-space pre-check.
+            free_space: u64::MAX,
+            head_lengths: HashMap::new(),
+        }
+    }
+}
+
+fn key(argv: &[String]) -> String {
+    argv.join("\u{1f}")
+}
+
+/// Hermetic test double for [`SystemOps`].
+///
+/// Unregistered commands succeed with empty output; unregistered downloads
+/// and HTTP calls fail. Use the `with_*` builders to script behavior and
+/// the accessors to assert on recorded effects.
+#[derive(Debug, Default)]
+pub struct FakeSystemOps {
+    state: Mutex<FakeState>,
+}
+
+impl FakeSystemOps {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Script a command's response, matched on exact argv.
+    pub fn with_command(&self, argv: &[&str], output: CommandOutput) -> &Self {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        self.state
+            .lock()
+            .unwrap()
+            .commands
+            .insert(key(&argv), FakeCommandBehavior::Output(output));
+        self
+    }
+
+    /// Script successive responses for one argv, matched exactly:
+    /// invocations yield the queued outputs in order, and the last
+    /// one repeats once the queue drains. For a probe whose answer
+    /// changes because the step changed the world between calls
+    /// (import fails → generate → import passes).
+    pub fn with_command_sequence(&self, argv: &[&str], outputs: Vec<CommandOutput>) -> &Self {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let queue: VecDeque<FakeCommandBehavior> = outputs
+            .into_iter()
+            .map(FakeCommandBehavior::Output)
+            .collect();
+        self.state.lock().unwrap().commands.insert(
+            key(&argv),
+            FakeCommandBehavior::Sequence(Arc::new(Mutex::new(queue))),
+        );
+        self
+    }
+
+    /// Script a command failure, matched on exact argv.
+    pub fn with_command_failure(&self, argv: &[&str], code: i32, stderr: &str) -> &Self {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        self.state.lock().unwrap().commands.insert(
+            key(&argv),
+            FakeCommandBehavior::Fail {
+                code,
+                stderr: stderr.to_string(),
+            },
+        );
+        self
+    }
+
+    /// Convenience: script `code --list-extensions` output.
+    pub fn with_listed_extensions(&self, extensions: &[&str]) -> &Self {
+        self.with_command(
+            &["code", "--list-extensions"],
+            CommandOutput {
+                exit_code: 0,
+                stdout: extensions.join("\n"),
+                stderr: String::new(),
+            },
+        )
+    }
+
+    pub fn with_file(&self, path: PathBuf, bytes: Vec<u8>) -> &Self {
+        self.state.lock().unwrap().files.insert(path, bytes);
+        self
+    }
+
+    /// Script the length `file_len` reports for `path`, independent
+    /// of any stored bytes (see `FakeState::file_lens`).
+    pub fn with_file_len(&self, path: PathBuf, len: u64) -> &Self {
+        self.state.lock().unwrap().file_lens.insert(path, len);
+        self
+    }
+
+    pub fn with_download(&self, url: &str, bytes: Vec<u8>) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .downloads
+            .insert(url.to_string(), bytes);
+        self
+    }
+
+    /// Script the VS Code CLI location the ops layer resolves
+    /// (as if found via the registry / install locations).
+    pub fn with_vscode_cli(&self, cli: &str) -> &Self {
+        self.state.lock().unwrap().vscode_cli = Some(cli.to_string());
+        self
+    }
+
+    pub fn with_http_get(&self, url: &str, resp: HttpResponse) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .http_get
+            .insert(url.to_string(), resp);
+        self
+    }
+
+    /// Script successive GET responses for one URL: each call takes
+    /// the next response, and the last one repeats — the GET
+    /// analogue of [`Self::with_command_sequence`].
+    pub fn with_http_get_sequence(&self, url: &str, resps: Vec<HttpResponse>) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .http_get_seq
+            .insert(url.to_string(), resps);
+        self
+    }
+
+    /// Directories removed via `remove_dir_all`, in order.
+    pub fn removed_dirs(&self) -> Vec<PathBuf> {
+        self.state.lock().unwrap().removed_dirs.clone()
+    }
+
+    pub fn with_http_post(&self, url: &str, resp: HttpResponse) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .http_post
+            .insert(url.to_string(), resp);
+        self
+    }
+
+    pub fn with_gpus(&self, gpus: Vec<GpuDescriptor>) -> &Self {
+        self.state.lock().unwrap().gpus = gpus;
+        self
+    }
+
+    pub fn with_gpu_error(&self, msg: &str) -> &Self {
+        self.state.lock().unwrap().gpu_error = Some(msg.to_string());
+        self
+    }
+
+    pub fn with_credential(&self, target: &str) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .credentials
+            .insert(target.to_string());
+        self
+    }
+
+    /// Script a credential value: `credential_exists` reports the target
+    /// and `credential_read` returns the value.
+    pub fn with_credential_value(&self, target: &str, value: &str) -> &Self {
+        let mut st = self.state.lock().unwrap();
+        st.credentials.insert(target.to_string());
+        st.credential_values
+            .insert(target.to_string(), value.to_string());
+        drop(st);
+        self
+    }
+
+    /// Script a pid as currently running (for `process_alive`).
+    pub fn with_live_pid(&self, pid: u32) -> &Self {
+        self.state.lock().unwrap().live_pids.insert(pid);
+        self
+    }
+
+    /// Script `kill_process` to fail (the pid stays live).
+    pub fn with_kill_failure(&self) -> &Self {
+        self.state.lock().unwrap().kill_fails = true;
+        self
+    }
+
+    /// Every pid passed to a successful `kill_process`, in order.
+    pub fn killed_pids(&self) -> Vec<u32> {
+        self.state.lock().unwrap().killed_pids.clone()
+    }
+
+    pub fn with_home(&self, home: PathBuf) -> &Self {
+        self.state.lock().unwrap().home = Some(home);
+        self
+    }
+
+    /// Script the free space reported by `free_space_bytes`.
+    pub fn with_free_space(&self, bytes: u64) -> &Self {
+        self.state.lock().unwrap().free_space = bytes;
+        self
+    }
+
+    /// Script the Content-Length reported by `http_head_content_length`.
+    pub fn with_head_length(&self, url: &str, bytes: u64) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .head_lengths
+            .insert(url.to_string(), bytes);
+        self
+    }
+
+    /// Every argv passed to `run_command`, in order.
+    pub fn executed_commands(&self) -> Vec<Vec<String>> {
+        self.state.lock().unwrap().executed.clone()
+    }
+
+    /// Every full command passed to `run_command`, in order
+    /// (parallel to [`Self::executed_commands`]), env included.
+    pub fn executed_cmds(&self) -> Vec<PlannedCommand> {
+        self.state.lock().unwrap().executed_cmds.clone()
+    }
+
+    /// Every argv passed to `spawn_detached`, in order.
+    pub fn spawns(&self) -> Vec<Vec<String>> {
+        self.state.lock().unwrap().spawns.clone()
+    }
+
+    /// Env map of every `spawn_detached` call, in order (parallel to
+    /// [`Self::spawns`]).
+    pub fn spawn_envs(&self) -> Vec<HashMap<String, String>> {
+        self.state.lock().unwrap().spawn_envs.clone()
+    }
+
+    /// Full command of every `spawn_detached` call, in order (parallel
+    /// to [`Self::spawns`]).
+    /// The stored value for a credential target, if any (test view of
+    /// what `credential_write` persisted).
+    pub fn credential_value(&self, target: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .credential_values
+            .get(target)
+            .cloned()
+    }
+
+    pub fn spawn_cmds(&self) -> Vec<PlannedCommand> {
+        self.state.lock().unwrap().spawn_cmds.clone()
+    }
+
+    /// Script spawned processes as exiting immediately: the pid is
+    /// never registered as live.
+    pub fn with_dead_spawn(&self) -> &Self {
+        self.state.lock().unwrap().spawn_dies = true;
+        self
+    }
+
+    /// (url, dest) download calls, in order.
+    pub fn downloads_made(&self) -> Vec<(String, PathBuf)> {
+        self.state.lock().unwrap().downloaded_to.clone()
+    }
+
+    /// (archive, dest) extraction calls, in order.
+    /// Script `run_elevated` to fail with this reason (e.g. the user
+    /// declined the UAC prompt).
+    pub fn with_elevated_error(&self, reason: &str) -> &Self {
+        self.state.lock().unwrap().elevated_error = Some(reason.to_string());
+        self
+    }
+
+    /// (archive, dest, prefix, strip_prefix) tar.gz extraction calls.
+    pub fn tar_gz_extractions(&self) -> Vec<(PathBuf, PathBuf, String, String)> {
+        self.state.lock().unwrap().extracted_tar_gz.clone()
+    }
+
+    /// (archive, dest, prefixes, strip_prefix) zip-prefix extraction calls.
+    pub fn zip_prefix_extractions(&self) -> Vec<(PathBuf, PathBuf, Vec<String>, String)> {
+        self.state.lock().unwrap().extracted_zip_prefixes.clone()
+    }
+
+    /// Argv of every `run_elevated` call, in order.
+    pub fn elevated_calls(&self) -> Vec<Vec<String>> {
+        self.state.lock().unwrap().elevated.clone()
+    }
+
+    pub fn extractions(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.state.lock().unwrap().extracted.clone()
+    }
+
+    /// (url, body) POST calls, in order.
+    pub fn posts(&self) -> Vec<(String, String)> {
+        self.state.lock().unwrap().posts.clone()
+    }
+
+    /// GET urls requested, in order.
+    pub fn gets(&self) -> Vec<String> {
+        self.state.lock().unwrap().gets.clone()
+    }
+
+    /// Current fake file contents.
+    pub fn file_bytes(&self, path: &PathBuf) -> Option<Vec<u8>> {
+        self.state.lock().unwrap().files.get(path).cloned()
+    }
+
+    /// Every (url, dest) passed to `download`, in order.
+    pub fn downloaded_to(&self) -> Vec<(String, PathBuf)> {
+        self.state.lock().unwrap().downloaded_to.clone()
+    }
+
+    /// Stage a file an extraction will produce: after any extract
+    /// call whose dest prefixes `path`, the file exists in the fake
+    /// fs with these bytes.
+    pub fn with_extracted_file(&self, path: PathBuf, bytes: Vec<u8>) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .extraction_files
+            .push((path, bytes));
+        self
+    }
+
+    fn materialize_extraction(st: &mut FakeState, dest: &Path) {
+        let staged: Vec<(PathBuf, Vec<u8>)> = st
+            .extraction_files
+            .iter()
+            .filter(|(p, _)| p.starts_with(dest))
+            .cloned()
+            .collect();
+        for (path, bytes) in staged {
+            st.files.insert(path, bytes);
+        }
+    }
+
+    pub fn ok_output(stdout: &str) -> CommandOutput {
+        CommandOutput {
+            exit_code: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    pub fn http_ok(body: &str) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            body: body.as_bytes().to_vec(),
+            elapsed_ms: 12,
+        }
+    }
+}
+
+#[async_trait]
+impl SystemOps for FakeSystemOps {
+    async fn vscode_cli(&self) -> Option<String> {
+        self.state.lock().unwrap().vscode_cli.clone()
+    }
+
+    async fn run_command(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.executed.push(cmd.argv.clone());
+        st.executed_cmds.push(cmd.clone());
+        match st.commands.get(&key(&cmd.argv)).cloned() {
+            Some(behavior) => behavior.into_result(&cmd.argv),
+            // Default: succeed quietly so tests only script what they assert on.
+            None => Ok(CommandOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        }
+    }
+
+    async fn spawn_detached(&self, cmd: &PlannedCommand) -> Result<u32, WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.spawns.push(cmd.argv.clone());
+        st.spawn_envs.push(cmd.env.clone());
+        st.spawn_cmds.push(cmd.clone());
+        // The scripted spawn is a live process until killed, unless the
+        // test scripted an immediately-exiting process.
+        if !st.spawn_dies {
+            st.live_pids.insert(4242);
+        }
+        Ok(4242)
+    }
+
+    fn process_alive(&self, pid: u32) -> bool {
+        self.state.lock().unwrap().live_pids.contains(&pid)
+    }
+
+    fn kill_process(&self, pid: u32) -> std::io::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        if st.kill_fails {
+            return Err(std::io::Error::other("scripted kill failure"));
+        }
+        st.live_pids.remove(&pid);
+        st.killed_pids.push(pid);
+        Ok(())
+    }
+
+    async fn download(
+        &self,
+        url: &str,
+        dest: &Path,
+        on_progress: &(dyn Fn(u64, u64) + Sync),
+    ) -> Result<u64, WizardError> {
+        let mut st = self.state.lock().unwrap();
+        let bytes = st
+            .downloads
+            .get(url)
+            .cloned()
+            .ok_or_else(|| WizardError::DownloadFailed {
+                url: url.to_string(),
+                reason: "no scripted download for this URL".to_string(),
+            })?;
+        let total = bytes.len() as u64;
+        on_progress(total / 2, total);
+        on_progress(total, total);
+        st.progress_calls.push((total / 2, total));
+        st.progress_calls.push((total, total));
+        st.downloaded_to.push((url.to_string(), dest.to_path_buf()));
+        st.files.insert(dest.to_path_buf(), bytes);
+        Ok(total)
+    }
+
+    async fn extract_zip(&self, archive: &Path, dest: &Path) -> Result<(), WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.extracted
+            .push((archive.to_path_buf(), dest.to_path_buf()));
+        Self::materialize_extraction(&mut st, dest);
+        Ok(())
+    }
+
+    async fn extract_tar_gz(
+        &self,
+        archive: &Path,
+        dest: &Path,
+        prefix: &str,
+        strip_prefix: &str,
+    ) -> Result<(), WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.extracted_tar_gz.push((
+            archive.to_path_buf(),
+            dest.to_path_buf(),
+            prefix.to_string(),
+            strip_prefix.to_string(),
+        ));
+        Self::materialize_extraction(&mut st, dest);
+        Ok(())
+    }
+
+    async fn extract_zip_prefixes(
+        &self,
+        archive: &Path,
+        dest: &Path,
+        prefixes: &[&str],
+        strip_prefix: &str,
+    ) -> Result<(), WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.extracted_zip_prefixes.push((
+            archive.to_path_buf(),
+            dest.to_path_buf(),
+            prefixes.iter().map(|p| p.to_string()).collect(),
+            strip_prefix.to_string(),
+        ));
+        Self::materialize_extraction(&mut st, dest);
+        Ok(())
+    }
+
+    async fn run_elevated(&self, cmd: &PlannedCommand) -> Result<CommandOutput, WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.elevated.push(cmd.argv.clone());
+        if let Some(reason) = &st.elevated_error {
+            return Err(WizardError::IoError {
+                path: PathBuf::from(cmd.argv.first().cloned().unwrap_or_default()),
+                reason: reason.clone(),
+            });
+        }
+        Ok(CommandOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+
+    async fn http_get(&self, url: &str) -> Result<HttpResponse, WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.gets.push(url.to_string());
+        if let Some(seq) = st.http_get_seq.get_mut(url) {
+            if seq.len() > 1 {
+                return Ok(seq.remove(0));
+            }
+            if let Some(resp) = seq.first() {
+                return Ok(resp.clone());
+            }
+        }
+        st.http_get
+            .get(url)
+            .cloned()
+            .ok_or_else(|| WizardError::HttpError {
+                url: url.to_string(),
+                reason: "no scripted GET response for this URL".to_string(),
+            })
+    }
+
+    async fn http_post(&self, url: &str, body: &str) -> Result<HttpResponse, WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.posts.push((url.to_string(), body.to_string()));
+        st.http_post
+            .get(url)
+            .cloned()
+            .ok_or_else(|| WizardError::HttpError {
+                url: url.to_string(),
+                reason: "no scripted POST response for this URL".to_string(),
+            })
+    }
+
+    async fn http_head_content_length(&self, url: &str) -> Result<Option<u64>, WizardError> {
+        Ok(self.state.lock().unwrap().head_lengths.get(url).copied())
+    }
+
+    async fn free_space_bytes(&self, _path: &Path) -> Result<u64, WizardError> {
+        Ok(self.state.lock().unwrap().free_space)
+    }
+
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>, WizardError> {
+        self.state
+            .lock()
+            .unwrap()
+            .files
+            .get(path)
+            .cloned()
+            .ok_or_else(|| WizardError::IoError {
+                path: path.to_path_buf(),
+                reason: "file not found in fake fs".to_string(),
+            })
+    }
+
+    async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), WizardError> {
+        self.state
+            .lock()
+            .unwrap()
+            .files
+            .insert(path.to_path_buf(), data.to_vec());
+        Ok(())
+    }
+
+    async fn remove_file(&self, path: &Path) -> Result<(), WizardError> {
+        self.state.lock().unwrap().files.remove(path);
+        Ok(())
+    }
+
+    async fn remove_dir_all(&self, path: &Path) -> Result<(), WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.removed_dirs.push(path.to_path_buf());
+        st.files.retain(|p, _| !p.starts_with(path));
+        Ok(())
+    }
+
+    async fn file_exists(&self, path: &Path) -> bool {
+        self.state.lock().unwrap().files.contains_key(path)
+    }
+
+    async fn file_len(&self, path: &Path) -> Option<u64> {
+        let st = self.state.lock().unwrap();
+        if let Some(len) = st.file_lens.get(path) {
+            return Some(*len);
+        }
+        st.files.get(path).map(|data| data.len() as u64)
+    }
+
+    async fn sha256_file(&self, path: &Path) -> Result<String, WizardError> {
+        let data = self.read_file(path).await?;
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    async fn gpu_inventory(&self) -> Result<Vec<GpuDescriptor>, WizardError> {
+        let st = self.state.lock().unwrap();
+        if let Some(msg) = &st.gpu_error {
+            return Err(WizardError::GpuProbeFailed(msg.clone()));
+        }
+        Ok(st.gpus.clone())
+    }
+
+    async fn credential_exists(&self, target: &str) -> Result<bool, WizardError> {
+        Ok(self.state.lock().unwrap().credentials.contains(target))
+    }
+
+    async fn credential_read(&self, target: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .credential_values
+            .get(target)
+            .cloned()
+    }
+
+    async fn credential_write(&self, target: &str, secret: &str) -> Result<(), WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.credentials.insert(target.to_string());
+        st.credential_values
+            .insert(target.to_string(), secret.to_string());
+        Ok(())
+    }
+
+    fn home_dir(&self) -> Option<PathBuf> {
+        self.state.lock().unwrap().home.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unscripted_command_succeeds_quietly() {
+        let ops = FakeSystemOps::new();
+        let out = ops
+            .run_command(&PlannedCommand::new(vec!["whatever".to_string()]))
+            .await
+            .unwrap();
+        assert!(out.success());
+        assert_eq!(ops.executed_commands().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scripted_command_failure_surfaces() {
+        let ops = FakeSystemOps::new();
+        ops.with_command_failure(&["uv", "venv"], 1, "uv not found");
+        let err = ops
+            .run_command(&PlannedCommand::new(vec![
+                "uv".to_string(),
+                "venv".to_string(),
+            ]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WizardError::CommandFailed { code: 1, .. }));
+    }
+
+    #[tokio::test]
+    async fn unscripted_download_fails_closed() {
+        let ops = FakeSystemOps::new();
+        let err = ops
+            .download("https://example.com/x", &PathBuf::from("x"), &|_, _| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WizardError::DownloadFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn fake_sha256_matches_real_algorithm() {
+        let ops = FakeSystemOps::new();
+        let p = PathBuf::from("f.bin");
+        ops.with_file(p.clone(), b"hello".to_vec());
+        assert_eq!(
+            ops.sha256_file(&p).await.unwrap(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+}
