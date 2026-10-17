@@ -3012,6 +3012,7 @@ async fn record_gateway_change(
         }
     }
     let started_at = backend_start_times(state).await;
+    let running = backend_running_ids(state).await;
     let configured: std::collections::HashSet<String> =
         post.backends.iter().map(|b| b.id.clone()).collect();
     activation::record_change(
@@ -3024,6 +3025,7 @@ async fn record_gateway_change(
         Vec::new(),
         &started_at,
         &configured,
+        &running,
     )
 }
 
@@ -3043,6 +3045,7 @@ async fn record_backend_change(
     backend_id: &str,
 ) -> Result<(), String> {
     let started_at = backend_start_times(state).await;
+    let running = backend_running_ids(state).await;
     let configured: std::collections::HashSet<String> =
         post.backends.iter().map(|b| b.id.clone()).collect();
     activation::record_change(
@@ -3055,6 +3058,7 @@ async fn record_backend_change(
         vec![backend_id.to_string()],
         &started_at,
         &configured,
+        &running,
     )
 }
 
@@ -4041,23 +4045,30 @@ async fn gateway_status(state: State<'_, AppState>) -> ApiResult {
     };
     let routing_log_len = state.routing_log.lock().await.len();
     // Activation-plan state for the status surfaces: saved changes
-    // nothing has activated yet (journal entries no gateway start
-    // or backend (re)start has resolved, or live config drift).
+    // that are genuinely pending — a running process still holds
+    // the pre-change state (pending_entries applies the live-state
+    // rule: changes whose targets are all stopped, or whose
+    // gateway is down, are already effective at the next start and
+    // never count here) — or live config drift while the gateway
+    // is up serving the stale file.
     let (activation_pending, activation_changes) = {
         let cfg = state.config.read().await;
         let journal = activation::load_journal(&state.data_dir);
         let started_at = backend_start_times(&state).await;
+        let running = backend_running_ids(&state).await;
         let configured: std::collections::HashSet<String> =
             cfg.backends.iter().map(|b| b.id.clone()).collect();
-        let unresolved = activation::unresolved_entries_scoped(
+        let pending = activation::pending_entries(
             &state.data_dir,
             &journal,
             &started_at,
             &configured,
+            &running,
+            up,
         );
         (
-            !unresolved.is_empty() || activation::config_drift(&cfg, &state.data_dir),
-            unresolved.len(),
+            !pending.is_empty() || (activation::config_drift(&cfg, &state.data_dir) && up),
+            pending.len(),
         )
     };
     Ok(json!({
@@ -4081,7 +4092,11 @@ async fn gateway_status(state: State<'_, AppState>) -> ApiResult {
 /// decision depends on. Each change carries its `activation`:
 /// `gateway_restart`, `restart` (a running backend must restart),
 /// or `next_start` (nothing running holds the old state; the change
-/// takes effect when the relevant process next starts).
+/// takes effect when the relevant process next starts). Changes
+/// whose targets are all stopped — or whose gateway is down — are
+/// already effective by that same rule and are NOT part of the
+/// plan: the plan exists only while a running process holds
+/// pre-change state (activation::pending_entries).
 #[tauri::command]
 async fn gateway_activation_plan(state: State<'_, AppState>) -> ApiResult {
     let cfg = state.config.read().await.clone();
@@ -4090,22 +4105,28 @@ async fn gateway_activation_plan(state: State<'_, AppState>) -> ApiResult {
     let running = backend_running_ids(&state).await;
     let configured: std::collections::HashSet<String> =
         cfg.backends.iter().map(|b| b.id.clone()).collect();
-    let unresolved =
-        activation::unresolved_entries_scoped(&state.data_dir, &journal, &started_at, &configured);
-    let drift = activation::config_drift(&cfg, &state.data_dir);
-    let pending = !unresolved.is_empty() || drift;
     let probe_host = manager_wizard::steps::gateway_probe_host(&cfg);
     let port = cfg.gateway.port;
     let up = tokio::task::spawn_blocking(move || probe_gateway(&probe_host, port))
         .await
         .unwrap_or(false);
+    let pending_entries = activation::pending_entries(
+        &state.data_dir,
+        &journal,
+        &started_at,
+        &configured,
+        &running,
+        up,
+    );
+    let drift = activation::config_drift(&cfg, &state.data_dir);
+    let pending = !pending_entries.is_empty() || (drift && up);
     let entry_ts = |e: &activation::ActivationEntry| {
         chrono::DateTime::parse_from_rfc3339(&e.ts)
             .ok()
             .map(|t| t.with_timezone(&chrono::Utc))
     };
     let mut backend_restart_ids: Vec<String> = Vec::new();
-    let changes: Vec<Value> = unresolved
+    let changes: Vec<Value> = pending_entries
         .iter()
         .map(|e| {
             let activation_kind = if e.scope == "backend" {
@@ -4145,8 +4166,8 @@ async fn gateway_activation_plan(state: State<'_, AppState>) -> ApiResult {
             })
         })
         .collect();
-    let gateway_pending = drift
-        || unresolved.iter().any(|e| e.scope != "backend")
+    let gateway_pending = (drift && up)
+        || pending_entries.iter().any(|e| e.scope != "backend")
         || changes.iter().any(|c| c["activation"] == "gateway_restart");
     let actionable = gateway_pending || changes.iter().any(|c| c["activation"] == "restart");
     Ok(json!({
@@ -4158,25 +4179,41 @@ async fn gateway_activation_plan(state: State<'_, AppState>) -> ApiResult {
         "actionable": actionable,
         "backend_restart_ids": backend_restart_ids,
         "changes": changes,
-        "snapshot_available": journal.snapshot.is_some() && !unresolved.is_empty(),
+        "snapshot_available": journal.snapshot.is_some() && !pending_entries.is_empty(),
     }))
 }
 
 /// Cancel the pending activation plan's changes: restore the
-/// configuration snapshot taken before the first unresolved change.
+/// configuration snapshot taken before the first pending change.
 /// Refused when the configuration has changed through another path
 /// since (the restore would discard that change too).
 #[tauri::command]
 async fn gateway_activation_cancel(state: State<'_, AppState>) -> ApiResult {
     let mut cfg = state.config.write().await;
-    // Scoped resolution with the real start times: entries whose
-    // changes are already live (their backends restarted) are not
-    // pending and must not be "cancelled" (code-review 4.1).
+    // Live-state resolution with the real start times, running set,
+    // and gateway probe: entries whose changes are already live
+    // (their backends restarted) or already effective (their
+    // targets are stopped, the gateway is down) are not pending
+    // and must not be "cancelled" (code-review 4.1; Pete's report,
+    // 2026-10-17 — cancel was the only resolution offered for an
+    // already-effective change, and it reverted the edit).
     let started_at = backend_start_times(&state).await;
+    let running = backend_running_ids(&state).await;
     let configured: std::collections::HashSet<String> =
         cfg.backends.iter().map(|b| b.id.clone()).collect();
-    let restored = match activation::cancel_target(&state.data_dir, &cfg, &started_at, &configured)
-    {
+    let probe_host = manager_wizard::steps::gateway_probe_host(&cfg);
+    let port = cfg.gateway.port;
+    let up = tokio::task::spawn_blocking(move || probe_gateway(&probe_host, port))
+        .await
+        .unwrap_or(false);
+    let restored = match activation::cancel_target(
+        &state.data_dir,
+        &cfg,
+        &started_at,
+        &configured,
+        &running,
+        up,
+    ) {
         Ok(Some(restored)) => restored,
         Ok(None) => return Ok(json!({ "cancelled": false, "reason": "no pending changes" })),
         Err(msg) => return Err(err(ApiError::InvalidInput(msg))),
@@ -7015,6 +7052,7 @@ mod tests {
             vec!["coder".to_string()],
             &std::collections::HashMap::new(),
             &configured,
+            &std::collections::HashSet::new(),
         )
         .unwrap();
         let journal = activation::load_journal(&dir);

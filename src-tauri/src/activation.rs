@@ -25,6 +25,19 @@
 //! YAML differing from the file), which also catches changes made
 //! outside the journaled commands.
 //!
+//! Unresolved is not the same as pending. A change is genuinely
+//! pending only while a running process still holds the pre-change
+//! state: a backend-scope entry whose targets are all stopped is
+//! already effective (the next start launches from the saved
+//! configuration — specs are re-registered from the live config on
+//! every save), and a gateway-scope entry is already effective
+//! while the gateway is down (its next start regenerates the YAML
+//! from the saved configuration). [`pending_entries`] applies that
+//! live-state rule; presenting an already-effective change as a
+//! pending plan demands an operator decision that cannot be acted
+//! on — its only offered resolution was cancelling the edit itself
+//! (Pete's report, 2026-10-17).
+//!
 //! Cancel semantics: the first unresolved entry snapshots the
 //! pre-change configuration. Cancelling restores that snapshot —
 //! refused when the current configuration no longer matches the
@@ -175,6 +188,53 @@ pub fn unresolved_entries_scoped(
         .collect()
 }
 
+/// The subset of the strict-unresolved entries that is genuinely
+/// pending once live process state is accounted for (see the module
+/// docs): an entry is pending only while a running process still
+/// holds its pre-change state.
+///
+/// - `backend` scope: pending when some target is running and has
+///   not (re)started at or after the entry — the same staleness
+///   test the plan's restart classification applies, so a pending
+///   backend entry always classifies `restart`. A target that is
+///   stopped makes its change already effective, never pending; a
+///   running target with no known start (adopted) counts as stale,
+///   so adopted processes stay pending, never silently effective.
+/// - `gateway` scope: pending only while the gateway is up
+///   (`gateway_up` is the caller's live probe result). A down
+///   gateway serves nothing, and its next start regenerates the
+///   YAML from the saved configuration.
+///
+/// Callers pass `running` from the same supervisor snapshot as
+/// `started_at` ([`backend_running_ids`] in the Tauri layer:
+/// Running or Starting processes).
+pub fn pending_entries(
+    data_dir: &Path,
+    journal: &ActivationJournal,
+    started_at: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    configured: &std::collections::HashSet<String>,
+    running: &std::collections::HashSet<String>,
+    gateway_up: bool,
+) -> Vec<ActivationEntry> {
+    unresolved_entries_scoped(data_dir, journal, started_at, configured)
+        .into_iter()
+        .filter(|e| {
+            if e.scope == "backend" {
+                let ts = entry_ts(e);
+                e.targets.iter().any(|t| {
+                    running.contains(t)
+                        && started_at
+                            .get(t)
+                            .map(|s| ts.map(|ts| *s < ts).unwrap_or(true))
+                            .unwrap_or(true)
+                })
+            } else {
+                gateway_up
+            }
+        })
+        .collect()
+}
+
 /// Whether the live configuration's generated gateway YAML differs
 /// from the file the running gateway was started with. A missing
 /// file (gateway never started) is not drift — nothing is running
@@ -202,7 +262,16 @@ fn normalize_yaml(text: &str) -> String {
 ///
 /// Resolution of the EXISTING entries uses the full scoped rule —
 /// the caller passes the running backends' real start times
-/// (`started_at`) and the configured backend ids. The gateway-only
+/// (`started_at`), the configured backend ids, and the running set
+/// (`running`). One prune goes further than the scoped rule:
+/// a backend-scope entry whose targets are all stopped is already
+/// effective (see [`pending_entries`]), so it prunes here too —
+/// otherwise it would anchor the cancel snapshot across a change
+/// no plan will ever show as pending. The running set is exact
+/// supervisor state, like the start times, so this cannot prune a
+/// change a running backend still holds. Gateway-scope entries
+/// prune only on the mtime rule: gateway liveness is a probe the
+/// record path does not perform. The gateway-only
 /// approximation this used before treated every backend-scope
 /// entry as unresolved forever (its start-time map was empty), so
 /// the prune never fired for them: entries accumulated past their
@@ -224,10 +293,17 @@ pub fn record_change(
     targets: Vec<String>,
     started_at: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
     configured: &std::collections::HashSet<String>,
+    running: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
     let _guard = journal_lock();
     let mut journal = load_journal(data_dir);
-    let unresolved = unresolved_entries_scoped(data_dir, &journal, started_at, configured);
+    let mut unresolved = unresolved_entries_scoped(data_dir, &journal, started_at, configured);
+    // Already-effective prune (see the doc comment): a backend
+    // entry with no running target is the configuration the next
+    // start launches with, so it leaves the journal here instead of
+    // anchoring the snapshot. An entry with any running target is
+    // kept whole — the running target's activation is still owed.
+    unresolved.retain(|e| e.scope != "backend" || e.targets.iter().any(|t| running.contains(t)));
     if unresolved.len() != journal.entries.len() || journal.entries.is_empty() {
         journal.entries = unresolved;
         if journal.entries.is_empty() {
@@ -267,25 +343,48 @@ pub fn clear_gateway_scope(data_dir: &Path) -> Result<(), String> {
 }
 
 /// The cancel target and its guard: the snapshot to restore, when
-/// the live configuration still matches the newest unresolved
-/// entry's post-change state. `Err` explains why cancel is refused.
+/// the live configuration still matches the newest pending entry's
+/// post-change state. `Err` explains why cancel is refused.
 ///
-/// Unresolved is computed with the full scoped rule (the caller
-/// passes real backend start times): a backend-scope entry whose
-/// backends already restarted is LIVE, not pending — cancelling
-/// must not "restore" over it (code-review 4.1).
+/// Pending is computed with live state ([`pending_entries`], on top
+/// of the full scoped rule): a backend-scope entry whose backends
+/// already restarted is LIVE, not pending — cancelling must not
+/// "restore" over it (code-review 4.1) — and an entry whose targets
+/// are all stopped (or whose gateway is down) is already effective
+/// the same way, so it is not the plan's to cancel either. When
+/// nothing is pending the answer is `None`, however many
+/// already-effective entries the journal still carries.
 pub fn cancel_target(
     data_dir: &Path,
     current: &AppConfig,
     started_at: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
     configured: &std::collections::HashSet<String>,
+    running: &std::collections::HashSet<String>,
+    gateway_up: bool,
 ) -> Result<Option<AppConfig>, String> {
     let _guard = journal_lock();
     let journal = load_journal(data_dir);
     let unresolved = unresolved_entries_scoped(data_dir, &journal, started_at, configured);
-    let Some(last) = unresolved.last() else {
+    let pending = pending_entries(
+        data_dir, &journal, started_at, configured, running, gateway_up,
+    );
+    let Some(last) = pending.last() else {
         return Ok(None);
     };
+    // Restoring the snapshot reverts EVERY journaled change back to
+    // it, including strict-unresolved entries that live state has
+    // already made effective (their targets are stopped; the change
+    // applies at the next start and is not pending). When any such
+    // entry exists, cancelling the pending set would silently
+    // discard it too — refuse, on the same principle as the
+    // post-change-state guard below.
+    if unresolved.len() != pending.len() {
+        return Err(
+            "some saved changes are already in effect because their targets are stopped — \
+             cancelling would discard those changes too, so the saved changes stand"
+                .to_string(),
+        );
+    }
     let current_value = serde_json::to_value(current)
         .map_err(|e| format!("current configuration is not serializable: {e}"))?;
     if current_value != last.config_after {
@@ -465,9 +564,12 @@ litellm_deployment_success_responses_total 9.0
                 .into_iter()
                 .collect();
         // The entry is live: nothing to cancel.
-        assert!(cancel_target(&dir, &cfg, &started, &configured)
-            .unwrap()
-            .is_none());
+        let running: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+        assert!(
+            cancel_target(&dir, &cfg, &started, &configured, &running, true)
+                .unwrap()
+                .is_none()
+        );
         // Recording a new change prunes the resolved entry and
         // restarts the snapshot from the new change's `pre`.
         let pre = cfg.clone();
@@ -483,6 +585,7 @@ litellm_deployment_success_responses_total 9.0
             Vec::new(),
             &started,
             &configured,
+            &running,
         )
         .unwrap();
         let journal = load_journal(&dir);
@@ -500,5 +603,283 @@ litellm_deployment_success_responses_total 9.0
         let e: ActivationEntry = serde_json::from_str(text).unwrap();
         assert_eq!(e.scope, "gateway");
         assert!(e.targets.is_empty());
+    }
+
+    fn ids(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn starts(
+        pairs: &[(&str, &str)],
+    ) -> std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> {
+        pairs.iter().map(|(k, v)| (k.to_string(), at(v))).collect()
+    }
+
+    #[test]
+    fn stopped_backend_change_is_not_pending() {
+        // Pete's report (2026-10-17): an offload edit on a stopped
+        // backend produced a pending plan with no Apply. The entry
+        // is strict-unresolved (the backend has never started since)
+        // but already effective — nothing runs the old flags, and
+        // the next start launches from the saved configuration.
+        let dir = Path::new("/nonexistent-activation-test");
+        let journal = ActivationJournal {
+            snapshot: None,
+            entries: vec![entry("backend", &["coder-nvidia"])],
+        };
+        let configured = ids(&["coder-nvidia"]);
+        let pending = pending_entries(dir, &journal, &starts(&[]), &configured, &ids(&[]), false);
+        assert!(pending.is_empty());
+        // The same for a gateway-scope entry while the gateway is
+        // down: its next start regenerates the YAML from the saved
+        // configuration, so the change is effective, not pending.
+        let journal = ActivationJournal {
+            snapshot: None,
+            entries: vec![entry("gateway", &[])],
+        };
+        let pending = pending_entries(dir, &journal, &starts(&[]), &configured, &ids(&[]), false);
+        assert!(pending.is_empty());
+        // ...but it IS pending while the gateway is up.
+        let pending = pending_entries(dir, &journal, &starts(&[]), &configured, &ids(&[]), true);
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn running_backend_change_is_pending() {
+        let dir = Path::new("/nonexistent-activation-test");
+        let journal = ActivationJournal {
+            snapshot: None,
+            entries: vec![entry("backend", &["coder"])],
+        };
+        let configured = ids(&["coder"]);
+        // Running, started BEFORE the 12:00 entry: the process
+        // holds the pre-change state — pending (restart class).
+        let pending = pending_entries(
+            dir,
+            &journal,
+            &starts(&[("coder", "2026-10-16T11:00:00+00:00")]),
+            &configured,
+            &ids(&["coder"]),
+            false,
+        );
+        assert_eq!(pending.len(), 1);
+        // Running with NO known start (adopted): stays pending —
+        // unknown uptime must never read as already effective.
+        let pending = pending_entries(
+            dir,
+            &journal,
+            &starts(&[]),
+            &configured,
+            &ids(&["coder"]),
+            false,
+        );
+        assert_eq!(pending.len(), 1);
+        // Running, (re)started AFTER the entry: the change is live
+        // (the strict rule already resolved it) — not pending.
+        let pending = pending_entries(
+            dir,
+            &journal,
+            &starts(&[("coder", "2026-10-16T13:00:00+00:00")]),
+            &configured,
+            &ids(&["coder"]),
+            false,
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn mixed_plan_only_the_running_targets_entry_is_pending() {
+        let dir = Path::new("/nonexistent-activation-test");
+        let journal = ActivationJournal {
+            snapshot: None,
+            entries: vec![
+                entry("backend", &["coder-nvidia"]),
+                entry("backend", &["coder"]),
+            ],
+        };
+        let configured = ids(&["coder-nvidia", "coder"]);
+        let pending = pending_entries(
+            dir,
+            &journal,
+            &starts(&[("coder", "2026-10-16T11:00:00+00:00")]),
+            &configured,
+            &ids(&["coder"]),
+            false,
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].targets, vec!["coder".to_string()]);
+    }
+
+    #[test]
+    fn next_start_of_stopped_backend_leaves_no_residue() {
+        // The stopped backend's entry is already effective before
+        // the start; after the start the strict rule resolves it,
+        // and the next record_change prunes it from the journal —
+        // no residue in the plan or the journal.
+        let dir = std::env::temp_dir().join(format!(
+            "activation-next-start-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = AppConfig::default_config();
+        let journal = ActivationJournal {
+            snapshot: Some(serde_json::to_value(&cfg).unwrap()),
+            entries: vec![entry("backend", &["coder"])],
+        };
+        save_journal(&dir, &journal).unwrap();
+        let configured = ids(&["coder"]);
+        // Before the start: not pending (already effective).
+        assert!(
+            pending_entries(&dir, &journal, &starts(&[]), &configured, &ids(&[]), false,)
+                .is_empty()
+        );
+        // After a start at 13:00 (entry is 12:00): strictly
+        // resolved, and recording a further change prunes it.
+        let started = starts(&[("coder", "2026-10-16T13:00:00+00:00")]);
+        assert!(unresolved_entries_scoped(&dir, &journal, &started, &configured).is_empty());
+        let mut post = cfg.clone();
+        post.gateway.port += 1;
+        record_change(
+            &dir,
+            &cfg,
+            &post,
+            "gateway_config",
+            "port".to_string(),
+            "gateway",
+            Vec::new(),
+            &started,
+            &configured,
+            &ids(&["coder"]),
+        )
+        .unwrap();
+        let journal = load_journal(&dir);
+        assert_eq!(journal.entries.len(), 1);
+        assert_eq!(journal.entries[0].kind, "gateway_config");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_change_prunes_an_already_effective_backend_entry() {
+        // A change recorded for a stopped backend, then another:
+        // the first entry prunes at the second record and the
+        // snapshot restarts from the second change's `pre` — the
+        // journal never accumulates already-effective entries.
+        let dir = std::env::temp_dir().join(format!(
+            "activation-effective-prune-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = AppConfig::default_config();
+        let configured = ids(&["coder"]);
+        let no_starts = starts(&[]);
+        let nobody_running = ids(&[]);
+        let mut post1 = cfg.clone();
+        post1.gateway.port += 1;
+        record_change(
+            &dir,
+            &cfg,
+            &post1,
+            "backend_flags",
+            "first".to_string(),
+            "backend",
+            vec!["coder".to_string()],
+            &no_starts,
+            &configured,
+            &nobody_running,
+        )
+        .unwrap();
+        let mut post2 = post1.clone();
+        post2.gateway.port += 1;
+        record_change(
+            &dir,
+            &post1,
+            &post2,
+            "backend_flags",
+            "second".to_string(),
+            "backend",
+            vec!["coder".to_string()],
+            &no_starts,
+            &configured,
+            &nobody_running,
+        )
+        .unwrap();
+        let journal = load_journal(&dir);
+        assert_eq!(journal.entries.len(), 1);
+        assert_eq!(journal.entries[0].summary, "second");
+        let snap: AppConfig =
+            serde_json::from_value(journal.snapshot.expect("snapshot restarted")).unwrap();
+        assert_eq!(snap.gateway.port, post1.gateway.port);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_uses_live_pending_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "activation-cancel-live-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg0 = AppConfig::default_config();
+        let mut cfg1 = cfg0.clone();
+        cfg1.gateway.port += 1;
+        let with_after = |scope: &str, targets: &[&str], after: &AppConfig| {
+            let mut e = entry(scope, targets);
+            e.config_after = serde_json::to_value(after).unwrap();
+            e
+        };
+        let configured = ids(&["coder", "coder-nvidia"]);
+        // Only an already-effective change (stopped target):
+        // nothing to cancel — the edit stands (Pete's case).
+        let journal = ActivationJournal {
+            snapshot: Some(serde_json::to_value(&cfg0).unwrap()),
+            entries: vec![with_after("backend", &["coder-nvidia"], &cfg1)],
+        };
+        save_journal(&dir, &journal).unwrap();
+        assert!(
+            cancel_target(&dir, &cfg1, &starts(&[]), &configured, &ids(&[]), false,)
+                .unwrap()
+                .is_none()
+        );
+        // A genuinely pending change (running target, started
+        // before the entry): cancel restores the snapshot.
+        let journal = ActivationJournal {
+            snapshot: Some(serde_json::to_value(&cfg0).unwrap()),
+            entries: vec![with_after("backend", &["coder"], &cfg1)],
+        };
+        save_journal(&dir, &journal).unwrap();
+        let started = starts(&[("coder", "2026-10-16T11:00:00+00:00")]);
+        let restored = cancel_target(&dir, &cfg1, &started, &configured, &ids(&["coder"]), false)
+            .unwrap()
+            .expect("pending change cancels");
+        assert_eq!(restored.gateway.port, cfg0.gateway.port);
+        // Pending + already-effective together: cancel refuses —
+        // restoring the snapshot would discard the effective change
+        // along with the pending one.
+        let mut cfg2 = cfg1.clone();
+        cfg2.gateway.port += 1;
+        let journal = ActivationJournal {
+            snapshot: Some(serde_json::to_value(&cfg0).unwrap()),
+            entries: vec![
+                with_after("backend", &["coder"], &cfg1),
+                with_after("backend", &["coder-nvidia"], &cfg2),
+            ],
+        };
+        save_journal(&dir, &journal).unwrap();
+        let err = cancel_target(&dir, &cfg2, &started, &configured, &ids(&["coder"]), false)
+            .expect_err("mixed pending + effective must refuse");
+        assert!(
+            err.contains("already in effect"),
+            "unexpected refusal: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
