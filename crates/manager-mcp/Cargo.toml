@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 manager-supervisor = { path = "../manager-supervisor" }
+manager-config = { path = "../manager-config" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

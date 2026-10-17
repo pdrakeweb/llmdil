@@ -343,10 +343,6 @@ pub struct AppState {
     /// `mcp-<id>`); pruning and orphan-surfacing in the backend commands
     /// must only ever touch ids in this set.
     backend_spec_ids: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// MCP server modes, overlaid on `manager_mcp::default_servers()`.
-    /// (No MCP section exists in `AppConfig` yet; modes are in-memory until
-    /// one lands.)
-    mcp_modes: Mutex<HashMap<String, manager_mcp::McpMode>>,
     /// Recent gateway routing decisions (spec §14 `gateway_recent_requests`).
     /// Every `gateway_test_routing` trace records here.
     routing_log: Mutex<manager_gateway::RoutingLog>,
@@ -390,7 +386,6 @@ impl AppState {
             download_latest_attempt: Mutex::new(HashMap::new()),
             verifying_downloads: std::sync::Mutex::new(std::collections::HashSet::new()),
             backend_spec_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
-            mcp_modes: Mutex::new(HashMap::new()),
             routing_log: Mutex::new(manager_gateway::RoutingLog::default()),
             gateway_stats: Mutex::new(gateway_stats::GatewayStatsStore::default()),
             winml: OnceCell::new(),
@@ -768,18 +763,21 @@ impl AppState {
         *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
 
-    /// MCP server registry with in-memory mode overrides applied.
+    /// The persisted MCP registry (`AppConfig.mcp`) — the source of
+    /// truth since MCP Phase 1 (design §3/§10.1). The session-only
+    /// `mcp_modes` overlay is deleted; exposure is persisted.
+    async fn mcp_registry(&self) -> Vec<manager_config::McpServerConfig> {
+        self.config.read().await.mcp.servers.clone()
+    }
+
+    /// MCP server registry as runtime views: `ServerSpec`s converted
+    /// from the persisted registry via `manager-mcp`'s conversion
+    /// (Gateway exposure maps to `McpMode::Remote` there — see its
+    /// doc comment — so the legacy spawn paths never spawn a
+    /// gateway-hosted server).
     async fn mcp_servers(&self) -> Vec<manager_mcp::ServerSpec> {
-        let modes = self.mcp_modes.lock().await;
-        manager_mcp::default_servers()
-            .into_iter()
-            .map(|mut s| {
-                if let Some(m) = modes.get(&s.id) {
-                    s.mode = *m;
-                }
-                s
-            })
-            .collect()
+        let cfg = self.config.read().await;
+        manager_mcp::server_specs_from_config(&cfg.mcp)
     }
 }
 
@@ -5759,32 +5757,117 @@ async fn diagnostics_export_bundle(state: State<'_, AppState>) -> ApiResult {
 // MCP / VS Code (§14)
 // ---------------------------------------------------------------------------
 
-/// MCP server list with live status (spec §14 `mcp_list`). Includes
-/// credential presence per env key (Windows Credential Manager lookup;
-/// values never read).
+/// One `mcp_list` entry (MCP design §9's needs, Phase 1 shape).
+/// Defined here rather than extending `manager_mcp::McpServerStatus`:
+/// the extra fields (`exposure`, `command`, `url`, `cred_ref`, the
+/// dual-target credential result) are the persisted registry's, not
+/// the runtime status's — the status struct stays the supervisor
+/// view. No UI calls these commands yet, so this payload is the
+/// contract the Phase 4 UI will consume.
+#[derive(Debug, Clone, Serialize)]
+struct McpListEntry {
+    pub id: String,
+    pub display_name: String,
+    /// Same value as `display_name` (the name `McpServerStatus`
+    /// historically carried), kept for back-compat readers.
+    pub name: String,
+    pub transport: manager_config::McpTransport,
+    pub exposure: manager_config::McpExposure,
+    /// Derived runtime mode (Gateway maps to Remote; see
+    /// `manager_mcp::server_spec_from_config`).
+    pub mode: manager_mcp::McpMode,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub url: Option<String>,
+    pub env_keys: Vec<String>,
+    pub cred_ref: Option<String>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub metered: bool,
+    pub rpm_limit: Option<u32>,
+    /// Live supervised-process state from `list_status`; only
+    /// Local servers are ever spawned, so this is meaningful
+    /// (and only ever true) for them.
+    pub running: bool,
+    /// Credential presence over the accepted targets (see
+    /// `credential_target_found`): true when any accepted target
+    /// exists.
+    pub credential_present: bool,
+    /// `"present"` | `"missing"` — the §9 card wording.
+    pub credential_status: String,
+    /// Which accepted Credential Manager target was found, when
+    /// one was (dual-target acceptance, design §10.1: for the two
+    /// legacy servers either the unified wizard target or the
+    /// legacy `llm-manager/mcp/<id>` target counts).
+    pub credential_target_found: Option<String>,
+    /// Per-env-key presence, as the pre-Phase-1 payload carried it
+    /// (values are never read).
+    pub credential_presence: Vec<(String, bool)>,
+}
+
+/// MCP server list with live status (spec §14 `mcp_list`), built
+/// from the persisted registry. Includes credential presence per
+/// env key (Windows Credential Manager lookup; values never read)
+/// with dual-target acceptance for the legacy servers (§10.1).
 #[tauri::command]
 async fn mcp_list(state: State<'_, AppState>) -> ApiResult {
+    let registry = state.mcp_registry().await;
     let servers = state.mcp_servers().await;
     let statuses = {
         let sup = state.supervisor().await.lock().await;
         manager_mcp::list_status(&*sup, &servers)
     };
+    let running: HashMap<String, bool> = statuses
+        .iter()
+        .map(|s| (s.id.clone(), s.running))
+        .collect();
     // Presence checks are blocking cmdkey calls; run off the async worker.
-    let presence: Vec<Vec<(String, bool)>> = tokio::task::spawn_blocking(move || {
-        servers
+    let servers_for_presence = servers.clone();
+    let found_targets: Vec<Option<String>> = tokio::task::spawn_blocking(move || {
+        servers_for_presence
             .iter()
-            .map(|s| manager_mcp::credential_presence(s, cmdkey_target_exists))
+            .map(|s| manager_mcp::credential_target_found(s, cmdkey_target_exists))
             .collect()
     })
     .await
     .map_err(|e| err(ApiError::Mcp(format!("presence check failed: {e}"))))?;
-    let mut out = serde_json::to_value(&statuses).map_err(jerr)?;
-    if let Value::Array(arr) = &mut out {
-        for (entry, pres) in arr.iter_mut().zip(presence.iter()) {
-            entry["credential_presence"] = serde_json::to_value(pres).unwrap_or(Value::Null);
-        }
-    }
-    Ok(out)
+    let entries: Vec<McpListEntry> = registry
+        .iter()
+        .zip(servers.iter())
+        .zip(found_targets.iter())
+        .map(|((cfg, spec), found)| {
+            let present = found.is_some();
+            McpListEntry {
+                id: cfg.id.clone(),
+                display_name: spec.name.clone(),
+                name: spec.name.clone(),
+                transport: cfg.transport,
+                exposure: cfg.exposure,
+                mode: spec.mode,
+                command: cfg.command.clone(),
+                args: cfg.args.clone(),
+                url: cfg.url.clone(),
+                env_keys: cfg.env_keys.clone(),
+                cred_ref: cfg.cred_ref.clone(),
+                allowed_tools: cfg.allowed_tools.clone(),
+                metered: cfg.metered,
+                rpm_limit: cfg.rpm_limit,
+                running: running.get(&cfg.id).copied().unwrap_or(false),
+                credential_present: present,
+                credential_status: if present {
+                    "present".to_string()
+                } else {
+                    "missing".to_string()
+                },
+                credential_target_found: found.clone(),
+                credential_presence: cfg
+                    .env_keys
+                    .iter()
+                    .map(|k| (k.clone(), present))
+                    .collect(),
+            }
+        })
+        .collect();
+    Ok(serde_json::to_value(&entries).map_err(jerr)?)
 }
 
 /// Check whether a Windows Credential Manager target exists.
@@ -5855,49 +5938,118 @@ async fn mcp_test_connection(state: State<'_, AppState>, id: String) -> ApiResul
     }
 }
 
-/// Set an MCP server's mode (spec §14 `mcp_set_mode`). Mode is stored
-/// in-memory (no MCP section in `AppConfig` yet). Switching to Local
-/// spawns the supervised process; switching away stops it.
+/// Set an MCP server's exposure (replaces `mcp_set_mode`, MCP
+/// Phase 1). Exposure is persisted in `AppConfig.mcp` through the
+/// validated save path (`manager_config::save` on a clone; only a
+/// successful save installs it in memory — the pattern of
+/// `backend_update_flags`). Transitioning INTO Local spawns the
+/// supervised process (the old set_mode behaviour); LEAVING Local
+/// stops it. Gateway servers are never spawned here — the gateway
+/// hosts them (Phase 2).
 #[tauri::command]
-async fn mcp_set_mode(state: State<'_, AppState>, id: String, mode: String) -> ApiResult {
-    let mode = match mode.as_str() {
-        "local" => manager_mcp::McpMode::Local,
-        "remote" => manager_mcp::McpMode::Remote,
-        "disabled" => manager_mcp::McpMode::Disabled,
+async fn mcp_set_exposure(state: State<'_, AppState>, id: String, exposure: String) -> ApiResult {
+    let exposure = match exposure.as_str() {
+        "gateway" => manager_config::McpExposure::Gateway,
+        "local" => manager_config::McpExposure::Local,
+        "disabled" => manager_config::McpExposure::Disabled,
         other => {
             return Err(err(ApiError::Mcp(format!(
-                "unknown mcp mode {other:?}; expected local | remote | disabled"
+                "unknown mcp exposure {other:?}; expected gateway | local | disabled"
             ))))
         }
     };
-    {
-        let known = manager_mcp::default_servers();
-        if !known.iter().any(|s| s.id == id) {
-            return Err(err(ApiError::NotFound(format!("mcp server {id}"))));
-        }
-        state.mcp_modes.lock().await.insert(id.clone(), mode);
-    }
+    let previous_exposure = {
+        let mut cfg = state.config.write().await;
+        let mut new_cfg = cfg.clone();
+        let server = new_cfg
+            .mcp
+            .servers
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| err(ApiError::NotFound(format!("mcp server {id}"))))?;
+        let previous = server.exposure;
+        server.exposure = exposure;
+        manager_config::save(&new_cfg, &state.config_path)
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
+        *cfg = new_cfg;
+        previous
+    };
     let servers = state.mcp_servers().await;
     let server = servers
         .iter()
         .find(|s| s.id == id)
-        .expect("mode was just set for a known server");
-    let mut sup = state.supervisor().await.lock().await;
-    match mode {
-        manager_mcp::McpMode::Local => {
-            manager_mcp::spawn_local(&mut *sup, server)
-                .await
-                .map_err(ApiError::from)
-                .map_err(jerr)?;
-        }
-        _ => {
-            manager_mcp::stop_local(&mut *sup, server)
-                .await
-                .map_err(ApiError::from)
-                .map_err(jerr)?;
-        }
+        .expect("exposure was just persisted for a known server");
+    if exposure == manager_config::McpExposure::Local
+        && previous_exposure != manager_config::McpExposure::Local
+    {
+        let mut sup = state.supervisor().await.lock().await;
+        manager_mcp::spawn_local(&mut *sup, server)
+            .await
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
+    } else if previous_exposure == manager_config::McpExposure::Local
+        && exposure != manager_config::McpExposure::Local
+    {
+        let mut sup = state.supervisor().await.lock().await;
+        manager_mcp::stop_local(&mut *sup, server)
+            .await
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
     }
-    Ok(json!({ "id": id, "mode": mode }))
+    Ok(json!({ "id": id, "exposure": exposure, "persisted": true }))
+}
+
+/// Create or update an MCP server in the persisted registry
+/// (upsert by id). The argument is the `McpServerConfig` shape as
+/// JSON (§3.1). Persistence goes through `manager_config::save`,
+/// which validates the whole config first — a §3.2 violation is
+/// returned as a command error and nothing is stored (neither on
+/// disk nor in memory).
+#[tauri::command]
+async fn mcp_save_server(
+    state: State<'_, AppState>,
+    server: manager_config::McpServerConfig,
+) -> ApiResult {
+    let id = server.id.clone();
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    match new_cfg.mcp.servers.iter_mut().find(|s| s.id == id) {
+        Some(existing) => *existing = server,
+        None => new_cfg.mcp.servers.push(server),
+    }
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    Ok(json!({ "id": id, "persisted": true }))
+}
+
+/// Remove an MCP server from the persisted registry. If it was
+/// Local and running, it is stopped first; then the removal is
+/// persisted through the validated save path.
+#[tauri::command]
+async fn mcp_delete_server(state: State<'_, AppState>, id: String) -> ApiResult {
+    let servers = state.mcp_servers().await;
+    let server = servers
+        .iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| err(ApiError::NotFound(format!("mcp server {id}"))))?;
+    if server.mode == manager_mcp::McpMode::Local {
+        let mut sup = state.supervisor().await.lock().await;
+        manager_mcp::stop_local(&mut *sup, server)
+            .await
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
+    }
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    new_cfg.mcp.servers.retain(|s| s.id != id);
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    Ok(json!({ "id": id, "deleted": true, "persisted": true }))
 }
 
 /// Install Continue.dev + Cline via the wizard's `vscode-extensions` step
@@ -6416,7 +6568,9 @@ fn main() {
             // MCP / VS Code
             mcp_list,
             mcp_test_connection,
-            mcp_set_mode,
+            mcp_set_exposure,
+            mcp_save_server,
+            mcp_delete_server,
             vscode_install_extensions,
             vscode_write_config,
             // MXC

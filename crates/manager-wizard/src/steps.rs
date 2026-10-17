@@ -4974,31 +4974,25 @@ impl WizardStep for VscodeExtensions {
 pub const GITHUB_CRED_TARGET: &str = "local-llm-service-manager/github-mcp";
 pub const GDRIVE_CRED_TARGET: &str = "local-llm-service-manager/gdrive-mcp";
 
-/// Step 8: write the MCP server config (GitHub + Google Drive) with
-/// credential *references*; verify the credentials exist.
+/// Step 8: verify the legacy MCP servers' credentials exist
+/// (GitHub + Google Drive). Presence only — values are never read.
+///
+/// MCP Phase 1 (design §10.1): this step no longer writes
+/// `<data_dir>/mcp/mcp-servers.json`. The persisted registry in
+/// `AppConfig.mcp` is the source of truth now; the old file is
+/// retired as a store, left in place if present (deleting user files
+/// is not the migration's job), and noted as inert in the step log.
+/// The registry-wide credential-presence rework is Phase 4; for now
+/// this step remains credential-presence only for the two legacy
+/// targets.
 pub struct McpServers;
 
 impl McpServers {
-    fn config_path(&self, ctx: &WizardContext) -> PathBuf {
+    /// Path of the retired `mcp-servers.json` store (design §10.1).
+    /// Used only to note its presence as inert in the step log —
+    /// nothing reads or writes it any more.
+    fn retired_config_path(&self, ctx: &WizardContext) -> PathBuf {
         ctx.data_dir.join("mcp").join("mcp-servers.json")
-    }
-
-    fn config_json() -> String {
-        json_pretty(&serde_json::json!({
-            "mcpServers": {
-                "github": {
-                    "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-github"],
-                    // Credential Manager target reference — never a value.
-                    "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": format!("<credential-manager:{GITHUB_CRED_TARGET}>") }
-                },
-                "gdrive": {
-                    "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-gdrive"],
-                    "env": { "GOOGLE_APPLICATION_CREDENTIALS": format!("<credential-manager:{GDRIVE_CRED_TARGET}>") }
-                }
-            }
-        }))
     }
 }
 
@@ -5041,14 +5035,24 @@ impl WizardStep for McpServers {
                 Err(e) => return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")])),
             }
         }
-        let path = self.config_path(ctx);
-        let json = Self::config_json();
-        if let Err(e) = ctx.ops.write_file(&path, json.as_bytes()).await {
-            return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
+        // Retired store (design §10.1): the step writes nothing. If a
+        // pre-Phase-1 mcp-servers.json is still on disk, say plainly
+        // in the success log that it is inert — left in place, and
+        // nothing reads it.
+        let retired = self.retired_config_path(ctx);
+        if ctx.ops.file_exists(&retired).await {
+            log.push(format!(
+                "note: {} is present but inert — the retired mcp-servers.json store is no longer written or read; the persisted AppConfig.mcp registry is the source of truth",
+                retired.display()
+            ));
+        } else {
+            log.push(
+                "note: the retired mcp-servers.json store is no longer written; the persisted AppConfig.mcp registry is the source of truth"
+                    .to_string(),
+            );
         }
-        log.push(format!("wrote {}", path.display()));
         Ok(StepOutcome::done(
-            "MCP servers configured (github, gdrive)".to_string(),
+            "MCP server credentials present (github, gdrive)".to_string(),
             log,
         ))
     }
@@ -9228,12 +9232,39 @@ mod tests {
         let ctx2 = ctx_with(ops2.clone(), RunMode::Install);
         let out2 = McpServers.run(&ctx2).await.unwrap();
         assert_eq!(out2.state, StepState::Done, "{out2:?}");
-        let raw = ops2
-            .file_bytes(&PathBuf::from("/data/mcp/mcp-servers.json"))
-            .unwrap();
-        let text = String::from_utf8(raw).unwrap();
-        assert!(text.contains("credential-manager:"), "{text}");
-        assert!(text.contains(GITHUB_CRED_TARGET), "{text}");
+        // Phase 1 (§10.1): the step writes nothing — the retired
+        // mcp-servers.json store must not be created, and the success
+        // log notes that it is inert.
+        assert!(
+            ops2.file_bytes(&PathBuf::from("/data/mcp/mcp-servers.json"))
+                .is_none(),
+            "mcp-servers.json must no longer be written"
+        );
+        let log_text = out2.log_tail.join("\n");
+        assert!(
+            log_text.contains("inert") || log_text.contains("no longer written"),
+            "{log_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_servers_notes_retired_file_inert_when_present() {
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_credential(GITHUB_CRED_TARGET);
+        ops.with_credential(GDRIVE_CRED_TARGET);
+        // A pre-Phase-1 file left on disk.
+        ops.with_file(PathBuf::from("/data/mcp/mcp-servers.json"), b"{}".to_vec());
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = McpServers.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let log_text = out.log_tail.join("\n");
+        assert!(log_text.contains("inert"), "{log_text}");
+        // The file is left in place, untouched.
+        assert_eq!(
+            ops.file_bytes(&PathBuf::from("/data/mcp/mcp-servers.json"))
+                .unwrap(),
+            b"{}".to_vec()
+        );
     }
 
     // --- WinMlRegister ---

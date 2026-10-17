@@ -2027,6 +2027,7 @@ dependencies = [
 name = "manager-mcp"
 version = "0.1.33"
 dependencies = [
+ "manager-config",
  "manager-supervisor",
  "serde",
  "serde_json",

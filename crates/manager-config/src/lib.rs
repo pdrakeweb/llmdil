@@ -85,6 +85,176 @@ pub struct AppConfig {
     /// next changes.
     #[serde(default)]
     pub catalog_revision: u32,
+    /// Persisted MCP server registry (MCP design §3.1). Serde-defaulted
+    /// so configurations written before the section existed load with
+    /// the seeded legacy registry (see [`McpConfig::default`]); an
+    /// explicit section — even an empty one — is preserved verbatim by
+    /// [`migrate`] (see §10.1 migration there).
+    #[serde(default)]
+    pub mcp: McpConfig,
+}
+
+/// MCP transport, as persisted in [`McpServerConfig`].
+///
+/// Defined here, in the schema crate, rather than reusing
+/// `manager_mcp::McpTransport`: `manager-config` is a leaf crate and
+/// `manager-mcp` already depends on the leaf supervisor crate — having
+/// config depend on `manager-mcp` would invert that layering. The serde
+/// shape is identical to the `manager-mcp` enum (lowercase `"stdio"` /
+/// `"http"`), and `manager-mcp` converts between the two (it may depend
+/// on this leaf crate without a cycle). This is a deliberate
+/// design-vs-code discrepancy from design §3.1, which assumed the
+/// existing `manager-mcp` enum could be reused directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    Http,
+}
+
+/// Where an MCP server is exposed (MCP design §3.1). Replaces the
+/// session-only `McpMode` overlay for persistence. Serde naming follows
+/// this crate's convention for mode enums (`lowercase`, as on
+/// [`ViewMode`]/[`MxcMode`]): `"gateway"` / `"local"` / `"disabled"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpExposure {
+    /// Registered in the generated LiteLLM gateway config.
+    Gateway,
+    /// App-supervised local process (the legacy github/gdrive behaviour).
+    Local,
+    /// Not registered and not spawned.
+    #[default]
+    Disabled,
+}
+
+/// Credential Manager target for the legacy GitHub MCP server, in the
+/// unified namespace the wizard uses (MCP design §10.1). The same
+/// string is `GITHUB_CRED_TARGET` in `manager-wizard`; it is defined
+/// here because the registry seed lives in this leaf crate and the
+/// wizard depends on config, not the reverse.
+pub const GITHUB_MCP_CRED_REF: &str = "local-llm-service-manager/github-mcp";
+/// Credential Manager target for the legacy Google Drive MCP server,
+/// unified namespace (see [`GITHUB_MCP_CRED_REF`]).
+pub const GDRIVE_MCP_CRED_REF: &str = "local-llm-service-manager/gdrive-mcp";
+/// Pre-unification credential target for the GitHub server
+/// (`llm-manager/mcp/github`, from `manager_mcp::default_servers`).
+/// Presence checks accept either target during the transition
+/// (MCP design §10.1).
+pub const LEGACY_GITHUB_MCP_CRED_REF: &str = "llm-manager/mcp/github";
+/// Pre-unification credential target for the Drive server.
+pub const LEGACY_GDRIVE_MCP_CRED_REF: &str = "llm-manager/mcp/gdrive";
+
+/// The persisted MCP server registry (MCP design §3.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+}
+
+impl McpConfig {
+    /// The seeded registry: the two legacy servers from
+    /// `manager_mcp::default_servers()`, as `Local` entries, but with
+    /// the unified credential namespace and the Drive env key
+    /// canonicalised to `GOOGLE_APPLICATION_CREDENTIALS` (MCP design
+    /// §10.1; the legacy registry's `GDRIVE_CREDENTIALS_PATH` was the
+    /// divergent name — the Drive server reads
+    /// `GOOGLE_APPLICATION_CREDENTIALS`, which is also what the wizard
+    /// step always wrote). Command/args/package parity with
+    /// `default_servers()` is otherwise exact: `npx -y` on the same
+    /// `@modelcontextprotocol/server-*` packages.
+    pub fn seeded() -> Self {
+        Self {
+            servers: seeded_mcp_servers(),
+        }
+    }
+}
+
+/// `Default` for [`McpConfig`] is the *seeded* registry, not an empty
+/// one: `AppConfig`'s `#[serde(default)] mcp` field uses this, so a
+/// config file with no `mcp` key at all loads with the legacy servers
+/// present (the §10.1 migration for pre-feature configs). An explicit
+/// empty registry is written as `McpConfig { servers: Vec::new() }`
+/// and is preserved as empty — serde only invokes this default when
+/// the key is absent, and [`migrate`] preserves an explicit section
+/// verbatim.
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self::seeded()
+    }
+}
+
+/// The seed servers for [`McpConfig::seeded`] (see its documentation
+/// for the unification/canonicalisation rules applied).
+pub fn seeded_mcp_servers() -> Vec<McpServerConfig> {
+    vec![
+        McpServerConfig {
+            id: "github".to_string(),
+            display_name: "GitHub".to_string(),
+            transport: McpTransport::Stdio,
+            exposure: McpExposure::Local,
+            command: Some("npx".to_string()),
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-github".to_string(),
+            ],
+            url: None,
+            env_keys: vec!["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()],
+            cred_ref: Some(GITHUB_MCP_CRED_REF.to_string()),
+            allowed_tools: None,
+            metered: false,
+            rpm_limit: None,
+        },
+        McpServerConfig {
+            id: "gdrive".to_string(),
+            display_name: "Google Drive".to_string(),
+            transport: McpTransport::Stdio,
+            exposure: McpExposure::Local,
+            command: Some("npx".to_string()),
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-gdrive".to_string(),
+            ],
+            url: None,
+            // Canonicalised (design §10.1): not the legacy
+            // GDRIVE_CREDENTIALS_PATH.
+            env_keys: vec!["GOOGLE_APPLICATION_CREDENTIALS".to_string()],
+            cred_ref: Some(GDRIVE_MCP_CRED_REF.to_string()),
+            allowed_tools: None,
+            metered: false,
+            rpm_limit: None,
+        },
+    ]
+}
+
+/// One persisted MCP server definition (MCP design §3.1). Every field
+/// carries a serde default so a partial JSON object loads: missing
+/// strings are empty, missing lists are empty, missing options are
+/// `None`, `transport` defaults to `stdio`, and `exposure` defaults
+/// to `disabled` (the safe choice for a partially-specified server —
+/// it is neither registered with the gateway nor spawned).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    pub id: String,
+    pub display_name: String,
+    pub transport: McpTransport,
+    pub exposure: McpExposure,
+    /// Stdio command; allowlist-validated at save (§3.2).
+    pub command: Option<String>,
+    /// Stdio args; pinned package versions for curated servers.
+    pub args: Vec<String>,
+    /// HTTP transport base URL.
+    pub url: Option<String>,
+    /// Env var NAMES the server needs; never values.
+    pub env_keys: Vec<String>,
+    /// Credential Manager target name for the `env_keys` values.
+    pub cred_ref: Option<String>,
+    pub allowed_tools: Option<Vec<String>>,
+    /// Paid upstream; drives the rpm cap + UI cost labelling.
+    pub metered: bool,
+    pub rpm_limit: Option<u32>,
 }
 
 /// Presenter mode for a data window (spec §4 hybrid view matrix).
@@ -516,6 +686,7 @@ impl AppConfig {
             catalog_seeded: false,
             defaults_repaired: true,
             catalog_revision: 0,
+            mcp: McpConfig::seeded(),
         }
     }
 }
@@ -972,6 +1143,9 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
         }
     }
 
+    // --- mcp servers (design §3.2) ---
+    validate_mcp_servers(&config.mcp, &mut errors);
+
     // --- telemetry ---
     if config.telemetry.retention_secs == 0 {
         errors.push("telemetry.retention_secs must be > 0".to_string());
@@ -1016,8 +1190,28 @@ pub fn migrate(raw: serde_json::Value) -> Result<AppConfig, ConfigError> {
             "config version {version} is newer than supported version {CURRENT_VERSION}"
         )));
     }
+    // MCP registry one-time migration (design §10.1), via the raw-JSON
+    // route: capture an explicit `mcp` section before defaults are
+    // overlaid. `apply_defaults` deep-merges over `default_config()`
+    // (whose `mcp` is the seed), so a config with NO `mcp` key gets the
+    // seeded registry injected — exactly once, at load; the seeded
+    // registry is then written back on the next save, so the key
+    // exists from then on. An explicit section, even an empty
+    // `{"servers": []}`, is restored verbatim after the merge, so an
+    // operator who later deletes every server is NOT resurrected on
+    // the next load. (A `null` mcp is treated as absent.)
+    let explicit_mcp = raw
+        .as_object()
+        .and_then(|o| o.get("mcp"))
+        .filter(|v| !v.is_null())
+        .cloned();
     let mut merged = raw;
     apply_defaults(&mut merged)?;
+    if let Some(mcp) = explicit_mcp {
+        if let Some(obj) = merged.as_object_mut() {
+            obj.insert("mcp".to_string(), mcp);
+        }
+    }
     if version != CURRENT_VERSION {
         if let Some(obj) = merged.as_object_mut() {
             obj.insert("version".to_string(), serde_json::json!(CURRENT_VERSION));
@@ -1121,6 +1315,176 @@ fn validate_split(backend_id: &str, flags: &ServerFlags, errors: &mut Vec<String
     }
 }
 
+/// Stdio commands LiteLLM allows for MCP servers; the manager mirrors
+/// the list at save time (MCP design §3.2 / §5.1).
+const MCP_STDIO_COMMAND_ALLOWLIST: &[&str] =
+    &["npx", "uvx", "python", "python3", "node", "docker", "deno"];
+
+/// Banned MCP server args (MCP design §3.2): rejected at save, never
+/// stripped, so the operator sees the refusal.
+const MCP_BANNED_ARGS: &[&str] = &["--allow-private-ips", "--ignore-robots-txt"];
+
+/// True when `id` matches `^[a-z][a-z0-9_]*$` (hand-rolled: this crate
+/// has no regex dependency, and the alphabet is small).
+fn is_valid_mcp_server_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The basename used for the stdio allowlist check: the last path
+/// component, splitting on BOTH `/` and `\` (a persisted config may
+/// carry a Windows-style path such as `C:\tools\npx.cmd` regardless of
+/// the OS reading it), lowercased, with a single trailing executable
+/// extension (`.exe` / `.cmd` / `.bat`) removed. So `npx`,
+/// `C:\tools\npx.cmd`, `/usr/local/bin/NPX.EXE`, and `npx.exe` all
+/// normalise to `npx`.
+fn mcp_command_basename(command: &str) -> String {
+    let base = command
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(command)
+        .to_lowercase();
+    for ext in [".exe", ".cmd", ".bat"] {
+        if let Some(stripped) = base.strip_suffix(ext) {
+            return stripped.to_string();
+        }
+    }
+    base
+}
+
+/// Pragmatic HTTP(S) URL check for MCP http servers (this crate has
+/// no `url` dependency; the existing style is hand-rolled checks like
+/// the gateway `bind_host` IP parse). Returns the lowercase host on
+/// success. Rejects: no `://`, a scheme other than http/https, an
+/// empty host, whitespace/control characters, and a non-numeric port.
+fn parse_mcp_http_url(url: &str) -> Result<(String, String), String> {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("url must not contain whitespace or control characters".to_string());
+    }
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| "url must be of the form <scheme>://<host>[/...]".to_string())?;
+    let scheme = scheme.to_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("url scheme {scheme:?} is not http or https"));
+    }
+    // Authority ends at the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Strip any userinfo.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if authority.is_empty() {
+        return Err("url has no host".to_string());
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        // IPv6 literal: [::1] or [::1]:port
+        let (h, tail) = bracketed
+            .split_once(']')
+            .ok_or_else(|| "url has an unterminated IPv6 host".to_string())?;
+        if let Some(port) = tail.strip_prefix(':') {
+            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("url port {port:?} is not numeric"));
+            }
+        } else if !tail.is_empty() {
+            return Err("url has unexpected characters after the IPv6 host".to_string());
+        }
+        h.to_lowercase()
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, port)) => {
+                if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(format!("url port {port:?} is not numeric"));
+                }
+                h.to_lowercase()
+            }
+            None => authority.to_lowercase(),
+        }
+    };
+    if host.is_empty() {
+        return Err("url has no host".to_string());
+    }
+    Ok((scheme, host))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// MCP registry validation (MCP design §3.2), called from [`validate`].
+fn validate_mcp_servers(mcp: &McpConfig, errors: &mut Vec<String>) {
+    let mut ids: HashSet<String> = HashSet::new();
+    for s in &mcp.servers {
+        if !is_valid_mcp_server_id(&s.id) {
+            errors.push(format!(
+                "mcp server id {:?} must match ^[a-z][a-z0-9_]*$",
+                s.id
+            ));
+        } else if !ids.insert(s.id.clone()) {
+            errors.push(format!("duplicate mcp server id {:?}", s.id));
+        }
+        for arg in &s.args {
+            for banned in MCP_BANNED_ARGS {
+                if arg == banned || arg.starts_with(&format!("{banned}=")) {
+                    errors.push(format!(
+                        "mcp server {:?}: arg {banned:?} is banned and is rejected, not stripped",
+                        s.id
+                    ));
+                }
+            }
+        }
+        match s.transport {
+            McpTransport::Stdio => match s.command.as_deref().map(str::trim) {
+                Some(cmd) if !cmd.is_empty() => {
+                    let base = mcp_command_basename(cmd);
+                    if !MCP_STDIO_COMMAND_ALLOWLIST.contains(&base.as_str()) {
+                        errors.push(format!(
+                                "mcp server {:?}: command basename {base:?} is not in the stdio allowlist {:?}",
+                                s.id, MCP_STDIO_COMMAND_ALLOWLIST
+                            ));
+                    }
+                }
+                _ => errors.push(format!(
+                    "mcp server {:?}: stdio transport requires a command",
+                    s.id
+                )),
+            },
+            McpTransport::Http => match s.url.as_deref().map(str::trim) {
+                Some(url) if !url.is_empty() => match parse_mcp_http_url(url) {
+                    Ok((scheme, host)) => {
+                        if scheme == "http" && !is_loopback_host(&host) {
+                            errors.push(format!(
+                                    "mcp server {:?}: http url is only allowed on loopback (127.0.0.1 / localhost / ::1); use https off-loopback",
+                                    s.id
+                                ));
+                        }
+                    }
+                    Err(e) => errors.push(format!("mcp server {:?}: {e}", s.id)),
+                },
+                _ => errors.push(format!(
+                    "mcp server {:?}: http transport requires a url",
+                    s.id
+                )),
+            },
+        }
+        if s.exposure == McpExposure::Gateway
+            && !s.env_keys.is_empty()
+            && s.cred_ref
+                .as_deref()
+                .map(str::trim)
+                .map(|r| r.is_empty())
+                .unwrap_or(true)
+        {
+            errors.push(format!(
+                "mcp server {:?}: gateway-exposed server with env_keys must name a cred_ref (the credential itself may be missing — that is a runtime state, not a save error)",
+                s.id
+            ));
+        }
+    }
+}
+
 fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -1202,7 +1566,9 @@ mod tests {
         let b: BackendConfig = serde_json::from_str(legacy).unwrap();
         assert_eq!(b.tool_call_probe, None);
         // While unset the field stays out of the serialized form.
-        assert!(!serde_json::to_string(&b).unwrap().contains("tool_call_probe"));
+        assert!(!serde_json::to_string(&b)
+            .unwrap()
+            .contains("tool_call_probe"));
         // A recorded probe round-trips with its lowercase outcome.
         let probed: BackendConfig = serde_json::from_str(
             r#"{"id":"planner","enabled":false,"model_file":"models/p.gguf","port":8081,"flags":{"n_ctx":32768,"n_batch":512,"tensor_split":[],"split_mode":"none"},"raw_flags":null,"restart_policy":{"max_retries":5,"backoff_base_secs":2},"overrides_global":false,"tool_call_probe":{"outcome":"verified","at_ms":1700000000000}}"#,
@@ -1943,6 +2309,214 @@ mod tests {
         let cfg = migrate(raw).expect("unknown fields must be ignored");
         assert_eq!(cfg.version, CURRENT_VERSION);
         validate(&cfg).expect("must still validate");
+    }
+
+    fn mcp_server(id: &str) -> McpServerConfig {
+        McpServerConfig {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            transport: McpTransport::Stdio,
+            exposure: McpExposure::Local,
+            command: Some("npx".to_string()),
+            args: vec!["-y".to_string(), "pkg".to_string()],
+            url: None,
+            env_keys: Vec::new(),
+            cred_ref: None,
+            allowed_tools: None,
+            metered: false,
+            rpm_limit: None,
+        }
+    }
+
+    fn cfg_with_mcp(servers: Vec<McpServerConfig>) -> AppConfig {
+        let mut cfg = working_config();
+        cfg.mcp = McpConfig { servers };
+        cfg
+    }
+
+    #[test]
+    fn mcp_seed_is_legacy_servers_with_unified_credentials() {
+        let seed = seeded_mcp_servers();
+        assert_eq!(seed.len(), 2);
+        let gh = &seed[0];
+        assert_eq!(gh.id, "github");
+        assert_eq!(gh.display_name, "GitHub");
+        assert_eq!(gh.exposure, McpExposure::Local);
+        assert_eq!(gh.transport, McpTransport::Stdio);
+        assert_eq!(gh.command.as_deref(), Some("npx"));
+        assert_eq!(gh.args, vec!["-y", "@modelcontextprotocol/server-github"]);
+        assert_eq!(gh.env_keys, vec!["GITHUB_PERSONAL_ACCESS_TOKEN"]);
+        assert_eq!(gh.cred_ref.as_deref(), Some(GITHUB_MCP_CRED_REF));
+        assert_eq!(GITHUB_MCP_CRED_REF, "local-llm-service-manager/github-mcp");
+        let gd = &seed[1];
+        assert_eq!(gd.id, "gdrive");
+        assert_eq!(gd.cred_ref.as_deref(), Some(GDRIVE_MCP_CRED_REF));
+        // Canonicalised env key, not the legacy divergent name.
+        assert_eq!(gd.env_keys, vec!["GOOGLE_APPLICATION_CREDENTIALS"]);
+        assert_eq!(gd.args, vec!["-y", "@modelcontextprotocol/server-gdrive"]);
+        // default_config carries the seed.
+        assert_eq!(AppConfig::default_config().mcp.servers, seed);
+        validate(&cfg_with_mcp(seed)).expect("seed must validate");
+    }
+
+    #[test]
+    fn mcp_partial_server_json_loads_with_defaults() {
+        let s: McpServerConfig = serde_json::from_str(r#"{"id":"x"}"#).unwrap();
+        assert_eq!(s.transport, McpTransport::Stdio);
+        assert_eq!(s.exposure, McpExposure::Disabled);
+        assert_eq!(s.command, None);
+        assert!(s.args.is_empty());
+        assert!(!s.metered);
+    }
+
+    #[test]
+    fn mcp_id_rules() {
+        for bad in ["", "GitHub", "1abc", "brave-search", "a b", "a.b", "_a"] {
+            let err = validate(&cfg_with_mcp(vec![mcp_server(bad)]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("must match"), "id {bad:?}: {err}");
+        }
+        for good in ["a", "brave_search", "a1", "web_fetch2"] {
+            validate(&cfg_with_mcp(vec![mcp_server(good)])).expect("valid id");
+        }
+        // Duplicate.
+        let err = validate(&cfg_with_mcp(vec![mcp_server("dup"), mcp_server("dup")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate mcp server id"), "{err}");
+    }
+
+    #[test]
+    fn mcp_stdio_command_allowlist_and_windows_basename() {
+        // Missing command.
+        let mut s = mcp_server("x");
+        s.command = None;
+        assert!(validate(&cfg_with_mcp(vec![s.clone()])).is_err());
+        // Not allowlisted.
+        s.command = Some("powershell".to_string());
+        assert!(validate(&cfg_with_mcp(vec![s.clone()])).is_err());
+        // Windows-style path + .cmd suffix normalises to npx.
+        s.command = Some(r"C:\tools\node\npx.cmd".to_string());
+        validate(&cfg_with_mcp(vec![s.clone()])).expect("windows npx.cmd basename");
+        // Unix path + .exe, upper case.
+        s.command = Some("/usr/local/bin/UVX.EXE".to_string());
+        validate(&cfg_with_mcp(vec![s.clone()])).expect("uvx.exe basename");
+        for ok in ["npx", "uvx", "python", "python3", "node", "docker", "deno"] {
+            s.command = Some(ok.to_string());
+            validate(&cfg_with_mcp(vec![s.clone()])).expect("allowlisted");
+        }
+    }
+
+    #[test]
+    fn mcp_banned_args_rejected() {
+        for banned in ["--allow-private-ips", "--ignore-robots-txt"] {
+            let mut s = mcp_server("x");
+            s.args.push(banned.to_string());
+            let err = validate(&cfg_with_mcp(vec![s])).unwrap_err().to_string();
+            assert!(err.contains(banned), "{err}");
+            assert!(err.contains("rejected"), "{err}");
+        }
+        // `=value` form is also the banned token.
+        let mut s = mcp_server("x");
+        s.args.push("--allow-private-ips=true".to_string());
+        assert!(validate(&cfg_with_mcp(vec![s])).is_err());
+    }
+
+    #[test]
+    fn mcp_http_url_rules() {
+        let http_server = |url: Option<&str>| McpServerConfig {
+            transport: McpTransport::Http,
+            command: None,
+            url: url.map(str::to_string),
+            ..mcp_server("remote")
+        };
+        // Missing url.
+        assert!(validate(&cfg_with_mcp(vec![http_server(None)])).is_err());
+        // Unparseable / wrong scheme.
+        for bad in [
+            "not-a-url",
+            "ftp://example.com",
+            "https://",
+            "https://exa mple.com",
+        ] {
+            assert!(
+                validate(&cfg_with_mcp(vec![http_server(Some(bad))])).is_err(),
+                "{bad}"
+            );
+        }
+        // https off-loopback is fine.
+        validate(&cfg_with_mcp(vec![http_server(Some(
+            "https://example.com/mcp",
+        ))]))
+        .expect("https");
+        // http off-loopback is not.
+        assert!(validate(&cfg_with_mcp(vec![http_server(Some("http://example.com"))])).is_err());
+        // http on loopback is allowed, in all three spellings (+ port).
+        for ok in [
+            "http://127.0.0.1:8080",
+            "http://localhost/mcp",
+            "http://[::1]:8080/mcp",
+        ] {
+            validate(&cfg_with_mcp(vec![http_server(Some(ok))])).expect("loopback http");
+        }
+    }
+
+    #[test]
+    fn mcp_gateway_with_env_keys_requires_cred_ref() {
+        let mut s = mcp_server("gw");
+        s.exposure = McpExposure::Gateway;
+        s.env_keys = vec!["SOME_KEY".to_string()];
+        s.cred_ref = None;
+        let err = validate(&cfg_with_mcp(vec![s.clone()]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cred_ref"), "{err}");
+        s.cred_ref = Some("local-llm-service-manager/gw".to_string());
+        // Credential itself missing is NOT a save error — only the ref.
+        validate(&cfg_with_mcp(vec![s.clone()])).expect("cred_ref named");
+        // Local with env keys and no cred_ref is allowed by this rule.
+        s.exposure = McpExposure::Local;
+        s.cred_ref = None;
+        validate(&cfg_with_mcp(vec![s])).expect("local needs no cred_ref by §3.2");
+        // Gateway with no env keys needs no cred_ref.
+        let mut s2 = mcp_server("gw2");
+        s2.exposure = McpExposure::Gateway;
+        validate(&cfg_with_mcp(vec![s2])).expect("gateway without env keys");
+    }
+
+    #[test]
+    fn migrate_without_mcp_key_seeds_registry() {
+        // Pre-feature config: a full current config JSON with the mcp
+        // key removed.
+        let mut raw = serde_json::to_value(working_config()).unwrap();
+        raw.as_object_mut().unwrap().remove("mcp");
+        let cfg = migrate(raw).expect("pre-feature config must migrate");
+        assert_eq!(cfg.mcp.servers, seeded_mcp_servers());
+        validate(&cfg).expect("seeded config validates");
+    }
+
+    #[test]
+    fn migrate_with_explicit_mcp_preserves_it_verbatim() {
+        // Explicit empty registry is preserved — no resurrection.
+        let mut raw = serde_json::to_value(working_config()).unwrap();
+        raw["mcp"] = serde_json::json!({ "servers": [] });
+        let cfg = migrate(raw).expect("explicit empty mcp");
+        assert!(cfg.mcp.servers.is_empty());
+        // Explicit custom registry is preserved.
+        let mut raw = serde_json::to_value(working_config()).unwrap();
+        raw["mcp"] = serde_json::json!({ "servers": [{
+            "id": "custom", "display_name": "Custom", "transport": "http",
+            "exposure": "disabled", "command": null, "args": [],
+            "url": "https://example.com/mcp", "env_keys": [],
+            "cred_ref": null, "allowed_tools": null, "metered": true,
+            "rpm_limit": 7
+        }]});
+        let cfg = migrate(raw).expect("explicit custom mcp");
+        assert_eq!(cfg.mcp.servers.len(), 1);
+        assert_eq!(cfg.mcp.servers[0].id, "custom");
+        assert_eq!(cfg.mcp.servers[0].rpm_limit, Some(7));
+        assert!(cfg.mcp.servers[0].metered);
     }
 
     #[test]
