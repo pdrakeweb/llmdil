@@ -2573,11 +2573,13 @@ export function renderModels(): string {
     </div>
     <div style="margin-top:10px"><button class="btn" id="addModelOptToggle" aria-expanded="false" title="Optional fields" aria-label="Optional fields" style="padding:2px 8px;font-size:11px">${icon("chevR")}</button></div>
     <div id="addModelOptional" style="display:none">
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px">
         <label style="font-size:12px;color:var(--text2)">Quant<br>
           <input id="addModelQuant" type="text" placeholder="Q4_K_M" style="${SELECT_STYLE};width:100%"></label>
         <label style="font-size:12px;color:var(--text2)">File name<span class="info-tip" title="Defaults to the URL's file name.">${icon("info")}</span><br>
           <input id="addModelFile" type="text" placeholder="model.gguf" style="${SELECT_STYLE};width:100%"></label>
+        <label style="font-size:12px;color:var(--text2)">Parameters (B)<span class="info-tip" title="Total parameter count in billions (e.g. 80 for an 80B model — for a mixture-of-experts model, the total, not the active count). Required for models outside the curated catalog: the count feeds memory-fit estimation and is never re-derived later.">${icon("info")}</span><br>
+          <input id="addModelParams" type="text" inputmode="decimal" placeholder="80" style="${SELECT_STYLE};width:100%"></label>
       </div>
     </div>
     <div class="card-actions"><button class="btn" id="addModelBtn">${icon("plus")} Add model</button></div>
@@ -2857,8 +2859,18 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       if (msg) { msg.style.color = "var(--err)"; msg.textContent = "Model id and source URL are required."; }
       return;
     }
+    const paramsRaw = val("#addModelParams");
+    let paramsB: number | undefined;
+    if (paramsRaw) {
+      const n = Number(paramsRaw);
+      if (!Number.isFinite(n) || n <= 0) {
+        if (msg) { msg.style.color = "var(--err)"; msg.textContent = "Parameters (B) must be a positive number (the model's total parameter count, e.g. 80)."; }
+        return;
+      }
+      paramsB = n;
+    }
     addBtn.disabled = true;
-    const r = await modelAdd(id, url, val("#addModelFile") || undefined, val("#addModelQuant") || undefined);
+    const r = await modelAdd(id, url, val("#addModelFile") || undefined, val("#addModelQuant") || undefined, paramsB);
     addBtn.disabled = false;
     if (msg) {
       msg.style.color = r.error ? "var(--err)" : "var(--text2)";

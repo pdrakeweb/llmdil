@@ -1010,9 +1010,12 @@ export async function modelSetEnabled(id: string, enabled: boolean): Promise<Cal
 }
 
 /** model_add — register a new model by id and GGUF source URL. File
- *  name and quant are optional (the file name defaults to the URL's
- *  last path segment). The model starts enabled with no pinned hash. */
-export async function modelAdd(id: string, sourceUrl: string, fileName?: string, quant?: string): Promise<CallResult<{ model_id: string }>> {
+ *  name, quant, and paramsB are optional (the file name defaults to
+ *  the URL's last path segment). paramsB is the total parameter count
+ *  in billions: the command resolves it from the curated catalog
+ *  when omitted and refuses the add when no source yields a count.
+ *  The model starts enabled with no pinned hash. */
+export async function modelAdd(id: string, sourceUrl: string, fileName?: string, quant?: string, paramsB?: number): Promise<CallResult<{ model_id: string }>> {
   if (!isTauri()) return { data: { model_id: id }, live: false };
   try {
     const data = await invoke<{ model_id: string }>("model_add", {
@@ -1020,7 +1023,7 @@ export async function modelAdd(id: string, sourceUrl: string, fileName?: string,
       sourceUrl,
       fileName: fileName ?? null,
       quant: quant ?? null,
-      paramsB: null,
+      paramsB: paramsB ?? null,
     });
     return { data, live: true };
   } catch (e) {
