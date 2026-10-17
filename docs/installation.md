@@ -31,19 +31,19 @@ driver first — do not hunt for a different llama.cpp build.
 
 ## Installing the application
 
-1. Download `Local-LLM-Service-Manager_<version>_x64-setup.exe` from the
-   [Releases page](https://github.com/pdrakeweb/local-llm-service-manager/releases).
+1. Download `LLMdil_<version>_x64-setup.exe` from the
+   [Releases page](https://github.com/pdrakeweb/llmdil/releases).
 2. Run it. Windows SmartScreen may show an "unrecognized app" prompt on first
    release — click *More info → Run anyway* (expected until the installer is
    code-signed).
 3. The installer wizard walks through:
    - **Welcome** — what the application manages.
    - **License** — Apache-2.0.
-   - **Install location** — defaults to `%LOCALAPPDATA%\Local LLM Service Manager`.
+   - **Install location** — defaults to `%LOCALAPPDATA%\LLMdil`.
    - **Options** — Start Menu shortcut (on), Desktop shortcut (off by default).
    - **Install** — copies the application. No drivers, models, or build tools
      are installed here; the in-app setup wizard handles the LLM stack.
-   - **Finish** — optional *Launch Local LLM Service Manager*.
+   - **Finish** — optional *Launch LLMdil*.
 4. On first launch, the **setup wizard** takes over — see
    [`usage.md`](usage.md) for its 10 steps.
 
@@ -52,7 +52,7 @@ The installer is per-user: no UAC elevation, no system-wide changes.
 ### Silent install
 
 ```powershell
-Local-LLM-Service-Manager_0.1.0_x64-setup.exe /S
+LLMdil_0.1.0_x64-setup.exe /S
 ```
 
 Installs with defaults to `%LOCALAPPDATA%`. Add `/D=C:\path` to override the
@@ -60,7 +60,7 @@ directory (must be the last argument, no quotes even with spaces).
 
 ## Uninstalling
 
-Use *Settings → Apps → Installed apps → Local LLM Service Manager →
+Use *Settings → Apps → Installed apps → LLMdil →
 Uninstall*, or re-run the installer and choose *Uninstall*.
 
 The uninstaller removes the application only. It asks before touching

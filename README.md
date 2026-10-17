@@ -1,4 +1,6 @@
-# Local LLM Service Manager
+# LLMdil
+
+Local Language Model Distribution & Inference Layer
 
 Windows desktop application (Tauri 2 + Rust) that installs, configures,
 supervises, and monitors a local LLM serving stack on a single workstation.
@@ -29,7 +31,7 @@ Target machine: Dell Precision 7865 — Threadripper PRO 5945WX, RTX A4000 16 GB
 ## Install
 
 Download the installer from the
-[Releases page](https://github.com/pdrakeweb/local-llm-service-manager/releases)
+[Releases page](https://github.com/pdrakeweb/llmdil/releases)
 and follow [`docs/installation.md`](docs/installation.md). The installer sets
 up the application; the in-app setup wizard then installs and configures the
 LLM stack itself.

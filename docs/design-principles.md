@@ -1,4 +1,4 @@
-# Design Principles — Local LLM Service Manager UI
+# Design Principles — LLMdil UI
 
 The durable reference for this app's UI. Every card and view is designed against these rules and audited with the checklist in Part 3.
 

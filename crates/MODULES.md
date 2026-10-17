@@ -1,6 +1,6 @@
 # Crate map — implementation contract
 
-Rust workspace scaffold for the Local LLM Service Manager. Ten library
+Rust workspace scaffold for LLMdil. Ten library
 crates under `crates/` (workspace members) plus the Tauri shell in
 `src-tauri/` (excluded from the workspace; path-deps to the crates).
 The UI shell is in `ui/` (Vite + plain TypeScript; framework-independent

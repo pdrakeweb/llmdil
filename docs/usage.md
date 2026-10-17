@@ -79,7 +79,7 @@ happened.
 
 ## Where things live
 
-- Application: `%LOCALAPPDATA%\Local LLM Service Manager`
+- Application: `%LOCALAPPDATA%\LLMdil`
 - Config and logs: `%APPDATA%\local-llm-service-manager`
 - Models: `%APPDATA%\local-llm-service-manager\models` (configurable in Settings)
 - llama.cpp builds: `%APPDATA%\local-llm-service-manager\bin`

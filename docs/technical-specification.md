@@ -1,4 +1,4 @@
-# Technical Specification — Local LLM Service Manager
+# Technical Specification — LLMdil
 
 Status: draft for implementation estimation. UI design approved Oct 8, 2026
 (`files/ui-design-brainstorm/design-b-hybrid.md`). No implementation begins before

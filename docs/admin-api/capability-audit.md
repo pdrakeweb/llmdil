@@ -1,4 +1,4 @@
-# Capability audit — Local LLM Service Manager
+# Capability audit — LLMdil
 
 Purpose: the complete inventory of capabilities the app exposes today, as the
 input to designing an admin REST API (served from the managed machine on an

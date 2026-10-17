@@ -11,7 +11,7 @@
         "label": "main",
         "minHeight": 640,
         "minWidth": 1024,
-        "title": "Local LLM Service Manager",
+        "title": "LLMdil",
         "width": 1280
       }
     ]
@@ -26,7 +26,7 @@
     "active": true,
     "category": "DeveloperTool",
     "copyright": "Copyright 2026 pdrakeweb",
-    "longDescription": "Local LLM Service Manager installs, configures, supervises and monitors a local LLM serving stack (llama.cpp backends, LiteLLM gateway, GPU telemetry, model library, MXC sandbox policies) on a Windows workstation.",
+    "longDescription": "LLMdil installs, configures, supervises and monitors a local LLM serving stack (llama.cpp backends, LiteLLM gateway, GPU telemetry, model library, MXC sandbox policies) on a Windows workstation.",
     "publisher": "pdrakeweb",
     "shortDescription": "Installs, configures, supervises and monitors a local LLM serving stack.",
     "targets": [
@@ -42,7 +42,7 @@
           "English"
         ],
         "minimumWebview2Version": "120.0.2210.61",
-        "startMenuFolder": "Local LLM Service Manager"
+        "startMenuFolder": "LLMdil"
       }
     },
     "icon": [
@@ -55,6 +55,6 @@
     "licenseFile": "../LICENSE"
   },
   "identifier": "com.pdrakeweb.llm-manager",
-  "productName": "Local LLM Service Manager",
+  "productName": "LLMdil",
   "version": "0.1.33"
 }
