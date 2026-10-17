@@ -18,7 +18,7 @@ import {
   getBackendConfig, getOptimizeState, modelAdd, modelAssign,
   optimizeCancelConsult, optimizeCancelJob, optimizeChangeSummary, optimizeConsult,
   optimizeDiscardPlan, optimizeDiscover, optimizeIsDestructive, optimizeKindLabel,
-  optimizeMeasureBackend, optimizeSavePurpose, optimizeSetItemOutcome, optimizeSetItemState,
+  optimizeMeasureBackend, optimizeRunBaseline, optimizeSavePurpose, optimizeSetItemOutcome, optimizeSetItemState,
   setBackendOffload, stopBackend, updateBackendFlags, updateGatewayConfig,
 } from "../api";
 import type {
@@ -108,6 +108,13 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
    *  the consult invoke passes the remaining entries' repo ids
    *  as candidateRepos and the server intersects. */
   let discovering = false;
+  /** Screening suite (Phase 5d): the backend this page instance
+   *  is running a baseline for, and its progress timer. The run
+   *  shares the GPU-job slot with measurements, so the server
+   *  payload's `measuring` flag covers it too. */
+  let evalBackend: string | null = null;
+  let evalStart = 0;
+  let evalTimer: number | null = null;
   const candidateRemoved = new Set<string>();
   const candidateKey = (c: OptimizeCandidate): string => `${c.repo_id}\n${c.file}`;
 
@@ -316,6 +323,57 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     </div>`;
   }
 
+  /** The §A.4 caveat, verbatim — stated wherever scores appear. */
+  const SCREENING_CAVEAT = "Screening suite — a small fixed set of checkable tasks. It screens out regressions; it is not a benchmark and does not rank models generally.";
+
+  function evalCategoryLabel(key: string): string {
+    const labels: Record<string, string> = {
+      instruction_following: "Instruction following",
+      factual_recall: "Factual recall",
+      arithmetic_reasoning: "Arithmetic/reasoning",
+      code_adjacent: "Code-adjacent",
+      summarization: "Summarization",
+      tool_call_formatting: "Tool-call formatting",
+      long_context_retrieval: "Long-context retrieval",
+    };
+    return labels[key] ?? key.replace(/_/g, " ");
+  }
+
+  /** The screening-suite block (Phase 5d, §A.4): the stored
+   *  baseline's scores — overall and per-category, as Label:
+   *  Value — with its backend, run time, and a stale marker
+   *  when the backend's config fingerprint has moved; a Run
+   *  baseline action on each running backend; and the §A.4
+   *  caveat wherever scores render. Scores sit beside speed
+   *  (the Measured throughput block above), never merged. */
+  function screeningHtml(st: OptimizeState, busy: boolean): string {
+    const b = st.eval_baseline;
+    const running = st.backends.filter((x) => x.running);
+    const age = b ? Math.floor((Date.now() - new Date(b.run_at).getTime()) / 1000) : NaN;
+    const baselineHtml = b ? `
+      <div class="opt-measure-row">
+        <span class="opt-target">${esc(b.backend_id)}</span>
+        <span class="opt-measure-figs">Overall: ${b.overall.passed}/${b.overall.total} · Run: ${esc(fmtTime(b.run_at))}${Number.isFinite(age) && age >= 0 ? ` · Age: ${fmtAge(age)}` : ""} · Suite version: ${b.suite_version}</span>
+        ${b.stale ? `<span class="stale-tag">Stale — configuration changed since this run</span>` : ""}
+      </div>
+      <div class="opt-measure-figs">${Object.entries(b.per_category).map(([k, s]) => `${esc(evalCategoryLabel(k))}: ${s.passed}/${s.total}`).join(" · ")}</div>
+      <div class="opt-note">${esc(b.caveat)}</div>`
+      : `<div class="opt-note">No baseline yet — run the suite against a running backend to record one.</div>
+      <div class="opt-note">${esc(SCREENING_CAVEAT)}</div>`;
+    return `<div class="opt-screening">
+      <div class="opt-field-label" style="margin-top:14px">Screening suite</div>
+      ${baselineHtml}
+      ${running.map((rb) => `<div class="opt-measure-row">
+        <span class="opt-target">${esc(rb.id)}</span>
+        <button class="btn" data-opt-eval="${esc(rb.id)}" ${busy ? "disabled" : ""}>${icon("target")} Run baseline</button>
+      </div>`).join("")}
+      ${evalBackend !== null ? `<div class="opt-consult-actions">
+        <span class="opt-consulting">${icon("clock")} Running the screening suite on ${esc(evalBackend)}${evalStart ? ` <span id="optEvalElapsed">${fmtElapsed(Math.floor((Date.now() - evalStart) / 1000))}</span>` : ""} — twelve checkable tasks, inside a 10-minute time-box.</span>
+        <button class="btn danger" data-opt-act="cancel-job">${icon("x")} Cancel</button>
+      </div>` : ""}
+    </div>`;
+  }
+
   /** The repo ids a consultation should receive: the stored
    *  candidates' repos after pruning, deduplicated. Undefined
    *  when no discovery set is stored (the server then has
@@ -390,6 +448,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
           <button class="btn danger" data-opt-act="cancel-job">${icon("x")} Cancel</button>
         </div>` : ""}
       </div>` : ""}
+      ${screeningHtml(st, measuring)}
     </div>
     <div id="optPlanHost">${planHtml(st)}</div>
     <details class="card opt-purposes">
@@ -474,6 +533,37 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     if (r.data) {
       state = r.data;
       statusLine = "";
+    }
+    paint();
+  }
+
+  async function runEvalBaseline(backendId: string): Promise<void> {
+    evalBackend = backendId;
+    evalStart = Date.now();
+    paint();
+    if (evalTimer !== null) window.clearInterval(evalTimer);
+    evalTimer = window.setInterval(() => {
+      const el = hostEl.querySelector("#optEvalElapsed");
+      if (el) el.textContent = fmtElapsed(Math.floor((Date.now() - evalStart) / 1000));
+    }, 1000);
+    const r = await optimizeRunBaseline(backendId);
+    if (evalTimer !== null) { window.clearInterval(evalTimer); evalTimer = null; }
+    evalBackend = null;
+    evalStart = 0;
+    if (disposed) return;
+    if (r.error) {
+      if (state) state.measuring = false;
+      statusLine = r.error === "screening eval cancelled"
+        ? "Screening baseline cancelled."
+        : `Screening baseline failed — ${r.error}`;
+      paint();
+      return;
+    }
+    if (r.data) {
+      state = r.data;
+      statusLine = r.data.eval_baseline
+        ? `Baseline recorded for ${r.data.eval_baseline.backend_id} — Overall: ${r.data.eval_baseline.overall.passed}/${r.data.eval_baseline.overall.total}.`
+        : "";
     }
     paint();
   }
@@ -752,6 +842,12 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       if (backendId) void runMeasure(backendId);
       return;
     }
+    const evalBtn = t.closest<HTMLElement>("[data-opt-eval]");
+    if (evalBtn) {
+      const backendId = evalBtn.dataset.optEval ?? "";
+      if (backendId) void runEvalBaseline(backendId);
+      return;
+    }
     const candidateRemove = t.closest<HTMLElement>("[data-opt-candidate-remove]");
     if (candidateRemove) {
       const key = candidateRemove.dataset.optCandidateRemove ?? "";
@@ -848,5 +944,6 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     disposed = true;
     if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
     if (measureTimer !== null) window.clearInterval(measureTimer);
+    if (evalTimer !== null) window.clearInterval(evalTimer);
   };
 }

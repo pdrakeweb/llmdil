@@ -24,9 +24,14 @@
 //!   A.5 option (b)): directive-seeded HF search, per-quant facts
 //!   from the model record, and local fit verdicts, assembled as
 //!   the context document's `candidates` block.
+//! - [`eval`]: the screening evaluation suite (addendum A.4):
+//!   twelve fixed, machine-checkable tasks, their pure checkers,
+//!   run records and aggregates, and the baseline comparison
+//!   predicates (presented as data, never used as a gate).
 
 pub mod context;
 pub mod discover;
+pub mod eval;
 pub mod fit;
 pub mod measure;
 pub mod parse;
@@ -44,6 +49,13 @@ pub use discover::{
     search_query_for_directive, seat_for_directive, CandidateFact, DiscoverError, HfClient,
     HfModelFacts, HfSearchHit, HfSibling, QuantFile, FIT_DOES_NOT_FIT, FIT_FITS,
     FIT_FITS_WITH_SPLIT, FIT_UNCHECKED, HF_DEFAULT_BASE_URL, MAX_QUERY_TERMS, MAX_SEARCH_REPOS,
+};
+pub use eval::{
+    aggregate_results, compare, eval_suite, failed_task, output_excerpt, passes, score_task,
+    suite_worst_case_tokens, BaselineRecord, Checker, EvalAggregate, EvalCategory, EvalComparison,
+    EvalRunRecord, EvalTask, EvalTaskResult, JsonFieldSpec, JsonType, LinePattern, Score,
+    ScoreDelta, EVAL_SUITE_VERSION, EVAL_TEMPERATURE, EVAL_TIME_BOX_SECS, MAX_TASK_OUTPUT_TOKENS,
+    SCREENING_CAVEAT, SUITE_TOKEN_BUDGET,
 };
 pub use fit::{evaluate_fit, layout_requirement, residency_per_gpu, FitOutcome, LayoutFacts};
 pub use measure::{

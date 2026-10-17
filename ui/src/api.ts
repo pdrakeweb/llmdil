@@ -1864,6 +1864,37 @@ export interface OptimizeCandidates {
   items: OptimizeCandidate[];
 }
 
+/** Passed/total for one screening-suite score line (overall
+ *  or one category). Mirrors manager-optimize's Score. */
+export interface OptimizeEvalScore {
+  passed: number;
+  total: number;
+}
+
+/** The stored screening-suite baseline (Phase 5d, addendum
+ *  A.4): the incumbent backend's suite run, keyed by its
+ *  config fingerprint at run time. `stale` means the stored
+ *  fingerprint no longer matches the backend's current one
+ *  (or the backend is gone, or the suite version moved) —
+ *  a stale baseline is shown as history, never as current.
+ *  `per_category` keys are the EvalCategory strings
+ *  (instruction_following, factual_recall, arithmetic_reasoning,
+ *  code_adjacent, summarization, tool_call_formatting,
+ *  long_context_retrieval). Experiment results (Phase 5e)
+ *  carry the same Score shape, so deltas render without
+ *  reshaping. */
+export interface OptimizeEvalBaseline {
+  backend_id: string;
+  config_fingerprint: string;
+  suite_version: number;
+  run_at: string;
+  overall: OptimizeEvalScore;
+  per_category: Record<string, OptimizeEvalScore>;
+  stale: boolean;
+  /** The §A.4 caveat, verbatim — stated wherever scores appear. */
+  caveat: string;
+}
+
 export interface OptimizeState {
   purpose: string;
   /** The stored plan's directive (addendum A.2): the consult
@@ -1889,6 +1920,9 @@ export interface OptimizeState {
   /** The stored discovery pre-pass set (Phase 5c), or null when
    *  no discovery has run. */
   candidates: OptimizeCandidates | null;
+  /** The stored screening-suite baseline (Phase 5d), or null
+   *  when no baseline has been run. */
+  eval_baseline: OptimizeEvalBaseline | null;
   consulting: boolean;
   /** A GPU-bound Optimize job (measurement, later an
    *  experiment batch) is currently running. */
@@ -1958,6 +1992,15 @@ export async function optimizeCancelConsult(): Promise<CallResult<{ cancelled: b
  *  two prompts × (warm-up + 3 runs), 600 s budget per run. */
 export function optimizeMeasureBackend(backendId: string) {
   return optimizeStateCmd("optimize_measure_backend", { backendId });
+}
+
+/** optimize_run_baseline — run the screening suite against a
+ *  running backend and store the result as the baseline
+ *  (Phase 5d). Long-running: inside the suite's 10-minute
+ *  time-box. Runs under the shared GPU-job slot, so
+ *  optimizeCancelJob cancels it. */
+export function optimizeRunBaseline(backendId: string) {
+  return optimizeStateCmd("optimize_run_baseline", { backendId });
 }
 
 /** optimize_cancel_job — fire the shared GPU-job cancellation

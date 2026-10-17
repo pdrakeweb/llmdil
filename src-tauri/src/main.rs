@@ -47,6 +47,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 mod activation;
 mod gateway_stats;
 mod optimize;
+mod optimize_eval;
 
 // ---------------------------------------------------------------------------
 // Events (Rust -> UI, spec §14)
@@ -6353,6 +6354,7 @@ fn main() {
             optimize::optimize_measure_backend,
             optimize::optimize_cancel_job,
             optimize::optimize_discover,
+            optimize_eval::optimize_run_baseline,
             diagnostics_export_bundle,
             // MCP / VS Code
             mcp_list,

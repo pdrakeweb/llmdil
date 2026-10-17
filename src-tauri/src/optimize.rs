@@ -189,18 +189,18 @@ fn fingerprint_inputs(
 // Input gathering: everything the pure core needs from the live app
 // ---------------------------------------------------------------------------
 
-struct Gathered {
+pub(crate) struct Gathered {
     measure: MeasureInputs,
     live: LiveSnapshot,
     candidates: Vec<ConsultCandidate>,
-    running: HashMap<String, bool>,
+    pub(crate) running: HashMap<String, bool>,
     /// Each configured backend's current measurement
     /// fingerprint (§A.1), computed from the same snapshot the
     /// context is built from.
-    fingerprints: HashMap<String, String>,
+    pub(crate) fingerprints: HashMap<String, String>,
 }
 
-async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
+pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
     // Telemetry snapshot (GPU inventory, per-process VRAM, peaks).
     let store = state.telemetry().await;
     let (samples, processes, temp_peaks_c) = {
@@ -439,7 +439,7 @@ fn validation_json(v: &ItemValidation) -> Value {
     })
 }
 
-async fn state_payload(state: &AppState) -> ApiResult {
+pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
     let cfg = state.config.read().await.clone();
     let gathered = gather(state, &cfg).await;
     let (default_running, best_overall) = consult_default(&gathered.candidates);
@@ -529,6 +529,7 @@ async fn state_payload(state: &AppState) -> ApiResult {
         },
         "plan": plan_json,
         "candidates": candidates_json(&load_candidates_file(state)),
+        "eval_baseline": crate::optimize_eval::eval_baseline_json(state, &gathered.fingerprints),
         "consulting": state.optimize_abort.lock().await.is_some(),
         "measuring": state.optimize_job_abort.lock().await.is_some(),
     }))
