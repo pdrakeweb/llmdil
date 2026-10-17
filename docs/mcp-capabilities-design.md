@@ -273,6 +273,28 @@ trimming mechanism) and as LiteLLM `allowed_tools`. The other six
 Brave tools (local, video, image, news, summarizer, place) stay
 off until the operator edits the server.
 
+**Implementation record (Phase 3, 2026-10-17).** The `<pinned>`
+versions above were resolved from the primary registries on
+2026-10-17 and are recorded here per this section's rule:
+`@brave/brave-search-mcp-server@2.1.4` (npm, `dist-tags.latest`
+for `@brave/brave-search-mcp-server`) and
+`mcp-server-fetch@2026.10.10` (PyPI, latest release of the
+date-versioned `mcp-server-fetch` project). The pins live in code
+as `BRAVE_SEARCH_PACKAGE_PIN` / `WEB_FETCH_PACKAGE_PIN` in
+`crates/manager-config`. Phase 3 implementation notes:
+`brave_search`'s `rpm_limit` (20) is stored on the entry and
+surfaced via `mcp_list` but is NOT emitted into the generated
+YAML — LiteLLM's `mcp_rpm_limit` is a key/team property, not a
+server-config property (§5.5's enforcement attaches at key
+issuance, which this app does not perform; see the Phase 2
+record). SearXNG's `search_tools:` shape was verified against
+LiteLLM's SearXNG search docs (`docs.litellm.ai/docs/search/searxng`):
+a list entry with `search_tool_name: searxng-search` and a
+`litellm_params` block carrying `search_provider: searxng` and
+`api_base`. The §8 real tool call uses the documented
+`POST /mcp-rest/tools/call` body (`{server_id, name, arguments}`
+with the unprefixed tool name — `docs.litellm.ai/docs/mcp_rest_api`).
+
 ## 4. Gateway config generation and spawn environment
 
 ### 4.1 The `mcp_servers:` block

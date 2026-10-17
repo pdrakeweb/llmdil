@@ -590,8 +590,22 @@ mod tests {
     #[test]
     fn conversion_of_seeded_registry_matches_legacy_shape() {
         let specs = server_specs_from_config(&manager_config::McpConfig::seeded());
-        assert_eq!(specs.len(), 2);
-        assert!(specs.iter().all(|s| s.mode == McpMode::Local));
+        // Phase 3: the seed carries the legacy pair plus the curated
+        // pair. The legacy entries keep their Local shape exactly;
+        // the curated entries map by exposure (Gateway -> Remote,
+        // Disabled -> Disabled) and are never app-spawned.
+        assert_eq!(specs.len(), 4);
+        let legacy: Vec<&ServerSpec> = specs
+            .iter()
+            .filter(|s| s.id == "github" || s.id == "gdrive")
+            .collect();
+        assert_eq!(legacy.len(), 2);
+        assert!(legacy.iter().all(|s| s.mode == McpMode::Local));
+        let brave = specs.iter().find(|s| s.id == "brave_search").unwrap();
+        assert_eq!(brave.mode, McpMode::Remote);
+        assert_eq!(brave.package, "@brave/brave-search-mcp-server@2.1.4");
+        let fetch = specs.iter().find(|s| s.id == "web_fetch").unwrap();
+        assert_eq!(fetch.mode, McpMode::Disabled);
         let gd = specs.iter().find(|s| s.id == "gdrive").unwrap();
         // Canonicalised env key in the registry view.
         assert_eq!(gd.env_keys, vec!["GOOGLE_APPLICATION_CREDENTIALS"]);

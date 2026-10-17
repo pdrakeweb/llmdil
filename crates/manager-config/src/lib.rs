@@ -92,6 +92,17 @@ pub struct AppConfig {
     /// [`migrate`] (see §10.1 migration there).
     #[serde(default)]
     pub mcp: McpConfig,
+    /// Set once the Phase 3 curated MCP servers (`brave_search` /
+    /// `web_fetch`, MCP design §3.3) have been seeded into
+    /// [`AppConfig::mcp`]. Follows the `defaults_repaired` precedent:
+    /// configurations created by current code are born with this set
+    /// (their registry already carries the curated entries), and
+    /// [`migrate`] performs the one-time append for older files —
+    /// keyed on the marker's ABSENCE from the raw JSON, because the
+    /// defaults overlay would otherwise fill it in. Once set, an
+    /// operator who deletes the curated entries is never reseeded.
+    #[serde(default)]
+    pub mcp_curated_seeded: bool,
 }
 
 /// MCP transport, as persisted in [`McpServerConfig`].
@@ -145,12 +156,60 @@ pub const GDRIVE_MCP_CRED_REF: &str = "local-llm-service-manager/gdrive-mcp";
 pub const LEGACY_GITHUB_MCP_CRED_REF: &str = "llm-manager/mcp/github";
 /// Pre-unification credential target for the Drive server.
 pub const LEGACY_GDRIVE_MCP_CRED_REF: &str = "llm-manager/mcp/gdrive";
+/// Credential Manager target for the curated Brave Search MCP server
+/// (MCP design §3.3).
+pub const BRAVE_SEARCH_MCP_CRED_REF: &str = "local-llm-service-manager/brave-search-mcp";
+
+/// Pinned Brave Search MCP server package (MCP design §3.3 / §6.1).
+///
+/// Pin: `@brave/brave-search-mcp-server@2.1.4` — the npm registry's
+/// `dist-tags.latest` for `@brave/brave-search-mcp-server`, resolved
+/// 2026-10-17. Recorded in the design's §3.3 implementation record.
+/// Bumping it is a code change, never a runtime resolution.
+pub const BRAVE_SEARCH_PACKAGE_PIN: &str = "@brave/brave-search-mcp-server@2.1.4";
+/// Pinned URL-fetch MCP server package (MCP design §3.3 / §6.2).
+///
+/// Pin: `mcp-server-fetch@2026.10.10` — the PyPI latest release of
+/// the date-versioned `mcp-server-fetch` project, resolved
+/// 2026-10-17. Recorded in the design's §3.3 implementation record.
+pub const WEB_FETCH_PACKAGE_PIN: &str = "mcp-server-fetch@2026.10.10";
+/// The Brave tools exposed by default (MCP design §3.3): the other
+/// six Brave tools stay off until the operator edits the server.
+/// Emitted both as LiteLLM `allowed_tools` and as the server's own
+/// `BRAVE_MCP_ENABLED_TOOLS` trimming env (by `manager-gateway`).
+pub const BRAVE_DEFAULT_ALLOWED_TOOLS: &[&str] = &["brave_web_search", "brave_llm_context"];
+
+/// SearXNG search-provider settings (MCP design §6.3): SearXNG is
+/// NOT an MCP server — LiteLLM ships it as a built-in search
+/// provider, reached through its Search API. These settings live on
+/// [`McpConfig`] because §6.3 specifies the feature inside the MCP
+/// capabilities design and the registry section is where its toggle
+/// belongs in the persisted shape; generation emits a top-level
+/// `search_tools:` block (never inside `mcp_servers:`) and the
+/// gateway spawn env gains `SEARXNG_API_BASE`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearxngSettings {
+    /// Operator toggle; off by default (no instance is stood up by
+    /// the app — §6.3's container is the operator's to run).
+    pub enabled: bool,
+    /// Base URL of the operator's SearXNG instance, e.g.
+    /// `http://127.0.0.1:8080`. Not a secret: it is plain config,
+    /// shown in the gateway plan like other non-secret values.
+    /// Validated as a non-empty http(s) URL only while `enabled`.
+    pub api_base: String,
+}
 
 /// The persisted MCP server registry (MCP design §3.1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpConfig {
     #[serde(default)]
     pub servers: Vec<McpServerConfig>,
+    /// SearXNG search-provider settings (§6.3). Serde-defaulted so
+    /// registry JSON written before the settings existed loads with
+    /// SearXNG disabled and no instance URL.
+    #[serde(default)]
+    pub searxng: SearxngSettings,
 }
 
 impl McpConfig {
@@ -163,10 +222,13 @@ impl McpConfig {
     /// `GOOGLE_APPLICATION_CREDENTIALS`, which is also what the wizard
     /// step always wrote). Command/args/package parity with
     /// `default_servers()` is otherwise exact: `npx -y` on the same
-    /// `@modelcontextprotocol/server-*` packages.
+    /// `@modelcontextprotocol/server-*` packages. Phase 3 appends the
+    /// two curated servers ([`curated_mcp_servers`]) after the legacy
+    /// pair, so a fresh registry carries all four entries.
     pub fn seeded() -> Self {
         Self {
             servers: seeded_mcp_servers(),
+            searxng: SearxngSettings::default(),
         }
     }
 }
@@ -185,10 +247,76 @@ impl Default for McpConfig {
     }
 }
 
-/// The seed servers for [`McpConfig::seeded`] (see its documentation
-/// for the unification/canonicalisation rules applied).
-pub fn seeded_mcp_servers() -> Vec<McpServerConfig> {
+/// The curated Phase 3 seed servers (MCP design §3.3): Brave Search
+/// (Gateway-exposed, metered) and URL fetch (Disabled by default,
+/// §13d). Pins are the [`BRAVE_SEARCH_PACKAGE_PIN`] /
+/// [`WEB_FETCH_PACKAGE_PIN`] constants — exact versions resolved
+/// from the primary registries (npm / PyPI) on 2026-10-17 and
+/// recorded in the design's §3.3 implementation record.
+pub fn curated_mcp_servers() -> Vec<McpServerConfig> {
     vec![
+        McpServerConfig {
+            id: "brave_search".to_string(),
+            display_name: "Brave Search".to_string(),
+            transport: McpTransport::Stdio,
+            exposure: McpExposure::Gateway,
+            command: Some("npx".to_string()),
+            args: vec![
+                "-y".to_string(),
+                BRAVE_SEARCH_PACKAGE_PIN.to_string(),
+                "--transport".to_string(),
+                "stdio".to_string(),
+            ],
+            url: None,
+            env_keys: vec!["BRAVE_API_KEY".to_string()],
+            cred_ref: Some(BRAVE_SEARCH_MCP_CRED_REF.to_string()),
+            allowed_tools: Some(
+                BRAVE_DEFAULT_ALLOWED_TOOLS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            metered: true,
+            // Stored on the entry and surfaced via `mcp_list` only.
+            // It is deliberately NOT emitted into the generated
+            // LiteLLM YAML: LiteLLM's `mcp_rpm_limit` is a key/team
+            // property, not a server-config property, and emitting
+            // an invented server key risks a LiteLLM config
+            // rejection. Actual enforcement attaches at virtual-key
+            // issuance (design §5.5) — which this app does not
+            // perform (there is no virtual-key issuance surface;
+            // the Phase 2 discrepancy recorded in
+            // docs/mcp-capabilities-design.md §12 / the Phase 2
+            // implementation), so in v1 the value is the documented
+            // cap the operator sees, not a gateway-enforced limit.
+            rpm_limit: Some(20),
+        },
+        McpServerConfig {
+            id: "web_fetch".to_string(),
+            // URL fetching only — never described as search (§6.2).
+            display_name: "Web Fetch".to_string(),
+            transport: McpTransport::Stdio,
+            // Disabled until explicitly enabled (§5.2 / §13d).
+            exposure: McpExposure::Disabled,
+            command: Some("uvx".to_string()),
+            args: vec![WEB_FETCH_PACKAGE_PIN.to_string()],
+            url: None,
+            env_keys: Vec::new(),
+            cred_ref: None,
+            // `fetch` is the server's only tool (§6.2).
+            allowed_tools: Some(vec!["fetch".to_string()]),
+            metered: false,
+            rpm_limit: None,
+        },
+    ]
+}
+
+/// The seed servers for [`McpConfig::seeded`] (see its documentation
+/// for the unification/canonicalisation rules applied): the two
+/// legacy Local servers followed by the Phase 3 curated pair
+/// ([`curated_mcp_servers`]).
+pub fn seeded_mcp_servers() -> Vec<McpServerConfig> {
+    let mut servers = vec![
         McpServerConfig {
             id: "github".to_string(),
             display_name: "GitHub".to_string(),
@@ -225,7 +353,9 @@ pub fn seeded_mcp_servers() -> Vec<McpServerConfig> {
             metered: false,
             rpm_limit: None,
         },
-    ]
+    ];
+    servers.extend(curated_mcp_servers());
+    servers
 }
 
 /// One persisted MCP server definition (MCP design §3.1). Every field
@@ -687,6 +817,9 @@ impl AppConfig {
             defaults_repaired: true,
             catalog_revision: 0,
             mcp: McpConfig::seeded(),
+            // Born seeded: the registry above already carries the
+            // curated entries (see the field's documentation).
+            mcp_curated_seeded: true,
         }
     }
 }
@@ -1145,6 +1278,7 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
 
     // --- mcp servers (design §3.2) ---
     validate_mcp_servers(&config.mcp, &mut errors);
+    validate_searxng(&config.mcp.searxng, &mut errors);
 
     // --- telemetry ---
     if config.telemetry.retention_secs == 0 {
@@ -1205,6 +1339,17 @@ pub fn migrate(raw: serde_json::Value) -> Result<AppConfig, ConfigError> {
         .and_then(|o| o.get("mcp"))
         .filter(|v| !v.is_null())
         .cloned();
+    // Curated-seeding marker (Phase 3, design §3.3): whether the raw
+    // file carries `mcp_curated_seeded` at all. The defaults overlay
+    // below fills a missing key from `default_config()` — where the
+    // marker is born set — so presence in the RAW JSON is the only
+    // honest signal that the one-time append already ran for this
+    // file. A pre-Phase-3 file has no marker key; a Phase 3 file
+    // always does (the field serializes unconditionally).
+    let mcp_curated_marker_present = raw
+        .as_object()
+        .map(|o| o.contains_key("mcp_curated_seeded"))
+        .unwrap_or(false);
     let mut merged = raw;
     apply_defaults(&mut merged)?;
     if let Some(mcp) = explicit_mcp {
@@ -1212,14 +1357,37 @@ pub fn migrate(raw: serde_json::Value) -> Result<AppConfig, ConfigError> {
             obj.insert("mcp".to_string(), mcp);
         }
     }
+    if !mcp_curated_marker_present {
+        if let Some(obj) = merged.as_object_mut() {
+            obj.insert("mcp_curated_seeded".to_string(), serde_json::json!(false));
+        }
+    }
     if version != CURRENT_VERSION {
         if let Some(obj) = merged.as_object_mut() {
             obj.insert("version".to_string(), serde_json::json!(CURRENT_VERSION));
         }
     }
-    serde_json::from_value(merged).map_err(|e| {
+    let mut cfg: AppConfig = serde_json::from_value(merged).map_err(|e| {
         ConfigError::MigrationFailed(format!("migrated config failed schema check: {e}"))
-    })
+    })?;
+    // One-time curated append (Phase 3): a configuration that has
+    // never been through this migration gains any curated server it
+    // lacks (by id — an operator-renamed or edited entry with a
+    // curated id is left alone), exactly once: the marker is set on
+    // the returned config and persists on the next save, so curated
+    // entries the operator later deletes stay deleted. This composes
+    // with the verbatim explicit-`mcp` restore above: the restore
+    // decides what the file said; this append is the migration the
+    // design orders for pre-Phase-3 files.
+    if !cfg.mcp_curated_seeded {
+        for server in curated_mcp_servers() {
+            if !cfg.mcp.servers.iter().any(|s| s.id == server.id) {
+                cfg.mcp.servers.push(server);
+            }
+        }
+        cfg.mcp_curated_seeded = true;
+    }
+    Ok(cfg)
 }
 
 /// Default data directory: `%APPDATA%\local-llm-service-manager`
@@ -1482,6 +1650,30 @@ fn validate_mcp_servers(mcp: &McpConfig, errors: &mut Vec<String>) {
                 s.id
             ));
         }
+    }
+}
+
+/// SearXNG settings validation (MCP design §6.3): only the enabled
+/// state constrains anything — `api_base` must then be a non-empty
+/// http(s) URL (checked with the same pragmatic parser as MCP http
+/// servers). Unlike MCP http servers there is no https-off-loopback
+/// rule: a SearXNG instance is operator infrastructure, bound to
+/// loopback or the LAN side per §6.3, so plain http to a LAN address
+/// is a legitimate configuration. Disabled carries no constraint at
+/// all, so a half-typed URL can be saved with the toggle off.
+fn validate_searxng(searxng: &SearxngSettings, errors: &mut Vec<String>) {
+    if !searxng.enabled {
+        return;
+    }
+    let api_base = searxng.api_base.trim();
+    if api_base.is_empty() {
+        errors.push(
+            "mcp.searxng: api_base must not be empty while searxng is enabled".to_string(),
+        );
+        return;
+    }
+    if let Err(e) = parse_mcp_http_url(api_base) {
+        errors.push(format!("mcp.searxng: api_base: {e}"));
     }
 }
 
@@ -2330,14 +2522,18 @@ mod tests {
 
     fn cfg_with_mcp(servers: Vec<McpServerConfig>) -> AppConfig {
         let mut cfg = working_config();
-        cfg.mcp = McpConfig { servers };
+        cfg.mcp = McpConfig {
+            servers,
+            searxng: SearxngSettings::default(),
+        };
         cfg
     }
 
     #[test]
     fn mcp_seed_is_legacy_servers_with_unified_credentials() {
         let seed = seeded_mcp_servers();
-        assert_eq!(seed.len(), 2);
+        // Phase 3: the legacy pair followed by the curated pair.
+        assert_eq!(seed.len(), 4);
         let gh = &seed[0];
         assert_eq!(gh.id, "github");
         assert_eq!(gh.display_name, "GitHub");
@@ -2357,6 +2553,142 @@ mod tests {
         // default_config carries the seed.
         assert_eq!(AppConfig::default_config().mcp.servers, seed);
         validate(&cfg_with_mcp(seed)).expect("seed must validate");
+    }
+
+    #[test]
+    fn mcp_curated_seed_entries_match_design() {
+        let curated = curated_mcp_servers();
+        assert_eq!(curated.len(), 2);
+        let brave = &curated[0];
+        assert_eq!(brave.id, "brave_search");
+        assert_eq!(brave.display_name, "Brave Search");
+        assert_eq!(brave.transport, McpTransport::Stdio);
+        assert_eq!(brave.exposure, McpExposure::Gateway);
+        assert_eq!(brave.command.as_deref(), Some("npx"));
+        assert_eq!(
+            brave.args,
+            vec![
+                "-y",
+                "@brave/brave-search-mcp-server@2.1.4",
+                "--transport",
+                "stdio"
+            ]
+        );
+        assert_eq!(brave.env_keys, vec!["BRAVE_API_KEY"]);
+        assert_eq!(brave.cred_ref.as_deref(), Some(BRAVE_SEARCH_MCP_CRED_REF));
+        assert_eq!(BRAVE_SEARCH_MCP_CRED_REF, "local-llm-service-manager/brave-search-mcp");
+        assert_eq!(
+            brave.allowed_tools.as_deref(),
+            Some(&["brave_web_search".to_string(), "brave_llm_context".to_string()][..])
+        );
+        assert!(brave.metered);
+        assert_eq!(brave.rpm_limit, Some(20));
+        let fetch = &curated[1];
+        assert_eq!(fetch.id, "web_fetch");
+        assert_eq!(fetch.display_name, "Web Fetch");
+        assert_eq!(fetch.transport, McpTransport::Stdio);
+        assert_eq!(fetch.exposure, McpExposure::Disabled);
+        assert_eq!(fetch.command.as_deref(), Some("uvx"));
+        assert_eq!(fetch.args, vec!["mcp-server-fetch@2026.10.10"]);
+        assert!(fetch.env_keys.is_empty());
+        assert_eq!(fetch.cred_ref, None);
+        assert_eq!(fetch.allowed_tools.as_deref(), Some(&["fetch".to_string()][..]));
+        assert!(!fetch.metered);
+        assert_eq!(fetch.rpm_limit, None);
+        // A fresh default config carries all four entries and is
+        // born with the curated-seeded marker set.
+        let default = AppConfig::default_config();
+        assert_eq!(default.mcp.servers.len(), 4);
+        assert!(default.mcp_curated_seeded);
+        assert_eq!(default.mcp.searxng, SearxngSettings::default());
+        validate(&default).expect("default with curated seed must validate");
+    }
+
+    #[test]
+    fn migrate_pre_phase3_config_gains_curated_exactly_once() {
+        // A Phase 1/2-era file: an explicit mcp section holding only
+        // the legacy pair, and NO mcp_curated_seeded key anywhere.
+        let mut raw = serde_json::to_value(working_config()).unwrap();
+        raw.as_object_mut().unwrap().remove("mcp_curated_seeded");
+        raw["mcp"] = serde_json::json!({ "servers": [
+            {
+                "id": "github", "display_name": "GitHub", "transport": "stdio",
+                "exposure": "local", "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "url": null, "env_keys": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+                "cred_ref": "local-llm-service-manager/github-mcp",
+                "allowed_tools": null, "metered": false, "rpm_limit": null
+            },
+            {
+                "id": "gdrive", "display_name": "Google Drive", "transport": "stdio",
+                "exposure": "local", "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-gdrive"],
+                "url": null, "env_keys": ["GOOGLE_APPLICATION_CREDENTIALS"],
+                "cred_ref": "local-llm-service-manager/gdrive-mcp",
+                "allowed_tools": null, "metered": false, "rpm_limit": null
+            }
+        ]});
+        let cfg = migrate(raw).expect("pre-Phase-3 config must migrate");
+        let ids: Vec<&str> = cfg.mcp.servers.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["github", "gdrive", "brave_search", "web_fetch"]);
+        assert!(cfg.mcp_curated_seeded);
+        validate(&cfg).expect("migrated config validates");
+        // Second load (of the now-Phase-3 shape): no duplication.
+        let cfg2 = migrate(serde_json::to_value(&cfg).unwrap()).expect("second load");
+        assert_eq!(cfg2.mcp.servers.len(), 4);
+        assert!(cfg2.mcp_curated_seeded);
+    }
+
+    #[test]
+    fn migrate_curated_entries_deleted_stay_deleted() {
+        // A Phase 3 file whose operator deleted both curated entries:
+        // the marker is present and set, so nothing is resurrected.
+        let mut cfg = working_config();
+        cfg.mcp.servers
+            .retain(|s| s.id == "github" || s.id == "gdrive");
+        assert_eq!(cfg.mcp.servers.len(), 2);
+        assert!(cfg.mcp_curated_seeded);
+        let back = migrate(serde_json::to_value(&cfg).unwrap()).expect("reload");
+        let ids: Vec<&str> = back.mcp.servers.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["github", "gdrive"]);
+        // An entirely empty registry with the marker set also stays empty.
+        let mut cfg = working_config();
+        cfg.mcp.servers.clear();
+        let back = migrate(serde_json::to_value(&cfg).unwrap()).expect("reload empty");
+        assert!(back.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn searxng_settings_default_and_validation() {
+        // Registry JSON written before the settings existed loads
+        // with SearXNG disabled and an empty base.
+        let mcp: McpConfig = serde_json::from_str(r#"{"servers":[]}"#).unwrap();
+        assert_eq!(mcp.searxng, SearxngSettings::default());
+        // Disabled: no constraint, even on a half-typed base.
+        let mut cfg = cfg_with_mcp(vec![]);
+        cfg.mcp.searxng = SearxngSettings {
+            enabled: false,
+            api_base: "not a url".to_string(),
+        };
+        validate(&cfg).expect("disabled searxng carries no constraint");
+        // Enabled with an empty base is rejected.
+        cfg.mcp.searxng = SearxngSettings {
+            enabled: true,
+            api_base: "  ".to_string(),
+        };
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("searxng"), "{err}");
+        // Enabled with a non-URL / wrong scheme is rejected.
+        cfg.mcp.searxng.api_base = "ftp://example.com".to_string();
+        assert!(validate(&cfg).is_err());
+        cfg.mcp.searxng.api_base = "not-a-url".to_string();
+        assert!(validate(&cfg).is_err());
+        // Enabled with loopback http (the §6.3 self-host shape) and
+        // with https both validate.
+        cfg.mcp.searxng.api_base = "http://127.0.0.1:8080".to_string();
+        validate(&cfg).expect("loopback http searxng validates");
+        cfg.mcp.searxng.api_base = "https://search.example.com/".to_string();
+        validate(&cfg).expect("https searxng validates");
     }
 
     #[test]

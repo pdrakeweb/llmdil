@@ -809,7 +809,14 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
                     }
                 }
             }
-            if !s.env_keys.is_empty() {
+            // Env block: secret-bearing keys first (always
+            // os.environ/ references, never literals — §4.1/§5.4),
+            // then any curated NON-secret literals for this server
+            // (see `curated_env_literals`). The block is emitted when
+            // either kind is present — web_fetch has no secret keys
+            // but still needs its literal.
+            let literals = curated_env_literals(s);
+            if !s.env_keys.is_empty() || !literals.is_empty() {
                 out.push_str("    env:\n");
                 for key in &s.env_keys {
                     // Secret values are always os.environ/ references,
@@ -819,6 +826,13 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
                         "      {}: {}\n",
                         yaml_scalar(key),
                         yaml_scalar(&format!("os.environ/{key}"))
+                    ));
+                }
+                for (key, value) in &literals {
+                    out.push_str(&format!(
+                        "      {}: {}\n",
+                        yaml_scalar(key),
+                        yaml_scalar(value)
                     ));
                 }
             }
@@ -836,7 +850,66 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
         }
     }
 
+    // --- search_tools (SearXNG, design §6.3) ---
+    // SearXNG is LiteLLM's built-in search provider, NOT an MCP
+    // server: its entry lives in a top-level `search_tools:` block
+    // alongside (never inside) `mcp_servers:`, in this fixed
+    // position after it. Shape verified against LiteLLM's SearXNG
+    // search docs (docs.litellm.ai/docs/search/searxng, accessed
+    // 2026-10-17): a list entry with `search_tool_name` and a
+    // `litellm_params` block carrying `search_provider: searxng`
+    // and the instance `api_base`. Emitted only when the provider
+    // is enabled with a non-empty base; otherwise nothing is
+    // emitted and the output is byte-identical to a config without
+    // the settings.
+    let searxng = &config.mcp.searxng;
+    if searxng.enabled && !searxng.api_base.trim().is_empty() {
+        out.push_str("search_tools:\n");
+        out.push_str("  - search_tool_name: searxng-search\n");
+        out.push_str("    litellm_params:\n");
+        out.push_str("      search_provider: searxng\n");
+        out.push_str(&format!(
+            "      api_base: {}\n",
+            yaml_scalar(searxng.api_base.trim())
+        ));
+    }
+
     Ok(out)
+}
+
+/// Non-secret curated env literals for one gateway MCP server,
+/// keyed by curated server id (MCP design §3.3 / §6.2). These are
+/// configuration values, not secrets, so — unlike the secret-bearing
+/// `env_keys`, which §4.1 mandates as `os.environ/` references —
+/// they are emitted as literal values in the server's `env:` block:
+///
+/// - `brave_search`: `BRAVE_MCP_ENABLED_TOOLS` is the server's own
+///   tool-trimming mechanism (§3.3); its value is the server's
+///   `allowed_tools` joined with `,`, so an operator edit to
+///   `allowed_tools` moves the literal with it. When `allowed_tools`
+///   is `None`, the design default pair
+///   ([`manager_config::BRAVE_DEFAULT_ALLOWED_TOOLS`]) is used.
+/// - `web_fetch`: `PYTHONIOENCODING: utf-8`, the Windows stdio note
+///   from the fetch server's docs (§6.2).
+///
+/// Any other server id gets no literals.
+fn curated_env_literals(
+    server: &manager_config::McpServerConfig,
+) -> Vec<(String, String)> {
+    match server.id.as_str() {
+        "brave_search" => {
+            let tools: Vec<&str> = match &server.allowed_tools {
+                Some(tools) => tools.iter().map(String::as_str).collect(),
+                None => manager_config::BRAVE_DEFAULT_ALLOWED_TOOLS.to_vec(),
+            };
+            vec![(
+                "BRAVE_MCP_ENABLED_TOOLS".to_string(),
+                tools.join(","),
+            )]
+        }
+        "web_fetch" => vec![("PYTHONIOENCODING".to_string(), "utf-8".to_string())],
+        _ => Vec::new(),
+    }
 }
 
 /// Resolve the single global `routing_strategy` for `router_settings`
@@ -1029,8 +1102,15 @@ mod tests {
 
     /// The 4-backend stack from the spec: planner :8081, coder :8082,
     /// coder-fast :8083, tool-runner :8084, OpenRouter tier enabled.
+    /// The MCP registry is pinned to the two legacy Local servers:
+    /// the Phase 3 default registry also carries a Gateway-exposed
+    /// curated server, and these fixtures predate it — tests that
+    /// exercise gateway MCP emission set the registry explicitly.
     fn four_backend_config() -> AppConfig {
         let mut cfg = AppConfig::default_config();
+        cfg.mcp
+            .servers
+            .retain(|s| s.id == "github" || s.id == "gdrive");
         cfg.backends = vec![
             backend("planner", 8081),
             backend("coder", 8082),
@@ -1225,6 +1305,139 @@ mod tests {
             1,
             "{yaml}"
         );
+    }
+
+    fn web_fetch_gateway_server() -> manager_config::McpServerConfig {
+        manager_config::McpServerConfig {
+            id: "web_fetch".to_string(),
+            display_name: "Web Fetch".to_string(),
+            transport: McpTransport::Stdio,
+            exposure: McpExposure::Gateway,
+            command: Some("uvx".to_string()),
+            args: vec!["mcp-server-fetch@2026.10.10".to_string()],
+            url: None,
+            env_keys: vec![],
+            cred_ref: None,
+            allowed_tools: Some(vec!["fetch".to_string()]),
+            metered: false,
+            rpm_limit: None,
+        }
+    }
+
+    #[test]
+    fn yaml_brave_env_carries_secret_ref_and_tools_literal() {
+        let mut cfg = four_backend_config();
+        cfg.mcp.servers.push(mcp_stdio_server());
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        // Secret stays an os.environ/ reference...
+        assert!(
+            yaml.contains("      BRAVE_API_KEY: os.environ/BRAVE_API_KEY\n"),
+            "{yaml}"
+        );
+        // ...and the non-secret trimming literal rides the same env
+        // block, derived from allowed_tools (§3.3).
+        assert!(
+            yaml.contains(
+                "      BRAVE_MCP_ENABLED_TOOLS: \"brave_web_search,brave_llm_context\"\n"
+            ),
+            "{yaml}"
+        );
+        // rpm_limit is never emitted into the YAML (§5.5 honesty:
+        // LiteLLM's mcp_rpm_limit is a key/team property).
+        assert!(!yaml.contains("rpm"), "{yaml}");
+    }
+
+    #[test]
+    fn yaml_brave_tools_literal_tracks_allowed_tools_edits() {
+        // Edited allowed_tools: the literal follows.
+        let mut cfg = four_backend_config();
+        let mut server = mcp_stdio_server();
+        server.allowed_tools = Some(vec!["brave_web_search".to_string()]);
+        cfg.mcp.servers.push(server);
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(
+            yaml.contains("      BRAVE_MCP_ENABLED_TOOLS: brave_web_search\n"),
+            "{yaml}"
+        );
+        // allowed_tools None: the literal falls back to the design
+        // default pair, and no allowed_tools line is emitted.
+        let mut cfg = four_backend_config();
+        let mut server = mcp_stdio_server();
+        server.allowed_tools = None;
+        cfg.mcp.servers.push(server);
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(
+            yaml.contains(
+                "      BRAVE_MCP_ENABLED_TOOLS: \"brave_web_search,brave_llm_context\"\n"
+            ),
+            "{yaml}"
+        );
+        assert!(!yaml.contains("allowed_tools:"), "{yaml}");
+    }
+
+    #[test]
+    fn yaml_web_fetch_env_carries_pythonioencoding_literal() {
+        let mut cfg = four_backend_config();
+        cfg.mcp.servers.push(web_fetch_gateway_server());
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(yaml.contains("  web_fetch:\n"), "{yaml}");
+        // The env block exists despite web_fetch having no secret
+        // env keys, and carries only the §6.2 literal.
+        assert!(yaml.contains("      PYTHONIOENCODING: utf-8\n"), "{yaml}");
+        assert!(!yaml.contains("os.environ/PYTHONIOENCODING"), "{yaml}");
+        // The seeded Disabled form is absent entirely (zero-Gateway
+        // output stays byte-identical — the snapshot test's domain).
+        let mut cfg = four_backend_config();
+        let mut disabled = web_fetch_gateway_server();
+        disabled.exposure = McpExposure::Disabled;
+        cfg.mcp.servers.push(disabled);
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(!yaml.contains("web_fetch"), "{yaml}");
+        assert!(!yaml.contains("PYTHONIOENCODING"), "{yaml}");
+    }
+
+    #[test]
+    fn yaml_non_curated_servers_get_no_literals() {
+        let mut cfg = four_backend_config();
+        let mut custom = mcp_stdio_server();
+        custom.id = "custom_search".to_string();
+        cfg.mcp.servers.push(custom);
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(yaml.contains("  custom_search:\n"), "{yaml}");
+        assert!(!yaml.contains("BRAVE_MCP_ENABLED_TOOLS"), "{yaml}");
+        assert!(!yaml.contains("PYTHONIOENCODING"), "{yaml}");
+    }
+
+    #[test]
+    fn yaml_searxng_search_tools_emitted_only_when_enabled() {
+        // Disabled (the default): no block, output unchanged.
+        let cfg = four_backend_config();
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(!yaml.contains("search_tools"), "{yaml}");
+        // Enabled but with an empty base: still nothing (validation
+        // rejects this state at save; generation stays total).
+        let mut cfg = four_backend_config();
+        cfg.mcp.searxng.enabled = true;
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(!yaml.contains("search_tools"), "{yaml}");
+        // Enabled with a base: the documented shape, top-level,
+        // after mcp_servers when both are present.
+        let mut cfg = four_backend_config();
+        cfg.mcp.searxng = manager_config::SearxngSettings {
+            enabled: true,
+            api_base: "http://127.0.0.1:8080".to_string(),
+        };
+        cfg.mcp.servers.push(mcp_stdio_server());
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(
+            yaml.contains(
+                "search_tools:\n  - search_tool_name: searxng-search\n    litellm_params:\n      search_provider: searxng\n      api_base: \"http://127.0.0.1:8080\"\n"
+            ),
+            "{yaml}"
+        );
+        let mcp_at = yaml.find("mcp_servers:").unwrap();
+        let search_at = yaml.find("search_tools:").unwrap();
+        assert!(mcp_at < search_at, "{yaml}");
     }
 
     #[test]

@@ -936,6 +936,73 @@ pub fn mcp_response_error(body: &str) -> Option<String> {
     }
 }
 
+/// Maximum length, in characters, of the response excerpt carried
+/// in an MCP tool-call test result (MCP design §8, Phase 3). A real
+/// Brave search response is far larger than anything a test result
+/// should hold; the excerpt exists so the operator can see the call
+/// produced plausible output, not to transport the output.
+pub const MCP_TOOL_CALL_DETAIL_MAX_CHARS: usize = 200;
+
+/// Build the JSON body for one `POST /mcp-rest/tools/call` request
+/// (LiteLLM MCP REST API docs, docs.litellm.ai/docs/mcp_rest_api,
+/// accessed 2026-10-17). The documented shape is
+/// `{"server_id": ..., "name": ..., "arguments": {...}}` where
+/// `name` may be the prefixed (`<server>-<tool>`) or the unprefixed
+/// tool name; callers here pass the UNPREFIXED name together with
+/// the server id, the combination the docs list as working
+/// ("unprefixed name + server name"). `arguments` is always a JSON
+/// object, never null (a null is a documented 500). This is the one
+/// place the body is constructed, so a Phase 5 on-machine finding
+/// about the shape changes exactly one function.
+pub fn mcp_tool_call_body(server_id: &str, tool_name: &str, arguments: serde_json::Value) -> String {
+    serde_json::json!({
+        "server_id": server_id,
+        "name": tool_name,
+        "arguments": arguments,
+    })
+    .to_string()
+}
+
+/// The fixed, harmless real-call body for the curated Brave test
+/// (MCP design §8): one `brave_web_search` call with a one-word
+/// query. Metered — only ever sent from the explicit per-server
+/// Test action, never from a start-time load check or a poll.
+pub fn brave_search_test_call_body() -> String {
+    mcp_tool_call_body(
+        "brave_search",
+        "brave_web_search",
+        serde_json::json!({ "query": "llmdil" }),
+    )
+}
+
+/// Summarize one `POST /mcp-rest/tools/call` response for a test
+/// result payload: `(ok, detail)`. Ok requires HTTP 200 and no
+/// error envelope ([`mcp_response_error`]). The detail is the
+/// gateway's own error text when it sent one, else a truncated
+/// excerpt of the body (capped at
+/// [`MCP_TOOL_CALL_DETAIL_MAX_CHARS`] characters — the full search
+/// response is never carried into a result payload).
+pub fn summarize_mcp_tool_call_response(status: u16, body: &str) -> (bool, String) {
+    if let Some(err) = mcp_response_error(body) {
+        return (false, truncate_excerpt(&format!("tool call error: {err}")));
+    }
+    if status != 200 {
+        return (false, truncate_excerpt(&format!("tool call failed: HTTP {status}")));
+    }
+    (true, truncate_excerpt(body.trim()))
+}
+
+/// Truncate `text` to [`MCP_TOOL_CALL_DETAIL_MAX_CHARS`]
+/// characters (on a char boundary), marking truncation with an
+/// ellipsis suffix.
+fn truncate_excerpt(text: &str) -> String {
+    if text.chars().count() <= MCP_TOOL_CALL_DETAIL_MAX_CHARS {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(MCP_TOOL_CALL_DETAIL_MAX_CHARS).collect();
+    format!("{kept}…")
+}
+
 /// The gateway inputs that travel to the spawned process via argv
 /// and environment rather than through `config.yaml` — invisible to
 /// a YAML-only comparison. The start-gateway step records the
@@ -973,6 +1040,37 @@ pub struct GatewaySpawnFingerprint {
     /// `mcp_stdio_enabled`, for the same pre-feature compatibility.
     #[serde(default)]
     pub mcp_servers_hash: String,
+    /// Hash of the SearXNG search-provider spawn inputs (MCP design
+    /// §6.3, Phase 3): the `SEARXNG_API_BASE` env value the gateway
+    /// was spawned with. Empty exactly when SearXNG contributed
+    /// nothing to the spawn (disabled, or enabled with an empty
+    /// base) — which is also what a pre-Phase-3 record holds, via
+    /// the serde default, so searxng-less configurations still
+    /// compare current against old records. Toggling SearXNG or
+    /// changing its base changes this hash and registers as drift.
+    #[serde(default)]
+    pub searxng_hash: String,
+}
+
+/// The fingerprint contribution of the SearXNG settings (see
+/// [`GatewaySpawnFingerprint::searxng_hash`]): the empty string when
+/// SearXNG is not in play for a spawn (disabled, or no base
+/// configured — generation emits no `search_tools:` block and the
+/// spawn env carries no `SEARXNG_API_BASE` in either case), else a
+/// SHA-256 over the enabled flag and the base URL. The base is
+/// config, not a secret, but it is hashed like the other spawn
+/// inputs for uniformity: the fingerprint detects change, it does
+/// not need to carry the value.
+pub fn searxng_fingerprint_hash(searxng: &manager_config::SearxngSettings) -> String {
+    use sha2::Digest as _;
+    let api_base = searxng.api_base.trim();
+    if !searxng.enabled || api_base.is_empty() {
+        return String::new();
+    }
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"searxng:v1:enabled:");
+    hasher.update(api_base.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn secret_fingerprint(secret: Option<&str>) -> String {
@@ -1008,6 +1106,7 @@ pub fn gateway_spawn_fingerprint(
         openrouter_key_hash: secret_fingerprint(openrouter_key),
         mcp_stdio_enabled: mcp_armed_set_has_stdio(mcp_armed),
         mcp_servers_hash: mcp_armed_servers_hash(mcp_armed),
+        searxng_hash: searxng_fingerprint_hash(&config.mcp.searxng),
     }
 }
 
@@ -2173,6 +2272,48 @@ mod tests {
     }
 
     #[test]
+    fn searxng_change_registers_as_gateway_drift() {
+        let dir = std::env::temp_dir().join(format!("wizard-gw-searxng-{}", std::process::id()));
+        let gw_dir = dir.join("gateway");
+        std::fs::create_dir_all(&gw_dir).unwrap();
+        let mut cfg = manager_config::AppConfig::default_config();
+        for b in cfg.backends.iter_mut() {
+            b.enabled = true;
+        }
+        cfg.mcp.searxng = manager_config::SearxngSettings {
+            enabled: true,
+            api_base: "http://127.0.0.1:8080".to_string(),
+        };
+        let armed = armed_gateway_mcp_servers(&cfg, |_| true);
+        let filtered = config_with_armed_gateway_mcp_servers(&cfg, |_| true);
+        let yaml = manager_gateway::generate_config_yaml(&filtered).unwrap();
+        assert!(yaml.contains("search_tools:"), "{yaml}");
+        std::fs::write(gw_dir.join("config.yaml"), &yaml).unwrap();
+        let fp = gateway_spawn_fingerprint(&cfg, true, Some("sk-master"), None, &armed);
+        std::fs::write(
+            gateway_spawn_state_path(&dir),
+            gateway_spawn_state_json(&fp, &yaml, None),
+        )
+        .unwrap();
+        assert!(gateway_config_is_current(&cfg, &dir, &fp, |_| true));
+        // Changing the base changes the fingerprint (and the YAML):
+        // not current.
+        let mut moved = cfg.clone();
+        moved.mcp.searxng.api_base = "http://127.0.0.1:9999".to_string();
+        let armed_moved = armed_gateway_mcp_servers(&moved, |_| true);
+        let fp_moved =
+            gateway_spawn_fingerprint(&moved, true, Some("sk-master"), None, &armed_moved);
+        assert_ne!(fp_moved.searxng_hash, fp.searxng_hash);
+        assert!(!gateway_config_is_current(&moved, &dir, &fp_moved, |_| true));
+        // Disabling entirely likewise drifts from the recorded spawn.
+        let mut off = cfg.clone();
+        off.mcp.searxng.enabled = false;
+        let fp_off = gateway_spawn_fingerprint(&off, true, Some("sk-master"), None, &armed);
+        assert!(!gateway_config_is_current(&off, &dir, &fp_off, |_| true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn mcp_response_parsers_accept_the_documented_shapes() {
         // Registered list: array of objects, array of strings,
         // envelope object.
@@ -2212,6 +2353,81 @@ mod tests {
         );
         assert_eq!(mcp_response_error(r#"{"tools":[]}"#), None);
         assert_eq!(mcp_response_error("not json"), None);
+    }
+
+    #[test]
+    fn searxng_fingerprint_covers_toggle_and_base_but_not_absence() {
+        let mut cfg = manager_config::AppConfig::default_config();
+        // SearXNG off (the default): the contribution is empty —
+        // exactly what a pre-Phase-3 spawn record holds.
+        let fp_off = gateway_spawn_fingerprint(&cfg, false, None, None, &[]);
+        assert_eq!(fp_off.searxng_hash, "");
+        assert_eq!(
+            searxng_fingerprint_hash(&manager_config::SearxngSettings::default()),
+            ""
+        );
+        // A legacy fingerprint JSON (no searxng_hash key) parses
+        // with the empty contribution and still equals the
+        // searxng-less fingerprint.
+        let legacy = r#"{"port":4000,"bind_host":"0.0.0.0","postgres_port":null,"master_key_hash":"","openrouter_key_hash":"","mcp_stdio_enabled":false,"mcp_servers_hash":""}"#;
+        let parsed: GatewaySpawnFingerprint = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.searxng_hash, "");
+        cfg.gateway.port = parsed.port;
+        // (fp_off was computed from the same default port; compare
+        // against a fingerprint rebuilt on the parsed port.)
+        assert_eq!(
+            gateway_spawn_fingerprint(&cfg, false, None, None, &[]).searxng_hash,
+            parsed.searxng_hash
+        );
+        // Enabled with a base: non-empty, and sensitive to both the
+        // toggle and the base value.
+        cfg.mcp.searxng = manager_config::SearxngSettings {
+            enabled: true,
+            api_base: "http://127.0.0.1:8080".to_string(),
+        };
+        let fp_on = gateway_spawn_fingerprint(&cfg, false, None, None, &[]);
+        assert_eq!(fp_on.searxng_hash.len(), 64);
+        assert_ne!(fp_on.searxng_hash, fp_off.searxng_hash);
+        cfg.mcp.searxng.api_base = "http://127.0.0.1:9999".to_string();
+        let fp_moved = gateway_spawn_fingerprint(&cfg, false, None, None, &[]);
+        assert_ne!(fp_moved.searxng_hash, fp_on.searxng_hash);
+        // Enabled with an empty base contributes nothing (no
+        // search_tools block, no spawn env — nothing to drift).
+        cfg.mcp.searxng.api_base = String::new();
+        assert_eq!(
+            gateway_spawn_fingerprint(&cfg, false, None, None, &[]).searxng_hash,
+            ""
+        );
+    }
+
+    #[test]
+    fn mcp_tool_call_body_and_summary_match_rest_docs() {
+        // The §8 Brave test body: unprefixed tool name + server_id,
+        // one-word query, arguments an object (never null).
+        let body = brave_search_test_call_body();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["server_id"], "brave_search");
+        assert_eq!(parsed["name"], "brave_web_search");
+        assert_eq!(parsed["arguments"], serde_json::json!({ "query": "llmdil" }));
+        // The generic constructor keeps the same shape.
+        let body = mcp_tool_call_body("srv", "tool", serde_json::json!({}));
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["arguments"], serde_json::json!({}));
+        // Summary: 200 without an error envelope is ok, with the
+        // excerpt capped at the documented length.
+        let long = "x".repeat(500);
+        let (ok, detail) = summarize_mcp_tool_call_response(200, &long);
+        assert!(ok);
+        assert_eq!(detail.chars().count(), MCP_TOOL_CALL_DETAIL_MAX_CHARS + 1);
+        // Error envelope and non-200 are failures carrying the
+        // gateway's text.
+        let (ok, detail) =
+            summarize_mcp_tool_call_response(200, r#"{"error":{"message":"boom"}}"#);
+        assert!(!ok);
+        assert!(detail.contains("boom"), "{detail}");
+        let (ok, detail) = summarize_mcp_tool_call_response(500, "oops");
+        assert!(!ok);
+        assert!(detail.contains("500"), "{detail}");
     }
 
     #[test]

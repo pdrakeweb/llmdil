@@ -5995,6 +5995,65 @@ fn gateway_http_get(host: &str, port: u16, path: &str, master_key: &str) -> Opti
     Some((status, parts.next()?.to_string()))
 }
 
+/// One raw HTTP POST against the gateway, returning (status, body)
+/// — the POST sibling of [`gateway_http_get`], used only by the
+/// explicit MCP test's real tool call below. Same conservative
+/// reading (chunked bodies are rejected, as in the metrics
+/// precedent). The read timeout is longer than the GET helper's:
+/// a cold stdio server spawn plus a live Brave query legitimately
+/// takes seconds.
+fn gateway_http_post(
+    host: &str,
+    port: u16,
+    path: &str,
+    master_key: &str,
+    body: &str,
+) -> Option<(u16, String)> {
+    use std::io::{Read, Write};
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    let addr = std::net::SocketAddr::new(ip, port);
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800)).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {master_key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > 8 * 1024 * 1024 {
+                    return None;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let mut parts = text.splitn(2, "\r\n\r\n");
+    let head = parts.next()?;
+    let status: u16 = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return None;
+    }
+    Some((status, parts.next()?.to_string()))
+}
+
 /// The Gateway-exposure connection test (MCP design §8): the same
 /// two calls the start-gateway step's post-start load check makes —
 /// `GET /v1/mcp/server` (is the server registered with the
@@ -6002,6 +6061,17 @@ fn gateway_http_get(host: &str, port: u16, path: &str, master_key: &str) -> Opti
 /// its tools list answer without error?) — against the running
 /// gateway, authenticated with the stored master key. Pass
 /// requires both. The result carries the tool names when listed.
+///
+/// Phase 3 (§8's explicit-Test addition): when the tested server is
+/// the curated `brave_search` AND the two-call test passes, this
+/// explicit test — and only this explicit test; the start-time load
+/// check never does it — performs ONE real tool call
+/// (`POST /mcp-rest/tools/call`, fixed harmless arguments from
+/// `manager_wizard::brave_search_test_call_body`) and the payload
+/// gains `real_call_ok` / `real_call_detail` (the detail is a
+/// capped excerpt, never the full search response). For
+/// `web_fetch` a real call is NEVER performed, even here (§8): its
+/// test stays registration + tools list, and its detail says so.
 async fn mcp_test_gateway_connection(
     state: &AppState,
     entry: &manager_config::McpServerConfig,
@@ -6027,6 +6097,7 @@ async fn mcp_test_gateway_connection(
             "detail": "gateway master key not available in Windows Credential Manager; start the gateway once so the app stores one",
         }));
     };
+    let master_for_call = master.clone();
     let (list, tools) = {
         let host = host.clone();
         let server_id = id.clone();
@@ -6093,7 +6164,7 @@ async fn mcp_test_gateway_connection(
         }
     };
     let ok = registered && tools_ok;
-    let detail = if ok {
+    let mut detail = if ok {
         format!(
             "registered with the gateway; {} tool(s) listed",
             tool_names.len()
@@ -6101,13 +6172,48 @@ async fn mcp_test_gateway_connection(
     } else {
         problems.join("; ")
     };
-    Ok(json!({
+    let mut payload = json!({
         "id": id,
         "ok": ok,
         "registered": registered,
         "tools": tool_names,
         "detail": detail,
-    }))
+    });
+    // Phase 3 real-call behaviour (§8) — explicit test only.
+    if id == "web_fetch" {
+        // NEVER a real call for web_fetch, even from this explicit
+        // test: a model-chosen URL fetch is the §5.2 SSRF surface,
+        // and the test's fixed arguments would still exercise it.
+        detail = format!("{detail}; real call skipped for web_fetch by design");
+        payload["detail"] = json!(detail);
+        payload["real_call_skipped"] = json!(true);
+    } else if id == "brave_search" && ok {
+        // One real, metered call with fixed harmless arguments.
+        // The body is built by the one constructor in
+        // manager-wizard (see its doc for the verified REST shape).
+        let body = manager_wizard::brave_search_test_call_body();
+        let call = {
+            let host = host.clone();
+            let master = master_for_call.clone();
+            tokio::task::spawn_blocking(move || {
+                gateway_http_post(&host, port, "/mcp-rest/tools/call", &master, &body)
+            })
+            .await
+            .unwrap_or(None)
+        };
+        let (call_ok, call_detail) = match &call {
+            Some((status, resp_body)) => {
+                manager_wizard::summarize_mcp_tool_call_response(*status, resp_body)
+            }
+            None => (
+                false,
+                "real tool call request failed: gateway unreachable".to_string(),
+            ),
+        };
+        payload["real_call_ok"] = json!(call_ok);
+        payload["real_call_detail"] = json!(call_detail);
+    }
+    Ok(payload)
 }
 
 /// Connection test for one MCP server (spec §14 `mcp_test_connection`),

@@ -2755,6 +2755,16 @@ impl StartGateway {
                 }
             }
         }
+        // SearXNG search provider (design §6.3): the instance URL is
+        // config, not a secret, so the manual block carries the real
+        // value — a manual start must behave like an app start.
+        let searxng = &ctx.config.mcp.searxng;
+        if searxng.enabled && !searxng.api_base.trim().is_empty() {
+            lines.push(format!(
+                "$env:SEARXNG_API_BASE = \"{}\"",
+                searxng.api_base.trim()
+            ));
+        }
         let spawn = self.spawn_command(ctx);
         // The spawn's own environment is not secret (UTF-8 stdio
         // forcing); emit it exactly as the step sets it.
@@ -3273,6 +3283,19 @@ impl StartGateway {
         }
         for (key, value) in mcp_env {
             cmd.env.insert(key.clone(), value.clone());
+        }
+        // SearXNG search provider (design §6.3): LiteLLM reads the
+        // instance URL from SEARXNG_API_BASE in the process
+        // environment (the generated YAML's search_tools entry
+        // carries the same value as its api_base). The base is
+        // config, not a secret, so it travels in plain form like
+        // the other non-secret spawn values.
+        let searxng = &ctx.config.mcp.searxng;
+        if searxng.enabled && !searxng.api_base.trim().is_empty() {
+            cmd.env.insert(
+                "SEARXNG_API_BASE".to_string(),
+                searxng.api_base.trim().to_string(),
+            );
         }
         // The database URL is present exactly when the app-managed
         // PostgreSQL is installed and running (the caller started
@@ -4305,6 +4328,18 @@ impl WizardStep for StartGateway {
                             );
                         }
                     }
+                }
+                // SearXNG (design §6.3): planned parity with the
+                // spawned env. The api_base is not a secret — it is
+                // config — so the plan shows the real value, the way
+                // spawn_command's own non-secret env values
+                // (PYTHONIOENCODING et al.) are shown.
+                let searxng = &ctx.config.mcp.searxng;
+                if searxng.enabled && !searxng.api_base.trim().is_empty() {
+                    spawn.env.insert(
+                        "SEARXNG_API_BASE".to_string(),
+                        searxng.api_base.trim().to_string(),
+                    );
                 }
                 cmds.push(spawn);
                 // Firewall reconciliation for the bind address: a
@@ -8787,6 +8822,96 @@ mod tests {
         assert_eq!(
             plan_spawn.env.get("BRAVE_API_KEY").map(String::as_str),
             Some("<set from credential manager>")
+        );
+    }
+
+    fn gateway_ctx_with_searxng(
+        ops: Arc<FakeSystemOps>,
+        api_base: &str,
+    ) -> WizardContext {
+        let mut cfg = test_config_with_models();
+        cfg.mcp.servers = vec![];
+        cfg.mcp.searxng = manager_config::SearxngSettings {
+            enabled: true,
+            api_base: api_base.to_string(),
+        };
+        WizardContext::new(cfg, PathBuf::from("/data"), RunMode::Install, ops)
+    }
+
+    #[tokio::test]
+    async fn start_gateway_searxng_env_yaml_and_fingerprint() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = fast_step();
+        let ctx = gateway_ctx_with_searxng(ops.clone(), "http://127.0.0.1:8080");
+        script_litellm_version(&ops, &step, &ctx, "1.105.1");
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        // Spawn env carries the real base (config, not a secret).
+        let envs = ops.spawn_envs();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].get("SEARXNG_API_BASE").map(String::as_str),
+            Some("http://127.0.0.1:8080")
+        );
+        // YAML gains the top-level search_tools block.
+        let cfg = ops
+            .file_bytes(&PathBuf::from("/data/gateway/config.yaml"))
+            .expect("config written");
+        let text = String::from_utf8(cfg).unwrap();
+        assert!(text.contains("search_tools:"), "{text}");
+        assert!(text.contains("search_provider: searxng"), "{text}");
+        // Fingerprint records the SearXNG contribution.
+        let state = ops
+            .file_bytes(&crate::gateway_spawn_state_path(&ctx.data_dir))
+            .expect("spawn state recorded");
+        let state: serde_json::Value = serde_json::from_slice(&state).unwrap();
+        assert_eq!(
+            state["fingerprint"]["searxng_hash"].as_str().unwrap().len(),
+            64,
+            "{state}"
+        );
+    }
+
+    #[test]
+    fn start_gateway_planned_spawn_carries_searxng_real_value() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let step = fast_step();
+        let ctx = gateway_ctx_with_searxng(ops.clone(), "http://127.0.0.1:8080");
+        let planned = step.planned_commands(&ctx);
+        let plan_spawn = planned
+            .iter()
+            .find(|c| c.argv.iter().any(|a| a == "--config"))
+            .expect("gateway spawn planned");
+        // The real value, not a placeholder: api_base is config.
+        assert_eq!(
+            plan_spawn.env.get("SEARXNG_API_BASE").map(String::as_str),
+            Some("http://127.0.0.1:8080")
+        );
+        // Disabled: no entry in the plan at all.
+        let mut cfg = test_config_with_models();
+        cfg.mcp.servers = vec![];
+        let ctx = WizardContext::new(cfg, PathBuf::from("/data"), RunMode::Install, ops);
+        let planned = step.planned_commands(&ctx);
+        let plan_spawn = planned
+            .iter()
+            .find(|c| c.argv.iter().any(|a| a == "--config"))
+            .expect("gateway spawn planned");
+        assert!(!plan_spawn.env.contains_key("SEARXNG_API_BASE"));
+    }
+
+    #[tokio::test]
+    async fn manual_start_block_carries_searxng_base() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let ctx = gateway_ctx_with_searxng(ops.clone(), "http://127.0.0.1:8080");
+        let block = StartGateway::default().manual_start_block(&ctx).await;
+        assert!(
+            block.contains("$env:SEARXNG_API_BASE = \"http://127.0.0.1:8080\""),
+            "{block}"
         );
     }
 
