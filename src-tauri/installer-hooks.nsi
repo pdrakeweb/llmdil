@@ -9,9 +9,9 @@
 ;   3. Directory page (per-user install dir, no UAC elevation)
 ;   4. Install files page
 ;   5. Finish page
-; The POSTINSTALL hook below adds a "Launch now?" prompt at the end of the
-; install-files step, implementing the finish-page "Launch Local LLM Service
-; Manager" offer.
+; There is no post-install launch prompt in this file: the finish page's
+; "Run LLMdil" checkbox (the template's MUI_FINISHPAGE_RUN, in
+; installer-template.nsi) is the installer's only launch offer.
 ;
 ; SILENT INSTALL FLAGS (built into NSIS, work with this installer):
 ;   installer.exe /S                — silent install (no wizard pages)
@@ -45,11 +45,3 @@
   RMDir /r "$APPDATA\local-llm-service-manager"
 !macroend
 
-; --- Install finish: offer to launch ------------------------------------------
-; Skipped entirely in silent installs (/S): there is no user to answer the
-; prompt, and a headless install must never block on a MessageBox.
-!macro NSIS_HOOK_POSTINSTALL
-  IfSilent +3
-  MessageBox MB_YESNO|MB_ICONQUESTION "Launch Local LLM Service Manager now?" IDNO +2
-  Exec '"$INSTDIR\local-llm-service-manager.exe"'
-!macroend

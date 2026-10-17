@@ -9,14 +9,17 @@ The Windows installer is a proper NSIS wizard built by `tauri-bundler` from
 2. **License** — shows the repo [`LICENSE`](../LICENSE) (Apache-2.0).
 3. **Directory** — per-user install directory (default under `%LOCALAPPDATA%`);
    overridable at install time.
-4. **Install files** — copies app binaries; at the end a prompt offers
-   **"Launch Local LLM Service Manager now?"** (implemented in
-   [`installer-hooks.nsi`](installer-hooks.nsi), `NSIS_HOOK_POSTINSTALL`).
-5. **Finish** — stock MUI finish page.
+4. **Install files** — copies app binaries. No launch prompt here: the
+   installer asks about launching exactly once, on the Finish page.
+5. **Finish** — MUI finish page carrying the single launch decision: the
+   **Launch LLMdil** checkbox runs the app when the wizard closes, next to
+   a **Create desktop shortcut** checkbox (both from the custom template
+   [`installer-template.nsi`](installer-template.nsi): `MUI_FINISHPAGE_RUN`
+   and the repurposed `MUI_FINISHPAGE_SHOWREADME` checkbox).
 
 Language: English only, no language selector. Start Menu folder
-"Local LLM Service Manager" is created; **no desktop shortcut** (stock tauri
-NSIS template does not create one).
+"LLMdil" is created; a desktop shortcut is created only when the
+Finish page's **Create desktop shortcut** box is checked.
 
 ## Uninstall: user data is kept by default
 
