@@ -1,5 +1,5 @@
 /* Local LLM Service Manager — UI shell (plain TypeScript, no framework).
-   Hash router over 10 views; the Tauri command boundary stays in api.ts so a
+   Hash router over 11 views; the Tauri command boundary stays in api.ts so a
    framework can replace this file later without changing command contracts. */
 
 import "./styles.css";
@@ -9,6 +9,7 @@ import { stackedBar } from "./charts";
 import { esc } from "./html";
 import { icon, type IconName } from "./icons";
 import { mountDashboard } from "./views/dashboard";
+import { renderMcp, wireMcp } from "./views/mcp";
 import { renderServiceMap, wireServiceMap } from "./views/serviceMap";
 import {
   applyActivationPlan, planApplyLine,
@@ -29,6 +30,7 @@ const ROUTES: Route[] = [
   { hash: "#/models", label: "Models", icon: "box", title: "Models" },
   { hash: "#/logs", label: "Logs", icon: "logs", title: "Logs" },
   { hash: "#/gateway", label: "Gateway", icon: "gateway", title: "Gateway" },
+  { hash: "#/mcp", label: "MCP Servers", icon: "layers", title: "MCP Servers" },
   { hash: "#/activation-plan", label: "Activation Plan", icon: "warn", title: "Activation Plan" },
   { hash: "#/settings", label: "Settings", icon: "gear", title: "Settings" },
   { hash: "#/wizard", label: "Setup Wizard", icon: "wrench", title: "Setup Wizard" },
@@ -275,6 +277,14 @@ async function render(): Promise<void> {
       view.innerHTML = renderGateway();
       {
         const c = await wireGateway(view);
+        if (gen !== renderGen) { c(); return; }
+        cleanup = c;
+      }
+      break;
+    case "#/mcp":
+      view.innerHTML = renderMcp();
+      {
+        const c = await wireMcp(view);
         if (gen !== renderGen) { c(); return; }
         cleanup = c;
       }

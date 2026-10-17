@@ -1536,6 +1536,307 @@ pub async fn test_request(base_url: &str, prompt: &str) -> Result<TestResult, Su
     })
 }
 
+/// Name of the probe tool offered by [`test_tool_call`]. A reply
+/// only verifies when it calls a tool with exactly this name.
+pub const TOOL_CALL_PROBE_TOOL_NAME: &str = "probe_get_weather";
+
+/// Outcome of a backend tool-call probe (MCP design §7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCallProbeOutcome {
+    /// `choices[0].message.tool_calls` was present, named the probe
+    /// tool, and its `arguments` parsed as JSON.
+    Verified,
+    /// No structured `tool_calls`, but tool-call markup leaked into
+    /// the message content (e.g. `<tool_call>…`): the model tried to
+    /// call the tool and the server/template did not structure it.
+    Unparsed,
+    /// Anything else: the health gate failed, the request failed, or
+    /// the reply was plain content with no tool call at all.
+    Failed,
+}
+
+/// Result of a backend tool-call probe ([`test_tool_call`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallProbeResult {
+    pub outcome: ToolCallProbeOutcome,
+    /// The completion's `finish_reason`, recorded either way;
+    /// `None` when no completion was received.
+    pub finish_reason: Option<String>,
+    /// Evidence from `GET /props`: whether a `chat_template_tool_use`
+    /// entry was present (at the top level or inside
+    /// `chat_template_caps`). Absence is evidence, not failure.
+    pub chat_template_tool_use: bool,
+    /// The `chat_template_caps` summary from `GET /props`, when the
+    /// server reported one; `None` when `/props` failed or carried
+    /// no caps.
+    pub chat_template_caps: Option<serde_json::Value>,
+    /// Human-readable summary of what the probe observed.
+    pub detail: String,
+    pub latency_ms: u64,
+}
+
+impl ToolCallProbeResult {
+    fn failed(
+        detail: impl Into<String>,
+        chat_template_tool_use: bool,
+        chat_template_caps: Option<serde_json::Value>,
+        finish_reason: Option<String>,
+        latency_ms: u64,
+    ) -> Self {
+        Self {
+            outcome: ToolCallProbeOutcome::Failed,
+            finish_reason,
+            chat_template_tool_use,
+            chat_template_caps,
+            detail: detail.into(),
+            latency_ms,
+        }
+    }
+}
+
+/// Tool-call probe for one backend (MCP design §7.2): verifies the
+/// backend actually emits structured `tool_calls`, which MCP tools
+/// reaching the model depend on. Built beside [`test_request`] on
+/// the same transport skeleton, but a new function — `test_request`
+/// is hard-coded at `max_tokens: 16` and parses only `content`.
+///
+/// Steps: (1) `GET {base_url}/health` gates the probe — a failure
+/// ends it as [`ToolCallProbeOutcome::Failed`]. (2) `GET /props`
+/// records the template evidence (see
+/// [`ToolCallProbeResult::chat_template_tool_use`]); its absence is
+/// not a failure. (3) A direct `POST /v1/chat/completions` to the
+/// backend (loopback, bypassing the gateway, so llama.cpp behaviour
+/// is isolated) with one probe tool that has a defined
+/// `parameters.properties` entry (a tool with no properties trips a
+/// known chat-template bug class), `tool_choice: "required"`, a
+/// prompt that unambiguously needs the tool,
+/// `chat_template_kwargs {enable_thinking: false}`, `max_tokens:
+/// 256`, and a 30 s timeout.
+///
+/// Probe-level failures (health, transport, HTTP, unparseable
+/// bodies, plain-content replies) are reported in the result as
+/// `Failed`, not as `Err` — the result is the probe's answer.
+pub async fn test_tool_call(base_url: &str) -> Result<ToolCallProbeResult, SupervisorError> {
+    let base = base_url.trim_end_matches('/');
+    let start = Instant::now();
+    let elapsed = |start: &Instant| start.elapsed().as_millis() as u64;
+    // NOTE: built without reqwest's `json` feature, like
+    // test_request; bodies go through serde_json directly.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| SupervisorError::Http(e.to_string()))?;
+
+    // (1) Health gate.
+    match client.get(format!("{base}/health")).send().await {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            return Ok(ToolCallProbeResult::failed(
+                format!(
+                    "backend health check failed: GET /health returned HTTP {}",
+                    resp.status().as_u16()
+                ),
+                false,
+                None,
+                None,
+                elapsed(&start),
+            ));
+        }
+        Err(e) => {
+            return Ok(ToolCallProbeResult::failed(
+                format!("backend health check failed: GET /health: {e}"),
+                false,
+                None,
+                None,
+                elapsed(&start),
+            ));
+        }
+    }
+
+    // (2) /props evidence.
+    let mut chat_template_tool_use = false;
+    let mut chat_template_caps: Option<serde_json::Value> = None;
+    if let Ok(resp) = client.get(format!("{base}/props")).send().await {
+        if resp.status().is_success() {
+            if let Ok(text) = resp.text().await {
+                if let Ok(props) = serde_json::from_str::<serde_json::Value>(&text) {
+                    chat_template_caps = props.get("chat_template_caps").cloned();
+                    chat_template_tool_use = props.get("chat_template_tool_use").is_some()
+                        || chat_template_caps
+                            .as_ref()
+                            .and_then(|caps| caps.as_object())
+                            .map(|caps| caps.contains_key("chat_template_tool_use"))
+                            .unwrap_or(false);
+                }
+            }
+        }
+    }
+
+    // (3) The tool-call request itself.
+    let body = serde_json::json!({
+        "model": "test",
+        "messages": [{
+            "role": "user",
+            "content": "What is the weather in Paris right now? You must use the probe_get_weather tool to find out.",
+        }],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": TOOL_CALL_PROBE_TOOL_NAME,
+                "description": "Get the current weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {
+                            "type": "string",
+                            "description": "The city to get the weather for.",
+                        },
+                    },
+                    "required": ["city"],
+                },
+            },
+        }],
+        "tool_choice": "required",
+        "chat_template_kwargs": {"enable_thinking": false},
+        "max_tokens": 256,
+        "stream": false,
+    });
+    let body_str =
+        serde_json::to_string(&body).map_err(|e| SupervisorError::Http(e.to_string()))?;
+    let resp = match client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body_str)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Ok(ToolCallProbeResult::failed(
+                format!("tool-call request failed: {e}"),
+                chat_template_tool_use,
+                chat_template_caps,
+                None,
+                elapsed(&start),
+            ));
+        }
+    };
+    let status = resp.status().as_u16();
+    let text = match resp.text().await {
+        Ok(text) => text,
+        Err(e) => {
+            return Ok(ToolCallProbeResult::failed(
+                format!("tool-call response could not be read: {e}"),
+                chat_template_tool_use,
+                chat_template_caps,
+                None,
+                elapsed(&start),
+            ));
+        }
+    };
+    if !(200..300).contains(&status) {
+        return Ok(ToolCallProbeResult::failed(
+            format!("tool-call request returned HTTP {status}"),
+            chat_template_tool_use,
+            chat_template_caps,
+            None,
+            elapsed(&start),
+        ));
+    }
+    let json: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(json) => json,
+        Err(e) => {
+            return Ok(ToolCallProbeResult::failed(
+                format!("tool-call response was not valid JSON: {e}"),
+                chat_template_tool_use,
+                chat_template_caps,
+                None,
+                elapsed(&start),
+            ));
+        }
+    };
+    let finish_reason = json
+        .pointer("/choices/0/finish_reason")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let message = json.pointer("/choices/0/message");
+    let tool_calls = message
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(|v| v.as_array());
+    if let Some(calls) = tool_calls {
+        if let Some(call) = calls.first() {
+            let name = call
+                .pointer("/function/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if name != TOOL_CALL_PROBE_TOOL_NAME {
+                return Ok(ToolCallProbeResult::failed(
+                    format!(
+                        "backend called tool {name:?}, not the probe tool {TOOL_CALL_PROBE_TOOL_NAME:?}"
+                    ),
+                    chat_template_tool_use,
+                    chat_template_caps,
+                    finish_reason,
+                    elapsed(&start),
+                ));
+            }
+            // Arguments arrive as a JSON string (OpenAI shape) or,
+            // from some servers, as an already-parsed object; either
+            // form must be valid JSON to verify.
+            let arguments_ok = match call.pointer("/function/arguments") {
+                Some(serde_json::Value::String(s)) => {
+                    serde_json::from_str::<serde_json::Value>(s).is_ok()
+                }
+                Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Array(_)) => true,
+                _ => false,
+            };
+            if arguments_ok {
+                return Ok(ToolCallProbeResult {
+                    outcome: ToolCallProbeOutcome::Verified,
+                    finish_reason,
+                    chat_template_tool_use,
+                    chat_template_caps,
+                    detail: format!(
+                        "backend emitted a structured tool call to {TOOL_CALL_PROBE_TOOL_NAME} with JSON arguments"
+                    ),
+                    latency_ms: elapsed(&start),
+                });
+            }
+            return Ok(ToolCallProbeResult::failed(
+                "backend emitted a tool call whose arguments did not parse as JSON",
+                chat_template_tool_use,
+                chat_template_caps,
+                finish_reason,
+                elapsed(&start),
+            ));
+        }
+    }
+    let content = message
+        .and_then(|m| m.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if content.contains("<tool_call") || content.contains("<|tool_call") {
+        return Ok(ToolCallProbeResult {
+            outcome: ToolCallProbeOutcome::Unparsed,
+            finish_reason,
+            chat_template_tool_use,
+            chat_template_caps,
+            detail:
+                "tool-call markup leaked into the message content instead of structured tool_calls"
+                    .to_string(),
+            latency_ms: elapsed(&start),
+        });
+    }
+    Ok(ToolCallProbeResult::failed(
+        "backend replied with plain content and no tool call",
+        chat_template_tool_use,
+        chat_template_caps,
+        finish_reason,
+        elapsed(&start),
+    ))
+}
+
 /// Supervisor errors.
 #[derive(Debug, thiserror::Error)]
 pub enum SupervisorError {
@@ -2586,6 +2887,127 @@ mod tests {
             sock.write_all(resp.as_bytes()).await.unwrap();
         });
         format!("http://127.0.0.1:{port}")
+    }
+
+    /// Spawn a hermetic fake backend serving the tool-call probe's
+    /// three requests in order: `GET /health`, `GET /props`, then
+    /// `POST /v1/chat/completions`. Returns the base URL. The chat
+    /// request is asserted against the probe's requirements (probe
+    /// tool name, a defined property, `tool_choice: "required"`,
+    /// thinking disabled). Fewer requests (the health-gate case)
+    /// simply leave the spawned task waiting on accept.
+    async fn fake_tool_probe_server(
+        health_status: u16,
+        props_body: &str,
+        chat_body: &str,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let props_body = props_body.to_string();
+        let chat_body = chat_body.to_string();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            for _ in 0..3 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let req = read_http_request(&mut sock).await;
+                let head = String::from_utf8_lossy(&req).into_owned();
+                let first = head.lines().next().unwrap_or("").to_string();
+                let (status, body) = if first.starts_with("GET /health ") {
+                    (health_status, "ok".to_string())
+                } else if first.starts_with("GET /props ") {
+                    (200, props_body.clone())
+                } else if first.starts_with("POST /v1/chat/completions ") {
+                    assert!(
+                        head.contains(TOOL_CALL_PROBE_TOOL_NAME),
+                        "probe request must offer the probe tool: {head}"
+                    );
+                    assert!(
+                        head.contains("\"city\""),
+                        "probe tool must define a property: {head}"
+                    );
+                    assert!(
+                        head.contains("\"tool_choice\":\"required\""),
+                        "probe request must require a tool call: {head}"
+                    );
+                    assert!(
+                        head.contains("\"enable_thinking\":false"),
+                        "probe request must disable thinking: {head}"
+                    );
+                    (200, chat_body.clone())
+                } else {
+                    panic!("unexpected request line: {first}");
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    const PROPS_WITH_TOOL_USE: &str =
+        r#"{"chat_template_caps":{"supports_tools":true,"chat_template_tool_use":true}}"#;
+
+    #[tokio::test]
+    async fn test_tool_call_verifies_structured_tool_call() {
+        let base = fake_tool_probe_server(
+            200,
+            PROPS_WITH_TOOL_USE,
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"probe_get_weather","arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        )
+        .await;
+        let r = test_tool_call(&base).await.unwrap();
+        assert_eq!(r.outcome, ToolCallProbeOutcome::Verified);
+        assert_eq!(r.finish_reason.as_deref(), Some("tool_calls"));
+        assert!(r.chat_template_tool_use);
+        assert_eq!(
+            r.chat_template_caps.as_ref().and_then(|c| c["supports_tools"].as_bool()),
+            Some(true)
+        );
+        assert!(r.detail.contains("probe_get_weather"), "{}", r.detail);
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_unparsed_when_markup_leaks_into_content() {
+        let base = fake_tool_probe_server(
+            200,
+            r#"{"chat_template_caps":{"supports_tools":false}}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"<tool_call>{\"name\":\"probe_get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>"},"finish_reason":"stop"}]}"#,
+        )
+        .await;
+        let r = test_tool_call(&base).await.unwrap();
+        assert_eq!(r.outcome, ToolCallProbeOutcome::Unparsed);
+        assert_eq!(r.finish_reason.as_deref(), Some("stop"));
+        // No chat_template_tool_use entry was reported.
+        assert!(!r.chat_template_tool_use);
+        assert!(r.chat_template_caps.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_failed_on_plain_content() {
+        let base = fake_tool_probe_server(
+            200,
+            PROPS_WITH_TOOL_USE,
+            r#"{"choices":[{"message":{"role":"assistant","content":"The weather in Paris is sunny."},"finish_reason":"stop"}]}"#,
+        )
+        .await;
+        let r = test_tool_call(&base).await.unwrap();
+        assert_eq!(r.outcome, ToolCallProbeOutcome::Failed);
+        assert_eq!(r.finish_reason.as_deref(), Some("stop"));
+        assert!(r.detail.contains("no tool call"), "{}", r.detail);
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_failed_at_health_gate() {
+        // /health is not 2xx: the probe ends as Failed before any
+        // /props or chat request is made.
+        let base = fake_tool_probe_server(503, PROPS_WITH_TOOL_USE, "{}").await;
+        let r = test_tool_call(&base).await.unwrap();
+        assert_eq!(r.outcome, ToolCallProbeOutcome::Failed);
+        assert!(r.detail.contains("health"), "{}", r.detail);
+        assert_eq!(r.finish_reason, None);
     }
 
     #[tokio::test]

@@ -29,8 +29,8 @@ use manager_config::{
 use manager_models::{self, DownloadHandle};
 use manager_mxc::{self, Policy};
 use manager_supervisor::{
-    test_request, BackoffPolicy, HealthProbe, HttpHealthProbe, LogLevelFilter, LogRecord,
-    LogStream, ProcessSpec, ProcessState, Supervisor,
+    test_request, test_tool_call, BackoffPolicy, HealthProbe, HttpHealthProbe, LogLevelFilter,
+    LogRecord, LogStream, ProcessSpec, ProcessState, Supervisor,
 };
 use manager_telemetry::{GpuInfo, GpuSample, NvidiaSmiSource, PollCadence, Poller, TelemetryStore};
 use manager_wizard::{
@@ -344,10 +344,6 @@ pub struct AppState {
     /// `mcp-<id>`); pruning and orphan-surfacing in the backend commands
     /// must only ever touch ids in this set.
     backend_spec_ids: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// MCP server modes, overlaid on `manager_mcp::default_servers()`.
-    /// (No MCP section exists in `AppConfig` yet; modes are in-memory until
-    /// one lands.)
-    mcp_modes: Mutex<HashMap<String, manager_mcp::McpMode>>,
     /// Recent gateway routing decisions (spec §14 `gateway_recent_requests`).
     /// Every `gateway_test_routing` trace records here.
     routing_log: Mutex<manager_gateway::RoutingLog>,
@@ -396,7 +392,6 @@ impl AppState {
             download_latest_attempt: Mutex::new(HashMap::new()),
             verifying_downloads: std::sync::Mutex::new(std::collections::HashSet::new()),
             backend_spec_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
-            mcp_modes: Mutex::new(HashMap::new()),
             routing_log: Mutex::new(manager_gateway::RoutingLog::default()),
             gateway_stats: Mutex::new(gateway_stats::GatewayStatsStore::default()),
             winml: OnceCell::new(),
@@ -655,13 +650,40 @@ impl AppState {
         } else {
             None
         };
+        // MCP arming for the drift path (MCP design §4.2, Phase 2):
+        // resolved by credential PRESENCE (credential_exists), not
+        // by reading values — the one arming rule in manager-wizard
+        // documents this accepted gap (the fingerprint hash covers
+        // the cred_ref name, never the value, so presence determines
+        // set membership unless a credential exists but is
+        // unreadable). Presence results are gathered async here and
+        // handed to the sync helpers as a lookup set.
+        let mut mcp_present: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for server in cfg
+            .mcp
+            .servers
+            .iter()
+            .filter(|s| s.exposure == manager_config::McpExposure::Gateway)
+        {
+            if let Some(target) = server.cred_ref.as_deref().filter(|r| !r.is_empty()) {
+                if ops.credential_exists(target).await.unwrap_or(false) {
+                    mcp_present.insert(target.to_string());
+                }
+            }
+        }
+        let mcp_armed = manager_wizard::armed_gateway_mcp_servers(cfg, |t| {
+            mcp_present.contains(t)
+        });
         let fingerprint = manager_wizard::gateway_spawn_fingerprint(
             cfg,
             postgres,
             master.as_deref(),
             openrouter.as_deref(),
+            &mcp_armed,
         );
-        manager_wizard::gateway_config_is_current(cfg, &self.data_dir, &fingerprint)
+        manager_wizard::gateway_config_is_current(cfg, &self.data_dir, &fingerprint, |t| {
+            mcp_present.contains(t)
+        })
     }
 
     /// Seed the install wizard's checklist from the machine's actual
@@ -775,18 +797,21 @@ impl AppState {
         *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
 
-    /// MCP server registry with in-memory mode overrides applied.
+    /// The persisted MCP registry (`AppConfig.mcp`) — the source of
+    /// truth since MCP Phase 1 (design §3/§10.1). The session-only
+    /// `mcp_modes` overlay is deleted; exposure is persisted.
+    async fn mcp_registry(&self) -> Vec<manager_config::McpServerConfig> {
+        self.config.read().await.mcp.servers.clone()
+    }
+
+    /// MCP server registry as runtime views: `ServerSpec`s converted
+    /// from the persisted registry via `manager-mcp`'s conversion
+    /// (Gateway exposure maps to `McpMode::Remote` there — see its
+    /// doc comment — so the legacy spawn paths never spawn a
+    /// gateway-hosted server).
     async fn mcp_servers(&self) -> Vec<manager_mcp::ServerSpec> {
-        let modes = self.mcp_modes.lock().await;
-        manager_mcp::default_servers()
-            .into_iter()
-            .map(|mut s| {
-                if let Some(m) = modes.get(&s.id) {
-                    s.mode = *m;
-                }
-                s
-            })
-            .collect()
+        let cfg = self.config.read().await;
+        manager_mcp::server_specs_from_config(&cfg.mcp)
     }
 }
 
@@ -1080,7 +1105,19 @@ async fn update_config(state: State<'_, AppState>, patch: Value) -> ApiResult {
     let mut cfg = state.config.write().await;
     let mut v = serde_json::to_value(&*cfg).map_err(jerr)?;
     merge_json(&mut v, patch);
-    let new_cfg: AppConfig = serde_json::from_value(v).map_err(jerr)?;
+    let mut new_cfg: AppConfig = serde_json::from_value(v).map_err(jerr)?;
+    // The tool-call probe is runtime state, never operator-set:
+    // each backend keeps the probe the app itself recorded, and a
+    // patch that changes its model file or raw flags invalidates
+    // that probe (MCP design §7.2).
+    for nb in new_cfg.backends.iter_mut() {
+        nb.tool_call_probe = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == nb.id)
+            .and_then(|b| b.tool_call_probe);
+    }
+    manager_config::reset_stale_tool_call_probes(&cfg, &mut new_cfg);
     // `save` validates before writing, so a failed save never clobbers
     // the last-known-good file.
     manager_config::save(&new_cfg, &state.config_path)
@@ -1384,6 +1421,12 @@ fn backend_spec(
         b.flags.n_ctx.to_string(),
         "-b".into(),
         b.flags.n_batch.to_string(),
+        // --jinja is explicit for every backend (MCP design §7.1):
+        // structured tool calls depend on the Jinja chat template,
+        // and the pinned llama.cpp build enables it by default —
+        // restating it makes the precondition audit-visible and
+        // pin-independent instead of relying on an upstream default.
+        "--jinja".into(),
     ];
 
     // The visible GPU indices (empty for CPU-only) when the launch is
@@ -1456,11 +1499,16 @@ fn backend_spec(
     );
     if let Some(raw) = &b.raw_flags {
         // raw_flags are operator-supplied llama-server arguments, with
-        // two reservations:
+        // three reservations:
         // - --host is filtered out (both "--host X" and "--host=X").
         //   Backends bind loopback; the LiteLLM gateway is the only
         //   network entry point, and an unauthenticated llama-server
         //   bound to the LAN by a stray flag would bypass it.
+        // - --no-jinja is filtered out (both spellings, bare tokens
+        //   with no value, plus the "--jinja=false" form). --jinja is
+        //   app-owned (see the structured args above): it is the
+        //   precondition for structured tool calling (MCP design
+        //   §7.1), so an operator flag must not silently disable it.
         // - When the launch is GPU-restricted, device-selection flags
         //   are remapped onto the visible subset (placement is the
         //   source of truth — see the fn docs).
@@ -1474,6 +1522,10 @@ fn backend_spec(
             }
             if t.starts_with("--host=") {
                 i += 1;
+                continue;
+            }
+            if t == "--no-jinja" || t == "--no_jinja" || t == "--jinja=false" {
+                i += 1; // bare token, no value to skip
                 continue;
             }
             if let Some(placed) = &visible {
@@ -1767,6 +1819,11 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
                 "adopted": st.map(|s| s.adopted).unwrap_or(false),
                 "restarts": st.map(|s| s.restarts).unwrap_or(0),
                 "uptime_secs": st.and_then(|s| s.uptime).map(|u| u.as_secs()),
+                // The persisted tool-call probe (MCP design §7.2):
+                // {outcome: verified|unparsed|failed, at_ms} or null
+                // when the backend has never been probed — the UI
+                // renders null as "not measured", never as a state.
+                "tool_call_probe": serde_json::to_value(b.tool_call_probe).unwrap_or(Value::Null),
             })
         })
         .collect();
@@ -2068,6 +2125,55 @@ async fn test_backend(state: State<'_, AppState>, id: String, prompt: String) ->
         .await
         .map_err(ApiError::from)
         .map_err(jerr)?;
+    Ok(serde_json::to_value(&result).map_err(jerr)?)
+}
+
+/// Tool-call probe against a backend (MCP design §7.2): health gate,
+/// `/props` template evidence, then a direct chat completion that
+/// must produce a structured tool call. The outcome is persisted on
+/// the backend as `tool_call_probe` (runtime state, not operator
+/// config — it never appears in a config diff) and the full probe
+/// result is returned.
+#[tauri::command]
+async fn backend_test_tool_call(state: State<'_, AppState>, id: String) -> ApiResult {
+    let base_url = {
+        let cfg = state.config.read().await;
+        let backend = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .ok_or_else(|| err(ApiError::NotFound(format!("backend {id}"))))?;
+        format!("http://127.0.0.1:{}", backend.port)
+    };
+    let result = test_tool_call(&base_url)
+        .await
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    // The supervisor and config crates spell the same three outcomes
+    // with separate enums (neither depends on the other); the
+    // mapping between them lives here, at the layer that holds both.
+    let outcome = match result.outcome {
+        manager_supervisor::ToolCallProbeOutcome::Verified => {
+            manager_config::ToolCallProbeOutcome::Verified
+        }
+        manager_supervisor::ToolCallProbeOutcome::Unparsed => {
+            manager_config::ToolCallProbeOutcome::Unparsed
+        }
+        manager_supervisor::ToolCallProbeOutcome::Failed => {
+            manager_config::ToolCallProbeOutcome::Failed
+        }
+    };
+    let mut cfg = state.config.write().await;
+    if let Some(b) = cfg.backends.iter_mut().find(|b| b.id == id) {
+        b.tool_call_probe = Some(manager_config::ToolCallProbe {
+            outcome,
+            at_ms: now_ms(),
+        });
+    }
+    manager_config::save(&cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    drop(cfg);
     Ok(serde_json::to_value(&result).map_err(jerr)?)
 }
 
@@ -3882,6 +3988,7 @@ async fn backend_add(
             backoff_base_secs: 2,
         },
         overrides_global: false,
+        tool_call_probe: None,
     });
     if let Some(m) = new_cfg.models.iter_mut().find(|m| m.id == model_id) {
         if !m.assigned_backends.contains(&id) {
@@ -4056,6 +4163,11 @@ async fn backend_set_offload(state: State<'_, AppState>, id: String, layers: u32
     let new_raw = manager_models::set_expert_offload(b.raw_flags.as_deref(), target);
     let changed = new_raw != b.raw_flags;
     b.raw_flags = new_raw.clone();
+    if changed {
+        // A raw-flags change invalidates the recorded tool-call
+        // probe (MCP design §7.2).
+        b.tool_call_probe = None;
+    }
     if changed {
         manager_config::validate(&new_cfg)
             .map_err(ApiError::from)
@@ -4267,6 +4379,10 @@ async fn gateway_status(state: State<'_, AppState>) -> ApiResult {
         "openrouter_cred_present": openrouter_cred_present,
         "activation_pending": activation_pending,
         "activation_changes": activation_changes,
+        // The LiteLLM version recorded by the last gateway spawn
+        // (MCP design §4.3); null when no spawn state has recorded
+        // one — the UI renders that as "not measured".
+        "litellm_version": manager_wizard::recorded_litellm_version(&state.data_dir),
     }))
 }
 
@@ -4409,8 +4525,29 @@ async fn gateway_activation_cancel(state: State<'_, AppState>) -> ApiResult {
     manager_config::save(&restored, &state.config_path)
         .map_err(ApiError::from)
         .map_err(jerr)?;
-    *cfg = restored;
+    *cfg = restored.clone();
     drop(cfg);
+    // Regenerate the gateway YAML from the restored config and
+    // write it immediately (MCP design §10.2): the on-disk YAML is
+    // what the running gateway serves and what the drift check
+    // compares against, so leaving the cancelled changes' YAML in
+    // place would leave disk, config, and gateway disagreeing
+    // until the next start. A regeneration failure does NOT fail
+    // the cancel — the config restore already succeeded, and the
+    // next gateway start regenerates the YAML from the restored
+    // config anyway — so the failure is reported in the result
+    // payload instead of as a command error.
+    let yaml_path = state.data_dir.join("gateway").join("config.yaml");
+    let yaml_error: Option<String> = match manager_gateway::generate_config_yaml(&restored) {
+        Ok(yaml) => {
+            let write = std::fs::create_dir_all(
+                yaml_path.parent().expect("the YAML path has a parent"),
+            )
+            .and_then(|_| std::fs::write(&yaml_path, yaml));
+            write.err().map(|e| format!("could not write {}: {e}", yaml_path.display()))
+        }
+        Err(e) => Some(format!("could not regenerate the gateway config: {e}")),
+    };
     activation::clear_journal(&state.data_dir).map_err(|e| jerr(ApiError::InvalidInput(e)))?;
     ensure_backend_specs(&state).await;
     // The plan's pending → resolved transition in the notification
@@ -4419,7 +4556,11 @@ async fn gateway_activation_cancel(state: State<'_, AppState>) -> ApiResult {
         let mut watch = state.notify_watch.lock().unwrap_or_else(|e| e.into_inner());
         watch.activation_cancelled = true;
     }
-    Ok(json!({ "cancelled": true }))
+    Ok(json!({
+        "cancelled": true,
+        "yaml_regenerated": yaml_error.is_none(),
+        "yaml_error": yaml_error,
+    }))
 }
 
 /// Mark the gateway side of the activation plan complete after a
@@ -5403,6 +5544,8 @@ async fn model_assign(
             .iter_mut()
             .find(|b| b.id == backend_id)
             .ok_or_else(|| err(ApiError::NotFound(format!("backend {backend_id}"))))?;
+        let prev_model_file = backend.model_file.clone();
+        let prev_raw_flags = backend.raw_flags.clone();
         backend.model_file = gguf_path;
         // A backend with no raw flags of its own takes the newly
         // assigned model's catalog default offload (e.g. Nemotron's
@@ -5424,6 +5567,11 @@ async fn model_assign(
         manager_models::apply_placement(backend, &split)
             .map_err(ApiError::from)
             .map_err(jerr)?;
+        // A model-file or raw-flags change invalidates the recorded
+        // tool-call probe (MCP design §7.2).
+        if backend.model_file != prev_model_file || backend.raw_flags != prev_raw_flags {
+            backend.tool_call_probe = None;
+        }
     }
     if let Some(model) = cfg.models.iter_mut().find(|m| m.id == id) {
         if !model.assigned_backends.contains(&backend_id) {
@@ -6262,32 +6410,117 @@ async fn diagnostics_export_bundle(state: State<'_, AppState>) -> ApiResult {
 // MCP / VS Code (§14)
 // ---------------------------------------------------------------------------
 
-/// MCP server list with live status (spec §14 `mcp_list`). Includes
-/// credential presence per env key (Windows Credential Manager lookup;
-/// values never read).
+/// One `mcp_list` entry (MCP design §9's needs, Phase 1 shape).
+/// Defined here rather than extending `manager_mcp::McpServerStatus`:
+/// the extra fields (`exposure`, `command`, `url`, `cred_ref`, the
+/// dual-target credential result) are the persisted registry's, not
+/// the runtime status's — the status struct stays the supervisor
+/// view. No UI calls these commands yet, so this payload is the
+/// contract the Phase 4 UI will consume.
+#[derive(Debug, Clone, Serialize)]
+struct McpListEntry {
+    pub id: String,
+    pub display_name: String,
+    /// Same value as `display_name` (the name `McpServerStatus`
+    /// historically carried), kept for back-compat readers.
+    pub name: String,
+    pub transport: manager_config::McpTransport,
+    pub exposure: manager_config::McpExposure,
+    /// Derived runtime mode (Gateway maps to Remote; see
+    /// `manager_mcp::server_spec_from_config`).
+    pub mode: manager_mcp::McpMode,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub url: Option<String>,
+    pub env_keys: Vec<String>,
+    pub cred_ref: Option<String>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub metered: bool,
+    pub rpm_limit: Option<u32>,
+    /// Live supervised-process state from `list_status`; only
+    /// Local servers are ever spawned, so this is meaningful
+    /// (and only ever true) for them.
+    pub running: bool,
+    /// Credential presence over the accepted targets (see
+    /// `credential_target_found`): true when any accepted target
+    /// exists.
+    pub credential_present: bool,
+    /// `"present"` | `"missing"` — the §9 card wording.
+    pub credential_status: String,
+    /// Which accepted Credential Manager target was found, when
+    /// one was (dual-target acceptance, design §10.1: for the two
+    /// legacy servers either the unified wizard target or the
+    /// legacy `llm-manager/mcp/<id>` target counts).
+    pub credential_target_found: Option<String>,
+    /// Per-env-key presence, as the pre-Phase-1 payload carried it
+    /// (values are never read).
+    pub credential_presence: Vec<(String, bool)>,
+}
+
+/// MCP server list with live status (spec §14 `mcp_list`), built
+/// from the persisted registry. Includes credential presence per
+/// env key (Windows Credential Manager lookup; values never read)
+/// with dual-target acceptance for the legacy servers (§10.1).
 #[tauri::command]
 async fn mcp_list(state: State<'_, AppState>) -> ApiResult {
+    let registry = state.mcp_registry().await;
     let servers = state.mcp_servers().await;
     let statuses = {
         let sup = state.supervisor().await.lock().await;
         manager_mcp::list_status(&*sup, &servers)
     };
+    let running: HashMap<String, bool> = statuses
+        .iter()
+        .map(|s| (s.id.clone(), s.running))
+        .collect();
     // Presence checks are blocking cmdkey calls; run off the async worker.
-    let presence: Vec<Vec<(String, bool)>> = tokio::task::spawn_blocking(move || {
-        servers
+    let servers_for_presence = servers.clone();
+    let found_targets: Vec<Option<String>> = tokio::task::spawn_blocking(move || {
+        servers_for_presence
             .iter()
-            .map(|s| manager_mcp::credential_presence(s, cmdkey_target_exists))
+            .map(|s| manager_mcp::credential_target_found(s, cmdkey_target_exists))
             .collect()
     })
     .await
     .map_err(|e| err(ApiError::Mcp(format!("presence check failed: {e}"))))?;
-    let mut out = serde_json::to_value(&statuses).map_err(jerr)?;
-    if let Value::Array(arr) = &mut out {
-        for (entry, pres) in arr.iter_mut().zip(presence.iter()) {
-            entry["credential_presence"] = serde_json::to_value(pres).unwrap_or(Value::Null);
-        }
-    }
-    Ok(out)
+    let entries: Vec<McpListEntry> = registry
+        .iter()
+        .zip(servers.iter())
+        .zip(found_targets.iter())
+        .map(|((cfg, spec), found)| {
+            let present = found.is_some();
+            McpListEntry {
+                id: cfg.id.clone(),
+                display_name: spec.name.clone(),
+                name: spec.name.clone(),
+                transport: cfg.transport,
+                exposure: cfg.exposure,
+                mode: spec.mode,
+                command: cfg.command.clone(),
+                args: cfg.args.clone(),
+                url: cfg.url.clone(),
+                env_keys: cfg.env_keys.clone(),
+                cred_ref: cfg.cred_ref.clone(),
+                allowed_tools: cfg.allowed_tools.clone(),
+                metered: cfg.metered,
+                rpm_limit: cfg.rpm_limit,
+                running: running.get(&cfg.id).copied().unwrap_or(false),
+                credential_present: present,
+                credential_status: if present {
+                    "present".to_string()
+                } else {
+                    "missing".to_string()
+                },
+                credential_target_found: found.clone(),
+                credential_presence: cfg
+                    .env_keys
+                    .iter()
+                    .map(|k| (k.clone(), present))
+                    .collect(),
+            }
+        })
+        .collect();
+    Ok(serde_json::to_value(&entries).map_err(jerr)?)
 }
 
 /// Check whether a Windows Credential Manager target exists.
@@ -6311,11 +6544,295 @@ fn cmdkey_target_exists(target: &str) -> bool {
     }
 }
 
-/// Connection test for one MCP server (spec §14 `mcp_test_connection`).
-/// Local: supervised process running. Remote (http): HTTP probe of the URL.
-/// Disabled servers report not-ok.
+/// One raw HTTP GET against the gateway, returning (status, body)
+/// — the transport for the gateway-exposure MCP test below.
+/// src-tauri has no HTTP-client dependency; `fetch_gateway_metrics`
+/// is the in-repo precedent for hand-rolled gateway HTTP over a
+/// TcpStream. `None` on any transport failure (gateway down,
+/// malformed reply, chunked body — the metrics precedent's
+/// conservative reading).
+fn gateway_http_get(host: &str, port: u16, path: &str, master_key: &str) -> Option<(u16, String)> {
+    use std::io::{Read, Write};
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    let addr = std::net::SocketAddr::new(ip, port);
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800)).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {master_key}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > 8 * 1024 * 1024 {
+                    return None;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let mut parts = text.splitn(2, "\r\n\r\n");
+    let head = parts.next()?;
+    let status: u16 = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return None;
+    }
+    Some((status, parts.next()?.to_string()))
+}
+
+/// One raw HTTP POST against the gateway, returning (status, body)
+/// — the POST sibling of [`gateway_http_get`], used only by the
+/// explicit MCP test's real tool call below. Same conservative
+/// reading (chunked bodies are rejected, as in the metrics
+/// precedent). The read timeout is longer than the GET helper's:
+/// a cold stdio server spawn plus a live Brave query legitimately
+/// takes seconds.
+fn gateway_http_post(
+    host: &str,
+    port: u16,
+    path: &str,
+    master_key: &str,
+    body: &str,
+) -> Option<(u16, String)> {
+    use std::io::{Read, Write};
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    let addr = std::net::SocketAddr::new(ip, port);
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800)).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {master_key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > 8 * 1024 * 1024 {
+                    return None;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let mut parts = text.splitn(2, "\r\n\r\n");
+    let head = parts.next()?;
+    let status: u16 = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return None;
+    }
+    Some((status, parts.next()?.to_string()))
+}
+
+/// The Gateway-exposure connection test (MCP design §8): the same
+/// two calls the start-gateway step's post-start load check makes —
+/// `GET /v1/mcp/server` (is the server registered with the
+/// gateway?) and `GET /mcp-rest/tools/list?server_id=<id>` (does
+/// its tools list answer without error?) — against the running
+/// gateway, authenticated with the stored master key. Pass
+/// requires both. The result carries the tool names when listed.
+///
+/// Phase 3 (§8's explicit-Test addition): when the tested server is
+/// the curated `brave_search` AND the two-call test passes, this
+/// explicit test — and only this explicit test; the start-time load
+/// check never does it — performs ONE real tool call
+/// (`POST /mcp-rest/tools/call`, fixed harmless arguments from
+/// `manager_wizard::brave_search_test_call_body`) and the payload
+/// gains `real_call_ok` / `real_call_detail` (the detail is a
+/// capped excerpt, never the full search response). For
+/// `web_fetch` a real call is NEVER performed, even here (§8): its
+/// test stays registration + tools list, and its detail says so.
+async fn mcp_test_gateway_connection(
+    state: &AppState,
+    entry: &manager_config::McpServerConfig,
+) -> ApiResult {
+    let id = entry.id.clone();
+    let (host, port) = {
+        let cfg = state.config.read().await;
+        (
+            manager_wizard::steps::gateway_probe_host(&cfg),
+            cfg.gateway.port,
+        )
+    };
+    let master = RealSystemOps::default()
+        .credential_read(manager_wizard::LITELLM_MASTER_KEY_CRED_TARGET)
+        .await
+        .filter(|k| !k.is_empty());
+    let Some(master) = master else {
+        return Ok(json!({
+            "id": id,
+            "ok": false,
+            "registered": false,
+            "tools": [],
+            "detail": "gateway master key not available in Windows Credential Manager; start the gateway once so the app stores one",
+        }));
+    };
+    let master_for_call = master.clone();
+    let (list, tools) = {
+        let host = host.clone();
+        let server_id = id.clone();
+        tokio::task::spawn_blocking(move || {
+            let list = gateway_http_get(&host, port, "/v1/mcp/server", &master);
+            let tools = gateway_http_get(
+                &host,
+                port,
+                &format!("/mcp-rest/tools/list?server_id={server_id}"),
+                &master,
+            );
+            (list, tools)
+        })
+        .await
+        .unwrap_or((None, None))
+    };
+    let mut problems: Vec<String> = Vec::new();
+    let registered = match &list {
+        Some((200, body)) => {
+            if manager_wizard::parse_mcp_registered_server_ids(body)
+                .iter()
+                .any(|r| r == &id)
+            {
+                true
+            } else {
+                problems.push("not in the gateway's registered MCP server list".to_string());
+                false
+            }
+        }
+        Some((status, body)) => {
+            let detail = manager_wizard::mcp_response_error(body)
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            problems.push(format!("GET /v1/mcp/server failed: {detail}"));
+            false
+        }
+        None => {
+            problems.push(format!("gateway unreachable at http://{host}:{port}"));
+            false
+        }
+    };
+    let mut tool_names: Vec<String> = Vec::new();
+    let tools_ok = match &tools {
+        Some((200, body)) => match manager_wizard::mcp_response_error(body) {
+            Some(e) => {
+                problems.push(format!("tools list returned an error: {e}"));
+                false
+            }
+            None => {
+                tool_names = manager_wizard::parse_mcp_tool_names(body);
+                true
+            }
+        },
+        Some((status, body)) => {
+            let detail = manager_wizard::mcp_response_error(body)
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            problems.push(format!("tools list failed: {detail}"));
+            false
+        }
+        None => {
+            if list.is_some() {
+                problems.push("tools list request failed: gateway unreachable".to_string());
+            }
+            false
+        }
+    };
+    let ok = registered && tools_ok;
+    let mut detail = if ok {
+        format!(
+            "registered with the gateway; {} tool(s) listed",
+            tool_names.len()
+        )
+    } else {
+        problems.join("; ")
+    };
+    let mut payload = json!({
+        "id": id,
+        "ok": ok,
+        "registered": registered,
+        "tools": tool_names,
+        "detail": detail,
+    });
+    // Phase 3 real-call behaviour (§8) — explicit test only.
+    if id == "web_fetch" {
+        // NEVER a real call for web_fetch, even from this explicit
+        // test: a model-chosen URL fetch is the §5.2 SSRF surface,
+        // and the test's fixed arguments would still exercise it.
+        detail = format!("{detail}; real call skipped for web_fetch by design");
+        payload["detail"] = json!(detail);
+        payload["real_call_skipped"] = json!(true);
+    } else if id == "brave_search" && ok {
+        // One real, metered call with fixed harmless arguments.
+        // The body is built by the one constructor in
+        // manager-wizard (see its doc for the verified REST shape).
+        let body = manager_wizard::brave_search_test_call_body();
+        let call = {
+            let host = host.clone();
+            let master = master_for_call.clone();
+            tokio::task::spawn_blocking(move || {
+                gateway_http_post(&host, port, "/mcp-rest/tools/call", &master, &body)
+            })
+            .await
+            .unwrap_or(None)
+        };
+        let (call_ok, call_detail) = match &call {
+            Some((status, resp_body)) => {
+                manager_wizard::summarize_mcp_tool_call_response(*status, resp_body)
+            }
+            None => (
+                false,
+                "real tool call request failed: gateway unreachable".to_string(),
+            ),
+        };
+        payload["real_call_ok"] = json!(call_ok);
+        payload["real_call_detail"] = json!(call_detail);
+    }
+    Ok(payload)
+}
+
+/// Connection test for one MCP server (spec §14 `mcp_test_connection`),
+/// keyed on the server's persisted EXPOSURE (MCP design §8):
+/// Gateway servers are tested against the running gateway (see
+/// [`mcp_test_gateway_connection`]); Local keeps the supervised-
+/// process liveness check and http servers the URL probe; Disabled
+/// servers report not-ok.
 #[tauri::command]
 async fn mcp_test_connection(state: State<'_, AppState>, id: String) -> ApiResult {
+    let registry = state.mcp_registry().await;
+    let entry = registry
+        .iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| err(ApiError::NotFound(format!("mcp server {id}"))))?;
+    if entry.exposure == manager_config::McpExposure::Gateway {
+        return mcp_test_gateway_connection(&state, entry).await;
+    }
     let servers = state.mcp_servers().await;
     let server = servers
         .iter()
@@ -6358,49 +6875,157 @@ async fn mcp_test_connection(state: State<'_, AppState>, id: String) -> ApiResul
     }
 }
 
-/// Set an MCP server's mode (spec §14 `mcp_set_mode`). Mode is stored
-/// in-memory (no MCP section in `AppConfig` yet). Switching to Local
-/// spawns the supervised process; switching away stops it.
+/// Set an MCP server's exposure (replaces `mcp_set_mode`, MCP
+/// Phase 1). Exposure is persisted in `AppConfig.mcp` through the
+/// validated save path (`manager_config::save` on a clone; only a
+/// successful save installs it in memory — the pattern of
+/// `backend_update_flags`). Transitioning INTO Local spawns the
+/// supervised process (the old set_mode behaviour); LEAVING Local
+/// stops it. Gateway servers are never spawned here — the gateway
+/// hosts them (Phase 2).
 #[tauri::command]
-async fn mcp_set_mode(state: State<'_, AppState>, id: String, mode: String) -> ApiResult {
-    let mode = match mode.as_str() {
-        "local" => manager_mcp::McpMode::Local,
-        "remote" => manager_mcp::McpMode::Remote,
-        "disabled" => manager_mcp::McpMode::Disabled,
+async fn mcp_set_exposure(state: State<'_, AppState>, id: String, exposure: String) -> ApiResult {
+    let exposure = match exposure.as_str() {
+        "gateway" => manager_config::McpExposure::Gateway,
+        "local" => manager_config::McpExposure::Local,
+        "disabled" => manager_config::McpExposure::Disabled,
         other => {
             return Err(err(ApiError::Mcp(format!(
-                "unknown mcp mode {other:?}; expected local | remote | disabled"
+                "unknown mcp exposure {other:?}; expected gateway | local | disabled"
             ))))
         }
     };
-    {
-        let known = manager_mcp::default_servers();
-        if !known.iter().any(|s| s.id == id) {
-            return Err(err(ApiError::NotFound(format!("mcp server {id}"))));
-        }
-        state.mcp_modes.lock().await.insert(id.clone(), mode);
-    }
+    let previous_exposure = {
+        let mut cfg = state.config.write().await;
+        let mut new_cfg = cfg.clone();
+        let server = new_cfg
+            .mcp
+            .servers
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| err(ApiError::NotFound(format!("mcp server {id}"))))?;
+        let previous = server.exposure;
+        server.exposure = exposure;
+        manager_config::save(&new_cfg, &state.config_path)
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
+        *cfg = new_cfg;
+        previous
+    };
     let servers = state.mcp_servers().await;
     let server = servers
         .iter()
         .find(|s| s.id == id)
-        .expect("mode was just set for a known server");
-    let mut sup = state.supervisor().await.lock().await;
-    match mode {
-        manager_mcp::McpMode::Local => {
-            manager_mcp::spawn_local(&mut *sup, server)
-                .await
-                .map_err(ApiError::from)
-                .map_err(jerr)?;
-        }
-        _ => {
-            manager_mcp::stop_local(&mut *sup, server)
-                .await
-                .map_err(ApiError::from)
-                .map_err(jerr)?;
-        }
+        .expect("exposure was just persisted for a known server");
+    if exposure == manager_config::McpExposure::Local
+        && previous_exposure != manager_config::McpExposure::Local
+    {
+        let mut sup = state.supervisor().await.lock().await;
+        manager_mcp::spawn_local(&mut *sup, server)
+            .await
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
+    } else if previous_exposure == manager_config::McpExposure::Local
+        && exposure != manager_config::McpExposure::Local
+    {
+        let mut sup = state.supervisor().await.lock().await;
+        manager_mcp::stop_local(&mut *sup, server)
+            .await
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
     }
-    Ok(json!({ "id": id, "mode": mode }))
+    Ok(json!({ "id": id, "exposure": exposure, "persisted": true }))
+}
+
+/// Create or update an MCP server in the persisted registry
+/// (upsert by id). The argument is the `McpServerConfig` shape as
+/// JSON (§3.1). Persistence goes through `manager_config::save`,
+/// which validates the whole config first — a §3.2 violation is
+/// returned as a command error and nothing is stored (neither on
+/// disk nor in memory).
+#[tauri::command]
+async fn mcp_save_server(
+    state: State<'_, AppState>,
+    server: manager_config::McpServerConfig,
+) -> ApiResult {
+    let id = server.id.clone();
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    match new_cfg.mcp.servers.iter_mut().find(|s| s.id == id) {
+        Some(existing) => *existing = server,
+        None => new_cfg.mcp.servers.push(server),
+    }
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    Ok(json!({ "id": id, "persisted": true }))
+}
+
+/// Remove an MCP server from the persisted registry. If it was
+/// Local and running, it is stopped first; then the removal is
+/// persisted through the validated save path.
+#[tauri::command]
+async fn mcp_delete_server(state: State<'_, AppState>, id: String) -> ApiResult {
+    let servers = state.mcp_servers().await;
+    let server = servers
+        .iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| err(ApiError::NotFound(format!("mcp server {id}"))))?;
+    if server.mode == manager_mcp::McpMode::Local {
+        let mut sup = state.supervisor().await.lock().await;
+        manager_mcp::stop_local(&mut *sup, server)
+            .await
+            .map_err(ApiError::from)
+            .map_err(jerr)?;
+    }
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    new_cfg.mcp.servers.retain(|s| s.id != id);
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    Ok(json!({ "id": id, "deleted": true, "persisted": true }))
+}
+
+/// Store an MCP server's credential in Windows Credential Manager
+/// under the server's declared `cred_ref` target (MCP design §9:
+/// the MCP view's credential Store action). The value goes straight
+/// to the ops-layer `credential_write` — the same mechanism the
+/// stored gateway master key uses — and is never logged, returned,
+/// or persisted anywhere else.
+#[tauri::command]
+async fn mcp_store_credential(state: State<'_, AppState>, id: String, value: String) -> ApiResult {
+    if value.trim().is_empty() {
+        return Err(err(ApiError::InvalidInput(
+            "credential value must not be empty".to_string(),
+        )));
+    }
+    let target = {
+        let cfg = state.config.read().await;
+        let server = cfg
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| err(ApiError::NotFound(format!("mcp server {id}"))))?;
+        server
+            .cred_ref
+            .clone()
+            .filter(|r| !r.trim().is_empty())
+            .ok_or_else(|| {
+                err(ApiError::InvalidInput(format!(
+                    "mcp server {id} declares no credential target"
+                )))
+            })?
+    };
+    RealSystemOps::default()
+        .credential_write(&target, &value)
+        .await
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    Ok(json!({ "id": id, "stored": true }))
 }
 
 /// Install Continue.dev + Cline via the wizard's `vscode-extensions` step
@@ -6870,6 +7495,7 @@ fn main() {
             stop_backend,
             restart_backend,
             test_backend,
+            backend_test_tool_call,
             backend_get_config,
             backend_preview_diff,
             backend_apply_config,
@@ -6934,7 +7560,10 @@ fn main() {
             // MCP / VS Code
             mcp_list,
             mcp_test_connection,
-            mcp_set_mode,
+            mcp_set_exposure,
+            mcp_save_server,
+            mcp_delete_server,
+            mcp_store_credential,
             vscode_install_extensions,
             vscode_write_config,
             // MXC
@@ -7089,6 +7718,9 @@ mod tests {
         // --port carries the configured port.
         let pos = spec.args.iter().position(|a| a == "--port").unwrap();
         assert_eq!(spec.args[pos + 1], b.port.to_string());
+        // --jinja is always present (MCP design §7.1): the tool-call
+        // precondition is a structured arg, not an upstream default.
+        assert!(spec.args.iter().any(|a| a == "--jinja"));
     }
 
     #[test]
@@ -7351,6 +7983,35 @@ mod tests {
         let spec = backend_spec(&cfg, &b, &[]);
         assert!(!spec.args.iter().any(|a| a.starts_with("--host")));
         assert!(spec.args.iter().any(|a| a == "--threads"));
+    }
+
+    #[test]
+    fn backend_spec_filters_no_jinja_from_raw_flags() {
+        // --jinja is app-owned (MCP design §7.1): every raw form
+        // that would disable it is stripped, in both spellings,
+        // while unrelated raw flags pass through.
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        for raw in [
+            "--no-jinja --threads 4",
+            "--no_jinja --threads 4",
+            "--jinja=false --threads 4",
+        ] {
+            b.raw_flags = Some(raw.into());
+            let spec = backend_spec(&cfg, &b, &[]);
+            assert!(
+                !spec.args.iter().any(|a| a.starts_with("--no-jinja")
+                    || a.starts_with("--no_jinja")
+                    || a == "--jinja=false"),
+                "raw form {raw:?} must be filtered"
+            );
+            assert!(spec.args.iter().any(|a| a == "--threads"));
+            // The structured --jinja survives exactly once.
+            assert_eq!(
+                spec.args.iter().filter(|a| *a == "--jinja").count(),
+                1
+            );
+        }
     }
 
     /// Register a catalog model in a test config and point a

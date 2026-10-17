@@ -16,6 +16,13 @@ use std::path::PathBuf;
 /// Patchable backend fields. All optional; `None` = leave unchanged.
 /// `raw_flags` is `Option<Option<String>>` so the UI can distinguish
 /// "not patched" (`None`) from "clear the raw flags" (`Some(None)`).
+///
+/// Deliberately absent: `tool_call_probe`. The probe is runtime
+/// state measured by the tool-call probe command (MCP design §7.2),
+/// not operator configuration, so it is never patchable and never
+/// rendered as a diff / activation change. Applying a patch that
+/// changes `model_file` or `raw_flags` *resets* it instead (see
+/// [`apply_config_diff`]).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct BackendPatch {
@@ -212,6 +219,16 @@ pub fn apply_config_diff(
     let diff = diff_config(backend_id, &config.backends[idx], patch);
     let original = config.backends[idx].clone();
     apply_patch_to_backend(&mut config.backends[idx], patch);
+    // A model or raw-flags change invalidates the recorded tool-call
+    // probe (MCP design §7.2): it measured a different serving
+    // configuration. The reset is not itself a diff change — the
+    // probe is runtime state, not operator config — and it rolls
+    // back with the backend below if validation fails.
+    if config.backends[idx].model_file != original.model_file
+        || config.backends[idx].raw_flags != original.raw_flags
+    {
+        config.backends[idx].tool_call_probe = None;
+    }
     match validate(config) {
         Ok(()) => Ok(diff),
         Err(e) => {
@@ -285,6 +302,59 @@ mod tests {
         let mut cfg = AppConfig::default_config();
         let err = apply_config_diff(&mut cfg, "nope", &BackendPatch::default()).unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn tool_call_probe_is_not_a_diff_field_and_resets_on_serving_change() {
+        use crate::{ToolCallProbe, ToolCallProbeOutcome};
+        let probe = Some(ToolCallProbe {
+            outcome: ToolCallProbeOutcome::Verified,
+            at_ms: 1_700_000_000_000,
+        });
+        // The probe never renders as a diff change: an empty patch
+        // against a probed backend is an empty diff.
+        let mut b = backend();
+        b.tool_call_probe = probe;
+        let diff = diff_config("planner", &b, &BackendPatch::default());
+        assert!(diff.changes.is_empty());
+
+        // A raw_flags change resets the probe to not measured, and
+        // the diff reports only the operator's own change.
+        let mut cfg = AppConfig::default_config();
+        cfg.backends[0].tool_call_probe = probe;
+        let id = cfg.backends[0].id.clone();
+        let patch = BackendPatch {
+            raw_flags: Some(Some("--threads 8".to_string())),
+            ..Default::default()
+        };
+        let diff = apply_config_diff(&mut cfg, &id, &patch).unwrap();
+        assert_eq!(diff.changes.len(), 1);
+        assert_eq!(diff.changes[0].field, "raw_flags");
+        assert_eq!(cfg.backends[0].tool_call_probe, None);
+
+        // A model_file change resets it too.
+        let mut cfg = AppConfig::default_config();
+        cfg.backends[0].tool_call_probe = probe;
+        // Disable so validation does not require a registered model.
+        cfg.backends[0].enabled = false;
+        let id = cfg.backends[0].id.clone();
+        let patch = BackendPatch {
+            model_file: Some(PathBuf::from("models/other.gguf")),
+            ..Default::default()
+        };
+        apply_config_diff(&mut cfg, &id, &patch).unwrap();
+        assert_eq!(cfg.backends[0].tool_call_probe, None);
+
+        // An unrelated change (n_ctx) leaves the probe in place.
+        let mut cfg = AppConfig::default_config();
+        cfg.backends[0].tool_call_probe = probe;
+        let id = cfg.backends[0].id.clone();
+        let patch = BackendPatch {
+            n_ctx: Some(16384),
+            ..Default::default()
+        };
+        apply_config_diff(&mut cfg, &id, &patch).unwrap();
+        assert_eq!(cfg.backends[0].tool_call_probe, probe);
     }
 
     #[test]

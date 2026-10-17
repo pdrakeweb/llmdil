@@ -610,6 +610,29 @@ export async function openUrl(url: string): Promise<CallResult<{ ok: boolean }>>
 
 /* ---------------- Backends (runtime state + supervision) ---------------- */
 
+/** Outcome of a backend tool-call probe (MCP design §7.2), as the
+ *  persisted config spells it (serde lowercase). */
+export type ToolCallProbeOutcome = "verified" | "unparsed" | "failed";
+
+/** A backend's persisted tool-call probe: the outcome plus when it
+ *  ran (Unix epoch ms). Absent/null on a row = never probed. */
+export interface ToolCallProbeData {
+  outcome: ToolCallProbeOutcome;
+  at_ms: number;
+}
+
+/** Result of backend_test_tool_call (manager-supervisor's
+ *  ToolCallProbeResult): the probe outcome, the /props template
+ *  evidence, and a human-readable detail line. */
+export interface BackendToolCallTestResult {
+  outcome: ToolCallProbeOutcome;
+  finish_reason: string | null;
+  chat_template_tool_use: boolean;
+  chat_template_caps: unknown;
+  detail: string;
+  latency_ms: number;
+}
+
 export interface BackendRow {
   id: string;
   enabled: boolean;
@@ -666,6 +689,11 @@ export interface BackendRow {
    *  counts let the form price any slider position with the same
    *  arithmetic as the backend memory requirement. */
   offload?: BackendOffload;
+  /** The backend's persisted tool-call probe (MCP design §7.2),
+   *  or null when it has never been probed — the card renders null
+   *  as "not measured", never as a measured state. Absent on
+   *  supervisor-only orphan rows, which carry no probe. */
+  tool_call_probe?: ToolCallProbeData | null;
 }
 
 /** A backend's expert-offload slider state (list_backends payload). */
@@ -1319,6 +1347,10 @@ export interface GatewayStatusData {
   activation_pending: boolean;
   /** How many journaled changes the pending plan carries. */
   activation_changes: number;
+  /** The LiteLLM version recorded by the last gateway spawn (MCP
+   *  design §4.3); null when no spawn has recorded one — rendered
+   *  as "not measured", never as a guess. */
+  litellm_version: string | null;
 }
 
 /** gateway_status — probe state (up) + port + group/rule counts + the
@@ -1338,7 +1370,7 @@ export async function getGatewayMasterKey(): Promise<CallResult<{ master_key: st
 }
 
 export async function getGatewayStatus(): Promise<CallResult<GatewayStatusData>> {
-  const fallback: GatewayStatusData = { port: 4000, groups: 0, routing_rules: 0, up: false, routing_log_len: 0, openrouter_cred_present: null, bind_host: "0.0.0.0", lan_ip: null, activation_pending: false, activation_changes: 0 };
+  const fallback: GatewayStatusData = { port: 4000, groups: 0, routing_rules: 0, up: false, routing_log_len: 0, openrouter_cred_present: null, bind_host: "0.0.0.0", lan_ip: null, activation_pending: false, activation_changes: 0, litellm_version: null };
   if (!isTauri()) return { data: fallback, live: false };
   try {
     const raw = await invoke<Partial<GatewayStatusData>>("gateway_status");
@@ -1354,6 +1386,7 @@ export async function getGatewayStatus(): Promise<CallResult<GatewayStatusData>>
         lan_ip: typeof raw.lan_ip === "string" ? raw.lan_ip : null,
         activation_pending: Boolean(raw.activation_pending),
         activation_changes: typeof raw.activation_changes === "number" ? raw.activation_changes : 0,
+        litellm_version: typeof raw.litellm_version === "string" ? raw.litellm_version : null,
       },
       live: true,
     };
@@ -1386,6 +1419,238 @@ export async function gatewayStop(): Promise<CallResult<{ ok: boolean; stopped: 
     return { data, live: true };
   } catch (e) {
     return { data: { ok: false, stopped: false }, live: true, error: errOf(e) };
+  }
+}
+
+/* ---------------- MCP servers (persisted registry) ---------------- */
+
+export type McpTransportKind = "stdio" | "http";
+export type McpExposureKind = "gateway" | "local" | "disabled";
+
+/** One mcp_list entry: a persisted registry server (the
+ *  McpServerConfig fields) plus live status — supervised-process
+ *  `running` (Local servers only) and credential presence over the
+ *  accepted Credential Manager targets (presence only; values are
+ *  never read). `credential_targets` from the Phase 4 brief does not
+ *  exist in the payload: the found target rides in
+ *  `credential_target_found`, and per-env-key presence in
+ *  `credential_presence`. */
+export interface McpServerRow {
+  id: string;
+  display_name: string;
+  /** Same value as display_name (back-compat name field). */
+  name: string;
+  transport: McpTransportKind;
+  exposure: McpExposureKind;
+  /** Derived runtime mode: remote | local | disabled. */
+  mode: string;
+  command: string | null;
+  args: string[];
+  url: string | null;
+  env_keys: string[];
+  cred_ref: string | null;
+  allowed_tools: string[] | null;
+  metered: boolean;
+  rpm_limit: number | null;
+  running: boolean;
+  credential_present: boolean;
+  /** "present" | "missing" — the §9 card wording. */
+  credential_status: string;
+  /** The accepted Credential Manager target that was found, when
+   *  one was (legacy servers accept either the unified wizard
+   *  target or the legacy llm-manager/mcp/<id> target). */
+  credential_target_found: string | null;
+  /** Per-env-key presence as [env key, present] pairs. */
+  credential_presence: [string, boolean][];
+}
+
+/** An MCP server definition as mcp_save_server accepts it: exactly
+ *  the persisted McpServerConfig serde shape (transport and
+ *  exposure are the lowercase tags; command/args serve stdio, url
+ *  serves http). */
+export interface McpServerInput {
+  id: string;
+  display_name: string;
+  transport: McpTransportKind;
+  exposure: McpExposureKind;
+  command: string | null;
+  args: string[];
+  url: string | null;
+  env_keys: string[];
+  cred_ref: string | null;
+  allowed_tools: string[] | null;
+  metered: boolean;
+  rpm_limit: number | null;
+}
+
+/** Result of mcp_test_connection. Two payload shapes exist, keyed
+ *  on the server's exposure:
+ *  - Gateway: { id, ok, registered, tools, detail } — plus, for the
+ *    curated servers after a passing test, real_call_ok /
+ *    real_call_detail (brave_search's one real, metered call) or
+ *    real_call_skipped (web_fetch never makes a real call).
+ *  - Local / Disabled: { id, ok, detail } — a supervised-process
+ *    liveness check (Local) or an unconditional not-ok (Disabled);
+ *    the Gateway-only fields stay absent. */
+export interface McpTestResult {
+  id: string;
+  ok: boolean;
+  detail: string;
+  registered?: boolean;
+  tools?: string[];
+  real_call_ok?: boolean;
+  real_call_detail?: string;
+  real_call_skipped?: boolean;
+}
+
+/** Sample-mode registry mirroring the four seeded servers, so the
+ *  MCP view renders under the browser smoke test. */
+function sampleMcpServers(): McpServerRow[] {
+  const base = {
+    name: "",
+    mode: "disabled",
+    command: null as string | null,
+    args: [] as string[],
+    url: null as string | null,
+    env_keys: [] as string[],
+    cred_ref: null as string | null,
+    allowed_tools: null as string[] | null,
+    metered: false,
+    rpm_limit: null as number | null,
+    running: false,
+    credential_present: false,
+    credential_status: "missing",
+    credential_target_found: null as string | null,
+    credential_presence: [] as [string, boolean][],
+  };
+  return [
+    {
+      ...base, id: "github", display_name: "GitHub", name: "GitHub",
+      transport: "stdio", exposure: "local", mode: "local",
+      command: "npx", args: ["-y", "@modelcontextprotocol/server-github"],
+      env_keys: ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+      cred_ref: "local-llm-service-manager/github-mcp",
+      running: true, credential_present: true, credential_status: "present",
+      credential_target_found: "local-llm-service-manager/github-mcp",
+      credential_presence: [["GITHUB_PERSONAL_ACCESS_TOKEN", true]],
+    },
+    {
+      ...base, id: "gdrive", display_name: "Google Drive", name: "Google Drive",
+      transport: "stdio", exposure: "local", mode: "local",
+      command: "npx", args: ["-y", "@modelcontextprotocol/server-gdrive"],
+      env_keys: ["GOOGLE_APPLICATION_CREDENTIALS"],
+      cred_ref: "local-llm-service-manager/gdrive-mcp",
+      credential_present: true, credential_status: "present",
+      credential_target_found: "local-llm-service-manager/gdrive-mcp",
+      credential_presence: [["GOOGLE_APPLICATION_CREDENTIALS", true]],
+    },
+    {
+      ...base, id: "brave_search", display_name: "Brave Search", name: "Brave Search",
+      transport: "stdio", exposure: "gateway", mode: "remote",
+      command: "npx",
+      args: ["-y", "@brave/brave-search-mcp-server@2.1.4", "--transport", "stdio"],
+      env_keys: ["BRAVE_API_KEY"],
+      cred_ref: "local-llm-service-manager/brave-search-mcp",
+      allowed_tools: ["brave_web_search", "brave_llm_context"],
+      metered: true, rpm_limit: 20,
+      credential_presence: [["BRAVE_API_KEY", false]],
+    },
+    {
+      ...base, id: "web_fetch", display_name: "Web Fetch", name: "Web Fetch",
+      transport: "stdio", exposure: "disabled", mode: "disabled",
+      command: "uvx", args: ["mcp-server-fetch@2026.10.10"],
+      allowed_tools: ["fetch"],
+    },
+  ];
+}
+
+/** mcp_list — the persisted MCP registry with live status. */
+export async function getMcpServers(): Promise<CallResult<McpServerRow[]>> {
+  if (!isTauri()) return { data: sampleMcpServers(), live: false };
+  try {
+    const data = await invoke<McpServerRow[]>("mcp_list");
+    return { data: Array.isArray(data) ? data : [], live: true };
+  } catch (e) {
+    return { data: [], live: true, error: errOf(e) };
+  }
+}
+
+/** mcp_test_connection — test one server (see McpTestResult for the
+ *  per-exposure payload shapes). For brave_search a passing test
+ *  performs one real, metered tool call — this wrapper is only ever
+ *  invoked from the view's explicit Test action, never on load or a
+ *  timer (design §8). */
+export async function testMcpServer(id: string): Promise<CallResult<McpTestResult>> {
+  if (!isTauri()) return { data: { id, ok: false, detail: "sample mode — tests run in the installed app" }, live: false };
+  try {
+    const data = await invoke<McpTestResult>("mcp_test_connection", { id });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { id, ok: false, detail: "" }, live: true, error: errOf(e) };
+  }
+}
+
+/** mcp_save_server — create or update (upsert by id) a registry
+ *  server. The command validates the whole config on save (§3.2);
+ *  a violation comes back as `error` and nothing is stored. */
+export async function saveMcpServer(server: McpServerInput): Promise<CallResult<{ id: string; persisted: boolean }>> {
+  if (!isTauri()) return { data: { id: server.id, persisted: false }, live: false };
+  try {
+    const data = await invoke<{ id: string; persisted: boolean }>("mcp_save_server", { server });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { id: server.id, persisted: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** mcp_delete_server — remove a registry server (a running Local
+ *  server is stopped first). */
+export async function deleteMcpServer(id: string): Promise<CallResult<{ id: string; deleted: boolean; persisted: boolean }>> {
+  if (!isTauri()) return { data: { id, deleted: true, persisted: false }, live: false };
+  try {
+    const data = await invoke<{ id: string; deleted: boolean; persisted: boolean }>("mcp_delete_server", { id });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { id, deleted: false, persisted: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** mcp_set_exposure — set a server's exposure (gateway | local |
+ *  disabled), persisted through the validated save path. */
+export async function setMcpExposure(id: string, exposure: McpExposureKind): Promise<CallResult<{ id: string; exposure: string; persisted: boolean }>> {
+  if (!isTauri()) return { data: { id, exposure, persisted: false }, live: false };
+  try {
+    const data = await invoke<{ id: string; exposure: string; persisted: boolean }>("mcp_set_exposure", { id, exposure });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { id, exposure, persisted: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** mcp_store_credential — store a server's credential in Windows
+ *  Credential Manager under its declared cred_ref target. The value
+ *  is passed to the command only; it is never returned or rendered. */
+export async function storeMcpCredential(id: string, value: string): Promise<CallResult<{ id: string; stored: boolean }>> {
+  if (!isTauri()) return { data: { id, stored: false }, live: false };
+  try {
+    const data = await invoke<{ id: string; stored: boolean }>("mcp_store_credential", { id, value });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { id, stored: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** backend_test_tool_call — probe a backend for structured
+ *  tool_calls (MCP design §7.2); the outcome persists on the
+ *  backend and renders on its card as the Tool calls line. */
+export async function testBackendToolCall(id: string): Promise<CallResult<BackendToolCallTestResult>> {
+  const fallback: BackendToolCallTestResult = { outcome: "failed", finish_reason: null, chat_template_tool_use: false, chat_template_caps: null, detail: "", latency_ms: 0 };
+  if (!isTauri()) return { data: fallback, live: false, error: "backend_test_tool_call is not available in sample mode" };
+  try {
+    const data = await invoke<BackendToolCallTestResult>("backend_test_tool_call", { id });
+    return { data, live: true };
+  } catch (e) {
+    return { data: fallback, live: true, error: errOf(e) };
   }
 }
 

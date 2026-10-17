@@ -78,6 +78,14 @@ pub struct ActivationEntry {
     /// gateway-scope entries.
     #[serde(default)]
     pub targets: Vec<String>,
+    /// Hash of the gateway YAML in effect BEFORE this change — the
+    /// on-disk `config.yaml` when present, else the YAML generated
+    /// from the pre-change configuration — recorded for drift
+    /// visibility (MCP design §10.2). `None` when neither source
+    /// exists. Serde-defaulted so journals written before this
+    /// field existed still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_change_yaml_hash: Option<String>,
 }
 
 /// The persisted journal: unresolved-change snapshot plus entries.
@@ -317,8 +325,26 @@ pub fn record_change(
         config_after: serde_json::to_value(post).unwrap_or(serde_json::Value::Null),
         scope: scope.to_string(),
         targets,
+        pre_change_yaml_hash: yaml_hash_before_change(data_dir, pre),
     });
     save_journal(data_dir, &journal)
+}
+
+/// The hash of the gateway YAML in effect before a change: the
+/// on-disk `config.yaml` when it exists and is non-empty (that is
+/// the YAML the running gateway was started with), else the YAML
+/// generated from the pre-change configuration. `None` when
+/// neither is available (no file yet and generation fails, e.g. a
+/// pre-change config with no enabled groups).
+fn yaml_hash_before_change(data_dir: &Path, pre: &AppConfig) -> Option<String> {
+    if let Ok(text) = std::fs::read_to_string(gateway_yaml_path(data_dir)) {
+        if !text.trim().is_empty() {
+            return Some(manager_wizard::gateway_yaml_hash(&text));
+        }
+    }
+    manager_gateway::generate_config_yaml(pre)
+        .ok()
+        .map(|yaml| manager_wizard::gateway_yaml_hash(&yaml))
 }
 
 /// Clear the journal (activation completed, or changes cancelled).
@@ -462,6 +488,7 @@ litellm_deployment_success_responses_total 9.0
             config_after: serde_json::Value::Null,
             scope: scope.to_string(),
             targets: targets.iter().map(|s| s.to_string()).collect(),
+            pre_change_yaml_hash: None,
         }
     }
 
@@ -598,11 +625,76 @@ litellm_deployment_success_responses_total 9.0
     }
 
     #[test]
+    fn record_change_records_pre_change_yaml_hash() {
+        let dir = std::env::temp_dir().join(format!("activation-yaml-hash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = AppConfig::default_config();
+        let mut post = cfg.clone();
+        post.gateway.port += 1;
+        let started = std::collections::HashMap::new();
+        let configured = std::collections::HashSet::new();
+        let running = std::collections::HashSet::new();
+        record_change(
+            &dir,
+            &cfg,
+            &post,
+            "gateway_config",
+            "port".to_string(),
+            "gateway",
+            Vec::new(),
+            &started,
+            &configured,
+            &running,
+        )
+        .unwrap();
+        let journal = load_journal(&dir);
+        assert_eq!(journal.entries.len(), 1);
+        // No on-disk YAML in the fresh dir: the hash is of the YAML
+        // generated from the pre-change config (when generation
+        // succeeds for it).
+        match manager_gateway::generate_config_yaml(&cfg) {
+            Ok(yaml) => assert_eq!(
+                journal.entries[0].pre_change_yaml_hash.as_deref(),
+                Some(manager_wizard::gateway_yaml_hash(&yaml).as_str())
+            ),
+            Err(_) => assert!(journal.entries[0].pre_change_yaml_hash.is_none()),
+        }
+        // With an on-disk config.yaml present, its hash wins — it
+        // is the YAML in effect, whatever the config now says.
+        let yaml_path = gateway_yaml_path(&dir);
+        std::fs::create_dir_all(yaml_path.parent().unwrap()).unwrap();
+        std::fs::write(&yaml_path, "sentinel: true\n").unwrap();
+        let mut post2 = post.clone();
+        post2.gateway.port += 1;
+        record_change(
+            &dir,
+            &post,
+            &post2,
+            "gateway_config",
+            "port again".to_string(),
+            "gateway",
+            Vec::new(),
+            &started,
+            &configured,
+            &running,
+        )
+        .unwrap();
+        let journal = load_journal(&dir);
+        let last = journal.entries.last().unwrap();
+        assert_eq!(
+            last.pre_change_yaml_hash.as_deref(),
+            Some(manager_wizard::gateway_yaml_hash("sentinel: true\n").as_str())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn legacy_entry_without_scope_defaults_to_gateway() {
         let text = r#"{"ts":"2026-10-16T12:00:00+00:00","kind":"backend_add","summary":"x","config_after":null}"#;
         let e: ActivationEntry = serde_json::from_str(text).unwrap();
         assert_eq!(e.scope, "gateway");
         assert!(e.targets.is_empty());
+        assert!(e.pre_change_yaml_hash.is_none());
     }
 
     fn ids(names: &[&str]) -> std::collections::HashSet<String> {
