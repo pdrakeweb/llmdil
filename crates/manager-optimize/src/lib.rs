@@ -23,6 +23,7 @@
 
 pub mod context;
 pub mod fit;
+pub mod measure;
 pub mod parse;
 pub mod plan;
 pub mod probe;
@@ -34,6 +35,12 @@ pub use context::{
     HardwareContext, MeasureInputs, ThroughputFact, TrafficWindow,
 };
 pub use fit::{evaluate_fit, layout_requirement, residency_per_gpu, FitOutcome, LayoutFacts};
+pub use measure::{
+    benchmark_prompts, facts as measurement_facts, measurement_fingerprint, median,
+    normalize_raw_flags, BenchResult, BenchRun, BenchmarkPrompt, MeasurementEntry,
+    MeasurementFingerprintInputs, MeasurementStore, BENCHMARK_TEMPERATURE, LONG_MAX_TOKENS,
+    LONG_PROMPT, MEASURED_RUNS, SHORT_MAX_TOKENS, SHORT_PROMPT,
+};
 pub use parse::{parse_plan, ParseError};
 pub use plan::{config_fingerprint, ApplyOutcome, Confidence, Decision, Plan, PlanItem, PlanKind};
 pub use probe::{probe_hardware, HardwareProbe};

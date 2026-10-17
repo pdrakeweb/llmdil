@@ -16,9 +16,9 @@
 import {
   addBackend, applyBackendConfig, deleteBackend, getAppConfig, getBackends,
   getBackendConfig, getOptimizeState, modelAdd, modelAssign,
-  optimizeCancelConsult, optimizeChangeSummary, optimizeConsult,
+  optimizeCancelConsult, optimizeCancelJob, optimizeChangeSummary, optimizeConsult,
   optimizeDiscardPlan, optimizeIsDestructive, optimizeKindLabel,
-  optimizeSavePurpose, optimizeSetItemOutcome, optimizeSetItemState,
+  optimizeMeasureBackend, optimizeSavePurpose, optimizeSetItemOutcome, optimizeSetItemState,
   setBackendOffload, stopBackend, updateBackendFlags, updateGatewayConfig,
 } from "../api";
 import type {
@@ -48,6 +48,13 @@ function fmtElapsed(secs: number): string {
   const m = Math.floor(secs / 60);
   const s = secs % 60;
   return m > 0 ? `${m} min ${s} s` : `${s} s`;
+}
+
+function fmtAge(secs: number): string {
+  if (secs < 60) return `${secs} s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)} min`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)} h`;
+  return `${Math.floor(secs / 86400)} d`;
 }
 
 /** Unwrap a CallResult or throw its error as an Error. */
@@ -84,6 +91,12 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   const openEditors = new Set<string>();
   let statusLine = "";
   let applyRunning = false;
+  /** The backend this page instance is measuring (Phase 5a), and
+   *  its progress timer — the server payload carries only the
+   *  shared job slot's occupied flag (`measuring`). */
+  let measuringBackend: string | null = null;
+  let measureStart = 0;
+  let measureTimer: number | null = null;
 
   const shortName = (modelId: string): string => {
     if (!state) return modelId;
@@ -238,6 +251,24 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     </div>`;
   }
 
+  function measureRow(b: OptimizeState["backends"][number], measuring: boolean): string {
+    const m = b.measured;
+    const parts: string[] = [];
+    if (m) {
+      if (m.prompt_per_second !== null) parts.push(`Prompt: ${trim1(m.prompt_per_second)} tok/s`);
+      if (m.predicted_per_second !== null) parts.push(`Generation: ${trim1(m.predicted_per_second)} tok/s`);
+      if (m.ttft_ms !== null) parts.push(`TTFT: ${trim1(m.ttft_ms)} ms`);
+      parts.push(`Age: ${fmtAge(m.age_secs)}`);
+    }
+    return `<div class="opt-measure-row">
+      <span class="opt-target">${esc(b.id)}</span>
+      ${parts.length
+        ? `<span class="opt-measure-figs">${esc(parts.join(" · "))}</span>`
+        : `<span class="opt-note">Not measured</span>`}
+      <button class="btn" data-opt-measure="${esc(b.id)}" ${measuring ? "disabled" : ""}>${icon("bolt")} Measure</button>
+    </div>`;
+  }
+
   function paint(): void {
     if (disposed || !host) return;
     if (loadError) {
@@ -254,6 +285,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     const summary = st.context_summary;
     const contextLine = `GPUs: ${summary.gpus} · Backends: ${summary.backends} · Groups: ${summary.groups} · Models: ${summary.models}${summary.traffic_window_label ? ` · Traffic window: ${esc(summary.traffic_window_label)}` : ""}`;
     const consulting = st.consulting;
+    const measuring = st.measuring || measuringBackend !== null;
     host.innerHTML = `
     <div class="card" id="optConsultCard">
       <div class="opt-consult-grid">
@@ -286,6 +318,14 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
              ${armed.has("consult") ? `<span class="opt-note">A new consultation replaces the plan and its decisions. Click again to confirm.</span>` : ""}`}
       </div>
       ${statusLine && !st.plan ? `<div class="opt-status">${esc(statusLine)}</div>` : ""}
+      ${running.length ? `<div class="opt-measurements">
+        <div class="opt-field-label" style="margin-top:14px">Measured throughput</div>
+        ${running.map((b) => measureRow(b, measuring)).join("")}
+        ${measuring ? `<div class="opt-consult-actions">
+          <span class="opt-consulting">${icon("clock")} Measuring${measuringBackend ? ` ${esc(measuringBackend)}` : ""}${measureStart ? ` <span id="optMeasureElapsed">${fmtElapsed(Math.floor((Date.now() - measureStart) / 1000))}</span>` : ""} — the standardized benchmark runs two prompts, warm-up plus three measured runs each.</span>
+          <button class="btn danger" data-opt-act="cancel-job">${icon("x")} Cancel</button>
+        </div>` : ""}
+      </div>` : ""}
     </div>
     <div id="optPlanHost">${planHtml(st)}</div>
     <details class="card opt-purposes">
@@ -328,6 +368,35 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         ? "Consultation cancelled."
         : `Consultation failed — ${r.error}`;
       if (state) paint(); else { loadError = r.error; paint(); }
+      return;
+    }
+    if (r.data) {
+      state = r.data;
+      statusLine = "";
+    }
+    paint();
+  }
+
+  async function runMeasure(backendId: string): Promise<void> {
+    measuringBackend = backendId;
+    measureStart = Date.now();
+    paint();
+    if (measureTimer !== null) window.clearInterval(measureTimer);
+    measureTimer = window.setInterval(() => {
+      const el = hostEl.querySelector("#optMeasureElapsed");
+      if (el) el.textContent = fmtElapsed(Math.floor((Date.now() - measureStart) / 1000));
+    }, 1000);
+    const r = await optimizeMeasureBackend(backendId);
+    if (measureTimer !== null) { window.clearInterval(measureTimer); measureTimer = null; }
+    measuringBackend = null;
+    measureStart = 0;
+    if (disposed) return;
+    if (r.error) {
+      if (state) state.measuring = false;
+      statusLine = r.error === "measurement cancelled"
+        ? "Measurement cancelled."
+        : `Measurement failed — ${r.error}`;
+      paint();
       return;
     }
     if (r.data) {
@@ -575,9 +644,18 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       })();
       return;
     }
+    const measureBtn = t.closest<HTMLElement>("[data-opt-measure]");
+    if (measureBtn) {
+      const backendId = measureBtn.dataset.optMeasure ?? "";
+      if (backendId) void runMeasure(backendId);
+      return;
+    }
     const act = t.closest<HTMLElement>("[data-opt-act]")?.dataset.optAct;
     if (!act) return;
     switch (act) {
+      case "cancel-job":
+        void optimizeCancelJob();
+        return;
       case "consult": {
         const hasDecisions = state?.plan?.items.some((i) => i.decision !== "undecided" || i.apply_outcome);
         if (state?.plan && hasDecisions && !armed.has("consult")) {
@@ -646,5 +724,6 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   return () => {
     disposed = true;
     if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
+    if (measureTimer !== null) window.clearInterval(measureTimer);
   };
 }

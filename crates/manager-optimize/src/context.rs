@@ -76,6 +76,12 @@ pub struct ThroughputFact {
     pub ttft_ms: Option<f64>,
     /// Seconds since the measurement was taken.
     pub age_secs: u64,
+    /// True when this entry's fingerprint is not the backend's
+    /// current configuration fingerprint: a retained older
+    /// measurement, surfaced as delta history (§A.1). The
+    /// context JSON carries `"superseded": true` only when this
+    /// is set, so a current fact's shape is unchanged.
+    pub superseded: bool,
 }
 
 /// Everything measured or computed that the builder cannot derive
@@ -407,7 +413,7 @@ pub fn build_context(
     if !measure.throughput.is_empty() {
         doc["measurements"] = json!({
             "throughput": measure.throughput.iter().map(|t| {
-                json!({
+                let mut v = json!({
                     "backend": t.backend_id,
                     "config_fingerprint": t.config_fingerprint,
                     "basis": "measured",
@@ -415,7 +421,11 @@ pub fn build_context(
                     "prompt_per_second": t.prompt_per_second,
                     "predicted_per_second": t.predicted_per_second,
                     "ttft_ms": t.ttft_ms,
-                })
+                });
+                if t.superseded {
+                    v["superseded"] = json!(true);
+                }
+                v
             }).collect::<Vec<_>>(),
         });
         meta.measured_blocks
@@ -727,6 +737,7 @@ mod tests {
             predicted_per_second: Some(21.8),
             ttft_ms: Some(240.0),
             age_secs: 3600,
+            superseded: false,
         });
         let (doc, meta) = build_context(&cfg, &measure, "1", "planner");
         let t = &doc["measurements"]["throughput"][0];
@@ -734,10 +745,33 @@ mod tests {
         assert_eq!(t["basis"], json!("measured"));
         assert_eq!(t["predicted_per_second"], json!(21.8));
         assert_eq!(t["age_secs"], json!(3600));
+        // A current fact carries no superseded key at all.
+        assert!(t.get("superseded").is_none());
         assert!(meta
             .measured_blocks
             .iter()
             .any(|b| b == "measured throughput"));
+    }
+
+    #[test]
+    fn measurements_section_labels_superseded_facts() {
+        // Addendum A.1: an entry under a superseded fingerprint
+        // may ride along as delta history, labeled as such.
+        let cfg = AppConfig::default_config();
+        let mut measure = MeasureInputs::default();
+        measure.throughput.push(ThroughputFact {
+            backend_id: "planner".to_string(),
+            config_fingerprint: "old456".to_string(),
+            prompt_per_second: Some(700.0),
+            predicted_per_second: Some(19.9),
+            ttft_ms: Some(260.0),
+            age_secs: 7200,
+            superseded: true,
+        });
+        let (doc, _) = build_context(&cfg, &measure, "1", "planner");
+        let t = &doc["measurements"]["throughput"][0];
+        assert_eq!(t["superseded"], json!(true));
+        assert_eq!(t["basis"], json!("measured"));
     }
 
     #[test]

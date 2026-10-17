@@ -130,10 +130,10 @@ export function mockOptimizeState(): OptimizeState {
       { name: "tool-runner", purpose: "" },
     ],
     backends: [
-      { id: "planner", purpose: "", running: true, enabled: true, model_id: "qwen3-27b-planner", short_name: "Qwen3.8-27B Planner" },
-      { id: "coder", purpose: "", running: true, enabled: true, model_id: "qwen3-coder-30b", short_name: "Qwen3-Coder-Next-80B" },
-      { id: "coder-fast", purpose: "", running: false, enabled: false, model_id: null, short_name: null },
-      { id: "tool-runner", purpose: "", running: false, enabled: false, model_id: null, short_name: null },
+      { id: "planner", purpose: "", running: true, enabled: true, model_id: "qwen3-27b-planner", short_name: "Qwen3.8-27B Planner", measured: { prompt_per_second: 812, predicted_per_second: 21.8, ttft_ms: 240, age_secs: 3600 } },
+      { id: "coder", purpose: "", running: true, enabled: true, model_id: "qwen3-coder-30b", short_name: "Qwen3-Coder-Next-80B", measured: null },
+      { id: "coder-fast", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null },
+      { id: "tool-runner", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null },
     ],
     context_summary: {
       gpus: 2, backends: 4, groups: 4, models: 3,
@@ -144,6 +144,7 @@ export function mockOptimizeState(): OptimizeState {
     default_backend: "planner",
     better_backend: null,
     consulting: false,
+    measuring: false,
     plan: {
       summary: "Sample plan — generated locally; no backend was consulted.",
       consulted_backend: "planner",

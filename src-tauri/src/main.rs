@@ -365,6 +365,13 @@ pub struct AppState {
     /// real cancellation, unlike `task_abort`, which only flips
     /// bookkeeping. One consultation at a time by construction.
     optimize_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Shared cancellation slot for GPU-bound Optimize jobs
+    /// (Phase 5: measurements and, later, experiment batches —
+    /// tracker #28 contract): one such job at a time, separate
+    /// from the consult slot above because a consultation and a
+    /// measurement are different jobs with different lifetimes.
+    /// Firing it drops the job's in-flight benchmark future.
+    optimize_job_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 /// On-disk form of the install wizard's progress
@@ -403,6 +410,7 @@ impl AppState {
             gateway_stats: Mutex::new(gateway_stats::GatewayStatsStore::default()),
             winml: OnceCell::new(),
             optimize_abort: Mutex::new(None),
+            optimize_job_abort: Mutex::new(None),
         }
     }
 
@@ -6342,6 +6350,8 @@ fn main() {
             optimize::optimize_set_item_outcome,
             optimize::optimize_validate_plan,
             optimize::optimize_discard_plan,
+            optimize::optimize_measure_backend,
+            optimize::optimize_cancel_job,
             diagnostics_export_bundle,
             // MCP / VS Code
             mcp_list,

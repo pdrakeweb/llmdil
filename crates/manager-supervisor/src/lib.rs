@@ -1637,6 +1637,204 @@ pub async fn chat_completion(
     })
 }
 
+/// Result of one benchmark completion (Optimize Phase 5a,
+/// design addendum A.1): the generation figures come from
+/// llama.cpp's own `timings` object, never from wall-clock
+/// token counting, because the server is the authority on how
+/// fast it processed and predicted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkSample {
+    /// Time from request start to the first streamed chunk
+    /// carrying non-empty content. `None` when the response was
+    /// not an event stream (the non-streaming fallback) — never
+    /// estimated (design A.1).
+    pub ttft_ms: Option<f64>,
+    pub prompt_per_second: Option<f64>,
+    pub predicted_per_second: Option<f64>,
+    pub content: String,
+    pub latency_ms: u64,
+}
+
+/// Rates from a llama.cpp `timings` object: the direct
+/// per-second fields when present, else derived from the
+/// millisecond / token counts the same object carries
+/// (`prompt_ms` + `prompt_n`, `predicted_ms` + `predicted_n`).
+fn timings_rates(json: &serde_json::Value) -> (Option<f64>, Option<f64>) {
+    let Some(t) = json.get("timings") else {
+        return (None, None);
+    };
+    let rate = |per_second: &str, ms: &str, n: &str| -> Option<f64> {
+        if let Some(v) = t.get(per_second).and_then(|v| v.as_f64()) {
+            if v > 0.0 {
+                return Some(v);
+            }
+        }
+        let ms = t.get(ms).and_then(|v| v.as_f64())?;
+        let n = t.get(n).and_then(|v| v.as_f64())?;
+        if ms > 0.0 && n > 0.0 {
+            Some(n / (ms / 1000.0))
+        } else {
+            None
+        }
+    };
+    (
+        rate("prompt_per_second", "prompt_ms", "prompt_n"),
+        rate("predicted_per_second", "predicted_ms", "predicted_n"),
+    )
+}
+
+fn absorb_timings(
+    json: &serde_json::Value,
+    prompt_per_second: &mut Option<f64>,
+    predicted_per_second: &mut Option<f64>,
+) {
+    let (p, g) = timings_rates(json);
+    if p.is_some() {
+        *prompt_per_second = p;
+    }
+    if g.is_some() {
+        *predicted_per_second = g;
+    }
+}
+
+/// A streaming benchmark completion against a backend's OpenAI
+/// surface: `POST {base_url}/v1/chat/completions` with
+/// `stream: true` and caller-set temperature / max_tokens.
+///
+/// Reads the SSE stream as it arrives: the time to the first
+/// chunk carrying non-empty delta content is the TTFT, and
+/// llama.cpp's `timings` object is taken from whichever chunk
+/// carries it (llama.cpp puts it on the final chunk). When the
+/// server answers with a plain JSON completion instead of an
+/// event stream, that body is parsed the same way and TTFT
+/// stays `None`. Cancellation is by future drop, exactly like
+/// [`chat_completion`] — the Optimize job slot relies on it.
+pub async fn benchmark_completion(
+    base_url: &str,
+    model: &str,
+    messages: &[ChatMessage],
+    temperature: f32,
+    max_tokens: u32,
+    timeout: Duration,
+) -> Result<BenchmarkSample, SupervisorError> {
+    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": true,
+    });
+    let body_str =
+        serde_json::to_string(&body).map_err(|e| SupervisorError::Http(e.to_string()))?;
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| SupervisorError::Http(e.to_string()))?;
+    let start = Instant::now();
+    let mut resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(body_str)
+        .send()
+        .await
+        .map_err(|e| SupervisorError::Http(e.to_string()))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let text = resp.text().await.unwrap_or_default();
+        let excerpt: String = text.chars().take(300).collect();
+        return Err(SupervisorError::Http(format!(
+            "backend returned HTTP {status}: {excerpt}"
+        )));
+    }
+    let is_event_stream = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/event-stream"))
+        .unwrap_or(false);
+    if !is_event_stream {
+        // Non-streaming fallback: a plain JSON completion with
+        // timings. TTFT is not measurable here and stays None.
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| SupervisorError::Http(e.to_string()))?;
+        let latency_ms = start.elapsed().as_millis() as u64;
+        let json: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| SupervisorError::Http(format!("unparseable response body: {e}")))?;
+        let mut prompt_per_second = None;
+        let mut predicted_per_second = None;
+        absorb_timings(&json, &mut prompt_per_second, &mut predicted_per_second);
+        let content = json
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        return Ok(BenchmarkSample {
+            ttft_ms: None,
+            prompt_per_second,
+            predicted_per_second,
+            content,
+            latency_ms,
+        });
+    }
+
+    let mut content = String::new();
+    let mut ttft_ms: Option<f64> = None;
+    let mut prompt_per_second = None;
+    let mut predicted_per_second = None;
+    let mut buffer = String::new();
+    // Process one SSE line: `data:` payloads carry the chunk
+    // JSON; `[DONE]` and blank separators carry nothing.
+    macro_rules! process_line {
+        ($line:expr) => {
+            if let Some(data) = $line.trim().strip_prefix("data:") {
+                let data = data.trim();
+                if !data.is_empty() && data != "[DONE]" {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        absorb_timings(&json, &mut prompt_per_second, &mut predicted_per_second);
+                        if let Some(delta) = json
+                            .pointer("/choices/0/delta/content")
+                            .and_then(|v| v.as_str())
+                        {
+                            if !delta.is_empty() {
+                                if ttft_ms.is_none() {
+                                    ttft_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+                                }
+                                content.push_str(delta);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+    }
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = buffer.find('\n') {
+                    let line: String = buffer.drain(..=pos).collect();
+                    process_line!(line);
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(SupervisorError::Http(e.to_string())),
+        }
+    }
+    if !buffer.is_empty() {
+        process_line!(buffer);
+    }
+    Ok(BenchmarkSample {
+        ttft_ms,
+        prompt_per_second,
+        predicted_per_second,
+        content,
+        latency_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
 /// Supervisor errors.
 #[derive(Debug, thiserror::Error)]
 pub enum SupervisorError {
@@ -2719,6 +2917,77 @@ mod tests {
         let r = test_request(&base, "hi").await.unwrap();
         assert_eq!(r.status, 500);
         assert!(r.content.is_none());
+    }
+
+    /// Spawn a hermetic fake HTTP server replying once with the
+    /// given content type and body (SSE-shaped when the type says
+    /// so). Returns the base URL.
+    async fn fake_typed_server(content_type: &str, body: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = body.to_string();
+        let content_type = content_type.to_string();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let req = read_http_request(&mut sock).await;
+            let head = String::from_utf8_lossy(&req);
+            assert!(head.starts_with("POST /v1/chat/completions "));
+            // The benchmark request must ask for streaming.
+            assert!(head.contains("\"stream\":true"), "request: {head}");
+            let resp = format!(
+                "HTTP/1.1 200 test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn benchmark_completion_reads_sse_timings_and_ttft() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"timings\":{\"prompt_per_second\":900.5,\"predicted_per_second\":25.25,\"prompt_ms\":44.0,\"prompt_n\":40,\"predicted_ms\":1000.0,\"predicted_n\":25}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let base = fake_typed_server("text/event-stream", sse).await;
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "benchmark".to_string(),
+        }];
+        let r = benchmark_completion(&base, "m", &messages, 0.0, 256, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(r.content, "Hello world");
+        assert_eq!(r.prompt_per_second, Some(900.5));
+        assert_eq!(r.predicted_per_second, Some(25.25));
+        assert!(r.ttft_ms.is_some(), "first content chunk sets TTFT");
+        assert!(r.ttft_ms.unwrap() >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn benchmark_completion_falls_back_to_plain_json() {
+        let base = fake_chat_server(
+            200,
+            r#"{"choices":[{"message":{"content":"plain answer"}}],"timings":{"prompt_ms":100.0,"prompt_n":50,"predicted_ms":2000.0,"predicted_n":40}}"#,
+        )
+        .await;
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "benchmark".to_string(),
+        }];
+        let r = benchmark_completion(&base, "m", &messages, 0.0, 128, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(r.content, "plain answer");
+        // No event stream: TTFT stays absent, never estimated.
+        assert_eq!(r.ttft_ms, None);
+        // Rates derived from the ms/token counts when the direct
+        // per-second fields are absent: 50 / 0.1 s, 40 / 2 s.
+        assert_eq!(r.prompt_per_second, Some(500.0));
+        assert_eq!(r.predicted_per_second, Some(20.0));
     }
 
     #[tokio::test]

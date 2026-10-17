@@ -19,10 +19,12 @@ use tauri::State;
 
 use manager_config::AppConfig;
 use manager_optimize::{
-    build_context, build_prompts, config_fingerprint, consult_default, default_purpose_seed,
-    estimate_tokens, parse_plan, probe_hardware, validate_plan, BackendMeasured, ConsultCandidate,
-    Decision, HardwareContext, ItemValidation, LayoutFacts, LiveSnapshot, MeasureInputs, Plan,
-    TrafficWindow, ValidationStatus,
+    benchmark_prompts, build_context, build_prompts, config_fingerprint, consult_default,
+    default_purpose_seed, estimate_tokens, measurement_facts, measurement_fingerprint, parse_plan,
+    probe_hardware, validate_plan, BackendMeasured, BenchResult, BenchRun, ConsultCandidate,
+    Decision, HardwareContext, ItemValidation, LayoutFacts, LiveSnapshot, MeasureInputs,
+    MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, Plan, TrafficWindow,
+    ValidationStatus, BENCHMARK_TEMPERATURE, MEASURED_RUNS,
 };
 use manager_supervisor::ProcessState;
 
@@ -32,6 +34,11 @@ use crate::{err, jerr, ApiError, ApiResult, AppState, TaskStatus};
 const CONSULT_MAX_TOKENS: u32 = 4096;
 const CONSULT_TEMPERATURE: f32 = 0.2;
 const CONSULT_TIMEOUT: Duration = Duration::from_secs(900);
+/// Per-run benchmark timeout (Phase 5a): generous, because the
+/// long prompt on a slow (heavily offloaded) backend is the
+/// slowest legitimate run — prompt processing alone can take
+/// minutes there.
+const MEASURE_RUN_TIMEOUT: Duration = Duration::from_secs(600);
 
 // ---------------------------------------------------------------------------
 // Plan persistence (<data_dir>/optimize-plan.json)
@@ -67,6 +74,66 @@ fn save_plan_file(state: &AppState, file: &PlanFile) -> Result<(), String> {
     std::fs::write(plan_path(state), text).map_err(|e| e.to_string())
 }
 
+fn measurements_path(state: &AppState) -> PathBuf {
+    state.data_dir.join("optimize-measurements.json")
+}
+
+/// The measurement-fingerprint inputs for one backend (§A.1),
+/// resolved from the live configuration: the model's verified
+/// stamp or on-disk size, the resolved offload, and the GPU set
+/// the backend is placed on (indices + names from the telemetry
+/// snapshot). An undetermined placement fingerprints against
+/// the whole GPU set — the launch is unrestricted then, so any
+/// GPU could be doing the work.
+fn fingerprint_inputs(
+    cfg: &AppConfig,
+    b: &manager_config::BackendConfig,
+    gpus: &[(u32, String)],
+) -> MeasurementFingerprintInputs {
+    let model = crate::model_for_backend(cfg, b);
+    let file_size_bytes = model
+        .map(|m| crate::resolve_under_data_dir(&cfg.data_dir, &m.gguf_path))
+        .or_else(|| Some(crate::resolve_under_data_dir(&cfg.data_dir, &b.model_file)))
+        .and_then(|p| std::fs::metadata(p).ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len());
+    let gpu_set: Vec<(u32, String)> = match crate::backend_gpu_visibility(b) {
+        crate::GpuVisibility::CpuOnly => Vec::new(),
+        crate::GpuVisibility::Gpus(indices) => indices
+            .iter()
+            .map(|i| {
+                (
+                    *i,
+                    gpus.iter()
+                        .find(|(idx, _)| idx == i)
+                        .map(|(_, name)| name.clone())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect(),
+        crate::GpuVisibility::Undetermined => gpus.to_vec(),
+    };
+    // Resolved offload: the offload info's resolved layer count
+    // when the backend's model is offload-capable, else the raw
+    // flags' own resolution.
+    let offload = match crate::backend_offload_info(cfg, b) {
+        Some(info) => manager_models::offload_for_layers(info.layers, info.moe_layers),
+        None => manager_models::expert_offload(b.raw_flags.as_deref()),
+    };
+    MeasurementFingerprintInputs {
+        verified_sha256: model.and_then(|m| m.verified_sha256.clone()),
+        file_size_bytes,
+        quant: model.map(|m| m.quant.clone()).unwrap_or_default(),
+        n_ctx: b.flags.n_ctx,
+        n_batch: b.flags.n_batch,
+        offload,
+        tensor_split: b.flags.tensor_split.clone(),
+        split_mode: b.flags.split_mode,
+        raw_flags: b.raw_flags.clone(),
+        gpus: gpu_set,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Input gathering: everything the pure core needs from the live app
 // ---------------------------------------------------------------------------
@@ -76,6 +143,10 @@ struct Gathered {
     live: LiveSnapshot,
     candidates: Vec<ConsultCandidate>,
     running: HashMap<String, bool>,
+    /// Each configured backend's current measurement
+    /// fingerprint (§A.1), computed from the same snapshot the
+    /// context is built from.
+    fingerprints: HashMap<String, String>,
 }
 
 async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
@@ -199,6 +270,23 @@ async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
         }
     }
 
+    // Measured throughput (§A.1): every configured backend's
+    // current fingerprint, then the store's facts against them —
+    // current entries plus superseded ones labeled as such.
+    let gpu_pairs: Vec<(u32, String)> = samples
+        .iter()
+        .map(|s| (s.index, s.name.clone()))
+        .collect();
+    let mut fingerprints: HashMap<String, String> = HashMap::new();
+    for b in &cfg.backends {
+        fingerprints.insert(
+            b.id.clone(),
+            measurement_fingerprint(&fingerprint_inputs(cfg, b, &gpu_pairs)),
+        );
+    }
+    let store = MeasurementStore::load(&measurements_path(state));
+    measure.throughput = measurement_facts(&store, &fingerprints, chrono::Utc::now());
+
     // Layout facts per model: from serving backends' resolved
     // layouts; catalog-only facts for models no backend serves.
     let mut layouts: HashMap<String, LayoutFacts> = HashMap::new();
@@ -271,6 +359,7 @@ async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
         live,
         candidates,
         running,
+        fingerprints,
     }
 }
 
@@ -334,6 +423,18 @@ async fn state_payload(state: &AppState) -> ApiResult {
         })).collect::<Vec<_>>(),
         "backends": cfg.backends.iter().map(|b| {
             let model = crate::model_for_backend(&cfg, b);
+            // The current-fingerprint measurement summary, when
+            // one exists (§A.1): the headline figures the Measure
+            // action produced, with their age. Superseded entries
+            // are context history, not the backend's figures.
+            let measured = gathered.measure.throughput.iter()
+                .find(|t| t.backend_id == b.id && !t.superseded)
+                .map(|t| json!({
+                    "prompt_per_second": t.prompt_per_second,
+                    "predicted_per_second": t.predicted_per_second,
+                    "ttft_ms": t.ttft_ms,
+                    "age_secs": t.age_secs,
+                }));
             json!({
                 "id": b.id,
                 "purpose": b.purpose,
@@ -341,6 +442,7 @@ async fn state_payload(state: &AppState) -> ApiResult {
                 "enabled": b.enabled,
                 "model_id": model.map(|m| m.id.clone()),
                 "short_name": model.map(|m| manager_optimize::model_short_name(&cfg, m)),
+                "measured": measured,
             })
         }).collect::<Vec<_>>(),
         "context_summary": {
@@ -367,6 +469,7 @@ async fn state_payload(state: &AppState) -> ApiResult {
         },
         "plan": plan_json,
         "consulting": state.optimize_abort.lock().await.is_some(),
+        "measuring": state.optimize_job_abort.lock().await.is_some(),
     }))
 }
 
@@ -645,6 +748,199 @@ pub async fn optimize_consult(
 pub async fn optimize_cancel_consult(state: State<'_, AppState>) -> ApiResult {
     let sender = {
         let mut slot = state.optimize_abort.lock().await;
+        slot.take()
+    };
+    match sender {
+        Some(tx) => {
+            let _ = tx.send(());
+            Ok(json!({ "cancelled": true }))
+        }
+        None => Ok(json!({ "cancelled": false })),
+    }
+}
+
+/// Measure one running backend (Phase 5a, §A.1): the
+/// standardized benchmark — one discarded warm-up then three
+/// measured runs per prompt, short then long, sequentially —
+/// against the backend's loopback port, under the shared
+/// GPU-job slot with scoped cancellation. The result replaces
+/// any entry under the same config fingerprint in the
+/// measurement store; the backend is never started, stopped,
+/// or reconfigured.
+#[tauri::command]
+pub async fn optimize_measure_backend(
+    state: State<'_, AppState>,
+    backend_id: String,
+) -> ApiResult {
+    {
+        let slot = state.optimize_job_abort.lock().await;
+        if slot.is_some() {
+            return Err(err(ApiError::InvalidInput(
+                "a measurement or experiment job is already running".to_string(),
+            )));
+        }
+    }
+    let cfg = state.config.read().await.clone();
+    let backend = cfg
+        .backends
+        .iter()
+        .find(|b| b.id == backend_id)
+        .ok_or_else(|| err(ApiError::NotFound(format!("backend {backend_id}"))))?
+        .clone();
+    let gathered = gather(&state, &cfg).await;
+    if gathered.running.get(&backend_id).copied() != Some(true) {
+        return Err(err(ApiError::InvalidInput(format!(
+            "backend '{backend_id}' is not running; measurements run against a running backend"
+        ))));
+    }
+    let fingerprint = gathered
+        .fingerprints
+        .get(&backend_id)
+        .cloned()
+        .ok_or_else(|| err(ApiError::NotFound(format!("backend {backend_id}"))))?;
+    let model_id = crate::model_for_backend(&cfg, &backend)
+        .map(|m| m.id.clone())
+        .unwrap_or_else(|| {
+            backend
+                .model_file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| backend.id.clone())
+        });
+    let task_id = state
+        .record_task(
+            "optimize-measure",
+            json!({ "backend": backend_id, "fingerprint": fingerprint }),
+        )
+        .await;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut slot = state.optimize_job_abort.lock().await;
+        if slot.is_some() {
+            state
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Failed,
+                    json!({ "error": "a measurement or experiment job is already running" }),
+                )
+                .await;
+            return Err(err(ApiError::InvalidInput(
+                "a measurement or experiment job is already running".to_string(),
+            )));
+        }
+        *slot = Some(tx);
+    }
+    // Loopback by construction, as with consultations (§3).
+    let base_url = format!("http://127.0.0.1:{}", backend.port);
+    let run_model = model_id.clone();
+    let run_backend = backend_id.clone();
+    let run_fingerprint = fingerprint.clone();
+    let run = async move {
+        let mut results: Vec<BenchResult> = Vec::new();
+        for prompt in benchmark_prompts() {
+            let messages = vec![manager_supervisor::ChatMessage {
+                role: "user".to_string(),
+                content: prompt.text.to_string(),
+            }];
+            // Warm-up, discarded (§A.1): first-run effects after
+            // a model load are not the configuration's steady
+            // state.
+            manager_supervisor::benchmark_completion(
+                &base_url,
+                &run_model,
+                &messages,
+                BENCHMARK_TEMPERATURE,
+                prompt.max_tokens,
+                MEASURE_RUN_TIMEOUT,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let mut runs: Vec<BenchRun> = Vec::new();
+            for _ in 0..MEASURED_RUNS {
+                let sample = manager_supervisor::benchmark_completion(
+                    &base_url,
+                    &run_model,
+                    &messages,
+                    BENCHMARK_TEMPERATURE,
+                    prompt.max_tokens,
+                    MEASURE_RUN_TIMEOUT,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                runs.push(BenchRun {
+                    prompt_per_second: sample.prompt_per_second,
+                    predicted_per_second: sample.predicted_per_second,
+                    ttft_ms: sample.ttft_ms,
+                    latency_ms: sample.latency_ms,
+                });
+            }
+            results.push(BenchResult::from_runs(runs));
+        }
+        let mut iter = results.into_iter();
+        Ok::<MeasurementEntry, String>(MeasurementEntry {
+            fingerprint: run_fingerprint,
+            backend_id: run_backend,
+            model_id: run_model,
+            measured_at: chrono::Utc::now().to_rfc3339(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            short: iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
+            long: iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
+        })
+    };
+    let outcome = tokio::select! {
+        res = run => Some(res),
+        _ = rx => None,
+    };
+    {
+        let mut slot = state.optimize_job_abort.lock().await;
+        *slot = None;
+    }
+    let entry = match outcome {
+        None => {
+            state
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Aborted,
+                    json!({ "backend": backend_id }),
+                )
+                .await;
+            return Err("measurement cancelled".to_string());
+        }
+        Some(Err(e)) => {
+            state
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Failed,
+                    json!({ "error": e.clone() }),
+                )
+                .await;
+            return Err(err(ApiError::InvalidInput(format!(
+                "measurement failed: {e}"
+            ))));
+        }
+        Some(Ok(entry)) => entry,
+    };
+    let mut store = MeasurementStore::load(&measurements_path(&state));
+    store.upsert(entry);
+    store.save(&measurements_path(&state))?;
+    state
+        .finish_task(
+            &task_id,
+            TaskStatus::Done,
+            json!({ "backend": backend_id, "fingerprint": fingerprint }),
+        )
+        .await;
+    state_payload(&state).await
+}
+
+/// Cancel the running GPU-bound Optimize job (a measurement,
+/// or an experiment batch in a later sub-phase): fires the
+/// shared job slot's abort handle, which drops the job's
+/// in-flight benchmark future.
+#[tauri::command]
+pub async fn optimize_cancel_job(state: State<'_, AppState>) -> ApiResult {
+    let sender = {
+        let mut slot = state.optimize_job_abort.lock().await;
         slot.take()
     };
     match sender {

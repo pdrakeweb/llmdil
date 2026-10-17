@@ -1815,6 +1815,13 @@ export interface OptimizePlan {
   sample: boolean;
 }
 
+export interface OptimizeMeasured {
+  prompt_per_second: number | null;
+  predicted_per_second: number | null;
+  ttft_ms: number | null;
+  age_secs: number;
+}
+
 export interface OptimizeBackendInfo {
   id: string;
   purpose: string;
@@ -1822,6 +1829,10 @@ export interface OptimizeBackendInfo {
   enabled: boolean;
   model_id: string | null;
   short_name: string | null;
+  /** Current-fingerprint measurement summary (Phase 5a), or
+   *  null when this backend's configuration has not been
+   *  measured. */
+  measured: OptimizeMeasured | null;
 }
 
 export interface OptimizeState {
@@ -1843,6 +1854,9 @@ export interface OptimizeState {
   better_backend: { id: string; short_name: string | null } | null;
   plan: OptimizePlan | null;
   consulting: boolean;
+  /** A GPU-bound Optimize job (measurement, later an
+   *  experiment batch) is currently running. */
+  measuring: boolean;
 }
 
 /** optimize_get_state — the page's full state: purposes, context
@@ -1885,6 +1899,26 @@ export async function optimizeCancelConsult(): Promise<CallResult<{ cancelled: b
   if (!isTauri()) return { data: { cancelled: false }, live: false };
   try {
     const data = await invoke<{ cancelled: boolean }>("optimize_cancel_consult");
+    return { data, live: true };
+  } catch (e) {
+    return { data: { cancelled: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** optimize_measure_backend — run the standardized benchmark
+ *  (Phase 5a) against one running backend and return the
+ *  refreshed state with its measurement summary. Long-running:
+ *  two prompts × (warm-up + 3 runs), 600 s budget per run. */
+export function optimizeMeasureBackend(backendId: string) {
+  return optimizeStateCmd("optimize_measure_backend", { backendId });
+}
+
+/** optimize_cancel_job — fire the shared GPU-job cancellation
+ *  handle (measurement / experiment jobs, not consultations). */
+export async function optimizeCancelJob(): Promise<CallResult<{ cancelled: boolean }>> {
+  if (!isTauri()) return { data: { cancelled: false }, live: false };
+  try {
+    const data = await invoke<{ cancelled: boolean }>("optimize_cancel_job");
     return { data, live: true };
   } catch (e) {
     return { data: { cancelled: false }, live: true, error: errOf(e) };
