@@ -1536,6 +1536,107 @@ pub async fn test_request(base_url: &str, prompt: &str) -> Result<TestResult, Su
     })
 }
 
+/// One chat message for [`chat_completion`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// Result of a full chat completion (the Optimize consultation's
+/// transport — design docs/optimize-design.md §3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionResult {
+    pub content: String,
+    pub finish_reason: Option<String>,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub latency_ms: u64,
+}
+
+/// A non-streaming chat completion against a backend's OpenAI
+/// surface: `POST {base_url}/v1/chat/completions` with caller-set
+/// temperature, max_tokens, and timeout.
+///
+/// This is deliberately NOT an extension of [`test_request`]: the
+/// test request is a probe (30 s, 16 tokens, status reported rather
+/// than errored), while a consultation is a minutes-long generation
+/// with its own budget where a non-2xx status or a missing first
+/// choice is a failure. Cancellation is by future drop: dropping
+/// this future aborts the in-flight HTTP request, which is what
+/// the Optimize scoped-cancellation handle relies on.
+pub async fn chat_completion(
+    base_url: &str,
+    model: &str,
+    messages: &[ChatMessage],
+    temperature: f32,
+    max_tokens: u32,
+    timeout: Duration,
+) -> Result<ChatCompletionResult, SupervisorError> {
+    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": false,
+    });
+    let body_str =
+        serde_json::to_string(&body).map_err(|e| SupervisorError::Http(e.to_string()))?;
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| SupervisorError::Http(e.to_string()))?;
+    let start = Instant::now();
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(body_str)
+        .send()
+        .await
+        .map_err(|e| SupervisorError::Http(e.to_string()))?;
+    let status = resp.status().as_u16();
+    let latency_ms = start.elapsed().as_millis() as u64;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| SupervisorError::Http(e.to_string()))?;
+    if !(200..300).contains(&status) {
+        let excerpt: String = text.chars().take(300).collect();
+        return Err(SupervisorError::Http(format!(
+            "backend returned HTTP {status}: {excerpt}"
+        )));
+    }
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| SupervisorError::Http(format!("unparseable response body: {e}")))?;
+    let content = json
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            SupervisorError::Http("response has no first-choice message content".to_string())
+        })?;
+    let finish_reason = json
+        .pointer("/choices/0/finish_reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let prompt_tokens = json
+        .pointer("/usage/prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    let completion_tokens = json
+        .pointer("/usage/completion_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    Ok(ChatCompletionResult {
+        content,
+        finish_reason,
+        prompt_tokens,
+        completion_tokens,
+        latency_ms,
+    })
+}
+
 /// Supervisor errors.
 #[derive(Debug, thiserror::Error)]
 pub enum SupervisorError {

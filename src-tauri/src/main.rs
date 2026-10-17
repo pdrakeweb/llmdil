@@ -46,6 +46,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 
 mod activation;
 mod gateway_stats;
+mod optimize;
 
 // ---------------------------------------------------------------------------
 // Events (Rust -> UI, spec §14)
@@ -357,6 +358,13 @@ pub struct AppState {
     gateway_stats: Mutex<gateway_stats::GatewayStatsStore>,
     /// WinML secondary-backend registry (stateful single-model rule).
     winml: OnceCell<Mutex<manager_winml::WinMlRegistry>>,
+    /// Scoped cancellation handle for the Optimize consultation
+    /// (design docs/optimize-design.md §1.2): the sender half of a
+    /// oneshot channel, present only while a consultation runs.
+    /// Firing it drops the in-flight chat-completion future —
+    /// real cancellation, unlike `task_abort`, which only flips
+    /// bookkeeping. One consultation at a time by construction.
+    optimize_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 /// On-disk form of the install wizard's progress
@@ -394,6 +402,7 @@ impl AppState {
             routing_log: Mutex::new(manager_gateway::RoutingLog::default()),
             gateway_stats: Mutex::new(gateway_stats::GatewayStatsStore::default()),
             winml: OnceCell::new(),
+            optimize_abort: Mutex::new(None),
         }
     }
 
@@ -3625,6 +3634,7 @@ async fn backend_add(
             members: vec![id.clone()],
             strategy: manager_config::RoutingStrategy::SimpleShuffle,
             fallbacks: Vec::new(),
+            purpose: String::new(),
         });
     } else {
         let g = new_cfg
@@ -3662,6 +3672,7 @@ async fn backend_add(
             backoff_base_secs: 2,
         },
         overrides_global: false,
+        purpose: String::new(),
     });
     if let Some(m) = new_cfg.models.iter_mut().find(|m| m.id == model_id) {
         if !m.assigned_backends.contains(&id) {
@@ -6322,6 +6333,15 @@ fn main() {
             // Tasks / diagnostics
             task_abort,
             tasks_list,
+            // Optimize page
+            optimize::optimize_get_state,
+            optimize::optimize_save_purpose,
+            optimize::optimize_consult,
+            optimize::optimize_cancel_consult,
+            optimize::optimize_set_item_state,
+            optimize::optimize_set_item_outcome,
+            optimize::optimize_validate_plan,
+            optimize::optimize_discard_plan,
             diagnostics_export_bundle,
             // MCP / VS Code
             mcp_list,
