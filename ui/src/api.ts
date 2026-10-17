@@ -1657,6 +1657,38 @@ export async function setMxcMode(mode: string): Promise<CallResult<{ ok: boolean
   }
 }
 
+/** Notification preferences (Settings → Notifications). Mirrors
+ *  `NotificationConfig` in manager-config: `enabled` is the master
+ *  switch; each category switch is ANDed with it app-side. */
+export interface NotificationSettings {
+  enabled: boolean;
+  operations: boolean;
+  failures: boolean;
+  activation: boolean;
+}
+
+export async function setNotificationConfig(config: NotificationSettings): Promise<CallResult<{ ok: boolean; persisted?: boolean }>> {
+  if (!isTauri()) return { data: { ok: false }, live: false, error: "notifications_set_config is not available in sample mode" };
+  try {
+    const data = await invoke<{ ok: boolean; persisted?: boolean }>("notifications_set_config", { config });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { ok: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** Fire one toast immediately, bypassing the category switches —
+ *  the Settings card's delivery check. */
+export async function sendTestNotification(): Promise<CallResult<{ ok: boolean }>> {
+  if (!isTauri()) return { data: { ok: false }, live: false, error: "notifications_send_test is not available in sample mode" };
+  try {
+    const data = await invoke<{ ok: boolean }>("notifications_send_test");
+    return { data, live: true };
+  } catch (e) {
+    return { data: { ok: false }, live: true, error: errOf(e) };
+  }
+}
+
 /** One MXC self-test probe outcome (manager-mxc's SelfTestCase minus
  *  the request detail, which the view does not render). */
 export interface MxcSelfTestCase {

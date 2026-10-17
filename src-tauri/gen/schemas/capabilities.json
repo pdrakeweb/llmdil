@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default capability: main window with core Tauri APIs","local":true,"windows":["main"],"permissions":["core:default"]}}
+{"default":{"identifier":"default","description":"Default capability: main window with core Tauri APIs","local":true,"windows":["main"],"permissions":["core:default","notification:default"]}}

@@ -46,6 +46,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 
 mod activation;
 mod gateway_stats;
+mod notify;
 
 // ---------------------------------------------------------------------------
 // Events (Rust -> UI, spec §14)
@@ -357,6 +358,11 @@ pub struct AppState {
     gateway_stats: Mutex<gateway_stats::GatewayStatsStore>,
     /// WinML secondary-backend registry (stateful single-model rule).
     winml: OnceCell<Mutex<manager_winml::WinMlRegistry>>,
+    /// Transition-watch state for the toast notification monitor
+    /// (see [`notify`]): backend states, gateway liveness expectation,
+    /// and activation-plan pending state, so state-driven toasts fire
+    /// on transitions only. std Mutex: synchronous diff/update only.
+    notify_watch: std::sync::Mutex<notify::NotifyWatch>,
 }
 
 /// On-disk form of the install wizard's progress
@@ -394,6 +400,7 @@ impl AppState {
             routing_log: Mutex::new(manager_gateway::RoutingLog::default()),
             gateway_stats: Mutex::new(gateway_stats::GatewayStatsStore::default()),
             winml: OnceCell::new(),
+            notify_watch: std::sync::Mutex::new(notify::NotifyWatch::default()),
         }
     }
 
@@ -1081,6 +1088,42 @@ async fn update_config(state: State<'_, AppState>, patch: Value) -> ApiResult {
         .map_err(jerr)?;
     *cfg = new_cfg;
     Ok(json!({ "ok": true, "persisted": true }))
+}
+
+/// Replace the notification preferences (Settings → Notifications).
+/// Save-then-install, exactly like `update_config`: the file is
+/// validated and written first; the in-memory config changes only
+/// when the save succeeds.
+#[tauri::command]
+async fn notifications_set_config(
+    state: State<'_, AppState>,
+    config: manager_config::NotificationConfig,
+) -> ApiResult {
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    new_cfg.notifications = config;
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)
+        .map_err(jerr)?;
+    *cfg = new_cfg;
+    Ok(json!({ "ok": true, "persisted": true }))
+}
+
+/// Fire one toast immediately (Settings → Notifications, "Send test
+/// notification"). Deliberately bypasses the category settings via
+/// `notify::send_toast`: the control exists to prove the OS delivery
+/// path, and a master switch set to off must not make it look broken
+/// — the card reports the switch state separately. A send error is
+/// returned so the card can show why delivery failed.
+#[tauri::command]
+async fn notifications_send_test(app: AppHandle) -> ApiResult {
+    notify::send_toast(
+        &app,
+        "LLMdil test notification",
+        "Toast delivery is working. Event notifications follow the switches on this card.",
+    )
+    .map_err(|e| err(ApiError::Io(e)))?;
+    Ok(json!({ "ok": true }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1986,6 +2029,24 @@ async fn restart_backend(
                     json!({ "error": format!("{e:?}") }),
                 )
                 .await;
+            // A restart the pending activation plan depends on just
+            // failed: that is the plan failing to apply. A restart
+            // failure with no plan entry for this backend is a plain
+            // command error the UI already shows — no toast.
+            let (unresolved, _) = activation_unresolved(&state).await;
+            if unresolved
+                .iter()
+                .any(|en| en.scope == "backend" && en.targets.iter().any(|t| t == &id))
+            {
+                notify::notify(
+                    &app,
+                    &state,
+                    notify::Category::Activation,
+                    "Activation plan failed",
+                    &format!("Backend {id} could not be restarted: {e}"),
+                )
+                .await;
+            }
             Err(err(ApiError::from(e)))
         }
     }
@@ -2202,6 +2263,15 @@ async fn run_wizard_step(app: AppHandle, state: State<'_, AppState>, step_id: St
     );
     let (done, _) = guard.progress();
     *state.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
+    // The step's display name, for the notification below (the
+    // report is dropped with the guard).
+    let step_name = guard
+        .report()
+        .steps
+        .iter()
+        .find(|s| s.id == step_id)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| step_id.clone());
     drop(guard);
     state.persist_wizard().await;
     state.reload_config_from_disk().await;
@@ -2221,6 +2291,62 @@ async fn run_wizard_step(app: AppHandle, state: State<'_, AppState>, step_id: St
             serde_json::to_value(&outcome).unwrap_or(Value::Null),
         )
         .await;
+    // Toasts: a step run is a discrete, operator-visible event (one
+    // toast per run, at its terminal state). A failed start-gateway
+    // while an activation plan is pending is the plan failing — one
+    // toast, the Activation one, not both categories.
+    let step_body = if outcome.message.trim().is_empty() {
+        step_name.clone()
+    } else {
+        format!("{step_name}: {}", outcome.message)
+    };
+    match outcome.state {
+        StepState::Done => {
+            notify::notify(
+                &app,
+                &state,
+                notify::Category::Operations,
+                "Setup step finished",
+                &step_body,
+            )
+            .await;
+        }
+        StepState::Failed => {
+            if step_id == "start-gateway" && activation_plan_pending(&state).await {
+                notify::notify(
+                    &app,
+                    &state,
+                    notify::Category::Activation,
+                    "Activation plan failed",
+                    &format!(
+                        "The gateway could not be started to apply the saved changes: {}",
+                        outcome.message
+                    ),
+                )
+                .await;
+            } else {
+                notify::notify(
+                    &app,
+                    &state,
+                    notify::Category::Failures,
+                    "Setup step failed",
+                    &step_body,
+                )
+                .await;
+            }
+        }
+        StepState::Manual => {
+            notify::notify(
+                &app,
+                &state,
+                notify::Category::Failures,
+                "Setup step needs manual action",
+                &step_body,
+            )
+            .await;
+        }
+        _ => {}
+    }
     Ok(json!({ "task_id": task_id, "outcome": outcome }))
 }
 
@@ -2544,6 +2670,29 @@ async fn download_model(app: AppHandle, state: State<'_, AppState>, id: String) 
     tokio::spawn(async move {
         let outcome = watcher_handle.wait().await;
         let st = watcher_app.state::<AppState>();
+        // Display name for the completion/failure toasts: the
+        // operator-set name, else the curated catalog name, else the
+        // model id (same precedence as `list_models`).
+        let watcher_name = {
+            let cfg = st.config.read().await;
+            cfg.models
+                .iter()
+                .find(|m| m.id == watcher_id)
+                .and_then(|m| {
+                    m.display_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    manager_models::curated_models()
+                        .iter()
+                        .find(|s| s.id == watcher_id)
+                        .map(|s| s.name.clone())
+                })
+                .unwrap_or_else(|| watcher_id.clone())
+        };
         // Every path below leaves verification; clear the mark first
         // so no outcome branch can skip it.
         st.verifying_downloads
@@ -2559,10 +2708,12 @@ async fn download_model(app: AppHandle, state: State<'_, AppState>, id: String) 
                         .find(|m| m.id == watcher_id)
                         .map(|m| m.sha256.clone())
                 };
+                let mut verified = false;
                 let (failed, verification_failure) = match pinned {
                     Some(sha) if is_real_pin(&sha) => {
                         match manager_models::verify_sha256(&watcher_dest, &sha).await {
                             Ok(true) => {
+                                verified = true;
                                 let mut cfg = st.config.write().await;
                                 if let Some(m) = cfg.models.iter_mut().find(|m| m.id == watcher_id)
                                 {
@@ -2607,6 +2758,29 @@ async fn download_model(app: AppHandle, state: State<'_, AppState>, id: String) 
                     }
                     _ => (None, false),
                 };
+                // Toasts: a finished download is the Operations
+                // event; a recorded failure in this arm is always a
+                // verification failure (transfer errors land in the
+                // Err arm below). The operator-cancelled arm stays
+                // silent — the operator already knows.
+                let toast = match &failed {
+                    None => Some((
+                        notify::Category::Operations,
+                        "Model download finished",
+                        if verified {
+                            format!(
+                                "{watcher_name} downloaded and verified against its pinned SHA-256."
+                            )
+                        } else {
+                            format!("{watcher_name} downloaded.")
+                        },
+                    )),
+                    Some(msg) => Some((
+                        notify::Category::Failures,
+                        "Model download failed verification",
+                        msg.clone(),
+                    )),
+                };
                 st.record_download_outcome(
                     &watcher_id,
                     DownloadOutcome {
@@ -2616,6 +2790,9 @@ async fn download_model(app: AppHandle, state: State<'_, AppState>, id: String) 
                     },
                 )
                 .await;
+                if let Some((category, title, body)) = toast {
+                    notify::notify(&watcher_app, &st, category, title, &body).await;
+                }
             }
             Err(manager_models::ModelError::Cancelled(_)) => {
                 // Operator-initiated: neither a completion nor a
@@ -2632,6 +2809,14 @@ async fn download_model(app: AppHandle, state: State<'_, AppState>, id: String) 
                         failed: Some(format!("download failed: {e}")),
                         verification_failure: false,
                     },
+                )
+                .await;
+                notify::notify(
+                    &watcher_app,
+                    &st,
+                    notify::Category::Failures,
+                    "Model download failed",
+                    &format!("{watcher_name} — download failed: {e}"),
                 )
                 .await;
             }
@@ -4228,6 +4413,12 @@ async fn gateway_activation_cancel(state: State<'_, AppState>) -> ApiResult {
     drop(cfg);
     activation::clear_journal(&state.data_dir).map_err(|e| jerr(ApiError::InvalidInput(e)))?;
     ensure_backend_specs(&state).await;
+    // The plan's pending → resolved transition in the notification
+    // monitor is a cancellation, not an application: stay silent.
+    {
+        let mut watch = state.notify_watch.lock().unwrap_or_else(|e| e.into_inner());
+        watch.activation_cancelled = true;
+    }
     Ok(json!({ "cancelled": true }))
 }
 
@@ -4240,9 +4431,36 @@ async fn gateway_activation_cancel(state: State<'_, AppState>) -> ApiResult {
 /// here: they resolve through their backends' (re)starts, which
 /// the scoped resolution rule observes directly.
 #[tauri::command]
-async fn gateway_activation_complete(state: State<'_, AppState>) -> ApiResult {
+async fn gateway_activation_complete(app: AppHandle, state: State<'_, AppState>) -> ApiResult {
+    let (before, _) = activation_unresolved(&state).await;
+    let gateway_entries = before.iter().filter(|e| e.scope == "gateway").count();
     activation::clear_gateway_scope(&state.data_dir)
         .map_err(|e| jerr(ApiError::InvalidInput(e)))?;
+    if gateway_entries > 0 {
+        // The gateway side of a plan just went live. When nothing
+        // remains pending, the plan is applied: fire the toast here
+        // and mark it so the monitor does not repeat it when it
+        // observes the same resolution. When backend entries are
+        // still outstanding, the monitor fires it as they resolve.
+        let (after, drift) = activation_unresolved(&state).await;
+        if after.is_empty() && !drift {
+            {
+                let mut watch = state
+                    .notify_watch
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                watch.activation_applied_notified = true;
+            }
+            notify::notify(
+                &app,
+                &state,
+                notify::Category::Activation,
+                "Activation plan applied",
+                "All saved changes are now live.",
+            )
+            .await;
+        }
+    }
     Ok(json!({ "cleared": true }))
 }
 
@@ -4322,6 +4540,15 @@ async fn gateway_stop(state: State<'_, AppState>) -> ApiResult {
         manager_wizard::steps::stop_postgres_server(&RealSystemOps::default(), &data_dir)
             .await
             .unwrap_or(false);
+    // The operator stopped the gateway deliberately: the
+    // notification monitor must not report it as down. Clear the
+    // expectation until a probe sees it up again.
+    {
+        let mut watch = state.notify_watch.lock().unwrap_or_else(|e| e.into_inner());
+        watch.gateway_expected = false;
+        watch.gateway_up = Some(false);
+        watch.gateway_down_strikes = 0;
+    }
     Ok(json!({ "ok": true, "stopped": stopped, "postgres_stopped": postgres_stopped }))
 }
 
@@ -4591,6 +4818,171 @@ async fn poll_gateway_metrics_once(state: &AppState) {
     if let Some(body) = body {
         let snap = gateway_stats::parse_metrics(&body, std::time::Instant::now());
         state.gateway_stats.lock().await.record(snap);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Toast notifications: transition monitor + shared plan snapshot
+// ---------------------------------------------------------------------------
+
+/// The activation plan's current unresolved entries and drift flag —
+/// the same computation `gateway_status` reports, shared by the
+/// notification monitor and the activation hooks.
+async fn activation_unresolved(state: &AppState) -> (Vec<activation::ActivationEntry>, bool) {
+    let cfg = state.config.read().await;
+    let journal = activation::load_journal(&state.data_dir);
+    let started_at = backend_start_times(state).await;
+    let configured: std::collections::HashSet<String> =
+        cfg.backends.iter().map(|b| b.id.clone()).collect();
+    let unresolved =
+        activation::unresolved_entries_scoped(&state.data_dir, &journal, &started_at, &configured);
+    let drift = activation::config_drift(&cfg, &state.data_dir);
+    (unresolved, drift)
+}
+
+/// Whether an activation plan is pending right now (any unresolved
+/// entry, or live config drift).
+async fn activation_plan_pending(state: &AppState) -> bool {
+    let (unresolved, drift) = activation_unresolved(state).await;
+    !unresolved.is_empty() || drift
+}
+
+/// One notification-monitor cycle: diff the supervisor's backend
+/// states, the gateway probe, and the activation plan against the
+/// watch state in `AppState.notify_watch`, and toast the transitions
+/// the taxonomy calls failures / applied plans. All watch mutations
+/// happen under the std mutex with no awaits held; the toasts fire
+/// after every lock is released.
+async fn notify_monitor_tick(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let mut toasts: Vec<(notify::Category, String, String)> = Vec::new();
+
+    // -- Backends: a move into Failed from Running/Starting is an
+    // unexpected exit. The reap runs here as elsewhere so a corpse is
+    // marked Failed even between UI polls; which caller reaps first
+    // does not matter, the Failed state persists in `status()`.
+    let (statuses, dead) = {
+        let mut sup = state.supervisor().await.lock().await;
+        let dead: HashMap<String, String> = sup
+            .reap_exited()
+            .into_iter()
+            .map(|(id, status)| (id, status.to_string()))
+            .collect();
+        (sup.status(), dead)
+    };
+    let backend_owned: std::collections::HashSet<String> = state
+        .backend_spec_ids
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    {
+        let mut watch = state.notify_watch.lock().unwrap_or_else(|e| e.into_inner());
+        for st in &statuses {
+            if !backend_owned.contains(&st.id) {
+                continue;
+            }
+            let prev = watch.backend_states.insert(st.id.clone(), st.state);
+            let was_active = matches!(
+                prev,
+                Some(ProcessState::Running) | Some(ProcessState::Starting)
+            );
+            if was_active && st.state == ProcessState::Failed {
+                let body = match dead.get(&st.id) {
+                    Some(status) => format!(
+                        "Backend {} exited unexpectedly ({status}). It stays down until restarted from the Backends view.",
+                        st.id
+                    ),
+                    None => format!(
+                        "Backend {} is no longer running. It stays down until restarted from the Backends view.",
+                        st.id
+                    ),
+                };
+                toasts.push((
+                    notify::Category::Failures,
+                    "Backend stopped unexpectedly".to_string(),
+                    body,
+                ));
+            }
+        }
+    }
+
+    // -- Gateway: probe liveness unless a wizard step is in flight
+    // (a step may be mid-restart of the gateway itself; the step's
+    // own outcome hook reports that case). Down fires only for a
+    // gateway the app has seen up and did not stop itself, and only
+    // after two consecutive missed probes.
+    let step_running = state
+        .wizard_step_running
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    if !step_running {
+        let (probe_host, port) = {
+            let cfg = state.config.read().await;
+            (
+                manager_wizard::steps::gateway_probe_host(&cfg),
+                cfg.gateway.port,
+            )
+        };
+        let up = tokio::task::spawn_blocking(move || probe_gateway(&probe_host, port))
+            .await
+            .unwrap_or(false);
+        let mut watch = state.notify_watch.lock().unwrap_or_else(|e| e.into_inner());
+        if up {
+            watch.gateway_up = Some(true);
+            watch.gateway_expected = true;
+            watch.gateway_down_strikes = 0;
+        } else {
+            if watch.gateway_expected {
+                watch.gateway_down_strikes = watch.gateway_down_strikes.saturating_add(1);
+                if watch.gateway_down_strikes >= 2 && watch.gateway_up == Some(true) {
+                    toasts.push((
+                        notify::Category::Failures,
+                        "Gateway is down".to_string(),
+                        format!(
+                            "The LiteLLM gateway on port {port} stopped responding. Start it again from the Gateway view or the Setup Wizard."
+                        ),
+                    ));
+                    watch.gateway_up = Some(false);
+                    watch.gateway_down_strikes = 0;
+                }
+            } else {
+                watch.gateway_up = Some(false);
+                watch.gateway_down_strikes = 0;
+            }
+        }
+    }
+
+    // -- Activation plan: pending → resolved fires the applied
+    // toast unless the resolution was a cancellation (flagged by the
+    // cancel command) or the completion command already fired it.
+    let (unresolved, drift) = activation_unresolved(&state).await;
+    let pending = !unresolved.is_empty() || drift;
+    {
+        let mut watch = state.notify_watch.lock().unwrap_or_else(|e| e.into_inner());
+        match watch.activation_pending {
+            None => watch.activation_pending = Some(pending),
+            Some(false) if pending => {
+                watch.activation_pending = Some(true);
+                watch.activation_applied_notified = false;
+                watch.activation_cancelled = false;
+            }
+            Some(true) if !pending => {
+                watch.activation_pending = Some(false);
+                if !watch.activation_cancelled && !watch.activation_applied_notified {
+                    toasts.push((
+                        notify::Category::Activation,
+                        "Activation plan applied".to_string(),
+                        "All saved changes are now live.".to_string(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (category, title, body) in toasts {
+        notify::notify(app, &state, category, &title, &body).await;
     }
 }
 
@@ -6363,6 +6755,10 @@ async fn updates_set_auto(
 
 fn main() {
     tauri::Builder::default()
+        // Toast notifications (Settings → Notifications). The plugin
+        // is driven from Rust via `notify::notify` — the events that
+        // matter occur in background tasks, not the webview.
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // Load the persisted config; `manager_config::load` falls back
             // to the `.bak` last-known-good copy on parse/validation
@@ -6404,6 +6800,16 @@ fn main() {
                     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 }
             });
+            // Notification monitor: watch backend states, gateway
+            // liveness, and the activation plan for the transitions
+            // the toast taxonomy fires on (see `notify_monitor_tick`).
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    notify_monitor_tick(&handle).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -6411,6 +6817,8 @@ fn main() {
             get_status,
             get_config,
             update_config,
+            notifications_set_config,
+            notifications_send_test,
             // Backends
             list_backends,
             start_backend,

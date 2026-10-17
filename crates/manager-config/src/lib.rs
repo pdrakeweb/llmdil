@@ -341,10 +341,60 @@ pub struct ComponentUpdate {
     pub last_checked: Option<DateTime<Utc>>,
 }
 
-/// Notification preferences.
+/// Notification preferences (Windows toast notifications).
+///
+/// `enabled` is the master switch; the three category switches gate
+/// the event classes the app toasts about (see the app layer's
+/// notification wiring for the taxonomy). The category fields carry
+/// serde defaults of `true` so configurations written before they
+/// existed — which hold only `enabled` — load with every category on,
+/// matching the behavior their single switch implied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationConfig {
     pub enabled: bool,
+    /// Long-running work finishing: setup step runs, model downloads.
+    #[serde(default = "default_true")]
+    pub operations: bool,
+    /// Things breaking: backends stopping unexpectedly, the gateway
+    /// going down or failing to start, step failures, download
+    /// failures.
+    #[serde(default = "default_true")]
+    pub failures: bool,
+    /// An activation plan finishing applying, or failing to apply.
+    #[serde(default = "default_true")]
+    pub activation: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            operations: true,
+            failures: true,
+            activation: true,
+        }
+    }
+}
+
+impl NotificationConfig {
+    /// Whether operations-category toasts may fire (master + category).
+    pub fn operations_enabled(&self) -> bool {
+        self.enabled && self.operations
+    }
+
+    /// Whether failure-category toasts may fire (master + category).
+    pub fn failures_enabled(&self) -> bool {
+        self.enabled && self.failures
+    }
+
+    /// Whether activation-category toasts may fire (master + category).
+    pub fn activation_enabled(&self) -> bool {
+        self.enabled && self.activation
+    }
 }
 
 /// Errors from config load/save/validate/migrate.
@@ -471,7 +521,7 @@ impl AppConfig {
             updates: UpdatePolicy {
                 components: HashMap::new(),
             },
-            notifications: NotificationConfig { enabled: true },
+            notifications: NotificationConfig::default(),
             setup_completed: false,
             catalog_seeded: false,
             defaults_repaired: true,
@@ -1875,5 +1925,47 @@ mod tests {
             .unwrap();
         b.model_file = PathBuf::from("MODELS\\QWEN3-8B.GGUF");
         validate(&cfg).expect("case/separator-insensitive match must validate");
+    }
+
+    #[test]
+    fn notification_config_legacy_shape_loads_with_categories_on() {
+        // Configurations written before the category switches exist
+        // hold only `enabled`; the serde defaults must switch every
+        // category on so the upgrade does not silently change what
+        // the operator's single switch used to mean.
+        let legacy: NotificationConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(legacy.enabled);
+        assert!(legacy.operations && legacy.failures && legacy.activation);
+        assert!(legacy.operations_enabled());
+        assert!(legacy.failures_enabled());
+        assert!(legacy.activation_enabled());
+
+        // A legacy config with the master switch off stays fully off.
+        let legacy_off: NotificationConfig = serde_json::from_str(r#"{"enabled":false}"#).unwrap();
+        assert!(!legacy_off.operations_enabled());
+        assert!(!legacy_off.failures_enabled());
+        assert!(!legacy_off.activation_enabled());
+    }
+
+    #[test]
+    fn notification_config_category_gates_compose_with_master() {
+        let mut n = NotificationConfig::default();
+        assert!(n.operations_enabled() && n.failures_enabled() && n.activation_enabled());
+        // Category off gates only its own category.
+        n.failures = false;
+        assert!(n.operations_enabled());
+        assert!(!n.failures_enabled());
+        assert!(n.activation_enabled());
+        // Master off gates everything, categories preserved.
+        n.enabled = false;
+        assert!(!n.operations_enabled());
+        assert!(!n.failures_enabled());
+        assert!(!n.activation_enabled());
+        // Round-trip keeps the explicit category choices.
+        let s = serde_json::to_string(&n).unwrap();
+        let back: NotificationConfig = serde_json::from_str(&s).unwrap();
+        assert!(!back.enabled && !back.failures && back.operations && back.activation);
+        // The default whole-config shape still validates.
+        assert!(validate(&AppConfig::default_config()).is_ok());
     }
 }

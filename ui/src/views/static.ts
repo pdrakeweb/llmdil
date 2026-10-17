@@ -22,6 +22,7 @@ import {
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
   getActivationPlan, activationCancelChanges, activationComplete, quiesceWait,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
+  setNotificationConfig, sendTestNotification,
 } from "../api";
 import type { ActivationChange, ActivationPlanData, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
 import type { GpuInfo, WizardStepState } from "../types";
@@ -4261,8 +4262,27 @@ function settingsPaint(
     <button class="btn" id="setExportBtn">${icon("download")} Export diagnostics bundle</button><span class="info-tip" title="The bundle contains raw, unredacted process logs. Review it before sharing.">${icon("info")}</span>
     <button class="btn" id="setOpenFolder" style="display:none">Open folder</button></div>`;
 
-  // --- Notifications ---
-  const notifPanel = notif ? settingsRows(humanEntries(notif)) : "";
+  // --- Notifications: master switch + one toggle per category,
+  // each persisted through notifications_set_config. A missing key
+  // reads as on (the Rust serde defaults agree), so a config written
+  // before the category switches existed renders its true state.
+  // Category toggles disable while the master is off (they keep
+  // their stored value; the backend ANDs them with the master). ---
+  const notifOn = (k: string): boolean => notif?.[k] !== false;
+  const notifMaster = notifOn("enabled");
+  const notifRow = (key: string, label: string, desc: string): string => {
+    const on = notifOn(key);
+    const dis = key !== "enabled" && !notifMaster;
+    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border)">
+      <span class="k">${esc(label)}<span class="info-tip" title="${esc(desc)}">${icon("info")}</span></span>
+      <button class="btn${on ? " primary" : ""}" data-notif-toggle="${key}"${dis ? " disabled" : ""} title="${esc(desc)}">${on ? "On" : "Off"}</button></div>`;
+  };
+  const notifPanel = notif ? `${notifRow("enabled", "Notifications", "Master switch for Windows toast notifications. Off silences every category below.")}
+    ${notifRow("operations", "Operations", "Long-running work finishing: a setup step completing, a model download completing.")}
+    ${notifRow("failures", "Failures", "A backend stopping unexpectedly, the gateway going down or failing to start, a setup step failing, a model download failing.")}
+    ${notifRow("activation", "Activation", "An activation plan finishing applying, or failing to apply.")}
+    <div class="card-actions" style="margin-top:10px"><button class="btn" data-notif-test>${icon("bell")} Send test notification</button></div>
+    <div style="font-size:12px;color:var(--text2);margin-top:6px">The test fires immediately, even with the master switch off — it verifies Windows can show this app's toasts.</div>` : "";
 
   // --- MXC sandbox: summary first — Mode control, Active policy,
   // Recent activity, self-test. The button group is the ONE home
@@ -4305,6 +4325,9 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
   const setUi: SettingsUi = { tab: "general", rulesFilter: "fs", rulesOpen: new Set<string>(), allOpen: false };
 
   let lastExportPath = "";
+  /** Last loaded notifications object, so a toggle click can send
+   *  the complete replacement (the command replaces the section). */
+  let lastNotif: Record<string, unknown> | null = null;
   const setMsg = (text: string, isErr = false): void => {
     const m = root.querySelector("#setMsg");
     if (m) m.innerHTML = text ? `<span style="color:${isErr ? "var(--err)" : "var(--text2)"}">${esc(text)}</span>` : "";
@@ -4323,6 +4346,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
         : "No configuration in sample mode.");
       return;
     }
+    lastNotif = asRecord(cfgR.data.notifications);
     // Policy/activity CallResults go in whole: their .error renders as
     // "unavailable — <error>", distinct from genuine absence.
     b.innerHTML = settingsPaint(cfgR.data, polR, actR, selfTestHtml, setUi);
@@ -4411,6 +4435,39 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
         </div>`;
       }
       await load();
+      return;
+    }
+
+    const notifBtn = t.closest("[data-notif-toggle]") as HTMLButtonElement | null;
+    if (notifBtn) {
+      const key = notifBtn.getAttribute("data-notif-toggle") ?? "";
+      if (!lastNotif || !["enabled", "operations", "failures", "activation"].includes(key)) return;
+      // Missing keys read as on (the serde defaults agree).
+      const next = {
+        enabled: lastNotif.enabled !== false,
+        operations: lastNotif.operations !== false,
+        failures: lastNotif.failures !== false,
+        activation: lastNotif.activation !== false,
+      };
+      const k = key as keyof typeof next;
+      next[k] = !next[k];
+      notifBtn.disabled = true;
+      const r = await setNotificationConfig(next);
+      if (disposed) return;
+      if (r.error) setMsg(`Notification settings not saved: ${r.error}`, true);
+      else setMsg("Notification settings saved.");
+      await load();
+      return;
+    }
+
+    const testBtn = t.closest("[data-notif-test]") as HTMLButtonElement | null;
+    if (testBtn) {
+      testBtn.disabled = true;
+      const r = await sendTestNotification();
+      testBtn.disabled = false;
+      if (disposed) return;
+      if (r.error) setMsg(`Test notification failed: ${r.error}`, true);
+      else setMsg("Test notification sent. If no toast appeared, check Windows notification settings for this app.");
       return;
     }
 
