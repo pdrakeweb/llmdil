@@ -437,6 +437,43 @@ struct PersistedWizard {
     report: WizardReport,
 }
 
+/// The Credential Manager target names whose credential is
+/// PRESENT, across the Gateway-exposure MCP servers of the given
+/// configurations — the arming predicate input for every drift
+/// and journaling comparison (MCP design §4.2: presence, not
+/// values; the accepted gap is documented on
+/// [`manager_wizard::armed_gateway_mcp_servers`]). Callers
+/// comparing a pre/post pair pass both configurations, so a
+/// server removed by the change still resolves its arming state
+/// for the pre-change side.
+async fn mcp_credential_presence(
+    cfgs: &[&AppConfig],
+) -> std::collections::HashSet<String> {
+    let ops = RealSystemOps::default();
+    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut targets: Vec<&str> = Vec::new();
+    for cfg in cfgs {
+        for server in cfg
+            .mcp
+            .servers
+            .iter()
+            .filter(|s| s.exposure == manager_config::McpExposure::Gateway)
+        {
+            if let Some(target) = server.cred_ref.as_deref().filter(|r| !r.is_empty()) {
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+        }
+    }
+    for target in targets {
+        if ops.credential_exists(target).await.unwrap_or(false) {
+            present.insert(target.to_string());
+        }
+    }
+    present
+}
+
 impl AppState {
     /// The app's data directory (config, logs, and the API's
     /// stores live under it). Exposed for the desktop shell's
@@ -735,19 +772,7 @@ impl AppState {
         // set membership unless a credential exists but is
         // unreadable). Presence results are gathered async here and
         // handed to the sync helpers as a lookup set.
-        let mut mcp_present: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for server in cfg
-            .mcp
-            .servers
-            .iter()
-            .filter(|s| s.exposure == manager_config::McpExposure::Gateway)
-        {
-            if let Some(target) = server.cred_ref.as_deref().filter(|r| !r.is_empty()) {
-                if ops.credential_exists(target).await.unwrap_or(false) {
-                    mcp_present.insert(target.to_string());
-                }
-            }
-        }
+        let mcp_present = mcp_credential_presence(&[cfg]).await;
         let mcp_armed = manager_wizard::armed_gateway_mcp_servers(cfg, |t| {
             mcp_present.contains(t)
         });
@@ -3631,12 +3656,14 @@ pub async fn op_update_gateway_config(
 }
 
 /// Journal a change for the gateway activation plan when it
-/// affects what the running gateway serves: the generated gateway
-/// configuration differs between `pre` and `post`, or `force` is set
-/// for changes the YAML does not carry (the bind address). Saves
-/// that leave the gateway configuration identical (a backend's
-/// context length, a tensor split) are backend-process concerns and
-/// create no gateway plan.
+/// affects what the running gateway serves: the gateway
+/// configuration a start would generate differs between `pre` and
+/// `post` (the armed-only MCP view on both sides — see
+/// [`activation::config_drift`] for why the raw registry is the
+/// wrong comparison), or `force` is set for changes the YAML does
+/// not carry (the bind address). Saves that leave the gateway
+/// configuration identical (a backend's context length, a tensor
+/// split) are backend-process concerns and create no gateway plan.
 ///
 /// Callers invoke this BEFORE persisting the configuration and
 /// propagate the error: a journal write failure then aborts the
@@ -3654,8 +3681,21 @@ async fn record_gateway_change(
     force: bool,
 ) -> Result<(), ApiError> {
     if !force {
-        let before = manager_gateway::generate_config_yaml(pre).unwrap_or_default();
-        let after = manager_gateway::generate_config_yaml(post).unwrap_or_default();
+        // Compare what a gateway start would WRITE, before and
+        // after: the armed-only MCP view on both sides (presence
+        // gathered across the pair, so a removed server still
+        // resolves). The raw registry is the wrong input — an edit
+        // to an unarmed server's stored fields changes the raw
+        // YAML but not the started one, and journaling it would
+        // demand a gateway restart that changes nothing (the same
+        // defect as the drift comparison's, tracker #42).
+        let presence = mcp_credential_presence(&[pre, post]).await;
+        let before_cfg =
+            manager_wizard::config_with_armed_gateway_mcp_servers(pre, |t| presence.contains(t));
+        let after_cfg =
+            manager_wizard::config_with_armed_gateway_mcp_servers(post, |t| presence.contains(t));
+        let before = manager_gateway::generate_config_yaml(&before_cfg).unwrap_or_default();
+        let after = manager_gateway::generate_config_yaml(&after_cfg).unwrap_or_default();
         if before == after {
             // The YAML does not carry the routing rule table: a
             // callback-only change (a window, the output reserve,
@@ -3663,8 +3703,8 @@ async fn record_gateway_change(
             // leaves the YAML identical but must still journal, or
             // the activation plan would never offer the restart
             // that regenerates llmdil_routing.py (design §6.3/§7).
-            let before_py = manager_gateway::generate_routing_callback(pre);
-            let after_py = manager_gateway::generate_routing_callback(post);
+            let before_py = manager_gateway::generate_routing_callback(&before_cfg);
+            let after_py = manager_gateway::generate_routing_callback(&after_cfg);
             if before_py == after_py {
                 return Ok(());
             }
@@ -4870,8 +4910,10 @@ pub async fn op_gateway_status(
             &running,
             up,
         );
+        let presence = mcp_credential_presence(&[&cfg]).await;
+        let drift = activation::config_drift(&cfg, &state.data_dir, |t| presence.contains(t));
         (
-            !pending.is_empty() || (activation::config_drift(&cfg, &state.data_dir) && up),
+            !pending.is_empty() || (drift && up),
             pending.len(),
         )
     };
@@ -4929,7 +4971,8 @@ pub async fn op_gateway_activation_plan(
         &running,
         up,
     );
-    let drift = activation::config_drift(&cfg, &state.data_dir);
+    let presence = mcp_credential_presence(&[&cfg]).await;
+    let drift = activation::config_drift(&cfg, &state.data_dir, |t| presence.contains(t));
     let pending = !pending_entries.is_empty() || (drift && up);
     let entry_ts = |e: &activation::ActivationEntry| {
         chrono::DateTime::parse_from_rfc3339(&e.ts)
@@ -9066,7 +9109,8 @@ async fn activation_unresolved(state: &AppState) -> (Vec<activation::ActivationE
         cfg.backends.iter().map(|b| b.id.clone()).collect();
     let unresolved =
         activation::unresolved_entries_scoped(&state.data_dir, &journal, &started_at, &configured);
-    let drift = activation::config_drift(&cfg, &state.data_dir);
+    let presence = mcp_credential_presence(&[&cfg]).await;
+    let drift = activation::config_drift(&cfg, &state.data_dir, |t| presence.contains(t));
     (unresolved, drift)
 }
 

@@ -292,6 +292,43 @@ package:
 Get-ChildItem "<data_dir>\python\venv\Lib\site-packages\litellm" -Recurse -Filter schema.prisma
 ```
 
+## Every activation plan restarts the gateway, even backend-only ones
+
+Signature: applying an activation plan whose changes are all
+backend-scoped still stops and restarts the gateway, and the plan
+shows "Gateway config: drifted" again immediately afterwards. A
+gateway restart never clears the state.
+
+Cause (fixed after v0.1.36, tracker #42): two drift definitions
+diverged. The start-gateway step writes `gateway/config.yaml` from
+the armed-only MCP view of the config (a Gateway-exposure MCP
+server whose credential cannot be resolved is omitted from that
+start), and the wizard's currency check compares against that same
+view. The activation plan's drift check
+(`activation::config_drift`) instead generated from the raw
+registry, whose YAML always contains the unarmed server's
+`mcp_servers:` block — a permanent mismatch against the file on
+disk whenever a Gateway server was configured but unarmed (the
+default state of the seeded `brave_search` until its Brave
+credential is stored). Drift while the gateway is up makes every
+plan gateway-pending, so both apply paths restarted the gateway.
+
+Fix: the activation drift check and the gateway-change journaling
+comparison both generate from the armed-only view, with arming
+resolved by credential presence — the one rule, shared with the
+wizard check. The activation drift check also compares the
+`llmdil_routing.py` sibling, as the wizard check always did.
+
+Note on restart cost: a gateway restart runs the start-gateway
+step, which is verify-first on a healthy install — the venv is
+reused when its probes pass (pinned Python, LiteLLM importable),
+packages are installed only when the import probe fails, and the
+Prisma client is verified (pin, generated client, connect probe)
+before any repair runs. The step's minutes are the verification
+probes plus LiteLLM's own cold boot, not a reinstall; the step log
+(`logs/wizard.log`) states which path was taken ("reusing existing
+venv", "Prisma install verified … — no changes made").
+
 ## Starting the gateway manually (PowerShell)
 
 For console-visible diagnosis. Run the app (and this window)

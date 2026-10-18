@@ -129,6 +129,10 @@ fn gateway_yaml_path(data_dir: &Path) -> PathBuf {
     data_dir.join("gateway").join("config.yaml")
 }
 
+fn gateway_routing_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("gateway").join("llmdil_routing.py")
+}
+
 /// Serializes every journal load-modify-save in this process.
 /// Commands run concurrently (a config save in one, an activation
 /// completion in another), and an unsynchronized load-modify-save
@@ -267,18 +271,55 @@ pub fn pending_entries(
         .collect()
 }
 
-/// Whether the live configuration's generated gateway YAML differs
-/// from the file the running gateway was started with. A missing
-/// file (gateway never started) is not drift — nothing is running
-/// on a stale config.
-pub fn config_drift(cfg: &AppConfig, data_dir: &Path) -> bool {
-    let Ok(generated) = manager_gateway::generate_config_yaml(cfg) else {
+/// Whether the configuration a gateway start would generate NOW
+/// differs from the files the running gateway was started with:
+/// the YAML and its routing-callback sibling.
+///
+/// The generation input is the ARMED-only MCP view
+/// ([`manager_wizard::config_with_armed_gateway_mcp_servers`]) —
+/// the same view the start-gateway step writes from. Generating
+/// from the raw registry instead made drift permanent whenever a
+/// Gateway-exposure server was configured but unarmed (its
+/// credential unresolvable): the raw YAML always carried an
+/// `mcp_servers:` block the file on disk never has, so every
+/// activation plan demanded a gateway restart — including
+/// backend-only plans — and no restart could clear it (tracker
+/// #42). `mcp_can_resolve` is the arming predicate, resolved by
+/// the app layer through credential PRESENCE — the same predicate
+/// (and documented gap) the wizard's own drift check uses
+/// ([`manager_wizard::gateway_config_is_current`]), so the two
+/// checks cannot diverge again.
+///
+/// A missing YAML file (gateway never started) is not drift —
+/// nothing is running on a stale config.
+pub fn config_drift(
+    cfg: &AppConfig,
+    data_dir: &Path,
+    mcp_can_resolve: impl FnMut(&str) -> bool,
+) -> bool {
+    let filtered = manager_wizard::config_with_armed_gateway_mcp_servers(cfg, mcp_can_resolve);
+    let Ok(generated) = manager_gateway::generate_config_yaml(&filtered) else {
         return false;
     };
     let Ok(on_disk) = std::fs::read_to_string(gateway_yaml_path(data_dir)) else {
         return false;
     };
-    normalize_yaml(&generated) != normalize_yaml(&on_disk)
+    if normalize_yaml(&generated) != normalize_yaml(&on_disk) {
+        return true;
+    }
+    // The routing callback is a second generated artifact
+    // (routing-rules design §6.3): a rule change can alter it
+    // without altering the YAML, so it is compared too — present
+    // and equal when a typed rule is enabled, absent when none
+    // is — the same rule `gateway_config_is_current` applies.
+    let routing_path = gateway_routing_path(data_dir);
+    match manager_gateway::generate_routing_callback(&filtered) {
+        Some(expected) => match std::fs::read_to_string(&routing_path) {
+            Ok(disk_py) => normalize_yaml(&expected) != normalize_yaml(&disk_py),
+            Err(_) => true,
+        },
+        None => routing_path.exists(),
+    }
 }
 
 fn normalize_yaml(text: &str) -> String {
@@ -1161,6 +1202,91 @@ litellm_deployment_success_responses_total 9.0
         .unwrap();
         let journal = load_journal(&dir);
         assert!(journal.offload_overrides.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn drift_test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "activation-drift-{label}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("gateway")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn config_drift_ignores_an_unarmed_gateway_mcp_server() {
+        // Regression (tracker #42): the start-gateway step writes
+        // the YAML from the armed-only MCP view, so a Gateway
+        // server whose credential does not resolve is omitted from
+        // the file. Drift generated from the raw registry carried
+        // that server's mcp_servers block forever: every plan —
+        // including backend-only ones — demanded a gateway restart
+        // no restart could satisfy. The default config's curated
+        // seed is exactly the production case: brave_search is
+        // Gateway-exposed with an env key whose credential most
+        // installs have not stored.
+        let dir = drift_test_dir("unarmed");
+        let mut cfg = AppConfig::default_config();
+        for b in cfg.backends.iter_mut() {
+            b.enabled = true;
+        }
+        assert!(cfg
+            .mcp
+            .servers
+            .iter()
+            .any(|s| s.exposure == manager_config::McpExposure::Gateway
+                && !s.env_keys.is_empty()));
+        // The file a start writes while the server is unarmed.
+        let unarmed = manager_wizard::config_with_armed_gateway_mcp_servers(&cfg, |_| false);
+        let yaml = manager_gateway::generate_config_yaml(&unarmed).unwrap();
+        assert!(!yaml.contains("mcp_servers:"), "{yaml}");
+        std::fs::write(gateway_yaml_path(&dir), &yaml).unwrap();
+        assert!(!config_drift(&cfg, &dir, |_| false));
+        // The same file reads as drift once the credential
+        // resolves: a start now would write the server in.
+        assert!(config_drift(&cfg, &dir, |_| true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_drift_detects_a_real_gateway_change() {
+        let dir = drift_test_dir("real-change");
+        let mut cfg = AppConfig::default_config();
+        for b in cfg.backends.iter_mut() {
+            b.enabled = true;
+        }
+        let armed = manager_wizard::config_with_armed_gateway_mcp_servers(&cfg, |_| true);
+        let yaml = manager_gateway::generate_config_yaml(&armed).unwrap();
+        assert!(yaml.contains("mcp_servers:"), "{yaml}");
+        std::fs::write(gateway_yaml_path(&dir), &yaml).unwrap();
+        assert!(!config_drift(&cfg, &dir, |_| true));
+        // A saved change the running gateway has not picked up is
+        // still drift: a backend's port is carried in the YAML as
+        // the deployment's api_base. (The gateway's own listen
+        // port is not — it travels via the spawn argv.)
+        cfg.backends[0].port += 1;
+        assert!(config_drift(&cfg, &dir, |_| true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_drift_covers_the_routing_callback_file() {
+        // A stale llmdil_routing.py beside an identical YAML is
+        // drift (the wizard's check has always compared it); a
+        // callback file with no enabled rule is drift too.
+        let dir = drift_test_dir("routing");
+        let mut cfg = AppConfig::default_config();
+        for b in cfg.backends.iter_mut() {
+            b.enabled = true;
+        }
+        // The file a start writes: the armed-only generation.
+        let view = manager_wizard::config_with_armed_gateway_mcp_servers(&cfg, |_| false);
+        let yaml = manager_gateway::generate_config_yaml(&view).unwrap();
+        std::fs::write(gateway_yaml_path(&dir), &yaml).unwrap();
+        assert!(!config_drift(&cfg, &dir, |_| false));
+        std::fs::write(gateway_routing_path(&dir), "# stale callback\n").unwrap();
+        assert!(config_drift(&cfg, &dir, |_| false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
