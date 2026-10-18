@@ -96,6 +96,38 @@ body {
 .btn.primary:hover { background: #2f7df0; }
 .btn:disabled { opacity: 0.5; cursor: default; }
 
+/* Enable/disable switch (design rule 16): a two-position slider
+   that shows state — green track + knob right + check glyph when
+   enabled, gray track + knob left + slash glyph when disabled.
+   Markup comes from ui/src/switch.ts (a <button role="switch">);
+   state styling keys off aria-checked so what is announced is
+   what is painted. */
+.switch {
+  background: none; border: 0; padding: 2px; cursor: pointer;
+  display: inline-flex; align-items: center; border-radius: 999px;
+}
+.switch-track {
+  position: relative; display: block; flex: 0 0 auto;
+  width: 38px; height: 20px; border-radius: 999px;
+  background: #454e5e; transition: background-color 0.15s ease;
+}
+.switch[aria-checked="true"] .switch-track { background: var(--ok); }
+.switch-knob {
+  position: absolute; top: 2px; left: 2px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; color: var(--text3);
+  display: flex; align-items: center; justify-content: center;
+  transition: left 0.15s ease;
+}
+.switch[aria-checked="true"] .switch-knob { left: 20px; color: var(--ok); }
+.switch .ic { width: 11px; height: 11px; }
+.switch:not(:disabled):hover .switch-track { filter: brightness(1.2); }
+.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.switch:disabled { opacity: 0.5; cursor: default; }
+@media (prefers-reduced-motion: reduce) {
+  .switch-track, .switch-knob { transition: none; }
+}
+
 /* View selector (Appliance | Console | Topology) */
 .viewsel {
   display: inline-flex; border: 1px solid var(--border);
