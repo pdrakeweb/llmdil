@@ -269,6 +269,7 @@ macro_rules! for_each_operation {
             // MCP / VS Code — peripheral, excluded from REST v1
             // (PLAN.md decision 10); Tauri surface unchanged.
             (McpList, mcp_list, R, op_mcp_list, [], None),
+            (McpStartPreflight, mcp_start_preflight, R, op_mcp_start_preflight, [], None),
             (McpTestConnection, mcp_test_connection, X, op_mcp_test_connection, [id: String], None),
             (McpSetExposure, mcp_set_exposure, X, op_mcp_set_exposure, [id: String, exposure: String], None),
             (McpSaveServer, mcp_save_server, X, op_mcp_save_server, [server: manager_config::McpServerConfig], None),
@@ -395,7 +396,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 105);
+        assert_eq!(OP_SPECS.len(), 106);
     }
 
     #[test]
