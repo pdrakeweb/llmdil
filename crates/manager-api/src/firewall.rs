@@ -122,12 +122,12 @@ pub async fn ensure(port: u16) -> Result<(), String> {
             .run_elevated(&planned(argv))
             .await
             .map_err(|e| e.to_string())?;
-        if out.status == 0 {
+        if out.exit_code == 0 {
             Ok(())
         } else {
             Err(format!(
                 "netsh add rule failed ({}): {}",
-                out.status,
+                out.exit_code,
                 out.stderr.trim()
             ))
         }
@@ -158,12 +158,12 @@ pub async fn remove(port: u16) -> Result<(), String> {
             .run_elevated(&planned(argv))
             .await
             .map_err(|e| e.to_string())?;
-        if out.status == 0 {
+        if out.exit_code == 0 {
             Ok(())
         } else {
             Err(format!(
                 "netsh delete rule failed ({}): {}",
-                out.status,
+                out.exit_code,
                 out.stderr.trim()
             ))
         }
