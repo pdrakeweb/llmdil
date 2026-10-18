@@ -97,6 +97,21 @@ check(unregistered.length === 0,
   `every invoked command name is registered (${invokedAt.size} invoked, ${registered.size} registered)` +
   (unregistered.length ? ` — unregistered: ${unregistered.map(([n, s]) => `${n} at ${s}`).join(", ")}` : ""));
 
+// Enable/disable controls are the shared state switch (design rule
+// 16): the bundle must carry the switch markup contract, the shared
+// component must exist, both views that host toggles must render
+// through it, and no source may still render the old action-icon
+// toggle (slash on enabled entities, check on disabled ones).
+check(bundle.includes('role="switch"'), "bundle contains the enable/disable switch (role=\"switch\")");
+check(bundle.includes("aria-checked"), "bundle exposes switch state via aria-checked");
+const allSrc = walkTs(join(root, "src")).map((f) => readFileSync(f, "utf8")).join("\n");
+check(allSrc.includes("function enableSwitch"), "shared enableSwitch component exists in ui/src");
+check(!allSrc.includes('? "ban" : "check"'), "no action-icon enable/disable toggle remains in ui/src");
+for (const view of ["views/static.ts", "views/mcp.ts"]) {
+  check(readFileSync(join(root, "src", view), "utf8").includes("enableSwitch("),
+    `${view} renders its enable/disable controls via enableSwitch`);
+}
+
 check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
 check(bundle.includes("__TAURI__"), "bundle contains the Tauri detection hook");

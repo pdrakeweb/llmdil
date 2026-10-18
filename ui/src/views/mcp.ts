@@ -18,6 +18,7 @@ import type {
 } from "../api";
 import { esc } from "../html";
 import { icon } from "../icons";
+import { enableSwitch } from "../switch";
 
 const SELECT_STYLE = "background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:6px 8px;font-size:12px";
 
@@ -174,13 +175,19 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
       ? `<div style="font-size:12px;margin-top:8px;color:${result.ok ? "var(--text2)" : "var(--err)"}">${esc(result.detail)}</div>
         ${result.real_call_ok !== undefined ? `<div style="font-size:12px;margin-top:4px;color:${result.real_call_ok ? "var(--text2)" : "var(--err)"}">Real call: ${result.real_call_ok ? "ok" : "failed"}${result.real_call_detail ? ` \u2014 ${esc(result.real_call_detail)}` : ""}</div>` : ""}`
       : "";
-    // Exposure toggle: icon-only (principle 15), cycling between
-    // the server's active exposure and Disabled; the full
-    // three-state choice lives in the edit form.
+    // Enable/disable is the shared state switch (rule 16): ON is
+    // the server's active exposure, OFF is Disabled; the click
+    // keeps cycling between the two through the same handler and
+    // command. The full three-state choice lives in the edit form.
     const restore = lastActive.get(s.id) ?? "gateway";
-    const toggle = s.exposure === "disabled"
-      ? `<button class="btn icon-only" data-mcp-act="exposure" data-mcp-id="${esc(s.id)}" title="${restore === "gateway" ? "Enable (register with gateway)" : "Enable (run locally)"}" aria-label="Enable ${esc(s.id)}">${icon("check")}</button>`
-      : `<button class="btn icon-only" data-mcp-act="exposure" data-mcp-id="${esc(s.id)}" title="${s.exposure === "gateway" ? "Disable (remove from gateway)" : "Disable (stop local server)"}" aria-label="Disable ${esc(s.id)}">${icon("ban")}</button>`;
+    const toggle = enableSwitch({
+      on: s.exposure !== "disabled",
+      name: `MCP server ${s.id}`,
+      attrs: `data-mcp-act="exposure" data-mcp-id="${esc(s.id)}"`,
+      title: s.exposure === "disabled"
+        ? `${s.id}: disabled — turn on to ${restore === "gateway" ? "register with the gateway" : "run locally"}`
+        : `${s.id}: enabled — ${s.exposure === "gateway" ? "registered with the gateway" : "running locally"}; turn off to disable`,
+    });
     const credRow = s.cred_ref
       ? `<div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
           <input type="password" data-mcp-cred-input placeholder="${esc(s.cred_ref)}" autocomplete="off" style="${SELECT_STYLE};flex:1;min-width:180px" aria-label="Credential value for ${esc(s.id)}">
