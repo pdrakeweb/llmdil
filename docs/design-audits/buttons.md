@@ -238,3 +238,32 @@ Pete reviewed this sweep and refined the rule. Rule 15 in `docs/design-principle
 | Words + icon (critical/destructive + restored standard-workflow) | 21 (16 swept + 5 restored) |
 
 Gates after the corrections: `npm run build` (tsc + vite) pass; `npm run smoke` pass.
+
+## Addendum — enable/disable state switch (2026-10-18, tracker #48)
+
+Pete's directive: the enable/disable buttons were confusing because the icon named the ACTION a click would take — an enabled entity showed a slash (click to disable), a disabled one a check (click to enable) — and were read as state. All enable/disable controls are now the shared two-position switch, recorded as design rule 16 in `docs/design-principles.md`: the switch shows STATE (enabled = green track, knob right, check glyph; disabled = gray track, knob left, slash glyph — the same two glyphs, reversed from the old buttons' meaning).
+
+**Component.** `enableSwitch` in `ui/src/switch.ts`, styles `.switch` in `ui/src/styles.css`. It renders a native `<button type="button" role="switch" aria-checked="…">` whose tooltip and accessible name state "<entity>: enabled|disabled". Keyboard operation is the native button's (Enter/Space); state styling keys off `aria-checked` so what is painted is what is announced. The caller passes the replaced button's exact `id` / `data-*` hooks through verbatim, so every delegated click handler resolves the switch through its existing `closest()` lookup and fires the identical command — no handler, confirmation, or guard changed anywhere in this sweep.
+
+**Sites swapped (8).**
+
+| Control | Surface | Before | Command (unchanged) |
+|---|---|---|---|
+| Backend enable / disable | Backend card (`data-back-act="enable"/"disable"`) | words + `check` / icon-only `ban` (two conditional buttons) | `applyBackendConfig(id, {enabled}, "OnNextRestart")` |
+| Model enable / disable | Model card (`data-model-act="toggle-enabled"`) | icon-only `ban` / `check` | `model_set_enabled` |
+| MCP server enable / disable | MCP card (`data-mcp-act="exposure"`) | icon-only `check` / `ban` | `mcp_set_exposure` (Disabled ↔ last active exposure) |
+| Routing rule enable / disable | Gateway view rule row (`data-rule-toggle`) | icon-only `ban` / `check` | gateway config save with `enabled` flipped |
+| OpenRouter tier enable / disable | Gateway view tier card (`#gwOrToggle`) | icon-only `ban` / `check` | `update_gateway_config` openrouter.enabled |
+| Notifications master + categories | Settings → Notifications (`data-notif-toggle`) | words On/Off buttons (`primary` when on) | `notifications_set_config` |
+| Admin API enable / disable | Settings → Remote Access (`data-ra-toggle`) | words Enable API / Disable API | `admin_api_set_enabled` |
+| Admin user enable / disable | Settings → Remote Access user rows (`data-ra-toggle-disabled`) | small words Enable / Disable | `admin_api_update_user` (disabled flag) |
+
+One rendering change beyond the control itself: the backend card previously showed Enable only on disabled backends and Disable only on stopped/failed enabled ones. The switch now renders on every configured backend card so the state is always visible; it is inert (native `disabled`) exactly when no toggle was offered before — an action in flight, or enabled in a live state (running/starting/stopping), where the command layer refuses disable-while-running. Its tooltip names that case ("enabled (stop it before disabling)").
+
+**Supersession.** For the enable/disable family this addendum supersedes judgment call 4 (enable/disable icon-only symmetry) and addendum C3 (backend Enable restored to words + icon as the card state's standard-workflow action): the family no longer uses buttons at all. Rule 15 and the C1/C2/C4/C5 restorations stand for all other actions.
+
+**Not enable/disable controls (unchanged, deliberately).** Gateway groups have no enable/disable control — a group's enabled state is derived from its member backends. Edit-form fields keep their inputs (add-backend Enabled checkbox, the MCP form's three-state exposure select and Metered checkbox, the routing-rule form's Advisory checkbox, placement GPU chips, the Logs Follow checkbox). Segmented mode selectors keep their idiom (supervision Process/Service; MXC Learning/Enforced/Disabled — the MXC Disabled choice also keeps its `confirm()` guard). Transport toggles keep the play/pause idiom (dashboard Pause/Resume live, model download Pause/Resume).
+
+**Smoke coverage.** `ui/scripts/smoke.mjs` now asserts the bundle carries `role="switch"` + `aria-checked`, that `enableSwitch` exists and is used by both views hosting toggles (`views/static.ts`, `views/mcp.ts`), and that no `? "ban" : "check"` action-icon toggle remains in `ui/src`.
+
+Gates: `npm run build` (tsc + vite) pass; `npm run smoke` pass.

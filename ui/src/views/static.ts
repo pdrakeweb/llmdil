@@ -8,6 +8,7 @@
 import { fmtCount, fmtGb, gaugeRing, meter, sparkline, stackedBar, trim1 } from "../charts";
 import { icon, type IconName } from "../icons";
 import { esc } from "../html";
+import { enableSwitch } from "../switch";
 import {
   runWizardStep, wizardBusyMessage, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit,
   getWizardCommands,
@@ -1264,8 +1265,22 @@ function backendCard(
   // card's logs button. An anchor, not a card action: navigation is
   // not disabled while a card action is in flight.
   const logsBtn = `<a class="btn icon-only" href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1" title="Logs" aria-label="Logs for ${esc(b.id)}">${icon("logs")}</a>`;
-  const enableBtn = `<button class="btn" data-back-act="enable" data-back-id="${esc(b.id)}" title="Enable backend"${dis}>${icon("check")} Enable</button>`;
-  const disableBtn = `<button class="btn icon-only" data-back-act="disable" data-back-id="${esc(b.id)}" title="Disable backend" aria-label="Disable ${esc(b.id)}"${dis}>${icon("ban")}</button>`;
+  // Enable/disable is the shared state switch (rule 16). It renders
+  // for every configured backend so the state is always visible;
+  // the control is inert exactly when the old buttons were not
+  // offered — an action in flight, or enabled in a live state (the
+  // command layer refuses disable-while-running: a running backend
+  // is stopped, not disabled). The data-back-act flips with the
+  // state, so the delegated handler fires the same
+  // applyBackendConfig call the two buttons fired.
+  const toggleable = !b.enabled || b.state === "stopped" || b.state === "failed";
+  const enableSw = enableSwitch({
+    on: b.enabled,
+    name: `Backend ${b.id}`,
+    attrs: `data-back-act="${b.enabled ? "disable" : "enable"}" data-back-id="${esc(b.id)}"`,
+    title: b.enabled && !toggleable ? `Backend ${b.id}: enabled (stop it before disabling)` : undefined,
+    disabled: inFlight.has(b.id) || !toggleable,
+  });
   const removeBtn = `<button class="btn icon-only danger${confirmRemove.has(b.id) ? " armed" : ""}" data-back-act="remove" data-back-id="${esc(b.id)}" title="${confirmRemove.has(b.id) ? "Confirm remove" : "Remove backend"}" aria-label="${confirmRemove.has(b.id) ? "Confirm remove" : "Remove"} ${esc(b.id)}"${dis}>${icon("trash")}</button>`;
   // Offer only what the command layer will accept:
   // - Stop whenever a live process exists (pid present, running or
@@ -1273,15 +1288,14 @@ function backendCard(
   //   orphan — stopping is always allowed.
   // - Start/Restart only for configured, enabled backends; no Start
   //   while a stop is still draining ("stopping").
-  // - Enable for configured disabled backends; Disable only while
-  //   stopped/failed (a running backend is stopped, not disabled).
+  // - The enable/disable switch shows on every configured backend;
+  //   it is toggleable only in the states listed for it above.
   // - Test only while running.
   const parts: string[] = [];
   if (b.pid !== null && active) parts.push(stopBtn);
   if (b.configured && b.enabled && active) parts.push(restartBtn);
   if (b.configured && b.enabled && !active && b.state !== "stopping") parts.push(startBtn);
-  if (b.configured && !b.enabled) parts.push(enableBtn);
-  if (b.configured && b.enabled && (b.state === "stopped" || b.state === "failed")) parts.push(disableBtn);
+  if (b.configured) parts.push(enableSw);
   if (b.state === "running") parts.push(testBtn);
   if (b.configured) parts.push(toolCallBtn);
   parts.push(logsBtn);
@@ -2747,8 +2761,9 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
       <button class="btn" data-model-act="delete" data-model-id="${esc(m.id)}">${icon("err")} Delete</button>`;
   }
   // Enable/disable is always offered: it controls whether the setup
-  // wizard's download step includes this model.
-  actions += ` <button class="btn icon-only" data-model-act="toggle-enabled" data-model-id="${esc(m.id)}" title="${m.enabled ? "Disable model" : "Enable model"}" aria-label="${m.enabled ? "Disable" : "Enable"} ${esc(m.id)}">${icon(m.enabled ? "ban" : "check")}</button>`;
+  // wizard's download step includes this model. The control is the
+  // shared state switch (rule 16).
+  actions += ` ${enableSwitch({ on: m.enabled, name: `Model ${m.id}`, attrs: `data-model-act="toggle-enabled" data-model-id="${esc(m.id)}"` })}`;
   // Rename is always offered: the short name is the operator's own
   // label for the model, independent of its download state.
   actions += ` <button class="btn icon-only" data-model-act="rename" data-model-id="${esc(m.id)}" title="Rename short name" aria-label="Rename short name of ${esc(m.id)}">${icon("pencil")}</button>`;
@@ -3796,7 +3811,7 @@ function gatewayPaint(
       <div style="display:flex;justify-content:space-between;gap:16px"><span class="k">Daily cap<span class="info-tip" title="Spending cap per day.">${icon("info")}</span></span><span class="v" style="font-size:12px;text-align:right">$${trim1(or.daily_cap_usd)}</span></div>
       ${allowRow}
     </div>
-    <div class="card-actions"><button class="btn icon-only" id="gwOrToggle" title="${or.enabled ? "Disable tier" : "Enable tier"}" aria-label="${or.enabled ? "Disable tier" : "Enable tier"}">${icon(or.enabled ? "ban" : "check")}</button></div>
+    <div class="card-actions">${enableSwitch({ on: or.enabled, name: "OpenRouter fallback tier", attrs: `id="gwOrToggle"` })}</div>
   </div>`;
   })();
 
@@ -3979,7 +3994,7 @@ function gatewayPaint(
       ${r.description ? `<span class="info-tip" title="${esc(r.description)}">${icon("info")}</span>` : ""}
       ${r.enabled ? "" : `<span class="chip status-tag status-off">Disabled</span>`}
       <span class="spacer" style="flex:1"></span>
-      <button class="btn icon-only" data-rule-toggle="${esc(r.id)}" title="${r.enabled ? "Disable rule" : "Enable rule"}" aria-label="${r.enabled ? "Disable" : "Enable"} rule ${esc(r.id)}">${icon(r.enabled ? "ban" : "check")}</button>
+      ${enableSwitch({ on: r.enabled, name: `Routing rule ${r.id}`, attrs: `data-rule-toggle="${esc(r.id)}"` })}
       <button class="btn icon-only" data-rule-edit="${esc(r.id)}" title="Edit rule" aria-label="Edit rule ${esc(r.id)}">${icon("pencil")}</button>
       <button class="btn danger${confirmRuleDelete.has(r.id) ? " armed" : ""}" data-rule-delete="${esc(r.id)}">${icon("trash")} ${confirmRuleDelete.has(r.id) ? "Confirm delete" : "Delete"}</button>
     </div>`;
@@ -4921,7 +4936,7 @@ function settingsPaint(
     const dis = key !== "enabled" && !notifMaster;
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border)">
       <span class="k">${esc(label)}<span class="info-tip" title="${esc(desc)}">${icon("info")}</span></span>
-      <button class="btn${on ? " primary" : ""}" data-notif-toggle="${key}"${dis ? " disabled" : ""} title="${esc(desc)}">${on ? "On" : "Off"}</button></div>`;
+      ${enableSwitch({ on, name: key === "enabled" ? "Notifications" : `${label} notifications`, attrs: `data-notif-toggle="${key}"`, disabled: dis })}</div>`;
   };
   const notifPanel = notif ? `${notifRow("enabled", "Notifications", "Master switch for Windows toast notifications. Off silences every category below.")}
     ${notifRow("operations", "Operations", "Long-running work finishing: a setup step completing, a model download completing.")}
@@ -4997,7 +5012,7 @@ function remoteAccessHtml(
     <span style="display:flex;gap:6px;align-items:center">
       <select data-ra-role-for="${esc(u.id)}" style="font-size:12px">${roles.map((r) => `<option value="${r}"${r === u.role ? " selected" : ""}>${r}</option>`).join("")}</select>
       <button class="btn" data-ra-apply-role="${esc(u.id)}" style="padding:1px 7px;font-size:11px">Apply</button>
-      <button class="btn" data-ra-toggle-disabled="${esc(u.id)}" style="padding:1px 7px;font-size:11px">${u.disabled ? "Enable" : "Disable"}</button>
+      ${enableSwitch({ on: !u.disabled, name: `User ${u.username}`, attrs: `data-ra-toggle-disabled="${esc(u.id)}"` })}
       <button class="btn" data-ra-reset="${esc(u.id)}" data-ra-name="${esc(u.username)}" style="padding:1px 7px;font-size:11px">Reset password</button>
       <button class="btn" data-ra-enroll="${esc(u.id)}" data-ra-name="${esc(u.username)}" style="padding:1px 7px;font-size:11px">Pairing code</button>
       <button class="btn" data-ra-delete="${esc(u.id)}" data-ra-name="${esc(u.username)}" style="padding:1px 7px;font-size:11px">Delete</button>
@@ -5006,7 +5021,7 @@ function remoteAccessHtml(
     <div style="display:flex;justify-content:space-between;gap:16px;margin:6px 0"><span class="k">Status</span><span class="v" style="font-size:12px">${stateText}</span></div>
     ${settingsRows(rows)}
     ${status.note ? `<div style="font-size:12px;color:var(--err);margin-top:6px">${esc(status.note)}</div>` : ""}
-    <div class="card-actions" style="margin-top:10px"><button class="btn${status.enabled ? "" : " primary"}" data-ra-toggle>${status.enabled ? "Disable API" : "Enable API"}</button>
+    <div class="card-actions" style="margin-top:10px">${enableSwitch({ on: status.enabled, name: "Admin API", attrs: "data-ra-toggle" })}
     <button class="btn" data-ra-regen>Regenerate certificate</button></div>
     <div style="font-size:12px;color:var(--text2);margin-top:16px">${users.length === 0 ? "First administrator" : "Users"}<span class="info-tip" title="Roles: viewer reads status; operator runs backends and the gateway; configurator also edits configuration; admin manages users and the API itself. Passwords need at least 12 characters.">${icon("info")}</span></div>
     ${userRows}
