@@ -1714,6 +1714,17 @@ impl Wizard {
             .find(id)
             .map(|s| s.name().to_string())
             .unwrap_or_default();
+        // A note explains why a step is sitting Queued (hydration
+        // drift, an interruption, a user skip). Once the step
+        // actually runs, the note's purpose is spent and its text
+        // must not ride along on the fresh outcome: a start-gateway
+        // run that failed inside PostgreSQL still displayed the
+        // pre-run "gateway configuration changed" note next to the
+        // failure, pointing at config drift as though it were the
+        // cause (field report 2026-10-18). Notes set by skip /
+        // mark_manual are unaffected — those paths synthesize their
+        // reports directly and never pass through here.
+        self.notes.remove(id);
         self.states.insert(id.to_string(), StepState::Running);
         ctx.ops.note_step_started();
         let started = Instant::now();
@@ -2785,6 +2796,32 @@ mod tests {
         // Done step is a no-op.
         w.retry("a");
         assert_eq!(w.state("a"), Some(StepState::Done));
+    }
+
+    #[tokio::test]
+    async fn run_clears_the_pre_run_note_from_the_report() {
+        // A note explains why a step sits Queued (e.g. the
+        // start-gateway drift note hydration attaches). Once the
+        // step runs, the fresh outcome replaces it: the note must
+        // not ride along on a failure it does not describe (field
+        // report 2026-10-18: a PostgreSQL start failure displayed
+        // the "gateway configuration changed" note).
+        let c = ctx();
+        let mut w = wizard(&[("a", true)]);
+        w.notes.insert(
+            "a".to_string(),
+            "gateway configuration changed since the gateway was started".to_string(),
+        );
+        // Still Queued: the note shows.
+        assert_eq!(
+            w.report().steps[0].note.as_deref(),
+            Some("gateway configuration changed since the gateway was started")
+        );
+        let out = w.run_step(&c, "a").await.unwrap();
+        assert_eq!(out.state, StepState::Failed);
+        let report = w.report();
+        assert_eq!(report.steps[0].state, StepState::Failed);
+        assert_eq!(report.steps[0].note, None);
     }
 
     #[tokio::test]
