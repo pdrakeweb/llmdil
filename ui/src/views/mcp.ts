@@ -197,6 +197,7 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
         <button class="btn" data-mcp-act="test" data-mcp-id="${esc(s.id)}"${testing ? " disabled" : ""}>${icon("bolt")} Test</button>
         ${toggle}
         <button class="btn icon-only" data-mcp-act="edit" data-mcp-id="${esc(s.id)}" title="Edit server" aria-label="Edit ${esc(s.id)}">${icon("gear")}</button>
+        ${s.mode === "local" ? `<a class="btn icon-only" href="#/logs?scope=${esc(encodeURIComponent(`mcp-${s.id}`))}&follow=1" title="Logs" aria-label="Logs for ${esc(s.id)}">${icon("logs")}</a>` : ""}
         <button class="btn danger${confirmRemove.has(s.id) ? " armed" : ""}" data-mcp-act="remove" data-mcp-id="${esc(s.id)}">${icon("trash")} ${confirmRemove.has(s.id) ? "Confirm remove" : "Remove"}</button>
       </div>
       ${note ? `<div style="margin-top:8px;font-size:12px;color:${note.err ? "var(--err)" : "var(--text2)"}">${esc(note.text)}</div>` : ""}

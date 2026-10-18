@@ -132,7 +132,8 @@ function serviceCard(b: BackendInfo, isGateway: boolean): string {
   // Restart would target a backend id that does not exist. Its action
   // is the Gateway view, where the start/restart control lives.
   const actions = isGateway
-    ? `<div class="card-actions"><a class="btn" href="#/gateway">${icon("gateway")} Open Gateway view</a></div>`
+    ? `<div class="card-actions"><a class="btn" href="#/gateway">${icon("gateway")} Open Gateway view</a>
+      <a class="btn icon-only" href="#/logs?scope=gateway&follow=1" title="Logs" aria-label="Gateway logs">${icon("logs")}</a></div>`
     : `<div class="card-actions">
       <button class="btn" data-act="restart" data-id="${esc(b.id)}">${icon("restart")} Restart</button>
       <button class="btn icon-only" data-act="logs" data-id="${esc(b.id)}" title="Logs" aria-label="Logs for ${esc(b.id)}">${icon("logs")}</button>
@@ -554,7 +555,7 @@ function render(): void {
     b.addEventListener("click", () => {
       const act = (b as HTMLElement).dataset.act;
       const id = (b as HTMLElement).dataset.id;
-      if (act === "logs" && id) location.hash = `#/logs?scope=${encodeURIComponent(id)}`;
+      if (act === "logs" && id) location.hash = `#/logs?scope=${encodeURIComponent(id)}&follow=1`;
       else if (act === "restart" && id) {
         (b as HTMLButtonElement).disabled = true; // guard against double-submit; render() rebuilds the DOM
         void (async () => {
