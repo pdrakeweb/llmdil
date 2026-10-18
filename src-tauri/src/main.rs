@@ -363,6 +363,23 @@ pub struct AppState {
     /// and activation-plan pending state, so state-driven toasts fire
     /// on transitions only. std Mutex: synchronous diff/update only.
     notify_watch: std::sync::Mutex<notify::NotifyWatch>,
+    /// Latest offload-probe state per backend id (see the probe run
+    /// after a start that activates a saved offload change). std
+    /// Mutex: synchronous insert/read only.
+    offload_probes: std::sync::Mutex<std::collections::HashMap<String, OffloadProbe>>,
+}
+
+/// One backend's offload-probe state: a start that activated a saved
+/// offload change runs a long-prompt probe against the new position;
+/// this records where that probe is. A `passed` probe means only
+/// that the probe completed — it does not certify the position.
+#[derive(Debug, Clone)]
+struct OffloadProbe {
+    /// `probing` | `passed` | `failed`.
+    state: String,
+    /// Offload slider position (MoE layers on system RAM) probed.
+    layers: u32,
+    detail: Option<String>,
 }
 
 /// On-disk form of the install wizard's progress
@@ -401,6 +418,7 @@ impl AppState {
             gateway_stats: Mutex::new(gateway_stats::GatewayStatsStore::default()),
             winml: OnceCell::new(),
             notify_watch: std::sync::Mutex::new(notify::NotifyWatch::default()),
+            offload_probes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1702,6 +1720,30 @@ async fn backend_start_preflight(state: &AppState, id: &str) -> Result<(), Strin
             ))));
         }
     }
+    // Offload guardrail (tracker #37): a saved position a placed
+    // GPU's restriction blocks refuses the start unless a journaled
+    // override covers exactly that position on exactly that
+    // placement. `cfg` here is a clone whose read guard dropped at
+    // the top of this function, so the telemetry accessor (which
+    // reads the config while initializing) is safe to call.
+    {
+        let store = state.telemetry().await;
+        let gpus = lock_telemetry(&store).inventory();
+        drop(store);
+        let journal = activation::load_journal(&state.data_dir);
+        if let Some(eval) = evaluate_backend_offload(&cfg, b, &gpus, &journal) {
+            if let Some(reason) = offload_block_reason(
+                &eval.restrictions,
+                eval.layers,
+                eval.moe_layers,
+                &eval.placed_ccs,
+                eval.cpu_only,
+                eval.overridden,
+            ) {
+                return Err(err(ApiError::InvalidInput(reason)));
+            }
+        }
+    }
     // Only the program path is consumed here, so the spec is built
     // without GPU inventory (its env/args are discarded).
     let spec = backend_spec(&cfg, b, &[]);
@@ -1725,6 +1767,212 @@ async fn backend_start_preflight(state: &AppState, id: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// Whether a saved offload change for `id` is still awaiting this
+/// start: the activation journal carries an unresolved backend-scope
+/// `backend_set_offload` entry targeting it.
+async fn offload_change_pending(state: &AppState, cfg: &AppConfig, id: &str) -> bool {
+    let journal = activation::load_journal(&state.data_dir);
+    let started_at = backend_start_times(state).await;
+    let configured: std::collections::HashSet<String> =
+        cfg.backends.iter().map(|b| b.id.clone()).collect();
+    activation::unresolved_entries_scoped(&state.data_dir, &journal, &started_at, &configured)
+        .iter()
+        .any(|e| {
+            e.scope == "backend"
+                && e.kind == "backend_set_offload"
+                && e.targets.iter().any(|t| t == id)
+        })
+}
+
+/// The offload probe context for a start of `id`, when the start
+/// activates a pending offload change: (layers, moe_layers, port)
+/// of the SAVED position. Captured before the spawn, after the
+/// preflight passes — a start that the preflight refuses never
+/// probes, and the position probed is the one being activated.
+async fn offload_probe_context(
+    state: &AppState,
+    id: &str,
+) -> Option<(u32, u32, u16)> {
+    let cfg = state.config.read().await.clone();
+    if !offload_change_pending(state, &cfg, id).await {
+        return None;
+    }
+    let b = cfg.backends.iter().find(|b| b.id == id)?;
+    let info = backend_offload_info(&cfg, b)?;
+    Some((info.layers, info.moe_layers, b.port))
+}
+
+/// Record a failed offload probe and toast it. The detail names the
+/// position and the verified alternative, or the request error —
+/// never a claim that any position is certified.
+async fn fail_offload_probe(
+    app: &AppHandle,
+    backend_id: &str,
+    layers: u32,
+    detail: String,
+) {
+    let state = app.state::<AppState>();
+    {
+        let mut probes = state
+            .offload_probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        probes.insert(
+            backend_id.to_string(),
+            OffloadProbe {
+                state: "failed".to_string(),
+                layers,
+                detail: Some(detail.clone()),
+            },
+        );
+    }
+    notify::notify(
+        app,
+        &state,
+        notify::Category::Failures,
+        "Offload probe failed",
+        &detail,
+    )
+    .await;
+}
+
+/// Whether the backend's supervised process is still alive (Running
+/// or Starting). Reaps first, so a process that exited since the
+/// last poll reads as gone here, not as its last live state: this
+/// reap-plus-status check is how the probe detects process death.
+async fn offload_probe_backend_alive(state: &AppState, id: &str) -> bool {
+    let mut sup = state.supervisor().await.lock().await;
+    sup.reap_exited();
+    sup.status()
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| matches!(s.state, ProcessState::Running | ProcessState::Starting))
+        .unwrap_or(false)
+}
+
+/// The background offload probe: wait for the backend to answer,
+/// then send one long prompt (about 4,000 tokens of prompt
+/// processing, exercised across many 512-token ubatches) at the
+/// newly activated offload position, then confirm the process is
+/// still alive. A passed probe means only that the probe completed.
+async fn run_offload_probe(
+    app: AppHandle,
+    backend_id: String,
+    layers: u32,
+    moe_layers: u32,
+    port: u16,
+) {
+    let state = app.state::<AppState>();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let stopped_detail = format!(
+        "the backend stopped during the offload probe at {layers} of {moe_layers} layers — this position is unverified on this GPU; full offload ({moe_layers} of {moe_layers} layers) is the verified position"
+    );
+    // Health phase: poll every 2s for up to 180s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let mut healthy = false;
+    while std::time::Instant::now() < deadline {
+        if !offload_probe_backend_alive(&state, &backend_id).await {
+            fail_offload_probe(&app, &backend_id, layers, stopped_detail).await;
+            return;
+        }
+        if test_request(&base_url, "ping").await.is_ok() {
+            healthy = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    if !healthy {
+        fail_offload_probe(
+            &app,
+            &backend_id,
+            layers,
+            format!(
+                "the backend did not respond during the offload probe at {layers} of {moe_layers} layers — this position is unverified on this GPU; full offload ({moe_layers} of {moe_layers} layers) is the verified position"
+            ),
+        )
+        .await;
+        return;
+    }
+    // Probe phase: one long prompt against the new position.
+    let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(450);
+    let probe_result = test_request(&base_url, &prompt).await;
+    // Process death outranks a request error: a dead backend's last
+    // request also fails, and the stopped detail is the actionable one.
+    if !offload_probe_backend_alive(&state, &backend_id).await {
+        fail_offload_probe(&app, &backend_id, layers, stopped_detail).await;
+        return;
+    }
+    match probe_result {
+        Ok(result) if result.status < 400 => {
+            let mut probes = state
+                .offload_probes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            probes.insert(
+                backend_id.clone(),
+                OffloadProbe {
+                    state: "passed".to_string(),
+                    layers,
+                    detail: None,
+                },
+            );
+        }
+        Ok(result) => {
+            fail_offload_probe(
+                &app,
+                &backend_id,
+                layers,
+                format!(
+                    "the offload probe request failed at {layers} of {moe_layers} layers: HTTP {}",
+                    result.status
+                ),
+            )
+            .await;
+        }
+        Err(e) => {
+            fail_offload_probe(
+                &app,
+                &backend_id,
+                layers,
+                format!(
+                    "the offload probe request failed at {layers} of {moe_layers} layers: {e}"
+                ),
+            )
+            .await;
+        }
+    }
+}
+
+/// Mark `id` as probing and spawn its background probe task.
+fn spawn_offload_probe(
+    app: &AppHandle,
+    state: &AppState,
+    id: &str,
+    layers: u32,
+    moe_layers: u32,
+    port: u16,
+) {
+    {
+        let mut probes = state
+            .offload_probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        probes.insert(
+            id.to_string(),
+            OffloadProbe {
+                state: "probing".to_string(),
+                layers,
+                detail: None,
+            },
+        );
+    }
+    let probe_app = app.clone();
+    let probe_id = id.to_string();
+    tokio::spawn(async move {
+        run_offload_probe(probe_app, probe_id, layers, moe_layers, port).await;
+    });
+}
+
 /// All backends with their launch ports, models, and live supervisor
 /// runtime state (process state, pid, restarts, uptime). Configured
 /// backends carry `configured: true`; the list also appends
@@ -1735,7 +1983,12 @@ async fn backend_start_preflight(state: &AppState, id: &str) -> Result<(), Strin
 #[tauri::command]
 async fn list_backends(state: State<'_, AppState>) -> ApiResult {
     adopt_orphan_backends(&state).await;
-    let cfg = state.config.read().await;
+    // Clone and drop the config guard here: the offload guardrail
+    // block below needs the telemetry inventory and the activation
+    // journal, and the telemetry accessor reads the config while
+    // initializing — it must never be called while this command
+    // holds the config guard (the rule ensure_backend_specs follows).
+    let cfg = state.config.read().await.clone();
     let mut sup = state.supervisor().await.lock().await;
     // Reap children that exited since the last read so a crashed backend
     // reports "failed" instead of "running" forever.
@@ -1801,11 +2054,88 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
             .iter()
             .filter_map(|b| backend_offload_info(&cfg, b).map(|o| (b.id.clone(), o)))
             .collect();
+        // Guardrail evaluations for the same backends. The config
+        // guard is NOT held here (cfg is a clone, dropped above), so
+        // the telemetry inventory can be fetched directly.
+        let gpus: Vec<GpuInfo> = {
+            let store = state.telemetry().await;
+            let inventory = lock_telemetry(&store).inventory();
+            inventory
+        };
+        let journal = activation::load_journal(&state.data_dir);
+        let evaluations: HashMap<String, OffloadEvaluation> = cfg
+            .backends
+            .iter()
+            .filter_map(|b| {
+                evaluate_backend_offload(&cfg, b, &gpus, &journal).map(|e| (b.id.clone(), e))
+            })
+            .collect();
+        let probes: std::collections::HashMap<String, OffloadProbe> = state
+            .offload_probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         for row in backends.iter_mut() {
-            let Some(id) = row["id"].as_str() else {
+            let Some(id) = row["id"].as_str().map(str::to_string) else {
                 continue;
             };
-            let Some(o) = offload.get(id) else { continue };
+            // The probe state attaches to every configured row,
+            // offload-capable or not (a probe only ever exists for
+            // an offload change, but the field's shape is uniform).
+            row["offload_probe"] = match probes.get(&id) {
+                Some(p) => json!({
+                    "state": p.state,
+                    "layers": p.layers,
+                    "detail": p.detail,
+                }),
+                None => Value::Null,
+            };
+            let Some(o) = offload.get(&id) else { continue };
+            // The guardrail object: emitted when a placed GPU is
+            // governed by a restriction (status by position), or
+            // when the placement is unknown (empty placed set, not
+            // CPU-only) while the model carries restrictions and
+            // the saved position is partial (status untested,
+            // against the first restriction's architecture).
+            let guardrail = evaluations.get(&id).and_then(|eval| {
+                let status = serde_json::to_value(eval.status).unwrap_or(Value::Null);
+                if let Some(cc) = eval.restricting_cc {
+                    let restriction = eval
+                        .restrictions
+                        .iter()
+                        .find(|r| r.compute_capability == cc)?;
+                    Some(json!({
+                        "compute_capability": format!("{}.{}", cc.0, cc.1),
+                        "allowed": serde_json::to_value(restriction.allowed)
+                            .unwrap_or(Value::Null),
+                        "status": status,
+                        "nearest_verified_layers": eval.nearest_verified_layers,
+                        "has_override": eval.has_override,
+                        "overridden": eval.overridden,
+                    }))
+                } else if eval.placed_ccs.is_empty()
+                    && !eval.cpu_only
+                    && !eval.restrictions.is_empty()
+                    && eval.layers != 0
+                    && eval.layers != eval.moe_layers
+                {
+                    let first = &eval.restrictions[0];
+                    Some(json!({
+                        "compute_capability": format!(
+                            "{}.{}",
+                            first.compute_capability.0, first.compute_capability.1
+                        ),
+                        "allowed": serde_json::to_value(first.allowed)
+                            .unwrap_or(Value::Null),
+                        "status": status,
+                        "nearest_verified_layers": eval.nearest_verified_layers,
+                        "has_override": eval.has_override,
+                        "overridden": eval.overridden,
+                    }))
+                } else {
+                    None
+                }
+            });
             row["offload"] = json!({
                 "moe_layers": o.moe_layers,
                 "layers": o.layers,
@@ -1814,6 +2144,9 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
                 "green_limit_layers": o.green_limit_layers,
                 "green_end": o.green_end,
                 "yellow_end": o.yellow_end,
+                "sys_bytes_by_position": o.sys_bytes_by_position,
+                "custom": o.custom,
+                "guardrail": guardrail,
             });
         }
     }
@@ -1909,6 +2242,9 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
 async fn start_backend(app: AppHandle, state: State<'_, AppState>, id: String) -> ApiResult {
     ensure_backend_specs(&state).await;
     backend_start_preflight(&state, &id).await?;
+    // Offload-probe capture: pending change + saved position,
+    // before the spawn (a refused start never reaches here).
+    let probe_ctx = offload_probe_context(&state, &id).await;
     let task_id = state
         .record_task("backend_start", json!({ "backend_id": id }))
         .await;
@@ -1922,6 +2258,9 @@ async fn start_backend(app: AppHandle, state: State<'_, AppState>, id: String) -
             state
                 .finish_task(&task_id, TaskStatus::Done, json!({ "backend_id": id }))
                 .await;
+            if let Some((layers, moe_layers, port)) = probe_ctx {
+                spawn_offload_probe(&app, &state, &id, layers, moe_layers, port);
+            }
             let _ = app.emit(
                 events::BACKEND_STATUS,
                 json!({ "id": id, "event": "started" }),
@@ -1997,6 +2336,9 @@ async fn restart_backend(
 ) -> ApiResult {
     ensure_backend_specs(&state).await;
     backend_start_preflight(&state, &id).await?;
+    // Offload-probe capture: pending change + saved position,
+    // before the restart's spawn.
+    let probe_ctx = offload_probe_context(&state, &id).await;
     let task_id = state
         .record_task(
             "backend_restart",
@@ -2015,6 +2357,9 @@ async fn restart_backend(
             state
                 .finish_task(&task_id, TaskStatus::Done, json!({ "backend_id": id }))
                 .await;
+            if let Some((layers, moe_layers, port)) = probe_ctx {
+                spawn_offload_probe(&app, &state, &id, layers, moe_layers, port);
+            }
             let _ = app.emit(
                 events::BACKEND_STATUS,
                 json!({ "id": id, "event": "restarted" }),
@@ -2554,6 +2899,7 @@ fn download_spec_for(cfg: &AppConfig, id: &str) -> Result<manager_models::ModelS
             expert_bytes: None,
             moe_layers: None,
             default_offload_layers: None,
+            offload_restrictions: Vec::new(),
         });
     }
     Err(err(ApiError::NotFound(format!(
@@ -3993,8 +4339,20 @@ fn catalog_default_raw_flags(model_id: &str) -> Option<String> {
 /// the same clone-validate-save path as the other backend
 /// mutations and journaled as a backend-scope activation change;
 /// applies on the backend's next start.
+///
+/// Guardrails (tracker #37): when the requested position is
+/// blocked for the model's pinned restriction on the GPUs the
+/// backend currently runs on, the save is refused unless
+/// `allow_override` is set — in which case a durable override is
+/// journaled (see `activation::OffloadOverride`). A non-blocked
+/// save clears any standing override for the backend.
 #[tauri::command]
-async fn backend_set_offload(state: State<'_, AppState>, id: String, layers: u32) -> ApiResult {
+async fn backend_set_offload(
+    state: State<'_, AppState>,
+    id: String,
+    layers: u32,
+    allow_override: Option<bool>,
+) -> ApiResult {
     // Capability is resolved before the write lock (resolution can
     // parse a GGUF header); the layer count is validated against
     // it here and the flags are rewritten under the lock.
@@ -4018,6 +4376,16 @@ async fn backend_set_offload(state: State<'_, AppState>, id: String, layers: u32
             "offload of {layers} layers exceeds the model's {moe_layers} MoE layers"
         ))));
     }
+    // Guardrail inputs fetched between the config reads: the GPU
+    // inventory (telemetry access must never hold the config lock —
+    // see ensure_backend_specs) and the activation journal (the
+    // standing override records live there).
+    let gpus = {
+        let store = state.telemetry().await;
+        let inventory = lock_telemetry(&store).inventory();
+        inventory
+    };
+    let journal = activation::load_journal(&state.data_dir);
     let mut cfg = state.config.write().await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
@@ -4028,20 +4396,48 @@ async fn backend_set_offload(state: State<'_, AppState>, id: String, layers: u32
     // against. Computed before the mutable borrow is taken, and it
     // shadows the pre-lock value: everything below uses the
     // under-lock count.
-    let moe_layers = {
+    let eval = {
         let b_ref = new_cfg
             .backends
             .iter()
             .find(|x| x.id == id)
             .ok_or_else(|| err(ApiError::NotFound(format!("backend {id}"))))?;
-        backend_offload_info(&new_cfg, b_ref)
-            .map(|o| o.moe_layers)
-            .ok_or_else(|| {
-                err(ApiError::InvalidInput(format!(
-                    "backend {id}'s model does not support expert offload"
-                )))
-            })?
+        let info = backend_offload_info(&new_cfg, b_ref).ok_or_else(|| {
+            err(ApiError::InvalidInput(format!(
+                "backend {id}'s model does not support expert offload"
+            )))
+        })?;
+        let (placed_ccs, cpu_only) = placed_offload_placement(b_ref, &gpus);
+        evaluate_offload_position(
+            &info.restrictions,
+            &id,
+            layers,
+            info.moe_layers,
+            placed_ccs,
+            cpu_only,
+            &journal,
+        )
     };
+    let moe_layers = eval.moe_layers;
+    // Guardrail enforcement (tracker #37), still before any
+    // mutation: a blocked requested position refuses the save
+    // unless the operator explicitly overrides it. An existing
+    // override does NOT grandfather a fresh save — the override is
+    // requested again at each blocked save, so the decision point
+    // stays where the UI can explain it.
+    let eval_blocked = eval.status == manager_models::OffloadStatus::Blocked;
+    if eval_blocked && allow_override != Some(true) {
+        if let Some(reason) = offload_block_reason(
+            &eval.restrictions,
+            layers,
+            moe_layers,
+            &eval.placed_ccs,
+            eval.cpu_only,
+            false,
+        ) {
+            return Err(err(ApiError::InvalidInput(reason)));
+        }
+    }
     let b = new_cfg
         .backends
         .iter_mut()
@@ -4087,6 +4483,29 @@ async fn backend_set_offload(state: State<'_, AppState>, id: String, layers: u32
         *cfg = new_cfg;
     }
     drop(cfg);
+    // Override bookkeeping: the command has succeeded (a config
+    // save error above returns before this point, so no override
+    // is ever recorded for a save that did not land). It applies
+    // even when `changed` is false — authorizing a standing value
+    // is the point of the override. A blocked save that proceeded
+    // records the override at the placed CCs evaluated under the
+    // lock; any non-blocked save clears a standing override (a
+    // verified save supersedes it).
+    let mut overridden = false;
+    if eval_blocked {
+        if activation::record_offload_override(
+            &state.data_dir,
+            &id,
+            layers,
+            eval.placed_ccs.clone(),
+        )
+        .is_ok()
+        {
+            overridden = true;
+        }
+    } else {
+        let _ = activation::clear_offload_overrides(&state.data_dir, &id);
+    }
     if changed {
         ensure_backend_specs(&state).await;
     }
@@ -4095,6 +4514,7 @@ async fn backend_set_offload(state: State<'_, AppState>, id: String, layers: u32
         "layers": layers,
         "raw_flags": new_raw,
         "changed": changed,
+        "overridden": overridden,
         // `persisted` is about the desired state being on disk:
         // after a successful save it is, and when nothing changed
         // it already was (code-review 4.16 — reporting false for
@@ -5716,6 +6136,34 @@ struct OffloadInfo {
     /// [`manager_models::offload_bands`]).
     green_end: f64,
     yellow_end: f64,
+    /// System-RAM weight bytes at every slider position
+    /// `0..=moe_layers` (see
+    /// [`manager_models::sys_bytes_by_position`]).
+    sys_bytes_by_position: Vec<u64>,
+    /// True when the saved offload spelling is not the canonical
+    /// form for its position (a hand-written `--cpu-moe`, an
+    /// `--n-cpu-moe=46` `=` spelling, ...). Whitespace-only
+    /// differences are not custom: the comparison is over
+    /// whitespace-split tokens re-joined.
+    custom: bool,
+    /// The catalog's per-architecture offload restrictions for the
+    /// backend's model (empty outside the curated catalog).
+    restrictions: Vec<manager_models::OffloadRestriction>,
+}
+
+/// Raw flags normalized for comparison: whitespace-split tokens
+/// re-joined with single spaces; `None` when nothing remains.
+fn token_normalized_flags(raw: Option<&str>) -> Option<String> {
+    let joined = raw
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
 }
 
 fn backend_offload_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> Option<OffloadInfo> {
@@ -5731,6 +6179,22 @@ fn backend_offload_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> O
     }
     let (green_end, yellow_end) = manager_models::offload_bands(moe_layers, green_limit_layers);
     let offload = manager_models::expert_offload(b.raw_flags.as_deref());
+    // Custom spelling: rewriting the detected position back through
+    // the canonical writer must reproduce the saved tokens exactly
+    // (after token normalization, so spacing alone never counts).
+    let canonical = manager_models::set_expert_offload(b.raw_flags.as_deref(), offload);
+    let custom = token_normalized_flags(b.raw_flags.as_deref())
+        != token_normalized_flags(canonical.as_deref());
+    let restrictions = layout
+        .catalog
+        .as_ref()
+        .map(|c| c.offload_restrictions.clone())
+        .unwrap_or_default();
+    let sys_bytes_by_position = manager_models::sys_bytes_by_position(
+        expert_bytes,
+        layout.expert_bytes_by_block.as_deref(),
+        moe_layers,
+    );
     Some(OffloadInfo {
         moe_layers,
         layers: offload.layers(moe_layers),
@@ -5739,7 +6203,169 @@ fn backend_offload_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> O
         green_limit_layers,
         green_end,
         yellow_end,
+        sys_bytes_by_position,
+        custom,
+        restrictions,
     })
+}
+
+/// A backend's GPU placement for guardrail evaluation: the placed
+/// GPUs' compute capabilities, and whether the launch is CPU-only.
+/// Undetermined placement yields an empty set (architecture unknown).
+fn placed_offload_placement(
+    b: &manager_config::BackendConfig,
+    gpus: &[GpuInfo],
+) -> (Vec<(u32, u32)>, bool) {
+    match backend_gpu_visibility(b) {
+        GpuVisibility::CpuOnly => (Vec::new(), true),
+        GpuVisibility::Gpus(indices) => (
+            indices
+                .iter()
+                .filter_map(|i| {
+                    gpus.iter()
+                        .find(|g| g.index == *i)
+                        .map(|g| g.compute_capability)
+                })
+                .collect(),
+            false,
+        ),
+        GpuVisibility::Undetermined => (Vec::new(), false),
+    }
+}
+
+/// The guardrail evaluation of one offload position for one backend.
+#[derive(Debug, Clone, PartialEq)]
+struct OffloadEvaluation {
+    layers: u32,
+    moe_layers: u32,
+    status: manager_models::OffloadStatus,
+    /// First placed compute capability a restriction governs, when
+    /// any placed GPU is restricted.
+    restricting_cc: Option<(u32, u32)>,
+    /// Nearest allowed position under the governing restriction
+    /// (the position itself when nothing governs it).
+    nearest_verified_layers: u32,
+    /// A journaled override exists for exactly this position on
+    /// exactly this placement.
+    has_override: bool,
+    /// The position is blocked AND a journaled override covers it.
+    overridden: bool,
+    placed_ccs: Vec<(u32, u32)>,
+    cpu_only: bool,
+    restrictions: Vec<manager_models::OffloadRestriction>,
+}
+
+/// Evaluate one offload position from its parts (the pure core of
+/// [`evaluate_backend_offload`], shared with the apply path, which
+/// evaluates the REQUESTED position rather than the saved one).
+#[allow(clippy::too_many_arguments)]
+fn evaluate_offload_position(
+    restrictions: &[manager_models::OffloadRestriction],
+    backend_id: &str,
+    layers: u32,
+    moe_layers: u32,
+    placed_ccs: Vec<(u32, u32)>,
+    cpu_only: bool,
+    journal: &activation::ActivationJournal,
+) -> OffloadEvaluation {
+    let status = manager_models::offload_status(
+        restrictions,
+        layers,
+        moe_layers,
+        &placed_ccs,
+        cpu_only,
+    );
+    let restricting_cc = placed_ccs.iter().copied().find(|cc| {
+        restrictions
+            .iter()
+            .any(|r| r.compute_capability == *cc)
+    });
+    // The nearest allowed position is computed against the
+    // restricting architecture; with no placed architecture it is
+    // computed against the first restriction's, so an unknown
+    // placement still offers the snap target for its own CC.
+    let nearest_cc = restricting_cc.or_else(|| {
+        if placed_ccs.is_empty() {
+            restrictions.first().map(|r| r.compute_capability)
+        } else {
+            None
+        }
+    });
+    let nearest_verified_layers = match nearest_cc {
+        Some(cc) => manager_models::nearest_allowed(restrictions, cc, layers, moe_layers),
+        None => layers,
+    };
+    let has_override =
+        activation::offload_override_covers(journal, backend_id, layers, &placed_ccs);
+    OffloadEvaluation {
+        layers,
+        moe_layers,
+        status,
+        restricting_cc,
+        nearest_verified_layers,
+        has_override,
+        overridden: status == manager_models::OffloadStatus::Blocked && has_override,
+        placed_ccs,
+        cpu_only,
+        restrictions: restrictions.to_vec(),
+    }
+}
+
+/// Evaluate a backend's SAVED offload position against the GPU
+/// inventory and the activation journal's standing overrides.
+/// `None` when the backend's model is not offload-capable.
+fn evaluate_backend_offload(
+    cfg: &AppConfig,
+    b: &manager_config::BackendConfig,
+    gpus: &[GpuInfo],
+    journal: &activation::ActivationJournal,
+) -> Option<OffloadEvaluation> {
+    let info = backend_offload_info(cfg, b)?;
+    let (placed_ccs, cpu_only) = placed_offload_placement(b, gpus);
+    Some(evaluate_offload_position(
+        &info.restrictions,
+        &b.id,
+        info.layers,
+        info.moe_layers,
+        placed_ccs,
+        cpu_only,
+        journal,
+    ))
+}
+
+/// The refusal reason for an offload position, when one applies:
+/// `Some` iff the position is guardrail-blocked and no journaled
+/// override covers it. Pure — the preflight, the apply path, and
+/// the tests all go through this one function.
+fn offload_block_reason(
+    restrictions: &[manager_models::OffloadRestriction],
+    layers: u32,
+    moe_layers: u32,
+    placed_ccs: &[(u32, u32)],
+    cpu_only: bool,
+    overridden: bool,
+) -> Option<String> {
+    if overridden {
+        return None;
+    }
+    if manager_models::offload_status(restrictions, layers, moe_layers, placed_ccs, cpu_only)
+        != manager_models::OffloadStatus::Blocked
+    {
+        return None;
+    }
+    // Blocked implies a placed CC matches a restriction; the first
+    // such CC names the architecture in the message and drives the
+    // nearest-allowed snap.
+    let cc = placed_ccs.iter().copied().find(|cc| {
+        restrictions
+            .iter()
+            .any(|r| r.compute_capability == *cc)
+    })?;
+    let nearest = manager_models::nearest_allowed(restrictions, cc, layers, moe_layers);
+    Some(format!(
+        "offload of {layers} of {moe_layers} layers is outside the verified range for this GPU (compute capability {}.{}) — set the offload to {nearest} of {moe_layers} layers in Edit Flags, or save the position with an explicit override",
+        cc.0, cc.1
+    ))
 }
 
 /// Project a tensor split onto discovered VRAM (spec §14
@@ -5819,6 +6445,7 @@ async fn placement_propose(
                 expert_bytes: None,
                 moe_layers: None,
                 default_offload_layers: None,
+                offload_restrictions: Vec::new(),
             }
         }
     };
@@ -7466,6 +8093,186 @@ mod tests {
             None,
         );
         assert!(backend_offload_info(&cfg, &b).is_none());
+    }
+
+    fn catalog_restrictions(model_id: &str) -> Vec<manager_models::OffloadRestriction> {
+        manager_models::curated_models()
+            .into_iter()
+            .find(|s| s.id == model_id)
+            .unwrap()
+            .offload_restrictions
+    }
+
+    #[test]
+    fn offload_block_reason_partial_on_p100_is_blocked() {
+        // Tracker #37: the field failure — Coder-Next at the
+        // position `--n-cpu-moe 46` spells, on a Pascal (6,0) GPU.
+        let restrictions = catalog_restrictions("qwen3-coder-30b");
+        let position = manager_models::expert_offload(Some("--n-cpu-moe 46"));
+        let reason = offload_block_reason(
+            &restrictions,
+            position.layers(48),
+            48,
+            &[(6, 0)],
+            false,
+            false,
+        )
+        .expect("46 of 48 on compute capability 6.0 is blocked");
+        assert!(reason.contains("offload of 46 of 48 layers"), "{reason}");
+        assert!(reason.contains("compute capability 6.0"), "{reason}");
+        assert!(
+            reason.contains("set the offload to 48 of 48 layers"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn offload_block_reason_overridden_position_is_allowed() {
+        let restrictions = catalog_restrictions("qwen3-coder-30b");
+        assert_eq!(
+            offload_block_reason(&restrictions, 46, 48, &[(6, 0)], false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn offload_block_reason_endpoints_are_allowed() {
+        let restrictions = catalog_restrictions("qwen3-coder-30b");
+        for layers in [0, 48] {
+            assert_eq!(
+                offload_block_reason(&restrictions, layers, 48, &[(6, 0)], false, false),
+                None,
+                "endpoint {layers} is verified on 6.0"
+            );
+        }
+    }
+
+    #[test]
+    fn offload_block_reason_other_gpu_is_allowed() {
+        // Placement re-evaluation: the same saved position on a
+        // newer GPU carries no pinned restriction.
+        let restrictions = catalog_restrictions("qwen3-coder-30b");
+        assert_eq!(
+            offload_block_reason(&restrictions, 46, 48, &[(8, 6)], false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn offload_block_reason_unrestricted_model_is_allowed() {
+        let restrictions = catalog_restrictions("nemotron-3.5-lightning-30b");
+        assert!(restrictions.is_empty());
+        assert_eq!(
+            offload_block_reason(&restrictions, 16, 24, &[(6, 0)], false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn offload_block_reason_cpu_only_is_allowed() {
+        let restrictions = catalog_restrictions("qwen3-coder-30b");
+        assert_eq!(
+            offload_block_reason(&restrictions, 46, 48, &[], true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn offload_info_payload_fields_for_coder_and_nemotron() {
+        // sys_bytes_by_position is exact for Coder-Next (uniform
+        // expert blocks): index 0 is empty, index 48 is the full
+        // expert bytes.
+        let mut cfg = test_cfg();
+        let b = serve_model(
+            &mut cfg,
+            "coder",
+            "qwen3-coder-30b",
+            "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
+            Some("--n-cpu-moe 46"),
+        );
+        let info = backend_offload_info(&cfg, &b).expect("coder info");
+        assert_eq!(info.sys_bytes_by_position.len(), 49);
+        assert_eq!(info.sys_bytes_by_position[0], 0);
+        assert_eq!(info.sys_bytes_by_position[48], info.expert_bytes);
+        assert!(!info.custom, "canonical spelling is not custom");
+        assert_eq!(info.restrictions.len(), 1);
+
+        // A padded-but-equivalent spelling is not custom either;
+        // a spelling the canonical form would not produce is.
+        let b = serve_model(
+            &mut cfg,
+            "coder",
+            "qwen3-coder-30b",
+            "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
+            Some("  --n-cpu-moe   46  "),
+        );
+        let info = backend_offload_info(&cfg, &b).expect("coder info");
+        assert!(!info.custom, "whitespace-only difference is not custom");
+
+        let b = serve_model(
+            &mut cfg,
+            "coder-fast",
+            "nemotron-3.5-lightning-30b",
+            "models/Nemotron.gguf",
+            Some("--n-cpu-moe=16"),
+        );
+        let info = backend_offload_info(&cfg, &b).expect("nemotron info");
+        assert!(
+            info.custom,
+            "the `=` spelling is not the canonical form for the position"
+        );
+        assert_eq!(info.sys_bytes_by_position.len(), 25);
+        assert!(info.restrictions.is_empty());
+    }
+
+    #[test]
+    fn evaluate_backend_offload_places_and_overrides() {
+        let mut cfg = test_cfg();
+        let b = serve_model(
+            &mut cfg,
+            "coder",
+            "qwen3-coder-30b",
+            "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
+            Some("--n-cpu-moe 46"),
+        );
+        // The coder backend is unsplit in the test config, so it
+        // places on GPU 0; make GPU 0 a Pascal card.
+        let mut gpus = test_gpus();
+        gpus[0].compute_capability = (6, 0);
+        let journal = activation::ActivationJournal::default();
+        let eval = evaluate_backend_offload(&cfg, &b, &gpus, &journal)
+            .expect("coder backend evaluates");
+        assert_eq!(eval.layers, 46);
+        assert_eq!(eval.moe_layers, 48);
+        assert_eq!(eval.status, manager_models::OffloadStatus::Blocked);
+        assert_eq!(eval.restricting_cc, Some((6, 0)));
+        assert_eq!(eval.nearest_verified_layers, 48);
+        assert!(!eval.has_override);
+        assert!(!eval.overridden);
+
+        // A journaled override for this backend, position, and
+        // placed-CC set flips overridden (and only that).
+        let journal = activation::ActivationJournal {
+            offload_overrides: vec![activation::OffloadOverride {
+                backend_id: "coder".to_string(),
+                layers: 46,
+                placed_ccs: vec![(6, 0)],
+                ts: "2026-10-17T00:00:00Z".to_string(),
+            }],
+            ..Default::default()
+        };
+        let eval = evaluate_backend_offload(&cfg, &b, &gpus, &journal)
+            .expect("coder backend evaluates");
+        assert!(eval.has_override);
+        assert!(eval.overridden);
+
+        // Same position on an unrestricted GPU: no restriction
+        // matches, nothing is blocked.
+        let gpus = test_gpus();
+        let eval = evaluate_backend_offload(&cfg, &b, &gpus, &journal)
+            .expect("coder backend evaluates");
+        assert_eq!(eval.restricting_cc, None);
+        assert_ne!(eval.status, manager_models::OffloadStatus::Blocked);
     }
 
     #[test]
