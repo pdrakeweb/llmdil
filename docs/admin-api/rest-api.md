@@ -416,7 +416,14 @@ behavior.)
 → `201` `{ "backend_id": "coder-fast", "group": "coder" }`. The backend
 is created with the app's seeded defaults; the gateway routes it after
 its next restart, and the creation records an activation-plan change,
-as in the app.
+as in the app. Optional body fields carry the launch parameters the
+app's add form offers: `n_ctx`, `n_batch` (validated as in
+`backend_update_flags`), `offload_layers` with `offload_override`
+(a guardrail-blocked position is refused unless the override is set,
+and the override is journaled, as in `backend_set_offload`), and
+`gpu_indices` (an explicit GPU selection, written as an even tensor
+split, replacing the telemetry assignment). Each omitted field keeps
+its creation default.
 
 #### `DELETE /api/v1/backends/{id}` — `destructive`
 `backend_delete` → `{ "backend_id", "deleted": true }`. Refused
