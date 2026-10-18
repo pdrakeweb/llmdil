@@ -329,6 +329,100 @@ probes plus LiteLLM's own cold boot, not a reinstall; the step log
 (`logs/wizard.log`) states which path was taken ("reusing existing
 venv", "Prisma install verified … — no changes made").
 
+## PostgreSQL start times out (pg_ctl killed at the command cap)
+
+Signature (v0.1.38 and earlier), in the start-gateway step
+outcome:
+
+```
+PostgreSQL failed to start: command failed: [pg_ctl.exe, -D <data dir>, -l <logs/postgres.log>, -o "-p 54329 -h 127.0.0.1", start] exited with code -1: timed out after 600s and was stopped
+```
+
+Cause (code-level): the start step ran `pg_ctl start` with no
+`-t` bound of its own, so pg_ctl waited for the server to report
+ready — however long crash recovery takes — capped only by the
+command runner's generic 600 s timeout. When the cap fired, the
+runner killed the whole process tree, including the postmaster
+pg_ctl was waiting on: a start that was merely slow (crash
+recovery after an unclean shutdown) was converted into another
+unclean shutdown, and the next start faced the same recovery
+again. The failure message on this path also carried no
+`postgres.log` tail, so why the server was slow never reached
+the report.
+
+Behavior after the fix:
+
+- `pg_ctl` runs with `-t 120` (its own wait bound) inside a
+  180 s command budget; the wait is bounded by the server's
+  readiness signals, not one opaque cap.
+- A live postmaster that already owns the data directory (left
+  running by a previous app session) is detected via
+  `postmaster.pid` and adopted: the step waits for it to accept
+  connections instead of spawning a competing `pg_ctl`. A
+  `postmaster.pid` whose process is dead — or whose pid has
+  been recycled by an unrelated program — is removed before
+  starting.
+- Every PostgreSQL start failure appends the tail of
+  `logs/postgres.log` to the step outcome, so the next report
+  is self-diagnosing.
+- The "gateway configuration changed since the gateway was
+  started" note no longer rides into a fresh step's report: a
+  note explains why a step was queued, and the run clears it
+  when the step actually executes.
+
+If it still fails, read the appended `postgres.log` tail first:
+it states the server's own reason (recovery still in progress,
+a lock or permission problem on the data directory, a port
+conflict). The manual start in step 4 below uses the same
+bounded command.
+
+## PostgreSQL start times out (pg_ctl killed at the command cap)
+
+Signature (v0.1.38 and earlier), in the start-gateway step
+outcome:
+
+```
+PostgreSQL failed to start: command failed: [pg_ctl.exe, -D <data dir>, -l <logs/postgres.log>, -o "-p 54329 -h 127.0.0.1", start] exited with code -1: timed out after 600s and was stopped
+```
+
+Cause (code-level): the start step ran `pg_ctl start` with no
+`-t` bound of its own, so pg_ctl waited for the server to report
+ready — however long crash recovery takes — capped only by the
+command runner's generic 600 s timeout. When the cap fired, the
+runner killed the whole process tree, including the postmaster
+pg_ctl was waiting on: a start that was merely slow (crash
+recovery after an unclean shutdown) was converted into another
+unclean shutdown, and the next start faced the same recovery
+again. The failure message on this path also carried no
+`postgres.log` tail, so why the server was slow never reached
+the report.
+
+Behavior after the fix:
+
+- `pg_ctl` runs with `-t 120` (its own wait bound) inside a
+  180 s command budget; the wait is bounded by the server's
+  readiness signals, not one opaque cap.
+- A live postmaster that already owns the data directory (left
+  running by a previous app session) is detected via
+  `postmaster.pid` and adopted: the step waits for it to accept
+  connections instead of spawning a competing `pg_ctl`. A
+  `postmaster.pid` whose process is dead — or whose pid has
+  been recycled by an unrelated program — is removed before
+  starting.
+- Every PostgreSQL start failure appends the tail of
+  `logs/postgres.log` to the step outcome, so the next report
+  is self-diagnosing.
+- The "gateway configuration changed since the gateway was
+  started" note no longer rides into a fresh step's report: a
+  note explains why a step was queued, and the run clears it
+  when the step actually executes.
+
+If it still fails, read the appended `postgres.log` tail first:
+it states the server's own reason (recovery still in progress,
+a lock or permission problem on the data directory, a port
+conflict). The manual start in step 4 below uses the same
+bounded command.
+
 ## Starting the gateway manually (PowerShell)
 
 For console-visible diagnosis. Run the app (and this window)
@@ -365,7 +459,7 @@ token.
    quoted executable path):
 
    ```powershell
-   & "<data_dir>\postgres\bin\pg_ctl.exe" -D "<data_dir>\postgres\data" -l "<data_dir>\logs\postgres.log" -o "-p <port> -h 127.0.0.1" start
+   & "<data_dir>\postgres\bin\pg_ctl.exe" -D "<data_dir>\postgres\data" -l "<data_dir>\logs\postgres.log" -o "-p <port> -h 127.0.0.1" -t 120 start
    ```
 
 5. Start the gateway (host and port are `gateway.bind_host` and
