@@ -4309,6 +4309,11 @@ async fn backend_get_launch_command(state: State<'_, AppState>, id: String) -> A
 /// (`GET /v1/models`; any syntactically valid HTTP status line = up)
 /// run on a blocking thread — the gateway is a separate LiteLLM
 /// process, so config alone cannot say whether it is up.
+/// `groups` counts ENABLED groups only (a group is enabled iff at
+/// least one member backend is enabled — the derived rule in
+/// manager-gateway): the generated config serves enabled groups
+/// only, so the configured total would misstate what the gateway
+/// runs (Pete, 2026-10-17, tracker #11).
 /// `routing_log_len` is the routing decision ring's actual current
 /// entry count (not its capacity). `openrouter_cred_present` reports
 /// whether the cloud tier's configured credential reference exists in
@@ -4322,7 +4327,7 @@ async fn gateway_status(state: State<'_, AppState>) -> ApiResult {
             cfg.gateway.port,
             cfg.gateway.bind_host.clone(),
             manager_wizard::steps::gateway_probe_host(&cfg),
-            cfg.gateway.groups.len(),
+            manager_gateway::enabled_group_count(&cfg),
             cfg.gateway.routing_rules.len(),
             cfg.gateway.openrouter.cred_ref.clone(),
         )

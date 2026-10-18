@@ -3475,7 +3475,8 @@ function gatewayPaint(
     : "";
   const summary = `<div class="card" style="margin-bottom:12px"><div class="sec-title">${dot(status.up ? "ok" : "err")} Gateway \u2014 LiteLLM \u00b7 ${status.up ? "up" : "down"}</div>
     <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px">
-      ${([["Port", String(port)], ["Groups", fmtCount(status.groups)], ["Routing rules", fmtCount(status.routing_rules)], ["Routing test traces", fmtCount(status.routing_log_len), "Routing test traces are dry-run decisions recorded from routing tests this session — live requests are not logged."], ["LiteLLM", status.litellm_version ?? "not measured", "The LiteLLM version the start-gateway step probed in the gateway venv at the last spawn (MCP design §4.3). Not measured until a spawn records one."]] as [string, string, string?][])
+      ${([["Port", String(port)], ["Groups", fmtCount(status.groups), "Enabled groups — a group counts when at least one of its member backends is enabled; the gateway serves enabled groups only."], ["Routing rules", fmtCount(status.routing_rules)], ["Routing test traces", fmtCount(status.routing_log_len), "Routing test traces are dry-run decisions recorded from routing tests this session — live requests are not logged."], ["LiteLLM", status.litellm_version ?? "not measured", "The LiteLLM version the start-gateway step probed in the gateway venv at the last spawn (MCP design §4.3). Not measured until a spawn records one."]] as [string, string, string?][])
+
         .map(([k, v, tip]) => `<div class="kv"><span class="k">${k}${tip ? `<span class="info-tip" title="${esc(tip)}">${icon("info")}</span>` : ""}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
     </div>
     ${gwStats}</div>`;

@@ -494,6 +494,22 @@ pub fn group_enabled(group: &ModelGroup, config: &AppConfig) -> bool {
     group_enabled_member_count(group, config) > 0
 }
 
+/// How many of the config's groups are enabled — the group count the
+/// status surfaces report (Pete, 2026-10-17, tracker #11). Since
+/// v0.1.32 the generated gateway config serves enabled groups only,
+/// so the configured total would describe a gateway that is not the
+/// one running; the status count is the enabled figure. The
+/// configured set stays visible in full on the Routing view's Groups
+/// tab.
+pub fn enabled_group_count(config: &AppConfig) -> usize {
+    config
+        .gateway
+        .groups
+        .iter()
+        .filter(|g| group_enabled(g, config))
+        .count()
+}
+
 // ---------------------------------------------------------------------------
 // Context-overflow routing rule (docs/routing-rules-design.md §4, §6.3)
 // ---------------------------------------------------------------------------
@@ -1943,6 +1959,58 @@ mod tests {
             .find(|g| g.name == "planner")
             .unwrap();
         assert!(group_enabled(planner, &cfg));
+    }
+
+    #[test]
+    fn enabled_group_count_all_enabled_equals_configured() {
+        let cfg = four_backend_config();
+        assert!(!cfg.gateway.groups.is_empty());
+        assert_eq!(enabled_group_count(&cfg), cfg.gateway.groups.len());
+    }
+
+    #[test]
+    fn enabled_group_count_counts_mixed_group() {
+        let mut cfg = four_backend_config();
+        let base = enabled_group_count(&cfg);
+        let mut coder_b = backend("coder-b", 8086);
+        coder_b.enabled = false;
+        cfg.backends.push(coder_b);
+        cfg.gateway.groups.push(ModelGroup {
+            name: "pair".to_string(),
+            members: vec!["coder".to_string(), "coder-b".to_string()],
+            strategy: RoutingStrategy::LeastBusy,
+            fallbacks: vec![],
+        });
+        // One enabled member is enough: the mixed group counts.
+        assert_eq!(enabled_group_count(&cfg), base + 1);
+    }
+
+    #[test]
+    fn enabled_group_count_skips_all_disabled_group() {
+        let mut cfg = four_backend_config();
+        let base = enabled_group_count(&cfg);
+        cfg.backends
+            .iter_mut()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .enabled = false;
+        // The coder group's only member is disabled: it drops out of
+        // the count while the configured total is unchanged.
+        assert_eq!(enabled_group_count(&cfg), base - 1);
+        assert_eq!(cfg.gateway.groups.len(), base);
+    }
+
+    #[test]
+    fn enabled_group_count_skips_memberless_group() {
+        let mut cfg = four_backend_config();
+        let base = enabled_group_count(&cfg);
+        cfg.gateway.groups.push(ModelGroup {
+            name: "empty".to_string(),
+            members: vec![],
+            strategy: RoutingStrategy::LeastBusy,
+            fallbacks: vec![],
+        });
+        assert_eq!(enabled_group_count(&cfg), base);
     }
 
     #[test]

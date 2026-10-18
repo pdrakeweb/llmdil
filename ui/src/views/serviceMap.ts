@@ -200,7 +200,7 @@ function topologySvg(d: MapData): string {
     node(COL.gateway, H / 2, "LiteLLM", "status unknown", C.grey, "", undefined, "#/gateway");
   } else {
     node(COL.gateway, H / 2, "LiteLLM",
-      `:${gateway.port} \u00b7 ${gateway.groups} groups \u00b7 ${gateway.routing_rules} rules${d.live && !gateway.up ? " \u00b7 down" : ""}`,
+      `:${gateway.port} \u00b7 ${gateway.groups} enabled groups \u00b7 ${gateway.routing_rules} rules${d.live && !gateway.up ? " \u00b7 down" : ""}`,
       d.live ? (gateway.up ? C.green : C.red) : C.grey, C.blue, undefined, "#/gateway");
   }
 
@@ -299,7 +299,7 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
   const vramTotal = d.gpus.reduce((a, g) => a + g.vram_total_gb, 0);
   const summary: [string, string][] = [
     ["Backends", `${running} / ${d.backends.length} running`],
-    ["Gateway", d.gatewayError ? "status unknown" : `:${d.gateway.port} \u00b7 ${d.gateway.groups} groups${d.live && !d.gateway.up ? " \u00b7 down" : ""}`],
+    ["Gateway", d.gatewayError ? "status unknown" : `:${d.gateway.port} \u00b7 ${d.gateway.groups} enabled groups${d.live && !d.gateway.up ? " \u00b7 down" : ""}`],
     ["Routing rules", String(d.gateway.routing_rules)],
     ["GPUs", `${d.gpus.length} detected`],
     ["VRAM used (all processes)", d.gpus.length ? `${fmtGb(vramUsed)} / ${fmtGb(vramTotal)} GB` : "—"],
