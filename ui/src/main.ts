@@ -212,8 +212,11 @@ function renderTaskbar(): void {
     <span class="grow"></span><span class="quiet">Task drawer</span>`;
 }
 
-/** Query params in the hash (e.g. #/logs?scope=llama-a4000 — the Logs
- *  deep link from the Backends view). */
+/** Query params in the hash (e.g. #/logs?scope=coder&follow=1 — the
+ *  Logs deep link carried by the "go to logs" buttons on entity cards:
+ *  the entity's scope preselected, Follow on). Params are consumed on
+ *  entry; the view re-renders per navigation, so a later plain visit
+ *  starts from defaults. */
 function hashParams(): URLSearchParams {
   return new URLSearchParams((location.hash.split("?")[1] ?? ""));
 }
@@ -274,7 +277,7 @@ async function render(): Promise<void> {
     case "#/logs":
       view.innerHTML = renderLogs();
       {
-        const c = await wireLogs(view, hashParams().get("scope") ?? undefined);
+        const c = await wireLogs(view, hashParams().get("scope") ?? undefined, hashParams().get("follow") === "1");
         if (gen !== renderGen) { c(); return; }
         cleanup = c;
       }

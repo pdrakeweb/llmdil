@@ -3206,7 +3206,7 @@ export function renderLogs(): string {
   <div id="logBody">${loadingHtml("Loading logs\u2026")}</div></div>`;
 }
 
-export async function wireLogs(root: HTMLElement, initialScope?: string): Promise<() => void> {
+export async function wireLogs(root: HTMLElement, initialScope?: string, initialFollow = false): Promise<() => void> {
   let disposed = false;
   /** Load coalescing (code-review 5.1): every load takes a
    *  sequence number and only the LATEST load paints. The previous
@@ -3558,7 +3558,16 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
   nextBtn?.addEventListener("click", onNext);
   exportBtn?.addEventListener("click", onExport);
 
-  await load();
+  // Deep link follow (#/logs?scope=<id>&follow=1 — the entity cards'
+  // "go to logs" buttons): arrive in exactly the state the Follow
+  // toggle produces — checkbox on, 2 s re-poll running, first load
+  // fired by onFollow itself.
+  if (initialFollow && followChk) {
+    followChk.checked = true;
+    onFollow();
+  } else {
+    await load();
+  }
 
   return () => {
     disposed = true;
