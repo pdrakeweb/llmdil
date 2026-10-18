@@ -1180,11 +1180,17 @@ mod tests {
     #[test]
     fn create_gets_a_free_port_assigned() {
         // Default config backends hold 8081..8084, gateway 4000.
+        // qwen3-8b is a catalog model but unregistered in the
+        // default config, so plan build chains its model.add
+        // ahead of the create (tracker #51); the create is the
+        // second item and still gets the first free port.
         let r = parse(
             "{\"items\":[{\"kind\":\"backend.create\",\"target\":\"coder-2\",\"change\":{\"model_id\":\"qwen3-8b\"}}]}",
         )
         .unwrap();
-        assert_eq!(r.items[0].change["port"], json!(8085));
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.items[0].kind, PlanKind::ModelAdd);
+        assert_eq!(r.items[1].change["port"], json!(8085));
     }
 
     #[test]
