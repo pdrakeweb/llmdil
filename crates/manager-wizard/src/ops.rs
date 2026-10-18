@@ -639,6 +639,116 @@ impl SystemOps for RealSystemOps {
         self.run_child(cmd, timeout).await
     }
 
+    async fn service_start_gateway(
+        &self,
+        def: &manager_services::ServiceDefinition,
+    ) -> Result<u32, WizardError> {
+        #[cfg(windows)]
+        {
+            use manager_services::ServiceControl;
+            let control = manager_services::scm::platform_control();
+            let name = def.name.clone();
+            let pid_file = def.pid_file.clone();
+            // SCM calls are synchronous; keep them off the async runtime.
+            tokio::task::spawn_blocking(move || {
+                if !control.is_registered(&name).map_err(|e| e.to_string())? {
+                    return Err(format!(
+                        "the gateway service '{name}' is not registered — register it in Settings → Supervision before starting it in service mode"
+                    ));
+                }
+                control.start(&name).map_err(|e| e.to_string())?;
+                if let Some(pid_file) = &pid_file {
+                    // The service host writes the child's pid once it
+                    // is spawned; wait for a live pid to appear.
+                    for _ in 0..150 {
+                        if let Ok(text) = std::fs::read_to_string(pid_file) {
+                            if let Ok(pid) = text.trim().parse::<u32>() {
+                                if process_alive(pid) {
+                                    return Ok(pid);
+                                }
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(format!(
+                        "gateway service '{name}' started but its process did not appear (no live pid in {})",
+                        pid_file.display()
+                    ))
+                } else {
+                    control
+                        .query(&name)
+                        .map_err(|e| e.to_string())?
+                        .pid
+                        .ok_or_else(|| {
+                            format!("gateway service '{name}' has no process id after start")
+                        })
+                }
+            })
+            .await
+            .map_err(|e| WizardError::IoError {
+                path: PathBuf::from("scm"),
+                reason: format!("service start task failed: {e}"),
+            })?
+            .map_err(|reason| WizardError::IoError {
+                path: PathBuf::from("scm"),
+                reason,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Err(WizardError::IoError {
+                path: PathBuf::from("scm"),
+                reason: format!(
+                    "service supervision requires Windows (service '{}')",
+                    def.name
+                ),
+            })
+        }
+    }
+
+    async fn service_stop(&self, name: &str) -> Result<(), WizardError> {
+        #[cfg(windows)]
+        {
+            use manager_services::ServiceControl;
+            let control = manager_services::scm::platform_control();
+            let name = name.to_string();
+            tokio::task::spawn_blocking(move || {
+                if !control.is_registered(&name).map_err(|e| e.to_string())? {
+                    return Ok(());
+                }
+                control.stop(&name).map_err(|e| e.to_string())?;
+                for _ in 0..150 {
+                    match control.query(&name).map_err(|e| e.to_string())?.state {
+                        manager_services::ServiceState::Stopped
+                        | manager_services::ServiceState::NotInstalled => return Ok(()),
+                        _ => std::thread::sleep(std::time::Duration::from_millis(100)),
+                    }
+                }
+                Err(format!(
+                    "service '{name}' did not reach the stopped state within 15 s"
+                ))
+            })
+            .await
+            .map_err(|e| WizardError::IoError {
+                path: PathBuf::from("scm"),
+                reason: format!("service stop task failed: {e}"),
+            })?
+            .map_err(|reason| WizardError::IoError {
+                path: PathBuf::from("scm"),
+                reason,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Err(WizardError::IoError {
+                path: PathBuf::from("scm"),
+                reason: format!(
+                    "service supervision requires Windows (service '{name}')"
+                ),
+            })
+        }
+    }
+
     async fn spawn_detached(&self, cmd: &PlannedCommand) -> Result<u32, WizardError> {
         let (prog, args) = cmd
             .argv

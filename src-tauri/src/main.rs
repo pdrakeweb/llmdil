@@ -123,6 +123,8 @@ pub struct DownloadProgressPayload {
 pub enum ApiError {
     Config(String),
     Supervisor(String),
+    /// Windows service supervision (manager-services) failures.
+    Services(String),
     Wizard(String),
     Telemetry(String),
     Gateway(String),
@@ -147,6 +149,7 @@ impl fmt::Display for ApiError {
         match self {
             ApiError::Config(e) => write!(f, "config error: {e}"),
             ApiError::Supervisor(e) => write!(f, "supervisor error: {e}"),
+            ApiError::Services(e) => write!(f, "service error: {e}"),
             ApiError::Wizard(e) => write!(f, "wizard error: {e}"),
             ApiError::Telemetry(e) => write!(f, "telemetry error: {e}"),
             ApiError::Gateway(e) => write!(f, "gateway error: {e}"),
@@ -792,6 +795,135 @@ impl AppState {
         let path = self.data_dir.join("config.json");
         if let Ok(cfg) = manager_config::load(&path) {
             *self.config.write().await = cfg;
+        }
+    }
+
+    /// Reconcile the persisted `setup_completed` flag with the
+    /// install wizard's actual state. The flag was historically set
+    /// only by the wizard view's Finish button (`setup_mark_complete`);
+    /// every other completion path — a full "Run setup" run, per-step
+    /// runs, skip / mark-manual, and launch-time hydration from live
+    /// machine checks — left it false, so a user with a functionally
+    /// complete setup was routed back to the wizard on every launch
+    /// (field-confirmed 2026-10-17: every step passing, flag false).
+    /// When the wizard's report shows every step Done, Manual, or
+    /// Skipped — the Finish dialog's own completeness predicate — the
+    /// flag is set and persisted, so launch routing (the UI reads the
+    /// flag via `setup_status`) sends the user to the Dashboard.
+    /// Best effort: a failed save keeps the in-memory value and the
+    /// next trigger retries.
+    async fn reconcile_setup_completed(&self) {
+        if self.config.read().await.setup_completed {
+            return;
+        }
+        let complete = {
+            let wizard = self.wizard(RunMode::Install).await;
+            let guard = wizard.lock().await;
+            let report = guard.report();
+            !report.steps.is_empty()
+                && report.steps.iter().all(|s| {
+                    matches!(
+                        s.state,
+                        manager_wizard::StepState::Done
+                            | manager_wizard::StepState::Manual
+                            | manager_wizard::StepState::Skipped
+                    )
+                })
+        };
+        if !complete {
+            return;
+        }
+        let mut cfg = self.config.write().await;
+        if cfg.setup_completed {
+            return;
+        }
+        let mut new_cfg = cfg.clone();
+        new_cfg.setup_completed = true;
+        match manager_config::save(&new_cfg, &self.config_path) {
+            Ok(()) => {
+                *cfg = new_cfg;
+                append_wizard_log(
+                    &self.data_dir,
+                    &[format!(
+                        "[{}] setup_completed reconciled: every wizard step is done/manual/skipped, so the flag was set without a Finish click",
+                        chrono::Utc::now().to_rfc3339()
+                    )],
+                );
+            }
+            Err(e) => {
+                append_wizard_log(
+                    &self.data_dir,
+                    &[format!(
+                        "[{}] setup_completed reconcile could not persist: {e}",
+                        chrono::Utc::now().to_rfc3339()
+                    )],
+                );
+            }
+        }
+    }
+
+    /// The configured supervision mode (process | service).
+    async fn supervision_mode(&self) -> manager_config::SupervisionMode {
+        self.config.read().await.supervision.mode
+    }
+
+    /// Whether lifecycle routing for `service_name` goes to the SCM:
+    /// the global mode is Service AND the service is registered.
+    /// Registration is the per-service opt-in, so an unregistered
+    /// backend in service mode keeps process supervision (mixed mode;
+    /// see docs/windows-services-design.md). SCM queries are
+    /// blocking; they run on the blocking pool.
+    async fn service_route_active(&self, service_name: &str) -> bool {
+        if self.supervision_mode().await != manager_config::SupervisionMode::Service {
+            return false;
+        }
+        let name = service_name.to_string();
+        tokio::task::spawn_blocking(move || {
+            use manager_services::ServiceControl;
+            manager_services::scm::platform_control()
+                .is_registered(&name)
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Regenerate a backend's service definition from the supervisor's
+    /// registered spawn spec — the same spec object process mode
+    /// spawns — and write it to `<data_dir>/services/`. Returns the
+    /// definition path.
+    async fn write_backend_service_definition(
+        &self,
+        backend_id: &str,
+    ) -> Result<std::path::PathBuf, String> {
+        ensure_backend_specs(self).await;
+        let spec = {
+            let sup = self.supervisor().await;
+            let sup = sup.lock().await;
+            sup.spec(backend_id).cloned()
+        };
+        let spec = spec.ok_or_else(|| format!("backend {backend_id} has no spawn spec"))?;
+        let def = manager_services::backend_definition(&spec, &self.data_dir.join("logs"));
+        manager_services::write_definition(&self.data_dir, &def).map_err(|e| e.to_string())
+    }
+
+    /// Definition sync for the config-save paths: regenerate the
+    /// backend's service definition when service mode is on. A sync
+    /// failure is written to the wizard log, never silently dropped —
+    /// and the start path regenerates as well and fails visibly there,
+    /// so a stale definition cannot quietly reach a service start.
+    async fn sync_backend_service_definition(&self, backend_id: &str) {
+        if self.supervision_mode().await != manager_config::SupervisionMode::Service {
+            return;
+        }
+        if let Err(e) = self.write_backend_service_definition(backend_id).await {
+            append_wizard_log(
+                &self.data_dir,
+                &[format!(
+                    "[{}] service definition sync for backend {backend_id} failed: {e}",
+                    chrono::Utc::now().to_rfc3339()
+                )],
+            );
         }
     }
 
@@ -2310,10 +2442,93 @@ async fn list_backends(state: State<'_, AppState>) -> ApiResult {
             "uptime_secs": st.uptime.map(|u| u.as_secs()),
         }));
     }
+    // Service supervision: in service mode, a registered service's
+    // SCM state is the truth for its row — the supervisor never
+    // spawned it, so its view is stale by construction. `pid` is the
+    // service host's pid (the llama-server child is the host's to
+    // manage); rows gain `service_managed: true`.
+    if cfg.supervision.mode == manager_config::SupervisionMode::Service {
+        let names: Vec<(String, String)> = backends
+            .iter()
+            .filter_map(|row| {
+                row["id"]
+                    .as_str()
+                    .map(|id| (id.to_string(), manager_services::backend_service_name(id)))
+            })
+            .collect();
+        let queried = tokio::task::spawn_blocking(move || {
+            use manager_services::ServiceControl;
+            let control = manager_services::scm::platform_control();
+            names
+                .into_iter()
+                .map(|(id, name)| (id, control.query(&name).ok()))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        for (id, status) in queried {
+            let Some(status) = status else { continue };
+            if matches!(status.state, manager_services::ServiceState::NotInstalled) {
+                continue;
+            }
+            if let Some(row) = backends.iter_mut().find(|r| r["id"] == json!(id)) {
+                row["state"] = json!(process_state_str(status.process_state()));
+                row["pid"] = json!(status.pid);
+                row["adopted"] = json!(false);
+                row["service_managed"] = json!(true);
+            }
+        }
+    }
     Ok(json!({ "backends": backends }))
 }
 
-/// Start a backend (supervisor spawn). Returns a task id.
+/// Service-mode backend start: regenerate the definition from the
+/// current spec, then start the service through the SCM. The
+/// service reports Running once the host has spawned llama-server;
+/// model-load progress is observed through `list_backends`, as in
+/// process mode.
+async fn scm_start_backend(state: &AppState, id: &str) -> Result<(), ApiError> {
+    state
+        .write_backend_service_definition(id)
+        .await
+        .map_err(ApiError::Services)?;
+    let name = manager_services::backend_service_name(id);
+    tokio::task::spawn_blocking(move || {
+        use manager_services::ServiceControl;
+        manager_services::scm::platform_control().start(&name)
+    })
+    .await
+    .map_err(|e| ApiError::Services(format!("service start task failed: {e}")))?
+    .map_err(|e| ApiError::Services(e.to_string()))
+}
+
+/// Service-mode backend stop: SCM stop, then wait for the stopped
+/// state — the supervisor's stop returns once the process is down,
+/// so the service path does too. (A service-mode stop terminates the
+/// host's job object: the whole tree goes down at once. The graceful
+/// drain window is process-mode behavior in increment 1.)
+async fn scm_stop_backend(id: &str) -> Result<(), ApiError> {
+    let name = manager_services::backend_service_name(id);
+    tokio::task::spawn_blocking(move || {
+        use manager_services::ServiceControl;
+        let control = manager_services::scm::platform_control();
+        control.stop(&name).map_err(|e| e.to_string())?;
+        for _ in 0..300 {
+            match control.query(&name).map_err(|e| e.to_string())?.state {
+                manager_services::ServiceState::Stopped
+                | manager_services::ServiceState::NotInstalled => return Ok(()),
+                _ => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        }
+        Err(format!("service '{name}' did not stop within 30 s"))
+    })
+    .await
+    .map_err(|e| ApiError::Services(format!("service stop task failed: {e}")))?
+    .map_err(ApiError::Services)
+}
+
+/// Start a backend (supervisor spawn, or SCM start in service mode
+/// when the backend is registered as a service). Returns a task id.
 #[tauri::command]
 async fn start_backend(app: AppHandle, state: State<'_, AppState>, id: String) -> ApiResult {
     ensure_backend_specs(&state).await;
@@ -2324,11 +2539,19 @@ async fn start_backend(app: AppHandle, state: State<'_, AppState>, id: String) -
     let task_id = state
         .record_task("backend_start", json!({ "backend_id": id }))
         .await;
-    let mut sup = state.supervisor().await.lock().await;
-    // Reap first: without this, a backend that crashed since the last
-    // list_backends poll would read as AlreadyRunning for a corpse.
-    sup.reap_exited();
-    let outcome = sup.spawn_backend(&id).await;
+    let outcome: Result<(), ApiError> = if state
+        .service_route_active(&manager_services::backend_service_name(&id))
+        .await
+    {
+        scm_start_backend(&state, &id).await
+    } else {
+        let mut sup = state.supervisor().await.lock().await;
+        // Reap first: without this, a backend that crashed since the
+        // last list_backends poll would read as AlreadyRunning for a
+        // corpse.
+        sup.reap_exited();
+        sup.spawn_backend(&id).await.map_err(ApiError::from)
+    };
     match outcome {
         Ok(()) => {
             state
@@ -2348,10 +2571,10 @@ async fn start_backend(app: AppHandle, state: State<'_, AppState>, id: String) -
                 .finish_task(
                     &task_id,
                     TaskStatus::Failed,
-                    json!({ "backend_id": id, "error": format!("{e:?}") }),
+                    json!({ "backend_id": id, "error": e.to_string() }),
                 )
                 .await;
-            Err(err(ApiError::from(e)))
+            Err(err(e))
         }
     }
 }
@@ -2371,13 +2594,24 @@ async fn stop_backend(
             json!({ "backend_id": id, "graceful": graceful }),
         )
         .await;
-    let outcome = state
-        .supervisor()
+    let outcome: Result<(), ApiError> = if state
+        .service_route_active(&manager_services::backend_service_name(&id))
         .await
-        .lock()
-        .await
-        .stop(&id, graceful)
-        .await;
+    {
+        // The graceful flag has no service-mode equivalent in
+        // increment 1 (see scm_stop_backend).
+        let _ = graceful;
+        scm_stop_backend(&id).await
+    } else {
+        state
+            .supervisor()
+            .await
+            .lock()
+            .await
+            .stop(&id, graceful)
+            .await
+            .map_err(ApiError::from)
+    };
     match outcome {
         Ok(()) => {
             state
@@ -2394,10 +2628,10 @@ async fn stop_backend(
                 .finish_task(
                     &task_id,
                     TaskStatus::Failed,
-                    json!({ "error": format!("{e:?}") }),
+                    json!({ "error": e.to_string() }),
                 )
                 .await;
-            Err(err(ApiError::from(e)))
+            Err(err(e))
         }
     }
 }
@@ -2421,13 +2655,27 @@ async fn restart_backend(
             json!({ "backend_id": id, "graceful": graceful }),
         )
         .await;
-    let outcome = state
-        .supervisor()
+    let outcome: Result<(), ApiError> = if state
+        .service_route_active(&manager_services::backend_service_name(&id))
         .await
-        .lock()
-        .await
-        .restart(&id, graceful)
-        .await;
+    {
+        // SCM stop (waits for the stopped state) + SCM start on a
+        // freshly regenerated definition.
+        let _ = graceful;
+        match scm_stop_backend(&id).await {
+            Ok(()) => scm_start_backend(&state, &id).await,
+            Err(e) => Err(e),
+        }
+    } else {
+        state
+            .supervisor()
+            .await
+            .lock()
+            .await
+            .restart(&id, graceful)
+            .await
+            .map_err(ApiError::from)
+    };
     match outcome {
         Ok(()) => {
             state
@@ -2447,7 +2695,7 @@ async fn restart_backend(
                 .finish_task(
                     &task_id,
                     TaskStatus::Failed,
-                    json!({ "error": format!("{e:?}") }),
+                    json!({ "error": e.to_string() }),
                 )
                 .await;
             // A restart the pending activation plan depends on just
@@ -2745,6 +2993,9 @@ async fn run_wizard_step(app: AppHandle, state: State<'_, AppState>, step_id: St
     drop(guard);
     state.persist_wizard().await;
     state.reload_config_from_disk().await;
+    // A step run can complete the checklist (this is also the path
+    // the wizard's "Run setup" full run takes, once per step).
+    state.reconcile_setup_completed().await;
     let payload = WizardProgressPayload {
         task_id: task_id.clone(),
         step_id: Some(step_id.clone()),
@@ -3865,6 +4116,7 @@ async fn setup_skip_step(state: State<'_, AppState>, step_id: String, note: Stri
     let wizard = state.wizard(RunMode::Install).await;
     wizard.lock().await.skip(&step_id, note);
     state.persist_wizard().await;
+    state.reconcile_setup_completed().await;
     Ok(json!({ "ok": true, "step_id": step_id }))
 }
 
@@ -3921,6 +4173,11 @@ async fn setup_get_steps(state: State<'_, AppState>) -> ApiResult {
         Ok(guard) => {
             let payload = wizard_steps_payload(&guard);
             *state.wizard_steps_cache.write().await = Some(payload.clone());
+            drop(guard);
+            // Reading the steps is also a healing trigger for the
+            // launch-routing flag (the wizard view polls this while
+            // the user works through setup in any order).
+            state.reconcile_setup_completed().await;
             Ok(payload)
         }
         Err(_) => {
@@ -4075,6 +4332,7 @@ async fn setup_mark_manual(
     let wizard = state.wizard(RunMode::Install).await;
     wizard.lock().await.mark_manual(&step_id, path, version);
     state.persist_wizard().await;
+    state.reconcile_setup_completed().await;
     Ok(json!({ "ok": true, "step_id": step_id }))
 }
 
@@ -4180,6 +4438,7 @@ async fn backend_apply_config(
     } else {
         None
     };
+    state.sync_backend_service_definition(&id).await;
     Ok(json!({
         "backend_id": id,
         "diff": diff,
@@ -4391,6 +4650,7 @@ async fn backend_add(
     *cfg = new_cfg;
     drop(cfg);
     ensure_backend_specs(&state).await;
+    state.sync_backend_service_definition(&id).await;
     Ok(json!({ "backend_id": id, "group": group, "persisted": true }))
 }
 
@@ -4449,6 +4709,7 @@ async fn backend_update_flags(
     *cfg = new_cfg;
     drop(cfg);
     ensure_backend_specs(&state).await;
+    state.sync_backend_service_definition(&id).await;
     Ok(json!({ "backend_id": id, "persisted": true, "applies": "next start" }))
 }
 
@@ -4652,6 +4913,7 @@ async fn backend_set_offload(
     if changed {
         ensure_backend_specs(&state).await;
     }
+    state.sync_backend_service_definition(&id).await;
     Ok(json!({
         "backend_id": id,
         "layers": layers,
@@ -4722,6 +4984,22 @@ async fn backend_delete(state: State<'_, AppState>, id: String) -> ApiResult {
     *cfg = new_cfg;
     drop(cfg);
     ensure_backend_specs(&state).await;
+    // A deleted backend's service registration is the operator's to
+    // remove (Settings → Supervision) — a config delete must not fire
+    // a UAC prompt from a list action. Record the leftover so it is
+    // discoverable rather than silent.
+    if state
+        .service_route_active(&manager_services::backend_service_name(&id))
+        .await
+    {
+        append_wizard_log(
+            &state.data_dir,
+            &[format!(
+                "[{}] backend {id} was deleted from the configuration but its Windows service is still registered; unregister it in Settings → Supervision",
+                chrono::Utc::now().to_rfc3339()
+            )],
+        );
+    }
     Ok(json!({ "backend_id": id, "deleted": true, "persisted": true }))
 }
 
@@ -5120,13 +5398,43 @@ async fn gateway_quiesce_wait(state: State<'_, AppState>, timeout_secs: u64) -> 
 #[tauri::command]
 async fn gateway_stop(state: State<'_, AppState>) -> ApiResult {
     let data_dir = state.data_dir.clone();
-    let stopped = tokio::task::spawn_blocking({
-        let data_dir = data_dir.clone();
-        move || manager_wizard::stop_gateway(&data_dir)
-    })
-    .await
-    .map_err(|e| err(ApiError::Gateway(format!("gateway stop task failed: {e}"))))?
-    .map_err(|e| err(ApiError::Gateway(e)))?;
+    // Service mode: the SCM owns the gateway process; the pid-file
+    // stop would kill the service host's child out from under it.
+    let stopped = if state
+        .service_route_active(manager_services::GATEWAY_SERVICE_NAME)
+        .await
+    {
+        tokio::task::spawn_blocking(|| {
+            use manager_services::ServiceControl;
+            let control = manager_services::scm::platform_control();
+            control
+                .stop(manager_services::GATEWAY_SERVICE_NAME)
+                .map_err(|e| e.to_string())?;
+            for _ in 0..150 {
+                match control
+                    .query(manager_services::GATEWAY_SERVICE_NAME)
+                    .map_err(|e| e.to_string())?
+                    .state
+                {
+                    manager_services::ServiceState::Stopped
+                    | manager_services::ServiceState::NotInstalled => return Ok(true),
+                    _ => std::thread::sleep(std::time::Duration::from_millis(100)),
+                }
+            }
+            Err("gateway service did not stop within 15 s".to_string())
+        })
+        .await
+        .map_err(|e| err(ApiError::Gateway(format!("gateway stop task failed: {e}"))))?
+        .map_err(|e| err(ApiError::Gateway(e)))?
+    } else {
+        tokio::task::spawn_blocking({
+            let data_dir = data_dir.clone();
+            move || manager_wizard::stop_gateway(&data_dir)
+        })
+        .await
+        .map_err(|e| err(ApiError::Gateway(format!("gateway stop task failed: {e}"))))?
+        .map_err(|e| err(ApiError::Gateway(e)))?
+    };
     // The app-managed PostgreSQL server exists to serve the
     // gateway's database; stop it after the gateway so nothing is
     // left holding pooled connections to a stopping server.
@@ -5147,6 +5455,205 @@ async fn gateway_stop(state: State<'_, AppState>) -> ApiResult {
         watch.gateway_down_strikes = 0;
     }
     Ok(json!({ "ok": true, "stopped": stopped, "postgres_stopped": postgres_stopped }))
+}
+
+/// The service host shim's expected location: beside the app
+/// executable. Installed builds ship it there; a branch test build
+/// copies the cargo-built binary next to the app (see
+/// docs/windows-services-design.md).
+fn service_host_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("llm-service-host.exe")))
+        .unwrap_or_else(|| std::path::PathBuf::from("llm-service-host.exe"))
+}
+
+fn require_service_host() -> Result<std::path::PathBuf, ApiError> {
+    let host = service_host_path();
+    if host.exists() {
+        Ok(host)
+    } else {
+        Err(ApiError::Services(format!(
+            "llm-service-host.exe not found beside the app executable (expected {}); \
+             build it with `cargo build -p manager-services --bin llm-service-host` and place it there",
+            host.display()
+        )))
+    }
+}
+
+/// Supervision state for Settings: the mode, the resolved service
+/// account, shim presence, and every managed service's registration
+/// + SCM state.
+#[tauri::command]
+async fn services_list(state: State<'_, AppState>) -> ApiResult {
+    let cfg = state.config.read().await.clone();
+    let host = service_host_path();
+    let mut targets: Vec<(String, String)> = cfg
+        .backends
+        .iter()
+        .map(|b| (b.id.clone(), manager_services::backend_service_name(&b.id)))
+        .collect();
+    targets.push((
+        "gateway".to_string(),
+        manager_services::GATEWAY_SERVICE_NAME.to_string(),
+    ));
+    let queried = tokio::task::spawn_blocking(move || {
+        use manager_services::ServiceControl;
+        let control = manager_services::scm::platform_control();
+        targets
+            .into_iter()
+            .map(|(target, name)| {
+                let status = control.query(&name).ok();
+                (target, name, status)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let services: Vec<Value> = queried
+        .into_iter()
+        .map(|(target, name, status)| {
+            let live = status.as_ref().filter(|s| {
+                !matches!(s.state, manager_services::ServiceState::NotInstalled)
+            });
+            json!({
+                "target": target,
+                "service_name": name,
+                "registered": live.is_some(),
+                "state": live.map(|s| serde_json::to_value(s.state).unwrap_or(Value::Null)),
+                "pid": live.and_then(|s| s.pid),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "mode": serde_json::to_value(cfg.supervision.mode).unwrap_or(Value::Null),
+        "account": manager_services::scm::current_user_account(),
+        "host_path": host.display().to_string(),
+        "host_present": host.exists(),
+        "services": services,
+    }))
+}
+
+/// Register one service (`target`: a backend id, or "gateway").
+/// Builds the current definition, then runs the elevated helper
+/// (`llm-service-host register`) through the app's existing runas
+/// pattern; the account password reaches the helper through a
+/// transient credential the helper deletes (and this command
+/// overwrites afterwards either way).
+#[tauri::command]
+async fn services_register(
+    state: State<'_, AppState>,
+    target: String,
+    password: Option<String>,
+) -> ApiResult {
+    let host = require_service_host().map_err(err)?;
+    let cfg = state.config.read().await.clone();
+    let mut def = if target == "gateway" {
+        let launch = manager_wizard::steps::gateway_service_launch(&cfg, &state.data_dir);
+        manager_services::gateway_definition(
+            launch,
+            state.data_dir.join("logs").join("gateway.stdout.log"),
+            state.data_dir.join("logs").join("gateway.stderr.log"),
+            manager_wizard::gateway_pid_path(&state.data_dir),
+        )
+    } else {
+        if !cfg.backends.iter().any(|b| b.id == target) {
+            return Err(err(ApiError::NotFound(format!("backend {target}"))));
+        }
+        let path = state
+            .write_backend_service_definition(&target)
+            .await
+            .map_err(|e| err(ApiError::Services(e)))?;
+        manager_services::read_definition(&path)
+            .map_err(|e| err(ApiError::Services(e.to_string())))?
+    };
+    let account = manager_services::scm::current_user_account().ok_or_else(|| {
+        err(ApiError::Services(
+            "could not resolve the current user account for the service".to_string(),
+        ))
+    })?;
+    def.account = Some(account.clone());
+    let service_name = def.name.clone();
+    let def_path = manager_services::write_definition(&state.data_dir, &def)
+        .map_err(|e| err(ApiError::Services(e.to_string())))?;
+    let password = password.unwrap_or_default();
+    if !password.is_empty() {
+        <RealSystemOps as manager_wizard::SystemOps>::credential_write(
+            &RealSystemOps::default(),
+            manager_services::SERVICE_ACCOUNT_PASSWORD_CRED_TARGET,
+            &password,
+        )
+        .await
+        .map_err(|e| {
+            err(ApiError::Services(format!(
+                "could not stage the account password: {e}"
+            )))
+        })?;
+    }
+    let cmd = manager_wizard::PlannedCommand::new(vec![
+        host.display().to_string(),
+        "register".to_string(),
+        "--definition".to_string(),
+        def_path.display().to_string(),
+    ]);
+    let outcome =
+        <RealSystemOps as manager_wizard::SystemOps>::run_elevated(&RealSystemOps::default(), &cmd).await;
+    if !password.is_empty() {
+        // The helper deletes the credential on any run; if the
+        // elevation was declined the helper never ran, so clear the
+        // staged value here (an empty write reads back as absent).
+        let _ = <RealSystemOps as manager_wizard::SystemOps>::credential_write(
+            &RealSystemOps::default(),
+            manager_services::SERVICE_ACCOUNT_PASSWORD_CRED_TARGET,
+            "",
+        )
+        .await;
+    }
+    let out = outcome.map_err(|e| {
+        err(ApiError::Services(format!(
+            "elevated registration could not run (was the prompt declined?): {e}"
+        )))
+    })?;
+    if out.exit_code != 0 {
+        return Err(err(ApiError::Services(format!(
+            "registration of {service_name} failed (helper exit {}); see logs/service-manage.log in the data directory",
+            out.exit_code
+        ))));
+    }
+    Ok(json!({ "ok": true, "service_name": service_name, "account": account }))
+}
+
+/// Unregister one service (`target`: a backend id, or "gateway")
+/// through the elevated helper. The service returns to process
+/// supervision; its definition file is left in place.
+#[tauri::command]
+async fn services_unregister(_state: State<'_, AppState>, target: String) -> ApiResult {
+    let host = require_service_host().map_err(err)?;
+    let service_name = if target == "gateway" {
+        manager_services::GATEWAY_SERVICE_NAME.to_string()
+    } else {
+        manager_services::backend_service_name(&target)
+    };
+    let cmd = manager_wizard::PlannedCommand::new(vec![
+        host.display().to_string(),
+        "unregister".to_string(),
+        "--name".to_string(),
+        service_name.clone(),
+    ]);
+    let out = <RealSystemOps as manager_wizard::SystemOps>::run_elevated(&RealSystemOps::default(), &cmd)
+        .await
+        .map_err(|e| {
+            err(ApiError::Services(format!(
+                "elevated unregister could not run (was the prompt declined?): {e}"
+            )))
+        })?;
+    if out.exit_code != 0 {
+        return Err(err(ApiError::Services(format!(
+            "unregister of {service_name} failed (helper exit {})",
+            out.exit_code
+        ))));
+    }
+    Ok(json!({ "ok": true, "service_name": service_name }))
 }
 
 /// One-shot gateway liveness probe: connect to <host>:<port> with a
@@ -6906,6 +7413,9 @@ async fn placement_apply(
     drop(cfg);
     match outcome {
         Ok(()) => {
+            for bid in &backend_ids {
+                state.sync_backend_service_definition(bid).await;
+            }
             state
                 .finish_task(
                     &task_id,
@@ -8124,6 +8634,10 @@ fn main() {
                 state.restore_wizard().await;
                 state.hydrate_wizard().await;
                 state.persist_wizard().await;
+                // Heal the launch-routing flag for installs that
+                // completed setup without the Finish button (see
+                // reconcile_setup_completed).
+                state.reconcile_setup_completed().await;
             });
             // Optimize experiment startup sweep (Phase 5e):
             // terminate leftover temp backends from an app crash
@@ -8214,6 +8728,9 @@ fn main() {
             update_gateway_config,
             gateway_status,
             gateway_stop,
+            services_list,
+            services_register,
+            services_unregister,
             gateway_activation_plan,
             gateway_activation_cancel,
             gateway_activation_complete,

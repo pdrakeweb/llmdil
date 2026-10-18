@@ -574,6 +574,38 @@ pub trait SystemOps: Send + Sync {
     }
     /// Spawn a long-lived process (gateway); returns the pid.
     async fn spawn_detached(&self, cmd: &PlannedCommand) -> Result<u32, WizardError>;
+    /// Start a registered Windows service (service supervision mode;
+    /// see manager-services and docs/windows-services-design.md) and
+    /// return the pid of the service's child process — read from the
+    /// definition's pid file once the service host has written it, so
+    /// the gateway step's pid-based health checks work unchanged.
+    /// The definition file itself is written by the caller
+    /// (`manager_services::write_definition`) before this runs.
+    /// The default implementation is unsupported; the real one lives
+    /// in [`ops::RealSystemOps`] on Windows.
+    async fn service_start_gateway(
+        &self,
+        def: &manager_services::ServiceDefinition,
+    ) -> Result<u32, WizardError> {
+        Err(WizardError::IoError {
+            path: PathBuf::from("scm"),
+            reason: format!(
+                "service supervision is not supported by this system-ops implementation (service '{}')",
+                def.name
+            ),
+        })
+    }
+    /// Stop a registered Windows service and wait until it reaches
+    /// the stopped state. A service that is not registered is not an
+    /// error: there is nothing to stop.
+    async fn service_stop(&self, name: &str) -> Result<(), WizardError> {
+        Err(WizardError::IoError {
+            path: PathBuf::from("scm"),
+            reason: format!(
+                "service supervision is not supported by this system-ops implementation (service '{name}')"
+            ),
+        })
+    }
     /// Whether a process with `pid` is currently alive.
     fn process_alive(&self, pid: u32) -> bool;
     /// Terminate the process with `pid`. On Windows the whole process

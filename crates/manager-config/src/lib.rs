@@ -55,6 +55,13 @@ pub struct AppConfig {
     /// are managed state (the password lives in Credential Manager).
     #[serde(default)]
     pub postgres: PostgresConfig,
+    /// How backends and the gateway are supervised: directly spawned
+    /// processes (the default, unchanged behavior) or registered
+    /// Windows services driven through the SCM (feature branch
+    /// `feature/windows-services`; see docs/windows-services-design.md).
+    /// Absent in configurations written before the setting existed.
+    #[serde(default)]
+    pub supervision: SupervisionConfig,
     /// Per-component pin / auto-update toggles.
     pub updates: UpdatePolicy,
     pub notifications: NotificationConfig,
@@ -738,6 +745,31 @@ impl Default for PostgresConfig {
     }
 }
 
+/// How backends and the gateway are supervised. `Process` is the
+/// historical behavior: the app spawns and supervises child processes
+/// itself (manager-supervisor). `Service`: each backend and the
+/// gateway are registered as Windows services and lifecycle calls
+/// route to the SCM (manager-services); a service that is not
+/// registered still falls back to process supervision, so the mode is
+/// effectively per-service by registration state — see
+/// docs/windows-services-design.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SupervisionMode {
+    #[default]
+    Process,
+    Service,
+}
+
+/// Supervision settings. Defaults to process mode so configurations
+/// written before the feature — and every install that never opts
+/// in — behave exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SupervisionConfig {
+    #[serde(default)]
+    pub mode: SupervisionMode,
+}
+
 /// Per-component update pins and auto-update toggles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdatePolicy {
@@ -932,6 +964,7 @@ impl AppConfig {
                 model_id: None,
             },
             postgres: PostgresConfig::default(),
+            supervision: SupervisionConfig::default(),
             updates: UpdatePolicy {
                 components: HashMap::new(),
             },
@@ -2289,6 +2322,27 @@ mod tests {
             back.gateway.groups[0].strategy,
             RoutingStrategy::LatencyBased
         );
+    }
+
+    #[test]
+    fn supervision_defaults_to_process_mode() {
+        let cfg = AppConfig::default_config();
+        assert_eq!(cfg.supervision.mode, SupervisionMode::Process);
+        // Configs written before the setting existed parse as process mode.
+        let mut v = serde_json::to_value(&cfg).expect("serialize");
+        v.as_object_mut().expect("object").remove("supervision");
+        let back: AppConfig = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back.supervision.mode, SupervisionMode::Process);
+    }
+
+    #[test]
+    fn supervision_mode_round_trips() {
+        let mut cfg = AppConfig::default_config();
+        cfg.supervision.mode = SupervisionMode::Service;
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        assert!(json.contains(r#""supervision":{"mode":"service"}"#));
+        let back: AppConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.supervision.mode, SupervisionMode::Service);
     }
 
     #[test]

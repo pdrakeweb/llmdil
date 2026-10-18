@@ -23,8 +23,9 @@ import {
   getActivationPlan, activationCancelChanges, activationComplete, quiesceWait,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
   setNotificationConfig, sendTestNotification,
+  servicesList, servicesRegister, servicesUnregister, setSupervisionMode,
 } from "../api";
-import type { ActivationChange, ActivationPlanData, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
+import type { ActivationChange, ActivationPlanData, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, ServicesInfo } from "../api";
 import type { GpuInfo, WizardStepState } from "../types";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
@@ -4709,7 +4710,7 @@ function mxcActivityInner(activityR: { data: MxcActivityData | null; error?: str
   return `<div style="font-size:12px;color:var(--text2);margin:14px 0 6px">Recent activity</div>${mixBar}${rows}`;
 }
 
-type SettingsTab = "general" | "updates" | "notifications" | "mxc";
+type SettingsTab = "general" | "updates" | "notifications" | "mxc" | "supervision";
 
 interface SettingsUi {
   tab: SettingsTab;
@@ -4718,17 +4719,63 @@ interface SettingsUi {
   allOpen: boolean;
 }
 
-/** One Settings section, four tab views (principle 2) — page length
- *  is the longest tab, not the sum of four stacked cards. The
+/** One Settings section, five tab views (principle 2) — page length
+ *  is the longest tab, not the sum of five stacked cards. The
  *  Notifications tab renders only when notification settings
  *  exist. All narrative rides info-tips; empty blocks render
  *  nothing. */
+
+/** The Supervision card body: mode toggle, shim/account state, and
+ *  one row per managed service with its registration + SCM state and
+ *  Register/Unregister actions. Registration is the per-service
+ *  opt-in; the mode alone changes nothing until a service is
+ *  registered (docs/windows-services-design.md). */
+function supervisionInner(svcR: { data: ServicesInfo; error?: string; live: boolean }): string {
+  if (svcR.error) {
+    return `<div style="font-size:12px;color:var(--err)">Supervision unavailable — ${esc(svcR.error)}</div>`;
+  }
+  if (!svcR.live) {
+    return `<div style="font-size:12px;color:var(--text2)">Service supervision is available in the installed app.</div>`;
+  }
+  const info = svcR.data;
+  const mode = info.mode === "service" ? "service" : "process";
+  const rows: { key: string; value: string }[] = [
+    { key: "Service account", value: info.account ?? "—" },
+    { key: "Service host (llm-service-host.exe)", value: info.host_present ? info.host_path : `missing — expected at ${info.host_path}` },
+  ];
+  const svcRows = info.services.map((s) => {
+    const state = s.registered
+      ? (typeof s.state === "string" ? s.state : "unknown")
+      : "not registered";
+    const btn = s.registered
+      ? `<button class="btn" data-svc-unregister="${esc(s.target)}">Unregister</button>`
+      : `<button class="btn" data-svc-register="${esc(s.target)}" ${info.host_present ? "" : "disabled"}>Register</button>`;
+    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px">
+      <span>${esc(s.target === "gateway" ? "Gateway" : s.target)} <span style="color:var(--text3)">${esc(s.service_name)}</span></span>
+      <span style="display:flex;align-items:center;gap:10px"><span>${esc(state)}</span>${btn}</span></div>`;
+  }).join("");
+  const anyUnregistered = info.services.some((s) => !s.registered);
+  const pwdRow = anyUnregistered
+    ? `<div style="display:flex;align-items:center;gap:10px;margin-top:10px;font-size:12px">
+        <span class="k">Account password</span>
+        <input type="password" id="svcPwd" autocomplete="off" style="flex:1" placeholder="Windows password for ${esc(info.account ?? "the service account")}">
+      </div>
+      <div style="font-size:11px;color:var(--text3);margin-top:4px">Registration runs elevated (one UAC prompt per service). Windows stores the password as the service's logon credential; the app does not keep it.</div>`
+    : "";
+  return `${settingsRows(rows)}
+    <div class="card-actions">${["process", "service"].map((m) =>
+      `<button class="btn${mode === m ? " primary" : ""}" data-sup-mode="${m}">${m === "process" ? "Process" : "Service"}</button>`).join("")}</div>
+    <div style="margin-top:10px">${svcRows}</div>
+    ${pwdRow}`;
+}
+
 function settingsPaint(
   cfg: Record<string, unknown>,
   policyR: { data: MxcPolicyData | null; error?: string; live: boolean },
   activityR: { data: MxcActivityData | null; error?: string; live: boolean },
   selfTestHtml: string,
   ui: SettingsUi,
+  svcR: { data: ServicesInfo; error?: string; live: boolean },
 ): string {
   const notif = asRecord(cfg.notifications);
   const tabs: { id: SettingsTab; label: string }[] = [
@@ -4736,6 +4783,7 @@ function settingsPaint(
     { id: "updates", label: "Updates & diagnostics" },
     ...(notif ? [{ id: "notifications" as SettingsTab, label: "Notifications" }] : []),
     { id: "mxc", label: "MXC sandbox" },
+    { id: "supervision", label: "Supervision" },
   ];
   const tab = tabs.some((t) => t.id === ui.tab) ? ui.tab : "general";
 
@@ -4842,9 +4890,11 @@ function settingsPaint(
     <div id="mxcSelfTest">${selfTestHtml}</div>`;
   const mxcPanel = `${modeBlock}${mxcPolicyInner(policyR, ui.rulesFilter, ui.rulesOpen, policyFile)}${mxcActivityInner(activityR)}${selfTest}`;
 
+  const supervisionPanel = supervisionInner(svcR);
   const panel = tab === "general" ? generalPanel
     : tab === "updates" ? updatesPanel
     : tab === "notifications" ? notifPanel
+    : tab === "supervision" ? supervisionPanel
     : mxcPanel;
   return `<div class="card" style="margin-bottom:12px"><div class="sec-title">${icon("gear")} Settings</div>
     <div class="viewsel" role="tablist" style="margin-bottom:12px">${tabs.map((t) => `<button data-set-tab="${t.id}"${t.id === tab ? ` class="active"` : ""}>${t.label}</button>`).join("")}</div>
@@ -4876,7 +4926,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
   };
 
   const load = async (): Promise<void> => {
-    const [cfgR, polR, actR] = await Promise.all([getAppConfig(), getMxcPolicy(), getMxcActivity()]);
+    const [cfgR, polR, actR, svcR] = await Promise.all([getAppConfig(), getMxcPolicy(), getMxcActivity(), servicesList()]);
     if (disposed) return;
     setBanner(root, "setBanner", bannerHtml(cfgR));
     const b = root.querySelector("#setBody");
@@ -4891,7 +4941,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     lastNotif = asRecord(cfgR.data.notifications);
     // Policy/activity CallResults go in whole: their .error renders as
     // "unavailable — <error>", distinct from genuine absence.
-    b.innerHTML = settingsPaint(cfgR.data, polR, actR, selfTestHtml, setUi);
+    b.innerHTML = settingsPaint(cfgR.data, polR, actR, selfTestHtml, setUi, svcR);
   };
 
   const onClick = async (ev: Event): Promise<void> => {
@@ -5002,6 +5052,22 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       return;
     }
 
+    const supBtn = t.closest("[data-sup-mode]") as HTMLButtonElement | null;
+    if (supBtn) {
+      const m = supBtn.getAttribute("data-sup-mode") ?? "process";
+      supBtn.disabled = true;
+      const r = await setSupervisionMode(m);
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`Supervision mode change failed: ${r.error}`, true);
+        supBtn.disabled = false;
+        return;
+      }
+      setMsg(`Supervision mode set to ${m}.`);
+      await load();
+      return;
+    }
+
     const testBtn = t.closest("[data-notif-test]") as HTMLButtonElement | null;
     if (testBtn) {
       testBtn.disabled = true;
@@ -5010,6 +5076,45 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       if (disposed) return;
       if (r.error) setMsg(`Test notification failed: ${r.error}`, true);
       else setMsg("Test notification sent. If no toast appeared, check Windows notification settings for this app.");
+      return;
+    }
+
+    const regBtn = t.closest("[data-svc-register]") as HTMLButtonElement | null;
+    if (regBtn) {
+      const target = regBtn.getAttribute("data-svc-register") ?? "";
+      const pwd = (root.querySelector("#svcPwd") as HTMLInputElement | null)?.value ?? "";
+      if (!pwd) {
+        setMsg("Enter the account password before registering.", true);
+        return;
+      }
+      regBtn.disabled = true;
+      setMsg(`Registering ${target} — approve the elevation prompt…`);
+      const r = await servicesRegister(target, pwd);
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`Registration of ${target} failed: ${r.error}`, true);
+        regBtn.disabled = false;
+        return;
+      }
+      setMsg(`Registered ${r.data.service_name} as ${r.data.account}.`);
+      await load();
+      return;
+    }
+
+    const unregBtn = t.closest("[data-svc-unregister]") as HTMLButtonElement | null;
+    if (unregBtn) {
+      const target = unregBtn.getAttribute("data-svc-unregister") ?? "";
+      unregBtn.disabled = true;
+      setMsg(`Unregistering ${target} — approve the elevation prompt…`);
+      const r = await servicesUnregister(target);
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`Unregister of ${target} failed: ${r.error}`, true);
+        unregBtn.disabled = false;
+        return;
+      }
+      setMsg(`Unregistered ${r.data.service_name}; it returns to process supervision.`);
+      await load();
       return;
     }
 
