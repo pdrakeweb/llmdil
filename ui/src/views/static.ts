@@ -1098,9 +1098,41 @@ function ctxShort(n: number): string {
  *  on the GPU. Weights only — the KV cache is offload-independent
  *  and shown on the card. */
 function offloadFigures(o: BackendOffload, layers: number): { gpuMib: number; sysMib: number } {
-  const sysBytes = Math.floor((o.expert_bytes * layers) / o.moe_layers);
+  // Prefer the backend's true per-block pricing for this position
+  // (UD quants price blocks unevenly, so a uniform share disagrees
+  // with the backend card's RAM figures at partial positions); the
+  // uniform share is the fallback for older payloads without it.
+  const priced = Array.isArray(o.sys_bytes_by_position) ? o.sys_bytes_by_position[layers] : undefined;
+  const sysBytes = typeof priced === "number" && Number.isFinite(priced)
+    ? priced
+    : Math.floor((o.expert_bytes * layers) / o.moe_layers);
   const mib = (bytes: number): number => Math.ceil(bytes / 1048576);
   return { gpuMib: mib(o.total_bytes - sysBytes), sysMib: mib(sysBytes) };
+}
+
+/** True when a slider position is outside the guardrail's verified
+ *  set: the guardrail allows endpoints only and the position is
+ *  neither endpoint. Such a position is untested on this GPU;
+ *  saving it requires an explicit override. */
+function offloadIsUntested(o: BackendOffload, layers: number): boolean {
+  return o.guardrail?.allowed === "endpoints_only" && layers !== 0 && layers !== o.moe_layers;
+}
+
+/** The offload slider's layers label, naming the untested state
+ *  when the (draft) position is outside the verified set. */
+function offloadLayersLabel(o: BackendOffload, layers: number): string {
+  return offloadIsUntested(o, layers)
+    ? `${layers} of ${o.moe_layers} MoE layers \u2014 untested on this GPU`
+    : `${layers} of ${o.moe_layers} MoE layers`;
+}
+
+/** The offload slider's info-tip text. An untested draft position
+ *  gains a sentence naming the GPU architecture it is unverified
+ *  on and the override rule for saving it. */
+function offloadTipText(o: BackendOffload, layers: number): string {
+  const base = "Routed-expert weights for the first N MoE layers run from system RAM instead of the GPU, freeing GPU memory at some speed cost. Green is this model's catalog default \u2014 the most offload that stays fast; past it, CPU expert computation increasingly dominates generation speed. Figures are weights only; the KV cache stays on the GPU. The slider saves when released and applies on the backend's next start.";
+  if (!offloadIsUntested(o, layers) || !o.guardrail) return base;
+  return `${base} This position is outside the range verified for this model's GPU architecture (compute capability ${o.guardrail.compute_capability}): partial offload positions are not verified there, and saving requires an explicit override while starts without one are refused.`;
 }
 
 /** The flag tokens a slider position writes — the canonical forms
@@ -1119,13 +1151,33 @@ function offloadGradient(o: BackendOffload): string {
   return `linear-gradient(90deg, ${C.green} 0%, ${C.green} ${pct(o.green_end)}, ${C.amber} ${pct(o.green_end)}, ${C.amber} ${pct(o.yellow_end)}, ${C.red} ${pct(o.yellow_end)}, ${C.red} 100%)`;
 }
 
+/** The offload slider track's background. With an endpoints-only
+ *  guardrail the interior of the track (between the two endpoint
+ *  positions' half-step zones at each end) is unverified, so it
+ *  renders muted and hatched rather than in the green/yellow/red
+ *  band gradient: a hatch layer and a muted fill span the interior
+ *  (a centered span, so background-position 50% places it exactly),
+ *  with the normal band gradient retained underneath and visible
+ *  only at the endpoint zones. Without a guardrail the track is
+ *  exactly the band gradient. */
+function offloadTrackBackground(o: BackendOffload): string {
+  if (o.guardrail?.allowed !== "endpoints_only" || o.moe_layers <= 1) return offloadGradient(o);
+  const interior = (((o.moe_layers - 1) / o.moe_layers) * 100).toFixed(1);
+  const span = `center / ${interior}% 100% no-repeat`;
+  const hatch = `repeating-linear-gradient(45deg, rgba(232,235,240,0.30) 0 2px, rgba(18,21,26,0.30) 2px 4px) ${span}`;
+  const muted = `linear-gradient(90deg, #3a4350, #3a4350) ${span}`;
+  return `${hatch}, ${muted}, ${offloadGradient(o)}`;
+}
+
 /** Draft state for the in-card flags form, non-null only for the
  *  backend whose form is open. ctxMax/modelId describe the backend's
  *  model (its rated context from the catalog), for annotating
  *  presets beyond the rating. offloadLayers is the offload slider's
  *  draft position (MoE layers on system RAM), null when the
- *  backend's model is not offload-capable. */
-export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null }
+ *  backend's model is not offload-capable. offloadPendingLayers is
+ *  a released draft position the guardrail blocks, awaiting the
+ *  operator's override/snap decision in the form, else null. */
+export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null }
 
 /** State for the in-card Placement form (tensor split editing,
  *  moved here from the GPUs page — Pete's direction, 2026-10-16),
@@ -1333,6 +1385,46 @@ function backendCard(
           .map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
       </div>`
     : "";
+  // Offload guardrail and probe lines for the saved position
+  // (at rest, not the flags-form draft). Status colors follow the
+  // design principles: light red for blocked/failed, amber for
+  // transitional/warning, gray for the neutral custom spelling.
+  // Nothing renders when none of the states apply (principle 13).
+  // A blocked-and-unresolved position carries the one-click
+  // resolving action; a custom spelling in that same state reuses
+  // that button rather than duplicating it.
+  const offloadStatusHtml = (() => {
+    const o = b.offload;
+    const probe = b.offload_probe;
+    if (!o && !probe) return "";
+    const lines: string[] = [];
+    const line = (color: string, inner: string): string =>
+      `<div style="font-size:12px;color:${color};margin-top:6px">${inner}</div>`;
+    const g = o?.guardrail ?? null;
+    if (o && g?.status === "blocked" && !g.overridden) {
+      lines.push(line("#ff7b72", `Start blocked: offload ${o.layers} of ${o.moe_layers} layers is outside the verified range for this GPU <button class="btn" data-back-act="offload-set-verified" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Set to ${g.nearest_verified_layers} of ${o.moe_layers} layers</button>`));
+    } else if (o && g?.status === "blocked" && g.overridden) {
+      lines.push(line("#e3b341", `Offload override recorded: ${o.layers} of ${o.moe_layers} layers is unverified on this GPU`));
+    } else if (o && g?.status === "untested") {
+      lines.push(line("#e3b341", `Partial offload: unverified on this GPU`));
+    }
+    if (o?.custom) {
+      lines.push(line("var(--text2)", `Offload: Custom (${o.layers} of ${o.moe_layers} layers)`));
+    }
+    if (probe?.state === "probing") {
+      lines.push(line("#e3b341", o ? `Probing offload: ${probe.layers} of ${o.moe_layers} layers` : `Probing offload: ${probe.layers} layers`));
+    } else if (probe?.state === "failed") {
+      const detail = (probe.detail ?? "").trim();
+      const inner = !detail
+        ? "Offload probe failed"
+        : detail.length <= 120
+          ? `Offload probe failed \u2014 ${esc(detail)}`
+          : `Offload probe failed<span class="info-tip" title="${esc(detail)}">${icon("info")}</span>`;
+      lines.push(line("#ff7b72", inner));
+    }
+    // A passed probe is transient assurance, not card state: no line.
+    return lines.join("");
+  })();
   // The flags editor renders inside this card (Pete's request,
   // 2026-10-16): preset dropdowns built from the model's rated
   // context, with a Custom numeric input when the value is not a
@@ -1351,10 +1443,22 @@ function backendCard(
     const o = b.offload;
     const n = flags.offloadLayers ?? o.layers;
     const figs = offloadFigures(o, n);
+    // A released position the guardrail blocks is not committed:
+    // the form carries an inline decision row until the operator
+    // saves it with an override or snaps to the nearest verified
+    // position. Both actions are operation-critical, so both keep
+    // their words and an icon.
+    const pending = flags.offloadPendingLayers;
+    const decisionHtml = pending !== null && o.guardrail && offloadIsUntested(o, pending) ? `<div data-offload-decision style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+      <span data-offload-decision-text style="font-size:12px;color:#e3b341">${pending} of ${o.moe_layers} layers is unverified on this GPU</span>
+      <button class="btn" data-back-act="offload-override" data-back-id="${esc(b.id)}"${dis}>${icon("warn")} Save with override</button>
+      <button class="btn" data-back-act="offload-snap" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Snap to ${o.guardrail.nearest_verified_layers} of ${o.moe_layers} layers</button>
+    </div>` : "";
     return `<div style="margin-top:12px">
-      <label style="font-size:12px;color:var(--text2);display:block">Expert offload to system RAM — <span data-offload-layers-label>${n} of ${o.moe_layers} MoE layers</span><span class="info-tip" title="Routed-expert weights for the first N MoE layers run from system RAM instead of the GPU, freeing GPU memory at some speed cost. Green is this model's catalog default — the most offload that stays fast; past it, CPU expert computation increasingly dominates generation speed. Figures are weights only; the KV cache stays on the GPU. The slider saves when released and applies on the backend's next start.">${icon("info")}</span></label>
-      <input type="range" class="offload-range" min="0" max="${o.moe_layers}" step="1" value="${n}" data-offload-slider data-offload-backend="${esc(b.id)}" style="background:${offloadGradient(o)}" aria-label="Expert offload layers for ${esc(b.id)}"${dis}>
+      <label style="font-size:12px;color:var(--text2);display:block">Expert offload to system RAM — <span data-offload-layers-label>${esc(offloadLayersLabel(o, n))}</span><span class="info-tip" data-offload-tip title="${esc(offloadTipText(o, n))}">${icon("info")}</span></label>
+      <input type="range" class="offload-range" min="0" max="${o.moe_layers}" step="1" value="${n}" data-offload-slider data-offload-backend="${esc(b.id)}" style="background:${offloadTrackBackground(o)}" aria-label="Expert offload layers for ${esc(b.id)}"${dis}>
       <div style="font-size:12px;color:var(--text2);margin-top:4px"><span data-offload-token style="font-family:var(--mono)">${esc(offloadTokenText(o, n))}</span> · GPU weights: <span data-offload-gpu>${fmtGb(figs.gpuMib / 1024)}</span> GiB · System RAM: <span data-offload-sys>${fmtGb(figs.sysMib / 1024)}</span> GiB</div>
+      ${decisionHtml}
     </div>`;
   })() : "";
   const flagsHtml = flags ? `<div class="backend-form-panel flags-panel">
@@ -1500,6 +1604,7 @@ function backendCard(
       ${toolCallHtml}
       ${gpuHtml}
       ${statsHtml}
+      ${offloadStatusHtml}
       ${detailsHtml}
       ${flagsHtml}
       ${placeHtml}
@@ -1648,7 +1753,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       <div class="grid2">${sorted(sec.rows).map((row) => {
         const mdl = flagsFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const flagsArg: FlagsDraft | null = flagsFor === row.id
-          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers }
+          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers, offloadPendingLayers: offloadPending?.backendId === row.id ? offloadPending.layers : null }
           : null;
         const pmdl = placeFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const placeArg: PlaceCardState | null = placeFor === row.id
@@ -1754,6 +1859,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         for (const k of [...set]) if (!alive.has(k)) set.delete(k);
       }
       if (flagsFor !== null && !alive.has(flagsFor)) flagsFor = null;
+      if (offloadPending !== null && !alive.has(offloadPending.backendId)) offloadPending = null;
       if (placeFor !== null && !alive.has(placeFor)) { placeFor = null; placeProjection = null; }
     }
     // While the offload slider is focused (mid-drag), a repaint
@@ -1784,11 +1890,16 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
    *  layers on system RAM); null when the backend's model is not
    *  offload-capable. */
   let flagsOffloadLayers: number | null = null;
+  /** A released offload position the guardrail blocks, awaiting the
+   *  operator's decision in the flags form (save with override, or
+   *  snap to the nearest verified position); null otherwise. */
+  let offloadPending: { backendId: string; layers: number } | null = null;
   /** True while a slider commit (backend_set_offload) is in
    *  flight; the slider ignores further commits until it lands. */
   let offloadCommitting = false;
   const closeFlagsForm = (): void => {
     flagsFor = null;
+    offloadPending = null;
     paint();
   };
   const openFlagsForm = (row: BackendRow): void => {
@@ -1797,6 +1908,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     flagsCtx = row.n_ctx ?? 32768;
     flagsBatch = row.n_batch ?? 512;
     flagsOffloadLayers = row.offload ? row.offload.layers : null;
+    offloadPending = null;
     paint();
   };
   /** Keep the draft in step with the in-card form fields. Preset
@@ -1847,10 +1959,65 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       const el = card.querySelector(sel);
       if (el) el.textContent = txt;
     };
-    setText("[data-offload-layers-label]", `${n} of ${o.moe_layers} MoE layers`);
+    setText("[data-offload-layers-label]", offloadLayersLabel(o, n));
     setText("[data-offload-token]", offloadTokenText(o, n));
     setText("[data-offload-gpu]", fmtGb(figs.gpuMib / 1024));
     setText("[data-offload-sys]", fmtGb(figs.sysMib / 1024));
+    const tip = card.querySelector("[data-offload-tip]");
+    if (tip) tip.setAttribute("title", offloadTipText(o, n));
+    // Keep a pending guardrail decision in step with the draft:
+    // its text follows a still-blocked position, and the row hides
+    // while the draft sits on a verified position (the release
+    // handler re-decides from the final position).
+    if (offloadPending?.backendId === id) {
+      const dec = card.querySelector("[data-offload-decision]") as HTMLElement | null;
+      if (dec) {
+        if (offloadIsUntested(o, n)) {
+          offloadPending.layers = n;
+          dec.style.display = "";
+          const dt = dec.querySelector("[data-offload-decision-text]");
+          if (dt) dt.textContent = `${n} of ${o.moe_layers} layers is unverified on this GPU`;
+        } else {
+          dec.style.display = "none";
+        }
+      }
+    }
+  };
+  /** Invoke backend_set_offload for one position and report the
+   *  outcome on the card. An override save's message names the
+   *  override; any other save keeps the token-form message. On
+   *  error the message carries the server's error and the pending
+   *  decision (if any) is left for the caller to restore. Returns
+   *  true when the position was saved. */
+  const saveOffloadPosition = async (id: string, n: number, allowOverride: boolean): Promise<boolean> => {
+    if (offloadCommitting) return false;
+    const row = lastRows.find((r) => r.id === id);
+    offloadCommitting = true;
+    inFlight.add(id);
+    paint();
+    try {
+      const r = await setBackendOffload(id, n, allowOverride);
+      if (disposed) return false;
+      if (r.error) {
+        msgs.set(id, { text: `Offload not saved: ${r.error}`, err: true });
+        paint();
+        return false;
+      }
+      offloadPending = null;
+      if (flagsFor === id) flagsOffloadLayers = n;
+      msgs.set(id, {
+        text: allowOverride
+          ? "Offload saved with override \u2014 applies on next start."
+          : `Offload saved (${row?.offload ? offloadTokenText(row.offload, n) : n}) \u2014 applies on next start.`,
+        err: false,
+      });
+      await load();
+      return true;
+    } finally {
+      offloadCommitting = false;
+      inFlight.delete(id);
+      if (!disposed) paint();
+    }
   };
   const commitOffload = async (ev: Event): Promise<void> => {
     const t = ev.target as HTMLInputElement;
@@ -1860,22 +2027,19 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     if (!row?.offload || offloadCommitting) return;
     const n = Number(t.value);
     flagsOffloadLayers = n;
-    if (n === row.offload.layers) return; // released where it started
-    offloadCommitting = true;
-    try {
-      const r = await setBackendOffload(id, n);
-      if (disposed) return;
-      if (r.error) {
-        msgs.set(id, { text: `Offload not saved: ${r.error}`, err: true });
-        flagsOffloadLayers = row.offload.layers;
-        paint();
-      } else {
-        msgs.set(id, { text: `Offload saved (${offloadTokenText(row.offload, n)}) — applies on next start.`, err: false });
-        await load();
-      }
-    } finally {
-      offloadCommitting = false;
-      if (!disposed) paint();
+    if (n === row.offload.layers) { offloadPending = null; paint(); return; } // released where it started
+    // A guardrail-blocked position is NOT invoked: the form renders
+    // the override/snap decision row for it instead.
+    if (offloadIsUntested(row.offload, n)) {
+      offloadPending = { backendId: id, layers: n };
+      paint();
+      return;
+    }
+    const ok = await saveOffloadPosition(id, n, false);
+    if (!ok && !disposed) {
+      // A rejected commit reverts the draft to the saved position.
+      flagsOffloadLayers = row.offload.layers;
+      paint();
     }
   };
   root.addEventListener("input", syncOffloadDraft);
@@ -2233,6 +2397,45 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         flagsFor = null;
         await load();
       }
+      return;
+    }
+
+    if (act === "offload-override") {
+      // Save the pending guardrail-blocked position with an explicit
+      // override. A server error surfaces on the card and the
+      // decision row stays (the helper keeps the pending state and
+      // the draft), so the operator can still snap instead.
+      const pending = offloadPending?.backendId === id ? offloadPending : null;
+      if (!pending) return;
+      await saveOffloadPosition(id, pending.layers, true);
+      return;
+    }
+
+    if (act === "offload-snap") {
+      // Move the draft to the nearest verified position and save it
+      // without an override. On error the draft returns to the
+      // blocked position, keeping the decision row coherent.
+      const pending = offloadPending?.backendId === id ? offloadPending : null;
+      const row = lastRows.find((r) => r.id === id);
+      const target = row?.offload?.guardrail?.nearest_verified_layers;
+      if (!pending || !row?.offload || target === undefined) return;
+      flagsOffloadLayers = target;
+      const ok = await saveOffloadPosition(id, target, false);
+      if (!ok && !disposed) {
+        flagsOffloadLayers = pending.layers;
+        paint();
+      }
+      return;
+    }
+
+    if (act === "offload-set-verified") {
+      // The blocked card line's resolving action: save the nearest
+      // verified position (no override). On error the helper has
+      // already surfaced the message on the card.
+      const row = lastRows.find((r) => r.id === id);
+      const target = row?.offload?.guardrail?.nearest_verified_layers;
+      if (!row?.offload || target === undefined) return;
+      await saveOffloadPosition(id, target, false);
       return;
     }
 

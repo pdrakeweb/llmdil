@@ -376,6 +376,42 @@ pub fn memory_requirement(
     }
 }
 
+/// System-RAM weight bytes for every offload position
+/// `0..=moe_layers`: entry `n` is the byte total
+/// [`memory_requirement`] assigns to system RAM when the first
+/// `n` MoE layers' experts are offloaded
+/// ([`ExpertOffload::CpuMoeLayers`], resolved through
+/// [`offload_for_layers`] at the endpoints). Position 0 is 0 and
+/// position `moe_layers` is `expert_bytes`.
+///
+/// With per-block sums whose length matches `moe_layers`, entry
+/// `n` is the true prefix sum of the first `n` blocks — the same
+/// arithmetic `memory_requirement`'s `CpuMoeLayers` branch uses.
+/// Without them (or with a mismatched list) it is the uniform
+/// share `expert_bytes * n / moe_layers`, again mirroring that
+/// branch. Callers that render a per-position table (the offload
+/// slider's RAM figures, guardrail evaluation) read it from here
+/// so the numbers can never drift from the requirement itself.
+pub fn sys_bytes_by_position(
+    expert_bytes: u64,
+    expert_bytes_by_block: Option<&[u64]>,
+    moe_layers: u32,
+) -> Vec<u64> {
+    if moe_layers == 0 {
+        return vec![0];
+    }
+    let blocks = match expert_bytes_by_block {
+        Some(blocks) if blocks.len() == moe_layers as usize => Some(blocks),
+        _ => None,
+    };
+    (0..=moe_layers)
+        .map(|n| match blocks {
+            Some(blocks) => blocks[..n as usize].iter().sum(),
+            None => expert_bytes * n as u64 / moe_layers as u64,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,6 +838,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sys_bytes_by_position_agrees_with_memory_requirement_per_block() {
+        // The same non-uniform layout as the per-block pricing
+        // test: the position table must reproduce
+        // memory_requirement's system-RAM figure at every
+        // position, endpoints included — position 0 resolves
+        // through offload_for_layers to ExpertOffload::None and
+        // position 4 to AllExperts, not CpuMoeLayers.
+        let blocks: [u64; 4] = [20 * GIB, 10 * GIB, 6 * GIB, 4 * GIB];
+        let by_position = sys_bytes_by_position(40 * GIB, Some(&blocks), 4);
+        assert_eq!(by_position, vec![0, 20 * GIB, 30 * GIB, 36 * GIB, 40 * GIB]);
+        for n in 0..=4u32 {
+            let r = memory_requirement(
+                49 * GIB,
+                Some(40 * GIB),
+                Some(&blocks),
+                MemoryBasis::Exact,
+                offload_for_layers(n, 4),
+                None,
+                Some(4),
+                32_768,
+            );
+            assert_eq!(
+                mib(by_position[n as usize]),
+                r.sys_weights_mib,
+                "position {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn sys_bytes_by_position_agrees_with_memory_requirement_uniform() {
+        // No per-block sums: the uniform share, at every position.
+        let by_position = sys_bytes_by_position(40 * GIB, None, 4);
+        assert_eq!(by_position, vec![0, 10 * GIB, 20 * GIB, 30 * GIB, 40 * GIB]);
+        for n in 0..=4u32 {
+            let r = memory_requirement(
+                49 * GIB,
+                Some(40 * GIB),
+                None,
+                MemoryBasis::Exact,
+                offload_for_layers(n, 4),
+                None,
+                Some(4),
+                32_768,
+            );
+            assert_eq!(
+                mib(by_position[n as usize]),
+                r.sys_weights_mib,
+                "position {n}"
+            );
+        }
+        // A block list that does not match the MoE layer count
+        // falls back to the uniform share, like memory_requirement.
+        let blocks: [u64; 4] = [20 * GIB, 10 * GIB, 6 * GIB, 4 * GIB];
+        assert_eq!(
+            sys_bytes_by_position(40 * GIB, Some(&blocks[..3]), 4),
+            by_position
+        );
+        // No MoE layers: a single zero entry, no division by zero.
+        assert_eq!(sys_bytes_by_position(40 * GIB, None, 0), vec![0]);
     }
 
     #[test]
