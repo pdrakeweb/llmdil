@@ -187,7 +187,7 @@ fn normalize_change(kind: PlanKind, change: &Value) -> ChangeVerdict {
         PlanKind::GroupSetStrategy => &["strategy"],
         PlanKind::GroupSetFallbacks => &["fallbacks"],
         PlanKind::GroupCreate => &["members", "strategy", "fallbacks"],
-        PlanKind::ModelAdd => &["source_url", "quant", "sha256"],
+        PlanKind::ModelAdd => &["source_url", "quant", "sha256", "params_b"],
         PlanKind::Advice => &["text"],
     };
     // A field the mapping does not admit: the reasoning may be
@@ -341,6 +341,20 @@ fn normalize_change(kind: PlanKind, change: &Value) -> ChangeVerdict {
             if let Some(s) = opt_str(obj, "sha256", &mut ok) {
                 out.insert("sha256".into(), json!(s));
             }
+            // A positive parameter count, when the proposal knows
+            // it (a discovered candidate's real figure): the add's
+            // executor passes it through, since an unregistered
+            // non-catalog model has no other params_b source and
+            // model_add refuses to guess. A malformed or
+            // non-positive value is a schema failure.
+            if let Some(v) = obj.get("params_b") {
+                match v.as_f64() {
+                    Some(p) if p > 0.0 => {
+                        out.insert("params_b".into(), json!(p));
+                    }
+                    _ => return ChangeVerdict::Drop,
+                }
+            }
         }
         PlanKind::BackendDelete | PlanKind::GroupDelete | PlanKind::Advice => unreachable!(),
     }
@@ -403,6 +417,278 @@ fn assign_create_port(cfg: &AppConfig, assigned: &HashSet<u16>) -> u16 {
     (8081..=8999)
         .find(|p| !used.contains(p))
         .unwrap_or(8999)
+}
+
+/// One discovered candidate from the consultation's context
+/// document (the `candidates` block `build_context` assembled
+/// from the discovery pre-pass): a grounding source for
+/// new-model proposals that are neither registered nor catalog
+/// models (tracker #51).
+struct CandidateGrounding {
+    repo_id: String,
+    file: String,
+    params_b: f64,
+}
+
+/// The registration id derived for a discovered candidate: the
+/// quant file's stem, lowered to the catalog's id conventions
+/// (letters, digits, '.', '_', '-' kept; anything else becomes
+/// '-'). Deterministic, so the same candidate always derives
+/// the same id — in the context, in a proposal, and here.
+fn candidate_model_id(file: &str) -> String {
+    let stem = file.strip_suffix(".gguf").unwrap_or(file);
+    stem.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// A synthesized `model.add` item, built exactly as an authored
+/// one is normalized: fingerprint over kind + target + change,
+/// the denial-memory decision rule, the create's own confidence
+/// (the add exists to serve the create's proposal).
+fn chained_model_add(
+    target: &str,
+    change: Value,
+    rationale: String,
+    confidence: Confidence,
+    denied_fingerprints: &HashSet<String>,
+) -> PlanItem {
+    let fp = fingerprint(PlanKind::ModelAdd, Some(target), &change);
+    let previously_denied = denied_fingerprints.contains(&fp);
+    PlanItem {
+        id: 0,
+        fingerprint: fp,
+        kind: PlanKind::ModelAdd,
+        target: Some(target.to_string()),
+        change,
+        advice_text: None,
+        rationale,
+        expected_effect: "Model registered".to_string(),
+        confidence,
+        decision: if previously_denied {
+            Decision::Denied
+        } else {
+            Decision::Undecided
+        },
+        previously_denied,
+        apply_outcome: None,
+        apply_error: None,
+    }
+}
+
+/// Ground every `backend.create`'s model reference (tracker
+/// #51). Plan construction is the reliable layer for this rule —
+/// the prompt states it, but a local model can still invent a
+/// plausible model id (the field case: a create on
+/// `qwen3.8-27b-moe`, offered with an Accept button, invalid at
+/// validation, silently skipped at apply). For each create, in
+/// plan order:
+///
+/// - model registered → the create stands;
+/// - a `model.add` for the model already emitted (authored
+///   earlier, or chained for an earlier create) → stands;
+/// - an authored `model.add` for the model sits LATER in the
+///   plan → it is moved ahead of the create (validation and
+///   apply both run in plan order, so order is the defect);
+/// - model in the curated catalog → a `model.add` carrying the
+///   catalog entry's URL, quant, and hash is chained ahead;
+/// - model naming a discovered candidate (its repo id, its
+///   `repo/file`, or the id derived from its file) → a
+///   `model.add` carrying the candidate's concrete HF resolve
+///   URL and real `params_b` is chained ahead, and the create's
+///   `model_id` is rewritten to the derived registration id;
+/// - anything else → the create is EXCLUDED: recorded in the
+///   plan's `excluded_items` with its reason, and stated in the
+///   plan summary. Never silently dropped, never offered.
+///
+/// New-model proposals therefore only ever come from the
+/// catalog or the discovery results — never free invention.
+fn ground_create_models(
+    items: Vec<PlanItem>,
+    cfg: &AppConfig,
+    context: &Value,
+    denied_fingerprints: &HashSet<String>,
+    summary: &mut String,
+) -> (Vec<PlanItem>, Vec<crate::plan::ExcludedItem>) {
+    let registered: HashSet<&str> = cfg.models.iter().map(|m| m.id.as_str()).collect();
+    let catalog = manager_models::curated_models();
+    let candidates: Vec<CandidateGrounding> = context
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let repo_id = c.get("repo_id")?.as_str()?.to_string();
+                    let file = c.get("file")?.as_str()?.to_string();
+                    let params_b = c.get("params_b").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    Some(CandidateGrounding {
+                        repo_id,
+                        file,
+                        params_b,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut out: Vec<PlanItem> = Vec::new();
+    let mut excluded: Vec<crate::plan::ExcludedItem> = Vec::new();
+    // Model ids an already-emitted model.add registers.
+    let mut adds_available: HashSet<String> = HashSet::new();
+    let mut pending = items;
+    while !pending.is_empty() {
+        let item = pending.remove(0);
+        if item.kind == PlanKind::ModelAdd {
+            if let Some(t) = &item.target {
+                adds_available.insert(t.clone());
+            }
+            out.push(item);
+            continue;
+        }
+        if item.kind != PlanKind::BackendCreate {
+            out.push(item);
+            continue;
+        }
+        let target = item.target.clone().unwrap_or_default();
+        let model_id = item
+            .change
+            .get("model_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Registered, or an add already emitted registers it.
+        if registered.contains(model_id.as_str()) || adds_available.contains(&model_id) {
+            out.push(item);
+            continue;
+        }
+        // An authored add for this model sits later in the plan:
+        // move it ahead of the create.
+        if let Some(pos) = pending
+            .iter()
+            .position(|p| p.kind == PlanKind::ModelAdd && p.target.as_deref() == Some(model_id.as_str()))
+        {
+            let add = pending.remove(pos);
+            adds_available.insert(model_id.clone());
+            out.push(add);
+            out.push(item);
+            continue;
+        }
+        // A catalog model: chain its registration from the
+        // catalog entry itself (URL, quant, pinned hash).
+        if let Some(spec) = catalog.iter().find(|s| s.id == model_id) {
+            let mut change = json!({
+                "source_url": spec.url,
+                "quant": spec.quant,
+            });
+            if !spec.sha256.is_empty() {
+                change["sha256"] = json!(spec.sha256);
+            }
+            let add = chained_model_add(
+                &model_id,
+                change,
+                format!(
+                    "Registers the catalog model '{model_id}' ({}), chained by the app at plan build: the backend.create for '{target}' names it, and it is in the curated catalog but not yet registered.",
+                    spec.name
+                ),
+                item.confidence,
+                denied_fingerprints,
+            );
+            adds_available.insert(model_id.clone());
+            out.push(add);
+            out.push(item);
+            continue;
+        }
+        // A discovered candidate, named by repo, repo/file, or
+        // the derived registration id.
+        let candidate = candidates.iter().find(|c| {
+            model_id == c.repo_id
+                || model_id == format!("{}/{}", c.repo_id, c.file)
+                || model_id == candidate_model_id(&c.file)
+        });
+        if let Some(c) = candidate {
+            let derived = candidate_model_id(&c.file);
+            let mut item = item;
+            if !adds_available.contains(&derived) && !registered.contains(derived.as_str()) {
+                // An authored add for the derived id later in
+                // the plan serves the create: move it ahead.
+                if let Some(pos) = pending.iter().position(|p| {
+                    p.kind == PlanKind::ModelAdd && p.target.as_deref() == Some(derived.as_str())
+                }) {
+                    let add = pending.remove(pos);
+                    adds_available.insert(derived.clone());
+                    out.push(add);
+                } else {
+                    let mut change = json!({
+                        "source_url": format!(
+                            "{}/{}/resolve/main/{}",
+                            crate::discover::HF_DEFAULT_BASE_URL, c.repo_id, c.file
+                        ),
+                    });
+                    if c.params_b > 0.0 {
+                        change["params_b"] = json!(c.params_b);
+                    }
+                    let add = chained_model_add(
+                        &derived,
+                        change,
+                        format!(
+                            "Registers the discovered model '{}/{}' (Hugging Face discovery pre-pass for this consultation), chained by the app at plan build: the backend.create for '{target}' is grounded in it.",
+                            c.repo_id, c.file
+                        ),
+                        item.confidence,
+                        denied_fingerprints,
+                    );
+                    adds_available.insert(derived.clone());
+                    out.push(add);
+                }
+            }
+            // The create must name the id the add registers (or
+            // the already-registered model with that id): rewrite
+            // and re-fingerprint, as port assignment rewrites a
+            // create's port at parse.
+            if item
+                .change
+                .get("model_id")
+                .and_then(|v| v.as_str())
+                != Some(derived.as_str())
+            {
+                item.change["model_id"] = json!(derived);
+                item.fingerprint = fingerprint(
+                    PlanKind::BackendCreate,
+                    item.target.as_deref(),
+                    &item.change,
+                );
+                item.previously_denied = denied_fingerprints.contains(&item.fingerprint);
+                if item.previously_denied {
+                    item.decision = Decision::Denied;
+                }
+            }
+            out.push(item);
+            continue;
+        }
+        // Ungroundable: exclude, record, and state it in the
+        // summary — the operator sees what was refused and why.
+        let reason = format!(
+            "model '{model_id}' is not registered, is not in the catalog, and was not among the models discovered for this consultation, so a backend on it can never be created"
+        );
+        if !summary.is_empty() {
+            summary.push(' ');
+        }
+        summary.push_str(&format!(
+            "Excluded at plan build: backend.create '{target}' names {reason}."
+        ));
+        excluded.push(crate::plan::ExcludedItem {
+            kind: PlanKind::BackendCreate,
+            target: item.target.clone(),
+            reason,
+        });
+    }
+    (out, excluded)
 }
 
 /// Parse the sibling `experiments` array (addendum A.3) with
@@ -767,6 +1053,16 @@ pub fn parse_plan(
         }
     }
 
+    // Ground every backend.create's model reference (tracker
+    // #51): chain the model.add that registers an unregistered
+    // catalog or discovered model ahead of its create, and
+    // exclude a create whose model resolves to neither —
+    // recorded on the plan and stated in the summary.
+    let mut summary = summary;
+    let (items, excluded_items) =
+        ground_create_models(items, cfg, &context, denied_fingerprints, &mut summary);
+    let mut items = items;
+
     let truncated = items.len().saturating_sub(MAX_ITEMS);
     items.truncate(MAX_ITEMS);
     for (i, item) in items.iter_mut().enumerate() {
@@ -785,6 +1081,7 @@ pub fn parse_plan(
         experiments_dropped_invalid,
         experiments_truncated,
         items,
+        excluded_items,
         consulted_backend: consulted_backend.to_string(),
         created_at: now.to_rfc3339(),
         config_hash: config_hash.to_string(),
@@ -1041,5 +1338,205 @@ mod tests {
         assert_eq!(r.items.len(), 25);
         assert_eq!(r.truncated, 5);
         assert_eq!(r.items[24].id, 25);
+    }
+
+    // ---- Tracker #51: grounding backend.create model references.
+
+    /// A config that validates cleanly with exactly one registered
+    /// model — the same trim validate.rs's tests use, since
+    /// default_config() alone does not pass whole-config
+    /// validation (its backends reference unregistered files).
+    fn cfg_one_model() -> AppConfig {
+        let mut cfg = AppConfig::default_config();
+        cfg.backends.retain(|b| b.id == "tool-runner");
+        cfg.gateway.groups = vec![manager_config::ModelGroup {
+            name: "tool-runner".to_string(),
+            members: vec!["tool-runner".to_string()],
+            strategy: manager_config::RoutingStrategy::SimpleShuffle,
+            fallbacks: Vec::new(),
+            purpose: String::new(),
+        }];
+        cfg.models.push(manager_config::ModelConfig {
+            id: "qwen3-8b".to_string(),
+            gguf_path: std::path::PathBuf::from("models/qwen3-8b.gguf"),
+            quant: "Q4_K_M".to_string(),
+            params_b: 8.0,
+            sha256: String::new(),
+            verified_at: None,
+            verified_sha256: None,
+            source_url: String::new(),
+            assigned_backends: vec!["tool-runner".to_string()],
+            enabled: true,
+            display_name: None,
+        });
+        cfg.backends[0].model_file = std::path::PathBuf::from("models/qwen3-8b.gguf");
+        cfg
+    }
+
+    fn parse_with(
+        response: &str,
+        cfg: &AppConfig,
+        context: Value,
+    ) -> Result<Plan, ParseError> {
+        parse_plan(
+            response,
+            cfg,
+            "planner",
+            "hash",
+            context,
+            &HashSet::new(),
+            "",
+            Utc::now(),
+        )
+    }
+
+    #[test]
+    fn create_on_unregistered_catalog_model_chains_model_add() {
+        // (a) A backend proposed on a catalog model that is not
+        // registered: the plan chains the catalog's model.add
+        // AHEAD of the create, and both validate as actionable.
+        let cfg = cfg_one_model();
+        let r = parse_with(
+            "{\"summary\":\"s\",\"items\":[{\"kind\":\"backend.create\",\"target\":\"planner-alt\",\"change\":{\"model_id\":\"qwen3-27b-planner\",\"port\":8090,\"n_ctx\":32768},\"rationale\":\"r\",\"confidence\":\"medium\"}]}",
+            &cfg,
+            json!({}),
+        )
+        .unwrap();
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.items[0].kind, PlanKind::ModelAdd);
+        assert_eq!(r.items[0].target.as_deref(), Some("qwen3-27b-planner"));
+        assert_eq!(r.items[1].kind, PlanKind::BackendCreate);
+        assert_eq!(r.items[1].target.as_deref(), Some("planner-alt"));
+        assert!(r.excluded_items.is_empty());
+        // The chained add carries the catalog entry's own facts.
+        let spec = manager_models::curated_models()
+            .into_iter()
+            .find(|s| s.id == "qwen3-27b-planner")
+            .expect("catalog carries the planner model");
+        assert_eq!(
+            r.items[0].change["source_url"].as_str(),
+            Some(spec.url.as_str())
+        );
+        assert_eq!(r.items[0].change["quant"].as_str(), Some(spec.quant.as_str()));
+        if !spec.sha256.is_empty() {
+            assert_eq!(
+                r.items[0].change["sha256"].as_str(),
+                Some(spec.sha256.as_str())
+            );
+        }
+        // Both items validate actionable against the live
+        // snapshot: the add carries the standing model.add
+        // warning, the create is valid — in plan order.
+        let live = crate::validate::LiveSnapshot {
+            layouts: std::collections::HashMap::new(),
+            free_vram_mib_per_gpu: vec![16384, 16384],
+            backend_running: std::collections::HashMap::new(),
+        };
+        let verdicts = crate::validate::validate_plan(&r, &cfg, &live);
+        assert_eq!(verdicts.len(), 2);
+        assert_eq!(
+            verdicts[0].status,
+            crate::validate::ValidationStatus::Warning,
+            "chained model.add verdict: {:?}",
+            verdicts[0].reason
+        );
+        assert_eq!(
+            verdicts[1].status,
+            crate::validate::ValidationStatus::Valid,
+            "chained backend.create verdict: {:?}",
+            verdicts[1].reason
+        );
+    }
+
+    #[test]
+    fn create_on_invented_model_is_excluded_with_reason() {
+        // (b) Pete's field case: a backend proposed on a model
+        // that is registered nowhere, in no catalog, and was not
+        // discovered. The create is excluded at plan build with
+        // the reason recorded and stated in the summary; the
+        // remaining valid item survives.
+        let r = parse(
+            "{\"summary\":\"Plan.\",\"items\":[{\"kind\":\"backend.create\",\"target\":\"planner-moe\",\"change\":{\"model_id\":\"qwen3.8-27b-moe\",\"port\":8087,\"n_ctx\":32768,\"offload_layers\":24,\"tensor_split\":[1.0,0.0]},\"rationale\":\"r\",\"confidence\":\"low\"},{\"kind\":\"backend.set_context\",\"target\":\"planner\",\"change\":{\"n_ctx\":131072},\"rationale\":\"r\"}]}",
+        )
+        .unwrap();
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].kind, PlanKind::BackendSetContext);
+        assert_eq!(r.excluded_items.len(), 1);
+        assert_eq!(r.excluded_items[0].kind, PlanKind::BackendCreate);
+        assert_eq!(r.excluded_items[0].target.as_deref(), Some("planner-moe"));
+        assert!(
+            r.excluded_items[0].reason.contains("qwen3.8-27b-moe"),
+            "reason names the model: {}",
+            r.excluded_items[0].reason
+        );
+        assert!(
+            r.summary.contains("planner-moe") && r.summary.contains("qwen3.8-27b-moe"),
+            "summary states the exclusion: {}",
+            r.summary
+        );
+        // The exclusion survives plan persistence (the field is
+        // part of the plan document, not a parse-time side note).
+        let round = serde_json::to_string(&r).unwrap();
+        let back: Plan = serde_json::from_str(&round).unwrap();
+        assert_eq!(back.excluded_items.len(), 1);
+    }
+
+    #[test]
+    fn create_on_discovered_candidate_chains_concrete_add() {
+        // (c) The consultation grounded the model in the HF
+        // discovery pre-pass: the chained add carries the
+        // candidate's concrete repo/file and real params_b, and
+        // the create is rewritten to the derived registration id.
+        let context = json!({
+            "candidates": [{
+                "repo_id": "someorg/Qwen3.8-27B-MoE-GGUF",
+                "file": "Qwen3.8-27B-MoE-Q4_K_M.gguf",
+                "params_b": 27.0,
+                "quant": "Q4_K_M"
+            }]
+        });
+        let r = parse_with(
+            "{\"items\":[{\"kind\":\"backend.create\",\"target\":\"planner-moe\",\"change\":{\"model_id\":\"someorg/Qwen3.8-27B-MoE-GGUF/Qwen3.8-27B-MoE-Q4_K_M.gguf\",\"port\":8087,\"n_ctx\":32768},\"rationale\":\"r\"}]}",
+            &AppConfig::default_config(),
+            context,
+        )
+        .unwrap();
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.items[0].kind, PlanKind::ModelAdd);
+        assert_eq!(
+            r.items[0].target.as_deref(),
+            Some("qwen3.8-27b-moe-q4_k_m")
+        );
+        assert_eq!(
+            r.items[0].change["source_url"].as_str(),
+            Some("https://huggingface.co/someorg/Qwen3.8-27B-MoE-GGUF/resolve/main/Qwen3.8-27B-MoE-Q4_K_M.gguf")
+        );
+        assert_eq!(r.items[0].change["params_b"].as_f64(), Some(27.0));
+        assert_eq!(r.items[1].kind, PlanKind::BackendCreate);
+        assert_eq!(
+            r.items[1].change["model_id"].as_str(),
+            Some("qwen3.8-27b-moe-q4_k_m")
+        );
+        assert!(r.excluded_items.is_empty());
+    }
+
+    #[test]
+    fn authored_model_add_after_its_create_is_relocated() {
+        // (d) The consultant authored both items but in the wrong
+        // order: the add moves ahead of the create, unchanged,
+        // and no second add is chained.
+        let r = parse(
+            "{\"items\":[{\"kind\":\"backend.create\",\"target\":\"planner-alt\",\"change\":{\"model_id\":\"qwen3-27b-planner\",\"port\":8090},\"rationale\":\"r\"},{\"kind\":\"model.add\",\"target\":\"qwen3-27b-planner\",\"change\":{\"source_url\":\"https://example.com/Qwen3-27B-Planner.gguf\",\"quant\":\"Q4_K_M\"},\"rationale\":\"register it\"}]}",
+        )
+        .unwrap();
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.items[0].kind, PlanKind::ModelAdd);
+        assert_eq!(
+            r.items[0].change["source_url"].as_str(),
+            Some("https://example.com/Qwen3-27B-Planner.gguf"),
+            "the authored add is the one relocated, not a chained copy"
+        );
+        assert_eq!(r.items[1].kind, PlanKind::BackendCreate);
+        assert!(r.excluded_items.is_empty());
     }
 }

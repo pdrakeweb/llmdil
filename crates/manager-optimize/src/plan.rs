@@ -210,6 +210,22 @@ pub struct PlanItem {
     pub apply_error: Option<String>,
 }
 
+/// A plan item excluded at parse because a reference in it could
+/// not be grounded (tracker #51): a `backend.create` whose model
+/// is neither registered, nor in the curated catalog, nor among
+/// the consultation's discovered candidates can never apply, so
+/// plan building removes it instead of offering it as a dead end.
+/// The exclusion is recorded here and stated in the plan summary
+/// — never a silent drop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExcludedItem {
+    pub kind: PlanKind,
+    /// The excluded item's target (for a create, the backend id).
+    pub target: Option<String>,
+    /// Why the item was excluded, in operator terms.
+    pub reason: String,
+}
+
 /// One consultation's plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
@@ -247,6 +263,12 @@ pub struct Plan {
     /// Hash of the configuration the plan was generated against;
     /// compared at apply time to detect drift (design §5.1).
     pub config_hash: String,
+    /// Items excluded at parse for ungroundable references
+    /// (tracker #51): each entry names the item and the reason,
+    /// and the plan summary states them. Serde-defaulted so plan
+    /// files written before this field stay readable.
+    #[serde(default)]
+    pub excluded_items: Vec<ExcludedItem>,
     /// Items dropped at parse for schema failures (design §4).
     pub dropped_invalid: usize,
     /// Items cut by the 25-item cap (design §4).

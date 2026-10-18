@@ -723,14 +723,20 @@ fn validate_one(
                     .map(|q| q.to_string())
                     .filter(|q| !q.is_empty())
                     .unwrap_or_else(|| "unknown".to_string()),
-                // The real model_add stores 0.0 when no figure is
-                // known and saves without validating — which
-                // leaves the config failing validate()'s
-                // params_b > 0 rule (a pre-existing discrepancy
-                // this simulation surfaces). The sim uses a
-                // positive placeholder: the item's validity is
-                // about the add itself, not that defect.
-                params_b: 1.0,
+                // The real model_add resolves the figure from
+                // the item, the catalog, or the source URL
+                // (tracker #32) and refuses to guess. The sim
+                // mirrors that: the item's own params_b when it
+                // carries a positive one (a discovery-chained
+                // add does), else a positive placeholder — the
+                // item's validity is about the add itself.
+                params_b: item
+                    .change
+                    .get("params_b")
+                    .and_then(|v| v.as_f64())
+                    .filter(|p| *p > 0.0)
+                    .map(|p| p as f32)
+                    .unwrap_or(1.0),
                 sha256: String::new(),
                 verified_at: None,
                 verified_sha256: None,
@@ -832,6 +838,7 @@ mod tests {
             experiments_dropped_invalid: 0,
             experiments_truncated: 0,
             items,
+            excluded_items: Vec::new(),
             consulted_backend: "planner".to_string(),
             created_at: String::new(),
             config_hash: String::new(),

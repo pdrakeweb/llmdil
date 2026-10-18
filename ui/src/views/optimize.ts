@@ -326,6 +326,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     const destructive = accepted.filter((i) => eligible(i) && optimizeIsDestructive(i.kind));
     const notes: string[] = [];
     if (plan.dropped_invalid > 0) notes.push(`${plan.dropped_invalid} item${plan.dropped_invalid === 1 ? " was" : "s were"} dropped as invalid`);
+    if (plan.excluded_items?.length) notes.push(`${plan.excluded_items.length} item${plan.excluded_items.length === 1 ? " was" : "s were"} excluded at plan build — see summary`);
     if (plan.truncated > 0) notes.push(`${plan.truncated} item${plan.truncated === 1 ? "" : "s"} cut by the 25-item cap`);
     return `<div class="card">
       <div class="opt-plan-head">
@@ -873,7 +874,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         return;
       }
       case "model.add": {
-        unwrap(await modelAdd(target, str("source_url"), undefined, typeof c.quant === "string" ? (c.quant as string) : undefined));
+        unwrap(await modelAdd(target, str("source_url"), undefined, typeof c.quant === "string" ? (c.quant as string) : undefined, typeof c.params_b === "number" ? (c.params_b as number) : undefined));
         return;
       }
       default:
