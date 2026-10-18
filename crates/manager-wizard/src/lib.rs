@@ -1226,6 +1226,27 @@ pub fn gateway_config_is_current(
     if normalize_gateway_yaml(&generated) != normalize_gateway_yaml(&on_disk) {
         return false;
     }
+    // The routing callback file is a second generated artifact
+    // (routing-rules design §6.3): rule changes can alter it without
+    // altering the YAML (a window or reserve change leaves the YAML
+    // keys untouched), so it is byte-compared too — present and
+    // equal when a typed rule is enabled, absent when none is.
+    let routing_path = data_dir.join("gateway").join("llmdil_routing.py");
+    match manager_gateway::generate_routing_callback(&filtered) {
+        Some(expected) => {
+            let Ok(disk_py) = std::fs::read_to_string(&routing_path) else {
+                return false;
+            };
+            if normalize_gateway_yaml(&expected) != normalize_gateway_yaml(&disk_py) {
+                return false;
+            }
+        }
+        None => {
+            if routing_path.exists() {
+                return false;
+            }
+        }
+    }
     let Ok(state_text) = std::fs::read_to_string(gateway_spawn_state_path(data_dir)) else {
         return false;
     };
@@ -2355,6 +2376,83 @@ mod tests {
         off.mcp.searxng.enabled = false;
         let fp_off = gateway_spawn_fingerprint(&off, true, Some("sk-master"), None, &armed);
         assert!(!gateway_config_is_current(&off, &dir, &fp_off, |_| true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn routing_rule_change_registers_as_gateway_drift() {
+        // The routing callback is a second generated artifact
+        // (routing-rules design §6.3): a rule-table change that
+        // leaves the YAML untouched must still read as drift, and
+        // a stale callback file with no enabled rule must too.
+        let dir = std::env::temp_dir().join(format!("wizard-gw-routing-{}", std::process::id()));
+        let gw_dir = dir.join("gateway");
+        std::fs::create_dir_all(&gw_dir).unwrap();
+        let mut cfg = manager_config::AppConfig::default_config();
+        for b in cfg.backends.iter_mut() {
+            b.enabled = true;
+        }
+        cfg.gateway.routing_rules.push(manager_config::RoutingRule {
+            id: "context-overflow".to_string(),
+            description: "test".to_string(),
+            enabled: true,
+            kind: Some(manager_config::RoutingRuleKind::ContextOverflow {
+                target_group: "planner".to_string(),
+                optimal_fraction: 0.5,
+                optimal_tokens: None,
+                output_reserve_tokens: 1024,
+                advisory: true,
+            }),
+            litellm_fragment: None,
+            source: "user".to_string(),
+        });
+        let armed = armed_gateway_mcp_servers(&cfg, |_| true);
+        let filtered = config_with_armed_gateway_mcp_servers(&cfg, |_| true);
+        let yaml = manager_gateway::generate_config_yaml(&filtered).unwrap();
+        let py = manager_gateway::generate_routing_callback(&filtered)
+            .expect("callback for an enabled rule");
+        std::fs::write(gw_dir.join("config.yaml"), &yaml).unwrap();
+        std::fs::write(gw_dir.join("llmdil_routing.py"), &py).unwrap();
+        let fp = gateway_spawn_fingerprint(&cfg, true, Some("sk-master"), None, &armed);
+        std::fs::write(
+            gateway_spawn_state_path(&dir),
+            gateway_spawn_state_json(&fp, &yaml, None),
+        )
+        .unwrap();
+        assert!(gateway_config_is_current(&cfg, &dir, &fp, |_| true));
+
+        // Change only a table value (the output reserve): the YAML
+        // is byte-identical, the callback differs — drift.
+        let mut changed = cfg.clone();
+        if let Some(manager_config::RoutingRuleKind::ContextOverflow {
+            output_reserve_tokens,
+            ..
+        }) = &mut changed.gateway.routing_rules[0].kind
+        {
+            *output_reserve_tokens = 4096;
+        }
+        let filtered_changed = config_with_armed_gateway_mcp_servers(&changed, |_| true);
+        assert_eq!(
+            manager_gateway::generate_config_yaml(&filtered_changed).unwrap(),
+            yaml,
+            "the reserve change must not alter the YAML for this test to prove its point"
+        );
+        let armed_changed = armed_gateway_mcp_servers(&changed, |_| true);
+        let fp_changed =
+            gateway_spawn_fingerprint(&changed, true, Some("sk-master"), None, &armed_changed);
+        assert!(!gateway_config_is_current(&changed, &dir, &fp_changed, |_| true));
+
+        // Disabling the rule while the file remains: drift.
+        let mut off = cfg.clone();
+        off.gateway.routing_rules[0].enabled = false;
+        let armed_off = armed_gateway_mcp_servers(&off, |_| true);
+        let fp_off = gateway_spawn_fingerprint(&off, true, Some("sk-master"), None, &armed_off);
+        assert!(!gateway_config_is_current(&off, &dir, &fp_off, |_| true));
+
+        // A callback file that no longer matches its own config
+        // (hand-edited / stale): drift.
+        std::fs::write(gw_dir.join("llmdil_routing.py"), "# tampered\n").unwrap();
+        assert!(!gateway_config_is_current(&cfg, &dir, &fp, |_| true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -4571,6 +4571,43 @@ impl WizardStep for StartGateway {
                     .with_manual_command(manual));
                 }
                 log.push(format!("wrote {}", cfg_path.display()));
+                // The context-overflow routing callback
+                // (routing-rules design §6.3) ships as a generated
+                // sibling the config's `callbacks:` entry resolves
+                // config-directory-relative. Written when a typed
+                // rule is enabled; a stale copy is removed when not,
+                // so disabling the rule restores exactly the
+                // pre-feature gateway directory.
+                let routing_path = ctx.data_dir.join("gateway").join("llmdil_routing.py");
+                match manager_gateway::generate_routing_callback(&generation_config) {
+                    Some(callback_py) => {
+                        if let Err(e) =
+                            ctx.ops.write_file(&routing_path, callback_py.as_bytes()).await
+                        {
+                            return Ok(StepOutcome::failed(
+                                format!(
+                                    "could not write the gateway routing callback {}: {e}",
+                                    routing_path.display()
+                                ),
+                                log,
+                            )
+                            .with_manual_command(manual));
+                        }
+                        log.push(format!("wrote {}", routing_path.display()));
+                    }
+                    None => {
+                        if let Err(e) = ctx.ops.remove_file(&routing_path).await {
+                            return Ok(StepOutcome::failed(
+                                format!(
+                                    "could not remove the stale gateway routing callback {}: {e}",
+                                    routing_path.display()
+                                ),
+                                log,
+                            )
+                            .with_manual_command(manual));
+                        }
+                    }
+                }
                 // Restart = stop the recorded gateway first; without
                 // this the spawn below is a duplicate that fails to
                 // bind while the old process keeps serving.
