@@ -1,6 +1,6 @@
 [package]
 name = "manager-app"
-version = "0.1.35"
+version = "0.1.36"
 edition = "2021"
 
 # Service core extracted from src-tauri (admin API plan, phase 0).
