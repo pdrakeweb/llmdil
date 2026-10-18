@@ -6780,6 +6780,7 @@ pub async fn op_mcp_list(
                 url: cfg.url.clone(),
                 env_keys: cfg.env_keys.clone(),
                 cred_ref: cfg.cred_ref.clone(),
+                signup_url: mcp_signup_url(cfg),
                 allowed_tools: cfg.allowed_tools.clone(),
                 metered: cfg.metered,
                 rpm_limit: cfg.rpm_limit,
@@ -6802,6 +6803,66 @@ pub async fn op_mcp_list(
     Ok(serde_json::to_value(&entries)?)
 }
 
+
+/// The registration / API-key page for a server's credential:
+/// its own stored `signup_url` when set, else the curated seed
+/// entry's for the same id — configurations seeded before the
+/// field existed carry the curated servers without it, and they
+/// must still surface the link.
+fn mcp_signup_url(server: &manager_config::McpServerConfig) -> Option<String> {
+    server
+        .signup_url
+        .clone()
+        .filter(|u| !u.trim().is_empty())
+        .or_else(|| {
+            manager_config::curated_mcp_servers()
+                .into_iter()
+                .find(|c| c.id == server.id)
+                .and_then(|c| c.signup_url)
+        })
+}
+
+/// The Gateway-exposed MCP servers a gateway start would omit for
+/// want of a credential (Pete, 2026-10-18): the data behind the
+/// start-gateway credential prompt. Each entry is a server that
+/// declares env keys and names a credential target, where the
+/// target is absent from Credential Manager — storing it (via
+/// `mcp_store_credential`) before the start makes the start's
+/// arming pass include the server in that same start; skipping
+/// leaves it out, which is the start's standing behavior.
+/// Desktop-only by design: non-interactive starts (service mode,
+/// supervision, the REST activation apply) never consult this —
+/// they omit unarmed servers silently, as before.
+pub async fn op_mcp_start_preflight(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+) -> ApiResult {
+    let cfg = state.config.read().await.clone();
+    let presence = mcp_credential_presence(&[&cfg]).await;
+    let servers: Vec<Value> = cfg
+        .mcp
+        .servers
+        .iter()
+        .filter(|s| {
+            s.exposure == manager_config::McpExposure::Gateway && !s.env_keys.is_empty()
+        })
+        .filter_map(|s| {
+            let cred_ref = s.cred_ref.as_deref().filter(|r| !r.is_empty())?;
+            if presence.contains(cred_ref) {
+                return None;
+            }
+            Some(json!({
+                "id": s.id,
+                "display_name": s.display_name,
+                "cred_ref": cred_ref,
+                "env_keys": s.env_keys,
+                "signup_url": mcp_signup_url(s),
+                "metered": s.metered,
+            }))
+        })
+        .collect();
+    Ok(json!({ "servers": servers }))
+}
 
 /// Check whether a Windows Credential Manager target exists.
 /// Presence only — the value is never read. Off Windows, always false.
@@ -7271,6 +7332,51 @@ mod tests {
         let mut cfg = AppConfig::default_config();
         cfg.data_dir = PathBuf::from("/data");
         cfg
+    }
+
+    #[test]
+    fn mcp_signup_url_prefers_stored_then_curated_seed() {
+        let cfg = test_cfg();
+        let brave = cfg
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.id == "brave_search")
+            .expect("default config seeds brave_search");
+        // The seeded entry carries the curated URL itself.
+        assert_eq!(
+            mcp_signup_url(brave).as_deref(),
+            Some(manager_config::BRAVE_SEARCH_SIGNUP_URL)
+        );
+        // A config seeded before the field existed (no stored URL)
+        // still resolves the curated seed's URL by id — the
+        // mcp_start_preflight prompt depends on this for installs
+        // that predate the field.
+        let mut legacy = brave.clone();
+        legacy.signup_url = None;
+        assert_eq!(
+            mcp_signup_url(&legacy).as_deref(),
+            Some(manager_config::BRAVE_SEARCH_SIGNUP_URL)
+        );
+        // A stored URL wins over the curated seed's.
+        let mut custom = brave.clone();
+        custom.signup_url = Some("https://example.com/keys".to_string());
+        assert_eq!(
+            mcp_signup_url(&custom).as_deref(),
+            Some("https://example.com/keys")
+        );
+        // A blank stored URL counts as unset and falls back.
+        let mut blank = brave.clone();
+        blank.signup_url = Some("  ".to_string());
+        assert_eq!(
+            mcp_signup_url(&blank).as_deref(),
+            Some(manager_config::BRAVE_SEARCH_SIGNUP_URL)
+        );
+        // An unknown server with no stored URL has no link.
+        let mut other = brave.clone();
+        other.id = "not_a_curated_server".to_string();
+        other.signup_url = None;
+        assert_eq!(mcp_signup_url(&other), None);
     }
 
     #[test]
@@ -8450,6 +8556,10 @@ struct McpListEntry {
     pub url: Option<String>,
     pub env_keys: Vec<String>,
     pub cred_ref: Option<String>,
+    /// Registration / API-key page for the server's credential,
+    /// resolved by [`mcp_signup_url`] (stored value, else the
+    /// curated seed's).
+    pub signup_url: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
     pub metered: bool,
     pub rpm_limit: Option<u32>,

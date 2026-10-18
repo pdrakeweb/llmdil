@@ -115,6 +115,10 @@ struct FakeState {
     credential_values: HashMap<String, String>,
     /// Pids `process_alive` reports as running.
     live_pids: HashSet<u32>,
+    /// Scripted executable image per pid, for `process_image_is`.
+    /// An unscripted pid is "unknown" (`None`), matching the trait
+    /// default — script an image to make a determination.
+    process_images: HashMap<u32, String>,
     /// Every pid passed to a successful `kill_process`, in order.
     killed_pids: Vec<u32>,
     /// When true, `kill_process` fails (and the pid stays live).
@@ -158,6 +162,7 @@ impl Default for FakeState {
             credentials: HashSet::new(),
             credential_values: HashMap::new(),
             live_pids: HashSet::new(),
+            process_images: HashMap::new(),
             killed_pids: Vec::new(),
             kill_fails: false,
             home: None,
@@ -339,6 +344,16 @@ impl FakeSystemOps {
     /// Script a pid as currently running (for `process_alive`).
     pub fn with_live_pid(&self, pid: u32) -> &Self {
         self.state.lock().unwrap().live_pids.insert(pid);
+        self
+    }
+
+    /// Script the executable image a pid runs as (for
+    /// `process_image_is`): the pid also reads as running — an image
+    /// determination implies a live process.
+    pub fn with_process_image(&self, pid: u32, image: &str) -> &Self {
+        let mut st = self.state.lock().unwrap();
+        st.live_pids.insert(pid);
+        st.process_images.insert(pid, image.to_string());
         self
     }
 
@@ -549,6 +564,16 @@ impl SystemOps for FakeSystemOps {
 
     fn process_alive(&self, pid: u32) -> bool {
         self.state.lock().unwrap().live_pids.contains(&pid)
+    }
+
+    fn process_image_is(&self, pid: u32, image: &str) -> Option<bool> {
+        let st = self.state.lock().unwrap();
+        if !st.live_pids.contains(&pid) {
+            return Some(false);
+        }
+        st.process_images
+            .get(&pid)
+            .map(|found| found.eq_ignore_ascii_case(image))
     }
 
     fn kill_process(&self, pid: u32) -> std::io::Result<()> {

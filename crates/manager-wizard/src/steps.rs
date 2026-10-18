@@ -2180,6 +2180,110 @@ async fn postgres_log_tail(ops: &dyn SystemOps, data_dir: &Path) -> String {
     }
 }
 
+/// pg_ctl's own start-wait bound (`-t`), in seconds. At expiry
+/// pg_ctl reports "server did not start in time" and exits,
+/// leaving the postmaster starting in the background — the caller
+/// polls for readiness itself (see [`ensure_postgres_running`]).
+/// Before this bound existed, the only limit on a slow postmaster
+/// startup was the command runner's generic 600 s cap, whose tree
+/// kill then killed the starting postmaster itself (field report
+/// 2026-10-18).
+const PG_CTL_START_WAIT_SECS: u64 = 120;
+/// Runner budget for the pg_ctl start command: above pg_ctl's own
+/// `-t` bound with headroom, so pg_ctl's own report — not the
+/// runner's tree kill — is what ends a slow start.
+const POSTGRES_START_COMMAND_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+/// Readiness poll cadence (the historical poll slept 500 ms).
+const POSTGRES_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// After a clean pg_ctl exit, readiness is expected promptly (the
+/// historical 30 × 500 ms poll).
+const POSTGRES_CLEAN_START_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// After pg_ctl stops waiting (its `-t` bound) the postmaster
+/// keeps starting; readiness may still be this far out (crash
+/// recovery over a large WAL backlog).
+const POSTGRES_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long to wait for an already-running postmaster (found via
+/// `postmaster.pid`) to reach readiness before reporting it stuck.
+const POSTGRES_ADOPT_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The `pg_ctl start` command for the app-managed server, shared
+/// by the runtime start ([`ensure_postgres_running`]), the install
+/// step's plan, and the start-gateway manual block, so all three
+/// run and show the same command.
+fn postgres_start_command(data_dir: &Path, port: u16) -> PlannedCommand {
+    let port_opt = format!("-p {port} -h 127.0.0.1");
+    let log_arg = postgres_log_path(data_dir).display().to_string();
+    pg_ctl_command(
+        data_dir,
+        &[
+            "-l",
+            &log_arg,
+            "-o",
+            &port_opt,
+            "-t",
+            &PG_CTL_START_WAIT_SECS.to_string(),
+            "start",
+        ],
+    )
+}
+
+/// `<data_dir>/postgres/data/postmaster.pid` — written by the
+/// postmaster at startup and removed on a clean stop; its first
+/// line is the postmaster's pid.
+fn postmaster_pid_path(data_dir: &Path) -> PathBuf {
+    postgres_data_dir(data_dir).join("postmaster.pid")
+}
+
+/// The pid recorded in `postmaster.pid`, when the file exists and
+/// its first line parses. Absent or unparseable both read as "no
+/// recorded postmaster".
+async fn read_postmaster_pid(ops: &dyn SystemOps, data_dir: &Path) -> Option<u32> {
+    let bytes = ops.read_file(&postmaster_pid_path(data_dir)).await.ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    text.lines().next()?.trim().parse().ok()
+}
+
+/// Outcome of [`wait_for_postgres_ready`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostgresWait {
+    /// `pg_isready` answered success.
+    Ready,
+    /// The window elapsed without readiness.
+    TimedOut,
+    /// A postmaster was required to exist and none does (the pid
+    /// file is gone, or its recorded pid is not running): nothing
+    /// is coming up, so waiting longer cannot help.
+    PostmasterGone,
+}
+
+/// Poll `pg_isready` until it answers, the window elapses, or —
+/// with `require_postmaster` — the postmaster disappears (a start
+/// that already failed fast must not burn the whole window).
+async fn wait_for_postgres_ready(
+    ops: &dyn SystemOps,
+    config: &AppConfig,
+    data_dir: &Path,
+    max: std::time::Duration,
+    require_postmaster: bool,
+) -> PostgresWait {
+    let started = std::time::Instant::now();
+    loop {
+        if postgres_ready(ops, config, data_dir).await {
+            return PostgresWait::Ready;
+        }
+        if require_postmaster {
+            match read_postmaster_pid(ops, data_dir).await {
+                Some(pid) if ops.process_alive(pid) => {}
+                _ => return PostgresWait::PostmasterGone,
+            }
+        }
+        if started.elapsed() >= max {
+            return PostgresWait::TimedOut;
+        }
+        tokio::time::sleep(POSTGRES_READY_POLL_INTERVAL).await;
+    }
+}
+
 fn pg_ctl_command(data_dir: &Path, args: &[&str]) -> PlannedCommand {
     let mut argv = vec![
         postgres_bin_dir(data_dir)
@@ -2216,40 +2320,133 @@ pub async fn ensure_postgres_running(
         ));
         return Ok(url);
     }
-    let port_opt = format!("-p {} -h 127.0.0.1", config.postgres.port);
-    let log_arg = postgres_log_path(data_dir).display().to_string();
-    let start = pg_ctl_command(data_dir, &["-l", &log_arg, "-o", &port_opt, "start"]);
-    match ops.run_command(&start).await {
+    // A postmaster the readiness probe cannot see yet: one left
+    // running by an earlier session (PostgreSQL stops with the
+    // gateway stop, but an app crash, a killed process tree, or a
+    // machine sleep can leave it behind) that is still starting —
+    // crash recovery after an unclean shutdown runs before it
+    // accepts connections, so `pg_isready` fails while it works.
+    // Starting a second postmaster against the same data directory
+    // cannot help (PostgreSQL refuses a second lock holder), so an
+    // existing one is adopted and awaited. A pid file whose pid is
+    // dead — or has been recycled by an unrelated process (Windows
+    // pid reuse; the image check tells the two apart) — is stale:
+    // remove it, so the fresh start below is not refused over a
+    // lock file no live server owns.
+    if let Some(pid) = read_postmaster_pid(ops, data_dir).await {
+        if !ops.process_alive(pid) {
+            log.push(format!(
+                "removing stale postmaster.pid: recorded pid {pid} is not running"
+            ));
+            let _ = ops.remove_file(&postmaster_pid_path(data_dir)).await;
+        } else if ops.process_image_is(pid, "postgres.exe") == Some(false) {
+            log.push(format!(
+                "removing stale postmaster.pid: recorded pid {pid} now belongs to a different program (pid reuse)"
+            ));
+            let _ = ops.remove_file(&postmaster_pid_path(data_dir)).await;
+        } else {
+            log.push(format!(
+                "PostgreSQL postmaster (pid {pid}) is running but not accepting connections yet — waiting for it instead of starting a second server"
+            ));
+            match wait_for_postgres_ready(ops, config, data_dir, POSTGRES_ADOPT_WAIT, true).await
+            {
+                PostgresWait::Ready => {
+                    log.push(format!(
+                        "PostgreSQL is accepting connections on 127.0.0.1:{} (existing postmaster, pid {pid})",
+                        config.postgres.port
+                    ));
+                    return Ok(url);
+                }
+                PostgresWait::PostmasterGone => {
+                    log.push(
+                        "the existing postmaster exited while starting; starting PostgreSQL afresh"
+                            .to_string(),
+                    );
+                    let _ = ops.remove_file(&postmaster_pid_path(data_dir)).await;
+                }
+                PostgresWait::TimedOut => {
+                    let tail = postgres_log_tail(ops, data_dir).await;
+                    return Err(format!(
+                        "PostgreSQL postmaster (pid {pid}) is running but did not accept connections within {} s — it may be stuck in startup; server log tail:\n{tail}",
+                        POSTGRES_ADOPT_WAIT.as_secs()
+                    ));
+                }
+            }
+        }
+    }
+    // pg_ctl's wait is bounded twice over: its own `-t` (see
+    // postgres_start_command) and the runner budget above it, set
+    // so pg_ctl's report — not the runner's tree kill — ends a slow
+    // start. The old invocation carried neither bound: a slow
+    // postmaster startup ran into the command runner's generic
+    // 600 s cap, the resulting tree kill killed the starting
+    // postmaster itself (guaranteeing another crash recovery on
+    // the next attempt), and the failure on that path carried no
+    // server log tail (field report 2026-10-18: "timed out after
+    // 600s and was stopped", undiagnosable from the outcome).
+    // Every failure below now carries the tail.
+    let start = postgres_start_command(data_dir, config.postgres.port);
+    let start_failure = match ops
+        .run_command_with_timeout(&start, POSTGRES_START_COMMAND_BUDGET)
+        .await
+    {
         Ok(out) if out.exit_code == 0 => {
             log.push(format!(
                 "PostgreSQL started on 127.0.0.1:{} (log: {})",
                 config.postgres.port,
                 postgres_log_path(data_dir).display()
             ));
+            None
         }
-        Ok(out) => {
+        Ok(out) => Some(format!(
+            "pg_ctl exit {}: {}",
+            out.exit_code,
+            out.stderr.trim()
+        )),
+        Err(e) => Some(e.to_string()),
+    };
+    // The definitive signal, either way. After a clean pg_ctl exit
+    // the server should already answer (the historical brief
+    // poll). After a pg_ctl failure the postmaster may still be
+    // starting — pg_ctl stops waiting at its `-t` bound while
+    // startup continues in the background — so poll longer, but
+    // stop early when no postmaster exists anymore (a fast FATAL
+    // must not burn the window).
+    let wait = wait_for_postgres_ready(
+        ops,
+        config,
+        data_dir,
+        if start_failure.is_none() {
+            POSTGRES_CLEAN_START_WAIT
+        } else {
+            POSTGRES_SETTLE_WAIT
+        },
+        start_failure.is_some(),
+    )
+    .await;
+    match wait {
+        PostgresWait::Ready => {
+            if start_failure.is_some() {
+                log.push(
+                    "PostgreSQL became ready after pg_ctl stopped waiting — startup completed in the background"
+                        .to_string(),
+                );
+            }
+            Ok(url)
+        }
+        _ => {
             let tail = postgres_log_tail(ops, data_dir).await;
-            return Err(format!(
-                "PostgreSQL failed to start (pg_ctl exit {}): {} — server log tail:\n{tail}",
-                out.exit_code,
-                out.stderr.trim()
-            ));
+            match start_failure {
+                Some(failure) => Err(format!(
+                    "PostgreSQL failed to start ({failure}) — server log tail:\n{tail}"
+                )),
+                None => Err(format!(
+                    "PostgreSQL did not become ready on 127.0.0.1:{} — server log tail:\n{tail}",
+                    config.postgres.port
+                )),
+            }
         }
-        Err(e) => return Err(format!("PostgreSQL failed to start: {e}")),
     }
-    // pg_ctl waits for readiness itself; poll pg_isready briefly for
-    // the definitive signal.
-    for _ in 0..30 {
-        if postgres_ready(ops, config, data_dir).await {
-            return Ok(url);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    let tail = postgres_log_tail(ops, data_dir).await;
-    Err(format!(
-        "PostgreSQL did not become ready on 127.0.0.1:{} — server log tail:\n{tail}",
-        config.postgres.port
-    ))
 }
 
 /// Stop the app-managed PostgreSQL server (`pg_ctl stop -m fast`:
@@ -2389,8 +2586,6 @@ impl WizardStep for InstallPostgres {
         let Some(pin) = self.pin.as_ref() else {
             return Vec::new();
         };
-        let port_opt = format!("-p {} -h 127.0.0.1", ctx.config.postgres.port);
-        let log_arg = postgres_log_path(&ctx.data_dir).display().to_string();
         vec![
             PlannedCommand::new(vec![
                 "download".to_string(),
@@ -2398,7 +2593,7 @@ impl WizardStep for InstallPostgres {
                 postgres_zip_path(&ctx.data_dir, pin).display().to_string(),
             ]),
             self.initdb_command(ctx),
-            pg_ctl_command(&ctx.data_dir, &["-l", &log_arg, "-o", &port_opt, "start"]),
+            postgres_start_command(&ctx.data_dir, ctx.config.postgres.port),
             self.createdb_command(ctx),
         ]
     }
@@ -2810,9 +3005,7 @@ impl StartGateway {
                 .to_string(),
         ];
         if postgres_installed(ctx.ops.as_ref(), &ctx.data_dir).await {
-            let port_opt = format!("-p {} -h 127.0.0.1", ctx.config.postgres.port);
-            let log_arg = postgres_log_path(&ctx.data_dir).display().to_string();
-            let pg = pg_ctl_command(&ctx.data_dir, &["-l", &log_arg, "-o", &port_opt, "start"]);
+            let pg = postgres_start_command(&ctx.data_dir, ctx.config.postgres.port);
             lines.push(ps_command_line(&pg.argv));
             // The REAL port, not a placeholder: a block that says
             // "paste this and it works" must not hand the operator a
@@ -8850,6 +9043,7 @@ mod tests {
             url: None,
             env_keys: vec!["BRAVE_API_KEY".to_string()],
             cred_ref: Some("local-llm-service-manager/brave-search-mcp".to_string()),
+            signup_url: None,
             allowed_tools: None,
             metered: false,
             rpm_limit: None,
@@ -10235,6 +10429,7 @@ mod tests {
             url: None,
             env_keys: vec!["EXAMPLE_API_KEY".to_string()],
             cred_ref: cred_ref.map(str::to_string),
+            signup_url: None,
             allowed_tools: None,
             metered: false,
             rpm_limit: None,
@@ -10767,6 +10962,236 @@ mod tests {
         let out = InstallPostgres::with_pin(pin).run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done, "{out:?}");
         assert!(ops.executed_commands().is_empty());
+    }
+
+    /// argv of the `pg_isready` probe `postgres_ready` runs for a
+    /// data dir, for scripting in the ensure-postgres tests below.
+    fn pg_isready_argv(data_dir: &Path) -> Vec<String> {
+        vec![
+            postgres_bin_dir(data_dir)
+                .join("pg_isready.exe")
+                .display()
+                .to_string(),
+            "-h".to_string(),
+            "127.0.0.1".to_string(),
+            "-p".to_string(),
+            "54329".to_string(),
+        ]
+    }
+
+    fn argv_refs(argv: &[String]) -> Vec<&str> {
+        argv.iter().map(String::as_str).collect()
+    }
+
+    fn pg_not_ready_output() -> CommandOutput {
+        CommandOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "no response".to_string(),
+        }
+    }
+
+    fn pg_ready_output() -> CommandOutput {
+        CommandOutput {
+            exit_code: 0,
+            stdout: "127.0.0.1:54329 - accepting connections".to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_start_adopts_live_postmaster_not_yet_ready() {
+        // A postmaster from an earlier session is still starting
+        // (pid file present, pid live and a postgres image, probe
+        // not answering yet): it is awaited, never competed with.
+        let ops = FakeSystemOps::new();
+        let data_dir = PathBuf::from("/data");
+        ops.with_file(postmaster_pid_path(&data_dir), b"4242\n/data\n".to_vec());
+        ops.with_process_image(4242, "postgres.exe");
+        let isready = pg_isready_argv(&data_dir);
+        ops.with_command_sequence(
+            &argv_refs(&isready),
+            vec![pg_not_ready_output(), pg_ready_output()],
+        );
+        let cfg = test_config_with_models();
+        let mut log = Vec::new();
+        let url = ensure_postgres_running(&ops, &cfg, &data_dir, &mut log)
+            .await
+            .expect("adopts the running postmaster");
+        assert!(url.contains("127.0.0.1:54329"), "{url}");
+        assert!(
+            log.iter().any(|l| l.contains("waiting for it")),
+            "{log:?}"
+        );
+        assert!(
+            !ops.executed_commands()
+                .iter()
+                .any(|a| a.iter().any(|x| x == "start")),
+            "no competing pg_ctl start: {:?}",
+            ops.executed_commands()
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_start_removes_stale_pid_file_with_dead_pid() {
+        let ops = FakeSystemOps::new();
+        let data_dir = PathBuf::from("/data");
+        let pid_path = postmaster_pid_path(&data_dir);
+        ops.with_file(pid_path.clone(), b"4242\n".to_vec());
+        // 4242 is not scripted live: the recorded postmaster is gone.
+        let isready = pg_isready_argv(&data_dir);
+        ops.with_command_sequence(
+            &argv_refs(&isready),
+            vec![pg_not_ready_output(), pg_ready_output()],
+        );
+        let cfg = test_config_with_models();
+        let mut log = Vec::new();
+        ensure_postgres_running(&ops, &cfg, &data_dir, &mut log)
+            .await
+            .expect("starts after clearing the stale pid file");
+        assert!(
+            ops.file_bytes(&pid_path).is_none(),
+            "stale pid file removed"
+        );
+        let start = postgres_start_command(&data_dir, 54329);
+        assert!(
+            ops.executed_commands().contains(&start.argv),
+            "pg_ctl start ran: {:?}",
+            ops.executed_commands()
+        );
+        // The start command carries pg_ctl's own wait bound.
+        assert!(start.argv.iter().any(|a| a == "-t"), "{:?}", start.argv);
+        assert!(start.argv.iter().any(|a| a == "120"), "{:?}", start.argv);
+    }
+
+    #[tokio::test]
+    async fn postgres_start_removes_pid_file_recycled_by_another_program() {
+        // The recorded pid is alive but belongs to an unrelated
+        // program now (Windows pid reuse): the pid file is stale
+        // even though the pid is not dead.
+        let ops = FakeSystemOps::new();
+        let data_dir = PathBuf::from("/data");
+        let pid_path = postmaster_pid_path(&data_dir);
+        ops.with_file(pid_path.clone(), b"4242\n".to_vec());
+        ops.with_process_image(4242, "explorer.exe");
+        let isready = pg_isready_argv(&data_dir);
+        ops.with_command_sequence(
+            &argv_refs(&isready),
+            vec![pg_not_ready_output(), pg_ready_output()],
+        );
+        let cfg = test_config_with_models();
+        let mut log = Vec::new();
+        ensure_postgres_running(&ops, &cfg, &data_dir, &mut log)
+            .await
+            .expect("starts after clearing the recycled pid file");
+        assert!(
+            ops.file_bytes(&pid_path).is_none(),
+            "recycled pid file removed"
+        );
+        let start = postgres_start_command(&data_dir, 54329);
+        assert!(ops.executed_commands().contains(&start.argv));
+    }
+
+    #[tokio::test]
+    async fn postgres_start_failure_carries_log_tail_when_pg_ctl_is_stopped() {
+        // The 2026-10-18 field failure shape: the pg_ctl command
+        // itself is stopped by a timeout (a WizardError, not an
+        // exit code). The failure must carry the server log tail —
+        // the old code attached it only to non-zero exits, leaving
+        // exactly this path undiagnosable.
+        let ops = FakeSystemOps::new();
+        let data_dir = PathBuf::from("/data");
+        let isready = pg_isready_argv(&data_dir);
+        ops.with_command(&argv_refs(&isready), pg_not_ready_output());
+        let start = postgres_start_command(&data_dir, 54329);
+        ops.with_command_failure(
+            &argv_refs(&start.argv),
+            -1,
+            "timed out after 180s and was stopped",
+        );
+        ops.with_file(
+            postgres_log_path(&data_dir),
+            b"2026-10-18 FATAL: the database system is starting up\nrecovery is in progress\n"
+                .to_vec(),
+        );
+        let cfg = test_config_with_models();
+        let mut log = Vec::new();
+        let err = ensure_postgres_running(&ops, &cfg, &data_dir, &mut log)
+            .await
+            .expect_err("the start must fail");
+        assert!(err.contains("timed out after 180s"), "{err}");
+        assert!(err.contains("server log tail"), "{err}");
+        assert!(err.contains("the database system is starting up"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn postgres_start_pg_ctl_failure_carries_log_tail() {
+        // pg_ctl exits non-zero at once (the postmaster FATALed,
+        // e.g. on the lock file): the settle poll sees no postmaster
+        // and returns promptly; the failure carries pg_ctl's report
+        // plus the server log tail.
+        let ops = FakeSystemOps::new();
+        let data_dir = PathBuf::from("/data");
+        let isready = pg_isready_argv(&data_dir);
+        ops.with_command(&argv_refs(&isready), pg_not_ready_output());
+        let start = postgres_start_command(&data_dir, 54329);
+        ops.with_command(
+            &argv_refs(&start.argv),
+            CommandOutput {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "could not start server".to_string(),
+            },
+        );
+        ops.with_file(
+            postgres_log_path(&data_dir),
+            b"FATAL: lock file \"postmaster.pid\" already exists\n".to_vec(),
+        );
+        let cfg = test_config_with_models();
+        let mut log = Vec::new();
+        let err = ensure_postgres_running(&ops, &cfg, &data_dir, &mut log)
+            .await
+            .expect_err("the start must fail");
+        assert!(err.contains("pg_ctl exit 1"), "{err}");
+        assert!(err.contains("server log tail"), "{err}");
+        assert!(err.contains("lock file"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn postgres_wait_reports_gone_ready_and_timeout() {
+        let data_dir = PathBuf::from("/data");
+        let cfg = test_config_with_models();
+        let isready = pg_isready_argv(&data_dir);
+        let ops = FakeSystemOps::new();
+        ops.with_command(&argv_refs(&isready), pg_not_ready_output());
+        // Gone: a postmaster is required but no pid file exists.
+        assert_eq!(
+            wait_for_postgres_ready(&ops, &cfg, &data_dir, POSTGRES_SETTLE_WAIT, true).await,
+            PostgresWait::PostmasterGone
+        );
+        // TimedOut: no postmaster requirement, never ready, and a
+        // zero window — returns without sleeping.
+        assert_eq!(
+            wait_for_postgres_ready(
+                &ops,
+                &cfg,
+                &data_dir,
+                std::time::Duration::ZERO,
+                false
+            )
+            .await,
+            PostgresWait::TimedOut
+        );
+        // Ready: the probe answers on the second call.
+        let ops2 = FakeSystemOps::new();
+        ops2.with_command_sequence(
+            &argv_refs(&isready),
+            vec![pg_not_ready_output(), pg_ready_output()],
+        );
+        assert_eq!(
+            wait_for_postgres_ready(&ops2, &cfg, &data_dir, POSTGRES_SETTLE_WAIT, false).await,
+            PostgresWait::Ready
+        );
     }
 
     #[tokio::test]

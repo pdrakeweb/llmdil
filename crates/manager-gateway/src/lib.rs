@@ -1627,6 +1627,7 @@ mod tests {
             ]),
             metered: true,
             rpm_limit: Some(20),
+            signup_url: None,
         }
     }
 
@@ -1641,6 +1642,7 @@ mod tests {
             url: Some("https://mcp.example.com/mcp".to_string()),
             env_keys: vec![],
             cred_ref: None,
+            signup_url: None,
             allowed_tools: None,
             metered: false,
             rpm_limit: None,
@@ -1753,6 +1755,7 @@ mod tests {
             url: None,
             env_keys: vec![],
             cred_ref: None,
+            signup_url: None,
             allowed_tools: Some(vec!["fetch".to_string()]),
             metered: false,
             rpm_limit: None,

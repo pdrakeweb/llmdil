@@ -1539,6 +1539,8 @@ export interface McpServerRow {
   url: string | null;
   env_keys: string[];
   cred_ref: string | null;
+  /** Registration / API-key page for the credential, when known. */
+  signup_url: string | null;
   allowed_tools: string[] | null;
   metered: boolean;
   rpm_limit: number | null;
@@ -1568,6 +1570,7 @@ export interface McpServerInput {
   url: string | null;
   env_keys: string[];
   cred_ref: string | null;
+  signup_url: string | null;
   allowed_tools: string[] | null;
   metered: boolean;
   rpm_limit: number | null;
@@ -1604,6 +1607,7 @@ function sampleMcpServers(): McpServerRow[] {
     url: null as string | null,
     env_keys: [] as string[],
     cred_ref: null as string | null,
+    signup_url: null as string | null,
     allowed_tools: null as string[] | null,
     metered: false,
     rpm_limit: null as number | null,
@@ -1641,6 +1645,10 @@ function sampleMcpServers(): McpServerRow[] {
       args: ["-y", "@brave/brave-search-mcp-server@2.1.4", "--transport", "stdio"],
       env_keys: ["BRAVE_API_KEY"],
       cred_ref: "local-llm-service-manager/brave-search-mcp",
+      // The live entry resolves the Brave Search API page here;
+      // the literal URL stays out of the sample fixture because
+      // the smoke test bans external URLs in the bundle.
+      signup_url: null,
       allowed_tools: ["brave_web_search", "brave_llm_context"],
       metered: true, rpm_limit: 20,
       credential_presence: [["BRAVE_API_KEY", false]],
@@ -1727,6 +1735,33 @@ export async function storeMcpCredential(id: string, value: string): Promise<Cal
     return { data, live: true };
   } catch (e) {
     return { data: { id, stored: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** One mcp_start_preflight entry: a Gateway-exposed MCP server a
+ *  gateway start would omit for want of a credential — the store
+ *  it via mcp_store_credential before the start and the start's
+ *  arming pass includes it in that same start. */
+export interface McpStartPreflightServer {
+  id: string;
+  display_name: string;
+  cred_ref: string;
+  env_keys: string[];
+  signup_url: string | null;
+  metered: boolean;
+}
+
+/** mcp_start_preflight — the enabled-but-unarmed Gateway MCP
+ *  servers, for the start-gateway credential prompt
+ *  (ui/src/mcp-prompt.ts). Empty when every Gateway server's
+ *  credential is present. */
+export async function mcpStartPreflight(): Promise<CallResult<{ servers: McpStartPreflightServer[] }>> {
+  if (!isTauri()) return { data: { servers: [] }, live: false };
+  try {
+    const data = await invoke<{ servers: McpStartPreflightServer[] }>("mcp_start_preflight");
+    return { data: { servers: Array.isArray(data?.servers) ? data.servers : [] }, live: true };
+  } catch (e) {
+    return { data: { servers: [] }, live: true, error: errOf(e) };
   }
 }
 

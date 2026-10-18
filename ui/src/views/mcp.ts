@@ -11,7 +11,7 @@
 
 import {
   deleteMcpServer, getBackends, getGatewayStatus, getMcpServers,
-  saveMcpServer, setMcpExposure, storeMcpCredential, testMcpServer,
+  openUrl, saveMcpServer, setMcpExposure, storeMcpCredential, testMcpServer,
 } from "../api";
 import type {
   BackendRow, McpExposureKind, McpServerInput, McpServerRow, McpTestResult, McpTransportKind,
@@ -52,6 +52,7 @@ interface McpFormDraft {
   url: string;
   env_keys: string;
   cred_ref: string;
+  signup_url: string;
   allowed_tools: string;
   metered: boolean;
   rpm_limit: string;
@@ -61,7 +62,7 @@ function emptyDraft(): McpFormDraft {
   return {
     id: "", display_name: "", transport: "stdio", exposure: "gateway",
     command: "", args: "", url: "", env_keys: "", cred_ref: "",
-    allowed_tools: "", metered: false, rpm_limit: "",
+    signup_url: "", allowed_tools: "", metered: false, rpm_limit: "",
   };
 }
 
@@ -76,6 +77,7 @@ function draftFromServer(s: McpServerRow): McpFormDraft {
     url: s.url ?? "",
     env_keys: s.env_keys.join(", "),
     cred_ref: s.cred_ref ?? "",
+    signup_url: s.signup_url ?? "",
     allowed_tools: (s.allowed_tools ?? []).join(", "),
     metered: s.metered,
     rpm_limit: s.rpm_limit === null ? "" : String(s.rpm_limit),
@@ -185,6 +187,7 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
       ? `<div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
           <input type="password" data-mcp-cred-input placeholder="${esc(s.cred_ref)}" autocomplete="off" style="${SELECT_STYLE};flex:1;min-width:180px" aria-label="Credential value for ${esc(s.id)}">
           <button class="btn" data-mcp-act="store-cred" data-mcp-id="${esc(s.id)}">${icon("shield")} Store</button>
+          ${!s.credential_present && s.signup_url ? `<button class="btn" data-mcp-act="get-key" data-mcp-id="${esc(s.id)}">${icon("external")} Get an API key</button>` : ""}
         </div>`
       : "";
     const note = msgs.get(s.id);
@@ -246,6 +249,8 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
         <input data-mcp-field="env_keys" type="text" value="${esc(draft.env_keys)}" placeholder="BRAVE_API_KEY" style="${SELECT_STYLE};width:100%"></label>
       <label style="font-size:12px;color:var(--text2)">Credential target<br>
         <input data-mcp-field="cred_ref" type="text" value="${esc(draft.cred_ref)}" placeholder="local-llm-service-manager/brave-search-mcp" style="${SELECT_STYLE};width:100%"></label>
+      <label style="font-size:12px;color:var(--text2)">Signup / API-key page (optional)<br>
+        <input data-mcp-field="signup_url" type="text" value="${esc(draft.signup_url)}" placeholder="Registration / API-key page URL (https)" style="${SELECT_STYLE};width:100%"></label>
       <label style="font-size:12px;color:var(--text2)">Allowed tools (comma-separated, optional)<br>
         <input data-mcp-field="allowed_tools" type="text" value="${esc(draft.allowed_tools)}" style="${SELECT_STYLE};width:100%"></label>
       <label style="font-size:12px;color:var(--text2)">Rate limit, rpm (optional)<br>
@@ -351,6 +356,7 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
       url: draft.url.trim() === "" ? null : draft.url.trim(),
       env_keys: splitList(draft.env_keys),
       cred_ref: draft.cred_ref.trim() === "" ? null : draft.cred_ref.trim(),
+      signup_url: draft.signup_url.trim() === "" ? null : draft.signup_url.trim(),
       allowed_tools: allowed.length ? allowed : null,
       metered: draft.metered,
       rpm_limit: rpm !== null && Number.isFinite(rpm) && rpm > 0 ? rpm : null,
@@ -444,6 +450,10 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
       await load();
       return;
     }
+    if (act === "get-key") {
+      if (server.signup_url) await openUrl(server.signup_url);
+      return;
+    }
     if (act === "store-cred") {
       const card = t.closest("[data-mcp-card]");
       const input = card?.querySelector("[data-mcp-cred-input]") as HTMLInputElement | null;
@@ -485,6 +495,7 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
     else if (field === "url") draft.url = t.value;
     else if (field === "env_keys") draft.env_keys = t.value;
     else if (field === "cred_ref") draft.cred_ref = t.value;
+    else if (field === "signup_url") draft.signup_url = t.value;
     else if (field === "allowed_tools") draft.allowed_tools = t.value;
     else if (field === "rpm_limit") draft.rpm_limit = t.value;
     else if (field === "transport" && ev.type === "change") {

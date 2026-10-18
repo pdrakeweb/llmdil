@@ -29,6 +29,7 @@ import {
   adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
 import type { ActivationChange, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, ServicesInfo } from "../api";
+import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
 import type { GpuInfo, WizardStepState } from "../types";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
@@ -4477,6 +4478,20 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     if (t.closest("#gwStartBtn")) {
       if (starting || stopping) return;
       starting = true;
+      // MCP credential prompt (Pete, 2026-10-18): Gateway MCP
+      // servers the start would omit for want of a credential are
+      // offered registration/storage first — before the stop, so
+      // cancelling leaves a running gateway untouched, and before
+      // the step, so a stored credential lands in this start's
+      // config.
+      const proceed = await promptForUnarmedMcpCredentials();
+      if (disposed) { starting = false; return; }
+      if (!proceed) {
+        starting = false;
+        gwMsg("Gateway start cancelled at the MCP credential prompt.");
+        await load();
+        return;
+      }
       try {
         // Restart is stop-then-start: the wizard step spawns a fresh
         // LiteLLM, which cannot take the port while the old process
