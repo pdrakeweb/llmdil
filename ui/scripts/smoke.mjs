@@ -32,7 +32,7 @@ const html = existsSync(indexHtml) ? readFileSync(indexHtml, "utf8") : "";
 check(/assets\/.*\.js/.test(html), "index.html references the JS bundle");
 
 const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
-for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval"]) {
+for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval"]) {
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
 // Cross-check: every Tauri command name the UI invokes must be
@@ -116,6 +116,15 @@ for (const view of ["views/static.ts", "views/mcp.ts"]) {
   check(readFileSync(join(root, "src", view), "utf8").includes("enableSwitch("),
     `${view} renders its enable/disable controls via enableSwitch`);
 }
+// Add-backend launch parameters (tracker #49): the add form hosts
+// the shared flags fields under its own draft attribute, renders
+// the offload slider through the shared component, and collects a
+// placement selection; the compiled fragments of that contract
+// must survive the build.
+check(bundle.includes("data-add-flags-field"), "bundle contains the add form's flags fields (data-add-flags-field)");
+check(bundle.includes("data-add-place-gpu"), "bundle contains the add form's placement chips (data-add-place-gpu)");
+check(allSrc.includes("function flagsCtxBatchHtml"), "shared flagsCtxBatchHtml renderer exists in ui/src");
+check(allSrc.includes("function offloadSliderHtml"), "shared offloadSliderHtml renderer exists in ui/src");
 
 check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
