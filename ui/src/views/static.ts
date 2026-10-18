@@ -1257,6 +1257,13 @@ function backendCard(
   // Tool-call probe (MCP design §7.2): a secondary safe action, so
   // icon-only with the action named in its tooltip/aria-label.
   const toolCallBtn = `<button class="btn icon-only" data-back-act="toolcall" data-back-id="${esc(b.id)}" title="Test tool calls" aria-label="Test tool calls for ${esc(b.id)}"${dis}>${icon("wrench")}</button>`;
+  // Go to logs (tracker #47): every backend has a Logs-view scope (its
+  // supervisor ring, retained even after removal), so the button is
+  // unconditional. Icon-only per rule 15 — non-destructive navigation,
+  // not the card's standard workflow action — matching the Dashboard
+  // card's logs button. An anchor, not a card action: navigation is
+  // not disabled while a card action is in flight.
+  const logsBtn = `<a class="btn icon-only" href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1" title="Logs" aria-label="Logs for ${esc(b.id)}">${icon("logs")}</a>`;
   const enableBtn = `<button class="btn" data-back-act="enable" data-back-id="${esc(b.id)}" title="Enable backend"${dis}>${icon("check")} Enable</button>`;
   const disableBtn = `<button class="btn icon-only" data-back-act="disable" data-back-id="${esc(b.id)}" title="Disable backend" aria-label="Disable ${esc(b.id)}"${dis}>${icon("ban")}</button>`;
   const removeBtn = `<button class="btn icon-only danger${confirmRemove.has(b.id) ? " armed" : ""}" data-back-act="remove" data-back-id="${esc(b.id)}" title="${confirmRemove.has(b.id) ? "Confirm remove" : "Remove backend"}" aria-label="${confirmRemove.has(b.id) ? "Confirm remove" : "Remove"} ${esc(b.id)}"${dis}>${icon("trash")}</button>`;
@@ -1277,6 +1284,7 @@ function backendCard(
   if (b.configured && b.enabled && (b.state === "stopped" || b.state === "failed")) parts.push(disableBtn);
   if (b.state === "running") parts.push(testBtn);
   if (b.configured) parts.push(toolCallBtn);
+  parts.push(logsBtn);
   // Removal is refused by the command layer while running; offer it
   // only for configured backends with no live process.
   if (b.configured && !active && b.state !== "stopping") parts.push(removeBtn);
@@ -1330,7 +1338,7 @@ function backendCard(
     const lines = tail && tail.length
       ? `<div style="margin-top:8px;font-size:11px;color:var(--text3)">Latest output<span class="info-tip" title="stderr preferred — that is where llama-server reports load failures">${icon("info")}</span></div><div class="logstream" style="margin-top:4px">${tail.map((r) => `<div class="ln"><span class="t">${esc(fmtTime(r.ts))}</span> <span class="chip">${esc(r.stream)}</span> ${esc(r.line)}</div>`).join("")}</div>`
       : "";
-    logsBlock = `${lines}<div style="margin-top:6px;font-size:12px"><a href="#/logs?scope=${esc(encodeURIComponent(b.id))}" style="color:var(--accent)">Open in Logs</a></div>`;
+    logsBlock = `${lines}<div style="margin-top:6px;font-size:12px"><a href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1" style="color:var(--accent)">Open in Logs</a></div>`;
   }
   // GPU residency for this backend, as bars (Pete's card redesign,
   // 2026-10-16): one horizontal bar per GPU, name at left, GiB at
@@ -3207,7 +3215,7 @@ export function renderLogs(): string {
   <div id="logBody">${loadingHtml("Loading logs\u2026")}</div></div>`;
 }
 
-export async function wireLogs(root: HTMLElement, initialScope?: string): Promise<() => void> {
+export async function wireLogs(root: HTMLElement, initialScope?: string, initialFollow = false): Promise<() => void> {
   let disposed = false;
   /** Load coalescing (code-review 5.1): every load takes a
    *  sequence number and only the LATEST load paints. The previous
@@ -3559,7 +3567,16 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
   nextBtn?.addEventListener("click", onNext);
   exportBtn?.addEventListener("click", onExport);
 
-  await load();
+  // Deep link follow (#/logs?scope=<id>&follow=1 — the entity cards'
+  // "go to logs" buttons): arrive in exactly the state the Follow
+  // toggle produces — checkbox on, 2 s re-poll running, first load
+  // fired by onFollow itself.
+  if (initialFollow && followChk) {
+    followChk.checked = true;
+    onFollow();
+  } else {
+    await load();
+  }
 
   return () => {
     disposed = true;
@@ -3724,6 +3741,7 @@ function gatewayPaint(
       <button class="btn" id="gwStopBtn"${status.up && !starting && !stopping ? "" : " disabled"}>${icon("pause")} Stop gateway</button>
       <a class="btn" href="#/wizard">${icon("wrench")} Setup Wizard</a>
       <button class="btn icon-only" id="gwAdminUiBtn" title="LiteLLM admin UI" aria-label="LiteLLM admin UI">${icon("gateway")}</button><span class="info-tip" title="Sign in as admin with the master key as the password. The admin UI requires a database — run the setup wizard's Install PostgreSQL step if sign-in reports &quot;Not connected to DB&quot;.">${icon("info")}</span>
+      <a class="btn icon-only" href="#/logs?scope=gateway&follow=1" title="Logs" aria-label="Gateway logs">${icon("logs")}</a>
     </div>`;
   const endpoint = `<div class="card" style="margin-bottom:12px"><div class="sec-title">${icon("gateway")} Client endpoint</div>
     <div style="font-size:12px;color:var(--text2);display:grid;gap:4px">
@@ -5451,7 +5469,7 @@ function wizardStepRow(s: WizardStepState, live: boolean, open: boolean): string
       ${s.detail ? `<div><span class="k">Outcome:</span> ${esc(s.detail)}</div>` : ""}
       ${s.note && s.state !== "running" ? `<div><span class="k">Note:</span> ${esc(s.note)}</div>` : ""}
       ${fixText ? `<div><span class="k">Fix:</span> ${esc(fixText)}</div>` : ""}
-      ${s.state === "failed" && s.logTail && s.logTail.length ? `<div><span class="k">Log (last 3 lines):</span> <a href="#/logs" style="font-size:11px">Open in Logs view</a><div style="margin-top:2px;font-family:var(--mono);font-size:11px;color:var(--text3)">${s.logTail.slice(-3).map((l) => esc(l)).join("<br>")}</div></div>` : ""}
+      ${s.state === "failed" && s.logTail && s.logTail.length ? `<div><span class="k">Log (last 3 lines):</span> <a href="#/logs?scope=wizard" style="font-size:11px">Open in Logs view</a><div style="margin-top:2px;font-family:var(--mono);font-size:11px;color:var(--text3)">${s.logTail.slice(-3).map((l) => esc(l)).join("<br>")}</div></div>` : ""}
       ${manualText ? `<div><div style="display:flex;gap:8px;align-items:center">${s.manualCommand ? `<span></span>` : `<span class="k">Manual commands (PowerShell):</span>`}<span style="flex:1"></span><button class="btn" data-copy-step="${esc(s.id)}" title="Copy commands" aria-label="Copy commands" style="padding:2px 8px;font-size:11px">${icon("copy")}</button></div>
         <pre style="margin:4px 0;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px">${esc(manualText)}</pre></div>` : ""}
     </div>`;

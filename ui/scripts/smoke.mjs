@@ -97,6 +97,12 @@ check(unregistered.length === 0,
   `every invoked command name is registered (${invokedAt.size} invoked, ${registered.size} registered)` +
   (unregistered.length ? ` — unregistered: ${unregistered.map(([n, s]) => `${n} at ${s}`).join(", ")}` : ""));
 
+// Go-to-logs deep links (tracker #47): entity cards link into the
+// Logs view with the entity's scope preselected and Follow on; the
+// compiled fragments of that link contract must survive the build.
+check(bundle.includes("#/logs?scope="), "bundle contains the Logs deep link (#/logs?scope=)");
+check(bundle.includes("&follow=1"), "bundle contains the Logs deep-link follow flag (&follow=1)");
+
 check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
 check(bundle.includes("__TAURI__"), "bundle contains the Tauri detection hook");
