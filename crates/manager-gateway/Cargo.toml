@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 manager-config = { path = "../manager-config" }
+manager-models = { path = "../manager-models" }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
