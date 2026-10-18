@@ -142,7 +142,7 @@ pub fn catalog_params_b(id: &str, source_url: &str) -> Option<f32> {
 /// `append_missing_catalog_models` in manager-config), so catalog
 /// additions reach installed systems without resurrecting models
 /// an operator deliberately deleted.
-pub const CATALOG_REVISION: u32 = 2;
+pub const CATALOG_REVISION: u32 = 3;
 
 /// Download progress snapshot for the progress callback.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -176,6 +176,11 @@ impl DownloadProgress {
 /// `manager_config::refresh_catalog_definition`. Qwen publishes no
 /// official GGUF repo for Qwen3-Coder-30B-A3B-Instruct, so the coder
 /// slot uses unsloth's GGUF conversion of the official weights.
+/// Catalog revision 3 added one opt-in entry: the planner model's
+/// `-mtp` build (`qwen3.8-27b-mtp`), the same GSQ-RCO IQ3_S weights
+/// plus the MTP (multi-token prediction) block, as a separate model
+/// so a Planner-MTP backend can be tested side by side with the
+/// existing planner without touching it.
 pub fn curated_models() -> Vec<ModelSpec> {
     vec![
         ModelSpec {
@@ -196,6 +201,39 @@ pub fn curated_models() -> Vec<ModelSpec> {
             // fully GPU-resident on a 16 GB card. Replaced the
             // Qwen3-32B that filled this slot at revision 2.
             url: "https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/resolve/main/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf"
+                .to_string(),
+        },
+        // Opt-in variant of the planner model (added at catalog
+        // revision 3): the same GSQ-RCO IQ3_S build plus the MTP
+        // (multi-token prediction) block — block 64, 15 tensors,
+        // head weights at Q6_K — which llama.cpp's
+        // `--spec-type draft-mtp` self-speculative decoding drafts
+        // with. A separate model entry on purpose: a Planner-MTP
+        // backend can be created, tuned, and benchmarked against
+        // the existing planner backend without modifying it (the
+        // two backends are started on demand, never together —
+        // 11,771,546,784 + 12,120,016,960 bytes of weights exceed
+        // a 16 GiB card before KV cache). Seeds disabled and
+        // unassigned, like the Nemotron opt-in below; no default
+        // backend is seeded for it. SHA-256 and size are the
+        // publisher's Hugging Face LFS metadata for this file
+        // (X-Linked-ETag / X-Linked-Size, pinned 2026-10-17; the
+        // same source reproduces the base planner file's pin
+        // exactly).
+        ModelSpec {
+            id: "qwen3.8-27b-mtp".to_string(),
+            name: "Qwen3.8-27B Planner-MTP (GSQ-RCO IQ3_S)".to_string(),
+            quant: "IQ3_S".to_string(),
+            size_bytes: 12_120_016_960,
+            sha256: "58fd826723939933dc86f45b7fe04545cbc2de1c70f6fe2cdd3858c87a98c12f".to_string(),
+            ctx_max: 262144,
+            params_b: 27.0,
+            enabled_by_default: false,
+            expert_bytes: Some(0),
+            moe_layers: None,
+            default_offload_layers: None,
+            offload_restrictions: Vec::new(),
+            url: "https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/resolve/main/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
                 .to_string(),
         },
         ModelSpec {
@@ -1782,30 +1820,47 @@ mod tests {
     // -- catalog + registry tests ---------------------------------------------
 
     #[test]
-    fn curated_models_are_five_with_pinned_hashes() {
+    fn curated_models_are_six_with_pinned_hashes() {
         let models = curated_models();
-        assert_eq!(models.len(), 5);
+        assert_eq!(models.len(), 6);
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
             vec![
                 "qwen3-27b-planner",
+                "qwen3.8-27b-mtp",
                 "qwen3-coder-30b",
                 "qwen2.5-coder-7b",
                 "qwen3-8b",
                 "nemotron-3.5-lightning-30b"
             ]
         );
-        // The default fleet seeds enabled; the opt-in candidate does not.
+        // The default fleet seeds enabled; the opt-in candidates do not.
         for m in &models {
             assert_eq!(
                 m.enabled_by_default,
-                m.id != "nemotron-3.5-lightning-30b",
+                m.id != "nemotron-3.5-lightning-30b" && m.id != "qwen3.8-27b-mtp",
                 "{}",
                 m.id
             );
         }
-        let nemotron = &models[4];
+        // The revision-3 opt-in: the planner model's -mtp build,
+        // pinned from the publisher's Hugging Face LFS metadata
+        // (2026-10-17). Same weights plus the MTP block, so it is
+        // larger than the base planner file and carries a different
+        // hash — never the base file's pin.
+        let mtp = &models[1];
+        assert_eq!(mtp.params_b, 27.0);
+        assert_eq!(mtp.size_bytes, 12_120_016_960);
+        assert_eq!(mtp.ctx_max, 262144);
+        assert_eq!(mtp.quant, "IQ3_S");
+        assert_eq!(
+            mtp.sha256,
+            "58fd826723939933dc86f45b7fe04545cbc2de1c70f6fe2cdd3858c87a98c12f"
+        );
+        assert_ne!(mtp.sha256, models[0].sha256);
+        assert!(mtp.url.ends_with("Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"));
+        let nemotron = &models[5];
         assert_eq!(nemotron.params_b, 31.6);
         assert_eq!(nemotron.size_bytes, 25_266_255_936);
         assert_eq!(nemotron.expert_bytes, Some(22_829_334_528));
@@ -1820,7 +1875,7 @@ mod tests {
         assert_eq!(planner.params_b, 27.0);
         assert_eq!(planner.size_bytes, 11_771_546_784);
         assert_eq!(planner.ctx_max, 262144);
-        let coder = &models[1];
+        let coder = &models[2];
         assert_eq!(coder.params_b, 80.0);
         assert_eq!(coder.size_bytes, 49_301_055_488);
         assert_eq!(coder.ctx_max, 262144);
@@ -1830,7 +1885,7 @@ mod tests {
         assert_eq!(coder.moe_layers, Some(48));
         assert_eq!(coder.default_offload_layers, Some(48));
         // The dense models carry no offload data.
-        for m in [&models[0], &models[2], &models[3]] {
+        for m in [&models[0], &models[1], &models[3], &models[4]] {
             assert_eq!(m.expert_bytes, Some(0), "{}", m.id);
             assert_eq!(m.moe_layers, None, "{}", m.id);
             assert_eq!(m.default_offload_layers, None, "{}", m.id);
