@@ -608,6 +608,18 @@ pub trait SystemOps: Send + Sync {
     }
     /// Whether a process with `pid` is currently alive.
     fn process_alive(&self, pid: u32) -> bool;
+    /// Whether the process with `pid` is an instance of the named
+    /// executable image (e.g. `"postgres.exe"`), when the platform
+    /// can say: `Some(true)` / `Some(false)` are determinations,
+    /// `None` is "cannot tell" — callers must treat `None`
+    /// conservatively, exactly like a match. Used to tell a live
+    /// postmaster apart from an unrelated process that recycled
+    /// its pid (the `postmaster.pid` inspection in
+    /// `steps::ensure_postgres_running`). The default implementation
+    /// cannot tell.
+    fn process_image_is(&self, _pid: u32, _image: &str) -> Option<bool> {
+        None
+    }
     /// Terminate the process with `pid`. On Windows the whole process
     /// tree dies with it (`taskkill /T`); the recorded gateway pid is
     /// the server process itself, so a bare termination suffices

@@ -153,6 +153,61 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// Whether the process with `pid` is an instance of the named
+/// executable image (`"postgres.exe"`), when the platform can say.
+///
+/// Windows: `tasklist` in CSV form filtered to the pid; the first
+/// field is the image name (same shell-out approach as
+/// [`process_alive`] — no extra FFI). Unix: `ps -p <pid> -o comm=`.
+/// A probe that cannot be carried out returns `None` (unknown);
+/// a probe that runs and finds no such process returns
+/// `Some(false)` — the pid names nothing, so it is certainly not
+/// the named image.
+pub fn process_image_is(pid: u32, image: &str) -> Option<bool> {
+    if !pid_is_signalable(pid) {
+        return Some(false);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("tasklist");
+        cmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+        // CREATE_NO_WINDOW: this probe runs from a GUI process.
+        cmd.creation_flags(0x08000000);
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let first = text.lines().next()?.trim();
+        // A live process renders as `"image.exe","pid",...`; no
+        // match renders as an INFO line with no quoted image field.
+        let found = first
+            .strip_prefix('"')
+            .and_then(|s| s.split('"').next())
+            .unwrap_or("");
+        Some(found.eq_ignore_ascii_case(image))
+    }
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return Some(false);
+        }
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let base = name.rsplit('/').next().unwrap_or(&name);
+        Some(base.eq_ignore_ascii_case(image))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = image;
+        None
+    }
+}
+
 /// Terminate the process with `pid`.
 ///
 /// Windows: `taskkill /PID <pid> /T /F` — tree semantics, because a
@@ -823,6 +878,10 @@ impl SystemOps for RealSystemOps {
 
     fn process_alive(&self, pid: u32) -> bool {
         process_alive(pid)
+    }
+
+    fn process_image_is(&self, pid: u32, image: &str) -> Option<bool> {
+        process_image_is(pid, image)
     }
 
     fn kill_process(&self, pid: u32) -> std::io::Result<()> {
