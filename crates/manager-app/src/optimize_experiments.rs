@@ -201,6 +201,13 @@ pub async fn op_optimize_set_experiment_state(
             file.denied_fingerprints.push(fp);
         }
     }
+    crate::optimize::opt_log1(
+        state,
+        &format!(
+            "experiment {experiment_id} (candidate {}) decision -> {decision:?}",
+            experiment.candidate_model_id
+        ),
+    );
     crate::optimize::save_plan_file(state, &file).map_err(ApiError::InvalidInput)?;
     crate::optimize::state_payload(state).await
 }
@@ -804,6 +811,17 @@ async fn run_experiment_inner(
 /// journal history and the plan's proposal (when the plan is
 /// still the one that proposed it).
 fn record_result(state: &AppState, result: &ExperimentResult) {
+    // Every experiment outcome funnels through here (tracker
+    // #52): completed, failed, timed out, cancelled, and
+    // deadline-skipped alike — one log line per result, with the
+    // measured figures and eval verdict in the detail text.
+    crate::optimize::opt_log1(
+        state,
+        &format!(
+            "experiment {} (candidate {}): {:?} — {}",
+            result.experiment_id, result.candidate_model_id, result.status, result.detail
+        ),
+    );
     let mut journal = load_journal(state);
     journal.record_result(result.clone());
     save_journal(state, &journal);
@@ -939,6 +957,21 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
         stopped_to_restart: Vec::new(),
         used_ports: HashSet::new(),
     };
+    crate::optimize::opt_log1(
+        state,
+        &format!(
+            "experiment batch {batch_id}: {} experiments: {}",
+            batch.len(),
+            batch
+                .iter()
+                .map(|e| format!(
+                    "#{} {} (serves: {})",
+                    e.id, e.candidate_model_id, e.serves
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    );
     let batch_start = Instant::now();
     let mut cancelled = false;
     let mut completed = 0usize;
@@ -974,6 +1007,13 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
         }
         let started_at = chrono::Utc::now().to_rfc3339();
         let temp_id = temp_backend_id(proposal.id);
+        crate::optimize::opt_log1(
+            state,
+            &format!(
+                "experiment {} (candidate {}): launching as temp backend {temp_id}",
+                proposal.id, proposal.candidate_model_id
+            ),
+        );
         let remaining_batch = Duration::from_secs(BATCH_TIMEOUT_SECS)
             .saturating_sub(batch_start.elapsed());
         let budget = Duration::from_secs(EXPERIMENT_TIMEOUT_SECS).min(remaining_batch);
@@ -1071,6 +1111,13 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
             json!({ "batch": batch_id, "completed": completed, "failed": failed }),
         )
     };
+    crate::optimize::opt_log1(
+        state,
+        &format!(
+            "experiment batch {batch_id} end: {completed} completed, {failed} failed{}",
+            if cancelled { ", cancelled" } else { "" }
+        ),
+    );
     state.finish_task(&task_id, status, detail).await;
     if cancelled {
         return Err(ApiError::InvalidInput("experiment batch cancelled".to_string()));

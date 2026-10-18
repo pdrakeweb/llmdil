@@ -29,7 +29,7 @@ import { esc } from "../html";
 import { icon } from "../icons";
 
 export function renderOptimize(): string {
-  return `<div class="topbar"><h1>Optimize</h1></div>
+  return `<div class="topbar"><h1>Optimize</h1><span class="spacer"></span><a class="btn icon-only" href="#/logs?scope=optimize&follow=1" title="Logs" aria-label="Optimize logs">${icon("logs")}</a></div>
   <div id="optRoot"><div class="card" style="color:var(--text2)">${icon("clock")} Loading…</div></div>`;
 }
 
