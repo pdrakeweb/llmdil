@@ -1,0 +1,11 @@
+Work through this problem step by step, showing your reasoning, then give the final answers clearly at the end.
+
+A warehouse stores boxes in stacks. There are 5 stacks. Stack A has twice as many boxes as stack B. Stack C has 7 fewer boxes than stack A. Stack D has as many boxes as stacks B and C combined. Stack E has 3 more boxes than stack D. The total number of boxes across all five stacks is 213.
+
+Part 1: How many boxes are in each stack? Show the algebra you use.
+
+Part 2: Boxes are removed from stack E, one truckload of 12 at a time, until fewer than 12 remain in stack E. How many full truckloads are removed, and how many boxes are left in stack E?
+
+Part 3: After those removals, boxes are moved from stack A to stack B until the two stacks are as close to equal as possible (moving whole boxes only, and not overshooting equality). How many boxes are moved, and what are the final counts of A and B?
+
+Part 4: State a general check you can apply to verify your Part 1 answer without redoing the whole calculation, and apply it.

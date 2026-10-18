@@ -1,0 +1,25 @@
+The Rust function below is supposed to compute a running median of a stream of f64 values, but it has bugs: it panics on some inputs, returns wrong results on others, and is slower than it needs to be.
+
+```rust
+fn running_median(values: &[f64]) -> Vec<f64> {
+    let mut out = Vec::new();
+    let mut seen: Vec<f64> = Vec::new();
+    for v in values {
+        seen.push(*v);
+        seen.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = seen.len();
+        if n % 2 == 1 {
+            out.push(seen[n / 2]);
+        } else {
+            out.push((seen[n / 2] + seen[n / 2 + 1]) / 2.0);
+        }
+    }
+    out
+}
+```
+
+Tasks:
+1. Identify every bug: for each one give a concrete input that exposes it and what the function does on that input (panic, wrong value, or wasted work), versus what it should do.
+2. Decide and state how NaN inputs should be handled, and justify the choice in one or two sentences.
+3. Provide a corrected implementation. Keep the same signature. If you change the algorithmic complexity, say what the old and new complexity are and why the change is or is not worth it at the sizes this function is likely to see.
+4. List three unit tests that would have caught the bugs you found, with the input and expected output of each.

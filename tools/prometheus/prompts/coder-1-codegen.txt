@@ -1,0 +1,11 @@
+Write a complete, self-contained Python 3 module implementing the specification below. Include the full code, then a short section explaining your design choices and edge cases.
+
+Specification: a rate limiter class `SlidingWindowRateLimiter`.
+
+- Constructor: `__init__(self, max_requests: int, window_seconds: float, clock=time.monotonic)`. The clock parameter is an injectable zero-argument callable returning seconds as a float, for testability.
+- Method `allow(self, key: str) -> bool`: returns True and records the request if `key` has made fewer than `max_requests` requests in the trailing `window_seconds`; otherwise returns False and records nothing.
+- Method `remaining(self, key: str) -> int`: how many more requests `key` may make right now.
+- Method `reset_at(self, key: str) -> float | None`: the clock time at which the oldest in-window request for `key` expires, or None if there are no in-window requests.
+- Expired timestamps must be pruned so memory per key does not grow without bound.
+- Keys are independent. The class must be safe to call from multiple threads.
+- Include a `if __name__ == "__main__":` self-test using a fake clock that asserts: the limit is enforced exactly, requests become allowed again after the window passes, `remaining` counts down correctly, and keys do not interfere with each other.

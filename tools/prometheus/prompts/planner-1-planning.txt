@@ -1,0 +1,12 @@
+You are planning a project. Write a detailed plan; do not ask clarifying questions.
+
+Scenario: A small software team of four engineers has 10 weeks to migrate a monolithic internal web application to a modular architecture without downtime. The application has paying internal users in three time zones, a Postgres database with about 400 GB of data, and a hard deadline because the current hosting contract expires at the end of week 10.
+
+Produce:
+1. A week-by-week plan for the 10 weeks, naming the main deliverable of each week.
+2. The three largest risks, and for each one a mitigation and an early warning sign that the risk is materialising.
+3. A rollback strategy for the database migration specifically, including the point of no return and how you would decide to roll back.
+4. A communication plan: who is told what, at which milestones.
+5. A short section on what you would deliberately NOT do in this migration, and why.
+
+Be specific and concrete throughout. Aim for a complete, structured answer.

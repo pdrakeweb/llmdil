@@ -1,0 +1,27 @@
+Review the following Python function as a senior engineer doing a code review. It processes uploaded CSV files for a reporting tool.
+
+```python
+import csv, os, sqlite3
+
+def process_upload(path, user_id):
+    conn = sqlite3.connect("reports.db")
+    cur = conn.cursor()
+    f = open(path)
+    reader = csv.reader(f)
+    rows = list(reader)
+    total = 0
+    for i, row in enumerate(rows):
+        if i == 0:
+            continue
+        cur.execute("INSERT INTO results VALUES ('%s', '%s', '%s')" % (user_id, row[0], row[1]))
+        total += float(row[2])
+    conn.commit()
+    os.remove(path)
+    return total
+```
+
+Produce a structured review:
+1. Every correctness bug you can find, each with the input or condition that triggers it and what happens.
+2. Every security problem, ranked by severity, with the attack it enables.
+3. Resource and robustness problems (file handles, memory, error handling, partial failure).
+4. A rewritten version of the function that fixes what you found, followed by a brief explanation of each change you made and why.
