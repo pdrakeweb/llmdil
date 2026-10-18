@@ -7813,6 +7813,230 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Stateful loopback stub for the offload-probe sequence
+    /// tests: answers GET /health and POST /v1/chat/completions
+    /// from per-path status scripts (each request pops the next
+    /// scripted status; the last one repeats). Returns the base
+    /// URL and the per-path request counters.
+    fn offload_probe_stub(
+        health_script: Vec<u16>,
+        chat_script: Vec<u16>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<usize>>,
+        std::sync::Arc<std::sync::Mutex<usize>>,
+    ) {
+        use std::io::{Read, Write};
+        fn next_status(
+            script: &std::sync::Mutex<Vec<u16>>,
+        ) -> u16 {
+            let mut script = script.lock().unwrap();
+            if script.len() > 1 {
+                script.remove(0)
+            } else {
+                script[0]
+            }
+        }
+        fn stub_body(path: &str, status: u16) -> String {
+            match (path, status) {
+                ("/health", 200) => "{\"status\":\"ok\"}".to_string(),
+                ("/health", _) => "{\"status\":\"loading\"}".to_string(),
+                (_, 200) => "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":4000,\"completion_tokens\":16}}".to_string(),
+                (_, 503) => "{\"error\":{\"message\":\"Loading model\",\"type\":\"unavailable_error\",\"code\":503}}".to_string(),
+                (_, s) => format!(
+                    "{{\"error\":{{\"message\":\"stub failure\",\"type\":\"server_error\",\"code\":{s}}}}}"
+                ),
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let health_script = std::sync::Arc::new(std::sync::Mutex::new(health_script));
+        let chat_script = std::sync::Arc::new(std::sync::Mutex::new(chat_script));
+        let health_count = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let chat_count = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        {
+            let health_script = std::sync::Arc::clone(&health_script);
+            let chat_script = std::sync::Arc::clone(&chat_script);
+            let health_count = std::sync::Arc::clone(&health_count);
+            let chat_count = std::sync::Arc::clone(&chat_count);
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    // Read the request head, then the body per
+                    // Content-Length, before responding.
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let mut content_length = 0usize;
+                    let mut head_end: Option<usize> = None;
+                    loop {
+                        if head_end.is_none() {
+                            head_end = buf
+                                .windows(4)
+                                .position(|w| w == b"\r\n\r\n")
+                                .map(|p| p + 4);
+                            if let Some(he) = head_end {
+                                let head = String::from_utf8_lossy(&buf[..he]).into_owned();
+                                for line in head.lines() {
+                                    let lower = line.to_ascii_lowercase();
+                                    if let Some(v) = lower.strip_prefix("content-length:") {
+                                        content_length = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(he) = head_end {
+                            if buf.len() >= he + content_length {
+                                break;
+                            }
+                        }
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            Err(_) => break,
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&buf).into_owned();
+                    let path = req
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
+                    let status = if path == "/health" {
+                        *health_count.lock().unwrap() += 1;
+                        next_status(&health_script)
+                    } else {
+                        *chat_count.lock().unwrap() += 1;
+                        next_status(&chat_script)
+                    };
+                    let body = stub_body(&path, status);
+                    let reason = match status {
+                        200 => "OK",
+                        500 => "Internal Server Error",
+                        503 => "Service Unavailable",
+                        _ => "Status",
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+        }
+        (
+            format!("http://127.0.0.1:{port}"),
+            health_count,
+            chat_count,
+        )
+    }
+
+    fn offload_probe_test_timing() -> OffloadProbeTiming {
+        OffloadProbeTiming {
+            ready_budget: Duration::from_secs(10),
+            ready_poll: Duration::from_millis(10),
+            retry_window: Duration::from_secs(10),
+            retry_poll: Duration::from_millis(10),
+        }
+    }
+
+    #[tokio::test]
+    async fn offload_probe_waits_out_loading_503s() {
+        // The tracker #46 field shape: /health reports 503 while
+        // the model loads, then 200. The probe must not send its
+        // chat request until readiness, and must then pass — the
+        // old status-blind "ping" gate fired the probe request
+        // into the loading 503 and reported a failure.
+        let (base, health_count, chat_count) =
+            offload_probe_stub(vec![503, 503, 200], vec![200]);
+        let mut alive = || {
+            Box::pin(async { true })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        };
+        let outcome = offload_probe_http_sequence(&base, offload_probe_test_timing(), &mut alive)
+            .await;
+        assert_eq!(outcome, OffloadProbeHttpOutcome::Passed);
+        assert!(*health_count.lock().unwrap() >= 3);
+        assert_eq!(*chat_count.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn offload_probe_reports_not_ready_without_sending_the_probe() {
+        // The backend never becomes ready: the outcome is the
+        // distinct NotReady, and the probe request is never sent —
+        // a not-ready backend must not read as a probe failure.
+        let (base, _health_count, chat_count) = offload_probe_stub(vec![503], vec![200]);
+        let timing = OffloadProbeTiming {
+            ready_budget: Duration::from_millis(300),
+            ..offload_probe_test_timing()
+        };
+        let mut alive = || {
+            Box::pin(async { true })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        };
+        let outcome = offload_probe_http_sequence(&base, timing, &mut alive).await;
+        assert_eq!(outcome, OffloadProbeHttpOutcome::NotReady);
+        assert_eq!(*chat_count.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn offload_probe_retries_transient_503_after_readiness() {
+        // Ready, but the first probe attempts still draw 503s
+        // (startup work racing the probe): retried within the
+        // window, then the probe passes.
+        let (base, _health_count, chat_count) =
+            offload_probe_stub(vec![200], vec![503, 503, 200]);
+        let mut alive = || {
+            Box::pin(async { true })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        };
+        let outcome = offload_probe_http_sequence(&base, offload_probe_test_timing(), &mut alive)
+            .await;
+        assert_eq!(outcome, OffloadProbeHttpOutcome::Passed);
+        assert_eq!(*chat_count.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn offload_probe_fails_on_error_status_after_readiness() {
+        // A non-transient error status after readiness is a real
+        // probe failure, reported immediately (no retry).
+        let (base, _health_count, chat_count) = offload_probe_stub(vec![200], vec![500]);
+        let mut alive = || {
+            Box::pin(async { true })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        };
+        let outcome = offload_probe_http_sequence(&base, offload_probe_test_timing(), &mut alive)
+            .await;
+        assert_eq!(
+            outcome,
+            OffloadProbeHttpOutcome::FailedAfterReady("HTTP 500".to_string())
+        );
+        assert_eq!(*chat_count.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn offload_probe_persistent_503_after_readiness_is_terminal() {
+        // A 503 that outlasts the retry window is reported as a
+        // failure after readiness — transient handling must not
+        // mask a backend that stays unavailable.
+        let (base, _health_count, chat_count) = offload_probe_stub(vec![200], vec![503]);
+        let timing = OffloadProbeTiming {
+            retry_window: Duration::from_millis(300),
+            ..offload_probe_test_timing()
+        };
+        let mut alive = || {
+            Box::pin(async { true })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        };
+        let outcome = offload_probe_http_sequence(&base, timing, &mut alive).await;
+        assert_eq!(
+            outcome,
+            OffloadProbeHttpOutcome::FailedAfterReady("HTTP 503".to_string())
+        );
+        assert!(*chat_count.lock().unwrap() >= 2);
+    }
+
     #[test]
     fn process_state_str_covers_all_variants() {
         for (v, want) in [
@@ -9474,11 +9698,140 @@ async fn fail_offload_probe(
     .await;
 }
 
-/// The background offload probe: wait for the backend to answer,
-/// then send one long prompt (about 4,000 tokens of prompt
+/// Timing knobs for the offload probe's HTTP sequence. Production
+/// values come from [`OffloadProbeTiming::production`]; tests shrink
+/// them so the sequence runs in milliseconds.
+#[derive(Debug, Clone, Copy)]
+struct OffloadProbeTiming {
+    /// How long to wait for the backend to report ready (GET
+    /// /health 2xx) before concluding the probe cannot run.
+    ready_budget: Duration,
+    /// Delay between readiness polls.
+    ready_poll: Duration,
+    /// After readiness, how long transient probe-request failures
+    /// (HTTP 503, transport errors) are retried before the failure
+    /// is reported as terminal.
+    retry_window: Duration,
+    /// Delay between probe-request retries.
+    retry_poll: Duration,
+}
+
+impl OffloadProbeTiming {
+    fn production() -> Self {
+        Self {
+            ready_budget: Duration::from_secs(180),
+            ready_poll: Duration::from_secs(2),
+            retry_window: Duration::from_secs(60),
+            retry_poll: Duration::from_secs(3),
+        }
+    }
+}
+
+/// What the offload probe's HTTP sequence concluded. Process death
+/// is detected through the alive check, never inferred from HTTP
+/// traffic, so a crashed backend is never reclassified as "not
+/// ready".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OffloadProbeHttpOutcome {
+    /// The backend reported ready and the probe request succeeded.
+    Passed,
+    /// The supervised process exited (or vanished) at some point
+    /// during the sequence.
+    BackendStopped,
+    /// The backend never reported ready within the readiness
+    /// budget, so the probe request was never sent. This is not
+    /// evidence about the offload position.
+    NotReady,
+    /// The backend reported ready and the probe request then
+    /// failed terminally: a non-transient HTTP status, or a
+    /// transient failure that persisted past the retry window.
+    /// Carries the failure text (e.g. "HTTP 500").
+    FailedAfterReady(String),
+}
+
+/// Liveness check consulted between readiness polls and probe
+/// attempts: true while the backend's process is alive.
+type OffloadProbeAlive<'a> = dyn FnMut() -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = bool> + Send + 'a>,
+    > + Send
+    + 'a;
+
+/// The offload probe's HTTP sequence, split from
+/// [`run_offload_probe`] so tests can drive it against a stub
+/// backend: wait for the app's readiness signal (GET /health 2xx —
+/// the definition the supervisor's health probe and the tool-call
+/// probe both use), then send the long probe prompt, retrying
+/// transient failures for a bounded window.
+///
+/// The readiness gate must NOT be a chat request: `test_request`
+/// returns Ok for any JSON-parseable response regardless of status,
+/// and llama-server answers chat completions with HTTP 503 (with a
+/// JSON error body) the whole time the model is loading. A
+/// status-blind gate therefore passes the moment the listener is
+/// up — minutes before the backend can serve — and the probe then
+/// fails on that same 503. That was the v0.1.38 field failure
+/// behind tracker #46.
+async fn offload_probe_http_sequence(
+    base_url: &str,
+    timing: OffloadProbeTiming,
+    alive: &mut OffloadProbeAlive<'_>,
+) -> OffloadProbeHttpOutcome {
+    // Readiness phase: poll GET /health until it reports 2xx.
+    let health = HttpHealthProbe::new(
+        format!("{}/health", base_url.trim_end_matches('/')),
+        Duration::from_secs(2),
+    );
+    let ready_deadline = std::time::Instant::now() + timing.ready_budget;
+    loop {
+        if !alive().await {
+            return OffloadProbeHttpOutcome::BackendStopped;
+        }
+        if matches!(
+            health.probe().await,
+            Ok(manager_supervisor::HealthStatus::Healthy)
+        ) {
+            break;
+        }
+        if std::time::Instant::now() >= ready_deadline {
+            return OffloadProbeHttpOutcome::NotReady;
+        }
+        tokio::time::sleep(timing.ready_poll).await;
+    }
+    // Probe phase: one long prompt (about 4,000 tokens of prompt
+    // processing, exercised across many 512-token ubatches) at the
+    // newly activated offload position. HTTP 503 is llama-server's
+    // not-ready/busy answer and a transport error can race the last
+    // of the startup work, so both retry within the window; any
+    // other failure — or a transient one that outlasts the window —
+    // is terminal.
+    let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(450);
+    let retry_deadline = std::time::Instant::now() + timing.retry_window;
+    loop {
+        let result = test_request(base_url, &prompt).await;
+        // Process death outranks a request error: a dead backend's
+        // last request also fails, and the stopped detail is the
+        // actionable one.
+        if !alive().await {
+            return OffloadProbeHttpOutcome::BackendStopped;
+        }
+        let (failure, transient) = match result {
+            Ok(r) if r.status < 400 => return OffloadProbeHttpOutcome::Passed,
+            Ok(r) => (format!("HTTP {}", r.status), r.status == 503),
+            Err(e) => (e.to_string(), true),
+        };
+        if !transient || std::time::Instant::now() >= retry_deadline {
+            return OffloadProbeHttpOutcome::FailedAfterReady(failure);
+        }
+        tokio::time::sleep(timing.retry_poll).await;
+    }
+}
+
+/// The background offload probe: wait for the backend to report
+/// ready, then send one long prompt (about 4,000 tokens of prompt
 /// processing, exercised across many 512-token ubatches) at the
-/// newly activated offload position, then confirm the process is
-/// still alive. A passed probe means only that the probe completed.
+/// newly activated offload position, confirming the process is
+/// still alive throughout. A passed probe means only that the
+/// probe completed.
 async fn run_offload_probe(
     sink: Arc<dyn EventSink>,
     state: Arc<AppState>,
@@ -9489,46 +9842,18 @@ async fn run_offload_probe(
 ) {
     let base_url = format!("http://127.0.0.1:{port}");
     let stopped_detail = format!(
-        "the backend stopped during the offload probe at {layers} of {moe_layers} layers — this position is unverified on this GPU; full offload ({moe_layers} of {moe_layers} layers) is the verified position"
+        "the backend stopped during the offload probe at the {layers} of {moe_layers} layers offload position — this position is unverified on this GPU; full offload ({moe_layers} of {moe_layers} layers) is the verified position"
     );
-    // Health phase: poll every 2s for up to 180s.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-    let mut healthy = false;
-    while std::time::Instant::now() < deadline {
-        if !offload_probe_backend_alive(&state, &backend_id).await {
-            fail_offload_probe(sink.as_ref(), &state, &backend_id, layers, stopped_detail).await;
-            return;
-        }
-        if test_request(&base_url, "ping").await.is_ok() {
-            healthy = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
-    if !healthy {
-        fail_offload_probe(
-            sink.as_ref(),
-            &state,
-            &backend_id,
-            layers,
-            format!(
-                "the backend did not respond during the offload probe at {layers} of {moe_layers} layers — this position is unverified on this GPU; full offload ({moe_layers} of {moe_layers} layers) is the verified position"
-            ),
-        )
-        .await;
-        return;
-    }
-    // Probe phase: one long prompt against the new position.
-    let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(450);
-    let probe_result = test_request(&base_url, &prompt).await;
-    // Process death outranks a request error: a dead backend's last
-    // request also fails, and the stopped detail is the actionable one.
-    if !offload_probe_backend_alive(&state, &backend_id).await {
-        fail_offload_probe(sink.as_ref(), &state, &backend_id, layers, stopped_detail).await;
-        return;
-    }
-    match probe_result {
-        Ok(result) if result.status < 400 => {
+    let timing = OffloadProbeTiming::production();
+    let mut alive = || {
+        let state = Arc::clone(&state);
+        let backend_id = backend_id.clone();
+        Box::pin(async move { offload_probe_backend_alive(&state, &backend_id).await })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+    };
+    let outcome = offload_probe_http_sequence(&base_url, timing, &mut alive).await;
+    match outcome {
+        OffloadProbeHttpOutcome::Passed => {
             let mut probes = state
                 .offload_probes
                 .lock()
@@ -9542,27 +9867,30 @@ async fn run_offload_probe(
                 },
             );
         }
-        Ok(result) => {
+        OffloadProbeHttpOutcome::BackendStopped => {
+            fail_offload_probe(sink.as_ref(), &state, &backend_id, layers, stopped_detail).await;
+        }
+        OffloadProbeHttpOutcome::NotReady => {
             fail_offload_probe(
                 sink.as_ref(),
                 &state,
                 &backend_id,
                 layers,
                 format!(
-                    "the offload probe request failed at {layers} of {moe_layers} layers: HTTP {}",
-                    result.status
+                    "the backend did not become ready within {}s, so the offload probe could not run — no conclusion about the {layers} of {moe_layers} layers offload position; this position is unverified on this GPU; full offload ({moe_layers} of {moe_layers} layers) is the verified position",
+                    timing.ready_budget.as_secs()
                 ),
             )
             .await;
         }
-        Err(e) => {
+        OffloadProbeHttpOutcome::FailedAfterReady(failure) => {
             fail_offload_probe(
                 sink.as_ref(),
                 &state,
                 &backend_id,
                 layers,
                 format!(
-                    "the offload probe request failed at {layers} of {moe_layers} layers: {e}"
+                    "the offload probe request failed at the {layers} of {moe_layers} layers offload position: {failure}"
                 ),
             )
             .await;
