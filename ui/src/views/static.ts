@@ -24,7 +24,7 @@ import {
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
   setNotificationConfig, sendTestNotification,
 } from "../api";
-import type { ActivationChange, ActivationPlanData, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
+import type { ActivationChange, ActivationPlanData, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire } from "../api";
 import type { GpuInfo, WizardStepState } from "../types";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
@@ -3358,10 +3358,23 @@ export async function wireLogs(root: HTMLElement, initialScope?: string): Promis
 }
 /* ---------------- Gateway ---------------- */
 
+/** Routing-rules card form state (routing-rules design §7), held
+ *  in the wireGateway closure so the 5-second repaint preserves an
+ *  open form. `editingId` null = adding a new rule; `optimalTokens`
+ *  is the raw input text — empty means the fraction default. */
+interface RuleFormState {
+  open: boolean;
+  editingId: string | null;
+  target: string;
+  optimalTokens: string;
+  advisory: boolean;
+}
+
 function gatewayPaint(
   status: GatewayStatusData,
   cfg: GatewayConfigData,
   backends: BackendRow[],
+  models: ModelRow[],
   yamlOpen: boolean,
   yamlText: string | null,
   yamlErr: string,
@@ -3375,6 +3388,11 @@ function gatewayPaint(
   routingTab: "flow" | "groups",
   orModelsOpen: boolean,
   openFragments: Set<string>,
+  ruleForm: RuleFormState,
+  confirmRuleDelete: Set<string>,
+  ruleRawFlags: Map<string, string | null>,
+  genTab: "yaml" | "routing",
+  routingPyText: string | null,
 ): string {
   const port = status.port || cfg.port;
   const backendById = new Map(backends.map((b) => [b.id, b]));
@@ -3638,66 +3656,180 @@ function gatewayPaint(
     </div>`
     : emptyHtml("No model groups are configured for the gateway.");
 
-  /* ---- Routing rules: source composition bar (when it encodes
-   * something the rows don't), rows as Label: Value with the
-   * description in an info-tip and the operative fragment behind a
-   * per-row expandable. Zero rules: the card is omitted. ---- */
-  const rules = cfg.routing_rules.length
-    ? (() => {
-        const bySource = new Map<string, number>();
-        for (const r of cfg.routing_rules) bySource.set(r.source, (bySource.get(r.source) ?? 0) + 1);
-        const tones = ["#6d7686", "#3a4350", "#a7b0bf", "#545e6e"];
-        const showBar = cfg.routing_rules.length >= 2 && bySource.size >= 2;
-        const bar = showBar
-          ? `<div style="margin-bottom:6px">${stackedBar([...bySource.entries()].map(([src, cnt], i) => ({
-              pct: (cnt / cfg.routing_rules.length) * 100,
-              color: tones[i % tones.length],
-              label: `${src}: ${cnt}`,
-            })), 600, 8)}
-            <div class="legend" style="margin-top:4px">${[...bySource.entries()].map(([src], i) => `<span><span class="sw" style="background:${tones[i % tones.length]}"></span>${esc(src)}</span>`).join("")}</div></div>`
-          : "";
-        const rows = cfg.routing_rules.map((r) => {
-          const open = openFragments.has(r.id);
-          return `<div style="display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)">
-            <span style="font-size:12px">Rule: <span style="font-family:var(--mono)">${esc(r.id)}</span></span>
-            <span class="info-tip" title="${esc(r.description)}">${icon("info")}</span>
-            <span class="spacer" style="flex:1"></span>
-            ${r.litellm_fragment ? `<button class="btn" data-fragment="${esc(r.id)}" aria-expanded="${open}" title="Fragment" aria-label="Fragment" style="padding:2px 8px;font-size:11px">${icon(open ? "chevD" : "chevR")}</button>` : ""}
-            <span class="chip">${esc(r.source)}</span></div>
-            ${open && r.litellm_fragment ? `<pre style="margin:6px 0;padding:10px 12px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-word">${esc(r.litellm_fragment)}</pre>` : ""}`;
-        }).join("");
-        return `<div class="card" style="margin-top:12px"><div class="sec-title">Routing rules</div>${bar}${rows}</div>`;
-      })()
-    : "";
+  /* ---- Routing rules (routing-rules design §7): the management
+   * surface for typed rules. The header renders always — it is the
+   * creation surface, not a data block; the body renders when rules
+   * exist or the form is open. Typed rules render as Label: Value
+   * rows with enable/disable (icon-only), edit (icon-only), and
+   * Delete (words + icon, destructive — principle 15); legacy
+   * fragment-only rules stay read-only (design §6.1) with their
+   * fragment behind a per-row expandable. The source composition
+   * bar survives from the read-only card for mixed rule lists. ---- */
+  /** A group's hard window, mirroring manager-gateway's baking:
+   *  the minimum over its enabled member backends of
+   *  min(configured context, the model's rated context). Null when
+   *  no enabled backend member bounds the group. */
+  const groupHardWindow = (g: GatewayGroup): number | null => {
+    let hard: number | null = null;
+    for (const member of g.members) {
+      const b = backendById.get(member);
+      if (!b || !b.enabled || b.n_ctx === undefined) continue;
+      const mdl = models.find((m) => sameModelFile(b.model_file, m.gguf_path));
+      const cap = mdl?.ctx_max ? mdl.ctx_max : null;
+      const w = cap !== null ? Math.min(b.n_ctx, cap) : b.n_ctx;
+      hard = hard === null ? w : Math.min(hard, w);
+    }
+    return hard;
+  };
+  /** The §6.2 warnings for a rule draft targeting `target`,
+   *  computed from the same data the generator bakes from. */
+  const ruleWarnings = (target: string): string[] => {
+    const warnings: string[] = [];
+    const tg = cfg.groups.find((g) => g.name === target);
+    if (!tg) return warnings;
+    if (tg.enabled_members === 0) {
+      warnings.push(`The target group ${target} has no enabled members — rerouted requests will fail until a member backend is enabled.`);
+    }
+    const targetHard = groupHardWindow(tg);
+    if (targetHard !== null) {
+      for (const g of cfg.groups) {
+        if (g.name === target) continue;
+        const h = groupHardWindow(g);
+        if (h !== null && targetHard <= h) {
+          warnings.push(`The target's window (${fmtCount(targetHard)} tokens) is not larger than ${g.name}'s (${fmtCount(h)} tokens) — the rule cannot help ${g.name}.`);
+        }
+      }
+    }
+    for (const g of cfg.groups) {
+      for (const member of g.members) {
+        const raw = ruleRawFlags.get(member);
+        if (!raw) continue;
+        const toks = raw.split(/\s+/);
+        for (let i = 0; i + 1 < toks.length; i++) {
+          if ((toks[i] === "--parallel" || toks[i] === "-np") && Number(toks[i + 1]) > 1) {
+            warnings.push(`${member} runs with ${toks[i]} ${toks[i + 1]} — its per-slot context is smaller than the window the rule assumes, so rerouting can trigger later than the rule intends.`);
+          }
+        }
+      }
+    }
+    return warnings;
+  };
+  const ruleOptimalText = (r: GatewayRule): string => {
+    const k = r.kind as GatewayRuleKind;
+    if (k.optimal_tokens !== null) return `${fmtCount(k.optimal_tokens)} tokens`;
+    const tg = cfg.groups.find((g) => g.name === k.target_group);
+    const hard = tg ? groupHardWindow(tg) : null;
+    const pct = `${Math.round(k.optimal_fraction * 100)}%`;
+    return hard !== null
+      ? `${fmtCount(Math.floor(k.optimal_fraction * hard))} tokens (${pct} of the target window)`
+      : `${pct} of the serving window`;
+  };
+  const typedRuleRow = (r: GatewayRule): string => {
+    const k = r.kind as GatewayRuleKind;
+    return `<div style="display:flex;gap:14px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);flex-wrap:wrap">
+      <span style="font-size:12px">Type: <b>Context overflow</b></span>
+      <span style="font-size:12px">Target: <b>${esc(k.target_group)}</b></span>
+      <span style="font-size:12px">Optimal: <b>${esc(ruleOptimalText(r))}</b></span>
+      <span style="font-size:12px">Advisory: <b>${k.advisory ? "On" : "Off"}</b></span>
+      ${r.description ? `<span class="info-tip" title="${esc(r.description)}">${icon("info")}</span>` : ""}
+      ${r.enabled ? "" : `<span class="chip status-tag status-off">Disabled</span>`}
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn icon-only" data-rule-toggle="${esc(r.id)}" title="${r.enabled ? "Disable rule" : "Enable rule"}" aria-label="${r.enabled ? "Disable" : "Enable"} rule ${esc(r.id)}">${icon(r.enabled ? "ban" : "check")}</button>
+      <button class="btn icon-only" data-rule-edit="${esc(r.id)}" title="Edit rule" aria-label="Edit rule ${esc(r.id)}">${icon("pencil")}</button>
+      <button class="btn danger${confirmRuleDelete.has(r.id) ? " armed" : ""}" data-rule-delete="${esc(r.id)}">${icon("trash")} ${confirmRuleDelete.has(r.id) ? "Confirm delete" : "Delete"}</button>
+    </div>`;
+  };
+  const legacyRuleRow = (r: GatewayRule): string => {
+    const open = openFragments.has(r.id);
+    return `<div style="display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)">
+      <span style="font-size:12px">Rule: <span style="font-family:var(--mono)">${esc(r.id)}</span></span>
+      <span class="info-tip" title="${esc(r.description)}">${icon("info")}</span>
+      <span class="spacer" style="flex:1"></span>
+      ${r.litellm_fragment ? `<button class="btn" data-fragment="${esc(r.id)}" aria-expanded="${open}" title="Fragment" aria-label="Fragment" style="padding:2px 8px;font-size:11px">${icon(open ? "chevD" : "chevR")}</button>` : ""}
+      <span class="chip">${esc(r.source)}</span></div>
+      ${open && r.litellm_fragment ? `<pre style="margin:6px 0;padding:10px 12px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-word">${esc(r.litellm_fragment)}</pre>` : ""}`;
+  };
+  const ruleFormHtml = (): string => {
+    if (!ruleForm.open) return "";
+    const warnings = ruleWarnings(ruleForm.target);
+    const targetOptions = cfg.groups
+      .map((g) => `<option value="${esc(g.name)}"${g.name === ruleForm.target ? " selected" : ""}>${esc(g.name)}</option>`)
+      .join("");
+    return `<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">
+      <div style="display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap">
+        <span style="font-size:12px">Type: <b>Context overflow</b></span>
+        <label style="font-size:12px">Target group
+          <select id="gwRuleTarget" class="input" style="display:block;margin-top:4px">${targetOptions}</select></label>
+        <label style="font-size:12px">Optimal tokens<span class="info-tip" title="Past this conversation size the serving model adds the compaction note. Empty = the default: half the serving model's window.">${icon("info")}</span>
+          <input id="gwRuleOptimal" class="input" type="number" min="1" step="1" placeholder="Default (half the window)" value="${esc(ruleForm.optimalTokens)}" style="display:block;margin-top:4px"></label>
+        <label style="font-size:12px;display:flex;gap:6px;align-items:center;padding-bottom:6px"><input type="checkbox" id="gwRuleAdvisory"${ruleForm.advisory ? " checked" : ""}> Advisory<span class="info-tip" title="When on, the serving model appends the compaction note past the optimal window. Off = reroute silently.">${icon("info")}</span></label>
+      </div>
+      ${warnings.map((w) => `<div style="color:var(--amber);font-size:12px;margin-top:6px">${icon("warn")} ${esc(w)}</div>`).join("")}
+      <div class="card-actions" style="margin-top:10px">
+        <button class="btn" id="gwRuleSaveBtn">${icon("check")} Save rule</button>
+        <button class="btn" id="gwRuleCancelBtn">Cancel</button>
+      </div>
+    </div>`;
+  };
+  const rules = (() => {
+    const bySource = new Map<string, number>();
+    for (const r of cfg.routing_rules) bySource.set(r.source, (bySource.get(r.source) ?? 0) + 1);
+    const tones = ["#6d7686", "#3a4350", "#a7b0bf", "#545e6e"];
+    const showBar = cfg.routing_rules.length >= 2 && bySource.size >= 2;
+    const bar = showBar
+      ? `<div style="margin-bottom:6px">${stackedBar([...bySource.entries()].map(([src, cnt], i) => ({
+          pct: (cnt / cfg.routing_rules.length) * 100,
+          color: tones[i % tones.length],
+          label: `${src}: ${cnt}`,
+        })), 600, 8)}
+        <div class="legend" style="margin-top:4px">${[...bySource.entries()].map(([src], i) => `<span><span class="sw" style="background:${tones[i % tones.length]}"></span>${esc(src)}</span>`).join("")}</div></div>`
+      : "";
+    const rows = cfg.routing_rules.map((r) => (r.kind ? typedRuleRow(r) : legacyRuleRow(r))).join("");
+    return `<div class="card" style="margin-top:12px"><div class="sec-title">${icon("gateway")} Routing rules<span class="info-tip" title="A context-overflow rule reroutes a request too large for its model group to the target group instead of failing it, and past the optimal window the serving model adds a one-line note advising a compacted or fresh conversation. Changes take effect when the gateway restarts — save, then apply the Activation Plan.">${icon("info")}</span>
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn" id="gwRuleAddBtn">${icon("plus")} Add rule</button></div>
+      ${bar}${rows}${ruleFormHtml()}</div>`;
+  })();
 
-  /* ---- Generated config: one collapsed row (title, summary
-   * values once fetched, Copy / Download / toggle); the two
-   * methodology sentences ride info-tips verbatim; a fetch in
-   * flight renders "Loading…" in the pre region, never an empty
-   * pre; a load failure is a header value with the raw error in
-   * its tooltip. ---- */
-  const yamlSummary = yamlText !== null && !yamlErr
+  /* ---- Generated config: one section, two views (design §7) —
+   * config.yaml, plus the llmdil_routing.py callback as a second
+   * tab when a typed routing rule is enabled. One collapsed row
+   * (title, summary values once fetched, Copy / Download / toggle
+   * acting on the active tab); the methodology sentences ride
+   * info-tips verbatim; a fetch in flight renders "Loading…" in
+   * the pre region, never an empty pre; a load failure is a header
+   * value with the raw error in its tooltip. ---- */
+  const hasRoutingCallback = cfg.routing_rules.some((r) => r.kind !== null && r.enabled);
+  const activeGenText = genTab === "routing" ? routingPyText : yamlText;
+  const genSummary = activeGenText !== null && !yamlErr
     ? (() => {
-        const lines = yamlText.replace(/\n$/, "").split("\n").length;
-        const models = (yamlText.match(/model_name:/g) ?? []).length;
+        const lines = activeGenText.replace(/\n$/, "").split("\n").length;
+        const models = genTab === "yaml" ? (activeGenText.match(/model_name:/g) ?? []).length : 0;
         return `<span style="font-size:12px;color:var(--text2)">Lines: <b style="color:var(--text)">${lines}</b></span>
-        <span style="font-size:12px;color:var(--text2)">Models: <b style="color:var(--text)">${models}</b></span>
+        ${genTab === "yaml" ? `<span style="font-size:12px;color:var(--text2)">Models: <b style="color:var(--text)">${models}</b></span>` : ""}
         <span style="font-size:12px;color:var(--text2)">Source: current configuration<span class="info-tip" title="The running gateway reads the config file written when it was last (re)started from the Setup Wizard. This preview is regenerated from the current configuration — after edits, the two can differ until the gateway is restarted.">${icon("info")}</span></span>`;
       })()
+    : "";
+  const genTabs = hasRoutingCallback
+    ? `<div class="viewsel" role="tablist" style="margin-top:10px">
+        <button data-gen-tab="yaml"${genTab === "yaml" ? ` class="active"` : ""}>config.yaml</button>
+        <button data-gen-tab="routing"${genTab === "routing" ? ` class="active"` : ""}>llmdil_routing.py</button>
+      </div>`
     : "";
   const yaml = `<div class="card" style="margin-top:12px">
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <span class="sec-title" style="margin:0">Generated config (preview)</span>
-      ${yamlErr ? `<span style="font-size:12px;color:var(--err)" title="${esc(yamlErr)}">Preview: failed to load</span>` : yamlSummary}
+      ${yamlErr ? `<span style="font-size:12px;color:var(--err)" title="${esc(yamlErr)}">Preview: failed to load</span>` : genSummary}
       <span class="spacer" style="flex:1"></span>
       <button class="btn icon-only" id="gwYamlCopyBtn" title="Copy generated config" aria-label="Copy generated config">${icon("copy")}</button>
-      <button class="btn icon-only" id="gwYamlDownloadBtn" title="Download config.yaml" aria-label="Download config.yaml">${icon("download")}</button>
-      <button class="btn icon-only" id="gwYamlBtn" title="${yamlOpen ? "Hide YAML" : "Preview LiteLLM YAML"}" aria-label="${yamlOpen ? "Hide YAML" : "Preview LiteLLM YAML"}">${icon(yamlOpen ? "eyeOff" : "eye")}</button>
+      <button class="btn icon-only" id="gwYamlDownloadBtn" title="Download ${genTab === "routing" ? "llmdil_routing.py" : "config.yaml"}" aria-label="Download ${genTab === "routing" ? "llmdil_routing.py" : "config.yaml"}">${icon("download")}</button>
+      <button class="btn icon-only" id="gwYamlBtn" title="${yamlOpen ? "Hide preview" : "Preview generated config"}" aria-label="${yamlOpen ? "Hide preview" : "Preview generated config"}">${icon(yamlOpen ? "eyeOff" : "eye")}</button>
     </div>
-    ${yamlOpen && !yamlErr ? (yamlText === null
+    ${genTabs}
+    ${yamlOpen && !yamlErr ? (activeGenText === null
       ? `<pre style="margin-top:10px;padding:12px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:11px">Loading\u2026</pre>`
-      : `<div style="display:flex;gap:8px;align-items:center;margin-top:10px"><span style="font-size:11px;color:var(--text3);font-family:var(--mono)">config.yaml</span><span class="info-tip" title="\`api_key: local\` in the generated config is LiteLLM's required non-empty placeholder — it is not a real key.">${icon("info")}</span></div>
-         <pre style="margin-top:6px;padding:12px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto">${esc(yamlText)}</pre>`) : ""}
+      : `<div style="display:flex;gap:8px;align-items:center;margin-top:10px"><span style="font-size:11px;color:var(--text3);font-family:var(--mono)">${genTab === "routing" ? "llmdil_routing.py" : "config.yaml"}</span>${genTab === "yaml" ? `<span class="info-tip" title="\`api_key: local\` in the generated config is LiteLLM's required non-empty placeholder — it is not a real key.">${icon("info")}</span>` : ""}</div>
+         <pre style="margin-top:6px;padding:12px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto">${esc(activeGenText)}</pre>`) : ""}
   </div>`;
 
   return activationPlanHtml(plan, planUi, "summary") + backendsNote + summary + gwActions + endpoint + openrouter + routing + rules + yaml;
@@ -3739,6 +3871,19 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
   let routingTab: "flow" | "groups" = "flow";
   let orModelsOpen = false;
   const openFragments = new Set<string>();
+  /** Models from the latest load (the routing-rule windows and
+   *  form warnings resolve each backend's rated context from
+   *  them, mirroring the generator). */
+  let lastModels: ModelRow[] = [];
+  /** Routing-rules form draft + Delete arming + the lazily fetched
+   *  per-backend raw flags behind the form's --parallel warning. */
+  const ruleForm: RuleFormState = { open: false, editingId: null, target: "", optimalTokens: "", advisory: true };
+  const confirmRuleDelete = new Set<string>();
+  const ruleRawFlags = new Map<string, string | null>();
+  /** Generated config card: active tab + the routing callback
+   *  preview text (fetched with the YAML). */
+  let genTab: "yaml" | "routing" = "yaml";
+  let routingPyText: string | null = null;
 
   const gwMsg = (text: string, isErr = false): void => {
     const m = root.querySelector("#gwMsg");
@@ -3770,9 +3915,10 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
   };
 
   const load = async (): Promise<void> => {
-    const [st, cfg, backs, pr] = await Promise.all([getGatewayStatus(), getGatewayConfig(), getBackends(), getActivationPlan()]);
+    const [st, cfg, backs, pr, mdls] = await Promise.all([getGatewayStatus(), getGatewayConfig(), getBackends(), getActivationPlan(), getModels()]);
     if (disposed) return;
     if (!pr.error && pr.data) lastPlan = pr.data;
+    if (!mdls.error) lastModels = mdls.data;
     const err = st.error ?? cfg.error;
     setBanner(root, "gwBanner", bannerHtml({ live: st.live && cfg.live, error: err }));
     const b = root.querySelector("#gwBody");
@@ -3788,20 +3934,77 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     lastUp = st.data.up;
     lastPort = st.data.port || cfg.data.port;
     lastLanIp = st.data.lan_ip ?? null;
-    b.innerHTML = gatewayPaint(st.data, cfg.data, backs.data, yamlOpen, yamlText, yamlErr, starting, stopping, backs.error ?? null, masterKey, keyRevealed, lastPlan, planUi, routingTab, orModelsOpen, openFragments);
+    b.innerHTML = gatewayPaint(st.data, cfg.data, backs.data, lastModels, yamlOpen, yamlText, yamlErr, starting, stopping, backs.error ?? null, masterKey, keyRevealed, lastPlan, planUi, routingTab, orModelsOpen, openFragments, ruleForm, confirmRuleDelete, ruleRawFlags, genTab, routingPyText);
   };
 
-  /** Fetch the generated YAML when a Copy/Download click needs it
-   * and none is loaded (or the last fetch failed) — the buttons
-   * never act on an empty string. Returns the text or null. */
-  const ensureYaml = async (): Promise<string | null> => {
-    if (yamlText !== null && !yamlErr) return yamlText;
+  /** Fetch the generated config when a Copy/Download click needs
+   * it and none is loaded (or the last fetch failed) — the buttons
+   * never act on an empty string. Returns the ACTIVE TAB's text
+   * (the routing callback tab when selected), or null. */
+  const ensureGen = async (): Promise<string | null> => {
+    const have = genTab === "routing" ? routingPyText : yamlText;
+    if (have !== null && !yamlErr) return have;
     const r = await getGatewayYaml();
     if (disposed) return null;
     if (r.error) { yamlErr = r.error; await load(); return null; }
     yamlText = r.data.yaml;
+    routingPyText = r.data.routing_py;
     yamlErr = "";
-    return yamlText;
+    return genTab === "routing" ? routingPyText : yamlText;
+  };
+
+  /** Serialize a rule back to the stored config shape for the
+   *  update_gateway_config merge-patch. The fragment rides its
+   *  untouched raw value, so saving an unrelated rule never
+   *  rewrites a legacy rule's stored fragment. */
+  const serializeRule = (r: GatewayRule): Record<string, unknown> => ({
+    id: r.id,
+    description: r.description,
+    enabled: r.enabled,
+    kind: r.kind,
+    litellm_fragment: r.fragment_raw === undefined ? null : r.fragment_raw,
+    source: r.source,
+  });
+
+  /** Save the full rules array through update_gateway_config (the
+   *  generic gateway merge-patch — no dedicated command, design
+   *  §7) and repaint with the outcome. */
+  const patchRules = async (rules: GatewayRule[], okMsg: string): Promise<void> => {
+    const r = await updateGatewayConfig({ routing_rules: rules.map(serializeRule) });
+    if (disposed) return;
+    if (r.error) {
+      gwMsg(`Routing rule change failed: ${r.error}`, true);
+    } else if (!r.data.persisted) {
+      gwMsg("The change was applied to the in-memory configuration only — it was not saved and will be lost when the app restarts.", true);
+    } else {
+      gwMsg(okMsg);
+    }
+    await load();
+  };
+
+  /** Open the rule form (add when `editing` is null, else edit that
+   *  typed rule). Member backends' raw flags are fetched lazily
+   *  for the form's --parallel warning (best-effort). */
+  const openRuleForm = async (editing: GatewayRule | null): Promise<void> => {
+    if (editing?.kind) {
+      ruleForm.editingId = editing.id;
+      ruleForm.target = editing.kind.target_group;
+      ruleForm.optimalTokens = editing.kind.optimal_tokens !== null ? String(editing.kind.optimal_tokens) : "";
+      ruleForm.advisory = editing.kind.advisory;
+    } else {
+      ruleForm.editingId = null;
+      ruleForm.target = lastCfg?.groups[0]?.name ?? "";
+      ruleForm.optimalTokens = "";
+      ruleForm.advisory = true;
+    }
+    ruleForm.open = true;
+    const ids = new Set((lastCfg?.groups ?? []).flatMap((g) => g.members));
+    await Promise.all([...ids].map(async (id) => {
+      if (ruleRawFlags.has(id)) return;
+      const r = await getBackendConfig(id);
+      if (r.data) ruleRawFlags.set(id, r.data.raw_flags);
+    }));
+    if (!disposed) await load();
   };
 
   const onClick = async (ev: Event): Promise<void> => {
@@ -3847,28 +4050,108 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     }
 
     if (t.closest("#gwYamlCopyBtn")) {
-      const text = await ensureYaml();
+      const text = await ensureGen();
       if (text === null || disposed) return;
       try {
         await navigator.clipboard.writeText(text);
         gwMsg("Generated config copied to the clipboard.");
       } catch {
-        gwMsg("Copy failed — open the preview and copy the YAML manually.", true);
+        gwMsg("Copy failed — open the preview and copy it manually.", true);
       }
       await load();
       return;
     }
 
     if (t.closest("#gwYamlDownloadBtn")) {
-      const text = await ensureYaml();
+      const text = await ensureGen();
       if (text === null || disposed) return;
       const url = URL.createObjectURL(new Blob([text], { type: "text/yaml" }));
       const a = document.createElement("a");
       a.href = url;
-      a.download = "config.yaml";
+      a.download = genTab === "routing" ? "llmdil_routing.py" : "config.yaml";
       a.click();
       URL.revokeObjectURL(url);
       await load();
+      return;
+    }
+
+    const gt = t.closest("[data-gen-tab]") as HTMLElement | null;
+    if (gt) {
+      genTab = gt.getAttribute("data-gen-tab") === "routing" ? "routing" : "yaml";
+      await load();
+      return;
+    }
+
+    if (t.closest("#gwRuleAddBtn")) {
+      await openRuleForm(null);
+      return;
+    }
+
+    const rtog = t.closest("[data-rule-toggle]") as HTMLElement | null;
+    if (rtog && lastCfg) {
+      const id = rtog.getAttribute("data-rule-toggle") ?? "";
+      const rules = lastCfg.routing_rules.map((r) => (r.id === id ? { ...r, enabled: !r.enabled } : r));
+      const rule = rules.find((r) => r.id === id);
+      await patchRules(rules, rule?.enabled ? `Routing rule ${id} enabled and saved.` : `Routing rule ${id} disabled and saved.`);
+      return;
+    }
+
+    const redit = t.closest("[data-rule-edit]") as HTMLElement | null;
+    if (redit && lastCfg) {
+      const rule = lastCfg.routing_rules.find((r) => r.id === (redit.getAttribute("data-rule-edit") ?? ""));
+      if (rule) await openRuleForm(rule);
+      return;
+    }
+
+    const rdel = t.closest("[data-rule-delete]") as HTMLElement | null;
+    if (rdel && lastCfg) {
+      const id = rdel.getAttribute("data-rule-delete") ?? "";
+      if (!confirmRuleDelete.has(id)) {
+        confirmRuleDelete.add(id);
+        await load();
+        return;
+      }
+      confirmRuleDelete.delete(id);
+      await patchRules(lastCfg.routing_rules.filter((r) => r.id !== id), `Routing rule ${id} deleted and saved.`);
+      return;
+    }
+
+    if (t.closest("#gwRuleCancelBtn")) {
+      ruleForm.open = false;
+      await load();
+      return;
+    }
+
+    if (t.closest("#gwRuleSaveBtn")) {
+      if (!lastCfg) return;
+      const optimalText = ruleForm.optimalTokens.trim();
+      const optimal = optimalText === "" ? null : Number(optimalText);
+      if (optimal !== null && (!Number.isFinite(optimal) || optimal <= 0 || Math.floor(optimal) !== optimal)) {
+        gwMsg("Optimal tokens must be a positive whole number, or empty for the default (half the serving window).", true);
+        return;
+      }
+      const editing = ruleForm.editingId !== null
+        ? lastCfg.routing_rules.find((r) => r.id === ruleForm.editingId)
+        : undefined;
+      const kind: GatewayRuleKind = {
+        type: "context-overflow",
+        target_group: ruleForm.target,
+        optimal_fraction: editing?.kind?.optimal_fraction ?? 0.5,
+        optimal_tokens: optimal,
+        output_reserve_tokens: editing?.kind?.output_reserve_tokens ?? 1024,
+        advisory: ruleForm.advisory,
+      };
+      const description = `Requests too large for their group are rerouted to ${ruleForm.target}; past the optimal window the serving model advises compacting the conversation`;
+      let rules: GatewayRule[];
+      if (editing) {
+        rules = lastCfg.routing_rules.map((r) => (r.id === editing.id ? { ...r, kind, description } : r));
+      } else {
+        let id = "context-overflow";
+        for (let n = 2; lastCfg.routing_rules.some((r) => r.id === id); n++) id = `context-overflow-${n}`;
+        rules = [...lastCfg.routing_rules, { id, description, source: "user", enabled: true, kind, litellm_fragment: undefined, fragment_raw: undefined }];
+      }
+      ruleForm.open = false;
+      await patchRules(rules, editing ? `Routing rule ${editing.id} saved.` : "Routing rule added and saved.");
       return;
     }
 
@@ -3882,12 +4165,16 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
       // failure) would hide config edits made since the last preview.
       yamlOpen = true;
       yamlText = null;
+      routingPyText = null;
       yamlErr = "";
       await load();
       const r = await getGatewayYaml();
       if (disposed) return;
       if (r.error) yamlErr = r.error;
-      else yamlText = r.data.yaml;
+      else {
+        yamlText = r.data.yaml;
+        routingPyText = r.data.routing_py;
+      }
       await load();
       return;
     }
@@ -4033,8 +4320,24 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     gwMsg("Network access saved — applies at the next gateway restart; the start-gateway step also reconciles the Windows firewall rule.");
     await load();
   };
+  /** Rule-form field changes update the draft in the closure (the
+   *  form re-renders from it); Target/Optimal changes repaint so
+   *  the §6.2 warnings track the draft. */
+  const onRuleFormChange = async (ev: Event): Promise<void> => {
+    const el = ev.target as HTMLElement;
+    if (el.closest("#gwRuleTarget")) {
+      ruleForm.target = (el as HTMLSelectElement).value;
+      await load();
+    } else if (el.closest("#gwRuleOptimal")) {
+      ruleForm.optimalTokens = (el as HTMLInputElement).value;
+      await load();
+    } else if (el.closest("#gwRuleAdvisory")) {
+      ruleForm.advisory = (el as HTMLInputElement).checked;
+    }
+  };
   root.addEventListener("click", onClick);
   root.addEventListener("change", onBindChange);
+  root.addEventListener("change", onRuleFormChange);
 
   await load();
 
@@ -4056,6 +4359,7 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     window.clearInterval(timer);
     root.removeEventListener("click", onClick);
     root.removeEventListener("change", onBindChange);
+    root.removeEventListener("change", onRuleFormChange);
   };
 }
 

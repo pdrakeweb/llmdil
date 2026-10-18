@@ -1216,14 +1216,41 @@ export interface GatewayGroup {
   enabled_members: number;
 }
 
+/** A typed routing rule's behavior (manager-config's
+ *  RoutingRuleKind, routing-rules design §6.2). Only the
+ *  context-overflow kind exists in v1. Absent/null on legacy
+ *  fragment-only rules, which are inert and render read-only. */
+export interface GatewayRuleKind {
+  type: "context-overflow";
+  target_group: string;
+  /** Advisory threshold as a fraction of the serving group's
+   *  hard window; ignored when optimal_tokens is set. */
+  optimal_fraction: number;
+  /** Absolute advisory threshold in tokens, or null for the
+   *  fraction default (half the serving group's window). */
+  optimal_tokens: number | null;
+  /** Output tokens assumed when a request sets no max_tokens. */
+  output_reserve_tokens: number;
+  advisory: boolean;
+}
+
 export interface GatewayRule {
   id: string;
   description: string;
   source: string;
+  /** Serde default true on payloads that predate the field. */
+  enabled: boolean;
+  /** The typed behavior, or null for a legacy fragment-only rule. */
+  kind: GatewayRuleKind | null;
   /** The LiteLLM config fragment this rule injects, carried by the
    *  get_gateway_config payload; shown in the rule's Fragment
    *  expandable. Absent on payloads that predate the field. */
   litellm_fragment?: string;
+  /** The fragment's untouched raw value from the payload, carried
+   *  so a save through update_gateway_config writes back exactly
+   *  what was stored (the display form above stringifies objects).
+   *  Undefined when the payload carried no fragment. */
+  fragment_raw?: unknown;
 }
 
 export interface GatewayGroup {
@@ -1237,16 +1264,6 @@ export interface GatewayGroup {
   enabled: boolean;
   /** How many member backends are enabled — the basis of `enabled`. */
   enabled_members: number;
-}
-
-export interface GatewayRule {
-  id: string;
-  description: string;
-  source: string;
-  /** The LiteLLM config fragment this rule injects, carried by the
-   *  get_gateway_config payload; shown in the rule's Fragment
-   *  expandable. Absent on payloads that predate the field. */
-  litellm_fragment?: string;
 }
 
 /** The OpenRouter cloud fallback tier (manager-config's
@@ -1288,7 +1305,30 @@ export async function getGatewayConfig(): Promise<CallResult<GatewayConfigData |
           ? g.enabled_members
           : (Array.isArray(g.members) ? g.members.length : 0),
       })) : [],
-      routing_rules: Array.isArray(raw.routing_rules) ? (raw.routing_rules as GatewayRule[]) : [],
+      routing_rules: Array.isArray(raw.routing_rules) ? (raw.routing_rules as Array<Partial<GatewayRule> & Record<string, unknown>>).map((r) => ({
+        id: typeof r.id === "string" ? r.id : "",
+        description: typeof r.description === "string" ? r.description : "",
+        source: typeof r.source === "string" ? r.source : "",
+        enabled: typeof r.enabled === "boolean" ? r.enabled : true,
+        kind: r.kind && typeof r.kind === "object" && (r.kind as GatewayRuleKind).type === "context-overflow"
+          ? {
+              type: "context-overflow" as const,
+              target_group: typeof (r.kind as GatewayRuleKind).target_group === "string" ? (r.kind as GatewayRuleKind).target_group : "",
+              optimal_fraction: typeof (r.kind as GatewayRuleKind).optimal_fraction === "number" ? (r.kind as GatewayRuleKind).optimal_fraction : 0.5,
+              optimal_tokens: typeof (r.kind as GatewayRuleKind).optimal_tokens === "number" ? (r.kind as GatewayRuleKind).optimal_tokens : null,
+              output_reserve_tokens: typeof (r.kind as GatewayRuleKind).output_reserve_tokens === "number" ? (r.kind as GatewayRuleKind).output_reserve_tokens : 1024,
+              advisory: (r.kind as GatewayRuleKind).advisory !== false,
+            }
+          : null,
+        // The fragment is an arbitrary JSON value in the stored
+        // config; objects render as their JSON text.
+        litellm_fragment: typeof r.litellm_fragment === "string"
+          ? r.litellm_fragment
+          : r.litellm_fragment != null
+            ? JSON.stringify(r.litellm_fragment)
+            : undefined,
+        fragment_raw: r.litellm_fragment === undefined ? undefined : r.litellm_fragment,
+      })) : [],
       request_log_len: typeof raw.request_log_len === "number" ? raw.request_log_len : 0,
       openrouter: or && typeof or === "object"
         ? {
@@ -1761,14 +1801,16 @@ export async function updateGatewayConfig(patch: Record<string, unknown>): Promi
   }
 }
 
-/** gateway_preview_yaml — the generated LiteLLM config.yaml. */
-export async function getGatewayYaml(): Promise<CallResult<{ yaml: string }>> {
-  if (!isTauri()) return { data: { yaml: "" }, live: false };
+/** gateway_preview_yaml — the generated LiteLLM config.yaml, plus
+ *  the generated llmdil_routing.py callback when a typed routing
+ *  rule is enabled (null otherwise). */
+export async function getGatewayYaml(): Promise<CallResult<{ yaml: string; routing_py: string | null }>> {
+  if (!isTauri()) return { data: { yaml: "", routing_py: null }, live: false };
   try {
-    const data = await invoke<{ yaml: string }>("gateway_preview_yaml");
-    return { data, live: true };
+    const data = await invoke<{ yaml: string; routing_py?: string | null }>("gateway_preview_yaml");
+    return { data: { yaml: data.yaml, routing_py: data.routing_py ?? null }, live: true };
   } catch (e) {
-    return { data: { yaml: "" }, live: true, error: errOf(e) };
+    return { data: { yaml: "", routing_py: null }, live: true, error: errOf(e) };
   }
 }
 

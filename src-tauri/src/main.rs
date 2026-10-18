@@ -3299,7 +3299,17 @@ async fn record_gateway_change(
         let before = manager_gateway::generate_config_yaml(pre).unwrap_or_default();
         let after = manager_gateway::generate_config_yaml(post).unwrap_or_default();
         if before == after {
-            return Ok(());
+            // The YAML does not carry the routing rule table: a
+            // callback-only change (a window, the output reserve,
+            // or the advisory toggle on an already-enabled rule)
+            // leaves the YAML identical but must still journal, or
+            // the activation plan would never offer the restart
+            // that regenerates llmdil_routing.py (design §6.3/§7).
+            let before_py = manager_gateway::generate_routing_callback(pre);
+            let after_py = manager_gateway::generate_routing_callback(post);
+            if before_py == after_py {
+                return Ok(());
+            }
         }
     }
     let started_at = backend_start_times(state).await;
@@ -5127,14 +5137,18 @@ async fn notify_monitor_tick(app: &AppHandle) {
     }
 }
 
-/// Preview the generated LiteLLM config.yaml.
+/// Preview the generated LiteLLM config.yaml — plus, when a typed
+/// routing rule is enabled, the generated `llmdil_routing.py`
+/// callback (the Generated config card's second tab; design §7).
+/// Null when no rule is enabled and no callback file is generated.
 #[tauri::command]
 async fn gateway_preview_yaml(state: State<'_, AppState>) -> ApiResult {
     let cfg = state.config.read().await;
     let yaml = manager_gateway::generate_config_yaml(&cfg)
         .map_err(ApiError::from)
         .map_err(jerr)?;
-    Ok(json!({ "yaml": yaml }))
+    let routing_py = manager_gateway::generate_routing_callback(&cfg);
+    Ok(json!({ "yaml": yaml, "routing_py": routing_py }))
 }
 
 /// Trace routing for a tagged request: `request` carries the model group
