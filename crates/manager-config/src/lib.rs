@@ -190,6 +190,13 @@ pub const BRAVE_SEARCH_MCP_CRED_REF: &str = "local-llm-service-manager/brave-sea
 /// 2026-10-17. Recorded in the design's §3.3 implementation record.
 /// Bumping it is a code change, never a runtime resolution.
 pub const BRAVE_SEARCH_PACKAGE_PIN: &str = "@brave/brave-search-mcp-server@2.1.4";
+/// Where a user registers for a Brave Search API key and copies
+/// one: the page the start-gateway credential prompt links to
+/// (Pete, 2026-10-18). Carried on the curated seed entry as
+/// [`McpServerConfig::signup_url`] and surfaced via `mcp_list` and
+/// the start preflight — operator-facing metadata only, never
+/// emitted into the generated LiteLLM YAML.
+pub const BRAVE_SEARCH_SIGNUP_URL: &str = "https://brave.com/search/api/";
 /// Pinned URL-fetch MCP server package (MCP design §3.3 / §6.2).
 ///
 /// Pin: `mcp-server-fetch@2026.10.10` — the PyPI latest release of
@@ -299,6 +306,7 @@ pub fn curated_mcp_servers() -> Vec<McpServerConfig> {
                     .map(|s| s.to_string())
                     .collect(),
             ),
+            signup_url: Some(BRAVE_SEARCH_SIGNUP_URL.to_string()),
             metered: true,
             // Stored on the entry and surfaced via `mcp_list` only.
             // It is deliberately NOT emitted into the generated
@@ -330,6 +338,7 @@ pub fn curated_mcp_servers() -> Vec<McpServerConfig> {
             allowed_tools: Some(vec!["fetch".to_string()]),
             metered: false,
             rpm_limit: None,
+            signup_url: None,
         },
     ]
 }
@@ -356,6 +365,7 @@ pub fn seeded_mcp_servers() -> Vec<McpServerConfig> {
             allowed_tools: None,
             metered: false,
             rpm_limit: None,
+            signup_url: None,
         },
         McpServerConfig {
             id: "gdrive".to_string(),
@@ -375,6 +385,7 @@ pub fn seeded_mcp_servers() -> Vec<McpServerConfig> {
             allowed_tools: None,
             metered: false,
             rpm_limit: None,
+            signup_url: None,
         },
     ];
     servers.extend(curated_mcp_servers());
@@ -408,6 +419,14 @@ pub struct McpServerConfig {
     /// Paid upstream; drives the rpm cap + UI cost labelling.
     pub metered: bool,
     pub rpm_limit: Option<u32>,
+    /// Where the user obtains the credential (the service's
+    /// registration / API-key page), when the server needs one:
+    /// the start-gateway credential prompt links there, and the
+    /// MCP Servers view shows the same link while the credential
+    /// is missing. Curated seed metadata; `None` for servers
+    /// without a public signup page. Never emitted into the
+    /// generated gateway config.
+    pub signup_url: Option<String>,
 }
 
 /// Presenter mode for a data window (spec §4 hybrid view matrix).
@@ -1923,6 +1942,11 @@ fn validate_mcp_servers(mcp: &McpConfig, errors: &mut Vec<String>) {
                 s.id
             ));
         }
+        if let Some(url) = s.signup_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            if let Err(e) = parse_mcp_http_url(url) {
+                errors.push(format!("mcp server {:?}: signup_url: {e}", s.id));
+            }
+        }
     }
 }
 
@@ -2976,6 +3000,7 @@ mod tests {
             url: None,
             env_keys: Vec::new(),
             cred_ref: None,
+            signup_url: None,
             allowed_tools: None,
             metered: false,
             rpm_limit: None,
@@ -3045,6 +3070,11 @@ mod tests {
         );
         assert!(brave.metered);
         assert_eq!(brave.rpm_limit, Some(20));
+        // The credential prompt's registration link (Pete,
+        // 2026-10-18): Brave carries the Search API page;
+        // web_fetch has no credential and no link.
+        assert_eq!(brave.signup_url.as_deref(), Some(BRAVE_SEARCH_SIGNUP_URL));
+        assert_eq!(BRAVE_SEARCH_SIGNUP_URL, "https://brave.com/search/api/");
         let fetch = &curated[1];
         assert_eq!(fetch.id, "web_fetch");
         assert_eq!(fetch.display_name, "Web Fetch");
@@ -3057,6 +3087,7 @@ mod tests {
         assert_eq!(fetch.allowed_tools.as_deref(), Some(&["fetch".to_string()][..]));
         assert!(!fetch.metered);
         assert_eq!(fetch.rpm_limit, None);
+        assert_eq!(fetch.signup_url, None);
         // A fresh default config carries all four entries and is
         // born with the curated-seeded marker set.
         let default = AppConfig::default_config();
@@ -3151,6 +3182,29 @@ mod tests {
         validate(&cfg).expect("loopback http searxng validates");
         cfg.mcp.searxng.api_base = "https://search.example.com/".to_string();
         validate(&cfg).expect("https searxng validates");
+    }
+
+    #[test]
+    fn mcp_signup_url_must_be_an_http_url_when_present() {
+        // Absent and blank both count as "no link" and validate.
+        let mut server = mcp_server("linky");
+        validate(&cfg_with_mcp(vec![server.clone()])).expect("no signup_url validates");
+        server.signup_url = Some("  ".to_string());
+        validate(&cfg_with_mcp(vec![server.clone()])).expect("blank signup_url validates");
+        // A real registration page validates (https, or http on
+        // loopback — the parse_mcp_http_url rule the server URL
+        // itself follows).
+        server.signup_url = Some("https://brave.com/search/api/".to_string());
+        validate(&cfg_with_mcp(vec![server.clone()])).expect("https signup_url validates");
+        // Anything else is rejected at save, so a stored config
+        // can never carry a link the prompt would open blindly.
+        server.signup_url = Some("not a url".to_string());
+        let err = validate(&cfg_with_mcp(vec![server.clone()]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("signup_url"), "{err}");
+        server.signup_url = Some("ftp://example.com/keys".to_string());
+        assert!(validate(&cfg_with_mcp(vec![server])).is_err());
     }
 
     #[test]

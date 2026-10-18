@@ -557,6 +557,7 @@ mod tests {
             url: None,
             env_keys: vec!["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()],
             cred_ref: Some(manager_config::GITHUB_MCP_CRED_REF.to_string()),
+            signup_url: None,
             allowed_tools: None,
             metered: false,
             rpm_limit: None,
