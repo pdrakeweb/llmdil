@@ -322,6 +322,31 @@ pub fn config_drift(
     }
 }
 
+/// Whether live config drift is pending work for an activation
+/// plan: only while the gateway is up serving the stale files.
+///
+/// [`config_drift`] is a file comparison — the generated files
+/// differ from the ones on disk. That difference is a plan fact
+/// only when a running gateway is serving the on-disk version:
+/// while the gateway is down, its next start regenerates both
+/// files from the saved configuration, so the difference resolves
+/// by itself and is not the plan's to state. The plan payload
+/// leaked the raw bit instead, so a backend-only plan (scope:
+/// backend, apply: restart one backend) asserted "Gateway config:
+/// drifted" directly above an apply line that did not touch the
+/// gateway — and the line's explanation claimed a RUNNING
+/// gateway's configuration differed while the gateway was down
+/// (Pete's report, 2026-10-18, tracker #45). This is the same
+/// live-state rule [`pending_entries`] applies to gateway-scope
+/// journal entries and `gateway_status` applies to its drift
+/// count; the plan's drift field was the one place that skipped
+/// it. Applying a backend-only plan neither addresses nor clears
+/// a down-gateway file difference, so the plan must not present
+/// it as pending work in either direction.
+pub fn drift_is_pending(drift: bool, gateway_up: bool) -> bool {
+    drift && gateway_up
+}
+
 fn normalize_yaml(text: &str) -> String {
     text.replace("\r\n", "\n").trim_end().to_string()
 }
@@ -1287,6 +1312,110 @@ litellm_deployment_success_responses_total 9.0
         assert!(!config_drift(&cfg, &dir, |_| false));
         std::fs::write(gateway_routing_path(&dir), "# stale callback\n").unwrap();
         assert!(config_drift(&cfg, &dir, |_| false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_drift_is_pending_only_while_the_gateway_is_up() {
+        // The raw file comparison is true whenever the on-disk
+        // YAML is stale; as PLAN state it counts only while a
+        // running gateway serves that file. Down, the next start
+        // regenerates it — nothing is pending and nothing may be
+        // stated as the plan's reason (tracker #45).
+        let dir = drift_test_dir("plan-gate");
+        let mut cfg = AppConfig::default_config();
+        for b in cfg.backends.iter_mut() {
+            b.enabled = true;
+        }
+        let view = manager_wizard::config_with_armed_gateway_mcp_servers(&cfg, |_| false);
+        let yaml = manager_gateway::generate_config_yaml(&view).unwrap();
+        std::fs::write(gateway_yaml_path(&dir), &yaml).unwrap();
+        cfg.backends[0].port += 1;
+        let raw = config_drift(&cfg, &dir, |_| false);
+        assert!(raw, "the stale file is raw drift");
+        assert!(!drift_is_pending(raw, false));
+        assert!(drift_is_pending(raw, true));
+        assert!(!drift_is_pending(false, true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backend_only_plan_with_a_stale_gateway_file_reports_no_gateway_drift() {
+        // Regression (tracker #45), the production shape: one
+        // backend-scope journal entry (a coder flags save — flags
+        // are not carried in the gateway YAML, so no gateway entry
+        // exists), the gateway DOWN (Pete's start had failed), and
+        // an on-disk gateway YAML left stale by an earlier start.
+        // The plan built from this state must show exactly the
+        // backend change and no gateway drift: the raw drift bit
+        // leaked into the plan payload and the card asserted
+        // "Gateway config: drifted" above "Apply restarts coder.",
+        // a restart that neither addresses nor clears any drift.
+        let dir = drift_test_dir("backend-only-plan");
+        let mut cfg = AppConfig::default_config();
+        for b in cfg.backends.iter_mut() {
+            b.enabled = true;
+        }
+        // The file an earlier start wrote (coder on its old port).
+        let view = manager_wizard::config_with_armed_gateway_mcp_servers(&cfg, |_| false);
+        let yaml = manager_gateway::generate_config_yaml(&view).unwrap();
+        std::fs::write(gateway_yaml_path(&dir), &yaml).unwrap();
+        // Journal the backend-only change: coder's flags, with
+        // coder running a process started before the save.
+        let pre = cfg.clone();
+        let mut post = cfg.clone();
+        post.backends
+            .iter_mut()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .raw_flags = Some("-ot exps=CPU".to_string());
+        let configured: std::collections::HashSet<String> =
+            post.backends.iter().map(|b| b.id.clone()).collect();
+        let running: std::collections::HashSet<String> =
+            ["coder".to_string()].into_iter().collect();
+        let started_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
+            [("coder".to_string(), chrono::Utc::now() - chrono::Duration::seconds(60))]
+                .into_iter()
+                .collect();
+        record_change(
+            &dir,
+            &pre,
+            &post,
+            "backend_flags",
+            "Backend `coder` flags changed".to_string(),
+            "backend",
+            vec!["coder".to_string()],
+            &started_at,
+            &configured,
+            &running,
+        )
+        .unwrap();
+        // The on-disk file predates the current configuration (a
+        // port move since the start that wrote it), so the raw
+        // comparison is drift — the state Pete's plan read.
+        cfg.backends
+            .iter_mut()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .port += 1;
+        let raw = config_drift(&cfg, &dir, |_| false);
+        assert!(raw, "precondition: the stale file is raw drift");
+        // The plan's composition (op_gateway_activation_plan):
+        // pending entries plus drift gated on the gateway probe.
+        let journal = load_journal(&dir);
+        let pending = pending_entries(&dir, &journal, &started_at, &configured, &running, false);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].scope, "backend");
+        assert_eq!(pending[0].targets, vec!["coder".to_string()]);
+        assert!(!pending[0].summary.to_lowercase().contains("gateway"));
+        assert!(
+            !drift_is_pending(raw, false),
+            "a backend-only plan must not report gateway drift while the gateway is down"
+        );
+        // The same stale file IS plan drift once the gateway is up
+        // serving it: then the plan owes a gateway restart, and
+        // gateway_pending (hence the apply line) must say so.
+        assert!(drift_is_pending(raw, true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1771,6 +1771,10 @@ export interface ActivationPlanData {
   gateway_up: boolean;
   /** A gateway-side change is pending (journal entry or drift). */
   gateway_pending?: boolean;
+  /** Live drift against the RUNNING gateway: the files it was
+   *  started with differ from the saved configuration. Always
+   *  false while the gateway is down — a stale file then is not
+   *  pending work, since the next start regenerates it. */
   drift: boolean;
   /** Pending while the gateway is down: the changes take effect at
    *  the next start rather than needing a restart. */
