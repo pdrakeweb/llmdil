@@ -30,7 +30,7 @@ import { icon } from "../icons";
 
 export function renderOptimize(): string {
   return `<div class="topbar"><h1>Optimize</h1></div>
-  <div id="optRoot"><div class="card" style="color:var(--text2)">${icon("clock")} Loading…</div></div>`;
+  <div class="view"><div id="optRoot"><div class="card" style="color:var(--text2)">${icon("clock")} Loading…</div></div></div>`;
 }
 
 const SELECT_STYLE = "background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:6px 8px;font-size:12px";

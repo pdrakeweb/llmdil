@@ -117,6 +117,15 @@ for (const view of ["views/static.ts", "views/mcp.ts"]) {
     `${view} renders its enable/disable controls via enableSwitch`);
 }
 
+// View scroll contract (tracker #50): the shell never scrolls
+// (body overflow:hidden, #app height:100vh); each view's content
+// must render inside the .view container (flex:1; overflow-y:auto)
+// or anything past the fold is clipped with no way to reach it.
+// The Optimize view once rendered #optRoot bare, leaving a long
+// plan unreachable — pin #optRoot inside .view in the source.
+check(readFileSync(join(root, "src", "views", "optimize.ts"), "utf8").includes('class="view"><div id="optRoot"'),
+  "Optimize view renders #optRoot inside the .view scroll container");
+
 check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
 check(bundle.includes("__TAURI__"), "bundle contains the Tauri detection hook");
