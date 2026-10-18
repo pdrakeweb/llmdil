@@ -8,6 +8,7 @@
    never fabricated data presented as live. */
 
 import { getDashboard, isTauri, restartBackend, runWizardStep, startBackend, systemVerdict } from "../api";
+import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
 import type { SystemVerdict } from "../api";
 import { esc } from "../html";
 import { fmtCount, fmtGb, fmtPct, gaugeRing, meter, sparkline, stackedBar, trim1 } from "../charts";
@@ -588,13 +589,21 @@ async function startAllServices(): Promise<void> {
     if (r.error) errors.push(`${b.id}: ${r.error}`);
   }
   if (gatewayDown && !disposed) {
-    const r = await runWizardStep("start-gateway");
-    if (r.error) {
-      errors.push(`gateway: ${r.error}`);
-    } else if (r.data.busy) {
-      errors.push("gateway: a setup step is already running");
-    } else if (r.data.outcome && r.data.outcome.state !== "done") {
-      errors.push(`gateway: ${r.data.outcome.message}`);
+    // MCP credential prompt (Pete, 2026-10-18): same pre-start
+    // step as the Gateway view's Start button. Cancelling skips
+    // only the gateway leg; the backends above already started.
+    const proceed = await promptForUnarmedMcpCredentials();
+    if (!proceed) {
+      errors.push("gateway: start cancelled at the MCP credential prompt");
+    } else if (!disposed) {
+      const r = await runWizardStep("start-gateway");
+      if (r.error) {
+        errors.push(`gateway: ${r.error}`);
+      } else if (r.data.busy) {
+        errors.push("gateway: a setup step is already running");
+      } else if (r.data.outcome && r.data.outcome.state !== "done") {
+        errors.push(`gateway: ${r.data.outcome.message}`);
+      }
     }
   }
   startAllBusy = false;
