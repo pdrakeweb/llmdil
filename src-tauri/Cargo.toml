@@ -24,6 +24,7 @@ manager-supervisor = { path = "../crates/manager-supervisor" }
 manager-telemetry = { path = "../crates/manager-telemetry" }
 manager-gateway = { path = "../crates/manager-gateway" }
 manager-models = { path = "../crates/manager-models" }
+manager-optimize = { path = "../crates/manager-optimize" }
 manager-mcp = { path = "../crates/manager-mcp" }
 manager-mxc = { path = "../crates/manager-mxc" }
 manager-winml = { path = "../crates/manager-winml" }

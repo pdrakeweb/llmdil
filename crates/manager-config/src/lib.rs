@@ -62,6 +62,13 @@ pub struct AppConfig {
     /// on launch until this is true.
     #[serde(default)]
     pub setup_completed: bool,
+    /// Deployment purpose for the Optimize page's consultant (Optimize
+    /// design §2.3): what this deployment is for, in the operator's own
+    /// words. Empty = unseeded; the Optimize page seeds it from the
+    /// install on first use and the operator owns it afterwards. Sent
+    /// only to a local backend during consultation — never a secret.
+    #[serde(default)]
+    pub optimize_purpose: String,
     /// Set once the curated model catalog has been seeded into `models`
     /// (first run). Seeding keys off this marker rather than
     /// `models.is_empty()`: an operator who deletes every model must not
@@ -454,6 +461,12 @@ pub struct BackendConfig {
     /// no probe recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_probe: Option<ToolCallProbe>,
+    /// What this backend is for, in the operator's words (Optimize
+    /// design §2.3). Empty = unstated; the consultant is told to infer
+    /// cautiously from names when intent is missing. Consultation
+    /// metadata only — it never affects serving.
+    #[serde(default)]
+    pub purpose: String,
 }
 
 /// Structured llama-server flags.
@@ -512,6 +525,10 @@ pub struct ModelGroup {
     pub strategy: RoutingStrategy,
     /// Ordered fallback chain, e.g. ["coder", "openrouter"].
     pub fallbacks: Vec<String>,
+    /// What this group is for, in the operator's words (Optimize
+    /// design §2.3). Empty = unstated. Consultation metadata only.
+    #[serde(default)]
+    pub purpose: String,
 }
 
 /// Routing strategy for a model group.
@@ -846,6 +863,7 @@ impl AppConfig {
                 members: vec![name.to_string()],
                 strategy,
                 fallbacks: fallbacks.into_iter().map(str::to_string).collect(),
+                purpose: String::new(),
             })
             .collect();
         let backends = ["planner", "coder", "coder-fast", "tool-runner"]
@@ -876,6 +894,7 @@ impl AppConfig {
                 },
                 overrides_global: false,
                 tool_call_probe: None,
+                purpose: String::new(),
             })
             .collect();
         Self {
@@ -918,6 +937,7 @@ impl AppConfig {
             },
             notifications: NotificationConfig::default(),
             setup_completed: false,
+            optimize_purpose: String::new(),
             catalog_seeded: false,
             defaults_repaired: true,
             catalog_revision: 0,

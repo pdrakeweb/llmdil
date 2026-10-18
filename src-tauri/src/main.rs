@@ -47,6 +47,9 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 mod activation;
 mod gateway_stats;
 mod notify;
+mod optimize;
+mod optimize_eval;
+mod optimize_experiments;
 
 // ---------------------------------------------------------------------------
 // Events (Rust -> UI, spec §14)
@@ -354,6 +357,20 @@ pub struct AppState {
     gateway_stats: Mutex<gateway_stats::GatewayStatsStore>,
     /// WinML secondary-backend registry (stateful single-model rule).
     winml: OnceCell<Mutex<manager_winml::WinMlRegistry>>,
+    /// Scoped cancellation handle for the Optimize consultation
+    /// (design docs/optimize-design.md §1.2): the sender half of a
+    /// oneshot channel, present only while a consultation runs.
+    /// Firing it drops the in-flight chat-completion future —
+    /// real cancellation, unlike `task_abort`, which only flips
+    /// bookkeeping. One consultation at a time by construction.
+    optimize_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Shared cancellation slot for GPU-bound Optimize jobs
+    /// (Phase 5: measurements and, later, experiment batches —
+    /// tracker #28 contract): one such job at a time, separate
+    /// from the consult slot above because a consultation and a
+    /// measurement are different jobs with different lifetimes.
+    /// Firing it drops the job's in-flight benchmark future.
+    optimize_job_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Transition-watch state for the toast notification monitor
     /// (see [`notify`]): backend states, gateway liveness expectation,
     /// and activation-plan pending state, so state-driven toasts fire
@@ -414,6 +431,8 @@ impl AppState {
             winml: OnceCell::new(),
             notify_watch: std::sync::Mutex::new(notify::NotifyWatch::default()),
             offload_probes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            optimize_abort: Mutex::new(None),
+            optimize_job_abort: Mutex::new(None),
         }
     }
 
@@ -4307,6 +4326,7 @@ async fn backend_add(
             members: vec![id.clone()],
             strategy: manager_config::RoutingStrategy::SimpleShuffle,
             fallbacks: Vec::new(),
+            purpose: String::new(),
         });
     } else {
         let g = new_cfg
@@ -4345,6 +4365,7 @@ async fn backend_add(
         },
         overrides_global: false,
         tool_call_probe: None,
+        purpose: String::new(),
     });
     if let Some(m) = new_cfg.models.iter_mut().find(|m| m.id == model_id) {
         if !m.assigned_backends.contains(&id) {
@@ -8104,6 +8125,14 @@ fn main() {
                 state.hydrate_wizard().await;
                 state.persist_wizard().await;
             });
+            // Optimize experiment startup sweep (Phase 5e):
+            // terminate leftover temp backends from an app crash
+            // mid-experiment and clear their journal records.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<AppState>();
+                optimize_experiments::startup_sweep(&state).await;
+            });
             // Gateway metrics poller: scrape LiteLLM's Prometheus
             // endpoint every 15 s into the stats store that feeds
             // the Dashboard's request/error/throughput figures.
@@ -8202,6 +8231,21 @@ fn main() {
             // Tasks / diagnostics
             task_abort,
             tasks_list,
+            // Optimize page
+            optimize::optimize_get_state,
+            optimize::optimize_save_purpose,
+            optimize::optimize_consult,
+            optimize::optimize_cancel_consult,
+            optimize::optimize_set_item_state,
+            optimize::optimize_set_item_outcome,
+            optimize::optimize_validate_plan,
+            optimize::optimize_discard_plan,
+            optimize::optimize_measure_backend,
+            optimize::optimize_cancel_job,
+            optimize::optimize_discover,
+            optimize_eval::optimize_run_baseline,
+            optimize_experiments::optimize_set_experiment_state,
+            optimize_experiments::optimize_run_experiments,
             diagnostics_export_bundle,
             // MCP / VS Code
             mcp_list,

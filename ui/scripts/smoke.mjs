@@ -47,7 +47,9 @@ let registered = new Set();
 try {
   const mainRs = readFileSync(mainRsPath, "utf8");
   const block = mainRs.split("generate_handler![")[1].split("])")[0].replace(/\/\/.*/g, "");
-  registered = new Set(block.split(",").map((s) => s.trim()).filter(Boolean));
+  // Entries may be module paths (optimize::optimize_get_state); Tauri
+  // registers the bare function name, so compare on the last segment.
+  registered = new Set(block.split(",").map((s) => s.trim().split("::").pop()).filter(Boolean));
 } catch { /* empty set fails the check below */ }
 check(registered.size > 0, `parsed registered Tauri commands from generate_handler! (${registered.size})`);
 

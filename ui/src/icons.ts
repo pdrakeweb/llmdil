@@ -62,6 +62,8 @@ export const icons = {
   eyeOff: () =>
     svg(`<path d="M5.6 5.9C3.4 6.9 1.8 8 1.8 8s2.3 3.8 6.2 3.8c1.2 0 2.3-.3 3.2-.8M10.4 5.9c2.2 1 3.8 2.1 3.8 2.1a17.4 17.4 0 0 1-1.9 2.1M6.3 6.7A2 2 0 0 0 8 10a2 2 0 0 0 1.3-.5"/><path d="M2.5 2.5l11 11"/>`),
   x: () => svg(`<path d="M4 4l8 8M12 4l-8 8"/>`),
+  target: () =>
+    svg(`<circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="2.4"/>`),
   plus: () => svg(`<path d="M8 3v10M3 8h10"/>`),
   chevL: () => svg(`<path d="m10 3.5L5.5 8 10 12.5"/>`),
   chevR: () => svg(`<path d="m6 3.5L10.5 8 6 12.5"/>`),

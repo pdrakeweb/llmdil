@@ -2154,6 +2154,7 @@ dependencies = [
  "manager-mcp",
  "manager-models",
  "manager-mxc",
+ "manager-optimize",
  "manager-supervisor",
  "manager-telemetry",
  "manager-winml",
@@ -2280,6 +2281,21 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "manager-optimize"
+version = "0.1.33"
+dependencies = [
+ "chrono",
+ "manager-config",
+ "manager-models",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

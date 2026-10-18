@@ -2009,6 +2009,7 @@ mod tests {
             },
             overrides_global: false,
             tool_call_probe: None,
+            purpose: String::new(),
         }
     }
 

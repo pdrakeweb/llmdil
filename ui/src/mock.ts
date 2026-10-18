@@ -3,6 +3,7 @@
    layout can be evaluated without a backend. */
 
 import { walk } from "./charts";
+import type { OptimizeExperiment, OptimizePlanItem, OptimizeState, OptimizeValidation } from "./api";
 import type { BackendInfo, DashboardModel, GpuInfo, WizardStepState } from "./types";
 
 export function mockBackends(): BackendInfo[] {
@@ -100,3 +101,180 @@ export const GPU_COLORS: Record<string, string> = {
   "p100-0": "#a371f7",
   "p100-1": "#39c5cf",
 };
+
+/** Sample Optimize page state for browser mode: the consult card
+ *  figures and a stored sample plan exercising the row states
+ *  (valid / warning / invalid, a denied delete, an advice row). */
+export function mockOptimizeState(): OptimizeState {
+  const item = (
+    id: number, kind: string, target: string | null,
+    change: Record<string, unknown>, extra: Partial<OptimizePlanItem> = {},
+  ): OptimizePlanItem => ({
+    id, fingerprint: `sample-${id}`, kind, target, change,
+    advice_text: null, rationale: "", expected_effect: "", confidence: "medium",
+    decision: "undecided", previously_denied: false, apply_outcome: null, apply_error: null,
+    ...extra,
+  });
+  const validation = (status: "valid" | "warning" | "invalid", reason: string | null = null,
+    gpu: [number, number] | null = null, sys: [number, number] | null = null, note: string | null = null): OptimizeValidation => ({
+    status, reason, expected: { gpu_ram_mib: gpu, sys_ram_mib: sys, note },
+  });
+  return {
+    purpose: "",
+    last_directive: "Explore better MoE capable models for the planner",
+    purpose_is_seed: true,
+    purpose_seed: "Local inference served to the LAN through one gateway. Groups: planner (Qwen3.8-27B Planner); coder (Qwen3-Coder-Next-80B).",
+    groups: [
+      { name: "planner", purpose: "" },
+      { name: "coder", purpose: "" },
+      { name: "coder-fast", purpose: "" },
+      { name: "tool-runner", purpose: "" },
+    ],
+    backends: [
+      { id: "planner", purpose: "", running: true, enabled: true, model_id: "qwen3-27b-planner", short_name: "Qwen3.8-27B Planner", measured: { prompt_per_second: 812, predicted_per_second: 21.8, ttft_ms: 240, age_secs: 3600 } },
+      { id: "coder", purpose: "", running: true, enabled: true, model_id: "qwen3-coder-30b", short_name: "Qwen3-Coder-Next-80B", measured: null },
+      { id: "coder-fast", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null },
+      { id: "tool-runner", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null },
+    ],
+    context_summary: {
+      gpus: 2, backends: 4, groups: 4, models: 3,
+      measured_blocks: ["backend running state and per-process VRAM", "gateway traffic"],
+      traffic_window_label: "1 h",
+    },
+    context: { sample: true },
+    default_backend: "planner",
+    better_backend: null,
+    candidates: {
+      directive: "Explore better MoE capable models for the planner",
+      retrieved_at: new Date().toISOString(),
+      items: [
+        { repo_id: "Qwen/Qwen3-30B-A3B-GGUF", file: "Qwen3-30B-A3B-Q4_K_M.gguf", architecture: "qwen3moe", params_b: 30.5, ctx_max: 40960, size_bytes: 18600000000, downloads: 812345, fit: "fits_with_split", retrieved_at: new Date().toISOString() },
+        { repo_id: "unsloth/Qwen3-Coder-Next-GGUF", file: "Qwen3-Coder-Next-UD-Q4_K_M.gguf", architecture: "qwen3moe", params_b: 80, ctx_max: 262144, size_bytes: 49301055488, downloads: 456789, fit: "does_not_fit", retrieved_at: new Date().toISOString() },
+      ],
+    },
+    eval_baseline: {
+      backend_id: "planner",
+      config_fingerprint: "sample-fingerprint",
+      suite_version: 1,
+      run_at: new Date(Date.now() - 3600_000).toISOString(),
+      overall: { passed: 11, total: 12 },
+      per_category: {
+        instruction_following: { passed: 3, total: 3 },
+        factual_recall: { passed: 2, total: 2 },
+        arithmetic_reasoning: { passed: 2, total: 2 },
+        code_adjacent: { passed: 1, total: 2 },
+        summarization: { passed: 1, total: 1 },
+        tool_call_formatting: { passed: 1, total: 1 },
+        long_context_retrieval: { passed: 1, total: 1 },
+      },
+      stale: false,
+      caveat: "Screening suite — a small fixed set of checkable tasks. It screens out regressions; it is not a benchmark and does not rank models generally.",
+    },
+    consulting: false,
+    measuring: false,
+    plan: {
+      summary: "Sample plan — generated locally; no backend was consulted.",
+      directive: "Explore better MoE capable models for the planner",
+      consulted_backend: "planner",
+      created_at: new Date().toISOString(),
+      config_hash: "sample",
+      dropped_invalid: 1,
+      truncated: 0,
+      dropped_fragments: ["{\"kind\":\"backend.set_offload\",\"target\":\"coder\",\"change\":{\"offload_layers\":\"most\"}}"],
+      raw_response: "{\"summary\": \"Sample plan\", \"items\": [ ... ]}",
+      context: { sample: true },
+      config_stale: false,
+      sample: true,
+      items: [
+        item(1, "backend.set_context", "planner", { n_ctx: 65536 }, {
+          rationale: "Planner requests regularly approach the current 32K context; doubling it doubles the KV cache, which the A4000 has room for.",
+          confidence: "high",
+        }),
+        item(2, "backend.set_offload", "coder", { offload_layers: 48 }, {
+          rationale: "Moving all MoE layers to system RAM frees the P100 entirely; system RAM is plentiful on this machine.",
+          confidence: "medium",
+        }),
+        item(3, "group.set_strategy", "coder", { strategy: "least-busy" }, {
+          rationale: "Least-busy spreads requests across group members instead of shuffling.",
+          confidence: "medium",
+        }),
+        item(4, "model.add", "sample-model", { source_url: "sample/sample-model-Q4_K_M.gguf", quant: "Q4_K_M" }, {
+          rationale: "Registers a model for later evaluation; nothing is downloaded.",
+          confidence: "low",
+        }),
+        item(5, "backend.delete", "coder-fast", {}, {
+          rationale: "The coder-fast backend has never run; removing it simplifies the layout.",
+          decision: "denied",
+          confidence: "low",
+        }),
+        item(6, "advice", null, {}, {
+          advice_text: "Consider enabling the tool-runner backend before routing tool calls through the coder group; the seat exists in the layout but is disabled.",
+        }),
+      ],
+      validations: [
+        validation("valid", null, [9216, 17408], null),
+        validation("warning", "fits now, but not alongside every configured backend when all are running", [44032, 2048], [40960, 45056]),
+        validation("valid"),
+        validation("warning", "registers the model only — the source URL and any hash are model-supplied and unverified; confirm the pinned hash in the Models view before downloading"),
+        validation("valid", null, null, null, "Backend will be stopped and removed"),
+        validation("valid"),
+      ],
+      experiments: [
+        {
+          id: 1, fingerprint: "sample-exp-1", candidate_model_id: "Qwen/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf",
+          flags: { n_ctx: 32768, tensor_split: [0.5, 0.5] },
+          serves: "Explore better MoE capable models for the planner",
+          hypothesis: "A 30B MoE with 3B active parameters should generate faster than the dense 27B at similar quality.",
+          predicted: { predicted_per_second: 35, fit: "alongside running backends" },
+          requires_stopping: [], run_eval: true, decision: "accepted", previously_denied: false,
+          result: {
+            experiment_id: 1, candidate_model_id: "Qwen/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf", batch_id: "sample-batch",
+            status: "completed",
+            detail: "Measured on opt-exp-1: generation 34.6 tok/s (short), 32.9 tok/s (long). Screen: 11/12 overall. Delta vs baseline: +0 passed overall; screen at/above baseline: true.",
+            measured: {
+              short: { prompt_per_second: 640, predicted_per_second: 34.6, ttft_ms: 190, runs: [] },
+              long: { prompt_per_second: 905, predicted_per_second: 32.9, ttft_ms: 840, runs: [] },
+            },
+            eval: {
+              backend_id: "opt-exp-1", suite_version: 1, run_at: new Date().toISOString(), results: [],
+              scores: {
+                overall: { passed: 11, total: 12 },
+                per_category: {
+                  instruction_following: { passed: 3, total: 3 },
+                  factual_recall: { passed: 2, total: 2 },
+                  arithmetic_reasoning: { passed: 2, total: 2 },
+                  code_adjacent: { passed: 1, total: 2 },
+                  summarization: { passed: 1, total: 1 },
+                  tool_call_formatting: { passed: 1, total: 1 },
+                  long_context_retrieval: { passed: 1, total: 1 },
+                },
+              },
+            },
+            comparison: {
+              overall: { baseline: { passed: 11, total: 12 }, candidate: { passed: 11, total: 12 }, delta_passed: 0, delta_fraction: 0 },
+              per_category: {},
+              screen_at_or_above_baseline: true,
+              any_category_zero_that_baseline_passes: false,
+              zero_categories_that_baseline_passes: [],
+            },
+            preflight: "fits alongside the backends staying running: needs 18432 MiB GPU RAM, 24576 MiB free after their residency",
+            started_at: new Date(Date.now() - 600_000).toISOString(),
+            finished_at: new Date(Date.now() - 300_000).toISOString(),
+          },
+        } as OptimizeExperiment,
+        {
+          id: 2, fingerprint: "sample-exp-2", candidate_model_id: "qwen3-coder-30b",
+          flags: { n_ctx: 65536, offload_layers: 24 },
+          serves: "Explore better MoE capable models for the planner",
+          hypothesis: "The catalog coder model with half its MoE layers offloaded may beat the planner's rates.",
+          predicted: { predicted_per_second: 28, fit: "only after stopping coder" },
+          requires_stopping: ["coder"], run_eval: false, decision: "denied", previously_denied: false,
+          result: null,
+        } as OptimizeExperiment,
+      ],
+      experiment_validations: [validation("valid"), validation("valid")],
+      experiments_dropped_invalid: 1,
+      experiments_truncated: 0,
+    },
+  };
+}
