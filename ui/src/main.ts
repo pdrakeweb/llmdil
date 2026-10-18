@@ -100,7 +100,10 @@ function paintActivationBanner(): void {
   // The same actions the plan card offers, under the same labels and
   // modes: drain-or-restart when the gateway is up with a gateway
   // change pending, otherwise the single Apply plan (start) action.
-  // The composed consequence line rides the Apply buttons' tooltip.
+  // The composed consequence line rides the Apply buttons' tooltip
+  // and renders as visible text on its own banner row: a gateway
+  // restart (and its possible install repair) must be stated before
+  // the operator clicks, not only on hover (2026-10-18).
   const tip = esc(planApplyLine(plan));
   const applyBtns = !plan.actionable
     ? ""
@@ -115,7 +118,8 @@ function paintActivationBanner(): void {
     <span class="ab-actions">
       <button class="btn" data-ab-act="review" title="Review activation plan"${dis}>${icon("eye")} Review</button>
       ${applyBtns}
-    </span></div>`
+    </span>
+    ${plan.actionable ? `<span style="flex-basis:100%">${esc(planApplyLine(plan))}</span>` : ""}</div>`
     + (bannerManual ? `<pre style="margin:0 12px 8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px;text-align:left">${esc(bannerManual)}</pre><div style="padding:0 12px 8px"><button class="btn icon-only" data-ab-act="copy-manual" title="Copy commands" aria-label="Copy commands">${icon("copy")}</button></div>` : "");
 }
 

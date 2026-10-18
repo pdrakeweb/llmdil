@@ -653,8 +653,16 @@ function planNameList(names: string[]): string {
  * gateway-scoped change is pending (a stopped gateway is started,
  * not restarted); targets whose process is stopped are named as
  * taking effect at their next start, and when nothing affected is
- * running the line says so. Exported for the app shell's
- * activation banner, which carries the same line. */
+ * running the line says so. A gateway (re)start is always named
+ * with what it can involve: the start-gateway step verifies the
+ * gateway's install first and repairs it when a check fails
+ * (venv, package install, Prisma generation), so the line says so
+ * — an operator must never learn that a plan restarted (let alone
+ * reinstalled) the gateway only by watching it happen (Pete's
+ * report, 2026-10-18). Exported for the app shell's activation
+ * banner, which carries the same line. Every surface renders this
+ * line as visible text next to the Apply actions, not only in the
+ * buttons' tooltip. */
 export function planApplyLine(plan: ActivationPlanData): string {
   const restarting = plan.backend_restart_ids ?? [];
   const backendTargets: string[] = [];
@@ -679,12 +687,15 @@ export function planApplyLine(plan: ActivationPlanData): string {
   } else {
     lead = plan.gateway_up ? "Apply restarts the gateway" : "Apply starts the gateway";
   }
+  const gatewayNote = plan.gateway_pending
+    ? " The gateway start verifies its install first and repairs or reinstalls it if a check fails."
+    : "";
   const tail = !stopped.length
     ? ""
     : stopped.length === 1
       ? ` The change to ${stopped[0]} takes effect at its next start.`
       : ` Changes to ${planNameList(stopped)} take effect at their next start.`;
-  return `${lead}.${tail}`;
+  return `${lead}.${gatewayNote}${tail}`;
 }
 
 /** The plan's aggregate counts, each computed once and rendered in
@@ -728,8 +739,13 @@ function planScopeBarHtml(plan: ActivationPlanData): string {
  * view's mode semantics: drain-then-restart or restart-now when the
  * gateway is up with a gateway change pending, else the single
  * Apply plan (start) action. The composed consequence line
- * (planApplyLine) rides the buttons' tooltip — it is explanation,
- * and explanation lives in tooltips (principle 4). */
+ * (planApplyLine) rides the buttons' tooltip AND renders as visible
+ * text beside the actions on every surface: what an apply will do
+ * — above all a gateway restart and its possible install repair —
+ * is a consequence the operator must see before clicking, not
+ * explanation that can wait for a hover (Pete's requirement,
+ * 2026-10-18; the visible rendering lives in activationPlanHtml
+ * and the shell banner). */
 function planApplyButtons(plan: ActivationPlanData, ui: PlanUiState): string {
   if (!plan.actionable) return "";
   const dis = ui.acting ? " disabled" : "";
@@ -768,6 +784,7 @@ function activationPlanHtml(plan: ActivationPlanData | null, ui: PlanUiState, va
         : `<a class="btn" href="#/activation-plan">Review</a>`}
       ${planApplyButtons(plan, ui)}
     </div>
+    ${plan.actionable ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">${esc(planApplyLine(plan))}</div>` : ""}
     ${planStatusHtml(ui)}
   </div>`;
   }
@@ -789,6 +806,7 @@ function activationPlanHtml(plan: ActivationPlanData | null, ui: PlanUiState, va
     </div>
     <div style="margin-top:10px">${planScopeBarHtml(plan)}</div>
     ${plan.drift ? `<div style="font-size:12px;color:var(--text2);margin-top:8px">Gateway config: <b style="color:var(--text)">drifted</b><span class="info-tip" title="The running gateway's configuration differs from the saved configuration.">${icon("info")}</span></div>` : ""}
+    ${plan.actionable ? `<div style="font-size:12px;color:var(--text2);margin-top:8px">${esc(planApplyLine(plan))}</div>` : ""}
     <div class="card-actions">${planApplyButtons(plan, ui)}
       ${cancelBtn}
       <button class="btn icon-only" data-plan-refresh title="Refresh" aria-label="Refresh">${icon("restart")}</button></div>
