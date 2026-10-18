@@ -3483,7 +3483,8 @@ fn wizard_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord>, bool) {
 /// outcome, and experiment event through this one append.
 /// Appends are best-effort — logging must never fail the
 /// operation it describes. Rotation mirrors the wizard log: past
-/// ~1 MiB the file becomes `optimize.prev.log`. Secret-free by
+/// ~1 MiB the file rotates to its `.prev` sibling
+/// (`optimize.log.prev`, via `prev_log_path`). Secret-free by
 /// construction: the only inputs are the operator's directive,
 /// the allowlist-built OptimizeContext document (sentinel-tested
 /// in manager-optimize), the consulted model's response to that
@@ -7426,7 +7427,7 @@ mod tests {
     fn optimize_log_roundtrip_with_previous_file() {
         // Tracker #52: the optimize scope's append/reader pair —
         // lines land in logs/optimize.log under source "optimize",
-        // and a rotated optimize.prev.log reads back archived
+        // and a rotated optimize.log.prev reads back archived
         // with has_previous set (the Logs-view scope contract).
         let dir = std::env::temp_dir().join(format!(
             "llm-mgr-optimize-log-{}",
@@ -7437,7 +7438,7 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         std::fs::write(
-            dir.join("logs").join("optimize.prev.log"),
+            dir.join("logs").join("optimize.log.prev"),
             "[2026-01-01T00:00:00Z] earlier run line\n",
         )
         .unwrap();
