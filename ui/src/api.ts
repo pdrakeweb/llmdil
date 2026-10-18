@@ -1295,6 +1295,9 @@ export function effectiveGatewayStrategy(cfg: GatewayConfigData): string | null 
 
 export interface GatewayStatusData {
   port: number;
+  /** Enabled groups only: a group counts when at least one of its
+   *  member backends is enabled — the groups the gateway actually
+   *  serves, not the configured total (tracker #11). */
   groups: number;
   routing_rules: number;
   /** Live probe result: true when the gateway answered on its port. */
