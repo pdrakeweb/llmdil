@@ -243,7 +243,7 @@ pub fn parse_metrics(text: &str, at: Instant) -> MetricsSnapshot {
         }
         match base {
             "litellm_deployment_success_responses" | "litellm_deployment_failure_responses" => {
-                let Some(api_base) = label_value(&labels, "api_base") else {
+                let Some(api_base) = label_value(labels, "api_base") else {
                     continue;
                 };
                 let entry = snap.deployments.entry(api_base).or_insert((0, 0));
@@ -254,7 +254,7 @@ pub fn parse_metrics(text: &str, at: Instant) -> MetricsSnapshot {
                 }
             }
             "litellm_input_tokens_metric" | "litellm_output_tokens_metric" => {
-                let Some(model) = label_value(&labels, "model") else {
+                let Some(model) = label_value(labels, "model") else {
                     continue;
                 };
                 *snap.tokens.entry(model).or_insert(0) += value;

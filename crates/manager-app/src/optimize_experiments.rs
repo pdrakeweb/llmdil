@@ -38,7 +38,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use tauri::State;
 
 use manager_config::AppConfig;
 use manager_optimize::{
@@ -51,7 +50,7 @@ use manager_optimize::{
 };
 use manager_supervisor::{HealthProbe, HttpHealthProbe, ProcessState};
 
-use crate::{err, ApiError, ApiResult, AppState, TaskStatus};
+use crate::{ApiError, AppState, TaskStatus};
 
 /// Per-run benchmark timeout, mirroring the measure command's
 /// (the long prompt on a heavily offloaded backend is slow).
@@ -93,7 +92,7 @@ fn save_journal(state: &AppState, journal: &ExperimentJournal) {
 /// entries from `config.backends` (they should never be
 /// there: temp backends are never written to the config) and
 /// clears the journal's active records. History is retained.
-pub(crate) async fn startup_sweep(state: &AppState) {
+pub async fn startup_sweep(state: &AppState) {
     // Defensive config scrub first, so a leftover temp entry
     // can never be started or routed as a real backend.
     {
@@ -165,35 +164,35 @@ pub(crate) async fn startup_sweep(state: &AppState) {
 /// into the plan file's denial memory, keyed by the
 /// experiment fingerprint, so an identical re-proposal in a
 /// later consultation arrives pre-denied.
-#[tauri::command]
-pub async fn optimize_set_experiment_state(
-    state: State<'_, AppState>,
+pub async fn op_optimize_set_experiment_state(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
     experiment_id: usize,
     decision: String,
-) -> ApiResult {
+) -> crate::ApiResult {
     let decision = match decision.as_str() {
         "accepted" => Decision::Accepted,
         "denied" => Decision::Denied,
         "undecided" => Decision::Undecided,
         other => {
-            return Err(err(ApiError::InvalidInput(format!(
+            return Err(ApiError::InvalidInput(format!(
                 "unknown decision '{other}'"
-            ))))
+            )))
         }
     };
-    let mut file = crate::optimize::load_plan_file(&state);
+    let mut file = crate::optimize::load_plan_file(state);
     let plan = file
         .plan
         .as_mut()
-        .ok_or_else(|| err(ApiError::NotFound("no plan".to_string())))?;
+        .ok_or_else(|| ApiError::NotFound("no plan".to_string()))?;
     let experiment = plan
         .experiments
         .iter_mut()
         .find(|e| e.id == experiment_id)
         .ok_or_else(|| {
-            err(ApiError::NotFound(format!(
+            ApiError::NotFound(format!(
                 "experiment {experiment_id}"
-            )))
+            ))
         })?;
     experiment.decision = decision;
     if decision == Decision::Denied {
@@ -202,8 +201,8 @@ pub async fn optimize_set_experiment_state(
             file.denied_fingerprints.push(fp);
         }
     }
-    crate::optimize::save_plan_file(&state, &file)?;
-    crate::optimize::state_payload(&state).await
+    crate::optimize::save_plan_file(state, &file).map_err(ApiError::InvalidInput)?;
+    crate::optimize::state_payload(state).await
 }
 
 // ---------------------------------------------------------------------------
@@ -869,21 +868,20 @@ async fn restart_stopped(state: &AppState, ids: &[String]) -> String {
 /// one tracked task (`optimize-experiments`) under the shared
 /// GPU-job slot, one experiment at a time, budgets enforced
 /// server-side. Undecided and denied proposals never run.
-#[tauri::command]
-pub async fn optimize_run_experiments(state: State<'_, AppState>) -> ApiResult {
+pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
     {
         let slot = state.optimize_job_abort.lock().await;
         if slot.is_some() {
-            return Err(err(ApiError::InvalidInput(
+            return Err(ApiError::InvalidInput(
                 "a measurement or experiment job is already running".to_string(),
-            )));
+            ));
         }
     }
-    let file = crate::optimize::load_plan_file(&state);
+    let file = crate::optimize::load_plan_file(state);
     let plan = file
         .plan
         .clone()
-        .ok_or_else(|| err(ApiError::NotFound("no plan".to_string())))?;
+        .ok_or_else(|| ApiError::NotFound("no plan".to_string()))?;
     let batch: Vec<ExperimentProposal> = plan
         .experiments
         .iter()
@@ -891,18 +889,18 @@ pub async fn optimize_run_experiments(state: State<'_, AppState>) -> ApiResult {
         .cloned()
         .collect();
     if batch.is_empty() {
-        return Err(err(ApiError::InvalidInput(
+        return Err(ApiError::InvalidInput(
             "no accepted experiments in the current plan; accept at least one proposal to run it".to_string(),
-        )));
+        ));
     }
     if batch.len() > manager_optimize::MAX_EXPERIMENTS {
-        return Err(err(ApiError::InvalidInput(format!(
+        return Err(ApiError::InvalidInput(format!(
             "at most {} experiments per batch",
             manager_optimize::MAX_EXPERIMENTS
-        ))));
+        )));
     }
     let cfg = state.config.read().await.clone();
-    let gathered0 = crate::optimize::gather(&state, &cfg).await;
+    let gathered0 = crate::optimize::gather(state, &cfg).await;
     let task_id = state
         .record_task(
             "optimize-experiments",
@@ -924,9 +922,9 @@ pub async fn optimize_run_experiments(state: State<'_, AppState>) -> ApiResult {
                     json!({ "error": "a measurement or experiment job is already running" }),
                 )
                 .await;
-            return Err(err(ApiError::InvalidInput(
+            return Err(ApiError::InvalidInput(
                 "a measurement or experiment job is already running".to_string(),
-            )));
+            ));
         }
         *slot = Some(tx);
     }
@@ -954,7 +952,7 @@ pub async fn optimize_run_experiments(state: State<'_, AppState>) -> ApiResult {
             for rest in &batch[idx..] {
                 let now = chrono::Utc::now().to_rfc3339();
                 record_result(
-                    &state,
+                    state,
                     &ExperimentResult {
                         experiment_id: rest.id,
                         candidate_model_id: rest.candidate_model_id.clone(),
@@ -979,7 +977,7 @@ pub async fn optimize_run_experiments(state: State<'_, AppState>) -> ApiResult {
         let remaining_batch = Duration::from_secs(BATCH_TIMEOUT_SECS)
             .saturating_sub(batch_start.elapsed());
         let budget = Duration::from_secs(EXPERIMENT_TIMEOUT_SECS).min(remaining_batch);
-        let inner = run_experiment_inner(&state, &cfg, proposal, &mut ctx);
+        let inner = run_experiment_inner(state, &cfg, proposal, &mut ctx);
         // Cancellation and timeout drop the inner future; the
         // cleanup below is outside it and always runs.
         let outcome = tokio::select! {
@@ -1009,13 +1007,13 @@ pub async fn optimize_run_experiments(state: State<'_, AppState>) -> ApiResult {
                 },
             },
         };
-        cleanup_temp(&state, &temp_id).await;
+        cleanup_temp(state, &temp_id).await;
         match outcome.status {
             ExperimentStatus::Completed => completed += 1,
             _ => failed += 1,
         }
         record_result(
-            &state,
+            state,
             &ExperimentResult {
                 experiment_id: proposal.id,
                 candidate_model_id: proposal.candidate_model_id.clone(),
@@ -1038,12 +1036,12 @@ pub async fn optimize_run_experiments(state: State<'_, AppState>) -> ApiResult {
     // Restart what the batch stopped (any outcome, including
     // cancellation and deadline), and state it in every result
     // this batch recorded — journal history and plan alike.
-    let note = restart_stopped(&state, &ctx.stopped_to_restart.clone()).await;
+    let note = restart_stopped(state, &ctx.stopped_to_restart.clone()).await;
     if !note.is_empty() {
-        let mut journal = load_journal(&state);
+        let mut journal = load_journal(state);
         journal.append_batch_detail(&batch_id, &note);
-        save_journal(&state, &journal);
-        let mut file = crate::optimize::load_plan_file(&state);
+        save_journal(state, &journal);
+        let mut file = crate::optimize::load_plan_file(state);
         if let Some(plan) = file.plan.as_mut() {
             for exp in plan.experiments.iter_mut() {
                 if let Some(result) = exp.result.as_mut() {
@@ -1055,7 +1053,7 @@ pub async fn optimize_run_experiments(state: State<'_, AppState>) -> ApiResult {
                     }
                 }
             }
-            let _ = crate::optimize::save_plan_file(&state, &file);
+            let _ = crate::optimize::save_plan_file(state, &file);
         }
     }
     {
@@ -1075,7 +1073,7 @@ pub async fn optimize_run_experiments(state: State<'_, AppState>) -> ApiResult {
     };
     state.finish_task(&task_id, status, detail).await;
     if cancelled {
-        return Err("experiment batch cancelled".to_string());
+        return Err(ApiError::InvalidInput("experiment batch cancelled".to_string()));
     }
-    crate::optimize::state_payload(&state).await
+    crate::optimize::state_payload(state).await
 }

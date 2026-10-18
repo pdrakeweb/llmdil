@@ -50,6 +50,18 @@ try {
   // Entries may be module paths (optimize::optimize_get_state); Tauri
   // registers the bare function name, so compare on the last segment.
   registered = new Set(block.split(",").map((s) => s.trim().split("::").pop()).filter(Boolean));
+  // The shell's own admin_api_* commands are listed literally in its
+  // handler macro; collect them by name wherever they appear.
+  for (const m of mainRs.matchAll(/admin_api_[a-z0-9_]+/g)) {
+    registered.add(m[0]);
+  }
+  // The shell generates its handlers from the manager-app operation
+  // registry (for_each_operation!), so the registered set is the
+  // registry's snake names plus the shell's own literal entries above.
+  const registryRs = readFileSync(join(root, "..", "crates", "manager-app", "src", "registry.rs"), "utf8");
+  for (const m of registryRs.matchAll(/\(\w+,\s*([a-z][a-z0-9_]*),\s*(?:R|C|D|L|X|S\w*),/g)) {
+    registered.add(m[1]);
+  }
 } catch { /* empty set fails the check below */ }
 check(registered.size > 0, `parsed registered Tauri commands from generate_handler! (${registered.size})`);
 

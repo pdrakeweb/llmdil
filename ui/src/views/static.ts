@@ -24,8 +24,11 @@ import {
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
   setNotificationConfig, sendTestNotification,
   servicesList, servicesRegister, servicesUnregister, setSupervisionMode,
+  adminApiGetStatus, adminApiSetEnabled, adminApiListUsers, adminApiCreateUser,
+  adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
+  adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationPlanData, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, ServicesInfo } from "../api";
+import type { ActivationChange, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, ServicesInfo } from "../api";
 import type { GpuInfo, WizardStepState } from "../types";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
@@ -4710,7 +4713,7 @@ function mxcActivityInner(activityR: { data: MxcActivityData | null; error?: str
   return `<div style="font-size:12px;color:var(--text2);margin:14px 0 6px">Recent activity</div>${mixBar}${rows}`;
 }
 
-type SettingsTab = "general" | "updates" | "notifications" | "mxc" | "supervision";
+type SettingsTab = "general" | "remote" | "updates" | "notifications" | "mxc" | "supervision";
 
 interface SettingsUi {
   tab: SettingsTab;
@@ -4719,8 +4722,8 @@ interface SettingsUi {
   allOpen: boolean;
 }
 
-/** One Settings section, five tab views (principle 2) — page length
- *  is the longest tab, not the sum of five stacked cards. The
+/** One Settings section, six tab views (principle 2) — page length
+ *  is the longest tab, not the sum of six stacked cards. The
  *  Notifications tab renders only when notification settings
  *  exist. All narrative rides info-tips; empty blocks render
  *  nothing. */
@@ -4776,10 +4779,12 @@ function settingsPaint(
   selfTestHtml: string,
   ui: SettingsUi,
   svcR: { data: ServicesInfo; error?: string; live: boolean },
+  remoteHtml = "",
 ): string {
   const notif = asRecord(cfg.notifications);
   const tabs: { id: SettingsTab; label: string }[] = [
     { id: "general", label: "General" },
+    { id: "remote", label: "Remote access" },
     { id: "updates", label: "Updates & diagnostics" },
     ...(notif ? [{ id: "notifications" as SettingsTab, label: "Notifications" }] : []),
     { id: "mxc", label: "MXC sandbox" },
@@ -4892,6 +4897,7 @@ function settingsPaint(
 
   const supervisionPanel = supervisionInner(svcR);
   const panel = tab === "general" ? generalPanel
+    : tab === "remote" ? remoteHtml
     : tab === "updates" ? updatesPanel
     : tab === "notifications" ? notifPanel
     : tab === "supervision" ? supervisionPanel
@@ -4899,6 +4905,74 @@ function settingsPaint(
   return `<div class="card" style="margin-bottom:12px"><div class="sec-title">${icon("gear")} Settings</div>
     <div class="viewsel" role="tablist" style="margin-bottom:12px">${tabs.map((t) => `<button data-set-tab="${t.id}"${t.id === tab ? ` class="active"` : ""}>${t.label}</button>`).join("")}</div>
     ${panel}</div>`;
+}
+
+
+/** Remote Access tab: the admin API's state, its users, and
+ *  device pairing. Values are Label: Value rows with copy buttons
+ *  (the global [data-copy-value] handler serves them); state the
+ *  API has not produced yet renders nothing. One-time values (a
+ *  temporary password, an enrollment payload) show until the next
+ *  action replaces them. */
+function remoteAccessHtml(
+  status: AdminApiStatus | null,
+  users: AdminApiUser[],
+  temp: { user: string; password: string } | null,
+  enroll: (AdminApiPairing & { user: string }) | null,
+  audit: AdminApiAuditEntry[] = [],
+): string {
+  if (!status) return loadingHtml("Loading remote access\u2026");
+  const stateText = status.running
+    ? `<span style="color:var(--ok)">Running</span>`
+    : status.enabled
+      ? `<span style="color:var(--err)">Enabled \u2014 not running</span>`
+      : `<span style="color:var(--text2)">Disabled</span>`;
+  const fwText = status.firewall === "ok" ? "Allowed: local subnet + Tailscale"
+    : status.firewall === "missing" ? "Rule missing"
+    : status.firewall === "drifted" ? "Rule differs from expected"
+    : status.firewall === "unsupported" ? "Not reported on this platform"
+    : "Unknown";
+  const rows: SettingsRow[] = [
+    { key: "Port", value: String(status.port) },
+    { key: "Bind", value: status.bind },
+    { key: "Firewall rule", value: fwText },
+    { key: "Users", value: String(status.user_count) },
+  ];
+  if (status.base_url) rows.unshift({ key: "Base URL", value: status.base_url, copy: status.base_url });
+  if (status.cert_sha256) rows.push({ key: "Certificate SHA-256", value: status.cert_sha256, copy: status.cert_sha256 });
+  const roles = ["viewer", "operator", "configurator", "admin"];
+  const userRows = users.map((u) => `<div style="display:flex;justify-content:space-between;gap:16px;align-items:center;padding:3px 0">
+    <span style="font-size:12px">${esc(u.username)}${u.disabled ? ` <span style="color:var(--text2)">(disabled)</span>` : ""}${u.must_change_password ? ` <span style="color:var(--warn)">(must change password)</span>` : ""}</span>
+    <span style="display:flex;gap:6px;align-items:center">
+      <select data-ra-role-for="${esc(u.id)}" style="font-size:12px">${roles.map((r) => `<option value="${r}"${r === u.role ? " selected" : ""}>${r}</option>`).join("")}</select>
+      <button class="btn" data-ra-apply-role="${esc(u.id)}" style="padding:1px 7px;font-size:11px">Apply</button>
+      <button class="btn" data-ra-toggle-disabled="${esc(u.id)}" style="padding:1px 7px;font-size:11px">${u.disabled ? "Enable" : "Disable"}</button>
+      <button class="btn" data-ra-reset="${esc(u.id)}" data-ra-name="${esc(u.username)}" style="padding:1px 7px;font-size:11px">Reset password</button>
+      <button class="btn" data-ra-enroll="${esc(u.id)}" data-ra-name="${esc(u.username)}" style="padding:1px 7px;font-size:11px">Pairing code</button>
+      <button class="btn" data-ra-delete="${esc(u.id)}" data-ra-name="${esc(u.username)}" style="padding:1px 7px;font-size:11px">Delete</button>
+    </span></div>`).join("");
+  return `<div style="font-size:12px;color:var(--text2)">Admin API<span class="info-tip" title="Serves the LLMdil control API to devices on this network. Access requires a user account and is limited by the firewall rule to the local subnet and Tailscale.">${icon("info")}</span></div>
+    <div style="display:flex;justify-content:space-between;gap:16px;margin:6px 0"><span class="k">Status</span><span class="v" style="font-size:12px">${stateText}</span></div>
+    ${settingsRows(rows)}
+    ${status.note ? `<div style="font-size:12px;color:var(--err);margin-top:6px">${esc(status.note)}</div>` : ""}
+    <div class="card-actions" style="margin-top:10px"><button class="btn${status.enabled ? "" : " primary"}" data-ra-toggle>${status.enabled ? "Disable API" : "Enable API"}</button>
+    <button class="btn" data-ra-regen>Regenerate certificate</button></div>
+    <div style="font-size:12px;color:var(--text2);margin-top:16px">${users.length === 0 ? "First administrator" : "Users"}<span class="info-tip" title="Roles: viewer reads status; operator runs backends and the gateway; configurator also edits configuration; admin manages users and the API itself. Passwords need at least 12 characters.">${icon("info")}</span></div>
+    ${userRows}
+    <div style="display:flex;gap:6px;align-items:center;margin-top:8px;flex-wrap:wrap">
+      <input id="raUser" type="text" placeholder="Username" style="font-size:12px" />
+      <input id="raPass" type="password" placeholder="Password (12+ characters)" style="font-size:12px" />
+      <select id="raRole" style="font-size:12px">${roles.map((r) => `<option value="${r}"${r === "admin" && users.length === 0 ? " selected" : ""}>${r}</option>`).join("")}</select>
+      <button class="btn" data-ra-create style="padding:1px 7px;font-size:11px">Create user</button>
+    </div>
+    ${audit.length ? `<div style="font-size:12px;color:var(--text2);margin-top:16px">Audit log<span class="info-tip" title="Every API mutation and sign-in event, newest first. Full log: logs/admin-api-audit.jsonl in the data directory.">${icon("info")}</span></div>
+    <div style="font-size:12px">${audit.map((e) => `<div style="display:flex;justify-content:space-between;gap:16px;padding:2px 0"><span>${esc(new Date(e.ts_ms).toLocaleString())} \u00b7 ${esc(e.actor)} \u00b7 ${esc(e.action)}${e.target ? ` \u00b7 ${esc(e.target)}` : ""}</span><span style="color:${e.result.startsWith("2") ? "var(--ok)" : "var(--err)"}">${esc(e.result)}</span></div>`).join("")}</div>` : ""}
+    ${temp ? `<div style="margin-top:12px">${settingsRows([{ key: `Temporary password \u00b7 ${temp.user}`, value: temp.password, copy: temp.password, tip: "Shown once. The user must change it at first sign-in." }])}</div>` : ""}
+    ${enroll ? `<div style="margin-top:12px"><div style="font-size:12px;color:var(--text2)">Pairing \u00b7 ${esc(enroll.user)}<span class="info-tip" title="Enter these values in the LLMdil app to pair this device. The code is single-use and expires in 10 minutes.">${icon("info")}</span></div>${settingsRows([
+      { key: "Base URL", value: enroll.base_url, copy: enroll.base_url },
+      { key: "Certificate SHA-256", value: enroll.cert_sha256 ?? "", copy: enroll.cert_sha256 ?? undefined },
+      { key: "Enrollment code", value: enroll.enrollment_code ?? "", copy: enroll.enrollment_code ?? undefined },
+    ])}</div>` : ""}`;
 }
 
 export function renderSettings(): string {
@@ -4920,6 +4994,19 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
   /** Last loaded notifications object, so a toggle click can send
    *  the complete replacement (the command replaces the section). */
   let lastNotif: Record<string, unknown> | null = null;
+  // Remote Access tab state, held outside the repainted DOM.
+  let raStatus: AdminApiStatus | null = null;
+  let raUsers: AdminApiUser[] = [];
+  let raTemp: { user: string; password: string } | null = null;
+  let raEnroll: (AdminApiPairing & { user: string }) | null = null;
+  let raAudit: AdminApiAuditEntry[] = [];
+  const loadRemote = async (): Promise<void> => {
+    const [st, us, au] = await Promise.all([adminApiGetStatus(), adminApiListUsers(), adminApiGetAudit(20)]);
+    if (disposed) return;
+    raStatus = st.data;
+    raUsers = us.data;
+    raAudit = au.data;
+  };
   const setMsg = (text: string, isErr = false): void => {
     const m = root.querySelector("#setMsg");
     if (m) m.innerHTML = text ? `<span style="color:${isErr ? "var(--err)" : "var(--text2)"}">${esc(text)}</span>` : "";
@@ -4941,7 +5028,10 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     lastNotif = asRecord(cfgR.data.notifications);
     // Policy/activity CallResults go in whole: their .error renders as
     // "unavailable — <error>", distinct from genuine absence.
-    b.innerHTML = settingsPaint(cfgR.data, polR, actR, selfTestHtml, setUi, svcR);
+    if (setUi.tab === "remote") await loadRemote();
+    if (disposed) return;
+    b.innerHTML = settingsPaint(cfgR.data, polR, actR, selfTestHtml, setUi, svcR,
+      remoteAccessHtml(raStatus, raUsers, raTemp, raEnroll, raAudit));
   };
 
   const onClick = async (ev: Event): Promise<void> => {
@@ -4971,6 +5061,99 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
 
     if (t.closest("[data-all-toggle]")) {
       setUi.allOpen = !setUi.allOpen;
+      await load();
+      return;
+    }
+
+
+    const raRegen = t.closest("[data-ra-regen]") as HTMLButtonElement | null;
+    if (raRegen) {
+      if (!confirm("Regenerate the API certificate? The fingerprint changes and every paired device must pair again.")) return;
+      raRegen.disabled = true;
+      const r = await adminApiRegenerateCert();
+      if (disposed) return;
+      if (r.error) setMsg(`Certificate regeneration failed: ${r.error}`, true);
+      else setMsg("Certificate regenerated. Paired devices must pair again.");
+      await load();
+      return;
+    }
+
+    const raToggle = t.closest("[data-ra-toggle]") as HTMLButtonElement | null;
+    if (raToggle && raStatus) {
+      raToggle.disabled = true;
+      const r = await adminApiSetEnabled(!raStatus.enabled);
+      if (disposed) return;
+      if (r.error) setMsg(`Admin API change failed: ${r.error}`, true);
+      await load();
+      return;
+    }
+
+    if (t.closest("[data-ra-create]")) {
+      const nameEl = root.querySelector("#raUser") as HTMLInputElement | null;
+      const passEl = root.querySelector("#raPass") as HTMLInputElement | null;
+      const roleEl = root.querySelector("#raRole") as HTMLSelectElement | null;
+      const r = await adminApiCreateUser(nameEl?.value ?? "", passEl?.value ?? "", roleEl?.value ?? "viewer");
+      if (disposed) return;
+      if (r.error) setMsg(`Create user failed: ${r.error}`, true);
+      else setMsg(`User ${r.data?.username ?? ""} created.`);
+      await load();
+      return;
+    }
+
+    const raApplyRole = t.closest("[data-ra-apply-role]") as HTMLElement | null;
+    if (raApplyRole) {
+      const id = raApplyRole.getAttribute("data-ra-apply-role") ?? "";
+      const sel = root.querySelector(`[data-ra-role-for="${id}"]`) as HTMLSelectElement | null;
+      const r = await adminApiUpdateUser(id, sel?.value);
+      if (disposed) return;
+      if (r.error) setMsg(`Role change failed: ${r.error}`, true);
+      await load();
+      return;
+    }
+
+    const raDis = t.closest("[data-ra-toggle-disabled]") as HTMLElement | null;
+    if (raDis) {
+      const id = raDis.getAttribute("data-ra-toggle-disabled") ?? "";
+      const u = raUsers.find((x) => x.id === id);
+      const r = await adminApiUpdateUser(id, undefined, !(u?.disabled ?? false));
+      if (disposed) return;
+      if (r.error) setMsg(`User change failed: ${r.error}`, true);
+      await load();
+      return;
+    }
+
+    const raReset = t.closest("[data-ra-reset]") as HTMLElement | null;
+    if (raReset) {
+      const id = raReset.getAttribute("data-ra-reset") ?? "";
+      const name = raReset.getAttribute("data-ra-name") ?? "";
+      const r = await adminApiResetPassword(id);
+      if (disposed) return;
+      if (r.error) setMsg(`Password reset failed: ${r.error}`, true);
+      else if (r.data) raTemp = { user: name, password: r.data };
+      await load();
+      return;
+    }
+
+    const raEnrollBtn = t.closest("[data-ra-enroll]") as HTMLElement | null;
+    if (raEnrollBtn) {
+      const id = raEnrollBtn.getAttribute("data-ra-enroll") ?? "";
+      const name = raEnrollBtn.getAttribute("data-ra-name") ?? "";
+      const r = await adminApiCreateEnrollment(id);
+      if (disposed) return;
+      if (r.error) setMsg(`Pairing code failed: ${r.error}`, true);
+      else if (r.data) raEnroll = { ...r.data, user: name };
+      await load();
+      return;
+    }
+
+    const raDelete = t.closest("[data-ra-delete]") as HTMLElement | null;
+    if (raDelete) {
+      const id = raDelete.getAttribute("data-ra-delete") ?? "";
+      const name = raDelete.getAttribute("data-ra-name") ?? "";
+      if (!confirm(`Delete user ${name}? Their sessions and API tokens are revoked.`)) return;
+      const r = await adminApiDeleteUser(id);
+      if (disposed) return;
+      if (r.error) setMsg(`Delete failed: ${r.error}`, true);
       await load();
       return;
     }

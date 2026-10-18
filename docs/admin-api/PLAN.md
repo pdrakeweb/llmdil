@@ -331,6 +331,36 @@ from the workspace and nothing can import from it:
   through both the Tauri adapter and the REST handler and compare
   (§3.9, phase 0).
 
+**The operation registry (Pete's drift-prevention requirement, as
+implemented in phase 0).** Every capability is declared exactly
+once, in `manager_app::registry`'s `for_each_operation!` macro: one
+entry per operation carrying its canonical name (the Tauri command
+name), its capability class (§3.5), its handler, its typed
+parameter list, and its REST route (`None` only for the explicit
+exclusions — desktop-only actions, the master-key value, the raw
+config patch, and the peripheral MCP/VS Code/WinML surface). From
+that single declaration, code generation produces:
+
+- the `Op` enum, the `OP_SPECS` table, and `dispatch()` in
+  manager-app — an exhaustive `match` with no wildcard arm, so a
+  registered operation without a dispatch arm does not compile;
+- the `#[tauri::command]` adapters and the `generate_handler!`
+  list in src-tauri;
+- the axum router in manager-api (phase 1), which registers each
+  spec's route with an authorization guard driven by the spec's
+  class through `role_allows` — itself an exhaustive `match` over
+  the class enum with no wildcard arm, so a new class cannot ship
+  without decided grants.
+
+Adding an operation is one registry line; the build then fails at
+every unhandled site until it is wired on all surfaces. Contract
+tests are the second line of defense: the registry enumerates
+itself (82 operations, unique names, unique routes, the §3.5
+matrix row by row), the frontend's invoked command names are
+checked against the registry (the `backend_test_request` defect
+class), and phase 1 adds a registry-vs-live-route-table test in
+manager-api.
+
 ### 3.2 Hosting: `manager-api`
 
 - New workspace crate **`manager-api`**: **axum** on the existing
@@ -789,3 +819,70 @@ fits), `rest-api.md` (89 endpoints, error envelope, operation
 model), `auth-plan.md` (roles, tokens, user store, transport),
 `implementation-plan.md` (hosting, extraction, phasing). Detail
 lives there; this document is the synthesis to approve.*
+
+## 9. As-built notes (October 17, 2026, branch feature/admin-api)
+
+What shipped, where the build settled questions the plan left
+open, and the deliberate deviations. Code won wherever it and the
+plan disagreed; this section is the record.
+
+**Surface totals.** 104 route records: 65 registry-generated op
+routes, 15 derived/composite routes, 24 auth/admin routes. Every
+endpoint documented in rest-api.md section 6 is implemented
+except two deliberate exclusions: `GET /gateway/master-key`
+(decision 4 — the op is routeless; the key never crosses REST in
+v1) and raw `PATCH /config` (decision 11). `POST
+/updates/components/{component_id}/apply` is routed and returns
+501 UNSUPPORTED from the app's own stub (decision 10).
+
+**Registry drift mechanism.** As specified in section 3.1:
+`for_each_operation!` in manager-app is the single declaration;
+the Tauri adapters, the handler list, the axum router, and the
+authorization table are all generated or derived from it, with
+exhaustive matching and contract tests on both sides (route
+table vs registry; frontend invoke scan vs registry plus the
+allowlisted desktop-local commands, which must exist in the
+shell source).
+
+**Composites** (model PATCH, gateway group CRUD, gateway start,
+activation apply, gateway-config bind_host split) inherit their
+authorization class from the operations they compose, looked up
+in the registry at table construction — with the one declared
+exception: the activation apply is class L (decision 5) although
+it internally runs the admin-class start-gateway step.
+`POST /gateway/start` inherits the step's class D. Composite
+read-modify-write sequences are serialized by a per-context lock.
+
+**Asynchronous endpoints.** AsyncOp routes, gateway start, and
+the activation apply answer 202 with an API-side operation record
+(TaskRecord shape), retained for the process lifetime and merged
+into `GET /operations`. Abort is bookkeeping with the app's
+semantics: the record flips to aborted; the underlying work is
+not cancellable and its completion never overwrites the abort.
+
+**Events.** `GET /api/v1/events` (SSE) carries the app's
+operation events with process-global ids. Live-only: nothing is
+replayed on reconnect; ids let a client detect gaps.
+
+**Deviations.**
+- TLS private key custody: a key file under
+  `<data_dir>/admin-api/tls/` rather than Windows Credential
+  Manager. The in-process server reads it at startup before any
+  UI exists; the directory is per-user app data alongside
+  `admin-users.json`. Moving custody is future hardening.
+- QR rendering: the desktop pairing surface shows the payload
+  (`base_url`, `cert_sha256`, enrollment code) as copyable values;
+  no QR library was installable in the build environment. The
+  payload format is the QR content, so rendering is additive
+  later.
+- Certificate SAN set: hostname + primary LAN IP + Tailscale IP
+  (when the CLI reports one) + loopback, regenerated when the set
+  changes at enable time; rotation is a desktop action that
+  restarts the server.
+- Test-environment note: workspace tests run on a Linux VM
+  without the Windows desktop stack; the Tauri shell is
+  type-checked against a stub harness, and the UI is
+  pattern-verified only. On-machine Windows validation (real
+  firewall prompts, tray behavior, LAN reachability) remains for
+  the first install.
+

@@ -1,0 +1,28 @@
+[package]
+name = "manager-app"
+version = "0.1.33"
+edition = "2021"
+
+# Service core extracted from src-tauri (admin API plan, phase 0).
+# Holds AppState, the operation implementations behind both the Tauri
+# command bridge and the admin REST API, the activation journal, and
+# the gateway stats sampler. Framework-free: no Tauri dependency.
+# src-tauri and manager-api are both thin adapters over this crate.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+manager-config = { path = "../manager-config" }
+manager-wizard = { path = "../manager-wizard" }
+manager-supervisor = { path = "../manager-supervisor" }
+manager-telemetry = { path = "../manager-telemetry" }
+manager-gateway = { path = "../manager-gateway" }
+manager-models = { path = "../manager-models" }
+manager-mcp = { path = "../manager-mcp" }
+manager-optimize = { path = "../manager-optimize" }
+manager-services = { path = "../manager-services" }
+manager-mxc = { path = "../manager-mxc" }
+manager-winml = { path = "../manager-winml" }

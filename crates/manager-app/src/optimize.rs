@@ -15,7 +15,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::State;
 
 use manager_config::AppConfig;
 use manager_optimize::{
@@ -28,7 +27,7 @@ use manager_optimize::{
 };
 use manager_supervisor::ProcessState;
 
-use crate::{err, jerr, ApiError, ApiResult, AppState, TaskStatus};
+use crate::{ApiError, ApiResult, AppState, TaskStatus};
 
 /// Consultation generation budget (design §3).
 const CONSULT_MAX_TOKENS: u32 = 4096;
@@ -593,21 +592,20 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
 
 /// Full page state: purposes, context summary + document, the
 /// stored plan with live validation states.
-#[tauri::command]
-pub async fn optimize_get_state(state: State<'_, AppState>) -> ApiResult {
-    state_payload(&state).await
+pub async fn op_optimize_get_state(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
+    state_payload(state).await
 }
 
 /// Persist a purpose text (design §2.3): the deployment purpose,
 /// or one group's / backend's. A scoped config save through
 /// `manager_config::save`, like every other config write.
-#[tauri::command]
-pub async fn optimize_save_purpose(
-    state: State<'_, AppState>,
+pub async fn op_optimize_save_purpose(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
     scope: String,
     target: Option<String>,
     text: String,
-) -> ApiResult {
+) -> crate::ApiResult {
     let mut new_cfg = state.config.read().await.clone();
     match scope.as_str() {
         "deployment" => new_cfg.optimize_purpose = text,
@@ -617,7 +615,7 @@ pub async fn optimize_save_purpose(
                 .backends
                 .iter_mut()
                 .find(|b| b.id == target)
-                .ok_or_else(|| err(ApiError::NotFound(format!("backend {target}"))))?;
+                .ok_or_else(|| ApiError::NotFound(format!("backend {target}")))?;
             b.purpose = text;
         }
         "group" => {
@@ -627,20 +625,19 @@ pub async fn optimize_save_purpose(
                 .groups
                 .iter_mut()
                 .find(|g| g.name == target)
-                .ok_or_else(|| err(ApiError::NotFound(format!("group {target}"))))?;
+                .ok_or_else(|| ApiError::NotFound(format!("group {target}")))?;
             g.purpose = text;
         }
         other => {
-            return Err(err(ApiError::InvalidInput(format!(
+            return Err(ApiError::InvalidInput(format!(
                 "unknown purpose scope '{other}'"
-            ))))
+            )))
         }
     }
     manager_config::save(&new_cfg, &state.config_path)
-        .map_err(ApiError::from)
-        .map_err(jerr)?;
+        .map_err(ApiError::from)?;
     *state.config.write().await = new_cfg;
-    state_payload(&state).await
+    state_payload(state).await
 }
 
 /// Run (or sample) a consultation. Live mode consults the chosen
@@ -648,14 +645,14 @@ pub async fn optimize_save_purpose(
 /// the scoped cancellation handle; sample mode parses a locally
 /// generated plan against the real context, with no backend
 /// involved.
-#[tauri::command]
-pub async fn optimize_consult(
-    state: State<'_, AppState>,
+pub async fn op_optimize_consult(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
     backend_id: Option<String>,
     sample: Option<bool>,
     directive: Option<String>,
     candidate_repos: Option<Vec<String>>,
-) -> ApiResult {
+) -> crate::ApiResult {
     let sample = sample.unwrap_or(false);
     // The operator directive for this consultation (addendum
     // A.2): trimmed; empty (or absent) means no directive. Sample
@@ -668,13 +665,13 @@ pub async fn optimize_consult(
     {
         let slot = state.optimize_abort.lock().await;
         if slot.is_some() {
-            return Err(err(ApiError::InvalidInput(
+            return Err(ApiError::InvalidInput(
                 "a consultation is already running".to_string(),
-            )));
+            ));
         }
     }
     let cfg = state.config.read().await.clone();
-    let mut gathered = gather(&state, &cfg).await;
+    let mut gathered = gather(state, &cfg).await;
     // Discovery pre-pass carriage (Phase 5c, §A.5): only a
     // consultation WITH a directive receives a candidates block,
     // and only the stored candidates gathered for that same
@@ -683,7 +680,7 @@ pub async fn optimize_consult(
     // intersected with the repos the operator left un-pruned
     // (`candidate_repos`; absent = all stored).
     if !directive.is_empty() {
-        let stored = load_candidates_file(&state);
+        let stored = load_candidates_file(state);
         if stored.directive == directive {
             gathered.measure.candidates = stored
                 .candidates
@@ -704,20 +701,20 @@ pub async fn optimize_consult(
         .or(best_overall)
         .or_else(|| cfg.backends.first().map(|b| b.id.clone()))
         .ok_or_else(|| {
-            err(ApiError::InvalidInput(
+            ApiError::InvalidInput(
                 "no backends are configured".to_string(),
-            ))
+            )
         })?;
     let backend = cfg
         .backends
         .iter()
         .find(|b| b.id == target)
-        .ok_or_else(|| err(ApiError::NotFound(format!("backend {target}"))))?
+        .ok_or_else(|| ApiError::NotFound(format!("backend {target}")))?
         .clone();
     if !sample && gathered.running.get(&target).copied() != Some(true) {
-        return Err(err(ApiError::InvalidInput(format!(
+        return Err(ApiError::InvalidInput(format!(
             "backend '{target}' is not running; consultations go to a running backend"
-        ))));
+        )));
     }
     let (context, meta) = build_context(
         &cfg,
@@ -738,10 +735,10 @@ pub async fn optimize_consult(
         let est = estimate_tokens(&system_prompt) + estimate_tokens(&user_prompt);
         let n_ctx = backend.flags.n_ctx as usize;
         if est + CONSULT_MAX_TOKENS as usize > n_ctx {
-            return Err(err(ApiError::InvalidInput(format!(
+            return Err(ApiError::InvalidInput(format!(
                 "the assembled context is ~{est} tokens (estimated at 4 characters per token); with the {CONSULT_MAX_TOKENS}-token response budget it needs {} tokens, over backend '{target}'s configured context of {n_ctx} — pick a backend with a larger context",
                 est + CONSULT_MAX_TOKENS as usize
-            ))));
+            )));
         }
     }
 
@@ -766,9 +763,9 @@ pub async fn optimize_consult(
                         json!({ "error": "a consultation is already running" }),
                     )
                     .await;
-                return Err(err(ApiError::InvalidInput(
+                return Err(ApiError::InvalidInput(
                     "a consultation is already running".to_string(),
-                )));
+                ));
             }
             *slot = Some(tx);
         }
@@ -814,7 +811,7 @@ pub async fn optimize_consult(
                         json!({ "backend": target }),
                     )
                     .await;
-                return Err("consultation cancelled".to_string());
+                return Err(ApiError::InvalidInput("consultation cancelled".to_string()));
             }
             Some(Err(e)) => {
                 state
@@ -824,9 +821,9 @@ pub async fn optimize_consult(
                         json!({ "error": e.to_string() }),
                     )
                     .await;
-                return Err(err(ApiError::InvalidInput(format!(
+                return Err(ApiError::InvalidInput(format!(
                     "consultation failed: {e}"
-                ))));
+                )));
             }
             Some(Ok(result)) => result.content,
         }
@@ -835,7 +832,7 @@ pub async fn optimize_consult(
     // Denial memory: everything denied so far — the stored set
     // plus the outgoing plan's denied items — pre-denies matches
     // in the new plan (§6).
-    let mut file = load_plan_file(&state);
+    let mut file = load_plan_file(state);
     let mut denied: HashSet<String> = file.denied_fingerprints.iter().cloned().collect();
     if let Some(old) = &file.plan {
         for item in &old.items {
@@ -864,9 +861,9 @@ pub async fn optimize_consult(
                     json!({ "error": format!("unparseable response: {e}") }),
                 )
                 .await;
-            return Err(err(ApiError::InvalidInput(format!(
+            return Err(ApiError::InvalidInput(format!(
                 "the backend's response could not be parsed: {e} — the raw response is not kept; try again or consult a different backend"
-            ))));
+            )));
         }
     };
     for item in &plan.items {
@@ -878,7 +875,7 @@ pub async fn optimize_consult(
     file.plan = Some(plan);
     file.sample = sample;
     file.denied_fingerprints = denied.into_iter().collect();
-    save_plan_file(&state, &file)?;
+    save_plan_file(state, &file).map_err(ApiError::InvalidInput)?;
     state
         .finish_task(
             &task_id,
@@ -886,7 +883,7 @@ pub async fn optimize_consult(
             json!({ "backend": target, "items": item_count }),
         )
         .await;
-    state_payload(&state).await
+    state_payload(state).await
 }
 
 /// Run the discovery pre-pass for a directive (Phase 5c,
@@ -898,42 +895,42 @@ pub async fn optimize_consult(
 /// and no configuration changes. A later consultation with
 /// the same directive receives the (operator-pruned) set as
 /// its context's `candidates` block.
-#[tauri::command]
-pub async fn optimize_discover(
-    state: State<'_, AppState>,
+pub async fn op_optimize_discover(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
     directive: String,
-) -> ApiResult {
+) -> crate::ApiResult {
     let directive = directive.trim().to_string();
     if directive.is_empty() {
-        return Err(err(ApiError::InvalidInput(
+        return Err(ApiError::InvalidInput(
             "candidate discovery needs a directive: enter one to seed the search".to_string(),
-        )));
+        ));
     }
     let cfg = state.config.read().await.clone();
-    let gathered = gather(&state, &cfg).await;
+    let gathered = gather(state, &cfg).await;
     let free_vram = gathered.live.free_vram_mib_per_gpu.clone();
     let retrieved_at = chrono::Utc::now().to_rfc3339();
     let client = HfClient::with_default_base()
-        .map_err(|e| err(ApiError::InvalidInput(format!("candidate discovery failed: {e}"))))?;
+        .map_err(|e| ApiError::InvalidInput(format!("candidate discovery failed: {e}")))?;
     let candidates = client
         .discover(&directive, &free_vram, &retrieved_at)
         .await
-        .map_err(|e| err(ApiError::InvalidInput(format!("candidate discovery failed: {e}"))))?;
+        .map_err(|e| ApiError::InvalidInput(format!("candidate discovery failed: {e}")))?;
     save_candidates_file(
-        &state,
+        state,
         &CandidatesFile {
             directive,
             retrieved_at,
             candidates,
         },
-    )?;
-    state_payload(&state).await
+    )
+    .map_err(ApiError::InvalidInput)?;
+    state_payload(state).await
 }
 
 /// Cancel the running consultation (design §1.2): fires the
 /// scoped abort handle, which drops the in-flight request.
-#[tauri::command]
-pub async fn optimize_cancel_consult(state: State<'_, AppState>) -> ApiResult {
+pub async fn op_optimize_cancel_consult(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
     let sender = {
         let mut slot = state.optimize_abort.lock().await;
         slot.take()
@@ -955,17 +952,17 @@ pub async fn optimize_cancel_consult(state: State<'_, AppState>) -> ApiResult {
 /// any entry under the same config fingerprint in the
 /// measurement store; the backend is never started, stopped,
 /// or reconfigured.
-#[tauri::command]
-pub async fn optimize_measure_backend(
-    state: State<'_, AppState>,
+pub async fn op_optimize_measure_backend(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
     backend_id: String,
-) -> ApiResult {
+) -> crate::ApiResult {
     {
         let slot = state.optimize_job_abort.lock().await;
         if slot.is_some() {
-            return Err(err(ApiError::InvalidInput(
+            return Err(ApiError::InvalidInput(
                 "a measurement or experiment job is already running".to_string(),
-            )));
+            ));
         }
     }
     let cfg = state.config.read().await.clone();
@@ -973,19 +970,19 @@ pub async fn optimize_measure_backend(
         .backends
         .iter()
         .find(|b| b.id == backend_id)
-        .ok_or_else(|| err(ApiError::NotFound(format!("backend {backend_id}"))))?
+        .ok_or_else(|| ApiError::NotFound(format!("backend {backend_id}")))?
         .clone();
-    let gathered = gather(&state, &cfg).await;
+    let gathered = gather(state, &cfg).await;
     if gathered.running.get(&backend_id).copied() != Some(true) {
-        return Err(err(ApiError::InvalidInput(format!(
+        return Err(ApiError::InvalidInput(format!(
             "backend '{backend_id}' is not running; measurements run against a running backend"
-        ))));
+        )));
     }
     let fingerprint = gathered
         .fingerprints
         .get(&backend_id)
         .cloned()
-        .ok_or_else(|| err(ApiError::NotFound(format!("backend {backend_id}"))))?;
+        .ok_or_else(|| ApiError::NotFound(format!("backend {backend_id}")))?;
     let model_id = crate::model_for_backend(&cfg, &backend)
         .map(|m| m.id.clone())
         .unwrap_or_else(|| {
@@ -1012,9 +1009,9 @@ pub async fn optimize_measure_backend(
                     json!({ "error": "a measurement or experiment job is already running" }),
                 )
                 .await;
-            return Err(err(ApiError::InvalidInput(
+            return Err(ApiError::InvalidInput(
                 "a measurement or experiment job is already running".to_string(),
-            )));
+            ));
         }
         *slot = Some(tx);
     }
@@ -1092,7 +1089,7 @@ pub async fn optimize_measure_backend(
                     json!({ "backend": backend_id }),
                 )
                 .await;
-            return Err("measurement cancelled".to_string());
+            return Err(ApiError::InvalidInput("measurement cancelled".to_string()));
         }
         Some(Err(e)) => {
             state
@@ -1102,15 +1099,15 @@ pub async fn optimize_measure_backend(
                     json!({ "error": e.clone() }),
                 )
                 .await;
-            return Err(err(ApiError::InvalidInput(format!(
+            return Err(ApiError::InvalidInput(format!(
                 "measurement failed: {e}"
-            ))));
+            )));
         }
         Some(Ok(entry)) => entry,
     };
-    let mut store = MeasurementStore::load(&measurements_path(&state));
+    let mut store = MeasurementStore::load(&measurements_path(state));
     store.upsert(entry);
-    store.save(&measurements_path(&state))?;
+    store.save(&measurements_path(state)).map_err(ApiError::InvalidInput)?;
     state
         .finish_task(
             &task_id,
@@ -1118,15 +1115,14 @@ pub async fn optimize_measure_backend(
             json!({ "backend": backend_id, "fingerprint": fingerprint }),
         )
         .await;
-    state_payload(&state).await
+    state_payload(state).await
 }
 
 /// Cancel the running GPU-bound Optimize job (a measurement,
 /// or an experiment batch in a later sub-phase): fires the
 /// shared job slot's abort handle, which drops the job's
 /// in-flight benchmark future.
-#[tauri::command]
-pub async fn optimize_cancel_job(state: State<'_, AppState>) -> ApiResult {
+pub async fn op_optimize_cancel_job(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
     let sender = {
         let mut slot = state.optimize_job_abort.lock().await;
         slot.take()
@@ -1141,36 +1137,36 @@ pub async fn optimize_cancel_job(state: State<'_, AppState>) -> ApiResult {
 }
 
 /// Set one plan item's tri-state decision (§5.2) and persist it.
-#[tauri::command]
-pub async fn optimize_set_item_state(
-    state: State<'_, AppState>,
+pub async fn op_optimize_set_item_state(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
     item_id: usize,
     decision: String,
-) -> ApiResult {
+) -> crate::ApiResult {
     let decision = match decision.as_str() {
         "accepted" => Decision::Accepted,
         "denied" => Decision::Denied,
         "undecided" => Decision::Undecided,
         other => {
-            return Err(err(ApiError::InvalidInput(format!(
+            return Err(ApiError::InvalidInput(format!(
                 "unknown decision '{other}'"
-            ))))
+            )))
         }
     };
-    let mut file = load_plan_file(&state);
+    let mut file = load_plan_file(state);
     let plan = file
         .plan
         .as_mut()
-        .ok_or_else(|| err(ApiError::NotFound("no plan".to_string())))?;
+        .ok_or_else(|| ApiError::NotFound("no plan".to_string()))?;
     let item = plan
         .items
         .iter_mut()
         .find(|i| i.id == item_id)
-        .ok_or_else(|| err(ApiError::NotFound(format!("plan item {item_id}"))))?;
+        .ok_or_else(|| ApiError::NotFound(format!("plan item {item_id}")))?;
     if item.kind.is_advice() {
-        return Err(err(ApiError::InvalidInput(
+        return Err(ApiError::InvalidInput(
             "advice items have no decision".to_string(),
-        )));
+        ));
     }
     item.decision = decision;
     if decision == Decision::Denied {
@@ -1179,66 +1175,64 @@ pub async fn optimize_set_item_state(
             file.denied_fingerprints.push(fp);
         }
     }
-    save_plan_file(&state, &file)?;
-    state_payload(&state).await
+    save_plan_file(state, &file).map_err(ApiError::InvalidInput)?;
+    state_payload(state).await
 }
 
 /// Record an apply outcome on one item (Phase 4 bookkeeping,
 /// §5.2): the UI orchestrator reports each item as it executes.
-#[tauri::command]
-pub async fn optimize_set_item_outcome(
-    state: State<'_, AppState>,
+pub async fn op_optimize_set_item_outcome(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
     item_id: usize,
     outcome: String,
     error: Option<String>,
-) -> ApiResult {
+) -> crate::ApiResult {
     let outcome = match outcome.as_str() {
         "applied" => manager_optimize::ApplyOutcome::Applied,
         "failed" => manager_optimize::ApplyOutcome::Failed,
         "not_attempted" => manager_optimize::ApplyOutcome::NotAttempted,
         other => {
-            return Err(err(ApiError::InvalidInput(format!(
+            return Err(ApiError::InvalidInput(format!(
                 "unknown outcome '{other}'"
-            ))))
+            )))
         }
     };
-    let mut file = load_plan_file(&state);
+    let mut file = load_plan_file(state);
     let plan = file
         .plan
         .as_mut()
-        .ok_or_else(|| err(ApiError::NotFound("no plan".to_string())))?;
+        .ok_or_else(|| ApiError::NotFound("no plan".to_string()))?;
     let item = plan
         .items
         .iter_mut()
         .find(|i| i.id == item_id)
-        .ok_or_else(|| err(ApiError::NotFound(format!("plan item {item_id}"))))?;
+        .ok_or_else(|| ApiError::NotFound(format!("plan item {item_id}")))?;
     item.apply_outcome = Some(outcome);
     item.apply_error = if outcome == manager_optimize::ApplyOutcome::Failed {
         error
     } else {
         None
     };
-    save_plan_file(&state, &file)?;
-    state_payload(&state).await
+    save_plan_file(state, &file).map_err(ApiError::InvalidInput)?;
+    state_payload(state).await
 }
 
 /// Re-validate the stored plan against live state. Validation
 /// states are derived on every state read, so this simply
 /// returns the refreshed payload.
-#[tauri::command]
-pub async fn optimize_validate_plan(state: State<'_, AppState>) -> ApiResult {
-    state_payload(&state).await
+pub async fn op_optimize_validate_plan(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
+    state_payload(state).await
 }
 
 /// Discard the stored plan and its decisions (§1.2). Denial
 /// memory is kept: those were explicit operator decisions.
-#[tauri::command]
-pub async fn optimize_discard_plan(state: State<'_, AppState>) -> ApiResult {
-    let mut file = load_plan_file(&state);
+pub async fn op_optimize_discard_plan(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
+    let mut file = load_plan_file(state);
     file.plan = None;
     file.sample = false;
-    save_plan_file(&state, &file)?;
-    state_payload(&state).await
+    save_plan_file(state, &file).map_err(ApiError::InvalidInput)?;
+    state_payload(state).await
 }
 
 // ---------------------------------------------------------------------------

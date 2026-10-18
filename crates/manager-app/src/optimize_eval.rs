@@ -27,14 +27,13 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::State;
 
 use manager_optimize::{
     eval_suite, failed_task, score_task, BaselineRecord, EvalRunRecord, EvalTaskResult,
     EVAL_SUITE_VERSION, EVAL_TEMPERATURE, EVAL_TIME_BOX_SECS, SCREENING_CAVEAT,
 };
 
-use crate::{err, ApiError, ApiResult, AppState, TaskStatus};
+use crate::{ApiError, AppState, TaskStatus};
 
 // ---------------------------------------------------------------------------
 // Baseline persistence (<data_dir>/optimize-eval.json)
@@ -191,14 +190,13 @@ pub async fn run_eval_suite(backend_id: &str, base_url: &str, model: &str) -> Ev
 /// kind `optimize-eval-baseline`, so it is cancellable through
 /// `optimize_cancel_job` and never overlaps a measurement or an
 /// experiment batch.
-#[tauri::command]
-pub async fn optimize_run_baseline(state: State<'_, AppState>, backend_id: String) -> ApiResult {
+pub async fn op_optimize_run_baseline(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>, backend_id: String) -> crate::ApiResult {
     {
         let slot = state.optimize_job_abort.lock().await;
         if slot.is_some() {
-            return Err(err(ApiError::InvalidInput(
+            return Err(ApiError::InvalidInput(
                 "a measurement or experiment job is already running".to_string(),
-            )));
+            ));
         }
     }
     let cfg = state.config.read().await.clone();
@@ -206,22 +204,22 @@ pub async fn optimize_run_baseline(state: State<'_, AppState>, backend_id: Strin
         .backends
         .iter()
         .find(|b| b.id == backend_id)
-        .ok_or_else(|| err(ApiError::NotFound(format!("backend {backend_id}"))))?
+        .ok_or_else(|| ApiError::NotFound(format!("backend {backend_id}")))?
         .clone();
     // The baseline is keyed by the backend's *current*
     // measurement fingerprint, computed from the same live
     // snapshot the state payload uses.
-    let gathered = crate::optimize::gather(&state, &cfg).await;
+    let gathered = crate::optimize::gather(state, &cfg).await;
     if gathered.running.get(&backend_id).copied() != Some(true) {
-        return Err(err(ApiError::InvalidInput(format!(
+        return Err(ApiError::InvalidInput(format!(
             "backend '{backend_id}' is not running; the screening suite runs against a running backend"
-        ))));
+        )));
     }
     let fingerprint = gathered
         .fingerprints
         .get(&backend_id)
         .cloned()
-        .ok_or_else(|| err(ApiError::NotFound(format!("backend {backend_id}"))))?;
+        .ok_or_else(|| ApiError::NotFound(format!("backend {backend_id}")))?;
     let model_id = crate::model_for_backend(&cfg, &backend)
         .map(|m| m.id.clone())
         .unwrap_or_else(|| {
@@ -252,9 +250,9 @@ pub async fn optimize_run_baseline(state: State<'_, AppState>, backend_id: Strin
                     json!({ "error": "a measurement or experiment job is already running" }),
                 )
                 .await;
-            return Err(err(ApiError::InvalidInput(
+            return Err(ApiError::InvalidInput(
                 "a measurement or experiment job is already running".to_string(),
-            )));
+            ));
         }
         *slot = Some(tx);
     }
@@ -278,17 +276,18 @@ pub async fn optimize_run_baseline(state: State<'_, AppState>, backend_id: Strin
                     json!({ "backend": backend_id }),
                 )
                 .await;
-            return Err("screening eval cancelled".to_string());
+            return Err(ApiError::InvalidInput("screening eval cancelled".to_string()));
         }
         Some(record) => record,
     };
     let baseline = BaselineRecord::from_run(&record, fingerprint.clone());
     save_eval_file(
-        &state,
+        state,
         &EvalFile {
             baseline: Some(baseline),
         },
-    )?;
+    )
+    .map_err(ApiError::InvalidInput)?;
     state
         .finish_task(
             &task_id,
@@ -301,5 +300,5 @@ pub async fn optimize_run_baseline(state: State<'_, AppState>, backend_id: Strin
             }),
         )
         .await;
-    crate::optimize::state_payload(&state).await
+    crate::optimize::state_payload(state).await
 }
