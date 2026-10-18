@@ -523,14 +523,69 @@ pub enum RoutingStrategy {
     LatencyBased,
 }
 
-/// A plain-language routing rule with its LiteLLM fragment.
+/// A routing rule (routing-rules design §6.2). Typed kinds are
+/// validated and emitted by the gateway config generator; a rule
+/// carrying only a legacy `litellm_fragment` is inert (never
+/// emitted) — see docs/routing-rules-design.md §6.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
     pub id: String,
     pub description: String,
-    pub litellm_fragment: serde_json::Value,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub kind: Option<RoutingRuleKind>,
+    /// Legacy raw fragment. Deprecated: retained so old configs
+    /// load; never emitted into the generated gateway config.
+    #[serde(default)]
+    pub litellm_fragment: Option<serde_json::Value>,
     /// Where the rule came from (wizard default | user).
     pub source: String,
+}
+
+/// The typed behavior of a [`RoutingRule`]. New kinds are added
+/// here as new variants; the tag is the serialized `type` field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum RoutingRuleKind {
+    /// Requests too large for their group are rerouted to a
+    /// large-context group; past the optimal window the serving
+    /// model is instructed to advise compaction (design §4–§5).
+    ContextOverflow {
+        /// The group oversized requests are rerouted to. Must name
+        /// an existing configured group; `openrouter` is rejected
+        /// (validated in [`validate`]).
+        target_group: String,
+        /// Advisory threshold as a fraction of the serving group's
+        /// hard window, in (0, 1). Ignored when `optimal_tokens`
+        /// is set.
+        #[serde(default = "default_optimal_fraction")]
+        optimal_fraction: f64,
+        /// Absolute advisory threshold in tokens; wins over
+        /// `optimal_fraction` when set.
+        #[serde(default)]
+        optimal_tokens: Option<u32>,
+        /// Output tokens assumed when a request sets no
+        /// `max_tokens` (design decision D3).
+        #[serde(default = "default_output_reserve")]
+        output_reserve_tokens: u32,
+        /// Whether the compaction advisory is injected past the
+        /// optimal window; off = silent rerouting only.
+        #[serde(default = "default_true")]
+        advisory: bool,
+    },
+}
+
+/// Serde default for the context-overflow rule's optimal fraction
+/// (design decision D4: half the serving group's hard window).
+fn default_optimal_fraction() -> f64 {
+    0.5
+}
+
+/// Serde default for the context-overflow rule's output reserve
+/// (design decision D3).
+fn default_output_reserve() -> u32 {
+    1024
 }
 
 /// OpenRouter cloud tier: failover, overflow, rubric-based escalation.
@@ -1320,10 +1375,95 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
         }
     }
     let mut rule_ids: HashSet<String> = HashSet::new();
+    let mut enabled_overflow_rules = 0usize;
     for r in &config.gateway.routing_rules {
         if !rule_ids.insert(r.id.clone()) {
             errors.push(format!("duplicate routing rule id {:?}", r.id));
         }
+        // Typed-rule validation (routing-rules design §6.2). Legacy
+        // fragment-only rules (kind: None) are inert and unchecked
+        // beyond the id. Target checks apply to ENABLED rules only:
+        // a disabled rule is inert, and checking its target here
+        // would make deleting a group fail every unrelated save
+        // while a disabled rule still points at it — the target is
+        // re-validated when the rule is re-enabled, because enabling
+        // goes through this same validation.
+        let Some(kind) = &r.kind else { continue };
+        match kind {
+            RoutingRuleKind::ContextOverflow {
+                target_group,
+                optimal_fraction,
+                optimal_tokens,
+                ..
+            } => {
+                if !optimal_fraction.is_finite()
+                    || *optimal_fraction <= 0.0
+                    || *optimal_fraction >= 1.0
+                {
+                    errors.push(format!(
+                        "routing rule {:?}: optimal_fraction must be in (0, 1)",
+                        r.id
+                    ));
+                }
+                if let Some(t) = optimal_tokens {
+                    if *t == 0 {
+                        errors.push(format!(
+                            "routing rule {:?}: optimal_tokens must be > 0 when set",
+                            r.id
+                        ));
+                    }
+                }
+                if r.enabled {
+                    enabled_overflow_rules += 1;
+                    if target_group == "openrouter" {
+                        errors.push(format!(
+                            "routing rule {:?}: \"openrouter\" cannot be a context-overflow target (oversized local traffic must never route to the metered cloud tier)",
+                            r.id
+                        ));
+                    } else if !group_names.contains(target_group) {
+                        errors.push(format!(
+                            "routing rule {:?}: target group {target_group:?} does not exist",
+                            r.id
+                        ));
+                    } else if let Some(t) = optimal_tokens {
+                        // optimal_tokens must sit below the target's
+                        // hard window. The exact window applies the
+                        // catalog context cap (manager-models), which
+                        // this crate cannot see; the enabled members'
+                        // configured n_ctx is an upper bound on it, so
+                        // a value at or above that bound is certainly
+                        // wrong (design §6.2: "when computable").
+                        let bound = config
+                            .gateway
+                            .groups
+                            .iter()
+                            .find(|g| &g.name == target_group)
+                            .and_then(|g| {
+                                g.members
+                                    .iter()
+                                    .filter_map(|m| {
+                                        config.backends.iter().find(|b| &b.id == m && b.enabled)
+                                    })
+                                    .map(|b| b.flags.n_ctx)
+                                    .min()
+                            });
+                        if let Some(bound) = bound {
+                            if *t >= bound {
+                                errors.push(format!(
+                                    "routing rule {:?}: optimal_tokens {t} must be below the target group's hard window (at most {bound} from its enabled members' configured context)",
+                                    r.id
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if enabled_overflow_rules > 1 {
+        errors.push(
+            "at most one enabled context-overflow routing rule is supported".to_string(),
+        );
     }
 
     // --- mcp servers (design §3.2) ---
@@ -2149,6 +2289,174 @@ mod tests {
     #[test]
     fn working_config_is_valid() {
         validate(&working_config()).expect("working config must validate");
+    }
+
+    fn overflow_rule(id: &str, target: &str) -> RoutingRule {
+        RoutingRule {
+            id: id.to_string(),
+            description: "test rule".to_string(),
+            enabled: true,
+            kind: Some(RoutingRuleKind::ContextOverflow {
+                target_group: target.to_string(),
+                optimal_fraction: 0.5,
+                optimal_tokens: None,
+                output_reserve_tokens: 1024,
+                advisory: true,
+            }),
+            litellm_fragment: None,
+            source: "user".to_string(),
+        }
+    }
+
+    #[test]
+    fn context_overflow_rule_validates() {
+        let mut cfg = working_config();
+        cfg.gateway
+            .routing_rules
+            .push(overflow_rule("context-overflow", "tool-runner"));
+        validate(&cfg).expect("an enabled rule with an existing target validates");
+    }
+
+    #[test]
+    fn context_overflow_openrouter_target_rejected() {
+        let mut cfg = working_config();
+        cfg.gateway
+            .routing_rules
+            .push(overflow_rule("context-overflow", "openrouter"));
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("openrouter"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn context_overflow_unknown_target_rejected() {
+        let mut cfg = working_config();
+        cfg.gateway
+            .routing_rules
+            .push(overflow_rule("context-overflow", "no-such-group"));
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn context_overflow_second_enabled_rule_rejected() {
+        let mut cfg = working_config();
+        cfg.gateway
+            .routing_rules
+            .push(overflow_rule("one", "tool-runner"));
+        cfg.gateway
+            .routing_rules
+            .push(overflow_rule("two", "tool-runner"));
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("at most one enabled"), "unexpected: {err}");
+        // A disabled second rule is inert and allowed.
+        cfg.gateway.routing_rules[1].enabled = false;
+        validate(&cfg).expect("one enabled + one disabled validates");
+    }
+
+    #[test]
+    fn disabled_rule_target_is_not_validated() {
+        // A disabled rule is inert: its target may dangle (e.g. the
+        // group was deleted) without blocking unrelated saves.
+        let mut cfg = working_config();
+        let mut rule = overflow_rule("context-overflow", "deleted-group");
+        rule.enabled = false;
+        cfg.gateway.routing_rules.push(rule);
+        validate(&cfg).expect("disabled rule with a dangling target validates");
+    }
+
+    #[test]
+    fn context_overflow_fraction_range_checked() {
+        for bad in [0.0, 1.0, f64::NAN, -0.5, 1.5] {
+            let mut cfg = working_config();
+            let mut rule = overflow_rule("context-overflow", "tool-runner");
+            if let Some(RoutingRuleKind::ContextOverflow {
+                optimal_fraction, ..
+            }) = &mut rule.kind
+            {
+                *optimal_fraction = bad;
+            }
+            cfg.gateway.routing_rules.push(rule);
+            let err = validate(&cfg).unwrap_err().to_string();
+            assert!(err.contains("optimal_fraction"), "fraction {bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn context_overflow_optimal_tokens_checked() {
+        // 0 is not a usable threshold.
+        let mut cfg = working_config();
+        let mut rule = overflow_rule("context-overflow", "tool-runner");
+        if let Some(RoutingRuleKind::ContextOverflow {
+            optimal_tokens, ..
+        }) = &mut rule.kind
+        {
+            *optimal_tokens = Some(0);
+        }
+        cfg.gateway.routing_rules.push(rule);
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("optimal_tokens"), "unexpected: {err}");
+
+        // At/above the target's enabled members' configured context
+        // (tool-runner: 32768) the threshold can never fire.
+        let mut cfg = working_config();
+        let mut rule = overflow_rule("context-overflow", "tool-runner");
+        if let Some(RoutingRuleKind::ContextOverflow {
+            optimal_tokens, ..
+        }) = &mut rule.kind
+        {
+            *optimal_tokens = Some(32768);
+        }
+        cfg.gateway.routing_rules.push(rule);
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("hard window"), "unexpected: {err}");
+
+        // Below it validates.
+        let mut cfg = working_config();
+        let mut rule = overflow_rule("context-overflow", "tool-runner");
+        if let Some(RoutingRuleKind::ContextOverflow {
+            optimal_tokens, ..
+        }) = &mut rule.kind
+        {
+            *optimal_tokens = Some(16384);
+        }
+        cfg.gateway.routing_rules.push(rule);
+        validate(&cfg).expect("optimal_tokens below the bound validates");
+    }
+
+    #[test]
+    fn legacy_fragment_rule_still_loads() {
+        // The pre-typed-rule shape: no `enabled`, no `kind`, the
+        // fragment a plain value. It must deserialize as an inert
+        // legacy rule (design §6.1) and validate.
+        let raw = serde_json::json!({
+            "id": "legacy",
+            "description": "old fragment rule",
+            "litellm_fragment": {"router_settings": {"num_retries": 2}},
+            "source": "user"
+        });
+        let rule: RoutingRule = serde_json::from_value(raw).expect("legacy rule deserializes");
+        assert!(rule.enabled, "absent enabled defaults to true");
+        assert!(rule.kind.is_none());
+        assert!(rule.litellm_fragment.is_some());
+        let mut cfg = working_config();
+        cfg.gateway.routing_rules.push(rule);
+        validate(&cfg).expect("legacy rule validates");
+    }
+
+    #[test]
+    fn context_overflow_serializes_with_kebab_type_tag() {
+        let rule = overflow_rule("context-overflow", "large-context");
+        let v = serde_json::to_value(&rule).expect("serialize");
+        assert_eq!(v["kind"]["type"], "context-overflow");
+        assert_eq!(v["kind"]["target_group"], "large-context");
+        assert_eq!(v["kind"]["optimal_fraction"], 0.5);
+        assert_eq!(v["kind"]["output_reserve_tokens"], 1024);
+        assert_eq!(v["kind"]["advisory"], true);
+        let back: RoutingRule = serde_json::from_value(v).expect("round trip");
+        assert!(matches!(
+            back.kind,
+            Some(RoutingRuleKind::ContextOverflow { .. })
+        ));
     }
 
     #[test]
