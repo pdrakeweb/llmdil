@@ -4947,7 +4947,12 @@ pub async fn op_gateway_status(
 /// whose targets are all stopped — or whose gateway is down — are
 /// already effective by that same rule and are NOT part of the
 /// plan: the plan exists only while a running process holds
-/// pre-change state (activation::pending_entries).
+/// pre-change state (activation::pending_entries). The payload's
+/// `drift` follows that rule too: it reports live drift against
+/// the RUNNING gateway only — while the gateway is down a stale
+/// generated file is not pending work (it regenerates at the next
+/// start) and is never stated as the plan's reason
+/// (activation::drift_is_pending).
 pub async fn op_gateway_activation_plan(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
@@ -4972,8 +4977,17 @@ pub async fn op_gateway_activation_plan(
         up,
     );
     let presence = mcp_credential_presence(&[&cfg]).await;
-    let drift = activation::config_drift(&cfg, &state.data_dir, |t| presence.contains(t));
-    let pending = !pending_entries.is_empty() || (drift && up);
+    // Drift enters the plan only as pending work: while the
+    // gateway is down a stale generated file regenerates at its
+    // next start, so the raw file comparison must not surface in
+    // the plan — a backend-only plan otherwise asserts gateway
+    // drift its apply never touches (tracker #45; the rule lives
+    // in activation::drift_is_pending).
+    let drift = activation::drift_is_pending(
+        activation::config_drift(&cfg, &state.data_dir, |t| presence.contains(t)),
+        up,
+    );
+    let pending = !pending_entries.is_empty() || drift;
     let entry_ts = |e: &activation::ActivationEntry| {
         chrono::DateTime::parse_from_rfc3339(&e.ts)
             .ok()
@@ -5020,7 +5034,7 @@ pub async fn op_gateway_activation_plan(
             })
         })
         .collect();
-    let gateway_pending = (drift && up)
+    let gateway_pending = drift
         || pending_entries.iter().any(|e| e.scope != "backend")
         || changes.iter().any(|c| c["activation"] == "gateway_restart");
     let actionable = gateway_pending || changes.iter().any(|c| c["activation"] == "restart");
