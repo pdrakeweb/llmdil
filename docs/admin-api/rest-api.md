@@ -318,6 +318,10 @@ in the API as in the app.
 }
 ```
 
+`groups` counts enabled groups only (derived as in §4.4: at least one
+member backend enabled) — the groups the gateway actually serves, not
+the configured total (Pete, 2026-10-17, tracker #11).
+
 ### 4.6 Activation plan (`gateway_activation_plan`)
 
 ```json
