@@ -1926,9 +1926,26 @@ async fn backend_start_preflight(state: &AppState, id: &str) -> Result<(), ApiEr
         .iter()
         .find(|b| b.id == id)
         .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+    backend_start_preflight_for(state, &cfg, b).await
+}
+
+/// The preflight itself, against an explicit config + backend
+/// rather than a lookup in the saved configuration. The Optimize
+/// experiment runner gates its temporary backends through this:
+/// a temp backend never enters the saved config, but its spawn
+/// must pass the same gate as any app-mediated start
+/// (code-review B-2) — most importantly the offload guardrail,
+/// evaluated against the cloned config that carries the temp
+/// backend.
+pub(crate) async fn backend_start_preflight_for(
+    state: &AppState,
+    cfg: &AppConfig,
+    b: &manager_config::BackendConfig,
+) -> Result<(), ApiError> {
     if !b.enabled {
         return Err(ApiError::InvalidInput(format!(
-            "backend {id} is disabled in the configuration; enable it before starting"
+            "backend {} is disabled in the configuration; enable it before starting",
+            b.id
         )));
     }
     reap_downloads(state).await;
@@ -1982,15 +1999,15 @@ async fn backend_start_preflight(state: &AppState, id: &str) -> Result<(), ApiEr
     // Offload guardrail (tracker #37): a saved position a placed
     // GPU's restriction blocks refuses the start unless a journaled
     // override covers exactly that position on exactly that
-    // placement. `cfg` here is a clone whose read guard dropped at
-    // the top of this function, so the telemetry accessor (which
-    // reads the config while initializing) is safe to call.
+    // placement. Callers pass a cloned config and hold no config
+    // guard, so the telemetry accessor (which reads the config
+    // while initializing) is safe to call.
     {
         let store = state.telemetry().await;
         let gpus = lock_telemetry(&store).inventory();
         drop(store);
         let journal = activation::load_journal(&state.data_dir);
-        if let Some(eval) = evaluate_backend_offload(&cfg, b, &gpus, &journal) {
+        if let Some(eval) = evaluate_backend_offload(cfg, b, &gpus, &journal) {
             if let Some(reason) = offload_block_reason(
                 &eval.restrictions,
                 eval.layers,
@@ -2005,7 +2022,7 @@ async fn backend_start_preflight(state: &AppState, id: &str) -> Result<(), ApiEr
     }
     // Only the program path is consumed here, so the spec is built
     // without GPU inventory (its env/args are discarded).
-    let spec = backend_spec(&cfg, b, &[]);
+    let spec = backend_spec(cfg, b, &[]);
     if !spec.program.exists() {
         return Err(ApiError::InvalidInput(format!(
             "llama-server is not installed (missing {}) — run the setup wizard to install llama.cpp",
