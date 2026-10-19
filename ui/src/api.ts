@@ -710,6 +710,12 @@ export interface BackendRow {
    *  otherwise. The state is decoded from the backend's saved
    *  raw flags: MTP is on iff `--spec-type draft-mtp` is present. */
   mtp?: BackendMtp;
+  /** Predicted throughput for the backend's SAVED
+   *  configuration (predicted-throughput design §7): the
+   *  exact-match measurement, in the measurement_lookup shape.
+   *  Absent when no exact measurement exists — never
+   *  null-as-zero — and independent of run state. */
+  predicted?: PredictedThroughput;
   /** Parallel slots state (configured rows — the flags form's
    *  Parallel slots field renders for every backend, so this is
    *  not capability-gated); absent on supervisor-only orphan
@@ -2774,6 +2780,98 @@ export interface OptimizeMeasured {
   age_secs: number;
 }
 
+/** The readable fingerprint inputs a v2 measurement was taken
+ *  under (predicted-throughput design §4.3): the offload as its
+ *  resolved label, the raw flags as the normalized string that
+ *  was hashed, the GPU set as sorted `index:name` strings. */
+export interface MeasurementInputs {
+  n_ctx: number;
+  n_batch: number;
+  offload: string;
+  tensor_split: number[];
+  split_mode: string;
+  raw_flags: string;
+  gpus: string[];
+}
+
+/** One resolved measurement — the shape shared by the
+ *  measurement_lookup exact/near results and the `predicted`
+ *  field of a list_backends row (design §7). The headline
+ *  figures plus the provenance the surfaces disclose: measured
+ *  date, source, app version, driver and llama build (§5.5). */
+export interface PredictedThroughput {
+  prompt_per_second: number | null;
+  predicted_per_second: number | null;
+  ttft_ms: number | null;
+  measured_at: string;
+  /** "benchmark" | "experiment" | "live"; null on v1 entries,
+   *  whose provenance was not recorded. */
+  source: string | null;
+  /** The entry's provenance backend id (a temp `opt-exp-<n>`
+   *  id for experiment entries). */
+  backend_id: string;
+  origin_backend_id: string | null;
+  model_id: string;
+  model_file: string | null;
+  app_version: string;
+  driver_version: string[];
+  llama_build: string | null;
+  inputs: MeasurementInputs | null;
+  /** Near matches only (design §5.3): the snapshot fields in
+   *  which the entry differs from the looked-up configuration,
+   *  named as the surfaces name them. */
+  differs?: string[];
+}
+
+/** The draft a measurement_lookup request carries (design
+ *  §6.2): the form's full draft state. `backend_id` for the
+ *  Edit Flags form (merged over the saved backend), `model_id`
+ *  for the Add Backend form. `parallel_slots` null is the
+ *  field's Auto state; `raw_flags` present is the advanced
+ *  editor's text and supersedes the structured fields. */
+export interface MeasurementLookupRequest {
+  backend_id?: string;
+  model_id?: string;
+  n_ctx?: number;
+  n_batch?: number;
+  offload_layers?: number | null;
+  mtp_position?: number | null;
+  parallel_slots?: number | null;
+  gpu_indices?: number[] | null;
+  raw_flags?: string | null;
+}
+
+export interface MeasurementLookupResult {
+  fingerprint: string;
+  exact: PredictedThroughput | null;
+  near: PredictedThroughput | null;
+}
+
+/** measurement_lookup — resolve a flags-form draft to its
+ *  exact and nearest near measurement (design §6.2). A pure
+ *  read: it never writes configuration. */
+export async function measurementLookup(request: MeasurementLookupRequest): Promise<CallResult<MeasurementLookupResult | null>> {
+  if (!isTauri()) return { data: null, live: false };
+  try {
+    const data = await invoke<MeasurementLookupResult>("measurement_lookup", { request });
+    return { data, live: true };
+  } catch (e) {
+    return { data: null, live: true, error: errOf(e) };
+  }
+}
+
+/** measurement_delete — delete one stored measurement by its
+ *  (fingerprint, measured_at) identity (design §10). */
+export async function measurementDelete(fingerprint: string, measuredAt: string): Promise<CallResult<{ deleted: boolean }>> {
+  if (!isTauri()) return { data: { deleted: false }, live: false };
+  try {
+    const data = await invoke<{ deleted: boolean }>("measurement_delete", { fingerprint, measuredAt });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { deleted: false }, live: true, error: errOf(e) };
+  }
+}
+
 export interface OptimizeBackendInfo {
   id: string;
   purpose: string;
@@ -2789,6 +2887,35 @@ export interface OptimizeBackendInfo {
    *  abbreviated benchmark's figures, or null. Always
    *  rendered as "Estimate", never as a measured figure. */
   estimated: OptimizeMeasured | null;
+  /** The backend's current measurement fingerprint and its
+   *  readable inputs (design §10): the history view names an
+   *  entry's differing fields against this configuration. */
+  current_fingerprint: string | null;
+  current_inputs: MeasurementInputs | null;
+}
+
+/** One stored measurement in the Optimize history payload
+ *  (design §10): the store entry as persisted (v2 provenance
+ *  fields optional — absent on v1 entries), annotated with the
+ *  configured backends whose prediction currently resolves to
+ *  it. */
+export interface OptimizeMeasurementEntry {
+  fingerprint: string;
+  backend_id: string;
+  model_id: string;
+  measured_at: string;
+  app_version: string;
+  short: OptimizeBenchResult;
+  long: OptimizeBenchResult;
+  source?: string | null;
+  origin_backend_id?: string | null;
+  model_file?: string | null;
+  model_sha256?: string | null;
+  model_size_bytes?: number | null;
+  inputs?: MeasurementInputs | null;
+  driver_version?: string[];
+  llama_build?: string | null;
+  current_for: string[];
 }
 
 /** One discovered Hugging Face candidate (Phase 5c): one quant
@@ -2870,6 +2997,9 @@ export interface OptimizeState {
   default_backend: string | null;
   better_backend: { id: string; short_name: string | null } | null;
   plan: OptimizePlan | null;
+  /** Every stored measurement (design §10), in store order;
+   *  the history card groups and sorts for display. */
+  measurements: OptimizeMeasurementEntry[];
   /** The stored discovery pre-pass set (Phase 5c), or null when
    *  no discovery has run. */
   candidates: OptimizeCandidates | null;

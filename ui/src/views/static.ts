@@ -14,6 +14,7 @@ import {
   getWizardCommands,
   getGpuTelemetry, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
   getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendMtp, setBackendParallel, setBackendRawFlags, setBackendFlagsMode, getBackendLaunchCommand,
+  measurementLookup,
   getBackendConfig, applyBackendConfig, testBackend, testBackendToolCall, placementPropose, placementApply,
   addBackend, backendAddPreview, deleteBackend, modelAssign,
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
@@ -30,7 +31,7 @@ import {
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
   adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendAddPreview, BackendMtp, BackendOffload, BackendParallel, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, ServicesInfo } from "../api";
+import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendAddPreview, BackendMtp, BackendOffload, BackendParallel, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
 import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
 import type { GpuInfo, WizardStepState } from "../types";
 
@@ -1446,6 +1447,110 @@ function mtpSavedTokenText(m: BackendMtp): string {
   return mtpTokenText(m.n_max);
 }
 
+/* ---------------- Predicted throughput (design §6, §7) -----
+ * One line shape for the flags forms (Edit Flags and Add
+ * Backend) and one tile for the backend card, all fed by the
+ * same resolved-measurement shape (api.ts PredictedThroughput),
+ * so a figure reads identically on every surface. */
+
+/** "Oct 14" — plus the year when it is not the current year
+ *  (or always, when `alwaysYear` — the card tile's tooltip,
+ *  §7). Unparseable input renders as the raw string. */
+const MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function fmtMeasuredDate(iso: string, alwaysYear: boolean): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const base = `${MONTHS_SHORT[d.getMonth()]} ${d.getDate()}`;
+  return alwaysYear || d.getFullYear() !== new Date().getFullYear()
+    ? `${base}, ${d.getFullYear()}`
+    : base;
+}
+
+/** The source phrase a tip names (§5.5 disclosure). A null
+ *  source is a v1 entry: the absence is stated, not filled in. */
+function predictedSourceLabel(source: string | null): string {
+  switch (source) {
+    case "benchmark": return "Benchmark";
+    case "experiment": return "Experiment run";
+    case "live": return "Live observation";
+    default: return "Source not recorded";
+  }
+}
+
+/** Placement in short form from an inputs snapshot: the GPU
+ *  names, "CPU only" for an empty GPU set, context and batch. */
+function predictedPlacementText(p: PredictedThroughput): string | null {
+  const inp = p.inputs;
+  if (!inp) return null;
+  const gpus = inp.gpus.length
+    ? inp.gpus.map((g) => g.split(":").slice(1).join(":") || g).join(", ")
+    : "CPU only";
+  return `Context ${inp.n_ctx.toLocaleString()} · Batch ${inp.n_batch.toLocaleString()} · ${gpus}`;
+}
+
+/** The form line's info-tip (§6.1): what the figures are, when
+ *  and how they were measured, the placement, and the
+ *  environment (§5.5). */
+function predictedFormTip(p: PredictedThroughput): string {
+  const d = new Date(p.measured_at);
+  const full = Number.isNaN(d.getTime())
+    ? p.measured_at
+    : `${MONTHS_SHORT[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
+  const sourcePhrase = p.source === "benchmark"
+    ? "by the standardized benchmark (the Optimize page's Measure action)"
+    : p.source === "experiment"
+      ? "by an Optimize experiment run"
+      : p.source === "live"
+        ? "from live gateway traffic"
+        : "before measurement sources were recorded (an early entry)";
+  const placement = predictedPlacementText(p);
+  const env = [`LLMdil ${p.app_version}`];
+  if (p.driver_version.length) env.push(`driver ${p.driver_version.join(", ")}`);
+  if (p.llama_build) env.push(`llama.cpp ${p.llama_build}`);
+  return `Measured ${full} ${sourcePhrase}. `
+    + (placement ? `Placement: ${placement}. ` : "Placement: not recorded for this entry. ")
+    + "Prompt processing comes from the 4,000-token prompt; generation and time to first token from the 200-token prompt. "
+    + `Environment: ${env.join(" · ")}.`;
+}
+
+/** The card tile's tooltip (§7): prompt rate, TTFT, measured
+ *  date, source, placement, and environment on one line. */
+function predictedCardTip(p: PredictedThroughput): string {
+  const parts: string[] = [];
+  if (p.prompt_per_second !== null) parts.push(`Prompt: ${trim1(p.prompt_per_second)} tok/s`);
+  if (p.ttft_ms !== null) parts.push(`TTFT: ${(p.ttft_ms / 1000).toFixed(2)} s`);
+  parts.push(`Measured: ${fmtMeasuredDate(p.measured_at, true)}`);
+  parts.push(predictedSourceLabel(p.source));
+  const placement = predictedPlacementText(p);
+  if (placement) parts.push(placement);
+  if (p.driver_version.length) parts.push(`Driver: ${p.driver_version.join(", ")}`);
+  if (p.llama_build) parts.push(`llama.cpp ${p.llama_build}`);
+  parts.push(`LLMdil ${p.app_version}`);
+  return parts.join(" · ");
+}
+
+/** The flags form's predicted line for one lookup result
+ *  (design §6.1 exact, §6.3 near): the exact line when an exact
+ *  match exists, else the muted Similar measurement line with
+ *  the differing fields named, else nothing at all (§5.4 —
+ *  empty renders nothing). */
+function predictedLineHtml(exact: PredictedThroughput | null, near: PredictedThroughput | null): string {
+  const figures = (p: PredictedThroughput): string => {
+    const parts: string[] = [];
+    if (p.predicted_per_second !== null) parts.push(`${trim1(p.predicted_per_second)} tok/s generation`);
+    if (p.prompt_per_second !== null) parts.push(`${trim1(p.prompt_per_second)} prompt`);
+    return parts.join(" · ");
+  };
+  if (exact && figures(exact)) {
+    return `<div style="font-size:12px;color:var(--text2);margin-top:6px">Predicted throughput: ${esc(figures(exact))} \u2014 measured ${esc(fmtMeasuredDate(exact.measured_at, false))}<span class="info-tip" title="${esc(predictedFormTip(exact))}">${icon("info")}</span></div>`;
+  }
+  if (near && figures(near)) {
+    const differs = (near.differs ?? []).join(", ");
+    return `<div style="font-size:12px;color:var(--text2);margin-top:6px">Similar measurement: ${esc(figures(near))}${differs ? ` \u2014 differs: ${esc(differs)}` : ""} \u2014 measured ${esc(fmtMeasuredDate(near.measured_at, false))}<span class="info-tip" title="${esc(predictedFormTip(near))}">${icon("info")}</span></div>`;
+  }
+  return "";
+}
+
 /** The --parallel conflict line's text. MTP drafting needs a
  *  single slot; the MTP control surfaces an explicit conflicting
  *  slot count and never rewrites it — the Parallel slots field
@@ -1827,6 +1932,7 @@ function backendCard(
   residency: Map<string, { gpu: number; name: string; mib: number | null }[]>,
   gpuNames: Map<number, string>,
   flags: FlagsDraft | null,
+  predictedHtml: string,
   place: PlaceCardState | null,
   gpuTotalsMiB: Map<number, number>,
   detailsOpen: boolean,
@@ -2009,10 +2115,22 @@ function backendCard(
   // Requests (1h) and Errors (1h) already live in the view's overview
   // list (numbers in one place, principle 6). Absent until a window
   // reports throughput.
-  const statsHtml = b.throughput_toks !== undefined
+  // The stat tiles: live Throughput (trailing window, present
+  // once the metrics poller has one) and Predicted throughput
+  // (the saved configuration's exact-match measurement, design
+  // §7 — generation only, the rest in the tooltip; absent
+  // entirely when no exact measurement exists).
+  const statTiles: [string, string, string | null][] = [];
+  if (b.throughput_toks !== undefined) {
+    statTiles.push(["Throughput", `${trim1(b.throughput_toks)} tok/s`, null]);
+  }
+  if (b.predicted && b.predicted.predicted_per_second !== null) {
+    statTiles.push(["Predicted throughput", `${trim1(b.predicted.predicted_per_second)} tok/s`, predictedCardTip(b.predicted)]);
+  }
+  const statsHtml = statTiles.length
     ? `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:8px">
-        ${[["Throughput", `${trim1(b.throughput_toks)} tok/s`]]
-          .map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
+        ${statTiles
+          .map(([k, v, tip]) => `<div class="kv"><span class="k">${esc(k)}${tip ? `<span class="info-tip" title="${esc(tip)}">${icon("info")}</span>` : ""}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
       </div>`
     : "";
   // Offload guardrail and probe lines for the saved position
@@ -2171,6 +2289,7 @@ function backendCard(
       <textarea data-flags-raw="${esc(b.id)}" rows="4" spellcheck="false" style="width:100%;margin-top:8px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 10px;font-family:var(--mono);font-size:12px" aria-label="Raw flags for ${esc(b.id)}">${esc(flags.rawText)}</textarea>
       <div data-flags-warnings>${flagsRawWarningsHtml(flags.rawWarnings)}</div>
       <div style="font-size:12px;color:var(--text2);margin-top:6px">Saved to the configuration immediately; applies on the backend's next start.</div>
+      <div data-predicted-slot>${predictedHtml}</div>
       <div class="card-actions"><button class="btn" data-back-act="flags-raw-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save flags</button>
         <button class="btn" data-back-act="flags-mode-structured" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Use structured form</button>
         <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
@@ -2181,6 +2300,7 @@ function backendCard(
       ${offloadHtml}
       ${mtpHtml}
       ${flagsRatedLineHtml({ ctxMax: flags.ctxMax, modelId: flags.modelId, savedText: "Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Placement form on this card." })}
+      <div data-predicted-slot>${predictedHtml}</div>
       <div class="card-actions"><button class="btn" data-back-act="flags-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save flags</button>
         <button class="btn" data-back-act="flags-mode-advanced" data-back-id="${esc(b.id)}"${dis}>${icon("pencil")} Edit flags as text</button>
         <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
@@ -2483,7 +2603,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
             busy: placeBusy,
           }
           : null;
-        return backendCard(row, openArgv, openMenus, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency, new Map(lastGpuList.map((g) => [Number(g.id), g.name])), flagsArg, placeArg, new Map(lastGpuList.map((g) => [Number(g.id), g.vram_total_gb * 1024])), openDetails.has(row.id));
+        return backendCard(row, openArgv, openMenus, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency, new Map(lastGpuList.map((g) => [Number(g.id), g.name])), flagsArg, flagsFor === row.id ? predictedHtml : "", placeArg, new Map(lastGpuList.map((g) => [Number(g.id), g.vram_total_gb * 1024])), openDetails.has(row.id));
       }).join("")}</div>
       </div>`).join("");
     if (!viewRows.length && lastRows.length) b.innerHTML = emptyHtml("No backends match the current filter.");
@@ -2646,9 +2766,54 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
    *  operator types (the save op's own list replaces them after a
    *  save — the server is the authority). */
   let flagsRawWarnings: FlagWarningLike[] = [];
+  /** The open flags form's predicted-throughput line
+   *  (predicted-throughput design §6): the last lookup's
+   *  rendered line for the CURRENT draft, held in wire state
+   *  so poll repaints re-render it and a lookup in flight
+   *  never blanks it (§6.2). Empty when the draft matches no
+   *  measurement exactly or nearly. */
+  let predictedHtml = "";
+  let predictedSeq = 0;
+  let predictedTimer: number | null = null;
+  const runPredictedLookup = async (): Promise<void> => {
+    const id = flagsFor;
+    if (!id) return;
+    const row = lastRows.find((r) => r.id === id);
+    if (!row) return;
+    const seq = ++predictedSeq;
+    const req: MeasurementLookupRequest = row.flags_advanced
+      ? { backend_id: id, raw_flags: flagsRawText }
+      : {
+          backend_id: id,
+          n_ctx: flagsCtx,
+          n_batch: flagsBatch,
+          offload_layers: flagsOffloadLayers,
+          mtp_position: flagsMtpPosition,
+          parallel_slots: flagsParallel,
+        };
+    const r = await measurementLookup(req);
+    if (disposed || seq !== predictedSeq || flagsFor !== id) return;
+    predictedHtml = r.data ? predictedLineHtml(r.data.exact, r.data.near) : "";
+    // Update the open form's slot in place: a repaint here
+    // could disturb an in-progress slider drag or text edit.
+    const slot = root.querySelector("[data-predicted-slot]");
+    if (slot) slot.innerHTML = predictedHtml;
+  };
+  /** Debounced lookup trigger (§6.2, ~300 ms): fires on the
+   *  same events that mutate the draft. */
+  const schedulePredictedLookup = (): void => {
+    if (predictedTimer !== null) window.clearTimeout(predictedTimer);
+    predictedTimer = window.setTimeout(() => {
+      predictedTimer = null;
+      void runPredictedLookup();
+    }, 300);
+  };
   const closeFlagsForm = (): void => {
     flagsFor = null;
     offloadPending = null;
+    predictedHtml = "";
+    predictedSeq += 1;
+    if (predictedTimer !== null) { window.clearTimeout(predictedTimer); predictedTimer = null; }
     paint();
   };
   const openFlagsForm = (row: BackendRow): void => {
@@ -2665,7 +2830,10 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     // nothing (tracker #60, entry performs no write).
     flagsRawText = row.raw_flags ?? "";
     flagsRawWarnings = rawFlagWarnings(flagsRawText);
+    predictedHtml = "";
+    predictedSeq += 1;
     paint();
+    schedulePredictedLookup();
   };
   /** Keep the draft in step with the in-card form fields. Preset
    *  selects repaint (to show or hide the Custom numeric input);
@@ -2681,6 +2849,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     flagsBatch = draft.batch;
     flagsParallel = draft.parallel;
     if (repaint) paint();
+    schedulePredictedLookup();
   };
   root.addEventListener("change", syncFlagsDraft);
   root.addEventListener("input", syncFlagsDraft);
@@ -2697,6 +2866,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     flagsRawWarnings = rawFlagWarnings(flagsRawText);
     const box = t.closest(".backend-card")?.querySelector("[data-flags-warnings]");
     if (box) box.innerHTML = flagsRawWarningsHtml(flagsRawWarnings);
+    schedulePredictedLookup();
   };
   root.addEventListener("input", syncRawDraft);
 
@@ -2718,6 +2888,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     if (!row?.offload) return;
     const n = Number(t.value);
     flagsOffloadLayers = n;
+    schedulePredictedLookup();
     const card = t.closest(".backend-card");
     if (!card) return;
     const o = row.offload;
@@ -2769,6 +2940,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         err: false,
       });
       await load();
+      schedulePredictedLookup();
       return true;
     } finally {
       offloadCommitting = false;
@@ -2838,6 +3010,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         err: false,
       });
       await load();
+      schedulePredictedLookup();
       return true;
     } finally {
       mtpCommitting = false;
@@ -2853,6 +3026,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     if (!row?.mtp || mtpCommitting) return;
     const n = Number(t.value);
     flagsMtpPosition = n;
+    schedulePredictedLookup();
     const card = t.closest(".backend-card");
     if (card) {
       const token = card.querySelector("[data-mtp-token]");
@@ -2906,6 +3080,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         err: false,
       });
       await load();
+      schedulePredictedLookup();
       return true;
     } finally {
       parallelCommitting = false;
@@ -3103,6 +3278,37 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     const gpuExcluded = new Set<number>();
     let gpuTouched = false;
     let previewSeq = 0;
+    /** The predicted-throughput line for the add form's draft
+     *  (design §6, shared with the Edit Flags form): the last
+     *  measurement_lookup result for the configuration this
+     *  form would create, debounced like the edit form's. */
+    let addPredictedHtml = "";
+    let addPredictedSeq = 0;
+    let addPredictedTimer: number | null = null;
+    const runAddLookup = async (): Promise<void> => {
+      const modelId = modelSelEl?.value ?? "";
+      if (!modelId) return;
+      const seq = ++addPredictedSeq;
+      const r = await measurementLookup({
+        model_id: modelId,
+        n_ctx: pDraft.ctx,
+        n_batch: pDraft.batch,
+        offload_layers: offLayers ?? preview?.offload?.layers ?? null,
+        parallel_slots: pDraft.parallel,
+        gpu_indices: gpuTouched ? selectedGpus() : null,
+      });
+      if (disposed || seq !== addPredictedSeq) return;
+      addPredictedHtml = r.data ? predictedLineHtml(r.data.exact, r.data.near) : "";
+      const slot = paramsEl?.querySelector("[data-add-predicted-slot]");
+      if (slot) slot.innerHTML = addPredictedHtml;
+    };
+    const scheduleAddLookup = (): void => {
+      if (addPredictedTimer !== null) window.clearTimeout(addPredictedTimer);
+      addPredictedTimer = window.setTimeout(() => {
+        addPredictedTimer = null;
+        void runAddLookup();
+      }, 300);
+    };
     const paramsEl = addHost.querySelector("#addBackParams") as HTMLElement | null;
     const selectedGpus = (): number[] =>
       lastGpuList.map((g) => Number(g.id)).filter((ix) => !gpuExcluded.has(ix));
@@ -3164,6 +3370,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       ${flagsParallelHtml({ value: pDraft.parallel, savedCustom: false, fieldAttr: "data-add-flags-field", disabled: false })}
       ${offloadHtml}
       ${flagsRatedLineHtml({ ctxMax, modelId: m?.id ?? null, savedText: "Saved when the backend is added; applies from its first start. Placement is set by the GPU selection below." })}
+      <div data-add-predicted-slot>${addPredictedHtml}</div>
       ${placeHtml}
     </div>`;
     };
@@ -3185,7 +3392,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       const seq = ++previewSeq;
       const r = await backendAddPreview(modelId, gpuTouched ? selectedGpus() : undefined);
       if (disposed || seq !== previewSeq) return;
-      if (r.error || !r.data) { preview = null; paintParams(); return; }
+      if (r.error || !r.data) { preview = null; paintParams(); scheduleAddLookup(); return; }
       preview = r.data;
       if (modelChanged) {
         offLayers = preview.offload ? preview.offload.layers : null;
@@ -3193,6 +3400,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         resetPlacementFromPreview();
       }
       paintParams();
+      scheduleAddLookup();
     };
     modelSelEl?.addEventListener("change", () => { void loadPreview(true); });
     paramsEl?.addEventListener("input", (ev) => {
@@ -3201,6 +3409,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         if (!preview?.offload) return;
         const n = Number((t as HTMLInputElement).value);
         offLayers = n;
+        scheduleAddLookup();
         const card = t.closest(".card");
         if (card) paintOffloadReadout(card, preview.offload, n);
         // Keep a pending decision in step with the draft (the
@@ -3223,7 +3432,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         return;
       }
       const field = t.getAttribute("data-add-flags-field");
-      if (field) applyFlagsField(pDraft, field, (t as HTMLInputElement).value, false);
+      if (field) { applyFlagsField(pDraft, field, (t as HTMLInputElement).value, false); scheduleAddLookup(); }
     });
     paramsEl?.addEventListener("change", (ev) => {
       const t = ev.target as HTMLElement;
@@ -3241,6 +3450,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
           offPending = null;
         }
         paintParams();
+        scheduleAddLookup();
         return;
       }
       if (t.hasAttribute("data-add-place-gpu")) {
@@ -3254,7 +3464,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         return;
       }
       const field = t.getAttribute("data-add-flags-field");
-      if (field && applyFlagsField(pDraft, field, (t as HTMLInputElement).value, true)) paintParams();
+      if (field && applyFlagsField(pDraft, field, (t as HTMLInputElement).value, true)) { paintParams(); scheduleAddLookup(); }
     });
     paramsEl?.addEventListener("click", (ev) => {
       const t = (ev.target as HTMLElement).closest("[data-add-decision]") as HTMLElement | null;
@@ -3631,6 +3841,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
           err: false,
         });
         await load();
+        schedulePredictedLookup();
       } finally {
         inFlight.delete(id);
         if (!disposed) paint();

@@ -15,14 +15,14 @@
 
 import {
   addBackend, applyBackendConfig, deleteBackend, downloadModel, getAppConfig, getBackends,
-  getBackendConfig, getModels, getOptimizeState, modelAdd, modelAssign,
+  getBackendConfig, getModels, getOptimizeState, measurementDelete, modelAdd, modelAssign,
   optimizeCancelConsult, optimizeCancelJob, optimizeChangeSummary, optimizeConsult,
   optimizeDiscardPlan, optimizeDiscover, optimizeEstimateBackend, optimizeEstimateExperiments, optimizeIsDestructive, optimizeKindLabel,
   optimizeMeasureBackend, optimizeRunBaseline, optimizeRunExperiments, optimizeSavePurpose, optimizeSetExperimentState, optimizeSetItemOutcome, optimizeSetItemState,
   setBackendOffload, stopBackend, updateBackendFlags, updateGatewayConfig,
 } from "../api";
 import type {
-  CallResult, OptimizeCandidate, OptimizeExperiment, OptimizePlanItem, OptimizeState,
+  CallResult, MeasurementInputs, OptimizeCandidate, OptimizeExperiment, OptimizeMeasurementEntry, OptimizePlanItem, OptimizeState,
 } from "../api";
 import { trim1 } from "../charts";
 import { esc } from "../html";
@@ -57,6 +57,31 @@ function fmtAge(secs: number): string {
   return `${Math.floor(secs / 86400)} d`;
 }
 
+/** The snapshot fields in which `current` (a backend's current
+ *  configuration) differs from `other` (a stored entry), in the
+ *  design §5.3 order and naming — the client-side mirror of the
+ *  store's diff, over the payload's snapshots (§10). */
+function diffInputFields(current: MeasurementInputs, other: MeasurementInputs): string[] {
+  const out: string[] = [];
+  if (current.n_ctx !== other.n_ctx) out.push("context");
+  if (current.n_batch !== other.n_batch) out.push("batch");
+  if (current.offload !== other.offload) out.push("offload");
+  if (current.tensor_split.length !== other.tensor_split.length
+    || current.tensor_split.some((v, i) => v !== other.tensor_split[i])) out.push("tensor split");
+  if (current.split_mode !== other.split_mode) out.push("split mode");
+  if (current.raw_flags !== other.raw_flags) out.push("raw flags");
+  if (current.gpus.length !== other.gpus.length
+    || current.gpus.some((v, i) => v !== other.gpus[i])) out.push("GPU set");
+  return out;
+}
+
+/** Placement in short form from an inputs snapshot: "GPU 0+1",
+ *  or "CPU" for an empty GPU set. */
+function placementShort(inputs: MeasurementInputs): string {
+  if (!inputs.gpus.length) return "CPU";
+  return `GPU ${inputs.gpus.map((g) => g.split(":")[0]).join("+")}`;
+}
+
 /** Unwrap a CallResult or throw its error as an Error. */
 function unwrap<T>(r: CallResult<T>): T {
   if (r.error) throw new Error(r.error);
@@ -86,6 +111,11 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   let consultStart = 0;
   /** Armed two-step confirms, by key ("consult", "discard", "destructive"). */
   const armed = new Set<string>();
+  /** The backend the Measurements history compares entries
+   *  against (design §10): an entry differing from its current
+   *  configuration in one or two named fields says so on its
+   *  row. Null until the operator picks one. */
+  let historyCompare: string | null = null;
   /** Purpose editor drafts, keyed "deployment" | "backend:<id>" | "group:<name>". */
   const drafts = new Map<string, string>();
   /** Directive field draft (addendum A.2). Null until the operator
@@ -430,6 +460,121 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     </div>`;
   }
 
+  /** The expansion of one history entry (design §10): the
+   *  full inputs snapshot plus app version, driver, and llama
+   *  build. A v1 entry has no snapshot: what exists is shown
+   *  and the absence stated, never papered over. */
+  function measurementDetailsHtml(e: OptimizeMeasurementEntry): string {
+    const rows: [string, string][] = [];
+    if (e.inputs) {
+      rows.push(["Offload", e.inputs.offload]);
+      rows.push(["Tensor split", e.inputs.tensor_split.length ? e.inputs.tensor_split.map((f) => `${Math.round(f * 100)}%`).join(" / ") : "none"]);
+      rows.push(["Split mode", e.inputs.split_mode]);
+      rows.push(["Raw flags", e.inputs.raw_flags || "(none)"]);
+      rows.push(["GPU set", e.inputs.gpus.join(", ") || "CPU only"]);
+    }
+    rows.push(["App version", e.app_version]);
+    if (e.driver_version?.length) rows.push(["Driver", e.driver_version.join(", ")]);
+    if (e.llama_build) rows.push(["llama.cpp build", e.llama_build]);
+    if (e.model_file) rows.push(["Model file", e.model_file]);
+    if (e.model_sha256) rows.push(["Model SHA-256", e.model_sha256]);
+    if (e.model_size_bytes != null) rows.push(["Model size", `${trim1(e.model_size_bytes / 1073741824)} GiB`]);
+    rows.push(["Fingerprint", e.fingerprint]);
+    const absence = e.inputs
+      ? ""
+      : `<div class="opt-note">Inputs, driver, and llama build were not recorded for this entry — it predates measurement provenance (store v2).</div>`;
+    return `${absence}${rows.map(([k, v]) => `<div style="font-size:12px"><span style="color:var(--text2)">${esc(k)}:</span> <span style="font-family:var(--mono)">${esc(v)}</span></div>`).join("")}`;
+  }
+
+  /** One Measurements history row (design §10): the headline
+   *  figures as Label: Value, measured date and age, source,
+   *  provenance backend, placement and context/batch from the
+   *  snapshot, the Current marker for the entry a configured
+   *  backend's prediction resolves to, the near-match diff
+   *  against the compare backend's current configuration, the
+   *  expansion, and the per-entry delete (two-step armed, the
+   *  page's confirm idiom). */
+  function measurementRowHtml(e: OptimizeMeasurementEntry, st: OptimizeState): string {
+    const gen = e.short.predicted_per_second ?? e.long.predicted_per_second;
+    const prompt = e.long.prompt_per_second ?? e.short.prompt_per_second;
+    const ttft = e.short.ttft_ms ?? e.long.ttft_ms;
+    const figs: string[] = [];
+    if (gen !== null) figs.push(`Generation: ${trim1(gen)} tok/s`);
+    if (prompt !== null) figs.push(`Prompt: ${trim1(prompt)} tok/s`);
+    if (ttft !== null) figs.push(`TTFT: ${trim1(ttft)} ms`);
+    const ageSecs = Math.max(0, Math.floor((Date.now() - new Date(e.measured_at).getTime()) / 1000));
+    const source = e.source === "benchmark"
+      ? "Benchmark"
+      : e.source === "experiment"
+        ? "Experiment"
+        : e.source === "live"
+          ? "Live"
+          : "Not recorded";
+    const meta: string[] = [
+      `Measured: ${fmtTime(e.measured_at)}`,
+      `Age: ${fmtAge(ageSecs)}`,
+      `Source: ${source}`,
+      `Backend: ${e.origin_backend_id ? `${e.backend_id} (from ${e.origin_backend_id})` : e.backend_id}`,
+    ];
+    if (e.inputs) {
+      meta.push(`Placement: ${placementShort(e.inputs)}`);
+      meta.push(`Context: ${e.inputs.n_ctx.toLocaleString()}`);
+      meta.push(`Batch: ${e.inputs.n_batch.toLocaleString()}`);
+    }
+    const current = e.current_for.length
+      ? `<span class="opt-measure-figs">Current for: ${esc(e.current_for.join(", "))}</span>`
+      : "";
+    let diffLine = "";
+    const cmp = historyCompare ? st.backends.find((b) => b.id === historyCompare) : undefined;
+    if (cmp?.current_inputs && e.inputs && !e.current_for.includes(cmp.id)) {
+      const diffs = diffInputFields(cmp.current_inputs, e.inputs);
+      if (diffs.length >= 1 && diffs.length <= 2) {
+        diffLine = `<div class="opt-note">differs from ${esc(cmp.id)}'s current configuration: ${esc(diffs.join(", "))}</div>`;
+      }
+    }
+    const delKey = `measurement:${e.fingerprint}:${e.measured_at}`;
+    const isArmed = armed.has(delKey);
+    return `<div class="opt-measure-row" style="align-items:flex-start">
+      <div>
+        ${figs.length ? `<div class="opt-measure-figs">${esc(figs.join(" · "))}</div>` : ""}
+        <div class="opt-note">${esc(meta.join(" · "))}</div>
+        ${current}${diffLine}
+        <details class="opt-why"><summary>Details</summary>${measurementDetailsHtml(e)}</details>
+      </div>
+      <button class="btn icon-only" data-opt-measurement-delete="${esc(e.fingerprint)}" data-opt-measurement-at="${esc(e.measured_at)}" title="${isArmed ? "Click again to delete this measurement" : "Delete measurement"}" aria-label="Delete measurement measured ${esc(e.measured_at)}"${isArmed ? ` style="color:var(--err)"` : ""}>${icon("x")}</button>
+    </div>`;
+  }
+
+  /** The Measurements history card (design §10): every stored
+   *  entry, grouped by model, newest first within a model.
+   *  Renders nothing when the store is empty. */
+  function measurementsHtml(st: OptimizeState): string {
+    const entries = st.measurements ?? [];
+    if (!entries.length) return "";
+    const byModel = new Map<string, OptimizeMeasurementEntry[]>();
+    for (const e of entries) {
+      const arr = byModel.get(e.model_id) ?? [];
+      arr.push(e);
+      byModel.set(e.model_id, arr);
+    }
+    const groups = [...byModel.entries()]
+      .map(([model, arr]) => ({
+        model,
+        arr: [...arr].sort((a, b) => b.measured_at.localeCompare(a.measured_at)),
+      }))
+      .sort((a, b) => (b.arr[0]?.measured_at ?? "").localeCompare(a.arr[0]?.measured_at ?? ""));
+    const compareOpts = st.backends
+      .filter((b) => b.current_inputs)
+      .map((b) => `<option value="${esc(b.id)}"${b.id === historyCompare ? " selected" : ""}>${esc(b.id)}</option>`)
+      .join("");
+    return `<details class="card opt-measurements">
+      <summary>Measurements</summary>
+      <p class="opt-note">Every stored measurement, grouped by model, newest first. The entry a backend's prediction resolves to is marked Current for that backend. Deleting an entry removes it from every surface at the next refresh.</p>
+      ${compareOpts ? `<div class="opt-consult-row"><label style="font-size:12px;color:var(--text2)">Compare against <select data-opt-history-compare style="${SELECT_STYLE}"><option value="">—</option>${compareOpts}</select></label></div>` : ""}
+      ${groups.map((g) => `<div class="opt-field-label" style="margin-top:10px">${esc(g.model)}</div>${g.arr.map((e) => measurementRowHtml(e, st)).join("")}`).join("")}
+    </details>`;
+  }
+
   function candidateFitLabel(fit: string): string {
     switch (fit) {
       case "fits": return "Fits";
@@ -598,7 +743,8 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       <p class="opt-note">Optional. A purpose tells the consulted model what a group or backend is for; without one it infers cautiously from names.</p>
       ${st.groups.map((g) => purposeEditor(`group:${g.name}`, `Group: ${g.name}`, g.purpose)).join("")}
       ${st.backends.map((b) => purposeEditor(`backend:${b.id}`, `Backend: ${b.id}`, b.purpose)).join("")}
-    </details>`;
+    </details>
+    ${measurementsHtml(st)}`;
   }
 
   async function refresh(): Promise<void> {
@@ -1119,6 +1265,26 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       })();
       return;
     }
+    const measurementDeleteBtn = t.closest<HTMLElement>("[data-opt-measurement-delete]");
+    if (measurementDeleteBtn) {
+      const fp = measurementDeleteBtn.dataset.optMeasurementDelete ?? "";
+      const at = measurementDeleteBtn.dataset.optMeasurementAt ?? "";
+      const key = `measurement:${fp}:${at}`;
+      if (!armed.has(key)) {
+        armed.add(key);
+        paint();
+        window.setTimeout(() => { armed.delete(key); if (!disposed) paint(); }, 5000);
+        return;
+      }
+      armed.delete(key);
+      void (async () => {
+        const r = await measurementDelete(fp, at);
+        if (disposed) return;
+        if (r.error) { statusLine = r.error; paint(); return; }
+        await refresh();
+      })();
+      return;
+    }
     const measureBtn = t.closest<HTMLElement>("[data-opt-measure]");
     if (measureBtn) {
       const backendId = measureBtn.dataset.optMeasure ?? "";
@@ -1220,6 +1386,15 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         void runApplyPhase(true);
         return;
       }
+    }
+  });
+
+  hostEl.addEventListener("change", (ev) => {
+    const t = ev.target as HTMLElement;
+    const sel = t.closest<HTMLElement>("[data-opt-history-compare]");
+    if (sel) {
+      historyCompare = (sel as HTMLSelectElement).value || null;
+      paint();
     }
   });
 

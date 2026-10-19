@@ -131,11 +131,12 @@ export function mockOptimizeState(): OptimizeState {
       { name: "tool-runner", purpose: "" },
     ],
     backends: [
-      { id: "planner", purpose: "", running: true, enabled: true, model_id: "qwen3-27b-planner", short_name: "Qwen3.8-27B Planner", measured: { prompt_per_second: 812, predicted_per_second: 21.8, ttft_ms: 240, age_secs: 3600 }, estimated: { prompt_per_second: 798, predicted_per_second: 21.1, ttft_ms: 255, age_secs: 7200 } },
-      { id: "coder", purpose: "", running: true, enabled: true, model_id: "qwen3-coder-30b", short_name: "Qwen3-Coder-Next-80B", measured: null, estimated: { prompt_per_second: 640, predicted_per_second: 18.4, ttft_ms: 410, age_secs: 1800 } },
-      { id: "coder-fast", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null, estimated: null },
-      { id: "tool-runner", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null, estimated: null },
+      { id: "planner", purpose: "", running: true, enabled: true, model_id: "qwen3-27b-planner", short_name: "Qwen3.8-27B Planner", measured: { prompt_per_second: 812, predicted_per_second: 21.8, ttft_ms: 240, age_secs: 3600 }, estimated: { prompt_per_second: 798, predicted_per_second: 21.1, ttft_ms: 255, age_secs: 7200 }, current_fingerprint: "sample-fingerprint-planner", current_inputs: { n_ctx: 32768, n_batch: 512, offload: "none", tensor_split: [1, 0], split_mode: "layer", raw_flags: "", gpus: ["0:NVIDIA RTX A4000"] } },
+      { id: "coder", purpose: "", running: true, enabled: true, model_id: "qwen3-coder-30b", short_name: "Qwen3-Coder-Next-80B", measured: null, estimated: { prompt_per_second: 640, predicted_per_second: 18.4, ttft_ms: 410, age_secs: 1800 }, current_fingerprint: "sample-fingerprint-coder", current_inputs: { n_ctx: 32768, n_batch: 512, offload: "all_experts", tensor_split: [0, 1], split_mode: "layer", raw_flags: "-ot exps=CPU", gpus: ["1:Tesla P100-PCIE-16GB"] } },
+      { id: "coder-fast", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null, estimated: null, current_fingerprint: null, current_inputs: null },
+      { id: "tool-runner", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null, estimated: null, current_fingerprint: null, current_inputs: null },
     ],
+    measurements: [],
     context_summary: {
       gpus: 2, backends: 4, groups: 4, models: 3,
       measured_blocks: ["backend running state and per-process VRAM", "gateway traffic"],
