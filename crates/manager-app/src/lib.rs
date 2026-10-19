@@ -7342,6 +7342,7 @@ pub async fn op_mcp_list(
                 env_keys: cfg.env_keys.clone(),
                 cred_ref: cfg.cred_ref.clone(),
                 signup_url: mcp_signup_url(cfg),
+                credential_hint: mcp_credential_hint(cfg),
                 allowed_tools: cfg.allowed_tools.clone(),
                 metered: cfg.metered,
                 rpm_limit: cfg.rpm_limit,
@@ -7383,6 +7384,28 @@ fn mcp_signup_url(server: &manager_config::McpServerConfig) -> Option<String> {
         })
 }
 
+/// The operator-facing description of a server's credential —
+/// what kind of credential to store and where it comes from:
+/// its own stored `credential_hint` when set, else the seeded
+/// registry entry's for the same id. Configurations persisted
+/// before the field existed carry the seeded servers without
+/// it, and their credential fields must still be labelled
+/// (Pete, 2026-10-18). The fallback consults the full seeded
+/// registry (not only the curated pair) because the legacy
+/// servers' hints live in the legacy seed.
+fn mcp_credential_hint(server: &manager_config::McpServerConfig) -> Option<String> {
+    server
+        .credential_hint
+        .clone()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| {
+            manager_config::seeded_mcp_servers()
+                .into_iter()
+                .find(|c| c.id == server.id)
+                .and_then(|c| c.credential_hint)
+        })
+}
+
 /// The Gateway-exposed MCP servers a gateway start would omit for
 /// want of a credential (Pete, 2026-10-18): the data behind the
 /// start-gateway credential prompt. Each entry is a server that
@@ -7418,6 +7441,7 @@ pub async fn op_mcp_start_preflight(
                 "cred_ref": cred_ref,
                 "env_keys": s.env_keys,
                 "signup_url": mcp_signup_url(s),
+                "credential_hint": mcp_credential_hint(s),
                 "metered": s.metered,
             }))
         })
@@ -7975,6 +7999,60 @@ mod tests {
         other.id = "not_a_curated_server".to_string();
         other.signup_url = None;
         assert_eq!(mcp_signup_url(&other), None);
+    }
+
+    #[test]
+    fn mcp_credential_hint_prefers_stored_then_seed() {
+        let cfg = test_cfg();
+        let find = |id: &str| {
+            cfg.mcp
+                .servers
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("default config seeds {id}"))
+                .clone()
+        };
+        // The seeded entries carry their hints themselves — the
+        // legacy pair's as well as the curated pair's (the signup
+        // fallback only covers the curated pair; the hint fallback
+        // covers the whole seeded registry).
+        assert_eq!(
+            mcp_credential_hint(&find("github")).as_deref(),
+            Some("GitHub personal access token — created under GitHub Settings, Developer settings, Personal access tokens")
+        );
+        assert_eq!(
+            mcp_credential_hint(&find("brave_search")).as_deref(),
+            Some("Brave Search API key — the subscription key from the Brave Search API page")
+        );
+        // A config persisted before the field existed (no stored
+        // hint) still resolves the seed's hint by id — existing
+        // installs' credential fields stay labelled.
+        let mut legacy = find("gdrive");
+        legacy.credential_hint = None;
+        assert_eq!(
+            mcp_credential_hint(&legacy).as_deref(),
+            Some("Path to the Google OAuth credentials JSON file — downloaded from Google Cloud Console, APIs & Services, Credentials; store the file path, not the file contents")
+        );
+        // A stored hint wins over the seed's, and a blank stored
+        // hint counts as unset and falls back.
+        let mut custom = find("github");
+        custom.credential_hint = Some("Example token".to_string());
+        assert_eq!(
+            mcp_credential_hint(&custom).as_deref(),
+            Some("Example token")
+        );
+        custom.credential_hint = Some("  ".to_string());
+        assert_eq!(
+            mcp_credential_hint(&custom).as_deref(),
+            Some("GitHub personal access token — created under GitHub Settings, Developer settings, Personal access tokens")
+        );
+        // A server with no credential (web_fetch) and an unknown
+        // id both resolve to no hint.
+        assert_eq!(mcp_credential_hint(&find("web_fetch")), None);
+        let mut other = find("github");
+        other.id = "not_a_seeded_server".to_string();
+        other.credential_hint = None;
+        assert_eq!(mcp_credential_hint(&other), None);
     }
 
     #[test]
@@ -9301,6 +9379,12 @@ struct McpListEntry {
     /// resolved by [`mcp_signup_url`] (stored value, else the
     /// curated seed's).
     pub signup_url: Option<String>,
+    /// What credential the operator stores for the server (kind
+    /// and where it comes from), resolved by
+    /// [`mcp_credential_hint`] (stored value, else the seeded
+    /// registry's for the same id). The MCP Servers view renders
+    /// it as the credential field's label.
+    pub credential_hint: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
     pub metered: bool,
     pub rpm_limit: Option<u32>,

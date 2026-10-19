@@ -1626,6 +1626,10 @@ export interface McpServerRow {
   cred_ref: string | null;
   /** Registration / API-key page for the credential, when known. */
   signup_url: string | null;
+  /** What credential to store (kind + where it comes from),
+   *  resolved by the backend (stored value, else the seed's for
+   *  the same id). Labels the card's credential field. */
+  credential_hint: string | null;
   allowed_tools: string[] | null;
   metered: boolean;
   rpm_limit: number | null;
@@ -1656,6 +1660,7 @@ export interface McpServerInput {
   env_keys: string[];
   cred_ref: string | null;
   signup_url: string | null;
+  credential_hint: string | null;
   allowed_tools: string[] | null;
   metered: boolean;
   rpm_limit: number | null;
@@ -1693,6 +1698,7 @@ function sampleMcpServers(): McpServerRow[] {
     env_keys: [] as string[],
     cred_ref: null as string | null,
     signup_url: null as string | null,
+    credential_hint: null as string | null,
     allowed_tools: null as string[] | null,
     metered: false,
     rpm_limit: null as number | null,
@@ -1709,6 +1715,7 @@ function sampleMcpServers(): McpServerRow[] {
       command: "npx", args: ["-y", "@modelcontextprotocol/server-github"],
       env_keys: ["GITHUB_PERSONAL_ACCESS_TOKEN"],
       cred_ref: "local-llm-service-manager/github-mcp",
+      credential_hint: "GitHub personal access token — created under GitHub Settings, Developer settings, Personal access tokens",
       running: true, credential_present: true, credential_status: "present",
       credential_target_found: "local-llm-service-manager/github-mcp",
       credential_presence: [["GITHUB_PERSONAL_ACCESS_TOKEN", true]],
@@ -1719,6 +1726,7 @@ function sampleMcpServers(): McpServerRow[] {
       command: "npx", args: ["-y", "@modelcontextprotocol/server-gdrive"],
       env_keys: ["GOOGLE_APPLICATION_CREDENTIALS"],
       cred_ref: "local-llm-service-manager/gdrive-mcp",
+      credential_hint: "Path to the Google OAuth credentials JSON file — downloaded from Google Cloud Console, APIs & Services, Credentials; store the file path, not the file contents",
       credential_present: true, credential_status: "present",
       credential_target_found: "local-llm-service-manager/gdrive-mcp",
       credential_presence: [["GOOGLE_APPLICATION_CREDENTIALS", true]],
@@ -1730,6 +1738,7 @@ function sampleMcpServers(): McpServerRow[] {
       args: ["-y", "@brave/brave-search-mcp-server@2.1.4", "--transport", "stdio"],
       env_keys: ["BRAVE_API_KEY"],
       cred_ref: "local-llm-service-manager/brave-search-mcp",
+      credential_hint: "Brave Search API key — the subscription key from the Brave Search API page",
       // The live entry resolves the Brave Search API page here;
       // the literal URL stays out of the sample fixture because
       // the smoke test bans external URLs in the bundle.
@@ -1833,6 +1842,7 @@ export interface McpStartPreflightServer {
   cred_ref: string;
   env_keys: string[];
   signup_url: string | null;
+  credential_hint: string | null;
   metered: boolean;
 }
 

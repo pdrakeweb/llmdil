@@ -25,6 +25,7 @@ function rowHtml(s: McpStartPreflightServer): string {
   return `<div class="mcp-prompt-row" data-prompt-row="${esc(s.id)}">
     <div class="mcp-prompt-head"><strong>${esc(s.display_name)}</strong><span class="mcp-prompt-cred" data-prompt-cred>Credential: missing</span></div>
     <div class="mcp-prompt-line">The gateway starts without this server until its credential is stored.${s.metered ? " Paid API." : ""}</div>
+    ${s.credential_hint ? `<div class="mcp-prompt-line">Credential: ${esc(s.credential_hint)}</div>` : ""}
     <div class="mcp-prompt-controls">
       ${s.signup_url ? `<button class="btn" data-prompt-act="link" data-prompt-id="${esc(s.id)}">${icon("external")} Get an API key</button>` : ""}
       <input type="password" data-prompt-input placeholder="${esc(s.env_keys[0] ?? "API key")}" autocomplete="off" aria-label="Credential value for ${esc(s.display_name)}">

@@ -2277,6 +2277,7 @@ mod tests {
             env_keys: env_keys.iter().map(|s| s.to_string()).collect(),
             cred_ref: cred_ref.map(str::to_string),
             signup_url: None,
+            credential_hint: None,
             allowed_tools: None,
             metered: false,
             rpm_limit: None,

@@ -300,6 +300,10 @@ pub fn curated_mcp_servers() -> Vec<McpServerConfig> {
             url: None,
             env_keys: vec!["BRAVE_API_KEY".to_string()],
             cred_ref: Some(BRAVE_SEARCH_MCP_CRED_REF.to_string()),
+            credential_hint: Some(
+                "Brave Search API key — the subscription key from the Brave Search API page"
+                    .to_string(),
+            ),
             allowed_tools: Some(
                 BRAVE_DEFAULT_ALLOWED_TOOLS
                     .iter()
@@ -339,6 +343,7 @@ pub fn curated_mcp_servers() -> Vec<McpServerConfig> {
             metered: false,
             rpm_limit: None,
             signup_url: None,
+            credential_hint: None,
         },
     ]
 }
@@ -362,6 +367,10 @@ pub fn seeded_mcp_servers() -> Vec<McpServerConfig> {
             url: None,
             env_keys: vec!["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()],
             cred_ref: Some(GITHUB_MCP_CRED_REF.to_string()),
+            credential_hint: Some(
+                "GitHub personal access token — created under GitHub Settings, Developer settings, Personal access tokens"
+                    .to_string(),
+            ),
             allowed_tools: None,
             metered: false,
             rpm_limit: None,
@@ -382,6 +391,13 @@ pub fn seeded_mcp_servers() -> Vec<McpServerConfig> {
             // GDRIVE_CREDENTIALS_PATH.
             env_keys: vec!["GOOGLE_APPLICATION_CREDENTIALS".to_string()],
             cred_ref: Some(GDRIVE_MCP_CRED_REF.to_string()),
+            // File-shaped credential (design §6.4): the stored
+            // value is the credentials file's path, not its
+            // contents — the server reads the env var as a path.
+            credential_hint: Some(
+                "Path to the Google OAuth credentials JSON file — downloaded from Google Cloud Console, APIs & Services, Credentials; store the file path, not the file contents"
+                    .to_string(),
+            ),
             allowed_tools: None,
             metered: false,
             rpm_limit: None,
@@ -427,6 +443,21 @@ pub struct McpServerConfig {
     /// without a public signup page. Never emitted into the
     /// generated gateway config.
     pub signup_url: Option<String>,
+    /// What credential the operator stores for this server — one
+    /// short instruction naming the credential kind and where it
+    /// comes from (e.g. "Brave Search API key — the subscription
+    /// key from the Brave Search API page"). The MCP Servers view
+    /// renders it as the credential field's label and the
+    /// start-gateway prompt shows it beside the store field, so
+    /// the operator is never asked for an unidentified value
+    /// (Pete, 2026-10-18). Operator-facing metadata like
+    /// `signup_url`: surfaced via `mcp_list` (resolved against the
+    /// seed for entries persisted before the field existed) and
+    /// never emitted into the generated gateway config. `None`
+    /// for servers without a credential, and for custom servers
+    /// whose operator has not described one — the view then
+    /// labels the field from the env key names instead.
+    pub credential_hint: Option<String>,
 }
 
 /// Presenter mode for a data window (spec §4 hybrid view matrix).
@@ -3001,6 +3032,7 @@ mod tests {
             env_keys: Vec::new(),
             cred_ref: None,
             signup_url: None,
+            credential_hint: None,
             allowed_tools: None,
             metered: false,
             rpm_limit: None,
@@ -3031,11 +3063,23 @@ mod tests {
         assert_eq!(gh.env_keys, vec!["GITHUB_PERSONAL_ACCESS_TOKEN"]);
         assert_eq!(gh.cred_ref.as_deref(), Some(GITHUB_MCP_CRED_REF));
         assert_eq!(GITHUB_MCP_CRED_REF, "local-llm-service-manager/github-mcp");
+        // The credential field's label (Pete, 2026-10-18): the
+        // seed names the credential kind for both legacy servers.
+        assert_eq!(
+            gh.credential_hint.as_deref(),
+            Some("GitHub personal access token — created under GitHub Settings, Developer settings, Personal access tokens")
+        );
         let gd = &seed[1];
         assert_eq!(gd.id, "gdrive");
         assert_eq!(gd.cred_ref.as_deref(), Some(GDRIVE_MCP_CRED_REF));
         // Canonicalised env key, not the legacy divergent name.
         assert_eq!(gd.env_keys, vec!["GOOGLE_APPLICATION_CREDENTIALS"]);
+        // File-shaped credential (§6.4): the hint says the stored
+        // value is the credentials file's path, not its contents.
+        assert_eq!(
+            gd.credential_hint.as_deref(),
+            Some("Path to the Google OAuth credentials JSON file — downloaded from Google Cloud Console, APIs & Services, Credentials; store the file path, not the file contents")
+        );
         assert_eq!(gd.args, vec!["-y", "@modelcontextprotocol/server-gdrive"]);
         // default_config carries the seed.
         assert_eq!(AppConfig::default_config().mcp.servers, seed);
@@ -3075,6 +3119,10 @@ mod tests {
         // web_fetch has no credential and no link.
         assert_eq!(brave.signup_url.as_deref(), Some(BRAVE_SEARCH_SIGNUP_URL));
         assert_eq!(BRAVE_SEARCH_SIGNUP_URL, "https://brave.com/search/api/");
+        assert_eq!(
+            brave.credential_hint.as_deref(),
+            Some("Brave Search API key — the subscription key from the Brave Search API page")
+        );
         let fetch = &curated[1];
         assert_eq!(fetch.id, "web_fetch");
         assert_eq!(fetch.display_name, "Web Fetch");
@@ -3088,6 +3136,7 @@ mod tests {
         assert!(!fetch.metered);
         assert_eq!(fetch.rpm_limit, None);
         assert_eq!(fetch.signup_url, None);
+        assert_eq!(fetch.credential_hint, None);
         // A fresh default config carries all four entries and is
         // born with the curated-seeded marker set.
         let default = AppConfig::default_config();
@@ -3215,6 +3264,12 @@ mod tests {
         assert_eq!(s.command, None);
         assert!(s.args.is_empty());
         assert!(!s.metered);
+        // Entries persisted before the credential label existed
+        // carry no hint; the view resolves one from the seed.
+        assert_eq!(s.credential_hint, None);
+        let s: McpServerConfig =
+            serde_json::from_str(r#"{"id":"x","credential_hint":"Example API key"}"#).unwrap();
+        assert_eq!(s.credential_hint.as_deref(), Some("Example API key"));
     }
 
     #[test]

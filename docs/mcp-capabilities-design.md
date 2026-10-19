@@ -747,6 +747,25 @@ route rather than lengthening the Gateway view (principles 1, 4):
   Storing a credential follows the existing pattern (a Store
   action that writes to Credential Manager; the value is never
   displayed after entry).
+
+  Credential labelling (fix, 2026-10-18): as first built, the
+  card's store field was an unlabelled password input whose only
+  hint was the Credential Manager target as placeholder text, so
+  the operator could not tell what credential to enter. Each
+  server entry now carries `credential_hint` — one short
+  instruction naming the credential kind and where it comes
+  from, seeded for the three credential-bearing servers (Brave:
+  the Search API subscription key; GitHub: a personal access
+  token; Drive: the OAuth credentials file's *path*, §6.4) —
+  resolved by `mcp_list` with the `mcp_signup_url` fallback
+  pattern (stored value, else the seed's for the same id, so
+  entries persisted before the field existed are still
+  labelled). The card renders it as the credential field's
+  label with the storage mechanics in an info-tip; the
+  start-gateway prompt shows the same line; the add/edit form
+  gains an optional Credential description field for custom
+  servers, and servers without a hint are labelled from their
+  env key names.
 - **Add server** opens a form card: id (validated live against
   §3.2), transport choice, command/args or URL, env key names +
   credential target, exposure choice. The command field's
