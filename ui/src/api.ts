@@ -2611,6 +2611,12 @@ export interface OptimizeValidation {
   status: "valid" | "warning" | "invalid";
   reason: string | null;
   expected: OptimizeExpected;
+  /** Predicted throughput for the item's RESULTING
+   *  configuration (predicted-throughput design §9), in the
+   *  shared measurement shape; present only on flag-changing
+   *  items (context/batch, offload, model assignment) whose
+   *  destination configuration has an exact measurement. */
+  predicted?: PredictedThroughput;
 }
 
 export interface OptimizePlanItem {

@@ -24,8 +24,8 @@ use manager_optimize::{
     BenchResult, BenchmarkPrompt, CandidateFact, ConsultCandidate, Decision, EstimateEntry,
     HardwareContext, HfClient, ItemValidation, LayoutFacts, LiveSnapshot, MeasureInputs,
     MeasurementEntry, MeasurementFingerprintInputs, MeasurementInputs, MeasurementSource,
-    MeasurementStore, Plan, TrafficWindow, ValidationStatus, BENCHMARK_TEMPERATURE, ESTIMATE_RUNS,
-    MEASURED_RUNS,
+    MeasurementStore, Plan, PlanItem, PlanKind, TrafficWindow, ValidationStatus,
+    BENCHMARK_TEMPERATURE, ESTIMATE_RUNS, MEASURED_RUNS,
 };
 use manager_supervisor::ProcessState;
 
@@ -648,6 +648,63 @@ fn validation_json(v: &ItemValidation) -> Value {
     })
 }
 
+/// The predicted throughput of a plan item's RESULTING
+/// configuration (predicted-throughput design §9): the saved
+/// backend with the item's change applied, resolved through the
+/// same fingerprint path as every other surface and answered by
+/// the store's fingerprint-only lookup. Only the flag-changing
+/// kinds carry one — context/batch (`set_context`, `set_flags`),
+/// offload (`set_offload`), model assignment (`set_model`) —
+/// because they are the items whose destination configuration
+/// the measurement key describes; every other kind renders no
+/// figure (principle 13). The change application mirrors the
+/// plan validator's own simulation and the lookup resolver's
+/// rule: a value the item does not change is never rewritten, so
+/// the resolved fingerprint is the one the applied configuration
+/// will actually carry.
+fn plan_item_predicted(
+    cfg: &AppConfig,
+    item: &PlanItem,
+    store: &MeasurementStore,
+    gpu_pairs: &[(u32, String)],
+) -> Option<Value> {
+    let target = item.target.as_ref()?;
+    let saved = cfg.backends.iter().find(|b| &b.id == target)?;
+    let mut merged = saved.clone();
+    let change = &item.change;
+    let get_u32 = |key: &str| change.get(key).and_then(Value::as_u64).map(|n| n as u32);
+    match item.kind {
+        PlanKind::BackendSetContext | PlanKind::BackendSetFlags => {
+            if let Some(n) = get_u32("n_ctx") {
+                merged.flags.n_ctx = n;
+            }
+            if let Some(n) = get_u32("n_batch") {
+                merged.flags.n_batch = n;
+            }
+        }
+        PlanKind::BackendSetOffload => {
+            let layers = get_u32("offload_layers")?;
+            if let Some(info) = crate::backend_offload_info(cfg, &merged) {
+                if layers != info.layers {
+                    merged.raw_flags = manager_models::set_expert_offload(
+                        merged.raw_flags.as_deref(),
+                        manager_models::offload_for_layers(layers, info.moe_layers),
+                    );
+                }
+            }
+        }
+        PlanKind::BackendSetModel => {
+            let model_id = change.get("model_id").and_then(Value::as_str)?;
+            let model = cfg.models.iter().find(|m| m.id == model_id)?;
+            merged.model_file = model.gguf_path.clone();
+        }
+        _ => return None,
+    }
+    let inputs = fingerprint_inputs(cfg, &merged, gpu_pairs);
+    let fingerprint = measurement_fingerprint(&inputs);
+    store.lookup(&fingerprint).map(predicted_json)
+}
+
 pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
     let cfg = state.config.read().await.clone();
     let gathered = gather(state, &cfg).await;
@@ -661,10 +718,31 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
     );
     let file = load_plan_file_current(state).await;
     let current_hash = current_config_hash(&cfg);
+    // Plan-item predictions (design §9) resolve against the
+    // measurement store and the telemetry GPU set, through the
+    // same inputs the card payload resolves (op_measurement_lookup
+    // fetches the pair list the same way).
+    let measure_store = MeasurementStore::load(&measurements_path(state));
+    let gpu_pairs: Vec<(u32, String)> = {
+        let telemetry = state.telemetry().await;
+        let guard = crate::lock_telemetry(&telemetry);
+        guard
+            .snapshot()
+            .iter()
+            .map(|s| (s.index, s.name.clone()))
+            .collect()
+    };
     let plan_json = file.plan.as_ref().map(|plan| {
         let validations = validate_plan(plan, &cfg, &gathered.live);
         let mut v = serde_json::to_value(plan).unwrap_or(Value::Null);
-        v["validations"] = Value::Array(validations.iter().map(validation_json).collect());
+        let mut validation_values: Vec<Value> =
+            validations.iter().map(validation_json).collect();
+        for (item, value) in plan.items.iter().zip(validation_values.iter_mut()) {
+            if let Some(p) = plan_item_predicted(&cfg, item, &measure_store, &gpu_pairs) {
+                value["predicted"] = p;
+            }
+        }
+        v["validations"] = Value::Array(validation_values);
         // Experiment validations (Phase 5e), aligned with
         // `plan.experiments`: light checks (candidate
         // resolvable, flags sane, stopping ids exist), in the
@@ -2326,4 +2404,107 @@ fn sample_response(cfg: &AppConfig) -> String {
         "experiments": experiments,
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bench(gen: f64) -> BenchResult {
+        BenchResult {
+            prompt_per_second: Some(30.0),
+            predicted_per_second: Some(gen),
+            ttft_ms: Some(120.0),
+            runs: Vec::new(),
+        }
+    }
+
+    fn entry(fingerprint: String, gen: f64) -> MeasurementEntry {
+        MeasurementEntry {
+            fingerprint,
+            backend_id: "planner".to_string(),
+            model_id: "model".to_string(),
+            measured_at: "2026-10-19T00:00:00Z".to_string(),
+            app_version: "0.1.41".to_string(),
+            short: bench(gen),
+            long: bench(gen),
+            source: None,
+            origin_backend_id: None,
+            model_file: None,
+            model_sha256: None,
+            model_size_bytes: None,
+            inputs: None,
+            driver_version: Vec::new(),
+            llama_build: None,
+        }
+    }
+
+    fn item(kind: PlanKind, target: &str, change: Value) -> PlanItem {
+        PlanItem {
+            id: 1,
+            fingerprint: "item".to_string(),
+            kind,
+            target: Some(target.to_string()),
+            change,
+            advice_text: None,
+            rationale: String::new(),
+            expected_effect: String::new(),
+            confidence: manager_optimize::Confidence::Low,
+            decision: Decision::Undecided,
+            previously_denied: false,
+            provision_for_experiment: None,
+            apply_outcome: None,
+            apply_error: None,
+        }
+    }
+
+    /// Design §9: a flag-changing item's validation carries the
+    /// exact-match measurement of the configuration the item
+    /// produces — not of the configuration it replaces.
+    #[test]
+    fn plan_item_predicted_resolves_the_resulting_configuration() {
+        let cfg = AppConfig::default_config();
+        let saved = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == "planner")
+            .expect("default config seeds planner");
+        // The configuration a set_context item would produce.
+        let mut merged = saved.clone();
+        merged.flags.n_ctx = 16384;
+        let fp = measurement_fingerprint(&fingerprint_inputs(&cfg, &merged, &[]));
+        let mut store = MeasurementStore::load(&PathBuf::from(
+            "/nonexistent-m2-test/optimize-measurements.json",
+        ));
+        store.upsert(entry(fp, 22.5));
+
+        let it = item(
+            PlanKind::BackendSetContext,
+            "planner",
+            json!({ "n_ctx": 16384 }),
+        );
+        let p = plan_item_predicted(&cfg, &it, &store, &[])
+            .expect("the resulting configuration has an exact measurement");
+        assert_eq!(p["predicted_per_second"], json!(22.5));
+
+        // A different destination configuration has no
+        // measurement and renders nothing.
+        let it = item(
+            PlanKind::BackendSetContext,
+            "planner",
+            json!({ "n_ctx": 8192 }),
+        );
+        assert!(plan_item_predicted(&cfg, &it, &store, &[]).is_none());
+
+        // Kinds that do not change the measured configuration
+        // never carry a prediction.
+        let it = item(
+            PlanKind::BackendSetEnabled,
+            "planner",
+            json!({ "enabled": true }),
+        );
+        assert!(plan_item_predicted(&cfg, &it, &store, &[]).is_none());
+        let it = item(PlanKind::Advice, "planner", json!({}));
+        assert!(plan_item_predicted(&cfg, &it, &store, &[]).is_none());
+    }
 }

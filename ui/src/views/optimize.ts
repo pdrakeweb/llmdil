@@ -193,6 +193,13 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     if (v.expected.sys_ram_mib) {
       parts.push(`System RAM: ${fmtGiB(v.expected.sys_ram_mib[0])} → ${fmtGiB(v.expected.sys_ram_mib[1])}`);
     }
+    // The destination configuration's stored measurement
+    // (predicted-throughput design §9): generation rate only,
+    // the card rule (D4) — the Optimize measure rows carry the
+    // full figures for the current configuration.
+    if (v.predicted && v.predicted.predicted_per_second !== null) {
+      parts.push(`Predicted throughput: ${trim1(v.predicted.predicted_per_second)} tok/s`);
+    }
     if (v.expected.note) parts.push(esc(v.expected.note));
     let html = parts.length ? `<span class="opt-expected">${parts.join(" · ")}</span>` : "";
     if (v.status === "warning") {
