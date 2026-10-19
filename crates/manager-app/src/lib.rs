@@ -8884,6 +8884,14 @@ mod tests {
             coder.flags.tensor_split = Vec::new();
         }
         let (state, dir) = advanced_test_state(cfg);
+        // Pin an empty telemetry store: op_model_assign skips its
+        // split-vs-GPU-count check when no telemetry has polled (its
+        // documented no-telemetry path). Against live host telemetry
+        // the fixed [1.0] split is rejected on multi-GPU machines,
+        // which is unrelated to the flags behavior under test.
+        let _ = state.telemetry.set(Arc::new(std::sync::Mutex::new(
+            TelemetryStore::new(),
+        )));
         let sink = test_sink();
         let r = op_model_assign(
             &state,
@@ -8914,6 +8922,10 @@ mod tests {
             coder.flags.split_mode = manager_config::SplitMode::Layer;
         }
         let (state, dir) = advanced_test_state(cfg);
+        // Same empty-telemetry pin as the advanced case above.
+        let _ = state.telemetry.set(Arc::new(std::sync::Mutex::new(
+            TelemetryStore::new(),
+        )));
         let r = op_model_assign(
             &state,
             &sink,
