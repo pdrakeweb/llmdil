@@ -333,7 +333,8 @@ the configured total (Pete, 2026-10-17, tracker #11).
 ```json
 {
   "pending": true, "gateway_up": true, "gateway_pending": false,
-  "drift": false, "applies_at_next_start": false, "actionable": true,
+  "drift": false, "files_differ": false,
+  "applies_at_next_start": false, "actionable": true,
   "backend_restart_ids": ["coder"],
   "changes": [ { "ts": "…", "kind": "…", "summary": "…",
                  "scope": "backend", "targets": ["coder"],
@@ -341,6 +342,15 @@ the configured total (Pete, 2026-10-17, tracker #11).
   "snapshot_available": true
 }
 ```
+
+When live config drift is the pending work, `changes` carries a
+synthesized item with `kind: "gateway_drift"` (scope `gateway`,
+activation `gateway_restart`) whose summary names the generated
+file that differs — drift is counted like any other change, so a
+pending plan never reports zero changes. `files_differ` is the
+raw generated-vs-on-disk comparison in any gateway state
+(informational while the gateway is down); `drift` remains its
+pending-work form (gateway up only).
 
 ### 4.7 GPU telemetry (`get_gpu_telemetry`)
 
