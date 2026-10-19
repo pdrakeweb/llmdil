@@ -413,9 +413,9 @@ payload; the API adds nothing.
 
 ## 5. Endpoint index
 
-87 implemented client-facing endpoints: 72 registry operation
+88 implemented client-facing endpoints: 73 registry operation
 routes + 15 derived/API-layer routes (§6.17). A further 24
-auth/admin routes (§6.17) bring the live surface to 111 route
+auth/admin routes (§6.17) bring the live surface to 112 route
 records. ("Op" = returns `202` + operation, §3.) Specified but not
 implemented in v1: the gateway master key (decision 4), raw
 `PATCH /config` (decision 11), and the peripheral domains
@@ -425,7 +425,7 @@ no route.
 | Domain | Count | Endpoints |
 |---|---|---|
 | Server / status | 2 | `GET /server` (public identity), `GET /status` |
-| Backends | 18 | list, create, get, delete, config get/patch, diff preview, start/stop/restart (Op), test, flags, offload, mtp, parallel, raw flags, flags mode, launch command |
+| Backends | 19 | list, create, get, delete, config get/patch, diff preview, start/stop/restart (Op), test, flags, offload, mtp, parallel, raw flags, flags mode, group membership, launch command |
 | Models | 11 | list, create, get, delete, patch, download (Op) + pause/resume/cancel, verify (Op), assign |
 | Placement | 2 | propose, apply |
 | Gateway | 12 | status, config get/patch, generated config, start (Op), stop, groups list + CRUD (4), routing test, routing recent — plus master key specified, NOT IMPLEMENTED (§6.5) |
@@ -603,6 +603,22 @@ structured flags writes (`flags`, `offload`, `mtp`, placement
 apply, and the flags fields of `config` patches) refuse with
 `400 INVALID_INPUT` naming the mode.
 
+#### `PUT /api/v1/backends/{id}/group` — `config`
+`gateway_set_backend_group`. Body: `{ "group": "coder" }`, or
+`{ "group": null }` to ungroup → `{ "backend_id", "group",
+"removed_from": [ … ], "changed", "persisted" }`. Move
+semantics (predicted-throughput design §8.5): the backend's id
+is removed from every group's member list and appended to the
+target's — a backend is in at most one group, and a hand-edited
+multi-group membership collapses, with every group it left
+named in `removed_from`. Setting the group the backend already
+solely occupies (or ungrouping an ungrouped backend) succeeds
+with `changed: false` and no config write. The change persists
+immediately and is journaled for the Activation Plan like every
+other membership change; it takes effect at the next gateway
+activation. `404` for an unknown backend or group; `400` for an
+empty group name (pass `null` to ungroup).
+
 #### `GET /api/v1/backends/{id}/launch-command` — `read`
 `backend_get_launch_command` → `{ "id", "argv": [ … ] }` — the exact
 argv the supervisor will run, including the CUDA visibility
@@ -734,9 +750,17 @@ The `groups` array of `GET /gateway/config`.
 Read-modify-write over `update_gateway_config`: create, patch
 (`members`, `strategy`, `fallbacks`), or remove one group by name.
 `name` is the group's identity (groups have no separate id in the
-app). Derived endpoints — there is no group command in the app; the
-server performs the same merge the desktop UI performs. Renaming a
-group is delete + create.
+app). Derived endpoints; renaming a group is delete + create.
+The desktop Groups page (predicted-throughput design §8) uses
+the app's own membership operations instead —
+`gateway_set_backend_group` (§6.2), `gateway_create_group`, and
+`gateway_delete_group` — whose rules are stricter than these
+routes': the move enforces one-group-per-backend, create takes
+a slug name only and makes an empty group, and delete refuses a
+non-empty group where the DELETE above removes the group with
+its membership. The create/delete operations are routeless in
+the registry (see §6.16): these derived routes are their REST
+surface.
 
 #### `GET /api/v1/gateway/generated-config` — `read`
 `gateway_preview_yaml` → `200`, `Content-Type: text/yaml`, body the
@@ -1082,17 +1106,17 @@ operations the draft knew (`mcp_save_server`,
 
 ### 6.16 Registry exclusions — every operation with no route
 
-The registry holds 115 operations: 70 routed (§6.1–§6.14) and 45
-with route `None`. A `None` route is an explicit exclusion, never
-an oversight (registry module docs); the complete list, grouped by
-reason:
+The registry holds 120 operations: 73 routed (§6.1–§6.14,
+§6.18) and 47 with route `None`. A `None` route is an explicit
+exclusion, never an oversight (registry module docs); the
+complete list, grouped by reason:
 
 | Reason | Operations |
 |---|---|
 | Raw config patch excluded (decision 11) | `update_config` (C) |
 | Master-key value never mirrored (decision 4) | `gateway_master_key` (SDisclosure) |
 | Desktop-only actions (§7.1–7.2) | `open_url` (L), `open_folder` (L) |
-| No 1:1 route — served inside a composition | `gateway_set_bind_host` (C, inside `PATCH /gateway/config`); `model_set_short_name` (C) and `model_set_enabled` (C), inside `PATCH /models/{id}`; `gateway_activation_complete` (L, server bookkeeping after apply/(re)start, §6.6); `gateway_activation_record_execution` (C, execution bookkeeping recorded by the desktop apply funnel, §6.6) |
+| No 1:1 route — served inside a composition | `gateway_set_bind_host` (C, inside `PATCH /gateway/config`); `model_set_short_name` (C) and `model_set_enabled` (C), inside `PATCH /models/{id}`; `gateway_activation_complete` (L, server bookkeeping after apply/(re)start, §6.6); `gateway_activation_record_execution` (C, execution bookkeeping recorded by the desktop apply funnel, §6.6); `gateway_create_group` (C) and `gateway_delete_group` (D), served by the derived group routes (§6.5/§6.17) |
 | Desktop-only preview | `backend_add_preview` (R) — the add-backend form's placement preview; creation itself is `POST /backends` |
 | MCP — peripheral (decision 10) | `mcp_list` (R), `mcp_start_preflight` (R), `mcp_test_connection` (X), `mcp_set_exposure` (X), `mcp_save_server` (X), `mcp_delete_server` (X), `mcp_store_credential` (X), `backend_test_tool_call` (L, gateway MCP tool-call test) |
 | VS Code — peripheral (decision 10) | `vscode_install_extensions` (X), `vscode_write_config` (X) |
