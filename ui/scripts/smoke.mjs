@@ -150,6 +150,14 @@ check(allSrc.includes("function offloadSliderHtml"), "shared offloadSliderHtml r
 check(readFileSync(join(root, "src", "views", "optimize.ts"), "utf8").includes('class="view"><div id="optRoot"'),
   "Optimize view renders #optRoot inside the .view scroll container");
 
+// Gateway-stats banner contract (tracker #58): the "statistics are
+// not available yet" banner explains a transient that only exists
+// while the gateway is up and the metrics poller has not yet landed
+// two scrapes. It must stay gated on the gateway being up — shown
+// while the gateway is down, it blames a wait that cannot end.
+check(readFileSync(join(root, "src", "views", "dashboard.ts"), "utf8").includes("m.gateway !== null && m.gatewayUp &&"),
+  "dashboard gateway-stats banner requires the gateway to be up");
+
 check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
 check(bundle.includes("__TAURI__"), "bundle contains the Tauri detection hook");
