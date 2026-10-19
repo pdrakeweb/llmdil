@@ -102,6 +102,9 @@ check(unregistered.length === 0,
 // compiled fragments of that link contract must survive the build.
 check(bundle.includes("#/logs?scope="), "bundle contains the Logs deep link (#/logs?scope=)");
 check(bundle.includes("&follow=1"), "bundle contains the Logs deep-link follow flag (&follow=1)");
+// The Optimize page header links to its own log scope (tracker
+// #52): the scope+follow fragment must survive the build.
+check(bundle.includes("#/logs?scope=optimize&follow=1"), "bundle contains the Optimize logs deep link (#/logs?scope=optimize&follow=1)");
 // Enable/disable controls are the shared state switch (design rule
 // 16): the bundle must carry the switch markup contract, the shared
 // component must exist, both views that host toggles must render

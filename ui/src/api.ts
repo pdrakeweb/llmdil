@@ -2452,12 +2452,27 @@ export interface OptimizeExperiment {
   result: OptimizeExperimentResult | null;
 }
 
+/** A plan item excluded at plan build because a reference in it
+ *  could not be grounded (tracker #51): a backend.create whose
+ *  model is neither registered, nor in the catalog, nor among
+ *  the consultation's discovered candidates. Recorded on the
+ *  plan and stated in its summary; never offered as actionable. */
+export interface OptimizeExcludedItem {
+  kind: string;
+  target?: string | null;
+  reason: string;
+}
+
 export interface OptimizePlan {
   summary: string;
   /** Operator directive that scoped this consultation (addendum
    *  A.2), stored verbatim on the plan; "" when none. */
   directive: string;
   items: OptimizePlanItem[];
+  /** Items excluded at plan build for ungroundable references
+   *  (tracker #51); absent on plans written before the field,
+   *  hence optional in the type. */
+  excluded_items?: OptimizeExcludedItem[];
   /** Experiment proposals (Phase 5e); absent on plans written
    *  before 5e, hence optional in the type. */
   experiments?: OptimizeExperiment[];

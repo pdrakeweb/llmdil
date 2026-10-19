@@ -3409,6 +3409,87 @@ fn wizard_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord>, bool) {
     (records, has_previous)
 }
 
+/// Optimize pipeline output, persisted to
+/// `<data_dir>/logs/optimize.log` and served by `get_logs` as the
+/// `optimize` scope (tracker #52). The Optimize pipeline's
+/// decisions otherwise live only in the stored plan and the
+/// transient consultation response: when a plan comes back wrong
+/// (tracker #51's dead-end items) there was nothing to inspect.
+/// The optimize modules write very verbose, timestamped records
+/// of every consultation, parse, validation verdict, apply
+/// outcome, and experiment event through this one append.
+/// Appends are best-effort — logging must never fail the
+/// operation it describes. Rotation mirrors the wizard log: past
+/// ~1 MiB the file rotates to its `.prev` sibling
+/// (`optimize.log.prev`, via `prev_log_path`). Secret-free by
+/// construction: the only inputs are the operator's directive,
+/// the allowlist-built OptimizeContext document (sentinel-tested
+/// in manager-optimize), the consulted model's response to that
+/// document, and verdicts computed from them — no call site reads
+/// credential stores, environment values, or config fields
+/// outside the context document.
+pub(crate) fn append_optimize_log(data_dir: &std::path::Path, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let logs = data_dir.join("logs");
+    if std::fs::create_dir_all(&logs).is_err() {
+        return;
+    }
+    let path = logs.join("optimize.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 1_048_576 {
+            let _ = std::fs::rename(&path, prev_log_path(&path));
+        }
+    }
+    let mut text = String::new();
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
+/// File-backed optimize records for `get_logs` (mirrors
+/// `wizard_log_records`): newest last-2000 lines per file.
+fn optimize_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord>, bool) {
+    let logs = data_dir.join("logs");
+    let mut records = Vec::new();
+    let mut has_previous = false;
+    for archived in [true, false] {
+        let base = logs.join("optimize.log");
+        let path = if archived { prev_log_path(&base) } else { base };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if archived {
+            has_previous = true;
+        }
+        let ts = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map(chrono::DateTime::<chrono::Utc>::from)
+            .unwrap_or_else(|_| chrono::Utc::now());
+        let text = String::from_utf8_lossy(&bytes);
+        for line in text.lines().rev().take(2000) {
+            records.push(LogRecord {
+                ts,
+                stream: LogStream::Stdout,
+                line: line.to_string(),
+                source: "optimize".to_string(),
+                archived,
+            });
+        }
+    }
+    (records, has_previous)
+}
+
 /// Query captured logs. `scope` is a process id — live, stopped, or an
 /// id that also has an archived previous-run ring; querying the id
 /// returns current and archived lines merged — `"gateway"`, the
@@ -3454,7 +3535,8 @@ pub async fn op_get_logs(
     // Unfiltered fetch: filtering, merging with the file-backed
     // gateway records, ordering, and pagination happen here so every
     // source is treated identically.
-    let mut records: Vec<LogRecord> = if scope == "gateway" || scope == "wizard" {
+    let mut records: Vec<LogRecord> = if scope == "gateway" || scope == "wizard" || scope == "optimize"
+    {
         Vec::new()
     } else {
         sup.logs_query(&scope, None, None, usize::MAX).records
@@ -3476,6 +3558,13 @@ pub async fn op_get_logs(
         scopes.push(json!({ "id": "wizard", "previous": wizard_previous }));
         if scope == "all" || scope == "wizard" {
             records.extend(wizard_records);
+        }
+    }
+    let (optimize_records, optimize_previous) = optimize_log_records(&state.data_dir);
+    if !optimize_records.is_empty() {
+        scopes.push(json!({ "id": "optimize", "previous": optimize_previous }));
+        if scope == "all" || scope == "optimize" {
+            records.extend(optimize_records);
         }
     }
     if let Some(filter) = level.as_deref().and_then(LogLevelFilter::parse) {
@@ -7613,6 +7702,43 @@ mod tests {
         let mut cfg = AppConfig::default_config();
         cfg.data_dir = PathBuf::from("/data");
         cfg
+    }
+
+    #[test]
+    fn optimize_log_roundtrip_with_previous_file() {
+        // Tracker #52: the optimize scope's append/reader pair —
+        // lines land in logs/optimize.log under source "optimize",
+        // and a rotated optimize.log.prev reads back archived
+        // with has_previous set (the Logs-view scope contract).
+        let dir = std::env::temp_dir().join(format!(
+            "llm-mgr-optimize-log-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::write(
+            dir.join("logs").join("optimize.log.prev"),
+            "[2026-01-01T00:00:00Z] earlier run line\n",
+        )
+        .unwrap();
+        append_optimize_log(
+            &dir,
+            &["[2026-01-01T00:01:00Z] consultation start".to_string()],
+        );
+        append_optimize_log(&dir, &[]); // empty appends are no-ops
+        let (records, has_previous) = optimize_log_records(&dir);
+        assert!(has_previous);
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.source == "optimize"));
+        let archived: Vec<&LogRecord> = records.iter().filter(|r| r.archived).collect();
+        assert_eq!(archived.len(), 1);
+        assert!(archived[0].line.contains("earlier run line"));
+        let current: Vec<&LogRecord> = records.iter().filter(|r| !r.archived).collect();
+        assert_eq!(current.len(), 1);
+        assert!(current[0].line.contains("consultation start"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

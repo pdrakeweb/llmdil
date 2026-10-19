@@ -75,6 +75,8 @@ pub use measure::{
     LONG_PROMPT, MEASURED_RUNS, SHORT_MAX_TOKENS, SHORT_PROMPT,
 };
 pub use parse::{parse_plan, ParseError};
-pub use plan::{config_fingerprint, ApplyOutcome, Confidence, Decision, Plan, PlanItem, PlanKind};
+pub use plan::{
+    config_fingerprint, ApplyOutcome, Confidence, Decision, ExcludedItem, Plan, PlanItem, PlanKind,
+};
 pub use probe::{probe_hardware, HardwareProbe};
 pub use validate::{validate_plan, ItemValidation, LiveSnapshot, ValidationStatus};

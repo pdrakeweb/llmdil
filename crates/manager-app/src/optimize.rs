@@ -40,6 +40,102 @@ const CONSULT_TIMEOUT: Duration = Duration::from_secs(900);
 const MEASURE_RUN_TIMEOUT: Duration = Duration::from_secs(600);
 
 // ---------------------------------------------------------------------------
+// Optimize log (tracker #52): very verbose records of the whole
+// pipeline in <data_dir>/logs/optimize.log, served by get_logs as
+// the "optimize" scope. Written through crate::append_optimize_log
+// (the wizard/gateway file pattern); see that function for the
+// secret-free argument. Every line is stamped the way the wizard
+// log stamps its lines — the reader stamps records with the file
+// mtime, so the in-line stamp is what keeps the file readable on
+// its own.
+// ---------------------------------------------------------------------------
+
+fn opt_log_line(text: &str) -> String {
+    format!("[{}] {text}", chrono::Utc::now().to_rfc3339())
+}
+
+pub(crate) fn opt_log(state: &AppState, lines: &[String]) {
+    crate::append_optimize_log(&state.data_dir, lines);
+}
+
+pub(crate) fn opt_log1(state: &AppState, text: &str) {
+    opt_log(state, &[opt_log_line(text)]);
+}
+
+/// The context manifest for the log: the sections assembled with
+/// their counts, the byte sizes of what was sent, and the model
+/// sets the consultation was grounded in. Rendered ONLY from the
+/// context document itself — the manifest records exactly what
+/// the consulted model was told, and the document is
+/// allowlist-built (manager-optimize's context.rs sentinel test),
+/// so nothing outside it can reach the log through here.
+fn context_manifest_lines(context: &Value, system_prompt: &str, user_prompt: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut sections: Vec<String> = Vec::new();
+    if let Some(obj) = context.as_object() {
+        for (key, value) in obj {
+            let size = match value {
+                Value::Array(a) => format!("{} entries", a.len()),
+                Value::Object(o) => format!("{} fields", o.len()),
+                _ => "scalar".to_string(),
+            };
+            sections.push(format!("{key} ({size})"));
+        }
+    }
+    lines.push(opt_log_line(&format!(
+        "context manifest: sections: {}",
+        sections.join(", ")
+    )));
+    lines.push(opt_log_line(&format!(
+        "context manifest: sizes: system prompt {} bytes, user prompt {} bytes, context document {} bytes",
+        system_prompt.len(),
+        user_prompt.len(),
+        serde_json::to_string(context).map(|s| s.len()).unwrap_or(0)
+    )));
+    let ids = |key: &str| -> Vec<String> {
+        context
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    lines.push(opt_log_line(&format!(
+        "context manifest: registered models sent: [{}]",
+        ids("models").join(", ")
+    )));
+    lines.push(opt_log_line(&format!(
+        "context manifest: catalog candidates sent: [{}]",
+        ids("catalog_candidates").join(", ")
+    )));
+    let candidates: Vec<String> = context
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let repo = c.get("repo_id")?.as_str()?;
+                    let file = c.get("file")?.as_str()?;
+                    let params = c
+                        .get("params_b")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    Some(format!("{repo}/{file} (params_b {params})"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    lines.push(opt_log_line(&format!(
+        "context manifest: discovery candidates sent: [{}]",
+        candidates.join(", ")
+    )));
+    lines
+}
+
+// ---------------------------------------------------------------------------
 // Plan persistence (<data_dir>/optimize-plan.json)
 // ---------------------------------------------------------------------------
 
@@ -729,16 +825,35 @@ pub async fn op_optimize_consult(
     };
     let (system_prompt, user_prompt) = build_prompts(&purpose, &directive, &context, &meta);
 
+    // Optimize log (tracker #52): the consultation's start and
+    // the manifest of what the consulted model is about to be
+    // told. The directive is the operator's own input.
+    {
+        let mut lines = vec![opt_log_line(&format!(
+            "consultation start: backend '{target}'{}; directive: {}",
+            if sample { " (sample)" } else { "" },
+            if directive.is_empty() {
+                "(none)".to_string()
+            } else {
+                format!("'{directive}'")
+            }
+        ))];
+        lines.extend(context_manifest_lines(&context, &system_prompt, &user_prompt));
+        opt_log(state, &lines);
+    }
+
     // Context-fit pre-check (design §3): the assembled prompt plus
     // the response budget must fit the consulted model's context.
     if !sample {
         let est = estimate_tokens(&system_prompt) + estimate_tokens(&user_prompt);
         let n_ctx = backend.flags.n_ctx as usize;
         if est + CONSULT_MAX_TOKENS as usize > n_ctx {
-            return Err(ApiError::InvalidInput(format!(
+            let msg = format!(
                 "the assembled context is ~{est} tokens (estimated at 4 characters per token); with the {CONSULT_MAX_TOKENS}-token response budget it needs {} tokens, over backend '{target}'s configured context of {n_ctx} — pick a backend with a larger context",
                 est + CONSULT_MAX_TOKENS as usize
-            )));
+            );
+            opt_log1(state, &format!("consultation refused: {msg}"));
+            return Err(ApiError::InvalidInput(msg));
         }
     }
 
@@ -804,6 +919,10 @@ pub async fn op_optimize_consult(
         }
         match outcome {
             None => {
+                opt_log1(
+                    state,
+                    &format!("consultation cancelled by operator (backend '{target}')"),
+                );
                 state
                     .finish_task(
                         &task_id,
@@ -814,6 +933,10 @@ pub async fn op_optimize_consult(
                 return Err(ApiError::InvalidInput("consultation cancelled".to_string()));
             }
             Some(Err(e)) => {
+                opt_log1(
+                    state,
+                    &format!("consultation failed: backend '{target}' error: {e}"),
+                );
                 state
                     .finish_task(
                         &task_id,
@@ -828,6 +951,20 @@ pub async fn op_optimize_consult(
             Some(Ok(result)) => result.content,
         }
     };
+
+    // The FULL raw response, before parsing (tracker #52): when a
+    // plan comes back wrong, this plus the manifest and the
+    // verdicts below are the whole diagnosis.
+    {
+        let mut lines = vec![opt_log_line(&format!(
+            "raw consultation response from '{target}' ({} bytes):",
+            response_text.len()
+        ))];
+        for line in response_text.lines() {
+            lines.push(opt_log_line(line));
+        }
+        opt_log(state, &lines);
+    }
 
     // Denial memory: everything denied so far — the stored set
     // plus the outgoing plan's denied items — pre-denies matches
@@ -854,6 +991,7 @@ pub async fn op_optimize_consult(
     ) {
         Ok(p) => p,
         Err(e) => {
+            opt_log1(state, &format!("parse failed: {e}"));
             state
                 .finish_task(
                     &task_id,
@@ -862,10 +1000,56 @@ pub async fn op_optimize_consult(
                 )
                 .await;
             return Err(ApiError::InvalidInput(format!(
-                "the backend's response could not be parsed: {e} — the raw response is not kept; try again or consult a different backend"
+                "the backend's response could not be parsed: {e} — the raw response is in the Optimize log (Logs view, scope 'optimize'); try again or consult a different backend"
             )));
         }
     };
+    // Per-item parse results, plan-build exclusions (tracker
+    // #51), and per-item validation verdicts WITH reasons
+    // (tracker #52) — the verdict lines are what would have
+    // diagnosed a dead-end plan item in one look.
+    {
+        let mut lines = vec![opt_log_line(&format!(
+            "parse result: {} items, {} excluded at plan build, {} dropped invalid, {} experiments",
+            plan.items.len(),
+            plan.excluded_items.len(),
+            plan.dropped_invalid,
+            plan.experiments.len()
+        ))];
+        for item in &plan.items {
+            lines.push(opt_log_line(&format!(
+                "parse item {}: {:?} target={} decision={:?} fingerprint={}",
+                item.id,
+                item.kind,
+                item.target.as_deref().unwrap_or("-"),
+                item.decision,
+                item.fingerprint
+            )));
+        }
+        for ex in &plan.excluded_items {
+            lines.push(opt_log_line(&format!(
+                "excluded at plan build: {:?} target={} — {}",
+                ex.kind,
+                ex.target.as_deref().unwrap_or("-"),
+                ex.reason
+            )));
+        }
+        let verdicts = validate_plan(&plan, &cfg, &gathered.live);
+        for (item, v) in plan.items.iter().zip(verdicts.iter()) {
+            lines.push(opt_log_line(&format!(
+                "validation: item {} ({:?} {}) -> {:?}{}",
+                item.id,
+                item.kind,
+                item.target.as_deref().unwrap_or("-"),
+                v.status,
+                v.reason
+                    .as_ref()
+                    .map(|r| format!(": {r}"))
+                    .unwrap_or_default()
+            )));
+        }
+        opt_log(state, &lines);
+    }
     for item in &plan.items {
         if item.decision == Decision::Denied {
             denied.insert(item.fingerprint.clone());
@@ -906,16 +1090,35 @@ pub async fn op_optimize_discover(
             "candidate discovery needs a directive: enter one to seed the search".to_string(),
         ));
     }
+    opt_log1(state, &format!("discovery start: directive '{directive}'"));
     let cfg = state.config.read().await.clone();
     let gathered = gather(state, &cfg).await;
     let free_vram = gathered.live.free_vram_mib_per_gpu.clone();
     let retrieved_at = chrono::Utc::now().to_rfc3339();
-    let client = HfClient::with_default_base()
-        .map_err(|e| ApiError::InvalidInput(format!("candidate discovery failed: {e}")))?;
+    let client = HfClient::with_default_base().map_err(|e| {
+        opt_log1(state, &format!("discovery failed: {e}"));
+        ApiError::InvalidInput(format!("candidate discovery failed: {e}"))
+    })?;
     let candidates = client
         .discover(&directive, &free_vram, &retrieved_at)
         .await
-        .map_err(|e| ApiError::InvalidInput(format!("candidate discovery failed: {e}")))?;
+        .map_err(|e| {
+            opt_log1(state, &format!("discovery failed: {e}"));
+            ApiError::InvalidInput(format!("candidate discovery failed: {e}"))
+        })?;
+    {
+        let mut lines = vec![opt_log_line(&format!(
+            "discovery result: {} candidates",
+            candidates.len()
+        ))];
+        for c in &candidates {
+            lines.push(opt_log_line(&format!(
+                "discovery candidate: {}/{} params_b={} size_bytes={} fit={}",
+                c.repo_id, c.file, c.params_b, c.size_bytes, c.fit
+            )));
+        }
+        opt_log(state, &lines);
+    }
     save_candidates_file(
         state,
         &CandidatesFile {
@@ -992,6 +1195,12 @@ pub async fn op_optimize_measure_backend(
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| backend.id.clone())
         });
+    opt_log1(
+        state,
+        &format!(
+            "measurement start: backend '{backend_id}' model '{model_id}' fingerprint {fingerprint}"
+        ),
+    );
     let task_id = state
         .record_task(
             "optimize-measure",
@@ -1082,6 +1291,10 @@ pub async fn op_optimize_measure_backend(
     }
     let entry = match outcome {
         None => {
+            opt_log1(
+                state,
+                &format!("measurement cancelled (backend '{backend_id}')"),
+            );
             state
                 .finish_task(
                     &task_id,
@@ -1092,6 +1305,10 @@ pub async fn op_optimize_measure_backend(
             return Err(ApiError::InvalidInput("measurement cancelled".to_string()));
         }
         Some(Err(e)) => {
+            opt_log1(
+                state,
+                &format!("measurement failed: backend '{backend_id}': {e}"),
+            );
             state
                 .finish_task(
                     &task_id,
@@ -1105,6 +1322,23 @@ pub async fn op_optimize_measure_backend(
         }
         Some(Ok(entry)) => entry,
     };
+    {
+        let rate = |v: Option<f64>| {
+            v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".to_string())
+        };
+        opt_log1(
+            state,
+            &format!(
+                "measurement result: backend '{}' model '{}': generation {} tok/s (short), {} tok/s (long); prompt {} tok/s; TTFT {} ms",
+                entry.backend_id,
+                entry.model_id,
+                rate(entry.short.predicted_per_second),
+                rate(entry.long.predicted_per_second),
+                rate(entry.long.prompt_per_second.or(entry.short.prompt_per_second)),
+                rate(entry.short.ttft_ms.or(entry.long.ttft_ms))
+            ),
+        );
+    }
     let mut store = MeasurementStore::load(&measurements_path(state));
     store.upsert(entry);
     store.save(&measurements_path(state)).map_err(ApiError::InvalidInput)?;
@@ -1175,6 +1409,14 @@ pub async fn op_optimize_set_item_state(
             file.denied_fingerprints.push(fp);
         }
     }
+    opt_log1(
+        state,
+        &format!(
+            "item {item_id} decision -> {decision:?} ({:?} {})",
+            item.kind,
+            item.target.as_deref().unwrap_or("-")
+        ),
+    );
     save_plan_file(state, &file).map_err(ApiError::InvalidInput)?;
     state_payload(state).await
 }
@@ -1208,12 +1450,28 @@ pub async fn op_optimize_set_item_outcome(
         .iter_mut()
         .find(|i| i.id == item_id)
         .ok_or_else(|| ApiError::NotFound(format!("plan item {item_id}")))?;
-    item.apply_outcome = Some(outcome);
-    item.apply_error = if outcome == manager_optimize::ApplyOutcome::Failed {
+    let apply_error = if outcome == manager_optimize::ApplyOutcome::Failed {
         error
     } else {
         None
     };
+    // The server-visible apply trail (tracker #52): the UI
+    // orchestrates apply through the mutation commands, so these
+    // outcome records are where per-item apply results land.
+    opt_log1(
+        state,
+        &format!(
+            "apply outcome: item {item_id} ({:?} {}) -> {outcome:?}{}",
+            item.kind,
+            item.target.as_deref().unwrap_or("-"),
+            apply_error
+                .as_ref()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default()
+        ),
+    );
+    item.apply_outcome = Some(outcome);
+    item.apply_error = apply_error;
     save_plan_file(state, &file).map_err(ApiError::InvalidInput)?;
     state_payload(state).await
 }

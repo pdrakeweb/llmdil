@@ -622,6 +622,7 @@ Allowed kinds and their change payloads:
 Constraints:
 - When the user prompt carries an operator directive for this consultation, proposals must serve that directive; layout changes unrelated to it belong in an advice item at most, not as executable changes.
 - Only these kinds. Only ids, group names, and model ids that appear in the context document (catalog candidates appear there too). A model that is neither registered nor in the catalog can only be proposed via model.add.
+- A backend.create's model_id must be one of: a registered model id, a catalog candidate id, or a repo id (or repo/file) from the \"candidates\" section. When it names a catalog candidate or a discovered candidate, the app inserts the registering model.add ahead of the create itself, so you do not need to propose that add. Any other model name is dropped from the plan at build time — never invent a model id.
 - Never propose raw llama-server flags. Flag changes are expressed only through the structured fields above; anything that needs a raw flag belongs in an advice item.
 - tensor_split fractions must sum to 1.0 and have one entry per GPU.
 - At most 12 items. Prefer a few high-value changes over a wholesale rewrite. Proposing no changes (an empty items list) is a valid answer.
