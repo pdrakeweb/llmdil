@@ -19,12 +19,13 @@ use serde_json::{json, Value};
 use manager_config::AppConfig;
 use manager_optimize::{
     benchmark_prompts, build_context, build_prompts, config_fingerprint, consult_default,
-    default_purpose_seed, estimate_prompts, estimate_tokens, measurement_facts,
+    default_purpose_seed, estimate_prompts, estimate_tokens, headline_figures, measurement_facts,
     measurement_fingerprint, parse_plan, probe_hardware, validate_plan, BackendMeasured,
     BenchResult, BenchmarkPrompt, CandidateFact, ConsultCandidate, Decision, EstimateEntry,
     HardwareContext, HfClient, ItemValidation, LayoutFacts, LiveSnapshot, MeasureInputs,
-    MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, Plan, TrafficWindow,
-    ValidationStatus, BENCHMARK_TEMPERATURE, ESTIMATE_RUNS, MEASURED_RUNS,
+    MeasurementEntry, MeasurementFingerprintInputs, MeasurementInputs, MeasurementSource,
+    MeasurementStore, Plan, TrafficWindow, ValidationStatus, BENCHMARK_TEMPERATURE, ESTIMATE_RUNS,
+    MEASURED_RUNS,
 };
 use manager_supervisor::ProcessState;
 
@@ -232,7 +233,7 @@ fn candidates_json(file: &CandidatesFile) -> Value {
 /// snapshot). An undetermined placement fingerprints against
 /// the whole GPU set — the launch is unrestricted then, so any
 /// GPU could be doing the work.
-fn fingerprint_inputs(
+pub(crate) fn fingerprint_inputs(
     cfg: &AppConfig,
     b: &manager_config::BackendConfig,
     gpus: &[(u32, String)],
@@ -281,6 +282,44 @@ fn fingerprint_inputs(
     }
 }
 
+/// The hash-or-size identity a v2 measurement entry records
+/// (design §4.2): the verified SHA-256 (trimmed, lowercased —
+/// the form the fingerprint hashes) when the fingerprint used
+/// it, else the file size. Exactly one of the two is `Some`:
+/// the identity the fingerprint actually used.
+pub(crate) fn entry_identity(
+    inputs: &MeasurementFingerprintInputs,
+) -> (Option<String>, Option<u64>) {
+    match inputs
+        .verified_sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(sha) => (Some(sha.to_lowercase()), None),
+        None => (None, inputs.file_size_bytes),
+    }
+}
+
+/// The driver versions of an input set's GPU set (design
+/// §4.2), deduplicated, in GPU-index order.
+pub(crate) fn driver_versions_for(
+    inputs: &MeasurementFingerprintInputs,
+    drivers: &HashMap<u32, String>,
+) -> Vec<String> {
+    let mut indices: Vec<u32> = inputs.gpus.iter().map(|(i, _)| *i).collect();
+    indices.sort_unstable();
+    let mut out: Vec<String> = Vec::new();
+    for i in indices {
+        if let Some(v) = drivers.get(&i) {
+            if !v.is_empty() && !out.contains(v) {
+                out.push(v.clone());
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Input gathering: everything the pure core needs from the live app
 // ---------------------------------------------------------------------------
@@ -294,12 +333,20 @@ pub(crate) struct Gathered {
     /// fingerprint (§A.1), computed from the same snapshot the
     /// context is built from.
     pub(crate) fingerprints: HashMap<String, String>,
+    /// Each configured backend's resolved fingerprint inputs —
+    /// the readable snapshot a v2 measurement entry records
+    /// (design §4.3), from the same resolution that produced
+    /// `fingerprints`.
+    pub(crate) input_sets: HashMap<String, MeasurementFingerprintInputs>,
+    /// GPU driver version by GPU index, from the telemetry
+    /// inventory — the environment a new measurement records.
+    pub(crate) gpu_driver_versions: HashMap<u32, String>,
 }
 
 pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
     // Telemetry snapshot (GPU inventory, per-process VRAM, peaks).
     let store = state.telemetry().await;
-    let (samples, processes, temp_peaks_c) = {
+    let (samples, processes, temp_peaks_c, gpu_driver_versions) = {
         let guard = crate::lock_telemetry(&store);
         let samples = guard.snapshot();
         let processes = guard.last_processes().to_vec();
@@ -312,7 +359,12 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
                     .map(|m| (s.index, m.value))
             })
             .collect();
-        (samples, processes, peaks)
+        let drivers: HashMap<u32, String> = guard
+            .inventory()
+            .iter()
+            .map(|g| (g.index, g.driver_version.clone()))
+            .collect();
+        (samples, processes, peaks, drivers)
     };
     // Supervisor statuses (reap first so stale pids do not
     // attribute VRAM to recycled processes).
@@ -425,11 +477,11 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
         .map(|s| (s.index, s.name.clone()))
         .collect();
     let mut fingerprints: HashMap<String, String> = HashMap::new();
+    let mut input_sets: HashMap<String, MeasurementFingerprintInputs> = HashMap::new();
     for b in &cfg.backends {
-        fingerprints.insert(
-            b.id.clone(),
-            measurement_fingerprint(&fingerprint_inputs(cfg, b, &gpu_pairs)),
-        );
+        let inputs = fingerprint_inputs(cfg, b, &gpu_pairs);
+        fingerprints.insert(b.id.clone(), measurement_fingerprint(&inputs));
+        input_sets.insert(b.id.clone(), inputs);
     }
     let store = MeasurementStore::load(&measurements_path(state));
     measure.throughput = measurement_facts(&store, &fingerprints, chrono::Utc::now());
@@ -518,6 +570,8 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
         candidates,
         running,
         fingerprints,
+        input_sets,
+        gpu_driver_versions,
     }
 }
 
@@ -622,14 +676,14 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
     // figures but carried under their own key and basis: the
     // page renders them as "Estimate", and they never enter
     // `gathered.measure.throughput` (the consultation facts).
-    let estimate_store = MeasurementStore::load(&measurements_path(state));
+    let store = MeasurementStore::load(&measurements_path(state));
     let now_utc = chrono::Utc::now();
     let estimated_by_backend: HashMap<String, Value> = cfg
         .backends
         .iter()
         .filter_map(|b| {
             let fp = gathered.fingerprints.get(&b.id)?;
-            let e = estimate_store.current_estimate(&b.id, fp)?;
+            let e = store.current_estimate(&b.id, fp)?;
             let estimated_at = chrono::DateTime::parse_from_rfc3339(&e.estimated_at)
                 .map(|t| t.with_timezone(&chrono::Utc))
                 .unwrap_or(now_utc);
@@ -646,6 +700,42 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
                     "age_secs": age_secs,
                 }),
             ))
+        })
+        .collect();
+    // The Measurements history (predicted-throughput design
+    // §10): every stored entry with its v2 provenance, each
+    // annotated with the configured backends whose prediction
+    // currently resolves to it — the fingerprint-only lookup
+    // winner for the backend's current fingerprint. The winner
+    // is identified by position in the store so duplicate
+    // (fingerprint, timestamp) entries annotate exactly the
+    // entry lookup surfaces.
+    let winner_index: HashMap<String, usize> = cfg
+        .backends
+        .iter()
+        .filter_map(|b| {
+            let fp = gathered.fingerprints.get(&b.id)?;
+            let winner = store.lookup(fp)?;
+            let idx = store
+                .entries
+                .iter()
+                .position(|e| std::ptr::eq(e, winner))?;
+            Some((b.id.clone(), idx))
+        })
+        .collect();
+    let measurements_json: Vec<Value> = store
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(idx, e)| {
+            let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
+            let current_for: Vec<String> = winner_index
+                .iter()
+                .filter(|(_, i)| **i == idx)
+                .map(|(id, _)| id.clone())
+                .collect();
+            v["current_for"] = json!(current_for);
+            v
         })
         .collect();
     let purpose = cfg.optimize_purpose.clone();
@@ -692,6 +782,14 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
                 "short_name": model.map(|m| manager_optimize::model_short_name(&cfg, m)),
                 "measured": measured,
                 "estimated": estimated_by_backend.get(&b.id).cloned(),
+                // The backend's current configuration in the
+                // history view's terms (§10): its fingerprint
+                // and readable inputs, so an entry's differing
+                // fields can be named against it.
+                "current_fingerprint": gathered.fingerprints.get(&b.id),
+                "current_inputs": gathered.input_sets.get(&b.id)
+                    .map(|i| serde_json::to_value(MeasurementInputs::from_fingerprint_inputs(i))
+                        .unwrap_or(Value::Null)),
             })
         }).collect::<Vec<_>>(),
         "context_summary": {
@@ -717,10 +815,295 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
             _ => None,
         },
         "plan": plan_json,
+        "measurements": measurements_json,
         "candidates": candidates_json(&load_candidates_file(state)),
         "eval_baseline": crate::optimize_eval::eval_baseline_json(state, &gathered.fingerprints),
         "consulting": state.optimize_abort.lock().await.is_some(),
         "measuring": state.optimize_job_abort.lock().await.is_some(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Predicted throughput (predicted-throughput design §5–§7)
+// ---------------------------------------------------------------------------
+
+/// The JSON shape of one resolved measurement, shared by the
+/// lookup's exact/near results and the `predicted` field of a
+/// list_backends row (§7: same shape): the headline figures
+/// composed the one way every surface composes them, plus the
+/// provenance the surfaces disclose — measured date, source,
+/// app version, driver and llama build (§5.5), and the inputs
+/// snapshot the tooltip and history name (§4.3).
+pub(crate) fn predicted_json(entry: &MeasurementEntry) -> Value {
+    let figures = headline_figures(entry);
+    json!({
+        "prompt_per_second": figures.prompt_per_second,
+        "predicted_per_second": figures.predicted_per_second,
+        "ttft_ms": figures.ttft_ms,
+        "measured_at": entry.measured_at,
+        "source": entry.source,
+        "backend_id": entry.backend_id,
+        "origin_backend_id": entry.origin_backend_id,
+        "model_id": entry.model_id,
+        "model_file": entry.model_file,
+        "app_version": entry.app_version,
+        "driver_version": entry.driver_version,
+        "llama_build": entry.llama_build,
+        "inputs": entry.inputs,
+    })
+}
+
+/// The draft a `measurement_lookup` request carries (design
+/// §6.2): the form's full draft state, not a delta. The Edit
+/// Flags form sends `backend_id` and merges over the saved
+/// backend; the Add Backend form sends `model_id` and resolves
+/// the configuration creation would build. `parallel_slots`
+/// null is the field's Auto state (no token), not an absence;
+/// `raw_flags` present is the advanced editor's text (§6.2,
+/// tracker #60) and supersedes the structured flag fields.
+#[derive(Debug, Deserialize)]
+pub(crate) struct MeasurementLookupRequest {
+    pub backend_id: Option<String>,
+    pub model_id: Option<String>,
+    pub n_ctx: Option<u32>,
+    pub n_batch: Option<u32>,
+    pub offload_layers: Option<u32>,
+    pub mtp_position: Option<u32>,
+    pub parallel_slots: Option<i64>,
+    pub gpu_indices: Option<Vec<u32>>,
+    pub raw_flags: Option<String>,
+}
+
+/// Resolve a lookup draft to the backend configuration it
+/// describes — the one resolver for the form line, shared by
+/// every surface that resolves a draft (§11). The Edit form
+/// path clones the saved backend and applies each structured
+/// field ONLY where the draft differs from the saved
+/// configuration's decoded state: a save op would rewrite its
+/// tokens canonically, so applying a rewrite for an unchanged
+/// value would fingerprint a string no save produced (a
+/// catalog-default offload position, an MTP length llama.cpp
+/// defaults, a `-np` spelling) and miss the measurement the
+/// card shows for the saved configuration. A changed value
+/// goes through the same pure transformation its save op
+/// uses, so the resolved fingerprint is the saved
+/// configuration's fingerprint the moment the draft is saved.
+async fn resolve_lookup_backend(
+    state: &std::sync::Arc<AppState>,
+    cfg: &AppConfig,
+    req: &MeasurementLookupRequest,
+) -> Result<manager_config::BackendConfig, ApiError> {
+    if let Some(backend_id) = &req.backend_id {
+        let saved = cfg
+            .backends
+            .iter()
+            .find(|b| &b.id == backend_id)
+            .ok_or_else(|| ApiError::NotFound(format!("backend {backend_id}")))?;
+        let mut merged = saved.clone();
+        if let Some(n) = req.n_ctx {
+            merged.flags.n_ctx = n;
+        }
+        if let Some(n) = req.n_batch {
+            merged.flags.n_batch = n;
+        }
+        if let Some(raw) = &req.raw_flags {
+            // Advanced mode (§6.2): the text is the single
+            // source of truth; the structured fields are inert.
+            merged.raw_flags = if raw.trim().is_empty() {
+                None
+            } else {
+                Some(raw.clone())
+            };
+        } else {
+            if let Some(layers) = req.offload_layers {
+                if let Some(info) = crate::backend_offload_info(cfg, &merged) {
+                    if layers != info.layers {
+                        let target =
+                            manager_models::offload_for_layers(layers, info.moe_layers);
+                        merged.raw_flags = manager_models::set_expert_offload(
+                            merged.raw_flags.as_deref(),
+                            target,
+                        );
+                    }
+                }
+            }
+            if let Some(pos) = req.mtp_position {
+                if let Some(info) = crate::backend_mtp_info(cfg, &merged) {
+                    let decoded = if info.enabled {
+                        info.n_max.unwrap_or(manager_models::LLAMA_CPP_N_MAX_DEFAULT)
+                    } else {
+                        0
+                    };
+                    if pos != decoded {
+                        merged.raw_flags = manager_models::set_mtp_draft(
+                            merged.raw_flags.as_deref(),
+                            if pos == 0 {
+                                manager_models::MtpDraft::Off
+                            } else {
+                                manager_models::MtpDraft::On(Some(pos))
+                            },
+                        );
+                    }
+                }
+            }
+            let saved_slots = crate::backend_parallel_info(&merged).slots;
+            if req.parallel_slots != saved_slots {
+                merged.raw_flags = manager_models::set_parallel_slots(
+                    merged.raw_flags.as_deref(),
+                    req.parallel_slots,
+                );
+            }
+        }
+        return Ok(merged);
+    }
+    let model_id = req.model_id.as_deref().ok_or_else(|| {
+        ApiError::InvalidInput(
+            "measurement_lookup needs a backend_id or a model_id".to_string(),
+        )
+    })?;
+    let model = cfg
+        .models
+        .iter()
+        .find(|m| m.id == model_id)
+        .ok_or_else(|| ApiError::NotFound(format!("model {model_id}")))?;
+    // The configuration creation would build (op_backend_add):
+    // the form's context/batch or the creation defaults, the
+    // placement from the GPU selection or the telemetry
+    // assignment, the catalog default offload as the raw-flags
+    // baseline.
+    let (tensor_split, split_mode) = match &req.gpu_indices {
+        Some(selected) => {
+            let store = state.telemetry().await;
+            let inventory = crate::lock_telemetry(&store).inventory();
+            let indices: Vec<u32> = inventory.iter().map(|g| g.index).collect();
+            crate::split_for_gpu_selection(&indices, selected)?
+        }
+        None => match crate::propose_new_backend_split(state, model_id).await {
+            Some((split, mode)) => (split, mode),
+            None => (Vec::new(), manager_config::SplitMode::None),
+        },
+    };
+    let mut backend = manager_config::BackendConfig {
+        id: String::new(),
+        enabled: true,
+        model_file: model.gguf_path.clone(),
+        port: 0,
+        flags: manager_config::ServerFlags {
+            n_ctx: req.n_ctx.unwrap_or(32768),
+            n_batch: req.n_batch.unwrap_or(512),
+            tensor_split,
+            split_mode,
+        },
+        raw_flags: crate::catalog_default_raw_flags(&model.id),
+        flags_advanced: false,
+        restart_policy: manager_config::RestartPolicy {
+            max_retries: 5,
+            backoff_base_secs: 2,
+        },
+        overrides_global: false,
+        tool_call_probe: None,
+        purpose: String::new(),
+    };
+    if let Some(raw) = &req.raw_flags {
+        backend.raw_flags = if raw.trim().is_empty() {
+            None
+        } else {
+            Some(raw.clone())
+        };
+    } else {
+        if let Some(layers) = req.offload_layers {
+            if let Some(info) = crate::backend_offload_info(cfg, &backend) {
+                let target = manager_models::offload_for_layers(layers, info.moe_layers);
+                backend.raw_flags =
+                    manager_models::set_expert_offload(backend.raw_flags.as_deref(), target);
+            }
+        }
+        if let Some(slots) = req.parallel_slots {
+            backend.raw_flags =
+                manager_models::set_parallel_slots(backend.raw_flags.as_deref(), Some(slots));
+        }
+    }
+    Ok(backend)
+}
+
+/// Resolve a form draft and answer with its exact and nearest
+/// near measurement (design §6.2): the fingerprint is computed
+/// through the same resolution path the Measure action uses,
+/// so the form, the card, and the consultation state the same
+/// numbers for the same configuration.
+pub async fn op_measurement_lookup(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
+    request: Value,
+) -> crate::ApiResult {
+    let req: MeasurementLookupRequest = serde_json::from_value(request)
+        .map_err(|e| ApiError::InvalidInput(format!("invalid measurement_lookup request: {e}")))?;
+    let cfg = state.config.read().await.clone();
+    let resolved = resolve_lookup_backend(state, &cfg, &req).await?;
+    let gpu_pairs: Vec<(u32, String)> = {
+        let store = state.telemetry().await;
+        let guard = crate::lock_telemetry(&store);
+        guard
+            .snapshot()
+            .iter()
+            .map(|s| (s.index, s.name.clone()))
+            .collect()
+    };
+    let inputs = fingerprint_inputs(&cfg, &resolved, &gpu_pairs);
+    let fingerprint = measurement_fingerprint(&inputs);
+    let store = MeasurementStore::load(&measurements_path(state));
+    let exact = store.lookup(&fingerprint);
+    let near = if exact.is_none() {
+        let model_id = crate::model_for_backend(&cfg, &resolved)
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| {
+                resolved
+                    .model_file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+        let (sha, size) = entry_identity(&inputs);
+        let target = MeasurementInputs::from_fingerprint_inputs(&inputs);
+        store
+            .near_match(&model_id, sha.as_deref(), size, &target)
+            .map(|(entry, diffs)| {
+                let mut v = predicted_json(entry);
+                v["differs"] = json!(diffs);
+                v
+            })
+    } else {
+        None
+    };
+    Ok(json!({
+        "fingerprint": fingerprint,
+        "exact": exact.map(predicted_json),
+        "near": near,
+    }))
+}
+
+/// Delete one stored measurement (design §10), identified by
+/// (fingerprint, measured_at). Deleting the entry a prediction
+/// resolves to removes the prediction at the next payload.
+pub async fn op_measurement_delete(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
+    fingerprint: String,
+    measured_at: String,
+) -> crate::ApiResult {
+    let mut store = MeasurementStore::load(&measurements_path(state));
+    if !store.delete(&fingerprint, &measured_at) {
+        return Err(ApiError::NotFound(
+            "measurement entry not found".to_string(),
+        ));
+    }
+    store
+        .save(&measurements_path(state))
+        .map_err(ApiError::InvalidInput)?;
+    Ok(json!({
+        "deleted": true,
+        "fingerprint": fingerprint,
+        "measured_at": measured_at,
     }))
 }
 
@@ -1242,22 +1625,30 @@ pub(crate) async fn benchmark_one_prompt(
     Ok(BenchResult::from_runs(samples))
 }
 
+/// A resolved benchmark-job target (see [`benchmark_target`]).
+struct BenchmarkTarget {
+    backend: manager_config::BackendConfig,
+    fingerprint: String,
+    model_id: String,
+    /// The resolved fingerprint inputs: the v2 entry's
+    /// recorded snapshot and hash-or-size identity.
+    inputs: MeasurementFingerprintInputs,
+    /// Driver versions of the fingerprint's GPU set, from the
+    /// telemetry snapshot the inputs were resolved against.
+    driver_versions: Vec<String>,
+}
+
 /// Resolve the target of a benchmark job (measurement or
 /// estimate): the backend's config, its current measurement
-/// fingerprint, and its model id. Benchmark jobs run only
-/// against a running backend — neither starts one.
+/// fingerprint, its model id, and the resolved fingerprint
+/// inputs (the v2 entry's recorded snapshot and identity).
+/// Benchmark jobs run only against a running backend — neither
+/// starts one.
 async fn benchmark_target(
     state: &AppState,
     backend_id: &str,
     job_noun: &str,
-) -> Result<
-    (
-        manager_config::BackendConfig,
-        String,
-        String,
-    ),
-    ApiError,
-> {
+) -> Result<BenchmarkTarget, ApiError> {
     let cfg = state.config.read().await.clone();
     let backend = cfg
         .backends
@@ -1285,16 +1676,29 @@ async fn benchmark_target(
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| backend.id.clone())
         });
-    Ok((backend, fingerprint, model_id))
+    let inputs = gathered
+        .input_sets
+        .get(backend_id)
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound(format!("backend {backend_id}")))?;
+    let driver_versions = driver_versions_for(&inputs, &gathered.gpu_driver_versions);
+    Ok(BenchmarkTarget {
+        backend,
+        fingerprint,
+        model_id,
+        inputs,
+        driver_versions,
+    })
 }
 
 /// Measure one running backend (Phase 5a, §A.1): the
 /// standardized benchmark — one discarded warm-up then three
 /// measured runs per prompt, short then long, sequentially —
 /// against the backend's loopback port, under the shared
-/// GPU-job slot with scoped cancellation. The result replaces
-/// any entry under the same config fingerprint in the
-/// measurement store; the backend is never started, stopped,
+/// GPU-job slot with scoped cancellation. The result is
+/// appended to the measurement store under the backend's
+/// config fingerprint (store v2 append semantics — lookup
+/// takes the newest); the backend is never started, stopped,
 /// or reconfigured.
 pub async fn op_optimize_measure_backend(
     state: &std::sync::Arc<crate::AppState>,
@@ -1309,8 +1713,10 @@ pub async fn op_optimize_measure_backend(
             ));
         }
     }
-    let (backend, fingerprint, model_id) =
-        benchmark_target(state, &backend_id, "measurements").await?;
+    let target = benchmark_target(state, &backend_id, "measurements").await?;
+    let backend = target.backend.clone();
+    let fingerprint = target.fingerprint.clone();
+    let model_id = target.model_id.clone();
     opt_log1(
         state,
         &format!(
@@ -1345,6 +1751,18 @@ pub async fn op_optimize_measure_backend(
     let run_model = model_id.clone();
     let run_backend = backend_id.clone();
     let run_fingerprint = fingerprint.clone();
+    // The v2 provenance the entry records (design §4.2): the
+    // readable inputs snapshot, the hash-or-size identity the
+    // fingerprint used, the model file name, and the driver
+    // versions of the fingerprint's GPU set.
+    let run_snapshot = MeasurementInputs::from_fingerprint_inputs(&target.inputs);
+    let (run_sha256, run_size_bytes) = entry_identity(&target.inputs);
+    let run_model_file = target
+        .backend
+        .model_file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    let run_drivers = target.driver_versions.clone();
     let run = async move {
         let mut results: Vec<BenchResult> = Vec::new();
         for prompt in benchmark_prompts() {
@@ -1363,6 +1781,9 @@ pub async fn op_optimize_measure_backend(
                 .await?,
             );
         }
+        // The server's build string, recorded when obtainable
+        // (§4.2); its absence never fails the measurement.
+        let llama_build = manager_supervisor::server_build_info(&base_url).await;
         let mut iter = results.into_iter();
         Ok::<MeasurementEntry, String>(MeasurementEntry {
             fingerprint: run_fingerprint,
@@ -1372,6 +1793,14 @@ pub async fn op_optimize_measure_backend(
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             short: iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
             long: iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
+            source: Some(MeasurementSource::Benchmark),
+            origin_backend_id: None,
+            model_file: run_model_file,
+            model_sha256: run_sha256,
+            model_size_bytes: run_size_bytes,
+            inputs: Some(run_snapshot),
+            driver_version: run_drivers,
+            llama_build,
         })
     };
     let outcome = tokio::select! {
@@ -1468,8 +1897,10 @@ pub async fn op_optimize_estimate_backend(
             ));
         }
     }
-    let (backend, fingerprint, model_id) =
-        benchmark_target(state, &backend_id, "estimates").await?;
+    let target = benchmark_target(state, &backend_id, "estimates").await?;
+    let backend = target.backend.clone();
+    let fingerprint = target.fingerprint.clone();
+    let model_id = target.model_id.clone();
     opt_log1(
         state,
         &format!(

@@ -1999,6 +1999,30 @@ fn absorb_timings(
     }
 }
 
+/// The server's reported build string (`GET /props` ->
+/// `build_info`), best-effort: any failure is `None`, because
+/// the build is provenance metadata — a measurement records it
+/// when obtainable (predicted-throughput design §4.2) — never
+/// a condition of the operation that asked.
+pub async fn server_build_info(base_url: &str) -> Option<String> {
+    let url = format!("{}/props", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let text = resp.text().await.ok()?;
+    let props: serde_json::Value = serde_json::from_str(&text).ok()?;
+    props
+        .get("build_info")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// A streaming benchmark completion against a backend's OpenAI
 /// surface: `POST {base_url}/v1/chat/completions` with
 /// `stream: true` and caller-set temperature / max_tokens.
