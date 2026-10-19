@@ -1854,6 +1854,110 @@ pub struct ChatCompletionResult {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub latency_ms: u64,
+    /// The HTTP status the backend answered with (always 2xx —
+    /// anything else is an error before this is built).
+    pub http_status: u16,
+    /// Transport size: the response body's byte length, before
+    /// any extraction. Kept beside `content` so a caller can
+    /// distinguish "the backend sent nothing" from "the backend
+    /// sent a body whose answer text extracted to nothing".
+    pub response_bytes: usize,
+    /// Size of the first choice's `reasoning_content`, when the
+    /// model returned one: a thinking model that spends its whole
+    /// token budget reasoning leaves the answer in this field's
+    /// shadow — `content` empty, this non-zero.
+    pub reasoning_bytes: usize,
+}
+
+/// The message text of a chat-completion choice: a plain string,
+/// or an array of content parts (the multimodal shape some
+/// servers emit even for text-only answers) whose text parts are
+/// joined. Anything else extracts to an empty string.
+fn message_text(message: &serde_json::Value, field: &str) -> String {
+    match message.get(field) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+/// Interpret a chat-completion response body (the pure core of
+/// [`chat_completion`], split out for tests): parse the JSON,
+/// extract the first choice's answer text, and — critically —
+/// refuse an empty answer. Before Oct 19, 2026 an empty `content`
+/// string was returned as a successful empty completion, which
+/// the Optimize consultation then logged as a "0 bytes" response
+/// and failed to parse as a plan, with the finish reason and
+/// usage that would have explained it discarded on the floor.
+/// An empty answer is now an error that names the finish reason,
+/// the token counts, and how much reasoning text the model
+/// produced instead, so the failure is diagnosable from the
+/// error alone.
+fn interpret_chat_completion(
+    http_status: u16,
+    text: &str,
+    latency_ms: u64,
+    max_tokens: u32,
+) -> Result<ChatCompletionResult, SupervisorError> {
+    let json: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| SupervisorError::Http(format!("unparseable response body: {e}")))?;
+    let message = json
+        .pointer("/choices/0/message")
+        .ok_or_else(|| {
+            SupervisorError::Http("response has no first-choice message".to_string())
+        })?;
+    let content = message_text(message, "content");
+    let reasoning = message_text(message, "reasoning_content");
+    let finish_reason = json
+        .pointer("/choices/0/finish_reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let prompt_tokens = json
+        .pointer("/usage/prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    let completion_tokens = json
+        .pointer("/usage/completion_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    if content.trim().is_empty() {
+        let usage = format!(
+            "finish_reason {}, completion_tokens {}",
+            finish_reason.as_deref().unwrap_or("absent"),
+            completion_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "absent".to_string()),
+        );
+        return Err(SupervisorError::Http(if reasoning.is_empty() {
+            format!(
+                "backend returned an empty completion ({usage}; response body {} bytes) — no answer text was produced",
+                text.len(),
+            )
+        } else if finish_reason.as_deref() == Some("length") {
+            format!(
+                "backend returned no answer text: the model spent the full {max_tokens}-token budget on reasoning ({} reasoning bytes, {usage}) — no content was produced",
+                reasoning.len(),
+            )
+        } else {
+            format!(
+                "backend returned no answer text, only reasoning ({} bytes, {usage})",
+                reasoning.len(),
+            )
+        }));
+    }
+    Ok(ChatCompletionResult {
+        content,
+        finish_reason,
+        prompt_tokens,
+        completion_tokens,
+        latency_ms,
+        http_status,
+        response_bytes: text.len(),
+        reasoning_bytes: reasoning.len(),
+    })
 }
 
 /// A non-streaming chat completion against a backend's OpenAI
@@ -1882,6 +1986,14 @@ pub async fn chat_completion(
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": false,
+        // The consultation wants a structured answer, not a
+        // reasoning trace: a thinking model left to itself can
+        // spend the entire token budget on reasoning and return
+        // an empty `content` (observed on Pete's Qwen3 planners,
+        // Oct 19, 2026 — 4,096 reasoning tokens at ~20 tok/s is
+        // the ~200 s the failed consultations took). Templates
+        // that do not know the kwarg ignore it.
+        "chat_template_kwargs": { "enable_thinking": false },
     });
     let body_str =
         serde_json::to_string(&body).map_err(|e| SupervisorError::Http(e.to_string()))?;
@@ -1898,45 +2010,18 @@ pub async fn chat_completion(
         .await
         .map_err(|e| SupervisorError::Http(e.to_string()))?;
     let status = resp.status().as_u16();
-    let latency_ms = start.elapsed().as_millis() as u64;
     let text = resp
         .text()
         .await
         .map_err(|e| SupervisorError::Http(e.to_string()))?;
+    let latency_ms = start.elapsed().as_millis() as u64;
     if !(200..300).contains(&status) {
         let excerpt: String = text.chars().take(300).collect();
         return Err(SupervisorError::Http(format!(
             "backend returned HTTP {status}: {excerpt}"
         )));
     }
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| SupervisorError::Http(format!("unparseable response body: {e}")))?;
-    let content = json
-        .pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            SupervisorError::Http("response has no first-choice message content".to_string())
-        })?;
-    let finish_reason = json
-        .pointer("/choices/0/finish_reason")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let prompt_tokens = json
-        .pointer("/usage/prompt_tokens")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    let completion_tokens = json
-        .pointer("/usage/completion_tokens")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    Ok(ChatCompletionResult {
-        content,
-        finish_reason,
-        prompt_tokens,
-        completion_tokens,
-        latency_ms,
-    })
+    interpret_chat_completion(status, &text, latency_ms, max_tokens)
 }
 
 /// Result of one benchmark completion (Optimize Phase 5a,
@@ -3378,6 +3463,82 @@ mod tests {
         assert_eq!(r.prompt_tokens, Some(5));
         assert_eq!(r.completion_tokens, Some(2));
         assert!(r.latency_ms < 5000);
+    }
+
+    #[test]
+    fn chat_completion_interprets_a_plain_answer() {
+        let body = r#"{"choices":[{"message":{"content":"{\"summary\":\"ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1200,"completion_tokens":300}}"#;
+        let r = interpret_chat_completion(200, body, 42, 4096).unwrap();
+        assert_eq!(r.content, "{\"summary\":\"ok\"}");
+        assert_eq!(r.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(r.prompt_tokens, Some(1200));
+        assert_eq!(r.completion_tokens, Some(300));
+        assert_eq!(r.http_status, 200);
+        assert_eq!(r.response_bytes, body.len());
+        assert_eq!(r.reasoning_bytes, 0);
+    }
+
+    #[test]
+    fn chat_completion_interprets_content_parts() {
+        // The array-of-parts message shape some servers emit:
+        // the text parts join into the answer.
+        let body = r#"{"choices":[{"message":{"content":[{"type":"text","text":"{\"sum"},{"type":"text","text":"mary\":\"ok\"}"}]},"finish_reason":"stop"}]}"#;
+        let r = interpret_chat_completion(200, body, 1, 4096).unwrap();
+        assert_eq!(r.content, "{\"summary\":\"ok\"}");
+    }
+
+    #[test]
+    fn chat_completion_refuses_a_reasoning_burned_budget() {
+        // Pete's Oct 19, 2026 field failure: the model spent the
+        // whole token budget on reasoning and produced no answer
+        // text at all. That must be an error naming the cause —
+        // never a successful empty completion.
+        let body = r#"{"choices":[{"message":{"content":"","reasoning_content":"thinking at length about the plan"},"finish_reason":"length"}],"usage":{"prompt_tokens":4500,"completion_tokens":4096}}"#;
+        let err = interpret_chat_completion(200, body, 200_000, 4096).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("spent the full 4096-token budget on reasoning"), "{msg}");
+        assert!(msg.contains("finish_reason length"), "{msg}");
+        assert!(msg.contains("completion_tokens 4096"), "{msg}");
+    }
+
+    #[test]
+    fn chat_completion_refuses_reasoning_without_an_answer() {
+        let body = r#"{"choices":[{"message":{"content":null,"reasoning_content":"some reasoning"},"finish_reason":"stop"}],"usage":{"completion_tokens":50}}"#;
+        let err = interpret_chat_completion(200, body, 900, 4096).unwrap_err();
+        assert!(err.to_string().contains("only reasoning"), "{err}");
+    }
+
+    #[test]
+    fn chat_completion_refuses_an_empty_completion() {
+        let body = r#"{"choices":[{"message":{"content":""},"finish_reason":"stop"}],"usage":{"completion_tokens":0}}"#;
+        let err = interpret_chat_completion(200, body, 5, 4096).unwrap_err();
+        assert!(err.to_string().contains("empty completion"), "{err}");
+    }
+
+    #[test]
+    fn chat_completion_refuses_a_missing_first_choice() {
+        let err = interpret_chat_completion(200, r#"{"choices":[]}"#, 5, 4096).unwrap_err();
+        assert!(err.to_string().contains("no first-choice message"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn chat_completion_surfaces_the_reasoning_burn_as_an_error() {
+        let base = fake_chat_server(
+            200,
+            r#"{"choices":[{"message":{"content":"","reasoning_content":"reasoning"},"finish_reason":"length"}],"usage":{"prompt_tokens":4500,"completion_tokens":4096}}"#,
+        )
+        .await;
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "plan please".to_string(),
+        }];
+        let err = chat_completion(&base, "m", &messages, 0.2, 4096, Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("spent the full 4096-token budget"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

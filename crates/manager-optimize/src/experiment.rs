@@ -14,7 +14,7 @@
 //!
 //! This module holds the pure parts of the phase: the proposal
 //! and result types, light validation, candidate resolution
-//! (experiments never download — a candidate whose file is not
+//! (a run never downloads — a candidate whose file is not
 //! already on disk fails preflight), the fit-verdict text, the
 //! temporary backend's configuration, the lowest-free-port rule,
 //! and the experiment journal's lifecycle. The I/O runner (spawn,
@@ -477,7 +477,7 @@ pub fn apply_experiment_decision(
 }
 
 // ---------------------------------------------------------------------------
-// Candidate resolution (preflight; experiments never download)
+// Candidate resolution (preflight; a run never downloads)
 // ---------------------------------------------------------------------------
 
 /// One registered model as resolution sees it: its id and its
@@ -493,8 +493,10 @@ pub struct RegisteredModelFile {
 /// id to record (the registered/catalog id, or the candidate
 /// string itself for an HF-form file) and the file's path.
 /// `NotOnDisk` carries the failure text — every not-on-disk
-/// outcome names the same remedy (§A.3: "download in Models
-/// first"), because experiments never download.
+/// outcome names the same remedies: the plan's own
+/// register/download steps when it carries them (provisioning
+/// is a plan-time act; a run never downloads), else the Models
+/// view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CandidateResolution {
     OnDisk { model_id: String, path: PathBuf },
@@ -504,7 +506,7 @@ pub enum CandidateResolution {
 fn not_on_disk(candidate: &str, why: &str) -> CandidateResolution {
     CandidateResolution::NotOnDisk {
         message: format!(
-            "candidate '{candidate}' is not on disk ({why}) — experiments never download; download in Models first"
+            "candidate '{candidate}' is not on disk ({why}) — an experiment run does not download models; if the plan carries register/download steps for it, apply those first, otherwise register and download it in the Models view"
         ),
     }
 }
@@ -980,7 +982,7 @@ mod tests {
         // Catalog id with no registered model: not on disk.
         match resolve_candidate("catalog-only", &registered, &catalog, models_dir, exists) {
             CandidateResolution::NotOnDisk { message } => {
-                assert!(message.contains("download in Models first"), "{message}");
+                assert!(message.contains("register and download it in the Models view"), "{message}");
             }
             other => panic!("{other:?}"),
         }
@@ -1019,7 +1021,7 @@ mod tests {
             }];
             match resolve_candidate(cand, &registered2, &catalog, models_dir, exists) {
                 CandidateResolution::NotOnDisk { message } => {
-                    assert!(message.contains("download in Models first"), "{cand}: {message}");
+                    assert!(message.contains("register and download it in the Models view"), "{cand}: {message}");
                 }
                 other => panic!("{cand}: {other:?}"),
             }

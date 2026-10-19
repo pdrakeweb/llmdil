@@ -125,6 +125,12 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   let directiveDraft: string | null = null;
   const openEditors = new Set<string>();
   let statusLine = "";
+  /** The last consultation's failure as this page knows it:
+   *  set from the run's own error return, and synced from the
+   *  server's recorded `consult_error` on every refresh — a run
+   *  that failed while the operator was on another view must
+   *  still surface, with the stored plan marked as previous. */
+  let lastConsultError = "";
   let applyRunning = false;
   /** The backend this page instance is measuring (Phase 5a), and
    *  its progress timer — the server payload carries only the
@@ -330,13 +336,24 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         const prompt = m?.long.prompt_per_second ?? m?.short.prompt_per_second;
         const ttft = m?.short.ttft_ms ?? m?.long.ttft_ms;
         const num = (x: number | null | undefined): string => x == null ? "—" : trim1(x);
-        const cats = r.eval ? Object.entries(r.eval.scores.per_category).map(([k, s]) => `${esc(evalCategoryLabel(k))}: ${s.passed}/${s.total}`).join(" · ") : "";
+        const cats = r.eval ? Object.entries(r.eval.scores.per_category).map(([k, s]) => optKv(evalCategoryLabel(k), `${s.passed}/${s.total}`)).join("") : "";
         const delta = r.comparison
-          ? `Overall delta: ${r.comparison.overall.delta_passed >= 0 ? "+" : ""}${r.comparison.overall.delta_passed} passed · Screen at/above baseline: ${r.comparison.screen_at_or_above_baseline ? "yes" : "no"}${r.comparison.any_category_zero_that_baseline_passes ? ` · Categories at zero the baseline passes: ${esc(r.comparison.zero_categories_that_baseline_passes.map(evalCategoryLabel).join(", "))}` : ""}`
+          ? `${r.comparison.overall.delta_passed >= 0 ? "+" : ""}${r.comparison.overall.delta_passed} passed · Screen at/above baseline: ${r.comparison.screen_at_or_above_baseline ? "yes" : "no"}${r.comparison.any_category_zero_that_baseline_passes ? ` · Categories at zero the baseline passes: ${r.comparison.zero_categories_that_baseline_passes.map(evalCategoryLabel).join(", ")}` : ""}`
           : "No baseline comparison";
-        return `<div class="opt-measure-row">
-          <span class="opt-target">${esc(e.candidate_model_id)}</span>
-          <span class="opt-measure-figs">Generation tok/s (short/long): ${num(genShort)} / ${num(genLong)} · Prompt tok/s: ${num(prompt)} · TTFT: ${ttft == null ? "—" : `${trim1(ttft)} ms`} · Screen overall: ${r.eval ? `${r.eval.scores.overall.passed}/${r.eval.scores.overall.total}` : "not run"}${cats ? ` · ${cats}` : ""} · Delta vs baseline: ${esc(delta)}</span>
+        return `<div class="opt-measure-card">
+          <div class="opt-measure-head">
+            <span class="opt-target">${esc(e.candidate_model_id)}</span>
+            <span class="opt-measure-state">${esc(r.status)}</span>
+          </div>
+          <div class="opt-measure-figs-block">
+            ${optKv("Generation (short)", `${num(genShort)} tok/s`)}
+            ${optKv("Generation (long)", `${num(genLong)} tok/s`)}
+            ${optKv("Prompt", `${num(prompt)} tok/s`)}
+            ${optKv("TTFT", ttft == null ? "—" : `${trim1(ttft)} ms`)}
+            ${optKv("Screen overall", r.eval ? `${r.eval.scores.overall.passed}/${r.eval.scores.overall.total}` : "not run")}
+            ${cats}
+            ${optKv("Delta vs baseline", delta)}
+          </div>
         </div>`;
       }).join("")}
       ${withResults.some((e) => e.result?.eval) ? `<div class="opt-note">${esc(SCREENING_CAVEAT)}</div>` : ""}
@@ -384,7 +401,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     if (plan.truncated > 0) notes.push(`${plan.truncated} item${plan.truncated === 1 ? "" : "s"} cut by the 25-item cap`);
     return `<div class="card">
       <div class="opt-plan-head">
-        <strong>Plan</strong>
+        <strong>${lastConsultError || st.consult_error ? "Previous plan" : "Plan"}</strong>
         <span class="opt-plan-meta">from ${esc(plan.consulted_backend)} · ${esc(fmtTime(plan.created_at))}</span>
         ${plan.directive?.trim() ? `<span class="opt-plan-meta">Directive: ${esc(plan.directive)}</span>` : ""}
         ${plan.sample ? `<span class="chip">Sample plan</span>` : ""}
@@ -429,34 +446,50 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     </div>`;
   }
 
+  /** One labeled figure row inside a measure card (design
+   *  rule 9, Label: Value — figures are never joined into a
+   *  running sentence). */
+  function optKv(label: string, value: string): string {
+    return `<div class="opt-kv"><span class="opt-kv-label">${esc(label)}:</span> <span class="opt-kv-value">${esc(value)}</span></div>`;
+  }
+
+  /** The measured/estimated figures of one backend as labeled
+   *  rows. Null figures render nothing (rules 12–13: unknown is
+   *  not zero, and an empty block does not render). */
+  function measureFigRows(f: OptimizeState["backends"][number]["measured"]): string {
+    if (!f) return "";
+    return [
+      f.prompt_per_second !== null ? optKv("Prompt", `${trim1(f.prompt_per_second)} tok/s`) : "",
+      f.predicted_per_second !== null ? optKv("Generation", `${trim1(f.predicted_per_second)} tok/s`) : "",
+      f.ttft_ms !== null ? optKv("TTFT", `${trim1(f.ttft_ms)} ms`) : "",
+      optKv("Age", fmtAge(f.age_secs)),
+    ].join("");
+  }
+
+  /** One backend's measure/estimate card (brief §4): a discrete
+   *  card per target in the backend-card idiom — header (id,
+   *  model, running state), labeled figure rows, and the actions
+   *  anchored in the card's own action row. Replaces the single
+   *  flex row whose figures read as one continuous blob of text
+   *  with buttons floating at its end. */
   function measureRow(b: OptimizeState["backends"][number], busy: boolean): string {
     const m = b.measured;
-    const parts: string[] = [];
-    if (m) {
-      if (m.prompt_per_second !== null) parts.push(`Prompt: ${trim1(m.prompt_per_second)} tok/s`);
-      if (m.predicted_per_second !== null) parts.push(`Generation: ${trim1(m.predicted_per_second)} tok/s`);
-      if (m.ttft_ms !== null) parts.push(`TTFT: ${trim1(m.ttft_ms)} ms`);
-      parts.push(`Age: ${fmtAge(m.age_secs)}`);
-    }
     // The estimate (tracker #56) renders beside the measured
     // figures under its own label — never in the measured
     // figures' place, and never without the word "Estimate".
     const e = b.estimated;
-    const estParts: string[] = [];
-    if (e) {
-      if (e.prompt_per_second !== null) estParts.push(`Prompt: ${trim1(e.prompt_per_second)} tok/s`);
-      if (e.predicted_per_second !== null) estParts.push(`Generation: ${trim1(e.predicted_per_second)} tok/s`);
-      if (e.ttft_ms !== null) estParts.push(`TTFT: ${trim1(e.ttft_ms)} ms`);
-      estParts.push(`Age: ${fmtAge(e.age_secs)}`);
-    }
-    return `<div class="opt-measure-row">
-      <span class="opt-target">${esc(b.id)}</span>
-      ${parts.length
-        ? `<span class="opt-measure-figs">${esc(parts.join(" · "))}</span>`
-        : e ? "" : `<span class="opt-note">Not measured</span>`}
-      ${e ? `<span class="opt-measure-figs">Estimate — ${esc(estParts.join(" · "))}</span>` : ""}
-      <button class="btn" data-opt-measure="${esc(b.id)}" ${busy ? "disabled" : ""}>${icon("bolt")} Measure</button>
-      <button class="btn" data-opt-estimate="${esc(b.id)}" ${busy ? "disabled" : ""}>${icon("gauge")} Estimate</button>
+    return `<div class="opt-measure-card">
+      <div class="opt-measure-head">
+        <span class="opt-target">${esc(b.id)}</span>
+        ${b.short_name || b.model_id ? `<span class="opt-measure-sub">${esc(b.short_name ?? b.model_id ?? "")}</span>` : ""}
+        <span class="opt-measure-state">${b.running ? "Running" : "Stopped"}</span>
+      </div>
+      ${m ? `<div class="opt-measure-figs-block">${measureFigRows(m)}</div>` : e ? "" : `<div class="opt-note">Not measured</div>`}
+      ${e ? `<div class="opt-measure-figs-block"><div class="opt-kv"><span class="opt-kv-label">Estimate —</span></div>${measureFigRows(e)}</div>` : ""}
+      <div class="opt-measure-actions">
+        <button class="btn" data-opt-measure="${esc(b.id)}" ${busy ? "disabled" : ""}>${icon("bolt")} Measure</button>
+        <button class="btn" data-opt-estimate="${esc(b.id)}" ${busy ? "disabled" : ""}>${icon("gauge")} Estimate</button>
+      </div>
     </div>`;
   }
 
@@ -534,7 +567,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     }
     const delKey = `measurement:${e.fingerprint}:${e.measured_at}`;
     const isArmed = armed.has(delKey);
-    return `<div class="opt-measure-row" style="align-items:flex-start">
+    return `<div class="opt-measure-history-row" style="align-items:flex-start">
       <div>
         ${figs.length ? `<div class="opt-measure-figs">${esc(figs.join(" · "))}</div>` : ""}
         <div class="opt-note">${esc(meta.join(" · "))}</div>
@@ -636,21 +669,33 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     const running = st.backends.filter((x) => x.running);
     const age = b ? Math.floor((Date.now() - new Date(b.run_at).getTime()) / 1000) : NaN;
     const baselineHtml = b ? `
-      <div class="opt-measure-row">
-        <span class="opt-target">${esc(b.backend_id)}</span>
-        <span class="opt-measure-figs">Overall: ${b.overall.passed}/${b.overall.total} · Run: ${esc(fmtTime(b.run_at))}${Number.isFinite(age) && age >= 0 ? ` · Age: ${fmtAge(age)}` : ""} · Suite version: ${b.suite_version}</span>
-        ${b.stale ? `<span class="stale-tag">Stale — configuration changed since this run</span>` : ""}
+      <div class="opt-measure-card">
+        <div class="opt-measure-head">
+          <span class="opt-target">${esc(b.backend_id)}</span>
+          ${b.stale ? `<span class="stale-tag">Stale — configuration changed since this run</span>` : ""}
+        </div>
+        <div class="opt-measure-figs-block">
+          ${optKv("Overall", `${b.overall.passed}/${b.overall.total}`)}
+          ${optKv("Run", fmtTime(b.run_at))}
+          ${Number.isFinite(age) && age >= 0 ? optKv("Age", fmtAge(age)) : ""}
+          ${optKv("Suite version", String(b.suite_version))}
+          ${Object.entries(b.per_category).map(([k, s]) => optKv(evalCategoryLabel(k), `${s.passed}/${s.total}`)).join("")}
+        </div>
       </div>
-      <div class="opt-measure-figs">${Object.entries(b.per_category).map(([k, s]) => `${esc(evalCategoryLabel(k))}: ${s.passed}/${s.total}`).join(" · ")}</div>
       <div class="opt-note">${esc(b.caveat)}</div>`
       : `<div class="opt-note">No baseline yet — run the suite against a running backend to record one.</div>
       <div class="opt-note">${esc(SCREENING_CAVEAT)}</div>`;
     return `<div class="opt-screening">
       <div class="opt-field-label" style="margin-top:14px">Screening suite</div>
       ${baselineHtml}
-      ${running.map((rb) => `<div class="opt-measure-row">
-        <span class="opt-target">${esc(rb.id)}</span>
-        <button class="btn" data-opt-eval="${esc(rb.id)}" ${busy ? "disabled" : ""}>${icon("target")} Run baseline</button>
+      ${running.map((rb) => `<div class="opt-measure-card">
+        <div class="opt-measure-head">
+          <span class="opt-target">${esc(rb.id)}</span>
+          <span class="opt-measure-state">Running</span>
+        </div>
+        <div class="opt-measure-actions">
+          <button class="btn" data-opt-eval="${esc(rb.id)}" ${busy ? "disabled" : ""}>${icon("target")} Run baseline</button>
+        </div>
       </div>`).join("")}
       ${evalBackend !== null ? `<div class="opt-consult-actions">
         <span class="opt-consulting">${icon("clock")} Running the screening suite on ${esc(evalBackend)}${evalStart ? ` <span id="optEvalElapsed">${fmtElapsed(Math.floor((Date.now() - evalStart) / 1000))}</span>` : ""} — twelve checkable tasks, inside a 10-minute time-box.</span>
@@ -689,6 +734,13 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     const summary = st.context_summary;
     const contextLine = `GPUs: ${summary.gpus} · Backends: ${summary.backends} · Groups: ${summary.groups} · Models: ${summary.models}${summary.traffic_window_label ? ` · Traffic window: ${esc(summary.traffic_window_label)}` : ""}`;
     const consulting = st.consulting;
+    // The elapsed clock reads the server's recorded start when
+    // there is one: this page instance's own consultStart is 0
+    // for a run it did not start, and (now − 0) rendered the
+    // Unix epoch as an elapsed time (Oct 19, 2026 field report:
+    // "29873905 min 35 s"). No known start, no elapsed figure.
+    const consultStartMs = st.consult_started_unix_ms ?? (consultStart > 0 ? consultStart : null);
+    const consultFailure = lastConsultError || st.consult_error || "";
     const measuring = st.measuring || measuringBackend !== null || estimatingBackend !== null || estimatesRunning;
     host.innerHTML = `
     <div class="card" id="optConsultCard">
@@ -718,12 +770,13 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       </div>
       <div class="opt-consult-actions">
         ${consulting
-          ? `<span class="opt-consulting">${icon("clock")} Consulting <span id="optElapsed">${fmtElapsed(Math.floor((Date.now() - consultStart) / 1000))}</span> — a large model on local hardware can take several minutes.</span>
+          ? `<span class="opt-consulting">${icon("clock")} Consulting${consultStartMs !== null ? ` <span id="optElapsed">${fmtElapsed(Math.max(0, Math.floor((Date.now() - consultStartMs) / 1000)))}</span>` : ""} — a large model on local hardware can take several minutes.</span>
              <button class="btn danger" data-opt-act="cancel-consult">${icon("x")} Cancel</button>`
           : `<button class="btn primary" data-opt-act="consult" ${running.length ? "" : "disabled"}>${icon("target")} ${armed.has("consult") ? "Replace the current plan?" : st.plan ? "Consult again" : "Consult"}</button>
              <button class="btn" data-opt-act="sample">${icon("layers")} Sample plan</button>
              ${armed.has("consult") ? `<span class="opt-note">A new consultation replaces the plan and its decisions. Click again to confirm.</span>` : ""}`}
       </div>
+      ${consultFailure ? `<div class="banner">${icon("err")} Consultation failed — ${esc(consultFailure)}${st.plan ? ` The plan below is the previous plan, from ${esc(fmtTime(st.plan.created_at))}.` : ""}</div>` : ""}
       ${statusLine && !st.plan ? `<div class="opt-status">${esc(statusLine)}</div>` : ""}
       ${running.length ? `<div class="opt-measurements">
         <div class="opt-field-label" style="margin-top:14px">Measured throughput</div>
@@ -745,6 +798,25 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       ${st.backends.map((b) => purposeEditor(`backend:${b.id}`, `Backend: ${b.id}`, b.purpose)).join("")}
     </details>
     ${measurementsHtml(st)}`;
+    // Keep the elapsed ticker alive for any consultation this
+    // page can see, not only one it started: entering the page
+    // mid-run starts it from the server's start time; the run
+    // ending stops it. (runConsult also manages the timer for
+    // its own runs; the null checks keep the two from doubling.)
+    if (consulting && consultStartMs !== null) {
+      if (elapsedTimer === null) {
+        elapsedTimer = window.setInterval(() => {
+          const el = hostEl.querySelector("#optElapsed");
+          const startMs = state?.consult_started_unix_ms ?? (consultStart > 0 ? consultStart : null);
+          if (el && startMs !== null) {
+            el.textContent = fmtElapsed(Math.max(0, Math.floor((Date.now() - startMs) / 1000)));
+          }
+        }, 1000);
+      }
+    } else if (!consulting && elapsedTimer !== null) {
+      window.clearInterval(elapsedTimer);
+      elapsedTimer = null;
+    }
   }
 
   async function refresh(): Promise<void> {
@@ -755,6 +827,9 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     } else if (r.data) {
       state = r.data;
       loadError = null;
+      // The server's recorded failure is authoritative: it
+      // survives this page not having run the consultation.
+      lastConsultError = r.data.consult_error ?? "";
     }
     paint();
   }
@@ -775,6 +850,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     }
     const directive = directiveDraft ?? state?.last_directive ?? "";
     consultStart = Date.now();
+    lastConsultError = "";
     if (state) state.consulting = true;
     paint();
     if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
@@ -787,6 +863,10 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     if (disposed) return;
     if (r.error) {
       if (state) state.consulting = false;
+      // The failure also renders as the banner above the plan
+      // (which is then headed "Previous plan"); a deliberate
+      // cancel is not a failure and gets no banner.
+      lastConsultError = r.error === "consultation cancelled" ? "" : r.error;
       statusLine = r.error === "consultation cancelled"
         ? "Consultation cancelled."
         : `Consultation failed — ${r.error}`;
@@ -795,6 +875,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     }
     if (r.data) {
       state = r.data;
+      lastConsultError = r.data.consult_error ?? "";
       // The field now defaults to the directive the new plan
       // recorded (the server's trimmed verbatim text).
       directiveDraft = r.data.last_directive ?? "";

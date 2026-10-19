@@ -526,9 +526,22 @@ table.tbl tr:last-child td { border-bottom: 0; }
 .opt-applybar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; }
 .opt-purposes { margin-top: 12px; }
 .opt-purposes > summary { cursor: pointer; font-weight: 600; }
-.opt-measure-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 6px 0; }
-.opt-measure-row .btn { margin-left: auto; }
 .opt-candidate-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 6px 0; }
 .opt-candidate-row .btn { margin-left: auto; }
 .opt-candidate-figs { font-family: var(--mono); font-size: 12px; color: var(--text2); }
+.opt-measure-history-row { display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; padding: 6px 0; }
+.opt-measure-history-row .btn { margin-left: auto; }
 .opt-measure-figs { font-family: var(--mono); font-size: 12px; color: var(--text2); }
+/* Measure/estimate cards (brief §4): one discrete card per
+   target — header, labeled figure rows, actions anchored in
+   the card's own action row. Replaces the single flex row whose
+   figures read as one continuous blob with floating buttons. */
+.opt-measure-card { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 10px 12px; margin: 8px 0; }
+.opt-measure-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.opt-measure-sub { color: var(--text2); font-size: 12px; }
+.opt-measure-state { margin-left: auto; font-size: 12px; color: var(--text2); }
+.opt-measure-figs-block { margin-top: 6px; }
+.opt-kv { font-size: 12px; padding: 1px 0; }
+.opt-kv-label { color: var(--text2); }
+.opt-kv-value { font-family: var(--mono); }
+.opt-measure-actions { display: flex; gap: 8px; margin-top: 10px; }

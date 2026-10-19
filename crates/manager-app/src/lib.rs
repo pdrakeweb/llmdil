@@ -401,6 +401,18 @@ pub struct AppState {
     /// design's one-consult-at-a-time rule): starting a consult
     /// stores its sender; firing it aborts the in-flight LLM call.
     optimize_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// When the running consultation started (Unix ms), recorded
+    /// beside the abort slot so the state payload can report a
+    /// true elapsed time to any page instance — the page's own
+    /// clock only knows about consultations it started itself.
+    optimize_consult_started_unix_ms: Mutex<Option<i64>>,
+    /// The last consultation's failure (message + Unix ms),
+    /// recorded when a run ends in failure and cleared when a
+    /// new run starts or one succeeds: a consultation that ran
+    /// while the operator was on another view must still surface
+    /// its failure on the Optimize page, not silently leave the
+    /// previous plan looking current.
+    optimize_consult_error: Mutex<Option<(String, i64)>>,
     /// Shared cancellation slot for GPU-bound Optimize jobs
     /// (Phase 5: measurements and experiment batches): one such job
     /// at a time, separate from the consult slot because a
@@ -511,6 +523,8 @@ impl AppState {
             gateway_stats: Mutex::new(gateway_stats::GatewayStatsStore::default()),
             winml: OnceCell::new(),
             optimize_abort: Mutex::new(None),
+            optimize_consult_started_unix_ms: Mutex::new(None),
+            optimize_consult_error: Mutex::new(None),
             optimize_job_abort: Mutex::new(None),
             notify_watch: std::sync::Mutex::new(notify::NotifyWatch::default()),
             offload_probes: std::sync::Mutex::new(std::collections::HashMap::new()),
