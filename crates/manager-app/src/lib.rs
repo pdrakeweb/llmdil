@@ -4696,6 +4696,7 @@ fn reserved_temp_backend_id_error(id: &str) -> ApiError {
     ))
 }
 
+#[allow(clippy::too_many_arguments)] // argument list is the registry contract
 pub async fn op_backend_add(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
