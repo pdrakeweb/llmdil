@@ -70,9 +70,10 @@ pub use eval::{
 };
 pub use fit::{evaluate_fit, layout_requirement, residency_per_gpu, FitOutcome, LayoutFacts};
 pub use measure::{
-    benchmark_prompts, estimate_prompts, facts as measurement_facts, measurement_fingerprint,
-    median, normalize_raw_flags, BenchResult, BenchRun, BenchmarkPrompt, EstimateEntry,
-    MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, BENCHMARK_TEMPERATURE,
+    benchmark_prompts, estimate_prompts, facts as measurement_facts, headline_figures,
+    measurement_fingerprint, median, normalize_raw_flags, BenchResult, BenchRun, BenchmarkPrompt,
+    EstimateEntry, HeadlineFigures, MeasurementEntry, MeasurementFingerprintInputs,
+    MeasurementInputs, MeasurementSource, MeasurementStore, BENCHMARK_TEMPERATURE,
     ESTIMATE_LONG_MAX_TOKENS, ESTIMATE_RUNS, ESTIMATE_SHORT_MAX_TOKENS, LONG_MAX_TOKENS, LONG_PROMPT,
     MEASURED_RUNS, SHORT_MAX_TOKENS, SHORT_PROMPT,
 };

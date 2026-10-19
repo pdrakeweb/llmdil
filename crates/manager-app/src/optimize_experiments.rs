@@ -831,12 +831,17 @@ async fn run_experiment_inner(
         let model_for_fp = registered_model.as_ref().or_else(|| {
             temp_cfg.models.iter().find(|m| m.id == model_id)
         });
-        let fp = manager_optimize::measurement_fingerprint(&temp_fingerprint_inputs(
-            &temp,
-            model_for_fp,
-            file_size,
-            &gpu_pairs,
-        ));
+        let fp_inputs = temp_fingerprint_inputs(&temp, model_for_fp, file_size, &gpu_pairs);
+        let fp = manager_optimize::measurement_fingerprint(&fp_inputs);
+        // The v2 provenance (predicted-throughput design §4.2):
+        // an experiment entry, its inputs snapshot and identity,
+        // the temp backend's driver environment, and the temp
+        // server's build when it reports one. The proposal
+        // derives the temp configuration from the candidate and
+        // flags alone, so no origin backend is known —
+        // `origin_backend_id` stays absent rather than guessed.
+        let (fp_sha256, fp_size_bytes) = crate::optimize::entry_identity(&fp_inputs);
+        let llama_build = manager_supervisor::server_build_info(&base_url).await;
         let entry = MeasurementEntry {
             fingerprint: fp,
             backend_id: temp_id.clone(),
@@ -845,6 +850,21 @@ async fn run_experiment_inner(
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             short,
             long,
+            source: Some(manager_optimize::MeasurementSource::Experiment),
+            origin_backend_id: None,
+            model_file: gguf_abs
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
+            model_sha256: fp_sha256,
+            model_size_bytes: fp_size_bytes,
+            inputs: Some(manager_optimize::MeasurementInputs::from_fingerprint_inputs(
+                &fp_inputs,
+            )),
+            driver_version: crate::optimize::driver_versions_for(
+                &fp_inputs,
+                &gathered.gpu_driver_versions,
+            ),
+            llama_build,
         };
         let mut store = MeasurementStore::load(&crate::optimize::measurements_path(state));
         store.upsert(entry);

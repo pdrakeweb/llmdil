@@ -260,7 +260,22 @@ lives in the app types cited; this is the wire contract summary.)
   "mtp": { "enabled": true, "n_max": 2, "parallel": 1,
            "custom": false },
   "raw_flags": "--parallel 1",
-  "flags_advanced": false
+  "flags_advanced": false,
+  "predicted": { "prompt_per_second": 33.5,
+                 "predicted_per_second": 22.5, "ttft_ms": 420,
+                 "measured_at": "2026-10-18T14:03:00Z",
+                 "source": "benchmark", "backend_id": "planner",
+                 "origin_backend_id": null,
+                 "model_id": "qwen3-27b-planner",
+                 "model_file": "Qwen3.8-27B-IQ3_S.gguf",
+                 "app_version": "0.1.42",
+                 "driver_version": ["581.57"],
+                 "llama_build": "b11658",
+                 "inputs": { "n_ctx": 32768, "n_batch": 512,
+                             "offload": "none",
+                             "tensor_split": [1.0, 0.0],
+                             "split_mode": "layer", "raw_flags": "",
+                             "gpus": ["0:NVIDIA RTX A4000"] } }
 }
 ```
 
@@ -271,7 +286,14 @@ MTP-capable backends (the catalog pins the capability); `n_max` is the
 explicit `--spec-draft-n-max`, or null when MTP is on without one
 (llama.cpp's default applies) or off; `parallel` is the explicit
 `--parallel` slot count, or null when unset. `configured: false` marks a
-supervisor-only orphan process; orphans accept `stop` only.
+supervisor-only orphan process; orphans accept `stop` only. The
+`predicted` block is present only when an exact-match measurement
+exists for the backend's saved configuration (predicted-throughput
+design §7): the standardized benchmark's headline figures plus the
+measurement's provenance (date, source, app version, driver, llama
+build, and the inputs snapshot it was measured under). It is absent —
+never zero-filled — when no measurement matches, and it describes the
+saved configuration regardless of run state.
 
 ### 4.2 Backend config (`backend_get_config`)
 
@@ -391,9 +413,9 @@ payload; the API adds nothing.
 
 ## 5. Endpoint index
 
-85 implemented client-facing endpoints: 70 registry operation
+87 implemented client-facing endpoints: 72 registry operation
 routes + 15 derived/API-layer routes (§6.17). A further 24
-auth/admin routes (§6.17) bring the live surface to 109 route
+auth/admin routes (§6.17) bring the live surface to 111 route
 records. ("Op" = returns `202` + operation, §3.) Specified but not
 implemented in v1: the gateway master key (decision 4), raw
 `PATCH /config` (decision 11), and the peripheral domains
@@ -416,6 +438,7 @@ no route.
 | Events | 1 | `GET /events` (SSE stream, §6.17) |
 | Config / settings | 1 | get — plus raw patch specified, NOT IMPLEMENTED (§6.12) |
 | MXC | 6 | policy get/put, mode, self-test, activity, tightening proposals |
+| Measurements | 2 | lookup (§6.18), delete (§6.18) |
 | Updates | 5 | list, check, apply, pin, auto |
 | Peripheral (MCP, VS Code, WinML) | 0 | Excluded from API v1 (decision 10) — §6.15/§6.16 |
 
@@ -1112,6 +1135,34 @@ The remaining 24 API-layer routes are the auth/admin surface
 `GET|POST /admin/api-tokens`, `DELETE /admin/api-tokens/{id}`,
 `POST /admin/enrollment-codes`, `GET /admin/audit` — all under
 `/api/v1`.
+
+### 6.18 Measurements
+
+The Optimize measurement store (predicted-throughput design §11):
+two routed operations, added because the history view's per-entry
+delete and the backend forms' draft lookup are cross-surface by
+nature — unlike the rest of the Optimize domain (§6.16), which
+stays desktop-only.
+
+#### `POST /api/v1/measurements/lookup` — `read`
+`measurement_lookup`. Body: `{ "request": { … } }` — a draft
+configuration: `backend_id` (edit form: the saved backend, with any
+of `n_ctx`, `n_batch`, `offload_layers`, `mtp_position`,
+`parallel_slots`, `raw_flags` overridden) or `model_id` (add form:
+a not-yet-created backend, with `gpu_indices` selecting the
+placement). → `{ "fingerprint", "exact": <predicted> | null,
+"near": <predicted + "differs": […]> | null }`, where `<predicted>`
+is the §4.1 `predicted` shape. `exact` is the newest measurement
+under the draft's fingerprint, whatever backend or experiment
+produced it; `near` is present only when there is no exact match:
+the closest same-model measurement whose recorded inputs differ in
+one or two named fields. Absences are nulls, never zero-filled.
+
+#### `DELETE /api/v1/measurements` — `delete`
+`measurement_delete`. Body: `{ "fingerprint", "measured_at" }` —
+an entry is identified by the pair. Removes that one entry from
+the store; history is otherwise append-only. → `{ "deleted": true,
+"fingerprint", "measured_at" }`; `404` when no such entry exists.
 
 ## 7. Capabilities that do not map cleanly
 
