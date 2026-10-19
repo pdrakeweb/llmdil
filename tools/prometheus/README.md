@@ -88,6 +88,14 @@ flags edited between arms. Never run both backends at once — stop
 one before starting the other (their weights alone exceed the
 A4000's 16 GiB). The script only measures and labels.
 
+Note (v0.1.40, 2026-10-18): LLMdil now carries an in-app MTP
+draft-length selector on MTP-capable backends, but it offers only
+Off / 1 / 2 / 3 / 4 (`--spec-draft-n-max` 1–4). The `mtp-nmax2` and
+`mtp-nmax3` arms below match selector positions; the `mtp-nmax5`
+arm predates the selector and can now only be set by hand-editing
+the backend's saved flags outside the app — treat it as a
+historical arm unless that distinction is the point of the run.
+
 Through the gateway — this needs a gateway group named
 `planner-mtp` with member `planner-mtp` (gateway model names are
 group names; a backend gets none by itself):
