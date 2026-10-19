@@ -1172,17 +1172,23 @@ function offloadTokenText(o: BackendOffload, layers: number): string {
 }
 
 /* ---------------- MTP draft control (tracker #53) ----------------
- * Mirrors the offload slider: state arrives in the list_backends
- * payload (`BackendMtp`, decoded server-side from the backend's
- * saved raw flags) and commits go through backend_set_mtp, which
- * rewrites only the MTP tokens. Slider positions are 0..4, where
- * 0 is Off. */
+ * State arrives in the list_backends payload (`BackendMtp`,
+ * decoded server-side from the backend's saved raw flags) and
+ * commits go through backend_set_mtp, which rewrites only the
+ * MTP tokens. Values are 0..4, where 0 is Off. The control is a
+ * dropdown in the ctx/batch selects' idiom (Pete, Oct 18, 2026:
+ * the original range slider showed neither its stops nor that
+ * it was a slider until clicked). */
 /** llama.cpp's `--spec-draft-n-max` default, used to place the
- *  slider for a backend that enables MTP without an explicit
+ *  control for a backend that enables MTP without an explicit
  *  length (and named in that state's readout). */
 const MTP_LLAMA_N_MAX_DEFAULT = 3;
 
-/** The slider position a saved MTP state implies: 0 when off;
+/** The values the dropdown offers: 0 is Off, 1..4 are
+ *  `--spec-draft-n-max` draft lengths. */
+const MTP_POSITIONS = [0, 1, 2, 3, 4];
+
+/** The control value a saved MTP state implies: 0 when off;
  *  the explicit length when set; llama.cpp's default when MTP is
  *  on without one. */
 function mtpPosition(m: BackendMtp): number {
@@ -1190,13 +1196,13 @@ function mtpPosition(m: BackendMtp): number {
   return m.n_max ?? MTP_LLAMA_N_MAX_DEFAULT;
 }
 
-/** The flag form a slider position writes (the readout while
- *  dragging, and the saved message after a commit). */
+/** The flag form a chosen value writes (the readout once a
+ *  value is chosen, and the saved message after a commit). */
 function mtpTokenText(pos: number): string {
   return pos === 0 ? "Speculative decoding off" : `--spec-type draft-mtp --spec-draft-n-max ${pos}`;
 }
 
-/** The readout for the SAVED state, before any drag: a backend
+/** The readout for the SAVED state, before any change: a backend
  *  that enables MTP without an explicit length runs at
  *  llama.cpp's default, and the readout says so rather than
  *  implying a saved value. */
@@ -1367,7 +1373,7 @@ function applyFlagsField(
  *  backend's model is not offload-capable. offloadPendingLayers is
  *  a released draft position the guardrail blocks, awaiting the
  *  operator's override/snap decision in the form, else null.
- *  mtpPosition is the MTP draft slider's draft position (0 = Off,
+ *  mtpPosition is the MTP draft control's chosen value (0 = Off,
  *  1..4 = draft tokens), null when the backend's model is not
  *  MTP-capable. */
 export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null }
@@ -1686,23 +1692,29 @@ function backendCard(
     return offloadSliderHtml({ offload: o, layers: n, ownerId: b.id, disabled: inFlight.has(b.id), decisionHtml });
   })() : "";
   // The MTP draft control (tracker #53), directly under the
-  // offload slider in the same panel and idiom: a slider over
-  // Off/1/2/3/4 whose position lives in the wire-level draft
-  // state (flags.mtpPosition), a Label: Value readout naming the
-  // flags the position writes, and the --parallel conflict line
-  // when the saved flags set a slot count other than 1. Rendered
-  // only for MTP-capable backends (the payload carries `mtp`).
-  // The readout shows the SAVED spelling until the slider moves;
-  // a backend on without an explicit length reads as llama.cpp's
-  // default rather than an implied saved value.
+  // offload slider in the same panel: a dropdown over
+  // Off/1/2/3/4 in the ctx/batch selects' idiom (SELECT_STYLE,
+  // the current value as the selected option, always visible at
+  // rest), whose value lives in the wire-level draft state
+  // (flags.mtpPosition), with the token readout naming the
+  // flags the value writes, and the --parallel conflict line
+  // when the saved flags set a slot count other than 1.
+  // Rendered only for MTP-capable backends (the payload carries
+  // `mtp`). The readout shows the SAVED spelling until the value
+  // changes; a backend on without an explicit length reads as
+  // llama.cpp's default rather than an implied saved value.
   const mtpHtml = flags && b.mtp ? (() => {
     const m = b.mtp;
     const pos = flags.mtpPosition ?? mtpPosition(m);
     const conflict = pos > 0 && m.parallel != null && m.parallel !== 1;
     return `<div style="margin-top:12px">
-      <label style="font-size:12px;color:var(--text2);display:block">MTP draft tokens: <b style="color:var(--text)" data-mtp-value-label>${pos === 0 ? "Off" : pos}</b></label>
-      <input type="range" class="offload-range" min="0" max="4" step="1" value="${pos}" data-mtp-slider data-mtp-backend="${esc(b.id)}" style="background:var(--panel2)" aria-label="MTP draft tokens for ${esc(b.id)}">
-      <div style="font-size:12px;color:var(--text2);margin-top:4px"><span data-mtp-token style="font-family:var(--mono)">${esc(mtpSavedTokenText(m))}</span>${m.custom ? `<span title="The saved flags spell MTP in a form the control does not write (an = spelling, a shared --spec-type list, ...). Saving from the slider writes the canonical tokens; every other flag is preserved."> · custom flags</span>` : ""}</div>
+      <label style="font-size:12px;color:var(--text2);display:block">MTP draft tokens<span class="info-tip" title="Speculative decoding: the model drafts up to this many tokens ahead and verifies them in a single pass. More draft tokens can generate faster, but drafts the verifier rejects are wasted work, so gains depend on how often drafts are accepted. Applies on the backend's next start.">${icon("info")}</span>
+        <span style="display:flex;gap:6px;margin-top:4px">
+          <select data-mtp-select data-mtp-backend="${esc(b.id)}" style="${SELECT_STYLE};flex:1;min-width:0" aria-label="MTP draft tokens for ${esc(b.id)}"${dis}>
+            ${MTP_POSITIONS.map((v) => `<option value="${v}"${v === pos ? " selected" : ""}>${v === 0 ? "Off" : String(v)}</option>`).join("")}
+          </select>
+        </span></label>
+      <div style="font-size:12px;color:var(--text2);margin-top:4px"><span data-mtp-token style="font-family:var(--mono)">${esc(mtpSavedTokenText(m))}</span>${m.custom ? `<span title="The saved flags spell MTP in a form the control does not write (an = spelling, a shared --spec-type list, ...). Saving from this control writes the canonical tokens; every other flag is preserved."> · custom flags</span>` : ""}</div>
       <div data-mtp-conflict style="font-size:12px;color:#e3b341;margin-top:4px;${conflict ? "" : "display:none"}">${m.parallel != null ? esc(mtpConflictText(m.parallel)) : ""}</div>
     </div>`;
   })() : "";
@@ -2125,12 +2137,13 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   /** True while a slider commit (backend_set_offload) is in
    *  flight; the slider ignores further commits until it lands. */
   let offloadCommitting = false;
-  /** The MTP slider's draft position while the flags form is
-   *  open (0 = Off, 1..4 = draft tokens); null when the open
+  /** The MTP draft control's chosen value while the flags form
+   *  is open (0 = Off, 1..4 = draft tokens); null when the open
    *  backend's model is not MTP-capable. */
   let flagsMtpPosition: number | null = null;
-  /** True while an MTP slider commit (backend_set_mtp) is in
-   *  flight; the slider ignores further commits until it lands. */
+  /** True while an MTP draft commit (backend_set_mtp) is in
+   *  flight; the control ignores further commits until it
+   *  lands. */
   let mtpCommitting = false;
   const closeFlagsForm = (): void => {
     flagsFor = null;
@@ -2266,39 +2279,20 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   root.addEventListener("input", syncOffloadDraft);
   root.addEventListener("change", commitOffload);
 
-  /* ---------------- MTP draft slider (tracker #53) ----------------
-   * The offload slider's shape, one panel down: "input" events
-   * move the draft and update the readout in place; the "change"
-   * event (slider release) commits through backend_set_mtp,
-   * which rewrites only the MTP tokens in the backend's raw
-   * flags. Position 0 commits as Off. A rejected commit reverts
-   * the draft to the saved position. The --parallel conflict
-   * line follows the draft: it shows whenever the position
-   * enables MTP and the SAVED flags set a slot count other
-   * than 1 — the control never rewrites that setting. */
-  const syncMtpDraft = (ev: Event): void => {
-    const t = ev.target as HTMLInputElement;
-    if (!t.hasAttribute("data-mtp-slider")) return;
-    const id = t.getAttribute("data-mtp-backend") ?? "";
-    if (id !== flagsFor) return;
-    const row = lastRows.find((r) => r.id === id);
-    if (!row?.mtp) return;
-    const n = Number(t.value);
-    flagsMtpPosition = n;
-    const card = t.closest(".backend-card");
-    if (!card) return;
-    const label = card.querySelector("[data-mtp-value-label]");
-    if (label) label.textContent = n === 0 ? "Off" : String(n);
-    const token = card.querySelector("[data-mtp-token]");
-    if (token) token.textContent = mtpTokenText(n);
-    const conflict = card.querySelector("[data-mtp-conflict]") as HTMLElement | null;
-    if (conflict) {
-      const show = n > 0 && row.mtp.parallel != null && row.mtp.parallel !== 1;
-      conflict.style.display = show ? "" : "none";
-    }
-  };
-  /** Invoke backend_set_mtp for one position and report the
-   *  outcome on the card. Returns true when the position was
+  /* ---------------- MTP draft control (tracker #53) ----------------
+   * A dropdown (the ctx/batch selects' idiom), so there is no
+   * drag preview to sync: the "change" event does the whole
+   * job — it moves the draft, updates the readouts in place,
+   * and commits through backend_set_mtp, which rewrites only
+   * the MTP tokens in the backend's raw flags. Value 0 commits
+   * as Off. Choosing the saved value is a no-op. A rejected
+   * commit reverts the draft to the saved value. The
+   * --parallel conflict line follows the draft: it shows
+   * whenever the value enables MTP and the SAVED flags set a
+   * slot count other than 1 — the control never rewrites that
+   * setting. */
+  /** Invoke backend_set_mtp for one value and report the
+   *  outcome on the card. Returns true when the value was
    *  saved. */
   const saveMtpPosition = async (id: string, pos: number): Promise<boolean> => {
     if (mtpCommitting) return false;
@@ -2328,24 +2322,33 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       if (!disposed) paint();
     }
   };
-  const commitMtp = async (ev: Event): Promise<void> => {
-    const t = ev.target as HTMLInputElement;
-    if (!t.hasAttribute("data-mtp-slider")) return;
+  const changeMtp = async (ev: Event): Promise<void> => {
+    const t = ev.target as HTMLSelectElement;
+    if (!t.hasAttribute("data-mtp-select")) return;
     const id = t.getAttribute("data-mtp-backend") ?? "";
     const row = lastRows.find((r) => r.id === id);
     if (!row?.mtp || mtpCommitting) return;
     const n = Number(t.value);
     flagsMtpPosition = n;
-    if (n === mtpPosition(row.mtp)) { paint(); return; } // released where it started
+    const card = t.closest(".backend-card");
+    if (card) {
+      const token = card.querySelector("[data-mtp-token]");
+      if (token) token.textContent = mtpTokenText(n);
+      const conflict = card.querySelector("[data-mtp-conflict]") as HTMLElement | null;
+      if (conflict) {
+        const show = n > 0 && row.mtp.parallel != null && row.mtp.parallel !== 1;
+        conflict.style.display = show ? "" : "none";
+      }
+    }
+    if (n === mtpPosition(row.mtp)) { paint(); return; } // the saved value chosen again
     const ok = await saveMtpPosition(id, n);
     if (!ok && !disposed) {
-      // A rejected commit reverts the draft to the saved position.
+      // A rejected commit reverts the draft to the saved value.
       flagsMtpPosition = mtpPosition(row.mtp);
       paint();
     }
   };
-  root.addEventListener("input", syncMtpDraft);
-  root.addEventListener("change", commitMtp);
+  root.addEventListener("change", changeMtp);
 
   /* ---------------- Placement form ----------------
    * Rendered INSIDE the backend's own card (backendCard), like the
