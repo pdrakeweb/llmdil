@@ -50,8 +50,9 @@ pub use experiment::{
     apply_experiment_decision, experiment_fingerprint, experiment_result_fact, fit_verdict_text,
     is_hf_form, lowest_free_port, resolve_candidate, temp_backend_config, temp_backend_id,
     validate_experiment, validate_experiment_for_plan, ActiveExperiment, CandidateResolution,
-    ExperimentFlags, ExperimentJournal, ExperimentMeasured, ExperimentPredicted,
-    ExperimentProposal, ExperimentProvisioning, ExperimentResult, ExperimentStatus,
+    ExperimentEstimate, ExperimentFlags, ExperimentJournal, ExperimentMeasured,
+    ExperimentPredicted, ExperimentProposal, ExperimentProvisioning, ExperimentResult,
+    ExperimentStatus,
     ExperimentValidation, RegisteredModelFile, BATCH_TIMEOUT_SECS, EXPERIMENT_TIMEOUT_SECS,
     MAX_EXPERIMENTS,
 };
@@ -70,10 +71,11 @@ pub use eval::{
 };
 pub use fit::{evaluate_fit, layout_requirement, residency_per_gpu, FitOutcome, LayoutFacts};
 pub use measure::{
-    benchmark_prompts, facts as measurement_facts, measurement_fingerprint, median,
-    normalize_raw_flags, BenchResult, BenchRun, BenchmarkPrompt, MeasurementEntry,
-    MeasurementFingerprintInputs, MeasurementStore, BENCHMARK_TEMPERATURE, LONG_MAX_TOKENS,
-    LONG_PROMPT, MEASURED_RUNS, SHORT_MAX_TOKENS, SHORT_PROMPT,
+    benchmark_prompts, estimate_prompts, facts as measurement_facts, measurement_fingerprint,
+    median, normalize_raw_flags, BenchResult, BenchRun, BenchmarkPrompt, EstimateEntry,
+    MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, BENCHMARK_TEMPERATURE,
+    ESTIMATE_LONG_MAX_TOKENS, ESTIMATE_RUNS, ESTIMATE_SHORT_MAX_TOKENS, LONG_MAX_TOKENS, LONG_PROMPT,
+    MEASURED_RUNS, SHORT_MAX_TOKENS, SHORT_PROMPT,
 };
 pub use parse::{parse_plan, ParseError};
 pub use plan::{

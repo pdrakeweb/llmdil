@@ -1249,6 +1249,7 @@ fn parse_experiments(
             previously_denied,
             provisioning: None,
             result: None,
+            estimate: None,
         });
     }
     let truncated = out.len().saturating_sub(MAX_EXPERIMENTS);

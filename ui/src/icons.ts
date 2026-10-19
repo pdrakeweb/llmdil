@@ -78,6 +78,8 @@ export const icons = {
     svg(`<path d="M6.5 3.5H4A1.5 1.5 0 0 0 2.5 5v7A1.5 1.5 0 0 0 4 13.5h7A1.5 1.5 0 0 0 12.5 12V9.5M9.5 2.5h4v4M13.2 2.8 7.8 8.2"/>`),
   peak: () =>
     svg(`<path d="M2 12.5 6.2 5l2.3 3.4L10.4 6 14 12.5z"/>`),
+  gauge: () =>
+    svg(`<path d="M2.8 12.5a6.5 6.5 0 1 1 10.4 0"/><path d="M8 12.5 11 6.5"/><circle cx="8" cy="12.5" r="1"/>`),
 };
 
 export type IconName = keyof typeof icons;
