@@ -199,6 +199,7 @@ fn write_keys(item: &PlanItem) -> Vec<(String, &'static str)> {
             }
         }
         PlanKind::ModelAdd => keys.push((format!("m:{target}"), "exists")),
+        PlanKind::ModelDownload => keys.push((format!("m:{target}"), "download")),
         PlanKind::Advice => {}
     }
     keys
@@ -767,6 +768,21 @@ fn validate_one(
                 display_name: None,
             });
         }
+        PlanKind::ModelDownload => {
+            // A download changes no configuration — it fetches
+            // the registered model's file — so the item is
+            // valid exactly when the model exists at this point
+            // in the simulated plan (registered in the config,
+            // or registered by an earlier item). Whether the
+            // file is already on disk is the executor's check,
+            // not the simulation's: re-downloading is harmless.
+            if !candidate.models.iter().any(|m| m.id == target) {
+                fail!(format!(
+                    "model '{target}' is not registered; register it before downloading it"
+                ));
+            }
+            expected_note = Some("Model file will be downloaded".to_string());
+        }
         PlanKind::Advice => unreachable!("advice returns earlier"),
     }
 
@@ -846,6 +862,7 @@ mod tests {
             confidence: Confidence::Medium,
             decision,
             previously_denied: false,
+            provision_for_experiment: None,
             apply_outcome: None,
             apply_error: None,
         }

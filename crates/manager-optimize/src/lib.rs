@@ -47,10 +47,11 @@ pub use context::{
     TrafficWindow,
 };
 pub use experiment::{
-    experiment_fingerprint, experiment_result_fact, fit_verdict_text, is_hf_form, lowest_free_port,
-    resolve_candidate, temp_backend_config, temp_backend_id, validate_experiment, ActiveExperiment,
-    CandidateResolution, ExperimentFlags, ExperimentJournal, ExperimentMeasured,
-    ExperimentPredicted, ExperimentProposal, ExperimentResult, ExperimentStatus,
+    apply_experiment_decision, experiment_fingerprint, experiment_result_fact, fit_verdict_text,
+    is_hf_form, lowest_free_port, resolve_candidate, temp_backend_config, temp_backend_id,
+    validate_experiment, validate_experiment_for_plan, ActiveExperiment, CandidateResolution,
+    ExperimentFlags, ExperimentJournal, ExperimentMeasured, ExperimentPredicted,
+    ExperimentProposal, ExperimentProvisioning, ExperimentResult, ExperimentStatus,
     ExperimentValidation, RegisteredModelFile, BATCH_TIMEOUT_SECS, EXPERIMENT_TIMEOUT_SECS,
     MAX_EXPERIMENTS,
 };

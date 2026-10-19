@@ -14,8 +14,8 @@
    Activation Plan flow (§5.3). */
 
 import {
-  addBackend, applyBackendConfig, deleteBackend, getAppConfig, getBackends,
-  getBackendConfig, getOptimizeState, modelAdd, modelAssign,
+  addBackend, applyBackendConfig, deleteBackend, downloadModel, getAppConfig, getBackends,
+  getBackendConfig, getModels, getOptimizeState, modelAdd, modelAssign,
   optimizeCancelConsult, optimizeCancelJob, optimizeChangeSummary, optimizeConsult,
   optimizeDiscardPlan, optimizeDiscover, optimizeIsDestructive, optimizeKindLabel,
   optimizeMeasureBackend, optimizeRunBaseline, optimizeRunExperiments, optimizeSavePurpose, optimizeSetExperimentState, optimizeSetItemOutcome, optimizeSetItemState,
@@ -188,7 +188,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     }
     const targetLabel = item.kind.startsWith("group.")
       ? `Group: ${esc(item.target ?? "")}`
-      : item.kind === "model.add"
+      : item.kind === "model.add" || item.kind === "model.download"
         ? `Model: ${esc(item.target ?? "")}`
         : `${esc(item.target ?? "")}${item.target && shortNameForBackend(item.target, st) ? ` · ${esc(shortNameForBackend(item.target, st) ?? "")}` : ""}`;
     return `<div class="opt-row ${invalid ? "invalid" : ""}">
@@ -204,6 +204,8 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       </div>
       ${optimizeIsDestructive(item.kind) && item.kind === "backend.delete"
         ? `<div class="opt-note">Applying this item stops the backend first, then deletes it.</div>` : ""}
+      ${item.provision_for_experiment
+        ? `<div class="opt-note">Required by experiment E${item.provision_for_experiment} — accepting that experiment accepts this step; denying it denies this step.</div>` : ""}
       ${item.rationale || item.expected_effect
         ? `<details class="opt-why"><summary>Why</summary>
              ${item.rationale ? `<p>${esc(item.rationale)}</p>` : ""}
@@ -263,6 +265,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         ${expTriState(e)}
       </div>
       <div class="opt-note">Serves: ${esc(e.serves)}</div>
+      ${e.provisioning ? `<div class="opt-note">Provisioning: plan item${e.provisioning.item_ids.length === 1 ? "" : "s"} ${e.provisioning.item_ids.join(", ")} register and download '${esc(e.provisioning.model_id)}' — accepting this experiment accepts those items, and the experiment can run once they are applied.</div>` : ""}
       ${e.requires_stopping.length ? `<div class="opt-note">Requires stopping: ${esc(e.requires_stopping.join(", "))} — this proposal starts denied; accepting it allows the run to stop ${e.requires_stopping.length === 1 ? "that backend" : "those backends"} (restarted after the batch).</div>` : ""}
       ${e.predicted.predicted_per_second != null || e.predicted.fit ? `<div class="opt-note">Predicted: ${e.predicted.predicted_per_second != null ? `${trim1(e.predicted.predicted_per_second)} tok/s` : ""}${e.predicted.fit ? ` · Fit: ${esc(e.predicted.fit)}` : ""}</div>` : ""}
       ${e.hypothesis ? `<details class="opt-why"><summary>Why</summary><p>${esc(e.hypothesis)}</p></details>` : ""}
@@ -876,6 +879,31 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       case "model.add": {
         unwrap(await modelAdd(target, str("source_url"), undefined, typeof c.quant === "string" ? (c.quant as string) : undefined, typeof c.params_b === "number" ? (c.params_b as number) : undefined));
         return;
+      }
+      case "model.download": {
+        // Experiment provisioning: fetch the registered model's
+        // file through the existing download machinery and wait
+        // for it to land — an experiment runs its candidate from
+        // disk, so the step is done only when the file is on
+        // disk and verified (or failed, which the row reports).
+        const before = unwrap(await getModels());
+        const row = before.find((m) => m.id === target);
+        if (!row) throw new Error(`model '${target}' is not registered`);
+        if (row.on_disk && !row.downloading) return;
+        // The op refuses a second spawn while one is in flight;
+        // an already-running download is simply awaited.
+        if (!row.downloading) unwrap(await downloadModel(target));
+        const deadline = Date.now() + 2 * 60 * 60 * 1000;
+        for (;;) {
+          await new Promise((r) => window.setTimeout(r, 2000));
+          const rows = unwrap(await getModels());
+          const now = rows.find((m) => m.id === target);
+          if (now?.download_error) throw new Error(now.download_error);
+          if (now?.on_disk && !now.downloading && !now.verifying) return;
+          if (Date.now() > deadline) {
+            throw new Error(`download of '${target}' did not finish within 2 hours — it continues in the background; watch it in the Models view`);
+          }
+        }
       }
       default:
         throw new Error(`kind ${item.kind} has no executor`);

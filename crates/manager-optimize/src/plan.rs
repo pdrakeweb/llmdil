@@ -80,6 +80,14 @@ pub enum PlanKind {
     GroupDelete,
     #[serde(rename = "model.add")]
     ModelAdd,
+    /// Download a registered model's GGUF file through the
+    /// existing download machinery. Never authored by the
+    /// consultant in practice — plan building chains it for an
+    /// experiment whose candidate the plan provisions (the
+    /// registration alone leaves the experiment unrunnable:
+    /// experiments never download at run time).
+    #[serde(rename = "model.download")]
+    ModelDownload,
     #[serde(rename = "advice")]
     Advice,
 }
@@ -101,6 +109,7 @@ impl PlanKind {
             PlanKind::GroupCreate => "group.create",
             PlanKind::GroupDelete => "group.delete",
             PlanKind::ModelAdd => "model.add",
+            PlanKind::ModelDownload => "model.download",
             PlanKind::Advice => "advice",
         }
     }
@@ -121,6 +130,7 @@ impl PlanKind {
             "group.create" => PlanKind::GroupCreate,
             "group.delete" => PlanKind::GroupDelete,
             "model.add" => PlanKind::ModelAdd,
+            "model.download" => PlanKind::ModelDownload,
             "advice" => PlanKind::Advice,
             _ => return None,
         })
@@ -143,6 +153,7 @@ impl PlanKind {
             PlanKind::GroupCreate => "New group",
             PlanKind::GroupDelete => "Delete",
             PlanKind::ModelAdd => "New model",
+            PlanKind::ModelDownload => "Download model",
             PlanKind::Advice => "Advice",
         }
     }
@@ -202,6 +213,20 @@ pub struct PlanItem {
     /// operator can always flip it.
     #[serde(default)]
     pub previously_denied: bool,
+    /// Experiment provisioning link: this item was chained by
+    /// plan building because experiment `N` (a plan experiment
+    /// id) needs its candidate model registered and downloaded
+    /// before it can run. Accepting that experiment accepts
+    /// this item; denying it denies this item. An item the
+    /// consultant authored (or one chained for a
+    /// `backend.create`) that an experiment also relies on is
+    /// NOT marked — it is linked from the experiment's
+    /// `provisioning` record only, so denying the experiment
+    /// never denies a step other plan items depend on.
+    /// Serde-defaulted so plan files written before this field
+    /// stay readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provision_for_experiment: Option<usize>,
     /// Apply outcome once an apply run has covered this item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apply_outcome: Option<ApplyOutcome>,
@@ -398,6 +423,7 @@ mod tests {
             PlanKind::GroupCreate,
             PlanKind::GroupDelete,
             PlanKind::ModelAdd,
+            PlanKind::ModelDownload,
             PlanKind::Advice,
         ] {
             assert_eq!(PlanKind::parse(k.as_str()), Some(k));

@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 
 use crate::eval::{EvalComparison, EvalRunRecord};
 use crate::measure::BenchResult;
-use crate::plan::{canonical_json, Decision};
+use crate::plan::{canonical_json, Decision, Plan, PlanKind};
 use crate::validate::ValidationStatus;
 
 /// Hard cap on experiment proposals per consultation (§A.3):
@@ -179,9 +179,33 @@ pub struct ExperimentProposal {
     pub decision: Decision,
     #[serde(default)]
     pub previously_denied: bool,
+    /// Plan-build provisioning for an unregistered candidate:
+    /// the plan items that register and download the model so
+    /// this experiment can run (inserted by the parser's
+    /// grounding pass). Absent when the candidate is already
+    /// registered (nothing to provision) and when it cannot be
+    /// resolved to any downloadable source — in that case
+    /// light validation states precisely what is missing.
+    /// Serde-defaulted so plan files written before this field
+    /// stay readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioning: Option<ExperimentProvisioning>,
     /// The recorded outcome once a batch has run this proposal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ExperimentResult>,
+}
+
+/// How one experiment's candidate model is provisioned by its
+/// plan: the registration id the candidate resolves to, and
+/// the plan items that register and download it, in plan
+/// order. Accepting the experiment accepts these items;
+/// denying it denies the ones plan building chained for it
+/// (see [`apply_experiment_decision`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExperimentProvisioning {
+    pub model_id: String,
+    #[serde(default)]
+    pub item_ids: Vec<usize>,
 }
 
 /// An experiment's fingerprint: hash of candidate + flags +
@@ -225,39 +249,37 @@ pub fn is_hf_form(candidate: &str) -> bool {
         && parts[parts.len() - 1].to_lowercase().ends_with(".gguf")
 }
 
-/// Light validation of one proposal (§A.3 state surface):
-/// the candidate must be resolvable in principle (a registered
-/// model id, a curated-catalog id, an HF repo/file form, or one
-/// of `extra_candidate_ids` — the candidates-block entries the
-/// consultation carried, as `repo_id/file`), the flags must be
-/// sane (a named context is positive; a named tensor split sums
-/// to 1.0), and every `requires_stopping` id must name a
-/// configured backend. On-disk existence is NOT checked here —
-/// that is preflight's job, stated in its own numbers.
-pub fn validate_experiment(
-    proposal: &ExperimentProposal,
+/// The candidate-resolvability problem, stated precisely:
+/// every source a candidate could resolve from is named, so
+/// an unresolvable candidate says exactly what is missing
+/// rather than offering a generic dead end. `None` when the
+/// candidate resolves from any source.
+fn candidate_problem(
+    candidate: &str,
     cfg: &AppConfig,
     extra_candidate_ids: &[String],
-) -> ExperimentValidation {
-    let mut problems: Vec<String> = Vec::new();
-    let candidate = proposal.candidate_model_id.trim();
-    if candidate.is_empty() {
-        problems.push("candidate_model_id is empty".to_string());
+) -> Option<String> {
+    let registered = cfg.models.iter().any(|m| m.id == candidate);
+    let catalog = manager_models::curated_models()
+        .iter()
+        .any(|s| s.id == candidate);
+    if registered
+        || catalog
+        || is_hf_form(candidate)
+        || extra_candidate_ids.iter().any(|c| c == candidate)
+    {
+        None
     } else {
-        let registered = cfg.models.iter().any(|m| m.id == candidate);
-        let catalog = manager_models::curated_models()
-            .iter()
-            .any(|s| s.id == candidate);
-        if !registered
-            && !catalog
-            && !is_hf_form(candidate)
-            && !extra_candidate_ids.iter().any(|c| c == candidate)
-        {
-            problems.push(format!(
-                "candidate '{candidate}' is not a registered model, a catalog model, or an HF repo/file"
-            ));
-        }
+        Some(format!(
+            "candidate '{candidate}' cannot be resolved: it is not a registered model, not in the curated catalog, not among the candidates discovered for this consultation, and not an HF repo/file (owner/repo/file.gguf), so no plan step can register or download it"
+        ))
     }
+}
+
+/// The non-candidate problems (flags and `requires_stopping`
+/// ids), shared by both validation entry points.
+fn non_candidate_problems(proposal: &ExperimentProposal, cfg: &AppConfig) -> Vec<String> {
+    let mut problems: Vec<String> = Vec::new();
     if let Some(n) = proposal.flags.n_ctx {
         if n == 0 {
             problems.push("n_ctx must be greater than 0".to_string());
@@ -281,6 +303,10 @@ pub fn validate_experiment(
             problems.push(format!("requires_stopping names unknown backend '{id}'"));
         }
     }
+    problems
+}
+
+fn verdict(problems: Vec<String>) -> ExperimentValidation {
     if problems.is_empty() {
         ExperimentValidation {
             status: ValidationStatus::Valid,
@@ -292,6 +318,129 @@ pub fn validate_experiment(
             reason: Some(problems.join("; ")),
         }
     }
+}
+
+/// Light validation of one proposal (§A.3 state surface):
+/// the candidate must be resolvable in principle (a registered
+/// model id, a curated-catalog id, an HF repo/file form, or one
+/// of `extra_candidate_ids` — the candidates-block entries the
+/// consultation carried, as `repo_id/file`), the flags must be
+/// sane (a named context is positive; a named tensor split sums
+/// to 1.0), and every `requires_stopping` id must name a
+/// configured backend. On-disk existence is NOT checked here —
+/// that is preflight's job, stated in its own numbers.
+pub fn validate_experiment(
+    proposal: &ExperimentProposal,
+    cfg: &AppConfig,
+    extra_candidate_ids: &[String],
+) -> ExperimentValidation {
+    let mut problems: Vec<String> = Vec::new();
+    let candidate = proposal.candidate_model_id.trim();
+    if candidate.is_empty() {
+        problems.push("candidate_model_id is empty".to_string());
+    } else if let Some(p) = candidate_problem(candidate, cfg, extra_candidate_ids) {
+        problems.push(p);
+    }
+    problems.extend(non_candidate_problems(proposal, cfg));
+    verdict(problems)
+}
+
+/// Plan-aware light validation: the state payload's check,
+/// which also credits the plan's own provisioning. A candidate
+/// the plan registers through its provisioning items is
+/// resolvable even though the current config does not register
+/// it yet — flagging it invalid would repeat the dead end this
+/// fixes. The one plan state that keeps such an experiment
+/// unrunnable is a DENIED registration item, and that is
+/// stated, with its remedy. A candidate with no provisioning
+/// and no other resolution gets the precise missing-source
+/// statement from [`candidate_problem`].
+pub fn validate_experiment_for_plan(
+    proposal: &ExperimentProposal,
+    cfg: &AppConfig,
+    extra_candidate_ids: &[String],
+    items: &[crate::plan::PlanItem],
+) -> ExperimentValidation {
+    let mut problems: Vec<String> = Vec::new();
+    let candidate = proposal.candidate_model_id.trim();
+    if candidate.is_empty() {
+        problems.push("candidate_model_id is empty".to_string());
+    } else if !cfg.models.iter().any(|m| m.id == candidate) {
+        match &proposal.provisioning {
+            Some(prov) => {
+                let add_denied = items.iter().any(|i| {
+                    prov.item_ids.contains(&i.id)
+                        && i.kind == PlanKind::ModelAdd
+                        && i.decision == Decision::Denied
+                });
+                if add_denied {
+                    problems.push(format!(
+                        "candidate '{candidate}' is registered by a plan item that is denied — accept the experiment (which accepts its provisioning items) or accept that item to run it"
+                    ));
+                }
+            }
+            None => {
+                if let Some(p) = candidate_problem(candidate, cfg, extra_candidate_ids) {
+                    problems.push(p);
+                }
+            }
+        }
+    }
+    problems.extend(non_candidate_problems(proposal, cfg));
+    verdict(problems)
+}
+
+/// Apply a tri-state decision to one experiment, cascading it
+/// to the experiment's provisioning items:
+///
+/// - Accept accepts every provisioning item (the registration
+///   and download the experiment needs) — including items the
+///   consultant authored or that other plan items also use;
+///   sharing never blocks acceptance.
+/// - Deny denies only the items plan building chained FOR
+///   this experiment (`provision_for_experiment`); a shared
+///   authored registration is never denied out from under the
+///   items that rely on it.
+/// - Undecided cascades nowhere.
+///
+/// Returns the fingerprints that transitioned to Denied (the
+/// experiment's own included) so the caller can record denial
+/// memory, or `None` when no experiment has that id.
+pub fn apply_experiment_decision(
+    plan: &mut Plan,
+    experiment_id: usize,
+    decision: Decision,
+) -> Option<Vec<String>> {
+    let pos = plan.experiments.iter().position(|e| e.id == experiment_id)?;
+    let provisioning = plan.experiments[pos].provisioning.clone();
+    let mut newly_denied: Vec<String> = Vec::new();
+    if decision == Decision::Denied && plan.experiments[pos].decision != Decision::Denied {
+        newly_denied.push(plan.experiments[pos].fingerprint.clone());
+    }
+    plan.experiments[pos].decision = decision;
+    match decision {
+        Decision::Accepted => {
+            if let Some(prov) = &provisioning {
+                for item in plan.items.iter_mut() {
+                    if prov.item_ids.contains(&item.id) {
+                        item.decision = Decision::Accepted;
+                    }
+                }
+            }
+        }
+        Decision::Denied => {
+            for item in plan.items.iter_mut() {
+                if item.provision_for_experiment == Some(experiment_id)
+                    && item.decision != Decision::Denied
+                {
+                    item.decision = Decision::Denied;
+                    newly_denied.push(item.fingerprint.clone());
+                }
+            }
+        }
+        Decision::Undecided => {}
+    }
+    Some(newly_denied)
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +828,7 @@ mod tests {
             run_eval: false,
             decision: Decision::Undecided,
             previously_denied: false,
+            provisioning: None,
             result: None,
         }
     }

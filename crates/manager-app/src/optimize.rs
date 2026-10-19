@@ -586,7 +586,16 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
             plan.experiments
                 .iter()
                 .map(|e| {
-                    let ev = manager_optimize::validate_experiment(e, &cfg, &extra_candidates);
+                    // Plan-aware: a candidate the plan itself
+                    // registers through its provisioning items is
+                    // resolvable even though the current config
+                    // does not register it yet.
+                    let ev = manager_optimize::validate_experiment_for_plan(
+                        e,
+                        &cfg,
+                        &extra_candidates,
+                        &plan.items,
+                    );
                     json!({
                         "status": match ev.status {
                             ValidationStatus::Valid => "valid",
