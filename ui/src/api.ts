@@ -1906,6 +1906,12 @@ export interface ActivationPlanData {
    *  false while the gateway is down — a stale file then is not
    *  pending work, since the next start regenerates it. */
   drift: boolean;
+  /** The raw generated-vs-on-disk file comparison, in any
+   *  gateway state. Informational while the gateway is down (the
+   *  next start regenerates the files); when drift is pending
+   *  work it is also itemized in `changes` as a `gateway_drift`
+   *  item, so a pending plan never counts zero changes. */
+  files_differ?: boolean;
   /** Pending while the gateway is down: the changes take effect at
    *  the next start rather than needing a restart. */
   applies_at_next_start: boolean;
@@ -1920,7 +1926,7 @@ export interface ActivationPlanData {
 }
 
 const EMPTY_PLAN: ActivationPlanData = {
-  pending: false, gateway_up: false, drift: false,
+  pending: false, gateway_up: false, drift: false, files_differ: false,
   applies_at_next_start: false, changes: [], snapshot_available: false,
 };
 

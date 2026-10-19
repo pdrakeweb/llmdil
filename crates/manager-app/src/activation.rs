@@ -175,7 +175,9 @@ fn save_journal(data_dir: &Path, journal: &ActivationJournal) -> Result<(), Stri
 /// When the running gateway's configuration was generated: the
 /// mtime of the YAML the start-gateway step last wrote. Entries at
 /// or before this instant were resolved by that start.
-fn gateway_config_written_at(data_dir: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn gateway_config_written_at(
+    data_dir: &Path,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     let meta = std::fs::metadata(gateway_yaml_path(data_dir)).ok()?;
     let modified = meta.modified().ok()?;
     Some(chrono::DateTime::<chrono::Utc>::from(modified))
@@ -292,34 +294,70 @@ pub fn pending_entries(
 ///
 /// A missing YAML file (gateway never started) is not drift —
 /// nothing is running on a stale config.
-pub fn config_drift(
+/// Which of the gateway's generated files differ from what a
+/// start would generate now — the element-level result behind
+/// [`config_drift`], so the activation plan can state honestly
+/// WHAT drifted. The comparison cannot say more: it knows the
+/// files differ, not which edit made them differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriftDetail {
+    /// `gateway/config.yaml` differs from the generated config.
+    pub yaml: bool,
+    /// `gateway/llmdil_routing.py` differs, is missing while a
+    /// typed routing rule is enabled, or is present while none
+    /// is.
+    pub routing: bool,
+}
+
+impl DriftDetail {
+    pub fn any(&self) -> bool {
+        self.yaml || self.routing
+    }
+}
+
+/// The element-level form of [`config_drift`] (whose doc comment
+/// describes the comparison); identical semantics — a generation
+/// failure or a missing YAML file is no drift at all, for either
+/// element.
+pub fn config_drift_detail(
     cfg: &AppConfig,
     data_dir: &Path,
     mcp_can_resolve: impl FnMut(&str) -> bool,
-) -> bool {
+) -> DriftDetail {
+    let none = DriftDetail {
+        yaml: false,
+        routing: false,
+    };
     let filtered = manager_wizard::config_with_armed_gateway_mcp_servers(cfg, mcp_can_resolve);
     let Ok(generated) = manager_gateway::generate_config_yaml(&filtered) else {
-        return false;
+        return none;
     };
     let Ok(on_disk) = std::fs::read_to_string(gateway_yaml_path(data_dir)) else {
-        return false;
+        return none;
     };
-    if normalize_yaml(&generated) != normalize_yaml(&on_disk) {
-        return true;
-    }
+    let yaml = normalize_yaml(&generated) != normalize_yaml(&on_disk);
     // The routing callback is a second generated artifact
     // (routing-rules design §6.3): a rule change can alter it
     // without altering the YAML, so it is compared too — present
     // and equal when a typed rule is enabled, absent when none
     // is — the same rule `gateway_config_is_current` applies.
     let routing_path = gateway_routing_path(data_dir);
-    match manager_gateway::generate_routing_callback(&filtered) {
+    let routing = match manager_gateway::generate_routing_callback(&filtered) {
         Some(expected) => match std::fs::read_to_string(&routing_path) {
             Ok(disk_py) => normalize_yaml(&expected) != normalize_yaml(&disk_py),
             Err(_) => true,
         },
         None => routing_path.exists(),
-    }
+    };
+    DriftDetail { yaml, routing }
+}
+
+pub fn config_drift(
+    cfg: &AppConfig,
+    data_dir: &Path,
+    mcp_can_resolve: impl FnMut(&str) -> bool,
+) -> bool {
+    config_drift_detail(cfg, data_dir, mcp_can_resolve).any()
 }
 
 /// Whether live config drift is pending work for an activation
@@ -345,6 +383,59 @@ pub fn config_drift(
 /// it as pending work in either direction.
 pub fn drift_is_pending(drift: bool, gateway_up: bool) -> bool {
     drift && gateway_up
+}
+
+/// The activation plan's change item for live config drift, so
+/// drift that makes a plan pending is also an item the plan
+/// COUNTS and LISTS (tracker #57). Before this, drift entered
+/// the plan's `pending`/`gateway_pending`/`actionable` as a bare
+/// boolean while `changes` came only from the journal, so a
+/// drift-only state rendered an actionable plan with zero items
+/// on every surface — the banner's "Pending changes: 0" beside
+/// Drain/Apply buttons, the plan page's 0/0/0 tiles above an
+/// enabled Apply. The journal can never contain this item:
+/// drift's inputs include journal-free state — an MCP credential
+/// stored or removed flips the armed view (hence the generated
+/// YAML) with no config save — so the item is synthesized at
+/// plan computation, never journaled. Applying the plan is its
+/// resolution: the gateway restart regenerates both files.
+///
+/// The summary states only what the comparison can honestly
+/// state — WHICH generated file differs. It must not name a
+/// cause: the credential-arming flip above leaves no trace the
+/// comparison could attribute. `written_at` (the YAML's mtime —
+/// when the running gateway's files were generated) is the
+/// item's timestamp; the current instant stands in when it is
+/// unknown.
+pub fn drift_plan_change(
+    detail: &DriftDetail,
+    written_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> serde_json::Value {
+    let (what, noun) = match (detail.yaml, detail.routing) {
+        (true, true) => (
+            "The gateway config file (config.yaml) and the routing callback file (llmdil_routing.py) differ",
+            "files",
+        ),
+        (true, false) => ("The gateway config file (config.yaml) differs", "file"),
+        (false, true) => (
+            "The routing callback file (llmdil_routing.py) differs",
+            "file",
+        ),
+        (false, false) => ("The gateway's generated files differ", "files"),
+    };
+    let ts = written_at
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    serde_json::json!({
+        "ts": ts,
+        "kind": "gateway_drift",
+        "summary": format!(
+            "{what} from the saved configuration — the running gateway is serving the older {noun}."
+        ),
+        "scope": "gateway",
+        "targets": [],
+        "activation": "gateway_restart",
+    })
 }
 
 fn normalize_yaml(text: &str) -> String {
@@ -1416,6 +1507,156 @@ litellm_deployment_success_responses_total 9.0
         // serving it: then the plan owes a gateway restart, and
         // gateway_pending (hence the apply line) must say so.
         assert!(drift_is_pending(raw, true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_drift_detail_names_the_differing_element() {
+        // Tracker #57: the plan's drift item must say WHICH
+        // generated file differs, so the element-level comparison
+        // reports the YAML and the routing callback separately.
+        let dir = drift_test_dir("detail");
+        let mut cfg = AppConfig::default_config();
+        for b in cfg.backends.iter_mut() {
+            b.enabled = true;
+        }
+        let view = manager_wizard::config_with_armed_gateway_mcp_servers(&cfg, |_| false);
+        let yaml = manager_gateway::generate_config_yaml(&view).unwrap();
+        std::fs::write(gateway_yaml_path(&dir), &yaml).unwrap();
+        let detail = config_drift_detail(&cfg, &dir, |_| false);
+        assert_eq!(
+            detail,
+            DriftDetail {
+                yaml: false,
+                routing: false
+            }
+        );
+        assert!(!detail.any());
+        // A callback file no enabled rule justifies: routing only.
+        std::fs::write(gateway_routing_path(&dir), "# stale callback\n").unwrap();
+        let detail = config_drift_detail(&cfg, &dir, |_| false);
+        assert_eq!(
+            detail,
+            DriftDetail {
+                yaml: false,
+                routing: true
+            }
+        );
+        // A saved change the YAML carries: YAML too.
+        std::fs::remove_file(gateway_routing_path(&dir)).unwrap();
+        cfg.backends[0].port += 1;
+        let detail = config_drift_detail(&cfg, &dir, |_| false);
+        assert_eq!(
+            detail,
+            DriftDetail {
+                yaml: true,
+                routing: false
+            }
+        );
+        assert!(detail.any());
+        assert_eq!(config_drift(&cfg, &dir, |_| false), detail.any());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drift_plan_change_item_shape_and_summary() {
+        // The synthesized item carries the fields every plan
+        // surface renders (ts/kind/summary/scope/targets/
+        // activation), classifies as a gateway restart, and names
+        // exactly the differing element(s) — never a cause.
+        let at = chrono::DateTime::parse_from_rfc3339("2026-10-18T22:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let item = drift_plan_change(
+            &DriftDetail {
+                yaml: true,
+                routing: false,
+            },
+            Some(at),
+        );
+        assert_eq!(item["kind"], "gateway_drift");
+        assert_eq!(item["scope"], "gateway");
+        assert_eq!(item["activation"], "gateway_restart");
+        assert_eq!(item["targets"], serde_json::json!([]));
+        assert_eq!(item["ts"], "2026-10-18T22:00:00+00:00");
+        let summary = item["summary"].as_str().unwrap();
+        assert!(summary.contains("config.yaml"), "{summary}");
+        assert!(!summary.contains("llmdil_routing.py"), "{summary}");
+
+        let item = drift_plan_change(
+            &DriftDetail {
+                yaml: false,
+                routing: true,
+            },
+            None,
+        );
+        let summary = item["summary"].as_str().unwrap();
+        assert!(summary.contains("llmdil_routing.py"), "{summary}");
+        assert!(!summary.contains("config.yaml"), "{summary}");
+
+        let item = drift_plan_change(
+            &DriftDetail {
+                yaml: true,
+                routing: true,
+            },
+            None,
+        );
+        let summary = item["summary"].as_str().unwrap();
+        assert!(summary.contains("config.yaml"), "{summary}");
+        assert!(summary.contains("llmdil_routing.py"), "{summary}");
+    }
+
+    #[test]
+    fn drift_only_state_composes_a_one_item_plan() {
+        // Regression (tracker #57), Pete's production shape: the
+        // gateway is UP serving files an earlier start wrote; the
+        // saved state has since drifted with NO journal entry —
+        // here the journal-free trigger itself: an MCP credential
+        // stored after the start arms a Gateway server, so a start
+        // now would write an mcp_servers block the on-disk file
+        // lacks (the #42 fixture's armed side). The plan composed
+        // the way op_gateway_activation_plan composes it must
+        // contain exactly one change — the drift item — so no
+        // surface can render "Pending changes: 0" beside an Apply.
+        let dir = drift_test_dir("drift-only-plan");
+        let mut cfg = AppConfig::default_config();
+        for b in cfg.backends.iter_mut() {
+            b.enabled = true;
+        }
+        // The file the running gateway was started with: written
+        // while the seeded Gateway server was unarmed.
+        let unarmed = manager_wizard::config_with_armed_gateway_mcp_servers(&cfg, |_| false);
+        let yaml = manager_gateway::generate_config_yaml(&unarmed).unwrap();
+        std::fs::write(gateway_yaml_path(&dir), &yaml).unwrap();
+        // No journal file at all: nothing was ever recorded.
+        let journal = load_journal(&dir);
+        let started_at = std::collections::HashMap::new();
+        let configured: std::collections::HashSet<String> =
+            cfg.backends.iter().map(|b| b.id.clone()).collect();
+        let running = std::collections::HashSet::new();
+        let pending = pending_entries(&dir, &journal, &started_at, &configured, &running, true);
+        assert!(pending.is_empty(), "precondition: no journal entries");
+        // The credential now resolves: drift, gateway up.
+        let detail = config_drift_detail(&cfg, &dir, |_| true);
+        assert!(detail.any(), "precondition: the armed view drifted");
+        assert!(detail.yaml);
+        let drift = drift_is_pending(detail.any(), true);
+        assert!(drift);
+        // The op's composition: entry changes (none) plus the
+        // synthesized drift item.
+        let mut changes: Vec<serde_json::Value> = Vec::new();
+        if drift {
+            changes.push(drift_plan_change(
+                &detail,
+                gateway_config_written_at(&dir),
+            ));
+        }
+        assert_eq!(changes.len(), 1, "a pending plan never has zero items");
+        assert_eq!(changes[0]["kind"], "gateway_drift");
+        assert_eq!(changes[0]["activation"], "gateway_restart");
+        // The same state with the gateway DOWN composes no item:
+        // the stale file is information, not pending work (#45).
+        assert!(!drift_is_pending(detail.any(), false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

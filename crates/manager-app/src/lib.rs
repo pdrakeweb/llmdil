@@ -5364,7 +5364,11 @@ pub async fn op_gateway_status(
         let drift = activation::config_drift(&cfg, &state.data_dir, |t| presence.contains(t));
         (
             !pending.is_empty() || (drift && up),
-            pending.len(),
+            // The count the activation plan itself reports:
+            // journal entries plus the plan's synthesized drift
+            // item when drift is pending work (tracker #57) —
+            // never "pending" beside a zero count.
+            pending.len() + usize::from(drift && up),
         )
     };
     Ok(json!({
@@ -5402,7 +5406,12 @@ pub async fn op_gateway_status(
 /// the RUNNING gateway only — while the gateway is down a stale
 /// generated file is not pending work (it regenerates at the next
 /// start) and is never stated as the plan's reason
-/// (activation::drift_is_pending).
+/// (activation::drift_is_pending). When drift is the pending
+/// work it also appears in `changes` as a synthesized
+/// `gateway_drift` item (activation::drift_plan_change), so a
+/// pending plan's change count is never zero (tracker #57); the
+/// raw comparison rides along as `files_differ`, informational
+/// in any gateway state.
 pub async fn op_gateway_activation_plan(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
@@ -5432,11 +5441,13 @@ pub async fn op_gateway_activation_plan(
     // next start, so the raw file comparison must not surface in
     // the plan — a backend-only plan otherwise asserts gateway
     // drift its apply never touches (tracker #45; the rule lives
-    // in activation::drift_is_pending).
-    let drift = activation::drift_is_pending(
-        activation::config_drift(&cfg, &state.data_dir, |t| presence.contains(t)),
-        up,
-    );
+    // in activation::drift_is_pending). The raw comparison rides
+    // the payload separately as `files_differ`, informational
+    // only, so the plan view can note a stale file the next start
+    // will regenerate without calling it pending.
+    let drift_detail =
+        activation::config_drift_detail(&cfg, &state.data_dir, |t| presence.contains(t));
+    let drift = activation::drift_is_pending(drift_detail.any(), up);
     let pending = !pending_entries.is_empty() || drift;
     let entry_ts = |e: &activation::ActivationEntry| {
         chrono::DateTime::parse_from_rfc3339(&e.ts)
@@ -5444,7 +5455,7 @@ pub async fn op_gateway_activation_plan(
             .map(|t| t.with_timezone(&chrono::Utc))
     };
     let mut backend_restart_ids: Vec<String> = Vec::new();
-    let changes: Vec<Value> = pending_entries
+    let mut changes: Vec<Value> = pending_entries
         .iter()
         .map(|e| {
             let activation_kind = if e.scope == "backend" {
@@ -5484,6 +5495,19 @@ pub async fn op_gateway_activation_plan(
             })
         })
         .collect();
+    // Drift that makes the plan pending is also an ITEM in it
+    // (tracker #57): the journal cannot contain it — drift's
+    // inputs include journal-free state (an MCP credential's
+    // presence flips the armed view with no config save) — so
+    // without a synthesized item, a drift-only plan offered an
+    // Apply over zero counted changes on every surface. The item
+    // is derived here, at plan computation, never journaled.
+    if drift {
+        changes.push(activation::drift_plan_change(
+            &drift_detail,
+            activation::gateway_config_written_at(&state.data_dir),
+        ));
+    }
     let gateway_pending = drift
         || pending_entries.iter().any(|e| e.scope != "backend")
         || changes.iter().any(|c| c["activation"] == "gateway_restart");
@@ -5493,6 +5517,7 @@ pub async fn op_gateway_activation_plan(
         "gateway_up": up,
         "gateway_pending": gateway_pending,
         "drift": drift,
+        "files_differ": drift_detail.any(),
         "applies_at_next_start": pending && !up,
         "actionable": actionable,
         "backend_restart_ids": backend_restart_ids,
