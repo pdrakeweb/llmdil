@@ -1,5 +1,9 @@
 # Design C — Cluster Service Map (NOC-style)
 
+Status (Oct 8, 2026): brainstorm candidate; not selected as the base
+direction — its cluster diagrams were integrated into the selected
+Design B Hybrid as alternate views. See `design-b-hybrid.md`.
+
 Direction: the Dell Precision 7865 is treated as a small inference cluster.
 The UI is its live service map. Setup is cluster bring-up. Nothing hides
 behind a single toggle; every node is addressable.

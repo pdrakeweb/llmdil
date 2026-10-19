@@ -3,6 +3,7 @@
 Card: Backend card · Renders in: Backends view, grouped under gateway-group sections · Source: `backendCard`, `ui/src/views/static.ts` (lines 880–1205 as read)
 Reference: `docs/design-principles.md` (14 principles, Part 3 checklist)
 Date: 2026-10-16 · Method: code inspection of the current tree. Line numbers are as read; the file is under concurrent edit by the UI-pass work, so lines may drift by a few.
+Post-v0.1.40 note (2026-10-18): the reference now runs to 16 principles/questions. The card has since gained an icon-only go-to-logs anchor (`#/logs?scope=<backend>&follow=1`, tracker #47), the enable/disable state switch (rule 16, tracker #48) in place of the Enable/Disable buttons, the expert-offload slider with guardrails, and — on MTP-capable models — the MTP draft-length selector (tracker #53), all in current `backendCard`, `ui/src/views/static.ts`.
 
 ## Verdict
 

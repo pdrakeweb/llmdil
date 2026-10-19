@@ -1,5 +1,9 @@
 # Design B: The Appliance Console
 Local LLM Service Manager — UI design brainstorm, direction B.
+Status (Oct 8, 2026): selected as the base direction, with Design C's
+cluster diagrams and Design A's console density integrated as alternate
+views — see `design-b-hybrid.md` (decision record). (The product was
+renamed LLMdil on 2026-10-17; this document predates the rename.)
 Author: Designer B (subagent). Date: 2026-10-08. Design only, no code.
 
 Direction name: **The Appliance Console** — LM Studio-inspired, appliance-style, guided.

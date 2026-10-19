@@ -6,6 +6,8 @@
 
 **Verdict: redesign needed — 11 of 14 checklist questions fail.**
 
+**Post-v0.1.40 note (2026-10-18):** this audit predates the implemented redesign (see `IMPLEMENTATION.md`): Settings is now one tabbed view, and its tabs have since grown to General, Updates & diagnostics, Notifications, MXC sandbox, Remote Access (Admin API + admin users), and Supervision (`renderSettings` / `wireSettings`, current `ui/src/views/static.ts`). The checklist also now runs to 16 questions, and the Notifications and Remote Access enable/disable controls are the shared state switch (rule 16), not On/Off or Enable/Disable buttons. The "four full cards stacked" scope statement above is the pre-redesign state.
+
 ## Scorecard
 
 | # | Question | Result |

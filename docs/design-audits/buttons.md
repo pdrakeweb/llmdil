@@ -205,6 +205,12 @@ Every changed button keeps its `id`, `data-*` hook, disabled-state logic, and ha
 
 Gates: `npm run build` (tsc + vite) pass; `npm run smoke` pass.
 
+> **Recount note (2026-10-18, v0.1.40):** the counts in the verdict above
+> and in the Updated counts table at the end of the 2026-10-17 addendum
+> (63 icon-only / 21 words + icon) are the counts *of that sweep*, not of
+> the current UI. A full recount against v0.1.40 is in the final addendum
+> of this document ("Recount — v0.1.40, 2026-10-18").
+
 ## Addendum — Pete's corrections (2026-10-17)
 
 Pete reviewed this sweep and refined the rule. Rule 15 in `docs/design-principles.md` (and checklist question 15) now carries the carve-out: **the standard workflow action of a surface — the action the user most likely wants to take next on it — keeps its words AND its icon even when non-destructive; icon-only is for secondary safe actions.** The corrections below apply that refinement. Handler hooks, ids, and click semantics are unchanged throughout; restorations change only the button content and drop the now-redundant `aria-label` (the visible word names the action), keeping `title`.
@@ -267,3 +273,68 @@ One rendering change beyond the control itself: the backend card previously show
 **Smoke coverage.** `ui/scripts/smoke.mjs` now asserts the bundle carries `role="switch"` + `aria-checked`, that `enableSwitch` exists and is used by both views hosting toggles (`views/static.ts`, `views/mcp.ts`), and that no `? "ban" : "check"` action-icon toggle remains in `ui/src`.
 
 Gates: `npm run build` (tsc + vite) pass; `npm run smoke` pass.
+
+## Addendum — Recount (v0.1.40, 2026-10-18)
+
+The 63 icon-only / 21 words + icon totals above describe the 2026-10-17
+sweep plus its corrections. They are **stale as totals for the current
+UI**: two whole surfaces of buttons have been added since (the Optimize
+view and the MCP Servers view, plus the gateway-start MCP credential
+prompt), the dashboard Start All bar has landed, and the #48 switch swap
+removed the enable/disable family from the button count entirely.
+
+**Method.** Template-level count, not a rendered-DOM count: every
+`<button` occurrence in `ui/src/**/*.ts` (`grep -ro "<button"`), classed
+by the class string and content pattern at its render site. One
+occurrence is a comment in `switch.ts`, leaving **172 `<button>` render
+sites**. A rendered-DOM recount would differ — several sites render in
+loops or conditionals, and small in-row icon-only buttons do not all
+carry the `.btn.icon-only` class — so the class-based split below is a
+floor for icon-only, not an exact census.
+
+| File | `<button` render sites | Notes |
+|---|---|---|
+| `ui/src/main.ts` | 5 | Activation banner (unchanged from the sweep) |
+| `ui/src/views/static.ts` | 123 | All pre-#48 views |
+| `ui/src/views/dashboard.ts` | 8 | Includes the Start All bar (below) |
+| `ui/src/views/optimize.ts` | 21 | New view — outside the original audit's scope |
+| `ui/src/views/mcp.ts` | 9 | New view — outside the original audit's scope |
+| `ui/src/mcp-prompt.ts` | 5 | New — gateway-start credential prompt |
+| `ui/src/switch.ts` | 1 | The shared switch component itself |
+
+**Icon-only split.** `btn icon-only` occurs 57 times in `ui/src`; 5 of
+those are `<a>` anchors (next paragraph), leaving **52 `<button>` render
+sites carrying the icon-only class**. The sweep's "63 icon-only" figure
+is therefore not comparable: it counted conversions, this counts current
+render sites carrying the class, and several post-sweep icon-only sites
+use compact in-row padding instead of the class.
+
+**Go-to-logs anchors (tracker #47) are not buttons.** Backend cards
+(`views/static.ts`), the dashboard gateway card and the Gateway view
+(`views/dashboard.ts`, `views/static.ts`), local MCP server cards
+(`views/mcp.ts`), and the Optimize topbar (`views/optimize.ts`) each
+carry an icon-only `<a class="btn icon-only" href="#/logs?scope=<id>&follow=1">`.
+Per this audit's own Scope decisions, anchors styled as buttons are out
+of the button count; they are recorded here because they are the
+icon-only additions a reader will notice first.
+
+**Switches are not buttons in this count's sense either.**
+`enableSwitch` has 8 call sites (7 in `views/static.ts`, 1 in
+`views/mcp.ts`); the Settings → Notifications call site renders one
+switch per category plus the master, so rendered switches exceed call
+sites. The #48 addendum's 8 swapped controls stand as recorded.
+
+**Corrections to earlier sections of this document.**
+
+- "Dashboard Start All bar — Not present in this tree" (inventory,
+  Cross-view shared elements) is superseded: the bar exists in v0.1.40
+  (`startAllBar`, `ui/src/views/dashboard.ts`) and renders
+  *Start All Services* as a words + `play` icon primary button — the
+  lifecycle treatment this audit predicted for it.
+- The inventory's scope line ("main.ts shell + activation banner,
+  views/dashboard.ts, views/static.ts") no longer covers the UI:
+  `views/optimize.ts`, `views/mcp.ts`, and `mcp-prompt.ts` hold 35
+  further render sites, none of them swept under rule 15. Their buttons
+  are predominantly words + icon workflow actions (consult, measure,
+  run, discover, store credential); a rule-15 sweep of those three
+  files is the open follow-up, not a finding recorded here.
