@@ -41,9 +41,9 @@ use serde_json::json;
 
 use manager_config::AppConfig;
 use manager_optimize::{
-    benchmark_prompts, compare, estimate_prompts, evaluate_fit, fit_verdict_text, lowest_free_port,
-    resolve_candidate, temp_backend_config, temp_backend_id, ActiveExperiment, BenchResult,
-    BenchRun, CandidateResolution, Decision, ExperimentEstimate, ExperimentJournal,
+    benchmark_prompts, compare, estimate_prompts, evaluate_fit, fit_verdict_text, is_temp_backend_id,
+    lowest_free_port, resolve_candidate, temp_backend_config, temp_backend_id, ActiveExperiment,
+    BenchResult, BenchRun, CandidateResolution, Decision, ExperimentEstimate, ExperimentJournal,
     ExperimentMeasured, ExperimentProposal, ExperimentResult, ExperimentStatus,
     MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, RegisteredModelFile,
     BATCH_TIMEOUT_SECS, BENCHMARK_TEMPERATURE, ESTIMATE_RUNS, EXPERIMENT_TIMEOUT_SECS, MEASURED_RUNS,
@@ -97,15 +97,15 @@ pub async fn startup_sweep(state: &AppState) {
     // can never be started or routed as a real backend.
     {
         let cfg = state.config.read().await.clone();
-        if cfg.backends.iter().any(|b| b.id.starts_with("opt-exp-")) {
+        if cfg.backends.iter().any(|b| is_temp_backend_id(&b.id)) {
             let mut new_cfg = cfg.clone();
             let removed: Vec<String> = new_cfg
                 .backends
                 .iter()
-                .filter(|b| b.id.starts_with("opt-exp-"))
+                .filter(|b| is_temp_backend_id(&b.id))
                 .map(|b| b.id.clone())
                 .collect();
-            new_cfg.backends.retain(|b| !b.id.starts_with("opt-exp-"));
+            new_cfg.backends.retain(|b| !is_temp_backend_id(&b.id));
             for g in new_cfg.gateway.groups.iter_mut() {
                 g.members.retain(|m| !removed.contains(m));
             }
