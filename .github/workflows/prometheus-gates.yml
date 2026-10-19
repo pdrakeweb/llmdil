@@ -74,12 +74,18 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: prometheus-workspace
+          # On this self-hosted runner CARGO_HOME is the machine toolchain;
+          # cache-bin cleanup deletes the host cargo/rustc proxies after every successful job.
+          cache-bin: false
 
       - name: Rust cache (src-tauri)
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
           key: prometheus-srctauri
+          # On this self-hosted runner CARGO_HOME is the machine toolchain;
+          # cache-bin cleanup deletes the host cargo/rustc proxies after every successful job.
+          cache-bin: false
 
       # UI first: src-tauri's cargo check embeds ../ui/dist, so the UI
       # build must exist before any src-tauri step (mirrors local gates).
