@@ -1,18 +1,23 @@
-# Admin API — AuthN/AuthZ Plan (design draft)
+# Admin API — AuthN/AuthZ Plan
 
-Status: design draft for Pete's review, 2026-10-16. No code written.
+Status: implemented as designed, with the reconciliations in
+PLAN.md §2.6 applied (notably: desktop-UI-only first-admin
+bootstrap, §3.5 note; `mxc_run_self_test` is read-class, §1 note).
+The authorization source of truth as built is
+`manager_app::registry` (108 operations with capability classes)
+plus `AUTH_ROUTES` in `crates/manager-api/src/auth_routes.rs`.
 Scope: authentication, authorization, user management, and transport
-exposure for the planned admin REST API (admin port on the managed
+exposure for the admin REST API (admin port on the managed
 machine, consumed first by an Android client). Endpoint-by-endpoint
 REST documentation lives in the companion API doc; this plan defines
 who may call what, and how callers prove who they are.
 
-Grounding facts from the current app (v0.1.32):
+Grounding facts from the app at design time (v0.1.32):
 
-- The capability surface is the ~82 Tauri commands in
-  `src-tauri/src/main.rs`, mirrored by `ui/src/api.ts`. There is no
-  actor concept today: the local desktop user is implicitly trusted,
-  and every command runs with the app's full authority.
+- The capability surface was the ~82 Tauri commands in
+  `src-tauri/src/main.rs`, mirrored by `ui/src/api.ts`. There was no
+  actor concept then: the local desktop user was implicitly trusted,
+  and every command ran with the app's full authority.
 - Real secrets (LiteLLM master key, Postgres password) live in
   Windows Credential Manager, never in the config JSON. The config
   file itself is operator-editable JSON in the app data dir.
@@ -67,8 +72,9 @@ export:
 Mutations that run or stop things but do not change saved
 configuration: `start_backend`, `stop_backend`, `restart_backend`,
 `test_backend`, `gateway_stop`, `gateway_quiesce_wait`,
-`gateway_activation_complete` / plan apply (executes already-saved
-changes), `download_model`, `model_pause_download`,
+`gateway_activation_complete` (class L in the registry but
+routeless — server bookkeeping, never a client call) / plan apply
+(executes already-saved changes), `download_model`, `model_pause_download`,
 `model_resume_download`, `cancel_download`, `task_abort`,
 `model_verify_checksum`, `telemetry_reset_peaks`,
 `telemetry_save_snapshot`.
@@ -78,7 +84,8 @@ changes), `download_model`, `model_pause_download`,
 Writes to saved configuration that take effect at apply/next start:
 `update_config`, `update_gateway_config`, `backend_add`,
 `backend_apply_config`, `backend_update_flags`,
-`backend_set_offload`, `model_add`, `model_assign`,
+`backend_set_offload`, `backend_set_mtp` (added after this plan;
+registry class C, routed), `model_add`, `model_assign`,
 `model_set_enabled`, `model_set_short_name`, `placement_apply`,
 `gateway_set_bind_host`, `telemetry_set_interval`,
 `updates_pin`, `updates_set_auto`, `setup_mark_complete` and the
@@ -101,9 +108,14 @@ Operations that change the security posture itself, or write
 credentials to new places: `update_mxc_policy`, `mxc_set_mode`
 (the MXC sandbox decides what tool execution is allowed —
 weakening it remotely must not be a mid-tier capability),
-`mxc_propose_tightening` is a read (R), `mxc_run_self_test` is L.
+`mxc_propose_tightening` is a read (R). As reconciled in PLAN.md
+§2.6 (item 9) and built, `mxc_run_self_test` is class **R**, not L
+as first drafted here — it is pure policy evaluation. The MCP
+mode operation is now `mcp_set_exposure` (renamed from
+`mcp_set_mode`), joined by `mcp_save_server`, `mcp_delete_server`,
+and `mcp_store_credential`, all class X.
 `vscode_write_config` (writes the master key into editor config
-files on disk), `vscode_install_extensions`, `mcp_set_mode`,
+files on disk), `vscode_install_extensions`,
 `mcp_test_connection` (MCP server entries can carry tokens).
 Plus everything in §4: user administration and this API's own
 settings (port, bind, TLS, token issuance).
@@ -272,6 +284,9 @@ any user exists. Rules:
   first admin user" — username + password fields, written straight
   to the user store. The loopback endpoint exists so a headless
   install is not locked out; both paths are equivalent in effect.
+  **As built (PLAN.md decision 9): desktop-UI-only** — v1 has no
+  headless mode, so no `/auth/bootstrap` network endpoint was
+  implemented; the desktop page is the only bootstrap path.
 - No default credentials, no factory password, no "admin/admin"
   first boot. If the user store is deleted, the API returns to
   enrollment mode and says so in the desktop UI.
@@ -298,11 +313,12 @@ any user exists. Rules:
 
 Recommendation: **implement TOTP as an optional per-user second
 factor in v1, not required.** Enrollment: user scans a QR (secret
-generated server-side, stored sealed in the user store — see §4
-note on store protection), 8 single-use recovery codes shown once
-and stored hashed. When enabled for a user, login returns a
-`totp_required` challenge; the access/refresh pair is issued only
-after the code verifies. Server accepts ±1 time step.
+generated server-side and stored in the OS credential store —
+never in the user store file, as built; see §4), 8 single-use
+recovery codes shown once and stored hashed. When enabled for a
+user, login returns a `totp_required` challenge; the access/refresh
+pair is issued only after the code verifies. Server accepts ±1
+time step.
 
 Suggested posture: Pete enables it on `admin` accounts; `viewer`
 accounts on the home LAN do not need it. Making it mandatory for
@@ -344,11 +360,12 @@ crate — **not** a field on `AppConfig`. Reasons:
   created/last-login timestamps), sessions (id, user, device name,
   token hashes, created/last-seen/expires), api tokens (id, user,
   name, role, token hash, created/last-used/optional expiry).
-- TOTP secrets are the one item that is stored reversibly (they
-  must be, to verify codes). Mitigation: they are sealed with a
-  machine-local key held in Windows Credential Manager alongside
-  the existing secrets, so the store file alone does not yield
-  them. Everything else in the file is hashes only.
+- TOTP secrets are the one item that must exist reversibly (to
+  verify codes). **As built, they are not in this file at all:**
+  each secret lives in the OS credential store (Windows Credential
+  Manager via the wizard ops layer) under
+  `llmdil/totp/<user-id>`, so the store file alone yields nothing
+  reversible. Everything in the file is hashes only.
 - Rejected: SQLite — the app has one database already (the
   gateway's Postgres, which belongs to LiteLLM, not the manager),
   and a second store for a handful of users buys transactions the
@@ -360,15 +377,24 @@ crate — **not** a field on `AppConfig`. Reasons:
 
 ### 4.2 Operations (admin-only, Class: user administration)
 
-- `POST /admin/users` — create (username, initial password, role).
-- `GET /admin/users` — list (never hashes, never secrets; role,
+All paths below are under `/api/v1` as built (the draft wrote
+them without the prefix).
+
+- `POST /api/v1/admin/users` — create (username, initial password, role).
+- `GET /api/v1/admin/users` — list (never hashes, never secrets; role,
   disabled, last login only).
-- `PATCH /admin/users/{id}` — change role, disable/enable.
-- `POST /admin/users/{id}/reset-password` — §3.6.
-- `DELETE /admin/users/{id}` — delete. Guards: cannot delete or
+- `PATCH /api/v1/admin/users/{id}` — change role, disable/enable.
+- `POST /api/v1/admin/users/{id}/reset-password` — §3.6.
+- `DELETE /api/v1/admin/users/{id}` — delete. Guards: cannot delete or
   disable the **last enabled admin** (the system must always keep
   a recoverable admin path short of local reset); cannot delete
   yourself.
+- Also built: `GET /api/v1/admin/users/{id}/sessions` and
+  `DELETE /api/v1/admin/users/{id}/sessions/{session_id}` (admin
+  session revocation), `GET|POST /api/v1/admin/api-tokens` and
+  `DELETE /api/v1/admin/api-tokens/{id}` (§3.3 tokens), and
+  `POST /api/v1/admin/enrollment-codes` (mint the one-time codes
+  the enrollment flow redeems at `POST /api/v1/enroll`).
 - Role assignment is a property of the user record, set only
   through these endpoints. Changing a role revokes the user's
   existing sessions (a demotion must take effect now, not at
@@ -400,8 +426,8 @@ by name, payloads by target id only.
 - The log is append-only from the API's perspective: no endpoint
   truncates or edits it; rotation is by file size with dated
   rollovers, matching the app's existing log handling.
-- Exposed read-only at `GET /admin/audit` (admin only), newest
-  first, paginated — same shape the Logs view already uses.
+- Exposed read-only at `GET /api/v1/admin/audit` (admin only),
+  newest first, paginated — same shape the Logs view already uses.
 
 ## 5. Transport and exposure
 
@@ -453,8 +479,9 @@ by name, payloads by target id only.
   token in memory only; biometric unlock gating the refresh
   token's use is an app-side decision for that phase, noted here
   because it determines how bad a stolen unlocked phone is (§6).
-- Versioning: the API is `/v1/…`; the pairing QR carries the base
-  URL so a future version can live beside it.
+- Versioning: the API is `/api/v1/…` (PLAN.md §2.6, item 7); the
+  pairing QR carries the base URL so a future version can live
+  beside it.
 
 ## 6. Threat model (brief)
 

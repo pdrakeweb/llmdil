@@ -6,6 +6,21 @@ duplicating them, and the order the work lands in. Companion documents:
 `rest-api.md` (endpoint surface) and `auth-plan.md` (roles, users,
 login). This plan is based on the codebase as of v0.1.32.
 
+**Status: implemented.** Phases 0–5 below all landed (Option B:
+`manager-app` extraction + `manager-api` hosted in-process);
+PLAN.md §9 is the as-built record. Points where the build settled
+differently from this draft, for readers using it as a reference:
+the admin port is **47821** (D3's 41231 suggestion was not taken;
+`AdminApiConfig` default in `manager-config`), bound
+0.0.0.0 with the firewall rule scoped to `localsubnet` +
+`100.64.0.0/10`; the identity document is
+`GET /api/v1/server` (not `/v1/server`); enrollment exchanges the
+one-time code for a standard per-device **session** (access +
+rotating refresh), not a standalone device token; and the shipped
+registry has grown past the 82 commands this plan counts — 108
+operations as of v0.1.40 (66 routed, 42 explicit exclusions;
+rest-api.md §6.16).
+
 ## Codebase facts the plan rests on
 
 - **All domain logic already lives in workspace crates.** Supervisor

@@ -1,6 +1,11 @@
 # LLMdil Android App — Implementation Plan
 
 Status: plan for Pete's review, 2026-10-17. No code written.
+The §8 decisions were adopted by Pete on 2026-10-17 (the
+recommendations as written). The app is a separate project
+(`pdrakeweb/llmdil-android`, package `com.ourdrakefamily.llmdil`);
+no Android client ships with LLMdil v0.1.40 — the API it will
+consume is implemented and documented in `rest-api.md`.
 Companion to `PLAN.md` (the admin API plan, approved 2026-10-17
 with the compiler's recommendations, plus Pete's override: the API
 binds all interfaces — any device on the LAN may reach it; no
@@ -26,7 +31,8 @@ kept to real decisions.
 
 The app is a remote control for one or more LLMdil
 deployments (Prometheus first). It does everything the API's
-`/api/v1` contract (`rest-api.md`, 89 endpoints) exposes to its
+`/api/v1` contract (`rest-api.md`, 105 route records at v0.1.40)
+exposes to its
 role, and nothing else — the API invents no behavior, and neither
 does the app. What the API excludes from v1, the app also excludes:
 no MCP/VS Code/WinML screens (`PLAN.md` decision 10), no raw
@@ -342,7 +348,13 @@ personal-APK credential exception is not needed here.
 ## 8. Open decisions for Pete
 
 Each with the plan's recommendation; approving this plan approves
-the recommendations except where overridden.
+the recommendations except where overridden. **All eight were
+adopted on 2026-10-17 as recommended** (sideload via GitHub
+release; minSdk 28; polling only in v1, SSE later, no FCM;
+biometric gate on refresh-token use; enrollment-only login; admin
+screens deferred to desktop; identity
+`pdrakeweb/llmdil-android` / `com.ourdrakefamily.llmdil`;
+phone-first, no orientation lock).
 
 1. **Distribution.** (a) Direct APK sideload — GitHub release on
    the app repo, installed on household devices (ADB sideloading

@@ -1,5 +1,14 @@
 # Capability audit — LLMdil
 
+Status: pre-implementation audit snapshot, 2026-10-16 — the design
+input for the Admin API, retained as a record. The codebase it
+describes has since been restructured: operations were extracted
+from `src-tauri/src/main.rs` into `manager-app` and are declared
+once in the operation registry (`crates/manager-app/src/registry.rs`,
+108 operations at v0.1.40), which is the current inventory; the
+as-built REST surface is `rest-api.md` and the as-built record is
+`PLAN.md` §9. Locations and counts below are as of the audit date.
+
 Purpose: the complete inventory of capabilities the app exposes today, as the
 input to designing an admin REST API (served from the managed machine on an
 admin port) that a future Android client will use for read and control.
