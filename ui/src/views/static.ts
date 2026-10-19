@@ -328,7 +328,7 @@ function baseName(p: string): string {
  *  model_assign writes the gguf_path verbatim, so an exact match is
  *  the assigned state; a basename match covers configs written with
  *  a different directory prefix. */
-function sameModelFile(modelFile: string, ggufPath: string): boolean {
+export function sameModelFile(modelFile: string, ggufPath: string): boolean {
   return modelFile !== "" && (modelFile === ggufPath || baseName(modelFile) === baseName(ggufPath));
 }
 
@@ -1514,8 +1514,10 @@ function predictedFormTip(p: PredictedThroughput): string {
 }
 
 /** The card tile's tooltip (§7): prompt rate, TTFT, measured
- *  date, source, placement, and environment on one line. */
-function predictedCardTip(p: PredictedThroughput): string {
+ *  date, source, placement, and environment on one line.
+ *  Exported for the Groups page's compact cards (§8.2), which
+ *  carry the same figure under the same rules. */
+export function predictedCardTip(p: PredictedThroughput): string {
   const parts: string[] = [];
   if (p.prompt_per_second !== null) parts.push(`Prompt: ${trim1(p.prompt_per_second)} tok/s`);
   if (p.ttft_ms !== null) parts.push(`TTFT: ${(p.ttft_ms / 1000).toFixed(2)} s`);
@@ -5578,7 +5580,7 @@ function gatewayPaint(
   };
 
   const routing = cfg.groups.length
-    ? `<div class="card" style="margin-bottom:12px"><div class="sec-title">${icon("gateway")} Routing</div>
+    ? `<div class="card" style="margin-bottom:12px"><div class="sec-title">${icon("gateway")} Routing<span class="spacer" style="flex:1"></span><a class="btn" href="#/groups">${icon("pencil")} Edit membership</a></div>
       ${effStrategy ? `<div style="font-size:12px;color:var(--text2)">Effective strategy: <b style="color:var(--text)">${esc(effStrategy)}</b><span class="info-tip" title="LiteLLM applies ONE global routing strategy — the strategy chips on the groups are labels, not per-group settings.">${icon("info")}</span></div>` : ""}
       <div class="viewsel" role="tablist" style="margin-top:10px">
         <button data-routing-tab="flow"${routingTab === "flow" ? ` class="active"` : ""}>Flow</button>

@@ -9,6 +9,7 @@ import { stackedBar } from "./charts";
 import { esc } from "./html";
 import { icon, type IconName } from "./icons";
 import { mountDashboard } from "./views/dashboard";
+import { renderGroups, wireGroups } from "./views/groups";
 import { renderMcp, wireMcp } from "./views/mcp";
 import { renderOptimize, wireOptimize } from "./views/optimize";
 import { renderServiceMap, wireServiceMap } from "./views/serviceMap";
@@ -31,6 +32,7 @@ const ROUTES: Route[] = [
   { hash: "#/models", label: "Models", icon: "box", title: "Models" },
   { hash: "#/logs", label: "Logs", icon: "logs", title: "Logs" },
   { hash: "#/gateway", label: "Gateway", icon: "gateway", title: "Gateway" },
+  { hash: "#/groups", label: "Groups", icon: "groups", title: "Groups" },
   { hash: "#/mcp", label: "MCP Servers", icon: "layers", title: "MCP Servers" },
   { hash: "#/optimize", label: "Optimize", icon: "target", title: "Optimize" },
   { hash: "#/activation-plan", label: "Activation Plan", icon: "warn", title: "Activation Plan" },
@@ -287,6 +289,14 @@ async function render(): Promise<void> {
       view.innerHTML = renderGateway();
       {
         const c = await wireGateway(view);
+        if (gen !== renderGen) { c(); return; }
+        cleanup = c;
+      }
+      break;
+    case "#/groups":
+      view.innerHTML = renderGroups();
+      {
+        const c = await wireGroups(view);
         if (gen !== renderGen) { c(); return; }
         cleanup = c;
       }

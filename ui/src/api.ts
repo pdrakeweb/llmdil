@@ -2192,6 +2192,52 @@ export async function updateGatewayConfig(patch: Record<string, unknown>): Promi
   }
 }
 
+/** gateway_set_backend_group — move a backend to a group, or
+ *  out of all groups when `group` is null (predicted-throughput
+ *  design §8.5, decision D5: one group per backend). The move
+ *  removes the id from every group's member list and appends it
+ *  to the target's, journaled for the Activation Plan like
+ *  every other membership change. `removed_from` names every
+ *  group the backend left — more than one only when a
+ *  hand-edited config had it in several. A drop on the lane the
+ *  backend solely occupies succeeds with `changed: false` and
+ *  no config write. */
+export async function gatewaySetBackendGroup(id: string, group: string | null): Promise<CallResult<{ backend_id: string; group: string | null; removed_from: string[]; changed: boolean; persisted: boolean }>> {
+  if (!isTauri()) return { data: { backend_id: id, group, removed_from: [], changed: false, persisted: false }, live: false, error: "gateway_set_backend_group is not available in sample mode" };
+  try {
+    const data = await invoke<{ backend_id: string; group: string | null; removed_from: string[]; changed: boolean; persisted: boolean }>("gateway_set_backend_group", { id, group });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { backend_id: id, group, removed_from: [], changed: false, persisted: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** gateway_create_group — create an empty group (design §8.5,
+ *  decision D11). The name follows the group slug rule
+ *  (lowercase letters, digits, hyphens). */
+export async function gatewayCreateGroup(name: string): Promise<CallResult<{ name: string; persisted: boolean }>> {
+  if (!isTauri()) return { data: { name, persisted: false }, live: false, error: "gateway_create_group is not available in sample mode" };
+  try {
+    const data = await invoke<{ name: string; persisted: boolean }>("gateway_create_group", { name });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { name, persisted: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** gateway_delete_group — delete an EMPTY group (design §8.5,
+ *  decision D11); a group with members is refused with the
+ *  member count, never cascaded. */
+export async function gatewayDeleteGroup(name: string): Promise<CallResult<{ name: string; deleted: boolean; persisted: boolean }>> {
+  if (!isTauri()) return { data: { name, deleted: false, persisted: false }, live: false, error: "gateway_delete_group is not available in sample mode" };
+  try {
+    const data = await invoke<{ name: string; deleted: boolean; persisted: boolean }>("gateway_delete_group", { name });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { name, deleted: false, persisted: false }, live: true, error: errOf(e) };
+  }
+}
+
 /** gateway_preview_yaml — the generated LiteLLM config.yaml, plus
  *  the generated llmdil_routing.py callback when a typed routing
  *  rule is enabled (null otherwise). */
