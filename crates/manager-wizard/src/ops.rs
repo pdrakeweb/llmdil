@@ -609,8 +609,9 @@ impl RealSystemOps {
         // a visible console window without CREATE_NO_WINDOW.
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW
+            // CREATE_NO_WINDOW. `c` is a tokio::process::Command,
+            // whose creation_flags is an inherent method on Windows —
+            // no std CommandExt import is needed (or used) here.
             c.creation_flags(0x08000000);
         }
         // Own process group on Unix, so the tree kill can signal the
@@ -825,8 +826,8 @@ impl SystemOps for RealSystemOps {
         // Detach from this process group so the child outlives the wizard.
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW | DETACHED_PROCESS
+            // CREATE_NO_WINDOW | DETACHED_PROCESS (tokio Command:
+            // creation_flags is inherent on Windows, no std import).
             c.creation_flags(0x08000000 | 0x00000008);
         }
         #[cfg(not(windows))]
@@ -1371,7 +1372,8 @@ impl SystemOps for RealSystemOps {
     async fn credential_exists(&self, target: &str) -> Result<bool, WizardError> {
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
+            // tokio Command below: creation_flags is inherent on
+            // Windows, so no std CommandExt import is needed here.
             let mut cmd = tokio::process::Command::new("cmdkey");
             cmd.arg(format!("/list:{target}"));
             // CREATE_NO_WINDOW: this probe runs from a GUI process.
