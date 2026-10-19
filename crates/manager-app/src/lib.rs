@@ -5859,27 +5859,28 @@ pub async fn op_gateway_set_bind_host(
 /// not follow the redirect never receives a body. That defect left
 /// the Dashboard's gateway statistics permanently empty in the
 /// field (every poll 307'd and was silently skipped) while the
-/// banner blamed a gateway restart that could not help. Returns
-/// the body only on a final HTTP 200; anything else — gateway
-/// down, the metrics callback not active (config predates v0.1.18
-/// until the next gateway start), an auth failure, a redirect
-/// loop — is None and the poll cycle is skipped.
+/// banner blamed a gateway restart that could not help.
+///
+/// The body arrives with chunked transfer encoding: LiteLLM's
+/// metrics app streams the exposition with no content length, so
+/// chunked is the normal case, and [`metrics_http_get`] de-chunks
+/// it strictly (a truncated or malformed stream fails the cycle —
+/// partial counters would corrupt the window deltas). An earlier
+/// version of this fetcher skipped chunked bodies outright on the
+/// theory that they would corrupt the parse; since the gateway
+/// answers ONLY chunked, that discarded every scrape and left the
+/// statistics permanently empty again (#58). Returns the body only
+/// on a final HTTP 200; anything else — gateway down, the metrics
+/// callback not active (config predates v0.1.18 until the next
+/// gateway start), an auth failure, a redirect loop — is None and
+/// the poll cycle is skipped.
 fn fetch_gateway_metrics(host: &str, port: u16, master_key: &str) -> Option<String> {
     const MAX_REDIRECTS: usize = 3;
     let mut path = "/metrics".to_string();
     for _ in 0..=MAX_REDIRECTS {
         let resp = metrics_http_get(host, port, &path, master_key)?;
         match resp.status {
-            200 => {
-                // A chunked body would corrupt the exposition parse.
-                // LiteLLM's /metrics answers with a content-length
-                // body, but skip the cycle rather than misread if
-                // that ever changes.
-                if resp.chunked {
-                    return None;
-                }
-                return Some(resp.body);
-            }
+            200 => return Some(resp.body),
             301 | 302 | 303 | 307 | 308 => {
                 path = metrics_redirect_path(&path, resp.location.as_deref()?)?;
             }
@@ -8194,6 +8195,135 @@ mod tests {
         assert_eq!(metrics_redirect_path("/metrics", "  "), None);
     }
 
+    /// A realistic LiteLLM 1.105 exposition excerpt: the series
+    /// names carry the prometheus_client `_total` suffix, the
+    /// deployment counters carry the `api_base` label the generated
+    /// config writes (`http://127.0.0.1:<port>/v1`), and the token
+    /// counters carry `model` = `openai/<backend-id>` (label sets
+    /// per litellm/types/integrations/prometheus.py in the 1.105.1
+    /// wheel).
+    fn exposition(success: u64, failure: u64, input: u64, output: u64) -> String {
+        format!(
+            "# HELP litellm_deployment_success_responses_total Total successful responses\n\
+             # TYPE litellm_deployment_success_responses_total counter\n\
+             litellm_deployment_success_responses_total{{api_base=\"http://127.0.0.1:8081/v1\",api_provider=\"openai\",litellm_model_name=\"openai/planner\",model_group=\"planner\",requested_model=\"planner\"}} {success}.0\n\
+             litellm_deployment_failure_responses_total{{api_base=\"http://127.0.0.1:8081/v1\",api_provider=\"openai\",litellm_model_name=\"openai/planner\",model_group=\"planner\",requested_model=\"planner\"}} {failure}.0\n\
+             litellm_input_tokens_metric_total{{model=\"openai/planner\",requested_model=\"planner\"}} {input}.0\n\
+             litellm_output_tokens_metric_total{{model=\"openai/planner\",requested_model=\"planner\"}} {output}.0\n"
+        )
+    }
+
+    /// Frame a body the way the gateway's streaming metrics app
+    /// does: hex-sized chunks (small, uneven sizes here so framing
+    /// boundaries land mid-line) and a terminating zero chunk.
+    fn chunk_frame(body: &str) -> Vec<u8> {
+        let bytes = body.as_bytes();
+        let mut out = Vec::new();
+        let mut sizes = [7usize, 64, 13, 256, 3].into_iter().cycle();
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let n = sizes.next().unwrap().min(rest.len());
+            out.extend_from_slice(format!("{n:x}\r\n").as_bytes());
+            out.extend_from_slice(&rest[..n]);
+            out.extend_from_slice(b"\r\n");
+            rest = &rest[n..];
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        out
+    }
+
+    /// The raw response exactly as it arrives off the wire from
+    /// LiteLLM 1.105's /metrics/ (captured from the real
+    /// `make_metrics_asgi_app` under uvicorn): 200, a content type,
+    /// `Transfer-Encoding: chunked`, no content length.
+    fn chunked_response(body: &str) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/plain; version=0.0.4; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        );
+        raw.extend_from_slice(&chunk_frame(body));
+        raw
+    }
+
+    #[test]
+    fn metrics_response_decodes_chunked_exposition() {
+        // #58: every real scrape arrives chunked. The decoder must
+        // hand the poller the plain exposition, byte for byte.
+        let body = exposition(41, 3, 12000, 3400);
+        let resp = decode_metrics_response(&chunked_response(&body)).expect("chunked 200 decodes");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, body);
+    }
+
+    #[test]
+    fn metrics_response_rejects_truncated_or_malformed_chunked() {
+        let body = exposition(41, 3, 12000, 3400);
+        let raw = chunked_response(&body);
+        // Cut before the terminating zero chunk: the stream was
+        // interrupted (read timeout mid-body) — a partial
+        // exposition must fail the cycle, not parse as smaller
+        // counters.
+        assert!(decode_metrics_response(&raw[..raw.len() - 10]).is_none());
+        // A non-hex chunk size is malformation, not a body.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+        bad.extend_from_slice(b"zz\r\nhello\r\n0\r\n\r\n");
+        assert!(decode_metrics_response(&bad).is_none());
+        // A chunk claiming more bytes than the stream carries.
+        let mut short = Vec::new();
+        short.extend_from_slice(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+        short.extend_from_slice(b"ff\r\ntiny\r\n0\r\n\r\n");
+        assert!(decode_metrics_response(&short).is_none());
+    }
+
+    #[test]
+    fn metrics_response_content_length_must_be_complete() {
+        let body = exposition(1, 0, 10, 5);
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let resp = decode_metrics_response(raw.as_bytes()).expect("complete body decodes");
+        assert_eq!(resp.body, body);
+        // One byte short of the declared length: truncated, skip.
+        assert!(decode_metrics_response(&raw.as_bytes()[..raw.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn metrics_response_redirect_keeps_location() {
+        let raw = b"HTTP/1.1 307 Temporary Redirect\r\nlocation: /metrics/\r\ncontent-length: 0\r\n\r\n";
+        let resp = decode_metrics_response(raw).expect("redirect decodes");
+        assert_eq!(resp.status, 307);
+        assert_eq!(resp.location.as_deref(), Some("/metrics/"));
+    }
+
+    #[test]
+    fn chunked_scrapes_populate_the_window() {
+        // The whole #58 chain at unit level: two chunked scrapes,
+        // decoded, parsed, and recorded, produce the trailing
+        // window the dashboard reads — requests_1h is defined.
+        use crate::gateway_stats::{parse_metrics, GatewayStatsStore};
+        let t0 = std::time::Instant::now();
+        let mut store = GatewayStatsStore::default();
+        for (at, body) in [
+            (t0, exposition(41, 3, 12000, 3400)),
+            (
+                t0 + std::time::Duration::from_secs(60),
+                exposition(55, 5, 18000, 5100),
+            ),
+        ] {
+            let resp = decode_metrics_response(&chunked_response(&body)).expect("scrape decodes");
+            store.record(parse_metrics(&resp.body, at));
+        }
+        let windows = store
+            .window_stats(&[("planner".to_string(), 8081)])
+            .expect("two snapshots make a window");
+        let w = windows["planner"];
+        assert_eq!(w.requests, 16); // +14 successes, +2 failures
+        assert_eq!(w.errors, 2);
+        assert_eq!(w.tokens, 7700); // (18000+5100) - (12000+3400)
+    }
+
     fn catalog_restrictions(model_id: &str) -> Vec<manager_models::OffloadRestriction> {
         manager_models::curated_models()
             .into_iter()
@@ -9327,7 +9457,8 @@ struct McpListEntry {
 struct MetricsHttpResponse {
     status: u16,
     location: Option<String>,
-    chunked: bool,
+    /// The message body with any chunked transfer encoding already
+    /// decoded (see [`decode_metrics_response`]).
     body: String,
 }
 
@@ -10290,8 +10421,9 @@ fn model_add_entry(
 /// src-tauri has no HTTP-client dependency; `fetch_gateway_metrics`
 /// is the in-repo precedent for hand-rolled gateway HTTP over a
 /// TcpStream. `None` on any transport failure (gateway down,
-/// malformed reply, chunked body — the metrics precedent's
-/// conservative reading).
+/// malformed reply, chunked body — this helper's conservative
+/// reading; the metrics fetcher de-chunks instead, see
+/// [`decode_metrics_response`]).
 fn gateway_http_get(host: &str, port: u16, path: &str, master_key: &str) -> Option<(u16, String)> {
     use std::io::{Read, Write};
     let ip: std::net::IpAddr = host.parse().ok()?;
@@ -10340,8 +10472,10 @@ fn gateway_http_get(host: &str, port: u16, path: &str, master_key: &str) -> Opti
 /// One raw HTTP POST against the gateway, returning (status, body)
 /// — the POST sibling of [`gateway_http_get`], used only by the
 /// explicit MCP test's real tool call below. Same conservative
-/// reading (chunked bodies are rejected, as in the metrics
-/// precedent). The read timeout is longer than the GET helper's:
+/// reading (chunked bodies are rejected; these JSON routes answer
+/// with a content length — unlike /metrics, which streams chunked
+/// and is de-chunked by [`metrics_http_get`]). The read timeout is
+/// longer than the GET helper's:
 /// a cold stdio server spawn plus a live Brave query legitimately
 /// takes seconds.
 fn gateway_http_post(
@@ -10431,9 +10565,22 @@ fn metrics_http_get(
             Err(_) => break,
         }
     }
-    let text = String::from_utf8_lossy(&raw);
-    let mut parts = text.splitn(2, "\r\n\r\n");
-    let head = parts.next()?;
+    decode_metrics_response(&raw)
+}
+
+/// Decode one raw HTTP response (status line, headers, body) read
+/// off the gateway socket into status, `Location`, and the message
+/// body with any chunked transfer encoding removed.
+///
+/// Strict on purpose: a chunked body must carry well-formed chunk
+/// framing through its terminating zero chunk, and a
+/// content-length body must be complete. A truncated or malformed
+/// response is None, never a partial read — a partial exposition
+/// parses as smaller counters, and the window math would read the
+/// drop as a gateway restart and overcount (#58).
+fn decode_metrics_response(raw: &[u8]) -> Option<MetricsHttpResponse> {
+    let head_end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&raw[..head_end]).into_owned();
     let status: u16 = head.split_whitespace().nth(1)?.parse().ok()?;
     let header = |name: &str| -> Option<String> {
         head.lines().skip(1).find_map(|line| {
@@ -10445,14 +10592,50 @@ fn metrics_http_get(
             }
         })
     };
+    let body_bytes = &raw[head_end + 4..];
+    let decoded = if header("transfer-encoding")
+        .map(|v| v.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false)
+    {
+        dechunk(body_bytes)?
+    } else if let Some(len) = header("content-length") {
+        let len: usize = len.parse().ok()?;
+        if body_bytes.len() < len {
+            return None;
+        }
+        body_bytes[..len].to_vec()
+    } else {
+        // Close-delimited body (the request says Connection: close).
+        body_bytes.to_vec()
+    };
     Some(MetricsHttpResponse {
         status,
         location: header("location"),
-        chunked: head
-            .to_ascii_lowercase()
-            .contains("transfer-encoding: chunked"),
-        body: parts.next()?.to_string(),
+        body: String::from_utf8(decoded).ok()?,
     })
+}
+
+/// Remove HTTP chunked transfer framing: repeated
+/// `<hex size>[;extensions]\r\n<size bytes>\r\n`, ended by a zero
+/// chunk (trailers may follow and are ignored). None on any
+/// malformation — bad hex, a short chunk, a missing CRLF, or no
+/// terminating zero chunk (i.e. the stream was cut short).
+fn dechunk(mut rest: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = rest.windows(2).position(|w| w == b"\r\n")?;
+        let line = std::str::from_utf8(&rest[..line_end]).ok()?;
+        let size = usize::from_str_radix(line.split(';').next()?.trim(), 16).ok()?;
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            return Some(out);
+        }
+        if rest.len() < size + 2 || &rest[size..size + 2] != b"\r\n" {
+            return None;
+        }
+        out.extend_from_slice(&rest[..size]);
+        rest = &rest[size + 2..];
+    }
 }
 
 /// Resolve a redirect `Location` against the path just requested,
