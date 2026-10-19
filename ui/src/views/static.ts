@@ -974,6 +974,7 @@ export function renderActivationPlan(): string {
 const PLAN_KIND_LABEL: Record<string, string> = {
   gateway_config: "Gateway config",
   gateway_bind: "Bind address",
+  gateway_drift: "Gateway drift",
   backend_apply_config: "Backend config",
   backend_add: "Backend added",
   backend_flags: "Flags",
@@ -1043,6 +1044,7 @@ export async function wireActivationPlan(root: HTMLElement): Promise<() => void>
     if (!lastPlan || !lastPlan.pending) {
       b.innerHTML = `<div class="card"><h3>${icon("check")} No activation plan pending<span class="info-tip" title="Every saved configuration change is live. A change that needs a restart to take effect — gateway routes, a backend's flags, tensor split, or model assignment — appears here, and in the banner at the top of the window, until it is applied.">${icon("info")}</span></h3>
         <div style="font-size:12px;color:var(--text2);margin-top:6px">Pending changes: <b style="color:var(--text)">0</b></div>
+        ${lastPlan && lastPlan.files_differ && !lastPlan.gateway_up ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Gateway config files on disk differ from the saved configuration — the next gateway start regenerates them, so nothing is pending.</div>` : ""}
         ${planStatusHtml(planUi)}
         <div class="card-actions"><button class="btn icon-only" data-plan-refresh title="Refresh" aria-label="Refresh">${icon("restart")}</button></div></div>`;
       return;
@@ -1054,7 +1056,9 @@ export async function wireActivationPlan(root: HTMLElement): Promise<() => void>
     // The Pending changes detail: header (gateway state + drift as
     // chips), the activation-class bar, then the table. Refresh
     // lives on the plan card above — one Refresh for the section.
-    // Drift-only: header + Drift chip, bar and table omitted.
+    // Drift arrives as a synthesized gateway_drift change item
+    // (tracker #57), so a drift-only plan lists it in the table
+    // like any journal change.
     const gwChip = `<span class="chip status-tag ${p.gateway_up ? "status-on" : "status-bad"}">Gateway: ${p.gateway_up ? "running" : "stopped"}</span>`;
     const driftChip = p.drift
       ? ` <span class="chip status-tag status-transition" title="The saved gateway configuration differs from the running one (drift).">Drift</span>`
