@@ -13,7 +13,7 @@ import {
   runWizardStep, wizardBusyMessage, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit,
   getWizardCommands,
   getGpuTelemetry, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
-  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendMtp, getBackendLaunchCommand,
+  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendMtp, setBackendParallel, getBackendLaunchCommand,
   getBackendConfig, applyBackendConfig, testBackend, testBackendToolCall, placementPropose, placementApply,
   addBackend, backendAddPreview, deleteBackend, modelAssign,
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
@@ -29,7 +29,7 @@ import {
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
   adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendAddPreview, BackendMtp, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, ServicesInfo } from "../api";
+import type { ActivationChange, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendAddPreview, BackendMtp, BackendOffload, BackendParallel, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, ServicesInfo } from "../api";
 import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
 import type { GpuInfo, WizardStepState } from "../types";
 
@@ -1113,6 +1113,19 @@ export async function wireActivationPlan(root: HTMLElement): Promise<() => void>
 const CTX_PRESETS = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
 /** Batch-size presets offered by the flags editor. */
 const BATCH_PRESETS = [128, 256, 512, 1024, 2048, 4096];
+/** Parallel-slot presets offered by the flags editor (tracker #61). */
+const PARALLEL_PRESETS = [1, 2, 4, 8];
+/** The Parallel slots control's range — the same bounds
+ *  backend_set_parallel validates (manager_models::parallel). */
+const PARALLEL_MIN = 1;
+const PARALLEL_MAX = 1024;
+/** The slot count llama.cpp's `--parallel` default (auto, -1)
+ *  initializes on the pinned build, banner-verified — see
+ *  manager_models::parallel. The unset field state names it so
+ *  the effective count is visible rather than a bare "auto", and
+ *  it seeds the Custom input when the operator leaves the
+ *  default to type a count. */
+const PARALLEL_LLAMA_AUTO_SLOTS = 4;
 
 /** 131072 -> "128K"; values under 1024 stay plain. */
 function ctxShort(n: number): string {
@@ -1207,10 +1220,12 @@ function mtpSavedTokenText(m: BackendMtp): string {
 }
 
 /** The --parallel conflict line's text. MTP drafting needs a
- *  single slot; the control surfaces an explicit conflicting
- *  slot count and never rewrites it. */
+ *  single slot; the MTP control surfaces an explicit conflicting
+ *  slot count and never rewrites it — the Parallel slots field
+ *  in the same form is where the operator sets it (tracker #61),
+ *  and the line says so. */
 function mtpConflictText(parallel: number): string {
-  return `Parallel slots: ${parallel} — MTP drafting needs --parallel 1; the next start will not draft until the saved flags set it`;
+  return `Parallel slots: ${parallel} — MTP drafting needs --parallel 1; set Parallel slots to 1 in the Flags form — the next start will not draft until then`;
 }
 
 /** The offload slider track's green-to-yellow-to-red gradient for
@@ -1275,6 +1290,50 @@ function flagsCtxBatchHtml(o: {
       </div>`;
 }
 
+/** The flag form the Parallel slots selection writes: the
+ *  canonical token for an explicit count, or the default's
+ *  description when unset. */
+function parallelTokenText(value: number | null): string {
+  if (value === null) return `llama.cpp default: auto (${PARALLEL_LLAMA_AUTO_SLOTS} slots)`;
+  if (value === -1) return "--parallel -1 (auto)";
+  return `--parallel ${value}`;
+}
+
+/** The parallel-slots field of the flags editor — a preset select
+ *  with a Custom numeric input when the value is not a preset,
+ *  in the ctx/batch idiom — shared between the Edit Flags form
+ *  and the Add backend form (tracker #61): one implementation of
+ *  the field, two hosts. The value is the explicit slot count,
+ *  or null for the unset state: no `--parallel` token is saved
+ *  and llama.cpp's default (auto) applies — the select's first
+ *  choice carries that state, so unset is a visible selection,
+ *  not an absence. `savedCustom` marks the saved spelling as one
+ *  the control does not write (an `-np` or `=` spelling, ...),
+ *  the MTP control's marker; the readout beside the field names
+ *  what the current selection writes. */
+function flagsParallelHtml(o: {
+  value: number | null;
+  savedCustom: boolean;
+  fieldAttr: string;
+  disabled: boolean;
+}): string {
+  const dis = o.disabled ? " disabled" : "";
+  const v = o.value;
+  const isCustom = v !== null && !PARALLEL_PRESETS.includes(v);
+  return `<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px;align-items:end">
+        <label style="font-size:12px;color:var(--text2)">Parallel slots (--parallel)<span class="info-tip" title="Request slots the server runs concurrently; each slot is an independent sequence with its own share of the work. An explicit count divides the context length across the slots; Auto (llama.cpp's default) keeps one unified KV cache at the full context. 1 suits a single request stream, and MTP drafting needs 1.">${icon("info")}</span>
+          <span style="display:flex;gap:6px;margin-top:4px">
+            <select ${o.fieldAttr}="parallel-preset" style="${SELECT_STYLE};flex:1;min-width:0"${dis}>
+              <option value="default"${v === null ? " selected" : ""}>Auto \u2014 llama.cpp default</option>
+              ${PARALLEL_PRESETS.map((p) => `<option value="${p}"${p === v ? " selected" : ""}>${p}</option>`).join("")}
+              <option value="custom"${isCustom ? " selected" : ""}>Custom\u2026</option>
+            </select>
+            ${isCustom ? `<input ${o.fieldAttr}="parallel-custom" type="number" value="${v}" min="${PARALLEL_MIN}" max="${PARALLEL_MAX}" style="${SELECT_STYLE};width:110px"${dis}>` : ""}
+          </span></label>
+        <div style="font-size:12px;color:var(--text2)"><span style="font-family:var(--mono)">${esc(parallelTokenText(v))}</span>${o.savedCustom ? `<span title="The saved flags spell parallel slots in a form the control does not write (an -np or = spelling, repeated tokens, ...). Saving from the field writes the canonical --parallel N; every other flag is preserved."> \u00b7 custom flags</span>` : ""}</div>
+      </div>`;
+}
+
 /** The rated-context line under the flags fields, shared by the
  *  Edit Flags form and the Add backend form. `savedText` is the
  *  host's sentence for when the values take effect (the edit form
@@ -1335,25 +1394,36 @@ function paintOffloadReadout(card: Element, o: BackendOffload, n: number): void 
 }
 
 /** Apply one flags-field event to a draft — the collection logic
- *  both forms share for the ctx/batch preset+custom pairs. Preset
- *  selects set the value on "change" and report that a repaint is
- *  needed (to show or hide the Custom numeric input); custom
- *  inputs only update the draft. Returns true when the host
- *  should repaint. */
+ *  both forms share for the ctx/batch preset+custom pairs and
+ *  the parallel preset+custom pair. Preset selects set the value
+ *  on "change" and report that a repaint is needed (to show or
+ *  hide the Custom numeric input); custom inputs only update the
+ *  draft. Returns true when the host should repaint. The parallel
+ *  value is the explicit slot count, or null for the field's
+ *  Default (auto) choice; choosing Custom seeds the input from
+ *  the current selection — the auto slot count when unset — so
+ *  the operator edits a real number, never a blank. */
 function applyFlagsField(
-  draft: { ctx: number; batch: number },
+  draft: { ctx: number; batch: number; parallel: number | null },
   field: string,
   value: string,
   isChange: boolean,
 ): boolean {
   if (field === "ctx-custom") { draft.ctx = Number(value); return false; }
   if (field === "batch-custom") { draft.batch = Number(value); return false; }
+  if (field === "parallel-custom") { draft.parallel = Number(value); return false; }
   if (isChange && field === "ctx-preset") {
     if (value !== "custom") draft.ctx = Number(value);
     return true;
   }
   if (isChange && field === "batch-preset") {
     if (value !== "custom") draft.batch = Number(value);
+    return true;
+  }
+  if (isChange && field === "parallel-preset") {
+    if (value === "default") draft.parallel = null;
+    else if (value === "custom") draft.parallel = draft.parallel ?? PARALLEL_LLAMA_AUTO_SLOTS;
+    else draft.parallel = Number(value);
     return true;
   }
   return false;
@@ -1369,8 +1439,10 @@ function applyFlagsField(
  *  operator's override/snap decision in the form, else null.
  *  mtpPosition is the MTP draft slider's draft position (0 = Off,
  *  1..4 = draft tokens), null when the backend's model is not
- *  MTP-capable. */
-export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null }
+ *  MTP-capable. parallel is the Parallel slots field's draft
+ *  selection: the explicit slot count, or null for the unset
+ *  state (llama.cpp's default, auto). */
+export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null; parallel: number | null }
 
 /** State for the in-card Placement form (tensor split editing,
  *  moved here from the GPUs page — Pete's direction, 2026-10-16),
@@ -1706,9 +1778,24 @@ function backendCard(
       <div data-mtp-conflict style="font-size:12px;color:#e3b341;margin-top:4px;${conflict ? "" : "display:none"}">${m.parallel != null ? esc(mtpConflictText(m.parallel)) : ""}</div>
     </div>`;
   })() : "";
+  // The Parallel slots field (tracker #61), under the ctx/batch
+  // pair: a preset+custom select over the backend's --parallel
+  // count, committing through backend_set_parallel on change —
+  // the sliders' commit model, since the value lives in raw flags
+  // like theirs, not in the Save button's ctx/batch. The custom
+  // marker shows while the draft still equals the saved value:
+  // it describes the saved spelling, and a changed selection has
+  // no saved spelling yet.
+  const parallelHtml = flags && b.parallel ? flagsParallelHtml({
+    value: flags.parallel,
+    savedCustom: b.parallel.custom && flags.parallel === b.parallel.slots,
+    fieldAttr: "data-flags-field",
+    disabled: inFlight.has(b.id),
+  }) : "";
   const flagsHtml = flags ? `<div class="backend-form-panel flags-panel">
       <div style="font-size:12px;font-weight:600">${icon("gear")} Flags for ${esc(b.id)}</div>
       ${flagsCtxBatchHtml({ ctx: flags.ctx, batch: flags.batch, ctxMax: flags.ctxMax, fieldAttr: "data-flags-field", disabled: inFlight.has(b.id) })}
+      ${parallelHtml}
       ${offloadHtml}
       ${mtpHtml}
       ${flagsRatedLineHtml({ ctxMax: flags.ctxMax, modelId: flags.modelId, savedText: "Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Placement form on this card." })}
@@ -1981,7 +2068,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       <div class="grid2">${sorted(sec.rows).map((row) => {
         const mdl = flagsFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const flagsArg: FlagsDraft | null = flagsFor === row.id
-          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers, offloadPendingLayers: offloadPending?.backendId === row.id ? offloadPending.layers : null, mtpPosition: flagsMtpPosition }
+          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers, offloadPendingLayers: offloadPending?.backendId === row.id ? offloadPending.layers : null, mtpPosition: flagsMtpPosition, parallel: flagsParallel }
           : null;
         const pmdl = placeFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const placeArg: PlaceCardState | null = placeFor === row.id
@@ -2132,6 +2219,15 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   /** True while an MTP slider commit (backend_set_mtp) is in
    *  flight; the slider ignores further commits until it lands. */
   let mtpCommitting = false;
+  /** The Parallel slots field's draft selection while the flags
+   *  form is open: the explicit --parallel count, or null for the
+   *  unset state (llama.cpp's default, auto). Unlike the MTP
+   *  position this exists for every backend — the field is not
+   *  capability-gated. */
+  let flagsParallel: number | null = null;
+  /** True while a parallel commit (backend_set_parallel) is in
+   *  flight; the field ignores further commits until it lands. */
+  let parallelCommitting = false;
   const closeFlagsForm = (): void => {
     flagsFor = null;
     offloadPending = null;
@@ -2144,6 +2240,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     flagsBatch = row.n_batch ?? 512;
     flagsOffloadLayers = row.offload ? row.offload.layers : null;
     flagsMtpPosition = row.mtp ? mtpPosition(row.mtp) : null;
+    flagsParallel = row.parallel ? row.parallel.slots : null;
     offloadPending = null;
     paint();
   };
@@ -2155,10 +2252,11 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     const t = ev.target as HTMLElement;
     const field = t.getAttribute("data-flags-field");
     if (!field) return;
-    const draft = { ctx: flagsCtx, batch: flagsBatch };
+    const draft = { ctx: flagsCtx, batch: flagsBatch, parallel: flagsParallel };
     const repaint = applyFlagsField(draft, field, (t as HTMLInputElement).value, ev.type === "change");
     flagsCtx = draft.ctx;
     flagsBatch = draft.batch;
+    flagsParallel = draft.parallel;
     if (repaint) paint();
   };
   root.addEventListener("change", syncFlagsDraft);
@@ -2347,6 +2445,78 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   root.addEventListener("input", syncMtpDraft);
   root.addEventListener("change", commitMtp);
 
+  /* ---------------- Parallel slots field (tracker #61) --------
+   * The ctx/batch idiom with the sliders' commit model: the
+   * draft syncs through syncFlagsDraft (the shared collection
+   * logic), and a "change" on the preset select or the Custom
+   * input commits through backend_set_parallel, which rewrites
+   * only the --parallel tokens in the backend's raw flags.
+   * Choosing Custom… only reveals the numeric input — the value
+   * commits when the input itself changes. A rejected or invalid
+   * commit reverts the draft to the saved selection. Setting the
+   * field to 1 is also what clears the MTP conflict line: the
+   * reload after the commit refreshes the payload it renders
+   * from. */
+  const saveParallelValue = async (id: string, n: number | null): Promise<boolean> => {
+    if (parallelCommitting) return false;
+    parallelCommitting = true;
+    inFlight.add(id);
+    paint();
+    try {
+      const r = await setBackendParallel(id, n);
+      if (disposed) return false;
+      if (r.error) {
+        msgs.set(id, { text: `Parallel slots not saved: ${r.error}`, err: true });
+        paint();
+        return false;
+      }
+      if (flagsFor === id) flagsParallel = n;
+      msgs.set(id, {
+        text: n === null
+          ? "Parallel slots returned to the llama.cpp default (auto) \u2014 applies on next start."
+          : `Parallel slots saved (${parallelTokenText(n)}) \u2014 applies on next start.`,
+        err: false,
+      });
+      await load();
+      return true;
+    } finally {
+      parallelCommitting = false;
+      inFlight.delete(id);
+      if (!disposed) paint();
+    }
+  };
+  const commitParallel = async (ev: Event): Promise<void> => {
+    const t = ev.target as HTMLElement;
+    const field = t.getAttribute("data-flags-field");
+    if (field !== "parallel-preset" && field !== "parallel-custom") return;
+    if (!flagsFor || parallelCommitting) return;
+    // Choosing Custom… reveals the numeric input; nothing commits
+    // until the input itself changes.
+    if (field === "parallel-preset" && (t as HTMLSelectElement).value === "custom") return;
+    const id = flagsFor;
+    const row = lastRows.find((r) => r.id === id);
+    if (!row?.parallel) return;
+    const saved = row.parallel.slots;
+    const n = flagsParallel;
+    if (n === saved) { paint(); return; } // changed back to the saved selection
+    // The same bounds the set op validates, checked here so the
+    // error reads in the form's own terms; the op re-validates
+    // regardless.
+    if (n !== null && (!Number.isInteger(n) || n < PARALLEL_MIN || n > PARALLEL_MAX)) {
+      msgs.set(id, { text: `Parallel slots must be between ${PARALLEL_MIN} and ${PARALLEL_MAX.toLocaleString()}.`, err: true });
+      flagsParallel = saved;
+      paint();
+      return;
+    }
+    const ok = await saveParallelValue(id, n);
+    if (!ok && !disposed) {
+      // A rejected commit reverts the draft to the saved selection.
+      flagsParallel = saved;
+      paint();
+    }
+  };
+  root.addEventListener("change", commitParallel);
+
   /* ---------------- Placement form ----------------
    * Rendered INSIDE the backend's own card (backendCard), like the
    * flags editor; the GPUs page shows placement read-only. State
@@ -2489,7 +2659,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
      * model-dependent: each backend_add_preview payload resets
      * them — the slider to the model's catalog default position,
      * the chips to the split creation would assign. */
-    const pDraft = { ctx: 32768, batch: 512 };
+    const pDraft: { ctx: number; batch: number; parallel: number | null } = { ctx: 32768, batch: 512, parallel: null };
     let preview: BackendAddPreview | null = null;
     let offLayers: number | null = null;
     /** A released offload position the guardrail blocks, awaiting
@@ -2563,6 +2733,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       paramsEl.innerHTML = `<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
       <div style="font-size:12px;font-weight:600">${icon("gear")} Launch parameters</div>
       ${flagsCtxBatchHtml({ ctx: pDraft.ctx, batch: pDraft.batch, ctxMax, fieldAttr: "data-add-flags-field", disabled: false })}
+      ${flagsParallelHtml({ value: pDraft.parallel, savedCustom: false, fieldAttr: "data-add-flags-field", disabled: false })}
       ${offloadHtml}
       ${flagsRatedLineHtml({ ctxMax, modelId: m?.id ?? null, savedText: "Saved when the backend is added; applies from its first start. Placement is set by the GPU selection below." })}
       ${placeHtml}
@@ -2704,6 +2875,14 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         if (msg) msg.innerHTML = `<span style="color:var(--err)">Batch size must be between 1 and the context length.</span>`;
         return;
       }
+      // Parallel slots: the same bounds the create op applies
+      // (backend_set_parallel's range), checked here in the form's
+      // terms; an untouched field (null) sends nothing and the
+      // backend is created with no --parallel token.
+      if (pDraft.parallel !== null && (!Number.isInteger(pDraft.parallel) || pDraft.parallel < PARALLEL_MIN || pDraft.parallel > PARALLEL_MAX)) {
+        if (msg) msg.innerHTML = `<span style="color:var(--err)">Parallel slots must be between ${PARALLEL_MIN} and ${PARALLEL_MAX.toLocaleString()}.</span>`;
+        return;
+      }
       // An undecided guardrail-blocked offload position cannot be
       // carried into creation (the op would refuse it without the
       // override): the operator decides here first.
@@ -2723,6 +2902,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         offloadLayers: preview?.offload ? (offLayers ?? preview.offload.layers) : undefined,
         offloadOverride: offPending?.override ? true : undefined,
         gpuIndices: gpuTouched ? selectedGpus() : undefined,
+        parallel: pDraft.parallel ?? undefined,
       });
       if (disposed) return;
       if (r.error) {
@@ -2740,6 +2920,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
           <div><span style="color:var(--text2)">Enabled:</span> ${enabled ? "yes" : "no"}</div>
           <div><span style="color:var(--text2)">Context:</span> ${pDraft.ctx.toLocaleString()}</div>
           <div><span style="color:var(--text2)">Batch:</span> ${pDraft.batch.toLocaleString()}</div>
+          ${pDraft.parallel !== null ? `<div><span style="color:var(--text2)">Parallel slots:</span> ${pDraft.parallel}</div>` : ""}
           ${preview?.offload ? `<div><span style="color:var(--text2)">Offload:</span> ${esc(offloadTokenText(preview.offload, offLayers ?? preview.offload.layers))}${offPending?.override ? " (override recorded)" : ""}</div>` : ""}
           ${gpuTouched ? `<div><span style="color:var(--text2)">GPUs:</span> ${esc(selectedGpus().map((ix) => `GPU ${ix}`).join(", "))}</div>` : ""}
           <div><span style="color:var(--text2)">Activation plan:</span> recorded<span class="info-tip" title="The change is recorded in the activation plan at the top of this page — the gateway routes the new backend after the plan is executed.">${icon("info")}</span></div>
