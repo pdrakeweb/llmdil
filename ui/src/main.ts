@@ -214,9 +214,10 @@ function renderTaskbar(): void {
 
 /** Query params in the hash (e.g. #/logs?scope=coder&follow=1 — the
  *  Logs deep link carried by the "go to logs" buttons on entity cards:
- *  the entity's scope preselected, Follow on). Params are consumed on
- *  entry; the view re-renders per navigation, so a later plain visit
- *  starts from defaults. */
+ *  the entity's scope preselected, Follow on). Params are applied on
+ *  entry and become the Logs view's session state (tracker #59): a
+ *  later plain visit restores the session state as left instead of
+ *  starting from defaults; defaults return only on an app restart. */
 function hashParams(): URLSearchParams {
   return new URLSearchParams((location.hash.split("?")[1] ?? ""));
 }

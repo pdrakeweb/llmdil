@@ -3653,6 +3653,127 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
 
 /* ---------------- Logs ---------------- */
 
+/** Logs view control state (tracker #59): everything the filter
+ *  card holds, kept at module level so leaving the view and coming
+ *  back within the same app run restores it exactly as left. An
+ *  app restart re-creates the module and returns to the defaults
+ *  below. While the view is wired the controls are the runtime
+ *  truth; wireLogs mirrors them into this object on every change
+ *  and once more from its cleanup. */
+interface LogsViewState {
+  scope: string;
+  level: string;
+  query: string;
+  from: string;
+  to: string;
+  sort: "asc" | "desc";
+  limit: number;
+  follow: boolean;
+  page: number;
+}
+
+function defaultLogsViewState(): LogsViewState {
+  return { scope: "all", level: "", query: "", from: "", to: "", sort: "desc", limit: 200, follow: false, page: 1 };
+}
+
+let logsViewState: LogsViewState = defaultLogsViewState();
+
+/** One recorded Logs search set (tracker #59): an applied query —
+ *  every getLogs parameter except the pagination offset — plus
+ *  when it last ran. Follow is view state, not part of a set:
+ *  applying a set never changes the Follow toggle. */
+interface LogSearchSet {
+  scope: string;
+  level: string;
+  query: string;
+  from: string;
+  to: string;
+  sort: "asc" | "desc";
+  limit: number;
+  ranAt: string;
+}
+
+const LOGS_RECENTS_KEY = "llm.logs.recents";
+const LOGS_RECENTS_CAP = 30;
+
+/** Recents persist across restarts in localStorage (the dashboard
+ *  view-mode pattern): 30 small entries at most. Stored data is
+ *  validated field by field; any storage problem degrades to an
+ *  empty history rather than breaking the view. */
+function loadLogsRecents(): LogSearchSet[] {
+  try {
+    const raw = localStorage.getItem(LOGS_RECENTS_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const out: LogSearchSet[] = [];
+    for (const e of parsed) {
+      if (!e || typeof e !== "object") continue;
+      const r = e as Record<string, unknown>;
+      if (typeof r.scope !== "string" || typeof r.ranAt !== "string") continue;
+      out.push({
+        scope: r.scope,
+        level: typeof r.level === "string" ? r.level : "",
+        query: typeof r.query === "string" ? r.query : "",
+        from: typeof r.from === "string" ? r.from : "",
+        to: typeof r.to === "string" ? r.to : "",
+        sort: r.sort === "asc" ? "asc" : "desc",
+        limit: typeof r.limit === "number" && [50, 200, 500].includes(r.limit) ? r.limit : 200,
+        ranAt: r.ranAt,
+      });
+      if (out.length >= LOGS_RECENTS_CAP) break;
+    }
+    return out;
+  } catch { return []; }
+}
+
+let logsRecents: LogSearchSet[] = loadLogsRecents();
+/** Whether the Recent searches section is expanded — session-only
+ *  view state. The section itself renders only while the history is
+ *  non-empty (principle 13). */
+let logsRecentsOpen = false;
+
+function saveLogsRecents(): void {
+  try { localStorage.setItem(LOGS_RECENTS_KEY, JSON.stringify(logsRecents)); } catch { /* storage unavailable */ }
+}
+
+/** A set's identity: the query fields only — ranAt is metadata, so
+ *  re-running the same set dedupes instead of duplicating. */
+function logSearchKey(s: LogSearchSet): string {
+  return JSON.stringify([s.scope, s.level, s.query, s.from, s.to, s.sort, s.limit]);
+}
+
+/** Record an applied search set: newest first; an identical set
+ *  moves to the top with a fresh ranAt; the oldest drop past the
+ *  cap. */
+function recordLogSearch(set: LogSearchSet): void {
+  const key = logSearchKey(set);
+  logsRecents = [set, ...logsRecents.filter((e) => logSearchKey(e) !== key)].slice(0, LOGS_RECENTS_CAP);
+  saveLogsRecents();
+}
+
+/** One-line summary of a search set: the scope, then only the
+ *  distinguishing values (defaults omitted), so entries scan. */
+function logSearchSummary(s: LogSearchSet): string {
+  const parts: string[] = [s.scope];
+  if (s.level) parts.push(`level ${s.level}`);
+  if (s.query) parts.push(`"${s.query}"`);
+  if (s.from || s.to) parts.push(`${s.from ? fmtRanAt(s.from) : "…"} → ${s.to ? fmtRanAt(s.to) : "…"}`);
+  if (s.sort === "asc") parts.push("oldest first");
+  if (s.limit !== 200) parts.push(`limit ${s.limit}`);
+  return parts.join(" · ");
+}
+
+/** A timestamp compactly — "18 Oct 22:14" (the full stamp rides
+ *  the title attribute where one is offered). Accepts ISO stamps
+ *  and datetime-local values alike. */
+function fmtRanAt(ts: string): string {
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime())
+    ? ts
+    : d.toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
 function fmtDateTime(ts: string): string {
   const d = new Date(ts);
   return Number.isNaN(d.getTime()) ? ts : d.toLocaleString("en-GB");
@@ -3715,6 +3836,7 @@ export function renderLogs(): string {
     <button class="btn icon-only" id="logExport" title="Export diagnostics bundle — the bundle contains raw, unredacted process logs. Review it before sharing." aria-label="Export diagnostics bundle">${icon("download")}</button>
     <button class="btn icon-only" id="logOpenFolder" title="Open folder" aria-label="Open folder" style="display:none">${icon("folder")}</button>
   </div></div>
+  <div id="logRecents"></div>
   <div id="logBody">${loadingHtml("Loading logs\u2026")}</div></div>`;
 }
 
@@ -3943,6 +4065,102 @@ export async function wireLogs(root: HTMLElement, initialScope?: string, initial
     }
   };
 
+  /* ---- Session state + recent searches (tracker #59) ---- */
+  const recentsEl = root.querySelector("#logRecents") as HTMLElement | null;
+  /** Set once this wire has applied its entry state. The router can
+   *  call a superseded wire's cleanup after its DOM was replaced;
+   *  such a wire must not snapshot its never-applied defaults over
+   *  the session state. */
+  let stateApplied = false;
+
+  /** Mirror the controls (and the closure page) into the
+   *  module-level session state. */
+  const syncLogsState = (): void => {
+    logsViewState = {
+      scope: scopeSel?.value ?? "all",
+      level: levelSel?.value ?? "",
+      query: searchInput?.value ?? "",
+      from: fromInput?.value ?? "",
+      to: toInput?.value ?? "",
+      sort: sortSel?.value === "asc" ? "asc" : "desc",
+      limit: Number(limitSel?.value ?? 200),
+      follow: followChk?.checked ?? false,
+      page,
+    };
+  };
+
+  /** The currently applied query as a search set, stamped now. The
+   *  query is the trimmed value — the one load() actually sends —
+   *  so sets differing only in stray spaces dedupe together. */
+  const currentSearchSet = (): LogSearchSet => ({
+    scope: logsViewState.scope,
+    level: logsViewState.level,
+    query: logsViewState.query.trim(),
+    from: logsViewState.from,
+    to: logsViewState.to,
+    sort: logsViewState.sort,
+    limit: logsViewState.limit,
+    ranAt: new Date().toISOString(),
+  });
+
+  /** Recent searches: an expandable section under the filter card,
+   *  collapsed by default (principle 1), omitted entirely while
+   *  the history is empty (principle 13). An entry click applies
+   *  the whole set; Clear empties the history (words + icon —
+   *  clearing is destructive, principle 15). */
+  const paintRecents = (): void => {
+    if (!recentsEl) return;
+    if (!logsRecents.length) { recentsEl.innerHTML = ""; return; }
+    const open = logsRecentsOpen;
+    recentsEl.innerHTML = `<div class="card" style="margin-bottom:12px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="btn" id="logRecentsToggle" aria-expanded="${open}">${icon(open ? "chevD" : "chevR")} Recent searches (${logsRecents.length})</button>
+        <span class="spacer" style="flex:1"></span>
+        ${open ? `<button class="btn" id="logRecentsClear">${icon("x")} Clear</button>` : ""}
+      </div>
+      ${open ? `<div style="display:grid;gap:2px;margin-top:8px">${logsRecents.map((e, i) => `<button class="btn" data-recent="${i}" title="${esc(fmtDateTime(e.ranAt))}" style="justify-content:flex-start;text-align:left"><span style="flex:1">${esc(logSearchSummary(e))}</span><span style="color:var(--text3);font-size:11px">${esc(fmtRanAt(e.ranAt))}</span></button>`).join("")}</div>` : ""}
+    </div>`;
+    recentsEl.querySelector("#logRecentsToggle")?.addEventListener("click", () => {
+      logsRecentsOpen = !logsRecentsOpen;
+      paintRecents();
+    });
+    recentsEl.querySelector("#logRecentsClear")?.addEventListener("click", () => {
+      logsRecents = [];
+      saveLogsRecents();
+      paintRecents();
+    });
+    recentsEl.querySelectorAll("[data-recent]").forEach((b) => {
+      b.addEventListener("click", () => {
+        const e = logsRecents[Number((b as HTMLElement).dataset.recent)];
+        if (e) applySearchSet(e);
+      });
+    });
+  };
+
+  /** Capture the applied set into the recents and repaint them. */
+  const captureSearch = (): void => {
+    recordLogSearch(currentSearchSet());
+    paintRecents();
+  };
+
+  /** Write a search set into the session state and the controls,
+   *  restart paging at 1, and run it. Follow is not part of a set
+   *  and is left as it stands. */
+  const applySearchSet = (s: LogSearchSet): void => {
+    mergeScopeOptions([{ value: s.scope, label: s.scope }]);
+    if (scopeSel) scopeSel.value = s.scope;
+    if (levelSel) levelSel.value = s.level;
+    if (searchInput) searchInput.value = s.query;
+    if (fromInput) fromInput.value = s.from;
+    if (toInput) toInput.value = s.to;
+    if (sortSel) sortSel.value = s.sort;
+    if (limitSel) limitSel.value = String(s.limit);
+    page = 1;
+    syncLogsState();
+    captureSearch();
+    void load();
+  };
+
   const filtersActive = (): boolean => Boolean(
     levelSel?.value || searchInput?.value.trim() || fromInput?.value || toInput?.value,
   );
@@ -3981,6 +4199,9 @@ export async function wireLogs(root: HTMLElement, initialScope?: string, initial
         r = await fetchPage();
         if (stale()) return;
       }
+      // The clamp may have moved the page; the session state keeps
+      // the page that is actually shown (tracker #59).
+      logsViewState.page = page;
       setBanner(root, "logBanner", bannerHtml(r));
       mergeScopeOptions(r.data.scopes.map((s) => ({
         value: s.id,
@@ -4017,25 +4238,67 @@ export async function wireLogs(root: HTMLElement, initialScope?: string, initial
   if (!disposed && backs.live && !backs.error) {
     mergeScopeOptions(backs.data.map((bk) => ({ value: bk.id, label: bk.id })));
   }
-  // Deep link (#/logs?scope=<id>): select it, adding the option when it
-  // is not a known backend id (e.g. a previous-run scope).
-  if (scopeSel && initialScope) {
-    mergeScopeOptions([{ value: initialScope, label: initialScope }]);
-    scopeSel.value = initialScope;
+  // Entry state (tracker #59). A parametrized entry — a deep link
+  // (#/logs?scope=<id>&follow=1, the entity cards' "go to logs"
+  // buttons; a scope alone from the wizard's failure link) — applies
+  // its params over the fresh defaults exactly as it did before #59,
+  // and the applied result becomes the session state and is
+  // captured as a recent search. A plain entry instead restores
+  // the session state verbatim — scope, level, search text, time
+  // bounds, sort, limit, Follow, and page.
+  const paramEntry = initialScope !== undefined || initialFollow;
+  if (paramEntry) {
+    // Deep link (#/logs?scope=<id>): select it, adding the option
+    // when it is not a known backend id (e.g. a previous-run scope).
+    if (scopeSel && initialScope) {
+      mergeScopeOptions([{ value: initialScope, label: initialScope }]);
+      scopeSel.value = initialScope;
+    }
+    if (followChk) followChk.checked = initialFollow;
+    stateApplied = true;
+    syncLogsState();
+    captureSearch();
+  } else {
+    // The retained scope may need its option added first (a scope
+    // whose backend has left the config, or a previous-run scope
+    // the first payload has not listed yet).
+    mergeScopeOptions([{ value: logsViewState.scope, label: logsViewState.scope }]);
+    if (scopeSel) scopeSel.value = logsViewState.scope;
+    if (levelSel) levelSel.value = logsViewState.level;
+    if (searchInput) searchInput.value = logsViewState.query;
+    if (fromInput) fromInput.value = logsViewState.from;
+    if (toInput) toInput.value = logsViewState.to;
+    if (sortSel) sortSel.value = logsViewState.sort;
+    if (limitSel) limitSel.value = String(logsViewState.limit);
+    if (followChk) followChk.checked = logsViewState.follow;
+    page = logsViewState.page;
+    stateApplied = true;
   }
+  paintRecents();
 
   /** Any filter change (scope, level, text, time bounds, sort, page
-   *  size) restarts paging at page 1. */
-  const onFilterChange = (): void => { page = 1; void load(); };
+   *  size) restarts paging at page 1 — and is a search being run:
+   *  it updates the session state and is captured into the recents
+   *  (tracker #59). Refresh, pager turns, and Follow toggles only
+   *  re-run or navigate the current search, so they sync the
+   *  session state without capturing. */
+  const onFilterChange = (): void => { page = 1; syncLogsState(); captureSearch(); void load(); };
   /** Manual Refresh reloads the current page as-is. */
   const onRefresh = (): void => { void load(); };
   const onSearch = (): void => {
     if (searchTimer !== null) window.clearTimeout(searchTimer);
-    searchTimer = window.setTimeout(() => { searchTimer = null; page = 1; void load(); }, 300);
+    searchTimer = window.setTimeout(() => {
+      searchTimer = null;
+      page = 1;
+      syncLogsState();
+      captureSearch();
+      void load();
+    }, 300);
   };
-  const onPrev = (): void => { if (page > 1) { page -= 1; void load(); } };
-  const onNext = (): void => { page += 1; void load(); };
+  const onPrev = (): void => { if (page > 1) { page -= 1; syncLogsState(); void load(); } };
+  const onNext = (): void => { page += 1; syncLogsState(); void load(); };
   const onFollow = (): void => {
+    syncLogsState();
     if (followTimer !== null) { window.clearInterval(followTimer); followTimer = null; }
     if (followChk?.checked) {
       followTimer = window.setInterval(() => { if (!disposed) void load(); }, 2000);
@@ -4070,12 +4333,12 @@ export async function wireLogs(root: HTMLElement, initialScope?: string, initial
   nextBtn?.addEventListener("click", onNext);
   exportBtn?.addEventListener("click", onExport);
 
-  // Deep link follow (#/logs?scope=<id>&follow=1 — the entity cards'
-  // "go to logs" buttons): arrive in exactly the state the Follow
-  // toggle produces — checkbox on, 2 s re-poll running, first load
-  // fired by onFollow itself.
-  if (initialFollow && followChk) {
-    followChk.checked = true;
+  // Arrival with Follow on — a deep link's follow=1, or a session
+  // state that was left following (tracker #59): arrive in exactly
+  // the state the Follow toggle produces — checkbox on, 2 s
+  // re-poll running, first load fired by onFollow itself, so the
+  // restored filters' results load before the tail resumes.
+  if (followChk?.checked) {
     onFollow();
   } else {
     await load();
@@ -4083,6 +4346,13 @@ export async function wireLogs(root: HTMLElement, initialScope?: string, initial
 
   return () => {
     disposed = true;
+    // Final session-state snapshot: the controls still hold the
+    // operator's last values (the router runs cleanup before the
+    // next view's markup replaces this DOM) — including search
+    // text whose debounce had not fired yet. Guarded by
+    // stateApplied so a superseded wire that never applied its
+    // entry state cannot overwrite the session with defaults.
+    if (stateApplied) syncLogsState();
     closePicker();
     if (followTimer !== null) window.clearInterval(followTimer);
     if (searchTimer !== null) window.clearTimeout(searchTimer);

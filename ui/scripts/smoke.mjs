@@ -105,6 +105,18 @@ check(bundle.includes("&follow=1"), "bundle contains the Logs deep-link follow f
 // The Optimize page header links to its own log scope (tracker
 // #52): the scope+follow fragment must survive the build.
 check(bundle.includes("#/logs?scope=optimize&follow=1"), "bundle contains the Optimize logs deep link (#/logs?scope=optimize&follow=1)");
+// Logs session state + recent searches (tracker #59): the view's
+// controls live in module-level session state so in-app navigation
+// restores them as left; applied search sets are recorded into a
+// capped, localStorage-persisted recents list (the dashboard
+// view-mode pattern) applied from an expandable section.
+check(bundle.includes("Recent searches"), "bundle contains the Recent searches section label");
+check(bundle.includes("llm.logs.recents"), "bundle contains the Logs recents storage key");
+const logsSrc = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+check(logsSrc.includes("let logsViewState"), "Logs session state lives at module level in static.ts");
+check(logsSrc.includes("function recordLogSearch"), "Logs recents recording exists in static.ts");
+check(logsSrc.includes("LOGS_RECENTS_CAP = 30"), "Logs recents cap is 30 in static.ts");
+check(logsSrc.includes('id="logRecents"'), "Logs view renders the recents section container");
 // Enable/disable controls are the shared state switch (design rule
 // 16): the bundle must carry the switch markup contract, the shared
 // component must exist, both views that host toggles must render
