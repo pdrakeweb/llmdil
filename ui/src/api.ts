@@ -690,6 +690,11 @@ export interface BackendRow {
   flags_advanced?: boolean;
   /** Gateway group this backend belongs to, or null when ungrouped. */
   group?: string | null;
+  /** Placement in short form ("GPU 0", "GPU 0+1", "CPU"),
+   *  derived server-side from the saved configuration (Groups
+   *  page, predicted-throughput design §8.2). Absent when the
+   *  placement cannot be determined from the config. */
+  placement?: string;
   /** Memory requirement under the backend's current configuration
    *  (configured rows whose model resolves): GPU-resident weights,
    *  system-RAM weights (expert offload), and the KV cache at the

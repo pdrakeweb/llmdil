@@ -2287,6 +2287,33 @@ pub async fn op_list_backends(
             row["predicted"] = p.clone();
         }
     }
+    // Placement in short form (Groups page, predicted-throughput
+    // design §8.2): where the saved configuration loads, derived
+    // from config alone by the same visibility resolution the
+    // measurement fingerprint uses. Absent when the placement
+    // cannot be determined from the config — unknown placement
+    // renders as nothing, never as a default (principle 12).
+    {
+        for row in backends.iter_mut() {
+            let Some(id) = row["id"].as_str() else {
+                continue;
+            };
+            let Some(b) = cfg.backends.iter().find(|b| b.id == id) else {
+                continue;
+            };
+            let placement = match backend_gpu_visibility(b) {
+                GpuVisibility::CpuOnly => Some("CPU".to_string()),
+                GpuVisibility::Gpus(idxs) => Some(format!(
+                    "GPU {}",
+                    idxs.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("+")
+                )),
+                GpuVisibility::Undetermined => None,
+            };
+            if let Some(p) = placement {
+                row["placement"] = json!(p);
+            }
+        }
+    }
     // Gateway request statistics (LiteLLM Prometheus snapshots from
     // the background poller): attach the trailing-hour figures where
     // the store has a window for the backend. Absent fields render
