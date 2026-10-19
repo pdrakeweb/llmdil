@@ -616,13 +616,29 @@ pub fn fit_verdict_text(
     }
 }
 
+/// The reserved backend-id prefix for temporary experiment
+/// backends: `opt-exp-<experiment id>`. This is the single
+/// source for the namespace — temp-id construction here, the
+/// startup sweep, and the user-creation reservation
+/// (code review B-3) all derive from it, so the three can
+/// never drift apart.
+pub const TEMP_BACKEND_ID_PREFIX: &str = "opt-exp-";
+
+/// Whether `id` falls in the reserved temp-backend namespace.
+/// Any id with this prefix is treated as an experiment temp
+/// backend by cleanup and by the startup sweep, so user
+/// backends must never carry it.
+pub fn is_temp_backend_id(id: &str) -> bool {
+    id.starts_with(TEMP_BACKEND_ID_PREFIX)
+}
+
 /// The temporary backend's id for one proposal within a plan:
 /// `opt-exp-<experiment id>` (§A.3 step 2). One live plan means
 /// ids cannot collide across plans; a leftover from a crashed
 /// run is removed by the startup sweep (and by cleanup, which
 /// unregisters before a re-run can reuse the id).
 pub fn temp_backend_id(experiment_id: usize) -> String {
-    format!("opt-exp-{experiment_id}")
+    format!("{TEMP_BACKEND_ID_PREFIX}{experiment_id}")
 }
 
 /// Build the in-memory temporary backend for one proposal. It
@@ -1036,6 +1052,32 @@ mod tests {
         let no = fit_verdict_text(24000, 12000, false, false, &["coder".to_string()]);
         assert!(no.contains("does not fit"), "{no}");
         assert!(no.contains("24000 MiB"), "{no}");
+    }
+
+    #[test]
+    fn temp_backend_namespace_is_one_reserved_prefix() {
+        // The namespace has a single source (code review B-3):
+        // temp-id construction, the startup sweep, and the
+        // user-creation reservation all derive from the one
+        // prefix constant.
+        assert_eq!(TEMP_BACKEND_ID_PREFIX, "opt-exp-");
+        assert_eq!(temp_backend_id(7), "opt-exp-7");
+        assert!(is_temp_backend_id(&temp_backend_id(7)));
+        assert!(is_temp_backend_id("opt-exp-1"));
+        // Near misses are NOT in the namespace: no trailing
+        // hyphen, or the text appearing mid-id.
+        assert!(!is_temp_backend_id("opt-exp"));
+        assert!(!is_temp_backend_id("optimizer-1"));
+        assert!(!is_temp_backend_id("planner"));
+        // Experiment temp creation is unaffected by the
+        // reservation: it still builds ids in the namespace.
+        let b = temp_backend_config(
+            &proposal("cand"),
+            PathBuf::from("models/cand.gguf"),
+            8090,
+            None,
+        );
+        assert!(is_temp_backend_id(&b.id));
     }
 
     #[test]
