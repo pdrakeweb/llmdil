@@ -107,6 +107,34 @@ pub struct ExperimentMeasured {
     pub long: BenchResult,
 }
 
+/// The ESTIMATED rates of one experiment estimate pass
+/// (tracker #56): both prompts' figures from the abbreviated
+/// benchmark profile ([`crate::measure::estimate_prompts`],
+/// one run each, no separate warm-up sequence). This is a
+/// separate record from [`ExperimentResult`] on purpose: an
+/// estimate is screening evidence, not a run outcome. It is
+/// stored on the proposal only — never in the experiment
+/// journal's history, never in the measurement store — so it
+/// can never surface anywhere as a measured fact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExperimentEstimate {
+    pub short: BenchResult,
+    pub long: BenchResult,
+    /// The batch (one `optimize_estimate_experiments`
+    /// invocation) that produced this estimate.
+    #[serde(default)]
+    pub batch_id: String,
+    /// The temporary backend the estimate ran against.
+    pub temp_backend_id: String,
+    /// The preflight verdict, stated in numbers.
+    pub preflight: String,
+    /// Operator-facing note: the abbreviated basis, plus any
+    /// batch restart note appended afterwards.
+    pub detail: String,
+    /// RFC 3339 timestamp of the estimate.
+    pub estimated_at: String,
+}
+
 /// The recorded outcome of one experiment run. Stored on the
 /// plan's proposal AND in the experiment journal's history, so
 /// results survive both cleanup and plan replacement (§A.3
@@ -182,6 +210,11 @@ pub struct ExperimentProposal {
     /// The recorded outcome once a batch has run this proposal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ExperimentResult>,
+    /// The latest estimate pass's figures (tracker #56), when
+    /// one has run. Separate from `result`: an estimate pass
+    /// is not a run and must never read as one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<ExperimentEstimate>,
 }
 
 /// An experiment's fingerprint: hash of candidate + flags +
@@ -665,6 +698,7 @@ impl ExperimentJournal {
 mod tests {
     use super::*;
     use crate::eval::{aggregate_results, EvalTaskResult};
+    use crate::measure::BenchRun;
 
     fn proposal(candidate: &str) -> ExperimentProposal {
         ExperimentProposal {
@@ -680,6 +714,7 @@ mod tests {
             decision: Decision::Undecided,
             previously_denied: false,
             result: None,
+            estimate: None,
         }
     }
 
@@ -887,6 +922,41 @@ mod tests {
         p.flags.offload_layers = Some(12);
         let b = temp_backend_config(&p, PathBuf::from("models/cand.gguf"), 8090, None);
         assert_eq!(b.raw_flags.as_deref(), Some("--n-cpu-moe 12"));
+    }
+
+    #[test]
+    fn proposal_estimate_round_trips_and_legacy_plans_have_none() {
+        let mut p = proposal("cand");
+        p.estimate = Some(ExperimentEstimate {
+            short: BenchResult::from_runs(vec![BenchRun {
+                prompt_per_second: Some(300.0),
+                predicted_per_second: Some(44.0),
+                ttft_ms: Some(120.0),
+                latency_ms: 1000,
+            }]),
+            long: BenchResult::from_runs(vec![BenchRun {
+                prompt_per_second: Some(700.0),
+                predicted_per_second: Some(40.0),
+                ttft_ms: Some(5000.0),
+                latency_ms: 6000,
+            }]),
+            batch_id: "estimate-batch".to_string(),
+            temp_backend_id: "opt-exp-1".to_string(),
+            preflight: "fits alongside".to_string(),
+            detail: "Estimate only".to_string(),
+            estimated_at: "2026-10-18T00:00:00Z".to_string(),
+        });
+        let text = serde_json::to_string(&p).unwrap();
+        let back: ExperimentProposal = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, p);
+        let estimate = back.estimate.unwrap();
+        assert_eq!(estimate.short.predicted_per_second, Some(44.0));
+        assert!(back.result.is_none(), "an estimate is not a run result");
+
+        let mut legacy = serde_json::to_value(proposal("cand")).unwrap();
+        legacy.as_object_mut().unwrap().remove("estimate");
+        let parsed: ExperimentProposal = serde_json::from_value(legacy).unwrap();
+        assert!(parsed.estimate.is_none());
     }
 
     fn result(batch: &str, id: usize, detail: &str) -> ExperimentResult {
