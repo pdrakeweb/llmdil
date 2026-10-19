@@ -306,7 +306,11 @@ function applianceView(m: DashboardModel, live: boolean): string {
     ? `<div class="card"><div class="empty">No backends or GPUs reported. Run the setup wizard to install and configure the stack.</div></div>` : "";
   // Blank stat fields were reported as a defect (Oct 15, 2026): when
   // no metrics window exists, state why instead of rendering dashes.
-  const noWindow = live && m.gateway !== null && svcs.every((b) => b.requests_1h === undefined)
+  // Only while the gateway is UP: the gateway card alone renders
+  // whenever the status probe answered (m.gateway non-null covers
+  // down too), and a down gateway has no statistics to wait for —
+  // its card already says so.
+  const noWindow = live && m.gateway !== null && m.gatewayUp && svcs.every((b) => b.requests_1h === undefined)
     ? `<div class="card" style="margin-bottom:12px;font-size:12px;color:var(--text2)">${icon("warn")} Gateway statistics are not available yet. They appear after the gateway has been running about 30 s with the app polling it (the generated config enables its metrics at gateway start).</div>`
     : "";
   return `${empty}
