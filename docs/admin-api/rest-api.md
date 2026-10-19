@@ -735,7 +735,7 @@ a summary — `id`, `started_at`, `finished_at`, `status`
 and the item counts (`items`, `applied`, `skipped`, `failed`).
 With `?execution_id=<id>`, returns `{ "execution": … }` — that
 execution's full record: the plan as computed at apply time, one
-item per change (`kind`, `summary`, `scope`, `targets`,
+item per change (`ts`, `kind`, `summary`, `scope`, `targets`,
 `activation`) with its `outcome` (`applied` | `skipped` |
 `failed`) and `detail` (skip reason or error text) — or
 `"execution": null` when the id has aged out of the retained
