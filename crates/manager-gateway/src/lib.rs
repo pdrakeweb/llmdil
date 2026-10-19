@@ -1601,8 +1601,12 @@ mod tests {
     fn yaml_snapshot_matches_checked_in_file() {
         let cfg = four_backend_config();
         let yaml = generate_config_yaml(&cfg).expect("generate");
-        let expected =
-            std::fs::read_to_string("tests/expected-config.yaml").expect("read snapshot");
+        // The checked-in snapshot is stored with LF endings; a Windows
+        // checkout with core.autocrlf rewrites it to CRLF on disk, so
+        // normalize before comparing against the generated YAML.
+        let expected = std::fs::read_to_string("tests/expected-config.yaml")
+            .expect("read snapshot")
+            .replace("\r\n", "\n");
         assert_eq!(yaml, expected, "generated YAML drifted from snapshot");
     }
 

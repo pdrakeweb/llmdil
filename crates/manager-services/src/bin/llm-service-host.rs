@@ -213,8 +213,10 @@ fn cred_read(target: &str) -> Option<String> {
 fn decode_credential_blob(blob: &[u8]) -> Option<String> {
     if blob.len() >= 2 && blob.len().is_multiple_of(2) {
         let units: Vec<u16> = blob
-            .chunks_exact(2)
-            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| u16::from_le_bytes(*p))
             .collect();
         if let Ok(s) = String::from_utf16(&units) {
             let trimmed = s.trim_end_matches('\0');
@@ -415,7 +417,7 @@ mod windows_host {
         if handle.is_null() {
             return;
         }
-        let mut status = SERVICE_STATUS {
+        let status = SERVICE_STATUS {
             dwServiceType: SERVICE_WIN32_OWN_PROCESS,
             dwCurrentState: state,
             dwControlsAccepted: accepted,
@@ -424,7 +426,7 @@ mod windows_host {
             dwCheckPoint: 0,
             dwWaitHint: wait_hint,
         };
-        unsafe { SetServiceStatus(handle, &mut status) };
+        unsafe { SetServiceStatus(handle, &status) };
     }
 
     fn report_specific_failure(specific: u32) {
@@ -435,7 +437,7 @@ mod windows_host {
         if handle.is_null() {
             return;
         }
-        let mut status = SERVICE_STATUS {
+        let status = SERVICE_STATUS {
             dwServiceType: SERVICE_WIN32_OWN_PROCESS,
             dwCurrentState: SERVICE_STOPPED,
             dwControlsAccepted: 0,
@@ -444,7 +446,7 @@ mod windows_host {
             dwCheckPoint: 0,
             dwWaitHint: 0,
         };
-        unsafe { SetServiceStatus(handle, &mut status) };
+        unsafe { SetServiceStatus(handle, &status) };
     }
 
     fn append_handle(path: &Path) -> Option<HANDLE> {
@@ -564,10 +566,8 @@ mod windows_host {
             )
         };
         // The child holds its own copies of the stdio handles now.
-        for h in [stdout, stderr] {
-            if let Some(h) = h {
-                unsafe { CloseHandle(h) };
-            }
+        for h in [stdout, stderr].into_iter().flatten() {
+            unsafe { CloseHandle(h) };
         }
         if stdin != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
             && !stdin.is_null()

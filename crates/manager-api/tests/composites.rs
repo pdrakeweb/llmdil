@@ -16,6 +16,12 @@ use manager_api::{build_router, ApiCtx, UserStore};
 use manager_app::AppState;
 
 async fn test_ctx() -> (Arc<ApiCtx>, std::path::PathBuf) {
+    test_ctx_with_config(manager_config::AppConfig::default_config()).await
+}
+
+async fn test_ctx_with_config(
+    cfg: manager_config::AppConfig,
+) -> (Arc<ApiCtx>, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "llm-api-composites-{}",
         std::time::SystemTime::now()
@@ -25,11 +31,7 @@ async fn test_ctx() -> (Arc<ApiCtx>, std::path::PathBuf) {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let config_path = dir.join("config.json");
-    let app = Arc::new(AppState::new(
-        manager_config::AppConfig::default_config(),
-        config_path,
-        dir.clone(),
-    ));
+    let app = Arc::new(AppState::new(cfg, config_path, dir.clone()));
     let ctx = ApiCtx::with_services(
         app,
         dir.clone(),
@@ -328,7 +330,16 @@ async fn gateway_config_bind_host_split() {
 
 #[tokio::test]
 async fn activation_apply_on_empty_plan_and_role_gate() {
-    let (ctx, _dir) = test_ctx().await;
+    // Hermetic gateway port: the activation plan probes the
+    // configured port for a live gateway, and drift only counts as
+    // pending while one answers. On a machine already running a
+    // gateway on the default port (a developer's own install) the
+    // otherwise-empty plan reads as gateway-pending, and the apply
+    // attempts a gateway restart this test never set up. A port
+    // nothing answers on keeps the plan empty on every host.
+    let mut cfg = manager_config::AppConfig::default_config();
+    cfg.gateway.port = 40099;
+    let (ctx, _dir) = test_ctx_with_config(cfg).await;
     let operator = seed_token(&ctx, "op", RoleName::Operator).await;
     let viewer = seed_token(&ctx, "look", RoleName::Viewer).await;
 

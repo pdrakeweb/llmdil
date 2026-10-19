@@ -476,8 +476,9 @@ impl SupervisedProcess {
         // GUI app would otherwise open a visible console window.
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW
+            // CREATE_NO_WINDOW. `cmd` is a tokio::process::Command,
+            // whose creation_flags is an inherent method on Windows —
+            // no std CommandExt import is needed (or used) here.
             cmd.creation_flags(0x08000000);
         }
         cmd.stdout(Stdio::piped())
@@ -2162,6 +2163,8 @@ pub enum SupervisorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the cfg(unix) port-occupancy test binds a std listener.
+    #[cfg(unix)]
     use std::net::TcpListener as StdTcpListener;
 
     #[test]
@@ -2208,6 +2211,10 @@ mod tests {
         }
     }
 
+    // Only the cfg(unix) spawn/log tests use these three helpers;
+    // gating them the same way keeps the Windows test target free of
+    // dead code.
+    #[cfg(unix)]
     fn test_ring() -> Arc<Mutex<RingBuffer<LogRecord>>> {
         Arc::new(Mutex::new(RingBuffer::new(1024)))
     }
@@ -2226,6 +2233,30 @@ mod tests {
         }
     }
 
+    /// Registration spec for the adoption tests, on either platform.
+    /// Adoption attaches to an already-running pid and never spawns
+    /// the spec's program; the spec names the same long-lived sleeper
+    /// the tests launch externally (`sleep 60` via sh on Unix, `ping`
+    /// on Windows) so the registration describes the adopted process.
+    fn ext_spec(id: &str) -> ProcessSpec {
+        #[cfg(unix)]
+        {
+            sh_spec(id, "exec sleep 60")
+        }
+        #[cfg(windows)]
+        {
+            ProcessSpec {
+                id: id.into(),
+                program: PathBuf::from("ping"),
+                args: vec!["-n".into(), "60".into(), "127.0.0.1".into()],
+                env: vec![],
+                workdir: None,
+                port: None,
+            }
+        }
+    }
+
+    #[cfg(unix)]
     async fn wait_for<F>(mut cond: F, timeout: Duration)
     where
         F: FnMut() -> bool,
@@ -2243,6 +2274,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn ring_lines_chronological(ring: &Arc<Mutex<RingBuffer<LogRecord>>>) -> Vec<String> {
         ring.lock()
             .unwrap()
@@ -2310,7 +2342,7 @@ mod tests {
             .unwrap();
         let pid = ext.id();
         let mut sup = Supervisor::new(test_policy());
-        sup.register_spec(sh_spec("ext", "exec sleep 60"));
+        sup.register_spec(ext_spec("ext"));
         // Unknown id and double-adoption are errors, like spawn.
         assert!(sup.adopt("missing", pid).is_err());
         sup.adopt("ext", pid).unwrap();
@@ -2342,7 +2374,7 @@ mod tests {
             .unwrap();
         let pid = ext.id();
         let mut sup = Supervisor::new(test_policy());
-        sup.register_spec(sh_spec("ext", "exec sleep 60"));
+        sup.register_spec(ext_spec("ext"));
         sup.adopt("ext", pid).unwrap();
         // The external process dies on its own.
         ext.kill().unwrap();

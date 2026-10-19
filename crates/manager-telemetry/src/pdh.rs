@@ -570,11 +570,15 @@ mod imp {
                 // array holds pointers and needs 8-byte alignment a
                 // Vec<u8> does not guarantee.
                 let mut buffer: Vec<u64> = Vec::new();
-                let mut size: u32 = 0;
                 let mut count: u32 = 0;
                 for attempt in 0..2 {
-                    size = 0;
                     count = 0;
+                    // The sizing answer is per-attempt state: PDH
+                    // writes it through the pointer and it is consumed
+                    // within the same iteration (buffer sizing and
+                    // the fill-size seed). Nothing after the loop
+                    // reads it, so it does not live outside.
+                    let mut size: u32 = 0;
                     let status = perf::PdhGetFormattedCounterArrayW(
                         counter,
                         perf::PDH_FMT_LARGE,
@@ -595,7 +599,6 @@ mod imp {
                         buffer.as_mut_ptr() as *mut perf::PDH_FMT_COUNTERVALUE_ITEM_W,
                     );
                     if status == 0 {
-                        size = fill_size;
                         break;
                     }
                     if status != perf::PDH_MORE_DATA || attempt == 1 {
