@@ -125,6 +125,52 @@ pub fn benchmark_prompts() -> [BenchmarkPrompt; 2] {
 }
 
 // ---------------------------------------------------------------------------
+// The estimate profile (tracker #56): the abbreviated benchmark
+// ---------------------------------------------------------------------------
+
+/// Generation budget for the short prompt in an estimate run:
+/// the short prompt's job is the decode rate, which is at
+/// steady state well inside 128 generated tokens — half the
+/// standard budget still leaves a stable timings sample.
+pub const ESTIMATE_SHORT_MAX_TOKENS: u32 = 128;
+/// Generation budget for the long prompt in an estimate run:
+/// the long prompt's job is prompt processing at depth (its
+/// ~4,000-token prefill IS the sample), so generation is cut
+/// to the minimum that still yields llama.cpp timings and a
+/// TTFT figure.
+pub const ESTIMATE_LONG_MAX_TOKENS: u32 = 16;
+/// Runs per prompt in an estimate: one, with no separate
+/// warm-up. An estimate is a directional figure, not a median;
+/// finalists are confirmed with the full benchmark.
+pub const ESTIMATE_RUNS: usize = 1;
+
+/// The two standardized prompts at the estimate profile's
+/// generation budgets: the same texts as [`benchmark_prompts`]
+/// (prompt processing at depth must come from the same long
+/// prompt), one run each, no warm-up.
+///
+/// Wall time, against a full measurement's (warm-up + 3 runs)
+/// × both prompts: the short run costs ≈ half (half the
+/// generation budget, prefill unchanged) and the long run
+/// ≈ half (the same 4,000-token prefill, near-zero
+/// generation), and each runs once instead of four times —
+/// ≈13% of a measurement's wall time in total.
+pub fn estimate_prompts() -> [BenchmarkPrompt; 2] {
+    [
+        BenchmarkPrompt {
+            name: "short",
+            text: SHORT_PROMPT,
+            max_tokens: ESTIMATE_SHORT_MAX_TOKENS,
+        },
+        BenchmarkPrompt {
+            name: "long",
+            text: LONG_PROMPT,
+            max_tokens: ESTIMATE_LONG_MAX_TOKENS,
+        },
+    ]
+}
+
+// ---------------------------------------------------------------------------
 // Median
 // ---------------------------------------------------------------------------
 
@@ -204,15 +250,39 @@ pub struct MeasurementEntry {
     pub long: BenchResult,
 }
 
+/// One backend configuration's ESTIMATE (tracker #56): the
+/// abbreviated benchmark's figures, stored alongside — never
+/// inside — the measurements. An estimate carries its own,
+/// weaker basis: it never replaces a measurement under the
+/// same fingerprint, and [`facts`] never surfaces one (the
+/// facts are the consultation's ground truth and are built
+/// from `entries` only).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EstimateEntry {
+    pub fingerprint: String,
+    pub backend_id: String,
+    pub model_id: String,
+    /// RFC 3339 timestamp of the estimate.
+    pub estimated_at: String,
+    pub app_version: String,
+    pub short: BenchResult,
+    pub long: BenchResult,
+}
+
 /// The on-disk store (`<data_dir>/optimize-measurements.json`):
-/// `{ "entries": [...] }`. Old entries are retained — they are
-/// the delta history a follow-up consultation reasons over —
-/// and surface as superseded once their fingerprint no longer
-/// matches the backend's configuration.
+/// `{ "entries": [...], "estimates": [...] }`. Old entries are
+/// retained — they are the delta history a follow-up
+/// consultation reasons over — and surface as superseded once
+/// their fingerprint no longer matches the backend's
+/// configuration. Estimates live in their own list under the
+/// same fingerprint key, with a separate basis (see
+/// [`EstimateEntry`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MeasurementStore {
     #[serde(default)]
     pub entries: Vec<MeasurementEntry>,
+    #[serde(default)]
+    pub estimates: Vec<EstimateEntry>,
 }
 
 impl MeasurementStore {
@@ -250,6 +320,35 @@ impl MeasurementStore {
     /// its current fingerprint.
     pub fn current(&self, backend_id: &str, fingerprint: &str) -> Option<&MeasurementEntry> {
         self.entries
+            .iter()
+            .find(|e| e.backend_id == backend_id && e.fingerprint == fingerprint)
+    }
+
+    /// Insert an estimate, replacing any existing ESTIMATE
+    /// under the same fingerprint. Measurements are never
+    /// touched: a full measurement of the same configuration
+    /// stands alongside the estimate, not over it, and an
+    /// estimate never displaces one.
+    pub fn upsert_estimate(&mut self, entry: EstimateEntry) {
+        if let Some(existing) = self
+            .estimates
+            .iter_mut()
+            .find(|e| e.fingerprint == entry.fingerprint)
+        {
+            *existing = entry;
+        } else {
+            self.estimates.push(entry);
+        }
+    }
+
+    /// The estimate for one backend under its current
+    /// fingerprint, when one exists.
+    pub fn current_estimate(
+        &self,
+        backend_id: &str,
+        fingerprint: &str,
+    ) -> Option<&EstimateEntry> {
+        self.estimates
             .iter()
             .find(|e| e.backend_id == backend_id && e.fingerprint == fingerprint)
     }
@@ -389,6 +488,10 @@ pub fn measurement_fingerprint(inputs: &MeasurementFingerprintInputs) -> String 
 /// entries, labeled superseded — the delta history a follow-up
 /// consultation reasons over ("the change cost 2 tok/s").
 /// Entries for backends absent from the map are not surfaced.
+/// Estimates (`store.estimates`, tracker #56) are NEVER
+/// surfaced here: this function reads `entries` only, so an
+/// estimate can never reach the consultation labeled as a
+/// measured fact.
 ///
 /// The headline figures combine the two prompts by what each
 /// measures best: prompt processing from the long prompt
@@ -615,6 +718,134 @@ mod tests {
         );
         assert!(loaded.current("planner", "nope").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn estimate_profile_shape() {
+        // One run per prompt, no warm-up (the run sequence is
+        // the runner's; the profile pins the budgets and the
+        // shared prompt texts).
+        assert_eq!(ESTIMATE_RUNS, 1);
+        assert_eq!(ESTIMATE_SHORT_MAX_TOKENS, 128);
+        assert_eq!(ESTIMATE_LONG_MAX_TOKENS, 16);
+        let est = estimate_prompts();
+        let std = benchmark_prompts();
+        // Same texts: prompt processing at depth must come from
+        // the same long prompt, the decode sample from the same
+        // short one — only the generation budgets shrink.
+        assert_eq!(est[0].text, std[0].text);
+        assert_eq!(est[1].text, std[1].text);
+        assert_eq!(est[0].name, "short");
+        assert_eq!(est[1].name, "long");
+        assert_eq!(est[0].max_tokens, ESTIMATE_SHORT_MAX_TOKENS);
+        assert_eq!(est[1].max_tokens, ESTIMATE_LONG_MAX_TOKENS);
+        // The fraction the profile promises, in wall-clock
+        // terms: time ≈ prefill tokens / prompt rate +
+        // generation tokens / decode rate, at representative
+        // rates (the planner figures used below: 810 tok/s
+        // prompt, 21 tok/s generation), prefill tokens ≈
+        // chars / 4. The estimate's total must land well under
+        // a quarter of the measurement's (warm-up + 3 runs).
+        let work = |prompts: &[BenchmarkPrompt; 2], runs: usize| -> f64 {
+            prompts
+                .iter()
+                .map(|p| {
+                    (p.text.len() as f64 / 4.0 / 810.0 + p.max_tokens as f64 / 21.0)
+                        * runs as f64
+                })
+                .sum()
+        };
+        let ratio = work(&est, ESTIMATE_RUNS) / work(&std, MEASURED_RUNS + 1);
+        assert!(
+            ratio < 0.25,
+            "estimate/measure work ratio {ratio:.3} must stay under 0.25"
+        );
+    }
+
+    fn estimate_entry(fingerprint: &str, backend: &str, at: &str) -> EstimateEntry {
+        EstimateEntry {
+            fingerprint: fingerprint.to_string(),
+            backend_id: backend.to_string(),
+            model_id: "m1".to_string(),
+            estimated_at: at.to_string(),
+            app_version: "0.1.40".to_string(),
+            // Deliberately far from the measured figures in
+            // `entry()` so a mix-up is visible in assertions.
+            short: BenchResult::from_runs(vec![run(111.0, 99.0, 111.0)]),
+            long: BenchResult::from_runs(vec![run(111.0, 88.0, 111.0)]),
+        }
+    }
+
+    #[test]
+    fn estimates_never_displace_measurements() {
+        let mut store = MeasurementStore::default();
+        store.upsert(entry("fp1", "planner", "2026-10-17T12:00:00Z"));
+        store.upsert_estimate(estimate_entry("fp1", "planner", "2026-10-17T12:30:00Z"));
+        // Both live under the same fingerprint, each intact.
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(store.estimates.len(), 1);
+        let measured = store.current("planner", "fp1").unwrap();
+        assert_eq!(measured.short.predicted_per_second, Some(21.0));
+        let estimate = store.current_estimate("planner", "fp1").unwrap();
+        assert_eq!(estimate.short.predicted_per_second, Some(99.0));
+        // A re-measurement replaces the measurement only; a
+        // re-estimate replaces the estimate only.
+        let mut newer = entry("fp1", "planner", "2026-10-17T13:00:00Z");
+        newer.app_version = "0.1.41".to_string();
+        store.upsert(newer);
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(store.estimates.len(), 1);
+        assert_eq!(
+            store.current_estimate("planner", "fp1").unwrap().estimated_at,
+            "2026-10-17T12:30:00Z"
+        );
+        store.upsert_estimate(estimate_entry("fp1", "planner", "2026-10-17T14:00:00Z"));
+        assert_eq!(store.estimates.len(), 1);
+        assert_eq!(
+            store.current("planner", "fp1").unwrap().app_version,
+            "0.1.41"
+        );
+        // Round trip: both lists persist.
+        let dir = std::env::temp_dir().join(format!(
+            "manager-optimize-estimate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("optimize-measurements.json");
+        store.save(&path).unwrap();
+        assert_eq!(MeasurementStore::load(&path), store);
+        let _ = std::fs::remove_dir_all(&dir);
+        // A pre-#56 file (no "estimates" key) loads with an
+        // empty estimate list and its entries intact.
+        let legacy: MeasurementStore =
+            serde_json::from_str(r#"{ "entries": [] }"#).unwrap();
+        assert!(legacy.estimates.is_empty());
+    }
+
+    #[test]
+    fn facts_never_surface_estimates() {
+        let now = DateTime::parse_from_rfc3339("2026-10-17T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut current = HashMap::new();
+        current.insert("planner".to_string(), "fp1".to_string());
+        // An estimate alone produces NO fact: the consultation
+        // must never see it labeled as measured.
+        let mut store = MeasurementStore::default();
+        store.upsert_estimate(estimate_entry("fp1", "planner", "2026-10-17T11:30:00Z"));
+        assert!(facts(&store, &current, now).is_empty());
+        // With a measurement under the same fingerprint, the
+        // fact carries the MEASUREMENT's figures, not the
+        // estimate's.
+        store.upsert(entry("fp1", "planner", "2026-10-17T11:00:00Z"));
+        let facts = facts(&store, &current, now);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].predicted_per_second, Some(21.0));
+        assert_eq!(facts[0].prompt_per_second, Some(810.0));
+        assert!(!facts[0].superseded);
     }
 
     #[test]
