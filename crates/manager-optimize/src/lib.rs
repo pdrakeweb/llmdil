@@ -76,7 +76,7 @@ pub use measure::{
     ESTIMATE_LONG_MAX_TOKENS, ESTIMATE_RUNS, ESTIMATE_SHORT_MAX_TOKENS, LONG_MAX_TOKENS, LONG_PROMPT,
     MEASURED_RUNS, SHORT_MAX_TOKENS, SHORT_PROMPT,
 };
-pub use parse::{parse_plan, ParseError};
+pub use parse::{parse_plan, reground_experiment_provisioning, ParseError};
 pub use plan::{
     config_fingerprint, ApplyOutcome, Confidence, Decision, ExcludedItem, Plan, PlanItem, PlanKind,
 };

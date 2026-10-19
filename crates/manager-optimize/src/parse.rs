@@ -943,6 +943,185 @@ fn ground_experiment_provisioning(
     links
 }
 
+/// Re-ground experiment provisioning on a plan being LOADED.
+///
+/// Plan building grounds every experiment's provisioning (see
+/// [`ground_experiment_provisioning`]), but a plan file written
+/// before that grounding existed — or by any build that lacked
+/// it — stores `provisioning: None`, and every later surface
+/// then dead-ends the experiment: plan-aware validation calls
+/// the candidate unresolvable even when the plan itself carries
+/// the `model.add` that registers it, and the runner fails it
+/// as undownloadable (Pete's Oct 18 plan, run on Oct 19, 2026).
+/// This pass applies the build-time resolution rules to a
+/// stored plan: a `model.add` already in the plan links (and
+/// only the download is chained); a catalog id or an HF
+/// repo/file candidate chains its registration and download;
+/// discovery resolves through the candidates recorded in the
+/// plan's own stored context. Chained items are appended after
+/// the plan's own items with fresh ids, mirroring how build
+/// appends them after the item cap. Returns whether the plan
+/// changed; the caller persists a changed plan so the repair
+/// is durable. Idempotent: an experiment that already carries
+/// provisioning is never touched.
+pub fn reground_experiment_provisioning(plan: &mut Plan, cfg: &AppConfig) -> bool {
+    let registered: HashSet<&str> = cfg.models.iter().map(|m| m.id.as_str()).collect();
+    let catalog = manager_models::curated_models();
+    let denied: HashSet<String> = HashSet::new();
+    let mut changed = false;
+    let mut next_id = plan.items.iter().map(|i| i.id).max().unwrap_or(0);
+
+    for exp_idx in 0..plan.experiments.len() {
+        if plan.experiments[exp_idx].provisioning.is_some() {
+            continue;
+        }
+        let candidate = plan.experiments[exp_idx]
+            .candidate_model_id
+            .trim()
+            .to_string();
+        if candidate.is_empty() || registered.contains(candidate.as_str()) {
+            continue;
+        }
+        let exp_id = plan.experiments[exp_idx].id;
+        // Resolve exactly as build time does: (registration
+        // id, add change to chain) — a None change means a plan
+        // item already registers the id. Discovery is consulted
+        // through the candidates the plan's own stored context
+        // carried (the same set the payload validates against).
+        let mut resolved: Option<(String, Option<Value>)> = None;
+        if plan.items.iter().any(|i| {
+            i.kind == PlanKind::ModelAdd && i.target.as_deref() == Some(candidate.as_str())
+        }) {
+            resolved = Some((candidate.clone(), None));
+        } else if let Some(c) = candidates_from_context(&plan.context).iter().find(|c| {
+            candidate == c.repo_id
+                || candidate == format!("{}/{}", c.repo_id, c.file)
+                || candidate == candidate_model_id(&c.file)
+        }) {
+            let derived = candidate_model_id(&c.file);
+            if registered.contains(derived.as_str()) {
+                plan.experiments[exp_idx].candidate_model_id = derived;
+                let fp = {
+                    let e = &plan.experiments[exp_idx];
+                    experiment_fingerprint(&e.candidate_model_id, &e.flags, &e.serves)
+                };
+                plan.experiments[exp_idx].fingerprint = fp;
+                changed = true;
+                continue;
+            } else if plan.items.iter().any(|i| {
+                i.kind == PlanKind::ModelAdd && i.target.as_deref() == Some(derived.as_str())
+            }) {
+                resolved = Some((derived, None));
+            } else {
+                let mut change = json!({
+                    "source_url": format!(
+                        "{}/{}/resolve/main/{}",
+                        crate::discover::HF_DEFAULT_BASE_URL, c.repo_id, c.file
+                    ),
+                });
+                if c.params_b > 0.0 {
+                    change["params_b"] = json!(c.params_b);
+                }
+                resolved = Some((derived, Some(change)));
+            }
+        } else if let Some(spec) = catalog.iter().find(|s| s.id == candidate) {
+            let mut change = json!({
+                "source_url": spec.url,
+                "quant": spec.quant,
+            });
+            if !spec.sha256.is_empty() {
+                change["sha256"] = json!(spec.sha256);
+            }
+            resolved = Some((candidate.clone(), Some(change)));
+        } else if is_hf_form(&candidate) {
+            let (prefix, file) = candidate
+                .rsplit_once('/')
+                .expect("HF form always contains a slash");
+            let derived = candidate_model_id(file);
+            if registered.contains(derived.as_str()) {
+                // The proposal names the model under its derived
+                // registration id, as build time would have left
+                // it; no provisioning is needed.
+                plan.experiments[exp_idx].candidate_model_id = derived;
+                let fp = {
+                    let e = &plan.experiments[exp_idx];
+                    experiment_fingerprint(&e.candidate_model_id, &e.flags, &e.serves)
+                };
+                plan.experiments[exp_idx].fingerprint = fp;
+                changed = true;
+                continue;
+            } else if plan.items.iter().any(|i| {
+                i.kind == PlanKind::ModelAdd && i.target.as_deref() == Some(derived.as_str())
+            }) {
+                resolved = Some((derived, None));
+            } else {
+                let change = json!({
+                    "source_url": format!(
+                        "{}/{}/resolve/main/{}",
+                        crate::discover::HF_DEFAULT_BASE_URL, prefix, file
+                    ),
+                });
+                resolved = Some((derived, Some(change)));
+            }
+        }
+        let Some((model_id, add_change)) = resolved else {
+            continue;
+        };
+        let mut item_ids: Vec<usize> = Vec::new();
+        match add_change {
+            Some(change) => {
+                let mut add = chained_model_add(
+                    &model_id,
+                    change,
+                    format!(
+                        "Registers the model '{model_id}', chained when a stored plan was re-grounded at load: experiment E{exp_id} proposes it as its candidate, and an unregistered candidate can never run."
+                    ),
+                    Confidence::Medium,
+                    &denied,
+                );
+                add.provision_for_experiment = Some(exp_id);
+                if plan.experiments[exp_idx].decision == Decision::Denied {
+                    add.decision = Decision::Denied;
+                }
+                next_id += 1;
+                add.id = next_id;
+                item_ids.push(add.id);
+                plan.items.push(add);
+            }
+            None => {
+                if let Some(add) = plan.items.iter().find(|i| {
+                    i.kind == PlanKind::ModelAdd && i.target.as_deref() == Some(model_id.as_str())
+                }) {
+                    item_ids.push(add.id);
+                }
+            }
+        }
+        if let Some(dl) = plan.items.iter().find(|i| {
+            i.kind == PlanKind::ModelDownload && i.target.as_deref() == Some(model_id.as_str())
+        }) {
+            item_ids.push(dl.id);
+        } else {
+            let mut dl = chained_model_download(&model_id, &plan.experiments[exp_idx], &denied);
+            next_id += 1;
+            dl.id = next_id;
+            item_ids.push(dl.id);
+            plan.items.push(dl);
+        }
+        if plan.experiments[exp_idx].candidate_model_id != model_id {
+            plan.experiments[exp_idx].candidate_model_id = model_id.clone();
+            let fp = {
+                let e = &plan.experiments[exp_idx];
+                experiment_fingerprint(&e.candidate_model_id, &e.flags, &e.serves)
+            };
+            plan.experiments[exp_idx].fingerprint = fp;
+        }
+        plan.experiments[exp_idx].provisioning =
+            Some(ExperimentProvisioning { model_id, item_ids });
+        changed = true;
+    }
+    changed
+}
+
 /// The entities one item creates, requires, and removes, for
 /// the dependency-ordering pass. Entities are keyed like the
 /// validation simulation's write scopes: `m:<model id>`,
@@ -2309,6 +2488,84 @@ mod tests {
             Decision::Undecided,
             "authored add is shared, never cascade-denied"
         );
+    }
+
+    #[test]
+    fn reground_repairs_a_prefix_stored_plan() {
+        use crate::validate::ValidationStatus;
+        // Pete's Oct 18 plan as a pre-provisioning build stored
+        // it: no provisioning record on the experiment and no
+        // chained download item. Loading it under current code
+        // must restore exactly what plan building produces —
+        // the authored add linked, the download chained — so
+        // validation and the runner stop dead-ending it.
+        let (cfg, built) = field_plan();
+        let mut plan = built.clone();
+        plan.items.retain(|i| i.kind != PlanKind::ModelDownload);
+        plan.experiments[0].provisioning = None;
+        // Before repair: the field failure — plan-aware
+        // validation calls the candidate unresolvable even
+        // though the plan carries its registration.
+        let ev_before = crate::experiment::validate_experiment_for_plan(
+            &plan.experiments[0],
+            &cfg,
+            &[],
+            &plan.items,
+        );
+        assert_eq!(ev_before.status, ValidationStatus::Invalid);
+
+        assert!(reground_experiment_provisioning(&mut plan, &cfg));
+        let exp = &plan.experiments[0];
+        let prov = exp
+            .provisioning
+            .as_ref()
+            .expect("reground must restore provisioning");
+        assert_eq!(prov.model_id, "qwen3.8-27b-moe");
+        assert_eq!(
+            prov.item_ids,
+            vec![1, 7],
+            "the authored add and the chained download"
+        );
+        let download = plan
+            .items
+            .iter()
+            .find(|i| i.id == 7)
+            .expect("download appended");
+        assert_eq!(download.kind, PlanKind::ModelDownload);
+        assert_eq!(download.provision_for_experiment, Some(1));
+        assert_eq!(
+            download.decision,
+            Decision::Denied,
+            "the chained download follows the experiment's decision"
+        );
+        // After repair the experiment validates exactly as the
+        // freshly built plan's does.
+        let ev = crate::experiment::validate_experiment_for_plan(exp, &cfg, &[], &plan.items);
+        assert_eq!(
+            ev.status,
+            ValidationStatus::Valid,
+            "E1 verdict: {:?}",
+            ev.reason
+        );
+        // Idempotent: a second pass changes nothing.
+        assert!(!reground_experiment_provisioning(&mut plan, &cfg));
+    }
+
+    #[test]
+    fn reground_leaves_an_unresolvable_candidate_unprovisioned() {
+        // No model.add in the plan, no catalog entry, no HF
+        // form: load-time re-grounding has no source either,
+        // and the precise missing-source verdict stands.
+        let cfg = cfg_planner_pair();
+        let mut plan = parse_with(
+            "{\"items\":[],\"experiments\":[{\"candidate_model_id\":\"totally-invented-model\",\"serves\":\"the directive\"}]}",
+            &cfg,
+            json!({}),
+        )
+        .unwrap();
+        assert!(plan.experiments[0].provisioning.is_none());
+        assert!(!reground_experiment_provisioning(&mut plan, &cfg));
+        assert!(plan.experiments[0].provisioning.is_none());
     }
 
     #[test]
