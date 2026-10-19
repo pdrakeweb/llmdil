@@ -22,6 +22,7 @@ import {
   getGatewayMasterKey, setGatewayBindHost,
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
   getActivationPlan, activationCancelChanges, activationComplete, quiesceWait,
+  recordActivationExecution, getActivationHistory, getActivationExecution,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
   setNotificationConfig, sendTestNotification,
   servicesList, servicesRegister, servicesUnregister, setSupervisionMode,
@@ -29,7 +30,7 @@ import {
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
   adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendAddPreview, BackendMtp, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, ServicesInfo } from "../api";
+import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendAddPreview, BackendMtp, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, ServicesInfo } from "../api";
 import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
 import type { GpuInfo, WizardStepState } from "../types";
 
@@ -869,23 +870,127 @@ async function executeActivationRestart(
  *  are left alone — they apply at that backend's next start and
  *  resolve in the plan on their own. Exported for the app shell's
  *  global activation banner, whose Apply button runs the same
- *  execution as the plan card and the Activation Plan view. */
+ *  execution as the plan card and the Activation Plan view.
+ *
+ *  Every apply — completed, partially failed, or aborted — is
+ *  recorded whole in the durable execution history (the Activation
+ *  Plan view's Recent executions) through
+ *  gateway_activation_record_execution: the plan as computed here,
+ *  one item per change with its outcome. Items start as unattempted
+ *  skips and each step overwrites the items it acts on, so an
+ *  abort leaves an accurate trail with no cleanup pass. The record
+ *  call's result is ignored: recording is best-effort and must
+ *  never change what an apply does or reports. */
 export async function applyActivationPlan(
   plan: ActivationPlanData,
   mode: "quiesce" | "restart" | "start",
   setStatus: (text: string, err?: boolean) => void,
   setManual?: (cmd: string | null) => void,
 ): Promise<boolean> {
-  for (const id of plan.backend_restart_ids ?? []) {
-    setStatus(`Restarting backend ${id}…`);
-    const r = await restartBackend(id);
-    if (r.error) { setStatus(`Backend ${id} restart failed: ${r.error}`, true); return false; }
+  const startedAt = new Date().toISOString();
+  const items: ActivationExecutionItem[] = plan.changes.map((c) => ({
+    ts: c.ts,
+    kind: c.kind,
+    summary: c.summary,
+    scope: c.scope ?? "",
+    targets: c.targets ?? [],
+    activation: c.activation ?? "",
+    outcome: "skipped",
+    detail: "Not attempted — the apply did not reach this item",
+  }));
+  let lastError = "";
+  const trackedStatus = (text: string, err = false): void => {
+    if (err) lastError = text;
+    setStatus(text, err);
+  };
+  const finish = (status: string, ok: boolean): boolean => {
+    void recordActivationExecution({
+      started_at: startedAt,
+      finished_at: new Date().toISOString(),
+      status,
+      source: "desktop",
+      mode,
+      drift: plan.drift,
+      gateway_up: plan.gateway_up,
+      gateway_pending: Boolean(plan.gateway_pending),
+      items,
+    });
+    return ok;
+  };
+  const restartIds = plan.backend_restart_ids ?? [];
+  const restarted = new Set<string>();
+  try {
+    for (const id of restartIds) {
+      trackedStatus(`Restarting backend ${id}…`);
+      const r = await restartBackend(id);
+      if (r.error) {
+        trackedStatus(`Backend ${id} restart failed: ${r.error}`, true);
+        for (const item of items) {
+          if (item.scope !== "backend") {
+            if (plan.gateway_pending) {
+              item.detail = "Not attempted — the apply stopped before the gateway restart";
+            }
+            continue;
+          }
+          if (item.targets.includes(id)) {
+            item.outcome = "failed";
+            item.detail = r.error;
+          } else if (item.targets.length && item.targets.every((t) => restarted.has(t))) {
+            item.outcome = "applied";
+            item.detail = undefined;
+          } else if (item.targets.some((t) => restartIds.includes(t))) {
+            item.detail = "Not attempted — the apply stopped after a failed backend restart";
+          } else {
+            item.detail = "Already effective — takes effect at the backend's next start";
+          }
+        }
+        return finish("failed", false);
+      }
+      restarted.add(id);
+    }
+    // Every named backend restarted: restart-class items are
+    // applied; the rest were already effective (their backends are
+    // stopped — the saved change is what the next start launches
+    // with).
+    for (const item of items) {
+      if (item.scope !== "backend") continue;
+      if (item.targets.some((t) => restarted.has(t))) {
+        item.outcome = "applied";
+        item.detail = undefined;
+      } else {
+        item.detail = "Already effective — takes effect at the backend's next start";
+      }
+    }
+    if (plan.gateway_pending) {
+      const ok = await executeActivationRestart(mode, trackedStatus, setManual);
+      for (const item of items) {
+        if (item.scope === "backend") continue;
+        if (ok) {
+          item.outcome = "applied";
+          item.detail = undefined;
+        } else {
+          item.outcome = "failed";
+          item.detail = lastError || "The gateway restart did not complete";
+        }
+      }
+      // The gateway step is the last step: reaching it means every
+      // step was attempted, so a failure here completes the
+      // execution with failures rather than aborting it.
+      const anyFailed = items.some((i) => i.outcome === "failed");
+      return finish(anyFailed ? "completed_with_failures" : "completed", ok);
+    }
+    trackedStatus("Backends restarted — the saved changes are live.");
+    return finish("completed", true);
+  } catch {
+    // An unexpected failure still leaves its record; the apply's
+    // contract to its callers (a boolean) is unchanged.
+    for (const item of items) {
+      if (item.outcome === "skipped" && item.detail?.startsWith("Not attempted")) {
+        item.detail = "Not attempted — the apply errored out";
+      }
+    }
+    return finish("failed", false);
   }
-  if (plan.gateway_pending) {
-    return executeActivationRestart(mode, setStatus, setManual);
-  }
-  setStatus("Backends restarted — the saved changes are live.");
-  return true;
 }
 
 /** Shared click handling for the plan card's buttons, used by the
@@ -1027,8 +1132,83 @@ export async function wireActivationPlan(root: HTMLElement): Promise<() => void>
    * error, or reports the plan as unavailable when none was ever
    * loaded (principle 12 — unknown is not "nothing pending"). */
   let lastError: string | null = null;
+  /** Recorded executions (newest first) and their fetch state,
+   * tracked independently of the plan: a history failure renders
+   * in the history card only and never disturbs the plan above
+   * it. Details load on first expansion and stay cached for the
+   * view's lifetime (an execution record never changes). */
+  let history: ActivationExecutionSummary[] | null = null;
+  let historyError: string | null = null;
+  const expandedExec = new Set<string>();
+  const execDetails = new Map<string, ActivationExecution | null>();
+  const execDetailErrors = new Map<string, string>();
   let disposed = false;
   let timer: number | null = null;
+
+  const execStatusChip = (status: string): string => {
+    if (status === "completed") return `<span class="chip status-tag status-on">Completed</span>`;
+    if (status === "completed_with_failures") return `<span class="chip status-tag status-transition">Completed with failures</span>`;
+    if (status === "failed") return `<span class="chip status-tag status-bad">Failed</span>`;
+    return `<span class="chip status-tag status-off">${esc(status)}</span>`;
+  };
+
+  const execOutcomeChip = (outcome: string): string => {
+    if (outcome === "applied") return `<span class="chip status-tag status-on">Applied</span>`;
+    if (outcome === "failed") return `<span class="chip status-tag status-bad">Failed</span>`;
+    return `<span class="chip status-tag status-off">Skipped</span>`;
+  };
+
+  const execDetailHtml = (id: string): string => {
+    if (!execDetails.has(id)) {
+      return `<div style="font-size:12px;color:var(--text2);margin-top:6px">Loading execution detail…</div>`;
+    }
+    const detail = execDetails.get(id);
+    if (!detail) {
+      return `<div style="font-size:12px;color:var(--err);margin-top:6px">${esc(execDetailErrors.get(id) ?? "Execution detail unavailable")}</div>`;
+    }
+    const modeLabel = detail.mode === "quiesce" ? "Drain and apply"
+      : detail.mode === "restart" ? "Apply now"
+      : detail.mode === "start" ? "Apply plan" : (detail.mode ?? "");
+    const meta = `<div style="font-size:12px;color:var(--text2);margin-top:6px">Mode: <b style="color:var(--text)">${esc(modeLabel)}</b> · Source: <b style="color:var(--text)">${esc(detail.source)}</b> · Gateway: <b style="color:var(--text)">${detail.gateway_up ? "running" : "stopped"}</b>${detail.drift ? ` · Gateway config: <b style="color:var(--text)">drifted</b>` : ""}</div>`;
+    if (!detail.items.length) {
+      return `${meta}<div style="font-size:12px;color:var(--text2);margin-top:6px">No plan changes — the apply addressed gateway drift only.</div>`;
+    }
+    const rows = detail.items.map((i) => `<tr><td>${esc(fmtDate(i.ts))} ${esc(fmtTime(i.ts))}</td><td>${planTargetCell(i)}</td><td>${planChangeCell(i)}</td><td>${execOutcomeChip(i.outcome)}</td><td>${i.detail ? esc(i.detail) : ""}</td></tr>`).join("");
+    return `${meta}<table class="dtab" style="margin-top:8px"><thead><tr><th>Saved</th><th>Target</th><th>Change</th><th>Outcome</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>`;
+  };
+
+  const execRowHtml = (s: ActivationExecutionSummary): string => {
+    const open = expandedExec.has(s.id);
+    return `<div style="border-top:1px solid var(--border);padding:8px 0">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px">
+        <span>${esc(fmtDate(s.started_at))} ${esc(fmtTime(s.started_at))}</span>
+        ${execStatusChip(s.status)}
+        <span>Applied: <b>${fmtCount(s.applied)}</b></span>
+        <span>Skipped: <b>${fmtCount(s.skipped)}</b></span>
+        <span>Failed: <b>${fmtCount(s.failed)}</b></span>
+        <span class="spacer" style="flex:1"></span>
+        <button class="btn icon-only" data-exec-toggle="${esc(s.id)}" title="${open ? "Hide" : "Show"} execution detail" aria-label="Toggle execution detail">${icon(open ? "x" : "eye")}</button>
+      </div>
+      ${open ? execDetailHtml(s.id) : ""}
+    </div>`;
+  };
+
+  /** The Recent executions card: durable apply history under the
+   * plan — summary rows first (time, status, outcome counts),
+   * the recorded plan contents on demand per row. */
+  const historySectionHtml = (): string => {
+    let body: string;
+    if (!history) {
+      body = historyError
+        ? `<div style="font-size:12px;color:var(--err);margin-top:6px">${esc(historyError)}</div>`
+        : `<div style="font-size:12px;color:var(--text2);margin-top:6px">Loading execution history…</div>`;
+    } else if (!history.length) {
+      body = `<div style="font-size:12px;color:var(--text2);margin-top:6px">No executions recorded</div>`;
+    } else {
+      body = history.map(execRowHtml).join("");
+    }
+    return `<div class="card" style="margin-top:12px"><h3>${icon("clock")} Recent executions</h3>${body}</div>`;
+  };
 
   const paint = (): void => {
     const b = root.querySelector("#activationBody");
@@ -1037,14 +1217,16 @@ export async function wireActivationPlan(root: HTMLElement): Promise<() => void>
       b.innerHTML = `<div class="card"><h3>${icon("warn")} Activation plan: unavailable</h3>
         <div style="font-size:12px;color:var(--err);margin-top:6px">${esc(lastError)}</div>
         ${planStatusHtml(planUi)}
-        <div class="card-actions"><button class="btn icon-only" data-plan-refresh title="Refresh" aria-label="Refresh">${icon("restart")}</button></div></div>`;
+        <div class="card-actions"><button class="btn icon-only" data-plan-refresh title="Refresh" aria-label="Refresh">${icon("restart")}</button></div></div>`
+        + historySectionHtml();
       return;
     }
     if (!lastPlan || !lastPlan.pending) {
       b.innerHTML = `<div class="card"><h3>${icon("check")} No activation plan pending<span class="info-tip" title="Every saved configuration change is live. A change that needs a restart to take effect — gateway routes, a backend's flags, tensor split, or model assignment — appears here, and in the banner at the top of the window, until it is applied.">${icon("info")}</span></h3>
         <div style="font-size:12px;color:var(--text2);margin-top:6px">Pending changes: <b style="color:var(--text)">0</b></div>
         ${planStatusHtml(planUi)}
-        <div class="card-actions"><button class="btn icon-only" data-plan-refresh title="Refresh" aria-label="Refresh">${icon("restart")}</button></div></div>`;
+        <div class="card-actions"><button class="btn icon-only" data-plan-refresh title="Refresh" aria-label="Refresh">${icon("restart")}</button></div></div>`
+        + historySectionHtml();
       return;
     }
     const p = lastPlan;
@@ -1075,11 +1257,11 @@ export async function wireActivationPlan(root: HTMLElement): Promise<() => void>
       <table class="dtab" style="margin-top:8px"><thead><tr><th>Saved</th><th>Target</th><th>Change</th><th>Activation</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
     const detail = `<div class="card"><h3>${icon("logs")} Pending changes <span class="spacer" style="flex:1"></span>${gwChip}${driftChip}</h3>${detailBody}</div>`;
-    b.innerHTML = errNote + activationPlanHtml(p, planUi, "full") + detail;
+    b.innerHTML = errNote + activationPlanHtml(p, planUi, "full") + detail + historySectionHtml();
   };
 
   const load = async (): Promise<void> => {
-    const r = await getActivationPlan();
+    const [r, h] = await Promise.all([getActivationPlan(), getActivationHistory()]);
     if (disposed) return;
     if (r.error) {
       // Keep the last good plan; the error surfaces in paint.
@@ -1088,12 +1270,45 @@ export async function wireActivationPlan(root: HTMLElement): Promise<() => void>
       lastError = null;
       lastPlan = r.data;
     }
+    if (h.error) {
+      // Same discipline for the history: keep the last good list.
+      historyError = h.error;
+    } else {
+      historyError = null;
+      history = h.data.executions;
+    }
     paint();
   };
 
   const onClick = async (ev: Event): Promise<void> => {
     const t = ev.target as HTMLElement;
     if (t.closest("[data-plan-refresh]")) { await load(); return; }
+    const et = t.closest("[data-exec-toggle]") as HTMLElement | null;
+    if (et) {
+      const id = et.getAttribute("data-exec-toggle") ?? "";
+      if (expandedExec.has(id)) {
+        expandedExec.delete(id);
+        paint();
+        return;
+      }
+      expandedExec.add(id);
+      paint();
+      if (!execDetails.has(id)) {
+        const d = await getActivationExecution(id);
+        if (disposed) return;
+        if (d.error) {
+          execDetails.set(id, null);
+          execDetailErrors.set(id, d.error);
+        } else {
+          execDetails.set(id, d.data.execution);
+          if (!d.data.execution) {
+            execDetailErrors.set(id, "This execution is no longer in the retained history");
+          }
+        }
+        paint();
+      }
+      return;
+    }
     const pt = t.closest("[data-plan-act]") as HTMLElement | null;
     if (!pt) return;
     await handlePlanAction(pt.getAttribute("data-plan-act") ?? "", planUi, paint, load, lastPlan);

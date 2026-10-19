@@ -1959,6 +1959,100 @@ export async function activationComplete(): Promise<CallResult<{ cleared: boolea
   }
 }
 
+/** One plan change inside a recorded activation execution, with
+ *  the outcome the apply recorded for it. */
+export interface ActivationExecutionItem {
+  /** When the change was saved (the journal entry's timestamp). */
+  ts: string;
+  kind: string;
+  summary: string;
+  scope: string;
+  targets: string[];
+  activation: string;
+  /** "applied", "skipped", or "failed". */
+  outcome: string;
+  /** Skip reason or failure error text; absent for applied items. */
+  detail?: string;
+}
+
+/** One recorded activation plan execution (a whole apply). Status:
+ *  "completed", "completed_with_failures", or "failed" (aborted
+ *  before every step was attempted). */
+export interface ActivationExecution {
+  id: string;
+  started_at: string;
+  finished_at: string;
+  status: string;
+  /** The surface that initiated the apply ("desktop"). */
+  source: string;
+  /** Apply mode: "quiesce", "restart", or "start". */
+  mode?: string;
+  drift: boolean;
+  gateway_up: boolean;
+  gateway_pending: boolean;
+  items: ActivationExecutionItem[];
+}
+
+/** The list form of a recorded execution: identity, times, status,
+ *  and per-outcome item counts (the full items ride the detail). */
+export interface ActivationExecutionSummary {
+  id: string;
+  started_at: string;
+  finished_at: string;
+  status: string;
+  source: string;
+  mode?: string;
+  drift: boolean;
+  gateway_up: boolean;
+  gateway_pending: boolean;
+  items: number;
+  applied: number;
+  skipped: number;
+  failed: number;
+}
+
+/** gateway_activation_record_execution — report one finished
+ *  activation plan apply for the durable execution history. The
+ *  apply funnel calls this when an apply ends (including an aborted
+ *  one) and ignores the result: recording is best-effort and must
+ *  never affect the activation it describes. The record argument is
+ *  the execution without its server-assigned id. */
+export async function recordActivationExecution(
+  record: Omit<ActivationExecution, "id">,
+): Promise<CallResult<{ recorded: boolean; id?: string | null }>> {
+  if (!isTauri()) return { data: { recorded: false }, live: false };
+  try {
+    const data = await invoke<{ recorded: boolean; id?: string | null }>("gateway_activation_record_execution", { record });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { recorded: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** gateway_activation_history — the recorded activation plan
+ *  executions, newest first. With an execution id, that execution's
+ *  full record (or null when it has aged out of the retained
+ *  history). */
+export async function getActivationHistory(): Promise<CallResult<{ executions: ActivationExecutionSummary[] }>> {
+  if (!isTauri()) return { data: { executions: [] }, live: false };
+  try {
+    const data = await invoke<{ executions: ActivationExecutionSummary[] }>("gateway_activation_history");
+    return { data, live: true };
+  } catch (e) {
+    return { data: { executions: [] }, live: true, error: errOf(e) };
+  }
+}
+
+export async function getActivationExecution(id: string): Promise<CallResult<{ execution: ActivationExecution | null }>> {
+  if (!isTauri()) return { data: { execution: null }, live: false };
+  try {
+    const data = await invoke<{ execution: ActivationExecution | null }>("gateway_activation_history", { executionId: id });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { execution: null }, live: true, error: errOf(e) };
+  }
+}
+
 /** gateway_quiesce_wait — wait for in-flight gateway requests to
  *  drain to zero (bounded by timeoutSecs); reports the final count
  *  when the wait times out. */

@@ -47,6 +47,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
 pub mod activation;
+pub mod activation_history;
 pub mod gateway_stats;
 pub mod notify;
 pub mod optimize;
@@ -5626,6 +5627,74 @@ pub async fn op_gateway_activation_complete(
     Ok(json!({ "cleared": true }))
 }
 
+
+/// Record one finished activation plan execution in the durable
+/// history ([`activation_history`]). The apply itself is
+/// orchestrated by the desktop UI (`applyActivationPlan`), which
+/// reports the execution whole when it ends — including an aborted
+/// one, whose record is the one an operator most needs to review.
+///
+/// Best-effort by contract, like the bookkeeping it follows:
+/// recording must never fail or alter the activation it describes,
+/// so an unparseable report or a failed write answers
+/// `recorded: false` instead of an error. The server assigns the
+/// execution id; any id in the report is ignored.
+pub async fn op_gateway_activation_record_execution(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    record: Value,
+) -> ApiResult {
+    let mut execution: activation_history::ActivationExecution =
+        match serde_json::from_value(record) {
+            Ok(e) => e,
+            Err(_) => return Ok(json!({ "recorded": false })),
+        };
+    let id = activation_history::record_execution(&state.data_dir, &mut execution);
+    Ok(json!({ "recorded": id.is_some(), "id": id }))
+}
+
+/// The activation plan execution history: with no `execution_id`,
+/// the recorded executions newest-first as summaries (id, times,
+/// status, source, plan state, per-outcome counts); with one, that
+/// execution's full record — the plan as computed at apply time
+/// with every item's outcome — or `null` when it is not in the
+/// retained history. A missing or corrupt history file reads as an
+/// empty history, never an error.
+pub async fn op_gateway_activation_history(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    execution_id: Option<String>,
+) -> ApiResult {
+    let history = activation_history::load_history(&state.data_dir);
+    if let Some(id) = execution_id {
+        let found = history.executions.iter().rev().find(|e| e.id == id);
+        return Ok(json!({ "execution": found }));
+    }
+    let summaries: Vec<Value> = history
+        .executions
+        .iter()
+        .rev()
+        .map(|e| {
+            let (applied, skipped, failed) = e.outcome_counts();
+            json!({
+                "id": e.id,
+                "started_at": e.started_at,
+                "finished_at": e.finished_at,
+                "status": e.status,
+                "source": e.source,
+                "mode": e.mode,
+                "drift": e.drift,
+                "gateway_up": e.gateway_up,
+                "gateway_pending": e.gateway_pending,
+                "items": e.items.len(),
+                "applied": applied,
+                "skipped": skipped,
+                "failed": failed,
+            })
+        })
+        .collect();
+    Ok(json!({ "executions": summaries }))
+}
 
 /// Quiesce wait: poll the gateway's in-flight request gauge until
 /// it reaches zero or the timeout expires. A gateway that does not
