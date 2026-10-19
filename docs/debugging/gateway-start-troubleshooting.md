@@ -22,9 +22,16 @@ again.
 
 v0.1.32 behavior:
 
-- Step budgets: start-gateway 10 minutes, other steps 5 minutes. A
-  step that exceeds its budget is killed and fails with a named
-  outcome instead of hanging.
+- Step budgets were introduced (originally start-gateway 10 minutes,
+  other steps 5 minutes). A step that exceeds its budget is killed
+  and fails with a named outcome instead of hanging. The original
+  start-gateway figure was itself incoherent — 600 s total against
+  900 s sub-budgets for the pin install, the generate, and the
+  package setup, so a legitimate cold repair chain could not finish
+  in one run (a run died at exactly 600003 ms mid-repair). Current
+  budgets (`step_budget` in `crates/manager-wizard/src/lib.rs`):
+  start-gateway 4,200 s (70 minutes, sized to cover the cold chain
+  end to end), other steps 1,200 s (20 minutes).
 - Subprocess timeouts underneath the budgets (10 minutes by
   default, 15 minutes for package installs and Prisma generation).
 - The busy message names the running step and how long it has been
@@ -330,6 +337,9 @@ probes plus LiteLLM's own cold boot, not a reinstall; the step log
 venv", "Prisma install verified … — no changes made").
 
 ## PostgreSQL start times out (pg_ctl killed at the command cap)
+
+Fixed in v0.1.39 (tracker #43); the behavior described under
+"Behavior after the fix" is what v0.1.39+ does.
 
 Signature (v0.1.38 and earlier), in the start-gateway step
 outcome:

@@ -5,6 +5,18 @@ Companion documents: `docs/mcp-capabilities-design.md` (gateway-native MCP for
 models served *by* Prometheus — a different surface, see §2.4) and the model
 research evidence file at `~/workspace/.tmp-assets/delegation-design/model-research.md`.
 
+**Implementation status (2026-10-17):** the Delegation MCP server
+was built the same day this design was written, but **not in this
+repository** — it is a separate, standalone Rust project (built on
+the `rmcp` MCP SDK) living outside the LLMdil tree, per the §2.3
+placement decision (the server runs on the client machine, hosted
+by the chat client). Nothing in this repo implements it: there is
+no delegation code in `crates/`, `src-tauri/`, or `ui/`, and no
+LLMdil release ships it. This document remains the design record
+for that external project; the gateway-side preconditions it
+references (§2.5 — `--jinja`, the `backend_test_tool_call` probe)
+did ship in this repo as part of the gateway MCP work.
+
 How to read the labels in this document: **VERIFIED** = taken from a primary
 source (Hugging Face model cards / API file metadata, llama.cpp documentation)
 on 2026-10-17. **ESTIMATE** = arithmetic or inference, reasoning shown, never a

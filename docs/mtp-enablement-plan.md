@@ -1,12 +1,63 @@
 # MTP Enablement Plan — Qwen3.8-27B Planner
 
-Status: workflow decided (2026-10-17), not yet executed. Goal: enable
-llama.cpp multi-token prediction (MTP) self-speculative decoding for
-the planner role and measure it against the current baseline before
-adopting it. The decided approach is a second model and a second
-backend — Planner-MTP — tested side by side with the existing
-planner. The existing planner model entry and planner backend are not
-modified at any point.
+Status: executed and shipped. The catalog entry shipped in v0.1.37;
+the tunable draft-length control shipped in v0.1.40 (tracker #53);
+draft acceptance was measured on Pete's machine under v0.1.40, but
+the step 5 adoption comparison has not been run under matched
+measurement — see "Shipped status and measured outcome" below.
+Goal: enable llama.cpp multi-token prediction (MTP)
+self-speculative decoding for the planner role and measure it
+against the current baseline before adopting it. The decided
+approach is a second model and a second backend — Planner-MTP —
+tested side by side with the existing planner. The existing planner
+model entry and planner backend are not modified at any point.
+
+## Shipped status and measured outcome (v0.1.40)
+
+- **Catalog (v0.1.37).** The `qwen3.8-27b-mtp` entry below shipped
+  with `CATALOG_REVISION 3` in `crates/manager-models`. MTP
+  capability is pinned per model by the catalog's `mtp: bool` field
+  (`catalog_mtp` in `crates/manager-models/src/lib.rs`); only the
+  `-mtp` build carries `mtp: true`.
+- **Tunable draft length (v0.1.40, tracker #53).** The backend card
+  carries an MTP slider (Off / 1 / 2 / 3 / 4) backed by the
+  `backend_set_mtp` op. State is decoded from, and rewritten into,
+  the backend's saved raw flags by
+  `crates/manager-models/src/mtp.rs` (`mtp_draft` /
+  `set_mtp_draft`): the writer owns only the `--spec-type draft-mtp`
+  and `--spec-draft-n-max` tokens and leaves every other flag
+  untouched. Enabling without an explicit length writes
+  `--spec-draft-n-max 2` (`MTP_DEFAULT_N_MAX`).
+- **`--parallel` is never rewritten by the app.** The writer above
+  does not touch it. When MTP is on and the saved flags set
+  `--parallel` / `-np` to a value other than 1, the UI shows a
+  warning that drafting will not occur until the saved flags set it
+  to 1. As of v0.1.40 there is still no in-app raw-flags editor, so
+  setting `--parallel 1` remains a hand edit of `config.json` (the
+  raw-flags instructions in step 3 are superseded for the
+  speculative flags by the slider, but not for `--parallel`).
+  Before v0.1.40 there was no UI surface for the speculative flags
+  at all; the manual raw-flags route in step 3 was the only one.
+- **Measured outcome (Pete's machine, v0.1.40).** With the spec
+  flags saved through the slider, the speculative path initialized
+  and draft acceptance measured 53.9% (132 accepted / 245 generated,
+  mean accepted length 2.07) on one workload and 84.0% (79/94, mean
+  length 2.68) on another — acceptance is healthy and
+  content-dependent. Live card statistics with MTP on (prompt 15.7 /
+  generation 13.1 tok/s) read lower than the earlier no-flags
+  baseline-script run (33.5 / 22.5), but those figure sets come from
+  different measurement paths (live card statistics vs the
+  standardized `Invoke-ModelBaseline.ps1` medians), so they do not
+  settle the speed question. The step 5 adoption gate (~1.3x) is
+  undetermined until the baseline script is re-run against
+  `planner-mtp` with the speculative flags on; no adoption decision
+  has been taken, and the `planner-mtp` backend and model are
+  retained.
+- **No MTP for the coder.** Qwen3-Coder-Next has no MTP head, no
+  MTP GGUF build exists, and llama.cpp's `draft-mtp` is not
+  implemented for the `qwen3next` architecture; its catalog entry
+  carries `mtp: false`. There is no coder equivalent of this plan
+  until a Qwen3.6-generation coder model exists.
 
 ## Current state
 
@@ -33,7 +84,10 @@ Published measurements isolate MTP at about 1.6x decode on this model
 class on an RTX 3090 (n-max 2 was the best draft length, +59.8%).
 Projected on the A4000: 30–37 tok/s generation, unverified until
 measured here. MTP accelerates decode only; prompt processing
-(prefill) is unaffected.
+(prefill) is unaffected. (Under v0.1.40, draft acceptance measured
+healthy at 53.9–84.0%, but the projected gain is unverified: the
+matched-instrument comparison has not been run — see "Shipped
+status and measured outcome".)
 
 ## Plan
 
@@ -53,7 +107,10 @@ measured here. MTP accelerates decode only; prompt processing
    - Port: any free port (backends each carry their own port; it is
      only used when measuring direct, step 4).
    - Raw flags: `--parallel 1 --spec-type draft-mtp
-     --spec-draft-n-max 2` to start. Two codebase facts shape this:
+     --spec-draft-n-max 2` to start. (As shipped, the two
+     speculative flags are set by the MTP slider instead — see
+     "Shipped status" above; only `--parallel 1` still requires
+     the hand edit this step describes.) Two codebase facts shape this:
      a backend's parallel-slot count exists only in raw flags (the
      structured flags generate `-c`, `-b`, `--tensor-split`, and
      `--split-mode` only — nothing emits `--parallel`, and
@@ -88,7 +145,10 @@ measured here. MTP accelerates decode only; prompt processing
    acceptance (accepted / drafted) whenever the server reports it.
 5. **Adoption gate.** Adopt MTP only if the production-sampling pass
    shows a median generation gain of at least about 1.3x over
-   `base-file`. Adoption means keeping the winning configuration on
+   `base-file`. (Status under v0.1.40: undetermined — acceptance
+   measured healthy, but the matched comparison against `base-file`
+   has not been run; see "Shipped status and measured outcome"
+   above.) Adoption means keeping the winning configuration on
    `planner-mtp` and using it as the planner (for gateway callers,
    repoint the `planner` group at the `planner-mtp` backend, or
    call the `planner-mtp` group). Retiring it means stopping and

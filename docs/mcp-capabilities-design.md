@@ -1,6 +1,15 @@
 # MCP Capabilities — Design
 
-Status: design only, not built. This design supersedes the
+Status: shipped. Phases 0–4 (§12) were implemented and merged on
+2026-10-17 and are in releases from v0.1.36, present in v0.1.40;
+Phase 5 (on-machine validation) remains Pete's. v0.1.39 (tracker
+#44) added `McpServerConfig.signup_url`, the `mcp_start_preflight`
+op, and a pre-start credential prompt in the UI. Two design points
+did **not** ship as written, and the sections below are annotated
+where they occur: per-key MCP grants (§5.3 — the generator emits
+`require_key_mcp_access_defined: true`, but the app has no
+virtual-key issuance surface, so it issues no `object_permission`
+grants), and the §3.1 schema's exact shape (§3.1 note). This design supersedes the
 Google-supplied blueprint "Integrating Web Search MCP Servers with
 LightLLM", which a council review rejected on 2026-10-17 (verdict:
 DO NOT SHIP; log `~/workspace/council_log_2026-10-17.md`). The
@@ -127,6 +136,12 @@ UX for a product with no chat UI:
 
 ### 1.4 What exists today (audit summary)
 
+> Historical: this audit describes the tree **before**
+> implementation (2026-10-17). The gaps below were the design's
+> starting point; they are closed by the shipped implementation
+> (see the status note at the top of this document) and the
+> file:line citations no longer describe the current tree.
+
 The design starts from less than the spec promised; the gaps are
 load-bearing and are closed in §3, §8, and §10:
 
@@ -230,6 +245,20 @@ persistence: `Gateway` (registered in the LiteLLM YAML), `Local`
 (app-supervised, the legacy behaviour for `github`/`gdrive`), and
 `Disabled`. `manager_config::validate` covers the new section on
 every save, like every other section.
+
+**As-shipped deltas from the schema above** (in
+`crates/manager-config/src/lib.rs`): `McpTransport` is defined in
+`manager-config` itself, not reused from `manager-mcp` — the
+crate layering forbids the dependency direction the sketch
+assumed, and the serde shape is identical. `McpServerConfig`
+carries one additional field, `signup_url: Option<String>`
+(v0.1.39, tracker #44): where the user obtains the server's
+credential, surfaced by `mcp_list` and by the `mcp_start_preflight`
+op's pre-start credential prompt, and never emitted into the
+generated YAML. `McpConfig` also carries the §6.3 SearXNG settings
+(`searxng: SearxngSettings`), which did ship: generation emits the
+top-level `search_tools:` block and the spawn environment gains
+`SEARXNG_API_BASE` when it is enabled.
 
 ### 3.2 Validation rules (save-time, first gate)
 
@@ -440,8 +469,15 @@ and which tools each server exposes:
   `general_settings` when any server is gateway-registered:
   a virtual key with no explicit MCP grant then gets **no** MCP
   servers, instead of LiteLLM's open-by-default every-server.
+  (Shipped: `crates/manager-gateway` emits the key exactly so.)
 - Manager-issued keys carry an explicit `object_permission`
   grant per server the operator enables for that key.
+  (**Not shipped:** per-key MCP grants are not implemented. The
+  app has no virtual-key issuance surface, so no code issues
+  `object_permission` grants; the `require_key_mcp_access_defined`
+  gate above is the part that shipped. The same gap is why
+  `brave_search`'s `rpm_limit` is stored and displayed but not
+  gateway-enforced — §5.5's enforcement attaches at key issuance.)
 - Server-side trimming (§3.3) limits what any granted caller
   can reach: Brave exposes two tools, not eight.
 - Direct `/mcp` clients approve calls in their own UI; that is

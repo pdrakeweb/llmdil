@@ -6,6 +6,13 @@ outside them. Implemented Oct 17, 2026 (tracker #37), following the
 research in the Oct 17, 2026 incident analysis of the `coder` backend's
 CUDA failure.
 
+Status: shipped — present in v0.1.40. The enforcement described
+below is in `crates/manager-models/src/guardrails.rs` (catalog pin
+and `offload_status` evaluation), the apply-time and launch-preflight
+paths in `crates/manager-app`, and the slider rendering in the UI;
+the one catalog pin remains Qwen3-Coder-Next-80B on compute
+capability (6, 0), endpoints only.
+
 ## The incident in one paragraph
 
 The `coder` backend (Qwen3-Coder-Next-80B, UD-Q4_K_M) ran at
