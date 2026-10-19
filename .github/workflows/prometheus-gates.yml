@@ -1,0 +1,102 @@
+name: Prometheus Gates
+
+# Full LLMdil gate set on Pete's self-hosted runner (Dell Precision 7865,
+# "Prometheus"). Exists so the gates that cannot run on the Linux VM —
+# above all the src-tauri test binary, which cannot link there — run
+# natively on Windows, and so Linux-side local compiles are needed only
+# when absolutely necessary.
+#
+# v1: workflow_dispatch only. No push/PR triggers until the flow is
+# proven; Pete or a chat dispatches runs explicitly.
+# The runner is a single machine: one job, sequential steps.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to check out and gate (branch, tag, or SHA)"
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prometheus-gates
+  cancel-in-progress: false
+
+jobs:
+  gates:
+    name: Full gate set (Prometheus)
+    runs-on: [self-hosted, windows, prometheus]
+    timeout-minutes: 180
+    steps:
+      - name: Check out ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Toolchain versions
+        run: |
+          git --version
+          rustc --version
+          cargo --version
+          node --version
+          npm --version
+
+      - name: Rust cache (workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: prometheus-workspace
+
+      - name: Rust cache (src-tauri)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: prometheus-srctauri
+
+      # UI first: src-tauri's cargo check embeds ../ui/dist, so the UI
+      # build must exist before any src-tauri step (mirrors local gates).
+      - name: UI install
+        run: npm ci
+        working-directory: ui
+
+      - name: UI build
+        run: npm run build
+        working-directory: ui
+
+      - name: UI smoke
+        run: npm run smoke
+        working-directory: ui
+
+      - name: Workspace tests
+        run: cargo test --workspace
+
+      - name: Workspace clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # src-tauri is excluded from the root workspace: run inside it.
+      - name: src-tauri check
+        run: cargo check --all-targets
+        working-directory: src-tauri
+
+      - name: src-tauri clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: src-tauri
+
+      - name: src-tauri tests
+        run: cargo test
+        working-directory: src-tauri
