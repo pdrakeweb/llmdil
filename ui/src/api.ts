@@ -677,6 +677,17 @@ export interface BackendRow {
   /** Configured tensor split fractions in nvidia-smi index order
    *  (configured rows only); empty when the backend is unsplit. */
   tensor_split?: number[];
+  /** The backend's saved raw llama-server flags, or null when it
+   *  carries none (configured rows only). The card displays the
+   *  string itself in advanced flags mode, and the flags panel
+   *  pre-fills its text editor from it. */
+  raw_flags?: string | null;
+  /** Advanced flags mode (tracker #60): the backend's raw flags
+   *  are edited directly as text and are the single source of
+   *  truth; the structured flags form is disabled for the backend
+   *  and the structured write paths refuse server-side. Absent
+   *  (structured mode) on rows from older payloads. */
+  flags_advanced?: boolean;
   /** Gateway group this backend belongs to, or null when ungrouped. */
   group?: string | null;
   /** Memory requirement under the backend's current configuration
@@ -894,6 +905,47 @@ export async function setBackendParallel(id: string, slots: number | null): Prom
   }
 }
 
+/** One validation warning about a raw-flags string
+ *  (backend_set_raw_flags payload). Warnings never block a save:
+ *  they report unknown tokens, duplicates, and malformed values
+ *  for flags the app understands. */
+export interface RawFlagWarning {
+  token: string;
+  message: string;
+}
+
+/** backend_set_raw_flags — save a backend's raw flags edited as
+ *  text (tracker #60, the advanced flags editor). Only available
+ *  in advanced flags mode; the server refuses in structured mode,
+ *  where the token-owning controls own the string. A null value
+ *  clears the flags. Validation warnings ride the result and
+ *  never block the save. Persisted immediately; applies on the
+ *  next start. */
+export async function setBackendRawFlags(id: string, rawFlags: string | null): Promise<CallResult<{ backend_id: string; raw_flags: string | null; changed: boolean; warnings: RawFlagWarning[] }>> {
+  if (!isTauri()) return { data: { backend_id: id, raw_flags: rawFlags, changed: false, warnings: [] }, live: false };
+  try {
+    const data = await invoke<{ backend_id: string; raw_flags: string | null; changed: boolean; warnings: RawFlagWarning[] }>("backend_set_raw_flags", { id, rawFlags });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { backend_id: id, raw_flags: null, changed: false, warnings: [] }, live: true, error: errOf(e) };
+  }
+}
+
+/** backend_set_flags_mode — turn a backend's advanced flags mode
+ *  on or off (tracker #60). The flip writes only the mode: the
+ *  backend's flags do not change by a single token in either
+ *  direction, and the result carries the (unchanged) saved string
+ *  the editor opens on. */
+export async function setBackendFlagsMode(id: string, advanced: boolean): Promise<CallResult<{ backend_id: string; flags_advanced: boolean; raw_flags: string | null; changed: boolean }>> {
+  if (!isTauri()) return { data: { backend_id: id, flags_advanced: advanced, raw_flags: null, changed: false }, live: false };
+  try {
+    const data = await invoke<{ backend_id: string; flags_advanced: boolean; raw_flags: string | null; changed: boolean }>("backend_set_flags_mode", { id, advanced });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { backend_id: id, flags_advanced: advanced, raw_flags: null, changed: false }, live: true, error: errOf(e) };
+  }
+}
+
 /** backend_add — create a backend for a registered model and route it
  *  through a gateway group (an existing one, or a new one when
  *  createGroup is true). The gateway routes it after its next restart.
@@ -1001,6 +1053,8 @@ export interface BackendConfigData {
   port: number;
   flags: Record<string, unknown>;
   raw_flags: string | null;
+  /** Advanced flags mode (tracker #60); absent on older payloads. */
+  flags_advanced?: boolean;
   restart_policy: Record<string, unknown>;
   overrides_global: boolean;
 }

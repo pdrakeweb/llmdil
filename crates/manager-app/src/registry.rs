@@ -205,6 +205,11 @@ macro_rules! for_each_operation {
             (BackendSetOffload, backend_set_offload, C, op_backend_set_offload, [id: String, layers: u32, allow_override: Option<bool>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/offload"))),
             (BackendSetMtp, backend_set_mtp, C, op_backend_set_mtp, [id: String, n_max: Option<u32>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/mtp"))),
             (BackendSetParallel, backend_set_parallel, C, op_backend_set_parallel, [id: String, slots: Option<u32>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/parallel"))),
+            // Advanced flags mode (tracker #60): the raw-flags save
+            // (advanced mode only; validation warns, never blocks)
+            // and the mode flip itself (writes no flags).
+            (BackendSetRawFlags, backend_set_raw_flags, C, op_backend_set_raw_flags, [id: String, raw_flags: Option<String>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/raw-flags"))),
+            (BackendSetFlagsMode, backend_set_flags_mode, C, op_backend_set_flags_mode, [id: String, advanced: bool], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/flags-mode"))),
             (BackendDelete, backend_delete, D, op_backend_delete, [id: String], Some(route(HttpMethod::Delete, "/api/v1/backends/{id}"))),
             (BackendGetLaunchCommand, backend_get_launch_command, SDisclosure, op_backend_get_launch_command, [id: String], Some(route(HttpMethod::Get, "/api/v1/backends/{id}/launch-command"))),
             // Wizard / setup
@@ -407,7 +412,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 113);
+        assert_eq!(OP_SPECS.len(), 115);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
+pub mod flags;
 pub mod gguf;
 pub mod guardrails;
 pub mod memory;
@@ -22,6 +23,7 @@ pub mod mtp;
 pub mod parallel;
 pub mod placement;
 
+pub use flags::{raw_flag_warnings, FlagWarning};
 pub use gguf::{parse_gguf_layout, GgufError, GgufLayout, KvGeometry};
 pub use guardrails::{
     nearest_allowed, offload_status, restriction_for, AllowedOffload, OffloadRestriction,
@@ -2107,6 +2109,7 @@ mod tests {
                 split_mode: manager_config::SplitMode::None,
             },
             raw_flags: None,
+            flags_advanced: false,
             restart_policy: manager_config::RestartPolicy {
                 max_retries: 5,
                 backoff_base_secs: 2,

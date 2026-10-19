@@ -672,6 +672,7 @@ pub fn temp_backend_config(
             tensor_split: split,
         },
         raw_flags,
+        flags_advanced: false,
         restart_policy: RestartPolicy {
             max_retries: 5,
             backoff_base_secs: 2,

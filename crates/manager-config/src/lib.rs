@@ -519,6 +519,18 @@ pub struct BackendConfig {
     /// §7.1): `--jinja` is app-owned so tool calling stays enabled.
     /// None means no extra flags.
     pub raw_flags: Option<String>,
+    /// Advanced flags mode (tracker #60): while true, this
+    /// backend's `raw_flags` are edited directly as text and are
+    /// the single source of truth for its launch flags — the
+    /// structured flags write paths (flags form, offload slider,
+    /// MTP control, placement apply) are refused by the command
+    /// layer, and the backend card presents the raw string rather
+    /// than structured readouts. Editor state only: the flag
+    /// itself changes nothing about a launch. Serde-defaulted and
+    /// skipped when false, so configurations written before the
+    /// field existed load — and re-serialize — unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub flags_advanced: bool,
     pub restart_policy: RestartPolicy,
     pub overrides_global: bool,
     /// The last tool-call probe result for this backend, or `None`
@@ -887,6 +899,13 @@ pub struct NotificationConfig {
     pub activation: bool,
 }
 
+/// Serde skip predicate for bool fields that serialize only when
+/// set (BackendConfig::flags_advanced): a pre-field configuration
+/// re-serializes byte-identically.
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 fn default_true() -> bool {
     true
 }
@@ -999,6 +1018,7 @@ impl AppConfig {
                 } else {
                     None
                 },
+                flags_advanced: false,
                 restart_policy: RestartPolicy {
                     max_retries: 5,
                     backoff_base_secs: 2,
@@ -1229,16 +1249,25 @@ pub fn refresh_catalog_definition(cfg: &mut AppConfig, refresh: &CatalogDefiniti
         let serving = backend.model_file == old_path;
         if serving {
             backend.model_file = new_path;
-            if refresh.clear_split
-                && (!backend.flags.tensor_split.is_empty()
-                    || backend.flags.split_mode != SplitMode::None)
-            {
-                backend.flags.tensor_split = Vec::new();
-                backend.flags.split_mode = SplitMode::None;
-            }
-            if let Some(raw) = &refresh.raw_flags {
-                if backend.raw_flags.is_none() {
-                    backend.raw_flags = Some(raw.clone());
+            // Advanced flags mode (tracker #60): the backend's
+            // flags are operator-owned text. The refresh still
+            // realigns the model file (identity, not flags), but
+            // it must not clear the split or fill raw flags behind
+            // the editor's back — the one-writer rule the command
+            // layer enforces for the structured setters applies to
+            // this load-time migration too.
+            if !backend.flags_advanced {
+                if refresh.clear_split
+                    && (!backend.flags.tensor_split.is_empty()
+                        || backend.flags.split_mode != SplitMode::None)
+                {
+                    backend.flags.tensor_split = Vec::new();
+                    backend.flags.split_mode = SplitMode::None;
+                }
+                if let Some(raw) = &refresh.raw_flags {
+                    if backend.raw_flags.is_none() {
+                        backend.raw_flags = Some(raw.clone());
+                    }
                 }
             }
         }
@@ -2104,6 +2133,78 @@ mod tests {
         assert!(serde_json::to_string(&probed)
             .unwrap()
             .contains("\"outcome\":\"verified\""));
+    }
+
+    #[test]
+    fn flags_advanced_defaults_off_and_round_trips() {
+        // A backend JSON written before the field existed loads
+        // in structured mode (tracker #60).
+        let legacy = r#"{"id":"planner","enabled":false,"model_file":"models/p.gguf","port":8081,"flags":{"n_ctx":32768,"n_batch":512,"tensor_split":[],"split_mode":"none"},"raw_flags":null,"restart_policy":{"max_retries":5,"backoff_base_secs":2},"overrides_global":false}"#;
+        let b: BackendConfig = serde_json::from_str(legacy).unwrap();
+        assert!(!b.flags_advanced);
+        // While off the field stays out of the serialized form, so
+        // a pre-field configuration re-serializes unchanged.
+        assert!(!serde_json::to_string(&b)
+            .unwrap()
+            .contains("flags_advanced"));
+        // On round-trips.
+        let advanced: BackendConfig = serde_json::from_str(
+            r#"{"id":"planner","enabled":false,"model_file":"models/p.gguf","port":8081,"flags":{"n_ctx":32768,"n_batch":512,"tensor_split":[],"split_mode":"none"},"raw_flags":"--parallel 1","restart_policy":{"max_retries":5,"backoff_base_secs":2},"overrides_global":false,"flags_advanced":true}"#,
+        )
+        .unwrap();
+        assert!(advanced.flags_advanced);
+        assert!(serde_json::to_string(&advanced)
+            .unwrap()
+            .contains("\"flags_advanced\":true"));
+    }
+
+    #[test]
+    fn catalog_refresh_skips_flag_writes_for_advanced_backends() {
+        // The load-time catalog refresh realigns the model file
+        // but must not clear the split or fill raw flags of a
+        // backend in advanced flags mode (tracker #60).
+        let mut cfg = AppConfig::default_config();
+        cfg.models.push(ModelConfig {
+            id: "qwen3-27b-planner".to_string(),
+            gguf_path: PathBuf::from("models/OldPlanner.gguf"),
+            quant: "Q4_K_M".to_string(),
+            params_b: 32.0,
+            sha256: "b".repeat(64),
+            verified_at: Some(Utc::now()),
+            verified_sha256: None,
+            source_url: "https://example.com/OldPlanner.gguf".to_string(),
+            assigned_backends: vec!["planner".to_string()],
+            enabled: true,
+            display_name: None,
+        });
+        let planner = cfg.backends.iter_mut().find(|b| b.id == "planner").unwrap();
+        planner.model_file = PathBuf::from("models/OldPlanner.gguf");
+        planner.flags.tensor_split = vec![0.5, 0.5];
+        planner.flags.split_mode = SplitMode::Layer;
+        planner.raw_flags = None;
+        planner.flags_advanced = true;
+        let refresh = CatalogDefinitionRefresh {
+            entry: CatalogModelEntry {
+                model_id: "qwen3-27b-planner".to_string(),
+                gguf_file_name: "NewPlanner.gguf".to_string(),
+                quant: "IQ3_S".to_string(),
+                params_b: 27.0,
+                sha256: "c".repeat(64),
+                source_url: "https://example.com/NewPlanner.gguf".to_string(),
+                assigned_backends: vec!["planner".to_string()],
+                enabled: true,
+            },
+            backend_id: "planner".to_string(),
+            clear_split: true,
+            raw_flags: Some("-ot exps=CPU".to_string()),
+        };
+        assert!(refresh_catalog_definition(&mut cfg, &refresh));
+        let planner = cfg.backends.iter().find(|b| b.id == "planner").unwrap();
+        // Identity realigned; flags untouched.
+        assert_eq!(planner.model_file, PathBuf::from("models/NewPlanner.gguf"));
+        assert_eq!(planner.flags.tensor_split, vec![0.5, 0.5]);
+        assert_eq!(planner.flags.split_mode, SplitMode::Layer);
+        assert_eq!(planner.raw_flags, None);
     }
 
     #[test]

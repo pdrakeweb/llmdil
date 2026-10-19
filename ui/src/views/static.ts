@@ -13,7 +13,7 @@ import {
   runWizardStep, wizardBusyMessage, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit,
   getWizardCommands,
   getGpuTelemetry, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
-  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendMtp, setBackendParallel, getBackendLaunchCommand,
+  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendMtp, setBackendParallel, setBackendRawFlags, setBackendFlagsMode, getBackendLaunchCommand,
   getBackendConfig, applyBackendConfig, testBackend, testBackendToolCall, placementPropose, placementApply,
   addBackend, backendAddPreview, deleteBackend, modelAssign,
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
@@ -1085,6 +1085,7 @@ const PLAN_KIND_LABEL: Record<string, string> = {
   backend_flags: "Flags",
   backend_set_offload: "Offload",
   backend_set_mtp: "MTP draft",
+  backend_set_raw_flags: "Raw flags",
   backend_delete: "Backend removed",
   backend_placement: "Placement",
   model_assign: "Model assignment",
@@ -1108,6 +1109,7 @@ function planChangeCell(c: ActivationChange): string {
   if (off) core = off[1];
   else if (mtpSet) core = mtpSet[1];
   else if (/^MTP draft turned off$/.test(core)) core = "";
+  else if (/^raw flags changed$/.test(core)) core = "";
   else if (core.includes(" changed to ")) core = core.split(" changed to ").pop() ?? core;
   else if (/^gateway configuration changed$/i.test(core)) core = "";
   const redundant = !core || label.toLowerCase().includes(core.toLowerCase());
@@ -1453,6 +1455,120 @@ function mtpConflictText(parallel: number): string {
   return `Parallel slots: ${parallel} — MTP drafting needs --parallel 1; set Parallel slots to 1 in the Flags form — the next start will not draft until then`;
 }
 
+/* ---------------- Advanced flags validation (tracker #60) ----------------
+ * A TypeScript mirror of manager-models' raw_flag_warnings, used
+ * only to render the advanced editor's warnings live while the
+ * operator types. The Rust function is the authority: the save op
+ * returns its own warning list and the panel adopts that list
+ * after saving. Keep the two in step — the flag set and the
+ * warning wording come from the Rust module.
+ *
+ * Warnings never block: an unknown token or a malformed value is
+ * passed to llama-server untouched and llama-server decides. */
+
+export interface FlagWarningLike { token: string; message: string }
+
+type FlagArity = { kind: "none" } | { kind: "value"; value: "int" | "any" } | { kind: "multi"; value: "int" | "any" };
+interface FlagSpecLike { canonical: string; reserved: boolean; arity: FlagArity }
+
+const V = (value: "int" | "any"): FlagArity => ({ kind: "value", value });
+const FLAG_SPECS: ReadonlyArray<readonly [string, string, boolean, FlagArity]> = [
+  ["--n-cpu-moe", "--n-cpu-moe", false, V("int")], ["-ncmoe", "--n-cpu-moe", false, V("int")],
+  ["--cpu-moe", "--cpu-moe", false, { kind: "none" }], ["-cmoe", "--cpu-moe", false, { kind: "none" }],
+  ["-ot", "--override-tensor", false, { kind: "multi", value: "any" }], ["--override-tensor", "--override-tensor", false, { kind: "multi", value: "any" }],
+  ["--spec-type", "--spec-type", false, V("any")],
+  ["--spec-draft-n-max", "--spec-draft-n-max", false, V("int")],
+  ["--parallel", "--parallel", false, V("int")], ["-np", "--parallel", false, V("int")],
+  ["--model", "--model", false, V("any")], ["-m", "--model", false, V("any")],
+  ["--port", "--port", false, V("int")],
+  ["--ctx-size", "--ctx-size", false, V("int")], ["-c", "--ctx-size", false, V("int")],
+  ["--batch-size", "--batch-size", false, V("int")], ["-b", "--batch-size", false, V("int")],
+  ["--tensor-split", "--tensor-split", false, V("any")], ["-ts", "--tensor-split", false, V("any")],
+  ["--split-mode", "--split-mode", false, V("any")],
+  ["--device", "--device", false, V("any")], ["-dev", "--device", false, V("any")],
+  ["--main-gpu", "--main-gpu", false, V("int")],
+  ["--gpu-layers", "--gpu-layers", false, V("int")], ["--n-gpu-layers", "--gpu-layers", false, V("int")], ["-ngl", "--gpu-layers", false, V("int")],
+  ["--threads", "--threads", false, V("int")], ["-t", "--threads", false, V("int")],
+  ["--jinja", "--jinja", false, { kind: "none" }],
+  ["--host", "--host", true, V("any")],
+  ["--no-jinja", "--no-jinja", true, { kind: "none" }], ["--no_jinja", "--no-jinja", true, { kind: "none" }],
+];
+const FLAG_SPEC_MAP: ReadonlyMap<string, FlagSpecLike> = new Map(FLAG_SPECS.map(([name, canonical, reserved, arity]) => [name, { canonical, reserved, arity }]));
+
+function flagSpecFor(token: string): FlagSpecLike | undefined {
+  if (token === "--jinja=false") return FLAG_SPEC_MAP.get("--no-jinja");
+  return FLAG_SPEC_MAP.get(token);
+}
+
+const isIntText = (s: string): boolean => /^[+-]?\d+$/.test(s);
+
+/** Validate raw flags text the way the save op will. Same
+ *  whitespace tokenization the flag decoders use. */
+export function rawFlagWarnings(raw: string): FlagWarningLike[] {
+  const tokens = raw.split(/\s+/).filter((t) => t !== "");
+  const out: FlagWarningLike[] = [];
+  const seen = new Map<string, string>();
+  const checkInt = (flagTok: string, value: string): void => {
+    if (!isIntText(value)) out.push({ token: flagTok, message: `${flagTok} expects a whole number; "${value}" will make llama-server reject the flag` });
+  };
+  const noteSeen = (flagTok: string, spec: FlagSpecLike): void => {
+    if (spec.arity.kind === "multi") return;
+    if (seen.has(spec.canonical)) out.push({ token: flagTok, message: `${spec.canonical} is set more than once (${flagTok}); only the last value is used` });
+    else seen.set(spec.canonical, flagTok);
+  };
+  let i = 0;
+  while (i < tokens.length) {
+    const tok = tokens[i];
+    if (!tok.startsWith("-")) {
+      out.push({ token: tok, message: `"${tok}" is not part of a flag llama-server knows; it will reject the launch arguments` });
+      i += 1;
+      continue;
+    }
+    const eq = tok.indexOf("=");
+    const name = eq >= 0 ? tok.slice(0, eq) : tok;
+    const inline = eq >= 0 ? tok.slice(eq + 1) : null;
+    const spec = flagSpecFor(name) ?? flagSpecFor(tok);
+    if (!spec) {
+      out.push({ token: name, message: `${name} is not a flag this app recognizes; it will be passed to llama-server unchanged` });
+      if (inline === null && i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) i += 1;
+      i += 1;
+      continue;
+    }
+    noteSeen(name, spec);
+    if (spec.reserved) {
+      out.push({ token: name, message: `${spec.canonical} is reserved: the app filters it out before launch, so it has no effect here` });
+    }
+    if (spec.arity.kind === "none") {
+      if (inline !== null && !(name === "--jinja" && inline === "false")) {
+        out.push({ token: name, message: `${name} takes no value; "=${inline}" will make llama-server reject the flag` });
+      }
+      i += 1;
+      continue;
+    }
+    const valueKind = spec.arity.value;
+    if (inline !== null) {
+      if (valueKind === "int") checkInt(name, inline);
+      i += 1;
+      continue;
+    }
+    if (i + 1 >= tokens.length || tokens[i + 1].startsWith("-")) {
+      out.push({ token: name, message: `${name} expects a value but none follows it` });
+      i += 1;
+      continue;
+    }
+    if (valueKind === "int") checkInt(name, tokens[i + 1]);
+    i += 2;
+  }
+  return out;
+}
+
+/** The advanced editor's warning lines (amber, inline under the
+ *  text box). Empty when the text is clean. */
+function flagsRawWarningsHtml(warnings: FlagWarningLike[]): string {
+  if (!warnings.length) return "";
+  return warnings.map((w) => `<div style="font-size:12px;color:#e3b341;margin-top:4px">${icon("warn")} ${esc(w.message)}</div>`).join("");
+}
+
 /** The offload slider track's green-to-yellow-to-red gradient for
  *  a model's band boundaries (fractions of the offloaded range,
  *  computed by the backend from the catalog green limit). */
@@ -1666,8 +1782,11 @@ function applyFlagsField(
  *  1..4 = draft tokens), null when the backend's model is not
  *  MTP-capable. parallel is the Parallel slots field's draft
  *  selection: the explicit slot count, or null for the unset
- *  state (llama.cpp's default, auto). */
-export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null; parallel: number | null }
+ *  state (llama.cpp's default, auto). advanced/rawText/rawWarnings
+ *  carry the advanced flags editor's draft (tracker #60): while
+ *  advanced is on, the raw text is the single source of truth and
+ *  the structured fields are inert. */
+export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null; parallel: number | null; advanced: boolean; rawText: string; rawWarnings: FlagWarningLike[] }
 
 /** State for the in-card Placement form (tensor split editing,
  *  moved here from the GPUs page — Pete's direction, 2026-10-16),
@@ -1913,13 +2032,23 @@ function backendCard(
       `<div style="font-size:12px;color:${color};margin-top:6px">${inner}</div>`;
     const g = o?.guardrail ?? null;
     if (o && g?.status === "blocked" && !g.overridden) {
-      lines.push(line("#ff7b72", `Start blocked: offload ${o.layers} of ${o.moe_layers} layers is outside the verified range for this GPU <button class="btn" data-back-act="offload-set-verified" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Set to ${g.nearest_verified_layers} of ${o.moe_layers} layers</button>`));
+      // The blocked fact is a launch-preflight fact and renders in
+      // both modes; the one-click resolving action is a flags
+      // write, so in advanced flags mode (tracker #60) the line
+      // carries no button — the editor is the remedy, and the
+      // server refuses the structured write anyway.
+      lines.push(line("#ff7b72", b.flags_advanced
+        ? `Start blocked: offload ${o.layers} of ${o.moe_layers} layers is outside the verified range for this GPU`
+        : `Start blocked: offload ${o.layers} of ${o.moe_layers} layers is outside the verified range for this GPU <button class="btn" data-back-act="offload-set-verified" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Set to ${g.nearest_verified_layers} of ${o.moe_layers} layers</button>`));
     } else if (o && g?.status === "blocked" && g.overridden) {
       lines.push(line("#e3b341", `Offload override recorded: ${o.layers} of ${o.moe_layers} layers is unverified on this GPU`));
     } else if (o && g?.status === "untested") {
       lines.push(line("#e3b341", `Partial offload: unverified on this GPU`));
     }
-    if (o?.custom) {
+    // The "custom spelling" line is a structured-form readout:
+    // in advanced mode the operator's own string is displayed
+    // verbatim (the raw flags line), so the line is redundant.
+    if (o?.custom && !b.flags_advanced) {
       lines.push(line("var(--text2)", `Offload: Custom (${o.layers} of ${o.moe_layers} layers)`));
     }
     if (probe?.state === "probing") {
@@ -1942,7 +2071,13 @@ function backendCard(
   // silently. Nothing renders in the ordinary states.
   const mtpStatusHtml = (() => {
     const m = b.mtp;
-    if (!m) return "";
+    // Advanced flags mode (tracker #60): both lines decode the
+    // raw flags into structured terms the mode supersedes. The
+    // raw string itself is displayed verbatim on the card, so a
+    // custom spelling or a --parallel conflict is visible in it
+    // directly, and the flags editor is the remedy the conflict
+    // copy points at.
+    if (!m || b.flags_advanced) return "";
     const lines: string[] = [];
     if (m.custom) {
       lines.push(`<div style="font-size:12px;color:var(--text2);margin-top:6px">MTP: Custom (${esc(mtpSavedTokenText(m))})</div>`);
@@ -2023,7 +2158,23 @@ function backendCard(
     fieldAttr: "data-flags-field",
     disabled: inFlight.has(b.id),
   }) : "";
-  const flagsHtml = flags ? `<div class="backend-form-panel flags-panel">
+  // Advanced flags mode (tracker #60): the panel is REPLACED by
+  // the raw-flags text editor — the structured controls are not
+  // rendered at all, so nothing inert invites an edit the server
+  // would refuse. The textarea pre-fills with the backend's saved
+  // raw flags (the string the structured decoders read); text
+  // edits sync to the wire-level draft, so poll repaints keep the
+  // text and the warning list renders live under the box.
+  const flagsHtml = flags ? (flags.advanced ? `<div class="backend-form-panel flags-panel">
+      <div style="font-size:12px;font-weight:600">${icon("gear")} Flags for ${esc(b.id)}</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:6px">Mode: Advanced<span class="info-tip" title="In advanced mode the text below is the backend's launch flags, edited directly. Context, batch, offload, MTP and placement are all set by this string; the structured form and its controls are disabled for this backend until you switch back. Warnings never block a save — unknown flags pass through to llama-server, which decides.">${icon("info")}</span></div>
+      <textarea data-flags-raw="${esc(b.id)}" rows="4" spellcheck="false" style="width:100%;margin-top:8px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 10px;font-family:var(--mono);font-size:12px" aria-label="Raw flags for ${esc(b.id)}">${esc(flags.rawText)}</textarea>
+      <div data-flags-warnings>${flagsRawWarningsHtml(flags.rawWarnings)}</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:6px">Saved to the configuration immediately; applies on the backend's next start.</div>
+      <div class="card-actions"><button class="btn" data-back-act="flags-raw-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save flags</button>
+        <button class="btn" data-back-act="flags-mode-structured" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Use structured form</button>
+        <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
+    </div>` : `<div class="backend-form-panel flags-panel">
       <div style="font-size:12px;font-weight:600">${icon("gear")} Flags for ${esc(b.id)}</div>
       ${flagsCtxBatchHtml({ ctx: flags.ctx, batch: flags.batch, ctxMax: flags.ctxMax, fieldAttr: "data-flags-field", disabled: inFlight.has(b.id) })}
       ${parallelHtml}
@@ -2031,8 +2182,9 @@ function backendCard(
       ${mtpHtml}
       ${flagsRatedLineHtml({ ctxMax: flags.ctxMax, modelId: flags.modelId, savedText: "Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Placement form on this card." })}
       <div class="card-actions"><button class="btn" data-back-act="flags-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save flags</button>
+        <button class="btn" data-back-act="flags-mode-advanced" data-back-id="${esc(b.id)}"${dis}>${icon("pencil")} Edit flags as text</button>
         <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
-    </div>` : "";
+    </div>`) : "";
   // The Placement form renders inside this card (moved from the
   // GPUs page, Pete's direction, 2026-10-16): the tensor split is a
   // per-backend setting, so it is edited here like the flags. The
@@ -2101,13 +2253,20 @@ function backendCard(
     ? `<select class="backend-model-select" data-back-model="${esc(b.id)}" style="${SELECT_STYLE};width:100%;min-width:0"${dis}>${modelOptions(b, models)}</select>`
     : `<span class="backend-model-file" title="${esc(b.model_file)}">${esc(b.model_file)}</span>`;
   const stripTiles: [string, string][] = [["Model", modelTileVal]];
-  if (b.n_ctx !== undefined) stripTiles.push(["Context", b.n_ctx.toLocaleString()]);
+  // Advanced flags mode (tracker #60): the structured readouts the
+  // mode supersedes are not presented as authoritative — the
+  // context value is decoded from flags the structured form no
+  // longer owns, so the tile shows an em dash with the explanation
+  // in its tooltip, and the KV estimate (derived from that
+  // context) is omitted. The raw flags line below carries the
+  // state itself.
+  if (b.n_ctx !== undefined) stripTiles.push(["Context", b.flags_advanced ? `<span title="Set by the raw flags in advanced flags mode">&#8212;</span>` : b.n_ctx.toLocaleString()]);
   if (b.gpu_ram_mib !== undefined) {
     stripTiles.push(["GPU RAM", `${fmtGb(b.gpu_ram_mib / 1024)} GiB`]);
     // An absent sys_ram_mib is unknown, never 0 (principle 12): the
     // tile renders only when the payload carries the figure.
     if (b.sys_ram_mib !== undefined) stripTiles.push(["System RAM", `${fmtGb(b.sys_ram_mib / 1024)} GiB`]);
-    if (b.kv_ram_mib != null) stripTiles.push(["KV cache", `<span title="KV cache at the configured context">${fmtGb(b.kv_ram_mib / 1024)} GiB</span>`]);
+    if (!b.flags_advanced && b.kv_ram_mib != null) stripTiles.push(["KV cache", `<span title="KV cache at the configured context">${fmtGb(b.kv_ram_mib / 1024)} GiB</span>`]);
   }
   const stripHtml = `<div style="display:grid;grid-template-columns:${["2fr", ...stripTiles.slice(1).map(() => "1fr")].join(" ")};gap:10px;margin-top:8px">
       ${stripTiles.map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${v}</span></div>`).join("")}
@@ -2122,7 +2281,9 @@ function backendCard(
     ["PID", b.pid !== null ? String(b.pid) : "—"],
     ["Uptime", fmtUptime(b.uptime_secs)],
   ];
-  if (b.n_batch != null) detailKv.push(["Batch", b.n_batch.toLocaleString()]);
+  // Batch is a structured flags readout like Context: omitted in
+  // advanced flags mode (tracker #60) rather than shown as fact.
+  if (!b.flags_advanced && b.n_batch != null) detailKv.push(["Batch", b.n_batch.toLocaleString()]);
   const detailsHtml = detailsOpen ? `<div class="backend-details">
       <div style="display:grid;grid-template-columns:repeat(${detailKv.length},1fr);gap:10px">
         ${detailKv.map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
@@ -2130,6 +2291,15 @@ function backendCard(
       ${splitEntries.length ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Configured split: ${splitSummary}</div>` : ""}
       ${basisTip ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Basis: ${esc(b.memory_basis ?? "")}<span class="info-tip" title="${esc(basisTip)}">${icon("info")}</span></div>` : ""}
     </div>` : "";
+  // Advanced flags mode (tracker #60): the saved raw flags ARE
+  // the configuration the operator owns in this mode, so they
+  // render verbatim in Label: Value form in place of the
+  // structured readouts the mode supersedes. An empty string
+  // renders no line (principle 13); the header chip carries the
+  // mode itself.
+  const rawFlagsHtml = b.flags_advanced && b.raw_flags
+    ? `<div style="font-size:12px;color:var(--text2);margin-top:8px">Flags: <span style="font-family:var(--mono);color:var(--text)">${esc(b.raw_flags)}</span></div>`
+    : "";
   // Tool-call probe state (MCP design §7.2): the persisted probe
   // outcome, or "not measured" when the backend has never been
   // probed (principle 12 — absence is not a measured state).
@@ -2144,11 +2314,13 @@ function backendCard(
         ${b.configured ? "" : `<span class="chip status-tag status-off" title="${esc(orphanText)}">not in config</span>`}
         ${b.configured ? `<span class="chip status-tag ${b.enabled ? "status-on" : "status-off"}">${b.enabled ? "enabled" : "disabled"}</span>` : ""}
         ${b.adopted ? `<span class="chip status-tag status-on" title="${esc(adoptedText)}">adopted</span>` : ""}
+        ${b.flags_advanced ? `<span class="chip status-tag" title="Advanced flags mode: this backend's launch flags are edited as raw text in the Flags panel, and the structured flags form is disabled for it.">advanced flags</span>` : ""}
         <span class="chip status-tag ${stateTagClass(b.state)}">${esc(b.state)}</span></h3>
       ${stripHtml}
       ${toolCallHtml}
       ${gpuHtml}
       ${statsHtml}
+      ${rawFlagsHtml}
       ${offloadStatusHtml}
       ${mtpStatusHtml}
       ${detailsHtml}
@@ -2299,7 +2471,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       <div class="grid2">${sorted(sec.rows).map((row) => {
         const mdl = flagsFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const flagsArg: FlagsDraft | null = flagsFor === row.id
-          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers, offloadPendingLayers: offloadPending?.backendId === row.id ? offloadPending.layers : null, mtpPosition: flagsMtpPosition, parallel: flagsParallel }
+          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers, offloadPendingLayers: offloadPending?.backendId === row.id ? offloadPending.layers : null, mtpPosition: flagsMtpPosition, parallel: flagsParallel, advanced: row.flags_advanced === true, rawText: flagsRawText, rawWarnings: flagsRawWarnings }
           : null;
         const pmdl = placeFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const placeArg: PlaceCardState | null = placeFor === row.id
@@ -2411,10 +2583,14 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     // While the offload slider is focused (mid-drag), a repaint
     // would recreate the range input and break the drag; the
     // draft is synced to wire state, so skipping one repaint
-    // loses nothing (same rule as the model rename input).
+    // loses nothing (same rule as the model rename input). The
+    // advanced flags textarea (tracker #60) follows the same
+    // rule: recreating it mid-edit would lose the caret.
     const sliderFocused = flagsFor !== null
       && (document.activeElement as HTMLElement | null)?.hasAttribute?.("data-offload-slider");
-    if (!sliderFocused) paint();
+    const rawFocused = flagsFor !== null
+      && (document.activeElement as HTMLElement | null)?.hasAttribute?.("data-flags-raw");
+    if (!sliderFocused && !rawFocused) paint();
     void fetchLogTails();
   };
 
@@ -2460,6 +2636,16 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   /** True while a parallel commit (backend_set_parallel) is in
    *  flight; the field ignores further commits until it lands. */
   let parallelCommitting = false;
+  /** The advanced flags editor's draft text (tracker #60): the
+   *  open backend's raw flags as edited, synced on every input
+   *  event so poll repaints re-render the textarea from here.
+   *  Initialized from the row's saved string when the form opens —
+   *  opening the editor performs no write. */
+  let flagsRawText = "";
+  /** The draft's validation warnings, recomputed live as the
+   *  operator types (the save op's own list replaces them after a
+   *  save — the server is the authority). */
+  let flagsRawWarnings: FlagWarningLike[] = [];
   const closeFlagsForm = (): void => {
     flagsFor = null;
     offloadPending = null;
@@ -2474,6 +2660,11 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     flagsMtpPosition = row.mtp ? mtpPosition(row.mtp) : null;
     flagsParallel = row.parallel ? row.parallel.slots : null;
     offloadPending = null;
+    // The advanced editor opens on the backend's CURRENT saved
+    // raw flags — a pure read of the row payload; opening writes
+    // nothing (tracker #60, entry performs no write).
+    flagsRawText = row.raw_flags ?? "";
+    flagsRawWarnings = rawFlagWarnings(flagsRawText);
     paint();
   };
   /** Keep the draft in step with the in-card form fields. Preset
@@ -2493,6 +2684,21 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   };
   root.addEventListener("change", syncFlagsDraft);
   root.addEventListener("input", syncFlagsDraft);
+  /** The advanced editor's textarea sync (tracker #60): keep the
+   *  draft text and its live warnings in wire state. The warning
+   *  list updates in place — no repaint, so typing is never
+   *  disturbed (the poll repaint is also skipped while the
+   *  textarea is focused; see load()). */
+  const syncRawDraft = (ev: Event): void => {
+    const t = ev.target as HTMLTextAreaElement;
+    if (!t.hasAttribute("data-flags-raw")) return;
+    if (t.getAttribute("data-flags-raw") !== flagsFor) return;
+    flagsRawText = t.value;
+    flagsRawWarnings = rawFlagWarnings(flagsRawText);
+    const box = t.closest(".backend-card")?.querySelector("[data-flags-warnings]");
+    if (box) box.innerHTML = flagsRawWarningsHtml(flagsRawWarnings);
+  };
+  root.addEventListener("input", syncRawDraft);
 
   /* ---------------- Offload slider ----------------
    * Part of the flags form when the backend's model is
@@ -3329,6 +3535,105 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         msgs.set(id, { text: `Flags saved (context ${flagsCtx.toLocaleString()}, batch ${flagsBatch}) — applies on next start.`, err: false });
         flagsFor = null;
         await load();
+      }
+      return;
+    }
+
+    if (act === "flags-mode-advanced") {
+      // Enter advanced flags mode (tracker #60). The flip writes
+      // only the mode — the saved flags do not change — but it
+      // closes the structured form, so unsaved structured edits
+      // (a moved ctx/batch draft or a pending offload decision)
+      // are discarded: confirm first, per the app's confirm
+      // idiom, only when there is something to lose.
+      const row = lastRows.find((r) => r.id === id);
+      if (!row) return;
+      const dirty = flagsCtx !== (row.n_ctx ?? 32768)
+        || flagsBatch !== (row.n_batch ?? 512)
+        || offloadPending !== null;
+      if (dirty && !confirm("Switch to advanced flags? Unsaved changes in this form will be discarded. The saved flags themselves do not change.")) return;
+      inFlight.add(id);
+      paint();
+      try {
+        const r = await setBackendFlagsMode(id, true);
+        if (disposed) return;
+        if (r.error) {
+          msgs.set(id, { text: `Advanced mode not enabled: ${r.error}`, err: true });
+          paint();
+          return;
+        }
+        msgs.set(id, { text: "Advanced flags mode on — the flags are edited as text in the panel.", err: false });
+        await load();
+        // Reopen the panel in its advanced form, on the saved
+        // string the mode flip returned (byte-identical to what
+        // was live — entering the mode writes no flags).
+        const fresh = lastRows.find((x) => x.id === id);
+        if (fresh) { flagsFor = null; openFlagsForm(fresh); }
+      } finally {
+        inFlight.delete(id);
+        if (!disposed) paint();
+      }
+      return;
+    }
+
+    if (act === "flags-mode-structured") {
+      // Leave advanced mode (tracker #60): the structured form
+      // decodes the SAVED raw string through the existing
+      // decoders, so unsaved text edits would be lost — confirm
+      // when the text differs from the saved string.
+      const row = lastRows.find((r) => r.id === id);
+      if (!row) return;
+      if (flagsRawText !== (row.raw_flags ?? "")
+        && !confirm("Return to the structured form? The unsaved flag edits in the text box will be discarded. The saved flags do not change.")) return;
+      inFlight.add(id);
+      paint();
+      try {
+        const r = await setBackendFlagsMode(id, false);
+        if (disposed) return;
+        if (r.error) {
+          msgs.set(id, { text: `Structured form not restored: ${r.error}`, err: true });
+          paint();
+          return;
+        }
+        msgs.set(id, { text: "Structured flags form restored — it shows the values decoded from the saved flags.", err: false });
+        await load();
+        const fresh = lastRows.find((x) => x.id === id);
+        if (fresh) { flagsFor = null; openFlagsForm(fresh); }
+      } finally {
+        inFlight.delete(id);
+        if (!disposed) paint();
+      }
+      return;
+    }
+
+    if (act === "flags-raw-save") {
+      // Save the advanced editor's text (tracker #60). The op
+      // journals like the other flags writes and applies on the
+      // next start; nothing restarts. Warnings ride the result
+      // and never block — the panel adopts the server's list.
+      inFlight.add(id);
+      paint();
+      try {
+        const text = flagsRawText;
+        const r = await setBackendRawFlags(id, text.trim() === "" ? null : text);
+        if (disposed) return;
+        if (r.error) {
+          msgs.set(id, { text: `Flags not saved: ${r.error}`, err: true });
+          paint();
+          return;
+        }
+        flagsRawText = r.data.raw_flags ?? "";
+        flagsRawWarnings = r.data.warnings ?? [];
+        msgs.set(id, {
+          text: r.data.changed
+            ? "Raw flags saved — applies on next start."
+            : "Raw flags unchanged.",
+          err: false,
+        });
+        await load();
+      } finally {
+        inFlight.delete(id);
+        if (!disposed) paint();
       }
       return;
     }
