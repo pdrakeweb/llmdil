@@ -6,8 +6,12 @@
 //! master key is never read, the OpenRouter credential appears
 //! neither as value nor as its Credential Manager target name, and
 //! no absolute data-dir path is included (model paths travel in
-//! their configured relative form). The redaction test in this
-//! module is a release gate for the feature.
+//! their configured relative form). Backend `raw_flags` never
+//! travel verbatim either: the string is unconstrained operator
+//! input and can carry secrets (an `--api-key` value, a token
+//! flag); only facts decoded from it (offload) are included. The
+//! redaction test in this module is a release gate for the
+//! feature.
 
 use std::collections::{HashMap, HashSet};
 
@@ -281,9 +285,14 @@ pub fn build_context(
             if let Some(m) = model {
                 v["model_id"] = json!(m.id);
             }
-            if let Some(raw) = &b.raw_flags {
-                v["raw_flags"] = json!(raw);
-            }
+            // `raw_flags` is deliberately NOT emitted (code
+            // review B-1): it is an unconstrained operator string
+            // tokenized into the llama-server command line, so a
+            // secret-bearing flag (`--api-key <value>`, a token
+            // flag, a credential path) would otherwise travel to
+            // the consulted backend, persist in the plan file, and
+            // return to the UI. Only the decoded, non-secret facts
+            // derived from it (the `offload` block below) travel.
             let moe_layers = model.and_then(|m| {
                 catalog
                     .iter()
@@ -720,6 +729,15 @@ mod tests {
 
     fn sentinel_config() -> AppConfig {
         let mut cfg = AppConfig::default_config();
+        // Secret-shaped raw flags (code review B-1): an
+        // unconstrained operator string can carry an API key or a
+        // token as a flag value. The benign `-ot exps=CPU` rides
+        // along so the test also proves the decoded offload fact
+        // still travels while the verbatim string does not.
+        cfg.backends[0].raw_flags = Some(
+            "--api-key SENTINEL-FLAG-KEY-63d1 --hf-token SENTINEL-HF-TOKEN-28be -ot exps=CPU"
+                .to_string(),
+        );
         cfg.data_dir = PathBuf::from("D:\\SENTINEL-DATA-DIR-7f3a");
         cfg.gateway.openrouter.enabled = true;
         cfg.gateway.openrouter.cred_ref = Some("SENTINEL-CRED-REF-9b1c".to_string());
@@ -748,6 +766,8 @@ mod tests {
             "SENTINEL-DATA-DIR-7f3a",
             "SENTINEL-RULE-DESC-44de",
             "SENTINEL-FRAGMENT-KEY-02fa",
+            "SENTINEL-FLAG-KEY-63d1",
+            "SENTINEL-HF-TOKEN-28be",
         ] {
             assert!(
                 !text.contains(sentinel),
@@ -762,19 +782,69 @@ mod tests {
             "password",
             "database_url",
             "api_key",
+            "api-key",
             "routing_rules",
             "data_dir",
+            // The verbatim flags string itself is not a context
+            // field any more (B-1) — only facts decoded from it.
+            "raw_flags",
         ] {
             assert!(
                 !lower.contains(key),
                 "context contains forbidden key {key}: {text}"
             );
         }
+        // The decoded offload fact derived from the seeded flags
+        // DOES travel (B-1 removes the verbatim string, not the
+        // planner's legitimate derived facts).
+        let seeded_id = cfg.backends[0].id.clone();
+        let entry = doc["backends"]
+            .as_array()
+            .and_then(|arr| arr.iter().find(|b| b["id"] == json!(seeded_id)))
+            .expect("seeded backend present in context");
+        assert_eq!(entry["offload"]["setting"], json!("all_experts"));
         // The non-secret OpenRouter facts DO travel (§2.2).
         assert_eq!(doc["gateway"]["openrouter"]["enabled"], json!(true));
         assert_eq!(doc["gateway"]["openrouter"]["daily_cap_usd"], json!(5.0));
         // Postgres is a port, never a URL (§2.4).
         assert_eq!(doc["postgres"]["port"], json!(54329));
+    }
+
+    /// B-1, surfaces 2 and 3: the context document is persisted
+    /// verbatim as `Plan.context` in optimize-plan.json and the
+    /// plan is serialized whole into the Optimize `state_payload`
+    /// for the UI. A plan built from the sentinel-seeded context
+    /// must therefore carry no secret-shaped flag content on
+    /// either surface.
+    #[test]
+    fn plan_surfaces_carry_no_sentinel_flag_secrets() {
+        let cfg = sentinel_config();
+        let (doc, _meta) = build_context(&cfg, &MeasureInputs::default(), "9.9.9", "planner");
+        let plan = crate::parse::parse_plan(
+            "{\"summary\":\"ok\",\"items\":[]}",
+            &cfg,
+            "planner",
+            "hash",
+            doc,
+            &HashSet::new(),
+            "",
+            chrono::Utc::now(),
+        )
+        .expect("minimal plan parses");
+        // Surface 2: the persisted plan (optimize-plan.json is
+        // this struct serialized); surface 3: state_payload
+        // embeds `serde_json::to_value(plan)`.
+        let text = serde_json::to_string(&plan).unwrap();
+        for sentinel in ["SENTINEL-FLAG-KEY-63d1", "SENTINEL-HF-TOKEN-28be"] {
+            assert!(
+                !text.contains(sentinel),
+                "plan leaked sentinel {sentinel}: {text}"
+            );
+        }
+        assert!(
+            !text.to_lowercase().contains("raw_flags"),
+            "plan carries a raw_flags field: {text}"
+        );
     }
 
     #[test]
