@@ -253,6 +253,12 @@ macro_rules! for_each_operation {
             // Internal bookkeeping: performed by the server after a
             // successful apply or gateway (re)start, not a client route.
             (GatewayActivationComplete, gateway_activation_complete, L, op_gateway_activation_complete, [], None),
+            // Execution history: the record write is reported by the
+            // desktop apply funnel when an apply ends (bookkeeping,
+            // not a client route, like gateway_activation_complete);
+            // the read is a plain history query.
+            (GatewayActivationRecordExecution, gateway_activation_record_execution, C, op_gateway_activation_record_execution, [record: Value], None),
+            (GatewayActivationHistory, gateway_activation_history, R, op_gateway_activation_history, [execution_id: Option<String>], Some(route(HttpMethod::Get, "/api/v1/activation-plan/history"))),
             (GatewayQuiesceWait, gateway_quiesce_wait, L, op_gateway_quiesce_wait, [timeout_secs: u64], Some(route(HttpMethod::Post, "/api/v1/activation-plan/quiesce-wait"))),
             (GatewayPreviewYaml, gateway_preview_yaml, R, op_gateway_preview_yaml, [], Some(route(HttpMethod::Get, "/api/v1/gateway/generated-config"))),
             (GatewayTestRouting, gateway_test_routing, R, op_gateway_test_routing, [request: Value], Some(route_wrap(HttpMethod::Post, "/api/v1/gateway/routing/test", "request"))),
@@ -398,7 +404,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 108);
+        assert_eq!(OP_SPECS.len(), 110);
     }
 
     #[test]

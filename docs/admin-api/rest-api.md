@@ -368,7 +368,7 @@ payload; the API adds nothing.
 
 ## 5. Endpoint index
 
-90 client-facing endpoints. ("Op" = returns `202` + operation, §3.)
+91 client-facing endpoints. ("Op" = returns `202` + operation, §3.)
 
 | Domain | Count | Endpoints |
 |---|---|---|
@@ -377,7 +377,7 @@ payload; the API adds nothing.
 | Models | 11 | list, create, get, delete, patch, download (Op) + pause/resume/cancel, verify (Op), assign |
 | Placement | 2 | propose, apply |
 | Gateway | 13 | status, config get/patch, generated config, master key, start (Op), stop, groups CRUD (4), routing test, routing recent |
-| Activation plan | 4 | get, apply (Op), quiesce-wait, cancel |
+| Activation plan | 5 | get, apply (Op), quiesce-wait, cancel, execution history |
 | Wizard / setup | 11 | steps, status, prerequisites, run (Op), retry, skip, mark-manual, commands, help URL, complete, audit (Op) |
 | Logs | 2 | query, scopes |
 | Telemetry | 4 | GPUs, interval, reset peaks, snapshot |
@@ -724,6 +724,28 @@ has since changed through another path, as in the app.
 `gateway_activation_complete` is **not** a client endpoint: it is
 bookkeeping the server performs after a successful apply or gateway
 (re)start. Listed here so the mapping is complete.
+
+#### `GET /api/v1/activation-plan/history` — `read`
+`gateway_activation_history`. The durable record of past activation
+plan executions (an apply is recorded whole when it ends, including
+an aborted one): `{ "executions": [ … ] }`, newest first, each entry
+a summary — `id`, `started_at`, `finished_at`, `status`
+(`completed` | `completed_with_failures` | `failed`), `source`,
+`mode`, the plan state (`drift`, `gateway_up`, `gateway_pending`),
+and the item counts (`items`, `applied`, `skipped`, `failed`).
+With `?execution_id=<id>`, returns `{ "execution": … }` — that
+execution's full record: the plan as computed at apply time, one
+item per change (`kind`, `summary`, `scope`, `targets`,
+`activation`) with its `outcome` (`applied` | `skipped` |
+`failed`) and `detail` (skip reason or error text) — or
+`"execution": null` when the id has aged out of the retained
+history (the newest 50 executions are kept). A missing or corrupt
+history file reads as an empty history, never an error.
+
+`gateway_activation_record_execution` is **not** a client endpoint:
+it is the bookkeeping write the desktop apply funnel reports when an
+apply ends, like `gateway_activation_complete`. Listed here so the
+mapping is complete.
 
 ### 6.7 Wizard / setup
 
