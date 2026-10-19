@@ -19,6 +19,7 @@ pub mod gguf;
 pub mod guardrails;
 pub mod memory;
 pub mod mtp;
+pub mod parallel;
 pub mod placement;
 
 pub use gguf::{parse_gguf_layout, GgufError, GgufLayout, KvGeometry};
@@ -30,7 +31,8 @@ pub use memory::{
     expert_offload, memory_requirement, offload_bands, offload_flag_string, offload_for_layers,
     set_expert_offload, sys_bytes_by_position, ExpertOffload, MemoryBasis, MemoryRequirement,
 };
-pub use mtp::{mtp_draft, parallel_slots, set_mtp_draft, MtpDraft};
+pub use mtp::{mtp_draft, set_mtp_draft, MtpDraft};
+pub use parallel::{parallel_slots, set_parallel_slots};
 pub use placement::{
     apply_placement, propose_placement, propose_placement_resident, validate_split,
     PlacementProjection,

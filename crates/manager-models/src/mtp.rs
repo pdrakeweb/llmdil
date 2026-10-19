@@ -130,37 +130,6 @@ pub fn mtp_draft(raw_flags: Option<&str>) -> MtpDraft {
     MtpDraft::On(n_max)
 }
 
-/// The `--parallel` / `-np` slot count in raw flags, when set
-/// explicitly: the last occurrence wins (llama.cpp's
-/// sequential-parse rule). A value that does not parse, or a
-/// trailing flag, reads as unset — decoding never invents a
-/// setting the flags do not state. MTP drafting needs a single
-/// slot; the control compares this against 1 to surface the
-/// conflict. This is a decode only — nothing in the app rewrites
-/// `--parallel` on the MTP path.
-pub fn parallel_slots(raw_flags: Option<&str>) -> Option<i64> {
-    let raw = raw_flags?;
-    let tokens: Vec<&str> = raw.split_whitespace().collect();
-    let mut slots: Option<i64> = None;
-    for (i, t) in tokens.iter().enumerate() {
-        if *t == "--parallel" || *t == "-np" {
-            if let Some(v) = tokens.get(i + 1) {
-                if let Ok(n) = v.parse::<i64>() {
-                    slots = Some(n);
-                }
-            }
-        } else if let Some(v) = t
-            .strip_prefix("--parallel=")
-            .or_else(|| t.strip_prefix("-np="))
-        {
-            if let Ok(n) = v.parse::<i64>() {
-                slots = Some(n);
-            }
-        }
-    }
-    slots
-}
-
 /// Rewrite the MTP tokens in raw llama-server flags, leaving
 /// every other flag untouched and in order. All `--spec-type`
 /// occurrences are removed and a single canonical flag is
@@ -340,25 +309,6 @@ mod tests {
             mtp_draft(Some("--spec-type draft-mtp --spec-draft-n-max 0")),
             MtpDraft::On(Some(0))
         );
-    }
-
-    #[test]
-    fn parallel_slots_decode() {
-        assert_eq!(parallel_slots(None), None);
-        assert_eq!(parallel_slots(Some("-c 262144")), None);
-        assert_eq!(parallel_slots(Some("--parallel 1")), Some(1));
-        assert_eq!(parallel_slots(Some("-np 4")), Some(4));
-        assert_eq!(parallel_slots(Some("--parallel=2")), Some(2));
-        assert_eq!(parallel_slots(Some("-np=3")), Some(3));
-        // Auto is an explicit, parseable setting.
-        assert_eq!(parallel_slots(Some("--parallel -1")), Some(-1));
-        // Last wins; malformed reads as unset.
-        assert_eq!(
-            parallel_slots(Some("--parallel 4 --parallel 1")),
-            Some(1)
-        );
-        assert_eq!(parallel_slots(Some("--parallel abc")), None);
-        assert_eq!(parallel_slots(Some("--parallel")), None);
     }
 
     #[test]

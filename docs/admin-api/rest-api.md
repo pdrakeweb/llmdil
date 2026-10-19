@@ -438,7 +438,9 @@ app's add form offers: `n_ctx`, `n_batch` (validated as in
 (a guardrail-blocked position is refused unless the override is set,
 and the override is journaled, as in `backend_set_offload`), and
 `gpu_indices` (an explicit GPU selection, written as an even tensor
-split, replacing the telemetry assignment). Each omitted field keeps
+split, replacing the telemetry assignment), and `parallel` (a slot
+count written into the created backend's raw flags as `--parallel N`,
+validated as in `backend_set_parallel`). Each omitted field keeps
 its creation default.
 
 #### `DELETE /api/v1/backends/{id}` — `destructive`
@@ -511,6 +513,16 @@ Sets the backend's MTP speculative decoding draft length
 backend's raw flags change. Only valid for MTP-capable backends
 (the `mtp` block in §4.1 says which); otherwise
 `400 INVALID_INPUT`, as in the app.
+
+#### `PUT /api/v1/backends/{id}/parallel` — `config`
+`backend_set_parallel`. Body: `{ "slots": 1 }` →
+`{ "backend_id", "slots": 1, "raw_flags": "…", "changed": true }`.
+Sets the backend's parallel slot count (the canonical
+`--parallel N`, 1–1024); `{ "slots": null }` removes the token,
+returning the backend to llama.cpp's default (auto). Only the
+parallel tokens in the backend's raw flags change. Applies at
+the backend's next start; the app records the activation-plan
+entry.
 
 #### `GET /api/v1/backends/{id}/launch-command` — `read`
 `backend_get_launch_command` → `{ "id", "argv": [ … ] }` — the exact

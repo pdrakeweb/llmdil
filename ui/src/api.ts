@@ -699,6 +699,11 @@ export interface BackendRow {
    *  otherwise. The state is decoded from the backend's saved
    *  raw flags: MTP is on iff `--spec-type draft-mtp` is present. */
   mtp?: BackendMtp;
+  /** Parallel slots state (configured rows — the flags form's
+   *  Parallel slots field renders for every backend, so this is
+   *  not capability-gated); absent on supervisor-only orphan
+   *  rows. Decoded from the backend's saved raw flags. */
+  parallel?: BackendParallel;
   /** The backend's persisted tool-call probe (MCP design §7.2),
    *  or null when it has never been probed — the card renders null
    *  as "not measured", never as a measured state. Absent on
@@ -769,12 +774,28 @@ export interface BackendMtp {
   n_max: number | null;
   /** The explicit `--parallel` slot count in the saved raw
    *  flags, or null when unset. MTP drafting needs 1; any other
-   *  explicit value is a conflict the form surfaces — the
-   *  control never rewrites it. */
+   *  explicit value is a conflict the form surfaces — the MTP
+   *  control itself never rewrites it; the Parallel slots field
+   *  (backend_set_parallel) is where it is set. */
   parallel: number | null;
   /** True when the saved MTP spelling is not the canonical form
    *  for its state (a bare `--spec-type draft-mtp` with no length
    *  token, an `=` spelling, ...). */
+  custom: boolean;
+}
+
+/** A backend's parallel-slots state (list_backends payload,
+ *  configured rows). Decoded server-side from the backend's
+ *  saved raw flags by the same decode pair the Parallel slots
+ *  field writes through. */
+export interface BackendParallel {
+  /** The explicit `--parallel` slot count in the saved raw
+   *  flags, or null when unset — llama.cpp's default (auto,
+   *  -1) then applies. An explicit -1 is a saved auto. */
+  slots: number | null;
+  /** True when the saved parallel spelling is not the canonical
+   *  `--parallel N` form for its state (an `-np` or `=` spelling,
+   *  repeated tokens, a non-canonical position). */
   custom: boolean;
 }
 
@@ -857,6 +878,22 @@ export async function setBackendMtp(id: string, nMax: number | null): Promise<Ca
   }
 }
 
+/** backend_set_parallel — set a backend's parallel slot count
+ *  (tracker #61; the flags form's Parallel slots field). `slots`
+ *  of 1..1024 writes the canonical `--parallel N`; null removes
+ *  the token, returning the backend to llama.cpp's default
+ *  (auto). Only the parallel tokens in the backend's raw flags
+ *  change. Persisted immediately; applies on the next start. */
+export async function setBackendParallel(id: string, slots: number | null): Promise<CallResult<{ backend_id: string; slots: number | null; raw_flags: string | null; changed: boolean }>> {
+  if (!isTauri()) return { data: { backend_id: id, slots, raw_flags: null, changed: false }, live: false };
+  try {
+    const data = await invoke<{ backend_id: string; slots: number | null; raw_flags: string | null; changed: boolean }>("backend_set_parallel", { id, slots });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { backend_id: id, slots, raw_flags: null, changed: false }, live: true, error: errOf(e) };
+  }
+}
+
 /** backend_add — create a backend for a registered model and route it
  *  through a gateway group (an existing one, or a new one when
  *  createGroup is true). The gateway routes it after its next restart.
@@ -865,7 +902,10 @@ export async function setBackendMtp(id: string, nMax: number | null): Promise<Ca
  *  512 batch, telemetry-assigned split, catalog default offload);
  *  offloadOverride records the operator's explicit override when a
  *  chosen offload position is guardrail-blocked, and gpuIndices is
- *  an explicit GPU selection replacing the telemetry assignment. */
+ *  an explicit GPU selection replacing the telemetry assignment.
+ *  parallel (tracker #61) is a chosen `--parallel` slot count
+ *  written into the created backend's raw flags; omitted writes
+ *  no token (llama.cpp's default). */
 export async function addBackend(input: {
   id: string;
   modelId: string;
@@ -878,6 +918,7 @@ export async function addBackend(input: {
   offloadLayers?: number;
   offloadOverride?: boolean;
   gpuIndices?: number[];
+  parallel?: number;
 }): Promise<CallResult<{ backend_id: string; group: string }>> {
   if (!isTauri()) return { data: { backend_id: input.id, group: input.group }, live: false };
   try {
@@ -894,6 +935,7 @@ export async function addBackend(input: {
     if (input.offloadLayers !== undefined) args.offloadLayers = input.offloadLayers;
     if (input.offloadOverride) args.offloadOverride = true;
     if (input.gpuIndices !== undefined) args.gpuIndices = input.gpuIndices;
+    if (input.parallel !== undefined) args.parallel = input.parallel;
     const data = await invoke<{ backend_id: string; group: string }>("backend_add", args);
     return { data, live: true };
   } catch (e) {

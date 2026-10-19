@@ -199,11 +199,12 @@ macro_rules! for_each_operation {
             (BackendGetConfig, backend_get_config, SConfig, op_backend_get_config, [id: String], Some(route(HttpMethod::Get, "/api/v1/backends/{id}/config"))),
             (BackendPreviewDiff, backend_preview_diff, R, op_backend_preview_diff, [id: String, patch: Value], Some(route(HttpMethod::Post, "/api/v1/backends/{id}/config/preview-diff"))),
             (BackendApplyConfig, backend_apply_config, C, op_backend_apply_config, [id: String, patch: Value, apply_mode: String], Some(route(HttpMethod::Patch, "/api/v1/backends/{id}/config"))),
-            (BackendAdd, backend_add, C, op_backend_add, [id: String, model_id: String, port: u16, group: String, create_group: bool, enabled: bool, n_ctx: Option<u32>, n_batch: Option<u32>, offload_layers: Option<u32>, offload_override: Option<bool>, gpu_indices: Option<Vec<u32>>], Some(route_created(HttpMethod::Post, "/api/v1/backends"))),
+            (BackendAdd, backend_add, C, op_backend_add, [id: String, model_id: String, port: u16, group: String, create_group: bool, enabled: bool, n_ctx: Option<u32>, n_batch: Option<u32>, offload_layers: Option<u32>, offload_override: Option<bool>, gpu_indices: Option<Vec<u32>>, parallel: Option<u32>], Some(route_created(HttpMethod::Post, "/api/v1/backends"))),
             (BackendAddPreview, backend_add_preview, R, op_backend_add_preview, [model_id: String, gpu_indices: Option<Vec<u32>>], None),
             (BackendUpdateFlags, backend_update_flags, C, op_backend_update_flags, [id: String, n_ctx: u32, n_batch: u32], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/flags"))),
             (BackendSetOffload, backend_set_offload, C, op_backend_set_offload, [id: String, layers: u32, allow_override: Option<bool>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/offload"))),
             (BackendSetMtp, backend_set_mtp, C, op_backend_set_mtp, [id: String, n_max: Option<u32>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/mtp"))),
+            (BackendSetParallel, backend_set_parallel, C, op_backend_set_parallel, [id: String, slots: Option<u32>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/parallel"))),
             (BackendDelete, backend_delete, D, op_backend_delete, [id: String], Some(route(HttpMethod::Delete, "/api/v1/backends/{id}"))),
             (BackendGetLaunchCommand, backend_get_launch_command, SDisclosure, op_backend_get_launch_command, [id: String], Some(route(HttpMethod::Get, "/api/v1/backends/{id}/launch-command"))),
             // Wizard / setup
@@ -406,7 +407,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 112);
+        assert_eq!(OP_SPECS.len(), 113);
     }
 
     #[test]
