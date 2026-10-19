@@ -1348,6 +1348,19 @@ pub async fn op_update_config(
     let mut v = serde_json::to_value(&*cfg)?;
     merge_json(&mut v, patch);
     let mut new_cfg: AppConfig = serde_json::from_value(v)?;
+    // Reserved temp-backend namespace (code review B-3): a patch
+    // may not introduce a NEW backend whose id falls in the
+    // `opt-exp-*` experiment namespace — the same reservation
+    // backend_add enforces at creation. An id already present in
+    // the current config is not a creation and is left alone;
+    // the startup sweep owns such leftovers.
+    for nb in &new_cfg.backends {
+        if manager_optimize::is_temp_backend_id(&nb.id)
+            && !cfg.backends.iter().any(|b| b.id == nb.id)
+        {
+            return Err(reserved_temp_backend_id_error(&nb.id));
+        }
+    }
     // Advanced flags mode (tracker #60): this whole-config merge
     // is the one remaining path that could rewrite a backend's
     // flags wholesale, so it is held to the same one-writer rule —
@@ -4650,6 +4663,22 @@ fn split_mode_str(mode: manager_config::SplitMode) -> &'static str {
 /// leaving the new backend at llama.cpp's default exactly as
 /// before.
 #[allow(clippy::too_many_arguments)] // argument list is the registry contract
+/// The `opt-exp-*` backend namespace is reserved for Optimize
+/// experiment temp backends (code review B-3): experiment
+/// cleanup stops and unregisters any backend carrying such an
+/// id, and the startup sweep deletes it from the config, so a
+/// user backend created with one would be destroyed by
+/// machinery that assumes it is temporary. User-facing creation
+/// paths refuse the prefix with this error, which names the
+/// reservation.
+fn reserved_temp_backend_id_error(id: &str) -> ApiError {
+    ApiError::InvalidInput(format!(
+        "backend id {id:?} is reserved: ids beginning with {:?} are reserved \
+         for Optimize experiment temp backends",
+        manager_optimize::TEMP_BACKEND_ID_PREFIX
+    ))
+}
+
 pub async fn op_backend_add(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
@@ -4680,6 +4709,9 @@ pub async fn op_backend_add(
         return Err(ApiError::InvalidInput(
             "backend name must be lowercase letters, digits, and hyphens".to_string(),
         ));
+    }
+    if manager_optimize::is_temp_backend_id(&id) {
+        return Err(reserved_temp_backend_id_error(&id));
     }
     if !valid_slug(&group) {
         return Err(ApiError::InvalidInput(
@@ -8481,6 +8513,98 @@ mod tests {
 
     fn test_sink() -> Arc<dyn EventSink> {
         Arc::new(NoopSink)
+    }
+
+    /// Code review B-3: user creation refuses the reserved
+    /// `opt-exp-*` experiment namespace, naming the reservation.
+    #[tokio::test]
+    async fn backend_add_refuses_reserved_temp_prefix() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        let r = op_backend_add(
+            &state,
+            &sink,
+            "opt-exp-1".to_string(),
+            "qwen3.8-27b".to_string(),
+            9999,
+            "planner".to_string(),
+            false,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("reserved"), "{msg}");
+                assert!(msg.contains("opt-exp-"), "{msg}");
+            }
+            other => panic!("expected the reservation refusal, got {other:?}"),
+        }
+        // Nothing was created.
+        let cfg = state.config.read().await;
+        assert!(!cfg.backends.iter().any(|b| b.id == "opt-exp-1"));
+        drop(cfg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Code review B-3: the whole-config patch path may not
+    /// smuggle in a new backend in the reserved namespace either.
+    #[tokio::test]
+    async fn update_config_refuses_a_new_reserved_temp_backend() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        let mut v = serde_json::to_value(state.config.read().await.clone()).unwrap();
+        let mut extra = v["backends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["id"] == "coder")
+            .unwrap()
+            .clone();
+        extra["id"] = json!("opt-exp-9");
+        extra["port"] = json!(9999);
+        extra["enabled"] = json!(false);
+        v["backends"].as_array_mut().unwrap().push(extra);
+        let patch = json!({ "backends": v["backends"].clone() });
+        match op_update_config(&state, &sink, patch).await {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("reserved"), "{msg}");
+                assert!(msg.contains("opt-exp-"), "{msg}");
+            }
+            other => panic!("expected the reservation refusal, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Code review B-3: the reservation guards creation only —
+    /// a config that already carries a reserved id (a pre-fix
+    /// leftover, which the startup sweep owns) is not newly
+    /// rejected by an unrelated patch.
+    #[tokio::test]
+    async fn update_config_leaves_a_preexisting_reserved_temp_backend_alone() {
+        let mut cfg = test_cfg();
+        let mut extra = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .clone();
+        extra.id = "opt-exp-9".to_string();
+        extra.port = 9999;
+        extra.enabled = false;
+        cfg.backends.push(extra);
+        let (state, dir) = advanced_test_state(cfg);
+        let sink = test_sink();
+        let r = op_update_config(&state, &sink, json!({ "supervision": { "mode": "process" } }))
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
