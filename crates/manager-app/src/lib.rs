@@ -6782,8 +6782,16 @@ pub async fn op_model_assign(
             split.len()
         )));
     }
-    let mut cfg = state.config.write().await;
-    let pre_cfg = cfg.clone();
+    // Mutate a clone and commit it to state.config only after
+    // placement, validation, journaling, and the save all succeed
+    // (the #32 pattern; code review B-4): the mutations below run
+    // ahead of checks that can fail — apply_placement, validate,
+    // the save itself — and a failure that left them in the live
+    // config would persist on the next unrelated save with no
+    // journal entry.
+    let mut guard = state.config.write().await;
+    let pre_cfg = guard.clone();
+    let mut cfg = pre_cfg.clone();
     let model = cfg
         .models
         .iter()
@@ -6868,7 +6876,10 @@ pub async fn op_model_assign(
     )
     .await?;
     manager_config::save(&cfg, &state.config_path)?;
-    drop(cfg);
+    // Commit point: every fallible step has succeeded, so the
+    // working clone becomes the live config.
+    *guard = cfg;
+    drop(guard);
     let task_id = state
         .record_task(
             "model_assign",
@@ -8915,6 +8926,81 @@ mod tests {
         assert_eq!(r["flags_untouched"], false);
         let saved = manager_config::load(&state.config_path).unwrap();
         let coder = saved.backends.iter().find(|b| b.id == "coder").unwrap();
+        assert_eq!(coder.raw_flags.as_deref(), Some("--n-cpu-moe 16"));
+        assert_eq!(coder.flags.tensor_split, vec![1.0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn model_assign_failure_leaves_config_and_journal_untouched() {
+        // Code review B-4: op_model_assign used to mutate the live
+        // config ahead of its fallible steps, so a failure after the
+        // mutation point left the in-memory config half-migrated —
+        // and the next unrelated save persisted it with no journal
+        // entry. Here apply_placement rejects the split (sums to
+        // 0.5) after model_file was set and the catalog raw-flags
+        // fill was written: exactly the traced half-migration. The
+        // op now mutates a clone and commits only after placement,
+        // validation, journaling, and the save all succeed.
+        let nemotron = manager_config::ModelConfig {
+            id: "nemotron-3.5-lightning-30b".to_string(),
+            gguf_path: PathBuf::from("models/nemotron.gguf"),
+            quant: "Q4_K_M".to_string(),
+            params_b: 30.0,
+            sha256: "a".repeat(64),
+            verified_at: None,
+            verified_sha256: None,
+            source_url: String::new(),
+            assigned_backends: Vec::new(),
+            enabled: true,
+            display_name: None,
+        };
+        let mut cfg = test_cfg();
+        cfg.models.push(nemotron);
+        {
+            let coder = cfg.backends.iter_mut().find(|b| b.id == "coder").unwrap();
+            // Blank flags: the assignment would fill the catalog
+            // default (--n-cpu-moe 16) before placement fails.
+            coder.raw_flags = Some("  ".to_string());
+            coder.flags.tensor_split = Vec::new();
+            coder.flags.split_mode = manager_config::SplitMode::Layer;
+        }
+        let (state, dir) = advanced_test_state(cfg);
+        let sink = test_sink();
+        let before = serde_json::to_value(state.config.read().await.clone()).unwrap();
+        let r = op_model_assign(
+            &state,
+            &sink,
+            "nemotron-3.5-lightning-30b".to_string(),
+            "coder".to_string(),
+            vec![0.5],
+        )
+        .await;
+        assert!(r.is_err(), "a split summing to 0.5 must be refused: {r:?}");
+        let after = serde_json::to_value(state.config.read().await.clone()).unwrap();
+        assert_eq!(
+            before, after,
+            "a failed assign must leave the live config byte-identical"
+        );
+        assert!(
+            activation::load_journal(&state.data_dir).entries.is_empty(),
+            "a failed assign must not journal"
+        );
+        // The state is not wedged: a valid assign right after the
+        // failure succeeds and persists in full.
+        let r = op_model_assign(
+            &state,
+            &sink,
+            "nemotron-3.5-lightning-30b".to_string(),
+            "coder".to_string(),
+            vec![1.0],
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["persisted"], true);
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let coder = saved.backends.iter().find(|b| b.id == "coder").unwrap();
+        assert_eq!(coder.model_file, PathBuf::from("models/nemotron.gguf"));
         assert_eq!(coder.raw_flags.as_deref(), Some("--n-cpu-moe 16"));
         assert_eq!(coder.flags.tensor_split, vec![1.0]);
         let _ = std::fs::remove_dir_all(&dir);
