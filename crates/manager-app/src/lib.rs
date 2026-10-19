@@ -55,10 +55,11 @@ pub mod optimize_eval;
 pub mod optimize_experiments;
 
 pub use optimize::{
-    op_optimize_cancel_consult, op_optimize_cancel_job, op_optimize_consult,
-    op_optimize_discard_plan, op_optimize_discover, op_optimize_estimate_backend,
-    op_optimize_get_state, op_optimize_measure_backend, op_optimize_save_purpose,
-    op_optimize_set_item_outcome, op_optimize_set_item_state, op_optimize_validate_plan,
+    op_measurement_delete, op_measurement_lookup, op_optimize_cancel_consult,
+    op_optimize_cancel_job, op_optimize_consult, op_optimize_discard_plan, op_optimize_discover,
+    op_optimize_estimate_backend, op_optimize_get_state, op_optimize_measure_backend,
+    op_optimize_save_purpose, op_optimize_set_item_outcome, op_optimize_set_item_state,
+    op_optimize_validate_plan,
 };
 pub use optimize_eval::op_optimize_run_baseline;
 pub use optimize_experiments::{
@@ -2233,6 +2234,43 @@ pub async fn op_list_backends(
                 "slots": p.slots,
                 "custom": p.custom,
             });
+        }
+    }
+    // Predicted throughput per configured backend
+    // (predicted-throughput design §7): the exact-match
+    // measurement for the backend's SAVED configuration,
+    // resolved through the same fingerprint path the Measure
+    // action uses and the store's fingerprint-only lookup.
+    // Absent when no exact measurement exists — never
+    // null-as-zero — and independent of run state.
+    {
+        let gpu_pairs: Vec<(u32, String)> = {
+            let store = state.telemetry().await;
+            let guard = lock_telemetry(&store);
+            guard
+                .snapshot()
+                .iter()
+                .map(|s| (s.index, s.name.clone()))
+                .collect()
+        };
+        let store = manager_optimize::MeasurementStore::load(&optimize::measurements_path(state));
+        let predicted: HashMap<String, Value> = cfg
+            .backends
+            .iter()
+            .filter_map(|b| {
+                let inputs = optimize::fingerprint_inputs(&cfg, b, &gpu_pairs);
+                let fp = manager_optimize::measurement_fingerprint(&inputs);
+                store
+                    .lookup(&fp)
+                    .map(|e| (b.id.clone(), optimize::predicted_json(e)))
+            })
+            .collect();
+        for row in backends.iter_mut() {
+            let Some(id) = row["id"].as_str() else {
+                continue;
+            };
+            let Some(p) = predicted.get(id) else { continue };
+            row["predicted"] = p.clone();
         }
     }
     // Gateway request statistics (LiteLLM Prometheus snapshots from

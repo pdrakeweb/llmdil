@@ -312,6 +312,13 @@ macro_rules! for_each_operation {
             (OptimizeDiscover, optimize_discover, L, op_optimize_discover, [directive: String], None),
             (OptimizeCancelConsult, optimize_cancel_consult, L, op_optimize_cancel_consult, [], None),
             (OptimizeMeasureBackend, optimize_measure_backend, L, op_optimize_measure_backend, [backend_id: String], None),
+            // Predicted throughput (design §6.2, §10): the lookup
+            // is a pure read over the measurement store plus the
+            // live configuration; the delete is the history
+            // view's per-entry control. Both carry REST routes
+            // by design §11, unlike the rest of this section.
+            (MeasurementLookup, measurement_lookup, R, op_measurement_lookup, [request: Value], Some(route_wrap(HttpMethod::Post, "/api/v1/measurements/lookup", "request"))),
+            (MeasurementDelete, measurement_delete, D, op_measurement_delete, [fingerprint: String, measured_at: String], Some(route(HttpMethod::Delete, "/api/v1/measurements"))),
             (OptimizeEstimateBackend, optimize_estimate_backend, L, op_optimize_estimate_backend, [backend_id: String], None),
             (OptimizeCancelJob, optimize_cancel_job, L, op_optimize_cancel_job, [], None),
             (OptimizeRunBaseline, optimize_run_baseline, L, op_optimize_run_baseline, [backend_id: String], None),
@@ -412,7 +419,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 115);
+        assert_eq!(OP_SPECS.len(), 117);
     }
 
     #[test]
