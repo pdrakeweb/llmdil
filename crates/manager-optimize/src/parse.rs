@@ -1481,7 +1481,7 @@ pub fn parse_plan(
     let mut summary = summary;
     let (items, excluded_items) =
         ground_create_models(items, cfg, &context, denied_fingerprints, &mut summary);
-    let mut items = items;
+    let items = items;
 
     // Dependency ordering: prerequisites before the items
     // that need them (registration before creation, creation
