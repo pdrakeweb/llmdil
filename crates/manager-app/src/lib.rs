@@ -6504,8 +6504,7 @@ pub async fn op_model_assign(
         .find(|m| m.id == id)
         .ok_or_else(|| ApiError::NotFound(format!("model {id}")))?;
     let gguf_path = model.gguf_path.clone();
-    let mut flags_untouched = false;
-    {
+    let flags_untouched = {
         let backend = cfg
             .backends
             .iter_mut()
@@ -6521,14 +6520,14 @@ pub async fn op_model_assign(
         // would write the operator's raw string) and the placement
         // application (placement_apply is refused outright in the
         // mode). The response reports the skip.
-        flags_untouched = backend.flags_advanced;
+        let untouched = backend.flags_advanced;
         // A backend with no raw flags of its own takes the newly
         // assigned model's catalog default offload (e.g. Nemotron's
         // --n-cpu-moe 16) — the same preservation rule as the
         // catalog definition refresh: backends carrying operator
         // flags keep them, and the offload slider adjusts from
         // there.
-        if !flags_untouched
+        if !untouched
             && backend
                 .raw_flags
                 .as_deref()
@@ -6540,7 +6539,7 @@ pub async fn op_model_assign(
                 backend.raw_flags = Some(flags);
             }
         }
-        if !flags_untouched {
+        if !untouched {
             manager_models::apply_placement(backend, &split)
                 .map_err(ApiError::from)?;
         }
@@ -6549,7 +6548,8 @@ pub async fn op_model_assign(
         if backend.model_file != prev_model_file || backend.raw_flags != prev_raw_flags {
             backend.tool_call_probe = None;
         }
-    }
+        untouched
+    };
     if let Some(model) = cfg.models.iter_mut().find(|m| m.id == id) {
         if !model.assigned_backends.contains(&backend_id) {
             model.assigned_backends.push(backend_id.clone());
@@ -8471,7 +8471,7 @@ mod tests {
             let coder = cfg.backends.iter_mut().find(|b| b.id == "coder").unwrap();
             coder.raw_flags = Some("  ".to_string());
             coder.flags.tensor_split = Vec::new();
-            coder.flags.split_mode = manager_models::SplitMode::Layer;
+            coder.flags.split_mode = manager_config::SplitMode::Layer;
         }
         let (state, dir) = advanced_test_state(cfg);
         let r = op_model_assign(
