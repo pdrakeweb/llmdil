@@ -6,8 +6,12 @@
 //! master key is never read, the OpenRouter credential appears
 //! neither as value nor as its Credential Manager target name, and
 //! no absolute data-dir path is included (model paths travel in
-//! their configured relative form). The redaction test in this
-//! module is a release gate for the feature.
+//! their configured relative form). Backend `raw_flags` never
+//! travel verbatim either: the string is unconstrained operator
+//! input and can carry secrets (an `--api-key` value, a token
+//! flag); only facts decoded from it (offload) are included. The
+//! redaction test in this module is a release gate for the
+//! feature.
 
 use std::collections::{HashMap, HashSet};
 
@@ -281,9 +285,14 @@ pub fn build_context(
             if let Some(m) = model {
                 v["model_id"] = json!(m.id);
             }
-            if let Some(raw) = &b.raw_flags {
-                v["raw_flags"] = json!(raw);
-            }
+            // `raw_flags` is deliberately NOT emitted (code
+            // review B-1): it is an unconstrained operator string
+            // tokenized into the llama-server command line, so a
+            // secret-bearing flag (`--api-key <value>`, a token
+            // flag, a credential path) would otherwise travel to
+            // the consulted backend, persist in the plan file, and
+            // return to the UI. Only the decoded, non-secret facts
+            // derived from it (the `offload` block below) travel.
             let moe_layers = model.and_then(|m| {
                 catalog
                     .iter()
