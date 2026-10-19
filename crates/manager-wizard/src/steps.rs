@@ -8015,7 +8015,7 @@ mod tests {
         assert_eq!(planned.len(), 7);
         // Probes first, then the pinned venv creation, pip, the spawn,
         // and the firewall reconciliation (show rule, elevated script).
-        assert!(planned[2].argv[0].ends_with("uv"));
+        assert!(planned[2].argv[0].ends_with(StartGateway::uv_binary_name()));
         assert!(planned[2].argv.contains(&"--python".to_string()));
         assert!(planned[2]
             .argv
@@ -9931,7 +9931,10 @@ mod tests {
         let ctx = ctx_with(Arc::new(FakeSystemOps::new()), RunMode::Install);
         let planned = StartGateway::default().planned_commands(&ctx);
         if cfg!(target_os = "windows") {
-            assert_eq!(planned.len(), 6);
+            // Bootstrap download + the seven commands of the
+            // uv-present plan (two probes, venv, pip, spawn, two
+            // firewall commands).
+            assert_eq!(planned.len(), 8);
             assert_eq!(planned[0].argv[0], "download");
             assert!(
                 planned[0].argv[1].contains("astral-sh/uv"),
@@ -9962,6 +9965,7 @@ mod tests {
 
     // --- InstallLlamaCpp: VC++ redistributable ---
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn vcredist_check_passes_off_windows() {
         // The probe is Windows-only; other platforms always pass.
@@ -11459,7 +11463,7 @@ mod tests {
         );
         let install_cmds = StartGateway::default().planned_commands(&install_ctx);
         assert_eq!(install_cmds.len(), 7);
-        assert!(install_cmds[2].argv[0].ends_with("uv"));
+        assert!(install_cmds[2].argv[0].ends_with(StartGateway::uv_binary_name()));
 
         // ...audit mode shows only the health probe.
         let audit_ctx = WizardContext::new(
