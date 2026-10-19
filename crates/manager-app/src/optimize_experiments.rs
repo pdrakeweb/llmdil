@@ -637,6 +637,20 @@ async fn run_experiment_inner(
         }
     }
 
+    // -- Start preflight (code-review B-2): the same gate every
+    // app-mediated start passes, evaluated against the cloned
+    // config carrying the temp backend. A proposal whose offload
+    // position the guardrails block fails here with the
+    // preflight's reason instead of spawning at that position —
+    // before any journal record or spec registration, so a
+    // refused experiment leaves nothing to clean up.
+    if let Err(e) = crate::backend_start_preflight_for(state, &temp_cfg, &temp).await {
+        return InnerOutcome::failed(
+            format!("start preflight refused the experiment's temp backend: {e}"),
+            preflight,
+        );
+    }
+
     // -- Journal the in-flight experiment BEFORE the spawn, so
     // a crash from here on leaves a sweep record.
     {
@@ -974,6 +988,17 @@ async fn restart_stopped(state: &AppState, ids: &[String]) -> String {
             restarted.push(id.clone());
             continue;
         }
+        drop(sup);
+        // Start preflight (code-review B-2): the restart goes
+        // through the same gate as any app-mediated start, so a
+        // backend whose saved position the guardrails now block
+        // is not relaunched unpreflighted; the refusal is stated
+        // in the note like any other restart failure.
+        if let Err(e) = crate::backend_start_preflight(state, id).await {
+            failed.push(format!("{id} (start preflight refused the restart: {e})"));
+            continue;
+        }
+        let mut sup = state.supervisor().await.lock().await;
         match sup.spawn_backend(id).await {
             Ok(()) => restarted.push(id.clone()),
             Err(e) => failed.push(format!("{id} ({e:?})")),
@@ -1310,4 +1335,164 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
 /// committed.
 pub async fn op_optimize_estimate_experiments(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
     run_experiment_batch(state, _sink, RunMode::Estimate).await
+}
+
+// ---------------------------------------------------------------------------
+// Tests (code-review B-2)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A state over a temp dir whose config registers the
+    /// Coder-Next catalog model — the #37 guardrail pin (partial
+    /// offload on compute capability (6,0) is EndpointsOnly) —
+    /// and whose telemetry inventory is an A4000 (8,6) at index 0
+    /// and a P100 (6,0) at index 1, so a [0.5, 0.5] split places
+    /// the backend on both.
+    async fn guardrail_test_state() -> (Arc<AppState>, AppConfig, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "llm-mgr-b2-preflight-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        // The candidate's file must exist for resolution; an
+        // empty file suffices — the guardrail prices from the
+        // catalog when the GGUF does not parse.
+        std::fs::write(dir.join("models/Coder.gguf"), b"").unwrap();
+        let mut cfg = AppConfig::default_config();
+        cfg.data_dir = dir.clone();
+        cfg.models.push(manager_config::ModelConfig {
+            id: "qwen3-coder-30b".to_string(),
+            gguf_path: PathBuf::from("models/Coder.gguf"),
+            quant: "UD-Q4_K_M".to_string(),
+            params_b: 80.0,
+            sha256: "b".repeat(64),
+            // Verified, so the preflight's verification gate
+            // passes and the guardrail is the refusing check.
+            verified_at: Some(chrono::Utc::now()),
+            verified_sha256: None,
+            source_url: String::new(),
+            assigned_backends: vec![],
+            enabled: true,
+            display_name: None,
+        });
+        let state = Arc::new(AppState::new(cfg.clone(), dir.join("config.json"), dir.clone()));
+        // Initialize the telemetry store, then replace its
+        // inventory with the fixture. The init's own probe finds
+        // no inventory in a test environment; on a machine with
+        // real NVIDIA GPUs it loads the real one during this
+        // call, and the fixture overwrite below still lands
+        // before any preflight reads it.
+        let store = state.telemetry().await;
+        let gpu = |index: u32, name: &str, cc: (u32, u32)| manager_telemetry::GpuInfo {
+            index,
+            name: name.to_string(),
+            uuid: format!("GPU-fixture-{index}"),
+            compute_capability: cc,
+            total_vram_mib: 16384,
+            pci_bus_id: format!("00000000:{:02x}:00.0", index + 1),
+            driver_version: "581.57".to_string(),
+            driver_model: None,
+            source: manager_telemetry::TelemetrySourceKind::NvidiaSmi,
+        };
+        crate::lock_telemetry(&store).set_inventory(vec![
+            gpu(0, "RTX A4000", (8, 6)),
+            gpu(1, "Tesla P100-PCIE-16GB", (6, 0)),
+        ]);
+        (state, cfg, dir)
+    }
+
+    /// The code review's traced case: a proposal at a
+    /// guardrail-blocked offload position must fail pre-spawn
+    /// with the preflight's reason — never reach the supervisor,
+    /// never leave a journal record.
+    #[tokio::test]
+    async fn guardrail_blocked_proposal_fails_pre_spawn_with_the_preflight_reason() {
+        let (state, cfg, dir) = guardrail_test_state().await;
+        // The review's parse fixture: Coder-Next at 40 of 48 MoE
+        // layers, split [0.5, 0.5] across the A4000 and the P100.
+        let proposal = ExperimentProposal {
+            id: 1,
+            fingerprint: "b2-test".to_string(),
+            candidate_model_id: "qwen3-coder-30b".to_string(),
+            flags: manager_optimize::ExperimentFlags {
+                n_ctx: None,
+                offload_layers: Some(40),
+                tensor_split: Some(vec![0.5, 0.5]),
+            },
+            serves: "guardrail wiring test".to_string(),
+            hypothesis: String::new(),
+            predicted: Default::default(),
+            requires_stopping: Vec::new(),
+            run_eval: false,
+            decision: Decision::Accepted,
+            previously_denied: false,
+            provisioning: None,
+            result: None,
+            estimate: None,
+        };
+        let mut ctx = BatchCtx {
+            consulted_backend: String::new(),
+            batch_running: HashSet::new(),
+            stopped_to_restart: Vec::new(),
+            used_ports: HashSet::new(),
+        };
+        let outcome = run_experiment_inner(&state, &cfg, &proposal, &mut ctx, RunMode::Full).await;
+        assert_eq!(outcome.status, ExperimentStatus::Failed);
+        assert!(
+            outcome.detail.contains("outside the verified range"),
+            "the failure must carry the start preflight's guardrail reason, got: {}",
+            outcome.detail
+        );
+        // Pre-spawn evidence: the temp backend never reached the
+        // supervisor, and the gate runs before the journal's
+        // active record is written.
+        let sup = state.supervisor().await.lock().await;
+        assert!(
+            sup.status().iter().all(|s| s.id != "opt-exp-1"),
+            "a refused experiment must never reach the supervisor"
+        );
+        drop(sup);
+        assert!(load_journal(&state).active.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The batch restart path goes through the same gate: a
+    /// stopped backend whose saved position the guardrails block
+    /// is not relaunched, and the note states the refusal with
+    /// the preflight's reason.
+    #[tokio::test]
+    async fn restart_stopped_refuses_a_guardrail_blocked_backend() {
+        let (state, cfg, dir) = guardrail_test_state().await;
+        // Point the saved coder backend at the registered
+        // Coder-Next model at the blocked position (40 of 48
+        // layers, split across both GPUs).
+        let mut cfg = cfg;
+        let coder = cfg.backends.iter_mut().find(|b| b.id == "coder").unwrap();
+        coder.enabled = true;
+        coder.model_file = PathBuf::from("models/Coder.gguf");
+        coder.flags.tensor_split = vec![0.5, 0.5];
+        coder.raw_flags = Some("--n-cpu-moe 40".to_string());
+        // restart_stopped's preflight reads the saved config.
+        *state.config.write().await = cfg;
+        let note = restart_stopped(&state, &["coder".to_string()]).await;
+        assert!(
+            note.contains("Restart failed for: coder"),
+            "the refusal must be stated as a restart failure, got: {note}"
+        );
+        assert!(
+            note.contains("outside the verified range"),
+            "the note must carry the preflight's guardrail reason, got: {note}"
+        );
+        let sup = state.supervisor().await.lock().await;
+        assert!(sup.status().iter().all(|s| s.id != "coder" || s.pid.is_none()));
+        drop(sup);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
