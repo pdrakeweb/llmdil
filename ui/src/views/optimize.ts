@@ -17,7 +17,7 @@ import {
   addBackend, applyBackendConfig, deleteBackend, getAppConfig, getBackends,
   getBackendConfig, getOptimizeState, modelAdd, modelAssign,
   optimizeCancelConsult, optimizeCancelJob, optimizeChangeSummary, optimizeConsult,
-  optimizeDiscardPlan, optimizeDiscover, optimizeIsDestructive, optimizeKindLabel,
+  optimizeDiscardPlan, optimizeDiscover, optimizeEstimateBackend, optimizeEstimateExperiments, optimizeIsDestructive, optimizeKindLabel,
   optimizeMeasureBackend, optimizeRunBaseline, optimizeRunExperiments, optimizeSavePurpose, optimizeSetExperimentState, optimizeSetItemOutcome, optimizeSetItemState,
   setBackendOffload, stopBackend, updateBackendFlags, updateGatewayConfig,
 } from "../api";
@@ -102,6 +102,13 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   let measuringBackend: string | null = null;
   let measureStart = 0;
   let measureTimer: number | null = null;
+  /** Estimate (tracker #56): the backend this page instance is
+   *  estimating, and its progress timer. The estimate shares
+   *  the GPU-job slot with measurements, so the server
+   *  payload's `measuring` flag covers it too. */
+  let estimatingBackend: string | null = null;
+  let estimateStart = 0;
+  let estimateTimer: number | null = null;
   /** Discovery pre-pass (Phase 5c): a run is in flight, and the
    *  candidate entries the operator has pruned from the stored
    *  set (keys "repo_id\nfile"). Pruning is local until consult:
@@ -122,6 +129,12 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   let experimentsRunning = false;
   let expStart = 0;
   let expTimer: number | null = null;
+  /** Experiment estimate batch (tracker #56): an estimate
+   *  pass is in flight from this page instance, and its
+   *  progress timer. Shares the GPU-job slot like the batch. */
+  let estimatesRunning = false;
+  let expEstStart = 0;
+  let expEstTimer: number | null = null;
   const candidateRemoved = new Set<string>();
   const candidateKey = (c: OptimizeCandidate): string => `${c.repo_id}\n${c.file}`;
 
@@ -244,7 +257,8 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     const plan = st.plan;
     const exps = plan?.experiments ?? [];
     if (!plan || !exps.length) return "";
-    const busy = st.measuring || experimentsRunning;
+    const busy = st.measuring || experimentsRunning || estimatesRunning;
+    const num = (x: number | null | undefined): string => x == null ? "—" : trim1(x);
     const accepted = exps.filter((e) => e.decision === "accepted").length;
     const withResults = exps.filter((e) => e.result);
     const notes: string[] = [];
@@ -268,6 +282,9 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       ${e.hypothesis ? `<details class="opt-why"><summary>Why</summary><p>${esc(e.hypothesis)}</p></details>` : ""}
       ${e.result ? `<div class="opt-note">Result: ${esc(e.result.status)} — ${esc(e.result.detail)}</div>
       ${e.result.preflight ? `<div class="opt-note">Preflight: ${esc(e.result.preflight)}</div>` : ""}` : ""}
+      ${e.estimate ? `<div class="opt-note">Estimate: Generation tok/s (short/long): ${num(e.estimate.short.predicted_per_second)} / ${num(e.estimate.long.predicted_per_second)} · Prompt tok/s: ${num(e.estimate.long.prompt_per_second ?? e.estimate.short.prompt_per_second)} · TTFT: ${e.estimate.short.ttft_ms == null && e.estimate.long.ttft_ms == null ? "—" : `${num(e.estimate.short.ttft_ms ?? e.estimate.long.ttft_ms)} ms`}${Number.isFinite((Date.now() - new Date(e.estimate.estimated_at).getTime()) / 1000) ? ` · Age: ${fmtAge(Math.max(0, Math.floor((Date.now() - new Date(e.estimate.estimated_at).getTime()) / 1000)))}` : ""}</div>
+      <div class="opt-note">${esc(e.estimate.detail)}</div>
+      ${e.estimate.preflight ? `<div class="opt-note">Preflight: ${esc(e.estimate.preflight)}</div>` : ""}` : ""}
     </div>`;
     }).join("");
     const resultsTable = withResults.length ? `<div class="opt-exp-results">
@@ -303,8 +320,12 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         ${experimentsRunning
           ? `<span class="opt-consulting">${icon("clock")} Running experiments <span id="optExpElapsed">${fmtElapsed(Math.floor((Date.now() - expStart) / 1000))}</span> — one at a time, up to 30 min each, 60 min per batch. Temp backends are cleaned up on every outcome.</span>
              <button class="btn danger" data-opt-act="cancel-job">${icon("x")} Cancel</button>`
-          : `<button class="btn primary" data-opt-act="run-experiments" ${accepted && !busy ? "" : "disabled"}>${icon("bolt")} Run experiments (${accepted})</button>
-             <span class="opt-note">Accepted experiments run one at a time on a temporary backend outside every gateway group; it is stopped and removed afterwards, on every outcome.</span>`}
+          : estimatesRunning
+            ? `<span class="opt-consulting">${icon("clock")} Estimating experiments <span id="optExpEstElapsed">${fmtElapsed(Math.floor((Date.now() - expEstStart) / 1000))}</span> — the abbreviated benchmark only, one at a time, same 60 min batch budget. Temp backends are cleaned up on every outcome.</span>
+               <button class="btn danger" data-opt-act="cancel-job">${icon("x")} Cancel</button>`
+            : `<button class="btn primary" data-opt-act="run-experiments" ${accepted && !busy ? "" : "disabled"}>${icon("bolt")} Run experiments (${accepted})</button>
+               <button class="btn" data-opt-act="estimate-experiments" ${accepted && !busy ? "" : "disabled"}>${icon("gauge")} Estimate experiments (${accepted})</button>
+               <span class="opt-note">Accepted experiments run one at a time on a temporary backend outside every gateway group; it is stopped and removed afterwards, on every outcome. Estimate runs the abbreviated benchmark only, to screen a batch before full runs.</span>`}
       </div>
       ${resultsTable}
     </div>`;
@@ -375,7 +396,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     </div>`;
   }
 
-  function measureRow(b: OptimizeState["backends"][number], measuring: boolean): string {
+  function measureRow(b: OptimizeState["backends"][number], busy: boolean): string {
     const m = b.measured;
     const parts: string[] = [];
     if (m) {
@@ -384,12 +405,25 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       if (m.ttft_ms !== null) parts.push(`TTFT: ${trim1(m.ttft_ms)} ms`);
       parts.push(`Age: ${fmtAge(m.age_secs)}`);
     }
+    // The estimate (tracker #56) renders beside the measured
+    // figures under its own label — never in the measured
+    // figures' place, and never without the word "Estimate".
+    const e = b.estimated;
+    const estParts: string[] = [];
+    if (e) {
+      if (e.prompt_per_second !== null) estParts.push(`Prompt: ${trim1(e.prompt_per_second)} tok/s`);
+      if (e.predicted_per_second !== null) estParts.push(`Generation: ${trim1(e.predicted_per_second)} tok/s`);
+      if (e.ttft_ms !== null) estParts.push(`TTFT: ${trim1(e.ttft_ms)} ms`);
+      estParts.push(`Age: ${fmtAge(e.age_secs)}`);
+    }
     return `<div class="opt-measure-row">
       <span class="opt-target">${esc(b.id)}</span>
       ${parts.length
         ? `<span class="opt-measure-figs">${esc(parts.join(" · "))}</span>`
-        : `<span class="opt-note">Not measured</span>`}
-      <button class="btn" data-opt-measure="${esc(b.id)}" ${measuring ? "disabled" : ""}>${icon("bolt")} Measure</button>
+        : e ? "" : `<span class="opt-note">Not measured</span>`}
+      ${e ? `<span class="opt-measure-figs">Estimate — ${esc(estParts.join(" · "))}</span>` : ""}
+      <button class="btn" data-opt-measure="${esc(b.id)}" ${busy ? "disabled" : ""}>${icon("bolt")} Measure</button>
+      <button class="btn" data-opt-estimate="${esc(b.id)}" ${busy ? "disabled" : ""}>${icon("gauge")} Estimate</button>
     </div>`;
   }
 
@@ -507,7 +541,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     const summary = st.context_summary;
     const contextLine = `GPUs: ${summary.gpus} · Backends: ${summary.backends} · Groups: ${summary.groups} · Models: ${summary.models}${summary.traffic_window_label ? ` · Traffic window: ${esc(summary.traffic_window_label)}` : ""}`;
     const consulting = st.consulting;
-    const measuring = st.measuring || measuringBackend !== null;
+    const measuring = st.measuring || measuringBackend !== null || estimatingBackend !== null || estimatesRunning;
     host.innerHTML = `
     <div class="card" id="optConsultCard">
       <div class="opt-consult-grid">
@@ -547,7 +581,9 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         <div class="opt-field-label" style="margin-top:14px">Measured throughput</div>
         ${running.map((b) => measureRow(b, measuring)).join("")}
         ${measuring ? `<div class="opt-consult-actions">
-          <span class="opt-consulting">${icon("clock")} Measuring${measuringBackend ? ` ${esc(measuringBackend)}` : ""}${measureStart ? ` <span id="optMeasureElapsed">${fmtElapsed(Math.floor((Date.now() - measureStart) / 1000))}</span>` : ""} — the standardized benchmark runs two prompts, warm-up plus three measured runs each.</span>
+          ${estimatingBackend
+            ? `<span class="opt-consulting">${icon("clock")} Estimating ${esc(estimatingBackend)}${estimateStart ? ` <span id="optEstimateElapsed">${fmtElapsed(Math.floor((Date.now() - estimateStart) / 1000))}</span>` : ""} — the abbreviated benchmark: the same two prompts, one run each, reduced generation budgets.</span>`
+            : `<span class="opt-consulting">${icon("clock")} Measuring${measuringBackend ? ` ${esc(measuringBackend)}` : ""}${measureStart ? ` <span id="optMeasureElapsed">${fmtElapsed(Math.floor((Date.now() - measureStart) / 1000))}</span>` : ""} — the standardized benchmark runs two prompts, warm-up plus three measured runs each.</span>`}
           <button class="btn danger" data-opt-act="cancel-job">${icon("x")} Cancel</button>
         </div>` : ""}
       </div>` : ""}
@@ -647,6 +683,35 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     paint();
   }
 
+  async function runEstimate(backendId: string): Promise<void> {
+    estimatingBackend = backendId;
+    estimateStart = Date.now();
+    paint();
+    if (estimateTimer !== null) window.clearInterval(estimateTimer);
+    estimateTimer = window.setInterval(() => {
+      const el = hostEl.querySelector("#optEstimateElapsed");
+      if (el) el.textContent = fmtElapsed(Math.floor((Date.now() - estimateStart) / 1000));
+    }, 1000);
+    const r = await optimizeEstimateBackend(backendId);
+    if (estimateTimer !== null) { window.clearInterval(estimateTimer); estimateTimer = null; }
+    estimatingBackend = null;
+    estimateStart = 0;
+    if (disposed) return;
+    if (r.error) {
+      if (state) state.measuring = false;
+      statusLine = r.error === "estimate cancelled"
+        ? "Estimate cancelled."
+        : `Estimate failed — ${r.error}`;
+      paint();
+      return;
+    }
+    if (r.data) {
+      state = r.data;
+      statusLine = "";
+    }
+    paint();
+  }
+
   async function runEvalBaseline(backendId: string): Promise<void> {
     evalBackend = backendId;
     evalStart = Date.now();
@@ -705,6 +770,39 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       const results = (r.data.plan?.experiments ?? []).filter((e) => e.result);
       statusLine = results.length
         ? `Experiments finished — ${results.filter((e) => e.result?.status === "completed").length} of ${results.length} completed. Results are in the Experiments section.`
+        : "";
+    }
+    paint();
+  }
+
+  async function runEstimateExperiments(): Promise<void> {
+    estimatesRunning = true;
+    expEstStart = Date.now();
+    paint();
+    if (expEstTimer !== null) window.clearInterval(expEstTimer);
+    expEstTimer = window.setInterval(() => {
+      const el = hostEl.querySelector("#optExpEstElapsed");
+      if (el) el.textContent = fmtElapsed(Math.floor((Date.now() - expEstStart) / 1000));
+    }, 1000);
+    const r = await optimizeEstimateExperiments();
+    if (expEstTimer !== null) { window.clearInterval(expEstTimer); expEstTimer = null; }
+    estimatesRunning = false;
+    expEstStart = 0;
+    if (disposed) return;
+    if (r.error) {
+      if (state) state.measuring = false;
+      statusLine = r.error === "experiment estimate batch cancelled"
+        ? "Experiment estimate batch cancelled — temp backends were cleaned up and any stopped backends restarted."
+        : `Experiment estimate batch failed — ${r.error}`;
+      paint();
+      return;
+    }
+    if (r.data) {
+      state = r.data;
+      const estimated = (r.data.plan?.experiments ?? []).filter((e) => e.estimate);
+      const acceptedCount = (r.data.plan?.experiments ?? []).filter((e) => e.decision === "accepted").length;
+      statusLine = estimated.length
+        ? `Experiment estimates finished — ${estimated.length} of ${acceptedCount} accepted estimated. Estimates are in the Experiments section.`
         : "";
     }
     paint();
@@ -999,6 +1097,12 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       if (backendId) void runMeasure(backendId);
       return;
     }
+    const estimateBtn = t.closest<HTMLElement>("[data-opt-estimate]");
+    if (estimateBtn) {
+      const backendId = estimateBtn.dataset.optEstimate ?? "";
+      if (backendId) void runEstimate(backendId);
+      return;
+    }
     const evalBtn = t.closest<HTMLElement>("[data-opt-eval]");
     if (evalBtn) {
       const backendId = evalBtn.dataset.optEval ?? "";
@@ -1038,6 +1142,9 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         return;
       case "run-experiments":
         void runExperiments();
+        return;
+      case "estimate-experiments":
+        void runEstimateExperiments();
         return;
       case "consult-results":
         void runConsult(false, state?.plan?.directive ?? "");
@@ -1107,7 +1214,9 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     disposed = true;
     if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
     if (measureTimer !== null) window.clearInterval(measureTimer);
+    if (estimateTimer !== null) window.clearInterval(estimateTimer);
     if (evalTimer !== null) window.clearInterval(evalTimer);
     if (expTimer !== null) window.clearInterval(expTimer);
+    if (expEstTimer !== null) window.clearInterval(expEstTimer);
   };
 }

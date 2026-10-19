@@ -2475,6 +2475,20 @@ export interface OptimizeExperimentResult {
   finished_at: string;
 }
 
+/** One experiment estimate pass's figures (tracker #56): the
+ *  abbreviated benchmark's results, recorded on the proposal.
+ *  An estimate is screening evidence — it is not a run result
+ *  and the figures are always rendered as "Estimate". */
+export interface OptimizeExperimentEstimate {
+  short: OptimizeBenchResult;
+  long: OptimizeBenchResult;
+  batch_id: string;
+  temp_backend_id: string;
+  preflight: string;
+  detail: string;
+  estimated_at: string;
+}
+
 /** One experiment proposal (Phase 5e, addendum A.3): a sibling
  *  of the plan items, not one of them. `requires_stopping`
  *  proposals start denied; undecided never runs. */
@@ -2491,6 +2505,9 @@ export interface OptimizeExperiment {
   decision: OptimizeDecision;
   previously_denied: boolean;
   result: OptimizeExperimentResult | null;
+  /** The latest estimate pass's figures (tracker #56), or
+   *  null/absent when no estimate pass has run. */
+  estimate?: OptimizeExperimentEstimate | null;
 }
 
 /** A plan item excluded at plan build because a reference in it
@@ -2553,6 +2570,10 @@ export interface OptimizeBackendInfo {
    *  null when this backend's configuration has not been
    *  measured. */
   measured: OptimizeMeasured | null;
+  /** Current-fingerprint ESTIMATE summary (tracker #56): the
+   *  abbreviated benchmark's figures, or null. Always
+   *  rendered as "Estimate", never as a measured figure. */
+  estimated: OptimizeMeasured | null;
 }
 
 /** One discovered Hugging Face candidate (Phase 5c): one quant
@@ -2711,6 +2732,17 @@ export function optimizeMeasureBackend(backendId: string) {
   return optimizeStateCmd("optimize_measure_backend", { backendId });
 }
 
+/** optimize_estimate_backend — run the abbreviated benchmark
+ *  (tracker #56) against one running backend and return the
+ *  refreshed state with its estimate summary: the same two
+ *  standardized prompts, one run each, no warm-up, reduced
+ *  generation budgets. Stored as an estimate under its own
+ *  basis; never replaces a measurement. Runs under the shared
+ *  GPU-job slot, so optimizeCancelJob cancels it. */
+export function optimizeEstimateBackend(backendId: string) {
+  return optimizeStateCmd("optimize_estimate_backend", { backendId });
+}
+
 /** optimize_run_baseline — run the screening suite against a
  *  running backend and store the result as the baseline
  *  (Phase 5d). Long-running: inside the suite's 10-minute
@@ -2753,6 +2785,18 @@ export function optimizeSetExperimentState(experimentId: number, decision: Optim
  *  optimizeCancelJob cancels it. */
 export function optimizeRunExperiments() {
   return optimizeStateCmd("optimize_run_experiments");
+}
+
+/** optimize_estimate_experiments — run the plan's accepted
+ *  experiments as one estimate batch (tracker #56): the same
+ *  lifecycle and budgets as a full batch, but each experiment
+ *  runs only the abbreviated benchmark against its temp
+ *  backend and records the figures on the proposal as an
+ *  estimate, so a batch can be screened before full runs are
+ *  committed. Runs under the shared GPU-job slot, so
+ *  optimizeCancelJob cancels it. */
+export function optimizeEstimateExperiments() {
+  return optimizeStateCmd("optimize_estimate_experiments");
 }
 
 /** optimize_set_item_outcome — record an apply outcome on one item

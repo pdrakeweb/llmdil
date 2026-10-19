@@ -131,10 +131,10 @@ export function mockOptimizeState(): OptimizeState {
       { name: "tool-runner", purpose: "" },
     ],
     backends: [
-      { id: "planner", purpose: "", running: true, enabled: true, model_id: "qwen3-27b-planner", short_name: "Qwen3.8-27B Planner", measured: { prompt_per_second: 812, predicted_per_second: 21.8, ttft_ms: 240, age_secs: 3600 } },
-      { id: "coder", purpose: "", running: true, enabled: true, model_id: "qwen3-coder-30b", short_name: "Qwen3-Coder-Next-80B", measured: null },
-      { id: "coder-fast", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null },
-      { id: "tool-runner", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null },
+      { id: "planner", purpose: "", running: true, enabled: true, model_id: "qwen3-27b-planner", short_name: "Qwen3.8-27B Planner", measured: { prompt_per_second: 812, predicted_per_second: 21.8, ttft_ms: 240, age_secs: 3600 }, estimated: { prompt_per_second: 798, predicted_per_second: 21.1, ttft_ms: 255, age_secs: 7200 } },
+      { id: "coder", purpose: "", running: true, enabled: true, model_id: "qwen3-coder-30b", short_name: "Qwen3-Coder-Next-80B", measured: null, estimated: { prompt_per_second: 640, predicted_per_second: 18.4, ttft_ms: 410, age_secs: 1800 } },
+      { id: "coder-fast", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null, estimated: null },
+      { id: "tool-runner", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null, estimated: null },
     ],
     context_summary: {
       gpus: 2, backends: 4, groups: 4, models: 3,
@@ -227,6 +227,14 @@ export function mockOptimizeState(): OptimizeState {
           hypothesis: "A 30B MoE with 3B active parameters should generate faster than the dense 27B at similar quality.",
           predicted: { predicted_per_second: 35, fit: "alongside running backends" },
           requires_stopping: [], run_eval: true, decision: "accepted", previously_denied: false,
+          estimate: {
+            short: { prompt_per_second: 655, predicted_per_second: 35.8, ttft_ms: 205, runs: [] },
+            long: { prompt_per_second: 890, predicted_per_second: 33.5, ttft_ms: 860, runs: [] },
+            batch_id: "sample-estimate-batch", temp_backend_id: "opt-exp-1",
+            preflight: "fits alongside the backends staying running: needs 18432 MiB GPU RAM, 24576 MiB free after their residency",
+            detail: "Estimate only — abbreviated benchmark (one run per prompt, reduced generation budgets). Confirm with a full experiment run before acting on it.",
+            estimated_at: new Date(Date.now() - 900_000).toISOString(),
+          },
           result: {
             experiment_id: 1, candidate_model_id: "Qwen/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf", batch_id: "sample-batch",
             status: "completed",
@@ -270,6 +278,7 @@ export function mockOptimizeState(): OptimizeState {
           predicted: { predicted_per_second: 28, fit: "only after stopping coder" },
           requires_stopping: ["coder"], run_eval: false, decision: "denied", previously_denied: false,
           result: null,
+          estimate: null,
         } as OptimizeExperiment,
       ],
       experiment_validations: [validation("valid"), validation("valid")],
