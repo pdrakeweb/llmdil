@@ -1692,14 +1692,7 @@ fn backend_spec(
         args.push(split);
     }
     args.push("--split-mode".into());
-    args.push(
-        match b.flags.split_mode {
-            manager_config::SplitMode::None => "none",
-            manager_config::SplitMode::Layer => "layer",
-            manager_config::SplitMode::Row => "row",
-        }
-        .into(),
-    );
+    args.push(split_mode_str(b.flags.split_mode).into());
     if let Some(raw) = &b.raw_flags {
         // raw_flags are operator-supplied llama-server arguments, with
         // three reservations:
@@ -2131,63 +2124,7 @@ pub async fn op_list_backends(
                 None => Value::Null,
             };
             let Some(o) = offload.get(&id) else { continue };
-            // The guardrail object: emitted when a placed GPU is
-            // governed by a restriction (status by position), or
-            // when the placement is unknown (empty placed set, not
-            // CPU-only) while the model carries restrictions and
-            // the saved position is partial (status untested,
-            // against the first restriction's architecture).
-            let guardrail = evaluations.get(&id).and_then(|eval| {
-                let status = serde_json::to_value(eval.status).unwrap_or(Value::Null);
-                if let Some(cc) = eval.restricting_cc {
-                    let restriction = eval
-                        .restrictions
-                        .iter()
-                        .find(|r| r.compute_capability == cc)?;
-                    Some(json!({
-                        "compute_capability": format!("{}.{}", cc.0, cc.1),
-                        "allowed": serde_json::to_value(restriction.allowed)
-                            .unwrap_or(Value::Null),
-                        "status": status,
-                        "nearest_verified_layers": eval.nearest_verified_layers,
-                        "has_override": eval.has_override,
-                        "overridden": eval.overridden,
-                    }))
-                } else if eval.placed_ccs.is_empty()
-                    && !eval.cpu_only
-                    && !eval.restrictions.is_empty()
-                    && eval.layers != 0
-                    && eval.layers != eval.moe_layers
-                {
-                    let first = &eval.restrictions[0];
-                    Some(json!({
-                        "compute_capability": format!(
-                            "{}.{}",
-                            first.compute_capability.0, first.compute_capability.1
-                        ),
-                        "allowed": serde_json::to_value(first.allowed)
-                            .unwrap_or(Value::Null),
-                        "status": status,
-                        "nearest_verified_layers": eval.nearest_verified_layers,
-                        "has_override": eval.has_override,
-                        "overridden": eval.overridden,
-                    }))
-                } else {
-                    None
-                }
-            });
-            row["offload"] = json!({
-                "moe_layers": o.moe_layers,
-                "layers": o.layers,
-                "expert_bytes": o.expert_bytes,
-                "total_bytes": o.total_bytes,
-                "green_limit_layers": o.green_limit_layers,
-                "green_end": o.green_end,
-                "yellow_end": o.yellow_end,
-                "sys_bytes_by_position": o.sys_bytes_by_position,
-                "custom": o.custom,
-                "guardrail": guardrail,
-            });
+            row["offload"] = offload_row_json(o, evaluations.get(&id));
         }
     }
     // Gateway request statistics (LiteLLM Prometheus snapshots from
@@ -4257,13 +4194,234 @@ pub async fn op_backend_apply_config(
 
 
 
+/// The tensor split a newly created backend for `model_id` is
+/// assigned from live telemetry: existing enabled backends are
+/// accounted for as they are, and the new backend is assigned a
+/// split by the same algorithm the wizard's tensor-split step
+/// uses. Computed before any config write lock is taken (the
+/// telemetry accessor reads the config while initializing, so the
+/// two must not nest). No telemetry yet (or a single GPU) yields
+/// None — the split stays unset and the wizard step assigns it
+/// later.
+async fn propose_new_backend_split(
+    state: &Arc<AppState>,
+    model_id: &str,
+) -> Option<(Vec<f32>, manager_config::SplitMode)> {
+    let snap = state.config.read().await.clone();
+    let vrams: Vec<u64> = {
+        let store = state.telemetry().await;
+        let guard = lock_telemetry(&store);
+        let mut samples = guard.snapshot();
+        samples.sort_by_key(|s| s.index);
+        samples.iter().map(|s| s.vram_total_mib).collect()
+    };
+    if vrams.len() < 2 {
+        return None;
+    }
+    let size_of = |model_file: &std::path::Path| -> u64 {
+        let target = resolve_under_data_dir(&snap.data_dir, model_file);
+        let model = snap
+            .models
+            .iter()
+            .find(|m| resolve_under_data_dir(&snap.data_dir, &m.gguf_path) == target);
+        match model {
+            Some(m) => {
+                let path = resolve_under_data_dir(&snap.data_dir, &m.gguf_path);
+                match std::fs::metadata(&path) {
+                    Ok(md) if md.is_file() => md.len(),
+                    _ => manager_wizard::steps::estimate_model_bytes(m.params_b as f64),
+                }
+            }
+            None => 0,
+        }
+    };
+    let mut inputs: Vec<manager_wizard::steps::SplitInput> = snap
+        .backends
+        .iter()
+        .filter(|b| b.enabled)
+        .map(|b| manager_wizard::steps::SplitInput {
+            // Account for what the backend actually puts on
+            // GPUs: with expert offload, only the resident
+            // share occupies VRAM.
+            model_bytes: backend_memory_requirement(&snap, b)
+                .map(|r| r.gpu_weights_mib * manager_models::MIB)
+                .unwrap_or_else(|| size_of(&b.model_file)),
+            existing: if b.flags.tensor_split.is_empty() {
+                None
+            } else {
+                Some(b.flags.tensor_split.clone())
+            },
+            assign: false,
+        })
+        .collect();
+    let new_model = snap.models.iter().find(|m| m.id == model_id);
+    inputs.push(manager_wizard::steps::SplitInput {
+        model_bytes: match new_model {
+            Some(m) => size_of(&m.gguf_path),
+            None => 0,
+        },
+        existing: None,
+        assign: true,
+    });
+    manager_wizard::steps::assign_splits(&inputs, &vrams)
+        .into_iter()
+        .last()
+        .flatten()
+}
+
+/// The tensor split for an explicit GPU selection (backend_add's
+/// `gpu_indices`, the add form's Placement chips): an even split
+/// across the selected GPUs, positions in telemetry index order —
+/// the composition the Placement form applies when no configured
+/// split covers the selection. Validation mirrors placement_apply
+/// (telemetry must exist, the selection must name inventory GPUs,
+/// and at least one GPU must be selected). The mode is Layer, as
+/// every assigned split carries (config validation requires a mode
+/// whenever a split is set).
+fn split_for_gpu_selection(
+    gpu_indices: &[u32],
+    selected: &[u32],
+) -> Result<(Vec<f32>, manager_config::SplitMode), ApiError> {
+    if gpu_indices.is_empty() {
+        return Err(ApiError::Telemetry(
+            "no telemetry yet; cannot validate placement".to_string(),
+        ));
+    }
+    if selected.is_empty() {
+        return Err(ApiError::InvalidInput(
+            "select at least one GPU for the split".to_string(),
+        ));
+    }
+    for s in selected {
+        if !gpu_indices.contains(s) {
+            return Err(ApiError::InvalidInput(format!(
+                "GPU {s} is not in the telemetry inventory"
+            )));
+        }
+    }
+    let share = 1.0 / selected.len() as f32;
+    let split: Vec<f32> = gpu_indices
+        .iter()
+        .map(|i| if selected.contains(i) { share } else { 0.0 })
+        .collect();
+    Ok((split, manager_config::SplitMode::Layer))
+}
+
+/// The context/batch validation shared by backend_update_flags
+/// and backend_add (the add form offers the same fields under the
+/// same rules): context within the accepted range, batch between
+/// 1 and the context length.
+fn validate_ctx_batch(n_ctx: u32, n_batch: u32) -> Result<(), ApiError> {
+    if !(1024..=1_048_576).contains(&n_ctx) {
+        return Err(ApiError::InvalidInput(
+            "context length must be between 1024 and 1048576".to_string(),
+        ));
+    }
+    if n_batch == 0 || n_batch > n_ctx {
+        return Err(ApiError::InvalidInput(
+            "batch size must be between 1 and the context length".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The resolved offload for a backend being created: the raw flags
+/// it starts with, and whether an override must be journaled for
+/// the position once the creation save lands.
+struct NewBackendOffload {
+    raw_flags: Option<String>,
+    record_override: bool,
+    placed_ccs: Vec<(u32, u32)>,
+}
+
+/// Validate a chosen expert-offload position for a backend being
+/// created and compute its starting raw flags (tracker #49). The
+/// position goes through the same capability and guardrail
+/// evaluation backend_set_offload applies to an existing backend:
+/// the model must be offload-capable, the position must fit its
+/// MoE layer count, and a guardrail-blocked position is refused
+/// unless the operator confirmed the override in the add form. The
+/// refusal wording is the creation path's own (there is no Edit
+/// Flags form for a backend that does not exist yet).
+fn resolve_new_backend_offload(
+    cfg: &AppConfig,
+    backend: &manager_config::BackendConfig,
+    gpus: &[GpuInfo],
+    journal: &activation::ActivationJournal,
+    layers: u32,
+    allow_override: bool,
+) -> Result<NewBackendOffload, ApiError> {
+    let info = backend_offload_info(cfg, backend).ok_or_else(|| {
+        ApiError::InvalidInput(format!(
+            "backend {}'s model does not support expert offload",
+            backend.id
+        ))
+    })?;
+    if layers > info.moe_layers {
+        return Err(ApiError::InvalidInput(format!(
+            "offload of {layers} layers exceeds the model's {} MoE layers",
+            info.moe_layers
+        )));
+    }
+    let (placed_ccs, cpu_only) = placed_offload_placement(backend, gpus);
+    let eval = evaluate_offload_position(
+        &info.restrictions,
+        &backend.id,
+        layers,
+        info.moe_layers,
+        placed_ccs,
+        cpu_only,
+        journal,
+    );
+    let blocked = eval.status == manager_models::OffloadStatus::Blocked;
+    if blocked && !allow_override {
+        // Blocked implies a placed CC matches a restriction (the
+        // status function blocks only on a placed match); the
+        // restricting CC names the architecture in the message.
+        let cc = eval.restricting_cc.unwrap_or((0, 0));
+        return Err(ApiError::InvalidInput(format!(
+            "offload of {layers} of {} layers is outside the verified range for this GPU (compute capability {}.{}) — choose {} of {} layers, or confirm the position with an explicit override",
+            info.moe_layers, cc.0, cc.1, eval.nearest_verified_layers, info.moe_layers
+        )));
+    }
+    let target = manager_models::offload_for_layers(layers, info.moe_layers);
+    let raw_flags = manager_models::set_expert_offload(backend.raw_flags.as_deref(), target);
+    Ok(NewBackendOffload {
+        raw_flags,
+        record_override: blocked,
+        placed_ccs: eval.placed_ccs,
+    })
+}
+
+/// The `--split-mode` spelling for a structured split mode.
+fn split_mode_str(mode: manager_config::SplitMode) -> &'static str {
+    match mode {
+        manager_config::SplitMode::None => "none",
+        manager_config::SplitMode::Layer => "layer",
+        manager_config::SplitMode::Row => "row",
+    }
+}
+
 /// Create a new backend and route it through the gateway (spec §14
-/// `backend_add`). The backend is created with the seeded defaults
-/// (32K context, a tensor split assigned from live telemetry when
-/// available, the standard restart policy) and
-/// the chosen registered model; it joins an existing gateway group
-/// or a new one created for it. The gateway picks the route up when
-/// it next (re)starts — its config is generated from this state.
+/// `backend_add`). The backend is created with the chosen registered
+/// model and the standard restart policy; it joins an existing
+/// gateway group or a new one created for it. The gateway picks the
+/// route up when it next (re)starts — its config is generated from
+/// this state.
+///
+/// The launch parameters the add form offers (tracker #49) ride the
+/// optional arguments; each `None` keeps the pre-#49 creation
+/// default exactly: 32K context, 512 batch, a tensor split assigned
+/// from live telemetry when available, and the model's catalog
+/// default expert offload. A chosen offload position is validated
+/// against the new backend's placement guardrails exactly as
+/// `backend_set_offload` validates it for an existing backend —
+/// a guardrail-blocked position is refused unless
+/// `offload_override` is set, in which case the override is
+/// journaled once the creation save lands. `gpu_indices` replaces
+/// the telemetry assignment with an even split across the selected
+/// GPUs (the Placement form's composition for an explicit
+/// selection).
 #[allow(clippy::too_many_arguments)] // argument list is the registry contract
 pub async fn op_backend_add(
     state: &Arc<AppState>,
@@ -4274,6 +4432,11 @@ pub async fn op_backend_add(
     group: String,
     create_group: bool,
     enabled: bool,
+    n_ctx: Option<u32>,
+    n_batch: Option<u32>,
+    offload_layers: Option<u32>,
+    offload_override: Option<bool>,
+    gpu_indices: Option<Vec<u32>>,
 ) -> ApiResult {
     let id = id.trim().to_string();
     let group = group.trim().to_string();
@@ -4300,75 +4463,38 @@ pub async fn op_backend_add(
             "port must be non-zero".to_string(),
         ));
     }
-    // Placement for the new backend, computed before the config
-    // write lock is taken (the telemetry accessor reads the config
-    // while initializing, so the two must not nest). Existing enabled
-    // backends are accounted for as they are; the new backend is
-    // assigned a split by the same algorithm the wizard's
-    // tensor-split step uses. No telemetry yet (or a single GPU)
-    // leaves the split unset — the wizard step assigns it later.
-    let new_backend_split: Option<(Vec<f32>, manager_config::SplitMode)> = {
-        let snap = state.config.read().await.clone();
-        let vrams: Vec<u64> = {
-            let store = state.telemetry().await;
-            let guard = lock_telemetry(&store);
-            let mut samples = guard.snapshot();
-            samples.sort_by_key(|s| s.index);
-            samples.iter().map(|s| s.vram_total_mib).collect()
-        };
-        if vrams.len() < 2 {
-            None
-        } else {
-            let size_of = |model_file: &std::path::Path| -> u64 {
-                let target = resolve_under_data_dir(&snap.data_dir, model_file);
-                let model = snap
-                    .models
-                    .iter()
-                    .find(|m| resolve_under_data_dir(&snap.data_dir, &m.gguf_path) == target);
-                match model {
-                    Some(m) => {
-                        let path = resolve_under_data_dir(&snap.data_dir, &m.gguf_path);
-                        match std::fs::metadata(&path) {
-                            Ok(md) if md.is_file() => md.len(),
-                            _ => manager_wizard::steps::estimate_model_bytes(m.params_b as f64),
-                        }
-                    }
-                    None => 0,
-                }
-            };
-            let mut inputs: Vec<manager_wizard::steps::SplitInput> = snap
-                .backends
-                .iter()
-                .filter(|b| b.enabled)
-                .map(|b| manager_wizard::steps::SplitInput {
-                    // Account for what the backend actually puts on
-                    // GPUs: with expert offload, only the resident
-                    // share occupies VRAM.
-                    model_bytes: backend_memory_requirement(&snap, b)
-                        .map(|r| r.gpu_weights_mib * manager_models::MIB)
-                        .unwrap_or_else(|| size_of(&b.model_file)),
-                    existing: if b.flags.tensor_split.is_empty() {
-                        None
-                    } else {
-                        Some(b.flags.tensor_split.clone())
-                    },
-                    assign: false,
-                })
-                .collect();
-            let new_model = snap.models.iter().find(|m| m.id == model_id);
-            inputs.push(manager_wizard::steps::SplitInput {
-                model_bytes: match new_model {
-                    Some(m) => size_of(&m.gguf_path),
-                    None => 0,
-                },
-                existing: None,
-                assign: true,
-            });
-            manager_wizard::steps::assign_splits(&inputs, &vrams)
-                .into_iter()
-                .last()
-                .flatten()
+    // Context/batch: the add form's values when chosen, the seeded
+    // defaults otherwise; validated by the same rules
+    // backend_update_flags applies (the batch bound reads the
+    // EFFECTIVE context, so an oversized batch against a small
+    // chosen context is refused here, not at first start).
+    let eff_ctx = n_ctx.unwrap_or(32768);
+    let eff_batch = n_batch.unwrap_or(512);
+    validate_ctx_batch(eff_ctx, eff_batch)?;
+    // GPU inventory, fetched before the config write lock when the
+    // request needs it (an explicit GPU selection to validate, or
+    // an offload position to evaluate against the placed GPUs'
+    // guardrails). The telemetry accessor reads the config while
+    // initializing, so it must never be called under the lock.
+    let gpu_inventory: Vec<GpuInfo> = if gpu_indices.is_some() || offload_layers.is_some() {
+        let store = state.telemetry().await;
+        let inventory = lock_telemetry(&store).inventory();
+        inventory
+    } else {
+        Vec::new()
+    };
+    // Placement for the new backend, likewise resolved before the
+    // write lock: the operator's GPU selection when one was made,
+    // else the telemetry assignment.
+    let (tensor_split, split_mode) = match &gpu_indices {
+        Some(selected) => {
+            let indices: Vec<u32> = gpu_inventory.iter().map(|g| g.index).collect();
+            split_for_gpu_selection(&indices, selected)?
         }
+        None => match propose_new_backend_split(state, &model_id).await {
+            Some((split, mode)) => (split, mode),
+            None => (Vec::new(), manager_config::SplitMode::None),
+        },
     };
     let mut cfg = state.config.write().await;
     let pre_cfg = cfg.clone();
@@ -4408,25 +4534,22 @@ pub async fn op_backend_add(
             g.members.push(id.clone());
         }
     }
-    let (tensor_split, split_mode) = match &new_backend_split {
-        Some((split, mode)) => (split.clone(), *mode),
-        None => (Vec::new(), manager_config::SplitMode::None),
-    };
-    new_cfg.backends.push(manager_config::BackendConfig {
+    let mut backend = manager_config::BackendConfig {
         id: id.clone(),
         enabled,
         model_file: model.gguf_path.clone(),
         port,
         flags: manager_config::ServerFlags {
-            n_ctx: 32768,
-            n_batch: 512,
+            n_ctx: eff_ctx,
+            n_batch: eff_batch,
             tensor_split,
             split_mode,
         },
         // A new backend starts with its model's catalog default
         // expert offload (the green limit), when the model pins
         // one — e.g. a backend created for Nemotron starts at
-        // --n-cpu-moe 16 rather than with no offload at all.
+        // --n-cpu-moe 16 rather than with no offload at all. A
+        // position chosen in the add form replaces it below.
         raw_flags: catalog_default_raw_flags(&model.id),
         restart_policy: manager_config::RestartPolicy {
             max_retries: 5,
@@ -4435,7 +4558,31 @@ pub async fn op_backend_add(
         overrides_global: false,
         tool_call_probe: None,
         purpose: String::new(),
-    });
+    };
+    // A chosen offload position is resolved against the constructed
+    // backend (its final placement drives the guardrail evaluation)
+    // before anything is journaled or saved, so a refused position
+    // leaves no trace. The override, when the operator confirmed a
+    // blocked position, is journaled only after the creation save
+    // lands — mirroring backend_set_offload, no override ever
+    // covers a change that did not persist.
+    let mut offload_override_to_record: Option<(u32, Vec<(u32, u32)>)> = None;
+    if let Some(layers) = offload_layers {
+        let journal = activation::load_journal(&state.data_dir);
+        let resolved = resolve_new_backend_offload(
+            &new_cfg,
+            &backend,
+            &gpu_inventory,
+            &journal,
+            layers,
+            offload_override == Some(true),
+        )?;
+        backend.raw_flags = resolved.raw_flags;
+        if resolved.record_override {
+            offload_override_to_record = Some((layers, resolved.placed_ccs));
+        }
+    }
+    new_cfg.backends.push(backend);
     if let Some(m) = new_cfg.models.iter_mut().find(|m| m.id == model_id) {
         if !m.assigned_backends.contains(&id) {
             m.assigned_backends.push(id.clone());
@@ -4457,11 +4604,90 @@ pub async fn op_backend_add(
         .map_err(ApiError::from)?;
     *cfg = new_cfg;
     drop(cfg);
+    if let Some((layers, placed_ccs)) = offload_override_to_record {
+        let _ = activation::record_offload_override(&state.data_dir, &id, layers, placed_ccs);
+    }
     ensure_backend_specs(state).await;
     state.sync_backend_service_definition(&id).await;
     Ok(json!({ "backend_id": id, "group": group, "persisted": true }))
 }
 
+
+/// Preview what creating a backend for `model_id` would carry
+/// (tracker #49): the expert-offload slider state for the model —
+/// the same `offload` object list_backends rows carry, computed
+/// over a transient backend holding the creation defaults (the
+/// catalog default offload position, the placement creation would
+/// use) — plus that placement itself (`tensor_split` /
+/// `split_mode`). The add form renders its offload control and
+/// Placement chips from this, so the model-dependent behavior
+/// (slider range, guardrail states) is the edit form's, computed by
+/// the same code. `gpu_indices` previews an explicit GPU selection
+/// instead of the telemetry assignment. Nothing is written.
+pub async fn op_backend_add_preview(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    model_id: String,
+    gpu_indices: Option<Vec<u32>>,
+) -> ApiResult {
+    let cfg = state.config.read().await.clone();
+    let model = cfg
+        .models
+        .iter()
+        .find(|m| m.id == model_id)
+        .ok_or_else(|| ApiError::NotFound(format!("model {model_id}")))?
+        .clone();
+    // The GPU inventory serves both call sites below (selection
+    // validation, guardrail evaluation). cfg is a clone, so no
+    // config lock is held while telemetry is touched.
+    let gpu_inventory: Vec<GpuInfo> = {
+        let store = state.telemetry().await;
+        let inventory = lock_telemetry(&store).inventory();
+        inventory
+    };
+    let (tensor_split, split_mode) = match &gpu_indices {
+        Some(selected) => {
+            let indices: Vec<u32> = gpu_inventory.iter().map(|g| g.index).collect();
+            split_for_gpu_selection(&indices, selected)?
+        }
+        None => match propose_new_backend_split(state, &model_id).await {
+            Some((split, mode)) => (split, mode),
+            None => (Vec::new(), manager_config::SplitMode::None),
+        },
+    };
+    // The transient backend creation would build, at its defaults.
+    let backend = manager_config::BackendConfig {
+        id: String::new(),
+        enabled: true,
+        model_file: model.gguf_path.clone(),
+        port: 0,
+        flags: manager_config::ServerFlags {
+            n_ctx: 32768,
+            n_batch: 512,
+            tensor_split: tensor_split.clone(),
+            split_mode,
+        },
+        raw_flags: catalog_default_raw_flags(&model.id),
+        restart_policy: manager_config::RestartPolicy {
+            max_retries: 5,
+            backoff_base_secs: 2,
+        },
+        overrides_global: false,
+        tool_call_probe: None,
+        purpose: String::new(),
+    };
+    let offload = backend_offload_info(&cfg, &backend).map(|info| {
+        let journal = activation::load_journal(&state.data_dir);
+        let eval = evaluate_backend_offload(&cfg, &backend, &gpu_inventory, &journal);
+        offload_row_json(&info, eval.as_ref())
+    });
+    Ok(json!({
+        "model_id": model_id,
+        "offload": offload,
+        "tensor_split": tensor_split,
+        "split_mode": split_mode_str(split_mode),
+    }))
+}
 
 /// Update a backend's llama-server sizing flags: context length
 /// (`-c`) and batch size (`-b`). This is the supported way to change
@@ -4476,16 +4702,7 @@ pub async fn op_backend_update_flags(
     n_ctx: u32,
     n_batch: u32,
 ) -> ApiResult {
-    if !(1024..=1_048_576).contains(&n_ctx) {
-        return Err(ApiError::InvalidInput(
-            "context length must be between 1024 and 1048576".to_string(),
-        ));
-    }
-    if n_batch == 0 || n_batch > n_ctx {
-        return Err(ApiError::InvalidInput(
-            "batch size must be between 1 and the context length".to_string(),
-        ));
-    }
+    validate_ctx_batch(n_ctx, n_batch)?;
     let mut cfg = state.config.write().await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
@@ -6209,6 +6426,70 @@ fn backend_offload_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> O
     })
 }
 
+/// The `offload` object a backend row carries — the slider state
+/// plus its guardrail object — shared by list_backends and the add
+/// form's preview (backend_add_preview), so the add form renders
+/// the offload control from exactly the payload the Edit Flags form
+/// renders from. The guardrail is emitted when a placed GPU is
+/// governed by a restriction (status by position), or when the
+/// placement is unknown (empty placed set, not CPU-only) while the
+/// model carries restrictions and the saved position is partial
+/// (status untested, against the first restriction's architecture);
+/// null otherwise.
+fn offload_row_json(o: &OffloadInfo, eval: Option<&OffloadEvaluation>) -> Value {
+    let guardrail = eval.and_then(|eval| {
+        let status = serde_json::to_value(eval.status).unwrap_or(Value::Null);
+        if let Some(cc) = eval.restricting_cc {
+            let restriction = eval
+                .restrictions
+                .iter()
+                .find(|r| r.compute_capability == cc)?;
+            Some(json!({
+                "compute_capability": format!("{}.{}", cc.0, cc.1),
+                "allowed": serde_json::to_value(restriction.allowed)
+                    .unwrap_or(Value::Null),
+                "status": status,
+                "nearest_verified_layers": eval.nearest_verified_layers,
+                "has_override": eval.has_override,
+                "overridden": eval.overridden,
+            }))
+        } else if eval.placed_ccs.is_empty()
+            && !eval.cpu_only
+            && !eval.restrictions.is_empty()
+            && eval.layers != 0
+            && eval.layers != eval.moe_layers
+        {
+            let first = &eval.restrictions[0];
+            Some(json!({
+                "compute_capability": format!(
+                    "{}.{}",
+                    first.compute_capability.0, first.compute_capability.1
+                ),
+                "allowed": serde_json::to_value(first.allowed)
+                    .unwrap_or(Value::Null),
+                "status": status,
+                "nearest_verified_layers": eval.nearest_verified_layers,
+                "has_override": eval.has_override,
+                "overridden": eval.overridden,
+            }))
+        } else {
+            None
+        }
+    });
+    json!({
+        "moe_layers": o.moe_layers,
+        "layers": o.layers,
+        "expert_bytes": o.expert_bytes,
+        "total_bytes": o.total_bytes,
+        "green_limit_layers": o.green_limit_layers,
+        "green_end": o.green_end,
+        "yellow_end": o.yellow_end,
+        "sys_bytes_by_position": o.sys_bytes_by_position,
+        "custom": o.custom,
+        "guardrail": guardrail,
+    })
+}
+
 
 /// Project a tensor split onto discovered VRAM (spec §14
 /// `placement_propose`). The model resolves from the curated catalog
@@ -7427,6 +7708,149 @@ mod tests {
             .expect("coder backend evaluates");
         assert_eq!(eval.restricting_cc, None);
         assert_ne!(eval.status, manager_models::OffloadStatus::Blocked);
+    }
+
+    #[test]
+    fn validate_ctx_batch_matches_update_flags_rules() {
+        assert!(validate_ctx_batch(32768, 512).is_ok());
+        assert!(validate_ctx_batch(1024, 1024).is_ok());
+        assert!(validate_ctx_batch(1_048_576, 1).is_ok());
+        // Below the context floor, above the ceiling, a zero
+        // batch, and a batch past the context all refuse.
+        assert!(validate_ctx_batch(1023, 512).is_err());
+        assert!(validate_ctx_batch(1_048_577, 512).is_err());
+        assert!(validate_ctx_batch(32768, 0).is_err());
+        assert!(validate_ctx_batch(2048, 4096).is_err());
+    }
+
+    #[test]
+    fn split_for_gpu_selection_composes_even_splits() {
+        let (split, mode) = split_for_gpu_selection(&[0, 1], &[0, 1]).unwrap();
+        assert_eq!(split, vec![0.5, 0.5]);
+        assert_eq!(mode, manager_config::SplitMode::Layer);
+        let (split, _) = split_for_gpu_selection(&[0, 1], &[1]).unwrap();
+        assert_eq!(split, vec![0.0, 1.0]);
+        let (split, mode) = split_for_gpu_selection(&[0], &[0]).unwrap();
+        assert_eq!(split, vec![1.0]);
+        assert_eq!(mode, manager_config::SplitMode::Layer);
+        // No telemetry, an empty selection, and an unknown GPU
+        // all refuse (placement_apply's validation, mirrored).
+        assert!(split_for_gpu_selection(&[], &[0]).is_err());
+        assert!(split_for_gpu_selection(&[0, 1], &[]).is_err());
+        assert!(split_for_gpu_selection(&[0, 1], &[2]).is_err());
+    }
+
+    fn register_test_model(cfg: &mut AppConfig, model_id: &str, file: &str) {
+        cfg.models.push(manager_config::ModelConfig {
+            id: model_id.to_string(),
+            gguf_path: PathBuf::from(file),
+            quant: "Q4_K_M".to_string(),
+            params_b: 30.0,
+            sha256: "a".repeat(64),
+            verified_at: None,
+            verified_sha256: None,
+            source_url: String::new(),
+            assigned_backends: Vec::new(),
+            enabled: true,
+            display_name: None,
+        });
+    }
+
+    fn uncreated_backend(
+        id: &str,
+        file: &str,
+        raw_flags: Option<String>,
+    ) -> manager_config::BackendConfig {
+        manager_config::BackendConfig {
+            id: id.to_string(),
+            enabled: true,
+            model_file: PathBuf::from(file),
+            port: 8090,
+            flags: manager_config::ServerFlags {
+                n_ctx: 32768,
+                n_batch: 512,
+                tensor_split: Vec::new(),
+                split_mode: manager_config::SplitMode::None,
+            },
+            raw_flags,
+            restart_policy: manager_config::RestartPolicy {
+                max_retries: 5,
+                backoff_base_secs: 2,
+            },
+            overrides_global: false,
+            tool_call_probe: None,
+            purpose: String::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_new_backend_offload_applies_creation_rules() {
+        let mut cfg = test_cfg();
+        register_test_model(
+            &mut cfg,
+            "qwen3-coder-30b",
+            "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
+        );
+        // The backend creation would build: unsplit (places on GPU
+        // 0), raw flags at the catalog default (full offload).
+        let backend = uncreated_backend(
+            "coder-2",
+            "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
+            catalog_default_raw_flags("qwen3-coder-30b"),
+        );
+        // GPU 0 is a Pascal card: partial positions are blocked.
+        let mut gpus = test_gpus();
+        gpus[0].compute_capability = (6, 0);
+        let journal = activation::ActivationJournal::default();
+
+        // A blocked position without an override refuses, naming
+        // the snap target.
+        let err = resolve_new_backend_offload(&cfg, &backend, &gpus, &journal, 46, false)
+            .err()
+            .expect("blocked position refuses");
+        assert!(
+            format!("{err}").contains("outside the verified range"),
+            "unexpected refusal: {err}"
+        );
+
+        // The same position with a confirmed override resolves and
+        // asks for the override to be journaled.
+        let resolved =
+            resolve_new_backend_offload(&cfg, &backend, &gpus, &journal, 46, true).unwrap();
+        assert_eq!(resolved.raw_flags.as_deref(), Some("--n-cpu-moe 46"));
+        assert!(resolved.record_override);
+        assert_eq!(resolved.placed_ccs, vec![(6, 0)]);
+
+        // The catalog default position resolves to the catalog
+        // default flags, with no override to record.
+        let resolved =
+            resolve_new_backend_offload(&cfg, &backend, &gpus, &journal, 48, false).unwrap();
+        assert_eq!(
+            resolved.raw_flags,
+            catalog_default_raw_flags("qwen3-coder-30b")
+        );
+        assert!(!resolved.record_override);
+
+        // No offload clears the tokens entirely.
+        let resolved =
+            resolve_new_backend_offload(&cfg, &backend, &gpus, &journal, 0, false).unwrap();
+        assert_eq!(resolved.raw_flags, None);
+
+        // Past the model's MoE layer count refuses.
+        assert!(resolve_new_backend_offload(&cfg, &backend, &gpus, &journal, 49, false).is_err());
+
+        // A model with no catalog offload pin is not
+        // offload-capable: any chosen position refuses.
+        let mut cfg = test_cfg();
+        register_test_model(&mut cfg, "qwen3-27b-planner", "models/planner.gguf");
+        let backend = uncreated_backend("planner-2", "models/planner.gguf", None);
+        let err = resolve_new_backend_offload(&cfg, &backend, &gpus, &journal, 1, false)
+            .err()
+            .expect("dense model refuses offload");
+        assert!(
+            format!("{err}").contains("does not support expert offload"),
+            "unexpected refusal: {err}"
+        );
     }
 
     #[test]

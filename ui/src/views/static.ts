@@ -15,7 +15,7 @@ import {
   getGpuTelemetry, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
   getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, getBackendLaunchCommand,
   getBackendConfig, applyBackendConfig, testBackend, testBackendToolCall, placementPropose, placementApply,
-  addBackend, deleteBackend, modelAssign,
+  addBackend, backendAddPreview, deleteBackend, modelAssign,
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
   verifyModel, deleteModel, modelSetEnabled, modelAdd, modelSetShortName,
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
@@ -29,7 +29,7 @@ import {
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
   adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, ServicesInfo } from "../api";
+import type { ActivationChange, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendAddPreview, BackendOffload, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, ServicesInfo } from "../api";
 import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
 import type { GpuInfo, WizardStepState } from "../types";
 
@@ -1193,6 +1193,126 @@ function offloadTrackBackground(o: BackendOffload): string {
   return `${hatch}, ${muted}, ${offloadGradient(o)}`;
 }
 
+/** The context/batch field pair of the flags editor — preset
+ *  selects with a Custom numeric input when the value is not a
+ *  preset — shared between the Edit Flags form and the Add backend
+ *  form (tracker #49): one implementation of the parameter
+ *  fields, two hosts. `fieldAttr` is the data attribute the host's
+ *  draft sync reads ("data-flags-field" in the edit form,
+ *  "data-add-flags-field" in the add form); ctxMax annotates
+ *  presets beyond the model's rated context. */
+function flagsCtxBatchHtml(o: {
+  ctx: number;
+  batch: number;
+  ctxMax: number | null;
+  fieldAttr: string;
+  disabled: boolean;
+}): string {
+  const dis = o.disabled ? " disabled" : "";
+  return `<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px">
+        <label style="font-size:12px;color:var(--text2)">Context length (-c)
+          <span style="display:flex;gap:6px;margin-top:4px">
+            <select ${o.fieldAttr}="ctx-preset" style="${SELECT_STYLE};flex:1;min-width:0"${dis}>
+              ${CTX_PRESETS.map((v) => `<option value="${v}"${v === o.ctx ? " selected" : ""}>${v.toLocaleString()} (${ctxShort(v)})${v === 32768 ? " \u2014 default" : ""}${o.ctxMax && v > o.ctxMax ? " \u2014 beyond rated" : ""}</option>`).join("")}
+              <option value="custom"${CTX_PRESETS.includes(o.ctx) ? "" : " selected"}>Custom\u2026</option>
+            </select>
+            ${CTX_PRESETS.includes(o.ctx) ? "" : `<input ${o.fieldAttr}="ctx-custom" type="number" value="${o.ctx}" min="1024" max="1048576" style="${SELECT_STYLE};width:110px"${dis}>`}
+          </span></label>
+        <label style="font-size:12px;color:var(--text2)">Batch size (-b)
+          <span style="display:flex;gap:6px;margin-top:4px">
+            <select ${o.fieldAttr}="batch-preset" style="${SELECT_STYLE};flex:1;min-width:0"${dis}>
+              ${BATCH_PRESETS.map((v) => `<option value="${v}"${v === o.batch ? " selected" : ""}>${v.toLocaleString()}${v === 512 ? " \u2014 default" : ""}</option>`).join("")}
+              <option value="custom"${BATCH_PRESETS.includes(o.batch) ? "" : " selected"}>Custom\u2026</option>
+            </select>
+            ${BATCH_PRESETS.includes(o.batch) ? "" : `<input ${o.fieldAttr}="batch-custom" type="number" value="${o.batch}" min="1" style="${SELECT_STYLE};width:110px"${dis}>`}
+          </span></label>
+      </div>`;
+}
+
+/** The rated-context line under the flags fields, shared by the
+ *  Edit Flags form and the Add backend form. `savedText` is the
+ *  host's sentence for when the values take effect (the edit form
+ *  saves to the configuration immediately; the add form saves at
+ *  creation). */
+function flagsRatedLineHtml(o: {
+  ctxMax: number | null;
+  modelId: string | null;
+  savedText: string;
+}): string {
+  return `<div style="font-size:12px;color:var(--text2);margin-top:6px">${o.modelId && o.ctxMax
+    ? `Rated context: ${o.ctxMax.toLocaleString()}<span class="info-tip" title="${esc(`Model ${o.modelId} is rated to ${ctxShort(o.ctxMax)} context (${o.ctxMax.toLocaleString()} tokens); larger values are accepted but exceed the rating. ${o.savedText}`)}">${icon("info")}</span>`
+    : `Context range: 1,024\u20131,048,576<span class="info-tip" title="Accepted context range: 1,024 to 1,048,576. ${o.savedText}">${icon("info")}</span>`}</div>`;
+}
+
+/** The expert-offload slider block — label with guardrail-aware
+ *  text, the slider track, the weight figures, and the host's
+ *  guardrail decision row — shared between the Edit Flags form
+ *  and the Add backend form. Dragging updates the readout in
+ *  place via paintOffloadReadout; the host owns what releasing
+ *  the slider means (the edit form saves immediately through
+ *  backend_set_offload; the add form records the position for
+ *  creation). */
+function offloadSliderHtml(o: {
+  offload: BackendOffload;
+  layers: number;
+  ownerId: string;
+  disabled: boolean;
+  decisionHtml: string;
+}): string {
+  const off = o.offload;
+  const n = o.layers;
+  const figs = offloadFigures(off, n);
+  const dis = o.disabled ? " disabled" : "";
+  return `<div style="margin-top:12px">
+      <label style="font-size:12px;color:var(--text2);display:block">Expert offload to system RAM \u2014 <span data-offload-layers-label>${esc(offloadLayersLabel(off, n))}</span><span class="info-tip" data-offload-tip title="${esc(offloadTipText(off, n))}">${icon("info")}</span></label>
+      <input type="range" class="offload-range" min="0" max="${off.moe_layers}" step="1" value="${n}" data-offload-slider data-offload-backend="${esc(o.ownerId)}" style="background:${offloadTrackBackground(off)}" aria-label="Expert offload layers for ${esc(o.ownerId)}"${dis}>
+      <div style="font-size:12px;color:var(--text2);margin-top:4px"><span data-offload-token style="font-family:var(--mono)">${esc(offloadTokenText(off, n))}</span> \u00b7 GPU weights: <span data-offload-gpu>${fmtGb(figs.gpuMib / 1024)}</span> GiB \u00b7 System RAM: <span data-offload-sys>${fmtGb(figs.sysMib / 1024)}</span> GiB</div>
+      ${o.decisionHtml}
+    </div>`;
+}
+
+/** Update an offload slider's readout in place (layers label,
+ *  flag tokens, weight figures, info tip) — shared by both forms,
+ *  so a drag never needs a repaint in either. */
+function paintOffloadReadout(card: Element, o: BackendOffload, n: number): void {
+  const figs = offloadFigures(o, n);
+  const setText = (sel: string, txt: string): void => {
+    const el = card.querySelector(sel);
+    if (el) el.textContent = txt;
+  };
+  setText("[data-offload-layers-label]", offloadLayersLabel(o, n));
+  setText("[data-offload-token]", offloadTokenText(o, n));
+  setText("[data-offload-gpu]", fmtGb(figs.gpuMib / 1024));
+  setText("[data-offload-sys]", fmtGb(figs.sysMib / 1024));
+  const tip = card.querySelector("[data-offload-tip]");
+  if (tip) tip.setAttribute("title", offloadTipText(o, n));
+}
+
+/** Apply one flags-field event to a draft — the collection logic
+ *  both forms share for the ctx/batch preset+custom pairs. Preset
+ *  selects set the value on "change" and report that a repaint is
+ *  needed (to show or hide the Custom numeric input); custom
+ *  inputs only update the draft. Returns true when the host
+ *  should repaint. */
+function applyFlagsField(
+  draft: { ctx: number; batch: number },
+  field: string,
+  value: string,
+  isChange: boolean,
+): boolean {
+  if (field === "ctx-custom") { draft.ctx = Number(value); return false; }
+  if (field === "batch-custom") { draft.batch = Number(value); return false; }
+  if (isChange && field === "ctx-preset") {
+    if (value !== "custom") draft.ctx = Number(value);
+    return true;
+  }
+  if (isChange && field === "batch-preset") {
+    if (value !== "custom") draft.batch = Number(value);
+    return true;
+  }
+  return false;
+}
+
 /** Draft state for the in-card flags form, non-null only for the
  *  backend whose form is open. ctxMax/modelId describe the backend's
  *  model (its rated context from the catalog), for annotating
@@ -1487,7 +1607,6 @@ function backendCard(
   const offloadHtml = flags && b.offload ? (() => {
     const o = b.offload;
     const n = flags.offloadLayers ?? o.layers;
-    const figs = offloadFigures(o, n);
     // A released position the guardrail blocks is not committed:
     // the form carries an inline decision row until the operator
     // saves it with an override or snaps to the nearest verified
@@ -1499,37 +1618,13 @@ function backendCard(
       <button class="btn" data-back-act="offload-override" data-back-id="${esc(b.id)}"${dis}>${icon("warn")} Save with override</button>
       <button class="btn" data-back-act="offload-snap" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Snap to ${o.guardrail.nearest_verified_layers} of ${o.moe_layers} layers</button>
     </div>` : "";
-    return `<div style="margin-top:12px">
-      <label style="font-size:12px;color:var(--text2);display:block">Expert offload to system RAM — <span data-offload-layers-label>${esc(offloadLayersLabel(o, n))}</span><span class="info-tip" data-offload-tip title="${esc(offloadTipText(o, n))}">${icon("info")}</span></label>
-      <input type="range" class="offload-range" min="0" max="${o.moe_layers}" step="1" value="${n}" data-offload-slider data-offload-backend="${esc(b.id)}" style="background:${offloadTrackBackground(o)}" aria-label="Expert offload layers for ${esc(b.id)}"${dis}>
-      <div style="font-size:12px;color:var(--text2);margin-top:4px"><span data-offload-token style="font-family:var(--mono)">${esc(offloadTokenText(o, n))}</span> · GPU weights: <span data-offload-gpu>${fmtGb(figs.gpuMib / 1024)}</span> GiB · System RAM: <span data-offload-sys>${fmtGb(figs.sysMib / 1024)}</span> GiB</div>
-      ${decisionHtml}
-    </div>`;
+    return offloadSliderHtml({ offload: o, layers: n, ownerId: b.id, disabled: inFlight.has(b.id), decisionHtml });
   })() : "";
   const flagsHtml = flags ? `<div class="backend-form-panel flags-panel">
       <div style="font-size:12px;font-weight:600">${icon("gear")} Flags for ${esc(b.id)}</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px">
-        <label style="font-size:12px;color:var(--text2)">Context length (-c)
-          <span style="display:flex;gap:6px;margin-top:4px">
-            <select data-flags-field="ctx-preset" style="${SELECT_STYLE};flex:1;min-width:0"${dis}>
-              ${CTX_PRESETS.map((v) => `<option value="${v}"${v === flags.ctx ? " selected" : ""}>${v.toLocaleString()} (${ctxShort(v)})${v === 32768 ? " \u2014 default" : ""}${flags.ctxMax && v > flags.ctxMax ? " \u2014 beyond rated" : ""}</option>`).join("")}
-              <option value="custom"${CTX_PRESETS.includes(flags.ctx) ? "" : " selected"}>Custom\u2026</option>
-            </select>
-            ${CTX_PRESETS.includes(flags.ctx) ? "" : `<input data-flags-field="ctx-custom" type="number" value="${flags.ctx}" min="1024" max="1048576" style="${SELECT_STYLE};width:110px"${dis}>`}
-          </span></label>
-        <label style="font-size:12px;color:var(--text2)">Batch size (-b)
-          <span style="display:flex;gap:6px;margin-top:4px">
-            <select data-flags-field="batch-preset" style="${SELECT_STYLE};flex:1;min-width:0"${dis}>
-              ${BATCH_PRESETS.map((v) => `<option value="${v}"${v === flags.batch ? " selected" : ""}>${v.toLocaleString()}${v === 512 ? " \u2014 default" : ""}</option>`).join("")}
-              <option value="custom"${BATCH_PRESETS.includes(flags.batch) ? "" : " selected"}>Custom\u2026</option>
-            </select>
-            ${BATCH_PRESETS.includes(flags.batch) ? "" : `<input data-flags-field="batch-custom" type="number" value="${flags.batch}" min="1" style="${SELECT_STYLE};width:110px"${dis}>`}
-          </span></label>
-      </div>
+      ${flagsCtxBatchHtml({ ctx: flags.ctx, batch: flags.batch, ctxMax: flags.ctxMax, fieldAttr: "data-flags-field", disabled: inFlight.has(b.id) })}
       ${offloadHtml}
-      <div style="font-size:12px;color:var(--text2);margin-top:6px">${flags.modelId && flags.ctxMax
-        ? `Rated context: ${flags.ctxMax.toLocaleString()}<span class="info-tip" title="${esc(`Model ${flags.modelId} is rated to ${ctxShort(flags.ctxMax)} context (${flags.ctxMax.toLocaleString()} tokens); larger values are accepted but exceed the rating. Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Placement form on this card.`)}">${icon("info")}</span>`
-        : `Context range: 1,024–1,048,576<span class="info-tip" title="Accepted context range: 1,024 to 1,048,576. Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Placement form on this card.">${icon("info")}</span>`}</div>
+      ${flagsRatedLineHtml({ ctxMax: flags.ctxMax, modelId: flags.modelId, savedText: "Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Placement form on this card." })}
       <div class="card-actions"><button class="btn" data-back-act="flags-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save flags</button>
         <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
     </div>` : "";
@@ -1964,16 +2059,11 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     const t = ev.target as HTMLElement;
     const field = t.getAttribute("data-flags-field");
     if (!field) return;
-    const val = (t as HTMLInputElement).value;
-    if (field === "ctx-custom") flagsCtx = Number(val);
-    else if (field === "batch-custom") flagsBatch = Number(val);
-    else if (ev.type === "change" && field === "ctx-preset") {
-      if (val !== "custom") flagsCtx = Number(val);
-      paint();
-    } else if (ev.type === "change" && field === "batch-preset") {
-      if (val !== "custom") flagsBatch = Number(val);
-      paint();
-    }
+    const draft = { ctx: flagsCtx, batch: flagsBatch };
+    const repaint = applyFlagsField(draft, field, (t as HTMLInputElement).value, ev.type === "change");
+    flagsCtx = draft.ctx;
+    flagsBatch = draft.batch;
+    if (repaint) paint();
   };
   root.addEventListener("change", syncFlagsDraft);
   root.addEventListener("input", syncFlagsDraft);
@@ -1999,17 +2089,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     const card = t.closest(".backend-card");
     if (!card) return;
     const o = row.offload;
-    const figs = offloadFigures(o, n);
-    const setText = (sel: string, txt: string): void => {
-      const el = card.querySelector(sel);
-      if (el) el.textContent = txt;
-    };
-    setText("[data-offload-layers-label]", offloadLayersLabel(o, n));
-    setText("[data-offload-token]", offloadTokenText(o, n));
-    setText("[data-offload-gpu]", fmtGb(figs.gpuMib / 1024));
-    setText("[data-offload-sys]", fmtGb(figs.sysMib / 1024));
-    const tip = card.querySelector("[data-offload-tip]");
-    if (tip) tip.setAttribute("title", offloadTipText(o, n));
+    paintOffloadReadout(card, o, n);
     // Keep a pending guardrail decision in step with the draft:
     // its text follows a still-blocked position, and the row hides
     // while the draft sits on a verified position (the release
@@ -2179,7 +2259,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     const modelOpts = lastModels.map((m) => `<option value="${esc(m.id)}">${esc(modelShortName(m))}</option>`).join("");
     const groupOpts = lastGroups.map((g) => `<option value="${esc(g.name)}">${esc(g.name)}</option>`).join("")
       + `<option value="__new__">New group\u2026</option>`;
-    addHost.innerHTML = `<div class="card"><h3>${icon("server")} Add a backend<span class="info-tip" title="The backend is created with the standard defaults (32K context; a tensor split is assigned from live GPU telemetry when available). Joining an existing group makes the gateway share that group's traffic across its members; a new group gives the backend its own model name.">${icon("info")}</span></h3>
+    addHost.innerHTML = `<div class="card"><h3>${icon("server")} Add a backend<span class="info-tip" title="The backend is created with the launch parameters below (32K context, 512 batch, and the model's catalog default offload unless changed); a tensor split is assigned from live GPU telemetry when available unless GPUs are picked under Placement. Joining an existing group makes the gateway share that group's traffic across its members; a new group gives the backend its own model name.">${icon("info")}</span></h3>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
       <label style="font-size:12px;color:var(--text2)">Name<span class="info-tip" title="lowercase, digits, hyphens">${icon("info")}</span><br>
         <input id="addBackName" type="text" placeholder="nemotron" style="${SELECT_STYLE};width:100%"></label>
@@ -2194,14 +2274,16 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       <input id="addBackNewGroup" type="text" placeholder="nemotron" style="${SELECT_STYLE};width:100%"></label>
     <label style="font-size:12px;color:var(--text2);display:block;margin-top:10px" title="The gateway routes enabled backends; it can be started right away.">
       <input id="addBackEnabled" type="checkbox" checked> Enabled</label>
+    <div id="addBackParams"></div>
     <div id="addBackStrip"></div>
     <div class="card-actions"><button class="btn" id="addBackSubmit">${icon("plus")} Add backend</button>
       <button class="btn icon-only" id="addBackCancel" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
     <div id="addBackMsg" style="font-size:12px;margin-top:6px"></div>
   </div>`;
-    // Model summary strip: the creation consequences the payload
-    // already carries — the creation-default context and the model's
-    // size. GPU/System RAM requirement tiles and a split preview
+    // Model summary strip: the model's size — the one creation
+    // consequence not carried by a form field (the context lives
+    // in the Launch parameters fields now, tracker #49, and a
+    // value lives in one place). GPU/System RAM requirement tiles
     // need a propose-assignment payload for a not-yet-created
     // backend, which does not exist (see IMPLEMENTATION.md gaps) —
     // those tiles are omitted, never zero-filled.
@@ -2214,12 +2296,204 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       const size = m.size_bytes ? fmtBytes(m.size_bytes)
         : m.catalog_size_bytes !== null ? `~${fmtBytes(m.catalog_size_bytes)} (estimate)` : null;
       stripEl.innerHTML = `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:10px">
-        <div class="kv"><span class="k">Context</span><span class="v" style="font-size:12px">32,768</span></div>
         ${size !== null ? `<div class="kv"><span class="k">Size</span><span class="v" style="font-size:12px">${esc(size)}</span></div>` : ""}
       </div>`;
     };
     modelSelEl?.addEventListener("change", paintStrip);
     paintStrip();
+
+    /* Launch parameters (tracker #49): the same fields the Edit
+     * Flags and Placement forms expose for an existing backend,
+     * rendered by the same helpers and collected into this draft
+     * for backend_add. ctx/batch start at the creation defaults
+     * and survive a model change (they are model-independent; only
+     * their rated-context annotation follows the model). The
+     * offload draft and the placement selection are
+     * model-dependent: each backend_add_preview payload resets
+     * them — the slider to the model's catalog default position,
+     * the chips to the split creation would assign. */
+    const pDraft = { ctx: 32768, batch: 512 };
+    let preview: BackendAddPreview | null = null;
+    let offLayers: number | null = null;
+    /** A released offload position the guardrail blocks, awaiting
+     *  the operator's decision in the form. `override` records the
+     *  decision to create with an explicit override (backend_add
+     *  journals it, as backend_set_offload does); without it the
+     *  position must be snapped or moved before submit. */
+    let offPending: { layers: number; override: boolean } | null = null;
+    /** GPU indices the operator unchecked in the Placement chips.
+     *  gpuTouched separates the previewed selection (creation
+     *  auto-assigns) from an explicit one (creation writes the
+     *  even split across it). */
+    const gpuExcluded = new Set<number>();
+    let gpuTouched = false;
+    let previewSeq = 0;
+    const paramsEl = addHost.querySelector("#addBackParams") as HTMLElement | null;
+    const selectedGpus = (): number[] =>
+      lastGpuList.map((g) => Number(g.id)).filter((ix) => !gpuExcluded.has(ix));
+    const paintParams = (): void => {
+      if (!paramsEl) return;
+      const m = lastModels.find((x) => x.id === modelSelEl?.value);
+      const ctxMax = m?.ctx_max ? m.ctx_max : null;
+      // The offload slider, when the previewed model is
+      // offload-capable. The decision row carries the edit form's
+      // two resolving actions with creation wording: nothing can
+      // be saved yet, so an override is recorded in the draft and
+      // carried by backend_add; snapping moves the draft to the
+      // nearest verified position.
+      let offloadHtml = "";
+      if (preview?.offload) {
+        const o = preview.offload;
+        const n = offLayers ?? o.layers;
+        let decisionHtml = "";
+        if (offPending && o.guardrail && offloadIsUntested(o, offPending.layers)) {
+          decisionHtml = offPending.override
+            ? `<div data-add-offload-decision style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+      <span data-add-decision-text style="font-size:12px;color:#e3b341">${offPending.layers} of ${o.moe_layers} layers is unverified on this GPU \u2014 the backend will be created with an override recorded</span>
+      <button class="btn" data-add-decision="snap">${icon("check")} Snap to ${o.guardrail.nearest_verified_layers} of ${o.moe_layers} layers</button>
+    </div>`
+            : `<div data-add-offload-decision style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+      <span data-add-decision-text style="font-size:12px;color:#e3b341">${offPending.layers} of ${o.moe_layers} layers is unverified on this GPU</span>
+      <button class="btn" data-add-decision="override">${icon("warn")} Create with override</button>
+      <button class="btn" data-add-decision="snap">${icon("check")} Snap to ${o.guardrail.nearest_verified_layers} of ${o.moe_layers} layers</button>
+    </div>`;
+        }
+        offloadHtml = offloadSliderHtml({ offload: o, layers: n, ownerId: "new backend", disabled: false, decisionHtml });
+      }
+      // Placement chips: the Placement form's include/exclude
+      // chips over the telemetry GPUs, defaulting to the split
+      // creation would assign.
+      let placeHtml = "";
+      if (lastGpuList.length) {
+        const split = preview?.tensor_split ?? [];
+        const summary = lastGpuList
+          .map((g, p) => ({ ix: Number(g.id), frac: split[p] ?? 0 }))
+          .filter((e) => e.frac > 0)
+          .map((e) => `GPU ${e.ix} \u2014 ${Math.round(e.frac * 100)}%`)
+          .join(" \u00b7 ");
+        placeHtml = `<div style="margin-top:12px">
+        <span style="font-size:12px;color:var(--text2)">Placement (tensor split)</span><span class="info-tip" title="The split divides the model's weights across the selected GPUs, in nvidia-smi index order. The selection starts at the split a creation would assign from live telemetry; changing it makes the split an even division across the selected GPUs instead.">${icon("info")}</span>
+        <div class="gpu-chip-row">${lastGpuList.map((g) => {
+          const ix = Number(g.id);
+          const on = !gpuExcluded.has(ix);
+          return `<label class="gpu-chip${on ? " on" : ""}" title="${esc(g.name)}"><span class="gpu-chip-top"><input type="checkbox" data-add-place-gpu="${ix}"${on ? " checked" : ""}> GPU ${ix}</span><span class="gpu-chip-name">${esc(gpuShortName(g.name))}</span></label>`;
+        }).join("")}</div>
+        ${summary ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Split: ${esc(summary)}</div>` : ""}
+      </div>`;
+      } else {
+        placeHtml = `<div style="font-size:12px;color:var(--text2);margin-top:12px">Placement: auto<span class="info-tip" title="No GPU telemetry yet \u2014 a tensor split cannot be previewed or selected; creation leaves the split unset, as it does today.">${icon("info")}</span></div>`;
+      }
+      paramsEl.innerHTML = `<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+      <div style="font-size:12px;font-weight:600">${icon("gear")} Launch parameters</div>
+      ${flagsCtxBatchHtml({ ctx: pDraft.ctx, batch: pDraft.batch, ctxMax, fieldAttr: "data-add-flags-field", disabled: false })}
+      ${offloadHtml}
+      ${flagsRatedLineHtml({ ctxMax, modelId: m?.id ?? null, savedText: "Saved when the backend is added; applies from its first start. Placement is set by the GPU selection below." })}
+      ${placeHtml}
+    </div>`;
+    };
+    const resetPlacementFromPreview = (): void => {
+      gpuExcluded.clear();
+      gpuTouched = false;
+      const split = preview?.tensor_split ?? [];
+      lastGpuList.forEach((g, p) => {
+        // No assigned split (single GPU, or none yet): an unsplit
+        // creation loads on the first GPU — the Placement form's
+        // fallback selection for the same state.
+        const on = split.length ? (split[p] ?? 0) > 0 : p === 0;
+        if (!on) gpuExcluded.add(Number(g.id));
+      });
+    };
+    const loadPreview = async (modelChanged: boolean): Promise<void> => {
+      const modelId = modelSelEl?.value ?? "";
+      if (!modelId) return;
+      const seq = ++previewSeq;
+      const r = await backendAddPreview(modelId, gpuTouched ? selectedGpus() : undefined);
+      if (disposed || seq !== previewSeq) return;
+      if (r.error || !r.data) { preview = null; paintParams(); return; }
+      preview = r.data;
+      if (modelChanged) {
+        offLayers = preview.offload ? preview.offload.layers : null;
+        offPending = null;
+        resetPlacementFromPreview();
+      }
+      paintParams();
+    };
+    modelSelEl?.addEventListener("change", () => { void loadPreview(true); });
+    paramsEl?.addEventListener("input", (ev) => {
+      const t = ev.target as HTMLElement;
+      if (t.hasAttribute("data-offload-slider")) {
+        if (!preview?.offload) return;
+        const n = Number((t as HTMLInputElement).value);
+        offLayers = n;
+        const card = t.closest(".card");
+        if (card) paintOffloadReadout(card, preview.offload, n);
+        // Keep a pending decision in step with the draft (the
+        // edit form's rule): its text follows a still-blocked
+        // position, and the row hides while the draft sits on a
+        // verified position; the release handler re-decides.
+        if (offPending) {
+          const dec = paramsEl.querySelector("[data-add-offload-decision]") as HTMLElement | null;
+          if (dec) {
+            if (offloadIsUntested(preview.offload, n)) {
+              offPending.layers = n;
+              dec.style.display = "";
+              const dt = dec.querySelector("[data-add-decision-text]");
+              if (dt) dt.textContent = `${n} of ${preview.offload.moe_layers} layers is unverified on this GPU${offPending.override ? " \u2014 the backend will be created with an override recorded" : ""}`;
+            } else {
+              dec.style.display = "none";
+            }
+          }
+        }
+        return;
+      }
+      const field = t.getAttribute("data-add-flags-field");
+      if (field) applyFlagsField(pDraft, field, (t as HTMLInputElement).value, false);
+    });
+    paramsEl?.addEventListener("change", (ev) => {
+      const t = ev.target as HTMLElement;
+      if (t.hasAttribute("data-offload-slider")) {
+        if (!preview?.offload) return;
+        const n = Number((t as HTMLInputElement).value);
+        offLayers = n;
+        // Release decides the pending state: a guardrail-blocked
+        // position becomes a decision the operator must make (an
+        // override confirmed for one position does not carry to
+        // another); a verified position clears it.
+        if (offloadIsUntested(preview.offload, n)) {
+          if (!offPending || offPending.layers !== n) offPending = { layers: n, override: false };
+        } else {
+          offPending = null;
+        }
+        paintParams();
+        return;
+      }
+      if (t.hasAttribute("data-add-place-gpu")) {
+        const ix = Number(t.getAttribute("data-add-place-gpu"));
+        if ((t as HTMLInputElement).checked) gpuExcluded.delete(ix);
+        else gpuExcluded.add(ix);
+        gpuTouched = true;
+        // The placement drives the guardrail evaluation: refresh
+        // the preview against the explicit selection.
+        void loadPreview(false);
+        return;
+      }
+      const field = t.getAttribute("data-add-flags-field");
+      if (field && applyFlagsField(pDraft, field, (t as HTMLInputElement).value, true)) paintParams();
+    });
+    paramsEl?.addEventListener("click", (ev) => {
+      const t = (ev.target as HTMLElement).closest("[data-add-decision]") as HTMLElement | null;
+      if (!t || !preview?.offload || !offPending) return;
+      if (t.getAttribute("data-add-decision") === "override") {
+        offPending.override = true;
+      } else {
+        // Snap: move the draft to the nearest verified position.
+        offLayers = preview.offload.guardrail?.nearest_verified_layers ?? offPending.layers;
+        offPending = null;
+      }
+      paintParams();
+    });
+    paintParams();
+    void loadPreview(true);
     const groupSelEl = addHost.querySelector("#addBackGroup") as HTMLSelectElement | null;
     const newWrap = addHost.querySelector("#addBackNewGroupWrap") as HTMLElement | null;
     groupSelEl?.addEventListener("change", () => {
@@ -2241,8 +2515,38 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         if (msg) msg.innerHTML = `<span style="color:var(--err)">Name, model, port, and group are required.</span>`;
         return;
       }
+      // Launch parameters: the same validation the create op
+      // applies (context range; batch within 1..=context), checked
+      // here so the error reads in the form's own terms; the op
+      // re-validates regardless.
+      if (!Number.isInteger(pDraft.ctx) || pDraft.ctx < 1024 || pDraft.ctx > 1048576) {
+        if (msg) msg.innerHTML = `<span style="color:var(--err)">Context length must be between 1,024 and 1,048,576.</span>`;
+        return;
+      }
+      if (!Number.isInteger(pDraft.batch) || pDraft.batch < 1 || pDraft.batch > pDraft.ctx) {
+        if (msg) msg.innerHTML = `<span style="color:var(--err)">Batch size must be between 1 and the context length.</span>`;
+        return;
+      }
+      // An undecided guardrail-blocked offload position cannot be
+      // carried into creation (the op would refuse it without the
+      // override): the operator decides here first.
+      if (offPending && !offPending.override) {
+        if (msg) msg.innerHTML = `<span style="color:var(--err)">Offload position ${offPending.layers} of ${preview?.offload?.moe_layers ?? ""} layers is unverified on this GPU \u2014 create with an override or snap to a verified position.</span>`;
+        return;
+      }
+      if (gpuTouched && !selectedGpus().length) {
+        if (msg) msg.innerHTML = `<span style="color:var(--err)">Select at least one GPU for the split.</span>`;
+        return;
+      }
       submit.disabled = true;
-      const r = await addBackend({ id: name, modelId, port, group, createGroup, enabled });
+      const r = await addBackend({
+        id: name, modelId, port, group, createGroup, enabled,
+        nCtx: pDraft.ctx,
+        nBatch: pDraft.batch,
+        offloadLayers: preview?.offload ? (offLayers ?? preview.offload.layers) : undefined,
+        offloadOverride: offPending?.override ? true : undefined,
+        gpuIndices: gpuTouched ? selectedGpus() : undefined,
+      });
       if (disposed) return;
       if (r.error) {
         if (msg) msg.innerHTML = `<span style="color:var(--err)">Add failed: ${esc(r.error)}</span>`;
@@ -2257,6 +2561,10 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
           <div><span style="color:var(--text2)">Port:</span> ${port}</div>
           <div><span style="color:var(--text2)">Group:</span> ${esc(group)}</div>
           <div><span style="color:var(--text2)">Enabled:</span> ${enabled ? "yes" : "no"}</div>
+          <div><span style="color:var(--text2)">Context:</span> ${pDraft.ctx.toLocaleString()}</div>
+          <div><span style="color:var(--text2)">Batch:</span> ${pDraft.batch.toLocaleString()}</div>
+          ${preview?.offload ? `<div><span style="color:var(--text2)">Offload:</span> ${esc(offloadTokenText(preview.offload, offLayers ?? preview.offload.layers))}${offPending?.override ? " (override recorded)" : ""}</div>` : ""}
+          ${gpuTouched ? `<div><span style="color:var(--text2)">GPUs:</span> ${esc(selectedGpus().map((ix) => `GPU ${ix}`).join(", "))}</div>` : ""}
           <div><span style="color:var(--text2)">Activation plan:</span> recorded<span class="info-tip" title="The change is recorded in the activation plan at the top of this page — the gateway routes the new backend after the plan is executed.">${icon("info")}</span></div>
         </div>
         <div class="card-actions"><button class="btn icon-only" id="addBackDone" title="Done" aria-label="Done">${icon("check")}</button></div></div>`;

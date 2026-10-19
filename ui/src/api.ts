@@ -818,7 +818,13 @@ export async function setBackendOffload(id: string, layers: number, allowOverrid
 
 /** backend_add — create a backend for a registered model and route it
  *  through a gateway group (an existing one, or a new one when
- *  createGroup is true). The gateway routes it after its next restart. */
+ *  createGroup is true). The gateway routes it after its next restart.
+ *  The optional launch parameters (tracker #49) are the add form's
+ *  fields: each one omitted keeps the creation default (32K context,
+ *  512 batch, telemetry-assigned split, catalog default offload);
+ *  offloadOverride records the operator's explicit override when a
+ *  chosen offload position is guardrail-blocked, and gpuIndices is
+ *  an explicit GPU selection replacing the telemetry assignment. */
 export async function addBackend(input: {
   id: string;
   modelId: string;
@@ -826,20 +832,58 @@ export async function addBackend(input: {
   group: string;
   createGroup: boolean;
   enabled: boolean;
+  nCtx?: number;
+  nBatch?: number;
+  offloadLayers?: number;
+  offloadOverride?: boolean;
+  gpuIndices?: number[];
 }): Promise<CallResult<{ backend_id: string; group: string }>> {
   if (!isTauri()) return { data: { backend_id: input.id, group: input.group }, live: false };
   try {
-    const data = await invoke<{ backend_id: string; group: string }>("backend_add", {
+    const args: Record<string, unknown> = {
       id: input.id,
       modelId: input.modelId,
       port: input.port,
       group: input.group,
       createGroup: input.createGroup,
       enabled: input.enabled,
-    });
+    };
+    if (input.nCtx !== undefined) args.nCtx = input.nCtx;
+    if (input.nBatch !== undefined) args.nBatch = input.nBatch;
+    if (input.offloadLayers !== undefined) args.offloadLayers = input.offloadLayers;
+    if (input.offloadOverride) args.offloadOverride = true;
+    if (input.gpuIndices !== undefined) args.gpuIndices = input.gpuIndices;
+    const data = await invoke<{ backend_id: string; group: string }>("backend_add", args);
     return { data, live: true };
   } catch (e) {
     return { data: { backend_id: input.id, group: input.group }, live: true, error: errOf(e) };
+  }
+}
+
+/** The add form's preview payload (backend_add_preview): what
+ *  creating a backend for a model would carry at the creation
+ *  defaults — the offload slider state in the same shape a backend
+ *  row carries (null when the model is not offload-capable), and
+ *  the placement creation would use. */
+export interface BackendAddPreview {
+  offload: BackendOffload | null;
+  tensor_split: number[];
+  split_mode: string;
+}
+
+/** backend_add_preview — the add form's model-dependent parameter
+ *  state: the offload control's range/bands/guardrail for the model
+ *  and the placement a creation would assign. gpuIndices previews
+ *  an explicit GPU selection instead of the telemetry assignment. */
+export async function backendAddPreview(modelId: string, gpuIndices?: number[]): Promise<CallResult<BackendAddPreview>> {
+  if (!isTauri()) return { data: { offload: null, tensor_split: [], split_mode: "none" }, live: false };
+  try {
+    const args: Record<string, unknown> = { modelId };
+    if (gpuIndices !== undefined) args.gpuIndices = gpuIndices;
+    const data = await invoke<BackendAddPreview>("backend_add_preview", args);
+    return { data, live: true };
+  } catch (e) {
+    return { data: { offload: null, tensor_split: [], split_mode: "none" }, live: true, error: errOf(e) };
   }
 }
 
