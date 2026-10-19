@@ -2150,6 +2150,27 @@ pub async fn op_list_backends(
             });
         }
     }
+    // Parallel slots state per configured backend (tracker #61):
+    // the flags form's Parallel slots field renders for every
+    // backend, so — unlike the capability-gated offload/MTP
+    // states above — this attaches to every configured row.
+    {
+        let parallel: HashMap<String, ParallelInfo> = cfg
+            .backends
+            .iter()
+            .map(|b| (b.id.clone(), backend_parallel_info(b)))
+            .collect();
+        for row in backends.iter_mut() {
+            let Some(id) = row["id"].as_str() else {
+                continue;
+            };
+            let Some(p) = parallel.get(id) else { continue };
+            row["parallel"] = json!({
+                "slots": p.slots,
+                "custom": p.custom,
+            });
+        }
+    }
     // Gateway request statistics (LiteLLM Prometheus snapshots from
     // the background poller): attach the trailing-hour figures where
     // the store has a window for the backend. Absent fields render
@@ -4438,6 +4459,21 @@ fn validate_ctx_batch(n_ctx: u32, n_batch: u32) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// The parallel-slots validation shared by backend_set_parallel
+/// and backend_add (the add form offers the same field under the
+/// same rules): the Parallel slots control's range — at least one
+/// slot, at most the app's ceiling (see
+/// [`manager_models::parallel`]).
+fn validate_parallel_slots(slots: u32) -> Result<(), ApiError> {
+    use manager_models::parallel::{PARALLEL_SLOTS_MAX, PARALLEL_SLOTS_MIN};
+    if !(PARALLEL_SLOTS_MIN..=PARALLEL_SLOTS_MAX).contains(&slots) {
+        return Err(ApiError::InvalidInput(format!(
+            "parallel slots must be between {PARALLEL_SLOTS_MIN} and {PARALLEL_SLOTS_MAX}"
+        )));
+    }
+    Ok(())
+}
+
 /// The resolved offload for a backend being created: the raw flags
 /// it starts with, and whether an override must be journaled for
 /// the position once the creation save lands.
@@ -4534,7 +4570,11 @@ fn split_mode_str(mode: manager_config::SplitMode) -> &'static str {
 /// journaled once the creation save lands. `gpu_indices` replaces
 /// the telemetry assignment with an even split across the selected
 /// GPUs (the Placement form's composition for an explicit
-/// selection).
+/// selection). A chosen parallel slot count (tracker #61) is
+/// written into the created backend's raw flags as part of the
+/// same single creation save; `None` writes no `--parallel` token,
+/// leaving the new backend at llama.cpp's default exactly as
+/// before.
 #[allow(clippy::too_many_arguments)] // argument list is the registry contract
 pub async fn op_backend_add(
     state: &Arc<AppState>,
@@ -4550,6 +4590,7 @@ pub async fn op_backend_add(
     offload_layers: Option<u32>,
     offload_override: Option<bool>,
     gpu_indices: Option<Vec<u32>>,
+    parallel: Option<u32>,
 ) -> ApiResult {
     let id = id.trim().to_string();
     let group = group.trim().to_string();
@@ -4584,6 +4625,12 @@ pub async fn op_backend_add(
     let eff_ctx = n_ctx.unwrap_or(32768);
     let eff_batch = n_batch.unwrap_or(512);
     validate_ctx_batch(eff_ctx, eff_batch)?;
+    // Parallel slots: validated by the same rules
+    // backend_set_parallel applies, when the add form chose a
+    // count.
+    if let Some(slots) = parallel {
+        validate_parallel_slots(slots)?;
+    }
     // GPU inventory, fetched before the config write lock when the
     // request needs it (an explicit GPU selection to validate, or
     // an offload position to evaluate against the placed GPUs'
@@ -4694,6 +4741,17 @@ pub async fn op_backend_add(
         if resolved.record_override {
             offload_override_to_record = Some((layers, resolved.placed_ccs));
         }
+    }
+    // A chosen parallel slot count is written into the constructed
+    // backend's raw flags — after the offload resolution above,
+    // which rewrites the same string — so the creation save below
+    // carries it with everything else. An absent choice writes no
+    // token: creation stays byte-identical to the pre-#61 shape.
+    if let Some(slots) = parallel {
+        backend.raw_flags = manager_models::set_parallel_slots(
+            backend.raw_flags.as_deref(),
+            Some(i64::from(slots)),
+        );
     }
     new_cfg.backends.push(backend);
     if let Some(m) = new_cfg.models.iter_mut().find(|m| m.id == model_id) {
@@ -5175,6 +5233,85 @@ pub async fn op_backend_set_mtp(
     Ok(json!({
         "backend_id": id,
         "n_max": n_max,
+        "raw_flags": new_raw,
+        "changed": changed,
+        // `persisted` is about the desired state being on disk:
+        // after a successful save it is, and when nothing changed
+        // it already was (same note as backend_set_offload).
+        "persisted": true,
+        "applies": "next start",
+    }))
+}
+
+/// Set a backend's parallel slot count (tracker #61; the flags
+/// form's Parallel slots field): rewrite only the `--parallel`
+/// tokens in the backend's raw flags — `slots` in the control's
+/// range writes the canonical `--parallel N`; `None` removes the
+/// token, returning the backend to llama.cpp's default (auto).
+/// Every other flag is preserved. This is the one write path for
+/// the setting: the MTP control surfaces a conflicting slot count
+/// but never rewrites it, so a slot change is always an explicit
+/// operator action in this field. Saved through the same
+/// clone-validate-save path as the other backend mutations and
+/// journaled as a backend-scope activation change with
+/// `applies: "next start"`; no restart happens here.
+pub async fn op_backend_set_parallel(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    id: String,
+    slots: Option<u32>,
+) -> ApiResult {
+    if let Some(n) = slots {
+        validate_parallel_slots(n)?;
+    }
+    let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
+    let mut new_cfg = cfg.clone();
+    let b = new_cfg
+        .backends
+        .iter_mut()
+        .find(|b| b.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+    let new_raw =
+        manager_models::set_parallel_slots(b.raw_flags.as_deref(), slots.map(i64::from));
+    let changed = new_raw != b.raw_flags;
+    b.raw_flags = new_raw.clone();
+    if changed {
+        // A raw-flags change invalidates the recorded tool-call
+        // probe (MCP design §7.2).
+        b.tool_call_probe = None;
+    }
+    if changed {
+        manager_config::validate(&new_cfg)
+            .map_err(ApiError::from)?;
+        let summary = match slots {
+            Some(n) => format!("Backend `{id}` parallel slots set to {n}"),
+            None => {
+                format!("Backend `{id}` parallel slots returned to the llama.cpp default (auto)")
+            }
+        };
+        record_backend_change(
+            state,
+            &pre_cfg,
+            &new_cfg,
+            "backend_set_parallel",
+            summary,
+            &id,
+        )
+        .await
+        ?;
+        manager_config::save(&new_cfg, &state.config_path)
+            .map_err(ApiError::from)?;
+        *cfg = new_cfg;
+    }
+    drop(cfg);
+    if changed {
+        ensure_backend_specs(state).await;
+    }
+    state.sync_backend_service_definition(&id).await;
+    Ok(json!({
+        "backend_id": id,
+        "slots": slots,
         "raw_flags": new_raw,
         "changed": changed,
         // `persisted` is about the desired state being on disk:
@@ -6730,8 +6867,9 @@ struct MtpInfo {
     n_max: Option<u32>,
     /// The explicit `--parallel` slot count, when the raw flags
     /// set one. MTP drafting needs a single slot; the control
-    /// compares this against 1 to surface the conflict — nothing
-    /// rewrites it.
+    /// compares this against 1 to surface the conflict — the MTP
+    /// control itself never rewrites it (the flags form's
+    /// Parallel slots field is the write path, tracker #61).
     parallel: Option<i64>,
     /// True when the saved MTP spelling is not the canonical form
     /// for its state (a bare `--spec-type draft-mtp` with no
@@ -6767,6 +6905,32 @@ fn backend_mtp_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> Optio
         parallel: manager_models::parallel_slots(b.raw_flags.as_deref()),
         custom,
     })
+}
+
+struct ParallelInfo {
+    /// The explicit `--parallel` slot count, or `None` when the
+    /// raw flags set none — llama.cpp's default (auto) then
+    /// applies (see [`manager_models::parallel`]).
+    slots: Option<i64>,
+    /// True when the saved parallel spelling is not the canonical
+    /// form for its state (an `-np` or `=` spelling, repeated
+    /// tokens, a non-canonical position). The same comparison as
+    /// the offload/MTP `custom`: the decoded state rewritten
+    /// canonically must reproduce the saved tokens exactly (after
+    /// token normalization, so spacing alone never counts).
+    custom: bool,
+}
+
+/// A backend's parallel-slots control state (tracker #61).
+/// Unlike the offload and MTP states this is not capability
+/// gated: the Parallel slots field renders for every configured
+/// backend, so every configured row carries it.
+fn backend_parallel_info(b: &manager_config::BackendConfig) -> ParallelInfo {
+    let slots = manager_models::parallel_slots(b.raw_flags.as_deref());
+    let canonical = manager_models::set_parallel_slots(b.raw_flags.as_deref(), slots);
+    let custom = token_normalized_flags(b.raw_flags.as_deref())
+        != token_normalized_flags(canonical.as_deref());
+    ParallelInfo { slots, custom }
 }
 
 
@@ -8038,6 +8202,67 @@ mod tests {
         assert!(validate_ctx_batch(1_048_577, 512).is_err());
         assert!(validate_ctx_batch(32768, 0).is_err());
         assert!(validate_ctx_batch(2048, 4096).is_err());
+    }
+
+    #[test]
+    fn validate_parallel_slots_matches_set_parallel_rules() {
+        assert!(validate_parallel_slots(1).is_ok());
+        assert!(validate_parallel_slots(4).is_ok());
+        assert!(validate_parallel_slots(1024).is_ok());
+        // Zero and past the control's ceiling refuse, with the
+        // range named in the message (the flags form renders the
+        // same bounds).
+        assert!(validate_parallel_slots(0).is_err());
+        let err = validate_parallel_slots(1025).expect_err("past the ceiling refuses");
+        assert!(
+            err.to_string().contains("parallel slots must be between 1 and 1024"),
+            "unexpected wording: {err}"
+        );
+    }
+
+    #[test]
+    fn backend_parallel_info_decodes_and_marks_custom_spellings() {
+        let info = |raw: Option<&str>| {
+            backend_parallel_info(&uncreated_backend(
+                "b",
+                "models/m.gguf",
+                raw.map(str::to_string),
+            ))
+        };
+        // Unset: no explicit count, and nothing to mark — the
+        // field presents llama.cpp's default.
+        let i = info(None);
+        assert_eq!(i.slots, None);
+        assert!(!i.custom);
+        let i = info(Some("-ot exps=CPU"));
+        assert_eq!(i.slots, None);
+        assert!(!i.custom);
+        // The canonical spelling the control itself writes.
+        let i = info(Some("--parallel 2"));
+        assert_eq!(i.slots, Some(2));
+        assert!(!i.custom);
+        let i = info(Some("--spec-type draft-mtp --parallel 1"));
+        assert_eq!(i.slots, Some(1));
+        assert!(!i.custom);
+        // Non-canonical spellings of the same value: the -np and
+        // = forms, and a canonical token in a non-canonical
+        // position (the shared custom definition: the canonical
+        // rewrite must reproduce the saved tokens exactly).
+        let i = info(Some("-np 2"));
+        assert_eq!(i.slots, Some(2));
+        assert!(i.custom);
+        let i = info(Some("--parallel=2"));
+        assert_eq!(i.slots, Some(2));
+        assert!(i.custom);
+        let i = info(Some("--parallel 1 --spec-type draft-mtp"));
+        assert_eq!(i.slots, Some(1));
+        assert!(i.custom);
+        // A malformed token decodes as unset but still marks: the
+        // flags carry a parallel spelling the control does not
+        // write.
+        let i = info(Some("--parallel abc"));
+        assert_eq!(i.slots, None);
+        assert!(i.custom);
     }
 
     #[test]
