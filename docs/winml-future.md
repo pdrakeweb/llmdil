@@ -10,6 +10,22 @@ works.
 
 Full research findings: `docs/winml-server-research-2026-10-15.md`.
 
+Status check against the code (v0.1.40): still deferred, and the
+inert surface is exactly the probe-only one described above. The
+registry carries four WinML ops — `winml_probe`, `winml_register`,
+`winml_unregister`, `winml_status` (desktop-only, in
+`crates/manager-app/src/registry.rs`) — backed by
+`crates/manager-winml`, which probes and records a registration;
+nothing in the tree downloads, installs, enables, or starts a
+WinML server. The known-wrong assumptions the research flagged are
+still in the code, harmless only because the path is inert:
+`winml_server_exe_path` still returns
+`C:\Program Files\WindowsML\WinMLServer.exe`, and the gateway
+generator still emits the WinML deployment as `openai/winml` with
+the placeholder key `local` under the `tool-runner` group when
+`winml.enabled` is set (`crates/manager-gateway/src/lib.rs`).
+There is no shipped WinML serving path.
+
 ## Why it is not ready (verified 2026-10-15, primary sources)
 
 - WinMLServer exists **only in the experimental NuGet line**:

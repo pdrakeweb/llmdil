@@ -1,6 +1,7 @@
 # Design A — Dense Developer Console (IDE-adjacent)
 Local LLM Service Manager — design direction
 Prepared: 2026-10-08. No code. Status: brainstorm candidate, to be chosen against other directions.
+(The product was renamed LLMdil on 2026-10-17; this document predates the rename. The selected direction is recorded in `design-b-hybrid.md`.)
 
 ## Direction name
 Dense Developer Console (IDE-adjacent). Working title for the app: **LLM Service Console**.

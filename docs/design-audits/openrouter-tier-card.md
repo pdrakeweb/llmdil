@@ -7,6 +7,8 @@ Scope: the OpenRouter fallback tier card, rendered inline in `gatewayPaint`,
 `status.openrouter_cred_present` (`boolean | null`, `ui/src/api.ts:1259`).
 Toggle wiring: `gwOrToggle`, `ui/src/views/static.ts:3240`.
 
+Post-v0.1.40 note (2026-10-18): the tier's enable/disable control is no longer a toggle button — it is the shared two-position state switch (`enableSwitch`, `ui/src/switch.ts`; tracker #48, design rule 16), still carrying the `gwOrToggle` id, so the wiring this audit cites is unchanged. Passages below that describe an "Enable tier | Disable tier" button describe the pre-switch control.
+
 Line numbers are as of this audit; the file is under active edit by another
 change, so the block is best located by `const or = cfg.openrouter`
 (currently `static.ts:2941`) and the `openrouter` template

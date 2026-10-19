@@ -39,14 +39,20 @@ installer.exe /S /D=C:\My\Dir    :: silent install to a custom directory
 `/D=` must be the **last** argument and must not be quoted, even if the path
 contains spaces.
 
-## Before the first release build
+## Release build checklist
 
-1. Add application icons: `icons/icon.ico`, `icons/32x32.png`,
-   `icons/128x128.png`, `icons/128x128@2x.png` and reference them via
-   `bundle.icon` in `tauri.conf.json` (tauri-bundler requires icon files at
-   bundle time).
-2. Verify `bundle.windows.nsis.license` still points at the repo LICENSE.
+Current release: v0.1.40. The installer artifact is
+`LLMdil_<version>_x64-setup.exe` (e.g. `LLMdil_0.1.40_x64-setup.exe`),
+installing per-user to `%LOCALAPPDATA%\LLMdil`.
+
+1. Application icons are in place — `icons/icon.ico`, `icons/32x32.png`,
+   `icons/128x128.png`, `icons/128x128@2x.png` (plus `icon.icns` /
+   `icon.png`) — and referenced via `bundle.icon` in `tauri.conf.json`
+   (tauri-bundler requires icon files at bundle time).
+2. Verify `bundle.licenseFile` in `tauri.conf.json` still points at the
+   repo LICENSE (`../LICENSE`).
 3. The release workflow (`.github/workflows/release.yml`) builds this
    installer on `windows-latest` and attaches the NSIS bundle to the GitHub
-   Release on every `v*` tag push. No updater artifacts are produced in v1
-   (no auto-update; see spec §12).
+   Release on every `v*` tag push; `.github/workflows/install-test.yml`
+   exercises the built installer. No updater artifacts are produced in
+   v0.1.x (no auto-update; see spec §12).

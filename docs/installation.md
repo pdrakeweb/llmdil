@@ -21,10 +21,18 @@ Researched October 2026 — this is settled, not experimental:
   compilation. The driver still *runs* Pascal; only the compiler moved on.
   CUDA 12.x-built binaries run on R580 drivers via minor-version
   compatibility.
-- **llama.cpp build:** the application pins upstream `bin-win-cuda-12.4-x64`
-  release assets, which ship the Pascal targets. One build serves the RTX
+- **llama.cpp build:** the application pins upstream llama.cpp **b11658**
+  (`llama-b11658-bin-win-cuda-12.4-x64.zip`, plus the matching cudart
+  archive), which ships the Pascal targets. One build serves the RTX
   A4000 (Ampere) and both P100s. CUDA 13.x builds are never used on this
   machine.
+- **Gateway database:** the wizard installs a bundled PostgreSQL
+  (pinned `postgresql-18.6-1-windows-x64-binaries.zip`) under the app data
+  directory — no separate database install is required.
+- **LiteLLM:** the gateway runs in a managed Python environment; the
+  version in use is the one named by the `litellm` component pin in the
+  app configuration (1.105.1 is the version verified with this release;
+  the wizard records the probed version at gateway start).
 
 If the in-app wizard reports a driver/build mismatch, update the NVIDIA
 driver first — do not hunt for a different llama.cpp build.
@@ -40,19 +48,21 @@ driver first — do not hunt for a different llama.cpp build.
    - **Welcome** — what the application manages.
    - **License** — Apache-2.0.
    - **Install location** — defaults to `%LOCALAPPDATA%\LLMdil`.
-   - **Options** — Start Menu shortcut (on), Desktop shortcut (off by default).
-   - **Install** — copies the application. No drivers, models, or build tools
+   - **Install** — copies the application. A Start Menu folder "LLMdil" is
+     created. No drivers, models, or build tools
      are installed here; the in-app setup wizard handles the LLM stack.
-   - **Finish** — optional *Launch LLMdil*.
+   - **Finish** — carries the single launch decision: the *Launch LLMdil*
+     checkbox, beside a *Create desktop shortcut* checkbox (a desktop
+     shortcut is created only when that box is checked).
 4. On first launch, the **setup wizard** takes over — see
-   [`usage.md`](usage.md) for its 10 steps.
+   [`usage.md`](usage.md) for its 12 steps.
 
 The installer is per-user: no UAC elevation, no system-wide changes.
 
 ### Silent install
 
 ```powershell
-LLMdil_0.1.0_x64-setup.exe /S
+LLMdil_0.1.40_x64-setup.exe /S
 ```
 
 Installs with defaults to `%LOCALAPPDATA%`. Add `/D=C:\path` to override the
@@ -63,9 +73,11 @@ directory (must be the last argument, no quotes even with spaces).
 Use *Settings → Apps → Installed apps → LLMdil →
 Uninstall*, or re-run the installer and choose *Uninstall*.
 
-The uninstaller removes the application only. It asks before touching
-`%APPDATA%\llm-manager` (configuration, logs) and the model library —
-downloaded GGUFs are large and are kept by default.
+The uninstaller removes the application binaries. User data in
+`%APPDATA%\local-llm-service-manager` (config.json, logs, downloaded GGUF
+models, managed Python env) is **kept** unless you answer "Yes" to the
+removal prompt — the prompt defaults to "No", and downloaded GGUFs are
+large and are kept by default.
 
 ## Troubleshooting
 

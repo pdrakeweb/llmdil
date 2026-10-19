@@ -5,6 +5,7 @@
 - **Audited against:** `docs/design-principles.md`, Part 3 checklist (every answer must be "no")
 - **Verdict:** Redesign needed — 11 of 14 checklist items fail
 - **Line numbers** are from the Oct 16, 2026 snapshot; `static.ts` is under concurrent edit by the Gateway/Logs UI pass, so lines may drift a few lines either way.
+- **Post-v0.1.40 note (2026-10-18):** the checklist now runs to 16 questions, and the card's Enable/Disable action is no longer a button — it is the shared two-position state switch (`enableSwitch`, `ui/src/switch.ts`; tracker #48, design rule 16). Mockups below that show a [Disable] button are the pre-switch design.
 
 ## Scorecard
 

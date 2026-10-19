@@ -1,12 +1,76 @@
 # MTP Enablement Plan — Qwen3.8-27B Planner
 
-Status: workflow decided (2026-10-17), not yet executed. Goal: enable
-llama.cpp multi-token prediction (MTP) self-speculative decoding for
-the planner role and measure it against the current baseline before
-adopting it. The decided approach is a second model and a second
-backend — Planner-MTP — tested side by side with the existing
-planner. The existing planner model entry and planner backend are not
-modified at any point.
+Status: executed and shipped. The catalog entry shipped in v0.1.37;
+the tunable draft-length control shipped in v0.1.40 (tracker #53);
+draft acceptance was measured on Pete's machine under v0.1.40, and a
+matched-workload comparison captured in a 2026-10-18 diagnostics
+bundle has since settled the speed question for the configuration
+as run: spec-on decode is a net loss from per-iteration draft
+overhead, so MTP stays off for the planner seat. The formal step 5
+script run and the `--parallel 1` configuration remain unrun —
+see "Shipped status and measured outcome" below.
+Goal: enable llama.cpp multi-token prediction (MTP)
+self-speculative decoding for the planner role and measure it
+against the current baseline before adopting it. The decided
+approach is a second model and a second backend — Planner-MTP —
+tested side by side with the existing planner. The existing planner
+model entry and planner backend are not modified at any point.
+
+## Shipped status and measured outcome (v0.1.40)
+
+- **Catalog (v0.1.37).** The `qwen3.8-27b-mtp` entry below shipped
+  with `CATALOG_REVISION 3` in `crates/manager-models`. MTP
+  capability is pinned per model by the catalog's `mtp: bool` field
+  (`catalog_mtp` in `crates/manager-models/src/lib.rs`); only the
+  `-mtp` build carries `mtp: true`.
+- **Tunable draft length (v0.1.40, tracker #53).** The backend card
+  carries an MTP draft-length control (Off / 1 / 2 / 3 / 4; a
+  slider in v0.1.40, a dropdown since the #53 follow-up) backed by the
+  `backend_set_mtp` op. State is decoded from, and rewritten into,
+  the backend's saved raw flags by
+  `crates/manager-models/src/mtp.rs` (`mtp_draft` /
+  `set_mtp_draft`): the writer owns only the `--spec-type draft-mtp`
+  and `--spec-draft-n-max` tokens and leaves every other flag
+  untouched. Enabling without an explicit length writes
+  `--spec-draft-n-max 2` (`MTP_DEFAULT_N_MAX`).
+- **`--parallel` is never rewritten by the app.** The writer above
+  does not touch it. When MTP is on and the saved flags set
+  `--parallel` / `-np` to a value other than 1, the UI shows a
+  warning that drafting will not occur until the saved flags set it
+  to 1. As of v0.1.40 there is still no in-app raw-flags editor, so
+  setting `--parallel 1` remains a hand edit of `config.json` (the
+  raw-flags instructions in step 3 are superseded for the
+  speculative flags by the slider, but not for `--parallel`).
+  Before v0.1.40 there was no UI surface for the speculative flags
+  at all; the manual raw-flags route in step 3 was the only one.
+- **Measured outcome (Pete's machine, v0.1.40).** With the spec
+  flags saved through the slider, the speculative path initialized
+  and draft acceptance measured 53.9% (132 accepted / 245 generated,
+  mean accepted length 2.07) on one workload and 84.0% (79/94, mean
+  length 2.68) on another — acceptance is healthy and
+  content-dependent. A later diagnostics bundle (2026-10-18,
+  v0.1.40) captured the Optimize standardized benchmark itself
+  running against `planner-mtp` with the spec flags on — warm-up
+  plus three runs per prompt, a matched workload — and settles the
+  speed question for the configuration as run: generation measured
+  8.3 tok/s (short prompt set) and 10.7 tok/s (long prompt set)
+  against 22.5 tok/s plain decode, a net loss at every captured
+  point. The loss is per-iteration overhead, not acceptance: each
+  draft iteration costs about 250 ms (about 5.7 plain decode steps
+  at ~44 ms) while returning 2.07 tokens at 53.9% acceptance and
+  2.68 at 84.0%. Every captured run still ran with `n_slots = 4` —
+  the `--parallel 1` edit never landed in the saved configuration
+  (a later app save overwrote it) — so `--parallel 1` remains
+  untested; the iteration cost would need to fall roughly 2–3x for
+  it to flip the outcome. The formal step 5 baseline-script run
+  has not been executed. Practical standing: MTP off is the
+  measured-right setting for the planner seat; the `planner-mtp`
+  backend and model are retained as an experiment seat.
+- **No MTP for the coder.** Qwen3-Coder-Next has no MTP head, no
+  MTP GGUF build exists, and llama.cpp's `draft-mtp` is not
+  implemented for the `qwen3next` architecture; its catalog entry
+  carries `mtp: false`. There is no coder equivalent of this plan
+  until a Qwen3.6-generation coder model exists.
 
 ## Current state
 
@@ -33,7 +97,11 @@ Published measurements isolate MTP at about 1.6x decode on this model
 class on an RTX 3090 (n-max 2 was the best draft length, +59.8%).
 Projected on the A4000: 30–37 tok/s generation, unverified until
 measured here. MTP accelerates decode only; prompt processing
-(prefill) is unaffected.
+(prefill) is unaffected. (Under v0.1.40, draft acceptance measured
+healthy at 53.9–84.0%, but the projected gain did not materialize:
+the matched-workload comparison in the 2026-10-18 diagnostics
+bundle shows a net decode loss from per-iteration draft overhead —
+see "Shipped status and measured outcome".)
 
 ## Plan
 
@@ -53,7 +121,10 @@ measured here. MTP accelerates decode only; prompt processing
    - Port: any free port (backends each carry their own port; it is
      only used when measuring direct, step 4).
    - Raw flags: `--parallel 1 --spec-type draft-mtp
-     --spec-draft-n-max 2` to start. Two codebase facts shape this:
+     --spec-draft-n-max 2` to start. (As shipped, the two
+     speculative flags are set by the MTP slider instead — see
+     "Shipped status" above; only `--parallel 1` still requires
+     the hand edit this step describes.) Two codebase facts shape this:
      a backend's parallel-slot count exists only in raw flags (the
      structured flags generate `-c`, `-b`, `--tensor-split`, and
      `--split-mode` only — nothing emits `--parallel`, and
@@ -88,7 +159,13 @@ measured here. MTP accelerates decode only; prompt processing
    acceptance (accepted / drafted) whenever the server reports it.
 5. **Adoption gate.** Adopt MTP only if the production-sampling pass
    shows a median generation gain of at least about 1.3x over
-   `base-file`. Adoption means keeping the winning configuration on
+   `base-file`. (Status under v0.1.40: not adopted. The gate's own
+   script run has not been executed, but the matched-workload
+   evidence in "Shipped status and measured outcome" above settles
+   the configuration as run (`n_slots = 4`) well under the gate:
+   spec-on generation is a net loss from per-iteration draft
+   overhead despite healthy acceptance. The one configuration that
+   could reopen the question, `--parallel 1`, is untested.) Adoption means keeping the winning configuration on
    `planner-mtp` and using it as the planner (for gateway callers,
    repoint the `planner` group at the `planner-mtp` backend, or
    call the `planner-mtp` group). Retiring it means stopping and

@@ -1,8 +1,50 @@
 # Technical Specification — LLMdil
 
-Status: draft for implementation estimation. UI design approved Oct 8, 2026
-(`files/ui-design-brainstorm/design-b-hybrid.md`). No implementation begins before
-Pete approves the design; this spec is the buildable record of what was approved.
+Status: historical design record. UI design approved Oct 8, 2026
+([`design-b-hybrid.md`](design-b-hybrid.md)); the system was built from this
+spec and first shipped as v0.1.0. Current shipped version: **v0.1.40**
+(Oct 18, 2026). This document is retained as the record of what was approved
+and why; where it differs from the shipped product, the code and the as-built
+docs govern — the operation registry
+(`crates/manager-app/src/registry.rs`, 108 operations at v0.1.40),
+[`docs/admin-api/rest-api.md`](admin-api/rest-api.md), and
+[`crates/MODULES.md`](../crates/MODULES.md).
+
+Known divergences between this spec and the shipped product:
+
+- **Frontend (§2.1, §17.6):** shipped as Vite + plain TypeScript; the Svelte 5
+  candidate was not adopted.
+- **App self-update (§2.1, §11.3, §12):** `tauri-plugin-updater` is not used.
+  App updates ship as GitHub release installers; the in-app Updates surface
+  covers components (llama.cpp, LiteLLM, models, extensions), not the app
+  itself.
+- **Telemetry (§5, §16, §17.7):** shipped NVML-primary with the `nvidia-smi`
+  XML parser as fallback (`manager_telemetry::default_telemetry_stack`) —
+  the reverse of the v1 plan stated here.
+- **Model catalog (§4.6):** the v0.1.0 table below is superseded. The curated
+  catalog is six entries at `CATALOG_REVISION` 3 — the original four slots
+  (with the coder slot now Qwen3-Coder-Next-80B), plus `qwen3.8-27b-mtp`
+  (the MTP planner variant) and `nemotron-3.5-lightning-30b` — with real
+  pinned SHA-256 values; see `crates/manager-models`.
+- **MCP (§8):** this section describes the editor-exposure registry
+  (GitHub / Google Drive rows for Continue/Cline). The shipped product adds a
+  second surface: MCP servers exposed *through the gateway* (curated
+  `brave_search` / `web_fetch` stdio servers in the generated LiteLLM
+  config) — see [`mcp-capabilities-design.md`](mcp-capabilities-design.md).
+  A third, client-side delegation MCP server is a separate project — see
+  [`delegation-mcp-design.md`](delegation-mcp-design.md).
+- **Inbound ports (§11.1):** the optional Admin REST API binds
+  `0.0.0.0:47821` when enabled (firewall-scoped to the local subnet and the
+  tailnet range) — see [`docs/admin-api/`](admin-api/PLAN.md). Managed
+  inference processes still bind locally by default.
+- **API surface (§14):** the pseudocode inventory below is superseded by the
+  operation registry, which generates the Tauri commands and the REST router
+  from one declaration per operation.
+- **Request ring (§4.8, §13):** the shipped routing log cap is 50 entries
+  (`ROUTING_LOG_CAP`), not 100.
+- **Target machine (§1.2):** as currently deployed, one Tesla P100 is
+  installed (the second was removed pending a cooling/relocation change);
+  the app discovers whatever GPUs are present.
 
 Acronyms used once here and then bare: MXC (Microsoft Execution Containers),
 NVML (NVIDIA Management Library), TTFT (time to first token), PSEC
@@ -702,6 +744,15 @@ per-component pin and auto-update toggles, "Check now".
 
 Tauri commands (request/response) and events (async). Signatures in Rust-ish
 pseudocode; exact types derive from §10.
+
+> As built, this inventory is superseded by the operation registry
+> (`crates/manager-app/src/registry.rs`): 108 operations at v0.1.40, each
+> declared once with its capability class, parameters, and REST route (or an
+> explicit desktop-only exclusion). Command names differ from the pseudocode
+> below (e.g. `list_backends`, not `backends_list`), and whole surfaces have
+> no counterpart here (Optimize, activation plan, Windows services, MCP
+> server management). The as-built REST table is
+> [`docs/admin-api/rest-api.md`](admin-api/rest-api.md).
 
 **Setup / wizard**
 - `setup_get_prerequisites() -> Vec<PrereqCheck>`

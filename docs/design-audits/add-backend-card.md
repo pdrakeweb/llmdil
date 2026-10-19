@@ -2,6 +2,8 @@
 
 Scope: the transient add-a-backend form and its post-submit confirmation card, rendered inline in `wireBackends` (`ui/src/views/static.ts`, form at lines 1656–1687, confirmation at lines 1713–1716), Backends view. Audited against the 14-question checklist in `docs/design-principles.md` Part 3. Every answer must be "no"; failures carry code evidence. Audit only — no code was changed.
 
+Post-v0.1.40 note (2026-10-18): the checklist now runs to 16 questions, and the form has since gained a *Launch parameters* section (tracker #49: context, batch, expert-offload draft, and GPU placement, sharing the flags-editor controls — `#addBackParams` in `wireBackends`, current `ui/src/views/static.ts`). The audit below predates both; its line numbers and its "no summary of the outcome" finding (Q3/Q8) should be re-scored against the current form before being cited.
+
 ## Scorecard
 
 | # | Checklist question (short) | Verdict | Evidence |

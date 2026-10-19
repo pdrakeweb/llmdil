@@ -1,15 +1,24 @@
-# Admin API — REST Contract (Draft)
+# Admin API — REST Contract
 
-Status: design draft for Pete's review. No code exists yet.
+Status: implemented. The API shipped with the admin-API build
+(PLAN.md §9) and this contract describes the shipped surface as of
+v0.1.40. The source of truth for routes is the operation registry —
+`crates/manager-app/src/registry.rs` (`for_each_operation!`): 115
+operations, of which 70 carry a REST route and 45 are explicit
+`None` exclusions (§6.16). Derived/composite and auth/admin routes
+are API-layer routes in `crates/manager-api` (§6.17); the full live
+surface is 109 route records (70 registry + 15 derived + 24
+auth/admin).
 Scope: an HTTP API served by the Service Manager on a dedicated **admin port**
 on the managed machine (separate from the LiteLLM gateway port), exposing the
 app's capabilities for read and control from a remote client (first consumer:
 an Android app).
 
-Source of the capability audit: the 95 Tauri commands registered in
-`src-tauri/src/main.rs` (`tauri::generate_handler!`, lines 5882–5977) and the
-client wrappers and payload types in `ui/src/api.ts`. Where this document
-names an app command, that is the implementation the endpoint wraps.
+Original source of the capability audit: the Tauri commands
+registered in `src-tauri/src/main.rs` (`tauri::generate_handler!`)
+and the client wrappers and payload types in `ui/src/api.ts`. Where
+this document names an app command, that is the operation the
+endpoint wraps (registry name in `manager_app::registry`).
 
 Companion documents (separate workstreams): the authN/authZ and roles plan
 consumes the capability classes defined in §2.7; this contract assumes every
@@ -43,10 +52,11 @@ endpoint requires authentication and says nothing about the scheme.
   the exposure rules.
 - Versioning is a single path segment (`v1`). Breaking shape changes ship as
   `v2` alongside `v1`; additive fields never bump the version.
-- `GET /api/v1/status` doubles as the discovery/teach-the-client probe: an
-  unauthenticated-UI client can confirm it is talking to a Service Manager
-  admin API and learn its version before presenting credentials (the
-  response itself still requires auth once auth ships — see open question 3).
+- Discovery is split as built: `GET /api/v1/server` (§6.1) is the
+  public identity document — an unauthenticated client can confirm
+  it is talking to a Service Manager admin API and learn its
+  versions before presenting credentials. `GET /api/v1/status`
+  itself requires authentication, like every other operation route.
 
 ### 2.2 Format
 
@@ -92,10 +102,10 @@ Every error response uses one envelope:
 }
 ```
 
-- `kind` is the app's `ApiError` variant name (`src-tauri/src/main.rs:119`):
+- `kind` is the app's `ApiError` variant name (`manager-app`):
   `Config`, `Supervisor`, `Wizard`, `Telemetry`, `Gateway`, `Models`,
-  `Mxc`, `Mcp`, `WinMl`, `NotFound`, `InvalidInput`, `ContractGap`,
-  `Unsupported`, `Io`, `Json`.
+  `Mxc`, `Mcp`, `WinMl`, `Services`, `NotFound`, `InvalidInput`,
+  `ContractGap`, `Unsupported`, `Io`, `Json`.
 - `code` is the stable machine-readable form (SCREAMING_SNAKE of `kind`),
   plus REST-layer codes that have no app counterpart: `BUSY` (a singleton
   resource is already running something), `OPERATION_FAILED` (an operation's
@@ -112,7 +122,8 @@ Every error response uses one envelope:
   | Singleton busy (wizard step already running, download already in flight, plan apply already running) | 409 | `BUSY` |
   | Config patch fails validation | 422 | `CONFIG` |
   | Capability deferred in the app itself | 501 | `UNSUPPORTED` |
-  | Everything else (`Supervisor`, `Gateway`, `Wizard`, `Telemetry`, `Models`, `Mxc`, `Mcp`, `WinMl`, `Io`, `Json`, `ContractGap`) | 500 | per kind |
+  | App contract gap (a crate API cannot express the operation) | 501 | `CONTRACT_GAP` |
+  | Everything else (`Supervisor`, `Gateway`, `Wizard`, `Telemetry`, `Models`, `Mxc`, `Mcp`, `WinMl`, `Services`, `Io`, `Json`) | 500 | per kind |
 
 - Implementation note: the Tauri boundary flattens `ApiError` to its
   Display string. The REST layer must capture the structured kind before
@@ -380,29 +391,48 @@ payload; the API adds nothing.
 
 ## 5. Endpoint index
 
-93 client-facing endpoints. ("Op" = returns `202` + operation, §3.)
+85 implemented client-facing endpoints: 70 registry operation
+routes + 15 derived/API-layer routes (§6.17). A further 24
+auth/admin routes (§6.17) bring the live surface to 109 route
+records. ("Op" = returns `202` + operation, §3.) Specified but not
+implemented in v1: the gateway master key (decision 4), raw
+`PATCH /config` (decision 11), and the peripheral domains
+(decision 10) — §6.16 accounts for every registry operation with
+no route.
 
 | Domain | Count | Endpoints |
 |---|---|---|
-| Status | 1 | `GET /status` |
-| Backends | 17 | list, create, get, delete, config get/patch, diff preview, start/stop/restart (Op), test, flags, offload, mtp, raw flags, flags mode, launch command |
+| Server / status | 2 | `GET /server` (public identity), `GET /status` |
+| Backends | 18 | list, create, get, delete, config get/patch, diff preview, start/stop/restart (Op), test, flags, offload, mtp, parallel, raw flags, flags mode, launch command |
 | Models | 11 | list, create, get, delete, patch, download (Op) + pause/resume/cancel, verify (Op), assign |
 | Placement | 2 | propose, apply |
-| Gateway | 13 | status, config get/patch, generated config, master key, start (Op), stop, groups CRUD (4), routing test, routing recent |
+| Gateway | 12 | status, config get/patch, generated config, start (Op), stop, groups list + CRUD (4), routing test, routing recent — plus master key specified, NOT IMPLEMENTED (§6.5) |
 | Activation plan | 5 | get, apply (Op), quiesce-wait, cancel, execution history |
 | Wizard / setup | 11 | steps, status, prerequisites, run (Op), retry, skip, mark-manual, commands, help URL, complete, audit (Op) |
 | Logs | 2 | query, scopes |
 | Telemetry | 4 | GPUs, interval, reset peaks, snapshot |
 | Operations | 3 | list, get, abort |
 | Diagnostics | 2 | create bundle (Op), download bundle |
-| Config / settings | 2 | get, patch |
+| Events | 1 | `GET /events` (SSE stream, §6.17) |
+| Config / settings | 1 | get — plus raw patch specified, NOT IMPLEMENTED (§6.12) |
 | MXC | 6 | policy get/put, mode, self-test, activity, tightening proposals |
 | Updates | 5 | list, check, apply, pin, auto |
-| Peripheral (MCP, VS Code, WinML) | 9 | §6.14 — candidates for exclusion from API v1 |
+| Peripheral (MCP, VS Code, WinML) | 0 | Excluded from API v1 (decision 10) — §6.15/§6.16 |
 
 ## 6. Endpoint reference
 
 ### 6.1 Status
+
+#### `GET /api/v1/server` — public (API-layer route, no backing operation)
+The deployment identity document (PLAN.md §3.8). No authentication
+required. Response:
+
+```json
+{ "deployment_id": "…", "app": "llmdil", "app_version": "0.1.40",
+  "api_version": "1",
+  "features": { "operations": true, "events_sse": true,
+                "auth": true } }
+```
 
 #### `GET /api/v1/status` — `read`
 Maps to `get_status`. Response:
@@ -501,7 +531,9 @@ changes exactly as the app does.
 start; the app records the activation-plan entry.
 
 #### `PUT /api/v1/backends/{id}/offload` — `config`
-`backend_set_offload`. Body: `{ "layers": 40 }` →
+`backend_set_offload`. Body: `{ "layers": 40 }`, with optional
+`"allow_override": true` to accept a guardrail-blocked position
+(the override is journaled, as in the app) →
 `{ "backend_id", "layers": 40, "raw_flags": "…", "changed": true }`.
 Only valid for offload-capable backends (the `offload` block in §4.1
 says which); otherwise `400 INVALID_INPUT`, as in the app.
@@ -897,8 +929,9 @@ first.
 One operation. The app has no get-by-id command; the server filters
 `tasks_list`. `404` when absent.
 
-#### `POST /api/v1/operations/{id}/abort` — `control`
-`task_abort` → the operation's resulting state. Aborting is
+#### `POST /api/v1/operations/{task_id}/abort` — `control`
+`task_abort` (the registry route template names the placeholder
+`task_id`) → the operation's resulting state. Aborting is
 best-effort per kind (§3.1); an already-terminal operation returns
 its state unchanged.
 
@@ -980,9 +1013,12 @@ Evaluation only; applying a proposal is `PUT /mxc/policy`.
 The `updates` section of `GET /config` (per-component
 `pinned_version`, `auto_update`, `last_checked`).
 
-#### `POST /api/v1/updates/check` — `control`
-`updates_check_all` → per-component check results (the app's
-payload).
+#### `POST /api/v1/updates/check` — `read`
+`updates_check_all`. Routed, but the app operation is a stub:
+it returns `501 UNSUPPORTED` ("Update checking ships in P6"),
+exactly like `updates_apply` below. The contract reserves the
+path; per-component results arrive when the app implements
+checking.
 
 #### `POST /api/v1/updates/components/{component_id}/apply` — `control`
 `updates_apply`. **Specified but deferred:** component updates are
@@ -998,25 +1034,84 @@ implements it; the contract reserves the path.
 `updates_set_auto`. Body: `{ "enabled": true }` →
 `{ "ok", "persisted", "component_id", "auto_update" }`.
 
-### 6.15 Peripheral capabilities (MCP, VS Code, WinML)
+### 6.15 Peripheral capabilities (MCP, VS Code, WinML) — excluded from v1
 
 These app capabilities exist but sit outside the manager's core
-domains. They are specified here for completeness of the audit;
-**recommendation: exclude from API v1** and add when a client need
-exists (the Android control app has no use for VS Code setup or MCP
-mode toggles).
+domains. As built (PLAN.md decision 10), **none of them has a REST
+route in v1**: every operation below is registered with route
+`None` in the registry (§6.16), the Tauri surface is unchanged, and
+adding any of them later is additive. The draft endpoint shapes
+once sketched here are withdrawn; two draft details are also stale
+against the current app — the MCP mode operation is now
+`mcp_set_exposure` (`{ "exposure": "…" }`, replacing
+`mcp_set_mode`), and the MCP surface has grown beyond the three
+operations the draft knew (`mcp_save_server`,
+`mcp_delete_server`, `mcp_store_credential`,
+`mcp_start_preflight`).
 
-| Endpoint | Class | App command |
+| App operation | Registry class | Status |
 |---|---|---|
-| `GET /api/v1/mcp/servers` | read | `mcp_list` |
-| `POST /api/v1/mcp/servers/{id}/test` | control | `mcp_test_connection` |
-| `PUT /api/v1/mcp/servers/{id}/mode` | config | `mcp_set_mode` — body `{ "mode": "…" }` |
-| `POST /api/v1/vscode/extensions` | control | `vscode_install_extensions` |
-| `POST /api/v1/vscode/config` | config | `vscode_write_config` — body `{ "backup": true }` |
-| `GET /api/v1/winml/status` | read | `winml_status` |
-| `POST /api/v1/winml/probe` | control | `winml_probe` |
-| `POST /api/v1/winml/register` | config | `winml_register` — body `{ "model_id": "…" }` |
-| `POST /api/v1/winml/unregister` | config | `winml_unregister` |
+| `mcp_list`, `mcp_start_preflight` | R | No route (decision 10) |
+| `mcp_test_connection`, `mcp_set_exposure`, `mcp_save_server`, `mcp_delete_server`, `mcp_store_credential` | X | No route (decision 10) |
+| `vscode_install_extensions`, `vscode_write_config` | X | No route (decision 10) |
+| `winml_status`, `winml_probe` | R | No route (decision 10) |
+| `winml_register`, `winml_unregister` | D | No route (decision 10) |
+
+### 6.16 Registry exclusions — every operation with no route
+
+The registry holds 115 operations: 70 routed (§6.1–§6.14) and 45
+with route `None`. A `None` route is an explicit exclusion, never
+an oversight (registry module docs); the complete list, grouped by
+reason:
+
+| Reason | Operations |
+|---|---|
+| Raw config patch excluded (decision 11) | `update_config` (C) |
+| Master-key value never mirrored (decision 4) | `gateway_master_key` (SDisclosure) |
+| Desktop-only actions (§7.1–7.2) | `open_url` (L), `open_folder` (L) |
+| No 1:1 route — served inside a composition | `gateway_set_bind_host` (C, inside `PATCH /gateway/config`); `model_set_short_name` (C) and `model_set_enabled` (C), inside `PATCH /models/{id}`; `gateway_activation_complete` (L, server bookkeeping after apply/(re)start, §6.6); `gateway_activation_record_execution` (C, execution bookkeeping recorded by the desktop apply funnel, §6.6) |
+| Desktop-only preview | `backend_add_preview` (R) — the add-backend form's placement preview; creation itself is `POST /backends` |
+| MCP — peripheral (decision 10) | `mcp_list` (R), `mcp_start_preflight` (R), `mcp_test_connection` (X), `mcp_set_exposure` (X), `mcp_save_server` (X), `mcp_delete_server` (X), `mcp_store_credential` (X), `backend_test_tool_call` (L, gateway MCP tool-call test) |
+| VS Code — peripheral (decision 10) | `vscode_install_extensions` (X), `vscode_write_config` (X) |
+| WinML — peripheral (decision 10) | `winml_probe` (R), `winml_status` (R), `winml_register` (D), `winml_unregister` (D) |
+| Notifications — desktop-only (toast delivery is a shell concern) | `notifications_set_config` (C), `notifications_send_test` (L) |
+| Windows services — desktop-only in v1 (SCM elevation is a shell concern) | `services_list` (R), `services_register` (D), `services_unregister` (D) |
+| Optimize — desktop-only in v1 | `optimize_get_state` (R), `optimize_validate_plan` (R), `optimize_save_purpose` (C), `optimize_set_item_state` (C), `optimize_set_item_outcome` (C), `optimize_discard_plan` (C), `optimize_set_experiment_state` (C), `optimize_consult` (L), `optimize_discover` (L), `optimize_cancel_consult` (L), `optimize_measure_backend` (L), `optimize_cancel_job` (L), `optimize_run_baseline` (L), `optimize_run_experiments` (L), `optimize_estimate_backend` (L), `optimize_estimate_experiments` (L) |
+
+### 6.17 API-layer routes (no backing registry operation)
+
+These routes live in `crates/manager-api`, not in the registry.
+The 15 derived routes are enumerated in `DERIVED_ROUTES`
+(`manager-api/src/http.rs`) and distributed through §5/§6 above:
+`GET /server`, `GET /backends/{id}`, `GET /models/{id}`,
+`GET /operations/{id}`, `GET /logs/scopes`, `GET /gateway/groups`,
+`GET /updates`, `PATCH /models/{id}`, `POST /gateway/groups`,
+`PATCH /gateway/groups/{name}`, `DELETE /gateway/groups/{name}`,
+`POST /gateway/start`, `POST /activation-plan/apply`,
+`GET /diagnostics/bundles/{bundle_id}/content`, and:
+
+#### `GET /api/v1/events` — `read` (any authenticated role)
+Server-Sent Events stream of the app's operation events
+(backend status, download progress, wizard progress, task
+progress), each with a process-global id. Live-only: nothing is
+replayed on reconnect; ids let a client detect gaps, and every
+fact the stream carries is also reachable by GET (PLAN.md §9).
+It is an API-layer route, **not** a registry operation.
+
+The remaining 24 API-layer routes are the auth/admin surface
+(`AUTH_ROUTES` in `manager-api/src/auth_routes.rs`), specified by
+`auth-plan.md`: `POST /auth/login`, `POST /auth/totp`,
+`POST /auth/refresh`, `POST /enroll`, `GET /auth/me`,
+`POST /auth/logout`, `POST /auth/password`, `GET /auth/sessions`,
+`DELETE /auth/sessions/{id}`, `POST /auth/totp/enroll`,
+`POST /auth/totp/verify`, `POST /auth/totp/disable`,
+`GET|POST /admin/users`, `PATCH|DELETE /admin/users/{id}`,
+`POST /admin/users/{id}/reset-password`,
+`GET /admin/users/{id}/sessions`,
+`DELETE /admin/users/{id}/sessions/{session_id}`,
+`GET|POST /admin/api-tokens`, `DELETE /admin/api-tokens/{id}`,
+`POST /admin/enrollment-codes`, `GET /admin/audit` — all under
+`/api/v1`.
 
 ## 7. Capabilities that do not map cleanly
 
@@ -1053,13 +1148,14 @@ mode toggles).
    is more than a wrapper.
 6. **`gateway_activation_complete`**: internal bookkeeping, not a
    client endpoint (§6.6).
-7. **Streaming: none required, none offered.** No app capability
-   streams: logs are paged queries, telemetry is poll snapshots,
-   download progress is state polling. API v1 keeps the poll model
-   throughout (operations, model state, telemetry snapshots). A
-   future SSE/WebSocket channel for telemetry and log tailing is
-   possible without breaking this contract, but no capability needs
-   it to map completely.
+7. **Streaming: polling is the contract; SSE is additive.** No app
+   capability streams: logs are paged queries, telemetry is poll
+   snapshots, download progress is state polling, and the poll
+   model remains the correctness path throughout. As built, an
+   SSE channel was added on top of it — `GET /api/v1/events`
+   (§6.17), an API-layer route fed by the `EventSink` broadcast.
+   No capability needs the stream to map completely, and a client
+   that never opens it loses nothing.
 8. **File pickers: none.** No audited command depends on a file
    dialog — model registration takes a URL, bundle export takes no
    destination. Nothing is lost to their absence remotely.
@@ -1070,6 +1166,12 @@ mode toggles).
     wanted, it is new app behavior first, API second.
 
 ## 8. Open questions for review
+
+Resolved since the draft: all four questions below were decided
+in `PLAN.md` §4 (port/exposure, decision 1–2; peripheral domains
+excluded, decision 10; operation retention = process lifetime,
+decision 15; raw config patch excluded, decision 11). The list is
+kept as the review record.
 
 1. **Admin port exposure**: bind loopback-only, LAN, or Tailscale
    only? (Auth plan territory, but it shapes whether `GET /status`

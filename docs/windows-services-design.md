@@ -1,7 +1,18 @@
 # Windows Services supervision — design note
 
 Branch: `feature/windows-services` (from v0.1.32, commit 99ee351).
-Status: increment 1 implemented (see "Increment 1 status" at the end).
+Status: increment 1 implemented (see "Increment 1 status" at the end)
+and merged to main; shipped in releases from v0.1.36, present in
+v0.1.40. The original gate — do not land until Pete has tested it on
+Prometheus — was superseded by the merge; what remains gated is
+**reliance**: session-0 GPU validation (§4a) is still an on-machine
+item, so service mode ships available but not yet validated for GPU
+backends. The deferred list at the end is current as of v0.1.40:
+no installer bundling of `llm-service-host.exe` (no `externalBin`
+entry in `src-tauri/tauri.conf.json`), PostgreSQL is still started
+process-managed via `pg_ctl` before the gateway service, start mode
+is still Manual (`ServiceStartMode::Manual` in
+`crates/manager-services`), and there is no boot-start.
 Pete's directive (2026-10-17): every backend and the gateway should be
 registered as Windows system services; the Service Manager starts/stops
 those services; when configuration changes, the service definition is
@@ -85,7 +96,8 @@ Definitions are generated from the exact objects process supervision
 spawns today; there is no second flag-construction path:
 
 - Backends: from `backend_spec()`'s `ProcessSpec`
-  (`src-tauri/src/main.rs`) — program (`<data_dir>\llamacpp\llama-server.exe`),
+  (now `crates/manager-app/src/lib.rs`; it lived in
+  `src-tauri/src/main.rs` when this note was written) — program (`<data_dir>\llamacpp\llama-server.exe`),
   args (model, port, context, batch, tensor split remapped onto placed
   GPUs, raw-flag filtering), env (`CUDA_VISIBLE_DEVICES` with GPU
   UUIDs), port. `manager_services::backend_definition(&ProcessSpec)`
@@ -359,7 +371,8 @@ Implemented in this branch:
   log files, pid file, kill-on-close job object; plus the elevated
   `register`/`unregister` helper modes). Unit tests for definition
   generation run on Linux.
-- App routing (`src-tauri`): backend start/stop/restart route to the
+- App routing (`src-tauri`; the app glue has since moved to
+  `crates/manager-app`): backend start/stop/restart route to the
   SCM when mode = service and the service is registered;
   `list_backends` merges SCM state for registered services;
   definitions regenerate on backend add / apply-config / update-flags

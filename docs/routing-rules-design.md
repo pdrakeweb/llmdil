@@ -1,6 +1,15 @@
 # Routing Rules — Design: the Context-Overflow Rule
 
-Status: design, awaiting Pete's approval before any build (design-first rule).
+Status: shipped — built as designed below and merged; in releases
+from v0.1.36, present in v0.1.40. The typed
+`RoutingRuleKind::ContextOverflow` is in `crates/manager-config`;
+generation in `crates/manager-gateway` bakes the per-group window
+table into the generated `llmdil_routing.py` pre-call hook and
+emits the native `context_window_fallbacks` safety net; with no
+enabled rule the generated YAML is byte-identical to the
+pre-feature output and no routing file is written. The §1
+description of the dormant fragment-only rule is the
+pre-implementation state this design started from.
 Date: 2026-10-17. Local tree only.
 
 Related: `docs/mcp-capabilities-design.md` (per-key MCP grants, gateway config
@@ -605,7 +614,9 @@ plus one sibling artifact, through the existing write-at-start path.
    too (present-and-equal when a rule is enabled, absent when not), or
    rule changes would not register as pending changes — and the MCP
    design's spawn fingerprint has the same blind spot, noted there for
-   coordination (§8).
+   coordination (§8). (Shipped: the wizard check and the activation
+   drift check in `crates/manager-app/src/activation.rs` both cover
+   the `llmdil_routing.py` sibling.)
 
 ### 6.4 The callback, specified
 

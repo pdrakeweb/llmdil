@@ -1,8 +1,11 @@
 # Admin API — Architectural Plan
 
-Status: compiled plan for Pete's review, 2026-10-16. No code written.
-Approving this document approves the architecture; implementation
-follows the phasing in §3.9.
+Status: approved 2026-10-16 and implemented; §9 records what
+shipped. The plan text below is the approved design as written;
+where the build settled or changed a point, §9 (including its
+v0.1.40 addendum) is the record — code won wherever the two
+disagreed. Approving this document approved the architecture;
+implementation followed the phasing in §3.9.
 
 Compiled from the four research documents in this directory, cited
 throughout as **[audit]** (`capability-audit.md`), **[rest]**
@@ -834,6 +837,35 @@ except two deliberate exclusions: `GET /gateway/master-key`
 v1) and raw `PATCH /config` (decision 11). `POST
 /updates/components/{component_id}/apply` is routed and returns
 501 UNSUPPORTED from the app's own stub (decision 10).
+
+**Addendum — v0.1.40 (October 18, 2026).** The totals above were
+written before three post-plan operations landed; the current
+registry (`crates/manager-app/src/registry.rs`) is the source of
+truth:
+
+- **108 operations** in total (the §3.1 contract test's "82
+  operations" is the plan-era count): **66 with REST routes**
+  (50 sync 200, 10 async 202, 2 created 201, 4 body-wrapped sync)
+  and **42 with route `None`**, each an explicit exclusion listed
+  in rest-api.md §6.16. The live surface is therefore **105 route
+  records**: 66 registry + 15 derived + 24 auth/admin.
+- The +1 routed operation over the totals above is
+  `backend_set_mtp` (`PUT /api/v1/backends/{id}/mtp`, class C,
+  tracker #53). The other growth is routeless: `mcp_start_preflight`
+  (#44) and `backend_add_preview` (#49, desktop-only) joined the
+  exclusions, and `backend_add` gained its optional launch
+  parameters (`n_ctx`, `n_batch`, `offload_layers`,
+  `offload_override`, `gpu_indices`) under its existing route.
+- The peripheral operations (§6.15 of rest-api.md — MCP, VS Code,
+  WinML) are likewise unimplemented over REST per decision 10;
+  the "every endpoint implemented" sentence above covers the v1
+  committed surface only.
+- `GET /api/v1/events` (SSE) is an API-layer derived route, not a
+  registry operation; the audit-log read path is
+  `GET /api/v1/admin/audit` (§3.4's `GET /admin/audit` omits the
+  prefix). Both `POST /updates/check` and
+  `POST /updates/components/{component_id}/apply` return 501
+  UNSUPPORTED from the app's stubs.
 
 **Registry drift mechanism.** As specified in section 3.1:
 `for_each_operation!` in manager-app is the single declaration;

@@ -58,8 +58,10 @@ Every distinct card type in the UI, where it renders, and its source.
 | Activation plan card | Activation Plan view; the same markup renders in the activation banner at the top of the main column | `activationPlanHtml`, `ui/src/views/static.ts` |
 | Pending changes card | Activation Plan view (changes table) | inline in `wireActivationPlan`, `ui/src/views/static.ts` |
 | Wizard step card | Setup Wizard view, one row per step | `wizardStepRow`, `ui/src/views/static.ts` |
-| Settings cards | Settings view — General, Updates & diagnostics, Notifications, MXC sandbox | `settingsCard`, `ui/src/views/static.ts` |
-| Logs filter card | Logs view (search, time window, sort, pagination bar) | inline in `renderLogs`, `ui/src/views/static.ts` |
+| Settings cards | Settings view — tabbed panels: General, Updates & diagnostics, Notifications, MXC sandbox, Remote Access (Admin API + admin users), Supervision | inline in `renderSettings` / `wireSettings`, `ui/src/views/static.ts` |
+| MCP server card | MCP Servers view, one per registered server | inline in `renderMcp` / `wireMcp`, `ui/src/views/mcp.ts` |
+| Optimize sections | Optimize view — consultation / plan, measurements, experiments, candidate discovery are section blocks, not cards | inline in `wireOptimize`, `ui/src/views/optimize.ts` |
+| Logs filter card | Logs view (search, scope, time window, sort, pagination bar) | inline in `renderLogs`, `ui/src/views/static.ts` |
 
 Not cards: the Models overview strip (`modelOverviewHtml`) is a summary table; the Service Map and the dashboard Console/Topology views are full-view layouts; log entries are table rows. Shared chart primitives (segmented/stacked bars, gauges, line charts) live in `ui/src/charts.ts` and are components, not cards.
 

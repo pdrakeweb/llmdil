@@ -14,6 +14,16 @@ wrong against the real server: the exe path, and the absence of authentication
 (the real server mints a random access key on every start and returns HTTP 401
 without it, so the app's existing probe and gateway registration would fail).
 
+Status note: this is a research record, not a build plan in
+flight. The wizard build sketched in §5 ("Design consequences")
+was dropped on 2026-10-15 — WinML is deferred; see
+`docs/winml-future.md`. The §5 table's "current code" column was
+re-verified against v0.1.40 and is still accurate: the app still
+assumes the `C:\Program Files\WindowsML` exe path
+(`crates/manager-winml`) and still emits `openai/winml` with the
+placeholder key in the gateway generator — both inert because
+nothing installs or starts a server.
+
 ---
 
 ## 1. Canonical distribution channel

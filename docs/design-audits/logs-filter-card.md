@@ -4,6 +4,7 @@ Card: Logs filter card (Logs view)
 Source: inline in `renderLogs` / painted by `wireLogs`, `ui/src/views/static.ts`
 Reference: `docs/design-principles.md` (14 principles, Part 3 checklist)
 Date: 2026-10-16
+Post-v0.1.40 note (2026-10-18): the checklist in `docs/design-principles.md` now runs to 16 questions (rules 15–16 added 2026-10-17/18), and the Logs view has since gained scope deep links — `#/logs?scope=<id>&follow=1`, used by the go-to-logs buttons on backend, gateway, MCP, and Optimize surfaces, with scopes including `optimize` and per-MCP-server scopes (`wireLogs`, `ui/src/views/static.ts`). Line numbers below are the 2026-10-16 snapshot.
 Verdict: **Minor gaps** — the control set is sound; the failures concentrate in two always-visible prose strings, a split pagination cluster, and one unformatted count. Targeted fixes, no structural redesign.
 
 ## Scorecard

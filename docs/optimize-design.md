@@ -1,6 +1,19 @@
 # Optimize Page — Design
 
-Status: design only, not built. Pete's feature spec, 2026-10-17: the app
+Status: shipped — Phases 0–5 and Addendum A are implemented in
+releases through v0.1.40 (core logic in `crates/manager-optimize`;
+app glue in `crates/manager-app/src/optimize.rs`,
+`optimize_eval.rs`, and `optimize_experiments.rs`). Two v0.1.40
+behavior notes: plan-build model grounding (tracker #51) — a
+`backend.create` item naming an unregistered model now gets a
+chained `model.add` from the catalog or the discovery candidates,
+or is excluded with its reason recorded in `Plan.excluded_items`,
+instead of simply failing validation (§6's non-resolution rule is
+superseded for creates by this grounding); and verbose logging
+(tracker #52) — the whole pipeline writes to
+`<data_dir>/logs/optimize.log`, rotating at ~1 MiB to
+`optimize.log.prev`, served by the Logs view as the `optimize`
+scope. Pete's feature spec, 2026-10-17: the app
 assembles the system configuration, the software's purpose, and its
 configuration and options; sends them to one of the running AI backends;
 and asks for optimizations to the layout — which models, which settings
@@ -568,6 +581,13 @@ decision for Pete (§8).
   treated as unverified text the operator confirms out-of-band
   before downloading. A model id outside the catalog and outside
   a `model.add` item fails validation by non-resolution.
+  (v0.1.40, tracker #51: for `backend.create` items the plan
+  builder grounds the reference first — it chains a `model.add`
+  from the catalog entry or a discovered candidate ahead of the
+  create, and a create whose model resolves nowhere is excluded
+  with its reason in `Plan.excluded_items` rather than offered.
+  See `ground_create_models` in
+  `crates/manager-optimize/src/parse.rs`.)
 - **Over-eager rewrites.** The prompt asks for at most 12 items and
   prefers minimal change; the parser caps at 25; no-op items are
   filtered by validation; conflicts invalidate the later item.
@@ -694,8 +714,15 @@ survive an app restart, and decisions are the operator's work.
 
 # Addendum A — Measurements, experiments, directives, and discovery (tracker #28)
 
-Status: Pete-directed Oct 17, 2026; **design only until Pete
-approves this addendum**. Phase placement: **Phase 5**, after the
+Status: Pete-directed Oct 17, 2026; **shipped as Phase 5**
+(sub-phases 5a–5e, in releases through v0.1.40: benchmark runner
+and fingerprint-keyed measurement store at
+`<data_dir>/optimize-measurements.json` with median-of-3 figures,
+directive capture, HF discovery pre-pass, screening suite, and the
+experiment runner using temporary `opt-exp-*` backends under the
+§A.3 budgets — at most 3 per batch, 30 minutes each, 60 minutes
+per batch — and never downloading models). Phase placement:
+**Phase 5**, after the
 apply executors (the current build's Phase 4), as its own phase
 with sub-phases (§A.7). The current build reserves what this
 addendum needs: the context schema carries a `measurements`
