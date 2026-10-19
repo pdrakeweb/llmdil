@@ -300,9 +300,11 @@ macro_rules! for_each_operation {
             (OptimizeDiscover, optimize_discover, L, op_optimize_discover, [directive: String], None),
             (OptimizeCancelConsult, optimize_cancel_consult, L, op_optimize_cancel_consult, [], None),
             (OptimizeMeasureBackend, optimize_measure_backend, L, op_optimize_measure_backend, [backend_id: String], None),
+            (OptimizeEstimateBackend, optimize_estimate_backend, L, op_optimize_estimate_backend, [backend_id: String], None),
             (OptimizeCancelJob, optimize_cancel_job, L, op_optimize_cancel_job, [], None),
             (OptimizeRunBaseline, optimize_run_baseline, L, op_optimize_run_baseline, [backend_id: String], None),
             (OptimizeRunExperiments, optimize_run_experiments, L, op_optimize_run_experiments, [], None),
+            (OptimizeEstimateExperiments, optimize_estimate_experiments, L, op_optimize_estimate_experiments, [], None),
             (VscodeInstallExtensions, vscode_install_extensions, X, op_vscode_install_extensions, [], None),
             (VscodeWriteConfig, vscode_write_config, X, op_vscode_write_config, [backup: bool], None),
             // MXC
@@ -398,7 +400,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 108);
+        assert_eq!(OP_SPECS.len(), 110);
     }
 
     #[test]

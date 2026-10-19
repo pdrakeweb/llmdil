@@ -19,11 +19,12 @@ use serde_json::{json, Value};
 use manager_config::AppConfig;
 use manager_optimize::{
     benchmark_prompts, build_context, build_prompts, config_fingerprint, consult_default,
-    default_purpose_seed, estimate_tokens, measurement_facts, measurement_fingerprint, parse_plan,
-    probe_hardware, validate_plan, BackendMeasured, BenchResult, BenchRun, CandidateFact,
-    ConsultCandidate, Decision, HardwareContext, HfClient, ItemValidation, LayoutFacts,
-    LiveSnapshot, MeasureInputs, MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore,
-    Plan, TrafficWindow, ValidationStatus, BENCHMARK_TEMPERATURE, MEASURED_RUNS,
+    default_purpose_seed, estimate_prompts, estimate_tokens, measurement_facts,
+    measurement_fingerprint, parse_plan, probe_hardware, validate_plan, BackendMeasured,
+    BenchResult, BenchmarkPrompt, CandidateFact, ConsultCandidate, Decision, EstimateEntry,
+    HardwareContext, HfClient, ItemValidation, LayoutFacts, LiveSnapshot, MeasureInputs,
+    MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, Plan, TrafficWindow,
+    ValidationStatus, BENCHMARK_TEMPERATURE, ESTIMATE_RUNS, MEASURED_RUNS,
 };
 use manager_supervisor::ProcessState;
 
@@ -607,6 +608,37 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
         v["sample"] = json!(file.sample);
         v
     });
+    // Current-fingerprint estimate summaries (tracker #56),
+    // composed with the same headline rule as the measured
+    // figures but carried under their own key and basis: the
+    // page renders them as "Estimate", and they never enter
+    // `gathered.measure.throughput` (the consultation facts).
+    let estimate_store = MeasurementStore::load(&measurements_path(state));
+    let now_utc = chrono::Utc::now();
+    let estimated_by_backend: HashMap<String, Value> = cfg
+        .backends
+        .iter()
+        .filter_map(|b| {
+            let fp = gathered.fingerprints.get(&b.id)?;
+            let e = estimate_store.current_estimate(&b.id, fp)?;
+            let estimated_at = chrono::DateTime::parse_from_rfc3339(&e.estimated_at)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .unwrap_or(now_utc);
+            let age_secs = now_utc
+                .signed_duration_since(estimated_at)
+                .num_seconds()
+                .max(0) as u64;
+            Some((
+                b.id.clone(),
+                json!({
+                    "prompt_per_second": e.long.prompt_per_second.or(e.short.prompt_per_second),
+                    "predicted_per_second": e.short.predicted_per_second.or(e.long.predicted_per_second),
+                    "ttft_ms": e.short.ttft_ms.or(e.long.ttft_ms),
+                    "age_secs": age_secs,
+                }),
+            ))
+        })
+        .collect();
     let purpose = cfg.optimize_purpose.clone();
     // The stored plan's directive (addendum A.2), offered as the
     // next consultation field's default text; "" when no plan (or
@@ -650,6 +682,7 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
                 "model_id": model.map(|m| m.id.clone()),
                 "short_name": model.map(|m| manager_optimize::model_short_name(&cfg, m)),
                 "measured": measured,
+                "estimated": estimated_by_backend.get(&b.id).cloned(),
             })
         }).collect::<Vec<_>>(),
         "context_summary": {
@@ -1147,6 +1180,105 @@ pub async fn op_optimize_cancel_consult(state: &std::sync::Arc<crate::AppState>,
     }
 }
 
+/// Run one benchmark prompt against a backend: an optional
+/// discarded warm-up, then `runs` measured completions,
+/// reduced to the median-bearing [`BenchResult`]. Shared by
+/// the full measurement, the abbreviated estimate (tracker
+/// #56), and experiment estimate passes. A warm-up failure and
+/// a run failure surface identically — the callers' existing
+/// error text names the stage that wraps this helper.
+pub(crate) async fn benchmark_one_prompt(
+    base_url: &str,
+    model: &str,
+    prompt: &BenchmarkPrompt,
+    warm_up: bool,
+    runs: usize,
+    timeout: Duration,
+) -> Result<BenchResult, String> {
+    let messages = vec![manager_supervisor::ChatMessage {
+        role: "user".to_string(),
+        content: prompt.text.to_string(),
+    }];
+    if warm_up {
+        manager_supervisor::benchmark_completion(
+            base_url,
+            model,
+            &messages,
+            BENCHMARK_TEMPERATURE,
+            prompt.max_tokens,
+            timeout,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    let mut samples = Vec::new();
+    for _ in 0..runs {
+        let sample = manager_supervisor::benchmark_completion(
+            base_url,
+            model,
+            &messages,
+            BENCHMARK_TEMPERATURE,
+            prompt.max_tokens,
+            timeout,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        samples.push(manager_optimize::BenchRun {
+            prompt_per_second: sample.prompt_per_second,
+            predicted_per_second: sample.predicted_per_second,
+            ttft_ms: sample.ttft_ms,
+            latency_ms: sample.latency_ms,
+        });
+    }
+    Ok(BenchResult::from_runs(samples))
+}
+
+/// Resolve the target of a benchmark job (measurement or
+/// estimate): the backend's config, its current measurement
+/// fingerprint, and its model id. Benchmark jobs run only
+/// against a running backend — neither starts one.
+async fn benchmark_target(
+    state: &AppState,
+    backend_id: &str,
+    job_noun: &str,
+) -> Result<
+    (
+        manager_config::BackendConfig,
+        String,
+        String,
+    ),
+    ApiError,
+> {
+    let cfg = state.config.read().await.clone();
+    let backend = cfg
+        .backends
+        .iter()
+        .find(|b| b.id == backend_id)
+        .ok_or_else(|| ApiError::NotFound(format!("backend {backend_id}")))?
+        .clone();
+    let gathered = gather(state, &cfg).await;
+    if gathered.running.get(backend_id).copied() != Some(true) {
+        return Err(ApiError::InvalidInput(format!(
+            "backend '{backend_id}' is not running; {job_noun} run against a running backend"
+        )));
+    }
+    let fingerprint = gathered
+        .fingerprints
+        .get(backend_id)
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound(format!("backend {backend_id}")))?;
+    let model_id = crate::model_for_backend(&cfg, &backend)
+        .map(|m| m.id.clone())
+        .unwrap_or_else(|| {
+            backend
+                .model_file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| backend.id.clone())
+        });
+    Ok((backend, fingerprint, model_id))
+}
+
 /// Measure one running backend (Phase 5a, §A.1): the
 /// standardized benchmark — one discarded warm-up then three
 /// measured runs per prompt, short then long, sequentially —
@@ -1168,33 +1300,8 @@ pub async fn op_optimize_measure_backend(
             ));
         }
     }
-    let cfg = state.config.read().await.clone();
-    let backend = cfg
-        .backends
-        .iter()
-        .find(|b| b.id == backend_id)
-        .ok_or_else(|| ApiError::NotFound(format!("backend {backend_id}")))?
-        .clone();
-    let gathered = gather(state, &cfg).await;
-    if gathered.running.get(&backend_id).copied() != Some(true) {
-        return Err(ApiError::InvalidInput(format!(
-            "backend '{backend_id}' is not running; measurements run against a running backend"
-        )));
-    }
-    let fingerprint = gathered
-        .fingerprints
-        .get(&backend_id)
-        .cloned()
-        .ok_or_else(|| ApiError::NotFound(format!("backend {backend_id}")))?;
-    let model_id = crate::model_for_backend(&cfg, &backend)
-        .map(|m| m.id.clone())
-        .unwrap_or_else(|| {
-            backend
-                .model_file
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| backend.id.clone())
-        });
+    let (backend, fingerprint, model_id) =
+        benchmark_target(state, &backend_id, "measurements").await?;
     opt_log1(
         state,
         &format!(
@@ -1232,43 +1339,20 @@ pub async fn op_optimize_measure_backend(
     let run = async move {
         let mut results: Vec<BenchResult> = Vec::new();
         for prompt in benchmark_prompts() {
-            let messages = vec![manager_supervisor::ChatMessage {
-                role: "user".to_string(),
-                content: prompt.text.to_string(),
-            }];
             // Warm-up, discarded (§A.1): first-run effects after
             // a model load are not the configuration's steady
             // state.
-            manager_supervisor::benchmark_completion(
-                &base_url,
-                &run_model,
-                &messages,
-                BENCHMARK_TEMPERATURE,
-                prompt.max_tokens,
-                MEASURE_RUN_TIMEOUT,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            let mut runs: Vec<BenchRun> = Vec::new();
-            for _ in 0..MEASURED_RUNS {
-                let sample = manager_supervisor::benchmark_completion(
+            results.push(
+                benchmark_one_prompt(
                     &base_url,
                     &run_model,
-                    &messages,
-                    BENCHMARK_TEMPERATURE,
-                    prompt.max_tokens,
+                    &prompt,
+                    true,
+                    MEASURED_RUNS,
                     MEASURE_RUN_TIMEOUT,
                 )
-                .await
-                .map_err(|e| e.to_string())?;
-                runs.push(BenchRun {
-                    prompt_per_second: sample.prompt_per_second,
-                    predicted_per_second: sample.predicted_per_second,
-                    ttft_ms: sample.ttft_ms,
-                    latency_ms: sample.latency_ms,
-                });
-            }
-            results.push(BenchResult::from_runs(runs));
+                .await?,
+            );
         }
         let mut iter = results.into_iter();
         Ok::<MeasurementEntry, String>(MeasurementEntry {
@@ -1341,6 +1425,153 @@ pub async fn op_optimize_measure_backend(
     }
     let mut store = MeasurementStore::load(&measurements_path(state));
     store.upsert(entry);
+    store.save(&measurements_path(state)).map_err(ApiError::InvalidInput)?;
+    state
+        .finish_task(
+            &task_id,
+            TaskStatus::Done,
+            json!({ "backend": backend_id, "fingerprint": fingerprint }),
+        )
+        .await;
+    state_payload(state).await
+}
+
+/// Estimate one running backend (tracker #56): the
+/// abbreviated benchmark — the same two standardized prompts,
+/// one run each, no separate warm-up, reduced generation
+/// budgets ([`estimate_prompts`]) — under the same shared
+/// GPU-job slot and cancellation discipline as a measurement.
+/// The backend is already running, so each prompt's single run
+/// doubles as its warm-up; the figures are directional, which
+/// is why they are stored as an estimate under their own
+/// basis: [`MeasurementStore::upsert_estimate`] never touches
+/// a measurement under the same fingerprint.
+pub async fn op_optimize_estimate_backend(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
+    backend_id: String,
+) -> crate::ApiResult {
+    {
+        let slot = state.optimize_job_abort.lock().await;
+        if slot.is_some() {
+            return Err(ApiError::InvalidInput(
+                "a measurement or experiment job is already running".to_string(),
+            ));
+        }
+    }
+    let (backend, fingerprint, model_id) =
+        benchmark_target(state, &backend_id, "estimates").await?;
+    opt_log1(
+        state,
+        &format!(
+            "estimate start: backend '{backend_id}' model '{model_id}' fingerprint {fingerprint} (abbreviated profile: one run per prompt, no warm-up, reduced generation budgets)"
+        ),
+    );
+    let task_id = state
+        .record_task(
+            "optimize-estimate",
+            json!({ "backend": backend_id, "fingerprint": fingerprint }),
+        )
+        .await;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut slot = state.optimize_job_abort.lock().await;
+        if slot.is_some() {
+            state
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Failed,
+                    json!({ "error": "a measurement or experiment job is already running" }),
+                )
+                .await;
+            return Err(ApiError::InvalidInput(
+                "a measurement or experiment job is already running".to_string(),
+            ));
+        }
+        *slot = Some(tx);
+    }
+    // Loopback by construction, as with measurements (§3).
+    let base_url = format!("http://127.0.0.1:{}", backend.port);
+    let run_model = model_id.clone();
+    let run_backend = backend_id.clone();
+    let run_fingerprint = fingerprint.clone();
+    let run = async move {
+        let mut results: Vec<BenchResult> = Vec::new();
+        for prompt in estimate_prompts() {
+            results.push(
+                benchmark_one_prompt(
+                    &base_url,
+                    &run_model,
+                    &prompt,
+                    false,
+                    ESTIMATE_RUNS,
+                    MEASURE_RUN_TIMEOUT,
+                )
+                .await?,
+            );
+        }
+        let mut iter = results.into_iter();
+        Ok::<EstimateEntry, String>(EstimateEntry {
+            fingerprint: run_fingerprint,
+            backend_id: run_backend,
+            model_id: run_model,
+            estimated_at: chrono::Utc::now().to_rfc3339(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            short: iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
+            long: iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
+        })
+    };
+    let outcome = tokio::select! {
+        res = run => Some(res),
+        _ = rx => None,
+    };
+    {
+        let mut slot = state.optimize_job_abort.lock().await;
+        *slot = None;
+    }
+    let entry = match outcome {
+        None => {
+            opt_log1(state, &format!("estimate cancelled (backend '{backend_id}')"));
+            state
+                .finish_task(&task_id, TaskStatus::Aborted, json!({ "backend": backend_id }))
+                .await;
+            return Err(ApiError::InvalidInput("estimate cancelled".to_string()));
+        }
+        Some(Err(e)) => {
+            opt_log1(
+                state,
+                &format!("estimate failed: backend '{backend_id}': {e}"),
+            );
+            state
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Failed,
+                    json!({ "error": e.clone() }),
+                )
+                .await;
+            return Err(ApiError::InvalidInput(format!("estimate failed: {e}")));
+        }
+        Some(Ok(entry)) => entry,
+    };
+    {
+        let rate = |v: Option<f64>| {
+            v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".to_string())
+        };
+        opt_log1(
+            state,
+            &format!(
+                "estimate result: backend '{}' model '{}': generation {} tok/s (short), {} tok/s (long); prompt {} tok/s; TTFT {} ms (estimate)",
+                entry.backend_id,
+                entry.model_id,
+                rate(entry.short.predicted_per_second),
+                rate(entry.long.predicted_per_second),
+                rate(entry.long.prompt_per_second.or(entry.short.prompt_per_second)),
+                rate(entry.short.ttft_ms.or(entry.long.ttft_ms))
+            ),
+        );
+    }
+    let mut store = MeasurementStore::load(&measurements_path(state));
+    store.upsert_estimate(entry);
     store.save(&measurements_path(state)).map_err(ApiError::InvalidInput)?;
     state
         .finish_task(

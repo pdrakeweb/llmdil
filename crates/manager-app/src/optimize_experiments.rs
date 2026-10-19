@@ -41,12 +41,12 @@ use serde_json::json;
 
 use manager_config::AppConfig;
 use manager_optimize::{
-    benchmark_prompts, compare, evaluate_fit, fit_verdict_text, lowest_free_port,
+    benchmark_prompts, compare, estimate_prompts, evaluate_fit, fit_verdict_text, lowest_free_port,
     resolve_candidate, temp_backend_config, temp_backend_id, ActiveExperiment, BenchResult,
-    BenchRun, CandidateResolution, Decision, ExperimentJournal,
+    BenchRun, CandidateResolution, Decision, ExperimentEstimate, ExperimentJournal,
     ExperimentMeasured, ExperimentProposal, ExperimentResult, ExperimentStatus,
     MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, RegisteredModelFile,
-    BATCH_TIMEOUT_SECS, BENCHMARK_TEMPERATURE, EXPERIMENT_TIMEOUT_SECS, MEASURED_RUNS,
+    BATCH_TIMEOUT_SECS, BENCHMARK_TEMPERATURE, ESTIMATE_RUNS, EXPERIMENT_TIMEOUT_SECS, MEASURED_RUNS,
 };
 use manager_supervisor::{HealthProbe, HttpHealthProbe, ProcessState};
 
@@ -216,6 +216,17 @@ pub async fn op_optimize_set_experiment_state(
 // The batch runner
 // ---------------------------------------------------------------------------
 
+/// What one batch pass does with each accepted proposal
+/// (tracker #56): a full run (benchmark + optional eval,
+/// recorded as an experiment result) or an estimate pass (the
+/// abbreviated benchmark only, recorded on the proposal as an
+/// estimate — never as a result).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunMode {
+    Full,
+    Estimate,
+}
+
 /// Per-batch mutable context the experiment runs share.
 struct BatchCtx {
     consulted_backend: String,
@@ -237,6 +248,10 @@ struct InnerOutcome {
     eval: Option<manager_optimize::EvalRunRecord>,
     comparison: Option<manager_optimize::EvalComparison>,
     preflight: String,
+    /// Estimate-pass figures (tracker #56); `Some` only for a
+    /// completed estimate pass. The batch loop stamps the
+    /// batch id and records it via `record_estimate`.
+    estimate: Option<ExperimentEstimate>,
 }
 
 impl InnerOutcome {
@@ -248,6 +263,7 @@ impl InnerOutcome {
             eval: None,
             comparison: None,
             preflight,
+            estimate: None,
         }
     }
 }
@@ -378,6 +394,7 @@ async fn run_experiment_inner(
     cfg: &AppConfig,
     proposal: &ExperimentProposal,
     ctx: &mut BatchCtx,
+    mode: RunMode,
 ) -> InnerOutcome {
     let temp_id = temp_backend_id(proposal.id);
 
@@ -552,7 +569,7 @@ async fn run_experiment_inner(
     // BEFORE any requires_stopping stops: the consulted
     // backend may be one of the backends the fit needs stopped.
     let mut baseline: Option<manager_optimize::BaselineRecord> = None;
-    if proposal.run_eval {
+    if mode == RunMode::Full && proposal.run_eval {
         let stored = crate::optimize_eval::load_baseline(state);
         let fresh = stored.as_ref().and_then(|b| {
             let is_fresh = b.suite_version == manager_optimize::EVAL_SUITE_VERSION
@@ -660,6 +677,63 @@ async fn run_experiment_inner(
         return InnerOutcome::failed(e, preflight);
     }
 
+    // -- Estimate pass (tracker #56): the abbreviated profile
+    // against the temp backend, then out — no measurement-store
+    // record, no eval. First-run effects on a freshly launched
+    // backend are handled by ONE discarded warm-up on the short
+    // prompt only, at the estimate's own budget: the model is
+    // already loaded (`wait_healthy` gated on that), and the
+    // long prompt gets no warm-up because its 4,000-token
+    // prefill IS the sample — discarding one would double the
+    // estimate's dominant cost to remove an effect (cold KV /
+    // allocator state) that is second-order next to the
+    // estimate's stated directional precision.
+    if mode == RunMode::Estimate {
+        let base_url = format!("http://127.0.0.1:{port}");
+        let mut results: Vec<BenchResult> = Vec::new();
+        for (index, prompt) in estimate_prompts().iter().enumerate() {
+            match crate::optimize::benchmark_one_prompt(
+                &base_url,
+                &model_id,
+                prompt,
+                index == 0,
+                ESTIMATE_RUNS,
+                EXP_RUN_TIMEOUT,
+            )
+            .await
+            {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    return InnerOutcome::failed(
+                        format!("estimate benchmark failed: {e}"),
+                        preflight,
+                    );
+                }
+            }
+        }
+        let mut iter = results.into_iter();
+        let short = iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
+        let long = iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
+        let detail = "Estimate only — abbreviated benchmark (one run per prompt, reduced generation budgets). Confirm with a full experiment run before acting on it.".to_string();
+        return InnerOutcome {
+            status: ExperimentStatus::Completed,
+            detail: detail.clone(),
+            measured: None,
+            eval: None,
+            comparison: None,
+            preflight: preflight.clone(),
+            estimate: Some(ExperimentEstimate {
+                short,
+                long,
+                batch_id: String::new(),
+                temp_backend_id: temp_id.clone(),
+                preflight,
+                detail,
+                estimated_at: chrono::Utc::now().to_rfc3339(),
+            }),
+        };
+    }
+
     // -- Standardized benchmark (§A.1), mirroring the measure
     // command's run sequence.
     let base_url = format!("http://127.0.0.1:{port}");
@@ -761,6 +835,7 @@ async fn run_experiment_inner(
                 eval: None,
                 comparison: None,
                 preflight,
+                estimate: None,
             };
         }
     }
@@ -804,6 +879,7 @@ async fn run_experiment_inner(
         eval,
         comparison,
         preflight,
+        estimate: None,
     }
 }
 
@@ -833,6 +909,37 @@ fn record_result(state: &AppState, result: &ExperimentResult) {
             .find(|e| e.id == result.experiment_id)
         {
             exp.result = Some(result.clone());
+            let _ = crate::optimize::save_plan_file(state, &file);
+        }
+    }
+}
+
+/// Record one completed estimate pass (tracker #56): the
+/// optimize log (distinctly from measurement / experiment-run
+/// lines) and the plan proposal's `estimate` field. Deliberately
+/// NOT the journal history and NOT the measurement store: an
+/// estimate is screening evidence recorded on the proposal,
+/// never a run outcome and never a measured fact.
+fn record_estimate(
+    state: &AppState,
+    experiment_id: usize,
+    candidate_model_id: &str,
+    estimate: ExperimentEstimate,
+) {
+    crate::optimize::opt_log1(
+        state,
+        &format!(
+            "experiment {experiment_id} estimate (candidate {candidate_model_id}): generation {} tok/s (short), {} tok/s (long); prompt {} tok/s; TTFT {} ms (estimate)",
+            fmt_rate(estimate.short.predicted_per_second),
+            fmt_rate(estimate.long.predicted_per_second),
+            fmt_rate(estimate.long.prompt_per_second.or(estimate.short.prompt_per_second)),
+            fmt_rate(estimate.short.ttft_ms.or(estimate.long.ttft_ms)),
+        ),
+    );
+    let mut file = crate::optimize::load_plan_file(state);
+    if let Some(plan) = file.plan.as_mut() {
+        if let Some(exp) = plan.experiments.iter_mut().find(|e| e.id == experiment_id) {
+            exp.estimate = Some(estimate);
             let _ = crate::optimize::save_plan_file(state, &file);
         }
     }
@@ -883,10 +990,15 @@ async fn restart_stopped(state: &AppState, ids: &[String]) -> String {
 }
 
 /// Run the plan's accepted experiments as one batch (§A.3):
-/// one tracked task (`optimize-experiments`) under the shared
-/// GPU-job slot, one experiment at a time, budgets enforced
-/// server-side. Undecided and denied proposals never run.
-pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
+/// one tracked task under the shared GPU-job slot, one
+/// experiment at a time, budgets enforced server-side.
+/// Undecided and denied proposals never run. `mode` selects
+/// the full run (`optimize-experiments`) or the estimate pass
+/// (tracker #56, `optimize-estimate-experiments`): same
+/// lifecycle, preflight, stopping, cleanup, and budgets; an
+/// estimate pass runs only the abbreviated benchmark and
+/// records its figures on the proposal as an estimate.
+async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>, mode: RunMode) -> crate::ApiResult {
     {
         let slot = state.optimize_job_abort.lock().await;
         if slot.is_some() {
@@ -921,7 +1033,11 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
     let gathered0 = crate::optimize::gather(state, &cfg).await;
     let task_id = state
         .record_task(
-            "optimize-experiments",
+            if mode == RunMode::Estimate {
+                "optimize-estimate-experiments"
+            } else {
+                "optimize-experiments"
+            },
             json!({
                 "experiments": batch.iter().map(|e| e.id).collect::<Vec<_>>(),
                 "candidates": batch.iter().map(|e| e.candidate_model_id.clone()).collect::<Vec<_>>(),
@@ -960,7 +1076,8 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
     crate::optimize::opt_log1(
         state,
         &format!(
-            "experiment batch {batch_id}: {} experiments: {}",
+            "experiment {}batch {batch_id}: {} experiments: {}",
+            if mode == RunMode::Estimate { "estimate " } else { "" },
             batch.len(),
             batch
                 .iter()
@@ -991,8 +1108,12 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
                         candidate_model_id: rest.candidate_model_id.clone(),
                         batch_id: batch_id.clone(),
                         status: ExperimentStatus::Timeout,
-                        detail: "not run: the 60-minute batch deadline was exceeded"
-                            .to_string(),
+                        detail: if mode == RunMode::Estimate {
+                            "estimate not run: the 60-minute batch deadline was exceeded"
+                        } else {
+                            "not run: the 60-minute batch deadline was exceeded"
+                        }
+                        .to_string(),
                         measured: None,
                         eval: None,
                         comparison: None,
@@ -1017,7 +1138,7 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
         let remaining_batch = Duration::from_secs(BATCH_TIMEOUT_SECS)
             .saturating_sub(batch_start.elapsed());
         let budget = Duration::from_secs(EXPERIMENT_TIMEOUT_SECS).min(remaining_batch);
-        let inner = run_experiment_inner(state, &cfg, proposal, &mut ctx);
+        let inner = run_experiment_inner(state, &cfg, proposal, &mut ctx, mode);
         // Cancellation and timeout drop the inner future; the
         // cleanup below is outside it and always runs.
         let outcome = tokio::select! {
@@ -1030,6 +1151,7 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
                     eval: None,
                     comparison: None,
                     preflight: String::new(),
+                    estimate: None,
                 }
             }
             res = tokio::time::timeout(budget, inner) => match res {
@@ -1044,6 +1166,7 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
                     eval: None,
                     comparison: None,
                     preflight: String::new(),
+                    estimate: None,
                 },
             },
         };
@@ -1052,22 +1175,45 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
             ExperimentStatus::Completed => completed += 1,
             _ => failed += 1,
         }
-        record_result(
-            state,
-            &ExperimentResult {
-                experiment_id: proposal.id,
-                candidate_model_id: proposal.candidate_model_id.clone(),
-                batch_id: batch_id.clone(),
-                status: outcome.status,
-                detail: outcome.detail,
-                measured: outcome.measured,
-                eval: outcome.eval,
-                comparison: outcome.comparison,
-                preflight: outcome.preflight,
-                started_at,
-                finished_at: chrono::Utc::now().to_rfc3339(),
-            },
-        );
+        let mut estimate_recorded = false;
+        if mode == RunMode::Estimate && outcome.status == ExperimentStatus::Completed {
+            if let Some(mut estimate) = outcome.estimate {
+                // A completed estimate pass records an estimate,
+                // not a result (tracker #56): no journal history,
+                // no measurement store, nothing that reads as a run.
+                estimate.batch_id = batch_id.clone();
+                record_estimate(state, proposal.id, &proposal.candidate_model_id, estimate);
+                estimate_recorded = true;
+            }
+        }
+        if !estimate_recorded {
+            // Estimate-mode failures still record a result so
+            // the failure is visible on the proposal; the detail
+            // is prefixed so it can never read as a full run's.
+            let detail = if mode == RunMode::Estimate
+                && outcome.status == ExperimentStatus::Failed
+            {
+                format!("Estimate: {}", outcome.detail)
+            } else {
+                outcome.detail
+            };
+            record_result(
+                state,
+                &ExperimentResult {
+                    experiment_id: proposal.id,
+                    candidate_model_id: proposal.candidate_model_id.clone(),
+                    batch_id: batch_id.clone(),
+                    status: outcome.status,
+                    detail,
+                    measured: outcome.measured,
+                    eval: outcome.eval,
+                    comparison: outcome.comparison,
+                    preflight: outcome.preflight,
+                    started_at,
+                    finished_at: chrono::Utc::now().to_rfc3339(),
+                },
+            );
+        }
         idx += 1;
         if cancelled {
             break;
@@ -1092,6 +1238,14 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
                         result.detail.push_str(&note);
                     }
                 }
+                if let Some(estimate) = exp.estimate.as_mut() {
+                    if estimate.batch_id == batch_id {
+                        if !estimate.detail.is_empty() {
+                            estimate.detail.push(' ');
+                        }
+                        estimate.detail.push_str(&note);
+                    }
+                }
             }
             let _ = crate::optimize::save_plan_file(state, &file);
         }
@@ -1114,13 +1268,39 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
     crate::optimize::opt_log1(
         state,
         &format!(
-            "experiment batch {batch_id} end: {completed} completed, {failed} failed{}",
+            "experiment {}batch {batch_id} end: {completed} {}, {failed} failed{}",
+            if mode == RunMode::Estimate { "estimate " } else { "" },
+            if mode == RunMode::Estimate { "estimated" } else { "completed" },
             if cancelled { ", cancelled" } else { "" }
         ),
     );
     state.finish_task(&task_id, status, detail).await;
     if cancelled {
-        return Err(ApiError::InvalidInput("experiment batch cancelled".to_string()));
+        return Err(ApiError::InvalidInput(
+            if mode == RunMode::Estimate {
+                "experiment estimate batch cancelled"
+            } else {
+                "experiment batch cancelled"
+            }
+            .to_string(),
+        ));
     }
     crate::optimize::state_payload(state).await
+}
+
+/// Run the plan's accepted experiments as one full batch
+/// (§A.3): benchmark + optional screening eval, recorded as
+/// experiment results.
+pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
+    run_experiment_batch(state, _sink, RunMode::Full).await
+}
+
+/// Run the plan's accepted experiments as one estimate batch
+/// (tracker #56): the same lifecycle as a full batch, but each
+/// experiment runs only the abbreviated benchmark against its
+/// temp backend and records the figures on the proposal as an
+/// estimate, so a batch can be screened before full runs are
+/// committed.
+pub async fn op_optimize_estimate_experiments(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
+    run_experiment_batch(state, _sink, RunMode::Estimate).await
 }

@@ -55,12 +55,14 @@ pub mod optimize_experiments;
 
 pub use optimize::{
     op_optimize_cancel_consult, op_optimize_cancel_job, op_optimize_consult,
-    op_optimize_discard_plan, op_optimize_discover, op_optimize_get_state,
-    op_optimize_measure_backend, op_optimize_save_purpose, op_optimize_set_item_outcome,
-    op_optimize_set_item_state, op_optimize_validate_plan,
+    op_optimize_discard_plan, op_optimize_discover, op_optimize_estimate_backend,
+    op_optimize_get_state, op_optimize_measure_backend, op_optimize_save_purpose,
+    op_optimize_set_item_outcome, op_optimize_set_item_state, op_optimize_validate_plan,
 };
 pub use optimize_eval::op_optimize_run_baseline;
-pub use optimize_experiments::{op_optimize_run_experiments, op_optimize_set_experiment_state};
+pub use optimize_experiments::{
+    op_optimize_estimate_experiments, op_optimize_run_experiments, op_optimize_set_experiment_state,
+};
 pub mod registry;
 
 // ---------------------------------------------------------------------------
