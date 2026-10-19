@@ -170,6 +170,54 @@ pub(crate) fn save_plan_file(state: &AppState, file: &PlanFile) -> Result<(), St
     std::fs::write(plan_path(state), text).map_err(|e| e.to_string())
 }
 
+/// Load the stored plan, re-grounding experiment provisioning
+/// first (see `manager_optimize::reground_experiment_provisioning`):
+/// a plan file written before provisioning was grounded at build
+/// time stores no provisioning links, and without this pass every
+/// consumer — payload validation, decision cascades, the runner —
+/// dead-ends its experiments as unresolvable. A repaired plan is
+/// persisted so the fix is durable, not recomputed forever.
+pub(crate) async fn load_plan_file_current(state: &AppState) -> PlanFile {
+    let mut file = load_plan_file(state);
+    let mut repaired = false;
+    if let Some(plan) = file.plan.as_mut() {
+        let cfg = state.config.read().await.clone();
+        repaired = manager_optimize::reground_experiment_provisioning(plan, &cfg);
+    }
+    if repaired {
+        let _ = save_plan_file(state, &file);
+    }
+    file
+}
+
+// ---------------------------------------------------------------------------
+// Consultation run record (state payload): when the running
+// consultation started, and how the last one failed. Recorded
+// server-side because the page instance that started a
+// consultation is not necessarily the one looking at the page
+// when it ends (the operator may be on the Logs view reading
+// the Optimize log — exactly how the Oct 19, 2026 failures
+// presented: an epoch-valued elapsed timer and a silently
+// retained previous plan).
+// ---------------------------------------------------------------------------
+
+async fn record_consult_start(state: &AppState) {
+    *state.optimize_consult_started_unix_ms.lock().await =
+        Some(chrono::Utc::now().timestamp_millis());
+    *state.optimize_consult_error.lock().await = None;
+}
+
+async fn record_consult_failure(state: &AppState, message: String) {
+    *state.optimize_consult_started_unix_ms.lock().await = None;
+    *state.optimize_consult_error.lock().await =
+        Some((message, chrono::Utc::now().timestamp_millis()));
+}
+
+async fn record_consult_success(state: &AppState) {
+    *state.optimize_consult_started_unix_ms.lock().await = None;
+    *state.optimize_consult_error.lock().await = None;
+}
+
 pub(crate) fn measurements_path(state: &AppState) -> PathBuf {
     state.data_dir.join("optimize-measurements.json")
 }
@@ -557,7 +605,7 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
         env!("CARGO_PKG_VERSION"),
         &consulted,
     );
-    let file = load_plan_file(state);
+    let file = load_plan_file_current(state).await;
     let current_hash = current_config_hash(&cfg);
     let plan_json = file.plan.as_ref().map(|plan| {
         let validations = validate_plan(plan, &cfg, &gathered.live);
@@ -720,6 +768,9 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
         "candidates": candidates_json(&load_candidates_file(state)),
         "eval_baseline": crate::optimize_eval::eval_baseline_json(state, &gathered.fingerprints),
         "consulting": state.optimize_abort.lock().await.is_some(),
+        "consult_started_unix_ms": *state.optimize_consult_started_unix_ms.lock().await,
+        "consult_error": state.optimize_consult_error.lock().await.as_ref().map(|(m, _)| m.clone()),
+        "consult_error_unix_ms": state.optimize_consult_error.lock().await.as_ref().map(|(_, t)| *t),
         "measuring": state.optimize_job_abort.lock().await.is_some(),
     }))
 }
@@ -907,6 +958,7 @@ pub async fn op_optimize_consult(
         .await;
 
     let response_text: String = if sample {
+        record_consult_start(state).await;
         sample_response(&cfg)
     } else {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -926,6 +978,7 @@ pub async fn op_optimize_consult(
             }
             *slot = Some(tx);
         }
+        record_consult_start(state).await;
         let model_name = crate::model_for_backend(&cfg, &backend)
             .map(|m| m.id.clone())
             .unwrap_or_else(|| backend.id.clone());
@@ -965,6 +1018,8 @@ pub async fn op_optimize_consult(
                     state,
                     &format!("consultation cancelled by operator (backend '{target}')"),
                 );
+                record_consult_failure(state, "consultation cancelled by operator".to_string())
+                    .await;
                 state
                     .finish_task(
                         &task_id,
@@ -979,6 +1034,7 @@ pub async fn op_optimize_consult(
                     state,
                     &format!("consultation failed: backend '{target}' error: {e}"),
                 );
+                record_consult_failure(state, format!("consultation failed: {e}")).await;
                 state
                     .finish_task(
                         &task_id,
@@ -990,7 +1046,30 @@ pub async fn op_optimize_consult(
                     "consultation failed: {e}"
                 )));
             }
-            Some(Ok(result)) => result.content,
+            Some(Ok(result)) => {
+                // Response diagnostics (Oct 19, 2026): the raw
+                // response log below records the extracted answer
+                // text only, which made a "0 bytes" response
+                // undiagnosable — the distinction between a body
+                // that never arrived, an extraction that found
+                // nothing, and a budget spent on reasoning lives
+                // in these figures.
+                opt_log1(
+                    state,
+                    &format!(
+                        "consultation response: backend '{target}' endpoint {base_url}/v1/chat/completions status {} transport {} bytes, content {} bytes, reasoning {} bytes, finish_reason {}, usage prompt_tokens {} completion_tokens {}, latency {} ms",
+                        result.http_status,
+                        result.response_bytes,
+                        result.content.len(),
+                        result.reasoning_bytes,
+                        result.finish_reason.as_deref().unwrap_or("absent"),
+                        result.prompt_tokens.map(|n| n.to_string()).unwrap_or_else(|| "absent".to_string()),
+                        result.completion_tokens.map(|n| n.to_string()).unwrap_or_else(|| "absent".to_string()),
+                        result.latency_ms,
+                    ),
+                );
+                result.content
+            }
         }
     };
 
@@ -1034,6 +1113,11 @@ pub async fn op_optimize_consult(
         Ok(p) => p,
         Err(e) => {
             opt_log1(state, &format!("parse failed: {e}"));
+            record_consult_failure(
+                state,
+                format!("the backend's response could not be parsed: {e}"),
+            )
+            .await;
             state
                 .finish_task(
                     &task_id,
@@ -1109,6 +1193,7 @@ pub async fn op_optimize_consult(
             json!({ "backend": target, "items": item_count }),
         )
         .await;
+    record_consult_success(state).await;
     state_payload(state).await
 }
 
@@ -1627,7 +1712,7 @@ pub async fn op_optimize_set_item_state(
             )))
         }
     };
-    let mut file = load_plan_file(state);
+    let mut file = load_plan_file_current(state).await;
     let plan = file
         .plan
         .as_mut()
@@ -1680,7 +1765,7 @@ pub async fn op_optimize_set_item_outcome(
             )))
         }
     };
-    let mut file = load_plan_file(state);
+    let mut file = load_plan_file_current(state).await;
     let plan = file
         .plan
         .as_mut()

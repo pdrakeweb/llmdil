@@ -23,9 +23,11 @@
 //!
 //! Budgets (§A.3, enforced here server-side): at most 3
 //! experiments per batch, 30 minutes per experiment, 60
-//! minutes per batch. Experiments never download: a candidate
-//! whose file is not already on disk fails preflight with
-//! "download in Models first".
+//! minutes per batch. A run never downloads: a candidate
+//! whose file is not already on disk fails preflight, naming
+//! the plan's register/download steps when it carries them
+//! (provisioning is applied as plan items before the run),
+//! else the Models view.
 //!
 //! Backends named in an accepted proposal's
 //! `requires_stopping` are stopped only when the fit verdict
@@ -183,7 +185,7 @@ pub async fn op_optimize_set_experiment_state(
             )))
         }
     };
-    let mut file = crate::optimize::load_plan_file(state);
+    let mut file = crate::optimize::load_plan_file_current(state).await;
     let plan = file
         .plan
         .as_mut()
@@ -405,8 +407,46 @@ async fn run_experiment_inner(
 ) -> InnerOutcome {
     let temp_id = temp_backend_id(proposal.id);
 
+    // -- Provisioning gate: when the plan provisions this
+    // candidate through register/download items, those items
+    // must have been applied before the run. Without this check
+    // the run fell through to plain candidate resolution and
+    // failed as though the model were simply missing, even
+    // though the plan carried the remedy (Oct 19, 2026 field
+    // report). Name the unapplied items so the failure is
+    // actionable.
+    if let Some(prov) = &proposal.provisioning {
+        let file = crate::optimize::load_plan_file(state);
+        if let Some(plan) = &file.plan {
+            let unapplied: Vec<usize> = prov
+                .item_ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    plan.items.iter().any(|i| {
+                        i.id == *id
+                            && i.apply_outcome != Some(manager_optimize::ApplyOutcome::Applied)
+                    })
+                })
+                .collect();
+            if !unapplied.is_empty() {
+                let ids = unapplied
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let message = format!(
+                    "candidate '{}' is provisioned by plan items {ids}, which have not been applied — apply the plan's register/download steps first, then re-run the experiment",
+                    prov.model_id
+                );
+                return InnerOutcome::failed(message.clone(), message);
+            }
+        }
+    }
+
     // -- Candidate resolution: the file must already be on
-    // disk; experiments never download (§A.3 step 1).
+    // disk; a run never downloads (§A.3 step 1) — provisioning
+    // happens as plan items, applied before the batch.
     let registered: Vec<RegisteredModelFile> = cfg
         .models
         .iter()
@@ -1039,7 +1079,7 @@ async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, _sink: &s
             ));
         }
     }
-    let file = crate::optimize::load_plan_file(state);
+    let file = crate::optimize::load_plan_file_current(state).await;
     let plan = file
         .plan
         .clone()
