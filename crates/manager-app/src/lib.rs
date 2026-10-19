@@ -1345,6 +1345,31 @@ pub async fn op_update_config(
     let mut v = serde_json::to_value(&*cfg)?;
     merge_json(&mut v, patch);
     let mut new_cfg: AppConfig = serde_json::from_value(v)?;
+    // Advanced flags mode (tracker #60): this whole-config merge
+    // is the one remaining path that could rewrite a backend's
+    // flags wholesale, so it is held to the same one-writer rule —
+    // a patch may not change the flags (structured or raw), the
+    // mode bit itself, or remove a backend that is in advanced
+    // mode. Mode flips go through backend_set_flags_mode so they
+    // are never smuggled inside an unrelated patch.
+    for pre_b in cfg.backends.iter().filter(|b| b.flags_advanced) {
+        let Some(nb) = new_cfg.backends.iter().find(|b| b.id == pre_b.id) else {
+            return Err(ApiError::InvalidInput(format!(
+                "the patch removes backend {}, which is in advanced flags \
+                 mode; remove it with backend_delete instead",
+                pre_b.id
+            )));
+        };
+        if !nb.flags_advanced
+            || nb.raw_flags != pre_b.raw_flags
+            || nb.flags.n_ctx != pre_b.flags.n_ctx
+            || nb.flags.n_batch != pre_b.flags.n_batch
+            || nb.flags.tensor_split != pre_b.flags.tensor_split
+            || nb.flags.split_mode != pre_b.flags.split_mode
+        {
+            return Err(advanced_flags_refusal(&pre_b.id));
+        }
+    }
     // The tool-call probe is runtime state, never operator-set:
     // each backend keeps the probe the app itself recorded, and a
     // patch that changes its model file or raw flags invalidates
@@ -2040,6 +2065,12 @@ pub async fn op_list_backends(
                 "n_ctx": b.flags.n_ctx,
                 "n_batch": b.flags.n_batch,
                 "tensor_split": b.flags.tensor_split,
+                // The saved raw flags and the advanced flags mode
+                // (tracker #60): the card renders the string itself
+                // in the mode, and the flags panel pre-fills its
+                // editor from it.
+                "raw_flags": b.raw_flags,
+                "flags_advanced": b.flags_advanced,
                 "group": cfg.gateway.groups.iter()
                     .find(|g| g.members.iter().any(|m| m == &b.id))
                     .map(|g| g.name.clone()),
@@ -3813,6 +3844,31 @@ async fn record_backend_change(
     .map_err(ApiError::Io)
 }
 
+/// The advanced-flags-mode refusal (tracker #60): while a backend
+/// is in advanced mode, its raw flags are operator-owned text and
+/// the single source of truth for its launch flags, so every
+/// structured write path for the backend is refused with this
+/// error. The UI disables its controls in the mode; this is the
+/// enforcement REST callers and the Optimize apply executor meet.
+fn advanced_flags_refusal(backend_id: &str) -> ApiError {
+    ApiError::InvalidInput(format!(
+        "backend {backend_id} is in advanced flags mode: its flags are \
+         edited as raw text (backend_set_raw_flags) and structured flags \
+         writes are refused until advanced mode is turned off \
+         (backend_set_flags_mode)"
+    ))
+}
+
+/// Refuse a structured flags write for a backend in advanced
+/// flags mode (tracker #60); a no-op otherwise.
+fn ensure_backend_not_advanced(b: &manager_config::BackendConfig) -> Result<(), ApiError> {
+    if b.flags_advanced {
+        Err(advanced_flags_refusal(&b.id))
+    } else {
+        Ok(())
+    }
+}
+
 /// Running backends' start instants (now minus supervisor uptime),
 /// for activation-plan resolution: a backend-scope entry resolves
 /// once every target has (re)started at or after it. Adopted
@@ -4250,10 +4306,25 @@ pub async fn op_backend_apply_config(
             )))
         }
     };
+    // Advanced flags mode (tracker #60): a patch touching the
+    // flags form's fields (context/batch, split, raw flags) is a
+    // structured flags write and is refused for an advanced
+    // backend; the patch's other fields (enabled, port, model
+    // file, restart policy) are not flags state and still apply.
+    let touches_flags = patch.n_ctx.is_some()
+        || patch.n_batch.is_some()
+        || patch.tensor_split.is_some()
+        || patch.split_mode.is_some()
+        || patch.raw_flags.is_some();
     let diff: ConfigDiff = {
         let mut cfg = state.config.write().await;
         let pre_cfg = cfg.clone();
         let mut new_cfg = cfg.clone();
+        if touches_flags {
+            if let Some(b) = new_cfg.backends.iter().find(|b| b.id == id) {
+                ensure_backend_not_advanced(b)?;
+            }
+        }
         let diff = manager_config::apply_config_diff(&mut new_cfg, &id, &patch)
             .map_err(ApiError::from)?;
         record_gateway_change(
@@ -4828,6 +4899,9 @@ pub async fn op_backend_update_flags(
         .iter_mut()
         .find(|b| b.id == id)
         .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+    // Advanced flags mode (tracker #60): context/batch are the
+    // flags form's fields; the form is inert in the mode.
+    ensure_backend_not_advanced(b)?;
     let changed = b.flags.n_ctx != n_ctx || b.flags.n_batch != n_batch;
     b.flags.n_ctx = n_ctx;
     b.flags.n_batch = n_batch;
@@ -4904,6 +4978,9 @@ pub async fn op_backend_set_offload(
             .iter()
             .find(|b| b.id == id)
             .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        // Advanced flags mode (tracker #60): the slider rewrites
+        // raw-flag tokens the operator owns as text in the mode.
+        ensure_backend_not_advanced(b)?;
         backend_offload_info(&cfg, b)
             .map(|o| o.moe_layers)
             .ok_or_else(|| {
@@ -4943,6 +5020,9 @@ pub async fn op_backend_set_offload(
             .iter()
             .find(|x| x.id == id)
             .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        // Re-checked under the write lock (tracker #60): the mode
+        // can have been entered since the pre-lock check.
+        ensure_backend_not_advanced(b_ref)?;
         let info = backend_offload_info(&new_cfg, b_ref).ok_or_else(|| {
             ApiError::InvalidInput(format!(
                 "backend {id}'s model does not support expert offload"
@@ -5110,6 +5190,9 @@ pub async fn op_backend_set_mtp(
             .iter()
             .find(|b| b.id == id)
             .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        // Advanced flags mode (tracker #60): the control rewrites
+        // raw-flag tokens the operator owns as text in the mode.
+        ensure_backend_not_advanced(b)?;
         if backend_mtp_info(&cfg, b).is_none() {
             return Err(ApiError::InvalidInput(format!(
                 "backend {id}'s model does not support MTP drafting"
@@ -5127,6 +5210,9 @@ pub async fn op_backend_set_mtp(
             .iter()
             .find(|b| b.id == id)
             .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        // Re-checked under the write lock (tracker #60), with the
+        // capability re-validation.
+        ensure_backend_not_advanced(b)?;
         if backend_mtp_info(&new_cfg, b).is_none() {
             return Err(ApiError::InvalidInput(format!(
                 "backend {id}'s model does not support MTP drafting"
@@ -5189,6 +5275,145 @@ pub async fn op_backend_set_mtp(
     }))
 }
 
+
+/// Turn a backend's advanced flags mode on or off (tracker #60).
+///
+/// The mode is editor state, and flipping it is deliberately
+/// minimal: it writes ONLY the `flags_advanced` field — never the
+/// backend's flags, by a single token. Entering advanced mode
+/// cannot canonicalize the string the structured setters would
+/// rewrite (they rewrite on save; this op performs no flags save),
+/// so the string the operator sees on entry is exactly the string
+/// that was live before. Leaving writes nothing either: the raw
+/// string stays as saved, and the structured form re-decodes it
+/// through the existing decoders (ServerFlags, expert offload,
+/// MTP) when it renders.
+///
+/// The flip is NOT journaled as an activation change: by itself it
+/// alters nothing a restart would activate — the journaled event
+/// is the raw-flags save that follows it. For the same reason the
+/// tool-call probe is untouched (the serving configuration did
+/// not change) and no service definition is re-synced (the launch
+/// spec does not carry the mode).
+pub async fn op_backend_set_flags_mode(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    id: String,
+    advanced: bool,
+) -> ApiResult {
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    let b = new_cfg
+        .backends
+        .iter_mut()
+        .find(|b| b.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+    let changed = b.flags_advanced != advanced;
+    b.flags_advanced = advanced;
+    let raw_flags = b.raw_flags.clone();
+    if changed {
+        manager_config::validate(&new_cfg)
+            .map_err(ApiError::from)?;
+        manager_config::save(&new_cfg, &state.config_path)
+            .map_err(ApiError::from)?;
+        *cfg = new_cfg;
+    }
+    Ok(json!({
+        "backend_id": id,
+        "flags_advanced": advanced,
+        "raw_flags": raw_flags,
+        "changed": changed,
+        "persisted": true,
+    }))
+}
+
+/// Save a backend's raw flags edited as text (tracker #60, the
+/// advanced flags editor's save). Only available while the
+/// backend is in advanced mode: in structured mode the raw string
+/// is written by the token-owning setters and the config patch,
+/// and this op refuses rather than becoming a second writer.
+///
+/// Validation is warn, never block: the string is checked with
+/// [`manager_models::raw_flag_warnings`] and the warnings ride
+/// the response, but any string saves — an unrecognized flag may
+/// be exactly what the operator needs, and llama-server's own
+/// start is the real check. The input is normalized the way the
+/// launch tokenizer sees it: leading/trailing whitespace is not
+/// content, and an all-whitespace string is no flags at all
+/// (`None`) — the same state the structured setters produce when
+/// their tokens are removed.
+///
+/// Saved through the same clone-validate-save path as the other
+/// flags setters and journaled as a backend-scope activation
+/// change (kind `backend_set_raw_flags`); a change clears the
+/// recorded tool-call probe (MCP design §7.2), as every raw-flags
+/// write does. Applies on the backend's next start; nothing is
+/// restarted here.
+pub async fn op_backend_set_raw_flags(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    id: String,
+    raw_flags: Option<String>,
+) -> ApiResult {
+    let new_raw: Option<String> = raw_flags
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let warnings = manager_models::raw_flag_warnings(new_raw.as_deref());
+    let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
+    let mut new_cfg = cfg.clone();
+    let b = new_cfg
+        .backends
+        .iter_mut()
+        .find(|b| b.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+    if !b.flags_advanced {
+        return Err(ApiError::InvalidInput(format!(
+            "backend {id} is not in advanced flags mode: in structured mode \
+             its raw flags are written by the structured flags controls; \
+             turn advanced mode on (backend_set_flags_mode) to edit them \
+             as text"
+        )));
+    }
+    let changed = b.raw_flags != new_raw;
+    b.raw_flags = new_raw.clone();
+    if changed {
+        // A raw-flags change invalidates the recorded tool-call
+        // probe (MCP design §7.2).
+        b.tool_call_probe = None;
+        manager_config::validate(&new_cfg)
+            .map_err(ApiError::from)?;
+        record_backend_change(
+            state,
+            &pre_cfg,
+            &new_cfg,
+            "backend_set_raw_flags",
+            format!("Backend `{id}` raw flags changed"),
+            &id,
+        )
+        .await
+        ?;
+        manager_config::save(&new_cfg, &state.config_path)
+            .map_err(ApiError::from)?;
+        *cfg = new_cfg;
+    }
+    drop(cfg);
+    if changed {
+        ensure_backend_specs(state).await;
+    }
+    state.sync_backend_service_definition(&id).await;
+    Ok(json!({
+        "backend_id": id,
+        "raw_flags": new_raw,
+        "changed": changed,
+        "warnings": warnings,
+        // `persisted` is about the desired state being on disk:
+        // after a successful save it is, and when nothing changed
+        // it already was (same note as backend_set_offload).
+        "persisted": true,
+        "applies": "next start",
+    }))
+}
 
 /// Remove a backend (spec §14 `backend_delete`). Refused while the
 /// backend is running — stop it first. The id is scrubbed from every
@@ -6279,6 +6504,7 @@ pub async fn op_model_assign(
         .find(|m| m.id == id)
         .ok_or_else(|| ApiError::NotFound(format!("model {id}")))?;
     let gguf_path = model.gguf_path.clone();
+    let mut flags_untouched = false;
     {
         let backend = cfg
             .backends
@@ -6288,25 +6514,36 @@ pub async fn op_model_assign(
         let prev_model_file = backend.model_file.clone();
         let prev_raw_flags = backend.raw_flags.clone();
         backend.model_file = gguf_path;
+        // Advanced flags mode (tracker #60): the assignment itself
+        // proceeds — the model a backend serves is not flags state —
+        // but its two flags side effects are skipped for an
+        // advanced backend: the catalog default fill below (it
+        // would write the operator's raw string) and the placement
+        // application (placement_apply is refused outright in the
+        // mode). The response reports the skip.
+        flags_untouched = backend.flags_advanced;
         // A backend with no raw flags of its own takes the newly
         // assigned model's catalog default offload (e.g. Nemotron's
         // --n-cpu-moe 16) — the same preservation rule as the
         // catalog definition refresh: backends carrying operator
         // flags keep them, and the offload slider adjusts from
         // there.
-        if backend
-            .raw_flags
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
+        if !flags_untouched
+            && backend
+                .raw_flags
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
         {
             if let Some(flags) = catalog_default_raw_flags(&id) {
                 backend.raw_flags = Some(flags);
             }
         }
-        manager_models::apply_placement(backend, &split)
-            .map_err(ApiError::from)?;
+        if !flags_untouched {
+            manager_models::apply_placement(backend, &split)
+                .map_err(ApiError::from)?;
+        }
         // A model-file or raw-flags change invalidates the recorded
         // tool-call probe (MCP design §7.2).
         if backend.model_file != prev_model_file || backend.raw_flags != prev_raw_flags {
@@ -6362,7 +6599,14 @@ pub async fn op_model_assign(
             json!({ "model_id": id, "backend_id": backend_id }),
         )
         .await;
-    Ok(json!({ "task_id": task_id, "persisted": true }))
+    Ok(json!({
+        "task_id": task_id,
+        "persisted": true,
+        // True when the target backend is in advanced flags mode
+        // (tracker #60): its split and raw flags were left
+        // untouched by the assignment.
+        "flags_untouched": flags_untouched,
+    }))
 }
 
 
@@ -6993,23 +7237,13 @@ pub async fn op_placement_apply(
     split: Vec<f32>,
     backend_id: Option<String>,
 ) -> ApiResult {
-    // Validate the split length against the telemetry snapshot first.
-    // Done before any config lock is taken: the telemetry accessor reads
-    // the config while initializing, so calling it under the write lock
-    // could deadlock (the same constraint model_assign documents).
-    let gpu_count = lock_telemetry(&state.telemetry().await).snapshot().len();
-    if gpu_count == 0 {
-        return Err(ApiError::Telemetry(
-            "no telemetry yet; cannot validate placement".to_string(),
-        ));
-    }
-    if split.len() != gpu_count {
-        // Same wording as manager_models::validate_split.
-        return Err(ApiError::InvalidInput(format!(
-            "tensor split has {} entries but there are {gpu_count} GPUs",
-            split.len()
-        )));
-    }
+    // Target resolution runs before telemetry validation: the
+    // advanced-flags refusal below must be answerable from the
+    // config alone (and targets are needed either way). The
+    // telemetry accessor is only touched after the config read
+    // guard is dropped — it reads the config while initializing,
+    // so calling it under any config lock could deadlock (the
+    // same constraint model_assign documents).
     let cfg = state.config.read().await;
     let pre_cfg = cfg.clone();
     let model = cfg
@@ -7054,10 +7288,50 @@ pub async fn op_placement_apply(
         }
         ids
     };
+    // Advanced flags mode (tracker #60): placement writes the
+    // structured tensor split, so an apply touching an advanced
+    // backend is refused whole — before telemetry validation and
+    // before any task is recorded — rather than leaving the other
+    // targets half-placed.
+    let advanced_targets: Vec<&str> = backend_ids
+        .iter()
+        .filter(|bid| {
+            cfg.backends
+                .iter()
+                .any(|b| &b.id == *bid && b.flags_advanced)
+        })
+        .map(|s| s.as_str())
+        .collect();
     drop(cfg);
+    if !advanced_targets.is_empty() {
+        return Err(ApiError::InvalidInput(format!(
+            "placement cannot be applied: {} in advanced flags mode; its tensor \
+             split is not written by the structured placement form until \
+             advanced mode is turned off (backend_set_flags_mode)",
+            advanced_targets
+                .iter()
+                .map(|id| format!("backend {id} is"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     if backend_ids.is_empty() {
         return Err(ApiError::NotFound(format!(
             "model {model_id} is not referenced by any backend; point a backend's model file at it first"
+        )));
+    }
+    // Validate the split length against the telemetry snapshot.
+    let gpu_count = lock_telemetry(&state.telemetry().await).snapshot().len();
+    if gpu_count == 0 {
+        return Err(ApiError::Telemetry(
+            "no telemetry yet; cannot validate placement".to_string(),
+        ));
+    }
+    if split.len() != gpu_count {
+        // Same wording as manager_models::validate_split.
+        return Err(ApiError::InvalidInput(format!(
+            "tensor split has {} entries but there are {gpu_count} GPUs",
+            split.len()
         )));
     }
     let task_id = state
@@ -7897,6 +8171,378 @@ mod tests {
         let mut cfg = AppConfig::default_config();
         cfg.data_dir = PathBuf::from("/data");
         cfg
+    }
+
+    /// An AppState over a temp dir for the advanced-flags op
+    /// tests (tracker #60): config file and data dir in scratch
+    /// space, so saves and the activation journal land there.
+    fn advanced_test_state(cfg: AppConfig) -> (Arc<AppState>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "llm-mgr-advanced-flags-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = cfg;
+        cfg.data_dir = dir.clone();
+        let state = Arc::new(AppState::new(cfg, dir.join("config.json"), dir.clone()));
+        (state, dir)
+    }
+
+    fn test_sink() -> Arc<dyn EventSink> {
+        Arc::new(NoopSink)
+    }
+
+    #[tokio::test]
+    async fn advanced_mode_flip_writes_no_flags_and_no_journal() {
+        let mut cfg = test_cfg();
+        // A deliberately non-canonical raw string (an `=` spelling
+        // and doubled spacing): any canonicalizing writer would
+        // rewrite it, so byte equality proves the flip wrote no
+        // flags (tracker #60, requirement: entry performs no write).
+        cfg.backends
+            .iter_mut()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .raw_flags = Some("--n-cpu-moe=46  --threads 8".to_string());
+        let (state, dir) = advanced_test_state(cfg);
+        let sink = test_sink();
+        let r = op_backend_set_flags_mode(&state, &sink, "coder".to_string(), true)
+            .await
+            .unwrap();
+        assert_eq!(r["flags_advanced"], true);
+        assert_eq!(r["changed"], true);
+        assert_eq!(r["raw_flags"], "--n-cpu-moe=46  --threads 8");
+        // On disk: the string is byte-identical and the mode is on.
+        let text = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        assert!(text.contains("--n-cpu-moe=46  --threads 8"), "{text}");
+        assert!(text.contains("\"flags_advanced\": true"), "{text}");
+        // A mode flip is not an activation change: no journal entry.
+        assert!(activation::load_journal(&dir).entries.is_empty());
+        // Re-flipping to the same state writes nothing.
+        let r = op_backend_set_flags_mode(&state, &sink, "coder".to_string(), true)
+            .await
+            .unwrap();
+        assert_eq!(r["changed"], false);
+        // Leaving the mode also writes no flags.
+        let r = op_backend_set_flags_mode(&state, &sink, "coder".to_string(), false)
+            .await
+            .unwrap();
+        assert_eq!(r["raw_flags"], "--n-cpu-moe=46  --threads 8");
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let coder = saved.backends.iter().find(|b| b.id == "coder").unwrap();
+        assert!(!coder.flags_advanced);
+        assert_eq!(coder.raw_flags.as_deref(), Some("--n-cpu-moe=46  --threads 8"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn raw_flags_save_requires_mode_journals_and_warns_without_blocking() {
+        let mut cfg = test_cfg();
+        cfg.backends
+            .iter_mut()
+            .find(|b| b.id == "planner")
+            .unwrap()
+            .tool_call_probe = Some(manager_config::ToolCallProbe {
+            outcome: manager_config::ToolCallProbeOutcome::Verified,
+            at_ms: 1,
+        });
+        let (state, dir) = advanced_test_state(cfg);
+        let sink = test_sink();
+        // Structured mode: the dedicated save refuses — the
+        // structured writers own the string there.
+        let err = op_backend_set_raw_flags(
+            &state,
+            &sink,
+            "planner".to_string(),
+            Some("--parallel 1".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, ApiError::InvalidInput(m) if m.contains("not in advanced flags mode")),
+            "{err}"
+        );
+        op_backend_set_flags_mode(&state, &sink, "planner".to_string(), true)
+            .await
+            .unwrap();
+        const RAW: &str = "--parallel 1 --spec-type draft-mtp --spec-draft-n-max 2 --threads 8";
+        let r = op_backend_set_raw_flags(&state, &sink, "planner".to_string(), Some(RAW.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(r["changed"], true);
+        assert_eq!(r["raw_flags"], RAW);
+        assert!(r["warnings"].as_array().unwrap().is_empty());
+        // Journaled as a backend-scope activation change, and the
+        // tool-call probe was cleared by the flags change.
+        let journal = activation::load_journal(&dir);
+        let entries: Vec<_> = journal
+            .entries
+            .iter()
+            .filter(|e| e.kind == "backend_set_raw_flags")
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].scope, "backend");
+        assert_eq!(entries[0].targets, vec!["planner".to_string()]);
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let planner = saved.backends.iter().find(|b| b.id == "planner").unwrap();
+        assert_eq!(planner.raw_flags.as_deref(), Some(RAW));
+        assert_eq!(planner.tool_call_probe, None);
+        // A no-change save journals nothing new.
+        let r = op_backend_set_raw_flags(&state, &sink, "planner".to_string(), Some(RAW.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(r["changed"], false);
+        assert_eq!(
+            activation::load_journal(&dir)
+                .entries
+                .iter()
+                .filter(|e| e.kind == "backend_set_raw_flags")
+                .count(),
+            1
+        );
+        // Warn, never block: a malformed value and an unrecognized
+        // flag both save, with the warnings on the response.
+        let r = op_backend_set_raw_flags(
+            &state,
+            &sink,
+            "planner".to_string(),
+            Some("--parallel abc --bogus-flag 3".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["changed"], true);
+        let warnings = r["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|w| w["token"] == "--parallel"));
+        assert!(warnings.iter().any(|w| w["token"] == "--bogus-flag"));
+        // An all-whitespace save clears the flags entirely.
+        let r = op_backend_set_raw_flags(&state, &sink, "planner".to_string(), Some("   ".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(r["changed"], true);
+        assert_eq!(r["raw_flags"], Value::Null);
+        let saved = manager_config::load(&state.config_path).unwrap();
+        assert_eq!(
+            saved.backends.iter().find(|b| b.id == "planner").unwrap().raw_flags,
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn structured_writers_refused_in_advanced_mode() {
+        let mut cfg = test_cfg();
+        for id in ["planner", "coder"] {
+            cfg.backends
+                .iter_mut()
+                .find(|b| b.id == id)
+                .unwrap()
+                .flags_advanced = true;
+        }
+        // Give planner an MTP-capable model so the MTP refusal is
+        // distinguishable from the capability refusal.
+        serve_model(
+            &mut cfg,
+            "planner",
+            "qwen3.8-27b-mtp",
+            "models/Qwen3.8-27B-MTP.gguf",
+            Some("--parallel 1"),
+        );
+        let (state, dir) = advanced_test_state(cfg);
+        let sink = test_sink();
+        let refused = |r: Result<Value, ApiError>| match r {
+            Err(ApiError::InvalidInput(m)) => m.contains("advanced flags mode"),
+            other => panic!("expected the advanced-mode refusal, got {other:?}"),
+        };
+        assert!(refused(
+            op_backend_update_flags(&state, &sink, "planner".to_string(), 32768, 512).await
+        ));
+        assert!(refused(
+            op_backend_set_offload(&state, &sink, "coder".to_string(), 4, None).await
+        ));
+        assert!(refused(
+            op_backend_set_mtp(&state, &sink, "planner".to_string(), Some(2)).await
+        ));
+        assert!(refused(
+            op_placement_apply(
+                &state,
+                &sink,
+                "qwen3.8-27b-mtp".to_string(),
+                vec![1.0],
+                Some("planner".to_string()),
+            )
+            .await
+        ));
+        // The config patch path refuses a flags-field patch...
+        assert!(refused(
+            op_backend_apply_config(
+                &state,
+                &sink,
+                "planner".to_string(),
+                json!({ "n_ctx": 4096 }),
+                "OnNextRestart".to_string(),
+            )
+            .await
+        ));
+        // ...but a non-flags patch still applies in the mode.
+        let r = op_backend_apply_config(
+            &state,
+            &sink,
+            "planner".to_string(),
+            json!({ "enabled": false }),
+            "OnNextRestart".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["persisted"], true);
+        // update_config cannot rewrite an advanced backend's flags.
+        let mut v = serde_json::to_value(state.config.read().await.clone()).unwrap();
+        for b in v["backends"].as_array_mut().unwrap().iter_mut() {
+            if b["id"] == "coder" {
+                b["raw_flags"] = json!("--threads 4");
+            }
+        }
+        let patch = json!({ "backends": v["backends"].clone() });
+        assert!(refused(op_update_config(&state, &sink, patch).await));
+        // A benign whole-config patch (the supervision toggle the
+        // Settings view sends) still succeeds.
+        let r = op_update_config(&state, &sink, json!({ "supervision": { "mode": "process" } }))
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn model_assign_leaves_advanced_backends_flags_untouched() {
+        let nemotron = manager_config::ModelConfig {
+            id: "nemotron-3.5-lightning-30b".to_string(),
+            gguf_path: PathBuf::from("models/nemotron.gguf"),
+            quant: "Q4_K_M".to_string(),
+            params_b: 30.0,
+            sha256: "a".repeat(64),
+            verified_at: None,
+            verified_sha256: None,
+            source_url: String::new(),
+            assigned_backends: Vec::new(),
+            enabled: true,
+            display_name: None,
+        };
+        // Advanced: the assignment proceeds, but neither the
+        // catalog raw-flags fill (the backend's blank flags would
+        // take Nemotron's --n-cpu-moe 16 in structured mode) nor
+        // the split application touches the backend's flags.
+        let mut cfg = test_cfg();
+        cfg.models.push(nemotron.clone());
+        {
+            let coder = cfg.backends.iter_mut().find(|b| b.id == "coder").unwrap();
+            coder.flags_advanced = true;
+            coder.raw_flags = Some("  ".to_string());
+            coder.flags.tensor_split = Vec::new();
+        }
+        let (state, dir) = advanced_test_state(cfg);
+        let sink = test_sink();
+        let r = op_model_assign(
+            &state,
+            &sink,
+            "nemotron-3.5-lightning-30b".to_string(),
+            "coder".to_string(),
+            vec![1.0],
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["flags_untouched"], true);
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let coder = saved.backends.iter().find(|b| b.id == "coder").unwrap();
+        assert_eq!(coder.model_file, PathBuf::from("models/nemotron.gguf"));
+        assert_eq!(coder.raw_flags.as_deref(), Some("  "));
+        assert!(coder.flags.tensor_split.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        // Structured control case: the same assignment fills the
+        // catalog default and applies the split. (split_mode is
+        // preset to Layer: a bare [1.0] split under mode none is
+        // invalid config, unrelated to this test.)
+        let mut cfg = test_cfg();
+        cfg.models.push(nemotron);
+        {
+            let coder = cfg.backends.iter_mut().find(|b| b.id == "coder").unwrap();
+            coder.raw_flags = Some("  ".to_string());
+            coder.flags.tensor_split = Vec::new();
+            coder.flags.split_mode = manager_models::SplitMode::Layer;
+        }
+        let (state, dir) = advanced_test_state(cfg);
+        let r = op_model_assign(
+            &state,
+            &sink,
+            "nemotron-3.5-lightning-30b".to_string(),
+            "coder".to_string(),
+            vec![1.0],
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["flags_untouched"], false);
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let coder = saved.backends.iter().find(|b| b.id == "coder").unwrap();
+        assert_eq!(coder.raw_flags.as_deref(), Some("--n-cpu-moe 16"));
+        assert_eq!(coder.flags.tensor_split, vec![1.0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn advanced_save_then_structured_decode_round_trip() {
+        let mut cfg = test_cfg();
+        serve_model(
+            &mut cfg,
+            "planner",
+            "qwen3.8-27b-mtp",
+            "models/Qwen3.8-27B-MTP.gguf",
+            None,
+        );
+        cfg.backends
+            .iter_mut()
+            .find(|b| b.id == "planner")
+            .unwrap()
+            .flags_advanced = true;
+        let (state, dir) = advanced_test_state(cfg);
+        let sink = test_sink();
+        // A mix of modeled flags (offload, MTP, parallel) and a
+        // foreign flag no control models (--threads).
+        const RAW: &str =
+            "--parallel 1 --spec-type draft-mtp --spec-draft-n-max 2 --threads 8 -ot exps=CPU";
+        let r = op_backend_set_raw_flags(&state, &sink, "planner".to_string(), Some(RAW.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(r["changed"], true);
+        assert!(r["warnings"].as_array().unwrap().is_empty());
+        // Leaving the mode writes nothing: the string survives
+        // byte-for-byte, foreign tokens included.
+        let r = op_backend_set_flags_mode(&state, &sink, "planner".to_string(), false)
+            .await
+            .unwrap();
+        assert_eq!(r["raw_flags"], RAW);
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let b = saved.backends.iter().find(|b| b.id == "planner").unwrap();
+        assert!(!b.flags_advanced);
+        assert_eq!(b.raw_flags.as_deref(), Some(RAW));
+        // The existing decoders read the saved string exactly as
+        // the structured form renders it.
+        assert_eq!(
+            manager_models::expert_offload(b.raw_flags.as_deref()),
+            manager_models::ExpertOffload::AllExperts
+        );
+        assert_eq!(
+            manager_models::mtp_draft(b.raw_flags.as_deref()),
+            manager_models::MtpDraft::On(Some(2))
+        );
+        assert_eq!(manager_models::parallel_slots(b.raw_flags.as_deref()), Some(1));
+        let info = backend_mtp_info(&saved, b).expect("planner-mtp is MTP-capable");
+        assert!(info.enabled);
+        assert_eq!(info.n_max, Some(2));
+        assert_eq!(info.parallel, Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

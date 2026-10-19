@@ -247,7 +247,9 @@ lives in the app types cited; this is the wire contract summary.)
                "total_bytes": 0, "green_limit_layers": 48,
                "green_end": 1.0, "yellow_end": 1.0 },
   "mtp": { "enabled": true, "n_max": 2, "parallel": 1,
-           "custom": false }
+           "custom": false },
+  "raw_flags": "--parallel 1",
+  "flags_advanced": false
 }
 ```
 
@@ -265,7 +267,7 @@ supervisor-only orphan process; orphans accept `stop` only.
 ```json
 {
   "id": "coder", "enabled": true, "model_file": "…", "port": 8082,
-  "flags": { }, "raw_flags": "-ot exps=CPU",
+  "flags": { }, "raw_flags": "-ot exps=CPU", "flags_advanced": false,
   "restart_policy": { }, "overrides_global": false
 }
 ```
@@ -368,12 +370,12 @@ payload; the API adds nothing.
 
 ## 5. Endpoint index
 
-90 client-facing endpoints. ("Op" = returns `202` + operation, §3.)
+92 client-facing endpoints. ("Op" = returns `202` + operation, §3.)
 
 | Domain | Count | Endpoints |
 |---|---|---|
 | Status | 1 | `GET /status` |
-| Backends | 15 | list, create, get, delete, config get/patch, diff preview, start/stop/restart (Op), test, flags, offload, mtp, launch command |
+| Backends | 17 | list, create, get, delete, config get/patch, diff preview, start/stop/restart (Op), test, flags, offload, mtp, raw flags, flags mode, launch command |
 | Models | 11 | list, create, get, delete, patch, download (Op) + pause/resume/cancel, verify (Op), assign |
 | Placement | 2 | propose, apply |
 | Gateway | 13 | status, config get/patch, generated config, master key, start (Op), stop, groups CRUD (4), routing test, routing recent |
@@ -501,6 +503,28 @@ Sets the backend's MTP speculative decoding draft length
 backend's raw flags change. Only valid for MTP-capable backends
 (the `mtp` block in §4.1 says which); otherwise
 `400 INVALID_INPUT`, as in the app.
+
+#### `PUT /api/v1/backends/{id}/raw-flags` — `config`
+`backend_set_raw_flags`. Body: `{ "raw_flags": "--parallel 1 …" }`
+(or `null` to clear) →
+`{ "backend_id", "raw_flags": "…", "changed": true, "warnings": [ { "token", "message" }, … ] }`.
+The advanced flags editor's save (tracker #60): the backend's raw
+flags edited directly as text. Only valid while the backend is in
+advanced flags mode (see `flags-mode` below); in structured mode
+the token-owning writes own the string and this refuses with
+`400 INVALID_INPUT`. Validation warnings ride the response and
+never block the save. Applies at the backend's next start; the app
+records the activation-plan entry.
+
+#### `PUT /api/v1/backends/{id}/flags-mode` — `config`
+`backend_set_flags_mode`. Body: `{ "advanced": true }` →
+`{ "backend_id", "flags_advanced": true, "raw_flags": "…", "changed": true }`.
+Turns a backend's advanced flags mode on or off (tracker #60). The
+flip writes only the mode: the backend's flags do not change by a
+single token in either direction. While the mode is on, the
+structured flags writes (`flags`, `offload`, `mtp`, placement
+apply, and the flags fields of `config` patches) refuse with
+`400 INVALID_INPUT` naming the mode.
 
 #### `GET /api/v1/backends/{id}/launch-command` — `read`
 `backend_get_launch_command` → `{ "id", "argv": [ … ] }` — the exact
