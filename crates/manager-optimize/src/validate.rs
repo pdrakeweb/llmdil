@@ -490,8 +490,29 @@ fn validate_one(
                 expected_note = Some("Backend will be stopped and removed".to_string());
             }
             candidate.backends.remove(pos);
+            // The apply executor scrubs the id from group
+            // member lists AND fallback chains (config
+            // validation rejects an unknown fallback, so a
+            // delete that left one behind could never be
+            // saved); the simulation mirrors it exactly, and
+            // the scrub is surfaced as a warning — the plan
+            // does not need a separate routing item to make
+            // the delete valid, but the operator should see
+            // the consequence on the delete's own row.
+            let mut fallback_groups: Vec<String> = Vec::new();
             for g in candidate.gateway.groups.iter_mut() {
                 g.members.retain(|m| m != &target);
+                let before = g.fallbacks.len();
+                g.fallbacks.retain(|f| f != &target);
+                if g.fallbacks.len() != before {
+                    fallback_groups.push(g.name.clone());
+                }
+            }
+            if !fallback_groups.is_empty() {
+                warnings.push(format!(
+                    "deleting '{target}' also removes it from the fallback chain of: {}",
+                    fallback_groups.join(", ")
+                ));
             }
             for m in candidate.models.iter_mut() {
                 m.assigned_backends.retain(|b| b != &target);
@@ -1063,6 +1084,36 @@ mod tests {
             out[0].expected.note.as_deref(),
             Some("Backend will be stopped and removed")
         );
+    }
+
+    #[test]
+    fn backend_delete_scrubs_group_fallbacks_and_warns() {
+        // The fixture defect: a group names the backend in its
+        // fallback chain, and no plan item rewrites that chain.
+        // The delete itself scrubs fallback references (the
+        // executor does the same), so the item is a Warning
+        // naming the scrub — not Invalid for a condition the
+        // delete's own application resolves.
+        let mut cfg = cfg_with_model();
+        cfg.gateway.groups[0].fallbacks = vec!["tool-runner".to_string()];
+        assert!(manager_config::validate(&cfg).is_ok());
+        let live = live_for(&cfg);
+        let p = plan(vec![item(
+            1,
+            PlanKind::BackendDelete,
+            "tool-runner",
+            json!({}),
+            Decision::Denied,
+        )]);
+        let out = validate_plan(&p, &cfg, &live);
+        assert_eq!(
+            out[0].status,
+            ValidationStatus::Warning,
+            "delete verdict: {:?}",
+            out[0].reason
+        );
+        let reason = out[0].reason.clone().unwrap_or_default();
+        assert!(reason.contains("fallback chain of: tool-runner"), "{reason}");
     }
 
     #[test]

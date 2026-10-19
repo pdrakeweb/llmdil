@@ -5189,9 +5189,11 @@ pub async fn op_backend_set_mtp(
 /// Remove a backend (spec §14 `backend_delete`). Refused while the
 /// backend is running — stop it first. The id is scrubbed from every
 /// group's member list (the gateway config generator rejects unknown
-/// members) and from models' assignment lists. A group left with no
-/// members stays in the config: it generates no gateway deployments
-/// and can gain members again later.
+/// members), from every group's fallback chain (config validation
+/// rejects unknown fallbacks, so a delete that left one behind could
+/// never be saved), and from models' assignment lists. A group left
+/// with no members stays in the config: it generates no gateway
+/// deployments and can gain members again later.
 pub async fn op_backend_delete(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
@@ -5220,6 +5222,7 @@ pub async fn op_backend_delete(
     new_cfg.backends.remove(pos);
     for g in new_cfg.gateway.groups.iter_mut() {
         g.members.retain(|m| m != &id);
+        g.fallbacks.retain(|f| f != &id);
     }
     for m in new_cfg.models.iter_mut() {
         m.assigned_backends.retain(|b| b != &id);
