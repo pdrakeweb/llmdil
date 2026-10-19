@@ -54,6 +54,7 @@ interface McpFormDraft {
   env_keys: string;
   cred_ref: string;
   signup_url: string;
+  credential_hint: string;
   allowed_tools: string;
   metered: boolean;
   rpm_limit: string;
@@ -63,7 +64,7 @@ function emptyDraft(): McpFormDraft {
   return {
     id: "", display_name: "", transport: "stdio", exposure: "gateway",
     command: "", args: "", url: "", env_keys: "", cred_ref: "",
-    signup_url: "", allowed_tools: "", metered: false, rpm_limit: "",
+    signup_url: "", credential_hint: "", allowed_tools: "", metered: false, rpm_limit: "",
   };
 }
 
@@ -79,6 +80,7 @@ function draftFromServer(s: McpServerRow): McpFormDraft {
     env_keys: s.env_keys.join(", "),
     cred_ref: s.cred_ref ?? "",
     signup_url: s.signup_url ?? "",
+    credential_hint: s.credential_hint ?? "",
     allowed_tools: (s.allowed_tools ?? []).join(", "),
     metered: s.metered,
     rpm_limit: s.rpm_limit === null ? "" : String(s.rpm_limit),
@@ -190,11 +192,24 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
         ? `${s.id}: disabled — turn on to ${restore === "gateway" ? "register with the gateway" : "run locally"}`
         : `${s.id}: enabled — ${s.exposure === "gateway" ? "registered with the gateway" : "running locally"}; turn off to disable`,
     });
+    // The credential store field is labelled with what credential
+    // it takes: the server's credential_hint (backend-resolved:
+    // stored, else the seed's) or, for a custom server without
+    // one, the env key names the value is passed under. The
+    // storage mechanics live in the info-tip (principle 5); the
+    // placeholder is the primary env key name, matching the
+    // start-gateway prompt's field.
+    const credKind = s.credential_hint
+      ?? (s.env_keys.length ? `value for ${s.env_keys.join(", ")}` : "value");
+    const credTip = `Stored only in Windows Credential Manager (target: ${s.cred_ref}) — never written to the config file. The value is supplied to the server as ${s.env_keys.join(" and ") || "its env keys"} when it runs.`;
     const credRow = s.cred_ref
-      ? `<div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
-          <input type="password" data-mcp-cred-input placeholder="${esc(s.cred_ref)}" autocomplete="off" style="${SELECT_STYLE};flex:1;min-width:180px" aria-label="Credential value for ${esc(s.id)}">
+      ? `<div style="margin-top:10px">
+          <label for="mcp-cred-${esc(s.id)}" style="font-size:12px;color:var(--text2)">Credential: ${esc(credKind)}<span class="info-tip" title="${esc(credTip)}">${icon("info")}</span></label>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:4px;flex-wrap:wrap">
+          <input type="password" id="mcp-cred-${esc(s.id)}" data-mcp-cred-input placeholder="${esc(s.env_keys[0] ?? "Credential value")}" autocomplete="off" style="${SELECT_STYLE};flex:1;min-width:180px" aria-label="Credential value for ${esc(s.id)}">
           <button class="btn" data-mcp-act="store-cred" data-mcp-id="${esc(s.id)}">${icon("shield")} Store</button>
           ${!s.credential_present && s.signup_url ? `<button class="btn" data-mcp-act="get-key" data-mcp-id="${esc(s.id)}">${icon("external")} Get an API key</button>` : ""}
+          </div>
         </div>`
       : "";
     const note = msgs.get(s.id);
@@ -253,12 +268,14 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
         <input data-mcp-field="url" type="text" value="${esc(draft.url)}" placeholder="MCP server URL (https, or http on loopback)" style="${SELECT_STYLE};width:100%"></label>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
-      <label style="font-size:12px;color:var(--text2)">Env key names (comma-separated)<br>
+      <label style="font-size:12px;color:var(--text2)">Env key names (comma-separated)<span class="info-tip" title="The environment variable names the stored credential value is supplied under when the server runs. Names only — the value itself is stored from the server card and is never entered here or saved in the config.">${icon("info")}</span><br>
         <input data-mcp-field="env_keys" type="text" value="${esc(draft.env_keys)}" placeholder="BRAVE_API_KEY" style="${SELECT_STYLE};width:100%"></label>
-      <label style="font-size:12px;color:var(--text2)">Credential target<br>
+      <label style="font-size:12px;color:var(--text2)">Credential target<span class="info-tip" title="The Windows Credential Manager target the server's credential value is stored under. One value is stored per server and supplied under each env key name.">${icon("info")}</span><br>
         <input data-mcp-field="cred_ref" type="text" value="${esc(draft.cred_ref)}" placeholder="local-llm-service-manager/brave-search-mcp" style="${SELECT_STYLE};width:100%"></label>
       <label style="font-size:12px;color:var(--text2)">Signup / API-key page (optional)<br>
         <input data-mcp-field="signup_url" type="text" value="${esc(draft.signup_url)}" placeholder="Registration / API-key page URL (https)" style="${SELECT_STYLE};width:100%"></label>
+      <label style="font-size:12px;color:var(--text2)">Credential description (optional)<span class="info-tip" title="Names the credential the operator stores for this server — its kind and where it comes from (for example, 'Brave Search API key'). Shown as the label on the server card's credential field and in the start-gateway credential prompt.">${icon("info")}</span><br>
+        <input data-mcp-field="credential_hint" type="text" value="${esc(draft.credential_hint)}" placeholder="What credential to store, and where it comes from" style="${SELECT_STYLE};width:100%"></label>
       <label style="font-size:12px;color:var(--text2)">Allowed tools (comma-separated, optional)<br>
         <input data-mcp-field="allowed_tools" type="text" value="${esc(draft.allowed_tools)}" style="${SELECT_STYLE};width:100%"></label>
       <label style="font-size:12px;color:var(--text2)">Rate limit, rpm (optional)<br>
@@ -365,6 +382,7 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
       env_keys: splitList(draft.env_keys),
       cred_ref: draft.cred_ref.trim() === "" ? null : draft.cred_ref.trim(),
       signup_url: draft.signup_url.trim() === "" ? null : draft.signup_url.trim(),
+      credential_hint: draft.credential_hint.trim() === "" ? null : draft.credential_hint.trim(),
       allowed_tools: allowed.length ? allowed : null,
       metered: draft.metered,
       rpm_limit: rpm !== null && Number.isFinite(rpm) && rpm > 0 ? rpm : null,
@@ -504,6 +522,7 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
     else if (field === "env_keys") draft.env_keys = t.value;
     else if (field === "cred_ref") draft.cred_ref = t.value;
     else if (field === "signup_url") draft.signup_url = t.value;
+    else if (field === "credential_hint") draft.credential_hint = t.value;
     else if (field === "allowed_tools") draft.allowed_tools = t.value;
     else if (field === "rpm_limit") draft.rpm_limit = t.value;
     else if (field === "transport" && ev.type === "change") {
