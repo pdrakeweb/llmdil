@@ -202,6 +202,7 @@ macro_rules! for_each_operation {
             (BackendAdd, backend_add, C, op_backend_add, [id: String, model_id: String, port: u16, group: String, create_group: bool, enabled: bool], Some(route_created(HttpMethod::Post, "/api/v1/backends"))),
             (BackendUpdateFlags, backend_update_flags, C, op_backend_update_flags, [id: String, n_ctx: u32, n_batch: u32], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/flags"))),
             (BackendSetOffload, backend_set_offload, C, op_backend_set_offload, [id: String, layers: u32, allow_override: Option<bool>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/offload"))),
+            (BackendSetMtp, backend_set_mtp, C, op_backend_set_mtp, [id: String, n_max: Option<u32>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/mtp"))),
             (BackendDelete, backend_delete, D, op_backend_delete, [id: String], Some(route(HttpMethod::Delete, "/api/v1/backends/{id}"))),
             (BackendGetLaunchCommand, backend_get_launch_command, SDisclosure, op_backend_get_launch_command, [id: String], Some(route(HttpMethod::Get, "/api/v1/backends/{id}/launch-command"))),
             // Wizard / setup
@@ -396,7 +397,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 106);
+        assert_eq!(OP_SPECS.len(), 107);
     }
 
     #[test]
