@@ -4664,6 +4664,9 @@ pub async fn op_backend_add(
         // --n-cpu-moe 16 rather than with no offload at all. A
         // position chosen in the add form replaces it below.
         raw_flags: catalog_default_raw_flags(&model.id),
+        // A created backend starts in structured flags mode; the
+        // operator opts into advanced mode per backend afterward.
+        flags_advanced: false,
         restart_policy: manager_config::RestartPolicy {
             max_retries: 5,
             backoff_base_secs: 2,
@@ -4781,6 +4784,7 @@ pub async fn op_backend_add_preview(
             split_mode,
         },
         raw_flags: catalog_default_raw_flags(&model.id),
+        flags_advanced: false,
         restart_policy: manager_config::RestartPolicy {
             max_retries: 5,
             backoff_base_secs: 2,
@@ -8090,6 +8094,7 @@ mod tests {
                 split_mode: manager_config::SplitMode::None,
             },
             raw_flags,
+            flags_advanced: false,
             restart_policy: manager_config::RestartPolicy {
                 max_retries: 5,
                 backoff_base_secs: 2,

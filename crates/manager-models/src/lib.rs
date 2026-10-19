@@ -2105,6 +2105,7 @@ mod tests {
                 split_mode: manager_config::SplitMode::None,
             },
             raw_flags: None,
+            flags_advanced: false,
             restart_policy: manager_config::RestartPolicy {
                 max_retries: 5,
                 backoff_base_secs: 2,
