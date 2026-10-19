@@ -2877,6 +2877,18 @@ export interface OptimizeState {
    *  when no baseline has been run. */
   eval_baseline: OptimizeEvalBaseline | null;
   consulting: boolean;
+  /** When the running consultation started (Unix ms), recorded
+   *  server-side: the only start time a page instance can trust
+   *  when it did not start the run itself (a local clock starts
+   *  at 0 and renders the epoch as an elapsed time). */
+  consult_started_unix_ms: number | null;
+  /** The last consultation's failure, recorded server-side when
+   *  a run ends in one and cleared when a new run starts or one
+   *  succeeds — so a failure that lands while the operator is on
+   *  another view still surfaces here instead of silently
+   *  leaving the previous plan looking current. */
+  consult_error: string | null;
+  consult_error_unix_ms: number | null;
   /** A GPU-bound Optimize job (measurement, later an
    *  experiment batch) is currently running. */
   measuring: boolean;

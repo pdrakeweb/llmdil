@@ -167,6 +167,21 @@ check(optimizeSrc.includes("data-opt-estimate"), "Optimize view renders the per-
 check(optimizeSrc.includes('data-opt-act="estimate-experiments"'), "Optimize view renders the Estimate experiments action");
 check(optimizeSrc.includes("Estimate —"), "Optimize view renders estimate figures under the Estimate label");
 
+// Optimize fix bundle (Oct 19, 2026): the consulting elapsed
+// clock reads the server's recorded start (a page instance that
+// did not start the run has no local start and must not render
+// the epoch as an elapsed time); a recorded consultation
+// failure surfaces as a banner with the stored plan headed
+// "Previous plan"; measure/estimate targets render as discrete
+// cards with their actions anchored in the card's action row,
+// not as one flex row of running text.
+check(optimizeSrc.includes("consult_started_unix_ms"), "Optimize view reads the server-recorded consultation start");
+check(optimizeSrc.includes("consult_error"), "Optimize view surfaces the server-recorded consultation failure");
+check(optimizeSrc.includes("Previous plan"), "Optimize view heads the retained plan 'Previous plan' after a failed consultation");
+check(optimizeSrc.includes('class="opt-measure-card"'), "Optimize view renders measure targets as cards");
+check(optimizeSrc.includes('class="opt-measure-actions"'), "Optimize view anchors card actions in the card action row");
+check(!optimizeSrc.includes('class="opt-measure-row"'), "Optimize view no longer renders the single-row measure blob");
+
 check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
 check(bundle.includes("__TAURI__"), "bundle contains the Tauri detection hook");

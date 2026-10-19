@@ -171,6 +171,9 @@ export function mockOptimizeState(): OptimizeState {
       caveat: "Screening suite — a small fixed set of checkable tasks. It screens out regressions; it is not a benchmark and does not rank models generally.",
     },
     consulting: false,
+    consult_started_unix_ms: null,
+    consult_error: null,
+    consult_error_unix_ms: null,
     measuring: false,
     plan: {
       summary: "Sample plan — generated locally; no backend was consulted.",
