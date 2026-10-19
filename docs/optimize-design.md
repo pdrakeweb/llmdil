@@ -1098,3 +1098,39 @@ designed it rides with Phase 5.)
    no code execution in v1. *Recommendation: as §A.4.*
 5. **canirun.ai** — no integration (§A.6). *Recommendation:
    none; HF API is the source.*
+
+## A.9 Plan coherence fixes (Oct 18, 2026 field report)
+
+Three defects from a real generated plan (an MoE planner
+replacement proposed by the coder backend), fixed together:
+
+- **Dependency ordering.** Plan building now orders items by
+  dependency — model registration before anything naming the
+  model, backend creation before routing naming it, routing
+  before the deletes that remove what it references, deletes
+  last among their dependents. Placement is depth-first in
+  emitted order: an item moves only when an edge forces it,
+  so the consultant's intent survives wherever no edge
+  applies. Validation and apply already ran in plan order;
+  they now judge the dependency order.
+- **Plan-aware delete validation.** A `backend.delete` scrubs
+  the id from group fallback chains as well as member lists —
+  in the validation simulation and in `backend_delete` itself
+  (the config validator rejects an unknown fallback, so a
+  delete that left one could never be saved). The simulation
+  reports the scrub as a warning on the delete item naming
+  the affected groups, instead of an Invalid the plan had no
+  item positioned to cure.
+- **Experiment provisioning.** An experiment whose candidate
+  is unregistered is no longer a dead end: plan building
+  chains a `model.add` (from the plan's own items, the
+  catalog, a discovered candidate — carrying its real
+  `params_b` — or the candidate's HF repo/file, in that
+  order) plus a `model.download` step through the existing
+  download machinery, linked from the proposal's
+  `provisioning` record. Accepting the experiment accepts
+  the steps; denying it denies only the steps chained for
+  it, never a shared authored registration. A candidate no
+  source resolves gets a validation message naming every
+  missing source. Experiments still never download at run
+  time — provisioning is plan items, applied like any other.

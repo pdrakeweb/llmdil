@@ -160,10 +160,13 @@ pub async fn startup_sweep(state: &AppState) {
 // ---------------------------------------------------------------------------
 
 /// Set one experiment proposal's tri-state decision (§A.3),
-/// mirroring `optimize_set_item_state`. Denials accumulate
-/// into the plan file's denial memory, keyed by the
-/// experiment fingerprint, so an identical re-proposal in a
-/// later consultation arrives pre-denied.
+/// mirroring `optimize_set_item_state`, with the provisioning
+/// cascade: the decision also lands on the plan items that
+/// register and download the experiment's candidate model.
+/// Denials accumulate into the plan file's denial memory,
+/// keyed by fingerprint (the experiment's and any cascaded
+/// item's), so an identical re-proposal in a later
+/// consultation arrives pre-denied.
 pub async fn op_optimize_set_experiment_state(
     state: &std::sync::Arc<crate::AppState>,
     _sink: &std::sync::Arc<dyn crate::EventSink>,
@@ -185,18 +188,23 @@ pub async fn op_optimize_set_experiment_state(
         .plan
         .as_mut()
         .ok_or_else(|| ApiError::NotFound("no plan".to_string()))?;
-    let experiment = plan
+    let candidate = plan
         .experiments
-        .iter_mut()
+        .iter()
         .find(|e| e.id == experiment_id)
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "experiment {experiment_id}"
-            ))
-        })?;
-    experiment.decision = decision;
-    if decision == Decision::Denied {
-        let fp = experiment.fingerprint.clone();
+        .map(|e| e.candidate_model_id.clone())
+        .ok_or_else(|| ApiError::NotFound(format!("experiment {experiment_id}")))?;
+    // The decision cascades to the experiment's provisioning
+    // items: accepting the experiment accepts the registration
+    // and download steps it needs; denying it denies the steps
+    // chained for it (never a shared authored registration).
+    // The cascade lives in manager-optimize with the plan
+    // types; denial memory records every fingerprint that
+    // transitioned to denied, the experiment's included.
+    let newly_denied =
+        manager_optimize::apply_experiment_decision(plan, experiment_id, decision)
+            .ok_or_else(|| ApiError::NotFound(format!("experiment {experiment_id}")))?;
+    for fp in newly_denied {
         if !file.denied_fingerprints.contains(&fp) {
             file.denied_fingerprints.push(fp);
         }
@@ -204,8 +212,7 @@ pub async fn op_optimize_set_experiment_state(
     crate::optimize::opt_log1(
         state,
         &format!(
-            "experiment {experiment_id} (candidate {}) decision -> {decision:?}",
-            experiment.candidate_model_id
+            "experiment {experiment_id} (candidate {candidate}) decision -> {decision:?}"
         ),
     );
     crate::optimize::save_plan_file(state, &file).map_err(ApiError::InvalidInput)?;

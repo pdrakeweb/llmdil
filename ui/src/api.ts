@@ -2518,6 +2518,10 @@ export interface OptimizePlanItem {
   confidence: "high" | "medium" | "low";
   decision: OptimizeDecision;
   previously_denied: boolean;
+  /** Experiment this item was chained to provision (register /
+   *  download its candidate model), when it is one; absent on
+   *  plans written before experiment provisioning. */
+  provision_for_experiment?: number | null;
   apply_outcome: "applied" | "failed" | "not_attempted" | null;
   apply_error: string | null;
 }
@@ -2600,6 +2604,11 @@ export interface OptimizeExperiment {
   run_eval: boolean;
   decision: OptimizeDecision;
   previously_denied: boolean;
+  /** Plan items that register and download this experiment's
+   *  candidate model, when the candidate is not registered and
+   *  the plan provisions it; absent otherwise (and on plans
+   *  written before experiment provisioning). */
+  provisioning?: { model_id: string; item_ids: number[] } | null;
   result: OptimizeExperimentResult | null;
 }
 
@@ -2894,6 +2903,7 @@ export function optimizeKindLabel(kind: string): string {
     case "group.create": return "New group";
     case "group.delete": return "Delete";
     case "model.add": return "New model";
+    case "model.download": return "Download model";
     default: return "Advice";
   }
 }
@@ -2939,6 +2949,7 @@ export function optimizeChangeSummary(item: OptimizePlanItem, shortName: (modelI
     case "group.create": return `Members: ${Array.isArray(c.members) ? (c.members as string[]).join(", ") : ""} · Strategy: ${String(c.strategy ?? "simple-shuffle")}`;
     case "group.delete": return `Group: ${t}`;
     case "model.add": return `Source: ${String(c.source_url ?? "")}`;
+    case "model.download": return "Downloads the GGUF file";
     default: return "";
   }
 }
