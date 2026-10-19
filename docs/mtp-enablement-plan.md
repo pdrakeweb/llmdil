@@ -2,9 +2,13 @@
 
 Status: executed and shipped. The catalog entry shipped in v0.1.37;
 the tunable draft-length control shipped in v0.1.40 (tracker #53);
-draft acceptance was measured on Pete's machine under v0.1.40, but
-the step 5 adoption comparison has not been run under matched
-measurement — see "Shipped status and measured outcome" below.
+draft acceptance was measured on Pete's machine under v0.1.40, and a
+matched-workload comparison captured in a 2026-10-18 diagnostics
+bundle has since settled the speed question for the configuration
+as run: spec-on decode is a net loss from per-iteration draft
+overhead, so MTP stays off for the planner seat. The formal step 5
+script run and the `--parallel 1` configuration remain unrun —
+see "Shipped status and measured outcome" below.
 Goal: enable llama.cpp multi-token prediction (MTP)
 self-speculative decoding for the planner role and measure it
 against the current baseline before adopting it. The decided
@@ -20,7 +24,8 @@ model entry and planner backend are not modified at any point.
   (`catalog_mtp` in `crates/manager-models/src/lib.rs`); only the
   `-mtp` build carries `mtp: true`.
 - **Tunable draft length (v0.1.40, tracker #53).** The backend card
-  carries an MTP slider (Off / 1 / 2 / 3 / 4) backed by the
+  carries an MTP draft-length control (Off / 1 / 2 / 3 / 4; a
+  slider in v0.1.40, a dropdown since the #53 follow-up) backed by the
   `backend_set_mtp` op. State is decoded from, and rewritten into,
   the backend's saved raw flags by
   `crates/manager-models/src/mtp.rs` (`mtp_draft` /
@@ -43,16 +48,24 @@ model entry and planner backend are not modified at any point.
   and draft acceptance measured 53.9% (132 accepted / 245 generated,
   mean accepted length 2.07) on one workload and 84.0% (79/94, mean
   length 2.68) on another — acceptance is healthy and
-  content-dependent. Live card statistics with MTP on (prompt 15.7 /
-  generation 13.1 tok/s) read lower than the earlier no-flags
-  baseline-script run (33.5 / 22.5), but those figure sets come from
-  different measurement paths (live card statistics vs the
-  standardized `Invoke-ModelBaseline.ps1` medians), so they do not
-  settle the speed question. The step 5 adoption gate (~1.3x) is
-  undetermined until the baseline script is re-run against
-  `planner-mtp` with the speculative flags on; no adoption decision
-  has been taken, and the `planner-mtp` backend and model are
-  retained.
+  content-dependent. A later diagnostics bundle (2026-10-18,
+  v0.1.40) captured the Optimize standardized benchmark itself
+  running against `planner-mtp` with the spec flags on — warm-up
+  plus three runs per prompt, a matched workload — and settles the
+  speed question for the configuration as run: generation measured
+  8.3 tok/s (short prompt set) and 10.7 tok/s (long prompt set)
+  against 22.5 tok/s plain decode, a net loss at every captured
+  point. The loss is per-iteration overhead, not acceptance: each
+  draft iteration costs about 250 ms (about 5.7 plain decode steps
+  at ~44 ms) while returning 2.07 tokens at 53.9% acceptance and
+  2.68 at 84.0%. Every captured run still ran with `n_slots = 4` —
+  the `--parallel 1` edit never landed in the saved configuration
+  (a later app save overwrote it) — so `--parallel 1` remains
+  untested; the iteration cost would need to fall roughly 2–3x for
+  it to flip the outcome. The formal step 5 baseline-script run
+  has not been executed. Practical standing: MTP off is the
+  measured-right setting for the planner seat; the `planner-mtp`
+  backend and model are retained as an experiment seat.
 - **No MTP for the coder.** Qwen3-Coder-Next has no MTP head, no
   MTP GGUF build exists, and llama.cpp's `draft-mtp` is not
   implemented for the `qwen3next` architecture; its catalog entry
@@ -85,9 +98,10 @@ class on an RTX 3090 (n-max 2 was the best draft length, +59.8%).
 Projected on the A4000: 30–37 tok/s generation, unverified until
 measured here. MTP accelerates decode only; prompt processing
 (prefill) is unaffected. (Under v0.1.40, draft acceptance measured
-healthy at 53.9–84.0%, but the projected gain is unverified: the
-matched-instrument comparison has not been run — see "Shipped
-status and measured outcome".)
+healthy at 53.9–84.0%, but the projected gain did not materialize:
+the matched-workload comparison in the 2026-10-18 diagnostics
+bundle shows a net decode loss from per-iteration draft overhead —
+see "Shipped status and measured outcome".)
 
 ## Plan
 
@@ -145,10 +159,13 @@ status and measured outcome".)
    acceptance (accepted / drafted) whenever the server reports it.
 5. **Adoption gate.** Adopt MTP only if the production-sampling pass
    shows a median generation gain of at least about 1.3x over
-   `base-file`. (Status under v0.1.40: undetermined — acceptance
-   measured healthy, but the matched comparison against `base-file`
-   has not been run; see "Shipped status and measured outcome"
-   above.) Adoption means keeping the winning configuration on
+   `base-file`. (Status under v0.1.40: not adopted. The gate's own
+   script run has not been executed, but the matched-workload
+   evidence in "Shipped status and measured outcome" above settles
+   the configuration as run (`n_slots = 4`) well under the gate:
+   spec-on generation is a net loss from per-iteration draft
+   overhead despite healthy acceptance. The one configuration that
+   could reopen the question, `--parallel 1`, is untested.) Adoption means keeping the winning configuration on
    `planner-mtp` and using it as the planner (for gateway callers,
    repoint the `planner` group at the `planner-mtp` backend, or
    call the `planner-mtp` group). Retiring it means stopping and
