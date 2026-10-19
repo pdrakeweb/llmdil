@@ -2211,6 +2211,10 @@ mod tests {
         }
     }
 
+    // Only the cfg(unix) spawn/log tests use these three helpers;
+    // gating them the same way keeps the Windows test target free of
+    // dead code.
+    #[cfg(unix)]
     fn test_ring() -> Arc<Mutex<RingBuffer<LogRecord>>> {
         Arc::new(Mutex::new(RingBuffer::new(1024)))
     }
@@ -2252,6 +2256,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn wait_for<F>(mut cond: F, timeout: Duration)
     where
         F: FnMut() -> bool,
@@ -2269,6 +2274,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn ring_lines_chronological(ring: &Arc<Mutex<RingBuffer<LogRecord>>>) -> Vec<String> {
         ring.lock()
             .unwrap()
