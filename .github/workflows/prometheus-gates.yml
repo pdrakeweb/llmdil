@@ -37,10 +37,23 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
-      - name: Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No toolchain-install step: the host toolchain is provisioned by
+      # tools/prometheus/Install-BuildToolchain.ps1. Verify it here in
+      # PowerShell — the previous dtolnay step declared shell: bash
+      # internally, which this runner cannot resolve — and fail loudly
+      # if any component (incl. clippy / rustfmt) is missing.
+      - name: Verify Rust toolchain
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustc --version
+          if ($LASTEXITCODE -ne 0) { throw 'rustc --version failed' }
+          cargo --version
+          if ($LASTEXITCODE -ne 0) { throw 'cargo --version failed' }
+          cargo clippy --version
+          if ($LASTEXITCODE -ne 0) { throw 'cargo clippy --version failed' }
+          cargo fmt --version
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt --version failed' }
 
       - name: Setup Node
         uses: actions/setup-node@v4
