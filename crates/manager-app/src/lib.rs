@@ -2127,6 +2127,29 @@ pub async fn op_list_backends(
             row["offload"] = offload_row_json(o, evaluations.get(&id));
         }
     }
+    // MTP draft control state per configured backend whose model
+    // is MTP-capable (see backend_mtp_info). Absent for every
+    // other backend — the flags form shows the control only when
+    // this is present.
+    {
+        let mtp: HashMap<String, MtpInfo> = cfg
+            .backends
+            .iter()
+            .filter_map(|b| backend_mtp_info(&cfg, b).map(|m| (b.id.clone(), m)))
+            .collect();
+        for row in backends.iter_mut() {
+            let Some(id) = row["id"].as_str() else {
+                continue;
+            };
+            let Some(m) = mtp.get(id) else { continue };
+            row["mtp"] = json!({
+                "enabled": m.enabled,
+                "n_max": m.n_max,
+                "parallel": m.parallel,
+                "custom": m.custom,
+            });
+        }
+    }
     // Gateway request statistics (LiteLLM Prometheus snapshots from
     // the background poller): attach the trailing-hour figures where
     // the store has a window for the backend. Absent fields render
@@ -2973,6 +2996,7 @@ fn download_spec_for(cfg: &AppConfig, id: &str) -> Result<manager_models::ModelS
             moe_layers: None,
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
+            mtp: false,
         });
     }
     Err(ApiError::NotFound(format!(
@@ -5042,6 +5066,125 @@ pub async fn op_backend_set_offload(
     }))
 }
 
+/// Set a backend's MTP speculative decoding (tracker #53; the
+/// flags form's MTP draft control): rewrite only the MTP tokens
+/// in the backend's raw flags — `n_max` of 1..=4 enables
+/// `--spec-type draft-mtp` with that `--spec-draft-n-max`;
+/// `None` turns MTP off. Every other flag is preserved,
+/// including `--parallel`: MTP drafting needs a single slot,
+/// but the control surfaces that conflict rather than rewriting
+/// the operator's slot setting (the no-silent-rewrite rule the
+/// offload guardrails follow). The backend's model must be
+/// MTP-capable (see [`backend_mtp_info`]). Saved through the
+/// same clone-validate-save path as the other backend mutations
+/// and journaled as a backend-scope activation change with
+/// `applies: "next start"`; no restart happens here.
+pub async fn op_backend_set_mtp(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    id: String,
+    n_max: Option<u32>,
+) -> ApiResult {
+    use manager_models::mtp::{MTP_N_MAX_MAX, MTP_N_MAX_MIN};
+    if let Some(n) = n_max {
+        if !(MTP_N_MAX_MIN..=MTP_N_MAX_MAX).contains(&n) {
+            return Err(ApiError::InvalidInput(format!(
+                "MTP draft length {n} is outside the control's range \
+                 {MTP_N_MAX_MIN}..={MTP_N_MAX_MAX}"
+            )));
+        }
+    }
+    // Capability is resolved against the current config before
+    // the write lock is taken, and re-resolved under the lock
+    // below (a concurrent model assignment can change which
+    // model this backend serves — the same shape as
+    // op_backend_set_offload).
+    {
+        let cfg = state.config.read().await;
+        let b = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        if backend_mtp_info(&cfg, b).is_none() {
+            return Err(ApiError::InvalidInput(format!(
+                "backend {id}'s model does not support MTP drafting"
+            )));
+        }
+    }
+    let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
+    let mut new_cfg = cfg.clone();
+    {
+        // Re-validate capability against the config actually
+        // being mutated.
+        let b = new_cfg
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        if backend_mtp_info(&new_cfg, b).is_none() {
+            return Err(ApiError::InvalidInput(format!(
+                "backend {id}'s model does not support MTP drafting"
+            )));
+        }
+    }
+    let b = new_cfg
+        .backends
+        .iter_mut()
+        .find(|b| b.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+    let target = match n_max {
+        Some(n) => manager_models::MtpDraft::On(Some(n)),
+        None => manager_models::MtpDraft::Off,
+    };
+    let new_raw = manager_models::set_mtp_draft(b.raw_flags.as_deref(), target);
+    let changed = new_raw != b.raw_flags;
+    b.raw_flags = new_raw.clone();
+    if changed {
+        // A raw-flags change invalidates the recorded tool-call
+        // probe (MCP design §7.2).
+        b.tool_call_probe = None;
+    }
+    if changed {
+        manager_config::validate(&new_cfg)
+            .map_err(ApiError::from)?;
+        let summary = match n_max {
+            Some(n) => format!("Backend `{id}` MTP draft set to {n} tokens"),
+            None => format!("Backend `{id}` MTP draft turned off"),
+        };
+        record_backend_change(
+            state,
+            &pre_cfg,
+            &new_cfg,
+            "backend_set_mtp",
+            summary,
+            &id,
+        )
+        .await
+        ?;
+        manager_config::save(&new_cfg, &state.config_path)
+            .map_err(ApiError::from)?;
+        *cfg = new_cfg;
+    }
+    drop(cfg);
+    if changed {
+        ensure_backend_specs(state).await;
+    }
+    state.sync_backend_service_definition(&id).await;
+    Ok(json!({
+        "backend_id": id,
+        "n_max": n_max,
+        "raw_flags": new_raw,
+        "changed": changed,
+        // `persisted` is about the desired state being on disk:
+        // after a successful save it is, and when nothing changed
+        // it already was (same note as backend_set_offload).
+        "persisted": true,
+        "applies": "next start",
+    }))
+}
+
 
 /// Remove a backend (spec §14 `backend_delete`). Refused while the
 /// backend is running — stop it first. The id is scrubbed from every
@@ -6579,6 +6722,53 @@ fn offload_row_json(o: &OffloadInfo, eval: Option<&OffloadEvaluation>) -> Value 
     })
 }
 
+struct MtpInfo {
+    /// Whether `--spec-type draft-mtp` is in the saved raw flags.
+    enabled: bool,
+    /// The explicit `--spec-draft-n-max`, or `None` when MTP is on
+    /// without one (llama.cpp's default then applies) or off.
+    n_max: Option<u32>,
+    /// The explicit `--parallel` slot count, when the raw flags
+    /// set one. MTP drafting needs a single slot; the control
+    /// compares this against 1 to surface the conflict — nothing
+    /// rewrites it.
+    parallel: Option<i64>,
+    /// True when the saved MTP spelling is not the canonical form
+    /// for its state (a bare `--spec-type draft-mtp` with no
+    /// length token, an `=` spelling, ...). The same comparison
+    /// as the offload slider's `custom`: the decoded state
+    /// rewritten canonically must reproduce the saved tokens
+    /// exactly (after token normalization, so spacing alone never
+    /// counts).
+    custom: bool,
+}
+
+/// A backend's MTP control state, when its model is MTP-capable.
+/// Capability is a catalog pin resolved live by model id or
+/// source URL (see [`manager_models::catalog_mtp`]) — never
+/// inferred from a model's name or file — so a backend whose
+/// capability is unknown gets no control rather than a
+/// speculative one.
+fn backend_mtp_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> Option<MtpInfo> {
+    let model = model_for_backend(cfg, b)?;
+    if !manager_models::catalog_mtp(&model.id, &model.source_url) {
+        return None;
+    }
+    let state = manager_models::mtp_draft(b.raw_flags.as_deref());
+    let canonical = manager_models::set_mtp_draft(b.raw_flags.as_deref(), state);
+    let custom = token_normalized_flags(b.raw_flags.as_deref())
+        != token_normalized_flags(canonical.as_deref());
+    Some(MtpInfo {
+        enabled: matches!(state, manager_models::MtpDraft::On(_)),
+        n_max: match state {
+            manager_models::MtpDraft::On(n) => n,
+            manager_models::MtpDraft::Off => None,
+        },
+        parallel: manager_models::parallel_slots(b.raw_flags.as_deref()),
+        custom,
+    })
+}
+
 
 /// Project a tensor split onto discovered VRAM (spec §14
 /// `placement_propose`). The model resolves from the curated catalog
@@ -6658,6 +6848,7 @@ pub async fn op_placement_propose(
                 moe_layers: None,
                 default_offload_layers: None,
                 offload_restrictions: Vec::new(),
+                mtp: false,
             }
         }
     };

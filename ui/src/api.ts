@@ -694,6 +694,11 @@ export interface BackendRow {
    *  counts let the form price any slider position with the same
    *  arithmetic as the backend memory requirement. */
   offload?: BackendOffload;
+  /** MTP draft control state (configured rows whose model is
+   *  MTP-capable — the catalog pins the capability); absent
+   *  otherwise. The state is decoded from the backend's saved
+   *  raw flags: MTP is on iff `--spec-type draft-mtp` is present. */
+  mtp?: BackendMtp;
   /** The backend's persisted tool-call probe (MCP design §7.2),
    *  or null when it has never been probed — the card renders null
    *  as "not measured", never as a measured state. Absent on
@@ -752,6 +757,25 @@ export interface BackendOffload {
   custom: boolean;
   /** Offload guardrail for this backend's GPU, or null when none applies. */
   guardrail: BackendOffloadGuardrail | null;
+}
+
+/** A backend's MTP draft control state (list_backends payload).
+ *  Present only when the backend's model is MTP-capable. */
+export interface BackendMtp {
+  /** Whether `--spec-type draft-mtp` is in the saved raw flags. */
+  enabled: boolean;
+  /** The explicit `--spec-draft-n-max`, or null when MTP is on
+   *  without one (llama.cpp's default then applies) or off. */
+  n_max: number | null;
+  /** The explicit `--parallel` slot count in the saved raw
+   *  flags, or null when unset. MTP drafting needs 1; any other
+   *  explicit value is a conflict the form surfaces — the
+   *  control never rewrites it. */
+  parallel: number | null;
+  /** True when the saved MTP spelling is not the canonical form
+   *  for its state (a bare `--spec-type draft-mtp` with no length
+   *  token, an `=` spelling, ...). */
+  custom: boolean;
 }
 
 /** list_backends — configured backends merged with live supervisor state. */
@@ -813,6 +837,23 @@ export async function setBackendOffload(id: string, layers: number, allowOverrid
     return { data, live: true };
   } catch (e) {
     return { data: { backend_id: id, layers, raw_flags: null, changed: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** backend_set_mtp — set a backend's MTP speculative decoding
+ *  draft length (tracker #53). `nMax` of 1..4 enables
+ *  `--spec-type draft-mtp` with that `--spec-draft-n-max`;
+ *  null turns MTP off. Only the MTP tokens in the backend's raw
+ *  flags change — `--parallel` is never rewritten; the payload's
+ *  `parallel` field lets the form surface a slot conflict
+ *  instead. Persisted immediately; applies on the next start. */
+export async function setBackendMtp(id: string, nMax: number | null): Promise<CallResult<{ backend_id: string; n_max: number | null; raw_flags: string | null; changed: boolean }>> {
+  if (!isTauri()) return { data: { backend_id: id, n_max: nMax, raw_flags: null, changed: false }, live: false };
+  try {
+    const data = await invoke<{ backend_id: string; n_max: number | null; raw_flags: string | null; changed: boolean }>("backend_set_mtp", { id, nMax });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { backend_id: id, n_max: nMax, raw_flags: null, changed: false }, live: true, error: errOf(e) };
   }
 }
 

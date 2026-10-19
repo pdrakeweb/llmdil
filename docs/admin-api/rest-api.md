@@ -245,13 +245,19 @@ lives in the app types cited; this is the wire contract summary.)
   "memory_basis": "exact | catalog | estimate",
   "offload": { "moe_layers": 48, "layers": 40, "expert_bytes": 0,
                "total_bytes": 0, "green_limit_layers": 48,
-               "green_end": 1.0, "yellow_end": 1.0 }
+               "green_end": 1.0, "yellow_end": 1.0 },
+  "mtp": { "enabled": true, "n_max": 2, "parallel": 1,
+           "custom": false }
 }
 ```
 
 Trailing-hour statistics and memory/offload blocks are present only when
 the app reports them (a metrics window exists; the model resolves); they
-are never zero-filled (§1 rule 4). `configured: false` marks a
+are never zero-filled (§1 rule 4). The `mtp` block is present only for
+MTP-capable backends (the catalog pins the capability); `n_max` is the
+explicit `--spec-draft-n-max`, or null when MTP is on without one
+(llama.cpp's default applies) or off; `parallel` is the explicit
+`--parallel` slot count, or null when unset. `configured: false` marks a
 supervisor-only orphan process; orphans accept `stop` only.
 
 ### 4.2 Backend config (`backend_get_config`)
@@ -362,12 +368,12 @@ payload; the API adds nothing.
 
 ## 5. Endpoint index
 
-89 client-facing endpoints. ("Op" = returns `202` + operation, §3.)
+90 client-facing endpoints. ("Op" = returns `202` + operation, §3.)
 
 | Domain | Count | Endpoints |
 |---|---|---|
 | Status | 1 | `GET /status` |
-| Backends | 14 | list, create, get, delete, config get/patch, diff preview, start/stop/restart (Op), test, flags, offload, launch command |
+| Backends | 15 | list, create, get, delete, config get/patch, diff preview, start/stop/restart (Op), test, flags, offload, mtp, launch command |
 | Models | 11 | list, create, get, delete, patch, download (Op) + pause/resume/cancel, verify (Op), assign |
 | Placement | 2 | propose, apply |
 | Gateway | 13 | status, config get/patch, generated config, master key, start (Op), stop, groups CRUD (4), routing test, routing recent |
@@ -485,6 +491,16 @@ start; the app records the activation-plan entry.
 `{ "backend_id", "layers": 40, "raw_flags": "…", "changed": true }`.
 Only valid for offload-capable backends (the `offload` block in §4.1
 says which); otherwise `400 INVALID_INPUT`, as in the app.
+
+#### `PUT /api/v1/backends/{id}/mtp` — `config`
+`backend_set_mtp`. Body: `{ "n_max": 2 }` →
+`{ "backend_id", "n_max": 2, "raw_flags": "…", "changed": true }`.
+Sets the backend's MTP speculative decoding draft length
+(`--spec-type draft-mtp` with that `--spec-draft-n-max`, 1–4);
+`{ "n_max": null }` turns MTP off. Only the MTP tokens in the
+backend's raw flags change. Only valid for MTP-capable backends
+(the `mtp` block in §4.1 says which); otherwise
+`400 INVALID_INPUT`, as in the app.
 
 #### `GET /api/v1/backends/{id}/launch-command` — `read`
 `backend_get_launch_command` → `{ "id", "argv": [ … ] }` — the exact

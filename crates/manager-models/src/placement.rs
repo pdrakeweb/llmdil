@@ -257,6 +257,7 @@ mod tests {
             moe_layers: None,
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
+            mtp: false,
         }
     }
 
