@@ -121,6 +121,7 @@ fn fit_verdict(total_mib: u64, free: &[u64]) -> manager_models::FitVerdict {
         default_offload_layers: None,
         url: String::new(),
         offload_restrictions: Vec::new(),
+        mtp: false,
     };
     manager_models::fit_check(&spec, free)
 }

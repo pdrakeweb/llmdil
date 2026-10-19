@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 pub mod gguf;
 pub mod guardrails;
 pub mod memory;
+pub mod mtp;
 pub mod placement;
 
 pub use gguf::{parse_gguf_layout, GgufError, GgufLayout, KvGeometry};
@@ -29,6 +30,7 @@ pub use memory::{
     expert_offload, memory_requirement, offload_bands, offload_flag_string, offload_for_layers,
     set_expert_offload, sys_bytes_by_position, ExpertOffload, MemoryBasis, MemoryRequirement,
 };
+pub use mtp::{mtp_draft, parallel_slots, set_mtp_draft, MtpDraft};
 pub use placement::{
     apply_placement, propose_placement, propose_placement_resident, validate_split,
     PlacementProjection,
@@ -104,6 +106,18 @@ pub struct ModelSpec {
     /// without a catalog-revision bump.
     #[serde(default)]
     pub offload_restrictions: Vec<OffloadRestriction>,
+    /// Whether this model's GGUF carries an MTP (multi-token
+    /// prediction) head that llama.cpp's `--spec-type draft-mtp`
+    /// self-speculative decoding can draft with. Only the planner
+    /// model's `-mtp` build pins it today — the base build has no
+    /// head, and neither does any other catalog model. Resolved
+    /// from the live catalog by model id (or source URL), like the
+    /// offload restrictions, so the pin reaches existing
+    /// configurations without a catalog-revision bump. A model
+    /// with no pin is not MTP-capable: capability is never
+    /// inferred from a model's name or file.
+    #[serde(default)]
+    pub mtp: bool,
 }
 
 /// The curated catalog's default expert offload for a model: the
@@ -134,6 +148,28 @@ pub fn catalog_params_b(id: &str, source_url: &str) -> Option<f32> {
         .iter()
         .find(|s| s.url == source_url)
         .map(|s| s.params_b)
+}
+
+/// Whether the curated catalog pins MTP capability for a model
+/// (see [`ModelSpec::mtp`]): an exact id match wins; otherwise an
+/// exact source-URL match — the same resolution
+/// [`catalog_params_b`] uses, so the catalog's `-mtp` build
+/// registered under an operator-chosen id still resolves. `false`
+/// when the catalog knows neither the id nor the URL: capability
+/// is a pinned fact, never a guess.
+pub fn catalog_mtp(id: &str, source_url: &str) -> bool {
+    let models = curated_models();
+    if let Some(spec) = models.iter().find(|s| s.id == id) {
+        return spec.mtp;
+    }
+    if source_url.is_empty() {
+        return false;
+    }
+    models
+        .iter()
+        .find(|s| s.url == source_url)
+        .map(|s| s.mtp)
+        .unwrap_or(false)
 }
 
 /// The curated catalog's revision. Bump whenever
@@ -200,6 +236,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             // 27B, in ISTA-DASLab's GSQ-RCO quantization at IQ3_S —
             // fully GPU-resident on a 16 GB card. Replaced the
             // Qwen3-32B that filled this slot at revision 2.
+            mtp: false,
             url: "https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/resolve/main/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf"
                 .to_string(),
         },
@@ -233,6 +270,9 @@ pub fn curated_models() -> Vec<ModelSpec> {
             moe_layers: None,
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
+            // The one MTP-capable catalog entry: this build
+            // carries the MTP head (see the entry comment above).
+            mtp: true,
             url: "https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/resolve/main/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
                 .to_string(),
         },
@@ -273,6 +313,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             // shards, which the single-file download/verify path
             // cannot consume. Replaced Qwen3-Coder-30B-A3B at
             // revision 2.
+            mtp: false,
             url: "https://huggingface.co/unsloth/Qwen3-Coder-Next-GGUF/resolve/main/Qwen3-Coder-Next-UD-Q4_K_M.gguf"
                 .to_string(),
         },
@@ -289,6 +330,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             moe_layers: None,
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
+            mtp: false,
             url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
                 .to_string(),
         },
@@ -305,6 +347,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             moe_layers: None,
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
+            mtp: false,
             url: "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
                 .to_string(),
         },
@@ -337,6 +380,7 @@ pub fn curated_models() -> Vec<ModelSpec> {
             moe_layers: Some(24),
             default_offload_layers: Some(16),
             offload_restrictions: Vec::new(),
+            mtp: false,
             url: "https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF/resolve/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf"
                 .to_string(),
         },
@@ -1181,6 +1225,7 @@ mod tests {
             moe_layers: None,
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
+            mtp: false,
         }
     }
 
@@ -1200,6 +1245,7 @@ mod tests {
             moe_layers: None,
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
+            mtp: false,
         };
         assert_eq!(spec.quant, "Q4_K_M");
         let p = DownloadProgress {
@@ -1402,6 +1448,7 @@ mod tests {
             moe_layers: None,
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
+            mtp: false,
         }
     }
 
