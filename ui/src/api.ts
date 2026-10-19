@@ -1952,6 +1952,8 @@ export async function activationComplete(): Promise<CallResult<{ cleared: boolea
 /** One plan change inside a recorded activation execution, with
  *  the outcome the apply recorded for it. */
 export interface ActivationExecutionItem {
+  /** When the change was saved (the journal entry's timestamp). */
+  ts: string;
   kind: string;
   summary: string;
   scope: string;

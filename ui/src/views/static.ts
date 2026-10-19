@@ -889,6 +889,7 @@ export async function applyActivationPlan(
 ): Promise<boolean> {
   const startedAt = new Date().toISOString();
   const items: ActivationExecutionItem[] = plan.changes.map((c) => ({
+    ts: c.ts,
     kind: c.kind,
     summary: c.summary,
     scope: c.scope ?? "",
@@ -1172,8 +1173,8 @@ export async function wireActivationPlan(root: HTMLElement): Promise<() => void>
     if (!detail.items.length) {
       return `${meta}<div style="font-size:12px;color:var(--text2);margin-top:6px">No plan changes — the apply addressed gateway drift only.</div>`;
     }
-    const rows = detail.items.map((i) => `<tr><td>${planTargetCell(i)}</td><td>${planChangeCell(i)}</td><td>${execOutcomeChip(i.outcome)}</td><td>${i.detail ? esc(i.detail) : ""}</td></tr>`).join("");
-    return `${meta}<table class="dtab" style="margin-top:8px"><thead><tr><th>Target</th><th>Change</th><th>Outcome</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>`;
+    const rows = detail.items.map((i) => `<tr><td>${esc(fmtDate(i.ts))} ${esc(fmtTime(i.ts))}</td><td>${planTargetCell(i)}</td><td>${planChangeCell(i)}</td><td>${execOutcomeChip(i.outcome)}</td><td>${i.detail ? esc(i.detail) : ""}</td></tr>`).join("");
+    return `${meta}<table class="dtab" style="margin-top:8px"><thead><tr><th>Saved</th><th>Target</th><th>Change</th><th>Outcome</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>`;
   };
 
   const execRowHtml = (s: ActivationExecutionSummary): string => {
