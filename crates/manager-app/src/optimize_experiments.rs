@@ -523,6 +523,8 @@ async fn run_experiment_inner(
             assigned_backends: vec![temp_id.clone()],
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
     }
     temp_cfg.backends.push(temp.clone());
@@ -1441,6 +1443,8 @@ mod tests {
             assigned_backends: vec![],
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         let state = Arc::new(AppState::new(cfg.clone(), dir.join("config.json"), dir.clone()));
         // Initialize the telemetry store, then replace its

@@ -862,6 +862,8 @@ mod tests {
             assigned_backends: vec!["tool-runner".to_string()],
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         let b = cfg
             .backends

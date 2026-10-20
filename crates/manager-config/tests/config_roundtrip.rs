@@ -35,6 +35,8 @@ fn rich_config() -> AppConfig {
         assigned_backends: vec!["tool-runner".to_string()],
         enabled: true,
         display_name: Some("Tool Runner 8B".to_string()),
+        moe_layers: None,
+        default_offload_layers: None,
     });
     let backend = cfg
         .backends

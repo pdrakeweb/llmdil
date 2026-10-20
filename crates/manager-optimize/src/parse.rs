@@ -2019,6 +2019,8 @@ mod tests {
             assigned_backends: vec!["tool-runner".to_string()],
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         cfg.backends[0].model_file = std::path::PathBuf::from("models/qwen3-8b.gguf");
         cfg
@@ -2279,6 +2281,8 @@ mod tests {
             assigned_backends: Vec::new(),
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         };
         cfg.backends = vec![
             backend("planner", "models/planner.gguf", 8081),
@@ -2459,6 +2463,8 @@ mod tests {
             assigned_backends: Vec::new(),
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         let registered = vec![crate::experiment::RegisteredModelFile {
             id: "qwen3.8-27b-moe".to_string(),

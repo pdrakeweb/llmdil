@@ -740,6 +740,27 @@ pub struct ModelConfig {
     /// it is the operator's own label, not catalog data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Operator-declared MoE geometry for a model the curated
+    /// catalog does not carry: the number of blocks that carry
+    /// routed-expert tensors (`--n-cpu-moe` counts these layers).
+    /// The catalog pins the same figures on its `ModelSpec`; a
+    /// user-added model can only acquire expert-offload controls
+    /// (the Edit Flags slider, the creation default) when the
+    /// operator declares them here. `None` for dense models and
+    /// for models whose capability was never declared. Catalog
+    /// values win where a catalog entry exists — these fields are
+    /// the fallback source, never an override of a catalog pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe_layers: Option<u32>,
+    /// The operator-declared default expert offload for a backend
+    /// serving this model, in MoE layers — the declared
+    /// counterpart of the catalog's `default_offload_layers`: the
+    /// offload a newly created or newly assigned backend starts
+    /// with, and the offload slider's green limit. Meaningful
+    /// only alongside [`ModelConfig::moe_layers`]; validation
+    /// requires it not exceed that count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_offload_layers: Option<u32>,
 }
 
 /// Validate an operator-chosen model display name for
@@ -760,6 +781,41 @@ pub fn validate_display_name(raw: &str) -> Result<String, String> {
         return Err("display name must not contain control characters".to_string());
     }
     Ok(name.to_string())
+}
+
+/// Validate an operator MoE declaration for
+/// [`ModelConfig::moe_layers`] / [`ModelConfig::default_offload_layers`]
+/// as the write paths (model add, model offload-spec edit) accept
+/// it: the pair is atomic — both fields or neither — the layer
+/// count is positive, and the default does not exceed it. Returns
+/// the error text on rejection. (Config validation is the lenient
+/// backstop for hand-edited files; this is the strict rule the
+/// forms and ops write by.)
+pub fn validate_moe_declaration(
+    moe_layers: Option<u32>,
+    default_offload_layers: Option<u32>,
+) -> Result<(), String> {
+    match (moe_layers, default_offload_layers) {
+        (None, None) => Ok(()),
+        (Some(layers), Some(default)) => {
+            if layers == 0 {
+                return Err("MoE layer count must be greater than zero".to_string());
+            }
+            if default > layers {
+                return Err(format!(
+                    "default offload of {default} layers exceeds the model's {layers} MoE layers"
+                ));
+            }
+            Ok(())
+        }
+        (Some(_), None) => Err(
+            "a MoE declaration needs both the layer count and the default offload layers"
+                .to_string(),
+        ),
+        (None, Some(_)) => Err(
+            "a default offload requires the MoE layer count it counts against".to_string(),
+        ),
+    }
 }
 
 /// Telemetry polling configuration (spec §5).
@@ -1189,6 +1245,8 @@ pub fn append_missing_catalog_models(cfg: &mut AppConfig, entries: &[CatalogMode
             assigned_backends: entry.assigned_backends.clone(),
             enabled: entry.enabled,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         changed = true;
     }
@@ -1486,6 +1544,31 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
             if let Err(e) = validate_display_name(name) {
                 errors.push(format!("model {:?}: display_name: {e}", m.id));
             }
+        }
+        // A declared offload default is meaningless without the
+        // MoE layer count it counts against, and can never exceed
+        // it (the write paths enforce the pair atomically; this is
+        // the backstop for hand-edited files).
+        match (m.moe_layers, m.default_offload_layers) {
+            (Some(0), _) => {
+                errors.push(format!(
+                    "model {:?}: moe_layers must be > 0 when declared",
+                    m.id
+                ));
+            }
+            (None, Some(_)) => {
+                errors.push(format!(
+                    "model {:?}: default_offload_layers requires moe_layers to be declared",
+                    m.id
+                ));
+            }
+            (Some(layers), Some(default)) if default > layers => {
+                errors.push(format!(
+                    "model {:?}: default_offload_layers {default} exceeds moe_layers {layers}",
+                    m.id
+                ));
+            }
+            _ => {}
         }
     }
 
@@ -2068,6 +2151,47 @@ fn replace_file(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn moe_declaration_loads_legacy_and_validates_pairs() {
+        // A config written before the declaration existed loads
+        // with both fields absent, and they stay out of the
+        // serialized form while unset.
+        let legacy = r#"{"id":"m","gguf_path":"models/m.gguf","quant":"Q4_K_M","params_b":27.0,"sha256":"","verified_at":null,"enabled":true}"#;
+        let m: ModelConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(m.moe_layers, None);
+        assert_eq!(m.default_offload_layers, None);
+        let ser = serde_json::to_string(&m).unwrap();
+        assert!(!ser.contains("moe_layers"), "{ser}");
+        assert!(!ser.contains("default_offload_layers"), "{ser}");
+        // A declared pair round-trips.
+        let declared: ModelConfig = serde_json::from_str(
+            r#"{"id":"m","gguf_path":"models/m.gguf","quant":"Q4_K_M","params_b":27.0,"sha256":"","verified_at":null,"enabled":true,"moe_layers":48,"default_offload_layers":16}"#,
+        )
+        .unwrap();
+        assert_eq!(declared.moe_layers, Some(48));
+        assert_eq!(declared.default_offload_layers, Some(16));
+
+        let cfg_with = |moe: Option<u32>, default: Option<u32>| {
+            let mut m: ModelConfig = serde_json::from_str(legacy).unwrap();
+            m.moe_layers = moe;
+            m.default_offload_layers = default;
+            let mut cfg = AppConfig::default_config();
+            cfg.models = vec![m];
+            cfg
+        };
+        // Consistent declarations validate: full pair, layers-only.
+        assert!(validate(&cfg_with(Some(48), Some(48))).is_ok());
+        assert!(validate(&cfg_with(Some(48), Some(0))).is_ok());
+        assert!(validate(&cfg_with(Some(48), None)).is_ok());
+        assert!(validate(&cfg_with(None, None)).is_ok());
+        // Inconsistent ones do not: a default with no layer count,
+        // a default past the count, a zero count.
+        assert!(validate(&cfg_with(None, Some(16))).is_err());
+        assert!(validate(&cfg_with(Some(48), Some(49))).is_err());
+        assert!(validate(&cfg_with(Some(0), None)).is_err());
+        assert!(validate(&cfg_with(Some(0), Some(0))).is_err());
+    }
+
+    #[test]
     fn display_name_validates_and_defaults() {
         assert_eq!(
             validate_display_name("  Coder Next  ").unwrap(),
@@ -2176,6 +2300,8 @@ mod tests {
             assigned_backends: vec!["planner".to_string()],
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         let planner = cfg.backends.iter_mut().find(|b| b.id == "planner").unwrap();
         planner.model_file = PathBuf::from("models/OldPlanner.gguf");
@@ -2248,6 +2374,8 @@ mod tests {
             assigned_backends: Vec::new(),
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         let entry = |id: &str, enabled: bool| CatalogModelEntry {
             model_id: id.to_string(),
@@ -2296,6 +2424,8 @@ mod tests {
             assigned_backends: vec!["planner".to_string()],
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         let planner = cfg.backends.iter_mut().find(|b| b.id == "planner").unwrap();
         planner.model_file = PathBuf::from("models/OldPlanner.gguf");
@@ -2349,6 +2479,8 @@ mod tests {
             assigned_backends: vec!["coder".to_string()],
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         // The operator moved the coder backend to another model's
         // file and set their own raw flags.
@@ -2415,6 +2547,8 @@ mod tests {
                 assigned_backends: vec!["coder".to_string()],
                 enabled: true,
                 display_name: None,
+                moe_layers: None,
+                default_offload_layers: None,
             });
             let coder = cfg.backends.iter_mut().find(|b| b.id == "coder").unwrap();
             coder.model_file = PathBuf::from("models/OldNemotron.gguf");
@@ -2480,6 +2614,8 @@ mod tests {
             assigned_backends: vec!["tool-runner".to_string()],
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         let backend = cfg
             .backends
@@ -2907,6 +3043,8 @@ mod tests {
             assigned_backends: Vec::new(),
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         let catalog = vec![CatalogModelDefaults {
             model_id: "qwen3-8b".to_string(),
@@ -2950,6 +3088,8 @@ mod tests {
             assigned_backends: vec!["tool-runner".to_string()],
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         // The operator pointed the backend at a custom file; neither
         // the file nor the model's hash/params may be rewritten. (The

@@ -1220,6 +1220,17 @@ export interface ModelRow {
    *  curated catalog (null for models outside it). The backend flags
    *  editor annotates context presets beyond this value. */
   ctx_max?: number | null;
+  /** The operator's MoE declaration on the model record: the MoE
+   *  layer count and the default offload layers declared in the
+   *  Add/Edit model forms. Null when never declared. */
+  moe_layers?: number | null;
+  default_offload_layers?: number | null;
+  /** The curated catalog's pins for the same figures (null for
+   *  models outside the catalog, or when the catalog pins
+   *  neither). A catalog pin wins over the record's declaration
+   *  wherever both exist. */
+  catalog_moe_layers?: number | null;
+  catalog_default_offload_layers?: number | null;
   fit_check_available: boolean;
 }
 
@@ -1328,8 +1339,11 @@ export async function modelSetEnabled(id: string, enabled: boolean): Promise<Cal
  *  the URL's last path segment). paramsB is the total parameter count
  *  in billions: the command resolves it from the curated catalog
  *  when omitted and refuses the add when no source yields a count.
- *  The model starts enabled with no pinned hash. */
-export async function modelAdd(id: string, sourceUrl: string, fileName?: string, quant?: string, paramsB?: number): Promise<CallResult<{ model_id: string }>> {
+ *  moeLayers/defaultOffloadLayers are the operator MoE declaration
+ *  (both or neither): they give a model outside the curated catalog
+ *  expert-offload controls. The model starts enabled with no
+ *  pinned hash. */
+export async function modelAdd(id: string, sourceUrl: string, fileName?: string, quant?: string, paramsB?: number, moeLayers?: number, defaultOffloadLayers?: number): Promise<CallResult<{ model_id: string }>> {
   if (!isTauri()) return { data: { model_id: id }, live: false };
   try {
     const data = await invoke<{ model_id: string }>("model_add", {
@@ -1338,10 +1352,29 @@ export async function modelAdd(id: string, sourceUrl: string, fileName?: string,
       fileName: fileName ?? null,
       quant: quant ?? null,
       paramsB: paramsB ?? null,
+      moeLayers: moeLayers ?? null,
+      defaultOffloadLayers: defaultOffloadLayers ?? null,
     });
     return { data, live: true };
   } catch (e) {
     return { data: { model_id: id }, live: true, error: errOf(e) };
+  }
+}
+
+/** model_set_offload_spec — set or clear a model's operator MoE
+ *  declaration (the MoE layer count + default offload layers).
+ *  Pass both null to clear the declaration. */
+export async function modelSetOffloadSpec(id: string, moeLayers: number | null, defaultOffloadLayers: number | null): Promise<CallResult<{ id: string; moe_layers: number | null; default_offload_layers: number | null }>> {
+  if (!isTauri()) return { data: { id, moe_layers: moeLayers, default_offload_layers: defaultOffloadLayers }, live: false };
+  try {
+    const data = await invoke<{ id: string; moe_layers: number | null; default_offload_layers: number | null }>("model_set_offload_spec", {
+      id,
+      moeLayers,
+      defaultOffloadLayers,
+    });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { id, moe_layers: moeLayers, default_offload_layers: defaultOffloadLayers }, live: true, error: errOf(e) };
   }
 }
 

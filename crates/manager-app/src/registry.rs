@@ -245,8 +245,11 @@ macro_rules! for_each_operation {
             (ModelSetShortName, model_set_short_name, C, op_model_set_short_name, [id: String, name: String], None),
             (ModelDelete, model_delete, D, op_model_delete, [id: String], Some(route(HttpMethod::Delete, "/api/v1/models/{id}"))),
             (ModelAssign, model_assign, C, op_model_assign, [id: String, backend_id: String, split: Vec<f32>], Some(route(HttpMethod::Post, "/api/v1/models/{id}/assign"))),
-            (ModelAdd, model_add, C, op_model_add, [id: String, source_url: String, file_name: Option<String>, quant: Option<String>, params_b: Option<f32>], Some(route_created(HttpMethod::Post, "/api/v1/models"))),
+            (ModelAdd, model_add, C, op_model_add, [id: String, source_url: String, file_name: Option<String>, quant: Option<String>, params_b: Option<f32>, moe_layers: Option<u32>, default_offload_layers: Option<u32>], Some(route_created(HttpMethod::Post, "/api/v1/models"))),
             (ModelSetEnabled, model_set_enabled, C, op_model_set_enabled, [id: String, enabled: bool], None),
+            // PATCH /models/{id} composite over this, model_set_short_name
+            // and model_set_enabled (rest-api.md §6.3); no 1:1 route.
+            (ModelSetOffloadSpec, model_set_offload_spec, C, op_model_set_offload_spec, [id: String, moe_layers: Option<u32>, default_offload_layers: Option<u32>], None),
             // Logs
             (GetLogs, get_logs, R, op_get_logs, [scope: String, level: Option<String>, search: Option<String>, query: Option<String>, since_ms: Option<i64>, until_ms: Option<i64>, order: Option<String>, offset: Option<u64>, limit: Option<u64>], Some(route(HttpMethod::Get, "/api/v1/logs"))),
             // Gateway
@@ -432,7 +435,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 121);
+        assert_eq!(OP_SPECS.len(), 122);
     }
 
     #[test]

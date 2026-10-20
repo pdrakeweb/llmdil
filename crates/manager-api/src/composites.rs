@@ -54,11 +54,19 @@ async fn get_one(ctx: &ApiCtx, op: Op, list_key: &str, id: &str) -> Result<Value
         .ok_or_else(|| ApiError::NotFound(format!("no resource with id `{id}`")))
 }
 
-/// PATCH /api/v1/models/{id}: `display_name` and/or `enabled`,
-/// dispatched to the two single-field operations (rest-api §6.3).
+/// PATCH /api/v1/models/{id}: `display_name`, `enabled`, and/or
+/// the MoE offload declaration (`moe_layers` +
+/// `default_offload_layers`), dispatched to the single-field
+/// operations (rest-api §6.3). The offload pair is applied
+/// atomically: when either key is present, both are read (an
+/// absent key counts as null) and passed to
+/// `model_set_offload_spec` — both null clears the declaration.
 pub async fn patch_model(ctx: &ApiCtx, id: &str, body: Value) -> Result<Value, ApiError> {
     let obj = closed_object(&body)?;
-    reject_unknown(obj, &["display_name", "enabled"])?;
+    reject_unknown(
+        obj,
+        &["display_name", "enabled", "moe_layers", "default_offload_layers"],
+    )?;
     if obj.is_empty() {
         return Err(invalid("no fields to apply"));
     }
@@ -84,11 +92,38 @@ pub async fn patch_model(ctx: &ApiCtx, id: &str, body: Value) -> Result<Value, A
         )
         .await?;
     }
+    if obj.contains_key("moe_layers") || obj.contains_key("default_offload_layers") {
+        let layer_arg = |key: &str| -> Result<Value, ApiError> {
+            match obj.get(key) {
+                None | Some(Value::Null) => Ok(Value::Null),
+                Some(v) => {
+                    let n = v
+                        .as_u64()
+                        .ok_or_else(|| invalid(format!("`{key}` must be a non-negative integer or null")))?;
+                    u32::try_from(n)
+                        .map(|n| json!(n))
+                        .map_err(|_| invalid(format!("`{key}` is out of range")))
+                }
+            }
+        };
+        call(
+            ctx,
+            Op::ModelSetOffloadSpec,
+            json!({
+                "id": id,
+                "moe_layers": layer_arg("moe_layers")?,
+                "default_offload_layers": layer_arg("default_offload_layers")?,
+            }),
+        )
+        .await?;
+    }
     let model = get_one(ctx, Op::ListModels, "models", id).await?;
     Ok(json!({
         "id": id,
         "name": model.get("display_name").or_else(|| model.get("name")).cloned().unwrap_or(Value::Null),
         "enabled": model.get("enabled").cloned().unwrap_or(json!(true)),
+        "moe_layers": model.get("moe_layers").cloned().unwrap_or(Value::Null),
+        "default_offload_layers": model.get("default_offload_layers").cloned().unwrap_or(Value::Null),
     }))
 }
 

@@ -18,7 +18,7 @@ import {
   getBackendConfig, applyBackendConfig, testBackend, testBackendToolCall, placementPropose, placementApply,
   addBackend, backendAddPreview, deleteBackend, modelAssign,
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
-  verifyModel, deleteModel, modelSetEnabled, modelAdd, modelSetShortName,
+  verifyModel, deleteModel, modelSetEnabled, modelAdd, modelSetShortName, modelSetOffloadSpec,
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
   getGatewayMasterKey, setGatewayBindHost,
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
@@ -4261,7 +4261,7 @@ function modelOverviewHtml(rows: ModelRow[], stats: Map<string, { backends: numb
   return `<div class="ovlist ov-m"><div class="ov-head"><span></span><span>Model</span><span>Quant</span><span>Size</span><span>State</span><span>Serving backends</span><span>Requests (1h)</span></div>${body}</div>`;
 }
 
-function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }, rename?: { draft: string } | null, detailsOpen = false): string {
+function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }, rename?: { draft: string } | null, detailsOpen = false, offload?: { layers: string; def: string } | null): string {
   const note = notes.get(m.id);
   const noteHtml = note
     ? `<div style="margin-top:8px;font-size:12px;color:${note.err ? "var(--err)" : "var(--text2)"}">${esc(note.text)}</div>` : "";
@@ -4331,6 +4331,10 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
   // Rename is always offered: the short name is the operator's own
   // label for the model, independent of its download state.
   actions += ` <button class="btn icon-only" data-model-act="rename" data-model-id="${esc(m.id)}" title="Rename short name" aria-label="Rename short name of ${esc(m.id)}">${icon("pencil")}</button>`;
+  // The MoE offload declaration editor is always offered too: it
+  // is how a model outside the curated catalog acquires
+  // expert-offload controls for its backends.
+  actions += ` <button class="btn icon-only" data-model-act="offload" data-model-id="${esc(m.id)}" title="MoE offload declaration" aria-label="MoE offload declaration of ${esc(m.id)}">${icon("layers")}</button>`;
   const renameHtml = rename ? `<div class="backend-form-panel flags-panel">
       <div style="font-size:12px;font-weight:600">Rename short name</div>
       <div style="display:flex;gap:6px;margin-top:6px;min-width:0">
@@ -4338,6 +4342,26 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
       </div>
       <div class="card-actions"><button class="btn" data-model-act="rename-save" data-model-id="${esc(m.id)}">${icon("check")} Save name</button>
         <button class="btn icon-only" data-model-act="rename-cancel" data-model-id="${esc(m.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
+    </div>` : "";
+  /* The effective offload figures: a catalog pin wins over the
+   * record's declaration wherever the catalog carries one. */
+  const effMoeLayers = m.catalog_moe_layers ?? m.moe_layers ?? null;
+  const effMoeDefault = m.catalog_default_offload_layers ?? m.default_offload_layers ?? null;
+  const catalogPinned = m.catalog_moe_layers != null && m.catalog_default_offload_layers != null;
+  const offloadHtml = offload ? `<div class="backend-form-panel flags-panel">
+      <div style="font-size:12px;font-weight:600">MoE offload declaration</div>
+      ${catalogPinned
+        ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">This model's offload figures come from the curated catalog — ${effMoeDefault} of ${effMoeLayers} MoE layers by default — and cannot be changed here.</div>
+          <div class="card-actions"><button class="btn icon-only" data-model-act="offload-cancel" data-model-id="${esc(m.id)}" title="Close" aria-label="Close">${icon("x")}</button></div>`
+        : `<div style="font-size:12px;color:var(--text2);margin-top:6px">Declare this model as mixture-of-experts (MoE) to give its backends expert-offload controls: a new backend starts at the default offload, and the Edit Flags slider ranges over the MoE layers. Clear both fields to remove the declaration.</div>
+          <div style="display:flex;gap:10px;margin-top:6px;flex-wrap:wrap">
+            <label style="font-size:12px;color:var(--text2)">MoE layers<br>
+              <input data-model-offload-layers="${esc(m.id)}" type="text" inputmode="numeric" value="${esc(offload.layers)}" placeholder="48" style="${SELECT_STYLE};width:110px"></label>
+            <label style="font-size:12px;color:var(--text2)">Default offload layers<br>
+              <input data-model-offload-default="${esc(m.id)}" type="text" inputmode="numeric" value="${esc(offload.def)}" placeholder="16" style="${SELECT_STYLE};width:110px"></label>
+          </div>
+          <div class="card-actions"><button class="btn" data-model-act="offload-save" data-model-id="${esc(m.id)}">${icon("check")} Save declaration</button>
+            <button class="btn icon-only" data-model-act="offload-cancel" data-model-id="${esc(m.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>`}
     </div>` : "";
   // Size carries the final size only when the file is on disk; in
   // download states the progress value carries the partial figure,
@@ -4385,11 +4409,13 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
       <div class="kv"><span class="k">Size</span><span class="v" style="font-size:12px">${sizeText}</span></div>
       ${m.params_b > 0 ? `<div class="kv"><span class="k">Parameters</span><span class="v" style="font-size:12px">${trim1(m.params_b)}B</span></div>` : ""}
       ${m.ctx_max != null ? `<div class="kv"><span class="k">Context</span><span class="v" style="font-size:12px">${m.ctx_max.toLocaleString()}</span></div>` : ""}
+      ${effMoeLayers != null && effMoeDefault != null ? `<div class="kv"><span class="k">Expert offload</span><span class="v" style="font-size:12px">Default: ${effMoeDefault} of ${effMoeLayers} layers</span></div>` : ""}
     </div>
     ${statsHtml}
     <div class="card-actions">${actions}</div>
     ${detailsHtml}
     ${renameHtml}
+    ${offloadHtml}
     ${dlErrHtml}
     ${noteHtml}
   </div>`;
@@ -4417,6 +4443,12 @@ export function renderModels(): string {
         <label style="font-size:12px;color:var(--text2)">Parameters (B)<span class="info-tip" title="Total parameter count in billions (e.g. 80 for an 80B model — for a mixture-of-experts model, the total, not the active count). Required for models outside the curated catalog: the count feeds memory-fit estimation and is never re-derived later.">${icon("info")}</span><br>
           <input id="addModelParams" type="text" inputmode="decimal" placeholder="80" style="${SELECT_STYLE};width:100%"></label>
       </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px">
+        <label style="font-size:12px;color:var(--text2)">MoE layers<span class="info-tip" title="For a mixture-of-experts (MoE) model: the number of layers carrying routed experts. Declaring this and the default offload gives the model's backends expert-offload controls — a new backend starts at the default offload and the Edit Flags slider ranges over these layers. Leave both MoE fields empty for a dense model.">${icon("info")}</span><br>
+          <input id="addModelMoeLayers" type="text" inputmode="numeric" placeholder="48" style="${SELECT_STYLE};width:100%"></label>
+        <label style="font-size:12px;color:var(--text2)">Default offload layers<span class="info-tip" title="How many MoE layers a new backend for this model offloads to system RAM by default (0 to the MoE layer count; the full count is full expert offload).">${icon("info")}</span><br>
+          <input id="addModelMoeDefault" type="text" inputmode="numeric" placeholder="16" style="${SELECT_STYLE};width:100%"></label>
+      </div>
     </div>
     <div class="card-actions"><button class="btn" id="addModelBtn">${icon("plus")} Add model</button></div>
     <div id="addModelMsg" style="font-size:12px;margin-top:6px;display:none"></div>
@@ -4434,6 +4466,23 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
    *  input) so poll repaints never lose typed text. */
   let renameFor: string | null = null;
   let renameDraft = "";
+  /** Offload-declaration form state: the model whose inline MoE
+   *  declaration form is open, and its two draft fields (kept as
+   *  text, like the rename draft, so poll repaints never lose
+   *  typed text). */
+  let offloadFor: string | null = null;
+  let offloadDraftLayers = "";
+  let offloadDraftDefault = "";
+  const syncOffloadDraft = (ev: Event): void => {
+    const t = ev.target as HTMLElement;
+    if (t.hasAttribute("data-model-offload-layers") && t.getAttribute("data-model-offload-layers") === offloadFor) {
+      offloadDraftLayers = (t as HTMLInputElement).value;
+    }
+    if (t.hasAttribute("data-model-offload-default") && t.getAttribute("data-model-offload-default") === offloadFor) {
+      offloadDraftDefault = (t as HTMLInputElement).value;
+    }
+  };
+  root.addEventListener("input", syncOffloadDraft);
   /** Models whose Details expandable is open (wire state outside
    *  the repainted DOM, so poll repaints preserve it). */
   const openModelDetails = new Set<string>();
@@ -4508,14 +4557,15 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       return;
     }
     lastRows = r.data;
-    // While the rename input has focus, a poll repaint would drop
-    // the caret mid-word; the draft is synced to wire state, so
-    // skipping one repaint loses nothing.
-    const renameFocused = renameFor !== null
-      && (document.activeElement as HTMLElement | null)?.hasAttribute?.("data-model-rename-input");
-    if (!renameFocused) {
+    // While a rename or offload input has focus, a poll repaint
+    // would drop the caret mid-word; the drafts are synced to
+    // wire state, so skipping one repaint loses nothing.
+    const active = document.activeElement as HTMLElement | null;
+    const formFocused = (renameFor !== null && !!active?.hasAttribute?.("data-model-rename-input"))
+      || (offloadFor !== null && (!!active?.hasAttribute?.("data-model-offload-layers") || !!active?.hasAttribute?.("data-model-offload-default")));
+    if (!formFocused) {
       if (mov) mov.innerHTML = modelOverviewHtml(lastRows, modelStats);
-      b.innerHTML = `<div class="cards-fluid">${lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id), renameFor === m.id ? { draft: renameDraft } : null, openModelDetails.has(m.id))).join("")}</div>`;
+      b.innerHTML = `<div class="cards-fluid">${lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id), renameFor === m.id ? { draft: renameDraft } : null, openModelDetails.has(m.id), offloadFor === m.id ? { layers: offloadDraftLayers, def: offloadDraftDefault } : null)).join("")}</div>`;
     }
     syncPoll();
   };
@@ -4643,6 +4693,55 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       return;
     }
 
+    if (act === "offload") {
+      if (offloadFor === id) { offloadFor = null; await load(); return; }
+      const row = lastRows.find((m) => m.id === id);
+      offloadFor = id;
+      offloadDraftLayers = row?.moe_layers != null ? String(row.moe_layers) : "";
+      offloadDraftDefault = row?.default_offload_layers != null ? String(row.default_offload_layers) : "";
+      await load();
+      return;
+    }
+
+    if (act === "offload-cancel") {
+      offloadFor = null;
+      await load();
+      return;
+    }
+
+    if (act === "offload-save") {
+      (t as HTMLButtonElement).disabled = true;
+      const layersRaw = offloadDraftLayers.trim();
+      const defRaw = offloadDraftDefault.trim();
+      let layers: number | null = null;
+      let def: number | null = null;
+      if (layersRaw || defRaw) {
+        const l = Number(layersRaw);
+        const d = Number(defRaw);
+        if (!layersRaw || !defRaw || !Number.isInteger(l) || !Number.isInteger(d) || l < 1 || d < 0 || d > l) {
+          notes.set(id, { text: "Declaration not saved: give both fields — MoE layers of 1 or more, and a default offload between 0 and the layer count (or clear both to remove the declaration).", err: true });
+          await load();
+          return;
+        }
+        layers = l;
+        def = d;
+      }
+      const r = await modelSetOffloadSpec(id, layers, def);
+      if (r.error) {
+        notes.set(id, { text: `Offload declaration failed: ${r.error}`, err: true });
+      } else {
+        offloadFor = null;
+        notes.set(id, {
+          text: layers === null
+            ? "MoE offload declaration cleared."
+            : `MoE offload declared: default ${def} of ${layers} layers. New backends start at the default, and this model's backends gain the Edit Flags offload slider.`,
+          err: false,
+        });
+      }
+      await load();
+      return;
+    }
+
     if (act === "verify") {
       const btn = t as HTMLButtonElement;
       btn.disabled = true;
@@ -4705,8 +4804,22 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       }
       paramsB = n;
     }
+    const moeLayersRaw = val("#addModelMoeLayers");
+    const moeDefRaw = val("#addModelMoeDefault");
+    let moeLayers: number | undefined;
+    let moeDefault: number | undefined;
+    if (moeLayersRaw || moeDefRaw) {
+      const l = Number(moeLayersRaw);
+      const d = Number(moeDefRaw);
+      if (!moeLayersRaw || !moeDefRaw || !Number.isInteger(l) || !Number.isInteger(d) || l < 1 || d < 0 || d > l) {
+        if (msg) { msg.style.color = "var(--err)"; msg.textContent = "MoE fields: give both — MoE layers of 1 or more and a default offload between 0 and the layer count — or leave both empty for a dense model."; }
+        return;
+      }
+      moeLayers = l;
+      moeDefault = d;
+    }
     addBtn.disabled = true;
-    const r = await modelAdd(id, url, val("#addModelFile") || undefined, val("#addModelQuant") || undefined, paramsB);
+    const r = await modelAdd(id, url, val("#addModelFile") || undefined, val("#addModelQuant") || undefined, paramsB, moeLayers, moeDefault);
     addBtn.disabled = false;
     if (msg) {
       msg.style.color = r.error ? "var(--err)" : "var(--text2)";
@@ -4723,6 +4836,7 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     root.removeEventListener("click", onClick);
     root.removeEventListener("click", onOvGoto);
     root.removeEventListener("input", syncRenameDraft);
+    root.removeEventListener("input", syncOffloadDraft);
     root.removeEventListener("keydown", onRenameKey);
   };
 }

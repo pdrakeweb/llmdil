@@ -6938,6 +6938,8 @@ mod tests {
                 assigned_backends: vec!["tool-runner".to_string()],
                 enabled: true,
                 display_name: None,
+                moe_layers: None,
+                default_offload_layers: None,
             },
             ModelConfig {
                 id: "qwen2.5-coder-7b".to_string(),
@@ -6951,6 +6953,8 @@ mod tests {
                 assigned_backends: vec!["coder-fast".to_string()],
                 enabled: true,
                 display_name: None,
+                moe_layers: None,
+                default_offload_layers: None,
             },
         ];
         c
