@@ -32,7 +32,7 @@ const html = existsSync(indexHtml) ? readFileSync(indexHtml, "utf8") : "";
 check(/assets\/.*\.js/.test(html), "index.html references the JS bundle");
 
 const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
-for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_parallel", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group"]) {
+for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_parallel", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group"]) {
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
 // Cross-check: every Tauri command name the UI invokes must be
@@ -196,6 +196,18 @@ check(groupsSrc.includes("gatewaySetBackendGroup"), "Groups view moves membershi
 check(bundle.includes("#/groups"), "bundle contains the Groups route (#/groups)");
 check(readFileSync(join(root, "src", "views", "static.ts"), "utf8").includes("Edit membership"),
   "Gateway Routing card links to the Groups editor (Edit membership)");
+
+// MoE offload declaration for user-added models: the Add Model
+// form carries the optional declaration pair, model cards render
+// the effective Expert offload figure, and the card's declaration
+// editor saves through model_set_offload_spec.
+check(bundle.includes("addModelMoeLayers"), "bundle contains the Add Model MoE layers field");
+check(bundle.includes("addModelMoeDefault"), "bundle contains the Add Model default offload field");
+check(bundle.includes("MoE layers"), "bundle contains the MoE declaration field label");
+const staticSrc = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+check(staticSrc.includes('data-model-act="offload"'), "Models view renders the offload declaration editor button");
+check(staticSrc.includes('data-model-act="offload-save"'), "Models view renders the declaration save action");
+check(staticSrc.includes("Expert offload"), "Models view renders the Expert offload card figure");
 
 check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
