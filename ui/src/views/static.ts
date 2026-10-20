@@ -26,12 +26,13 @@ import {
   recordActivationExecution, getActivationHistory, getActivationExecution,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
   setNotificationConfig, sendTestNotification,
+  getAppUpdateStatus, appUpdateCheck, appUpdateSetChecking, appUpdateSetAuto, appUpdateDownload,
   servicesList, servicesRegister, servicesUnregister, setSupervisionMode,
   adminApiGetStatus, adminApiSetEnabled, adminApiListUsers, adminApiCreateUser,
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
   adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendAddPreview, BackendMtp, BackendOffload, BackendParallel, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
+import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, BackendMtp, BackendOffload, BackendParallel, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
 import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
 import type { GpuInfo, WizardStepState } from "../types";
 
@@ -6462,6 +6463,55 @@ interface SettingsUi {
   allOpen: boolean;
 }
 
+/** The LLMdil self-update block at the top of the Updates tab:
+ *  the two operator switches, the check state as Label: Value rows,
+ *  and the check / download actions. Fed by the app_update_status
+ *  payload, not the config: last-checked, available, and staged
+ *  are runtime state. The per-component pins below it are a
+ *  separate mechanism (the wizard's component updates) and stay
+ *  separate here too. Applying a staged update is the shell
+ *  banner's Restart, not a control on this tab. */
+function appUpdateInner(upd: AppUpdateInfo | null, live: boolean): string {
+  const head = `<div style="font-size:12px;color:var(--text2)">LLMdil updates<span class="info-tip" title="Checks GitHub Releases for a newer LLMdil. Auto-update downloads and verifies the installer in the background; it is applied only when you restart from the banner — the running installation is never replaced in place.">${icon("info")}</span></div>`;
+  if (!live) {
+    return `${head}<div style="font-size:12px;color:var(--text2);margin-top:6px">Update checking is available in the installed app.</div>`;
+  }
+  if (!upd) {
+    return `${head}<div style="font-size:12px;color:var(--text2);margin-top:6px">Update state unavailable.</div>`;
+  }
+  const fmtMs = (ms: number): string => fmtDateTime(new Date(ms).toISOString());
+  const switchRow = (key: string, label: string, desc: string, on: boolean, disabled: boolean): string =>
+    `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border)">
+      <span class="k">${esc(label)}<span class="info-tip" title="${esc(desc)}">${icon("info")}</span></span>
+      ${enableSwitch({ on, name: label, attrs: `data-appupd-toggle="${key}"`, disabled })}</div>`;
+  const rows: { key: string; value: string }[] = [
+    { key: "Current version", value: upd.current_version },
+  ];
+  if (upd.last_checked_unix_ms !== null) {
+    const outcome = upd.last_check_outcome === "update_available" ? "update available"
+      : upd.last_check_outcome === "up_to_date" ? "up to date"
+      : upd.last_check_outcome === "failed" ? `failed${upd.last_check_error ? ` — ${upd.last_check_error}` : ""}`
+      : "";
+    rows.push({ key: "Last checked", value: `${fmtMs(upd.last_checked_unix_ms)}${outcome ? ` · ${outcome}` : ""}` });
+  }
+  if (upd.available) rows.push({ key: "Available version", value: upd.available.version });
+  if (upd.staged) rows.push({ key: "Staged", value: `${upd.staged.version} · staged ${fmtMs(upd.staged.staged_at_unix_ms)} — restart to apply` });
+  const applyNote = upd.last_apply && !upd.last_apply.ok
+    ? `<div style="font-size:12px;color:var(--err);margin-top:6px">Update to ${esc(upd.last_apply.version)} failed: ${esc(upd.last_apply.message)}</div>`
+    : "";
+  const stageErr = upd.last_stage_error
+    ? `<div style="font-size:12px;color:var(--err);margin-top:6px">Download failed: ${esc(upd.last_stage_error)}</div>`
+    : "";
+  const canDownload = !!upd.available && !upd.staged && !upd.auto_update;
+  return `${head}
+    ${switchRow("checking", "Update checking", "Check GitHub Releases for a newer LLMdil at startup and every 6 hours while running.", upd.check_enabled, false)}
+    ${switchRow("auto", "Auto-update", "Download and verify a new release automatically when a check finds one. Applying still takes a restart.", upd.auto_update, !upd.check_enabled)}
+    <div style="margin-top:6px">${settingsRows(rows)}</div>
+    ${applyNote}${stageErr}
+    <div class="card-actions" style="margin-top:8px"><button class="btn" data-appupd-check>${icon("search")} Check now</button>
+    ${canDownload ? `<button class="btn" data-appupd-download>${icon("download")} Download ${esc(upd.available!.version)}</button>` : ""}</div>`;
+}
+
 /** One Settings section, six tab views (principle 2) — page length
  *  is the longest tab, not the sum of six stacked cards. The
  *  Notifications tab renders only when notification settings
@@ -6520,6 +6570,7 @@ function settingsPaint(
   ui: SettingsUi,
   svcR: { data: ServicesInfo; error?: string; live: boolean },
   remoteHtml = "",
+  appUpdateHtml = "",
 ): string {
   const notif = asRecord(cfg.notifications);
   const tabs: { id: SettingsTab; label: string }[] = [
@@ -6559,7 +6610,7 @@ function settingsPaint(
   if (primStr(cfg.setup_completed) !== null) {
     generalRows.push({ key: "Setup completed", value: cfg.setup_completed ? "yes" : "no" });
   }
-  const KNOWN_CFG = new Set(["data_dir", "config_path", "telemetry", "winml", "setup_completed", "updates", "notifications", "mxc"]);
+  const KNOWN_CFG = new Set(["data_dir", "config_path", "telemetry", "winml", "setup_completed", "updates", "app_update", "notifications", "mxc"]);
   for (const [k, v] of Object.entries(cfg)) {
     if (KNOWN_CFG.has(k)) continue;
     extraRows.push({ key: humanLabel(k), value: summarizeValue(v) });
@@ -6588,10 +6639,10 @@ function settingsPaint(
     // entirely; the diagnostics actions below remain (they are the
     // tab's content, not an empty state).
     policyBlock = `${restRows.length ? settingsRows(restRows) : ""}
-      ${compHtml ? `<div style="font-size:12px;color:var(--text2);margin:10px 0 6px">Components</div>${compHtml}` : ""}`;
+      ${compHtml}`;
   }
-  const updatesPanel = `<div style="font-size:12px;color:var(--text2)">Updates<span class="info-tip" title="Update checking is not supported in v0.1.x.">${icon("info")}</span></div>
-    ${policyBlock}
+  const updatesPanel = `${appUpdateHtml}
+    ${policyBlock ? `<div style="font-size:12px;color:var(--text2);margin-top:14px">Components<span class="info-tip" title="Per-component version pins the setup wizard manages (LiteLLM, llama.cpp). Separate from LLMdil's own updates above.">${icon("info")}</span></div>${policyBlock}` : ""}
     <div style="font-size:12px;color:var(--text2);margin-top:14px">Diagnostics</div>
     <div class="card-actions"><a class="btn" href="#/wizard">${icon("search")} Open Setup Wizard</a>
     <button class="btn icon-only" id="setExportBtn" title="Export diagnostics bundle" aria-label="Export diagnostics bundle">${icon("download")}</button><span class="info-tip" title="The bundle contains raw, unredacted process logs. Review it before sharing.">${icon("info")}</span>
@@ -6752,9 +6803,16 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     if (m) m.innerHTML = text ? `<span style="color:${isErr ? "var(--err)" : "var(--text2)"}">${esc(text)}</span>` : "";
   };
 
+  /** Last app-update status payload, for the Updates tab block and
+   *  its toggle handlers (the switch sends the negation of the
+   *  rendered state). */
+  let lastAppUpd: AppUpdateInfo | null = null;
+  let appUpdLive = false;
   const load = async (): Promise<void> => {
-    const [cfgR, polR, actR, svcR] = await Promise.all([getAppConfig(), getMxcPolicy(), getMxcActivity(), servicesList()]);
+    const [cfgR, polR, actR, svcR, updR] = await Promise.all([getAppConfig(), getMxcPolicy(), getMxcActivity(), servicesList(), getAppUpdateStatus()]);
     if (disposed) return;
+    lastAppUpd = updR.error ? lastAppUpd : updR.data;
+    appUpdLive = updR.live;
     setBanner(root, "setBanner", bannerHtml(cfgR));
     const b = root.querySelector("#setBody");
     if (!b) return;
@@ -6771,7 +6829,8 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     if (setUi.tab === "remote") await loadRemote();
     if (disposed) return;
     b.innerHTML = settingsPaint(cfgR.data, polR, actR, selfTestHtml, setUi, svcR,
-      remoteAccessHtml(raStatus, raUsers, raTemp, raEnroll, raAudit));
+      remoteAccessHtml(raStatus, raUsers, raTemp, raEnroll, raAudit),
+      appUpdateInner(lastAppUpd, appUpdLive));
   };
 
   const onClick = async (ev: Event): Promise<void> => {
@@ -6949,6 +7008,48 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
           ${failed.map((c) => `<div style="color:var(--err)">${esc(c.name)}: expected ${esc(c.expected)}, got ${esc(c.actual)} \u2014 ${esc(c.description)}</div>`).join("")}
         </div>`;
       }
+      await load();
+      return;
+    }
+
+    const appUpdBtn = t.closest("[data-appupd-toggle]") as HTMLButtonElement | null;
+    if (appUpdBtn) {
+      const key = appUpdBtn.getAttribute("data-appupd-toggle") ?? "";
+      if (!lastAppUpd || !["checking", "auto"].includes(key)) return;
+      appUpdBtn.disabled = true;
+      const r = key === "checking"
+        ? await appUpdateSetChecking(!lastAppUpd.check_enabled)
+        : await appUpdateSetAuto(!lastAppUpd.auto_update);
+      if (disposed) return;
+      if (r.error) setMsg(`Update settings not saved: ${r.error}`, true);
+      else setMsg("Update settings saved.");
+      await load();
+      return;
+    }
+
+    if (t.closest("[data-appupd-check]")) {
+      const btn = t.closest("[data-appupd-check]") as HTMLButtonElement;
+      btn.disabled = true;
+      setMsg("Checking GitHub Releases…");
+      const r = await appUpdateCheck();
+      if (disposed) return;
+      if (r.error) setMsg(`Update check failed: ${r.error}`, true);
+      else if (r.data.last_check_outcome === "failed") setMsg(`Update check failed: ${r.data.last_check_error ?? "unknown error"}`, true);
+      else if (r.data.available) setMsg(`LLMdil ${r.data.available.version} is available.`);
+      else setMsg("LLMdil is up to date.");
+      await load();
+      return;
+    }
+
+    if (t.closest("[data-appupd-download]")) {
+      const btn = t.closest("[data-appupd-download]") as HTMLButtonElement;
+      btn.disabled = true;
+      setMsg("Downloading the update…");
+      const r = await appUpdateDownload();
+      if (disposed) return;
+      if (r.error) setMsg(`Download failed: ${r.error}`, true);
+      else if (r.data.staged) setMsg(`LLMdil ${r.data.staged.version} downloaded and verified — restart from the banner to apply it.`);
+      else if (r.data.last_stage_error) setMsg(`Download failed: ${r.data.last_stage_error}`, true);
       await load();
       return;
     }

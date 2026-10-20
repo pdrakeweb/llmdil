@@ -391,6 +391,22 @@ table.tbl tr:last-child td { border-bottom: 0; }
 .activation-banner .ab-status.err { color: var(--err); }
 .activation-banner .ab-actions { margin-left: auto; display: inline-flex; gap: 6px; }
 
+/* Global app-update header: same slot family as the activation
+   banner, shown whenever a verified update is staged and waiting
+   on a restart. State-derived — it renders from the staged record,
+   so it survives navigation and app restarts. Info-blue rather
+   than the activation banner's amber: nothing is wrong, an action
+   is available. */
+.update-banner {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: #10233a; border-bottom: 1px solid #1d4066; color: #7db8f0;
+  padding: 8px 14px; font-size: 12px;
+}
+.update-banner .ab-text { display: inline-flex; align-items: center; gap: 6px; }
+.update-banner .ab-status { color: var(--text2); }
+.update-banner .ab-status.err { color: var(--err); }
+.update-banner .ab-actions { margin-left: auto; display: inline-flex; gap: 6px; }
+
 /* Section titles */
 .sec-title { font-size: 13px; font-weight: 700; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
 .sec-title .ic { width: 14px; height: 14px; }

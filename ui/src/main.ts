@@ -3,8 +3,8 @@
    framework can replace this file later without changing command contracts. */
 
 import "./styles.css";
-import { getActivationPlan, getAppConfig, getBackends, getGatewayStatus, getSetupStatus, getStatus, isTauri } from "./api";
-import type { ActivationPlanData } from "./api";
+import { appUpdateRestart, getActivationPlan, getAppConfig, getAppUpdateStatus, getBackends, getGatewayStatus, getSetupStatus, getStatus, isTauri } from "./api";
+import type { ActivationPlanData, AppUpdateInfo } from "./api";
 import { stackedBar } from "./charts";
 import { esc } from "./html";
 import { icon, type IconName } from "./icons";
@@ -54,6 +54,7 @@ function shell(): string {
       <div class="side-foot" id="sideFoot"><div class="row"><span class="dot idle"></span> status…</div></div>
     </aside>
     <div class="main">
+      <div id="updateBanner"></div>
       <div id="activationBanner"></div>
       <div id="view" style="display:flex;flex-direction:column;flex:1;min-height:0"></div>
       <div class="taskbar" id="taskbar"></div>
@@ -176,6 +177,62 @@ async function onBannerClick(ev: Event): Promise<void> {
   paintActivationBanner();
   await refreshActivationBanner();
   void render();
+}
+
+/* ---------------- Global app-update banner ----------------
+ * Shown whenever the app-update state carries a staged update
+ * newer than the running version — the banner is derived from
+ * that state on every poll, never from a one-time event, so it
+ * survives navigation and app restarts until the update is
+ * applied or superseded. Restart hands off to the backend's
+ * apply helper and the app exits; a failure recorded by a
+ * previous apply for this same version rides the banner so the
+ * operator sees why it is still here. */
+let updateInfo: AppUpdateInfo | null = null;
+let updateRestarting = false;
+let updateStatus = "";
+let updateStatusErr = false;
+
+function paintUpdateBanner(): void {
+  const el = document.getElementById("updateBanner");
+  if (!el) return;
+  const banner = updateInfo?.banner;
+  if (!banner) { el.innerHTML = ""; return; }
+  const fail = banner.last_apply_error;
+  el.innerHTML = `<div class="update-banner">
+    <span class="ab-text">${icon("restart")} <b>Restart LLMdil to update</b> — Version: ${esc(banner.version)}</span>
+    ${fail ? `<span class="ab-status err">Previous update attempt failed: ${esc(fail)}</span>` : ""}
+    ${updateStatus ? `<span class="ab-status${updateStatusErr ? " err" : ""}">${esc(updateStatus)}</span>` : ""}
+    <span class="ab-actions">
+      <button class="btn" data-ub-act="restart"${updateRestarting ? " disabled" : ""}>${icon("restart")} Restart</button>
+    </span>
+  </div>`;
+}
+
+async function refreshUpdateBanner(): Promise<void> {
+  if (!isTauri()) { updateInfo = null; paintUpdateBanner(); return; }
+  const r = await getAppUpdateStatus();
+  if (r.error) return; // keep the last known state on a failed poll
+  updateInfo = r.data;
+  if (!r.data.banner) { updateStatus = ""; updateStatusErr = false; }
+  paintUpdateBanner();
+}
+
+async function onUpdateBannerClick(ev: Event): Promise<void> {
+  const t = (ev.target as HTMLElement).closest("[data-ub-act]") as HTMLElement | null;
+  if (!t || t.getAttribute("data-ub-act") !== "restart" || updateRestarting) return;
+  updateRestarting = true;
+  updateStatus = "Restarting to apply the update…";
+  updateStatusErr = false;
+  paintUpdateBanner();
+  const r = await appUpdateRestart();
+  if (r.error) {
+    updateRestarting = false;
+    updateStatus = `Restart failed: ${r.error}`;
+    updateStatusErr = true;
+    paintUpdateBanner();
+  }
+  // On success the process exits; nothing further renders.
 }
 
 /** Sidebar status footer, driven by live data when available. */
@@ -333,6 +390,7 @@ async function render(): Promise<void> {
   if (gen !== renderGen) return; // a newer render took over mid-flight
   renderTaskbar();
   void refreshActivationBanner();
+  void refreshUpdateBanner();
   void renderSideFoot();
   if (sideFootTimer === null) {
     sideFootTimer = window.setInterval(() => { void renderSideFoot(); }, 15000);
@@ -345,8 +403,11 @@ async function main(): Promise<void> {
   app.innerHTML = shell();
   window.addEventListener("hashchange", () => void render());
   document.getElementById("activationBanner")?.addEventListener("click", (ev) => void onBannerClick(ev));
+  document.getElementById("updateBanner")?.addEventListener("click", (ev) => void onUpdateBannerClick(ev));
   void refreshActivationBanner();
+  void refreshUpdateBanner();
   window.setInterval(() => { void refreshActivationBanner(); }, 10000);
+  window.setInterval(() => { void refreshUpdateBanner(); }, 30000);
   // First launch: open the setup wizard until it is marked complete.
   if (isTauri() && !location.hash) {
     try {
