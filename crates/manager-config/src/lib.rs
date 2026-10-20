@@ -73,6 +73,16 @@ pub struct AppConfig {
     pub admin_api: AdminApiConfig,
     /// Per-component pin / auto-update toggles.
     pub updates: UpdatePolicy,
+    /// App self-update preferences (Settings → Updates & diagnostics):
+    /// whether LLMdil itself checks GitHub Releases for a newer
+    /// version and whether a found release is downloaded and staged
+    /// automatically. Distinct from `updates` above, which pins
+    /// *components* (LiteLLM, llama.cpp builds, …) the wizard manages;
+    /// the two never share state. Absent in configurations written
+    /// before the section existed — the defaults are the Pete-safe
+    /// pair (checking on, auto-update off).
+    #[serde(default)]
+    pub app_update: AppUpdateConfig,
     pub notifications: NotificationConfig,
     /// Set when the user finishes the setup wizard; the UI opens the wizard
     /// on launch until this is true.
@@ -867,6 +877,34 @@ pub struct UpdatePolicy {
     pub components: HashMap<String, ComponentUpdate>,
 }
 
+/// App self-update preferences. Only the two operator switches are
+/// configuration; everything else about self-update (last check,
+/// staged installer, apply outcomes) is runtime state kept in the
+/// app-update state file under the data directory, never here, so a
+/// config write can neither forge nor erase a staged update.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppUpdateConfig {
+    /// Check GitHub Releases for a newer LLMdil at startup and
+    /// periodically while running.
+    #[serde(default = "default_true")]
+    pub check_enabled: bool,
+    /// Download and stage a newer release automatically when a
+    /// check finds one. The staged installer is only ever *applied*
+    /// by the operator pressing Restart (see manager-app's
+    /// app_update module); staging never touches the running install.
+    #[serde(default)]
+    pub auto_update: bool,
+}
+
+impl Default for AppUpdateConfig {
+    fn default() -> Self {
+        Self {
+            check_enabled: true,
+            auto_update: false,
+        }
+    }
+}
+
 /// Update policy for one component (llama.cpp build, LiteLLM, models, ...).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentUpdate {
@@ -1068,6 +1106,7 @@ impl AppConfig {
             updates: UpdatePolicy {
                 components: HashMap::new(),
             },
+            app_update: AppUpdateConfig::default(),
             notifications: NotificationConfig::default(),
             setup_completed: false,
             optimize_purpose: String::new(),
