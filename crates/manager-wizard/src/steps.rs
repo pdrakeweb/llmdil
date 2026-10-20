@@ -6,12 +6,300 @@
 //! [`FakeSystemOps`](crate::fake::FakeSystemOps).
 
 use crate::{
-    checksums_match, is_pinned_hash, PlannedCommand, RunMode, StepOutcome, SystemOps,
-    WizardContext, WizardError, WizardStep,
+    checksums_match, is_pinned_hash, CommandOutput, PlannedCommand, RunMode, StepLogSink,
+    StepOutcome, SystemOps, WizardContext, WizardError, WizardStep,
 };
 use async_trait::async_trait;
 use manager_config::{AppConfig, BackendConfig, McpExposure, ModelConfig, SplitMode, SupervisionMode};
 use std::path::{Path, PathBuf};
+
+// ---------------------------------------------------------------------------
+// Step progress logging
+// ---------------------------------------------------------------------------
+//
+// A step's collected log (the `Vec<String>` every step builds) is
+// persisted by the caller only when the step RETURNS, so on its own
+// it leaves the wizard log silent for the whole run — a cold
+// multi-minute install reads as a hang (field report 2026-10-19).
+// The helpers here pair the collected log with the context's live
+// sink: phase boundaries and verdicts go to both ([`push_log`]);
+// high-frequency progress (download percentages, wait ticks) goes
+// to the sink only ([`WizardContext::emit_log`]), so the collected
+// log stays a readable end-of-step record instead of a transcript
+// of every tick.
+
+/// Record one step log line: appended to the step's collected log
+/// and emitted to the live sink at the same moment.
+fn push_log(ctx: &WizardContext, log: &mut Vec<String>, line: String) {
+    ctx.emit_log(&line);
+    log.push(line);
+}
+
+/// Compact elapsed label for start/finish pairs ("83.2s", "2m 05s").
+fn fmt_elapsed(start: std::time::Instant) -> String {
+    let secs = start.elapsed().as_secs_f64();
+    if secs < 120.0 {
+        format!("{secs:.1}s")
+    } else {
+        let total = secs.round() as u64;
+        format!("{}m {:02}s", total / 60, total % 60)
+    }
+}
+
+/// The last `max_lines` lines of a captured output, for attaching a
+/// failing command's own words to the step log without dumping the
+/// whole capture.
+fn output_tail_lines(text: &str, max_lines: usize) -> Vec<&str> {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(max_lines)..].to_vec()
+}
+
+/// One-line failure evidence for a probe: exit code plus the tail
+/// of whichever capture carries text (a Python probe's traceback
+/// lands on stderr; a version print lands on stdout). Probes used
+/// to discard this and report a bare bool/None, which threw away
+/// exactly the line that says WHY a healthy-looking install failed
+/// verification — the failure then looked identical to a missing
+/// install and triggered the full repair path blind.
+fn probe_failure_detail(out: &CommandOutput) -> String {
+    let capture = if !out.stderr.trim().is_empty() {
+        &out.stderr
+    } else {
+        &out.stdout
+    };
+    let tail = output_tail_lines(capture.trim(), 3).join(" | ");
+    if tail.is_empty() {
+        format!("exit {} (no output)", out.exit_code)
+    } else {
+        format!("exit {}: {tail}", out.exit_code)
+    }
+}
+
+/// Extract a `major.minor` version from a probe's stdout: the LAST
+/// line that is exactly a two-part version. Whole-stdout equality
+/// (the previous parse) treated any extra output — an interpreter
+/// warning, a sitecustomize banner — as a different version, which
+/// read as "wrong Python" and forced a full venv rebuild on every
+/// start. Noise around the version is not a different version.
+fn parse_two_part_version(stdout: &str) -> Option<String> {
+    stdout.lines().rev().find_map(|line| {
+        let line = line.trim();
+        let mut parts = line.split('.');
+        let major = parts.next()?;
+        let minor = parts.next()?;
+        if parts.next().is_some()
+            || major.is_empty()
+            || minor.is_empty()
+            || !major.bytes().all(|b| b.is_ascii_digit())
+            || !minor.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        Some(line.to_string())
+    })
+}
+
+/// Extract a `major.minor.patch` version from a probe's stdout:
+/// the LAST line that starts with three numeric components (a
+/// pre-release/build suffix is allowed). See
+/// [`parse_two_part_version`] for why the parse tolerates noise.
+fn parse_semver_version(stdout: &str) -> Option<String> {
+    stdout.lines().rev().find_map(|line| {
+        let line = line.trim();
+        let mut numeric = 0usize;
+        let mut chars = line.char_indices().peekable();
+        let mut end = 0usize;
+        while let Some((i, c)) = chars.next() {
+            if c.is_ascii_digit() {
+                end = i + c.len_utf8();
+            } else if c == '.' && numeric < 3 {
+                numeric += 1;
+                end = i + 1;
+            } else {
+                break;
+            }
+        }
+        // Count the components in the consumed digit/dot prefix.
+        let prefix = &line[..end];
+        let components = prefix.split('.').filter(|p| !p.is_empty()).count();
+        if components == 3 && prefix.bytes().filter(|&b| b == b'.').count() == 2 {
+            // The character after the patch digits must not extend
+            // the number (a fourth component is a different shape).
+            match line[end..].chars().next() {
+                None => Some(line.to_string()),
+                Some(c) if !c.is_ascii_digit() && c != '.' => Some(line.to_string()),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    })
+}
+
+/// Run a command with the step log wrapped around it: the argv is
+/// recorded BEFORE the run (so a long command is never a silent
+/// window), the exit and elapsed time after it, and on a non-zero
+/// exit the tail of the captured output joins the log — a failed
+/// command's own words belong in the step log, not only in the
+/// failure message. A spawn/timeout error is logged the same way
+/// and returned to the caller.
+async fn run_command_logged(
+    ctx: &WizardContext,
+    log: &mut Vec<String>,
+    cmd: &PlannedCommand,
+    timeout: Option<std::time::Duration>,
+) -> Result<CommandOutput, WizardError> {
+    push_log(ctx, log, format!("running: {}", cmd.argv.join(" ")));
+    let started = std::time::Instant::now();
+    let result = match timeout {
+        Some(budget) => ctx.ops.run_command_with_timeout(cmd, budget).await,
+        None => ctx.ops.run_command(cmd).await,
+    };
+    match result {
+        Ok(out) => {
+            push_log(
+                ctx,
+                log,
+                format!("exit {} in {}", out.exit_code, fmt_elapsed(started)),
+            );
+            if !out.success() {
+                let (label, capture) = if !out.stderr.trim().is_empty() {
+                    ("stderr", &out.stderr)
+                } else {
+                    ("stdout", &out.stdout)
+                };
+                let tail = output_tail_lines(capture.trim(), 10);
+                if !tail.is_empty() {
+                    push_log(ctx, log, format!("command {label} (last lines):"));
+                    for line in tail {
+                        push_log(ctx, log, line.to_string());
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Err(e) => {
+            push_log(
+                ctx,
+                log,
+                format!("command failed in {}: {e}", fmt_elapsed(started)),
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Throttled download progress for the live sink: the first call,
+/// every ~10-point percentage step, at least every 5 s while bytes
+/// move, and completion. The collected step log keeps only the
+/// download's start/finish lines (recorded by the caller) — the
+/// percentage ticks are live-only progress, not record.
+struct ProgressEmitter {
+    sink: Option<StepLogSink>,
+    label: String,
+    started: std::time::Instant,
+    last_emit_ms: std::sync::atomic::AtomicU64,
+    last_pct: std::sync::atomic::AtomicU64,
+}
+
+impl ProgressEmitter {
+    fn new(ctx: &WizardContext, label: impl Into<String>) -> Self {
+        Self {
+            sink: ctx.log_sink(),
+            label: label.into(),
+            started: std::time::Instant::now(),
+            last_emit_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
+            // u64::MAX = no percentage emitted yet.
+            last_pct: std::sync::atomic::AtomicU64::new(u64::MAX),
+        }
+    }
+
+    fn progress(&self, downloaded: u64, total: u64) {
+        use std::sync::atomic::Ordering;
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        let pct = if total > 0 {
+            Some(downloaded.saturating_mul(100) / total)
+        } else {
+            None
+        };
+        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        let last_ms = self.last_emit_ms.load(Ordering::Relaxed);
+        let first = last_ms == u64::MAX;
+        let pct_step = match (pct, self.last_pct.load(Ordering::Relaxed)) {
+            (Some(p), prev) => prev == u64::MAX || p >= prev + 10,
+            (None, _) => false,
+        };
+        let complete = total > 0 && downloaded >= total;
+        let due = first || pct_step || complete || elapsed_ms >= last_ms + 5_000;
+        if !due {
+            return;
+        }
+        self.last_emit_ms.store(elapsed_ms, Ordering::Relaxed);
+        if let Some(p) = pct {
+            self.last_pct.store(p, Ordering::Relaxed);
+        }
+        sink(match pct {
+            Some(p) => format!(
+                "downloading {}: {downloaded} / {total} bytes ({p}%)",
+                self.label
+            ),
+            None => format!("downloading {}: {downloaded} bytes", self.label),
+        });
+    }
+}
+
+/// Incremental reader over an append-only log file (the
+/// postmaster's own log): each call returns the lines written since
+/// the previous call, so a wait loop can stream a starting
+/// server's FATAL lines into the step log as they land instead of
+/// only attaching a tail after the wait has already failed.
+struct FileLineStreamer {
+    emitted: usize,
+}
+
+impl FileLineStreamer {
+    fn new() -> Self {
+        Self { emitted: 0 }
+    }
+
+    /// Start from the file's current end: lines already in the
+    /// file predate this wait and are not this wait's news.
+    async fn prime(&mut self, ops: &dyn SystemOps, path: &Path) {
+        self.emitted = match ops.read_file(path).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).lines().count(),
+            Err(_) => 0,
+        };
+    }
+
+    /// Emit every line appended since the last call, prefixed so
+    /// the step log attributes them to their writer.
+    async fn stream_new(
+        &mut self,
+        ctx: &WizardContext,
+        ops: &dyn SystemOps,
+        path: &Path,
+        prefix: &str,
+        log: &mut Vec<String>,
+    ) {
+        let Ok(bytes) = ops.read_file(path).await else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.len() < self.emitted {
+            // The file shrank (rotated/recreated): resync to its
+            // end rather than replaying it.
+            self.emitted = lines.len();
+            return;
+        }
+        for line in &lines[self.emitted..] {
+            push_log(ctx, log, format!("{prefix}{line}"));
+        }
+        self.emitted = lines.len();
+    }
+}
 ///
 /// Shared by the [`VscodeExtensions`] wizard step and the Tauri
 /// `vscode_write_config` command so both write byte-identical configs.
@@ -917,13 +1205,23 @@ impl WizardStep for InstallLlamaCpp {
                         && matches!(ctx.ops.sha256_file(&archive).await, Ok(h) if checksums_match(&h, &archive_pin.sha256));
                     if !archive_ok {
                         let url = pin.asset_url(&archive_pin.asset);
-                        log.push(format!("downloading {url}"));
+                        push_log(ctx, &mut log, format!("downloading {url}"));
                         // The planned commands must equal the spawned
                         // actions: the downloads in this loop are exactly
                         // planned_commands()[0] and planned_commands()[1],
                         // in this order, when they are needed at all.
-                        match ctx.ops.download(&url, &archive, &|_, _| {}).await {
-                            Ok(bytes) => log.push(format!("downloaded {bytes} bytes")),
+                        let progress = ProgressEmitter::new(ctx, archive_pin.asset.clone());
+                        let dl_started = std::time::Instant::now();
+                        match ctx
+                            .ops
+                            .download(&url, &archive, &|d, t| progress.progress(d, t))
+                            .await
+                        {
+                            Ok(bytes) => push_log(
+                                ctx,
+                                &mut log,
+                                format!("downloaded {bytes} bytes in {}", fmt_elapsed(dl_started)),
+                            ),
                             Err(e) => {
                                 return Ok(StepOutcome::failed(
                                     format!("{e}"),
@@ -958,14 +1256,25 @@ impl WizardStep for InstallLlamaCpp {
                             archive_pin.asset
                         ));
                     }
+                    push_log(
+                        ctx,
+                        &mut log,
+                        format!("extracting {} to {}", archive_pin.asset, dir.display()),
+                    );
+                    let extract_started = std::time::Instant::now();
                     if let Err(e) = ctx.ops.extract_zip(&archive, &dir).await {
                         return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
                     }
-                    log.push(format!(
-                        "extracted {} to {}",
-                        archive_pin.asset,
-                        dir.display()
-                    ));
+                    push_log(
+                        ctx,
+                        &mut log,
+                        format!(
+                            "extracted {} to {} in {}",
+                            archive_pin.asset,
+                            dir.display(),
+                            fmt_elapsed(extract_started)
+                        ),
+                    );
                 }
                 let marker_json = serde_json::json!({
                     "tag": pin.tag,
@@ -1660,8 +1969,17 @@ impl WizardStep for DownloadModels {
                         }
                     }
                     if needs_download {
-                        log.push(format!("downloading {} → {}", url, dest.display()));
-                        if let Err(e) = ctx.ops.download(&url, &dest, &|_, _| {}).await {
+                        push_log(
+                            ctx,
+                            &mut log,
+                            format!("downloading {} → {}", url, dest.display()),
+                        );
+                        let progress = ProgressEmitter::new(ctx, model.id.clone());
+                        if let Err(e) = ctx
+                            .ops
+                            .download(&url, &dest, &|d, t| progress.progress(d, t))
+                            .await
+                        {
                             return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
                         }
                         if pinned {
@@ -2256,31 +2574,84 @@ enum PostgresWait {
     PostmasterGone,
 }
 
+/// How often a readiness wait reports itself: every this many
+/// polls (~10 s at the 500 ms cadence) the wait streams the new
+/// server-log lines into the step log and notes the elapsed time
+/// on the live sink. A starting postmaster can spend minutes in
+/// crash recovery; without the ticks the wait is a silent window
+/// indistinguishable from a hang (field report 2026-10-19).
+const POSTGRES_WAIT_TICK_POLLS: u32 = 20;
+
 /// Poll `pg_isready` until it answers, the window elapses, or —
 /// with `require_postmaster` — the postmaster disappears (a start
 /// that already failed fast must not burn the whole window).
+/// While waiting, the postmaster's own log lines stream into the
+/// step log (see [`POSTGRES_WAIT_TICK_POLLS`]), so a failing
+/// start's FATAL lines surface as they are written instead of
+/// only as a tail after the wait has already failed.
 async fn wait_for_postgres_ready(
-    ops: &dyn SystemOps,
-    config: &AppConfig,
+    ctx: &WizardContext,
     data_dir: &Path,
     max: std::time::Duration,
     require_postmaster: bool,
+    log: &mut Vec<String>,
 ) -> PostgresWait {
+    wait_for_postgres_ready_ticked(
+        ctx,
+        data_dir,
+        max,
+        require_postmaster,
+        log,
+        POSTGRES_WAIT_TICK_POLLS,
+    )
+    .await
+}
+
+/// [`wait_for_postgres_ready`] with the tick cadence as a
+/// parameter, so tests can tick every poll instead of every
+/// ~10 s.
+async fn wait_for_postgres_ready_ticked(
+    ctx: &WizardContext,
+    data_dir: &Path,
+    max: std::time::Duration,
+    require_postmaster: bool,
+    log: &mut Vec<String>,
+    tick_polls: u32,
+) -> PostgresWait {
+    let ops = ctx.ops.as_ref();
+    let config = &ctx.config;
+    let log_path = postgres_log_path(data_dir);
     let started = std::time::Instant::now();
+    let mut streamer = FileLineStreamer::new();
+    streamer.prime(ops, &log_path).await;
+    let mut polls: u32 = 0;
     loop {
         if postgres_ready(ops, config, data_dir).await {
+            streamer.stream_new(ctx, ops, &log_path, "postgres: ", log).await;
             return PostgresWait::Ready;
         }
         if require_postmaster {
             match read_postmaster_pid(ops, data_dir).await {
                 Some(pid) if ops.process_alive(pid) => {}
-                _ => return PostgresWait::PostmasterGone,
+                _ => {
+                    streamer.stream_new(ctx, ops, &log_path, "postgres: ", log).await;
+                    return PostgresWait::PostmasterGone;
+                }
             }
         }
         if started.elapsed() >= max {
             return PostgresWait::TimedOut;
         }
         tokio::time::sleep(POSTGRES_READY_POLL_INTERVAL).await;
+        polls += 1;
+        if tick_polls > 0 && polls % tick_polls == 0 {
+            streamer.stream_new(ctx, ops, &log_path, "postgres: ", log).await;
+            ctx.emit_log(&format!(
+                "waiting for PostgreSQL on 127.0.0.1:{} — {:.0}s elapsed",
+                config.postgres.port,
+                started.elapsed().as_secs_f64()
+            ));
+        }
     }
 }
 
@@ -2304,20 +2675,25 @@ fn pg_ctl_command(data_dir: &Path, args: &[&str]) -> PlannedCommand {
 /// PostgreSQL's refusal to run under an administrative token, which
 /// is recorded in that log verbatim.
 pub async fn ensure_postgres_running(
-    ops: &dyn SystemOps,
-    config: &AppConfig,
-    data_dir: &Path,
+    ctx: &WizardContext,
     log: &mut Vec<String>,
 ) -> Result<String, String> {
+    let ops = ctx.ops.as_ref();
+    let config = &ctx.config;
+    let data_dir = ctx.data_dir.as_path();
     let password = crate::ensure_postgres_password(ops)
         .await
         .map_err(|e| format!("could not obtain the PostgreSQL password: {e}"))?;
     let url = postgres_database_url(config, &password);
     if postgres_ready(ops, config, data_dir).await {
-        log.push(format!(
-            "PostgreSQL already running on 127.0.0.1:{}",
-            config.postgres.port
-        ));
+        push_log(
+            ctx,
+            log,
+            format!(
+                "PostgreSQL already running on 127.0.0.1:{}",
+                config.postgres.port
+            ),
+        );
         return Ok(url);
     }
     // A postmaster the readiness probe cannot see yet: one left
@@ -2335,30 +2711,45 @@ pub async fn ensure_postgres_running(
     // lock file no live server owns.
     if let Some(pid) = read_postmaster_pid(ops, data_dir).await {
         if !ops.process_alive(pid) {
-            log.push(format!(
-                "removing stale postmaster.pid: recorded pid {pid} is not running"
-            ));
+            push_log(
+                ctx,
+                log,
+                format!("removing stale postmaster.pid: recorded pid {pid} is not running"),
+            );
             let _ = ops.remove_file(&postmaster_pid_path(data_dir)).await;
         } else if ops.process_image_is(pid, "postgres.exe") == Some(false) {
-            log.push(format!(
-                "removing stale postmaster.pid: recorded pid {pid} now belongs to a different program (pid reuse)"
-            ));
+            push_log(
+                ctx,
+                log,
+                format!(
+                    "removing stale postmaster.pid: recorded pid {pid} now belongs to a different program (pid reuse)"
+                ),
+            );
             let _ = ops.remove_file(&postmaster_pid_path(data_dir)).await;
         } else {
-            log.push(format!(
-                "PostgreSQL postmaster (pid {pid}) is running but not accepting connections yet — waiting for it instead of starting a second server"
-            ));
-            match wait_for_postgres_ready(ops, config, data_dir, POSTGRES_ADOPT_WAIT, true).await
-            {
+            push_log(
+                ctx,
+                log,
+                format!(
+                    "PostgreSQL postmaster (pid {pid}) is running but not accepting connections yet — waiting for it instead of starting a second server"
+                ),
+            );
+            match wait_for_postgres_ready(ctx, data_dir, POSTGRES_ADOPT_WAIT, true, log).await {
                 PostgresWait::Ready => {
-                    log.push(format!(
-                        "PostgreSQL is accepting connections on 127.0.0.1:{} (existing postmaster, pid {pid})",
-                        config.postgres.port
-                    ));
+                    push_log(
+                        ctx,
+                        log,
+                        format!(
+                            "PostgreSQL is accepting connections on 127.0.0.1:{} (existing postmaster, pid {pid})",
+                            config.postgres.port
+                        ),
+                    );
                     return Ok(url);
                 }
                 PostgresWait::PostmasterGone => {
-                    log.push(
+                    push_log(
+                        ctx,
+                        log,
                         "the existing postmaster exited while starting; starting PostgreSQL afresh"
                             .to_string(),
                     );
@@ -2386,16 +2777,24 @@ pub async fn ensure_postgres_running(
     // 600s and was stopped", undiagnosable from the outcome).
     // Every failure below now carries the tail.
     let start = postgres_start_command(data_dir, config.postgres.port);
-    let start_failure = match ops
-        .run_command_with_timeout(&start, POSTGRES_START_COMMAND_BUDGET)
-        .await
+    let start_failure = match run_command_logged(
+        ctx,
+        log,
+        &start,
+        Some(POSTGRES_START_COMMAND_BUDGET),
+    )
+    .await
     {
         Ok(out) if out.exit_code == 0 => {
-            log.push(format!(
-                "PostgreSQL started on 127.0.0.1:{} (log: {})",
-                config.postgres.port,
-                postgres_log_path(data_dir).display()
-            ));
+            push_log(
+                ctx,
+                log,
+                format!(
+                    "PostgreSQL started on 127.0.0.1:{} (log: {})",
+                    config.postgres.port,
+                    postgres_log_path(data_dir).display()
+                ),
+            );
             None
         }
         Ok(out) => Some(format!(
@@ -2413,8 +2812,7 @@ pub async fn ensure_postgres_running(
     // stop early when no postmaster exists anymore (a fast FATAL
     // must not burn the window).
     let wait = wait_for_postgres_ready(
-        ops,
-        config,
+        ctx,
         data_dir,
         if start_failure.is_none() {
             POSTGRES_CLEAN_START_WAIT
@@ -2422,12 +2820,15 @@ pub async fn ensure_postgres_running(
             POSTGRES_SETTLE_WAIT
         },
         start_failure.is_some(),
+        log,
     )
     .await;
     match wait {
         PostgresWait::Ready => {
             if start_failure.is_some() {
-                log.push(
+                push_log(
+                    ctx,
+                    log,
                     "PostgreSQL became ready after pg_ctl stopped waiting — startup completed in the background"
                         .to_string(),
                 );
@@ -2672,9 +3073,19 @@ impl WizardStep for InstallPostgres {
                 && matches!(ctx.ops.sha256_file(&zip).await, Ok(h) if checksums_match(&h, &pin.sha256));
             if !zip_ok {
                 let url = pin.url();
-                log.push(format!("downloading {url}"));
-                match ctx.ops.download(&url, &zip, &|_, _| {}).await {
-                    Ok(bytes) => log.push(format!("downloaded {bytes} bytes")),
+                push_log(ctx, &mut log, format!("downloading {url}"));
+                let progress = ProgressEmitter::new(ctx, pin.asset.clone());
+                let dl_started = std::time::Instant::now();
+                match ctx
+                    .ops
+                    .download(&url, &zip, &|d, t| progress.progress(d, t))
+                    .await
+                {
+                    Ok(bytes) => push_log(
+                        ctx,
+                        &mut log,
+                        format!("downloaded {bytes} bytes in {}", fmt_elapsed(dl_started)),
+                    ),
                     Err(e) => {
                         return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
                     }
@@ -2731,6 +3142,16 @@ impl WizardStep for InstallPostgres {
                     }
                 }
             }
+            push_log(
+                ctx,
+                &mut log,
+                format!(
+                    "extracting PostgreSQL binaries from {} to {}",
+                    zip.display(),
+                    postgres_root(&ctx.data_dir).display()
+                ),
+            );
+            let extract_started = std::time::Instant::now();
             if let Err(e) = ctx
                 .ops
                 .extract_zip_prefixes(
@@ -2743,10 +3164,15 @@ impl WizardStep for InstallPostgres {
             {
                 return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
             }
-            log.push(format!(
-                "extracted bin/lib/share/include to {}",
-                postgres_root(&ctx.data_dir).display()
-            ));
+            push_log(
+                ctx,
+                &mut log,
+                format!(
+                    "extracted bin/lib/share/include to {} in {}",
+                    postgres_root(&ctx.data_dir).display(),
+                    fmt_elapsed(extract_started)
+                ),
+            );
             if !self.binaries_present(ctx).await {
                 return Ok(StepOutcome::failed(
                     "extraction did not produce the pinned PostgreSQL binaries",
@@ -2795,12 +3221,14 @@ impl WizardStep for InstallPostgres {
             // std::fs removal: Drop cannot await the ops trait.
             let _pwfile_guard = PwFileGuard(pwfile.clone());
             let initdb = self.initdb_command(ctx);
-            let result = ctx.ops.run_command(&initdb).await;
+            let result = run_command_logged(ctx, &mut log, &initdb, None).await;
             // The password file is single-use: always remove it.
             let _ = ctx.ops.remove_file(&pwfile).await;
             match result {
                 Ok(out) if out.exit_code == 0 => {
-                    log.push(
+                    push_log(
+                        ctx,
+                        &mut log,
                         "database cluster initialized (superuser postgres, scram-sha-256, UTF8)"
                             .to_string(),
                     );
@@ -2824,19 +3252,21 @@ impl WizardStep for InstallPostgres {
         }
 
         // Start the server and create the gateway's database.
-        if let Err(e) =
-            ensure_postgres_running(ctx.ops.as_ref(), &ctx.config, &ctx.data_dir, &mut log).await
-        {
+        if let Err(e) = ensure_postgres_running(ctx, &mut log).await {
             return Ok(StepOutcome::failed(e, log));
         }
         let mut createdb = self.createdb_command(ctx);
         createdb.env.insert("PGPASSWORD".to_string(), password);
-        match ctx.ops.run_command(&createdb).await {
+        match run_command_logged(ctx, &mut log, &createdb, None).await {
             Ok(out) if out.exit_code == 0 => {
-                log.push(format!("database {POSTGRES_DATABASE} created"));
+                push_log(ctx, &mut log, format!("database {POSTGRES_DATABASE} created"));
             }
             Ok(out) if out.stderr.contains("already exists") => {
-                log.push(format!("database {POSTGRES_DATABASE} already exists"));
+                push_log(
+                    ctx,
+                    &mut log,
+                    format!("database {POSTGRES_DATABASE} already exists"),
+                );
             }
             Ok(out) => {
                 return Ok(StepOutcome::failed(
@@ -2893,6 +3323,14 @@ pub fn gateway_probe_host(config: &AppConfig) -> String {
 // ---------------------------------------------------------------------------
 // 6. Start LiteLLM gateway
 // ---------------------------------------------------------------------------
+
+/// Budget for the quick verification probes (interpreter version,
+/// package import, package version): each is a version print or an
+/// import, done in seconds when healthy. They previously ran at
+/// the ops layer's generic 600 s command budget, so a wedged probe
+/// held the step silently for ten minutes before any repair was
+/// even chosen.
+const PROBE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Step 6: bootstrap the managed Python env (uv), generate `config.yaml`
 /// from the app config, spawn LiteLLM on :4000, health-check.
@@ -3160,8 +3598,13 @@ impl StartGateway {
         };
         let dir = Self::uv_bin_dir(ctx);
         let archive = dir.join(Self::uv_archive_name());
+        // ensure_uv has no step log of its own — the download's
+        // progress goes to the live sink only.
+        ctx.emit_log(&format!("downloading {url} (uv bootstrap)"));
+        let progress = ProgressEmitter::new(ctx, "uv");
+        let dl_started = std::time::Instant::now();
         ctx.ops
-            .download(&url, &archive, &|_, _| {})
+            .download(&url, &archive, &|d, t| progress.progress(d, t))
             .await
             .map_err(|e| {
                 StepOutcome::failed(
@@ -3169,12 +3612,22 @@ impl StartGateway {
                     vec![format!("{e:?}")],
                 )
             })?;
+        ctx.emit_log(&format!(
+            "uv bootstrap downloaded in {}",
+            fmt_elapsed(dl_started)
+        ));
+        ctx.emit_log(&format!("extracting the uv bootstrap archive to {}", dir.display()));
+        let extract_started = std::time::Instant::now();
         ctx.ops.extract_zip(&archive, &dir).await.map_err(|e| {
             StepOutcome::failed(
                 format!("uv bootstrap extraction failed: {e}"),
                 vec![format!("{e:?}")],
             )
         })?;
+        ctx.emit_log(&format!(
+            "uv bootstrap extracted in {}",
+            fmt_elapsed(extract_started)
+        ));
         Ok(bundled)
     }
 
@@ -3245,35 +3698,56 @@ impl StartGateway {
         ])
     }
 
-    /// The existing venv interpreter's "major.minor" version, or None
-    /// when there is no venv interpreter or it cannot report one.
-    async fn venv_python_version(&self, ctx: &WizardContext) -> Option<String> {
+    /// The interpreter probe WITH its evidence: on failure the
+    /// second element says why (no interpreter, spawn error, exit
+    /// code + output tail, or output with no version in it), so
+    /// the caller can record the actual defect in the step log
+    /// before choosing a repair. Probes used to answer a bare
+    /// bool/None, which made a corrupted venv indistinguishable
+    /// from a missing one — and the repair for "missing" is the
+    /// full rebuild. Bounded by [`PROBE_COMMAND_TIMEOUT`].
+    async fn venv_python_version_probe(
+        &self,
+        ctx: &WizardContext,
+    ) -> (Option<String>, Option<String>) {
         let python = self.venv_python(ctx);
         if !ctx.ops.file_exists(&python).await {
-            return None;
+            return (None, Some("the venv interpreter does not exist".into()));
         }
-        let out = ctx
+        match ctx
             .ops
-            .run_command(&self.version_probe_command(ctx))
+            .run_command_with_timeout(&self.version_probe_command(ctx), PROBE_COMMAND_TIMEOUT)
             .await
-            .ok()?;
-        if !out.success() {
-            return None;
-        }
-        let v = out.stdout.trim().to_string();
-        if v.is_empty() {
-            None
-        } else {
-            Some(v)
+        {
+            Ok(out) if out.success() => match parse_two_part_version(&out.stdout) {
+                Some(v) => (Some(v), None),
+                None => (
+                    None,
+                    Some(format!(
+                        "no version in the interpreter's output: {}",
+                        output_tail_lines(out.stdout.trim(), 2).join(" | ")
+                    )),
+                ),
+            },
+            Ok(out) => (None, Some(probe_failure_detail(&out))),
+            Err(e) => (None, Some(format!("the interpreter could not run: {e}"))),
         }
     }
 
-    /// Whether litellm already imports in the venv.
-    async fn litellm_importable(&self, ctx: &WizardContext) -> bool {
-        matches!(
-            ctx.ops.run_command(&self.litellm_probe_command(ctx)).await,
-            Ok(out) if out.success()
-        )
+    /// The import probe WITH its evidence (see
+    /// [`Self::venv_python_version_probe`]): on failure the second
+    /// element carries the import error itself — the line that
+    /// distinguishes a missing package from a corrupted one.
+    async fn litellm_import_probe(&self, ctx: &WizardContext) -> (bool, Option<String>) {
+        match ctx
+            .ops
+            .run_command_with_timeout(&self.litellm_probe_command(ctx), PROBE_COMMAND_TIMEOUT)
+            .await
+        {
+            Ok(out) if out.success() => (true, None),
+            Ok(out) => (false, Some(probe_failure_detail(&out))),
+            Err(e) => (false, Some(format!("the interpreter could not run: {e}"))),
+        }
     }
 
     fn pip_command(&self, ctx: &WizardContext, uv: &std::path::Path) -> PlannedCommand {
@@ -4024,13 +4498,8 @@ impl StartGateway {
         log: &mut Vec<String>,
     ) -> Result<(), StepOutcome> {
         let generate = self.prisma_generate_command(ctx, database_url, schema);
-        log.push(format!("running: {}", generate.argv.join(" ")));
         const GENERATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
-        match ctx
-            .ops
-            .run_command_with_timeout(&generate, GENERATE_TIMEOUT)
-            .await
-        {
+        match run_command_logged(ctx, log, &generate, Some(GENERATE_TIMEOUT)).await {
             Ok(out) if out.success() => {
                 if !out.stdout.trim().is_empty() {
                     log.push(out.stdout.trim().to_string());
@@ -4069,23 +4538,34 @@ impl StartGateway {
         ])
     }
 
-    /// The venv's installed prisma-client-py version ("0.11.0"), or
-    /// None when it cannot be determined (package missing, import
-    /// broken) — callers treat None as a mismatch with the pin.
-    async fn installed_prisma_version(&self, ctx: &WizardContext) -> Option<String> {
-        let out = ctx
+    /// The prisma version probe WITH its evidence (see
+    /// [`Self::venv_python_version_probe`]): on failure the second
+    /// element says why, so a repair decision can be logged with
+    /// its cause. The parse tolerates noise around the version
+    /// line ([`parse_semver_version`]) — output pollution used to
+    /// read as "version unknown" and trigger the full pin repair
+    /// (package removal + reinstall + regenerate) on every start.
+    async fn installed_prisma_version_probe(
+        &self,
+        ctx: &WizardContext,
+    ) -> (Option<String>, Option<String>) {
+        match ctx
             .ops
-            .run_command(&self.prisma_version_command(ctx))
+            .run_command_with_timeout(&self.prisma_version_command(ctx), PROBE_COMMAND_TIMEOUT)
             .await
-            .ok()?;
-        if !out.success() {
-            return None;
-        }
-        let v = out.stdout.trim().to_string();
-        if v.is_empty() {
-            None
-        } else {
-            Some(v)
+        {
+            Ok(out) if out.success() => match parse_semver_version(&out.stdout) {
+                Some(v) => (Some(v), None),
+                None => (
+                    None,
+                    Some(format!(
+                        "no version in the probe output: {}",
+                        output_tail_lines(out.stdout.trim(), 2).join(" | ")
+                    )),
+                ),
+            },
+            Ok(out) => (None, Some(probe_failure_detail(&out))),
+            Err(e) => (None, Some(format!("the probe could not run: {e}"))),
         }
     }
 
@@ -4108,19 +4588,13 @@ impl StartGateway {
     /// [`crate::LITELLM_MCP_FLOOR_VERSION`] is enforced from
     /// Phase 2, when gateway-registered stdio servers exist.
     async fn installed_litellm_version(&self, ctx: &WizardContext) -> Option<String> {
-        let out = ctx
+        match ctx
             .ops
-            .run_command(&self.litellm_version_command(ctx))
+            .run_command_with_timeout(&self.litellm_version_command(ctx), PROBE_COMMAND_TIMEOUT)
             .await
-            .ok()?;
-        if !out.success() {
-            return None;
-        }
-        let v = out.stdout.trim().to_string();
-        if v.is_empty() {
-            None
-        } else {
-            Some(v)
+        {
+            Ok(out) if out.success() => parse_semver_version(&out.stdout),
+            _ => None,
         }
     }
 
@@ -4182,15 +4656,23 @@ impl StartGateway {
         uv: &Path,
         log: &mut Vec<String>,
     ) -> Result<(), StepOutcome> {
-        let installed = self.installed_prisma_version(ctx).await;
+        let (installed, probe_detail) = self.installed_prisma_version_probe(ctx).await;
         if installed.as_deref() == Some(crate::PRISMA_PINNED_VERSION) {
             return Ok(());
         }
-        log.push(format!(
-            "installed prisma-client-py ({}) does not match the pinned {} — clearing the stale generated client and reinstalling the pinned package",
-            installed.as_deref().unwrap_or("unknown"),
-            crate::PRISMA_PINNED_VERSION
-        ));
+        push_log(
+            ctx,
+            log,
+            format!(
+                "installed prisma-client-py ({}) does not match the pinned {} — clearing the stale generated client and reinstalling the pinned package",
+                match (&installed, &probe_detail) {
+                    (Some(v), _) => v.clone(),
+                    (None, Some(detail)) => format!("unknown — probe failed: {detail}"),
+                    (None, None) => "unknown".to_string(),
+                },
+                crate::PRISMA_PINNED_VERSION
+            ),
+        );
         let dir = self.prisma_package_dir(ctx);
         if ctx.ops.file_exists(&dir).await {
             ctx.ops.remove_dir_all(&dir).await.map_err(|e| {
@@ -4204,18 +4686,14 @@ impl StartGateway {
             })?;
         }
         let cmd = self.prisma_pin_command(ctx, uv);
-        log.push(format!("running: {}", cmd.argv.join(" ")));
         const PIN_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
-        match ctx
-            .ops
-            .run_command_with_timeout(&cmd, PIN_INSTALL_TIMEOUT)
-            .await
-        {
+        match run_command_logged(ctx, log, &cmd, Some(PIN_INSTALL_TIMEOUT)).await {
             Ok(out) if out.success() => {
-                log.push(format!(
-                    "prisma-client-py {} installed",
-                    crate::PRISMA_PINNED_VERSION
-                ));
+                push_log(
+                    ctx,
+                    log,
+                    format!("prisma-client-py {} installed", crate::PRISMA_PINNED_VERSION),
+                );
                 Ok(())
             }
             Ok(out) => {
@@ -4340,12 +4818,15 @@ impl StartGateway {
             );
         }
         // --- Verification (no mutation) ---
-        let installed = self.installed_prisma_version(ctx).await;
+        let (installed, version_probe_detail) =
+            self.installed_prisma_version_probe(ctx).await;
         let version_ok = installed.as_deref() == Some(crate::PRISMA_PINNED_VERSION);
         let client_present = ctx.ops.file_exists(&self.generated_client_path(ctx)).await;
         if version_ok && client_present {
             if self.prisma_probe_failure(ctx, database_url).await.is_none() {
-                log.push(
+                push_log(
+                    ctx,
+                    log,
                     "Prisma install verified (pinned version, generated client present, connect probe passed) — no changes made"
                         .to_string(),
                 );
@@ -4357,16 +4838,26 @@ impl StartGateway {
                     .await;
                 return Ok(());
             }
-            log.push(
+            push_log(
+                ctx,
+                log,
                 "Prisma verification failed at the connect probe — repairing the install"
                     .to_string(),
             );
         } else {
-            log.push(format!(
-                "Prisma verification failed (installed version: {}, generated client: {}) — repairing the install",
-                installed.as_deref().unwrap_or("unknown"),
-                if client_present { "present" } else { "missing" }
-            ));
+            push_log(
+                ctx,
+                log,
+                format!(
+                    "Prisma verification failed (installed version: {}, generated client: {}) — repairing the install",
+                    match (&installed, &version_probe_detail) {
+                        (Some(v), _) => v.clone(),
+                        (None, Some(detail)) => format!("unknown — probe failed: {detail}"),
+                        (None, None) => "unknown".to_string(),
+                    },
+                    if client_present { "present" } else { "missing" }
+                ),
+            );
         }
         // --- Repair (durable state first, then mutations) ---
         self.write_prisma_repair_state(ctx, "pin", log).await;
@@ -4491,29 +4982,71 @@ impl StartGateway {
     async fn wait_healthy(&self, ctx: &WizardContext, pid: u32, log: &mut Vec<String>) -> bool {
         let url = self.gateway_url(ctx);
         let headers = self.gateway_auth_headers(ctx).await;
+        let wait_started = std::time::Instant::now();
+        push_log(
+            ctx,
+            log,
+            format!(
+                "waiting for the gateway to answer on :{} (up to {} probes)",
+                ctx.config.gateway.port, self.health_retries
+            ),
+        );
         for attempt in 1..=self.health_retries {
             // Fail fast when the child is gone: probing a dead process
             // for the full budget reports a timeout and hides the real
             // failure, which the captured log tail then has to explain.
             if !ctx.ops.process_alive(pid) {
-                log.push(format!(
-                    "gateway process (pid {pid}) exited during startup (probe attempt {attempt})"
-                ));
+                push_log(
+                    ctx,
+                    log,
+                    format!(
+                        "gateway process (pid {pid}) exited during startup (probe attempt {attempt})"
+                    ),
+                );
                 return false;
             }
+            // Probe outcomes are recorded on the first attempt,
+            // every tenth, and on success: a full 120-attempt wait
+            // otherwise floods the step log with near-identical
+            // lines while showing nothing new.
+            let log_attempt = attempt == 1 || attempt % 10 == 0;
             match ctx.ops.http_get_with_headers(&url, &headers).await {
                 Ok(resp) if resp.status == 200 => {
-                    log.push(format!(
-                        "gateway healthy on :{} (attempt {attempt})",
-                        ctx.config.gateway.port
-                    ));
+                    push_log(
+                        ctx,
+                        log,
+                        format!(
+                            "gateway healthy on :{} (attempt {attempt})",
+                            ctx.config.gateway.port
+                        ),
+                    );
                     return true;
                 }
-                Ok(resp) => log.push(format!(
-                    "health probe attempt {attempt}: HTTP {}",
-                    resp.status
-                )),
-                Err(e) => log.push(format!("health probe attempt {attempt}: {e}")),
+                Ok(resp) => {
+                    if log_attempt {
+                        push_log(
+                            ctx,
+                            log,
+                            format!(
+                                "health probe attempt {attempt}: HTTP {} ({:.0}s elapsed)",
+                                resp.status,
+                                wait_started.elapsed().as_secs_f64()
+                            ),
+                        );
+                    }
+                }
+                Err(e) => {
+                    if log_attempt {
+                        push_log(
+                            ctx,
+                            log,
+                            format!(
+                                "health probe attempt {attempt}: {e} ({:.0}s elapsed)",
+                                wait_started.elapsed().as_secs_f64()
+                            ),
+                        );
+                    }
+                }
             }
             if attempt < self.health_retries {
                 tokio::time::sleep(std::time::Duration::from_millis(self.health_interval_ms)).await;
@@ -4544,6 +5077,14 @@ impl StartGateway {
         if self.db_sustain_ms == 0 {
             return true;
         }
+        push_log(
+            ctx,
+            log,
+            format!(
+                "confirming the gateway stays healthy for {} s (database path)",
+                self.db_sustain_ms / 1000
+            ),
+        );
         let url = self.gateway_url(ctx);
         let headers = self.gateway_auth_headers(ctx).await;
         let window = std::time::Duration::from_millis(self.db_sustain_ms);
@@ -4744,7 +5285,7 @@ impl WizardStep for StartGateway {
                 let manual = self.manual_start_block(ctx).await;
                 let uv = match self.ensure_uv(ctx).await {
                     Ok(p) => {
-                        log.push(format!("using uv at {}", p.display()));
+                        push_log(ctx, &mut log, format!("using uv at {}", p.display()));
                         p
                     }
                     Err(outcome) => return Ok(outcome.with_manual_command(manual)),
@@ -4762,32 +5303,71 @@ impl WizardStep for StartGateway {
                 // install or built with an unpinned (too new)
                 // Python, which previously made every retry fail
                 // with "already exists" before the real error.
-                let existing_version = self.venv_python_version(ctx).await;
+                // The probes carry their failure evidence into the
+                // log (see venv_python_version_probe): which repair
+                // runs — and why — is always stated before it runs.
+                let (existing_version, version_probe_detail) =
+                    self.venv_python_version_probe(ctx).await;
                 let venv_current =
                     existing_version.as_deref() == Some(crate::GATEWAY_PYTHON_VERSION);
-                let litellm_ok = venv_current && self.litellm_importable(ctx).await;
+                let (litellm_ok, import_probe_detail) = if venv_current {
+                    self.litellm_import_probe(ctx).await
+                } else {
+                    (false, None)
+                };
                 let setup_cmds: Vec<PlannedCommand> = if litellm_ok {
-                    log.push(format!(
-                        "reusing existing venv (Python {}) — litellm already installed",
-                        crate::GATEWAY_PYTHON_VERSION
-                    ));
+                    push_log(
+                        ctx,
+                        &mut log,
+                        format!(
+                            "existing install verified — skipping install (venv on Python {}; litellm, prisma and prometheus_client import cleanly)",
+                            crate::GATEWAY_PYTHON_VERSION
+                        ),
+                    );
                     Vec::new()
                 } else if venv_current {
-                    log.push(format!(
-                        "venv is on Python {} but litellm is not importable — installing packages only (the venv itself is kept)",
-                        crate::GATEWAY_PYTHON_VERSION
-                    ));
+                    push_log(
+                        ctx,
+                        &mut log,
+                        format!(
+                            "venv is on Python {} but the litellm import probe failed ({}) — installing packages only (the venv itself is kept)",
+                            crate::GATEWAY_PYTHON_VERSION,
+                            import_probe_detail.as_deref().unwrap_or("no detail")
+                        ),
+                    );
                     vec![self.pip_command(ctx, &uv)]
                 } else {
                     match &existing_version {
-                        Some(v) => log.push(format!(
-                            "existing venv uses Python {v}; recreating it with Python {}",
-                            crate::GATEWAY_PYTHON_VERSION
-                        )),
-                        None => log.push(format!(
-                            "creating venv with Python {}",
-                            crate::GATEWAY_PYTHON_VERSION
-                        )),
+                        Some(v) => push_log(
+                            ctx,
+                            &mut log,
+                            format!(
+                                "existing venv uses Python {v}; recreating it with Python {}",
+                                crate::GATEWAY_PYTHON_VERSION
+                            ),
+                        ),
+                        None => {
+                            if ctx.ops.file_exists(&self.venv_python(ctx)).await {
+                                push_log(
+                                    ctx,
+                                    &mut log,
+                                    format!(
+                                        "the venv interpreter probe failed ({}) — recreating the venv with Python {}",
+                                        version_probe_detail.as_deref().unwrap_or("no detail"),
+                                        crate::GATEWAY_PYTHON_VERSION
+                                    ),
+                                );
+                            } else {
+                                push_log(
+                                    ctx,
+                                    &mut log,
+                                    format!(
+                                        "creating venv with Python {}",
+                                        crate::GATEWAY_PYTHON_VERSION
+                                    ),
+                                );
+                            }
+                        }
                     }
                     vec![self.venv_command(ctx, &uv), self.pip_command(ctx, &uv)]
                 };
@@ -4798,10 +5378,7 @@ impl WizardStep for StartGateway {
                 const SETUP_COMMAND_TIMEOUT: std::time::Duration =
                     std::time::Duration::from_secs(900);
                 for cmd in &setup_cmds {
-                    log.push(format!("running: {}", cmd.argv.join(" ")));
-                    match ctx
-                        .ops
-                        .run_command_with_timeout(cmd, SETUP_COMMAND_TIMEOUT)
+                    match run_command_logged(ctx, &mut log, cmd, Some(SETUP_COMMAND_TIMEOUT))
                         .await
                     {
                         Ok(out) if out.success() => {
@@ -4816,13 +5393,15 @@ impl WizardStep for StartGateway {
                                     out.exit_code,
                                     cmd.argv.join(" ")
                                 ),
-                                vec![out.stderr],
+                                log,
                             )
                             .with_manual_command(manual))
                         }
                         Err(e) => {
-                            return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")])
-                                .with_manual_command(manual))
+                            return Ok(
+                                StepOutcome::failed(format!("{e}"), log)
+                                    .with_manual_command(manual),
+                            )
                         }
                     }
                 }
@@ -4832,8 +5411,10 @@ impl WizardStep for StartGateway {
                 // check in the arming pass that follows.
                 let litellm_version = self.installed_litellm_version(ctx).await;
                 match &litellm_version {
-                    Some(v) => log.push(format!("detected LiteLLM version: {v}")),
-                    None => log.push(
+                    Some(v) => push_log(ctx, &mut log, format!("detected LiteLLM version: {v}")),
+                    None => push_log(
+                        ctx,
+                        &mut log,
                         "LiteLLM version could not be determined (the version probe returned nothing usable)"
                             .to_string(),
                     ),
@@ -4995,14 +5576,7 @@ impl WizardStep for StartGateway {
                 // migrates against it at startup. Not installed →
                 // no DATABASE_URL, the pre-PostgreSQL behavior.
                 let database_url = if postgres_installed(ctx.ops.as_ref(), &ctx.data_dir).await {
-                    match ensure_postgres_running(
-                        ctx.ops.as_ref(),
-                        &ctx.config,
-                        &ctx.data_dir,
-                        &mut log,
-                    )
-                    .await
-                    {
+                    match ensure_postgres_running(ctx, &mut log).await {
                         Ok(url) => {
                             // Verify (and only if needed, repair)
                             // the Prisma install before the spawn:
@@ -5064,11 +5638,23 @@ impl WizardStep for StartGateway {
                 // startup failure is undiagnosable from inside the app.
                 spawn.stdout_log = Some(self.gateway_stdout_log(ctx));
                 spawn.stderr_log = Some(self.gateway_stderr_log(ctx));
-                log.push(format!(
-                    "gateway output is captured to {} and {}",
-                    self.gateway_stdout_log(ctx).display(),
-                    self.gateway_stderr_log(ctx).display()
-                ));
+                push_log(
+                    ctx,
+                    &mut log,
+                    format!(
+                        "gateway output is captured to {} and {}",
+                        self.gateway_stdout_log(ctx).display(),
+                        self.gateway_stderr_log(ctx).display()
+                    ),
+                );
+                push_log(
+                    ctx,
+                    &mut log,
+                    format!(
+                        "spawning the gateway process ({})",
+                        spawn.argv.first().cloned().unwrap_or_default()
+                    ),
+                );
                 let pid = if ctx.config.supervision.mode == SupervisionMode::Service {
                     // Service mode: regenerate the gateway's service
                     // definition from this spawn (secret values become
@@ -5097,7 +5683,7 @@ impl WizardStep for StartGateway {
                         }
                     }
                 };
-                log.push(format!("LiteLLM spawned (pid {pid})"));
+                push_log(ctx, &mut log, format!("LiteLLM spawned (pid {pid})"));
                 // Record the pid so a later stop (the gateway_stop
                 // command) or restart (this step re-run) terminates
                 // exactly this process instead of guessing by port.
@@ -5107,7 +5693,11 @@ impl WizardStep for StartGateway {
                     .write_file(&pid_path, pid.to_string().as_bytes())
                     .await
                 {
-                    Ok(()) => log.push(format!("recorded gateway pid in {}", pid_path.display())),
+                    Ok(()) => push_log(
+                        ctx,
+                        &mut log,
+                        format!("recorded gateway pid in {}", pid_path.display()),
+                    ),
                     Err(e) => log.push(format!(
                         "warning: could not record the gateway pid in {}: {e}; \
                          stopping this gateway later will not be possible",
@@ -5221,6 +5811,62 @@ impl WizardStep for StartGateway {
                         mcp_load_failed.join(", ")
                     );
                 }
+                // Final re-check, immediately before reporting
+                // done: between the health confirmation above and
+                // here, the step runs the MCP load check and the
+                // firewall reconcile — the reconcile can wait on a
+                // UAC prompt for minutes — and a gateway that died
+                // in that window was still reported as a successful
+                // start (field report 2026-10-19: the step said
+                // "done" while the Gateway page showed the gateway
+                // down). One last probe at the health check's own
+                // standard: in process mode the spawned pid must
+                // still be alive (a service host may legitimately
+                // restart its child, so service mode relies on the
+                // probe alone) and the authenticated models
+                // endpoint must answer 200. A failure here fails
+                // the step with the gateway's output attached, like
+                // any other health failure.
+                let final_check_failure =
+                    if ctx.config.supervision.mode != SupervisionMode::Service
+                        && !ctx.ops.process_alive(pid)
+                    {
+                        Some(format!(
+                            "the gateway process (pid {pid}) exited after its health checks passed"
+                        ))
+                    } else {
+                        let headers = self.gateway_auth_headers(ctx).await;
+                        match ctx
+                            .ops
+                            .http_get_with_headers(&self.gateway_url(ctx), &headers)
+                            .await
+                        {
+                            Ok(resp) if resp.status == 200 => None,
+                            Ok(resp) => Some(format!(
+                                "the gateway answered HTTP {} on the final health re-check after passing its health checks",
+                                resp.status
+                            )),
+                            Err(e) => Some(format!(
+                                "the gateway is unreachable on the final health re-check ({e}) after passing its health checks"
+                            )),
+                        }
+                    };
+                if let Some(reason) = final_check_failure {
+                    self.append_gateway_log_tail(ctx, &mut log).await;
+                    return Ok(StepOutcome::failed(
+                        format!(
+                            "gateway started but did not stay up: {reason} — the gateway's output is in the step log and in {}",
+                            ctx.data_dir.join("logs").display()
+                        ),
+                        log,
+                    )
+                    .with_manual_command(manual));
+                }
+                push_log(
+                    ctx,
+                    &mut log,
+                    "final health re-check passed — the gateway is still serving".to_string(),
+                );
                 Ok(StepOutcome::done(message, log))
             }
             RunMode::Audit => {
@@ -6244,9 +6890,19 @@ impl WizardStep for InstallMxc {
                 && matches!(ctx.ops.sha256_file(&tarball).await, Ok(h) if checksums_match(&h, &pin.tarball_sha256));
             if !tarball_ok {
                 let url = pin.tarball_url();
-                log.push(format!("downloading {url}"));
-                match ctx.ops.download(&url, &tarball, &|_, _| {}).await {
-                    Ok(bytes) => log.push(format!("downloaded {bytes} bytes")),
+                push_log(ctx, &mut log, format!("downloading {url}"));
+                let progress = ProgressEmitter::new(ctx, pin.tarball_asset.clone());
+                let dl_started = std::time::Instant::now();
+                match ctx
+                    .ops
+                    .download(&url, &tarball, &|d, t| progress.progress(d, t))
+                    .await
+                {
+                    Ok(bytes) => push_log(
+                        ctx,
+                        &mut log,
+                        format!("downloaded {bytes} bytes in {}", fmt_elapsed(dl_started)),
+                    ),
                     Err(e) => {
                         return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]))
                     }
@@ -6275,6 +6931,16 @@ impl WizardStep for InstallMxc {
                     pin.tarball_asset
                 ));
             }
+            push_log(
+                ctx,
+                &mut log,
+                format!(
+                    "extracting {} to {}",
+                    pin.tarball_asset,
+                    mxc_bin_dir(ctx).display()
+                ),
+            );
+            let extract_started = std::time::Instant::now();
             if let Err(e) = ctx
                 .ops
                 .extract_tar_gz(&tarball, &root, "package/bin/x64/", "package/")
@@ -6282,10 +6948,15 @@ impl WizardStep for InstallMxc {
             {
                 return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")]));
             }
-            log.push(format!(
-                "extracted package/bin/x64 to {}",
-                mxc_bin_dir(ctx).display()
-            ));
+            push_log(
+                ctx,
+                &mut log,
+                format!(
+                    "extracted package/bin/x64 to {} in {}",
+                    mxc_bin_dir(ctx).display(),
+                    fmt_elapsed(extract_started)
+                ),
+            );
             if !self.binaries_verified(ctx, &pin).await {
                 return Ok(StepOutcome::failed(
                     "extraction did not produce the pinned wxc executables",
@@ -6650,10 +7321,29 @@ impl SmokeTest {
         for (id, port) in targets {
             let url = format!("http://127.0.0.1:{port}/health");
             let start = std::time::Instant::now();
+            // A model load can take most of the budget; the wait
+            // announces itself and reports in about every 30 s on
+            // the live sink instead of sitting silent.
+            push_log(
+                ctx,
+                log,
+                format!(
+                    "waiting for backend '{id}' on :{port} to become healthy (model load; up to {} s)",
+                    self.ready_budget_ms / 1000
+                ),
+            );
+            let mut last_tick_s = 0u64;
             loop {
                 if let Ok(resp) = ctx.ops.http_get(&url).await {
                     if resp.status == 200 {
-                        log.push(format!("backend '{id}' healthy on :{port}"));
+                        push_log(
+                            ctx,
+                            log,
+                            format!(
+                                "backend '{id}' healthy on :{port} after {}",
+                                fmt_elapsed(start)
+                            ),
+                        );
                         break;
                     }
                 }
@@ -6664,6 +7354,13 @@ impl SmokeTest {
                             self.ready_budget_ms / 1000
                         ),
                         log.clone(),
+                    ));
+                }
+                let elapsed_s = start.elapsed().as_secs();
+                if elapsed_s >= last_tick_s + 30 {
+                    last_tick_s = elapsed_s;
+                    ctx.emit_log(&format!(
+                        "still waiting for backend '{id}' on :{port} — {elapsed_s}s elapsed"
                     ));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(self.ready_poll_ms.max(1)))
@@ -8129,6 +8826,294 @@ mod tests {
             "no venv/pip commands may run: {executed:?}"
         );
         assert_eq!(ops.spawns().len(), 1);
+    }
+
+    /// A recording live sink for the logging tests: every line a
+    /// step emits while running lands here.
+    fn recording_sink() -> (crate::StepLogSink, Arc<std::sync::Mutex<Vec<String>>>) {
+        let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = lines.clone();
+        (
+            Arc::new(move |line: String| captured.lock().unwrap().push(line)),
+            lines,
+        )
+    }
+
+    #[tokio::test]
+    async fn start_gateway_fast_path_logs_existing_install_verified() {
+        // The healthy-start contract (field report 2026-10-19):
+        // the step log states the verification and the skip, with
+        // the probe evidence — and the same lines reach the live
+        // sink WHILE the step runs (the wizard log is written from
+        // the sink, so this is what the operator watches).
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+            db_sustain_ms: 0,
+        };
+        let (sink, emitted) = recording_sink();
+        let ctx = ctx_with(ops.clone(), RunMode::Install).with_log_sink(sink);
+        ops.with_file(step.venv_python(&ctx), Vec::new());
+        let probe = step.version_probe_command(&ctx);
+        let probe_argv: Vec<&str> = probe.argv.iter().map(String::as_str).collect();
+        ops.with_command(
+            &probe_argv,
+            crate::CommandOutput {
+                exit_code: 0,
+                stdout: format!("{}\n", crate::GATEWAY_PYTHON_VERSION),
+                stderr: String::new(),
+            },
+        );
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("existing install verified — skipping install")),
+            "{:?}",
+            out.log_tail
+        );
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|l| l.contains("existing install verified — skipping install")),
+            "live sink received the verification line: {emitted:?}"
+        );
+        assert!(
+            emitted
+                .iter()
+                .any(|l| l.contains("waiting for the gateway to answer")),
+            "live sink received the health-wait line: {emitted:?}"
+        );
+        assert!(
+            emitted
+                .iter()
+                .any(|l| l.contains("final health re-check passed")),
+            "live sink received the final re-check line: {emitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_gateway_import_probe_failure_logs_error_and_repairs_packages_only() {
+        // The reinstall-on-every-start defect: a probe failure used
+        // to be a bare bool, so the log never said WHAT failed and
+        // the repair looked identical to a full reinstall. The
+        // import error itself must be logged BEFORE the repair,
+        // and a package-level failure must not recreate the venv.
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+            db_sustain_ms: 0,
+        };
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        ops.with_file(step.venv_python(&ctx), Vec::new());
+        let version_probe = step.version_probe_command(&ctx);
+        let version_argv: Vec<&str> = version_probe.argv.iter().map(String::as_str).collect();
+        ops.with_command(
+            &version_argv,
+            crate::CommandOutput {
+                exit_code: 0,
+                stdout: format!("{}\n", crate::GATEWAY_PYTHON_VERSION),
+                stderr: String::new(),
+            },
+        );
+        let import_probe = step.litellm_probe_command(&ctx);
+        let import_argv: Vec<&str> = import_probe.argv.iter().map(String::as_str).collect();
+        ops.with_command(
+            &import_argv,
+            crate::CommandOutput {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "ModuleNotFoundError: No module named 'litellm'".to_string(),
+            },
+        );
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let repair_line = out
+            .log_tail
+            .iter()
+            .position(|l| l.contains("litellm import probe failed"))
+            .expect("the probe failure is logged");
+        assert!(
+            out.log_tail[repair_line].contains("ModuleNotFoundError"),
+            "{}",
+            out.log_tail[repair_line]
+        );
+        assert!(
+            out.log_tail[repair_line].contains("installing packages only"),
+            "{}",
+            out.log_tail[repair_line]
+        );
+        // The repair line precedes the pip run's own log line.
+        let pip_line = out
+            .log_tail
+            .iter()
+            .position(|l| l.starts_with("running:") && l.contains("pip"))
+            .expect("the pip repair is logged");
+        assert!(repair_line < pip_line, "{:?}", out.log_tail);
+        let executed = ops.executed_commands();
+        assert!(
+            executed.iter().any(|a| a.iter().any(|x| x == "install")),
+            "pip install ran: {executed:?}"
+        );
+        assert!(
+            executed.iter().all(|a| !a.iter().any(|x| x == "venv")),
+            "the venv itself is kept: {executed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_gateway_tolerates_noisy_version_probe_output() {
+        // Output pollution around the version line (an interpreter
+        // warning, a sitecustomize banner) used to fail the
+        // whole-stdout equality parse and force a full venv
+        // rebuild on every start. Noise is not a different
+        // version.
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+            db_sustain_ms: 0,
+        };
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        ops.with_file(step.venv_python(&ctx), Vec::new());
+        let probe = step.version_probe_command(&ctx);
+        let probe_argv: Vec<&str> = probe.argv.iter().map(String::as_str).collect();
+        ops.with_command(
+            &probe_argv,
+            crate::CommandOutput {
+                exit_code: 0,
+                stdout: format!(
+                    "Warning: interpreter plugin failed to load\n{}\n",
+                    crate::GATEWAY_PYTHON_VERSION
+                ),
+                stderr: String::new(),
+            },
+        );
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("existing install verified — skipping install")),
+            "{:?}",
+            out.log_tail
+        );
+        let executed = ops.executed_commands();
+        assert!(
+            executed
+                .iter()
+                .all(|a| !a.iter().any(|x| x == "venv" || x == "install")),
+            "no venv/pip commands may run: {executed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_gateway_fails_when_gateway_dies_after_health_checks() {
+        // The false-"done" hole (field report 2026-10-19): health
+        // passed, then the gateway died during the post-health
+        // work (MCP check, firewall reconcile) — the step still
+        // reported done. The final re-check must catch it.
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get_sequence(
+            "http://127.0.0.1:4000/v1/models",
+            vec![
+                FakeSystemOps::http_ok(r#"{"data":[]}"#),
+                crate::HttpResponse {
+                    status: 500,
+                    body: Vec::new(),
+                    elapsed_ms: 0,
+                },
+            ],
+        );
+        ops.with_file(
+            PathBuf::from("/data/logs/gateway.stderr.log"),
+            b"litellm: fatal error after startup\n".to_vec(),
+        );
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+            db_sustain_ms: 0,
+        };
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(
+            out.message.contains("did not stay up"),
+            "{}",
+            out.message
+        );
+        assert!(
+            out.message.contains("HTTP 500"),
+            "{}",
+            out.message
+        );
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("fatal error after startup")),
+            "gateway output attached: {:?}",
+            out.log_tail
+        );
+    }
+
+    #[test]
+    fn version_parsers_tolerate_noise_and_reject_other_shapes() {
+        assert_eq!(parse_two_part_version("3.12\n").as_deref(), Some("3.12"));
+        assert_eq!(
+            parse_two_part_version("Warning: noisy plugin\n3.12\n").as_deref(),
+            Some("3.12")
+        );
+        assert_eq!(parse_two_part_version("3.12.1\n"), None);
+        assert_eq!(parse_two_part_version("Python 3.12\n"), None);
+        assert_eq!(parse_two_part_version(""), None);
+        assert_eq!(
+            parse_semver_version("1.105.1\n").as_deref(),
+            Some("1.105.1")
+        );
+        assert_eq!(
+            parse_semver_version("UserWarning: something\n0.11.0\n").as_deref(),
+            Some("0.11.0")
+        );
+        assert_eq!(parse_semver_version("1.2\n"), None);
+        assert_eq!(parse_semver_version("1.2.3.4\n"), None);
+        assert_eq!(parse_semver_version("no version here\n"), None);
+    }
+
+    #[test]
+    fn progress_emitter_throttles_ticks() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let (sink, emitted) = recording_sink();
+        let ctx = ctx_with(ops, RunMode::Install).with_log_sink(sink);
+        let emitter = ProgressEmitter::new(&ctx, "thing.zip");
+        emitter.progress(0, 100); // first call always emits
+        emitter.progress(5, 100); // <10-point step, <5 s: throttled
+        emitter.progress(15, 100); // >=10-point step: emits
+        emitter.progress(100, 100); // completion: emits
+        let emitted = emitted.lock().unwrap();
+        assert_eq!(emitted.len(), 3, "{emitted:?}");
+        assert!(emitted[0].contains("(0%)"), "{}", emitted[0]);
+        assert!(emitted[1].contains("(15%)"), "{}", emitted[1]);
+        assert!(emitted[2].contains("(100%)"), "{}", emitted[2]);
     }
 
     #[tokio::test]
@@ -11005,12 +11990,24 @@ mod tests {
         }
     }
 
+    /// Context for the free postgres functions in the tests
+    /// below: they take the context for its config, data dir, ops
+    /// and live sink.
+    fn pg_ctx(ops: &Arc<FakeSystemOps>, cfg: AppConfig, data_dir: &Path) -> WizardContext {
+        WizardContext::new(
+            cfg,
+            data_dir.to_path_buf(),
+            RunMode::Install,
+            ops.clone(),
+        )
+    }
+
     #[tokio::test]
     async fn postgres_start_adopts_live_postmaster_not_yet_ready() {
         // A postmaster from an earlier session is still starting
         // (pid file present, pid live and a postgres image, probe
         // not answering yet): it is awaited, never competed with.
-        let ops = FakeSystemOps::new();
+        let ops = Arc::new(FakeSystemOps::new());
         let data_dir = PathBuf::from("/data");
         ops.with_file(postmaster_pid_path(&data_dir), b"4242\n/data\n".to_vec());
         ops.with_process_image(4242, "postgres.exe");
@@ -11020,8 +12017,9 @@ mod tests {
             vec![pg_not_ready_output(), pg_ready_output()],
         );
         let cfg = test_config_with_models();
+        let ctx = pg_ctx(&ops, cfg, &data_dir);
         let mut log = Vec::new();
-        let url = ensure_postgres_running(&ops, &cfg, &data_dir, &mut log)
+        let url = ensure_postgres_running(&ctx, &mut log)
             .await
             .expect("adopts the running postmaster");
         assert!(url.contains("127.0.0.1:54329"), "{url}");
@@ -11040,7 +12038,7 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_start_removes_stale_pid_file_with_dead_pid() {
-        let ops = FakeSystemOps::new();
+        let ops = Arc::new(FakeSystemOps::new());
         let data_dir = PathBuf::from("/data");
         let pid_path = postmaster_pid_path(&data_dir);
         ops.with_file(pid_path.clone(), b"4242\n".to_vec());
@@ -11051,8 +12049,9 @@ mod tests {
             vec![pg_not_ready_output(), pg_ready_output()],
         );
         let cfg = test_config_with_models();
+        let ctx = pg_ctx(&ops, cfg, &data_dir);
         let mut log = Vec::new();
-        ensure_postgres_running(&ops, &cfg, &data_dir, &mut log)
+        ensure_postgres_running(&ctx, &mut log)
             .await
             .expect("starts after clearing the stale pid file");
         assert!(
@@ -11075,7 +12074,7 @@ mod tests {
         // The recorded pid is alive but belongs to an unrelated
         // program now (Windows pid reuse): the pid file is stale
         // even though the pid is not dead.
-        let ops = FakeSystemOps::new();
+        let ops = Arc::new(FakeSystemOps::new());
         let data_dir = PathBuf::from("/data");
         let pid_path = postmaster_pid_path(&data_dir);
         ops.with_file(pid_path.clone(), b"4242\n".to_vec());
@@ -11086,8 +12085,9 @@ mod tests {
             vec![pg_not_ready_output(), pg_ready_output()],
         );
         let cfg = test_config_with_models();
+        let ctx = pg_ctx(&ops, cfg, &data_dir);
         let mut log = Vec::new();
-        ensure_postgres_running(&ops, &cfg, &data_dir, &mut log)
+        ensure_postgres_running(&ctx, &mut log)
             .await
             .expect("starts after clearing the recycled pid file");
         assert!(
@@ -11105,7 +12105,7 @@ mod tests {
         // exit code). The failure must carry the server log tail —
         // the old code attached it only to non-zero exits, leaving
         // exactly this path undiagnosable.
-        let ops = FakeSystemOps::new();
+        let ops = Arc::new(FakeSystemOps::new());
         let data_dir = PathBuf::from("/data");
         let isready = pg_isready_argv(&data_dir);
         ops.with_command(&argv_refs(&isready), pg_not_ready_output());
@@ -11121,8 +12121,9 @@ mod tests {
                 .to_vec(),
         );
         let cfg = test_config_with_models();
+        let ctx = pg_ctx(&ops, cfg, &data_dir);
         let mut log = Vec::new();
-        let err = ensure_postgres_running(&ops, &cfg, &data_dir, &mut log)
+        let err = ensure_postgres_running(&ctx, &mut log)
             .await
             .expect_err("the start must fail");
         assert!(err.contains("timed out after 180s"), "{err}");
@@ -11136,7 +12137,7 @@ mod tests {
         // e.g. on the lock file): the settle poll sees no postmaster
         // and returns promptly; the failure carries pg_ctl's report
         // plus the server log tail.
-        let ops = FakeSystemOps::new();
+        let ops = Arc::new(FakeSystemOps::new());
         let data_dir = PathBuf::from("/data");
         let isready = pg_isready_argv(&data_dir);
         ops.with_command(&argv_refs(&isready), pg_not_ready_output());
@@ -11154,8 +12155,9 @@ mod tests {
             b"FATAL: lock file \"postmaster.pid\" already exists\n".to_vec(),
         );
         let cfg = test_config_with_models();
+        let ctx = pg_ctx(&ops, cfg, &data_dir);
         let mut log = Vec::new();
-        let err = ensure_postgres_running(&ops, &cfg, &data_dir, &mut log)
+        let err = ensure_postgres_running(&ctx, &mut log)
             .await
             .expect_err("the start must fail");
         assert!(err.contains("pg_ctl exit 1"), "{err}");
@@ -11168,35 +12170,124 @@ mod tests {
         let data_dir = PathBuf::from("/data");
         let cfg = test_config_with_models();
         let isready = pg_isready_argv(&data_dir);
-        let ops = FakeSystemOps::new();
+        let ops = Arc::new(FakeSystemOps::new());
         ops.with_command(&argv_refs(&isready), pg_not_ready_output());
+        let ctx = pg_ctx(&ops, cfg.clone(), &data_dir);
+        let mut log = Vec::new();
         // Gone: a postmaster is required but no pid file exists.
         assert_eq!(
-            wait_for_postgres_ready(&ops, &cfg, &data_dir, POSTGRES_SETTLE_WAIT, true).await,
+            wait_for_postgres_ready(&ctx, &data_dir, POSTGRES_SETTLE_WAIT, true, &mut log).await,
             PostgresWait::PostmasterGone
         );
         // TimedOut: no postmaster requirement, never ready, and a
         // zero window — returns without sleeping.
         assert_eq!(
             wait_for_postgres_ready(
-                &ops,
-                &cfg,
+                &ctx,
                 &data_dir,
                 std::time::Duration::ZERO,
-                false
+                false,
+                &mut log
             )
             .await,
             PostgresWait::TimedOut
         );
         // Ready: the probe answers on the second call.
-        let ops2 = FakeSystemOps::new();
+        let ops2 = Arc::new(FakeSystemOps::new());
         ops2.with_command_sequence(
             &argv_refs(&isready),
             vec![pg_not_ready_output(), pg_ready_output()],
         );
+        let ctx2 = pg_ctx(&ops2, cfg, &data_dir);
         assert_eq!(
-            wait_for_postgres_ready(&ops2, &cfg, &data_dir, POSTGRES_SETTLE_WAIT, false).await,
+            wait_for_postgres_ready(&ctx2, &data_dir, POSTGRES_SETTLE_WAIT, false, &mut log)
+                .await,
             PostgresWait::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_log_streamer_emits_only_appended_lines() {
+        // The readiness waits stream the postmaster's own log into
+        // the step log: lines already present when the wait starts
+        // are history (the failure tail covers them); lines
+        // appended during the wait are this start's news and must
+        // surface as they land.
+        let ops = Arc::new(FakeSystemOps::new());
+        let data_dir = PathBuf::from("/data");
+        let log_path = postgres_log_path(&data_dir);
+        ops.with_file(log_path.clone(), b"l1\nl2\nl3\n".to_vec());
+        let ctx = pg_ctx(&ops, test_config_with_models(), &data_dir);
+        let mut streamer = FileLineStreamer::new();
+        streamer.prime(ops.as_ref(), &log_path).await;
+        let mut log: Vec<String> = Vec::new();
+        streamer
+            .stream_new(&ctx, ops.as_ref(), &log_path, "postgres: ", &mut log)
+            .await;
+        assert!(log.is_empty(), "primed lines are not replayed: {log:?}");
+        // The postmaster appends two lines (a FATAL among them).
+        ops.with_file(
+            log_path.clone(),
+            b"l1\nl2\nl3\nl4\nFATAL: could not open lock file\n".to_vec(),
+        );
+        streamer
+            .stream_new(&ctx, ops.as_ref(), &log_path, "postgres: ", &mut log)
+            .await;
+        assert_eq!(
+            log,
+            vec![
+                "postgres: l4".to_string(),
+                "postgres: FATAL: could not open lock file".to_string()
+            ]
+        );
+        streamer
+            .stream_new(&ctx, ops.as_ref(), &log_path, "postgres: ", &mut log)
+            .await;
+        assert_eq!(log.len(), 2, "no line is emitted twice: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn postgres_wait_ticks_report_elapsed_on_the_live_sink() {
+        // With the tick set to every poll, a two-poll wait reports
+        // itself twice on the live sink — the production cadence
+        // (~10 s) is the same code with a larger tick.
+        let data_dir = PathBuf::from("/data");
+        let cfg = test_config_with_models();
+        let isready = pg_isready_argv(&data_dir);
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_command_sequence(
+            &argv_refs(&isready),
+            vec![
+                pg_not_ready_output(),
+                pg_not_ready_output(),
+                pg_ready_output(),
+            ],
+        );
+        let lines: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = lines.clone();
+        let ctx = pg_ctx(&ops, cfg, &data_dir).with_log_sink(Arc::new(move |line: String| {
+            captured.lock().unwrap().push(line)
+        }));
+        let mut log = Vec::new();
+        let outcome = wait_for_postgres_ready_ticked(
+            &ctx,
+            &data_dir,
+            POSTGRES_SETTLE_WAIT,
+            false,
+            &mut log,
+            1,
+        )
+        .await;
+        assert_eq!(outcome, PostgresWait::Ready);
+        let lines = lines.lock().unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("waiting for PostgreSQL on 127.0.0.1:54329"))
+                .count(),
+            2,
+            "{lines:?}"
         );
     }
 
