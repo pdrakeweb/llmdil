@@ -25,7 +25,7 @@ import {
   getActivationPlan, activationCancelChanges, activationComplete, quiesceWait,
   recordActivationExecution, getActivationHistory, getActivationExecution,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
-  setNotificationConfig, sendTestNotification,
+  setNotificationConfig, sendTestNotification, updateAppConfig, updatesPin, updatesSetAuto,
   servicesList, servicesRegister, servicesUnregister, setSupervisionMode,
   adminApiGetStatus, adminApiSetEnabled, adminApiListUsers, adminApiCreateUser,
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
@@ -5710,6 +5710,8 @@ function gatewayPaint(
     <div style="font-size:12px;color:var(--text2);display:grid;gap:4px">
       <div>Base URL: <span style="font-family:var(--mono);color:var(--text)">http://127.0.0.1:${port}/v1</span>
         <button class="btn icon-only" id="gwBaseUrlCopyBtn" title="Copy base URL" aria-label="Copy base URL">${icon("copy")}</button></div>
+      <div>Port:<span class="info-tip" title="The gateway's listen port, saved to the configuration through update_gateway_config and validated against every other claimed port. Applies when the gateway next starts; the activation plan tracks the restart.">${icon("info")}</span> <input id="gwPortInput" type="number" min="1" max="65535" value="${port}" style="width:90px;font-size:12px">
+        <button class="btn" id="gwPortApply" style="padding:1px 7px;font-size:11px">Apply</button></div>
       <div>Network access:${bindTip ? `<span class="info-tip" title="${esc(bindTip)}">${icon("info")}</span>` : ""} <select id="gwBindSelect" class="input" style="width:auto;display:inline-block;padding:2px 6px">
           <option value="0.0.0.0"${status.bind_host !== "127.0.0.1" ? " selected" : ""}>Local network (all interfaces)</option>
           <option value="127.0.0.1"${status.bind_host === "127.0.0.1" ? " selected" : ""}>This computer only (127.0.0.1)</option>
@@ -5745,8 +5747,11 @@ function gatewayPaint(
     const credStatusRow = or.cred_ref || or.enabled
       ? `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">Credential status</span><span>${credChip}</span></div>`
       : "";
-    const allowRow = `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">Model allowlist</span><span class="v" style="font-size:12px;text-align:right">${or.model_allowlist.length ? `${or.model_allowlist.length} model${or.model_allowlist.length === 1 ? "" : "s"}` : "none"}${or.model_allowlist.length ? ` <button class="btn" data-or-models aria-expanded="${orModelsOpen}" title="Model allowlist" aria-label="Model allowlist" style="padding:1px 7px;font-size:11px">${icon(orModelsOpen ? "chevD" : "chevR")}</button>` : ""}</span></div>
-      ${orModelsOpen && or.model_allowlist.length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">${or.model_allowlist.map((m) => `<span class="chip">${esc(m)}</span>`).join("")}</div>` : ""}`;
+    const allowRow = `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">Model allowlist</span><span class="v" style="font-size:12px;text-align:right">${or.model_allowlist.length ? `${or.model_allowlist.length} model${or.model_allowlist.length === 1 ? "" : "s"}` : "none"} <button class="btn" data-or-models aria-expanded="${orModelsOpen}" title="Model allowlist" aria-label="Model allowlist" style="padding:1px 7px;font-size:11px">${icon(orModelsOpen ? "chevD" : "chevR")}</button></span></div>
+      ${orModelsOpen ? `${or.model_allowlist.length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">${or.model_allowlist.map((m) => `<span class="chip">${esc(m)}</span>`).join("")}</div>` : ""}
+      <div style="margin-top:6px"><label style="font-size:12px;color:var(--text2)">Models, one per line
+        <textarea id="gwOrAllowInput" rows="3" style="display:block;width:100%;font-size:12px;margin-top:4px">${esc(or.model_allowlist.join("\n"))}</textarea></label>
+      <div class="card-actions" style="margin-top:6px"><button class="btn" id="gwOrAllowSave" style="padding:1px 7px;font-size:11px">Save allowlist</button></div></div>` : ""}`;
     return `<div class="card" style="margin-bottom:12px${or.enabled ? "" : ";opacity:.65"}"><div class="sec-title">${icon("gateway")} OpenRouter fallback tier
       <span class="spacer" style="flex:1"></span>
       ${or.enabled
@@ -5754,9 +5759,9 @@ function gatewayPaint(
         : `<span class="chip status-tag status-off" title="The tier is disabled — fallback entries naming openrouter are dropped when the gateway config is generated, and no traffic is sent to OpenRouter.">disabled</span>`}
     </div>
     <div class="kv" style="gap:10px">
-      ${or.cred_ref ? `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">Credential<span class="info-tip" title="When the gateway starts, the key is read from Windows Credential Manager (reference above) and passed to LiteLLM as OPENROUTER_API_KEY. The key itself is never stored in the configuration.">${icon("info")}</span></span><span class="v" style="font-size:12px;text-align:right">${esc(or.cred_ref)} <button class="btn" id="gwOrCredCopyBtn" title="Copy credential reference" aria-label="Copy credential reference" style="padding:1px 7px;font-size:11px">${icon("copy")}</button></span></div>` : ""}
+      <div style="display:flex;justify-content:space-between;gap:16px;align-items:center"><span class="k">Credential<span class="info-tip" title="The Credential Manager target holding the OpenRouter key. When the gateway starts, the key is read from Windows Credential Manager (this reference) and passed to LiteLLM as OPENROUTER_API_KEY. The key itself is never stored in the configuration. Clear the field and save to remove the reference.">${icon("info")}</span></span><span style="display:flex;gap:6px;align-items:center"><input id="gwOrCredInput" type="text" value="${esc(or.cred_ref ?? "")}" placeholder="Credential Manager target" style="width:220px;font-size:12px"><button class="btn" id="gwOrCredSave" style="padding:1px 7px;font-size:11px">Save</button>${or.cred_ref ? `<button class="btn" id="gwOrCredCopyBtn" title="Copy credential reference" aria-label="Copy credential reference" style="padding:1px 7px;font-size:11px">${icon("copy")}</button>` : ""}</span></div>
       ${credStatusRow}
-      <div style="display:flex;justify-content:space-between;gap:16px"><span class="k">Daily cap<span class="info-tip" title="Spending cap per day.">${icon("info")}</span></span><span class="v" style="font-size:12px;text-align:right">$${trim1(or.daily_cap_usd)}</span></div>
+      <div style="display:flex;justify-content:space-between;gap:16px;align-items:center"><span class="k">Daily cap<span class="info-tip" title="Spending cap per day.">${icon("info")}</span></span><span style="display:flex;gap:6px;align-items:center"><span style="font-size:12px">$</span><input id="gwOrCapInput" type="number" min="0" step="0.5" value="${or.daily_cap_usd}" style="width:90px;font-size:12px"><button class="btn" id="gwOrCapSave" style="padding:1px 7px;font-size:11px">Save</button></span></div>
       ${allowRow}
     </div>
     <div class="card-actions">${enableSwitch({ on: or.enabled, name: "OpenRouter fallback tier", attrs: `id="gwOrToggle"` })}</div>
@@ -5848,6 +5853,11 @@ function gatewayPaint(
         <span class="spacer" style="flex:1"></span><span class="chip">${esc(g.strategy)}</span></h3>
       ${bar}
       ${fallbacks}
+      <div style="display:flex;gap:6px;align-items:center;margin-top:8px;flex-wrap:wrap">
+        <label style="font-size:12px;color:var(--text2)">Fallbacks <input type="text" data-group-fallbacks-input="${esc(g.name)}" value="${esc(g.fallbacks.join(", "))}" style="width:240px;font-size:12px"></label>
+        <button class="btn" data-group-fallbacks-save="${esc(g.name)}" style="padding:1px 7px;font-size:11px">Save</button>
+        <span class="info-tip" title="The ordered fallback chain for this group: backend ids, or openrouter for the cloud tier, comma-separated. Saved through update_gateway_config and validated — an unknown name is refused. Applies when the gateway next starts.">${icon("info")}</span>
+      </div>
     </div>`;
   };
 
@@ -6529,6 +6539,65 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
       }
       await load();
     }
+
+    const gwSave = async (patch: Record<string, unknown>, okText: string): Promise<void> => {
+      const r = await updateGatewayConfig(patch);
+      if (disposed) return;
+      if (r.error) gwMsg(`Change not saved: ${r.error}`, true);
+      else if (!r.data.persisted) gwMsg("The change was applied to the in-memory configuration only — it was not saved and will be lost when the app restarts.", true);
+      else gwMsg(okText);
+      await load();
+    };
+
+    if (t.closest("#gwPortApply")) {
+      const port = Math.round(Number((root.querySelector("#gwPortInput") as HTMLInputElement | null)?.value));
+      if (!Number.isFinite(port) || port < 1 || port > 65535) {
+        gwMsg("Gateway port must be between 1 and 65535.", true);
+        return;
+      }
+      await gwSave({ port }, "Gateway port saved — applies at the next gateway start.");
+      return;
+    }
+
+    if (t.closest("#gwOrCredSave")) {
+      const v = ((root.querySelector("#gwOrCredInput") as HTMLInputElement | null)?.value ?? "").trim();
+      await gwSave({ openrouter: { cred_ref: v === "" ? null : v } },
+        v === "" ? "Credential reference cleared and saved." : "Credential reference saved.");
+      return;
+    }
+
+    if (t.closest("#gwOrCapSave")) {
+      const cap = Number((root.querySelector("#gwOrCapInput") as HTMLInputElement | null)?.value);
+      if (!Number.isFinite(cap) || cap < 0) {
+        gwMsg("Daily cap must be a number of dollars, 0 or more.", true);
+        return;
+      }
+      await gwSave({ openrouter: { daily_cap_usd: cap } }, "OpenRouter daily cap saved.");
+      return;
+    }
+
+    if (t.closest("#gwOrAllowSave")) {
+      const raw = (root.querySelector("#gwOrAllowInput") as HTMLTextAreaElement | null)?.value ?? "";
+      const list = [...new Set(raw.split(/[\n,]/).map((s) => s.trim()).filter(Boolean))];
+      await gwSave({ openrouter: { model_allowlist: list } }, "OpenRouter model allowlist saved.");
+      return;
+    }
+
+    const fbSave = t.closest("[data-group-fallbacks-save]") as HTMLElement | null;
+    if (fbSave && lastCfg) {
+      const name = fbSave.getAttribute("data-group-fallbacks-save") ?? "";
+      const input = root.querySelector(`[data-group-fallbacks-input="${name}"]`) as HTMLInputElement | null;
+      const list = [...new Set((input?.value ?? "").split(",").map((s) => s.trim()).filter(Boolean))];
+      // Patch the full groups array with only this group's chain
+      // changed; the stored fields ride through verbatim (the
+      // derived enabled/enabled_members are not stored fields).
+      const groups = lastCfg.groups.map((g) => ({
+        name: g.name, members: g.members, strategy: g.strategy, purpose: g.purpose,
+        fallbacks: g.name === name ? list : g.fallbacks,
+      }));
+      await gwSave({ groups }, `Fallbacks for ${name} saved — applies at the next gateway start.`);
+      return;
+    }
   };
   const onBindChange = async (ev: Event): Promise<void> => {
     const sel = ev.target as HTMLElement;
@@ -6814,31 +6883,65 @@ function settingsPaint(
   const configPath = primStr(cfg.config_path);
   if (configPath !== null) generalRows.push({ key: "Configuration file", value: configPath, copy: configPath });
   const tel = asRecord(cfg.telemetry);
+  let telIntervalMs: number | null = null;
   if (tel) {
     const intervalKey = ["poll_interval_ms", "interval_ms", "poll_ms", "interval"].find((k) => typeof tel[k] === "number");
-    if (intervalKey) generalRows.push({ key: "Telemetry poll interval", value: `${(tel[intervalKey] as number).toLocaleString()} ms` });
+    if (intervalKey) telIntervalMs = tel[intervalKey] as number;
     // Raw telemetry subkeys are detail, not summary: they move to
     // the collapsed "All configuration values" expandable below.
+    // retention_secs is annotated there: stored schema with no
+    // consumer in this build — configuration detail, not a setting.
     for (const [k, v] of Object.entries(tel)) {
       if (k === intervalKey) continue;
-      extraRows.push({ key: `Telemetry \u00b7 ${humanLabel(k)}`, value: summarizeValue(v) });
+      extraRows.push({ key: `Telemetry \u00b7 ${humanLabel(k)}`, value: summarizeValue(v),
+        ...(k === "retention_secs" ? { tip: "Stored in the configuration schema; no component reads it in this build — the sampler's retention window is fixed. Shown as configuration detail, not as a setting." } : {}) });
     }
-  } else if (primStr(cfg.telemetry) !== null) {
-    generalRows.push({ key: "Telemetry poll interval", value: `${primStr(cfg.telemetry)} ms` });
   }
   const winml = asRecord(cfg.winml);
-  if (winml && primStr(winml.enabled) !== null) {
-    generalRows.push({ key: "Windows ML", value: winml.enabled ? "enabled" : "disabled" });
-  }
-  if (primStr(cfg.setup_completed) !== null) {
-    generalRows.push({ key: "Setup completed", value: cfg.setup_completed ? "yes" : "no" });
-  }
-  const KNOWN_CFG = new Set(["data_dir", "config_path", "telemetry", "winml", "setup_completed", "updates", "notifications", "mxc"]);
+  const pgCfg = asRecord(cfg.postgres);
+  const pgPort = pgCfg && typeof pgCfg.port === "number" ? pgCfg.port : null;
+  // postgres joins KNOWN_CFG: it has a dedicated editor below, so
+  // the raw aggregate no longer duplicates it in the dump. Setup
+  // completed is wizard state, not a preference — it renders as a
+  // status line under the editors, not as a settings row.
+  const KNOWN_CFG = new Set(["data_dir", "config_path", "telemetry", "winml", "setup_completed", "updates", "notifications", "mxc", "postgres"]);
   for (const [k, v] of Object.entries(cfg)) {
     if (KNOWN_CFG.has(k)) continue;
     extraRows.push({ key: humanLabel(k), value: summarizeValue(v) });
   }
+  // --- General editors (settings-pages sweep, Oct 19 2026): every
+  // stored value on this tab carries a working control wired to its
+  // real save path — telemetry_set_interval for the poll interval,
+  // the generic update_config patch for WinML and the Postgres port.
+  const telBucket = telIntervalMs !== null ? cadenceBucket(telIntervalMs) : null;
+  const telemetryEditor = telIntervalMs !== null ? `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border)">
+      <span class="k">Telemetry poll interval<span class="info-tip" title="How often the GPU telemetry sampler polls. Saved immediately; the running sampler's cadence is fixed at startup, so a change applies when the app restarts. The sampler buckets the stored value: 0 = off, up to 1500 ms = 1 s, above that = 5 s. The GPUs view carries the same setting as a preset select.">${icon("info")}</span></span>
+      <span style="display:flex;gap:6px;align-items:center">
+        <input id="setTelInterval" type="number" min="0" max="60000" step="100" value="${telIntervalMs}" style="width:100px;font-size:12px">
+        <span style="font-size:12px;color:var(--text2)">ms \u00b7 sampler: ${telBucket ? telBucket.label : ""}</span>
+        <button class="btn" id="setTelApply" style="padding:1px 7px;font-size:11px">Apply</button>
+      </span></div>` : "";
+  const winmlEditor = winml ? `<div style="padding:4px 0;border-bottom:1px solid var(--border)">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:16px">
+        <span class="k">Windows ML<span class="info-tip" title="The Windows ML inference server. Enabling requires a model id — set one here or through the Setup Wizard's WinML step, which also registers the server. The port is claimed only while Windows ML is enabled. Changes save through the generic config patch and are validated before they are written.">${icon("info")}</span></span>
+        ${enableSwitch({ on: winml.enabled === true, name: "Windows ML", attrs: `id="setWinmlToggle"` })}
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;margin-top:6px;flex-wrap:wrap">
+        <label style="font-size:12px;color:var(--text2)">Port <input id="setWinmlPort" type="number" min="1" max="65535" value="${typeof winml.port === "number" ? winml.port : 8090}" style="width:90px;font-size:12px"></label>
+        <label style="font-size:12px;color:var(--text2)">Model <input id="setWinmlModel" type="text" value="${esc(primStr(winml.model_id) ?? "")}" placeholder="model id" style="width:180px;font-size:12px"></label>
+        <button class="btn" id="setWinmlApply" style="padding:1px 7px;font-size:11px">Apply</button>
+      </div></div>` : "";
+  const postgresEditor = pgPort !== null ? `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border)">
+      <span class="k">PostgreSQL port<span class="info-tip" title="Loopback port of the app-managed PostgreSQL server the gateway migrates against at launch. Saved immediately and validated against every other claimed port; it applies the next time PostgreSQL starts — a running gateway keeps the server it started with.">${icon("info")}</span></span>
+      <span style="display:flex;gap:6px;align-items:center">
+        <input id="setPgPort" type="number" min="1" max="65535" value="${pgPort}" style="width:100px;font-size:12px">
+        <button class="btn" id="setPgApply" style="padding:1px 7px;font-size:11px">Apply</button>
+      </span></div>` : "";
+  const setupStatus = primStr(cfg.setup_completed) !== null
+    ? `<div style="font-size:12px;color:var(--text2);margin-top:10px">Setup: ${cfg.setup_completed ? "completed" : "not completed"}<span class="info-tip" title="Wizard completion state recorded by the Setup Wizard — not a preference. Run the Setup Wizard to change it.">${icon("info")}</span></div>`
+    : "";
   const generalPanel = `${settingsRows(generalRows)}
+    ${telemetryEditor}${winmlEditor}${postgresEditor}${setupStatus}
     ${extraRows.length ? `<div style="margin-top:12px"><button class="btn" data-all-toggle aria-expanded="${ui.allOpen}" title="All configuration values" aria-label="All configuration values" style="padding:2px 8px;font-size:11px">${icon(ui.allOpen ? "chevD" : "chevR")}</button>
       ${ui.allOpen ? `<div style="margin-top:8px">${settingsRows(extraRows)}</div>` : ""}</div>` : ""}`;
 
@@ -6853,9 +6956,22 @@ function settingsPaint(
       if (!c) return `<div style="display:flex;justify-content:space-between;gap:16px;padding:4px 0"><span class="k">${esc(name)}</span><span style="font-size:12px">${esc(summarizeValue(v))}</span></div>`;
       const pinned = primStr(c.pinned_version);
       const checked = primStr(c.last_checked);
-      return `<div style="display:flex;justify-content:space-between;gap:16px;padding:4px 0;border-bottom:1px solid var(--border)">
-        <span class="k">${esc(name)}</span>
-        <span style="font-size:12px;text-align:right">Version: <b>${pinned !== null ? `pinned ${esc(pinned)}` : "unpinned"}</b> \u00b7 Auto-update: ${c.auto_update ? "on" : "off"}${checked !== null ? ` \u00b7 Checked: ${esc(fmtDate(checked))}` : ""}</span></div>`;
+      // Pin and auto-update carry working controls wired to their
+      // dedicated ops (updates_pin / updates_set_auto); last_checked
+      // stays text — it is a recorded timestamp, not a setting.
+      return `<div style="padding:4px 0;border-bottom:1px solid var(--border)">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:16px">
+          <span class="k">${esc(name)}</span>
+          <span style="display:flex;gap:6px;align-items:center">
+            <span style="font-size:12px;color:var(--text2)">Auto-update</span>
+            ${enableSwitch({ on: c.auto_update === true, name: `${name} auto-update`, attrs: `data-comp-auto="${esc(name)}"` })}
+          </span></div>
+        <div style="display:flex;gap:6px;align-items:center;margin-top:6px;flex-wrap:wrap">
+          <label style="font-size:12px;color:var(--text2)">Pinned version <input type="text" data-comp-pin-input="${esc(name)}" value="${pinned !== null ? esc(pinned) : ""}" placeholder="unpinned" style="width:170px;font-size:12px"></label>
+          <button class="btn" data-comp-pin-save="${esc(name)}" style="padding:1px 7px;font-size:11px">${pinned !== null ? "Save pin" : "Pin"}</button>
+          ${pinned !== null ? `<button class="btn" data-comp-unpin="${esc(name)}" style="padding:1px 7px;font-size:11px">Unpin</button>` : ""}
+          ${checked !== null ? `<span style="font-size:12px;color:var(--text2)">Checked: ${esc(fmtDate(checked))}</span>` : ""}
+        </div></div>`;
     }).join("") : "";
     const restRows = humanEntries(restUpdates);
     // No policy content at all -> the policy block is omitted
@@ -6907,7 +7023,16 @@ function settingsPaint(
   const selfTest = `<div style="font-size:12px;color:var(--text2);margin-top:14px">Self-test</div>
     <div class="card-actions"><button class="btn icon-only" data-mxc-selftest title="Run self-test" aria-label="Run self-test">${icon("shield")}</button></div>
     <div id="mxcSelfTest">${selfTestHtml}</div>`;
-  const mxcPanel = `${modeBlock}${mxcPolicyInner(policyR, ui.rulesFilter, ui.rulesOpen, policyFile)}${mxcActivityInner(activityR)}${selfTest}`;
+  // The policy file path is stored config (mxc.path) — it gets an
+  // editor wired to the generic config patch. The policy document's
+  // contents (version, default, rules) stay read-only below: they
+  // are the file's data, edited in the file itself.
+  const policyFileEditor = policyFile !== null ? `<div style="display:flex;gap:6px;align-items:center;margin-top:12px;flex-wrap:wrap">
+      <label style="font-size:12px;color:var(--text2)">Policy file <input id="setMxcPath" type="text" value="${esc(policyFile)}" style="width:340px;font-size:12px"></label>
+      <button class="btn" id="setMxcPathApply" style="padding:1px 7px;font-size:11px">Apply</button>
+      <span class="info-tip" title="Path of the MXC policy document, saved to the configuration. The app reads the policy when it starts, so a path change applies on restart. If the file does not exist, the built-in default policy applies.">${icon("info")}</span>
+    </div>` : "";
+  const mxcPanel = `${modeBlock}${policyFileEditor}${mxcPolicyInner(policyR, ui.rulesFilter, ui.rulesOpen, null)}${mxcActivityInner(activityR)}${selfTest}`;
 
   const supervisionPanel = supervisionInner(svcR);
   const panel = tab === "general" ? generalPanel
@@ -6947,7 +7072,6 @@ function remoteAccessHtml(
     : status.firewall === "unsupported" ? "Not reported on this platform"
     : "Unknown";
   const rows: SettingsRow[] = [
-    { key: "Port", value: String(status.port) },
     { key: "Bind", value: status.bind },
     { key: "Firewall rule", value: fwText },
     { key: "Users", value: String(status.user_count) },
@@ -6967,6 +7091,12 @@ function remoteAccessHtml(
     </span></div>`).join("");
   return `<div style="font-size:12px;color:var(--text2)">Admin API<span class="info-tip" title="Serves the LLMdil control API to devices on this network. Access requires a user account and is limited by the firewall rule to the local subnet and Tailscale.">${icon("info")}</span></div>
     <div style="display:flex;justify-content:space-between;gap:16px;margin:6px 0"><span class="k">Status</span><span class="v" style="font-size:12px">${stateText}</span></div>
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border)">
+      <span class="k">Port<span class="info-tip" title="TCP port for the Admin API listener, saved through the generic config patch. The running listener keeps its current port until the API is switched off and on, or the app restarts; the firewall rule reconciles to the saved port when the API next starts.">${icon("info")}</span></span>
+      <span style="display:flex;gap:6px;align-items:center">
+        <input id="raPort" type="number" min="1" max="65535" value="${status.port}" style="width:100px;font-size:12px">
+        <button class="btn" data-ra-port-save style="padding:1px 7px;font-size:11px">Apply</button>
+      </span></div>
     ${settingsRows(rows)}
     ${status.note ? `<div style="font-size:12px;color:var(--err);margin-top:6px">${esc(status.note)}</div>` : ""}
     <div class="card-actions" style="margin-top:10px">${enableSwitch({ on: status.enabled, name: "Admin API", attrs: "data-ra-toggle" })}
@@ -7223,6 +7353,170 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
           ${failed.map((c) => `<div style="color:var(--err)">${esc(c.name)}: expected ${esc(c.expected)}, got ${esc(c.actual)} \u2014 ${esc(c.description)}</div>`).join("")}
         </div>`;
       }
+      await load();
+      return;
+    }
+
+    const telApply = t.closest("#setTelApply") as HTMLButtonElement | null;
+    if (telApply) {
+      const el = root.querySelector("#setTelInterval") as HTMLInputElement | null;
+      const ms = Math.round(Number(el?.value));
+      if (!Number.isFinite(ms) || ms < 0 || ms > 60000) {
+        setMsg("Poll interval must be a number of milliseconds between 0 and 60000.", true);
+        return;
+      }
+      telApply.disabled = true;
+      const r = await setTelemetryInterval(ms);
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`Poll interval not saved: ${r.error}`, true);
+        telApply.disabled = false;
+        return;
+      }
+      const eff = cadenceBucket(ms);
+      setMsg(eff.value === "0"
+        ? "Telemetry polling off — saved; applies on restart."
+        : `Poll interval saved — sampler cadence ${eff.label}; applies on restart.`);
+      await load();
+      return;
+    }
+
+    const winmlToggle = t.closest("#setWinmlToggle") as HTMLButtonElement | null;
+    if (winmlToggle) {
+      const on = winmlToggle.getAttribute("aria-checked") === "true";
+      winmlToggle.disabled = true;
+      const r = await updateAppConfig({ winml: { enabled: !on } });
+      if (disposed) return;
+      if (r.error) setMsg(`Windows ML change not saved: ${r.error}`, true);
+      else setMsg(on ? "Windows ML disabled and saved." : "Windows ML enabled and saved.");
+      await load();
+      return;
+    }
+
+    const winmlApply = t.closest("#setWinmlApply") as HTMLButtonElement | null;
+    if (winmlApply) {
+      const port = Math.round(Number((root.querySelector("#setWinmlPort") as HTMLInputElement | null)?.value));
+      const model = ((root.querySelector("#setWinmlModel") as HTMLInputElement | null)?.value ?? "").trim();
+      if (!Number.isFinite(port) || port < 1 || port > 65535) {
+        setMsg("Windows ML port must be between 1 and 65535.", true);
+        return;
+      }
+      winmlApply.disabled = true;
+      const r = await updateAppConfig({ winml: { port, model_id: model === "" ? null : model } });
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`Windows ML settings not saved: ${r.error}`, true);
+        winmlApply.disabled = false;
+        return;
+      }
+      setMsg("Windows ML port and model saved.");
+      await load();
+      return;
+    }
+
+    const pgApply = t.closest("#setPgApply") as HTMLButtonElement | null;
+    if (pgApply) {
+      const port = Math.round(Number((root.querySelector("#setPgPort") as HTMLInputElement | null)?.value));
+      if (!Number.isFinite(port) || port < 1 || port > 65535) {
+        setMsg("PostgreSQL port must be between 1 and 65535.", true);
+        return;
+      }
+      pgApply.disabled = true;
+      const r = await updateAppConfig({ postgres: { port } });
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`PostgreSQL port not saved: ${r.error}`, true);
+        pgApply.disabled = false;
+        return;
+      }
+      setMsg("PostgreSQL port saved — applies the next time PostgreSQL starts.");
+      await load();
+      return;
+    }
+
+    const raPortSave = t.closest("[data-ra-port-save]") as HTMLButtonElement | null;
+    if (raPortSave) {
+      const port = Math.round(Number((root.querySelector("#raPort") as HTMLInputElement | null)?.value));
+      if (!Number.isFinite(port) || port < 1 || port > 65535) {
+        setMsg("Admin API port must be between 1 and 65535.", true);
+        return;
+      }
+      raPortSave.disabled = true;
+      const r = await updateAppConfig({ admin_api: { port } });
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`Admin API port not saved: ${r.error}`, true);
+        raPortSave.disabled = false;
+        return;
+      }
+      setMsg("Admin API port saved — switch the API off and on, or restart the app, to apply it.");
+      await load();
+      return;
+    }
+
+    const compAuto = t.closest("[data-comp-auto]") as HTMLButtonElement | null;
+    if (compAuto) {
+      const name = compAuto.getAttribute("data-comp-auto") ?? "";
+      const on = compAuto.getAttribute("aria-checked") === "true";
+      compAuto.disabled = true;
+      const r = await updatesSetAuto(name, !on);
+      if (disposed) return;
+      if (r.error) setMsg(`Auto-update change for ${name} not saved: ${r.error}`, true);
+      else setMsg(`Auto-update ${!on ? "on" : "off"} for ${name} — saved.`);
+      await load();
+      return;
+    }
+
+    const compPinSave = t.closest("[data-comp-pin-save]") as HTMLButtonElement | null;
+    if (compPinSave) {
+      const name = compPinSave.getAttribute("data-comp-pin-save") ?? "";
+      const input = root.querySelector(`[data-comp-pin-input="${name}"]`) as HTMLInputElement | null;
+      const version = (input?.value ?? "").trim();
+      if (!version) {
+        setMsg(`Enter a version to pin ${name} to, or clear the pin with Unpin.`, true);
+        return;
+      }
+      compPinSave.disabled = true;
+      const r = await updatesPin(name, version);
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`Pin for ${name} not saved: ${r.error}`, true);
+        compPinSave.disabled = false;
+        return;
+      }
+      setMsg(`${name} pinned to ${version} — saved.`);
+      await load();
+      return;
+    }
+
+    const compUnpin = t.closest("[data-comp-unpin]") as HTMLButtonElement | null;
+    if (compUnpin) {
+      const name = compUnpin.getAttribute("data-comp-unpin") ?? "";
+      compUnpin.disabled = true;
+      const r = await updatesPin(name, null);
+      if (disposed) return;
+      if (r.error) setMsg(`Unpin of ${name} failed: ${r.error}`, true);
+      else setMsg(`${name} unpinned — saved.`);
+      await load();
+      return;
+    }
+
+    const mxcPathApply = t.closest("#setMxcPathApply") as HTMLButtonElement | null;
+    if (mxcPathApply) {
+      const path = ((root.querySelector("#setMxcPath") as HTMLInputElement | null)?.value ?? "").trim();
+      if (!path) {
+        setMsg("Policy file path must not be empty.", true);
+        return;
+      }
+      mxcPathApply.disabled = true;
+      const r = await updateAppConfig({ mxc: { path } });
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`Policy file path not saved: ${r.error}`, true);
+        mxcPathApply.disabled = false;
+        return;
+      }
+      setMsg("Policy file path saved — applies when the app restarts.");
       await load();
       return;
     }

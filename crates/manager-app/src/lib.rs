@@ -9271,6 +9271,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Settings-pages sweep (Oct 19, 2026): every field the sweep
+    /// wired to a Settings/Gateway editor must round-trip through
+    /// its real save path — op call, save, reload from disk shows
+    /// the new value. Covers the dedicated ops (notifications,
+    /// telemetry interval, updates pin/auto), the generic config
+    /// patch (Postgres port, Admin API port, WinML, MXC policy
+    /// path), and the gateway config patch (port, OpenRouter tier,
+    /// group fallbacks).
+    #[tokio::test]
+    async fn settings_controls_round_trip_through_real_ops() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+
+        // Notifications master: to false, and back to true.
+        let notif = manager_config::NotificationConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        op_notifications_set_config(&state, &sink, notif).await.unwrap();
+        let loaded = manager_config::load(&state.config_path).unwrap();
+        assert!(!loaded.notifications.enabled);
+        let notif = manager_config::NotificationConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        op_notifications_set_config(&state, &sink, notif).await.unwrap();
+        let loaded = manager_config::load(&state.config_path).unwrap();
+        assert!(loaded.notifications.enabled);
+
+        // Telemetry poll interval.
+        op_telemetry_set_interval(&state, &sink, 2500).await.unwrap();
+        let loaded = manager_config::load(&state.config_path).unwrap();
+        assert_eq!(loaded.telemetry.poll_interval_ms, 2500);
+
+        // Generic config patch: Postgres port, Admin API port,
+        // WinML enable + port + model, MXC policy path.
+        op_update_config(&state, &sink, json!({ "postgres": { "port": 54330 } }))
+            .await
+            .unwrap();
+        op_update_config(&state, &sink, json!({ "admin_api": { "port": 47822 } }))
+            .await
+            .unwrap();
+        op_update_config(
+            &state,
+            &sink,
+            json!({ "winml": { "enabled": true, "port": 8091, "model_id": "qwen3-8b" } }),
+        )
+        .await
+        .unwrap();
+        op_update_config(&state, &sink, json!({ "mxc": { "path": "/tmp/custom-policy.json" } }))
+            .await
+            .unwrap();
+        let loaded = manager_config::load(&state.config_path).unwrap();
+        assert_eq!(loaded.postgres.port, 54330);
+        assert_eq!(loaded.admin_api.port, 47822);
+        assert!(loaded.winml.enabled);
+        assert_eq!(loaded.winml.port, 8091);
+        assert_eq!(loaded.winml.model_id.as_deref(), Some("qwen3-8b"));
+        assert_eq!(loaded.mxc.path, PathBuf::from("/tmp/custom-policy.json"));
+
+        // Component pin + auto-update, then unpin + re-enable.
+        op_updates_pin(&state, &sink, "litellm".to_string(), Some("1.105.1".to_string()))
+            .await
+            .unwrap();
+        op_updates_set_auto(&state, &sink, "litellm".to_string(), false)
+            .await
+            .unwrap();
+        let loaded = manager_config::load(&state.config_path).unwrap();
+        let comp = loaded.updates.components.get("litellm").unwrap();
+        assert_eq!(comp.pinned_version.as_deref(), Some("1.105.1"));
+        assert!(!comp.auto_update);
+        op_updates_pin(&state, &sink, "litellm".to_string(), None)
+            .await
+            .unwrap();
+        op_updates_set_auto(&state, &sink, "litellm".to_string(), true)
+            .await
+            .unwrap();
+        let loaded = manager_config::load(&state.config_path).unwrap();
+        let comp = loaded.updates.components.get("litellm").unwrap();
+        assert_eq!(comp.pinned_version, None);
+        assert!(comp.auto_update);
+
+        // Gateway patch: port, the OpenRouter tier fields, and one
+        // group's fallback chain (the full groups array rides
+        // through in stored form, only the chain changes).
+        op_update_gateway_config(&state, &sink, json!({ "port": 4001 }))
+            .await
+            .unwrap();
+        op_update_gateway_config(
+            &state,
+            &sink,
+            json!({ "openrouter": { "cred_ref": "openrouter-key", "daily_cap_usd": 12.5, "model_allowlist": ["openai/gpt-5"] } }),
+        )
+        .await
+        .unwrap();
+        let mut groups_patch =
+            serde_json::to_value(&state.config.read().await.gateway.groups).unwrap();
+        groups_patch.as_array_mut().unwrap()[0]["fallbacks"] = json!(["openrouter"]);
+        op_update_gateway_config(&state, &sink, json!({ "groups": groups_patch }))
+            .await
+            .unwrap();
+        let loaded = manager_config::load(&state.config_path).unwrap();
+        assert_eq!(loaded.gateway.port, 4001);
+        assert_eq!(loaded.gateway.openrouter.cred_ref.as_deref(), Some("openrouter-key"));
+        assert_eq!(loaded.gateway.openrouter.daily_cap_usd, 12.5);
+        assert_eq!(loaded.gateway.openrouter.model_allowlist, vec!["openai/gpt-5".to_string()]);
+        assert_eq!(loaded.gateway.groups[0].fallbacks, vec!["openrouter".to_string()]);
+        // The groups patch must not reset the stored purpose.
+        assert_eq!(
+            loaded.gateway.groups[0].purpose,
+            test_cfg().gateway.groups[0].purpose
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn advanced_mode_flip_writes_no_flags_and_no_journal() {
         let mut cfg = test_cfg();
