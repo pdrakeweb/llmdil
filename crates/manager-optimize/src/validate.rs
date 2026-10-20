@@ -767,6 +767,8 @@ fn validate_one(
                 assigned_backends: Vec::new(),
                 enabled: true,
                 display_name: None,
+                moe_layers: None,
+                default_offload_layers: None,
             });
         }
         PlanKind::ModelDownload => {
@@ -915,6 +917,8 @@ mod tests {
             assigned_backends: vec!["tool-runner".to_string()],
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         cfg.backends[0].model_file = PathBuf::from("models/qwen3-8b.gguf");
         assert!(

@@ -908,6 +908,8 @@ mod tests {
             assigned_backends: Vec::new(),
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         for cand in [
             "my-model",              // registered
