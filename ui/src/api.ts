@@ -1442,6 +1442,10 @@ export interface GatewayGroup {
   members: string[];
   strategy: string;
   fallbacks: string[];
+  /** The operator's stated purpose for the group (Optimize design
+   *  §2.3), carried so a groups patch writes it back verbatim
+   *  instead of resetting it to the serde default. */
+  purpose: string;
   /** Derived by the backend (manager-gateway), never stored: the
    *  group is enabled iff at least one member backend is enabled,
    *  and only enabled groups reach the generated gateway config. */
@@ -1492,6 +1496,10 @@ export interface GatewayGroup {
   members: string[];
   strategy: string;
   fallbacks: string[];
+  /** The operator's stated purpose for the group (Optimize design
+   *  §2.3), carried so a groups patch writes it back verbatim
+   *  instead of resetting it to the serde default. */
+  purpose: string;
   /** Derived by the backend (manager-gateway), never stored: the
    *  group is enabled iff at least one member backend is enabled,
    *  and only enabled groups reach the generated gateway config. */
@@ -1534,6 +1542,7 @@ export async function getGatewayConfig(): Promise<CallResult<GatewayConfigData |
         members: Array.isArray(g.members) ? g.members : [],
         strategy: typeof g.strategy === "string" ? g.strategy : "",
         fallbacks: Array.isArray(g.fallbacks) ? g.fallbacks : [],
+        purpose: typeof g.purpose === "string" ? g.purpose : "",
         enabled: typeof g.enabled === "boolean" ? g.enabled : true,
         enabled_members: typeof g.enabled_members === "number"
           ? g.enabled_members
@@ -2248,6 +2257,22 @@ export async function setSupervisionMode(mode: string): Promise<CallResult<{ ok:
   }
 }
 
+/** update_config — merge a JSON patch into the stored configuration.
+ *  The app validates the merged config and saves it atomically; the
+ *  in-memory config changes only when the save succeeds, so a
+ *  rejected patch leaves every setting untouched. The generic save
+ *  path behind the Settings editors that have no dedicated op
+ *  (WinML, PostgreSQL port, Admin API port, MXC policy path). */
+export async function updateAppConfig(patch: Record<string, unknown>): Promise<CallResult<{ ok: boolean; persisted?: boolean }>> {
+  if (!isTauri()) return { data: { ok: false }, live: false, error: "update_config is not available in sample mode" };
+  try {
+    const data = await invoke<{ ok: boolean; persisted?: boolean }>("update_config", { patch });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { ok: false }, live: true, error: errOf(e) };
+  }
+}
+
 /** Register one service (backend id or "gateway") via the elevated
  *  helper. The account password is handed over through a transient
  *  credential the helper deletes; it is never persisted by the app. */
@@ -2435,6 +2460,30 @@ export async function setNotificationConfig(config: NotificationSettings): Promi
   if (!isTauri()) return { data: { ok: false }, live: false, error: "notifications_set_config is not available in sample mode" };
   try {
     const data = await invoke<{ ok: boolean; persisted?: boolean }>("notifications_set_config", { config });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { ok: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** updates_pin — pin a component to a version (or clear the pin with
+ *  null) and persist it. The pin/auto toggles have dedicated ops even
+ *  though update *checking* is still an Unsupported stub. */
+export async function updatesPin(componentId: string, version: string | null): Promise<CallResult<{ ok: boolean; persisted?: boolean }>> {
+  if (!isTauri()) return { data: { ok: false }, live: false, error: "updates_pin is not available in sample mode" };
+  try {
+    const data = await invoke<{ ok: boolean; persisted?: boolean }>("updates_pin", { componentId, version });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { ok: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** updates_set_auto — set a component's auto-update flag and persist it. */
+export async function updatesSetAuto(componentId: string, enabled: boolean): Promise<CallResult<{ ok: boolean; persisted?: boolean }>> {
+  if (!isTauri()) return { data: { ok: false }, live: false, error: "updates_set_auto is not available in sample mode" };
+  try {
+    const data = await invoke<{ ok: boolean; persisted?: boolean }>("updates_set_auto", { componentId, enabled });
     return { data, live: true };
   } catch (e) {
     return { data: { ok: false }, live: true, error: errOf(e) };

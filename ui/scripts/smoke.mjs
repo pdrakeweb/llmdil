@@ -32,7 +32,7 @@ const html = existsSync(indexHtml) ? readFileSync(indexHtml, "utf8") : "";
 check(/assets\/.*\.js/.test(html), "index.html references the JS bundle");
 
 const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
-for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_parallel", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete"]) {
+for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_parallel", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete", "update_config", "updates_pin", "updates_set_auto"]) {
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
 // Cross-check: every Tauri command name the UI invokes must be
@@ -181,6 +181,29 @@ check(optimizeSrc.includes("Previous plan"), "Optimize view heads the retained p
 check(optimizeSrc.includes('class="opt-measure-card"'), "Optimize view renders measure targets as cards");
 check(optimizeSrc.includes('class="opt-measure-actions"'), "Optimize view anchors card actions in the card action row");
 check(!optimizeSrc.includes('class="opt-measure-row"'), "Optimize view no longer renders the single-row measure blob");
+
+// Settings-pages sweep (Oct 19, 2026): every stored value rendered
+// on a settings surface carries a working control wired to its real
+// save path. The compiled/source fragments of those controls must
+// survive the build — a value with no editor is the defect class
+// this sweep removed.
+const settingsSrc = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+check(settingsSrc.includes('id="setTelInterval"'), "Settings renders the telemetry poll interval editor (setTelInterval)");
+check(settingsSrc.includes('id="setWinmlToggle"'), "Settings renders the Windows ML switch (setWinmlToggle)");
+check(settingsSrc.includes('id="setWinmlPort"'), "Settings renders the Windows ML port editor (setWinmlPort)");
+check(settingsSrc.includes('id="setPgPort"'), "Settings renders the PostgreSQL port editor (setPgPort)");
+check(settingsSrc.includes('id="raPort"'), "Settings renders the Admin API port editor (raPort)");
+check(settingsSrc.includes('id="setMxcPath"'), "Settings renders the MXC policy file editor (setMxcPath)");
+check(settingsSrc.includes("data-comp-auto"), "Settings renders per-component auto-update switches (data-comp-auto)");
+check(settingsSrc.includes("data-comp-pin-input"), "Settings renders per-component pin editors (data-comp-pin-input)");
+check(settingsSrc.includes('id="gwPortInput"'), "Gateway view renders the gateway port editor (gwPortInput)");
+check(settingsSrc.includes('id="gwOrCredInput"'), "Gateway view renders the OpenRouter credential reference editor (gwOrCredInput)");
+check(settingsSrc.includes('id="gwOrCapInput"'), "Gateway view renders the OpenRouter daily cap editor (gwOrCapInput)");
+check(settingsSrc.includes('id="gwOrAllowInput"'), "Gateway view renders the OpenRouter allowlist editor (gwOrAllowInput)");
+check(settingsSrc.includes("data-group-fallbacks-save"), "Gateway view renders per-group fallback editors (data-group-fallbacks-save)");
+check(settingsSrc.includes("updatesSetAuto("), "Settings wires component auto-update through updatesSetAuto");
+check(settingsSrc.includes("updatesPin("), "Settings wires component pins through updatesPin");
+check(settingsSrc.includes("updateAppConfig("), "Settings wires generic config editors through updateAppConfig");
 
 check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
