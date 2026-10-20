@@ -155,9 +155,9 @@ function gpuCard(g: GpuInfo, expanded: Set<string>, modelRows: GpuModelRow[] = [
   const downChip = down ? ` <span class="chip badge-err" title="Down — not reported by the telemetry source in recent polls; the readings shown are the last known values. A GPU that has fallen off the bus (nvidia-smi reports it as lost) recovers only on a system reboot.">down</span>` : "";
   const peakTip = g.temp_peak_c !== undefined ? ` title="Peak ${trim1(g.temp_peak_c)} \u00b0C since last reset or app start"` : "";
   const memUtil = g.mem_util_pct !== undefined
-    ? `<div class="mrow"><span class="mlabel">Memory util</span><span class="mval">${g.mem_util_pct}%</span></div>` : "";
+    ? `<div class="mrow"><span class="mlabel">Memory util</span><span class="mval">${trim1(g.mem_util_pct)}%</span></div>` : "";
   const fan = g.fan_pct !== undefined
-    ? `<div class="mrow"><span class="mlabel">Fan</span><span class="mval">${g.fan_pct}%</span></div>` : "";
+    ? `<div class="mrow"><span class="mlabel">Fan</span><span class="mval">${trim1(g.fan_pct)}%</span></div>` : "";
   const tempSpark = g.temp_spark && g.temp_spark.length
     ? `<div class="mrow"><span></span>${sparkline(g.temp_spark, 240, 26, C.amber)}</div>` : "";
   const powerSpark = g.power_w != null && g.power_spark && g.power_spark.length
@@ -222,11 +222,11 @@ function gpuCard(g: GpuInfo, expanded: Set<string>, modelRows: GpuModelRow[] = [
     const head = `<div data-proc-toggle="${esc(key)}" role="button" tabindex="0" style="display:flex;gap:8px;align-items:center;padding:5px 6px;cursor:pointer;border-bottom:1px solid #232a34">
       <span style="color:var(--text3);font-size:10px">${open ? "\u25be" : "\u25b8"}</span>
       <span style="flex:1;min-width:0;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(label)}${ctx}</span>
-      <span style="font-size:12px;font-family:var(--mono)">${measured ? `${(p.vram_mib as number).toLocaleString()} MiB` : "not measured"}</span></div>`;
+      <span style="font-size:12px;font-family:var(--mono)">${measured ? `${fmtCount(p.vram_mib as number)} MiB` : "not measured"}</span></div>`;
     const detail = open ? `<div style="padding:6px 6px 8px 24px;font-size:11px;color:var(--text2);display:grid;gap:2px;border-bottom:1px solid #232a34">
       <div>Process: ${esc(p.process)}</div>
       <div>PID: ${p.pid}</div>
-      <div>VRAM on GPU ${esc(g.id)}: ${measured ? `${(p.vram_mib as number).toLocaleString()} MiB` : "not measured — per-process accounting is unavailable for this GPU"}</div>
+      <div>VRAM on GPU ${esc(g.id)}: ${measured ? `${fmtCount(p.vram_mib as number)} MiB` : "not measured — per-process accounting is unavailable for this GPU"}</div>
       <div>Backend: ${p.backend !== "—" ? esc(p.backend) : "not attributed to a backend"}</div>
       ${p.backend !== "—" && p.vram_mib !== null && p.vram_mib < 1024 ? `<div>Under 1 GiB: this process holds only its CUDA context on this GPU, not model weights.</div>` : ""}
     </div>` : "";
@@ -274,7 +274,7 @@ function gpuCard(g: GpuInfo, expanded: Set<string>, modelRows: GpuModelRow[] = [
       <div${down ? ` style="opacity:.65"` : ""}>
       ${vramHtml}
       <div style="display:flex;gap:18px;justify-content:center;margin:12px 0">
-        ${gaugeRing(g.util_pct, 84, C.blue, String(g.util_pct), "UTIL")}
+        ${gaugeRing(g.util_pct, 84, C.blue, trim1(g.util_pct), "UTIL")}
       </div>
       <div class="gpu-metrics">
         <div class="mrow"><span class="mlabel">Temperature</span><span class="mval"${peakTip}>${trim1(g.temp_c)} \u00b0C</span></div>
@@ -365,7 +365,7 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
             : g.status === "down" ? ovStatusBtn("err", "err", `card-gpu-${g.id}`, `${g.name}: down — go to card`)
             : g.status === "degraded" || g.status === "starting" ? ovStatusBtn("warn", "warn", `card-gpu-${g.id}`, `${g.name}: ${g.status} — go to card`)
             : ovStatusBtn("idle", "pause", `card-gpu-${g.id}`, `${g.name}: ${g.status} — go to card`);
-          return `<div class="ov-row">${btn}<span class="ov-name">${esc(g.name)}</span><span class="ov-dim">${g.util_pct}%</span><span class="ov-dim">${fmtGb(g.vram_used_gb)} / ${fmtGb(g.vram_total_gb)} GiB</span><span class="ov-dim">${g.temp_c} \u00b0C</span><span class="ov-dim">${g.power_w == null ? (g.power_absence === "driver_not_available" ? "not measured" : "N/A") : `${g.power_w} W`}</span><span class="ov-dim">${(g.processes ?? []).length}</span></div>`;
+          return `<div class="ov-row">${btn}<span class="ov-name">${esc(g.name)}</span><span class="ov-dim">${trim1(g.util_pct)}%</span><span class="ov-dim">${fmtGb(g.vram_used_gb)} / ${fmtGb(g.vram_total_gb)} GiB</span><span class="ov-dim">${trim1(g.temp_c)} \u00b0C</span><span class="ov-dim">${g.power_w == null ? (g.power_absence === "driver_not_available" ? "not measured" : "N/A") : `${trim1(g.power_w)} W`}</span><span class="ov-dim">${(g.processes ?? []).length}</span></div>`;
         }).join("")}</div>` : "";
     }
     const b = root.querySelector("#gpuBody");
@@ -1508,9 +1508,11 @@ const PARALLEL_MAX = 1024;
  *  default to type a count. */
 const PARALLEL_LLAMA_AUTO_SLOTS = 4;
 
-/** 131072 -> "128K"; values under 1024 stay plain. */
+/** 131072 -> "128K"; values under 1024 stay plain. The quotient
+ *  renders through trim1: a non-power-of-two context (10000)
+ *  reads "9.8K", never the raw 9.765625K. */
 function ctxShort(n: number): string {
-  return n >= 1024 ? `${n / 1024}K` : String(n);
+  return n >= 1024 ? `${trim1(n / 1024)}K` : String(n);
 }
 
 /** Expert-offload weight figures for a slider position, priced
@@ -1644,7 +1646,7 @@ function predictedPlacementText(p: PredictedThroughput): string | null {
   const gpus = inp.gpus.length
     ? inp.gpus.map((g) => g.split(":").slice(1).join(":") || g).join(", ")
     : "CPU only";
-  return `Context ${inp.n_ctx.toLocaleString()} · Batch ${inp.n_batch.toLocaleString()} · ${gpus}`;
+  return `Context ${fmtCount(inp.n_ctx)} · Batch ${fmtCount(inp.n_batch)} · ${gpus}`;
 }
 
 /** The form line's info-tip (§6.1): what the figures are, when
@@ -1679,7 +1681,7 @@ function predictedFormTip(p: PredictedThroughput): string {
 export function predictedCardTip(p: PredictedThroughput): string {
   const parts: string[] = [];
   if (p.prompt_per_second !== null) parts.push(`Prompt: ${trim1(p.prompt_per_second)} tok/s`);
-  if (p.ttft_ms !== null) parts.push(`TTFT: ${(p.ttft_ms / 1000).toFixed(2)} s`);
+  if (p.ttft_ms !== null) parts.push(`TTFT: ${trim1(p.ttft_ms / 1000)} s`);
   parts.push(`Measured: ${fmtMeasuredDate(p.measured_at, true)}`);
   parts.push(predictedSourceLabel(p.source));
   const placement = predictedPlacementText(p);
@@ -1881,7 +1883,7 @@ function flagsCtxBatchHtml(o: {
         <label style="font-size:12px;color:var(--text2)">Context length (-c)
           <span style="display:flex;gap:6px;margin-top:4px">
             <select ${o.fieldAttr}="ctx-preset" style="${SELECT_STYLE};flex:1;min-width:0"${dis}>
-              ${CTX_PRESETS.map((v) => `<option value="${v}"${v === o.ctx ? " selected" : ""}>${v.toLocaleString()} (${ctxShort(v)})${v === 32768 ? " \u2014 default" : ""}${o.ctxMax && v > o.ctxMax ? " \u2014 beyond rated" : ""}</option>`).join("")}
+              ${CTX_PRESETS.map((v) => `<option value="${v}"${v === o.ctx ? " selected" : ""}>${fmtCount(v)} (${ctxShort(v)})${v === 32768 ? " \u2014 default" : ""}${o.ctxMax && v > o.ctxMax ? " \u2014 beyond rated" : ""}</option>`).join("")}
               <option value="custom"${CTX_PRESETS.includes(o.ctx) ? "" : " selected"}>Custom\u2026</option>
             </select>
             ${CTX_PRESETS.includes(o.ctx) ? "" : `<input ${o.fieldAttr}="ctx-custom" type="number" value="${o.ctx}" min="1024" max="1048576" style="${SELECT_STYLE};width:110px"${dis}>`}
@@ -1889,7 +1891,7 @@ function flagsCtxBatchHtml(o: {
         <label style="font-size:12px;color:var(--text2)">Batch size (-b)
           <span style="display:flex;gap:6px;margin-top:4px">
             <select ${o.fieldAttr}="batch-preset" style="${SELECT_STYLE};flex:1;min-width:0"${dis}>
-              ${BATCH_PRESETS.map((v) => `<option value="${v}"${v === o.batch ? " selected" : ""}>${v.toLocaleString()}${v === 512 ? " \u2014 default" : ""}</option>`).join("")}
+              ${BATCH_PRESETS.map((v) => `<option value="${v}"${v === o.batch ? " selected" : ""}>${fmtCount(v)}${v === 512 ? " \u2014 default" : ""}</option>`).join("")}
               <option value="custom"${BATCH_PRESETS.includes(o.batch) ? "" : " selected"}>Custom\u2026</option>
             </select>
             ${BATCH_PRESETS.includes(o.batch) ? "" : `<input ${o.fieldAttr}="batch-custom" type="number" value="${o.batch}" min="1" style="${SELECT_STYLE};width:110px"${dis}>`}
@@ -1952,7 +1954,7 @@ function flagsRatedLineHtml(o: {
   savedText: string;
 }): string {
   return `<div style="font-size:12px;color:var(--text2);margin-top:6px">${o.modelId && o.ctxMax
-    ? `Rated context: ${o.ctxMax.toLocaleString()}<span class="info-tip" title="${esc(`Model ${o.modelId} is rated to ${ctxShort(o.ctxMax)} context (${o.ctxMax.toLocaleString()} tokens); larger values are accepted but exceed the rating. ${o.savedText}`)}">${icon("info")}</span>`
+    ? `Rated context: ${fmtCount(o.ctxMax)}<span class="info-tip" title="${esc(`Model ${o.modelId} is rated to ${ctxShort(o.ctxMax)} context (${fmtCount(o.ctxMax)} tokens); larger values are accepted but exceed the rating. ${o.savedText}`)}">${icon("info")}</span>`
     : `Context range: 1,024\u20131,048,576<span class="info-tip" title="Accepted context range: 1,024 to 1,048,576. ${o.savedText}">${icon("info")}</span>`}</div>`;
 }
 
@@ -2485,10 +2487,10 @@ function backendCard(
     const rows = p.split.map((frac, i) => {
       const gi = p.gpu_indices && p.gpu_indices[i] !== undefined ? p.gpu_indices[i] : i;
       const gname = place.gpus.find((g) => g.index === gi)?.name ?? `GPU ${gi}`;
-      const free = p.free_mib && p.free_mib[i] !== undefined ? `${p.free_mib[i].toLocaleString()} MiB` : "\u2014";
+      const free = p.free_mib && p.free_mib[i] !== undefined ? `${fmtCount(p.free_mib[i])} MiB` : "\u2014";
       const fit = frac === 0 ? "not used" : p.per_gpu_fits[i] ? "fits" : "does not fit";
-      const creditCells = credited ? `<td>${(p.current_mib?.[i] ?? 0).toLocaleString()} MiB</td><td>${(p.additional_mib?.[i] ?? p.per_gpu_mib[i]).toLocaleString()} MiB</td>` : "";
-      return `<tr><td>${esc(gname)}</td><td>${Math.round(frac * 100)}%</td><td>${p.per_gpu_mib[i].toLocaleString()} MiB</td>${creditCells}<td>${free}</td><td>${fit}</td></tr>`;
+      const creditCells = credited ? `<td>${fmtCount(p.current_mib?.[i] ?? 0)} MiB</td><td>${fmtCount(p.additional_mib?.[i] ?? p.per_gpu_mib[i])} MiB</td>` : "";
+      return `<tr><td>${esc(gname)}</td><td>${Math.round(frac * 100)}%</td><td>${fmtCount(p.per_gpu_mib[i])} MiB</td>${creditCells}<td>${free}</td><td>${fit}</td></tr>`;
     }).join("");
     const ageMs = p.snapshot_age_ms ?? null;
     return `<div style="margin-top:10px">
@@ -2541,7 +2543,7 @@ function backendCard(
   // in its tooltip, and the KV estimate (derived from that
   // context) is omitted. The raw flags line below carries the
   // state itself.
-  if (b.n_ctx !== undefined) stripTiles.push(["Context", b.flags_advanced ? `<span title="Set by the raw flags in advanced flags mode">&#8212;</span>` : b.n_ctx.toLocaleString()]);
+  if (b.n_ctx !== undefined) stripTiles.push(["Context", b.flags_advanced ? `<span title="Set by the raw flags in advanced flags mode">&#8212;</span>` : fmtCount(b.n_ctx)]);
   if (b.gpu_ram_mib !== undefined) {
     stripTiles.push(["GPU RAM", `${fmtGb(b.gpu_ram_mib / 1024)} GiB`]);
     // An absent sys_ram_mib is unknown, never 0 (principle 12): the
@@ -2564,7 +2566,7 @@ function backendCard(
   ];
   // Batch is a structured flags readout like Context: omitted in
   // advanced flags mode (tracker #60) rather than shown as fact.
-  if (!b.flags_advanced && b.n_batch != null) detailKv.push(["Batch", b.n_batch.toLocaleString()]);
+  if (!b.flags_advanced && b.n_batch != null) detailKv.push(["Batch", fmtCount(b.n_batch)]);
   const detailsHtml = detailsOpen ? `<div class="backend-details">
       <div style="display:grid;grid-template-columns:repeat(${detailKv.length},1fr);gap:10px">
         ${detailKv.map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
@@ -2719,7 +2721,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
             : row.state === "failed" ? ovStatusBtn("err", "err", `card-backend-${row.id}`, `${row.id}: failed — go to card`)
             : row.state === "starting" || row.state === "stopping" ? ovStatusBtn("warn", "clock", `card-backend-${row.id}`, `${row.id}: ${row.state} — go to card`)
             : ovStatusBtn("idle", "pause", `card-backend-${row.id}`, `${row.id}: ${row.state} — go to card`);
-          return `<div class="ov-row">${btn}<span class="ov-name">${esc(row.id)}</span><span class="ov-dim">${esc(row.state)}</span><span class="ov-dim">${esc(row.group ?? "ungrouped")}</span><span class="ov-dim">${row.port}</span><span class="ov-dim">${esc(gpuTxt)}</span><span class="ov-dim">${row.requests_1h !== undefined ? row.requests_1h.toLocaleString() : "\u2014"}</span><span class="ov-dim">${row.errors_1h !== undefined ? String(row.errors_1h) : "\u2014"}</span></div>`;
+          return `<div class="ov-row">${btn}<span class="ov-name">${esc(row.id)}</span><span class="ov-dim">${esc(row.state)}</span><span class="ov-dim">${esc(row.group ?? "ungrouped")}</span><span class="ov-dim">${row.port}</span><span class="ov-dim">${esc(gpuTxt)}</span><span class="ov-dim">${row.requests_1h !== undefined ? fmtCount(row.requests_1h) : "\u2014"}</span><span class="ov-dim">${row.errors_1h !== undefined ? fmtCount(row.errors_1h) : "\u2014"}</span></div>`;
         }).join("")}</div>` : "";
     }
     const f = backFilter.trim().toLowerCase();
@@ -3267,7 +3269,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     // error reads in the form's own terms; the op re-validates
     // regardless.
     if (n !== null && (!Number.isInteger(n) || n < PARALLEL_MIN || n > PARALLEL_MAX)) {
-      msgs.set(id, { text: `Parallel slots must be between ${PARALLEL_MIN} and ${PARALLEL_MAX.toLocaleString()}.`, err: true });
+      msgs.set(id, { text: `Parallel slots must be between ${PARALLEL_MIN} and ${fmtCount(PARALLEL_MAX)}.`, err: true });
       flagsParallel = saved;
       paint();
       return;
@@ -3679,7 +3681,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       // terms; an untouched field (null) sends nothing and the
       // backend is created with no --parallel token.
       if (pDraft.parallel !== null && (!Number.isInteger(pDraft.parallel) || pDraft.parallel < PARALLEL_MIN || pDraft.parallel > PARALLEL_MAX)) {
-        if (msg) msg.innerHTML = `<span style="color:var(--err)">Parallel slots must be between ${PARALLEL_MIN} and ${PARALLEL_MAX.toLocaleString()}.</span>`;
+        if (msg) msg.innerHTML = `<span style="color:var(--err)">Parallel slots must be between ${PARALLEL_MIN} and ${fmtCount(PARALLEL_MAX)}.</span>`;
         return;
       }
       // An undecided guardrail-blocked offload position cannot be
@@ -3717,8 +3719,8 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
           <div><span style="color:var(--text2)">Port:</span> ${port}</div>
           <div><span style="color:var(--text2)">Group:</span> ${esc(group)}</div>
           <div><span style="color:var(--text2)">Enabled:</span> ${enabled ? "yes" : "no"}</div>
-          <div><span style="color:var(--text2)">Context:</span> ${pDraft.ctx.toLocaleString()}</div>
-          <div><span style="color:var(--text2)">Batch:</span> ${pDraft.batch.toLocaleString()}</div>
+          <div><span style="color:var(--text2)">Context:</span> ${fmtCount(pDraft.ctx)}</div>
+          <div><span style="color:var(--text2)">Batch:</span> ${fmtCount(pDraft.batch)}</div>
           ${pDraft.parallel !== null ? `<div><span style="color:var(--text2)">Parallel slots:</span> ${pDraft.parallel}</div>` : ""}
           ${preview?.offload ? `<div><span style="color:var(--text2)">Offload:</span> ${esc(offloadTokenText(preview.offload, offLayers ?? preview.offload.layers))}${offPending?.override ? " (override recorded)" : ""}</div>` : ""}
           ${gpuTouched ? `<div><span style="color:var(--text2)">GPUs:</span> ${esc(selectedGpus().map((ix) => `GPU ${ix}`).join(", "))}</div>` : ""}
@@ -3903,7 +3905,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         flagsFor = null;
         await load();
       } else {
-        msgs.set(id, { text: `Flags saved (context ${flagsCtx.toLocaleString()}, batch ${flagsBatch}) — applies on next start.`, err: false });
+        msgs.set(id, { text: `Flags saved (context ${fmtCount(flagsCtx)}, batch ${fmtCount(flagsBatch)}) — applies on next start.`, err: false });
         flagsFor = null;
         await load();
       }
@@ -4257,7 +4259,7 @@ function modelOverviewHtml(rows: ModelRow[], stats: Map<string, { backends: numb
     else if ((m.partial_bytes ?? 0) > 0) { btn = ovStatusBtn("warn", "warn", `card-model-${m.id}`, `${m.id}: partial download — go to card`); stateTxt = "partial download"; }
     else { btn = ovStatusBtn("idle", "download", `card-model-${m.id}`, `${m.id}: not downloaded — go to card`); stateTxt = "not downloaded"; }
     const size = m.on_disk ? fmtBytes(m.size_bytes) : (m.partial_bytes ? `${fmtBytes(m.partial_bytes)} partial` : "\u2014");
-    return `<div class="ov-row">${btn}<span class="ov-name" title="${esc(m.id)}">${esc(modelShortName(m))}</span><span class="ov-dim">${esc(m.quant)}</span><span class="ov-dim">${esc(size)}</span><span class="ov-dim">${esc(stateTxt)}</span><span class="ov-dim">${st ? String(st.backends) : "0"}</span><span class="ov-dim">${st?.req !== undefined ? st.req.toLocaleString() : "\u2014"}</span></div>`;
+    return `<div class="ov-row">${btn}<span class="ov-name" title="${esc(m.id)}">${esc(modelShortName(m))}</span><span class="ov-dim">${esc(m.quant)}</span><span class="ov-dim">${esc(size)}</span><span class="ov-dim">${esc(stateTxt)}</span><span class="ov-dim">${st ? fmtCount(st.backends) : "0"}</span><span class="ov-dim">${st?.req !== undefined ? fmtCount(st.req) : "\u2014"}</span></div>`;
   }).join("");
   return `<div class="ovlist ov-m"><div class="ov-head"><span></span><span>Model</span><span>Quant</span><span>Size</span><span>State</span><span>Serving backends</span><span>Requests (1h)</span></div>${body}</div>`;
 }
@@ -4377,13 +4379,13 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
    * stats row and no placeholder sentence. */
   const statsHtml = stats && stats.backends > 0 && stats.req !== undefined
     ? `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 8px;align-items:center">
-        <div class="kv"><span class="k">Requests (1h)</span><span class="v" style="font-size:12px">${stats.req.toLocaleString()}</span></div>
-        ${stats.err !== undefined ? `<div class="kv"><span class="k">Errors (1h)</span><span class="v" style="font-size:12px">${stats.err.toLocaleString()}</span></div>` : ""}
+        <div class="kv"><span class="k">Requests (1h)</span><span class="v" style="font-size:12px">${fmtCount(stats.req)}</span></div>
+        ${stats.err !== undefined ? `<div class="kv"><span class="k">Errors (1h)</span><span class="v" style="font-size:12px">${fmtCount(stats.err)}</span></div>` : ""}
         ${stats.toks !== undefined ? `<div class="kv"><span class="k">Throughput</span><span class="v" style="font-size:12px">${trim1(stats.toks)} tok/s</span></div>` : ""}
       </div>
       ${stats.err !== undefined && stats.req > 0 ? stackedBar([
-        { pct: (stats.err / stats.req) * 100, color: C.red, label: `Errors: ${stats.err.toLocaleString()} of ${stats.req.toLocaleString()}` },
-        { pct: ((stats.req - stats.err) / stats.req) * 100, color: "#3a4350", label: `Succeeded: ${(stats.req - stats.err).toLocaleString()} of ${stats.req.toLocaleString()}` },
+        { pct: (stats.err / stats.req) * 100, color: C.red, label: `Errors: ${fmtCount(stats.err)} of ${fmtCount(stats.req)}` },
+        { pct: ((stats.req - stats.err) / stats.req) * 100, color: "#3a4350", label: `Succeeded: ${fmtCount(stats.req - stats.err)} of ${fmtCount(stats.req)}` },
       ], 600, 6) : ""}`
     : "";
   /* Details expandable: the full hash (with copy), verified date,
@@ -4409,7 +4411,7 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
       <div class="kv"><span class="k">File</span><span class="v" style="font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(m.gguf_path)}">${esc(m.gguf_path)}</span> <button class="btn" data-model-act="copy-path" data-model-id="${esc(m.id)}" title="Copy file path" aria-label="Copy file path" style="padding:1px 7px;font-size:11px">${icon("copy")}</button></div>
       <div class="kv"><span class="k">Size</span><span class="v" style="font-size:12px">${sizeText}</span></div>
       ${m.params_b > 0 ? `<div class="kv"><span class="k">Parameters</span><span class="v" style="font-size:12px">${trim1(m.params_b)}B</span></div>` : ""}
-      ${m.ctx_max != null ? `<div class="kv"><span class="k">Context</span><span class="v" style="font-size:12px">${m.ctx_max.toLocaleString()}</span></div>` : ""}
+      ${m.ctx_max != null ? `<div class="kv"><span class="k">Context</span><span class="v" style="font-size:12px">${fmtCount(m.ctx_max)}</span></div>` : ""}
       ${effMoeLayers != null && effMoeDefault != null ? `<div class="kv"><span class="k">Expert offload</span><span class="v" style="font-size:12px">Default: ${effMoeDefault} of ${effMoeLayers} layers</span></div>` : ""}
     </div>
     ${statsHtml}
@@ -6779,8 +6781,8 @@ function mxcActivityInner(activityR: { data: MxcActivityData | null; error?: str
   const totalAll = [...totals.values()].reduce((a, b) => a + b, 0);
   const decColor = (d: string): string => d === "allow" ? C.green : d === "deny" ? "#f85149" : d === "prompt" ? C.amber : "#6d7686";
   const mixBar = totalAll > 0
-    ? `<div style="margin-bottom:6px">${stackedBar([...totals.entries()].map(([d, n]) => ({ pct: (n / totalAll) * 100, color: decColor(d), label: `${d}: ${n.toLocaleString()}` })), 600, 8)}
-       <div class="legend" style="margin-top:4px">${[...totals.entries()].map(([d, n]) => `<span><span class="sw" style="background:${decColor(d)}"></span>${esc(d)} ${n.toLocaleString()}</span>`).join("")}</div></div>`
+    ? `<div style="margin-bottom:6px">${stackedBar([...totals.entries()].map(([d, n]) => ({ pct: (n / totalAll) * 100, color: decColor(d), label: `${d}: ${fmtCount(n)}` })), 600, 8)}
+       <div class="legend" style="margin-top:4px">${[...totals.entries()].map(([d, n]) => `<span><span class="sw" style="background:${decColor(d)}"></span>${esc(d)} ${fmtCount(n)}</span>`).join("")}</div></div>`
     : "";
   const decChip = (d: string): string => d === "allow" ? "badge-ok" : d === "deny" ? "badge-err" : d === "prompt" ? "badge-warn" : "";
   const rows = data.entries.map((e) => {

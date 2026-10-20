@@ -330,19 +330,19 @@ function consoleView(m: DashboardModel): string {
     // and could not render).
     const rate = b.throughput_toks
       ? `${trim1(b.throughput_toks)} tok/s`
-      : b.requests_1h !== undefined ? `${b.requests_1h} req/h` : "—";
+      : b.requests_1h !== undefined ? `${fmtCount(b.requests_1h)} req/h` : "—";
     return `<tr>
     <td>${statusDot(b.status)} ${esc(b.name)}</td><td>:${b.port}</td><td>${b.model ? esc(b.model) : "—"}</td>
-    <td>${b.health ?? "—"}</td><td>${rate}</td>
+    <td>${b.health == null ? "—" : trim1(b.health)}</td><td>${rate}</td>
     <td>${b.spark && b.spark.length ? sparkline(b.spark, 120, 20, C.blue) : "—"}</td></tr>`;
   }).join("");
   const gpuRows = m.gpus.map((g) => {
     const vramPct = Math.round((g.vram_used_gb / g.vram_total_gb) * 100);
-    return `<tr><td>${statusDot(g.status)} ${esc(g.name)}</td><td>${g.util_pct}%</td>
+    return `<tr><td>${statusDot(g.status)} ${esc(g.name)}</td><td>${trim1(g.util_pct)}%</td>
       <td>${meter(g.util_pct, 120, 8, C.blue)}</td>
       <td>${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GB</td>
       <td>${meter(vramPct, 120, 8, C.purple)}</td>
-      <td>${g.temp_c}°C</td><td>${g.power_w == null ? (g.power_absence === "driver_not_available" ? "not measured" : "—") : `${trim1(g.power_w)} W`}</td></tr>`;
+      <td>${trim1(g.temp_c)}°C</td><td>${g.power_w == null ? (g.power_absence === "driver_not_available" ? "not measured" : "—") : `${trim1(g.power_w)} W`}</td></tr>`;
   }).join("");
   return `<div class="card" style="margin-bottom:12px"><div class="sec-title">Services</div>
     <table class="tbl"><thead><tr><th>Service</th><th>Port</th><th>Model</th><th>Health</th><th>Rate</th><th>Trend</th></tr></thead>
@@ -401,7 +401,7 @@ function topologyView(m: DashboardModel): string {
     }
   });
   gpus.forEach((g, i) => {
-    node(colX[2], cy(i, gpus.length), g.name, `${g.util_pct}% util`, statusColor(g.status));
+    node(colX[2], cy(i, gpus.length), g.name, `${trim1(g.util_pct)}% util`, statusColor(g.status));
   });
   // Backend -> GPU connectivity comes from the configured tensor
   // splits (the placement rows' segments), exactly like the full

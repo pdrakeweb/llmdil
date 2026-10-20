@@ -308,5 +308,67 @@ check(allowed.length === 0, `no external asset URLs in bundle (found ${allowed.l
 
 check(bundle.length > 20_000, `bundle is non-trivial (${bundle.length} bytes)`);
 
+// Numeric display discipline (design-principles rule 14): every
+// displayed number renders through the charts.ts utility family
+// (trim1 / fmtGb / fmtCount / fmtPct). Raw float interpolation leaked
+// full-precision values into the UI — the GPUs overview row printed
+// power as "11.350000381469727 W" because it interpolated g.power_w
+// directly instead of routing it through trim1. Two layers of pin:
+// (1) behavior — the extracted formatters turn the reported power
+// value into "11.4"; (2) sites — the sources carry no raw
+// interpolation of the telemetry floats and no locale-dependent
+// no-argument toLocaleString() on counts/contexts.
+const chartsSrcNum = readFileSync(join(root, "src", "charts.ts"), "utf8");
+function extractFn(src, name) {
+  const start = src.indexOf(`export function ${name}(`);
+  if (start < 0) return null;
+  const open = src.indexOf("{", start);
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") { depth--; if (depth === 0) return src.slice(start, i + 1); }
+  }
+  return null;
+}
+const fmtNames = ["trim1", "fmtGb", "fmtCount", "fmtPct"];
+const fmtBodies = fmtNames.map((n) => extractFn(chartsSrcNum, n));
+check(fmtBodies.every(Boolean), "charts.ts exports the numeric formatter family (trim1/fmtGb/fmtCount/fmtPct)");
+let fmt = null;
+try {
+  const plain = fmtBodies.join("\n").replace(/export /g, "").replace(/: (number|string)/g, "");
+  fmt = new Function(`${plain}; return { trim1, fmtGb, fmtCount, fmtPct };`)();
+} catch { /* null fails the behavior checks below */ }
+check(fmt !== null, "numeric formatters evaluate for behavior checks");
+if (fmt) {
+  check(fmt.trim1(11.350000381469727) === "11.4", `trim1 renders the reported power value at one decimal ("${fmt.trim1(11.350000381469727)}")`);
+  check(fmt.trim1(140) === "140", "trim1 drops the trailing .0 at magnitude >= 100");
+  check(fmt.trim1(95.25) === "95.3", "trim1 keeps one decimal below 100");
+  check(fmt.trim1(Number.NaN) === "\u2014", "trim1 renders a non-finite value as the unknown marker");
+  check(fmt.fmtGb(16.376) === "16.4", "fmtGb renders through trim1");
+  check(fmt.fmtCount(1234567) === "1,234,567", "fmtCount renders counts with en-US separators");
+  check(fmt.fmtCount(512.6) === "513", "fmtCount rounds to an integer");
+  check(fmt.fmtPct(0.125) === "12.5", "fmtPct renders a fraction as a one-decimal percent figure");
+}
+const staticSrcNum = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+const dashSrcNum = readFileSync(join(root, "src", "views", "dashboard.ts"), "utf8");
+const mapSrcNum = readFileSync(join(root, "src", "views", "serviceMap.ts"), "utf8");
+const optSrcNum = readFileSync(join(root, "src", "views", "optimize.ts"), "utf8");
+check(staticSrcNum.includes("trim1(g.power_w)"), "GPUs overview row renders power through trim1");
+check(!staticSrcNum.includes("${g.power_w} W"), "GPUs overview row does not interpolate raw power");
+check(!staticSrcNum.includes("${g.util_pct}%") && !staticSrcNum.includes("${g.temp_c}"), "GPUs views do not interpolate raw util/temp");
+check(!staticSrcNum.includes("${g.mem_util_pct}%") && !staticSrcNum.includes("${g.fan_pct}%"), "GPU card does not interpolate raw memory-util/fan percentages");
+check(!staticSrcNum.includes("String(g.util_pct)"), "GPU gauge center label renders through trim1, not String()");
+check(!staticSrcNum.includes(".toFixed(2)"), "no two-decimal fixed rendering remains in static.ts (predicted-throughput TTFT routes through trim1)");
+check(staticSrcNum.includes("trim1(n / 1024)"), "ctxShort renders the K quotient through trim1");
+check(!dashSrcNum.includes("${g.util_pct}%") && !dashSrcNum.includes("${g.temp_c}"), "dashboard console/topology do not interpolate raw util/temp");
+check(dashSrcNum.includes("trim1(b.health)"), "dashboard console renders backend health through trim1");
+check(dashSrcNum.includes("fmtCount(b.requests_1h)"), "dashboard console renders request counts through fmtCount");
+check(!mapSrcNum.includes("String(g.util_pct)") && mapSrcNum.includes("trim1(g.util_pct)"), "service map GPU load gauge renders util through trim1");
+check(optSrcNum.includes("fmtCount(e.inputs.n_ctx)") && optSrcNum.includes("fmtCount(e.flags.n_ctx)"), "Optimize renders context sizes through fmtCount");
+for (const [name, src] of [["static.ts", staticSrcNum], ["dashboard.ts", dashSrcNum], ["serviceMap.ts", mapSrcNum], ["optimize.ts", optSrcNum]]) {
+  check(!/\.toLocaleString\(\)/.test(src.replace(/new Date\([^)]*\)\.toLocaleString\(\)/g, "")),
+    `${name} has no locale-dependent no-argument toLocaleString() on a numeric value (counts/contexts route through fmtCount)`);
+}
+
 if (failures > 0) { console.error(`\n${failures} smoke check(s) failed`); process.exit(1); }
 console.log("\nsmoke: all checks passed");

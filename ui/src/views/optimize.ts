@@ -24,7 +24,7 @@ import {
 import type {
   CallResult, MeasurementInputs, OptimizeCandidate, OptimizeExperiment, OptimizeMeasurementEntry, OptimizePlanItem, OptimizeState,
 } from "../api";
-import { trim1 } from "../charts";
+import { fmtCount, trim1 } from "../charts";
 import { esc } from "../html";
 import { icon } from "../icons";
 
@@ -284,7 +284,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
 
   function expFlagsSummary(e: OptimizeExperiment): string {
     const parts: string[] = [];
-    if (typeof e.flags.n_ctx === "number") parts.push(`Context: ${e.flags.n_ctx.toLocaleString("en-US")}`);
+    if (typeof e.flags.n_ctx === "number") parts.push(`Context: ${fmtCount(e.flags.n_ctx)}`);
     if (typeof e.flags.offload_layers === "number") parts.push(`Offload: ${e.flags.offload_layers} layers`);
     if (Array.isArray(e.flags.tensor_split) && e.flags.tensor_split.length) {
       parts.push(`Split: ${e.flags.tensor_split.map((f) => `${Math.round(f * 100)}`).join(" / ")} %`);
@@ -558,8 +558,8 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     ];
     if (e.inputs) {
       meta.push(`Placement: ${placementShort(e.inputs)}`);
-      meta.push(`Context: ${e.inputs.n_ctx.toLocaleString()}`);
-      meta.push(`Batch: ${e.inputs.n_batch.toLocaleString()}`);
+      meta.push(`Context: ${fmtCount(e.inputs.n_ctx)}`);
+      meta.push(`Batch: ${fmtCount(e.inputs.n_batch)}`);
     }
     const current = e.current_for.length
       ? `<span class="opt-measure-figs">Current for: ${esc(e.current_for.join(", "))}</span>`

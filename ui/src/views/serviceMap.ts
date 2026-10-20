@@ -12,7 +12,7 @@
 
 import { getAppConfig, getBackends, getGatewayStatus, getGpuTelemetry, systemVerdict } from "../api";
 import type { BackendRow, GatewayStatusData } from "../api";
-import { fmtGb, gaugeRing } from "../charts";
+import { fmtGb, gaugeRing, trim1 } from "../charts";
 import { icon } from "../icons";
 import { esc } from "../html";
 import type { GpuInfo } from "../types";
@@ -330,7 +330,7 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
   const gpuLoad = root.querySelector("#mapGpuLoad");
   if (gpuLoad) {
     gpuLoad.innerHTML = d.gpus.length
-      ? d.gpus.map((g) => `<div style="display:flex;align-items:center;gap:10px;margin:8px 0"><span style="font-size:12px;width:70px">${esc(g.name.replace("Tesla ", ""))}</span>${gaugeRing(g.util_pct, 44, g.util_pct > 60 ? C.amber : C.green, String(g.util_pct), "%")}</div>`).join("")
+      ? d.gpus.map((g) => `<div style="display:flex;align-items:center;gap:10px;margin:8px 0"><span style="font-size:12px;width:70px">${esc(g.name.replace("Tesla ", ""))}</span>${gaugeRing(g.util_pct, 44, g.util_pct > 60 ? C.amber : C.green, trim1(g.util_pct), "%")}</div>`).join("")
       : `<div class="empty">no GPUs reported</div>`;
   }
 }
