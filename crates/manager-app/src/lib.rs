@@ -1272,6 +1272,8 @@ async fn ensure_catalog_models(state: &AppState) {
                 assigned_backends,
                 enabled: spec.enabled_by_default,
                 display_name: None,
+                moe_layers: None,
+                default_offload_layers: None,
             }
         })
         .collect();
@@ -3082,6 +3084,10 @@ pub async fn op_list_models(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -
         .iter()
         .map(|s| (s.id.as_str(), s.name.as_str()))
         .collect();
+    let catalog_offload: HashMap<&str, (Option<u32>, Option<u32>)> = catalog
+        .iter()
+        .map(|s| (s.id.as_str(), (s.moe_layers, s.default_offload_layers)))
+        .collect();
     let models: Vec<Value> = cfg
         .models
         .iter()
@@ -3113,6 +3119,14 @@ pub async fn op_list_models(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -
                 "download_error": outcomes.get(&m.id).and_then(|o| o.failed.clone()),
                 "catalog_size_bytes": catalog_sizes.get(m.id.as_str()).copied(),
                 "ctx_max": catalog_ctx.get(m.id.as_str()).copied(),
+                // The operator's MoE declaration on the model
+                // record, and the catalog's pins for the same
+                // figures: the Models view's offload editor reads
+                // the pair (catalog wins where it pins a value).
+                "moe_layers": m.moe_layers,
+                "default_offload_layers": m.default_offload_layers,
+                "catalog_moe_layers": catalog_offload.get(m.id.as_str()).and_then(|p| p.0),
+                "catalog_default_offload_layers": catalog_offload.get(m.id.as_str()).and_then(|p| p.1),
             })
         })
         .collect();
@@ -3157,8 +3171,8 @@ fn download_spec_for(cfg: &AppConfig, id: &str) -> Result<manager_models::ModelS
             ctx_max: 0,
             enabled_by_default: m.enabled,
             expert_bytes: None,
-            moe_layers: None,
-            default_offload_layers: None,
+            moe_layers: m.moe_layers,
+            default_offload_layers: m.default_offload_layers,
             offload_restrictions: Vec::new(),
             mtp: false,
         });
@@ -4908,12 +4922,14 @@ pub async fn op_backend_add(
             tensor_split,
             split_mode,
         },
-        // A new backend starts with its model's catalog default
-        // expert offload (the green limit), when the model pins
-        // one — e.g. a backend created for Nemotron starts at
-        // --n-cpu-moe 16 rather than with no offload at all. A
-        // position chosen in the add form replaces it below.
-        raw_flags: catalog_default_raw_flags(&model.id),
+        // A new backend starts with its model's default expert
+        // offload (the green limit), when one is pinned — by the
+        // catalog, or by the operator's declaration on the model
+        // record for a model the catalog does not carry — e.g. a
+        // backend created for Nemotron starts at --n-cpu-moe 16
+        // rather than with no offload at all. A position chosen
+        // in the add form replaces it below.
+        raw_flags: model_default_raw_flags(&model),
         // A created backend starts in structured flags mode; the
         // operator opts into advanced mode per backend afterward.
         flags_advanced: false,
@@ -5044,7 +5060,7 @@ pub async fn op_backend_add_preview(
             tensor_split: tensor_split.clone(),
             split_mode,
         },
-        raw_flags: catalog_default_raw_flags(&model.id),
+        raw_flags: model_default_raw_flags(&model),
         flags_advanced: false,
         restart_policy: manager_config::RestartPolicy {
             max_retries: 5,
@@ -5132,6 +5148,31 @@ fn catalog_default_raw_flags(model_id: &str) -> Option<String> {
         .and_then(|s| {
             manager_models::offload_flag_string(manager_models::catalog_default_offload(&s))
         })
+}
+
+/// The raw flags a backend serving `model` starts with, resolved
+/// against the model record as well as the catalog: the catalog
+/// default when the catalog pins one for the model's id (see
+/// [`catalog_default_raw_flags`]); otherwise the operator's
+/// declared default on the model record
+/// ([`ModelConfig::moe_layers`] /
+/// [`ModelConfig::default_offload_layers`]) in canonical form —
+/// the path that gives a user-added MoE model the same creation
+/// default a catalog model gets. `None` when neither source pins
+/// a default that writes tokens.
+fn model_default_raw_flags(model: &manager_config::ModelConfig) -> Option<String> {
+    if let Some(flags) = catalog_default_raw_flags(&model.id) {
+        return Some(flags);
+    }
+    let layers = model.moe_layers?;
+    let default = model.default_offload_layers?;
+    if layers == 0 {
+        return None;
+    }
+    manager_models::offload_flag_string(manager_models::offload_for_layers(
+        default.min(layers),
+        layers,
+    ))
 }
 
 /// Set a backend's expert offload (the Edit Flags form's offload
@@ -7009,12 +7050,54 @@ pub async fn op_model_set_enabled(
     Ok(json!({ "model_id": id, "enabled": enabled }))
 }
 
+/// Set or clear a model's operator MoE declaration: the MoE layer
+/// count and the default offload layers that give a model the
+/// curated catalog does not carry expert-offload controls (the
+/// creation default and the Edit Flags slider's green limit are
+/// resolved from it when the catalog pins neither). Both fields
+/// `None` clears the declaration. The pair is validated atomically
+/// (see [`manager_config::validate_moe_declaration`]) before
+/// anything is written, and the save validates again, so a
+/// rejected edit leaves the stored model untouched. Catalog
+/// models keep resolving from the catalog — a declaration stored
+/// on one is shadowed by the catalog pin, never an override.
+pub async fn op_model_set_offload_spec(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    id: String,
+    moe_layers: Option<u32>,
+    default_offload_layers: Option<u32>,
+) -> ApiResult {
+    manager_config::validate_moe_declaration(moe_layers, default_offload_layers)
+        .map_err(ApiError::InvalidInput)?;
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    let m = new_cfg
+        .models
+        .iter_mut()
+        .find(|m| m.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("model {id}")))?;
+    m.moe_layers = moe_layers;
+    m.default_offload_layers = default_offload_layers;
+    manager_config::save(&new_cfg, &state.config_path)?;
+    *cfg = new_cfg;
+    Ok(json!({
+        "id": id,
+        "moe_layers": moe_layers,
+        "default_offload_layers": default_offload_layers,
+    }))
+}
+
 /// Add a model to the registry: an id, the https URL of its GGUF file,
-/// and optionally an explicit file name, quant label, and parameter
+/// and optionally an explicit file name, quant label, parameter
 /// count (see [`model_add_entry`] for how the count is resolved and
-/// when the add is refused). The model starts enabled with no pinned
-/// SHA-256 — its downloads run unverified (the Models view shows
+/// when the add is refused), and a MoE declaration (the MoE layer
+/// count plus the default offload layers — the pair that gives a
+/// model the curated catalog does not carry expert-offload
+/// controls; see [`manager_config::validate_moe_declaration`]).
+/// The model starts enabled with no pinned SHA-256 — its downloads run unverified (the Models view shows
 /// "hash not pinned") until a hash is recorded in the configuration.
+#[allow(clippy::too_many_arguments)]
 pub async fn op_model_add(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
@@ -7023,6 +7106,8 @@ pub async fn op_model_add(
     file_name: Option<String>,
     quant: Option<String>,
     params_b: Option<f32>,
+    moe_layers: Option<u32>,
+    default_offload_layers: Option<u32>,
 ) -> ApiResult {
     // Resolve everything before taking the config lock: a rejected
     // add must leave the in-memory config and the saved file
@@ -7030,7 +7115,15 @@ pub async fn op_model_add(
     // config first, so when the save then failed validation the
     // invalid entry stayed in memory and poisoned every later save
     // in the session.)
-    let entry = model_add_entry(&id, &source_url, file_name, quant, params_b)?;
+    let entry = model_add_entry(
+        &id,
+        &source_url,
+        file_name,
+        quant,
+        params_b,
+        moe_layers,
+        default_offload_layers,
+    )?;
     let id = entry.id.clone();
     let mut cfg = state.config.write().await;
     if cfg.models.iter().any(|m| m.id == id) {
@@ -7090,6 +7183,10 @@ pub async fn op_model_assign(
         .find(|m| m.id == id)
         .ok_or_else(|| ApiError::NotFound(format!("model {id}")))?;
     let gguf_path = model.gguf_path.clone();
+    // The model's default offload flags (catalog pin, or the
+    // operator's declared default on the model record), resolved
+    // before the mutable backend borrow below.
+    let default_flags = model_default_raw_flags(model);
     let flags_untouched = {
         let backend = cfg
             .backends
@@ -7108,11 +7205,12 @@ pub async fn op_model_assign(
         // mode). The response reports the skip.
         let untouched = backend.flags_advanced;
         // A backend with no raw flags of its own takes the newly
-        // assigned model's catalog default offload (e.g. Nemotron's
-        // --n-cpu-moe 16) — the same preservation rule as the
-        // catalog definition refresh: backends carrying operator
-        // flags keep them, and the offload slider adjusts from
-        // there.
+        // assigned model's default offload (e.g. Nemotron's
+        // --n-cpu-moe 16 from the catalog, or a user-added MoE
+        // model's declared default) — the same preservation rule
+        // as the catalog definition refresh: backends carrying
+        // operator flags keep them, and the offload slider
+        // adjusts from there.
         if !untouched
             && backend
                 .raw_flags
@@ -7121,8 +7219,8 @@ pub async fn op_model_assign(
                 .unwrap_or("")
                 .is_empty()
         {
-            if let Some(flags) = catalog_default_raw_flags(&id) {
-                backend.raw_flags = Some(flags);
+            if let Some(flags) = &default_flags {
+                backend.raw_flags = Some(flags.clone());
             }
         }
         if !untouched {
@@ -7338,6 +7436,13 @@ struct WeightLayout {
     /// is a catalog model (the offload slider's green limit and
     /// default live there).
     catalog: Option<manager_models::ModelSpec>,
+    /// The offload slider's green limit (in MoE layers) for the
+    /// backend's model: the catalog's pinned default when the
+    /// catalog carries one, else the operator's declared default
+    /// on the model record ([`ModelConfig::default_offload_layers`])
+    /// — the fallback that gives a user-added MoE model offload
+    /// controls. `None` when neither source pins one.
+    green_limit_layers: Option<u32>,
 }
 
 fn resolve_weight_layout(
@@ -7390,6 +7495,14 @@ fn resolve_weight_layout(
                 manager_models::MemoryBasis::Estimate,
             ),
         };
+    // The slider's green limit resolves per figure, catalog
+    // first: a catalog pin wins; where the catalog carries no
+    // default (or no entry at all), the operator's declared
+    // default on the model record supplies it.
+    let green_limit_layers = catalog
+        .as_ref()
+        .and_then(|c| c.default_offload_layers)
+        .or(model.default_offload_layers);
     Some(WeightLayout {
         total_bytes,
         expert_bytes,
@@ -7398,6 +7511,7 @@ fn resolve_weight_layout(
         kv_per_token,
         basis,
         catalog,
+        green_limit_layers,
     })
 }
 
@@ -7430,7 +7544,9 @@ struct OffloadInfo {
     layers: u32,
     expert_bytes: u64,
     total_bytes: u64,
-    /// The green limit in layers (the catalog default offload).
+    /// The green limit in layers (the model's default offload —
+    /// the catalog pin, or the operator's declared default for a
+    /// model outside the catalog).
     green_limit_layers: u32,
     /// Slider band boundaries as fractions (see
     /// [`manager_models::offload_bands`]).
@@ -7456,10 +7572,12 @@ fn backend_offload_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> O
     let layout = resolve_weight_layout(cfg, b)?;
     let expert_bytes = layout.expert_bytes?;
     let moe_layers = layout.moe_layers?;
-    // The bands derive from the catalog's green limit, so a model
-    // without one (dense, or outside the curated catalog) gets no
-    // slider rather than invented band boundaries.
-    let green_limit_layers = layout.catalog.as_ref()?.default_offload_layers?;
+    // The bands derive from the model's green limit (the catalog
+    // default, or the operator's declared default for a model the
+    // catalog does not carry), so a model with no green limit
+    // from either source gets no slider rather than invented
+    // band boundaries.
+    let green_limit_layers = layout.green_limit_layers?;
     if expert_bytes == 0 || moe_layers == 0 {
         return None;
     }
@@ -7709,8 +7827,8 @@ pub async fn op_placement_propose(
                 ctx_max: 0,
                 enabled_by_default: m.enabled,
                 expert_bytes: None,
-                moe_layers: None,
-                default_offload_layers: None,
+                moe_layers: m.moe_layers,
+                default_offload_layers: m.default_offload_layers,
                 offload_restrictions: Vec::new(),
                 mtp: false,
             }
@@ -9353,6 +9471,8 @@ mod tests {
             assigned_backends: Vec::new(),
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         };
         // Advanced: the assignment proceeds, but neither the
         // catalog raw-flags fill (the backend's blank flags would
@@ -9449,6 +9569,8 @@ mod tests {
             assigned_backends: Vec::new(),
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         };
         let mut cfg = test_cfg();
         cfg.models.push(nemotron);
@@ -9845,6 +9967,8 @@ mod tests {
             assigned_backends: Vec::new(),
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
     }
 
@@ -10419,6 +10543,8 @@ mod tests {
             assigned_backends: vec![backend_id.to_string()],
             enabled: true,
             display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
         });
         let b = cfg
             .backends
@@ -10511,6 +10637,423 @@ mod tests {
             None,
         );
         assert!(backend_offload_info(&cfg, &b).is_none());
+    }
+
+    /// A minimal GGUF header (directory only — the layout parser
+    /// reads nothing past it) with `moe_blocks` blocks carrying one
+    /// routed-expert tensor each, plus `dense_blocks` plain blocks.
+    fn gguf_header_bytes(moe_blocks: u32, dense_blocks: u32) -> Vec<u8> {
+        fn w_str(out: &mut Vec<u8>, s: &str) {
+            out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        fn w_kv_str(out: &mut Vec<u8>, key: &str, v: &str) {
+            w_str(out, key);
+            out.extend_from_slice(&8u32.to_le_bytes());
+            w_str(out, v);
+        }
+        fn w_kv_u32(out: &mut Vec<u8>, key: &str, v: u32) {
+            w_str(out, key);
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        fn w_tensor(out: &mut Vec<u8>, name: &str, elems: u64) {
+            w_str(out, name);
+            out.extend_from_slice(&1u32.to_le_bytes()); // n_dims
+            out.extend_from_slice(&elems.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // F32
+            out.extend_from_slice(&0u64.to_le_bytes()); // offset
+        }
+        let total = moe_blocks + dense_blocks;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&(total as u64).to_le_bytes()); // tensor count
+        b.extend_from_slice(&2u64.to_le_bytes()); // kv count
+        w_kv_str(&mut b, "general.architecture", "testarch");
+        w_kv_u32(&mut b, "testarch.block_count", total);
+        for i in 0..moe_blocks {
+            w_tensor(&mut b, &format!("blk.{i}.ffn_gate_exps.weight"), 256);
+        }
+        for i in 0..dense_blocks {
+            w_tensor(
+                &mut b,
+                &format!("blk.{}.ffn_gate.weight", moe_blocks + i),
+                256,
+            );
+        }
+        b
+    }
+
+    #[test]
+    fn model_default_raw_flags_render_declared_defaults() {
+        let mut cfg = test_cfg();
+        register_test_model(&mut cfg, "user-moe-27b", "models/user-moe.gguf");
+        let mut model = cfg.models.last().unwrap().clone();
+        // No declaration: no default, exactly like a dense model.
+        assert_eq!(model_default_raw_flags(&model), None);
+        model.moe_layers = Some(48);
+        model.default_offload_layers = Some(48);
+        assert_eq!(
+            model_default_raw_flags(&model).as_deref(),
+            Some("-ot exps=CPU")
+        );
+        model.default_offload_layers = Some(16);
+        assert_eq!(
+            model_default_raw_flags(&model).as_deref(),
+            Some("--n-cpu-moe 16")
+        );
+        // A declared default of 0 writes no tokens.
+        model.default_offload_layers = Some(0);
+        assert_eq!(model_default_raw_flags(&model), None);
+        // Layers without a default cannot form a position.
+        model.default_offload_layers = None;
+        assert_eq!(model_default_raw_flags(&model), None);
+    }
+
+    #[test]
+    fn catalog_pin_wins_over_a_record_declaration() {
+        let mut cfg = test_cfg();
+        // A Nemotron record carrying a conflicting declaration
+        // (full offload): the catalog's 16-of-24 pin still wins,
+        // for the creation default and the slider's green limit.
+        let b = serve_model(
+            &mut cfg,
+            "coder-fast",
+            "nemotron-3.5-lightning-30b",
+            "models/Nemotron.gguf",
+            None,
+        );
+        let m = cfg
+            .models
+            .iter_mut()
+            .find(|m| m.id == "nemotron-3.5-lightning-30b")
+            .unwrap();
+        m.moe_layers = Some(24);
+        m.default_offload_layers = Some(24);
+        let model = cfg
+            .models
+            .iter()
+            .find(|m| m.id == "nemotron-3.5-lightning-30b")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            model_default_raw_flags(&model).as_deref(),
+            Some("--n-cpu-moe 16")
+        );
+        let info = backend_offload_info(&cfg, &b).expect("nemotron is offload-capable");
+        assert_eq!(info.green_limit_layers, 16);
+    }
+
+    #[test]
+    fn declared_moe_model_gets_offload_info_once_its_file_parses() {
+        // The slider's figures split by source: the layer count
+        // and expert bytes come from the downloaded GGUF's parse;
+        // the green limit — the one input that used to be
+        // catalog-only — comes from the record's declaration.
+        let dir = std::env::temp_dir().join(format!(
+            "llm-mgr-declared-moe-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::write(
+            dir.join("models").join("user-moe.gguf"),
+            gguf_header_bytes(48, 0),
+        )
+        .unwrap();
+        let mut cfg = test_cfg();
+        cfg.data_dir = dir.clone();
+        register_test_model(&mut cfg, "user-moe-27b", "models/user-moe.gguf");
+        cfg.models.last_mut().unwrap().moe_layers = Some(48);
+        cfg.models.last_mut().unwrap().default_offload_layers = Some(16);
+        let b = uncreated_backend(
+            "moe-backend",
+            "models/user-moe.gguf",
+            Some("--n-cpu-moe 16".to_string()),
+        );
+        let info = backend_offload_info(&cfg, &b).expect("declared MoE model is offload-capable");
+        assert_eq!(info.moe_layers, 48);
+        assert_eq!(info.green_limit_layers, 16);
+        assert_eq!(info.layers, 16);
+        assert!((info.green_end - 16.0 / 48.0).abs() < 1e-9);
+        assert!(info.restrictions.is_empty());
+        // Without the declaration the same parse yields no slider:
+        // the green limit has no source.
+        cfg.models.last_mut().unwrap().moe_layers = None;
+        cfg.models.last_mut().unwrap().default_offload_layers = None;
+        assert!(backend_offload_info(&cfg, &b).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn user_declared_moe_model_round_trip() {
+        // Pete's shape: a user-added 27B-class MoE model the
+        // catalog does not carry, declared at add time.
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        let r = op_model_add(
+            &state,
+            &sink,
+            "qwen3.8-27b-moe".to_string(),
+            "https://example.com/Qwen3.8-27B-MoE.gguf".to_string(),
+            None,
+            None,
+            Some(27.0),
+            Some(48),
+            Some(16),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["model_id"], "qwen3.8-27b-moe");
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let m = saved
+            .models
+            .iter()
+            .find(|m| m.id == "qwen3.8-27b-moe")
+            .unwrap();
+        assert_eq!(m.moe_layers, Some(48));
+        assert_eq!(m.default_offload_layers, Some(16));
+        // The downloaded file lands: a 48-block MoE GGUF.
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::write(
+            dir.join("models").join("Qwen3.8-27B-MoE.gguf"),
+            gguf_header_bytes(48, 0),
+        )
+        .unwrap();
+        // Backend creation applies the declared default.
+        let r = op_backend_add(
+            &state,
+            &sink,
+            "moe-backend".to_string(),
+            "qwen3.8-27b-moe".to_string(),
+            8199,
+            "moe".to_string(),
+            true,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["backend_id"], "moe-backend");
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let b = saved
+            .backends
+            .iter()
+            .find(|b| b.id == "moe-backend")
+            .unwrap()
+            .clone();
+        assert_eq!(b.raw_flags.as_deref(), Some("--n-cpu-moe 16"));
+        // The add form's preview and the Edit Flags payload agree:
+        // the control exists, ranged over the parsed layer count,
+        // greened at the declared default.
+        let preview = op_backend_add_preview(
+            &state,
+            &sink,
+            "qwen3.8-27b-moe".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        let off = preview["offload"].as_object().expect("preview carries offload");
+        assert_eq!(off["moe_layers"], 48);
+        assert_eq!(off["green_limit_layers"], 16);
+        assert_eq!(off["layers"], 16);
+        let cfg_now = state.config.read().await.clone();
+        let info = backend_offload_info(&cfg_now, &b).expect("offload info for the new backend");
+        assert_eq!(info.moe_layers, 48);
+        assert_eq!(info.green_limit_layers, 16);
+        // The slider op rewrites only the offload tokens: partial,
+        // full, and off — a sibling -ot assignment and an unrelated
+        // flag survive every rewrite.
+        op_backend_set_offload(&state, &sink, "moe-backend".to_string(), 24, None)
+            .await
+            .unwrap();
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let flags = saved
+            .backends
+            .iter()
+            .find(|b| b.id == "moe-backend")
+            .unwrap()
+            .raw_flags
+            .clone()
+            .unwrap();
+        assert_eq!(flags, "--n-cpu-moe 24");
+        // A sibling -ot assignment and an unrelated flag reach the
+        // record the way the app allows: written as text in
+        // advanced mode, carried verbatim when the backend returns
+        // to structured mode.
+        op_backend_set_flags_mode(&state, &sink, "moe-backend".to_string(), true)
+            .await
+            .unwrap();
+        op_backend_set_raw_flags(
+            &state,
+            &sink,
+            "moe-backend".to_string(),
+            Some("--mlock -ot ffn_down_shexp=CPU --n-cpu-moe 24".to_string()),
+        )
+        .await
+        .unwrap();
+        op_backend_set_flags_mode(&state, &sink, "moe-backend".to_string(), false)
+            .await
+            .unwrap();
+        op_backend_set_offload(&state, &sink, "moe-backend".to_string(), 48, None)
+            .await
+            .unwrap();
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let flags = saved
+            .backends
+            .iter()
+            .find(|b| b.id == "moe-backend")
+            .unwrap()
+            .raw_flags
+            .clone()
+            .unwrap();
+        assert!(flags.contains("-ot exps=CPU"), "{flags}");
+        assert!(flags.contains("-ot ffn_down_shexp=CPU"), "{flags}");
+        assert!(flags.contains("--mlock"), "{flags}");
+        assert!(!flags.contains("--n-cpu-moe"), "{flags}");
+        op_backend_set_offload(&state, &sink, "moe-backend".to_string(), 0, None)
+            .await
+            .unwrap();
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let flags = saved
+            .backends
+            .iter()
+            .find(|b| b.id == "moe-backend")
+            .unwrap()
+            .raw_flags
+            .clone()
+            .unwrap();
+        assert!(!flags.contains("--n-cpu-moe"), "{flags}");
+        assert!(!flags.contains("-ot exps=CPU"), "{flags}");
+        assert!(flags.contains("-ot ffn_down_shexp=CPU"), "{flags}");
+        assert!(flags.contains("--mlock"), "{flags}");
+        // Editing the declaration moves the default; clearing it
+        // removes the control (the green limit loses its source).
+        let r = op_model_set_offload_spec(
+            &state,
+            &sink,
+            "qwen3.8-27b-moe".to_string(),
+            Some(48),
+            Some(48),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["default_offload_layers"], 48);
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let m = saved
+            .models
+            .iter()
+            .find(|m| m.id == "qwen3.8-27b-moe")
+            .unwrap();
+        assert_eq!(model_default_raw_flags(m).as_deref(), Some("-ot exps=CPU"));
+        op_model_set_offload_spec(&state, &sink, "qwen3.8-27b-moe".to_string(), None, None)
+            .await
+            .unwrap();
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let b = saved
+            .backends
+            .iter()
+            .find(|b| b.id == "moe-backend")
+            .unwrap()
+            .clone();
+        assert!(backend_offload_info(&saved, &b).is_none());
+        // Invalid declarations refuse at both write paths and
+        // persist nothing.
+        assert!(matches!(
+            op_model_set_offload_spec(
+                &state,
+                &sink,
+                "qwen3.8-27b-moe".to_string(),
+                Some(48),
+                Some(49),
+            )
+            .await,
+            Err(ApiError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            op_model_add(
+                &state,
+                &sink,
+                "bad-moe".to_string(),
+                "https://example.com/bad.gguf".to_string(),
+                None,
+                None,
+                Some(9.0),
+                Some(48),
+                None,
+            )
+            .await,
+            Err(ApiError::InvalidInput(_))
+        ));
+        let saved = manager_config::load(&state.config_path).unwrap();
+        assert!(!saved.models.iter().any(|m| m.id == "bad-moe"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn dense_user_model_gets_no_offload_control() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        op_model_add(
+            &state,
+            &sink,
+            "dense-7b".to_string(),
+            "https://example.com/dense-7b.gguf".to_string(),
+            None,
+            None,
+            Some(7.0),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::write(
+            dir.join("models").join("dense-7b.gguf"),
+            gguf_header_bytes(0, 4),
+        )
+        .unwrap();
+        op_backend_add(
+            &state,
+            &sink,
+            "dense-backend".to_string(),
+            "dense-7b".to_string(),
+            8198,
+            "moe".to_string(),
+            true,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let b = saved
+            .backends
+            .iter()
+            .find(|b| b.id == "dense-backend")
+            .unwrap()
+            .clone();
+        assert_eq!(b.raw_flags, None);
+        assert!(backend_offload_info(&saved, &b).is_none());
+        let preview = op_backend_add_preview(&state, &sink, "dense-7b".to_string(), None)
+            .await
+            .unwrap();
+        assert!(preview["offload"].is_null());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -11033,6 +11576,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             );
             match r {
                 Err(ApiError::InvalidInput(msg)) => {
@@ -11048,6 +11593,8 @@ mod tests {
                 None,
                 None,
                 Some(0.0),
+                None,
+                None,
             );
             assert!(matches!(r, Err(ApiError::InvalidInput(_))), "{r:?}");
         }
@@ -11063,6 +11610,8 @@ mod tests {
                 None,
                 None,
                 Some(7.5),
+                None,
+                None,
             )
             .expect("explicit params resolve");
             assert_eq!(e.id, "my-7b");
@@ -11077,7 +11626,7 @@ mod tests {
             cfg.models.push(e);
             manager_config::validate(&cfg).expect("added entry validates");
             // An explicit value wins over the catalog.
-            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, Some(9.0))
+            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, Some(9.0), None, None)
                 .expect("explicit params resolve");
             assert_eq!(e.params_b, 9.0);
         }
@@ -11085,7 +11634,7 @@ mod tests {
         #[test]
         fn model_add_entry_resolves_params_from_catalog() {
             // By id.
-            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, None)
+            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, None, None, None)
                 .expect("catalog id resolves");
             assert_eq!(e.params_b, 8.0);
             // By exact source URL under an operator-chosen id.
@@ -11095,19 +11644,65 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .expect("catalog URL resolves");
             assert_eq!(e.params_b, 8.0);
         }
 
         #[test]
+        fn model_add_entry_stores_and_validates_the_moe_declaration() {
+            let e = model_add_entry(
+                "moe-27b",
+                "https://example.com/moe.gguf",
+                None,
+                None,
+                Some(27.0),
+                Some(48),
+                Some(16),
+            )
+            .expect("declared pair resolves");
+            assert_eq!(e.moe_layers, Some(48));
+            assert_eq!(e.default_offload_layers, Some(16));
+            let mut cfg = test_cfg();
+            cfg.models.push(e);
+            manager_config::validate(&cfg).expect("declared entry validates");
+            // The pair is atomic at the write path: half a
+            // declaration, an over-range default, and a zero count
+            // all refuse.
+            for (layers, default) in [
+                (Some(48), None),
+                (None, Some(16)),
+                (Some(48), Some(49)),
+                (Some(0), Some(0)),
+            ] {
+                assert!(
+                    matches!(
+                        model_add_entry(
+                            "moe-27b",
+                            "https://example.com/moe.gguf",
+                            None,
+                            None,
+                            Some(27.0),
+                            layers,
+                            default,
+                        ),
+                        Err(ApiError::InvalidInput(_))
+                    ),
+                    "{layers:?} / {default:?} must refuse"
+                );
+            }
+        }
+
+        #[test]
         fn model_add_entry_keeps_the_existing_input_rules() {
             assert!(matches!(
-                model_add_entry("  ", "https://example.com/x.gguf", None, None, Some(1.0)),
+                model_add_entry("  ", "https://example.com/x.gguf", None, None, Some(1.0), None, None),
                 Err(ApiError::InvalidInput(_))
             ));
             assert!(matches!(
-                model_add_entry("m", "http://example.com/x.gguf", None, None, Some(1.0)),
+                model_add_entry("m", "http://example.com/x.gguf", None, None, Some(1.0), None, None),
                 Err(ApiError::InvalidInput(_))
             ));
             assert!(matches!(
@@ -11116,7 +11711,9 @@ mod tests {
                     "https://example.com/x.gguf",
                     Some("sub/dir.gguf".to_string()),
                     None,
-                    Some(1.0)
+                    Some(1.0),
+                    None,
+                    None
                 ),
                 Err(ApiError::InvalidInput(_))
             ));
@@ -11153,6 +11750,8 @@ mod tests {
                 assigned_backends: Vec::new(),
                 enabled: true,
                 display_name: None,
+                moe_layers: None,
+                default_offload_layers: None,
             });
             assert!(manager_config::save(&new_cfg, &path).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), before, "file untouched");
@@ -12141,6 +12740,8 @@ fn model_add_entry(
     file_name: Option<String>,
     quant: Option<String>,
     params_b: Option<f32>,
+    moe_layers: Option<u32>,
+    default_offload_layers: Option<u32>,
 ) -> Result<manager_config::ModelConfig, ApiError> {
     let id = id.trim().to_string();
     if id.is_empty() {
@@ -12171,6 +12772,8 @@ fn model_add_entry(
             "file name must be a plain .gguf file name".to_string(),
         ));
     }
+    manager_config::validate_moe_declaration(moe_layers, default_offload_layers)
+        .map_err(ApiError::InvalidInput)?;
     let params_b = params_b
         .filter(|p| *p > 0.0)
         .or_else(|| manager_models::catalog_params_b(&id, source_url))
@@ -12194,6 +12797,8 @@ fn model_add_entry(
         assigned_backends: Vec::new(),
         enabled: true,
         display_name: None,
+        moe_layers,
+        default_offload_layers,
     })
 }
 

@@ -1098,7 +1098,7 @@ async fn resolve_lookup_backend(
     // The configuration creation would build (op_backend_add):
     // the form's context/batch or the creation defaults, the
     // placement from the GPU selection or the telemetry
-    // assignment, the catalog default offload as the raw-flags
+    // assignment, the model's default offload as the raw-flags
     // baseline.
     let (tensor_split, split_mode) = match &req.gpu_indices {
         Some(selected) => {
@@ -1123,7 +1123,7 @@ async fn resolve_lookup_backend(
             tensor_split,
             split_mode,
         },
-        raw_flags: crate::catalog_default_raw_flags(&model.id),
+        raw_flags: crate::model_default_raw_flags(model),
         flags_advanced: false,
         restart_policy: manager_config::RestartPolicy {
             max_retries: 5,
