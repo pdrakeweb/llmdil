@@ -10735,8 +10735,9 @@ mod tests {
     }
 
     /// (k) Without a database there is no confirmation window,
-    /// however long it is configured: the first healthy probe is
-    /// the only GET.
+    /// however long it is configured: the only GETs are the first
+    /// healthy probe and the step's single final re-check — the
+    /// configured 5 s window would have probed many more times.
     #[tokio::test]
     async fn start_gateway_without_database_skips_confirmation_window() {
         let ops = Arc::new(FakeSystemOps::new());
@@ -10753,7 +10754,7 @@ mod tests {
         let ctx = ctx_with(ops.clone(), RunMode::Install);
         let out = step.run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done, "{out:?}");
-        assert_eq!(ops.gets().len(), 1, "{:?}", ops.gets());
+        assert_eq!(ops.gets().len(), 2, "{:?}", ops.gets());
     }
 
     /// (l) Spawn env on the database path: DATABASE_URL is set,
