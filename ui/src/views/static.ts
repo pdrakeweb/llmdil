@@ -2171,7 +2171,7 @@ function backendCard(
         ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="flags" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Edit</button>` : ""}
         <button class="menu-item" role="menuitem" data-back-menu-item data-back-act="argv" data-back-id="${esc(b.id)}"${dis}>${icon("logs")} Launch command</button>
         ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="toolcall" data-back-id="${esc(b.id)}"${dis}>${icon("wrench")} Test tool calls</button>` : ""}
-        <a class="menu-item" role="menuitem" data-back-menu-item href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1">${icon("logs")} View all logs</a>
+        <a class="menu-item" role="menuitem" data-back-menu-item data-back-id="${esc(b.id)}" href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1">${icon("logs")} View all logs</a>
       </div>` : ""}
     </div>`;
   const argvOpen = openArgv.has(b.id);
