@@ -2109,16 +2109,12 @@ function backendCard(
   const restartBtn = `<button class="btn" data-back-act="restart" data-back-id="${esc(b.id)}"${dis}>${icon("restart")} Restart</button>`;
   const startBtn = `<button class="btn" data-back-act="start" data-back-id="${esc(b.id)}"${dis}>${icon("play")} Start</button>`;
   const testBtn = `<button class="btn icon-only" data-back-act="test" data-back-id="${esc(b.id)}" title="Test backend" aria-label="Test ${esc(b.id)}"${dis}>${icon("bolt")}</button>`;
-  // Tool-call probe (MCP design §7.2): a secondary safe action, so
-  // icon-only with the action named in its tooltip/aria-label.
-  const toolCallBtn = `<button class="btn icon-only" data-back-act="toolcall" data-back-id="${esc(b.id)}" title="Test tool calls" aria-label="Test tool calls for ${esc(b.id)}"${dis}>${icon("wrench")}</button>`;
-  // Go to logs (tracker #47): every backend has a Logs-view scope (its
-  // supervisor ring, retained even after removal), so the button is
-  // unconditional. Icon-only per rule 15 — non-destructive navigation,
-  // not the card's standard workflow action — matching the Dashboard
-  // card's logs button. An anchor, not a card action: navigation is
-  // not disabled while a card action is in flight.
-  const logsBtn = `<a class="btn icon-only" href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1" title="Logs" aria-label="Logs for ${esc(b.id)}">${icon("logs")}</a>`;
+  // The tool-call probe (MCP design §7.2) and the go-to-logs link
+  // (tracker #47) are NOT card-face buttons: the wrench read as an
+  // edit control (Pete's report, 2026-10-20), so both live in the
+  // card's Other-actions menu below. Every backend has a Logs-view
+  // scope (its supervisor ring, retained even after removal), so
+  // the menu's logs item is unconditional, like the button was.
   // Enable/disable is the shared state switch (rule 16). It renders
   // for every configured backend so the state is always visible;
   // the control is inert exactly when the old buttons were not
@@ -2151,8 +2147,6 @@ function backendCard(
   if (b.configured && b.enabled && !active && b.state !== "stopping") parts.push(startBtn);
   if (b.configured) parts.push(enableSw);
   if (b.state === "running") parts.push(testBtn);
-  if (b.configured) parts.push(toolCallBtn);
-  parts.push(logsBtn);
   // Removal is refused by the command layer while running; offer it
   // only for configured backends with no live process.
   if (b.configured && !active && b.state !== "stopping") parts.push(removeBtn);
@@ -2168,6 +2162,8 @@ function backendCard(
         ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="flags" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Edit flags</button>
         <button class="menu-item" role="menuitem" data-back-menu-item data-back-act="placement" data-back-id="${esc(b.id)}"${dis}>${icon("layers")} Placement</button>` : ""}
         <button class="menu-item" role="menuitem" data-back-menu-item data-back-act="argv" data-back-id="${esc(b.id)}"${dis}>${icon("logs")} Launch command</button>
+        ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="toolcall" data-back-id="${esc(b.id)}"${dis}>${icon("wrench")} Test tool calls</button>` : ""}
+        <a class="menu-item" role="menuitem" data-back-menu-item href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1">${icon("logs")} View all logs</a>
       </div>` : ""}
     </div>`;
   const argvOpen = openArgv.has(b.id);
@@ -2197,16 +2193,20 @@ function backendCard(
   const adoptedText = b.adopted
     ? "Started by a previous launch and adopted by this session. Output from before adoption is not in the Logs view."
     : "";
+  // One rendering for a stored log line, shared by the failed
+  // block below and the Details section's latest-lines block.
+  const logLineHtml = (r: LogRow): string => `<div class="ln"><span class="t">${esc(fmtTime(r.ts))}</span> <span class="chip">${esc(r.stream)}</span> ${esc(r.line)}</div>`;
   let logsBlock = "";
   if (b.state === "failed") {
     const tail = logTails.get(b.id);
     // An empty tail renders no block at all (principle 13) — the
-    // "Open in Logs" link below still carries the operator to the
-    // full log. The caption's qualifier rides its info-tip.
+    // full log is one menu click away ("View all logs" in the
+    // Other-actions menu). The caption's qualifier rides its
+    // info-tip.
     const lines = tail && tail.length
-      ? `<div style="margin-top:8px;font-size:11px;color:var(--text3)">Latest output<span class="info-tip" title="stderr preferred — that is where llama-server reports load failures">${icon("info")}</span></div><div class="logstream" style="margin-top:4px">${tail.map((r) => `<div class="ln"><span class="t">${esc(fmtTime(r.ts))}</span> <span class="chip">${esc(r.stream)}</span> ${esc(r.line)}</div>`).join("")}</div>`
+      ? `<div style="margin-top:8px;font-size:11px;color:var(--text3)">Latest output<span class="info-tip" title="stderr preferred — that is where llama-server reports load failures">${icon("info")}</span></div><div class="logstream" style="margin-top:4px">${tail.map(logLineHtml).join("")}</div>`
       : "";
-    logsBlock = `${lines}<div style="margin-top:6px;font-size:12px"><a href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1" style="color:var(--accent)">Open in Logs</a></div>`;
+    logsBlock = lines;
   }
   // GPU residency for this backend, as bars (Pete's card redesign,
   // 2026-10-16): one horizontal bar per GPU, name at left, GiB at

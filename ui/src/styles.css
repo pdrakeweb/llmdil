@@ -270,6 +270,7 @@ body {
 }
 .menu-item:hover { background: var(--panel); }
 .menu-item:disabled { opacity: 0.5; cursor: default; }
+a.menu-item { text-decoration: none; }
 
 /* In-card editing forms sit on their own tinted panel so the form's
    full extent is visually separate from the card's static data. */
