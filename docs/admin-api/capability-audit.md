@@ -418,7 +418,7 @@ because any API consumer of per-process VRAM depends on this path.
 ### `get_gpu_telemetry` — read
 - What: Current GPU telemetry snapshot with per-process VRAM attribution.
 - Entry: `get_gpu_telemetry`, main.rs:1800. UI: yes.
-- In: none. Out: `{samples: [{index, name, ts, utilization_pct, vram_used_mib, vram_total_mib, temp_c, power_w, stale, down?, source, mem_util_pct, fan_pct, power_limit_w, temp_peak_c}], processes: [{gpu_index, pid, name, vram_mib: number|null, backend_id}], at_ms, has_polled, source_error}`. `vram_mib` is `null` when not measured (WDDM without PDH data) — unknown, never 0. `down` marks a GPU retained after falling off the bus. Peaks ride on the samples.
+- In: none. Out: `{samples: [{index, name, ts, utilization_pct, vram_used_mib, vram_total_mib, temp_c, power_w, power_absence, stale, down?, source, mem_util_pct, fan_pct, power_limit_w, temp_peak_c}], processes: [{gpu_index, pid, name, vram_mib: number|null, backend_id}], at_ms, has_polled, source_error}`. `vram_mib` is `null` when not measured (WDDM without PDH data) — unknown, never 0. `power_absence` classifies a null `power_w`: `driver_not_available` (driver answered N/A) vs `field_missing` (no power element in the source output). `down` marks a GPU retained after falling off the bus. Peaks ride on the samples.
 - Side effects: lazily starts the telemetry poller on first use; emits the `telemetry-update` event.
 
 ### `telemetry_set_interval` — mutate
