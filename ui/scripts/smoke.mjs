@@ -289,9 +289,12 @@ check(staticSrc.includes('id="modelAddForm"'), "Models view renders the add-form
 check(staticSrc.includes("function modelAddFormHtml"), "Add Model form renders from the shared form template");
 check(staticSrc.includes('addModelHost.innerHTML = ""'), "closing the Add Model form empties its host (every field clears with it)");
 check((staticSrc.match(/closeAddModelForm\(\)/g) || []).length === 2, "Add Model form close is invoked only from the open toggle and the success branch");
-check(staticSrc.includes("closeAddModelForm();\n      await load();"), "Add Model success branch closes the form before repainting the list");
-const addFailIdx = staticSrc.indexOf("`Add failed: ${r.error}`");
-const addCloseIdx = staticSrc.indexOf("closeAddModelForm();\n      await load();");
+// Multi-line fragments are matched on an LF-normalized copy: the
+// Windows runner checks the sources out with CRLF endings.
+const staticSrcLf = staticSrc.replace(/\r\n/g, "\n");
+check(staticSrcLf.includes("closeAddModelForm();\n      await load();"), "Add Model success branch closes the form before repainting the list");
+const addFailIdx = staticSrcLf.indexOf("`Add failed: ${r.error}`");
+const addCloseIdx = staticSrcLf.indexOf("closeAddModelForm();\n      await load();");
 check(addFailIdx >= 0 && addCloseIdx > addFailIdx, "Add Model failure branch writes the error ahead of the success-only close (input preserved)");
 const renderModelsSrc = staticSrc.split("export function renderModels")[1]?.split("export async function wireModels")[0] ?? "";
 check(renderModelsSrc.includes('id="modelAddForm"') && !renderModelsSrc.includes("addModelId"),
