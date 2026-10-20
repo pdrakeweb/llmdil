@@ -2131,41 +2131,93 @@ struct VramGateReading {
     index: u32,
     total_mib: u64,
     free_mib: u64,
+    /// The GPU was absent from the latest successful telemetry
+    /// poll after having been reported before: the store retains
+    /// it flagged down with last-known readings. A down GPU is
+    /// not a full GPU — it is a device that stopped responding.
+    down: bool,
 }
 
-/// One GPU on which a backend's requirement does not fit.
+/// Why the start gate refuses one GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VramGateClass {
+    /// The requirement exceeds the card's total memory: no state
+    /// of the machine lets this configuration start on this GPU
+    /// at this context size.
+    ExceedsTotal,
+    /// The requirement fits the card but not its measured free
+    /// memory.
+    InsufficientFree,
+    /// The device itself appears offline or not responding: it
+    /// is flagged down in telemetry, missing from a snapshot
+    /// that reads other GPUs, or reporting zero total memory.
+    /// Distinct from a memory shortage — the remedy is the GPU,
+    /// not the configuration.
+    GpuUnavailable,
+}
+
+/// One GPU on which a backend cannot start.
 struct VramGateFailure {
     index: u32,
+    class: VramGateClass,
     required_mib: u64,
     /// The free MiB the gate compared against: measured free plus
     /// the starting backend's own credited residency when it is
     /// already running (a restart frees its current weights before
     /// the new spawn allocates, so its own hold is not a shortage).
+    /// Zero for a GPU with no usable reading.
     free_mib: u64,
     total_mib: u64,
-    /// The requirement exceeds the card's total memory: no state
-    /// of the machine lets this configuration start on this GPU
-    /// at this context size.
-    exceeds_total: bool,
 }
 
-/// The pure start-gate math: a failure for every required GPU
-/// whose share exceeds its effective free memory (measured free
-/// plus any credited residency for that GPU). GPUs with no
-/// reading are not judged, and a zero requirement never fails.
+/// The pure start-gate math. Every placed GPU is judged first
+/// for availability: a GPU flagged down, reporting zero total
+/// memory, or missing from a non-empty reading set is
+/// unavailable — no memory figure from it can be trusted,
+/// whatever the requirement. (An empty reading set means
+/// telemetry has nothing at all; the caller does not invoke the
+/// gate then, and this function judges nothing either.) A
+/// measurable GPU then fails on its requirement share exceeding
+/// its effective free memory (measured free plus any credited
+/// residency for that GPU); a zero requirement never fails the
+/// memory math.
 fn vram_gate_failures(
+    placed: &[u32],
     required: &[(u32, u64)],
     readings: &[VramGateReading],
     credit: &[(u32, u64)],
 ) -> Vec<VramGateFailure> {
     let mut out = Vec::new();
-    for &(index, req) in required {
+    for &index in placed {
+        let req = required
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        let reading = readings.iter().find(|r| r.index == index);
+        let unavailable = match reading {
+            Some(r) => r.down || r.total_mib == 0,
+            // Missing from a snapshot that reads other GPUs:
+            // unavailable. Missing because telemetry has nothing
+            // at all: not judged (the skip posture).
+            None => !readings.is_empty(),
+        };
+        if unavailable {
+            out.push(VramGateFailure {
+                index,
+                class: VramGateClass::GpuUnavailable,
+                required_mib: req,
+                free_mib: 0,
+                total_mib: reading.map(|r| r.total_mib).unwrap_or(0),
+            });
+            continue;
+        }
+        let Some(r) = reading else {
+            continue;
+        };
         if req == 0 {
             continue;
         }
-        let Some(r) = readings.iter().find(|r| r.index == index) else {
-            continue;
-        };
         let credited = credit
             .iter()
             .find(|(i, _)| *i == index)
@@ -2175,10 +2227,14 @@ fn vram_gate_failures(
         if req > free {
             out.push(VramGateFailure {
                 index,
+                class: if req > r.total_mib {
+                    VramGateClass::ExceedsTotal
+                } else {
+                    VramGateClass::InsufficientFree
+                },
                 required_mib: req,
                 free_mib: free,
                 total_mib: r.total_mib,
-                exceeds_total: req > r.total_mib,
             });
         }
     }
@@ -2200,8 +2256,11 @@ fn vram_gate_failures(
 ///
 /// Skips when nothing can be measured or judged: CPU-only or
 /// undetermined placement, an unresolvable memory requirement,
-/// or no telemetry reading for any placed GPU (the fit
-/// evaluator's "no telemetry, no fit claim" posture).
+/// or a wholly empty telemetry snapshot (the fit evaluator's
+/// "no telemetry, no fit claim" posture). A placed GPU missing
+/// from a snapshot that does read other GPUs is NOT a skip: the
+/// device was enumerated before and is gone, or never answered —
+/// the gate refuses it as unavailable (see [`VramGateClass`]).
 async fn vram_start_gate(
     state: &AppState,
     cfg: &AppConfig,
@@ -2238,18 +2297,17 @@ async fn vram_start_gate(
             .unwrap_or(0)
     };
     let required: Vec<(u32, u64)> = placed.iter().map(|&i| (i, share_of(i))).collect();
-    if required.iter().all(|(_, share)| *share == 0) {
-        return Ok(());
-    }
-    // A down GPU (absent from recent polls, retained with
-    // last-known readings) has no usable capacity: it reads as
-    // zero free, as in the placement projection.
+    // Availability is judged even when every share is zero (a
+    // stale split distributes nothing, but the spawn still
+    // selects the placed devices): the readings carry each
+    // sample's down flag through for the gate math to classify.
     let readings: Vec<VramGateReading> = samples
         .iter()
         .map(|s| VramGateReading {
             index: s.index,
             total_mib: s.vram_total_mib,
-            free_mib: if s.down { 0 } else { s.free_vram_mib() },
+            free_mib: s.free_vram_mib(),
+            down: s.down,
         })
         .collect();
     let statuses: Vec<(String, ProcessState)> = {
@@ -2275,7 +2333,7 @@ async fn vram_start_gate(
     } else {
         Vec::new()
     };
-    let failures = vram_gate_failures(&required, &readings, &credit);
+    let failures = vram_gate_failures(&placed, &required, &readings, &credit);
     if failures.is_empty() {
         return Ok(());
     }
@@ -2293,31 +2351,49 @@ async fn vram_start_gate(
     };
     let mut parts: Vec<String> = Vec::new();
     for f in &failures {
-        if f.exceeds_total {
-            parts.push(format!(
-                "GPU {} needs {} MiB, which exceeds the GPU's total memory ({} MiB; {} MiB free) at this context size",
-                f.index, f.required_mib, f.total_mib, f.free_mib
-            ));
-        } else {
-            let mut part = format!(
-                "GPU {} needs {} MiB but only {} MiB is free (of {} MiB) — insufficient free memory on the GPU",
-                f.index, f.required_mib, f.free_mib, f.total_mib
-            );
-            let consumers = consumers_on(f.index);
-            if consumers.len() == 1 {
-                part += &format!("; backend '{}' is running on this GPU", consumers[0]);
-            } else if !consumers.is_empty() {
-                let named: Vec<String> =
-                    consumers.iter().map(|c| format!("'{c}'")).collect();
-                part += &format!("; backends {} are running on this GPU", named.join(", "));
+        match f.class {
+            VramGateClass::GpuUnavailable => {
+                parts.push(format!(
+                    "GPU {} appears offline or not responding — telemetry has no usable reading for it",
+                    f.index
+                ));
             }
-            parts.push(part);
+            VramGateClass::ExceedsTotal => {
+                parts.push(format!(
+                    "GPU {} needs {} MiB, which exceeds the GPU's total memory ({} MiB; {} MiB free) at this context size",
+                    f.index, f.required_mib, f.total_mib, f.free_mib
+                ));
+            }
+            VramGateClass::InsufficientFree => {
+                let mut part = format!(
+                    "GPU {} needs {} MiB but only {} MiB is free (of {} MiB) — insufficient free memory on the GPU",
+                    f.index, f.required_mib, f.free_mib, f.total_mib
+                );
+                let consumers = consumers_on(f.index);
+                if consumers.len() == 1 {
+                    part += &format!("; backend '{}' is running on this GPU", consumers[0]);
+                } else if !consumers.is_empty() {
+                    let named: Vec<String> =
+                        consumers.iter().map(|c| format!("'{c}'")).collect();
+                    part += &format!("; backends {} are running on this GPU", named.join(", "));
+                }
+                parts.push(part);
+            }
         }
     }
+    let any_unavailable = failures
+        .iter()
+        .any(|f| f.class == VramGateClass::GpuUnavailable);
+    let remedy = if any_unavailable {
+        "check the GPU (power, seating, driver) and try again; if the GPU is healthy, reduce the context size or the model footprint, or free the GPU, before starting"
+    } else {
+        "reduce the context size or the model footprint, or free the GPU, before starting"
+    };
     Err(ApiError::InvalidInput(format!(
-        "backend {} cannot start: {} — reduce the context size or the model footprint, or free the GPU, before starting",
+        "backend {} cannot start: {} — {}",
         b.id,
-        parts.join("; ")
+        parts.join("; "),
+        remedy
     )))
 }
 
@@ -10603,6 +10679,16 @@ mod tests {
             index,
             total_mib,
             free_mib,
+            down: false,
+        }
+    }
+
+    fn vram_reading_down(index: u32, total_mib: u64, free_mib: u64) -> VramGateReading {
+        VramGateReading {
+            index,
+            total_mib,
+            free_mib,
+            down: true,
         }
     }
 
@@ -10610,6 +10696,7 @@ mod tests {
     fn vram_gate_passes_when_requirement_fits_free() {
         // 12 GiB required on GPU 1, 15 GiB free of 16 GiB: fits.
         let failures = vram_gate_failures(
+            &[1],
             &[(1, 12 * 1024)],
             &[vram_reading(1, 16 * 1024, 15 * 1024)],
             &[],
@@ -10623,6 +10710,7 @@ mod tests {
         // ~11 GiB free because another backend is resident. Under
         // the card total, so the cause is insufficient free memory.
         let failures = vram_gate_failures(
+            &[1],
             &[(1, 15_862)],
             &[vram_reading(1, 16_384, 11_245)],
             &[],
@@ -10633,7 +10721,7 @@ mod tests {
         assert_eq!(f.required_mib, 15_862);
         assert_eq!(f.free_mib, 11_245);
         assert_eq!(f.total_mib, 16_384);
-        assert!(!f.exceeds_total);
+        assert_eq!(f.class, VramGateClass::InsufficientFree);
     }
 
     #[test]
@@ -10641,12 +10729,13 @@ mod tests {
         // More required than the card holds at all: a different
         // cause class than a busy card, even with every byte free.
         let failures = vram_gate_failures(
+            &[0],
             &[(0, 17 * 1024)],
             &[vram_reading(0, 16 * 1024, 16 * 1024)],
             &[],
         );
         assert_eq!(failures.len(), 1);
-        assert!(failures[0].exceeds_total);
+        assert_eq!(failures[0].class, VramGateClass::ExceedsTotal);
         assert_eq!(failures[0].free_mib, 16 * 1024);
     }
 
@@ -10655,6 +10744,7 @@ mod tests {
         // Split across two GPUs: GPU 0 has room, GPU 1 does not.
         // Only the short GPU is named.
         let failures = vram_gate_failures(
+            &[0, 1],
             &[(0, 8 * 1024), (1, 8 * 1024)],
             &[
                 vram_reading(0, 16 * 1024, 16 * 1024),
@@ -10673,6 +10763,7 @@ mod tests {
         // back (the restart frees it before allocating), so the
         // same configuration passes its own gate.
         let failures = vram_gate_failures(
+            &[1],
             &[(1, 15 * 1024)],
             &[vram_reading(1, 16 * 1024, 1024)],
             &[(1, 14_500)],
@@ -10681,12 +10772,69 @@ mod tests {
         // A requirement grown past what the credit covers still
         // fails: 15 GiB required, 1 GiB free + 13 GiB credited.
         let failures = vram_gate_failures(
+            &[1],
             &[(1, 15 * 1024)],
             &[vram_reading(1, 16 * 1024, 1024)],
             &[(1, 13 * 1024)],
         );
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].free_mib, 1024 + 13 * 1024);
+    }
+
+    #[test]
+    fn vram_gate_down_gpu_is_unavailable_not_short() {
+        // The thermal-offline shape: the placed GPU fell out of
+        // the telemetry polls and is retained flagged down with
+        // last-known figures that would otherwise "fit". The
+        // class is unavailable, not a memory verdict — the
+        // figures are not trustworthy.
+        let failures = vram_gate_failures(
+            &[1],
+            &[(1, 12 * 1024)],
+            &[vram_reading_down(1, 16 * 1024, 15 * 1024)],
+            &[],
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].class, VramGateClass::GpuUnavailable);
+        assert_eq!(failures[0].index, 1);
+    }
+
+    #[test]
+    fn vram_gate_missing_gpu_in_live_snapshot_is_unavailable() {
+        // Telemetry reads GPU 0 fine but has never reported the
+        // placed GPU 1 (the app started while the card was
+        // offline): unavailable, not a skip.
+        let failures = vram_gate_failures(
+            &[1],
+            &[(1, 12 * 1024)],
+            &[vram_reading(0, 16 * 1024, 16 * 1024)],
+            &[],
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].class, VramGateClass::GpuUnavailable);
+        assert_eq!(failures[0].index, 1);
+    }
+
+    #[test]
+    fn vram_gate_zero_total_is_unavailable() {
+        // A reading whose total memory is zero is a device not
+        // responding with real figures, not a very full card.
+        let failures = vram_gate_failures(
+            &[0],
+            &[(0, 1024)],
+            &[vram_reading(0, 0, 0)],
+            &[],
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].class, VramGateClass::GpuUnavailable);
+    }
+
+    #[test]
+    fn vram_gate_empty_snapshot_judges_nothing() {
+        // Telemetry has nothing at all (not started, no NVML):
+        // the gate makes no claim in either direction.
+        let failures = vram_gate_failures(&[1], &[(1, 12 * 1024)], &[], &[]);
+        assert!(failures.is_empty());
     }
 
     #[test]
