@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{
-    GpuInfo, GpuSample, ProcessSample, TelemetryError, TelemetrySource, TelemetrySourceKind,
-    STALE_AFTER_SECS,
+    GpuInfo, GpuSample, PowerAbsence, ProcessSample, TelemetryError, TelemetrySource,
+    TelemetrySourceKind, STALE_AFTER_SECS,
 };
 
 /// How many samples per GPU the history ring keeps. At the default 1 s
@@ -173,6 +173,26 @@ impl TelemetryStore {
             // raise a power peak.
             if let Some(power_w) = sample.power_w {
                 raise_mark(&mut peak.power_w, power_w, ts);
+            }
+
+            // A GPU entering the field-missing power state means the
+            // source document carried no power elements at all — a
+            // parser/source mismatch (bug state), distinct from the
+            // driver answering N/A. Log the transition once, not on
+            // every poll, so the state is visible in the log as well
+            // as recorded on the sample.
+            if sample.power_absence == Some(PowerAbsence::FieldMissing)
+                && self
+                    .latest
+                    .get(&idx)
+                    .map(|prev| prev.sample.power_absence)
+                    != Some(Some(PowerAbsence::FieldMissing))
+            {
+                tracing::warn!(
+                    gpu_index = idx,
+                    gpu_name = %sample.name,
+                    "telemetry source output has no power elements for this GPU; power recorded as field-missing (parser/source mismatch), not driver N/A"
+                );
             }
 
             let ring = self.history.entry(idx).or_default();
@@ -633,6 +653,61 @@ mod tests {
 
         store.reset_peaks();
         assert!(store.peaks(0).is_none());
+    }
+
+    #[test]
+    fn power_absence_states_survive_the_store() {
+        // The recorded absence cause is part of the stored state:
+        // the snapshot (and everything serialized from it) must keep
+        // the driver-N/A state distinct from the field-missing state,
+        // and a measured sample must carry no absence.
+        let mut store = TelemetryStore::new();
+        let mut na = sample_at(0, 0, 50.0);
+        na.power_w = None;
+        na.power_absence = Some(PowerAbsence::DriverNotAvailable);
+        let mut missing = sample_at(1, 0, 50.0);
+        missing.power_w = None;
+        missing.power_absence = Some(PowerAbsence::FieldMissing);
+        let measured = sample_at(2, 0, 50.0); // fresh() carries a power value
+        store.update(vec![na, missing, measured]);
+        let snap = store.snapshot();
+        assert_eq!(snap[0].power_w, None);
+        assert_eq!(
+            snap[0].power_absence,
+            Some(PowerAbsence::DriverNotAvailable)
+        );
+        assert_eq!(snap[1].power_w, None);
+        assert_eq!(snap[1].power_absence, Some(PowerAbsence::FieldMissing));
+        assert!(snap[2].power_w.is_some());
+        assert_eq!(snap[2].power_absence, None);
+        // History rings carry the same state.
+        assert_eq!(
+            store.history(1)[0].power_absence,
+            Some(PowerAbsence::FieldMissing)
+        );
+        // A later measured poll clears the recorded absence.
+        let mut recovered = sample_at(1, 0, 51.0);
+        recovered.power_w = Some(88.0);
+        recovered.power_absence = None;
+        store.update(vec![recovered]);
+        let snap = store.snapshot();
+        assert_eq!(snap[1].power_absence, None);
+        assert_eq!(snap[1].power_w, Some(88.0));
+
+        // Serialization: the state crosses the payload boundary under
+        // its snake_case name, and payloads written before the field
+        // existed still deserialize (absence unknown -> None).
+        let json = serde_json::to_string(&snap[0]).expect("sample serializes");
+        assert!(
+            json.contains("\"power_absence\":\"driver_not_available\""),
+            "{json}"
+        );
+        let back: GpuSample = serde_json::from_str(&json).expect("sample round-trips");
+        assert_eq!(back.power_absence, Some(PowerAbsence::DriverNotAvailable));
+        let mut v = serde_json::to_value(&snap[0]).expect("sample to value");
+        v.as_object_mut().expect("object").remove("power_absence");
+        let old: GpuSample = serde_json::from_value(v).expect("older payload loads");
+        assert_eq!(old.power_absence, None);
     }
 
     #[test]

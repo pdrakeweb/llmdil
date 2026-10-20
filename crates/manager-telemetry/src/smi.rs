@@ -17,7 +17,10 @@
 //!   current drivers) report `N/A` for power readings while every
 //!   other field is valid. It degrades to `None` like the other
 //!   optional metrics — requiring it took the whole source down on
-//!   real hardware (2026-10-15). Separately, nvidia-smi v570+ renamed
+//!   real hardware (2026-10-15). When it degrades, the sample records
+//!   which absence occurred ([`crate::PowerAbsence`]): the driver
+//!   answering `N/A` is a hardware state; no power element at all is
+//!   a parser/source mismatch (a bug state). Separately, nvidia-smi v570+ renamed
 //!   the power elements outright (`power_draw`/`power_limit` are
 //!   gone; instantaneous/average draw and current/requested limit
 //!   elements replaced them), so the parser accepts both schemas.
@@ -30,7 +33,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    DriverModel, GpuInfo, GpuSample, ProcessSample, TelemetryError, TelemetrySource,
+    DriverModel, GpuInfo, GpuSample, PowerAbsence, ProcessSample, TelemetryError, TelemetrySource,
     TelemetrySourceKind,
 };
 
@@ -218,6 +221,7 @@ struct ParsedGpu {
     mem_util_pct: Option<f32>,
     temp_c: f32,
     power_w: Option<f32>,
+    power_absence: Option<PowerAbsence>,
     power_limit_w: Option<f32>,
     fan_pct: Option<f32>,
     clocks_graphics_mhz: Option<u32>,
@@ -237,6 +241,7 @@ impl ParsedGpu {
             vram_total_mib: self.mem_total_mib,
             temp_c: self.temp_c,
             power_w: self.power_w,
+            power_absence: self.power_absence,
             stale: false,
             down: false,
             source: TelemetrySourceKind::NvidiaSmi,
@@ -528,9 +533,36 @@ fn finalize_gpu(
     // so read the old names first, then the new ones (driver 582.78
     // on the reference machine emits only the new names, which left
     // power blank on every GPU until this fallback landed).
-    let power_w = ["power_draw", "instantaneous_power_draw", "instant_power_draw", "average_power_draw"]
+    //
+    // Absence is classified, not just dropped (see
+    // [`crate::PowerAbsence`]): when no candidate yields a value, the
+    // sample records whether the document carried any draw element
+    // answered `N/A` (the driver state) or no usable element at all
+    // (a parser/source mismatch). Only elements under
+    // <gpu_power_readings> count — the <gpu_memory_power_readings>
+    // and <module_power_readings> `power_draw` elements are
+    // different readings and must not classify the board reading.
+    const DRAW_ELEMENTS: [&str; 4] = [
+        "power_draw",
+        "instantaneous_power_draw",
+        "instant_power_draw",
+        "average_power_draw",
+    ];
+    let draw_raws: Vec<Option<String>> = DRAW_ELEMENTS
         .iter()
-        .find_map(|el| get(&format!("gpu_power_readings/{el}")).and_then(|s| parse_watts(&s)));
+        .map(|el| get(&format!("gpu_power_readings/{el}")))
+        .collect();
+    let power_w = draw_raws
+        .iter()
+        .flatten()
+        .find_map(|s| parse_watts(s));
+    let power_absence = if power_w.is_some() {
+        None
+    } else if draw_raws.iter().flatten().any(|s| is_na(s)) {
+        Some(PowerAbsence::DriverNotAvailable)
+    } else {
+        Some(PowerAbsence::FieldMissing)
+    };
     let power_limit_w = ["power_limit", "current_power_limit", "requested_power_limit", "enforced_power_limit"]
         .iter()
         .find_map(|el| get(&format!("gpu_power_readings/{el}")).and_then(|s| parse_watts(&s)));
@@ -560,6 +592,7 @@ fn finalize_gpu(
         mem_util_pct: get("utilization/memory_util").and_then(|s| parse_percent(&s)),
         temp_c,
         power_w,
+        power_absence,
         power_limit_w,
         fan_pct: get("fan_speed").and_then(|s| parse_percent(&s)),
         clocks_graphics_mhz: get("clocks/graphics_clock").and_then(|s| parse_mhz(&s)),
@@ -587,6 +620,7 @@ mod tests {
         assert_eq!(a4000.vram_total_mib, 16384);
         assert!((a4000.temp_c - 67.0).abs() < f32::EPSILON);
         assert!((a4000.power_w.expect("power reported") - 95.30).abs() < 0.01);
+        assert_eq!(a4000.power_absence, None, "measured power records no absence");
         assert_eq!(a4000.fan_pct, Some(32.0));
         assert_eq!(a4000.power_limit_w, Some(140.0));
         assert_eq!(a4000.clocks_graphics_mhz, Some(1560));
@@ -713,6 +747,11 @@ mod tests {
         assert_eq!(samples.len(), 1);
         let s = &samples[0];
         assert_eq!(s.power_w, None);
+        assert_eq!(
+            s.power_absence,
+            Some(PowerAbsence::DriverNotAvailable),
+            "an N/A answer is the driver state, not a missing field"
+        );
         assert_eq!(s.power_limit_w, Some(140.0));
         assert_eq!(s.vram_total_mib, 16384);
         assert!((s.temp_c - 41.0).abs() < f32::EPSILON);
@@ -746,7 +785,66 @@ mod tests {
             (s.power_w.expect("power reported under the v570 names") - 42.50).abs() < 0.01,
             "instantaneous draw is the power_draw successor"
         );
+        assert_eq!(s.power_absence, None);
         assert_eq!(s.power_limit_w, Some(140.0));
+    }
+
+    #[test]
+    fn missing_power_elements_are_field_missing_not_driver_na() {
+        // Legacy-format output with no <gpu_power_readings> block at
+        // all: the field is absent from the document, which is a
+        // parser/source mismatch (bug state) — it must not be
+        // recorded as the driver answering N/A (hardware state).
+        let xml = r#"<?xml version="1.0" ?><nvidia_smi_log>
+<driver_version>470.82.01</driver_version><attached_gpus>1</attached_gpus>
+<gpu id="00000000:65:00.0">
+<product_name>Tesla P100-PCIE-16GB</product_name>
+<uuid>GPU-dddd</uuid><minor_number>0</minor_number>
+<pci><pci_bus>00000000:65:00.0</pci_bus></pci>
+<fan_speed>N/A</fan_speed>
+<fb_memory_usage><total>16384 MiB</total><used>2048 MiB</used></fb_memory_usage>
+<utilization><gpu_util>12 %</gpu_util></utilization>
+<temperature><gpu_temp>38 C</gpu_temp></temperature>
+<processes></processes>
+</gpu></nvidia_smi_log>"#;
+        let samples = NvidiaSmiSource::parse_xml(xml).expect("missing power block must parse");
+        assert_eq!(samples.len(), 1);
+        let s = &samples[0];
+        assert_eq!(s.power_w, None);
+        assert_eq!(s.power_limit_w, None);
+        assert_eq!(
+            s.power_absence,
+            Some(PowerAbsence::FieldMissing),
+            "no power element in the document is a missing field, not an N/A"
+        );
+    }
+
+    #[test]
+    fn sibling_power_blocks_do_not_classify_board_power() {
+        // <gpu_memory_power_readings> and <module_power_readings>
+        // carry their own power_draw elements (N/A here, as on real
+        // hardware). They are different readings: with no
+        // <gpu_power_readings> block the board reading is missing,
+        // and the siblings' N/A must not reclassify it as a driver
+        // N/A for board power.
+        let xml = r#"<?xml version="1.0" ?><nvidia_smi_log>
+<driver_version>582.78</driver_version><attached_gpus>1</attached_gpus>
+<gpu id="00000000:01:00.0">
+<product_name>NVIDIA RTX A4000</product_name>
+<uuid>GPU-eeee</uuid><minor_number>0</minor_number>
+<pci><pci_bus>00000000:01:00.0</pci_bus></pci>
+<fan_speed>30 %</fan_speed>
+<fb_memory_usage><total>16384 MiB</total><used>1024 MiB</used></fb_memory_usage>
+<utilization><gpu_util>5 %</gpu_util></utilization>
+<temperature><gpu_temp>35 C</gpu_temp></temperature>
+<gpu_memory_power_readings><power_draw>N/A</power_draw></gpu_memory_power_readings>
+<module_power_readings><power_draw>N/A</power_draw><current_power_limit>N/A</current_power_limit></module_power_readings>
+<processes></processes>
+</gpu></nvidia_smi_log>"#;
+        let samples = NvidiaSmiSource::parse_xml(xml).expect("sibling blocks must parse");
+        let s = &samples[0];
+        assert_eq!(s.power_w, None);
+        assert_eq!(s.power_absence, Some(PowerAbsence::FieldMissing));
     }
 
     #[test]

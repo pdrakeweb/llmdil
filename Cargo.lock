@@ -1140,6 +1140,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
