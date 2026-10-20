@@ -2287,6 +2287,33 @@ pub async fn op_list_backends(
             row["predicted"] = p.clone();
         }
     }
+    // Placement in short form (Groups page, predicted-throughput
+    // design §8.2): where the saved configuration loads, derived
+    // from config alone by the same visibility resolution the
+    // measurement fingerprint uses. Absent when the placement
+    // cannot be determined from the config — unknown placement
+    // renders as nothing, never as a default (principle 12).
+    {
+        for row in backends.iter_mut() {
+            let Some(id) = row["id"].as_str() else {
+                continue;
+            };
+            let Some(b) = cfg.backends.iter().find(|b| b.id == id) else {
+                continue;
+            };
+            let placement = match backend_gpu_visibility(b) {
+                GpuVisibility::CpuOnly => Some("CPU".to_string()),
+                GpuVisibility::Gpus(idxs) => Some(format!(
+                    "GPU {}",
+                    idxs.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("+")
+                )),
+                GpuVisibility::Undetermined => None,
+            };
+            if let Some(p) = placement {
+                row["placement"] = json!(p);
+            }
+        }
+    }
     // Gateway request statistics (LiteLLM Prometheus snapshots from
     // the background poller): attach the trailing-hour figures where
     // the store has a window for the backend. Absent fields render
@@ -5735,6 +5762,218 @@ pub async fn op_backend_delete(
 }
 
 
+/// Move a backend to a group, or out of all groups
+/// (predicted-throughput design §8.5 — the Groups page's drop and
+/// "Move to" menu). Move semantics (decision D5): a backend is in
+/// at most one group, so the id is removed from every group's
+/// member list and appended to the target's; `group: None` is
+/// ungroup. A hand-edited config that lists the backend in several
+/// groups is normalized by the move — the response's
+/// `removed_from` names every group it left, so the page can state
+/// the collapse. Dropping a backend on the lane it solely occupies
+/// (or ungrouping an ungrouped backend) succeeds without a config
+/// write. Persists through the same clone-validate-save path as
+/// `backend_add`/`backend_delete` and journals as a gateway-scope
+/// change, so the Activation Plan applies the move at the next
+/// gateway activation, exactly like every other membership change;
+/// the gateway does not restart here.
+pub async fn op_gateway_set_backend_group(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    id: String,
+    group: Option<String>,
+) -> ApiResult {
+    let target: Option<String> = match group {
+        Some(name) => {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return Err(ApiError::InvalidInput(
+                    "group name must not be empty; pass null to ungroup the backend"
+                        .to_string(),
+                ));
+            }
+            Some(name)
+        }
+        None => None,
+    };
+    let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
+    let mut new_cfg = cfg.clone();
+    if !new_cfg.backends.iter().any(|b| b.id == id) {
+        return Err(ApiError::NotFound(format!("backend {id}")));
+    }
+    if let Some(name) = &target {
+        if !new_cfg.gateway.groups.iter().any(|g| &g.name == name) {
+            return Err(ApiError::NotFound(format!("group {name}")));
+        }
+    }
+    let mut removed_from: Vec<String> = Vec::new();
+    let mut added = false;
+    for g in new_cfg.gateway.groups.iter_mut() {
+        let is_target = target.as_deref() == Some(g.name.as_str());
+        if !is_target && g.members.iter().any(|m| m == &id) {
+            g.members.retain(|m| m != &id);
+            removed_from.push(g.name.clone());
+        }
+    }
+    if let Some(name) = &target {
+        let g = new_cfg
+            .gateway
+            .groups
+            .iter_mut()
+            .find(|g| &g.name == name)
+            .expect("target group existence checked above");
+        if !g.members.iter().any(|m| m == &id) {
+            g.members.push(id.clone());
+            added = true;
+        }
+    }
+    let changed = added || !removed_from.is_empty();
+    if changed {
+        manager_config::validate(&new_cfg)
+            .map_err(ApiError::from)?;
+        let summary = match &target {
+            Some(name) => format!("Backend `{id}` moved to group `{name}`"),
+            None => format!("Backend `{id}` removed from all groups (ungrouped)"),
+        };
+        record_gateway_change(
+            state,
+            &pre_cfg,
+            &new_cfg,
+            "gateway_set_backend_group",
+            summary,
+            false,
+        )
+        .await
+        ?;
+        manager_config::save(&new_cfg, &state.config_path)
+            .map_err(ApiError::from)?;
+        *cfg = new_cfg;
+    }
+    Ok(json!({
+        "backend_id": id,
+        "group": target,
+        "removed_from": removed_from,
+        "changed": changed,
+        // Same note as the flags setters: after a successful save
+        // the desired state is on disk, and when nothing changed
+        // it already was.
+        "persisted": true,
+    }))
+}
+
+/// Create an empty group (predicted-throughput design §8.5,
+/// decision D11 — the Groups page's New group). The name follows
+/// the same slug rule `backend_add` applies to the group it joins
+/// or creates. The new group starts with the creation default
+/// strategy and no members or fallbacks; it generates no gateway
+/// deployments until a backend moves into it, so the save
+/// journals an activation change only if the generated gateway
+/// configuration actually moves (an empty group does not move
+/// it — `record_gateway_change` decides, as for every gateway
+/// edit).
+pub async fn op_gateway_create_group(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    name: String,
+) -> ApiResult {
+    let name = name.trim().to_string();
+    // The slug rule backend_add applies to group names (kept in
+    // step deliberately: one naming rule for groups everywhere).
+    let valid_slug = !name.is_empty()
+        && name.len() <= 48
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if !valid_slug {
+        return Err(ApiError::InvalidInput(
+            "group name must be lowercase letters, digits, and hyphens".to_string(),
+        ));
+    }
+    let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
+    let mut new_cfg = cfg.clone();
+    if new_cfg.gateway.groups.iter().any(|g| g.name == name) {
+        return Err(ApiError::InvalidInput(format!(
+            "group '{name}' already exists"
+        )));
+    }
+    new_cfg.gateway.groups.push(manager_config::ModelGroup {
+        name: name.clone(),
+        members: Vec::new(),
+        strategy: manager_config::RoutingStrategy::SimpleShuffle,
+        fallbacks: Vec::new(),
+        purpose: String::new(),
+    });
+    manager_config::validate(&new_cfg)
+        .map_err(ApiError::from)?;
+    record_gateway_change(
+        state,
+        &pre_cfg,
+        &new_cfg,
+        "gateway_create_group",
+        format!("Group `{name}` created"),
+        false,
+    )
+    .await
+    ?;
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)?;
+    *cfg = new_cfg;
+    Ok(json!({ "name": name, "persisted": true }))
+}
+
+/// Delete a group (predicted-throughput design §8.5, decision
+/// D11). Only an empty group deletes: a group with members is
+/// refused with the member count, never cascaded — emptying a
+/// group is a series of visible moves on the Groups page, not a
+/// side effect of a delete. (Member here is the config's member
+/// list, which includes `host:port` external endpoints; a group
+/// holding only those is still not empty.) Same save path and
+/// gateway journaling as the other group ops.
+pub async fn op_gateway_delete_group(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    name: String,
+) -> ApiResult {
+    let name = name.trim().to_string();
+    let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
+    let mut new_cfg = cfg.clone();
+    let pos = new_cfg
+        .gateway
+        .groups
+        .iter()
+        .position(|g| g.name == name)
+        .ok_or_else(|| ApiError::NotFound(format!("group {name}")))?;
+    let members = new_cfg.gateway.groups[pos].members.len();
+    if members > 0 {
+        return Err(ApiError::InvalidInput(format!(
+            "group '{name}' is not empty: it has {members} member(s); \
+             move them elsewhere before deleting the group"
+        )));
+    }
+    new_cfg.gateway.groups.remove(pos);
+    manager_config::validate(&new_cfg)
+        .map_err(ApiError::from)?;
+    record_gateway_change(
+        state,
+        &pre_cfg,
+        &new_cfg,
+        "gateway_delete_group",
+        format!("Group `{name}` deleted"),
+        false,
+    )
+    .await
+    ?;
+    manager_config::save(&new_cfg, &state.config_path)
+        .map_err(ApiError::from)?;
+    *cfg = new_cfg;
+    Ok(json!({ "name": name, "deleted": true, "persisted": true }))
+}
+
 /// Exact argv the supervisor would spawn (must equal the wizard's
 /// planned_commands output per spec).
 pub async fn op_backend_get_launch_command(
@@ -8629,6 +8868,197 @@ mod tests {
         // Nothing was created.
         let cfg = state.config.read().await;
         assert!(!cfg.backends.iter().any(|b| b.id == "opt-exp-1"));
+        drop(cfg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Groups page membership (predicted-throughput design
+    /// §8.5): the move joins exactly one group and leaves every
+    /// other; the response names the group it left.
+    #[tokio::test]
+    async fn gateway_set_backend_group_moves_membership() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        let r = op_gateway_set_backend_group(
+            &state,
+            &sink,
+            "coder".to_string(),
+            Some("planner".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["changed"], json!(true));
+        assert_eq!(r["group"], json!("planner"));
+        assert_eq!(r["removed_from"], json!(["coder"]));
+        let cfg = state.config.read().await;
+        let memberships: Vec<&str> = cfg
+            .gateway
+            .groups
+            .iter()
+            .filter(|g| g.members.iter().any(|m| m == "coder"))
+            .map(|g| g.name.as_str())
+            .collect();
+        assert_eq!(memberships, vec!["planner"]);
+        drop(cfg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A move onto the lane the backend solely occupies — and an
+    /// ungroup of an already-ungrouped backend — succeed without
+    /// a write (design §8.4: drops are idempotent).
+    #[tokio::test]
+    async fn gateway_set_backend_group_noop_drops_do_not_write() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        let r = op_gateway_set_backend_group(
+            &state,
+            &sink,
+            "coder".to_string(),
+            Some("coder".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["changed"], json!(false));
+        assert_eq!(r["removed_from"], json!([]));
+        // Ungroup once (a real change), then again (a no-op).
+        let r = op_gateway_set_backend_group(&state, &sink, "coder".to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(r["changed"], json!(true));
+        assert_eq!(r["group"], Value::Null);
+        let r = op_gateway_set_backend_group(&state, &sink, "coder".to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(r["changed"], json!(false));
+        let cfg = state.config.read().await;
+        assert!(!cfg
+            .gateway
+            .groups
+            .iter()
+            .any(|g| g.members.iter().any(|m| m == "coder")));
+        drop(cfg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hand-edited config can list one backend in several
+    /// groups; a move collapses it to the single target group
+    /// and reports every group it was removed from (design §8.3).
+    #[tokio::test]
+    async fn gateway_set_backend_group_collapses_multi_membership() {
+        let mut cfg = test_cfg();
+        // coder is seeded into group "coder"; add it to "planner" too.
+        cfg.gateway
+            .groups
+            .iter_mut()
+            .find(|g| g.name == "planner")
+            .unwrap()
+            .members
+            .push("coder".to_string());
+        let (state, dir) = advanced_test_state(cfg);
+        let sink = test_sink();
+        let r = op_gateway_set_backend_group(
+            &state,
+            &sink,
+            "coder".to_string(),
+            Some("tool-runner".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["changed"], json!(true));
+        let mut removed: Vec<String> =
+            serde_json::from_value(r["removed_from"].clone()).unwrap();
+        removed.sort();
+        assert_eq!(removed, vec!["coder".to_string(), "planner".to_string()]);
+        let cfg = state.config.read().await;
+        let memberships: Vec<&str> = cfg
+            .gateway
+            .groups
+            .iter()
+            .filter(|g| g.members.iter().any(|m| m == "coder"))
+            .map(|g| g.name.as_str())
+            .collect();
+        assert_eq!(memberships, vec!["tool-runner"]);
+        drop(cfg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unknown backends and groups are NotFound; an empty group
+    /// string is refused rather than read as ungroup.
+    #[tokio::test]
+    async fn gateway_set_backend_group_rejects_unknowns() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        let r = op_gateway_set_backend_group(
+            &state,
+            &sink,
+            "nope".to_string(),
+            Some("planner".to_string()),
+        )
+        .await;
+        assert!(matches!(r, Err(ApiError::NotFound(_))), "{r:?}");
+        let r = op_gateway_set_backend_group(
+            &state,
+            &sink,
+            "coder".to_string(),
+            Some("nope".to_string()),
+        )
+        .await;
+        assert!(matches!(r, Err(ApiError::NotFound(_))), "{r:?}");
+        let r = op_gateway_set_backend_group(
+            &state,
+            &sink,
+            "coder".to_string(),
+            Some("  ".to_string()),
+        )
+        .await;
+        assert!(matches!(r, Err(ApiError::InvalidInput(_))), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Group lifecycle (design §8.5/D11): create makes an empty
+    /// group under the slug rule and refuses duplicates; delete
+    /// refuses a non-empty group with its member count and
+    /// deletes an empty one.
+    #[tokio::test]
+    async fn gateway_group_create_and_delete() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        let r = op_gateway_create_group(&state, &sink, "batch-jobs".to_string())
+            .await
+            .unwrap();
+        assert_eq!(r["name"], json!("batch-jobs"));
+        {
+            let cfg = state.config.read().await;
+            let g = cfg
+                .gateway
+                .groups
+                .iter()
+                .find(|g| g.name == "batch-jobs")
+                .unwrap();
+            assert!(g.members.is_empty());
+            assert_eq!(g.strategy, manager_config::RoutingStrategy::SimpleShuffle);
+        }
+        let r = op_gateway_create_group(&state, &sink, "batch-jobs".to_string()).await;
+        assert!(matches!(r, Err(ApiError::InvalidInput(_))), "{r:?}");
+        let r = op_gateway_create_group(&state, &sink, "Bad Name".to_string()).await;
+        assert!(matches!(r, Err(ApiError::InvalidInput(_))), "{r:?}");
+        // Non-empty delete is refused, naming the count.
+        let r = op_gateway_delete_group(&state, &sink, "coder".to_string()).await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("not empty"), "{msg}");
+                assert!(msg.contains('1'), "{msg}");
+            }
+            other => panic!("expected the not-empty refusal, got {other:?}"),
+        }
+        let r = op_gateway_delete_group(&state, &sink, "batch-jobs".to_string())
+            .await
+            .unwrap();
+        assert_eq!(r["deleted"], json!(true));
+        let r = op_gateway_delete_group(&state, &sink, "batch-jobs".to_string()).await;
+        assert!(matches!(r, Err(ApiError::NotFound(_))), "{r:?}");
+        let cfg = state.config.read().await;
+        assert!(!cfg.gateway.groups.iter().any(|g| g.name == "batch-jobs"));
         drop(cfg);
         let _ = std::fs::remove_dir_all(&dir);
     }

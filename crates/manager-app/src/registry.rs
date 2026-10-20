@@ -269,6 +269,18 @@ macro_rules! for_each_operation {
             (GatewayPreviewYaml, gateway_preview_yaml, R, op_gateway_preview_yaml, [], Some(route(HttpMethod::Get, "/api/v1/gateway/generated-config"))),
             (GatewayTestRouting, gateway_test_routing, R, op_gateway_test_routing, [request: Value], Some(route_wrap(HttpMethod::Post, "/api/v1/gateway/routing/test", "request"))),
             (GatewayRecentRequests, gateway_recent_requests, R, op_gateway_recent_requests, [], Some(route(HttpMethod::Get, "/api/v1/gateway/routing/recent"))),
+            // Group membership (predicted-throughput design §8.5):
+            // the move op carries a route — no API-layer composition
+            // performs move semantics (remove from every group, join
+            // exactly one). Create/delete are the desktop surface
+            // for the group lifecycle with the app's own rules
+            // (slug names, delete-empty-only); REST group CRUD is
+            // served by the API-layer derived routes over
+            // update_gateway_config (rest-api.md §6.17), so they
+            // are explicit exclusions here, like model_set_short_name.
+            (GatewaySetBackendGroup, gateway_set_backend_group, C, op_gateway_set_backend_group, [id: String, group: Option<String>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/group"))),
+            (GatewayCreateGroup, gateway_create_group, C, op_gateway_create_group, [name: String], None),
+            (GatewayDeleteGroup, gateway_delete_group, D, op_gateway_delete_group, [name: String], None),
             // Telemetry / placement
             (GetGpuTelemetry, get_gpu_telemetry, R, op_get_gpu_telemetry, [], Some(route(HttpMethod::Get, "/api/v1/telemetry/gpus"))),
             (TelemetrySetInterval, telemetry_set_interval, C, op_telemetry_set_interval, [ms: u64], Some(route(HttpMethod::Put, "/api/v1/telemetry/interval"))),
@@ -419,7 +431,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 117);
+        assert_eq!(OP_SPECS.len(), 120);
     }
 
     #[test]

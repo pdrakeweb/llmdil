@@ -20,6 +20,8 @@ export const icons = {
     svg(`<path d="M3 2.5h10M3 6h10M3 9.5h10M3 13h6"/>`),
   gateway: () =>
     svg(`<circle cx="8" cy="8" r="2"/><path d="M8 1.5v3M8 11.5v3M1.5 8h3M11.5 8h3"/>`),
+  groups: () =>
+    svg(`<circle cx="6" cy="6" r="2.4"/><path d="M1.8 13.6c.6-2.3 2.2-3.5 4.2-3.5s3.6 1.2 4.2 3.5"/><circle cx="11.6" cy="6.4" r="1.9"/><path d="M11.2 10.2c1.9.1 3.2 1.2 3.8 3.2"/>`),
   gear: () =>
     svg(`<circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2 3.4 12.6"/>`),
   check: () =>

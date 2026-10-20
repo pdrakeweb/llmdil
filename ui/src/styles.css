@@ -545,3 +545,21 @@ table.tbl tr:last-child td { border-bottom: 0; }
 .opt-kv-label { color: var(--text2); }
 .opt-kv-value { font-family: var(--mono); }
 .opt-measure-actions { display: flex; gap: 8px; margin-top: 10px; }
+
+/* Groups page (predicted-throughput design §8): one lane per
+   group plus Ungrouped, lanes side by side with horizontal
+   scroll when they outnumber the width; compact backend cards
+   are the drag source, lanes the drop targets (the .dragover
+   outline is the drop affordance while a drag is over a lane). */
+.groups-lanes { display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; padding-bottom: 8px; }
+.group-lane { flex: 1 1 240px; min-width: 230px; max-width: 360px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
+.group-lane.dragover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.group-lane-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.group-lane-name { font-size: 13px; font-weight: 700; }
+.group-mini-card { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; cursor: grab; }
+.group-mini-card:active { cursor: grabbing; }
+.group-mini-head { display: flex; align-items: center; gap: 8px; }
+.group-mini-id { font-weight: 600; font-size: 13px; }
+.group-mini-line { font-size: 12px; color: var(--text2); margin-top: 4px; }
+.group-ext-chip { margin-bottom: 8px; }
+.group-drop-hint { font-size: 12px; color: var(--text3); border: 1px dashed var(--border); border-radius: 8px; padding: 10px; text-align: center; }
