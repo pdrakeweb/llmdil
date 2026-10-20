@@ -2689,6 +2689,13 @@ function backendCard(
   const rawFlagsHtml = b.flags_advanced && b.raw_flags
     ? `<div style="font-size:12px;color:var(--text2);margin-top:8px">Flags: <span style="font-family:var(--mono);color:var(--text)">${esc(b.raw_flags)}</span></div>`
     : "";
+  // The supervisor's recorded failure reason, in the failed
+  // state only: it names the cause (e.g. the device-unavailable
+  // fail-fast verdict) the state chip cannot. Principle 9 form —
+  // a noun label and the value, no sentence.
+  const failureHtml = b.state === "failed" && b.failure_reason
+    ? `<div style="font-size:12px;color:var(--err);margin-top:6px">Failure: ${esc(b.failure_reason)}</div>`
+    : "";
   const detailsBtn = `<button class="btn icon-only" data-back-act="details" data-back-id="${esc(b.id)}" aria-expanded="${detailsOpen}" title="Details" aria-label="Details">${icon(detailsOpen ? "chevD" : "chevR")}</button>`;
   return `<div class="card backend-card" id="card-backend-${esc(b.id)}">
       <h3 class="backend-card-head">${stateDot(b.state)} ${esc(b.id)} <span class="port">:${b.port}</span>
@@ -2698,6 +2705,7 @@ function backendCard(
         ${b.adopted ? `<span class="chip status-tag status-on" title="${esc(adoptedText)}">adopted</span>` : ""}
         ${b.flags_advanced ? `<span class="chip status-tag" title="Advanced flags mode: this backend's launch flags are edited as raw text in the Flags panel, and the structured flags form is disabled for it.">advanced flags</span>` : ""}
         <span class="chip status-tag ${stateTagClass(b.state)}">${esc(b.state)}</span></h3>
+      ${failureHtml}
       ${stripHtml}
       ${gpuHtml}
       ${statsHtml}

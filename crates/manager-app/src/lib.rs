@@ -2453,6 +2453,12 @@ pub async fn op_list_backends(
                 "adopted": st.map(|s| s.adopted).unwrap_or(false),
                 "restarts": st.map(|s| s.restarts).unwrap_or(0),
                 "uptime_secs": st.and_then(|s| s.uptime).map(|u| u.as_secs()),
+                // The supervisor's recorded reason for the last
+                // spawn/load failure (e.g. the device-unavailable
+                // fail-fast verdict), or null when the last start
+                // did not fail with a recorded reason. The card's
+                // failed state surfaces it verbatim.
+                "failure_reason": st.and_then(|s| s.failure_reason.clone()),
                 // The persisted tool-call probe (MCP design §7.2):
                 // {outcome: verified|unparsed|failed, at_ms} or null
                 // when the backend has never been probed — the UI
@@ -2724,6 +2730,7 @@ pub async fn op_list_backends(
             "adopted": st.adopted,
             "restarts": st.restarts,
             "uptime_secs": st.uptime.map(|u| u.as_secs()),
+            "failure_reason": st.failure_reason,
         }));
     }
     // Service supervision: in service mode, a registered service's
