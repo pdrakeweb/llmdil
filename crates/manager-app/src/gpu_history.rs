@@ -11,16 +11,15 @@
 //! a JSON store in the data dir (`gpu-history.json`).
 //!
 //! Retention is two-tier and bounded by time, so the caps below are
-//! also hard count caps:
-//! - recent tier: full-rate points (one per 15 s) for 48 h —
-//!   at most [`RECENT_CAP`] points per GPU;
-//! - archive tier: 5-minute bucket averages for 7 days — at most
-//!   [`ARCHIVE_CAP`] points per GPU.
-//! A point serializes to roughly 60 bytes of compact JSON, so the
-//! worst case is ~0.8 MB per GPU (~3.3 MB on a four-GPU machine).
-//! Points that age out of the recent tier are folded into archive
-//! buckets (averaged), never dropped silently inside the retention
-//! window, and archive points older than 7 days are pruned.
+//! also hard count caps. The recent tier holds full-rate points (one
+//! per 15 s) for 48 h — at most [`RECENT_CAP`] points per GPU. The
+//! archive tier holds 5-minute bucket averages for 7 days — at most
+//! [`ARCHIVE_CAP`] points per GPU. A point serializes to roughly 95
+//! bytes of compact JSON, so the worst case is ~1.3 MB per GPU
+//! (~5.2 MB on a four-GPU machine). Points that age out of the
+//! recent tier are folded into archive buckets (averaged), never
+//! dropped silently inside the retention window, and archive points
+//! older than 7 days are pruned.
 //!
 //! Throughput attribution: the per-backend token rate is the gateway
 //! stats store's latest interval rate (the same figure the Dashboard
@@ -160,7 +159,6 @@ pub fn attribute_throughput(rates: &[(f32, GpuPlacement)]) -> HashMap<u32, f32> 
 /// returned timestamp is a real sample's, never an invented one.
 fn average_points(points: &[HistoryPoint]) -> HistoryPoint {
     debug_assert!(!points.is_empty());
-    let n = points.len() as f32;
     let mean = |vals: &[f32]| vals.iter().sum::<f32>() / vals.len() as f32;
     let opt_mean = |get: &dyn Fn(&HistoryPoint) -> Option<f32>| {
         let vals: Vec<f32> = points.iter().filter_map(get).collect();
@@ -614,7 +612,10 @@ mod tests {
     fn record_appends_and_survives_restart() {
         let dir = test_dir("round-trip");
         let mut store = GpuHistoryStore::default();
-        let t0 = 1_700_000_000_000;
+        // Current-time stamps: load_history compacts against the
+        // wall clock, and points from a fixed past date are beyond
+        // retention by the time they are read back — correctly.
+        let t0 = chrono::Utc::now().timestamp_millis() / 1000 * 1000;
         let mut throughput = HashMap::new();
         throughput.insert(0, 22.5);
         store.record(t0, &[sample(0, t0, 60.0)], &throughput);
@@ -719,7 +720,7 @@ mod tests {
         let start = 1_700_000_000_000;
         for day in 0..8 {
             let day_start = start + day * day_ms;
-            let mut series = store.gpus.entry(0).or_default();
+            let series = store.gpus.entry(0).or_default();
             series.name = "GPU-0".to_string();
             for i in 0..(day_ms / SAMPLE_INTERVAL_MS) {
                 series
@@ -730,12 +731,13 @@ mod tests {
             let series = &store.gpus[&0];
             assert!(series.recent.len() <= RECENT_CAP, "day {day} recent cap");
             assert!(series.archive.len() <= ARCHIVE_CAP, "day {day} archive cap");
-            // Worst-case size accounting: points are capped, so the
-            // serialized file is bounded (~60 B/point + name).
+            // Worst-case size accounting: point counts are capped,
+            // and a serialized point measures ~93 bytes (field names
+            // included), so one GPU's file stays bounded.
             let text = serde_json::to_string(&store).unwrap();
             assert!(
-                text.len() < 1_000_000,
-                "day {day}: one GPU's history stays under 1 MB (got {})",
+                text.len() < 1_600_000,
+                "day {day}: one GPU's history stays under 1.6 MB (got {})",
                 text.len()
             );
         }
