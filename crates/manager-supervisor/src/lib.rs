@@ -279,6 +279,13 @@ pub struct ProcessSpec {
     pub workdir: Option<PathBuf>,
     /// Optional TCP port checked for conflicts before spawn (spec §6.2).
     pub port: Option<u16>,
+    /// Launch the process at below-normal priority (Windows:
+    /// `BELOW_NORMAL_PRIORITY_CLASS` at creation, below-normal
+    /// memory priority after spawn) so a thrashing process yields
+    /// the desktop session instead of locking it up. Set for
+    /// llama-server backends; other supervised processes (MCP
+    /// servers) leave it false. Ignored off Windows.
+    pub low_priority: bool,
 }
 
 impl ProcessSpec {
@@ -451,10 +458,14 @@ impl SupervisedProcess {
         env: &[(String, String)],
         log_ring: Arc<Mutex<RingBuffer<LogRecord>>>,
     ) -> Result<Self, SupervisorError> {
-        Self::spawn_with_workdir(id, program, args, env, None, log_ring).await
+        Self::spawn_with_workdir(id, program, args, env, None, log_ring, false).await
     }
 
-    /// `spawn` plus an explicit working directory.
+    /// `spawn` plus an explicit working directory. `low_priority`
+    /// (Windows only) creates the process at
+    /// `BELOW_NORMAL_PRIORITY_CLASS` and then sets its memory
+    /// priority below normal; either failing is a logged warning,
+    /// never a failed spawn.
     pub async fn spawn_with_workdir(
         id: &str,
         program: &Path,
@@ -462,6 +473,7 @@ impl SupervisedProcess {
         env: &[(String, String)],
         workdir: Option<&Path>,
         log_ring: Arc<Mutex<RingBuffer<LogRecord>>>,
+        low_priority: bool,
     ) -> Result<Self, SupervisorError> {
         let mut cmd = Command::new(program);
         cmd.args(args);
@@ -479,8 +491,17 @@ impl SupervisedProcess {
             // CREATE_NO_WINDOW. `cmd` is a tokio::process::Command,
             // whose creation_flags is an inherent method on Windows —
             // no std CommandExt import is needed (or used) here.
-            cmd.creation_flags(0x08000000);
+            let mut flags = 0x08000000;
+            if low_priority {
+                // BELOW_NORMAL_PRIORITY_CLASS: the process still
+                // gets every idle cycle, but the scheduler never
+                // prefers it over the desktop session's threads.
+                flags |= 0x00004000;
+            }
+            cmd.creation_flags(flags);
         }
+        #[cfg(not(windows))]
+        let _ = low_priority;
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -489,6 +510,12 @@ impl SupervisedProcess {
             .spawn()
             .map_err(|e| SupervisorError::SpawnFailed(id.to_string(), e.to_string()))?;
         tracing::info!(process = id, pid = child.id(), "spawned supervised process");
+        #[cfg(windows)]
+        if low_priority {
+            if let Some(pid) = child.id() {
+                lower_memory_priority(pid, id);
+            }
+        }
 
         let mut readers = Vec::with_capacity(2);
         if let Some(out) = child.stdout.take() {
@@ -795,6 +822,48 @@ async fn wait_port_free(port: u16, timeout: Duration) -> bool {
     }
 }
 
+/// Set a just-spawned process's memory priority to below normal
+/// (Windows `SetProcessInformation` / ProcessMemoryPriority): under
+/// memory pressure the OS trims this process's working set before
+/// the desktop session's. Best effort — failures are logged and
+/// never propagated; priority is a session-courtesy setting, not
+/// a spawn precondition.
+#[cfg(windows)]
+fn lower_memory_priority(pid: u32, id: &str) {
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, ProcessMemoryPriority, SetProcessInformation, MEMORY_PRIORITY_BELOW_NORMAL,
+        MEMORY_PRIORITY_INFORMATION, PROCESS_SET_INFORMATION,
+    };
+    let handle = unsafe { OpenProcess(PROCESS_SET_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        tracing::warn!(
+            process = id,
+            pid,
+            "could not open process to set below-normal memory priority"
+        );
+        return;
+    }
+    let info = MEMORY_PRIORITY_INFORMATION {
+        MemoryPriority: MEMORY_PRIORITY_BELOW_NORMAL,
+    };
+    let ok = unsafe {
+        SetProcessInformation(
+            handle,
+            ProcessMemoryPriority,
+            &info as *const MEMORY_PRIORITY_INFORMATION as *const std::ffi::c_void,
+            std::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+        )
+    };
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+    if ok == 0 {
+        tracing::warn!(
+            process = id,
+            pid,
+            "could not set below-normal memory priority"
+        );
+    }
+}
+
 /// Whether a process with `pid` currently exists.
 pub fn pid_alive(pid: u32) -> bool {
     #[cfg(windows)]
@@ -1060,6 +1129,7 @@ impl Supervisor {
             &spec.env,
             spec.workdir.as_deref(),
             ring,
+            spec.low_priority,
         )
         .await?;
         self.live.insert(id.to_string(), proc);
@@ -2286,6 +2356,7 @@ mod tests {
             env: vec![],
             workdir: None,
             port: None,
+            low_priority: false,
         };
         sup.register_spec(spec);
         assert!(sup.spec("idle").is_some());
@@ -2339,6 +2410,7 @@ mod tests {
             env: vec![],
             workdir: None,
             port: None,
+            low_priority: false,
         }
     }
 
@@ -2361,6 +2433,7 @@ mod tests {
                 env: vec![],
                 workdir: None,
                 port: None,
+                low_priority: false,
             }
         }
     }
@@ -2566,12 +2639,36 @@ mod tests {
             &[],
             Some(Path::new("/tmp")),
             ring.clone(),
+            false,
         )
         .await
         .unwrap();
         wait_for(|| !ring.lock().unwrap().is_empty(), Duration::from_secs(5)).await;
         let lines = ring_lines_chronological(&ring);
         assert!(lines.iter().any(|l| l == "/tmp"), "lines: {lines:?}");
+        proc.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_with_low_priority_still_spawns() {
+        // The priority knobs are Windows-only; off Windows the flag
+        // is accepted and ignored, and on Windows a failed priority
+        // call must not fail the spawn — either way the process
+        // runs and answers to kill.
+        let ring = Arc::new(Mutex::new(RingBuffer::new(1024)));
+        let spec = ext_spec("lowprio");
+        let mut proc = SupervisedProcess::spawn_with_workdir(
+            &spec.id,
+            &spec.program,
+            &spec.args,
+            &spec.env,
+            None,
+            ring,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(proc.is_running());
         proc.kill().await.unwrap();
     }
 
@@ -2807,6 +2904,7 @@ mod tests {
             env: vec![("CUDA_VISIBLE_DEVICES".into(), "0,1".into())],
             workdir: None,
             port: Some(8081),
+            low_priority: false,
         });
         assert_eq!(
             sup.launch_argv("llama").unwrap(),

@@ -289,6 +289,7 @@ pub fn process_spec_for(server: &ServerSpec) -> Option<ProcessSpec> {
         env: Vec::new(),
         workdir: None,
         port: None,
+        low_priority: false,
     })
 }
 
