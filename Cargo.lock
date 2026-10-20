@@ -1017,10 +1017,13 @@ dependencies = [
  "manager-telemetry",
  "manager-winml",
  "manager-wizard",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

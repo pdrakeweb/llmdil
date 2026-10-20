@@ -48,6 +48,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 
 pub mod activation;
 pub mod activation_history;
+pub mod app_update;
 pub mod gateway_stats;
 pub mod notify;
 pub mod optimize;
@@ -60,6 +61,10 @@ pub use optimize::{
     op_optimize_estimate_backend, op_optimize_get_state, op_optimize_measure_backend,
     op_optimize_save_purpose, op_optimize_set_item_outcome, op_optimize_set_item_state,
     op_optimize_validate_plan,
+};
+pub use app_update::{
+    op_app_update_check, op_app_update_download, op_app_update_restart, op_app_update_set_auto,
+    op_app_update_set_checking, op_app_update_status,
 };
 pub use optimize_eval::op_optimize_run_baseline;
 pub use optimize_experiments::{
@@ -425,6 +430,13 @@ pub struct AppState {
     /// state-driven toasts fire on transitions only. std Mutex:
     /// synchronous diff/update only.
     notify_watch: std::sync::Mutex<notify::NotifyWatch>,
+    /// Serializes app self-update work (check / stage / apply): a
+    /// scheduled check, a manual check, and a Settings download can
+    /// race on the same state file and staging directory otherwise.
+    /// Held across the operation; the network calls involved are
+    /// bounded (release list is one small JSON document, the
+    /// installer ~8 MB).
+    app_update_guard: Mutex<()>,
     /// Latest offload-probe state per backend id (see the probe run
     /// after a start that activates a saved offload change). std
     /// Mutex: synchronous insert/read only.
@@ -527,6 +539,7 @@ impl AppState {
             optimize_consult_error: Mutex::new(None),
             optimize_job_abort: Mutex::new(None),
             notify_watch: std::sync::Mutex::new(notify::NotifyWatch::default()),
+            app_update_guard: Mutex::new(()),
             offload_probes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }

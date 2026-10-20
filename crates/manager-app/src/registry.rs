@@ -342,7 +342,18 @@ macro_rules! for_each_operation {
             (UpdatesCheckAll, updates_check_all, R, op_updates_check_all, [], Some(route(HttpMethod::Post, "/api/v1/updates/check"))),
             (UpdatesApply, updates_apply, D, op_updates_apply, [component_id: String], Some(route(HttpMethod::Post, "/api/v1/updates/components/{component_id}/apply"))),
             (UpdatesPin, updates_pin, C, op_updates_pin, [component_id: String, version: Option<String>], Some(route(HttpMethod::Put, "/api/v1/updates/components/{component_id}/pin"))),
-            (UpdatesSetAuto, updates_set_auto, C, op_updates_set_auto, [component_id: String, enabled: bool], Some(route(HttpMethod::Put, "/api/v1/updates/components/{component_id}/auto")))
+            (UpdatesSetAuto, updates_set_auto, C, op_updates_set_auto, [component_id: String, enabled: bool], Some(route(HttpMethod::Put, "/api/v1/updates/components/{component_id}/auto"))),
+            // App self-update (Settings → Updates & diagnostics):
+            // the app's own GitHub-Releases check / stage / apply,
+            // kept distinct from the per-component pins above —
+            // different source, artifact, and applier (see
+            // manager-app's app_update module).
+            (AppUpdateStatus, app_update_status, R, op_app_update_status, [], Some(route(HttpMethod::Get, "/api/v1/app-update"))),
+            (AppUpdateCheck, app_update_check, L, op_app_update_check, [], Some(route(HttpMethod::Post, "/api/v1/app-update/check"))),
+            (AppUpdateSetChecking, app_update_set_checking, C, op_app_update_set_checking, [enabled: bool], Some(route(HttpMethod::Put, "/api/v1/app-update/checking"))),
+            (AppUpdateSetAuto, app_update_set_auto, C, op_app_update_set_auto, [enabled: bool], Some(route(HttpMethod::Put, "/api/v1/app-update/auto"))),
+            (AppUpdateDownload, app_update_download, L, op_app_update_download, [], Some(route(HttpMethod::Post, "/api/v1/app-update/download"))),
+            (AppUpdateRestart, app_update_restart, D, op_app_update_restart, [], Some(route(HttpMethod::Post, "/api/v1/app-update/restart")))
         }
     };
 }
@@ -419,7 +430,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 117);
+        assert_eq!(OP_SPECS.len(), 123);
     }
 
     #[test]
