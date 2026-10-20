@@ -265,6 +265,38 @@ check(staticSrc.includes('data-model-act="offload"'), "Models view renders the o
 check(staticSrc.includes('data-model-act="offload-save"'), "Models view renders the declaration save action");
 check(staticSrc.includes("Expert offload"), "Models view renders the Expert offload card figure");
 
+// Add Model form UX (Oct 20, 2026): the control that made the
+// form appear and the form's submit control carried the same
+// label, and a successful submit left the filled form on screen.
+// The form now follows the Groups/Add-Backend conventions: the
+// topbar's "Add model" button (plus icon, as "New group") opens
+// it, the submit is "Create model" (check icon, as "Create
+// group"), and the form lives in a #modelAddForm host (the Add
+// Backend pattern) — a successful create empties the host, which
+// clears and hides the form, while a failed create returns ahead
+// of the close with the operator's input untouched. The harness
+// is static and cannot drive a DOM submit, so the outcome
+// behavior is pinned by the handler's source fragments: the
+// close helper empties the host and is invoked only from the
+// open toggle and the success branch (Cancel passes the function
+// reference), with the failure branch's error write ahead of it.
+check(bundle.includes('id="modelAdd"'), "bundle contains the Models topbar Add model open control");
+check(bundle.includes("Create model"), "bundle contains the Add Model submit label (Create model)");
+check(staticSrc.includes('id="modelAdd" title="Add model">${icon("plus")} Add model'), "Models topbar opens the form via the Add model button");
+check(staticSrc.includes('id="addModelBtn">${icon("check")} Create model'), "Add Model submit is labeled Create model, distinct from the open control");
+check(!staticSrc.includes('id="addModelBtn">${icon("plus")} Add model'), "Add Model submit no longer carries the open control's label");
+check(staticSrc.includes('id="modelAddForm"'), "Models view renders the add-form host (#modelAddForm)");
+check(staticSrc.includes("function modelAddFormHtml"), "Add Model form renders from the shared form template");
+check(staticSrc.includes('addModelHost.innerHTML = ""'), "closing the Add Model form empties its host (every field clears with it)");
+check((staticSrc.match(/closeAddModelForm\(\)/g) || []).length === 2, "Add Model form close is invoked only from the open toggle and the success branch");
+check(staticSrc.includes("closeAddModelForm();\n      await load();"), "Add Model success branch closes the form before repainting the list");
+const addFailIdx = staticSrc.indexOf("`Add failed: ${r.error}`");
+const addCloseIdx = staticSrc.indexOf("closeAddModelForm();\n      await load();");
+check(addFailIdx >= 0 && addCloseIdx > addFailIdx, "Add Model failure branch writes the error ahead of the success-only close (input preserved)");
+const renderModelsSrc = staticSrc.split("export function renderModels")[1]?.split("export async function wireModels")[0] ?? "";
+check(renderModelsSrc.includes('id="modelAddForm"') && !renderModelsSrc.includes("addModelId"),
+  "Models shell renders only the add-form host (the form itself appears on open)");
+
 // Settings-pages sweep (Oct 19, 2026): every stored value rendered
 // on a settings surface carries a working control wired to its real
 // save path. The compiled/source fragments of those controls must
