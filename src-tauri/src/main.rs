@@ -122,6 +122,18 @@ macro_rules! tauri_handler {
 }
 
 fn main() {
+    // Apply-helper mode (app self-update): a process spawned by the
+    // Restart action with --llmdil-apply-update never starts the
+    // shell — it waits for the app to exit, runs the staged
+    // installer, records the outcome, and relaunches. Handled here,
+    // before any Tauri state exists, so the helper holds no locks
+    // the exiting app needs released.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if manager_app::app_update::is_helper_invocation(&args) {
+            std::process::exit(manager_app::app_update::run_apply_helper(&args));
+        }
+    }
     tauri::Builder::default()
         // Toast notifications (Settings → Notifications). The plugin
         // is driven from Rust via the EventSink toast capability —
@@ -227,6 +239,17 @@ fn main() {
                     manager_app::poll_gateway_metrics_once(&state).await;
                     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 }
+            });
+            // App self-update checker: one check shortly after
+            // startup, then every CHECK_INTERVAL (6 h), each gated
+            // on the operator's update-checking switch at the time.
+            // Findings land in the app-update state file; the shell
+            // banner and Settings derive from it.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<Arc<AppState>>().inner().clone();
+                let sink: Arc<dyn EventSink> = Arc::new(TauriSink(handle));
+                manager_app::app_update::checker_loop(state, sink).await;
             });
             // Admin REST API: serve in-process while enabled (the
             // enable/disable flow itself lives in
