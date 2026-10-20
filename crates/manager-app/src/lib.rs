@@ -608,11 +608,24 @@ impl AppState {
         // before the first Models visit saw an empty registry and its
         // download step reported "no models configured".)
         ensure_catalog_models(self).await;
+        // Live step progress goes straight to wizard.log: the step
+        // outcome's own log is only persisted when the step returns,
+        // so a multi-minute step (a cold package install, a database
+        // wait) otherwise leaves the file silent between "started"
+        // and the outcome block and reads as a hang.
+        let log_data_dir = self.data_dir.clone();
+        let log_sink: manager_wizard::StepLogSink = Arc::new(move |line: String| {
+            append_wizard_log(
+                &log_data_dir,
+                &[format!("[{}] {line}", chrono::Utc::now().to_rfc3339())],
+            );
+        });
         WizardContext {
             config: self.config.read().await.clone(),
             data_dir: self.data_dir.clone(),
             mode,
             ops: Arc::new(RealSystemOps::default()),
+            log_sink: Some(log_sink),
         }
     }
 
