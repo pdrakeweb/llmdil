@@ -121,7 +121,12 @@ fn requirement_of(
     let model = resolve_model(cfg, backend)?;
     let facts = live.layouts.get(&model.id)?;
     let offload = manager_models::expert_offload(backend.raw_flags.as_deref());
-    Some(layout_requirement(facts, offload, backend.flags.n_ctx))
+    Some(layout_requirement(
+        facts,
+        offload,
+        backend.flags.n_ctx,
+        manager_models::effective_slots(backend.raw_flags.as_deref()),
+    ))
 }
 
 fn strategy_of(s: &str) -> RoutingStrategy {
@@ -939,6 +944,7 @@ mod tests {
                 expert_bytes_by_block: None,
                 moe_layers: None,
                 kv_per_token: Some(8192),
+                rs_bytes_per_seq: None,
                 basis: manager_models::MemoryBasis::Estimate,
                 ctx_max: 131072,
                 params_b: 8.0,

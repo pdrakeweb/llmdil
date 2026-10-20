@@ -124,6 +124,32 @@ pub struct NotifyWatch {
     pub activation_cancelled: bool,
 }
 
+/// Compose the backend-failure toast body. `exit_status` is the
+/// reaped process's exit string when this monitor pass's own reap
+/// saw the exit (absent when another reader reaped first);
+/// `reason` is the supervisor's recorded failure reason for the
+/// backend (e.g. the device-unavailable fail-fast verdict). When
+/// a reason is recorded it is named as its own sentence: it
+/// states the cause, which the exit string cannot. The recorded
+/// string carries no trailing period, so the sentence is
+/// terminated here when it does not already end with one. With
+/// no reason the body is byte-identical to the pre-reason copy.
+fn backend_failure_body(id: &str, exit_status: Option<&str>, reason: Option<&str>) -> String {
+    let mut body = match exit_status {
+        Some(status) => format!("Backend {id} exited unexpectedly ({status})."),
+        None => format!("Backend {id} is no longer running."),
+    };
+    if let Some(reason) = reason {
+        body.push(' ');
+        body.push_str(reason);
+        if !body.ends_with('.') {
+            body.push('.');
+        }
+    }
+    body.push_str(" It stays down until restarted from the Backends view.");
+    body
+}
+
 /// One pass of the notification monitor (the shell runs it on a
 /// 5-second loop): detect the state-driven transitions — a backend
 /// dying unexpectedly, the gateway going down after being up, an
@@ -164,16 +190,11 @@ pub async fn monitor_tick(state: &AppState, sink: &dyn EventSink) {
                 Some(ProcessState::Running) | Some(ProcessState::Starting)
             );
             if was_active && st.state == ProcessState::Failed {
-                let body = match dead.get(&st.id) {
-                    Some(status) => format!(
-                        "Backend {} exited unexpectedly ({status}). It stays down until restarted from the Backends view.",
-                        st.id
-                    ),
-                    None => format!(
-                        "Backend {} is no longer running. It stays down until restarted from the Backends view.",
-                        st.id
-                    ),
-                };
+                let body = backend_failure_body(
+                    &st.id,
+                    dead.get(&st.id).map(String::as_str),
+                    st.failure_reason.as_deref(),
+                );
                 toasts.push((
                     Category::Failures,
                     "Backend stopped unexpectedly".to_string(),
@@ -260,5 +281,41 @@ pub async fn monitor_tick(state: &AppState, sink: &dyn EventSink) {
 
     for (category, title, body) in toasts {
         notify(sink, state, category, &title, &body).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backend_failure_body;
+
+    const GPU_REASON: &str =
+        "GPU unavailable: the device was busy or unavailable while the backend loaded";
+
+    #[test]
+    fn failure_body_without_reason_is_the_original_copy() {
+        assert_eq!(
+            backend_failure_body("planner", Some("exit code: 1"), None),
+            "Backend planner exited unexpectedly (exit code: 1). It stays down until restarted from the Backends view."
+        );
+        assert_eq!(
+            backend_failure_body("planner", None, None),
+            "Backend planner is no longer running. It stays down until restarted from the Backends view."
+        );
+    }
+
+    #[test]
+    fn failure_body_names_the_recorded_reason() {
+        // The device-unavailable fail-fast case: the reason is
+        // the operator-actionable fact and appears as its own
+        // sentence in both reap shapes. The recorded string has
+        // no trailing period; the helper terminates the sentence.
+        assert_eq!(
+            backend_failure_body("planner-moe", Some("exit code: 1"), Some(GPU_REASON)),
+            "Backend planner-moe exited unexpectedly (exit code: 1). GPU unavailable: the device was busy or unavailable while the backend loaded. It stays down until restarted from the Backends view."
+        );
+        assert_eq!(
+            backend_failure_body("planner-moe", None, Some(GPU_REASON)),
+            "Backend planner-moe is no longer running. GPU unavailable: the device was busy or unavailable while the backend loaded. It stays down until restarted from the Backends view."
+        );
     }
 }

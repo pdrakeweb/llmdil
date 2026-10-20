@@ -24,7 +24,7 @@ pub mod parallel;
 pub mod placement;
 
 pub use flags::{raw_flag_warnings, FlagWarning};
-pub use gguf::{parse_gguf_layout, GgufError, GgufLayout, KvGeometry};
+pub use gguf::{parse_gguf_layout, GgufError, GgufLayout, KvGeometry, RsGeometry};
 pub use guardrails::{
     nearest_allowed, offload_status, restriction_for, AllowedOffload, OffloadRestriction,
     OffloadStatus,
@@ -34,7 +34,7 @@ pub use memory::{
     set_expert_offload, sys_bytes_by_position, ExpertOffload, MemoryBasis, MemoryRequirement,
 };
 pub use mtp::{mtp_draft, set_mtp_draft, MtpDraft, LLAMA_CPP_N_MAX_DEFAULT};
-pub use parallel::{parallel_slots, set_parallel_slots};
+pub use parallel::{effective_slots, parallel_slots, set_parallel_slots};
 pub use placement::{
     apply_placement, propose_placement, propose_placement_resident, validate_split,
     PlacementProjection,

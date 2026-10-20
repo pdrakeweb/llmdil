@@ -39,6 +39,41 @@ impl KvGeometry {
     }
 }
 
+/// Recurrent-state geometry derived from GGUF metadata, for the
+/// hybrid SSM / gated-delta-net architectures whose layers carry
+/// a recurrent state instead of (or alongside) a KV cache —
+/// llama.cpp allocates that state on the GPU as its "rs cache"
+/// (llama-memory-recurrent), sized per sequence and independent
+/// of context length. The state has two parts per recurrent
+/// layer, mirroring llama.cpp's `n_embd_r()` / `n_embd_s()`:
+/// the convolution state `(d_conv - 1) * (d_inner + 2 * n_group *
+/// d_state)` elements and the SSM state `d_state * d_inner`
+/// elements, both held in F32 whatever the weight type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RsGeometry {
+    /// Layers carrying a recurrent state: the block count minus
+    /// the KV layers, the complement of the parser's KV-layer
+    /// derivation, so the two counts always sum to the block
+    /// count within this parser's own arithmetic.
+    pub recr_layers: u32,
+    /// Convolution-state elements per layer (`n_embd_r()`).
+    pub embd_r: u32,
+    /// SSM-state elements per layer (`n_embd_s()`).
+    pub embd_s: u32,
+}
+
+impl RsGeometry {
+    /// Total recurrent-state bytes for ONE sequence across all
+    /// recurrent layers. Saturating, like [`KvGeometry`]: the
+    /// fields come from the file header.
+    pub fn bytes_per_seq(&self) -> u64 {
+        (self.embd_r as u64)
+            .saturating_add(self.embd_s as u64)
+            .saturating_mul(4)
+            .saturating_mul(self.recr_layers as u64)
+    }
+}
+
 /// The memory layout of one GGUF file, from its header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GgufLayout {
@@ -64,6 +99,9 @@ pub struct GgufLayout {
     pub moe_block_count: Option<u32>,
     /// KV geometry when the metadata carries it completely.
     pub kv: Option<KvGeometry>,
+    /// Recurrent-state geometry when the metadata carries the
+    /// SSM dimensions (hybrid SSM / delta-net architectures).
+    pub rs: Option<RsGeometry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +362,39 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
         }
         _ => None,
     };
+    // Recurrent-state geometry: the SSM dimensions llama.cpp's
+    // loader reads (`<arch>.ssm.*`). Present only on the hybrid
+    // SSM / delta-net architectures; a dense model carries none
+    // and gets no state term. The element widths follow
+    // llama.cpp's hparams formulas (saturating, capped at u32 —
+    // a header claiming more is not a plausible geometry and
+    // saturates to "enormous" downstream, never wraps small).
+    let rs = match (block_count, get("ssm.state_size"), get("ssm.inner_size")) {
+        (Some(blocks), Some(d_state), Some(d_inner)) if d_state > 0 && d_inner > 0 => {
+            let kv_layers = kv.map(|k| k.kv_layers).unwrap_or(0);
+            let recr_layers = blocks.saturating_sub(kv_layers);
+            if recr_layers == 0 {
+                None
+            } else {
+                let d_conv = get("ssm.conv_kernel").unwrap_or(0);
+                let n_group = get("ssm.group_count").unwrap_or(0);
+                let cap = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+                let embd_s = cap((d_state as u64).saturating_mul(d_inner as u64));
+                let embd_r = cap(
+                    (if d_conv > 0 { d_conv - 1 } else { 0 } as u64).saturating_mul(
+                        (d_inner as u64)
+                            .saturating_add(2u64.saturating_mul(n_group as u64).saturating_mul(d_state as u64)),
+                    ),
+                );
+                Some(RsGeometry {
+                    recr_layers,
+                    embd_r,
+                    embd_s,
+                })
+            }
+        }
+        _ => None,
+    };
 
     let mut tensor_bytes: u64 = 0;
     let mut expert_bytes: u64 = 0;
@@ -379,6 +450,7 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
         block_count,
         moe_block_count,
         kv,
+        rs,
     })
 }
 
@@ -459,6 +531,66 @@ mod tests {
         let layout = parse_gguf_layout(&b).unwrap();
         assert_eq!(layout.kv.unwrap().kv_layers, 12);
         assert_eq!(layout.kv.unwrap().bytes_per_token(), 24_576);
+    }
+
+    #[test]
+    fn ssm_metadata_yields_recurrent_state_geometry() {
+        // A hybrid header in the Qwen3-Next family shape: 64
+        // blocks, full attention every 4th layer (16 KV layers,
+        // 48 recurrent), plus the SSM dimensions llama.cpp's
+        // loader reads. The widths are the Whittle-MoE incident
+        // model's family geometry: the formula's output for it
+        // (598.5 MiB at 4 sequences) is the allocation llama.cpp
+        // measured on Pete's machine for planner-moe.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&10u64.to_le_bytes());
+        w_kv_str(&mut b, "general.architecture", "testarch");
+        w_kv_u32(&mut b, "testarch.block_count", 64);
+        w_kv_u32(&mut b, "testarch.attention.head_count_kv", 2);
+        w_kv_u32(&mut b, "testarch.attention.key_length", 256);
+        w_kv_u32(&mut b, "testarch.attention.value_length", 256);
+        w_kv_u32(&mut b, "testarch.full_attention_interval", 4);
+        w_kv_u32(&mut b, "testarch.ssm.conv_kernel", 4);
+        w_kv_u32(&mut b, "testarch.ssm.inner_size", 6144);
+        w_kv_u32(&mut b, "testarch.ssm.state_size", 128);
+        w_kv_u32(&mut b, "testarch.ssm.group_count", 16);
+        let layout = parse_gguf_layout(&b).unwrap();
+        assert_eq!(layout.kv.unwrap().kv_layers, 16);
+        let rs = layout.rs.unwrap();
+        assert_eq!(rs.recr_layers, 48);
+        // n_embd_s = d_state * d_inner; n_embd_r = (d_conv - 1) *
+        // (d_inner + 2 * n_group * d_state) — llama.cpp's formulas.
+        assert_eq!(rs.embd_s, 128 * 6144);
+        assert_eq!(rs.embd_r, 3 * (6144 + 2 * 16 * 128));
+        // F32 elements: (30,720 + 786,432) * 4 B * 48 layers.
+        assert_eq!(rs.bytes_per_seq(), 156_893_184);
+    }
+
+    #[test]
+    fn no_ssm_metadata_no_recurrent_state() {
+        // The dense sample header carries no ssm.* keys.
+        let layout = parse_gguf_layout(&sample_header()).unwrap();
+        assert_eq!(layout.rs, None);
+        // SSM dimensions with every layer carrying KV (interval
+        // 1) leave no recurrent layers: no state term either.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&8u64.to_le_bytes());
+        w_kv_str(&mut b, "general.architecture", "testarch");
+        w_kv_u32(&mut b, "testarch.block_count", 4);
+        w_kv_u32(&mut b, "testarch.attention.head_count_kv", 2);
+        w_kv_u32(&mut b, "testarch.attention.key_length", 64);
+        w_kv_u32(&mut b, "testarch.attention.value_length", 64);
+        w_kv_u32(&mut b, "testarch.ssm.conv_kernel", 4);
+        w_kv_u32(&mut b, "testarch.ssm.inner_size", 2048);
+        w_kv_u32(&mut b, "testarch.ssm.state_size", 128);
+        let layout = parse_gguf_layout(&b).unwrap();
+        assert_eq!(layout.rs, None);
     }
 
     #[test]

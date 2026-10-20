@@ -253,6 +253,7 @@ lives in the app types cited; this is the wire contract summary.)
   "tensor_split": [0.5, 0.5],
   "group": "coder",
   "gpu_ram_mib": 2458, "sys_ram_mib": 44564, "kv_ram_mib": 768,
+  "rs_ram_mib": null, "failure_reason": null,
   "memory_basis": "exact | catalog | estimate",
   "offload": { "moe_layers": 48, "layers": 40, "expert_bytes": 0,
                "total_bytes": 0, "green_limit_layers": 48,

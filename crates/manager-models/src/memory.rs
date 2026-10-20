@@ -271,6 +271,13 @@ pub struct MemoryRequirement {
     /// KV cache at the backend's configured context size, when the
     /// model's KV geometry is known. Weights only otherwise.
     pub kv_mib: Option<u64>,
+    /// Recurrent-state cache (llama.cpp's "rs cache") at the
+    /// backend's effective slot count, when the model's
+    /// recurrent-state geometry is known (hybrid SSM / delta-net
+    /// architectures). The state is per sequence and independent
+    /// of context size; dense models carry none. Absent when the
+    /// geometry is unknown — never counted as zero.
+    pub rs_mib: Option<u64>,
     pub basis: MemoryBasis,
 }
 
@@ -288,6 +295,14 @@ fn mib(bytes: u64) -> u64 {
 /// layers, and hybrid models carry experts in only some blocks
 /// (Nemotron: 24 of 53).
 /// `kv_bytes_per_token` comes from the GGUF KV geometry.
+///
+/// `rs_bytes_per_seq` is the model's recurrent-state bytes for
+/// one sequence (from the GGUF recurrent-state geometry) and
+/// `n_seq` the backend's effective slot count: the state cache
+/// llama.cpp allocates is the per-sequence figure times the slot
+/// count, independent of `n_ctx`. (llama.cpp can add rollback
+/// snapshot planes for speculative state restore; those are not
+/// modeled — the term prices the live state, one row per slot.)
 ///
 /// `expert_bytes_by_block` carries the per-MoE-block expert sums
 /// from the GGUF layout (in block order), when available. A partial
@@ -322,8 +337,12 @@ pub fn memory_requirement(
     kv_bytes_per_token: Option<u64>,
     moe_layers: Option<u32>,
     n_ctx: u32,
+    rs_bytes_per_seq: Option<u64>,
+    n_seq: u32,
 ) -> MemoryRequirement {
     let kv_mib = kv_bytes_per_token.map(|per| mib(per.saturating_mul(n_ctx as u64)));
+    let rs_mib = rs_bytes_per_seq
+        .map(|per| mib(per.saturating_mul(n_seq.max(1) as u64)));
     let mut basis = basis;
     let sys_bytes: u64 = match offload {
         ExpertOffload::None => 0,
@@ -334,6 +353,7 @@ pub fn memory_requirement(
                     gpu_weights_mib: mib(total_bytes),
                     sys_weights_mib: 0,
                     kv_mib,
+                    rs_mib,
                     basis: MemoryBasis::Estimate,
                 }
             }
@@ -363,6 +383,7 @@ pub fn memory_requirement(
                     gpu_weights_mib: mib(total_bytes),
                     sys_weights_mib: 0,
                     kv_mib,
+                    rs_mib,
                     basis: MemoryBasis::Estimate,
                 }
             }
@@ -372,6 +393,7 @@ pub fn memory_requirement(
         gpu_weights_mib: mib(total_bytes - sys_bytes.min(total_bytes)),
         sys_weights_mib: mib(sys_bytes),
         kv_mib,
+        rs_mib,
         basis,
     }
 }
@@ -536,12 +558,69 @@ mod tests {
             Some(24_576),
             Some(48),
             32_768,
+            None,
+            4,
         );
         assert_eq!(r.sys_weights_mib, 46 * 1024);
         assert_eq!(r.gpu_weights_mib, 3 * 1024);
         // 24,576 B/token x 32,768 tokens = 768 MiB.
         assert_eq!(r.kv_mib, Some(768));
         assert_eq!(r.basis, MemoryBasis::Exact);
+        // No recurrent-state geometry was passed: no state term.
+        assert_eq!(r.rs_mib, None);
+    }
+
+    #[test]
+    fn recurrent_state_term_completes_the_planner_moe_requirement() {
+        // The planner-moe incident shape (Oct 20, 2026), in MiB:
+        // the Whittle-MoE-27B Q8_0 file (27,350 MiB of tensors),
+        // every routed expert on the CPU, 13,814 MiB of non-expert
+        // weights left on the GPU, KV 2,048 MiB at n_ctx 32768
+        // (65,536 B/token), and the recurrent-state geometry the
+        // GGUF parse yields for the family (156,893,184 B per
+        // sequence) at the auto slot count of 4. Before the rs
+        // term existed this requirement summed to 15,862 MiB and
+        // the start gate passed a configuration whose true total
+        // — 16,460 MiB by llama.cpp's own allocation figures
+        // (13,813.54 weights + 598.50 state + 2,048 KV) — exceeds
+        // a 16,384 MiB card even empty.
+        let mib_bytes = |m: u64| m * MIB;
+        let r = memory_requirement(
+            mib_bytes(27_350),
+            Some(mib_bytes(13_536)),
+            None,
+            MemoryBasis::Exact,
+            ExpertOffload::AllExperts,
+            Some(65_536),
+            Some(64),
+            32_768,
+            Some(156_893_184),
+            4,
+        );
+        assert_eq!(r.gpu_weights_mib, 13_814);
+        assert_eq!(r.sys_weights_mib, 13_536);
+        assert_eq!(r.kv_mib, Some(2_048));
+        // 156,893,184 B x 4 sequences = 598.5 MiB, ceiled to 599.
+        assert_eq!(r.rs_mib, Some(599));
+        let total = r.gpu_weights_mib + r.kv_mib.unwrap() + r.rs_mib.unwrap();
+        assert_eq!(total, 16_461);
+        assert!(total >= 16_460, "the incident's true requirement");
+        assert!(total > 16_384, "over an empty 16 GiB card's total");
+        // The state term scales with slots, not context: one
+        // sequence carries a quarter of it.
+        let r1 = memory_requirement(
+            mib_bytes(27_350),
+            Some(mib_bytes(13_536)),
+            None,
+            MemoryBasis::Exact,
+            ExpertOffload::AllExperts,
+            Some(65_536),
+            Some(64),
+            32_768,
+            Some(156_893_184),
+            1,
+        );
+        assert_eq!(r1.rs_mib, Some(150));
     }
 
     #[test]
@@ -555,6 +634,8 @@ mod tests {
             None,
             Some(48),
             32_768,
+            None,
+            4,
         );
         assert_eq!(r.gpu_weights_mib, 12 * 1024);
         assert_eq!(r.sys_weights_mib, 0);
@@ -575,6 +656,8 @@ mod tests {
             None,
             Some(48),
             32_768,
+            None,
+            4,
         );
         assert_eq!(r.sys_weights_mib, 24 * 1024);
         assert_eq!(r.gpu_weights_mib, 25 * 1024);
@@ -590,6 +673,8 @@ mod tests {
             None,
             Some(48),
             32_768,
+            None,
+            4,
         );
         assert_eq!(r.basis, MemoryBasis::Catalog);
     }
@@ -610,6 +695,8 @@ mod tests {
             None,
             Some(4),
             32_768,
+            None,
+            4,
         );
         assert_eq!(r.sys_weights_mib, 30 * 1024);
         assert_eq!(r.gpu_weights_mib, 19 * 1024);
@@ -626,6 +713,8 @@ mod tests {
             None,
             Some(4),
             32_768,
+            None,
+            4,
         );
         assert_eq!(r.sys_weights_mib, 20 * 1024);
         assert_eq!(r.basis, MemoryBasis::Estimate);
@@ -648,6 +737,8 @@ mod tests {
             None,
             Some(24),
             32_768,
+            None,
+            4,
         );
         assert_eq!(r.sys_weights_mib, 14_515);
         assert_eq!(r.gpu_weights_mib, 9_574);
@@ -861,6 +952,8 @@ mod tests {
                 None,
                 Some(4),
                 32_768,
+                None,
+                4,
             );
             assert_eq!(
                 mib(by_position[n as usize]),
@@ -885,6 +978,8 @@ mod tests {
                 None,
                 Some(4),
                 32_768,
+                None,
+                4,
             );
             assert_eq!(
                 mib(by_position[n as usize]),
@@ -914,6 +1009,8 @@ mod tests {
             None,
             None,
             32_768,
+            None,
+            4,
         );
         assert_eq!(r.gpu_weights_mib, 49 * 1024);
         assert_eq!(r.sys_weights_mib, 0);

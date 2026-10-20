@@ -744,11 +744,17 @@ export interface BackendRow {
   placement?: string;
   /** Memory requirement under the backend's current configuration
    *  (configured rows whose model resolves): GPU-resident weights,
-   *  system-RAM weights (expert offload), and the KV cache at the
-   *  configured context when the model's geometry is known. */
+   *  system-RAM weights (expert offload), the KV cache at the
+   *  configured context, and the recurrent-state cache at the
+   *  effective slot count when the model's geometry is known. */
   gpu_ram_mib?: number;
   sys_ram_mib?: number;
   kv_ram_mib?: number | null;
+  rs_ram_mib?: number | null;
+  /** The supervisor's recorded reason for the backend's last
+   *  spawn/load failure, when one was recorded (e.g. the
+   *  device-unavailable fail-fast verdict); null otherwise. */
+  failure_reason?: string | null;
   /** How the requirement was derived: exact | catalog | estimate. */
   memory_basis?: string;
   /** Expert-offload slider state (configured rows whose model is

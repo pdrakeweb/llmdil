@@ -373,6 +373,21 @@ const optimizeRsSrc = readFileSync(join(root, "..", "crates", "manager-app", "sr
 check(optimizeRsSrc.includes("contention note"), "measurement start logs a contention note when a consultation targets the same backend");
 check(optimizeRsSrc.includes("fn consult_running_on"), "the contention match is a named predicate in the measure path");
 
+// Preflight completion (Oct 20, 2026): the backend card carries
+// the requirement's recurrent-state term as a State cache tile
+// beside the KV tile (hybrid SSM models), and the failed state
+// surfaces the supervisor's recorded failure_reason under the
+// header in "Label: Value" form. The row type declares both
+// fields so the payload contract is explicit.
+const apiSrc = readFileSync(join(root, "src", "api.ts"), "utf8");
+check(apiSrc.includes("rs_ram_mib?: number | null"), "BackendRow declares the recurrent-state cache field");
+check(apiSrc.includes("failure_reason?: string | null"), "BackendRow declares the recorded failure reason");
+check(staticSrc.includes('["State cache"'), "Backends card renders the State cache tile");
+check(staticSrc.includes("b.rs_ram_mib != null"), "State cache tile renders only when the requirement carries the term");
+check(staticSrc.includes('b.state === "failed" && b.failure_reason'), "Failure line is gated on the failed state and a recorded reason");
+check(staticSrc.includes("Failure: ${esc(b.failure_reason)}"), "Backends card renders the recorded failure reason");
+check(bundle.includes("State cache"), "bundle contains the State cache tile label");
+
 // Settings-pages sweep (Oct 19, 2026): every stored value rendered
 // on a settings surface carries a working control wired to its real
 // save path. The compiled/source fragments of those controls must

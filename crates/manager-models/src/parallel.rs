@@ -79,6 +79,24 @@ pub fn parallel_slots(raw_flags: Option<&str>) -> Option<i64> {
     slots
 }
 
+/// The slot count a backend actually runs with: the explicit
+/// `--parallel` value when it is a positive count, otherwise
+/// llama.cpp's auto default ([`LLAMA_CPP_PARALLEL_AUTO_SLOTS`]) —
+/// an absent token, an explicit auto (-1), and a malformed or
+/// non-positive value all land on auto, matching how the server
+/// treats them. Consumers that size per-sequence state (the
+/// recurrent-state cache term in the memory requirement) need
+/// this effective count, not the raw decoded setting. An explicit
+/// count past the control's ceiling clamps to it (the ceiling's
+/// own arithmetic: past it even minimum-size slots exceed the
+/// largest context the app accepts).
+pub fn effective_slots(raw_flags: Option<&str>) -> u32 {
+    match parallel_slots(raw_flags) {
+        Some(n) if n > 0 => (n as u32).min(PARALLEL_SLOTS_MAX),
+        _ => LLAMA_CPP_PARALLEL_AUTO_SLOTS as u32,
+    }
+}
+
 /// Rewrite the parallel tokens in raw llama-server flags,
 /// leaving every other flag untouched and in order. All existing
 /// `--parallel` / `-np` occurrences (both spellings, including
@@ -147,6 +165,20 @@ mod tests {
         );
         assert_eq!(parallel_slots(Some("--parallel abc")), None);
         assert_eq!(parallel_slots(Some("--parallel")), None);
+    }
+
+    #[test]
+    fn effective_slots_resolves_auto_and_clamps() {
+        // Absent, explicit auto, and malformed all run auto (4).
+        assert_eq!(effective_slots(None), 4);
+        assert_eq!(effective_slots(Some("-ot exps=CPU")), 4);
+        assert_eq!(effective_slots(Some("--parallel -1")), 4);
+        assert_eq!(effective_slots(Some("--parallel abc")), 4);
+        // A positive explicit count is the count.
+        assert_eq!(effective_slots(Some("--parallel 1")), 1);
+        assert_eq!(effective_slots(Some("-np=8")), 8);
+        // Past the control ceiling the count clamps to it.
+        assert_eq!(effective_slots(Some("--parallel 4096")), PARALLEL_SLOTS_MAX);
     }
 
     #[test]

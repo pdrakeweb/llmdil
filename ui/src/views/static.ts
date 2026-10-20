@@ -2598,7 +2598,7 @@ function backendCard(
         : "";
   // Metric strip (Pete's card redesign): one row of labeled
   // single-value tiles — Model, Context, GPU RAM, System RAM, KV
-  // cache. No sentences; the model tile is a VALUE (the served
+  // cache, State cache. No sentences; the model tile is a VALUE (the served
   // model's short name, the file path in its tooltip) — the old
   // inline select assigned on selection with no save, so model
   // changes moved into the Edit panel (Pete's report, 2026-10-20).
@@ -2621,6 +2621,7 @@ function backendCard(
     // tile renders only when the payload carries the figure.
     if (b.sys_ram_mib !== undefined) stripTiles.push(["System RAM", `${fmtGb(b.sys_ram_mib / 1024)} GiB`]);
     if (!b.flags_advanced && b.kv_ram_mib != null) stripTiles.push(["KV cache", `<span title="KV cache at the configured context">${fmtGb(b.kv_ram_mib / 1024)} GiB</span>`]);
+    if (!b.flags_advanced && b.rs_ram_mib != null) stripTiles.push(["State cache", `<span title="Recurrent-state cache at the configured slot count">${fmtGb(b.rs_ram_mib / 1024)} GiB</span>`]);
   }
   const stripHtml = `<div style="display:grid;grid-template-columns:${["2fr", ...stripTiles.slice(1).map(() => "1fr")].join(" ")};gap:10px;margin-top:8px">
       ${stripTiles.map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${v}</span></div>`).join("")}
@@ -2688,6 +2689,13 @@ function backendCard(
   const rawFlagsHtml = b.flags_advanced && b.raw_flags
     ? `<div style="font-size:12px;color:var(--text2);margin-top:8px">Flags: <span style="font-family:var(--mono);color:var(--text)">${esc(b.raw_flags)}</span></div>`
     : "";
+  // The supervisor's recorded failure reason, in the failed
+  // state only: it names the cause (e.g. the device-unavailable
+  // fail-fast verdict) the state chip cannot. Principle 9 form —
+  // a noun label and the value, no sentence.
+  const failureHtml = b.state === "failed" && b.failure_reason
+    ? `<div style="font-size:12px;color:var(--err);margin-top:6px">Failure: ${esc(b.failure_reason)}</div>`
+    : "";
   const detailsBtn = `<button class="btn icon-only" data-back-act="details" data-back-id="${esc(b.id)}" aria-expanded="${detailsOpen}" title="Details" aria-label="Details">${icon(detailsOpen ? "chevD" : "chevR")}</button>`;
   return `<div class="card backend-card" id="card-backend-${esc(b.id)}">
       <h3 class="backend-card-head">${stateDot(b.state)} ${esc(b.id)} <span class="port">:${b.port}</span>
@@ -2697,6 +2705,7 @@ function backendCard(
         ${b.adopted ? `<span class="chip status-tag status-on" title="${esc(adoptedText)}">adopted</span>` : ""}
         ${b.flags_advanced ? `<span class="chip status-tag" title="Advanced flags mode: this backend's launch flags are edited as raw text in the Flags panel, and the structured flags form is disabled for it.">advanced flags</span>` : ""}
         <span class="chip status-tag ${stateTagClass(b.state)}">${esc(b.state)}</span></h3>
+      ${failureHtml}
       ${stripHtml}
       ${gpuHtml}
       ${statsHtml}

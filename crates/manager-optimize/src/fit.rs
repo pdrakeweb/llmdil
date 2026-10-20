@@ -25,6 +25,9 @@ pub struct LayoutFacts {
     pub expert_bytes_by_block: Option<Vec<u64>>,
     pub moe_layers: Option<u32>,
     pub kv_per_token: Option<u64>,
+    /// Recurrent-state bytes per sequence (GGUF recurrent-state
+    /// geometry); None for dense models and unknown geometry.
+    pub rs_bytes_per_seq: Option<u64>,
     pub basis: MemoryBasis,
     /// Rated maximum context (catalog `ctx_max`); 0 = unknown.
     pub ctx_max: u32,
@@ -33,10 +36,13 @@ pub struct LayoutFacts {
 
 /// A backend's memory requirement from layout facts — the same
 /// arithmetic `backend_memory_requirement` performs in src-tauri.
+/// `n_seq` is the backend's effective slot count (the
+/// recurrent-state term is per sequence).
 pub fn layout_requirement(
     facts: &LayoutFacts,
     offload: ExpertOffload,
     n_ctx: u32,
+    n_seq: u32,
 ) -> MemoryRequirement {
     manager_models::memory_requirement(
         facts.total_bytes,
@@ -47,13 +53,16 @@ pub fn layout_requirement(
         facts.kv_per_token,
         facts.moe_layers,
         n_ctx,
+        facts.rs_bytes_per_seq,
+        n_seq,
     )
 }
 
 /// Total GPU-resident MiB of a requirement (weights + KV when the
-/// KV geometry is known).
+/// KV geometry is known + recurrent-state cache when its geometry
+/// is known).
 pub fn gpu_total_mib(req: &MemoryRequirement) -> u64 {
-    req.gpu_weights_mib + req.kv_mib.unwrap_or(0)
+    req.gpu_weights_mib + req.kv_mib.unwrap_or(0) + req.rs_mib.unwrap_or(0)
 }
 
 /// Distribute a requirement's GPU-resident total over the GPUs by
@@ -209,7 +218,12 @@ pub fn others_residency(
             continue;
         };
         let offload = manager_models::expert_offload(b.raw_flags.as_deref());
-        let req = layout_requirement(facts, offload, b.flags.n_ctx);
+        let req = layout_requirement(
+            facts,
+            offload,
+            b.flags.n_ctx,
+            manager_models::effective_slots(b.raw_flags.as_deref()),
+        );
         let per = residency_per_gpu(&req, &b.flags.tensor_split, n_gpus);
         let bucket = if running.get(&b.id).copied().unwrap_or(false) {
             &mut running_res
@@ -234,6 +248,7 @@ mod tests {
             expert_bytes_by_block: None,
             moe_layers: None,
             kv_per_token: None,
+            rs_bytes_per_seq: None,
             basis: MemoryBasis::Estimate,
             ctx_max: 0,
             params_b: 12.0,
@@ -242,7 +257,7 @@ mod tests {
 
     #[test]
     fn residency_empty_split_is_first_gpu() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, 32768);
+        let req = layout_requirement(&facts(), ExpertOffload::None, 32768, 4);
         assert_eq!(residency_per_gpu(&req, &[], 2), vec![12 * 1024, 0]);
         assert_eq!(
             residency_per_gpu(&req, &[0.5, 0.5], 2),
@@ -254,7 +269,7 @@ mod tests {
 
     #[test]
     fn fit_fails_when_free_vram_is_taken_by_a_running_backend() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, 32768);
+        let req = layout_requirement(&facts(), ExpertOffload::None, 32768, 4);
         // 16 GiB free on GPU 0, but a running backend holds 8 GiB:
         // the 12 GiB model cannot be placed.
         let out = evaluate_fit(&req, &[], &[16 * 1024, 0], &[8 * 1024, 0], &[0, 0]);
@@ -267,7 +282,7 @@ mod tests {
 
     #[test]
     fn fit_warns_when_it_only_fits_by_moving_accounted_residency() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, 32768);
+        let req = layout_requirement(&facts(), ExpertOffload::None, 32768, 4);
         // 16 GiB free; a STOPPED backend accounts 8 GiB. The model
         // fits now but not alongside the stopped backend.
         let out = evaluate_fit(&req, &[], &[16 * 1024, 0], &[0, 0], &[8 * 1024, 0]);
