@@ -309,6 +309,9 @@ pub fn build_context(
                 if let Some(kv) = req.kv_mib {
                     r["kv_ram_mib"] = json!(kv);
                 }
+                if let Some(rs) = req.rs_mib {
+                    r["rs_ram_mib"] = json!(rs);
+                }
                 v["memory_requirement"] = r;
             }
             if !b.purpose.trim().is_empty() {
@@ -879,6 +882,7 @@ mod tests {
                 gpu_weights_mib: 5000,
                 sys_weights_mib: 0,
                 kv_mib: Some(512),
+                rs_mib: None,
                 basis: manager_models::MemoryBasis::Estimate,
             },
         );

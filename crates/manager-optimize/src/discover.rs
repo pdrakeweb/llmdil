@@ -327,13 +327,15 @@ pub fn fit_verdict(
         expert_bytes_by_block: None,
         moe_layers: None,
         kv_per_token: None,
+        rs_bytes_per_seq: None,
         basis: MemoryBasis::Estimate,
         ctx_max,
         params_b,
     };
-    // No offload is proposed for a candidate, and with no KV
-    // geometry the requirement is weights-only at any context.
-    let req = layout_requirement(&facts, ExpertOffload::None, 0);
+    // No offload is proposed for a candidate, and with no KV or
+    // recurrent-state geometry the requirement is weights-only
+    // at any context and any slot count.
+    let req = layout_requirement(&facts, ExpertOffload::None, 0, 1);
     let zeros = vec![0u64; free_vram_mib_per_gpu.len()];
     let outcome = evaluate_fit(&req, &[], free_vram_mib_per_gpu, &zeros, &zeros);
     if !outcome.placeable {

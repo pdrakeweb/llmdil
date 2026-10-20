@@ -2598,7 +2598,7 @@ function backendCard(
         : "";
   // Metric strip (Pete's card redesign): one row of labeled
   // single-value tiles — Model, Context, GPU RAM, System RAM, KV
-  // cache. No sentences; the model tile is a VALUE (the served
+  // cache, State cache. No sentences; the model tile is a VALUE (the served
   // model's short name, the file path in its tooltip) — the old
   // inline select assigned on selection with no save, so model
   // changes moved into the Edit panel (Pete's report, 2026-10-20).
@@ -2621,6 +2621,7 @@ function backendCard(
     // tile renders only when the payload carries the figure.
     if (b.sys_ram_mib !== undefined) stripTiles.push(["System RAM", `${fmtGb(b.sys_ram_mib / 1024)} GiB`]);
     if (!b.flags_advanced && b.kv_ram_mib != null) stripTiles.push(["KV cache", `<span title="KV cache at the configured context">${fmtGb(b.kv_ram_mib / 1024)} GiB</span>`]);
+    if (!b.flags_advanced && b.rs_ram_mib != null) stripTiles.push(["State cache", `<span title="Recurrent-state cache at the configured slot count">${fmtGb(b.rs_ram_mib / 1024)} GiB</span>`]);
   }
   const stripHtml = `<div style="display:grid;grid-template-columns:${["2fr", ...stripTiles.slice(1).map(() => "1fr")].join(" ")};gap:10px;margin-top:8px">
       ${stripTiles.map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${v}</span></div>`).join("")}

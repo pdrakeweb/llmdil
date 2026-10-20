@@ -68,7 +68,7 @@ and listed again in §13).
 ### `list_backends` — read
 - What: Configured backends merged with live supervisor state.
 - Entry: `list_backends`, main.rs:1477. UI: yes (`getBackends`, `listBackends`).
-- In: none. Out: `{backends: [{id, enabled, configured, port, model_file, state (stopped|starting|running|stopping|failed), pid, adopted, restarts, uptime_secs, requests_1h?, errors_1h?, throughput_toks?, n_ctx?, n_batch?, tensor_split?, group?, gpu_ram_mib?, sys_ram_mib?, kv_ram_mib?, memory_basis?, offload?}]}`. Rows with `configured: false` are supervisor-only orphan processes. Trailing-hour stats come from the gateway metrics store (see §13.2); memory figures derive from the model's GGUF layout (`manager-models` gguf/memory modules).
+- In: none. Out: `{backends: [{id, enabled, configured, port, model_file, state (stopped|starting|running|stopping|failed), pid, adopted, restarts, uptime_secs, requests_1h?, errors_1h?, throughput_toks?, n_ctx?, n_batch?, tensor_split?, group?, gpu_ram_mib?, sys_ram_mib?, kv_ram_mib?, rs_ram_mib?, memory_basis?, offload?}]}`. Rows with `configured: false` are supervisor-only orphan processes. `rs_ram_mib` is the recurrent-state cache (hybrid SSM models) at the backend's effective slot count. Trailing-hour stats come from the gateway metrics store (see §13.2); memory figures derive from the model's GGUF layout (`manager-models` gguf/memory modules).
 - Side effects: none directly; reads the supervisor and telemetry stores.
 
 ### `start_backend` — lifecycle

@@ -2463,7 +2463,8 @@ pub async fn op_list_backends(
         .collect();
     // Memory requirements per configured backend (GPU-resident
     // weights, system-RAM weights under expert offload, KV at the
-    // configured context, and the derivation basis). Absent when
+    // configured context, recurrent-state cache at the effective
+    // slot count, and the derivation basis). Absent when
     // the backend's model cannot be resolved.
     {
         let memory: HashMap<String, manager_models::MemoryRequirement> = cfg
@@ -2479,6 +2480,7 @@ pub async fn op_list_backends(
             row["gpu_ram_mib"] = json!(req.gpu_weights_mib);
             row["sys_ram_mib"] = json!(req.sys_weights_mib);
             row["kv_ram_mib"] = json!(req.kv_mib);
+            row["rs_ram_mib"] = json!(req.rs_mib);
             row["memory_basis"] = serde_json::to_value(req.basis).unwrap_or(Value::Null);
         }
     }
@@ -7755,6 +7757,10 @@ struct WeightLayout {
     expert_bytes_by_block: Option<Vec<u64>>,
     moe_layers: Option<u32>,
     kv_per_token: Option<u64>,
+    /// Recurrent-state bytes per sequence from the GGUF header's
+    /// SSM geometry (hybrid architectures), same provenance as
+    /// `kv_per_token`.
+    rs_bytes_per_seq: Option<u64>,
     basis: manager_models::MemoryBasis,
     /// The curated catalog entry for the backend's model, when it
     /// is a catalog model (the offload slider's green limit and
@@ -7790,35 +7796,45 @@ fn resolve_weight_layout(
     // the mixture Exact, a label neither source earned
     // (code-review 4.12). Without a parse, the catalog's pins are
     // Catalog; anything else is an Estimate.
-    let (total_bytes, expert_bytes, expert_bytes_by_block, kv_per_token, moe_layers, basis) =
-        match (&layout, &catalog) {
-            (Some(l), _) => (
-                l.tensor_bytes,
-                Some(l.expert_bytes),
-                Some(l.expert_bytes_by_block.clone()),
-                l.kv.map(|k| k.bytes_per_token()),
-                l.moe_block_count,
-                manager_models::MemoryBasis::Exact,
-            ),
-            (None, Some(c)) => (
-                c.size_bytes,
-                c.expert_bytes,
-                None,
-                None,
-                c.moe_layers,
-                manager_models::MemoryBasis::Catalog,
-            ),
-            (None, None) => (
-                file_len.unwrap_or_else(|| {
-                    manager_wizard::steps::estimate_model_bytes(model.params_b as f64)
-                }),
-                None,
-                None,
-                None,
-                None,
-                manager_models::MemoryBasis::Estimate,
-            ),
-        };
+    let (
+        total_bytes,
+        expert_bytes,
+        expert_bytes_by_block,
+        kv_per_token,
+        rs_bytes_per_seq,
+        moe_layers,
+        basis,
+    ) = match (&layout, &catalog) {
+        (Some(l), _) => (
+            l.tensor_bytes,
+            Some(l.expert_bytes),
+            Some(l.expert_bytes_by_block.clone()),
+            l.kv.map(|k| k.bytes_per_token()),
+            l.rs.map(|g| g.bytes_per_seq()),
+            l.moe_block_count,
+            manager_models::MemoryBasis::Exact,
+        ),
+        (None, Some(c)) => (
+            c.size_bytes,
+            c.expert_bytes,
+            None,
+            None,
+            None,
+            c.moe_layers,
+            manager_models::MemoryBasis::Catalog,
+        ),
+        (None, None) => (
+            file_len.unwrap_or_else(|| {
+                manager_wizard::steps::estimate_model_bytes(model.params_b as f64)
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            manager_models::MemoryBasis::Estimate,
+        ),
+    };
     // The slider's green limit resolves per figure, catalog
     // first: a catalog pin wins; where the catalog carries no
     // default (or no entry at all), the operator's declared
@@ -7833,6 +7849,7 @@ fn resolve_weight_layout(
         expert_bytes_by_block,
         moe_layers,
         kv_per_token,
+        rs_bytes_per_seq,
         basis,
         catalog,
         green_limit_layers,
@@ -7840,7 +7857,8 @@ fn resolve_weight_layout(
 }
 
 /// A backend's memory requirement (GPU-resident weights, system-RAM
-/// weights, KV at its configured context) under its current serving
+/// weights, KV at its configured context, recurrent-state cache at
+/// its effective slot count) under its current serving
 /// configuration — see [`manager_models::memory_requirement`]. None
 /// when the backend's model cannot be resolved.
 fn backend_memory_requirement(
@@ -7858,6 +7876,8 @@ fn backend_memory_requirement(
         layout.kv_per_token,
         layout.moe_layers,
         b.flags.n_ctx,
+        layout.rs_bytes_per_seq,
+        manager_models::effective_slots(b.raw_flags.as_deref()),
     ))
 }
 
@@ -10837,6 +10857,57 @@ mod tests {
         assert_eq!(f.free_mib, 11_245);
         assert_eq!(f.total_mib, 16_384);
         assert_eq!(f.class, VramGateClass::InsufficientFree);
+    }
+
+    #[test]
+    fn preflight_requirement_includes_recurrent_state_cache() {
+        // The planner-moe incident end to end through the
+        // production requirement: Whittle-MoE-27B Q8_0 file
+        // (27,350 MiB of tensors, 13,536 MiB of them routed
+        // experts, all offloaded), KV 65,536 B/token at n_ctx
+        // 32768, recurrent-state geometry 156,893,184 B per
+        // sequence at the auto slot count of 4. llama.cpp's own
+        // figures for this configuration total 16,460 MiB
+        // (13,813.54 weights + 598.50 state + 2,048 KV) — over a
+        // 16,384 MiB card's total even when the card is empty, so
+        // the gate must refuse with the exceeds-total class. The
+        // weights+KV subtotal alone (15,862 MiB) is exactly the
+        // figure the pre-rs-term requirement produced when the
+        // start was wrongly allowed.
+        let mib_bytes = |m: u64| m * manager_models::MIB;
+        let req = manager_models::memory_requirement(
+            mib_bytes(27_350),
+            Some(mib_bytes(13_536)),
+            None,
+            manager_models::MemoryBasis::Exact,
+            manager_models::ExpertOffload::AllExperts,
+            Some(65_536),
+            Some(64),
+            32_768,
+            Some(156_893_184),
+            4,
+        );
+        assert_eq!(req.gpu_weights_mib, 13_814);
+        assert_eq!(req.kv_mib, Some(2_048));
+        assert_eq!(req.rs_mib, Some(599));
+        let per_gpu = manager_optimize::residency_per_gpu(&req, &[0.0, 1.0], 2);
+        assert_eq!(per_gpu, vec![0, 16_461]);
+        let required: Vec<(u32, u64)> = per_gpu
+            .iter()
+            .enumerate()
+            .filter(|(_, mib)| **mib > 0)
+            .map(|(i, mib)| (i as u32, *mib))
+            .collect();
+        let failures = vram_gate_failures(
+            &[1],
+            &required,
+            &[vram_reading(1, 16_384, 16_384)],
+            &[],
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].class, VramGateClass::ExceedsTotal);
+        assert_eq!(failures[0].required_mib, 16_461);
+        assert!(failures[0].required_mib >= 16_460);
     }
 
     #[test]

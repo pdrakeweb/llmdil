@@ -2382,6 +2382,7 @@ mod tests {
                 expert_bytes_by_block: None,
                 moe_layers: Some(48),
                 kv_per_token: Some(8192),
+                rs_bytes_per_seq: None,
                 basis: manager_models::MemoryBasis::Estimate,
                 ctx_max: 131072,
                 params_b: 27.0,
