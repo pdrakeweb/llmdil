@@ -8702,13 +8702,17 @@ mod tests {
         let sink = test_sink();
 
         // Notifications master: to false, and back to true.
-        let mut notif = manager_config::NotificationConfig::default();
-        notif.enabled = false;
+        let notif = manager_config::NotificationConfig {
+            enabled: false,
+            ..Default::default()
+        };
         op_notifications_set_config(&state, &sink, notif).await.unwrap();
         let loaded = manager_config::load(&state.config_path).unwrap();
         assert!(!loaded.notifications.enabled);
-        let mut notif = manager_config::NotificationConfig::default();
-        notif.enabled = true;
+        let notif = manager_config::NotificationConfig {
+            enabled: true,
+            ..Default::default()
+        };
         op_notifications_set_config(&state, &sink, notif).await.unwrap();
         let loaded = manager_config::load(&state.config_path).unwrap();
         assert!(loaded.notifications.enabled);
