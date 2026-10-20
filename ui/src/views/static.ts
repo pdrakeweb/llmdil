@@ -15,6 +15,7 @@ import {
   getGpuTelemetry, getGpuHistory, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
   getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendMtp, setBackendParallel, setBackendRawFlags, setBackendFlagsMode, getBackendLaunchCommand,
   measurementLookup,
+  optimizeMeasureBackend,
   getBackendConfig, applyBackendConfig, testBackend, testBackendToolCall, placementPropose, placementApply,
   addBackend, backendAddPreview, deleteBackend, modelAssign,
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
@@ -118,6 +119,15 @@ function fmtUptime(secs: number | null): string {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m ${s % 60}s`;
   return `${s}s`;
+}
+
+/** Elapsed for an in-flight job, in the Optimize view's format
+ *  ("45 s", "2 min 5 s"): the predicted-throughput refresh's
+ *  Measuring state ticks in this shape. */
+function fmtElapsed(secs: number): string {
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return m > 0 ? `${m} min ${s} s` : `${s} s`;
 }
 
 function fmtTime(ts: string): string {
@@ -2108,6 +2118,7 @@ function backendCard(
   place: PlaceCardState | null,
   gpuTotalsMiB: Map<number, number>,
   detailsOpen: boolean,
+  predictRefreshing: Map<string, number>,
 ): string {
   const active = b.state === "running" || b.state === "starting";
   // Buttons render disabled while this card's action is in flight.
@@ -2293,21 +2304,49 @@ function backendCard(
   // The stat tiles: live Throughput (trailing window, present
   // once the metrics poller has one) and Predicted throughput
   // (the saved configuration's exact-match measurement, design
-  // §7 — generation only, the rest in the tooltip; absent
-  // entirely when no exact measurement exists).
+  // §7 — generation only, the rest in the tooltip).
   const statTiles: [string, string, string | null][] = [];
   if (b.throughput_toks !== undefined) {
     statTiles.push(["Throughput", `${trim1(b.throughput_toks)} tok/s`, null]);
   }
-  if (b.predicted && b.predicted.predicted_per_second !== null) {
-    statTiles.push(["Predicted throughput", `${trim1(b.predicted.predicted_per_second)} tok/s`, predictedCardTip(b.predicted)]);
-  }
-  const statsHtml = statTiles.length
-    ? `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:8px">
+  // Predicted throughput renders on EVERY card (Pete,
+  // 2026-10-20): with no exact measurement the tile carries the
+  // explicit "Not measured" empty state — never 0, never an
+  // omitted field (principle 12) — and the Refresh control
+  // beside it runs the standardized benchmark (the Optimize
+  // Measure profile, the one whose entries feed the prediction)
+  // to fill or update it. Measuring requires a running backend
+  // (the measure op's own rule), so a stopped or unconfigured
+  // backend's control is disabled with the reason as its title.
+  const predictedTile = ((): string => {
+    const startedAt = predictRefreshing.get(b.id);
+    const fig = b.predicted && b.predicted.predicted_per_second !== null
+      ? b.predicted.predicted_per_second
+      : null;
+    const canMeasure = b.configured && b.state === "running";
+    const refreshTitle = startedAt !== undefined
+      ? "Measurement running"
+      : !b.configured
+        ? "Not in the configuration — nothing to measure"
+        : b.state !== "running"
+          ? "Backend is not running — start it to refresh the prediction"
+          : "Refresh the prediction — runs the standardized benchmark";
+    const refreshBtn = `<button class="btn" data-back-act="predict-refresh" data-back-id="${esc(b.id)}" style="padding:2px 8px;font-size:11px" title="${esc(refreshTitle)}" aria-label="Refresh predicted throughput for ${esc(b.id)}"${startedAt !== undefined || !canMeasure ? " disabled" : ""}>${icon("restart")} Refresh</button>`;
+    const tip = fig !== null && b.predicted
+      ? predictedCardTip(b.predicted)
+      : "No measurement of this backend's saved configuration yet. Refresh runs the standardized benchmark (the Optimize page's Measure action) against the running backend and stores the result as the prediction.";
+    const value = startedAt !== undefined
+      ? `Measuring <span data-pred-elapsed="${esc(b.id)}">${fmtElapsed(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)))}</span>`
+      : fig !== null
+        ? `${trim1(fig)} tok/s`
+        : `<span style="color:var(--text3);font-weight:400">Not measured</span>`;
+    return `<div class="kv"><span class="k">Predicted throughput<span class="info-tip" title="${esc(tip)}">${icon("info")}</span></span><span class="v" style="font-size:13px">${value} ${refreshBtn}</span></div>`;
+  })();
+  const statsHtml = `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:8px">
         ${statTiles
           .map(([k, v, tip]) => `<div class="kv"><span class="k">${esc(k)}${tip ? `<span class="info-tip" title="${esc(tip)}">${icon("info")}</span>` : ""}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
-      </div>`
-    : "";
+        ${predictedTile}
+      </div>`;
   // Offload guardrail and probe lines for the saved position
   // (at rest, not the flags-form draft). Status colors follow the
   // design principles: light red for blocked/failed, amber for
@@ -2722,6 +2761,31 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   /** Backend ids with an action invoke in flight; their card buttons
    *  render disabled (the set outlives any single repaint). */
   const inFlight = new Set<string>();
+  /** Backends whose predicted-throughput refresh (a Measure
+   *  run started from the card) is in flight, by start time.
+   *  Held outside the repainted DOM like the other card state,
+   *  so poll repaints keep the Measuring state; a refresh
+   *  deliberately does NOT join inFlight — a measurement takes
+   *  minutes and must not disable the card or stall the poll. */
+  const predictRefreshing = new Map<string, number>();
+  /** The 1 s elapsed ticker for in-flight prediction
+   *  refreshes (the Optimize view's pattern). */
+  let predictTimer: number | null = null;
+  const stopPredictTicker = (): void => {
+    if (predictTimer !== null) { window.clearInterval(predictTimer); predictTimer = null; }
+  };
+  const startPredictTicker = (): void => {
+    if (predictTimer !== null) return;
+    predictTimer = window.setInterval(() => {
+      if (!predictRefreshing.size) { stopPredictTicker(); return; }
+      root.querySelectorAll<HTMLElement>("[data-pred-elapsed]").forEach((el) => {
+        const startedAt = predictRefreshing.get(el.getAttribute("data-pred-elapsed") ?? "");
+        if (startedAt !== undefined) {
+          el.textContent = fmtElapsed(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+        }
+      });
+    }, 1000);
+  };
   let lastRows: BackendRow[] = [];
   /** Measured GPU residency by backend id (telemetry attribution). */
   let residency = new Map<string, { gpu: number; name: string; mib: number | null }[]>();
@@ -2828,7 +2892,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
             busy: placeBusy,
           }
           : null;
-        return backendCard(row, openArgv, openMenus, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency, new Map(lastGpuList.map((g) => [Number(g.id), g.name])), flagsArg, flagsFor === row.id ? predictedHtml : "", placeArg, new Map(lastGpuList.map((g) => [Number(g.id), g.vram_total_gb * 1024])), openDetails.has(row.id));
+        return backendCard(row, openArgv, openMenus, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency, new Map(lastGpuList.map((g) => [Number(g.id), g.name])), flagsArg, flagsFor === row.id ? predictedHtml : "", placeArg, new Map(lastGpuList.map((g) => [Number(g.id), g.vram_total_gb * 1024])), openDetails.has(row.id), predictRefreshing);
       }).join("")}</div>
       </div>`).join("");
     if (!viewRows.length && lastRows.length) b.innerHTML = emptyHtml("No backends match the current filter.");
@@ -3913,6 +3977,41 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       return;
     }
 
+    if (act === "predict-refresh") {
+      // A Measure run against the running backend, awaited here
+      // the way the Optimize view awaits it: the tile carries
+      // the Measuring state from the wire-level map while the
+      // invoke is outstanding, the field updates from the
+      // refreshed rows on completion (no page reload), and a
+      // failure lands on the card's note — never silent. The
+      // op's own refusals (job slot busy, backend stopped
+      // mid-run) arrive as the error and surface the same way.
+      if (predictRefreshing.has(id)) return;
+      const row = lastRows.find((r) => r.id === id);
+      if (!row || !row.configured || row.state !== "running") return;
+      predictRefreshing.set(id, Date.now());
+      msgs.delete(id);
+      paint();
+      startPredictTicker();
+      const r = await optimizeMeasureBackend(id);
+      predictRefreshing.delete(id);
+      if (!predictRefreshing.size) stopPredictTicker();
+      if (disposed) return;
+      if (r.error) {
+        msgs.set(id, {
+          text: r.error === "measurement cancelled"
+            ? "Prediction refresh cancelled."
+            : `Prediction refresh failed — ${r.error}`,
+          err: true,
+        });
+        paint();
+      } else {
+        msgs.delete(id);
+        await load();
+      }
+      return;
+    }
+
     if (act === "flags") {
       // The one Edit entry point: it opens the whole Edit
       // session — the Edit panel (model, flags) and the
@@ -4336,6 +4435,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   return () => {
     disposed = true;
     window.clearInterval(timer);
+    stopPredictTicker();
     root.removeEventListener("click", onClick);
     root.removeEventListener("click", onOvGoto);
     root.removeEventListener("keydown", onKeyDown);
