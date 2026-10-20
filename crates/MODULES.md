@@ -367,7 +367,10 @@ Service core extracted from the Tauri shell (admin API plan, phase 0):
 `AppState` and its task/download registries, all 108 operation
 implementations at v0.1.40 (`op_*`, framework-free, typed `ApiError`), the
 activation journal (`activation`), and the gateway stats sampler
-(`gateway_stats`). `registry` holds the single operation
+(`gateway_stats`). App self-update lives in `app_update`: the
+GitHub-Releases check, installer staging with SHA-256
+verification, the state file under `<data_dir>/app-update/`, and
+the apply-helper entry the shell runs before the UI starts. `registry` holds the single operation
 declaration (`for_each_operation!`) from which the `Op` enum,
 `OP_SPECS`, `dispatch()`, the Tauri command adapters, and the REST
 router are all generated — see `docs/admin-api/PLAN.md` §3.1.
