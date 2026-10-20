@@ -77,9 +77,9 @@ The summary variant's non-dismissed Review is an `<a href="#/activation-plan">`,
 | Disable (`data-back-act="disable"`) | Safe (toggle) | icon-only | unchanged |
 | Remove (`data-back-act="remove"`) | Destructive | icon-only | unchanged |
 | Advanced options menu toggle | Safe | icon-only | unchanged |
-| Menu items: Edit flags / Placement / Launch command | Menu idiom | words + icon | unchanged — scope decision (below) |
+| Menu items: Edit / Launch command / Test tool calls / View all logs | Menu idiom | words + icon | unchanged in form — **membership changed 2026-10-20 (Pete's backend-card declutter): "Edit flags" became "Edit" and opens the consolidated Edit session (model + flags panel, Placement section); the separate Placement item is gone; Test tool calls (`toolcall`) and View all logs moved in from the card face, where the wrench read as an edit control** |
 | Details toggle (`data-back-act="details"`) | Safe (expand) | glyph + words | icon-only `chevD`/`chevR` (call 5) |
-| Save flags (`flags-save`) | Critical (form commit) | words | words + `check` icon |
+| Save (`flags-save` / `flags-raw-save`) | Critical (form commit) | words | words + `check` icon — **relabeled from "Save flags" 2026-10-20: the Edit panel's Save also applies the panel's model draft through model_assign** |
 | Cancel (flags form) | Safe | words | icon-only `x` |
 | Propose split (`place-propose`) | Safe (computation) | words | icon-only `search` (call 13) → **words + `search`** (restored — addendum C4) |
 | Apply split (`place-apply`) | Critical (apply) | words | words + `check` icon |

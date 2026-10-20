@@ -739,17 +739,22 @@ function modelFileShortName(path: string): string {
   return path ? baseName(path).replace(/\.gguf$/i, "") : "no model assigned";
 }
 
-/** Options for a backend card's model dropdown: every registered
- *  model, labeled by short name only, with the one the backend
- *  currently serves selected. When the backend's model_file matches
- *  no registered model (a custom path), a leading option carries the
- *  current file's short name so the control shows the true state;
- *  choosing it is a no-op. */
-function modelOptions(b: BackendRow, models: ModelRow[]): string {
+/** Options for a backend's model dropdown: every registered
+ *  model, labeled by short name only. With no `selectedId`, the
+ *  model the backend currently serves is selected; the Edit
+ *  panel passes its draft id instead, so a poll repaint renders
+ *  the operator's unsaved choice, not the saved model (the draft
+ *  is what Save will apply). When the backend's model_file matches
+ *  no registered model (a custom path), a leading option carries
+ *  the current file's short name so the control shows the true
+ *  state; choosing it is a no-op. */
+function modelOptions(b: BackendRow, models: ModelRow[], selectedId?: string): string {
   const matched = models.some((m) => sameModelFile(b.model_file, m.gguf_path));
-  const lead = matched ? "" : `<option value="" selected>${esc(modelFileShortName(b.model_file))} (current)</option>`;
-  return lead + models.map((m) =>
-    `<option value="${esc(m.id)}"${sameModelFile(b.model_file, m.gguf_path) ? " selected" : ""}>${esc(modelShortName(m))}</option>`).join("");
+  const lead = matched ? "" : `<option value=""${selectedId === undefined || selectedId === "" ? " selected" : ""}>${esc(modelFileShortName(b.model_file))} (current)</option>`;
+  return lead + models.map((m) => {
+    const sel = selectedId !== undefined ? m.id === selectedId : sameModelFile(b.model_file, m.gguf_path);
+    return `<option value="${esc(m.id)}"${sel ? " selected" : ""}>${esc(modelShortName(m))}</option>`;
+  }).join("");
 }
 
 /* ---------------- Gateway activation plan ----------------
@@ -2053,8 +2058,12 @@ function applyFlagsField(
  *  state (llama.cpp's default, auto). advanced/rawText/rawWarnings
  *  carry the advanced flags editor's draft (tracker #60): while
  *  advanced is on, the raw text is the single source of truth and
- *  the structured fields are inert. */
-export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null; parallel: number | null; advanced: boolean; rawText: string; rawWarnings: FlagWarningLike[] }
+ *  the structured fields are inert. editModelId is the Edit
+ *  panel's model draft: the registered model chosen in the
+ *  panel's Model select ("" when the backend's file matches no
+ *  registered model), applied through model_assign only when the
+ *  panel saves — the card face carries no model control. */
+export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null; parallel: number | null; advanced: boolean; rawText: string; rawWarnings: FlagWarningLike[]; editModelId: string }
 
 /** State for the in-card Placement form (tensor split editing,
  *  moved here from the GPUs page — Pete's direction, 2026-10-16),
@@ -2109,16 +2118,12 @@ function backendCard(
   const restartBtn = `<button class="btn" data-back-act="restart" data-back-id="${esc(b.id)}"${dis}>${icon("restart")} Restart</button>`;
   const startBtn = `<button class="btn" data-back-act="start" data-back-id="${esc(b.id)}"${dis}>${icon("play")} Start</button>`;
   const testBtn = `<button class="btn icon-only" data-back-act="test" data-back-id="${esc(b.id)}" title="Test backend" aria-label="Test ${esc(b.id)}"${dis}>${icon("bolt")}</button>`;
-  // Tool-call probe (MCP design §7.2): a secondary safe action, so
-  // icon-only with the action named in its tooltip/aria-label.
-  const toolCallBtn = `<button class="btn icon-only" data-back-act="toolcall" data-back-id="${esc(b.id)}" title="Test tool calls" aria-label="Test tool calls for ${esc(b.id)}"${dis}>${icon("wrench")}</button>`;
-  // Go to logs (tracker #47): every backend has a Logs-view scope (its
-  // supervisor ring, retained even after removal), so the button is
-  // unconditional. Icon-only per rule 15 — non-destructive navigation,
-  // not the card's standard workflow action — matching the Dashboard
-  // card's logs button. An anchor, not a card action: navigation is
-  // not disabled while a card action is in flight.
-  const logsBtn = `<a class="btn icon-only" href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1" title="Logs" aria-label="Logs for ${esc(b.id)}">${icon("logs")}</a>`;
+  // The tool-call probe (MCP design §7.2) and the go-to-logs link
+  // (tracker #47) are NOT card-face buttons: the wrench read as an
+  // edit control (Pete's report, 2026-10-20), so both live in the
+  // card's Other-actions menu below. Every backend has a Logs-view
+  // scope (its supervisor ring, retained even after removal), so
+  // the menu's logs item is unconditional, like the button was.
   // Enable/disable is the shared state switch (rule 16). It renders
   // for every configured backend so the state is always visible;
   // the control is inert exactly when the old buttons were not
@@ -2151,8 +2156,6 @@ function backendCard(
   if (b.configured && b.enabled && !active && b.state !== "stopping") parts.push(startBtn);
   if (b.configured) parts.push(enableSw);
   if (b.state === "running") parts.push(testBtn);
-  if (b.configured) parts.push(toolCallBtn);
-  parts.push(logsBtn);
   // Removal is refused by the command layer while running; offer it
   // only for configured backends with no live process.
   if (b.configured && !active && b.state !== "stopping") parts.push(removeBtn);
@@ -2165,9 +2168,10 @@ function backendCard(
   const advancedMenu = `<div class="advanced-menu-wrap" data-back-menu-wrap>
       <button class="btn icon-only" data-back-menu="${esc(b.id)}" aria-haspopup="menu" aria-expanded="${menuOpen}" title="Advanced options" aria-label="Advanced options for ${esc(b.id)}"${dis}>${icon("menu")}</button>
       ${menuOpen ? `<div class="advanced-menu" role="menu" aria-label="Advanced options for ${esc(b.id)}">
-        ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="flags" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Edit flags</button>
-        <button class="menu-item" role="menuitem" data-back-menu-item data-back-act="placement" data-back-id="${esc(b.id)}"${dis}>${icon("layers")} Placement</button>` : ""}
+        ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="flags" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Edit</button>` : ""}
         <button class="menu-item" role="menuitem" data-back-menu-item data-back-act="argv" data-back-id="${esc(b.id)}"${dis}>${icon("logs")} Launch command</button>
+        ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="toolcall" data-back-id="${esc(b.id)}"${dis}>${icon("wrench")} Test tool calls</button>` : ""}
+        <a class="menu-item" role="menuitem" data-back-menu-item data-back-id="${esc(b.id)}" href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1">${icon("logs")} View all logs</a>
       </div>` : ""}
     </div>`;
   const argvOpen = openArgv.has(b.id);
@@ -2197,16 +2201,24 @@ function backendCard(
   const adoptedText = b.adopted
     ? "Started by a previous launch and adopted by this session. Output from before adoption is not in the Logs view."
     : "";
+  // One rendering for a stored log line, shared by the failed
+  // block below and the Details section's latest-lines block.
+  const logLineHtml = (r: LogRow): string => `<div class="ln"><span class="t">${esc(fmtTime(r.ts))}</span> <span class="chip">${esc(r.stream)}</span> ${esc(r.line)}</div>`;
   let logsBlock = "";
-  if (b.state === "failed") {
+  // Suppressed while Details are open: the expansion's
+  // latest-lines block shows the same stored tail (all 5 lines)
+  // directly above, and the lines render in one place only.
+  if (b.state === "failed" && !detailsOpen) {
     const tail = logTails.get(b.id);
     // An empty tail renders no block at all (principle 13) — the
-    // "Open in Logs" link below still carries the operator to the
-    // full log. The caption's qualifier rides its info-tip.
+    // full log is one menu click away ("View all logs" in the
+    // Other-actions menu). The caption's qualifier rides its
+    // info-tip. The stored tail holds 5 lines (the Details
+    // block's count); this diagnostic block keeps its last 3.
     const lines = tail && tail.length
-      ? `<div style="margin-top:8px;font-size:11px;color:var(--text3)">Latest output<span class="info-tip" title="stderr preferred — that is where llama-server reports load failures">${icon("info")}</span></div><div class="logstream" style="margin-top:4px">${tail.map((r) => `<div class="ln"><span class="t">${esc(fmtTime(r.ts))}</span> <span class="chip">${esc(r.stream)}</span> ${esc(r.line)}</div>`).join("")}</div>`
+      ? `<div style="margin-top:8px;font-size:11px;color:var(--text3)">Latest output<span class="info-tip" title="stderr preferred — that is where llama-server reports load failures">${icon("info")}</span></div><div class="logstream" style="margin-top:4px">${tail.slice(-3).map(logLineHtml).join("")}</div>`
       : "";
-    logsBlock = `${lines}<div style="margin-top:6px;font-size:12px"><a href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1" style="color:var(--accent)">Open in Logs</a></div>`;
+    logsBlock = lines;
   }
   // GPU residency for this backend, as bars (Pete's card redesign,
   // 2026-10-16): one horizontal bar per GPU, name at left, GiB at
@@ -2446,25 +2458,42 @@ function backendCard(
   // raw flags (the string the structured decoders read); text
   // edits sync to the wire-level draft, so poll repaints keep the
   // text and the warning list renders live under the box.
+  // The Edit panel's Model field (Pete's report, 2026-10-20):
+  // the model is chosen here, as a draft, and applied through
+  // model_assign only when the panel saves — the card face no
+  // longer carries a model control that assigns on selection.
+  // The select renders the DRAFT as selected (modelOptions'
+  // selectedId), so a poll repaint shows the operator's unsaved
+  // choice. Rendered in both panel variants: model_assign
+  // preserves an advanced backend's raw flags verbatim
+  // (flags_untouched), so the field is safe in advanced mode too.
+  const editModelHtml = flags ? `<div style="margin-top:10px">
+      <label style="font-size:12px;color:var(--text2);display:block">Model<span class="info-tip" title="The model this backend serves. The change applies only when you save from this panel; a running backend picks the new model up on its next start.">${icon("info")}</span>
+        <span style="display:flex;gap:6px;margin-top:4px">
+          <select data-edit-model="${esc(b.id)}" style="${SELECT_STYLE};flex:1;min-width:0" aria-label="Model for ${esc(b.id)}"${dis}>${modelOptions(b, models, flags.editModelId)}</select>
+        </span></label>
+    </div>` : "";
   const flagsHtml = flags ? (flags.advanced ? `<div class="backend-form-panel flags-panel">
-      <div style="font-size:12px;font-weight:600">${icon("gear")} Flags for ${esc(b.id)}</div>
+      <div style="font-size:12px;font-weight:600">${icon("pencil")} Edit ${esc(b.id)}</div>
+      ${editModelHtml}
       <div style="font-size:12px;color:var(--text2);margin-top:6px">Mode: Advanced<span class="info-tip" title="In advanced mode the text below is the backend's launch flags, edited directly. Context, batch, offload, MTP and placement are all set by this string; the structured form and its controls are disabled for this backend until you switch back. Warnings never block a save — unknown flags pass through to llama-server, which decides.">${icon("info")}</span></div>
       <textarea data-flags-raw="${esc(b.id)}" rows="4" spellcheck="false" style="width:100%;margin-top:8px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 10px;font-family:var(--mono);font-size:12px" aria-label="Raw flags for ${esc(b.id)}">${esc(flags.rawText)}</textarea>
       <div data-flags-warnings>${flagsRawWarningsHtml(flags.rawWarnings)}</div>
       <div style="font-size:12px;color:var(--text2);margin-top:6px">Saved to the configuration immediately; applies on the backend's next start.</div>
       <div data-predicted-slot>${predictedHtml}</div>
-      <div class="card-actions"><button class="btn" data-back-act="flags-raw-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save flags</button>
+      <div class="card-actions"><button class="btn" data-back-act="flags-raw-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save</button>
         <button class="btn" data-back-act="flags-mode-structured" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Use structured form</button>
         <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
     </div>` : `<div class="backend-form-panel flags-panel">
-      <div style="font-size:12px;font-weight:600">${icon("gear")} Flags for ${esc(b.id)}</div>
+      <div style="font-size:12px;font-weight:600">${icon("pencil")} Edit ${esc(b.id)}</div>
+      ${editModelHtml}
       ${flagsCtxBatchHtml({ ctx: flags.ctx, batch: flags.batch, ctxMax: flags.ctxMax, fieldAttr: "data-flags-field", disabled: inFlight.has(b.id) })}
       ${parallelHtml}
       ${offloadHtml}
       ${mtpHtml}
-      ${flagsRatedLineHtml({ ctxMax: flags.ctxMax, modelId: flags.modelId, savedText: "Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Placement form on this card." })}
+      ${flagsRatedLineHtml({ ctxMax: flags.ctxMax, modelId: flags.modelId, savedText: "Saved to the configuration immediately; applies on the backend's next start. Tensor split is set in the Placement section below." })}
       <div data-predicted-slot>${predictedHtml}</div>
-      <div class="card-actions"><button class="btn" data-back-act="flags-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save flags</button>
+      <div class="card-actions"><button class="btn" data-back-act="flags-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save</button>
         <button class="btn" data-back-act="flags-mode-advanced" data-back-id="${esc(b.id)}"${dis}>${icon("pencil")} Edit flags as text</button>
         <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
     </div>`) : "";
@@ -2530,10 +2559,13 @@ function backendCard(
         : "";
   // Metric strip (Pete's card redesign): one row of labeled
   // single-value tiles — Model, Context, GPU RAM, System RAM, KV
-  // cache. No sentences; the model tile carries the model select
-  // (configured) or the file name (orphan), as before.
+  // cache. No sentences; the model tile is a VALUE (the served
+  // model's short name, the file path in its tooltip) — the old
+  // inline select assigned on selection with no save, so model
+  // changes moved into the Edit panel (Pete's report, 2026-10-20).
+  const matchedModel = models.find((m) => sameModelFile(b.model_file, m.gguf_path));
   const modelTileVal = b.configured
-    ? `<select class="backend-model-select" data-back-model="${esc(b.id)}" style="${SELECT_STYLE};width:100%;min-width:0"${dis}>${modelOptions(b, models)}</select>`
+    ? `<span class="backend-model-file" title="${esc(b.model_file)}">${esc(matchedModel ? modelShortName(matchedModel) : modelFileShortName(b.model_file))}</span>`
     : `<span class="backend-model-file" title="${esc(b.model_file)}">${esc(b.model_file)}</span>`;
   const stripTiles: [string, string][] = [["Model", modelTileVal]];
   // Advanced flags mode (tracker #60): the structured readouts the
@@ -2559,7 +2591,9 @@ function backendCard(
   // the memory basis (its explanation rides the info-tip). Open
   // state lives in the wire layer, so poll repaints keep it.
   // State is not repeated here — the header's state chip carries it
-  // (numbers and states live in one place, principle 6).
+  // (numbers and states live in one place, principle 6). The
+  // section renders BELOW the actions bar in the card template
+  // (Pete's declutter, 2026-10-20).
   const detailKv: [string, string][] = [
     ["PID", b.pid !== null ? String(b.pid) : "—"],
     ["Uptime", fmtUptime(b.uptime_secs)],
@@ -2567,12 +2601,44 @@ function backendCard(
   // Batch is a structured flags readout like Context: omitted in
   // advanced flags mode (tracker #60) rather than shown as fact.
   if (!b.flags_advanced && b.n_batch != null) detailKv.push(["Batch", fmtCount(b.n_batch)]);
+  // Tool-call probe state (MCP design §7.2): the persisted probe
+  // outcome, or "not measured" when the backend has never been
+  // probed (principle 12 — absence is not a measured state). It
+  // rendered on the card face until the 2026-10-20 declutter
+  // moved it here; the probe itself runs from the menu's Test
+  // tool calls item. Supervisor-only orphan rows carry no probe
+  // and no tile.
+  if (b.configured) detailKv.push(["Tool calls", b.tool_call_probe ? b.tool_call_probe.outcome : "not measured"]);
+  // Offload Layers: the saved expert-offload position, from the
+  // same offload info the Edit panel's slider renders. A model
+  // with no routed experts has no offload position to report —
+  // the value says so plainly, never 0 (principle 12).
+  if (b.configured) {
+    detailKv.push(["Offload Layers", b.offload
+      ? b.offload.layers <= 0
+        ? `Off (0 of ${b.offload.moe_layers})`
+        : b.offload.layers >= b.offload.moe_layers
+          ? `Full (${b.offload.moe_layers} of ${b.offload.moe_layers})`
+          : `${b.offload.layers} of ${b.offload.moe_layers}`
+      : "Not applicable"]);
+  }
+  // Latest log lines: the stored tail for this backend (the same
+  // get_logs records behind the menu's View all logs, with the
+  // failed block's stderr preference). The block renders only
+  // once a fetch has landed — an unfetched tail omits it
+  // (principle 13); a fetched-but-empty tail states the fact.
+  const detailTail = logTails.get(b.id);
+  const logLinesHtml = detailTail === undefined ? "" : `<div style="margin-top:10px">
+      <div style="font-size:11px;color:var(--text3)">Latest log lines<span class="info-tip" title="The backend's most recent log lines, newest last — the same records the Logs view shows for this backend. The full log is under View all logs in the card's menu.">${icon("info")}</span></div>
+      ${detailTail.length ? `<div class="logstream backend-logtail" style="margin-top:4px">${detailTail.map(logLineHtml).join("")}</div>` : `<div style="font-size:12px;color:var(--text2);margin-top:4px">None recorded</div>`}
+    </div>`;
   const detailsHtml = detailsOpen ? `<div class="backend-details">
       <div style="display:grid;grid-template-columns:repeat(${detailKv.length},1fr);gap:10px">
         ${detailKv.map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
       </div>
       ${splitEntries.length ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Configured split: ${splitSummary}</div>` : ""}
       ${basisTip ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Basis: ${esc(b.memory_basis ?? "")}<span class="info-tip" title="${esc(basisTip)}">${icon("info")}</span></div>` : ""}
+      ${logLinesHtml}
     </div>` : "";
   // Advanced flags mode (tracker #60): the saved raw flags ARE
   // the configuration the operator owns in this mode, so they
@@ -2582,13 +2648,6 @@ function backendCard(
   // mode itself.
   const rawFlagsHtml = b.flags_advanced && b.raw_flags
     ? `<div style="font-size:12px;color:var(--text2);margin-top:8px">Flags: <span style="font-family:var(--mono);color:var(--text)">${esc(b.raw_flags)}</span></div>`
-    : "";
-  // Tool-call probe state (MCP design §7.2): the persisted probe
-  // outcome, or "not measured" when the backend has never been
-  // probed (principle 12 — absence is not a measured state).
-  // Supervisor-only orphan rows carry no probe and no line.
-  const toolCallHtml = b.configured
-    ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Tool calls: <b style="color:var(--text)">${b.tool_call_probe ? esc(b.tool_call_probe.outcome) : "not measured"}</b></div>`
     : "";
   const detailsBtn = `<button class="btn icon-only" data-back-act="details" data-back-id="${esc(b.id)}" aria-expanded="${detailsOpen}" title="Details" aria-label="Details">${icon(detailsOpen ? "chevD" : "chevR")}</button>`;
   return `<div class="card backend-card" id="card-backend-${esc(b.id)}">
@@ -2600,19 +2659,18 @@ function backendCard(
         ${b.flags_advanced ? `<span class="chip status-tag" title="Advanced flags mode: this backend's launch flags are edited as raw text in the Flags panel, and the structured flags form is disabled for it.">advanced flags</span>` : ""}
         <span class="chip status-tag ${stateTagClass(b.state)}">${esc(b.state)}</span></h3>
       ${stripHtml}
-      ${toolCallHtml}
       ${gpuHtml}
       ${statsHtml}
       ${rawFlagsHtml}
       ${offloadStatusHtml}
       ${mtpStatusHtml}
-      ${detailsHtml}
       ${flagsHtml}
       ${placeHtml}
       <div class="card-actions backend-actions">${detailsBtn}
         ${actions}
         ${advancedMenu}</div>
       <div class="back-msg" style="margin-top:8px;font-size:12px">${msgHtml}</div>
+      ${detailsHtml}
       ${logsBlock}
       ${argv}
     </div>`;
@@ -2657,6 +2715,10 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const logTails = new Map<string, LogRow[]>();
   /** Ids whose log tail has been fetched (or is in flight) this mount. */
   const tailsWanted = new Set<string>();
+  /** Ids with a Details-driven tail refetch in flight: the
+   *  open-Details path refetches on each load cycle instead of
+   *  once per mount, so it tracks its own in-flight set. */
+  const tailsFetching = new Set<string>();
   /** Backend ids with an action invoke in flight; their card buttons
    *  render disabled (the set outlives any single repaint). */
   const inFlight = new Set<string>();
@@ -2754,7 +2816,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       <div class="grid2">${sorted(sec.rows).map((row) => {
         const mdl = flagsFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const flagsArg: FlagsDraft | null = flagsFor === row.id
-          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers, offloadPendingLayers: offloadPending?.backendId === row.id ? offloadPending.layers : null, mtpPosition: flagsMtpPosition, parallel: flagsParallel, advanced: row.flags_advanced === true, rawText: flagsRawText, rawWarnings: flagsRawWarnings }
+          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers, offloadPendingLayers: offloadPending?.backendId === row.id ? offloadPending.layers : null, mtpPosition: flagsMtpPosition, parallel: flagsParallel, advanced: row.flags_advanced === true, rawText: flagsRawText, rawWarnings: flagsRawWarnings, editModelId: flagsEditModelId }
           : null;
         const pmdl = placeFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const placeArg: PlaceCardState | null = placeFor === row.id
@@ -2779,23 +2841,39 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   backStateSel?.addEventListener("change", () => { backState = backStateSel.value; paint(); });
   backFilterInput?.addEventListener("input", () => { backFilter = backFilterInput.value; paint(); });
 
-  /** Lazily fetch the last log lines for failed backends and repaint.
-   *  get_logs takes the bare process id (the same scope the Logs view
-   *  sends); records arrive newest-first. Stderr lines are preferred —
-   *  that is where llama-server reports load failures. */
+  /** Lazily fetch the last log lines for the cards that show
+   *  them, and repaint. One stored tail (up to 5 lines) serves
+   *  two blocks: a failed backend's diagnostic block — fetched
+   *  once per mount, as it has always been — and the Details
+   *  section's latest-lines block, fetched while Details are
+   *  open and refreshed on each load cycle, repainting only when
+   *  the tail actually changed. get_logs takes the bare process
+   *  id (the same scope the Logs view sends); records arrive
+   *  newest-first. Stderr lines are preferred — that is where
+   *  llama-server reports load failures. */
   const fetchLogTails = async (): Promise<void> => {
     const rows = lastRows;
     let fetched = false;
     for (const row of rows) {
-      if (row.state !== "failed" || tailsWanted.has(row.id)) continue;
-      tailsWanted.add(row.id);
-      const r = await getLogs(row.id, { limit: 50 });
-      if (disposed) return;
-      if (r.error) { tailsWanted.delete(row.id); continue; }
-      const stderr = r.data.lines.filter((x) => x.stream === "stderr");
-      const source = stderr.length ? stderr : r.data.lines;
-      logTails.set(row.id, source.slice(0, 3).reverse());
-      fetched = true;
+      const detailsWants = openDetails.has(row.id);
+      if (row.state !== "failed" && !detailsWants) continue;
+      if (detailsWants ? tailsFetching.has(row.id) : tailsWanted.has(row.id)) continue;
+      if (detailsWants) tailsFetching.add(row.id); else tailsWanted.add(row.id);
+      try {
+        const r = await getLogs(row.id, { limit: 50 });
+        if (disposed) return;
+        if (r.error) { if (!detailsWants) tailsWanted.delete(row.id); continue; }
+        const stderr = r.data.lines.filter((x) => x.stream === "stderr");
+        const source = stderr.length ? stderr : r.data.lines;
+        const tail = source.slice(0, 5).reverse();
+        const prev = logTails.get(row.id);
+        const changed = !prev || prev.length !== tail.length
+          || prev.some((p, i) => p.ts !== tail[i].ts || p.line !== tail[i].line);
+        logTails.set(row.id, tail);
+        if (changed) fetched = true;
+      } finally {
+        tailsFetching.delete(row.id);
+      }
     }
     // Repaint only if these are still the current rows (a reload or an
     // error paint may have superseded them while fetches were in flight).
@@ -2844,8 +2922,9 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       const prev = prevStates.get(row.id);
       if (prev !== undefined && prev !== row.state) { msgs.delete(row.id); confirmRemove.delete(row.id); }
       // A backend that is no longer failed gets a fresh tail fetch if it
-      // fails again.
-      if (row.state !== "failed") { logTails.delete(row.id); tailsWanted.delete(row.id); }
+      // fails again — unless its Details are open, where the stored
+      // tail is the expansion's latest-lines data and stays.
+      if (row.state !== "failed" && !openDetails.has(row.id)) { logTails.delete(row.id); tailsWanted.delete(row.id); }
     }
     // Prune per-backend card state for ids that no longer exist
     // (code-review 5.9): a deleted backend's notes, caches, and
@@ -2856,7 +2935,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       for (const map of [msgs, argvCache, logTails] as Map<string, unknown>[]) {
         for (const k of [...map.keys()]) if (!alive.has(k)) map.delete(k);
       }
-      for (const set of [confirmRemove, openArgv, openDetails, inFlight, tailsWanted] as Set<string>[]) {
+      for (const set of [confirmRemove, openArgv, openDetails, inFlight, tailsWanted, tailsFetching] as Set<string>[]) {
         for (const k of [...set]) if (!alive.has(k)) set.delete(k);
       }
       if (flagsFor !== null && !alive.has(flagsFor)) flagsFor = null;
@@ -2884,13 +2963,19 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   /* ---------------- Flags editor ----------------
    * Rendered INSIDE the backend's own card (backendCard, from the
    * draft state below) — the previous placement above the list read
-   * as if nothing had happened when Edit flags was clicked. The
+   * as if nothing had happened when Edit was clicked. The
    * draft values live outside the repainted DOM, so the poll repaint
    * cannot clobber an open form: paint() re-renders the form from
    * this state, and field events sync back into it. */
   let flagsFor: string | null = null;
   let flagsCtx = 32768;
   let flagsBatch = 512;
+  /** The Edit panel's model draft: the registered model chosen
+   *  in the panel's Model select ("" when the open backend's file
+   *  matches no registered model). Synced on the select's change
+   *  event and applied through model_assign only when the panel
+   *  saves; closing the panel discards it. */
+  let flagsEditModelId = "";
   /** Offload slider draft position for the open flags form (MoE
    *  layers on system RAM); null when the backend's model is not
    *  offload-capable. */
@@ -2982,6 +3067,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const openFlagsForm = (row: BackendRow): void => {
     if (flagsFor === row.id) { closeFlagsForm(); return; }
     flagsFor = row.id;
+    flagsEditModelId = lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path))?.id ?? "";
     flagsCtx = row.n_ctx ?? 32768;
     flagsBatch = row.n_batch ?? 512;
     flagsOffloadLayers = row.offload ? row.offload.layers : null;
@@ -3016,6 +3102,19 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   };
   root.addEventListener("change", syncFlagsDraft);
   root.addEventListener("input", syncFlagsDraft);
+  /** The Edit panel's Model select sync: the choice is a DRAFT,
+   *  recorded here and applied through model_assign only when
+   *  the panel saves (Pete's report, 2026-10-20 — the card-face
+   *  dropdown this replaces assigned on selection). No repaint:
+   *  the select already shows the chosen option, and the draft
+   *  re-renders it on the next poll repaint. */
+  const syncEditModel = (ev: Event): void => {
+    const t = ev.target as HTMLSelectElement;
+    if (!t.hasAttribute("data-edit-model")) return;
+    if (t.getAttribute("data-edit-model") !== flagsFor) return;
+    flagsEditModelId = t.value;
+  };
+  root.addEventListener("change", syncEditModel);
   /** The advanced editor's textarea sync (tracker #60): keep the
    *  draft text and its live warnings in wire state. The warning
    *  list updates in place — no repaint, so typing is never
@@ -3283,6 +3382,36 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   };
   root.addEventListener("change", commitParallel);
 
+  /** Apply the Edit panel's model draft through model_assign,
+   *  carrying the backend's current tensor split so the
+   *  assignment changes the model only (the split is the
+   *  Placement section's own save). Returns "none" when the
+   *  draft names the model the backend already serves (or no
+   *  registered model), "saved" when the assignment landed, and
+   *  "failed" when the op rejected it — the error is on the
+   *  card and the caller keeps the panel open, saving nothing
+   *  else, so a failed model change never reads as a partial
+   *  save. model_assign itself is atomic (it commits only after
+   *  placement, validation, journal, and save all succeed) and
+   *  reports flags_untouched for advanced-flags backends. */
+  const saveEditModel = async (id: string): Promise<"none" | "saved" | "failed"> => {
+    const row = lastRows.find((r) => r.id === id);
+    const model = lastModels.find((m) => m.id === flagsEditModelId);
+    if (!row || !model || sameModelFile(row.model_file, model.gguf_path)) return "none";
+    const cfgR = await getBackendConfig(id);
+    const cfgFlags = cfgR.data?.flags as { tensor_split?: unknown } | undefined;
+    const split = Array.isArray(cfgFlags?.tensor_split)
+      && cfgFlags.tensor_split.every((x) => typeof x === "number" && Number.isFinite(x))
+      ? (cfgFlags.tensor_split as number[]) : [];
+    const r = await modelAssign(id, model.id, split);
+    if (disposed) return "failed";
+    if (r.error) {
+      msgs.set(id, { text: `Model change failed: ${r.error}`, err: true });
+      return "failed";
+    }
+    return "saved";
+  };
+
   /* ---------------- Placement form ----------------
    * Rendered INSIDE the backend's own card (backendCard), like the
    * flags editor; the GPUs page shows placement read-only. State
@@ -3302,6 +3431,15 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     placeExcluded.clear();
     paint();
   };
+  /** Close the whole Edit session (the Edit panel and the
+   *  Placement section). A successful Save closes the surface,
+   *  returning the card to its normal state (Pete's report,
+   *  2026-10-20: Save flags left the edit form open — most
+   *  visibly the advanced editor, whose save deliberately kept
+   *  the panel up). A failed save never calls this: the surface
+   *  stays open with the operator's input intact and the error
+   *  on the card. */
+  const closeEditSession = (): void => { closeFlagsForm(); closePlaceForm(); };
   const openPlaceForm = (row: BackendRow): void => {
     if (placeFor === row.id) { closePlaceForm(); return; }
     placeFor = row.id;
@@ -3766,25 +3904,29 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     const act = t.getAttribute("data-back-act") ?? "";
 
     if (act === "details") {
-      if (openDetails.has(id)) openDetails.delete(id); else openDetails.add(id);
+      const opening = !openDetails.has(id);
+      if (opening) openDetails.add(id); else openDetails.delete(id);
       paint();
+      // The expansion's latest-lines block wants this backend's
+      // tail now, not at the next poll's load.
+      if (opening) void fetchLogTails();
       return;
     }
 
     if (act === "flags") {
+      // The one Edit entry point: it opens the whole Edit
+      // session — the Edit panel (model, flags) and the
+      // Placement section below it — or closes the session when
+      // any part of it is open.
       const row = lastRows.find((r) => r.id === id);
-      if (row) openFlagsForm(row);
+      if (!row) return;
+      if (flagsFor === id || placeFor === id) closeEditSession();
+      else { openFlagsForm(row); openPlaceForm(row); }
       return;
     }
 
     if (act === "flags-cancel") {
       closeFlagsForm();
-      return;
-    }
-
-    if (act === "placement") {
-      const row = lastRows.find((r) => r.id === id);
-      if (row) openPlaceForm(row);
       return;
     }
 
@@ -3892,22 +4034,39 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     }
 
     if (act === "flags-save") {
-      const r = await updateBackendFlags(id, flagsCtx, flagsBatch);
-      if (disposed) return;
-      if (r.error) {
-        // Keep the form open with the error on the card — closing on
-        // a rejected value would read as if the save had happened.
-        msgs.set(id, { text: `Flags not saved: ${r.error}`, err: true });
-        paint();
-      } else if (r.data.persisted === false) {
-        // Code-review 5.2: a non-persisted save is not a save.
-        msgs.set(id, { text: "Flags applied for this session only — they were not saved and will be lost when the app restarts.", err: true });
-        flagsFor = null;
-        await load();
-      } else {
-        msgs.set(id, { text: `Flags saved (context ${fmtCount(flagsCtx)}, batch ${fmtCount(flagsBatch)}) — applies on next start.`, err: false });
-        flagsFor = null;
-        await load();
+      // The Edit panel's Save: the model draft applies first —
+      // a failed assignment saves nothing else and keeps the
+      // panel open — then the ctx/batch draft goes through the
+      // flags save. The card note names both halves of the
+      // outcome, so a flags failure after a landed model change
+      // never reads as a full save or a full failure.
+      inFlight.add(id);
+      paint();
+      try {
+        const mres = await saveEditModel(id);
+        if (disposed) return;
+        if (mres === "failed") { paint(); return; }
+        const modelNote = mres === "saved" ? `Model set to ${flagsEditModelId}. ` : "";
+        const r = await updateBackendFlags(id, flagsCtx, flagsBatch);
+        if (disposed) return;
+        if (r.error) {
+          // Keep the form open with the error on the card — closing on
+          // a rejected value would read as if the save had happened.
+          msgs.set(id, { text: mres === "saved" ? `Model set to ${flagsEditModelId} — flags not saved: ${r.error}` : `Flags not saved: ${r.error}`, err: true });
+          paint();
+        } else if (r.data.persisted === false) {
+          // Code-review 5.2: a non-persisted save is not a save.
+          msgs.set(id, { text: `${modelNote}Flags applied for this session only — they were not saved and will be lost when the app restarts.`, err: true });
+          closeEditSession();
+          await load();
+        } else {
+          msgs.set(id, { text: `${modelNote}Flags saved (context ${fmtCount(flagsCtx)}, batch ${fmtCount(flagsBatch)}) — applies on next start.`, err: false });
+          closeEditSession();
+          await load();
+        }
+      } finally {
+        inFlight.delete(id);
+        if (!disposed) paint();
       }
       return;
     }
@@ -3983,28 +4142,44 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       // Save the advanced editor's text (tracker #60). The op
       // journals like the other flags writes and applies on the
       // next start; nothing restarts. Warnings ride the result
-      // and never block — the panel adopts the server's list.
+      // and never block (the operator saw the same list live
+      // while typing; the server's list replaces the draft's in
+      // wire state). On success the Edit surface closes like the
+      // structured Save's — see closeEditSession.
       inFlight.add(id);
       paint();
       try {
+        // The Edit panel's model draft rides this Save too, with
+        // the structured Save's rule: a failed assignment saves
+        // nothing else and keeps the panel open.
+        const mres = await saveEditModel(id);
+        if (disposed) return;
+        if (mres === "failed") { paint(); return; }
+        const modelNote = mres === "saved" ? `Model set to ${flagsEditModelId}. ` : "";
         const text = flagsRawText;
         const r = await setBackendRawFlags(id, text.trim() === "" ? null : text);
         if (disposed) return;
         if (r.error) {
-          msgs.set(id, { text: `Flags not saved: ${r.error}`, err: true });
+          msgs.set(id, { text: mres === "saved" ? `Model set to ${flagsEditModelId} — flags not saved: ${r.error}` : `Flags not saved: ${r.error}`, err: true });
           paint();
           return;
         }
         flagsRawText = r.data.raw_flags ?? "";
         flagsRawWarnings = r.data.warnings ?? [];
         msgs.set(id, {
-          text: r.data.changed
+          text: modelNote + (r.data.changed
             ? "Raw flags saved — applies on next start."
-            : "Raw flags unchanged.",
+            : "Raw flags unchanged."),
           err: false,
         });
+        // A successful save closes the Edit surface (Pete's
+        // report, 2026-10-20) — the advanced editor previously
+        // stayed open on the adopted text by design, which is
+        // the behavior Pete filed against. The adopted text and
+        // warnings above keep the wire state coherent; reopening
+        // Edit reseeds from the saved row regardless.
+        closeEditSession();
         await load();
-        schedulePredictedLookup();
       } finally {
         inFlight.delete(id);
         if (!disposed) paint();
@@ -4140,44 +4315,6 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       if (!disposed) paint();
     }
   };
-  /** Model dropdown change: assign the chosen model to the backend
-   *  through model_assign, carrying the backend's current tensor
-   *  split so the assignment changes the model only. The card note
-   *  tells the operator a restart applies it to a running backend. */
-  const onModelChange = async (ev: Event): Promise<void> => {
-    const sel = (ev.target as HTMLElement).closest("[data-back-model]") as HTMLSelectElement | null;
-    if (!sel || sel.disabled) return;
-    const backendId = sel.getAttribute("data-back-model") ?? "";
-    const modelId = sel.value;
-    if (!backendId || !modelId) return;
-    const row = lastRows.find((b) => b.id === backendId);
-    const model = lastModels.find((m) => m.id === modelId);
-    if (!row || !model || sameModelFile(row.model_file, model.gguf_path)) return;
-    inFlight.add(backendId);
-    paint();
-    try {
-      const cfgR = await getBackendConfig(backendId);
-      const flags = cfgR.data?.flags as { tensor_split?: unknown } | undefined;
-      const split = Array.isArray(flags?.tensor_split)
-        && flags.tensor_split.every((x) => typeof x === "number" && Number.isFinite(x))
-        ? (flags.tensor_split as number[]) : [];
-      const r = await modelAssign(backendId, modelId, split);
-      if (disposed) return;
-      if (r.error) {
-        msgs.set(backendId, { text: `Model change failed: ${r.error}`, err: true });
-      } else {
-        msgs.set(backendId, {
-          text: row.state === "running" || row.state === "starting"
-            ? `Model set to ${modelId}. Restart the backend to use it.`
-            : `Model set to ${modelId}.`,
-          err: false,
-        });
-      }
-    } finally {
-      inFlight.delete(backendId);
-      if (!disposed) await load();
-    }
-  };
   const onKeyDown = (ev: KeyboardEvent): void => {
     if (ev.key === "Escape" && openMenus.size) {
       openMenus.clear();
@@ -4186,7 +4323,6 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   };
   root.addEventListener("click", onClick);
   root.addEventListener("click", onOvGoto);
-  root.addEventListener("change", onModelChange);
   root.addEventListener("keydown", onKeyDown);
 
   await load();
@@ -4202,8 +4338,8 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     window.clearInterval(timer);
     root.removeEventListener("click", onClick);
     root.removeEventListener("click", onOvGoto);
-    root.removeEventListener("change", onModelChange);
     root.removeEventListener("keydown", onKeyDown);
+    root.removeEventListener("change", syncEditModel);
     root.removeEventListener("change", syncFlagsDraft);
     root.removeEventListener("input", syncFlagsDraft);
     root.removeEventListener("input", syncOffloadDraft);

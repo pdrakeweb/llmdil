@@ -224,6 +224,45 @@ check(bundle.includes("#/groups"), "bundle contains the Groups route (#/groups)"
 check(readFileSync(join(root, "src", "views", "static.ts"), "utf8").includes("Edit membership"),
   "Gateway Routing card links to the Groups editor (Edit membership)");
 
+// Backend card declutter (Oct 20, 2026): the card face carries no
+// standalone Test tool calls button and no Logs link — both are
+// items in the card's Other-actions menu; the edit entry point is
+// the single "Edit" (Placement is a section of the Edit session,
+// not its own menu item); the card face has no model-mutating
+// dropdown — the Model tile is a value and the choice is a draft
+// in the Edit panel, applied through model_assign only when the
+// panel saves; the Details expansion renders below the actions
+// bar and carries the tool-call state, an Offload Layers field,
+// and a latest-log-lines block fed by the open-Details tail
+// fetch. The harness renders no DOM, so these pin the source
+// fragments of that contract, in the established style.
+const backendSrc = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+const cardFnSrc = backendSrc.slice(backendSrc.indexOf("function backendCard("), backendSrc.indexOf("export function renderBackends"));
+check(cardFnSrc.includes('data-back-menu-item data-back-act="toolcall"'), "backend card menu carries the Test tool calls item");
+check(cardFnSrc.includes("View all logs"), "backend card menu carries the View all logs item");
+check(!cardFnSrc.includes("const toolCallBtn"), "backend card face has no standalone Test tool calls button");
+check(!cardFnSrc.includes("const logsBtn"), "backend card face has no standalone Logs button");
+check(cardFnSrc.includes('data-back-menu-item data-back-act="flags"'), "backend card menu carries the Edit entry point");
+check(cardFnSrc.includes("} Edit</button>"), "the backend card's edit entry point is labeled 'Edit'");
+check(!cardFnSrc.includes("Edit flags</button>"), "no 'Edit flags' entry point remains on the backend card");
+check(!cardFnSrc.includes('data-back-act="placement"'), "backend card menu has no separate Placement item (Placement is a section of Edit)");
+check(!cardFnSrc.includes("data-back-model"), "backend card face has no model-mutating dropdown");
+check(cardFnSrc.includes("data-edit-model"), "Edit panel carries the model choice as a draft select (data-edit-model)");
+check(backendSrc.includes("const saveEditModel"), "the Edit save applies the model draft through model_assign (saveEditModel)");
+check(!backendSrc.includes("onModelChange"), "no assign-on-selection model change handler remains");
+check(cardFnSrc.indexOf('class="card-actions backend-actions"') >= 0
+  && cardFnSrc.indexOf('class="card-actions backend-actions"') < cardFnSrc.indexOf("${detailsHtml}"),
+  "the Details expansion renders below the actions bar");
+check(cardFnSrc.includes('["Tool calls"'), "Details carries the tool-call state");
+check(cardFnSrc.includes('["Offload Layers"'), "Details carries the Offload Layers field");
+check(cardFnSrc.includes("Latest log lines"), "Details carries the latest-log-lines block");
+check(backendSrc.includes("openDetails.has(row.id)"), "log tails fetch for backends whose Details are open");
+check(backendSrc.includes("const closeEditSession"), "a successful Edit save closes the whole Edit surface (closeEditSession)");
+check((backendSrc.split("closeEditSession();").length - 1) >= 3, "both Edit saves and the Edit toggle close through closeEditSession");
+check(backendSrc.includes('if (mres === "failed") { paint(); return; }'), "a failed model assignment keeps the Edit surface open with its input intact");
+check(bundle.includes("View all logs"), "bundle contains the View all logs menu label");
+check(bundle.includes("Latest log lines"), "bundle contains the Latest log lines caption");
+
 
 // GPU power absence states: the telemetry payload classifies a null
 // power reading as the driver answering N/A (hardware state) or the
