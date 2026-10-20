@@ -398,6 +398,27 @@ WDDM devices), `backend_id`. The payload also carries the derived
 per-GPU info list the desktop renders. Field-for-field the app's
 payload; the API adds nothing.
 
+### 4.8 GPU history (`get_gpu_history`)
+
+Recorded per-GPU history behind the GPUs page charts, sampled from
+the telemetry snapshot every 15 s and persisted in the data dir
+(`gpu-history.json`): full-rate points for 48 h, 5-minute averaged
+points for 7 days. Payload: `{ range, generated_at_ms, gpus }`;
+each entry is `{ index, name, interval_ms, points }` where a point
+is `{ ts_ms, temp_c, util_pct, throughput_toks, power_w }`.
+`throughput_toks` and `power_w` are **null when not measured** at
+that tick: power is null when the card reports no power reading,
+and throughput is null when no running backend's rate attributes
+to the GPU. Throughput attribution: a backend's gateway token rate
+(the Dashboard's per-backend throughput figure) counts only while
+the backend has a live supervised process; a single-GPU placement
+attributes the full rate, a split placement pro-rates by the
+tensor-split shares. Points are decimated to at most 600 per GPU
+by consecutive-group averaging; `interval_ms` is the nominal
+spacing of the returned points, and a gap in time between points
+is an interval with no recording (the app was off, or the GPU was
+not reported) — never an interpolated value.
+
 ### 4.8 Log page (`get_logs`)
 
 ```json
@@ -966,6 +987,12 @@ on the managed machine; the API returns its path as metadata (the
 diagnostics bundle is the way to get telemetry off the machine —
 §6.11). See §7 on path-returning commands.
 
+#### `GET /api/v1/telemetry/history/{range}` — `read`
+`get_gpu_history` → §4.8. `range` is `1h`, `24h`, or `7d` (any
+other value fails with `INVALID_INPUT`); the path placeholder
+merges into the argument object by name, like every route
+argument.
+
 ### 6.10 Operations
 
 #### `GET /api/v1/operations` — `read`
@@ -1106,7 +1133,7 @@ operations the draft knew (`mcp_save_server`,
 
 ### 6.16 Registry exclusions — every operation with no route
 
-The registry holds 120 operations: 73 routed (§6.1–§6.14,
+The registry holds 121 operations: 74 routed (§6.1–§6.14,
 §6.18) and 47 with route `None`. A `None` route is an explicit
 exclusion, never an oversight (registry module docs); the
 complete list, grouped by reason:
