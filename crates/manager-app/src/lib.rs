@@ -2118,7 +2118,203 @@ pub(crate) async fn backend_start_preflight_for(
             model_path.display()
         )));
     }
-    Ok(())
+    vram_start_gate(state, cfg, b).await
+}
+
+/// One placed GPU's measured memory state, as the start gate sees
+/// it: a single telemetry snapshot taken at start time.
+struct VramGateReading {
+    index: u32,
+    total_mib: u64,
+    free_mib: u64,
+}
+
+/// One GPU on which a backend's requirement does not fit.
+struct VramGateFailure {
+    index: u32,
+    required_mib: u64,
+    /// The free MiB the gate compared against: measured free plus
+    /// the starting backend's own credited residency when it is
+    /// already running (a restart frees its current weights before
+    /// the new spawn allocates, so its own hold is not a shortage).
+    free_mib: u64,
+    total_mib: u64,
+    /// The requirement exceeds the card's total memory: no state
+    /// of the machine lets this configuration start on this GPU
+    /// at this context size.
+    exceeds_total: bool,
+}
+
+/// The pure start-gate math: a failure for every required GPU
+/// whose share exceeds its effective free memory (measured free
+/// plus any credited residency for that GPU). GPUs with no
+/// reading are not judged, and a zero requirement never fails.
+fn vram_gate_failures(
+    required: &[(u32, u64)],
+    readings: &[VramGateReading],
+    credit: &[(u32, u64)],
+) -> Vec<VramGateFailure> {
+    let mut out = Vec::new();
+    for &(index, req) in required {
+        if req == 0 {
+            continue;
+        }
+        let Some(r) = readings.iter().find(|r| r.index == index) else {
+            continue;
+        };
+        let credited = credit
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        let free = r.free_mib.saturating_add(credited);
+        if req > free {
+            out.push(VramGateFailure {
+                index,
+                required_mib: req,
+                free_mib: free,
+                total_mib: r.total_mib,
+                exceeds_total: req > r.total_mib,
+            });
+        }
+    }
+    out
+}
+
+/// Measured free-VRAM gate (planner-moe load-failure diagnosis,
+/// Oct 20, 2026): refuse a start whose per-GPU memory requirement
+/// — the same requirement the backend cards display
+/// ([`backend_memory_requirement`]), distributed over the
+/// placement by the configured tensor split
+/// ([`manager_optimize::residency_per_gpu`], the distribution the
+/// fit evaluator uses) — exceeds the free VRAM measured on a
+/// placed GPU at start time. Before this gate the preflight read
+/// no memory figures at all, so an oversized backend started and
+/// burned ~10 minutes in llama.cpp's fit-retry loop before
+/// failing. The check is a single snapshot; nothing is polled or
+/// cached across starts.
+///
+/// Skips when nothing can be measured or judged: CPU-only or
+/// undetermined placement, an unresolvable memory requirement,
+/// or no telemetry reading for any placed GPU (the fit
+/// evaluator's "no telemetry, no fit claim" posture).
+async fn vram_start_gate(
+    state: &AppState,
+    cfg: &AppConfig,
+    b: &manager_config::BackendConfig,
+) -> Result<(), ApiError> {
+    let placed: Vec<u32> = match backend_gpu_visibility(b) {
+        GpuVisibility::Gpus(indices) => indices,
+        _ => return Ok(()),
+    };
+    let Some(req) = backend_memory_requirement(cfg, b) else {
+        return Ok(());
+    };
+    // Telemetry snapshot first, supervisor status second; neither
+    // lock is held while the other is taken (the order the other
+    // preflight readers follow).
+    let mut samples = {
+        let store = state.telemetry().await;
+        let snapshot = lock_telemetry(&store).snapshot();
+        snapshot
+    };
+    samples.sort_by_key(|s| s.index);
+    if samples.is_empty() {
+        return Ok(());
+    }
+    // Per-GPU requirement shares, aligned to the snapshot order
+    // (split fraction position ↔ snapshot position is the
+    // placement projection's convention).
+    let per_gpu = manager_optimize::residency_per_gpu(&req, &b.flags.tensor_split, samples.len());
+    let share_of = |index: u32| -> u64 {
+        samples
+            .iter()
+            .position(|s| s.index == index)
+            .map(|pos| per_gpu[pos])
+            .unwrap_or(0)
+    };
+    let required: Vec<(u32, u64)> = placed.iter().map(|&i| (i, share_of(i))).collect();
+    if required.iter().all(|(_, share)| *share == 0) {
+        return Ok(());
+    }
+    // A down GPU (absent from recent polls, retained with
+    // last-known readings) has no usable capacity: it reads as
+    // zero free, as in the placement projection.
+    let readings: Vec<VramGateReading> = samples
+        .iter()
+        .map(|s| VramGateReading {
+            index: s.index,
+            total_mib: s.vram_total_mib,
+            free_mib: if s.down { 0 } else { s.free_vram_mib() },
+        })
+        .collect();
+    let statuses: Vec<(String, ProcessState)> = {
+        let sup = state.supervisor().await.lock().await;
+        sup.status()
+            .into_iter()
+            .map(|s| (s.id, s.state))
+            .collect()
+    };
+    let running: std::collections::HashSet<&str> = statuses
+        .iter()
+        .filter(|(_, st)| matches!(st, ProcessState::Running | ProcessState::Starting))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    // A restart's own current residency is credited back: the
+    // running process frees its weights before the replacement
+    // allocates. The credit basis is the configured split applied
+    // to the current requirement — the placement projection's
+    // credit basis, for the same reason (no launched-split record
+    // exists separate from the configured one).
+    let credit: Vec<(u32, u64)> = if running.contains(b.id.as_str()) {
+        required.clone()
+    } else {
+        Vec::new()
+    };
+    let failures = vram_gate_failures(&required, &readings, &credit);
+    if failures.is_empty() {
+        return Ok(());
+    }
+    // Name the running app-managed backends placed on a failing
+    // GPU: the known consumers of the memory that is not free.
+    let consumers_on = |index: u32| -> Vec<String> {
+        cfg.backends
+            .iter()
+            .filter(|o| o.id != b.id && running.contains(o.id.as_str()))
+            .filter(|o| {
+                matches!(backend_gpu_visibility(o), GpuVisibility::Gpus(ref idxs) if idxs.contains(&index))
+            })
+            .map(|o| o.id.clone())
+            .collect()
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for f in &failures {
+        if f.exceeds_total {
+            parts.push(format!(
+                "GPU {} needs {} MiB, which exceeds the GPU's total memory ({} MiB; {} MiB free) at this context size",
+                f.index, f.required_mib, f.total_mib, f.free_mib
+            ));
+        } else {
+            let mut part = format!(
+                "GPU {} needs {} MiB but only {} MiB is free (of {} MiB) — insufficient free memory on the GPU",
+                f.index, f.required_mib, f.free_mib, f.total_mib
+            );
+            let consumers = consumers_on(f.index);
+            if consumers.len() == 1 {
+                part += &format!("; backend '{}' is running on this GPU", consumers[0]);
+            } else if !consumers.is_empty() {
+                let named: Vec<String> =
+                    consumers.iter().map(|c| format!("'{c}'")).collect();
+                part += &format!("; backends {} are running on this GPU", named.join(", "));
+            }
+            parts.push(part);
+        }
+    }
+    Err(ApiError::InvalidInput(format!(
+        "backend {} cannot start: {} — reduce the context size or the model footprint, or free the GPU, before starting",
+        b.id,
+        parts.join("; ")
+    )))
 }
 
 
@@ -10396,6 +10592,97 @@ mod tests {
 
     fn backend(cfg: &AppConfig, id: &str) -> manager_config::BackendConfig {
         cfg.backends.iter().find(|b| b.id == id).unwrap().clone()
+    }
+
+    fn vram_reading(index: u32, total_mib: u64, free_mib: u64) -> VramGateReading {
+        VramGateReading {
+            index,
+            total_mib,
+            free_mib,
+        }
+    }
+
+    #[test]
+    fn vram_gate_passes_when_requirement_fits_free() {
+        // 12 GiB required on GPU 1, 15 GiB free of 16 GiB: fits.
+        let failures = vram_gate_failures(
+            &[(1, 12 * 1024)],
+            &[vram_reading(1, 16 * 1024, 15 * 1024)],
+            &[],
+        );
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn vram_gate_refuses_when_free_is_short() {
+        // The planner-moe shape: ~15.5 GiB required on the P100,
+        // ~11 GiB free because another backend is resident. Under
+        // the card total, so the cause is insufficient free memory.
+        let failures = vram_gate_failures(
+            &[(1, 15_862)],
+            &[vram_reading(1, 16_384, 11_245)],
+            &[],
+        );
+        assert_eq!(failures.len(), 1);
+        let f = &failures[0];
+        assert_eq!(f.index, 1);
+        assert_eq!(f.required_mib, 15_862);
+        assert_eq!(f.free_mib, 11_245);
+        assert_eq!(f.total_mib, 16_384);
+        assert!(!f.exceeds_total);
+    }
+
+    #[test]
+    fn vram_gate_classifies_requirement_over_card_total() {
+        // More required than the card holds at all: a different
+        // cause class than a busy card, even with every byte free.
+        let failures = vram_gate_failures(
+            &[(0, 17 * 1024)],
+            &[vram_reading(0, 16 * 1024, 16 * 1024)],
+            &[],
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].exceeds_total);
+        assert_eq!(failures[0].free_mib, 16 * 1024);
+    }
+
+    #[test]
+    fn vram_gate_split_flags_only_the_short_gpu() {
+        // Split across two GPUs: GPU 0 has room, GPU 1 does not.
+        // Only the short GPU is named.
+        let failures = vram_gate_failures(
+            &[(0, 8 * 1024), (1, 8 * 1024)],
+            &[
+                vram_reading(0, 16 * 1024, 16 * 1024),
+                vram_reading(1, 16 * 1024, 4 * 1024),
+            ],
+            &[],
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].index, 1);
+    }
+
+    #[test]
+    fn vram_gate_credit_covers_a_restart() {
+        // A restart of a backend already holding most of the card:
+        // measured free is tiny, but its own residency is credited
+        // back (the restart frees it before allocating), so the
+        // same configuration passes its own gate.
+        let failures = vram_gate_failures(
+            &[(1, 15 * 1024)],
+            &[vram_reading(1, 16 * 1024, 1024)],
+            &[(1, 14_500)],
+        );
+        assert!(failures.is_empty());
+        // A requirement grown past what the credit covers still
+        // fails: 15 GiB required, 1 GiB free + 13 GiB credited.
+        let failures = vram_gate_failures(
+            &[(1, 15 * 1024)],
+            &[vram_reading(1, 16 * 1024, 1024)],
+            &[(1, 13 * 1024)],
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].free_mib, 1024 + 13 * 1024);
     }
 
     #[test]
