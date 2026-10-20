@@ -2205,14 +2205,18 @@ function backendCard(
   // block below and the Details section's latest-lines block.
   const logLineHtml = (r: LogRow): string => `<div class="ln"><span class="t">${esc(fmtTime(r.ts))}</span> <span class="chip">${esc(r.stream)}</span> ${esc(r.line)}</div>`;
   let logsBlock = "";
-  if (b.state === "failed") {
+  // Suppressed while Details are open: the expansion's
+  // latest-lines block shows the same stored tail (all 5 lines)
+  // directly above, and the lines render in one place only.
+  if (b.state === "failed" && !detailsOpen) {
     const tail = logTails.get(b.id);
     // An empty tail renders no block at all (principle 13) — the
     // full log is one menu click away ("View all logs" in the
     // Other-actions menu). The caption's qualifier rides its
-    // info-tip.
+    // info-tip. The stored tail holds 5 lines (the Details
+    // block's count); this diagnostic block keeps its last 3.
     const lines = tail && tail.length
-      ? `<div style="margin-top:8px;font-size:11px;color:var(--text3)">Latest output<span class="info-tip" title="stderr preferred — that is where llama-server reports load failures">${icon("info")}</span></div><div class="logstream" style="margin-top:4px">${tail.map(logLineHtml).join("")}</div>`
+      ? `<div style="margin-top:8px;font-size:11px;color:var(--text3)">Latest output<span class="info-tip" title="stderr preferred — that is where llama-server reports load failures">${icon("info")}</span></div><div class="logstream" style="margin-top:4px">${tail.slice(-3).map(logLineHtml).join("")}</div>`
       : "";
     logsBlock = lines;
   }
@@ -2587,7 +2591,9 @@ function backendCard(
   // the memory basis (its explanation rides the info-tip). Open
   // state lives in the wire layer, so poll repaints keep it.
   // State is not repeated here — the header's state chip carries it
-  // (numbers and states live in one place, principle 6).
+  // (numbers and states live in one place, principle 6). The
+  // section renders BELOW the actions bar in the card template
+  // (Pete's declutter, 2026-10-20).
   const detailKv: [string, string][] = [
     ["PID", b.pid !== null ? String(b.pid) : "—"],
     ["Uptime", fmtUptime(b.uptime_secs)],
@@ -2595,12 +2601,44 @@ function backendCard(
   // Batch is a structured flags readout like Context: omitted in
   // advanced flags mode (tracker #60) rather than shown as fact.
   if (!b.flags_advanced && b.n_batch != null) detailKv.push(["Batch", fmtCount(b.n_batch)]);
+  // Tool-call probe state (MCP design §7.2): the persisted probe
+  // outcome, or "not measured" when the backend has never been
+  // probed (principle 12 — absence is not a measured state). It
+  // rendered on the card face until the 2026-10-20 declutter
+  // moved it here; the probe itself runs from the menu's Test
+  // tool calls item. Supervisor-only orphan rows carry no probe
+  // and no tile.
+  if (b.configured) detailKv.push(["Tool calls", b.tool_call_probe ? b.tool_call_probe.outcome : "not measured"]);
+  // Offload Layers: the saved expert-offload position, from the
+  // same offload info the Edit panel's slider renders. A model
+  // with no routed experts has no offload position to report —
+  // the value says so plainly, never 0 (principle 12).
+  if (b.configured) {
+    detailKv.push(["Offload Layers", b.offload
+      ? b.offload.layers <= 0
+        ? `Off (0 of ${b.offload.moe_layers})`
+        : b.offload.layers >= b.offload.moe_layers
+          ? `Full (${b.offload.moe_layers} of ${b.offload.moe_layers})`
+          : `${b.offload.layers} of ${b.offload.moe_layers}`
+      : "Not applicable"]);
+  }
+  // Latest log lines: the stored tail for this backend (the same
+  // get_logs records behind the menu's View all logs, with the
+  // failed block's stderr preference). The block renders only
+  // once a fetch has landed — an unfetched tail omits it
+  // (principle 13); a fetched-but-empty tail states the fact.
+  const detailTail = logTails.get(b.id);
+  const logLinesHtml = detailTail === undefined ? "" : `<div style="margin-top:10px">
+      <div style="font-size:11px;color:var(--text3)">Latest log lines<span class="info-tip" title="The backend's most recent log lines, newest last — the same records the Logs view shows for this backend. The full log is under View all logs in the card's menu.">${icon("info")}</span></div>
+      ${detailTail.length ? `<div class="logstream backend-logtail" style="margin-top:4px">${detailTail.map(logLineHtml).join("")}</div>` : `<div style="font-size:12px;color:var(--text2);margin-top:4px">None recorded</div>`}
+    </div>`;
   const detailsHtml = detailsOpen ? `<div class="backend-details">
       <div style="display:grid;grid-template-columns:repeat(${detailKv.length},1fr);gap:10px">
         ${detailKv.map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
       </div>
       ${splitEntries.length ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Configured split: ${splitSummary}</div>` : ""}
       ${basisTip ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Basis: ${esc(b.memory_basis ?? "")}<span class="info-tip" title="${esc(basisTip)}">${icon("info")}</span></div>` : ""}
+      ${logLinesHtml}
     </div>` : "";
   // Advanced flags mode (tracker #60): the saved raw flags ARE
   // the configuration the operator owns in this mode, so they
@@ -2610,13 +2648,6 @@ function backendCard(
   // mode itself.
   const rawFlagsHtml = b.flags_advanced && b.raw_flags
     ? `<div style="font-size:12px;color:var(--text2);margin-top:8px">Flags: <span style="font-family:var(--mono);color:var(--text)">${esc(b.raw_flags)}</span></div>`
-    : "";
-  // Tool-call probe state (MCP design §7.2): the persisted probe
-  // outcome, or "not measured" when the backend has never been
-  // probed (principle 12 — absence is not a measured state).
-  // Supervisor-only orphan rows carry no probe and no line.
-  const toolCallHtml = b.configured
-    ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Tool calls: <b style="color:var(--text)">${b.tool_call_probe ? esc(b.tool_call_probe.outcome) : "not measured"}</b></div>`
     : "";
   const detailsBtn = `<button class="btn icon-only" data-back-act="details" data-back-id="${esc(b.id)}" aria-expanded="${detailsOpen}" title="Details" aria-label="Details">${icon(detailsOpen ? "chevD" : "chevR")}</button>`;
   return `<div class="card backend-card" id="card-backend-${esc(b.id)}">
@@ -2628,19 +2659,18 @@ function backendCard(
         ${b.flags_advanced ? `<span class="chip status-tag" title="Advanced flags mode: this backend's launch flags are edited as raw text in the Flags panel, and the structured flags form is disabled for it.">advanced flags</span>` : ""}
         <span class="chip status-tag ${stateTagClass(b.state)}">${esc(b.state)}</span></h3>
       ${stripHtml}
-      ${toolCallHtml}
       ${gpuHtml}
       ${statsHtml}
       ${rawFlagsHtml}
       ${offloadStatusHtml}
       ${mtpStatusHtml}
-      ${detailsHtml}
       ${flagsHtml}
       ${placeHtml}
       <div class="card-actions backend-actions">${detailsBtn}
         ${actions}
         ${advancedMenu}</div>
       <div class="back-msg" style="margin-top:8px;font-size:12px">${msgHtml}</div>
+      ${detailsHtml}
       ${logsBlock}
       ${argv}
     </div>`;
@@ -2685,6 +2715,10 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const logTails = new Map<string, LogRow[]>();
   /** Ids whose log tail has been fetched (or is in flight) this mount. */
   const tailsWanted = new Set<string>();
+  /** Ids with a Details-driven tail refetch in flight: the
+   *  open-Details path refetches on each load cycle instead of
+   *  once per mount, so it tracks its own in-flight set. */
+  const tailsFetching = new Set<string>();
   /** Backend ids with an action invoke in flight; their card buttons
    *  render disabled (the set outlives any single repaint). */
   const inFlight = new Set<string>();
@@ -2807,23 +2841,39 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   backStateSel?.addEventListener("change", () => { backState = backStateSel.value; paint(); });
   backFilterInput?.addEventListener("input", () => { backFilter = backFilterInput.value; paint(); });
 
-  /** Lazily fetch the last log lines for failed backends and repaint.
-   *  get_logs takes the bare process id (the same scope the Logs view
-   *  sends); records arrive newest-first. Stderr lines are preferred —
-   *  that is where llama-server reports load failures. */
+  /** Lazily fetch the last log lines for the cards that show
+   *  them, and repaint. One stored tail (up to 5 lines) serves
+   *  two blocks: a failed backend's diagnostic block — fetched
+   *  once per mount, as it has always been — and the Details
+   *  section's latest-lines block, fetched while Details are
+   *  open and refreshed on each load cycle, repainting only when
+   *  the tail actually changed. get_logs takes the bare process
+   *  id (the same scope the Logs view sends); records arrive
+   *  newest-first. Stderr lines are preferred — that is where
+   *  llama-server reports load failures. */
   const fetchLogTails = async (): Promise<void> => {
     const rows = lastRows;
     let fetched = false;
     for (const row of rows) {
-      if (row.state !== "failed" || tailsWanted.has(row.id)) continue;
-      tailsWanted.add(row.id);
-      const r = await getLogs(row.id, { limit: 50 });
-      if (disposed) return;
-      if (r.error) { tailsWanted.delete(row.id); continue; }
-      const stderr = r.data.lines.filter((x) => x.stream === "stderr");
-      const source = stderr.length ? stderr : r.data.lines;
-      logTails.set(row.id, source.slice(0, 3).reverse());
-      fetched = true;
+      const detailsWants = openDetails.has(row.id);
+      if (row.state !== "failed" && !detailsWants) continue;
+      if (detailsWants ? tailsFetching.has(row.id) : tailsWanted.has(row.id)) continue;
+      if (detailsWants) tailsFetching.add(row.id); else tailsWanted.add(row.id);
+      try {
+        const r = await getLogs(row.id, { limit: 50 });
+        if (disposed) return;
+        if (r.error) { if (!detailsWants) tailsWanted.delete(row.id); continue; }
+        const stderr = r.data.lines.filter((x) => x.stream === "stderr");
+        const source = stderr.length ? stderr : r.data.lines;
+        const tail = source.slice(0, 5).reverse();
+        const prev = logTails.get(row.id);
+        const changed = !prev || prev.length !== tail.length
+          || prev.some((p, i) => p.ts !== tail[i].ts || p.line !== tail[i].line);
+        logTails.set(row.id, tail);
+        if (changed) fetched = true;
+      } finally {
+        tailsFetching.delete(row.id);
+      }
     }
     // Repaint only if these are still the current rows (a reload or an
     // error paint may have superseded them while fetches were in flight).
@@ -2872,8 +2922,9 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       const prev = prevStates.get(row.id);
       if (prev !== undefined && prev !== row.state) { msgs.delete(row.id); confirmRemove.delete(row.id); }
       // A backend that is no longer failed gets a fresh tail fetch if it
-      // fails again.
-      if (row.state !== "failed") { logTails.delete(row.id); tailsWanted.delete(row.id); }
+      // fails again — unless its Details are open, where the stored
+      // tail is the expansion's latest-lines data and stays.
+      if (row.state !== "failed" && !openDetails.has(row.id)) { logTails.delete(row.id); tailsWanted.delete(row.id); }
     }
     // Prune per-backend card state for ids that no longer exist
     // (code-review 5.9): a deleted backend's notes, caches, and
@@ -2884,7 +2935,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       for (const map of [msgs, argvCache, logTails] as Map<string, unknown>[]) {
         for (const k of [...map.keys()]) if (!alive.has(k)) map.delete(k);
       }
-      for (const set of [confirmRemove, openArgv, openDetails, inFlight, tailsWanted] as Set<string>[]) {
+      for (const set of [confirmRemove, openArgv, openDetails, inFlight, tailsWanted, tailsFetching] as Set<string>[]) {
         for (const k of [...set]) if (!alive.has(k)) set.delete(k);
       }
       if (flagsFor !== null && !alive.has(flagsFor)) flagsFor = null;
@@ -3844,8 +3895,12 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     const act = t.getAttribute("data-back-act") ?? "";
 
     if (act === "details") {
-      if (openDetails.has(id)) openDetails.delete(id); else openDetails.add(id);
+      const opening = !openDetails.has(id);
+      if (opening) openDetails.add(id); else openDetails.delete(id);
       paint();
+      // The expansion's latest-lines block wants this backend's
+      // tail now, not at the next poll's load.
+      if (opening) void fetchLogTails();
       return;
     }
 

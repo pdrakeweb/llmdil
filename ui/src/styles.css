@@ -419,6 +419,11 @@ table.tbl tr:last-child td { border-bottom: 0; }
   padding: 12px 16px; overflow-x: auto;
 }
 .logstream .ln { white-space: pre; }
+/* The backend card's in-Details tail wraps instead of scrolling:
+   the card is a summary surface, and a horizontal scrollbar inside
+   it would break the card layout (the Logs view keeps the scroll). */
+.backend-logtail { overflow-x: visible; }
+.backend-logtail .ln { white-space: pre-wrap; word-break: break-word; }
 .logstream .t { color: var(--text3); }
 .logstream .lvl-info { color: var(--accent); }
 .logstream .lvl-warn { color: var(--warn); }
