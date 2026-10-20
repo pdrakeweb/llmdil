@@ -228,6 +228,20 @@ fn main() {
                     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 }
             });
+            // GPU history recorder: sample the telemetry snapshot
+            // every 15 s into the persistent per-GPU history that
+            // backs the GPUs page history charts (temperature,
+            // utilization, throughput, power over 1 h / 24 h / 7 d).
+            // Best-effort: a skipped tick is a chart gap, never an
+            // error surface.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<Arc<AppState>>().inner().clone();
+                loop {
+                    manager_app::gpu_history::record_gpu_history_once(&state).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                }
+            });
             // Admin REST API: serve in-process while enabled (the
             // enable/disable flow itself lives in
             // admin_api_set_enabled).

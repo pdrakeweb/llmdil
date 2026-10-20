@@ -49,6 +49,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 pub mod activation;
 pub mod activation_history;
 pub mod gateway_stats;
+pub mod gpu_history;
 pub mod notify;
 pub mod optimize;
 pub mod optimize_eval;
@@ -61,6 +62,7 @@ pub use optimize::{
     op_optimize_save_purpose, op_optimize_set_item_outcome, op_optimize_set_item_state,
     op_optimize_validate_plan,
 };
+pub use gpu_history::op_get_gpu_history;
 pub use optimize_eval::op_optimize_run_baseline;
 pub use optimize_experiments::{
     op_optimize_estimate_experiments, op_optimize_run_experiments, op_optimize_set_experiment_state,
@@ -340,6 +342,10 @@ pub struct AppState {
     telemetry: OnceCell<Arc<std::sync::Mutex<TelemetryStore>>>,
     /// Keeps the telemetry poll loop alive for the app's lifetime.
     telemetry_poller: OnceCell<std::sync::Mutex<manager_telemetry::store::PollHandle>>,
+    /// Persistent per-GPU telemetry history (see [`gpu_history`]):
+    /// loaded from the data dir on first use, appended by the
+    /// recorder loop, read by the history query op.
+    gpu_history: OnceCell<std::sync::Mutex<gpu_history::GpuHistoryCell>>,
     wizard_install: OnceCell<Mutex<Wizard>>,
     wizard_audit: OnceCell<Mutex<Wizard>>,
     /// Last setup_get_steps payload, refreshed whenever the install
@@ -506,6 +512,7 @@ impl AppState {
             supervisor: OnceCell::new(),
             telemetry: OnceCell::new(),
             telemetry_poller: OnceCell::new(),
+            gpu_history: OnceCell::new(),
             wizard_install: OnceCell::new(),
             wizard_audit: OnceCell::new(),
             wizard_steps_cache: RwLock::new(None),
@@ -728,6 +735,21 @@ impl AppState {
             })
             .await
             .clone()
+    }
+
+    /// The persistent GPU history cell. The first call loads the
+    /// history file from the data dir (missing/corrupt = empty);
+    /// the recorder appends and the history op reads through the
+    /// same cell, so the file's in-memory image is single-owned.
+    async fn gpu_history(&self) -> &std::sync::Mutex<gpu_history::GpuHistoryCell> {
+        self.gpu_history
+            .get_or_init(|| async {
+                std::sync::Mutex::new(gpu_history::GpuHistoryCell {
+                    store: gpu_history::load_history(&self.data_dir),
+                    last_saved_ms: 0,
+                })
+            })
+            .await
     }
 
     /// Transport setup can only fail on local client misconfiguration;

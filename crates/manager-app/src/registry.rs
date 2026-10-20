@@ -286,6 +286,7 @@ macro_rules! for_each_operation {
             (TelemetrySetInterval, telemetry_set_interval, C, op_telemetry_set_interval, [ms: u64], Some(route(HttpMethod::Put, "/api/v1/telemetry/interval"))),
             (TelemetryResetPeaks, telemetry_reset_peaks, L, op_telemetry_reset_peaks, [], Some(route(HttpMethod::Post, "/api/v1/telemetry/reset-peaks"))),
             (TelemetrySaveSnapshot, telemetry_save_snapshot, L, op_telemetry_save_snapshot, [], Some(route(HttpMethod::Post, "/api/v1/telemetry/snapshots"))),
+            (GetGpuHistory, get_gpu_history, R, op_get_gpu_history, [range: String], Some(route(HttpMethod::Get, "/api/v1/telemetry/history/{range}"))),
             (PlacementPropose, placement_propose, R, op_placement_propose, [model_id: String, split: Vec<f32>, backend_id: Option<String>], Some(route(HttpMethod::Post, "/api/v1/placement/propose"))),
             (PlacementApply, placement_apply, C, op_placement_apply, [model_id: String, split: Vec<f32>, backend_id: Option<String>], Some(route(HttpMethod::Post, "/api/v1/placement/apply"))),
             // Tasks / diagnostics
@@ -431,7 +432,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 120);
+        assert_eq!(OP_SPECS.len(), 121);
     }
 
     #[test]
