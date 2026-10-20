@@ -260,6 +260,19 @@ pub enum RunMode {
     Audit,
 }
 
+/// Live sink for step progress lines: invoked with one line at the
+/// moment the line is produced, while the step is still running.
+/// The step outcome's collected log is otherwise only persisted
+/// when the step RETURNS, so without a sink a multi-minute step
+/// (a cold package install, a database wait) shows a single
+/// "started" line for its whole duration and reads as a hang
+/// (field report 2026-10-19: start-gateway silent for minutes at a
+/// time). Production attaches a sink that appends to `wizard.log`;
+/// tests attach a recorder; steps emit through
+/// [`WizardContext::emit_log`] and treat the sink as best-effort —
+/// a missing sink changes nothing about the outcome log.
+pub type StepLogSink = Arc<dyn Fn(String) + Send + Sync>;
+
 /// Context handed to every step.
 pub struct WizardContext {
     pub config: AppConfig,
@@ -268,6 +281,9 @@ pub struct WizardContext {
     /// Injectable system effects (production: [`ops::RealSystemOps`],
     /// tests: [`fake::FakeSystemOps`]).
     pub ops: Arc<dyn SystemOps>,
+    /// Live progress sink (see [`StepLogSink`]); `None` outside the
+    /// app shell (unit tests, one-shot CLI runs).
+    pub log_sink: Option<StepLogSink>,
 }
 
 impl WizardContext {
@@ -282,6 +298,31 @@ impl WizardContext {
             data_dir,
             mode,
             ops,
+            log_sink: None,
+        }
+    }
+
+    /// Attach a live progress sink (see [`StepLogSink`]).
+    pub fn with_log_sink(mut self, sink: StepLogSink) -> Self {
+        self.log_sink = Some(sink);
+        self
+    }
+
+    /// The attached live progress sink, when any — for handing to
+    /// progress callbacks (download progress) that outlive a single
+    /// call frame.
+    pub fn log_sink(&self) -> Option<StepLogSink> {
+        self.log_sink.clone()
+    }
+
+    /// Emit one progress line to the live sink, when one is
+    /// attached. Steps call this for progress that must be visible
+    /// WHILE the step runs (phase boundaries, wait ticks, streamed
+    /// server-log lines); the outcome log remains the durable
+    /// end-of-step record.
+    pub fn emit_log(&self, line: &str) {
+        if let Some(sink) = &self.log_sink {
+            sink(line.to_string());
         }
     }
 }
