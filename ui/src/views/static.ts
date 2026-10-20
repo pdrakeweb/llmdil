@@ -5,14 +5,14 @@
    (live=false) views show a sample-mode banner and honest empty states
    instead of fabricated data. */
 
-import { fmtCount, fmtGb, gaugeRing, meter, sparkline, stackedBar, trim1 } from "../charts";
+import { fmtCount, fmtGb, gaugeRing, historyChart, historyChartX, historyChartY, meter, sparkline, stackedBar, trim1, type HistoryChartGeom, type HistoryChartSeries } from "../charts";
 import { icon, type IconName } from "../icons";
 import { esc } from "../html";
 import { enableSwitch } from "../switch";
 import {
   runWizardStep, wizardBusyMessage, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit,
   getWizardCommands,
-  getGpuTelemetry, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
+  getGpuTelemetry, getGpuHistory, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
   getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendMtp, setBackendParallel, setBackendRawFlags, setBackendFlagsMode, getBackendLaunchCommand,
   measurementLookup,
   getBackendConfig, applyBackendConfig, testBackend, testBackendToolCall, placementPropose, placementApply,
@@ -31,7 +31,7 @@ import {
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
   adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendAddPreview, BackendMtp, BackendOffload, BackendParallel, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, LogRow, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
+import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, BackendAddPreview, BackendMtp, BackendOffload, BackendParallel, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, LogRow, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
 import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
 import type { GpuInfo, WizardStepState } from "../types";
 
@@ -307,7 +307,8 @@ export function renderGpus(): string {
       </select></label>
     <input id="gpuFilter" type="text" placeholder="Filter by GPU name" style="background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:5px 8px;font-size:12px;min-width:180px">
   </div>
-  <div id="gpuBody">${loadingHtml("Loading GPU telemetry\u2026")}</div></div>`;
+  <div id="gpuBody">${loadingHtml("Loading GPU telemetry\u2026")}</div>
+  <div id="gpuHistory"></div></div>`;
 }
 
 /** The backend cadence buckets: Off, anything up to 1500 ms runs at 1s,
@@ -428,6 +429,148 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     }
   };
 
+  /* ---------------- History charts ----------------
+     Recorded per-GPU history (temperature, utilization, throughput,
+     power) from get_gpu_history: sampled server-side every 15 s and
+     persisted across restarts. One chart per metric, one series per
+     GPU; the range selector switches the dataset. Hover shows the
+     exact value + timestamp at the nearest recorded point. Breaks
+     in a line are unrecorded or unmeasured intervals — nothing is
+     interpolated. */
+  const HIST_RANGES = ["1h", "24h", "7d"];
+  let histRange = "24h";
+  const histCharts = new Map<string, { geom: HistoryChartGeom; series: HistoryChartSeries[] }>();
+  const HIST_METRICS: { key: string; title: string; unit: string; fixed?: [number, number]; get: (p: GpuHistoryPoint) => number | null }[] = [
+    { key: "temp", title: "Temperature (°C)", unit: "°C", get: (p) => p.temp_c },
+    { key: "util", title: "Utilization (%)", unit: "%", fixed: [0, 100], get: (p) => p.util_pct },
+    { key: "tps", title: "Throughput (tok/s)", unit: "tok/s", get: (p) => p.throughput_toks },
+    { key: "power", title: "Power (W)", unit: "W", get: (p) => p.power_w },
+  ];
+  const HIST_TIP = "Throughput is each running backend's gateway token rate, attributed to the GPUs its placement uses: the full rate on a single GPU, pro-rated by tensor-split share across a split. A backend that is not running contributes nothing, and a GPU with no contributing backend shows no throughput value. Power appears only where the card reports it. Breaks in a line are intervals with no recording — the app was off, or the value was not measured.";
+  const fmtHistTime = (ts: number): string => {
+    const d = new Date(ts);
+    const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return histRange === "7d" ? `${d.toLocaleDateString([], { weekday: "short" })} ${hm}` : hm;
+  };
+  const paintHistory = (data: GpuHistoryData, error?: string): void => {
+    const host = root.querySelector("#gpuHistory");
+    if (!host) return;
+    histCharts.clear();
+    const palette = [C.blue, C.purple, C.teal, C.amber, C.green];
+    const rangeBtns = HIST_RANGES.map((r) => `<button class="btn" data-hist-range="${r}" style="${r === histRange ? "border-color:#4a9eff;color:#4a9eff" : ""}">${r}</button>`).join("");
+    const emptyNote = `<div style="font-size:12px;color:var(--text2)">No GPU history recorded yet — history accumulates while the app runs.</div>`;
+    let body: string;
+    if (error) {
+      body = `<div style="font-size:12px;color:var(--text2)">GPU history unavailable: ${esc(error)}</div>`;
+    } else if (!data.gpus.some((g) => g.points.length)) {
+      body = emptyNote;
+    } else {
+      const cards = HIST_METRICS.map((m) => {
+        const series: HistoryChartSeries[] = data.gpus.map((g, i) => ({
+          label: g.name,
+          color: palette[i % palette.length],
+          intervalMs: g.interval_ms,
+          points: g.points.map((p) => ({ ts: p.ts_ms, v: m.get(p) })),
+        }));
+        // A metric no GPU measured in this window renders no chart
+        // (principles 12/13): e.g. Power before any card reports it.
+        if (!series.some((s) => s.points.some((p) => p.v !== null))) return "";
+        const { svg, geom } = historyChart(series, { fixedRange: m.fixed, fmtTime: fmtHistTime });
+        if (!svg) return "";
+        histCharts.set(m.key, { geom, series });
+        const legend = series.map((s) => `<span><span class="sw" style="background:${s.color}"></span>${esc(s.label)}</span>`).join("");
+        return `<div class="card">
+          <div style="font-size:12px;color:var(--text2)">${esc(m.title)}</div>
+          <div class="legend" style="margin:2px 0 4px">${legend}</div>
+          <div class="hist-wrap" data-hist-metric="${m.key}" style="position:relative">${svg}<div class="hist-tip" style="position:absolute;display:none;pointer-events:none;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:11px;color:var(--text);z-index:5;white-space:nowrap"></div></div>
+        </div>`;
+      }).join("");
+      body = cards ? `<div class="cards-fluid">${cards}</div>` : emptyNote;
+    }
+    host.innerHTML = `<div style="display:flex;align-items:center;gap:10px;margin:14px 0 10px">
+        <span style="font-size:14px;font-weight:600">History</span>
+        <span style="display:inline-flex;gap:4px">${rangeBtns}</span>
+        <span class="info-tip" title="${esc(HIST_TIP)}">${icon("info")}</span>
+      </div>${body}`;
+    attachHistHover();
+  };
+  const attachHistHover = (): void => {
+    root.querySelectorAll(".hist-wrap").forEach((wrap) => {
+      const metric = wrap.getAttribute("data-hist-metric") ?? "";
+      const st = histCharts.get(metric);
+      const svg = wrap.querySelector("svg");
+      const tip = wrap.querySelector(".hist-tip") as HTMLElement | null;
+      const m = HIST_METRICS.find((x) => x.key === metric);
+      if (!st || !svg || !tip || !m) return;
+      const zone = svg.querySelector(".hist-zone");
+      const guide = svg.querySelector(".hist-guide");
+      const markers = svg.querySelector(".hist-markers");
+      if (!zone || !markers) return;
+      const clear = (): void => {
+        tip.style.display = "none";
+        markers.innerHTML = "";
+        guide?.setAttribute("opacity", "0");
+      };
+      zone.addEventListener("mouseleave", clear);
+      zone.addEventListener("mousemove", (ev: Event) => {
+        const e = ev as MouseEvent;
+        const rect = svg.getBoundingClientRect();
+        if (!rect.width) return;
+        const x = ((e.clientX - rect.left) / rect.width) * st.geom.w;
+        const ts = st.geom.t0 + ((x - st.geom.padL) / Math.max(1, st.geom.w - st.geom.padL - st.geom.padR)) * (st.geom.t1 - st.geom.t0);
+        // Nearest recorded point per series; a series whose nearest
+        // point is far (> 1.5 intervals) or unmeasured shows nothing.
+        let guideTs: number | null = null;
+        const rows: string[] = [];
+        let circles = "";
+        for (const s of st.series) {
+          let best: { ts: number; v: number | null } | null = null;
+          for (const p of s.points) {
+            if (!best || Math.abs(p.ts - ts) < Math.abs(best.ts - ts)) best = p;
+          }
+          if (!best || best.v === null || Math.abs(best.ts - ts) > 1.5 * s.intervalMs) continue;
+          if (guideTs === null) guideTs = best.ts;
+          circles += `<circle cx="${historyChartX(st.geom, best.ts).toFixed(1)}" cy="${historyChartY(st.geom, best.v).toFixed(1)}" r="3" fill="${s.color}" stroke="var(--panel)" stroke-width="1.5"/>`;
+          rows.push(`<div><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${s.color};margin-right:5px"></span>${esc(s.label)}: ${trim1(best.v)} ${esc(m.unit)}</div>`);
+        }
+        if (guideTs === null || !rows.length) { clear(); return; }
+        const gx = historyChartX(st.geom, guideTs);
+        guide?.setAttribute("x1", gx.toFixed(1));
+        guide?.setAttribute("x2", gx.toFixed(1));
+        guide?.setAttribute("opacity", "0.6");
+        markers.innerHTML = circles;
+        tip.innerHTML = `<div style="color:var(--text3);margin-bottom:2px">${esc(fmtHistTime(guideTs))}</div>${rows.join("")}`;
+        tip.style.display = "block";
+        const wrapW = (wrap as HTMLElement).clientWidth;
+        const px = (gx / st.geom.w) * wrapW;
+        tip.style.left = px > wrapW * 0.62 ? "" : `${Math.round(px + 10)}px`;
+        tip.style.right = px > wrapW * 0.62 ? `${Math.round(wrapW - px + 10)}px` : "";
+        tip.style.top = "6px";
+      });
+    });
+  };
+  let histLoading = false;
+  const loadHistory = async (): Promise<void> => {
+    if (histLoading) return;
+    histLoading = true;
+    try {
+      const r = await getGpuHistory(histRange);
+      if (disposed) return;
+      paintHistory(r.data, r.error);
+    } finally {
+      histLoading = false;
+    }
+  };
+  const onHistRange = (ev: Event): void => {
+    const t = (ev.target as HTMLElement).closest("[data-hist-range]");
+    if (!t) return;
+    const r = t.getAttribute("data-hist-range");
+    if (!r || r === histRange) return;
+    histRange = r;
+    void loadHistory();
+  };
+  root.addEventListener("click", onHistRange);
+
   /* ---------------- Resident models (read-only) ----------------
      Placement moved to the backend cards (Pete's direction,
      2026-10-16): the split is a per-backend setting, edited there.
@@ -532,16 +675,24 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
   }
 
   await load();
+  void loadHistory();
 
   // Live refresh: telemetry ages even when the user does nothing.
   const timer = window.setInterval(() => {
     if (!disposed) { void load(); }
   }, 2000);
+  // History refreshes on its own slower cadence — the recorder
+  // ticks every 15 s server-side.
+  const histTimer = window.setInterval(() => {
+    if (!disposed) { void loadHistory(); }
+  }, 30000);
 
   return () => {
     disposed = true;
     window.clearInterval(timer);
+    window.clearInterval(histTimer);
     root.removeEventListener("click", onOvGoto);
+    root.removeEventListener("click", onHistRange);
     refreshBtn?.removeEventListener("click", onRefresh);
     resetBtn?.removeEventListener("click", onResetPeaks);
     snapshotBtn?.removeEventListener("click", onSnapshot);

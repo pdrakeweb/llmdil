@@ -3,7 +3,7 @@
    layout can be evaluated without a backend. */
 
 import { walk } from "./charts";
-import type { OptimizeExperiment, OptimizePlanItem, OptimizeState, OptimizeValidation } from "./api";
+import type { GpuHistoryData, OptimizeExperiment, OptimizePlanItem, OptimizeState, OptimizeValidation } from "./api";
 import type { BackendInfo, DashboardModel, GpuInfo, WizardStepState } from "./types";
 
 export function mockBackends(): BackendInfo[] {
@@ -59,6 +59,46 @@ export function mockGpus(): GpuInfo[] {
         { model: "qwen3-8b", layers: "32/32 layers" },
       ] },
   ];
+}
+
+/** Sample-mode GPU history: two GPUs over the requested range,
+ *  with an app-off gap in the middle, no throughput before the gap
+ *  (no backend running), and the P100's power unmeasured throughout
+ *  (driver [N/A]) — the shapes the history charts must render
+ *  honestly: gaps as gaps, absent values as absent. */
+export function mockGpuHistory(range: string): GpuHistoryData {
+  const span = range === "1h" ? 3_600_000 : range === "7d" ? 7 * 24 * 3_600_000 : 24 * 3_600_000;
+  const step = Math.max(15_000, Math.round(span / 240));
+  const now = Date.now();
+  const start = now - span;
+  const mk = (seed: number, tempBase: number, utilBase: number, tpsBase: number, withPower: boolean) => {
+    const temps = walk(240, tempBase, 3, seed);
+    const utils = walk(240, utilBase, 14, seed + 1);
+    const tps = walk(240, tpsBase, 3, seed + 2);
+    const pws = walk(240, 120, 14, seed + 3);
+    const points = [];
+    for (let i = 0; i < 240; i++) {
+      const ts = start + i * step;
+      // App-off gap: no points at all for the middle fifth.
+      if (i >= 96 && i < 144) continue;
+      points.push({
+        ts_ms: ts,
+        temp_c: temps[i],
+        util_pct: Math.max(0, Math.min(100, utils[i])),
+        // No backend running before the gap: throughput unmeasured.
+        throughput_toks: i < 96 ? null : Math.max(0, tps[i]),
+        power_w: withPower ? pws[i] : null,
+      });
+    }
+    return points;
+  };
+  return {
+    range,
+    gpus: [
+      { index: 0, name: "RTX A4000", interval_ms: step, points: mk(201, 66, 55, 21, true) },
+      { index: 1, name: "Tesla P100-PCIE-16GB", interval_ms: step, points: mk(211, 58, 30, 12, false) },
+    ],
+  };
 }
 
 export function mockDashboard(): DashboardModel {

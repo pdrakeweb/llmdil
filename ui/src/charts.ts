@@ -86,8 +86,7 @@ export function meter(pct: number, width: number, height: number, color: string)
   </svg>`;
 }
 
-/** Small deterministic pseudo-random walk for mock history series. */
-export function walk(n: number, base: number, amp: number, seed: number): number[] {
+/** Small deterministic pseudo-random walk for mock history series. */export function walk(n: number, base: number, amp: number, seed: number): number[] {
   let s = seed;
   const out: number[] = [];
   let v = base;
@@ -128,4 +127,152 @@ export function fmtCount(v: number): string {
  *  computed from the same fraction so they can never disagree. */
 export function fmtPct(frac: number): string {
   return trim1(frac * 100);
+}
+
+/* ---------------- Time-series history chart ----------------
+   One line per series over a shared time axis, for the GPUs page
+   history section. Every drawn point is a real sample (or a stated
+   average of real samples, produced server-side): a null value or
+   a time gap wider than 3x the series' nominal interval breaks
+   the line — gaps are drawn as gaps, never interpolated across an
+   app-off period. The geometry is returned alongside the SVG so
+   the view's hover handler can map pointer positions back to
+   timestamps with the same scales the renderer used. */
+
+export interface HistoryChartPoint {
+  ts: number;
+  v: number | null;
+}
+
+export interface HistoryChartSeries {
+  label: string;
+  color: string;
+  /** Nominal spacing of the points (ms); wider dt = a gap. */
+  intervalMs: number;
+  points: HistoryChartPoint[];
+}
+
+export interface HistoryChartGeom {
+  w: number;
+  h: number;
+  padL: number;
+  padR: number;
+  padT: number;
+  padB: number;
+  t0: number;
+  t1: number;
+  vmin: number;
+  vmax: number;
+}
+
+export function historyChartX(g: HistoryChartGeom, ts: number): number {
+  return g.padL + ((ts - g.t0) / Math.max(1, g.t1 - g.t0)) * (g.w - g.padL - g.padR);
+}
+
+export function historyChartY(g: HistoryChartGeom, v: number): number {
+  return g.padT + (1 - (v - g.vmin) / Math.max(1e-9, g.vmax - g.vmin)) * (g.h - g.padT - g.padB);
+}
+
+export interface HistoryChartOpts {
+  w?: number;
+  h?: number;
+  /** Fixed value range (e.g. utilization 0-100); default: data range, padded. */
+  fixedRange?: [number, number];
+  /** Axis time label for a timestamp (range-dependent format). */
+  fmtTime: (ts: number) => string;
+}
+
+export function historyChart(
+  series: HistoryChartSeries[],
+  opts: HistoryChartOpts,
+): { svg: string; geom: HistoryChartGeom } {
+  const w = opts.w ?? 720;
+  const h = opts.h ?? 190;
+  const geom: HistoryChartGeom = {
+    w, h, padL: 44, padR: 10, padT: 8, padB: 20,
+    t0: 0, t1: 1, vmin: 0, vmax: 1,
+  };
+  const all = series.flatMap((s) => s.points);
+  if (!all.length) return { svg: "", geom };
+  geom.t0 = Math.min(...all.map((p) => p.ts));
+  geom.t1 = Math.max(...all.map((p) => p.ts));
+  if (geom.t1 <= geom.t0) geom.t1 = geom.t0 + 1;
+  const vals = all.map((p) => p.v).filter((v): v is number => v !== null);
+  if (opts.fixedRange) {
+    [geom.vmin, geom.vmax] = opts.fixedRange;
+  } else if (vals.length) {
+    geom.vmin = Math.min(...vals);
+    geom.vmax = Math.max(...vals);
+    const pad = (geom.vmax - geom.vmin) * 0.08 || 1;
+    geom.vmin -= pad;
+    geom.vmax += pad;
+    if (geom.vmin < 0 && Math.min(...vals) >= 0) geom.vmin = 0;
+  }
+  const plotW = w - geom.padL - geom.padR;
+  const plotH = h - geom.padT - geom.padB;
+  const gridY = [geom.vmax, (geom.vmin + geom.vmax) / 2, geom.vmin]
+    .map((v) => {
+      const y = historyChartY(geom, v);
+      return `<line x1="${geom.padL}" y1="${y.toFixed(1)}" x2="${w - geom.padR}" y2="${y.toFixed(1)}" stroke="#232a34" stroke-width="1"/>`
+        + `<text x="${geom.padL - 6}" y="${(y + 3).toFixed(1)}" text-anchor="end" font-size="10" fill="var(--text3)">${esc(trim1(v))}</text>`;
+    })
+    .join("");
+  const gridX = [geom.t0, (geom.t0 + geom.t1) / 2, geom.t1]
+    .map((t, i) => {
+      const x = historyChartX(geom, t);
+      const anchor = i === 0 ? "start" : i === 2 ? "end" : "middle";
+      return `<text x="${x.toFixed(1)}" y="${h - 5}" text-anchor="${anchor}" font-size="10" fill="var(--text3)">${esc(opts.fmtTime(Math.round(t)))}</text>`;
+    })
+    .join("");
+  const paths = series
+    .map((s) => {
+      // Split into contiguous segments: a null value (not measured
+      // at that tick) or a time gap wider than 3x the nominal
+      // interval ends the segment — the line never connects across
+      // either.
+      const segs: { x: number; y: number }[][] = [];
+      let cur: { x: number; y: number }[] = [];
+      let prevTs: number | null = null;
+      let broken = true;
+      for (const p of s.points) {
+        if (p.v === null) {
+          if (cur.length) segs.push(cur);
+          cur = [];
+          broken = true;
+          continue;
+        }
+        if (!broken && prevTs !== null && p.ts - prevTs > 3 * s.intervalMs) {
+          broken = true;
+        }
+        if (broken && cur.length) {
+          segs.push(cur);
+          cur = [];
+        }
+        broken = false;
+        cur.push({ x: historyChartX(geom, p.ts), y: historyChartY(geom, p.v) });
+        prevTs = p.ts;
+      }
+      if (cur.length) segs.push(cur);
+      return segs
+        .map((seg) => {
+          if (seg.length === 1) {
+            // An isolated point has no line to draw; mark it with
+            // a dot so a lone real sample is visible as itself.
+            return `<circle cx="${seg[0].x.toFixed(1)}" cy="${seg[0].y.toFixed(1)}" r="1.8" fill="${s.color}"/>`;
+          }
+          const d = seg
+            .map((pt, i) => `${i === 0 ? "M" : "L"} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`)
+            .join(" ");
+          return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.5"/>`;
+        })
+        .join("");
+    })
+    .join("");
+  const svg = `<svg viewBox="0 0 ${w} ${h}" style="display:block;width:100%;height:auto" aria-hidden="true">`
+    + `${gridY}${gridX}${paths}`
+    + `<line class="hist-guide" x1="0" y1="${geom.padT}" x2="0" y2="${h - geom.padB}" stroke="var(--text3)" stroke-width="1" opacity="0"/>`
+    + `<g class="hist-markers"></g>`
+    + `<rect class="hist-zone" x="${geom.padL}" y="${geom.padT}" width="${plotW}" height="${plotH}" fill="transparent"/>`
+    + `</svg>`;
+  return { svg, geom };
 }

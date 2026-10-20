@@ -9,7 +9,7 @@
 */
 
 import { trim1 } from "./charts";
-import { mockBackends, mockDashboard, mockGpus, mockOptimizeState, mockWizardSteps } from "./mock";
+import { mockBackends, mockDashboard, mockGpuHistory, mockGpus, mockOptimizeState, mockWizardSteps } from "./mock";
 import type { BackendInfo, DashboardModel, GpuInfo, Status, StatusResponse, WizardStepState } from "./types";
 
 export {}; // module marker
@@ -239,6 +239,47 @@ export async function getGpuTelemetry(): Promise<CallResult<GpuTelemetryData>> {
     }
   }
   return { data: { gpus: mockGpus(), stale: false, atMs: null, hasPolled: true, source: null, sourceError: null }, live: false };
+}
+
+/** One recorded GPU history point (get_gpu_history). throughput_toks
+ *  and power_w are null when the value was not measured at that tick
+ *  — never coerced to 0 (unknown is not zero). */
+export interface GpuHistoryPoint {
+  ts_ms: number;
+  temp_c: number;
+  util_pct: number;
+  throughput_toks: number | null;
+  power_w: number | null;
+}
+
+/** One GPU's history series: decimated points plus their nominal
+ *  spacing (the chart breaks the line where the real gap exceeds
+ *  3x interval_ms, and at null values). */
+export interface GpuHistoryGpu {
+  index: number;
+  name: string;
+  interval_ms: number;
+  points: GpuHistoryPoint[];
+}
+
+export interface GpuHistoryData {
+  range: string;
+  gpus: GpuHistoryGpu[];
+}
+
+/** get_gpu_history — recorded per-GPU history for the GPUs page
+ *  charts (temperature, utilization, throughput, power) over the
+ *  "1h" / "24h" / "7d" ranges. */
+export async function getGpuHistory(range: string): Promise<CallResult<GpuHistoryData>> {
+  if (isTauri()) {
+    try {
+      const r = await invoke<{ range: string; gpus: GpuHistoryGpu[] }>("get_gpu_history", { range });
+      return { data: { range: r.range, gpus: Array.isArray(r.gpus) ? r.gpus : [] }, live: true };
+    } catch (e) {
+      return { data: { range, gpus: [] }, live: true, error: errOf(e) };
+    }
+  }
+  return { data: mockGpuHistory(range), live: false };
 }
 
 /** Placement rows derived from the app config: one row per configured

@@ -32,7 +32,7 @@ const html = existsSync(indexHtml) ? readFileSync(indexHtml, "utf8") : "";
 check(/assets\/.*\.js/.test(html), "index.html references the JS bundle");
 
 const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
-for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_parallel", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group"]) {
+for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_parallel", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history"]) {
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
 // Cross-check: every Tauri command name the UI invokes must be
@@ -196,6 +196,21 @@ check(groupsSrc.includes("gatewaySetBackendGroup"), "Groups view moves membershi
 check(bundle.includes("#/groups"), "bundle contains the Groups route (#/groups)");
 check(readFileSync(join(root, "src", "views", "static.ts"), "utf8").includes("Edit membership"),
   "Gateway Routing card links to the Groups editor (Edit membership)");
+
+// GPU history charts: the GPUs view renders a History section with
+// a 1h/24h/7d range selector and one chart per metric, fed by
+// get_gpu_history; the chart helper breaks series at time gaps and
+// unmeasured values instead of interpolating across them.
+const gpuHistSrc = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+check(gpuHistSrc.includes('id="gpuHistory"'), "GPUs view renders the history section container");
+check(gpuHistSrc.includes("data-hist-range"), "GPUs history renders the range selector (data-hist-range)");
+check(gpuHistSrc.includes("data-hist-metric"), "GPUs history renders per-metric chart containers (data-hist-metric)");
+check(gpuHistSrc.includes("getGpuHistory(histRange)"), "GPUs history loads through get_gpu_history");
+check(bundle.includes("Throughput (tok/s)"), "bundle contains the history Throughput chart title");
+check(bundle.includes("No GPU history recorded yet"), "bundle contains the empty-history state");
+const chartsSrc = readFileSync(join(root, "src", "charts.ts"), "utf8");
+check(chartsSrc.includes("export function historyChart"), "shared historyChart renderer exists in charts.ts");
+check(chartsSrc.includes("3 * s.intervalMs"), "historyChart breaks series at gaps wider than 3x the nominal interval");
 
 check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
