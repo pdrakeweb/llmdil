@@ -55,6 +55,14 @@ export interface GpuInfo {
   vram_total_gb: number;
   temp_c: number;
   power_w: number | null;
+  /** Why power_w is null, when the payload classifies it:
+   *  "driver_not_available" — the driver answered N/A for the power
+   *  elements (a hardware state; renders as "not measured");
+   *  "field_missing" — the telemetry source carried no power element
+   *  at all (a bug state; renders as an unclaimed absence, never as
+   *  "not measured"). Undefined when power was measured, and on
+   *  payloads from before the field existed. */
+  power_absence?: "driver_not_available" | "field_missing";
   /* temp_peak_c and power_limit_w ARE carried by the live payload
      (nullable there; undefined here when the payload carries null), as
      are fan_pct / mem_util_pct (nullable per GPU — e.g. fanless P100s

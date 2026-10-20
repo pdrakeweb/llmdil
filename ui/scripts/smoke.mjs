@@ -197,6 +197,19 @@ check(bundle.includes("#/groups"), "bundle contains the Groups route (#/groups)"
 check(readFileSync(join(root, "src", "views", "static.ts"), "utf8").includes("Edit membership"),
   "Gateway Routing card links to the Groups editor (Edit membership)");
 
+// GPU power absence states: the telemetry payload classifies a null
+// power reading as the driver answering N/A (hardware state) or the
+// field missing from the source output (bug state). "Not measured"
+// is the driver state's wording only — the GPUs card and the
+// dashboard render it solely under that classification — and a
+// measured draw renders with its limit alongside.
+check(logsSrc.includes('power_absence === "driver_not_available"'), "GPUs view gates the 'not measured' power value on the driver-N/A state");
+check(logsSrc.includes("/ ${trim1(g.power_limit_w)} W"), "GPUs card renders the power draw with the limit alongside");
+check(readFileSync(join(root, "src", "api.ts"), "utf8").includes("power_absence: s.power_absence ?? undefined"),
+  "telemetry adapt maps power_absence from the payload");
+check(readFileSync(join(root, "src", "views", "dashboard.ts"), "utf8").includes('power_absence === "driver_not_available" ? "not measured" : "—"'),
+  "dashboard power value gates 'not measured' on the driver-N/A state");
+
 check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
 check(bundle.includes("__TAURI__"), "bundle contains the Tauri detection hook");
