@@ -257,6 +257,9 @@ check(cardFnSrc.includes('["Tool calls"'), "Details carries the tool-call state"
 check(cardFnSrc.includes('["Offload Layers"'), "Details carries the Offload Layers field");
 check(cardFnSrc.includes("Latest log lines"), "Details carries the latest-log-lines block");
 check(backendSrc.includes("openDetails.has(row.id)"), "log tails fetch for backends whose Details are open");
+check(backendSrc.includes("const closeEditSession"), "a successful Edit save closes the whole Edit surface (closeEditSession)");
+check((backendSrc.split("closeEditSession();").length - 1) >= 3, "both Edit saves and the Edit toggle close through closeEditSession");
+check(backendSrc.includes('if (mres === "failed") { paint(); return; }'), "a failed model assignment keeps the Edit surface open with its input intact");
 check(bundle.includes("View all logs"), "bundle contains the View all logs menu label");
 check(bundle.includes("Latest log lines"), "bundle contains the Latest log lines caption");
 

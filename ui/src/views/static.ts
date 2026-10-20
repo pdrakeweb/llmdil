@@ -3431,6 +3431,15 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     placeExcluded.clear();
     paint();
   };
+  /** Close the whole Edit session (the Edit panel and the
+   *  Placement section). A successful Save closes the surface,
+   *  returning the card to its normal state (Pete's report,
+   *  2026-10-20: Save flags left the edit form open — most
+   *  visibly the advanced editor, whose save deliberately kept
+   *  the panel up). A failed save never calls this: the surface
+   *  stays open with the operator's input intact and the error
+   *  on the card. */
+  const closeEditSession = (): void => { closeFlagsForm(); closePlaceForm(); };
   const openPlaceForm = (row: BackendRow): void => {
     if (placeFor === row.id) { closePlaceForm(); return; }
     placeFor = row.id;
@@ -3911,7 +3920,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       // any part of it is open.
       const row = lastRows.find((r) => r.id === id);
       if (!row) return;
-      if (flagsFor === id || placeFor === id) { closeFlagsForm(); closePlaceForm(); }
+      if (flagsFor === id || placeFor === id) closeEditSession();
       else { openFlagsForm(row); openPlaceForm(row); }
       return;
     }
@@ -4048,11 +4057,11 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         } else if (r.data.persisted === false) {
           // Code-review 5.2: a non-persisted save is not a save.
           msgs.set(id, { text: `${modelNote}Flags applied for this session only — they were not saved and will be lost when the app restarts.`, err: true });
-          flagsFor = null;
+          closeEditSession();
           await load();
         } else {
           msgs.set(id, { text: `${modelNote}Flags saved (context ${fmtCount(flagsCtx)}, batch ${fmtCount(flagsBatch)}) — applies on next start.`, err: false });
-          flagsFor = null;
+          closeEditSession();
           await load();
         }
       } finally {
@@ -4133,7 +4142,10 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       // Save the advanced editor's text (tracker #60). The op
       // journals like the other flags writes and applies on the
       // next start; nothing restarts. Warnings ride the result
-      // and never block — the panel adopts the server's list.
+      // and never block (the operator saw the same list live
+      // while typing; the server's list replaces the draft's in
+      // wire state). On success the Edit surface closes like the
+      // structured Save's — see closeEditSession.
       inFlight.add(id);
       paint();
       try {
@@ -4160,8 +4172,14 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
             : "Raw flags unchanged."),
           err: false,
         });
+        // A successful save closes the Edit surface (Pete's
+        // report, 2026-10-20) — the advanced editor previously
+        // stayed open on the adopted text by design, which is
+        // the behavior Pete filed against. The adopted text and
+        // warnings above keep the wire state coherent; reopening
+        // Edit reseeds from the saved row regardless.
+        closeEditSession();
         await load();
-        schedulePredictedLookup();
       } finally {
         inFlight.delete(id);
         if (!disposed) paint();
