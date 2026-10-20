@@ -17,7 +17,7 @@
 
 import {
   gatewayCreateGroup, gatewayDeleteGroup, gatewaySetBackendGroup,
-  getBackends, getGatewayConfig, getModels,
+  getBackends, getGatewayConfig, getModels, optimizeMeasureBackend,
 } from "../api";
 import type {
   BackendRow, GatewayConfigData, GatewayGroup, ModelRow,
@@ -43,6 +43,15 @@ function emptyHtml(text: string): string {
   return `<div class="card" style="color:var(--text2)">${esc(text)}</div>`;
 }
 
+/** Elapsed for an in-flight job, in the Optimize view's format
+ *  ("45 s", "2 min 5 s"): the predicted-throughput refresh's
+ *  Measuring state ticks in this shape. */
+function fmtElapsed(secs: number): string {
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return m > 0 ? `${m} min ${s} s` : `${s} s`;
+}
+
 export function renderGroups(): string {
   return `${topbar("Groups", `<a class="btn" href="#/gateway">${icon("gateway")} Gateway</a>
     <button class="btn" data-groups-new>${icon("plus")} New group</button>`)}
@@ -65,6 +74,33 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
   const openMenus = new Set<string>();
   /** Group names whose Delete button is armed for confirmation. */
   const confirmDelete = new Set<string>();
+  /** Backends whose predicted-throughput refresh (a Measure
+   *  run started from the mini card) is in flight, by start
+   *  time; state lives outside the repainted DOM so poll
+   *  repaints keep the Measuring state. */
+  const predictRefreshing = new Map<string, number>();
+  /** The last refresh failure per backend, rendered on its
+   *  card until a refresh succeeds — a failure is visible on
+   *  the card, never silent. */
+  const predictNotes = new Map<string, string>();
+  /** The 1 s elapsed ticker for in-flight prediction
+   *  refreshes (the Optimize view's pattern). */
+  let predictTimer: number | null = null;
+  const stopPredictTicker = (): void => {
+    if (predictTimer !== null) { window.clearInterval(predictTimer); predictTimer = null; }
+  };
+  const startPredictTicker = (): void => {
+    if (predictTimer !== null) return;
+    predictTimer = window.setInterval(() => {
+      if (!predictRefreshing.size) { stopPredictTicker(); return; }
+      root.querySelectorAll<HTMLElement>("[data-group-pred-elapsed]").forEach((el) => {
+        const startedAt = predictRefreshing.get(el.getAttribute("data-group-pred-elapsed") ?? "");
+        if (startedAt !== undefined) {
+          el.textContent = fmtElapsed(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+        }
+      });
+    }, 1000);
+  };
   /** The move in flight, applied optimistically over the last
    *  fetched membership until the op lands. */
   let pending: { id: string; to: string | null } | null = null;
@@ -144,9 +180,32 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
       </div>` : ""}
     </div>`
       : "";
-    const predicted = b.predicted && b.predicted.predicted_per_second !== null
-      ? `<div class="group-mini-line">Predicted throughput: <span style="color:var(--text)">${trim1(b.predicted.predicted_per_second)} tok/s</span><span class="info-tip" title="${esc(predictedCardTip(b.predicted))}">${icon("info")}</span></div>`
-      : "";
+    // Predicted throughput renders on EVERY card (Pete,
+    // 2026-10-20): the figure when an exact measurement
+    // resolves, the explicit "Not measured" empty state when
+    // none does (never 0, never an omitted line), and the
+    // Refresh control beside it — the same Measure dispatch
+    // the Backends card's Refresh makes. Measuring requires a
+    // running backend (the measure op's own rule), so a
+    // stopped backend's control is disabled with the reason
+    // as its title.
+    const fig = b.predicted && b.predicted.predicted_per_second !== null
+      ? b.predicted.predicted_per_second
+      : null;
+    const pStarted = predictRefreshing.get(b.id);
+    const pCanMeasure = b.state === "running";
+    const pTitle = pStarted !== undefined
+      ? "Measurement running"
+      : !pCanMeasure
+        ? "Backend is not running — start it to refresh the prediction"
+        : "Refresh the prediction — runs the standardized benchmark";
+    const pBtn = `<button class="btn" data-group-predict-refresh="${esc(b.id)}" style="padding:2px 8px;font-size:11px" title="${esc(pTitle)}" aria-label="Refresh predicted throughput for ${esc(b.id)}"${pStarted !== undefined || !pCanMeasure ? " disabled" : ""}>${icon("restart")} Refresh</button>`;
+    const pNote = predictNotes.get(b.id);
+    const predicted = `<div class="group-mini-line">Predicted throughput: ${pStarted !== undefined
+      ? `Measuring <span data-group-pred-elapsed="${esc(b.id)}">${fmtElapsed(Math.max(0, Math.floor((Date.now() - pStarted) / 1000)))}</span>`
+      : fig !== null
+        ? `<span style="color:var(--text)">${trim1(fig)} tok/s</span><span class="info-tip" title="${esc(predictedCardTip(b.predicted!))}">${icon("info")}</span>`
+        : `<span style="color:var(--text3)">Not measured</span>`} ${pBtn}</div>${pNote ? `<div class="group-mini-line" style="color:var(--err)">${esc(pNote)}</div>` : ""}`;
     const isPending = pending !== null && pending.id === b.id;
     return `<div class="group-mini-card" draggable="true" data-group-card="${esc(b.id)}" data-group-lane="${esc(laneKey)}">
       <div class="group-mini-head"><span class="dot ${dotClass(b.state)}"></span><span class="group-mini-id">${esc(b.id)}</span><span style="color:var(--text3);font-family:var(--mono);font-size:12px">:${b.port}</span>${menu}</div>
@@ -265,6 +324,37 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
     paintStatus();
   }
 
+  /** Refresh one card's predicted throughput: a Measure run
+   *  against the running backend through the existing Optimize
+   *  job machinery (the Measure profile — the one whose entries
+   *  feed the prediction; never the Estimate profile). The
+   *  card shows the Measuring state while the invoke is
+   *  outstanding, updates from the refreshed rows on
+   *  completion, and carries the failure on the card when the
+   *  run fails or is refused. */
+  async function doPredictRefresh(id: string): Promise<void> {
+    if (predictRefreshing.has(id)) return;
+    const row = byId().get(id);
+    if (!row || row.state !== "running") return;
+    predictRefreshing.set(id, Date.now());
+    predictNotes.delete(id);
+    paint();
+    startPredictTicker();
+    const r = await optimizeMeasureBackend(id);
+    predictRefreshing.delete(id);
+    if (!predictRefreshing.size) stopPredictTicker();
+    if (disposed) return;
+    if (r.error) {
+      predictNotes.set(id, r.error === "measurement cancelled"
+        ? "Prediction refresh cancelled."
+        : `Prediction refresh failed — ${r.error}`);
+      paint();
+      return;
+    }
+    predictNotes.delete(id);
+    await load();
+  }
+
   async function doMove(id: string, to: string | null): Promise<void> {
     openMenus.clear();
     const current = membershipsOf(id);
@@ -334,6 +424,8 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
       paintForm();
       return;
     }
+    const pr = t.closest("[data-group-predict-refresh]") as HTMLElement | null;
+    if (pr) { void doPredictRefresh(pr.getAttribute("data-group-predict-refresh")!); return; }
     if (t.closest("[data-group-create]")) { void doCreate(); return; }
     if (t.closest("[data-group-create-cancel]")) {
       formOpen = false;
@@ -437,5 +529,6 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
   return () => {
     disposed = true;
     window.clearInterval(timer);
+    stopPredictTicker();
   };
 }

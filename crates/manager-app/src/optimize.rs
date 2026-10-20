@@ -1801,6 +1801,22 @@ struct BenchmarkTarget {
     driver_versions: Vec<String>,
 }
 
+/// Whether a consultation is currently running against
+/// `backend_id`: its task record exists and is still Running.
+/// Consultations record their target backend in the task detail
+/// (op_optimize_consult); the abort slot alone cannot say which
+/// backend a running consultation is using.
+fn consult_running_on(
+    tasks: &HashMap<String, crate::TaskRecord>,
+    backend_id: &str,
+) -> bool {
+    tasks.values().any(|t| {
+        t.kind == "optimize-consult"
+            && t.status == TaskStatus::Running
+            && t.detail.get("backend").and_then(Value::as_str) == Some(backend_id)
+    })
+}
+
 /// Resolve the target of a benchmark job (measurement or
 /// estimate): the backend's config, its current measurement
 /// fingerprint, its model id, and the resolved fingerprint
@@ -1886,6 +1902,23 @@ pub async fn op_optimize_measure_backend(
             "measurement start: backend '{backend_id}' model '{model_id}' fingerprint {fingerprint}"
         ),
     );
+    // Contention honesty: the consultation and GPU-job families
+    // hold separate slots — no rule serializes a measurement
+    // against a consultation (the decision is Pete's and has
+    // not been taken). When the running consultation targets
+    // this same backend, the log says so: the figures are then
+    // measured under contention and read accordingly.
+    {
+        let tasks = state.tasks.lock().await;
+        if consult_running_on(&tasks, &backend_id) {
+            opt_log1(
+                state,
+                &format!(
+                    "contention note: a consultation is running on backend '{backend_id}' concurrently with this measurement — no serialization rule is in force, so the figures are measured under contention"
+                ),
+            );
+        }
+    }
     let task_id = state
         .record_task(
             "optimize-measure",
@@ -2506,5 +2539,49 @@ mod tests {
         assert!(plan_item_predicted(&cfg, &it, &store, &[]).is_none());
         let it = item(PlanKind::Advice, "planner", json!({}));
         assert!(plan_item_predicted(&cfg, &it, &store, &[]).is_none());
+    }
+
+    fn task(kind: &str, status: TaskStatus, backend: Option<&str>) -> crate::TaskRecord {
+        crate::TaskRecord {
+            id: "t".to_string(),
+            kind: kind.to_string(),
+            status,
+            detail: match backend {
+                Some(b) => json!({ "backend": b }),
+                None => json!({}),
+            },
+            created_ms: 0,
+        }
+    }
+
+    /// The contention note at measurement start fires only for
+    /// a consultation that is still running against the SAME
+    /// backend: a finished consultation, another job kind, a
+    /// different backend, or a record without a backend detail
+    /// is not contention with this measurement.
+    #[test]
+    fn consult_running_on_matches_only_the_running_consult_for_the_backend() {
+        let mut tasks = HashMap::new();
+        tasks.insert(
+            "a".to_string(),
+            task("optimize-consult", TaskStatus::Running, Some("planner")),
+        );
+        assert!(consult_running_on(&tasks, "planner"));
+        assert!(!consult_running_on(&tasks, "coder"));
+        tasks.insert(
+            "a".to_string(),
+            task("optimize-consult", TaskStatus::Done, Some("planner")),
+        );
+        assert!(!consult_running_on(&tasks, "planner"));
+        tasks.insert(
+            "a".to_string(),
+            task("optimize-measure", TaskStatus::Running, Some("planner")),
+        );
+        assert!(!consult_running_on(&tasks, "planner"));
+        tasks.insert(
+            "a".to_string(),
+            task("optimize-consult", TaskStatus::Running, None),
+        );
+        assert!(!consult_running_on(&tasks, "planner"));
     }
 }

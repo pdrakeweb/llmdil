@@ -339,6 +339,40 @@ const renderModelsSrc = staticSrc.split("export function renderModels")[1]?.spli
 check(renderModelsSrc.includes('id="modelAddForm"') && !renderModelsSrc.includes("addModelId"),
   "Models shell renders only the add-form host (the form itself appears on open)");
 
+// Predicted throughput field + refresh (Oct 20, 2026): the
+// field renders on EVERY backend card (the Backends stat tile
+// and the Groups mini card), with an explicit "Not measured"
+// empty state when no exact measurement resolves — design
+// §7's absent-tile behavior superseded for cards by Pete's
+// direction that the field be present even when empty. The
+// Refresh control beside it dispatches the existing Optimize
+// Measure job (the Measure profile, whose entries feed the
+// prediction), never the Estimate profile, and renders
+// disabled with the not-running reason for a stopped backend;
+// while a refresh runs, the field carries a Measuring elapsed
+// state. With no consultation/measurement serialization rule
+// in force, a measurement that starts while a consultation
+// targets the same backend logs the overlap (contention
+// honesty) — pinned at the Rust source.
+check(bundle.includes("predict-refresh"), "bundle contains the predicted-throughput Refresh control");
+check(staticSrc.includes('data-back-act="predict-refresh"'), "Backends card renders the predicted-throughput Refresh control");
+check(staticSrc.includes("Not measured</span>"), "Backends card renders the predicted-throughput empty state (Not measured)");
+check(staticSrc.includes('act === "predict-refresh"'), "Backends view handles the predicted-throughput Refresh action");
+check(groupsSrc.includes("data-group-predict-refresh"), "Groups card renders the predicted-throughput Refresh control");
+check(groupsSrc.includes("Not measured"), "Groups card renders the predicted-throughput empty state (Not measured)");
+check(groupsSrc.includes("doPredictRefresh"), "Groups view handles the predicted-throughput Refresh action");
+check(staticSrc.includes("optimizeMeasureBackend(id)"), "Backends Refresh dispatches the Optimize Measure job");
+check(groupsSrc.includes("optimizeMeasureBackend(id)"), "Groups Refresh dispatches the Optimize Measure job");
+check(!staticSrc.includes("optimizeEstimateBackend"), "Backends view never dispatches the Estimate profile (predictions feed from Measure only)");
+check(!groupsSrc.includes("optimizeEstimateBackend"), "Groups view never dispatches the Estimate profile (predictions feed from Measure only)");
+check(staticSrc.includes("start it to refresh the prediction"), "Backends Refresh states the not-running reason in place");
+check(groupsSrc.includes("start it to refresh the prediction"), "Groups Refresh states the not-running reason in place");
+check(staticSrc.includes("data-pred-elapsed"), "Backends card renders the refresh Measuring elapsed state");
+check(groupsSrc.includes("data-group-pred-elapsed"), "Groups card renders the refresh Measuring elapsed state");
+const optimizeRsSrc = readFileSync(join(root, "..", "crates", "manager-app", "src", "optimize.rs"), "utf8");
+check(optimizeRsSrc.includes("contention note"), "measurement start logs a contention note when a consultation targets the same backend");
+check(optimizeRsSrc.includes("fn consult_running_on"), "the contention match is a named predicate in the measure path");
+
 // Settings-pages sweep (Oct 19, 2026): every stored value rendered
 // on a settings surface carries a working control wired to its real
 // save path. The compiled/source fragments of those controls must
