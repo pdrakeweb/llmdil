@@ -739,17 +739,22 @@ function modelFileShortName(path: string): string {
   return path ? baseName(path).replace(/\.gguf$/i, "") : "no model assigned";
 }
 
-/** Options for a backend card's model dropdown: every registered
- *  model, labeled by short name only, with the one the backend
- *  currently serves selected. When the backend's model_file matches
- *  no registered model (a custom path), a leading option carries the
- *  current file's short name so the control shows the true state;
- *  choosing it is a no-op. */
-function modelOptions(b: BackendRow, models: ModelRow[]): string {
+/** Options for a backend's model dropdown: every registered
+ *  model, labeled by short name only. With no `selectedId`, the
+ *  model the backend currently serves is selected; the Edit
+ *  panel passes its draft id instead, so a poll repaint renders
+ *  the operator's unsaved choice, not the saved model (the draft
+ *  is what Save will apply). When the backend's model_file matches
+ *  no registered model (a custom path), a leading option carries
+ *  the current file's short name so the control shows the true
+ *  state; choosing it is a no-op. */
+function modelOptions(b: BackendRow, models: ModelRow[], selectedId?: string): string {
   const matched = models.some((m) => sameModelFile(b.model_file, m.gguf_path));
-  const lead = matched ? "" : `<option value="" selected>${esc(modelFileShortName(b.model_file))} (current)</option>`;
-  return lead + models.map((m) =>
-    `<option value="${esc(m.id)}"${sameModelFile(b.model_file, m.gguf_path) ? " selected" : ""}>${esc(modelShortName(m))}</option>`).join("");
+  const lead = matched ? "" : `<option value=""${selectedId === undefined || selectedId === "" ? " selected" : ""}>${esc(modelFileShortName(b.model_file))} (current)</option>`;
+  return lead + models.map((m) => {
+    const sel = selectedId !== undefined ? m.id === selectedId : sameModelFile(b.model_file, m.gguf_path);
+    return `<option value="${esc(m.id)}"${sel ? " selected" : ""}>${esc(modelShortName(m))}</option>`;
+  }).join("");
 }
 
 /* ---------------- Gateway activation plan ----------------
@@ -2053,8 +2058,12 @@ function applyFlagsField(
  *  state (llama.cpp's default, auto). advanced/rawText/rawWarnings
  *  carry the advanced flags editor's draft (tracker #60): while
  *  advanced is on, the raw text is the single source of truth and
- *  the structured fields are inert. */
-export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null; parallel: number | null; advanced: boolean; rawText: string; rawWarnings: FlagWarningLike[] }
+ *  the structured fields are inert. editModelId is the Edit
+ *  panel's model draft: the registered model chosen in the
+ *  panel's Model select ("" when the backend's file matches no
+ *  registered model), applied through model_assign only when the
+ *  panel saves — the card face carries no model control. */
+export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null; parallel: number | null; advanced: boolean; rawText: string; rawWarnings: FlagWarningLike[]; editModelId: string }
 
 /** State for the in-card Placement form (tensor split editing,
  *  moved here from the GPUs page — Pete's direction, 2026-10-16),
@@ -2159,8 +2168,7 @@ function backendCard(
   const advancedMenu = `<div class="advanced-menu-wrap" data-back-menu-wrap>
       <button class="btn icon-only" data-back-menu="${esc(b.id)}" aria-haspopup="menu" aria-expanded="${menuOpen}" title="Advanced options" aria-label="Advanced options for ${esc(b.id)}"${dis}>${icon("menu")}</button>
       ${menuOpen ? `<div class="advanced-menu" role="menu" aria-label="Advanced options for ${esc(b.id)}">
-        ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="flags" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Edit flags</button>
-        <button class="menu-item" role="menuitem" data-back-menu-item data-back-act="placement" data-back-id="${esc(b.id)}"${dis}>${icon("layers")} Placement</button>` : ""}
+        ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="flags" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Edit</button>` : ""}
         <button class="menu-item" role="menuitem" data-back-menu-item data-back-act="argv" data-back-id="${esc(b.id)}"${dis}>${icon("logs")} Launch command</button>
         ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="toolcall" data-back-id="${esc(b.id)}"${dis}>${icon("wrench")} Test tool calls</button>` : ""}
         <a class="menu-item" role="menuitem" data-back-menu-item href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1">${icon("logs")} View all logs</a>
@@ -2446,25 +2454,42 @@ function backendCard(
   // raw flags (the string the structured decoders read); text
   // edits sync to the wire-level draft, so poll repaints keep the
   // text and the warning list renders live under the box.
+  // The Edit panel's Model field (Pete's report, 2026-10-20):
+  // the model is chosen here, as a draft, and applied through
+  // model_assign only when the panel saves — the card face no
+  // longer carries a model control that assigns on selection.
+  // The select renders the DRAFT as selected (modelOptions'
+  // selectedId), so a poll repaint shows the operator's unsaved
+  // choice. Rendered in both panel variants: model_assign
+  // preserves an advanced backend's raw flags verbatim
+  // (flags_untouched), so the field is safe in advanced mode too.
+  const editModelHtml = flags ? `<div style="margin-top:10px">
+      <label style="font-size:12px;color:var(--text2);display:block">Model<span class="info-tip" title="The model this backend serves. The change applies only when you save from this panel; a running backend picks the new model up on its next start.">${icon("info")}</span>
+        <span style="display:flex;gap:6px;margin-top:4px">
+          <select data-edit-model="${esc(b.id)}" style="${SELECT_STYLE};flex:1;min-width:0" aria-label="Model for ${esc(b.id)}"${dis}>${modelOptions(b, models, flags.editModelId)}</select>
+        </span></label>
+    </div>` : "";
   const flagsHtml = flags ? (flags.advanced ? `<div class="backend-form-panel flags-panel">
-      <div style="font-size:12px;font-weight:600">${icon("gear")} Flags for ${esc(b.id)}</div>
+      <div style="font-size:12px;font-weight:600">${icon("pencil")} Edit ${esc(b.id)}</div>
+      ${editModelHtml}
       <div style="font-size:12px;color:var(--text2);margin-top:6px">Mode: Advanced<span class="info-tip" title="In advanced mode the text below is the backend's launch flags, edited directly. Context, batch, offload, MTP and placement are all set by this string; the structured form and its controls are disabled for this backend until you switch back. Warnings never block a save — unknown flags pass through to llama-server, which decides.">${icon("info")}</span></div>
       <textarea data-flags-raw="${esc(b.id)}" rows="4" spellcheck="false" style="width:100%;margin-top:8px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 10px;font-family:var(--mono);font-size:12px" aria-label="Raw flags for ${esc(b.id)}">${esc(flags.rawText)}</textarea>
       <div data-flags-warnings>${flagsRawWarningsHtml(flags.rawWarnings)}</div>
       <div style="font-size:12px;color:var(--text2);margin-top:6px">Saved to the configuration immediately; applies on the backend's next start.</div>
       <div data-predicted-slot>${predictedHtml}</div>
-      <div class="card-actions"><button class="btn" data-back-act="flags-raw-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save flags</button>
+      <div class="card-actions"><button class="btn" data-back-act="flags-raw-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save</button>
         <button class="btn" data-back-act="flags-mode-structured" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Use structured form</button>
         <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
     </div>` : `<div class="backend-form-panel flags-panel">
-      <div style="font-size:12px;font-weight:600">${icon("gear")} Flags for ${esc(b.id)}</div>
+      <div style="font-size:12px;font-weight:600">${icon("pencil")} Edit ${esc(b.id)}</div>
+      ${editModelHtml}
       ${flagsCtxBatchHtml({ ctx: flags.ctx, batch: flags.batch, ctxMax: flags.ctxMax, fieldAttr: "data-flags-field", disabled: inFlight.has(b.id) })}
       ${parallelHtml}
       ${offloadHtml}
       ${mtpHtml}
-      ${flagsRatedLineHtml({ ctxMax: flags.ctxMax, modelId: flags.modelId, savedText: "Saved to the configuration immediately; applies on the backend's next start. Tensor split is set by the Placement form on this card." })}
+      ${flagsRatedLineHtml({ ctxMax: flags.ctxMax, modelId: flags.modelId, savedText: "Saved to the configuration immediately; applies on the backend's next start. Tensor split is set in the Placement section below." })}
       <div data-predicted-slot>${predictedHtml}</div>
-      <div class="card-actions"><button class="btn" data-back-act="flags-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save flags</button>
+      <div class="card-actions"><button class="btn" data-back-act="flags-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save</button>
         <button class="btn" data-back-act="flags-mode-advanced" data-back-id="${esc(b.id)}"${dis}>${icon("pencil")} Edit flags as text</button>
         <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
     </div>`) : "";
@@ -2530,10 +2555,13 @@ function backendCard(
         : "";
   // Metric strip (Pete's card redesign): one row of labeled
   // single-value tiles — Model, Context, GPU RAM, System RAM, KV
-  // cache. No sentences; the model tile carries the model select
-  // (configured) or the file name (orphan), as before.
+  // cache. No sentences; the model tile is a VALUE (the served
+  // model's short name, the file path in its tooltip) — the old
+  // inline select assigned on selection with no save, so model
+  // changes moved into the Edit panel (Pete's report, 2026-10-20).
+  const matchedModel = models.find((m) => sameModelFile(b.model_file, m.gguf_path));
   const modelTileVal = b.configured
-    ? `<select class="backend-model-select" data-back-model="${esc(b.id)}" style="${SELECT_STYLE};width:100%;min-width:0"${dis}>${modelOptions(b, models)}</select>`
+    ? `<span class="backend-model-file" title="${esc(b.model_file)}">${esc(matchedModel ? modelShortName(matchedModel) : modelFileShortName(b.model_file))}</span>`
     : `<span class="backend-model-file" title="${esc(b.model_file)}">${esc(b.model_file)}</span>`;
   const stripTiles: [string, string][] = [["Model", modelTileVal]];
   // Advanced flags mode (tracker #60): the structured readouts the
@@ -2754,7 +2782,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       <div class="grid2">${sorted(sec.rows).map((row) => {
         const mdl = flagsFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const flagsArg: FlagsDraft | null = flagsFor === row.id
-          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers, offloadPendingLayers: offloadPending?.backendId === row.id ? offloadPending.layers : null, mtpPosition: flagsMtpPosition, parallel: flagsParallel, advanced: row.flags_advanced === true, rawText: flagsRawText, rawWarnings: flagsRawWarnings }
+          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers, offloadPendingLayers: offloadPending?.backendId === row.id ? offloadPending.layers : null, mtpPosition: flagsMtpPosition, parallel: flagsParallel, advanced: row.flags_advanced === true, rawText: flagsRawText, rawWarnings: flagsRawWarnings, editModelId: flagsEditModelId }
           : null;
         const pmdl = placeFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const placeArg: PlaceCardState | null = placeFor === row.id
@@ -2884,13 +2912,19 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   /* ---------------- Flags editor ----------------
    * Rendered INSIDE the backend's own card (backendCard, from the
    * draft state below) — the previous placement above the list read
-   * as if nothing had happened when Edit flags was clicked. The
+   * as if nothing had happened when Edit was clicked. The
    * draft values live outside the repainted DOM, so the poll repaint
    * cannot clobber an open form: paint() re-renders the form from
    * this state, and field events sync back into it. */
   let flagsFor: string | null = null;
   let flagsCtx = 32768;
   let flagsBatch = 512;
+  /** The Edit panel's model draft: the registered model chosen
+   *  in the panel's Model select ("" when the open backend's file
+   *  matches no registered model). Synced on the select's change
+   *  event and applied through model_assign only when the panel
+   *  saves; closing the panel discards it. */
+  let flagsEditModelId = "";
   /** Offload slider draft position for the open flags form (MoE
    *  layers on system RAM); null when the backend's model is not
    *  offload-capable. */
@@ -2982,6 +3016,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const openFlagsForm = (row: BackendRow): void => {
     if (flagsFor === row.id) { closeFlagsForm(); return; }
     flagsFor = row.id;
+    flagsEditModelId = lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path))?.id ?? "";
     flagsCtx = row.n_ctx ?? 32768;
     flagsBatch = row.n_batch ?? 512;
     flagsOffloadLayers = row.offload ? row.offload.layers : null;
@@ -3016,6 +3051,19 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   };
   root.addEventListener("change", syncFlagsDraft);
   root.addEventListener("input", syncFlagsDraft);
+  /** The Edit panel's Model select sync: the choice is a DRAFT,
+   *  recorded here and applied through model_assign only when
+   *  the panel saves (Pete's report, 2026-10-20 — the card-face
+   *  dropdown this replaces assigned on selection). No repaint:
+   *  the select already shows the chosen option, and the draft
+   *  re-renders it on the next poll repaint. */
+  const syncEditModel = (ev: Event): void => {
+    const t = ev.target as HTMLSelectElement;
+    if (!t.hasAttribute("data-edit-model")) return;
+    if (t.getAttribute("data-edit-model") !== flagsFor) return;
+    flagsEditModelId = t.value;
+  };
+  root.addEventListener("change", syncEditModel);
   /** The advanced editor's textarea sync (tracker #60): keep the
    *  draft text and its live warnings in wire state. The warning
    *  list updates in place — no repaint, so typing is never
@@ -3282,6 +3330,36 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     }
   };
   root.addEventListener("change", commitParallel);
+
+  /** Apply the Edit panel's model draft through model_assign,
+   *  carrying the backend's current tensor split so the
+   *  assignment changes the model only (the split is the
+   *  Placement section's own save). Returns "none" when the
+   *  draft names the model the backend already serves (or no
+   *  registered model), "saved" when the assignment landed, and
+   *  "failed" when the op rejected it — the error is on the
+   *  card and the caller keeps the panel open, saving nothing
+   *  else, so a failed model change never reads as a partial
+   *  save. model_assign itself is atomic (it commits only after
+   *  placement, validation, journal, and save all succeed) and
+   *  reports flags_untouched for advanced-flags backends. */
+  const saveEditModel = async (id: string): Promise<"none" | "saved" | "failed"> => {
+    const row = lastRows.find((r) => r.id === id);
+    const model = lastModels.find((m) => m.id === flagsEditModelId);
+    if (!row || !model || sameModelFile(row.model_file, model.gguf_path)) return "none";
+    const cfgR = await getBackendConfig(id);
+    const cfgFlags = cfgR.data?.flags as { tensor_split?: unknown } | undefined;
+    const split = Array.isArray(cfgFlags?.tensor_split)
+      && cfgFlags.tensor_split.every((x) => typeof x === "number" && Number.isFinite(x))
+      ? (cfgFlags.tensor_split as number[]) : [];
+    const r = await modelAssign(id, model.id, split);
+    if (disposed) return "failed";
+    if (r.error) {
+      msgs.set(id, { text: `Model change failed: ${r.error}`, err: true });
+      return "failed";
+    }
+    return "saved";
+  };
 
   /* ---------------- Placement form ----------------
    * Rendered INSIDE the backend's own card (backendCard), like the
@@ -3772,19 +3850,19 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     }
 
     if (act === "flags") {
+      // The one Edit entry point: it opens the whole Edit
+      // session — the Edit panel (model, flags) and the
+      // Placement section below it — or closes the session when
+      // any part of it is open.
       const row = lastRows.find((r) => r.id === id);
-      if (row) openFlagsForm(row);
+      if (!row) return;
+      if (flagsFor === id || placeFor === id) { closeFlagsForm(); closePlaceForm(); }
+      else { openFlagsForm(row); openPlaceForm(row); }
       return;
     }
 
     if (act === "flags-cancel") {
       closeFlagsForm();
-      return;
-    }
-
-    if (act === "placement") {
-      const row = lastRows.find((r) => r.id === id);
-      if (row) openPlaceForm(row);
       return;
     }
 
@@ -3892,22 +3970,39 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     }
 
     if (act === "flags-save") {
-      const r = await updateBackendFlags(id, flagsCtx, flagsBatch);
-      if (disposed) return;
-      if (r.error) {
-        // Keep the form open with the error on the card — closing on
-        // a rejected value would read as if the save had happened.
-        msgs.set(id, { text: `Flags not saved: ${r.error}`, err: true });
-        paint();
-      } else if (r.data.persisted === false) {
-        // Code-review 5.2: a non-persisted save is not a save.
-        msgs.set(id, { text: "Flags applied for this session only — they were not saved and will be lost when the app restarts.", err: true });
-        flagsFor = null;
-        await load();
-      } else {
-        msgs.set(id, { text: `Flags saved (context ${fmtCount(flagsCtx)}, batch ${fmtCount(flagsBatch)}) — applies on next start.`, err: false });
-        flagsFor = null;
-        await load();
+      // The Edit panel's Save: the model draft applies first —
+      // a failed assignment saves nothing else and keeps the
+      // panel open — then the ctx/batch draft goes through the
+      // flags save. The card note names both halves of the
+      // outcome, so a flags failure after a landed model change
+      // never reads as a full save or a full failure.
+      inFlight.add(id);
+      paint();
+      try {
+        const mres = await saveEditModel(id);
+        if (disposed) return;
+        if (mres === "failed") { paint(); return; }
+        const modelNote = mres === "saved" ? `Model set to ${flagsEditModelId}. ` : "";
+        const r = await updateBackendFlags(id, flagsCtx, flagsBatch);
+        if (disposed) return;
+        if (r.error) {
+          // Keep the form open with the error on the card — closing on
+          // a rejected value would read as if the save had happened.
+          msgs.set(id, { text: mres === "saved" ? `Model set to ${flagsEditModelId} — flags not saved: ${r.error}` : `Flags not saved: ${r.error}`, err: true });
+          paint();
+        } else if (r.data.persisted === false) {
+          // Code-review 5.2: a non-persisted save is not a save.
+          msgs.set(id, { text: `${modelNote}Flags applied for this session only — they were not saved and will be lost when the app restarts.`, err: true });
+          flagsFor = null;
+          await load();
+        } else {
+          msgs.set(id, { text: `${modelNote}Flags saved (context ${fmtCount(flagsCtx)}, batch ${fmtCount(flagsBatch)}) — applies on next start.`, err: false });
+          flagsFor = null;
+          await load();
+        }
+      } finally {
+        inFlight.delete(id);
+        if (!disposed) paint();
       }
       return;
     }
@@ -3987,20 +4082,27 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       inFlight.add(id);
       paint();
       try {
+        // The Edit panel's model draft rides this Save too, with
+        // the structured Save's rule: a failed assignment saves
+        // nothing else and keeps the panel open.
+        const mres = await saveEditModel(id);
+        if (disposed) return;
+        if (mres === "failed") { paint(); return; }
+        const modelNote = mres === "saved" ? `Model set to ${flagsEditModelId}. ` : "";
         const text = flagsRawText;
         const r = await setBackendRawFlags(id, text.trim() === "" ? null : text);
         if (disposed) return;
         if (r.error) {
-          msgs.set(id, { text: `Flags not saved: ${r.error}`, err: true });
+          msgs.set(id, { text: mres === "saved" ? `Model set to ${flagsEditModelId} — flags not saved: ${r.error}` : `Flags not saved: ${r.error}`, err: true });
           paint();
           return;
         }
         flagsRawText = r.data.raw_flags ?? "";
         flagsRawWarnings = r.data.warnings ?? [];
         msgs.set(id, {
-          text: r.data.changed
+          text: modelNote + (r.data.changed
             ? "Raw flags saved — applies on next start."
-            : "Raw flags unchanged.",
+            : "Raw flags unchanged."),
           err: false,
         });
         await load();
@@ -4140,44 +4242,6 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       if (!disposed) paint();
     }
   };
-  /** Model dropdown change: assign the chosen model to the backend
-   *  through model_assign, carrying the backend's current tensor
-   *  split so the assignment changes the model only. The card note
-   *  tells the operator a restart applies it to a running backend. */
-  const onModelChange = async (ev: Event): Promise<void> => {
-    const sel = (ev.target as HTMLElement).closest("[data-back-model]") as HTMLSelectElement | null;
-    if (!sel || sel.disabled) return;
-    const backendId = sel.getAttribute("data-back-model") ?? "";
-    const modelId = sel.value;
-    if (!backendId || !modelId) return;
-    const row = lastRows.find((b) => b.id === backendId);
-    const model = lastModels.find((m) => m.id === modelId);
-    if (!row || !model || sameModelFile(row.model_file, model.gguf_path)) return;
-    inFlight.add(backendId);
-    paint();
-    try {
-      const cfgR = await getBackendConfig(backendId);
-      const flags = cfgR.data?.flags as { tensor_split?: unknown } | undefined;
-      const split = Array.isArray(flags?.tensor_split)
-        && flags.tensor_split.every((x) => typeof x === "number" && Number.isFinite(x))
-        ? (flags.tensor_split as number[]) : [];
-      const r = await modelAssign(backendId, modelId, split);
-      if (disposed) return;
-      if (r.error) {
-        msgs.set(backendId, { text: `Model change failed: ${r.error}`, err: true });
-      } else {
-        msgs.set(backendId, {
-          text: row.state === "running" || row.state === "starting"
-            ? `Model set to ${modelId}. Restart the backend to use it.`
-            : `Model set to ${modelId}.`,
-          err: false,
-        });
-      }
-    } finally {
-      inFlight.delete(backendId);
-      if (!disposed) await load();
-    }
-  };
   const onKeyDown = (ev: KeyboardEvent): void => {
     if (ev.key === "Escape" && openMenus.size) {
       openMenus.clear();
@@ -4186,7 +4250,6 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   };
   root.addEventListener("click", onClick);
   root.addEventListener("click", onOvGoto);
-  root.addEventListener("change", onModelChange);
   root.addEventListener("keydown", onKeyDown);
 
   await load();
@@ -4202,8 +4265,8 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     window.clearInterval(timer);
     root.removeEventListener("click", onClick);
     root.removeEventListener("click", onOvGoto);
-    root.removeEventListener("change", onModelChange);
     root.removeEventListener("keydown", onKeyDown);
+    root.removeEventListener("change", syncEditModel);
     root.removeEventListener("change", syncFlagsDraft);
     root.removeEventListener("input", syncFlagsDraft);
     root.removeEventListener("input", syncOffloadDraft);
