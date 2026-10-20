@@ -35,6 +35,33 @@ const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join
 for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_parallel", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group"]) {
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
+// Nav completeness: the sidebar is generated from the ROUTES array
+// in src/main.ts, so every route's hash and label must survive into
+// the built bundle. Nothing else here renders or enumerates the
+// nav, so a dropped or renamed route would pass the whole harness
+// while the installed app silently loses a page (the Optimize nav
+// item was reported missing against v0.1.42; that instance was a
+// stale running process, but the harness gap is real). Parse the
+// array from the source so this tracks the source of truth instead
+// of a second hand-maintained list.
+const shellSrc = readFileSync(join(root, "src", "main.ts"), "utf8");
+const routesBlock = shellSrc.split("const ROUTES")[1]?.split("];")[0] ?? "";
+const navRoutes = [...routesBlock.matchAll(/\{\s*hash:\s*"([^"]+)",\s*label:\s*"([^"]+)"/g)]
+  .map((m) => ({ hash: m[1], label: m[2] }));
+check(navRoutes.length > 0, `parsed nav routes from ROUTES in src/main.ts (${navRoutes.length})`);
+function escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+for (const r of navRoutes) {
+  check(bundle.includes(r.hash), `bundle contains the nav route hash "${r.hash}"`);
+  check(bundle.includes(r.label), `bundle contains the nav route label "${r.label}"`);
+  // The bound entry is the part that can actually fail: the bare
+  // hash also appears in the router's dispatch switch in main.ts
+  // and labels appear in view titles, so either string alone
+  // survives a route dropped from ROUTES. Only the compiled
+  // object literal carrying hash and label together proves the
+  // nav data itself survived the build.
+  const entry = new RegExp(`hash\\s*:\\s*"${escapeRegExp(r.hash)}"\\s*,\\s*label\\s*:\\s*"${escapeRegExp(r.label)}"`);
+  check(entry.test(bundle), `bundle contains the compiled ROUTES entry for "${r.hash}" (${r.label})`);
+}
 // Cross-check: every Tauri command name the UI invokes must be
 // registered in src-tauri's generate_handler! list. A mismatch is
 // silent at build time and only fails at runtime in the installed app
