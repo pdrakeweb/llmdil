@@ -391,6 +391,9 @@ pending-work form (gateway up only).
 
 Per-GPU samples: `index`, `name`, `ts`, `utilization_pct`,
 `vram_used_mib`, `vram_total_mib`, `temp_c`, `power_w` (nullable),
+`power_absence` (nullable: `driver_not_available` when the driver
+answered N/A for the power elements, `field_missing` when the source
+output carried no power element at all; null when power was measured),
 `stale`, `down`, `source` (`nvml` | `nvidiasmi`), `mem_util_pct`,
 `fan_pct`, `power_limit_w`, `temp_peak_c`; plus per-process attribution:
 `gpu_index`, `pid`, `name`, `vram_mib` (**null when not measured** —

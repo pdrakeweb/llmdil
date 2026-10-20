@@ -83,6 +83,26 @@ pub struct GpuInfo {
     pub source: TelemetrySourceKind,
 }
 
+/// Why a sample carries no power reading, when it does not.
+///
+/// `power_w: None` alone conflates two different states: the driver
+/// answering `N/A` for the power elements (a hardware state — the
+/// card/driver mode exposes no power sensor) and the source document
+/// carrying no power element at all (a bug state — parser and driver
+/// schema have drifted apart, as they did at nvidia-smi v570). The
+/// store records which one occurred on every sample so the two are
+/// distinguishable in the payload, in snapshot exports, and in logs;
+/// `None` here means power was measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerAbsence {
+    /// Power elements were present and the driver answered `N/A`.
+    DriverNotAvailable,
+    /// No power element existed in the source document at all (or
+    /// none carried a usable value): a parser/source mismatch.
+    FieldMissing,
+}
+
 /// One telemetry sample for one GPU.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuSample {
@@ -99,6 +119,13 @@ pub struct GpuSample {
     /// [`smi`]); both cases must degrade to None, never fail the
     /// sample or the source.
     pub power_w: Option<f32>,
+    /// Why [`Self::power_w`] is `None`, when it is: the driver
+    /// answered `N/A` ([`PowerAbsence::DriverNotAvailable`]) or the
+    /// source carried no power element at all
+    /// ([`PowerAbsence::FieldMissing`]). `None` when power was
+    /// measured. Absent on older payloads (defaults to `None`).
+    #[serde(default)]
+    pub power_absence: Option<PowerAbsence>,
     /// True when no successful poll within [`STALE_AFTER_SECS`].
     pub stale: bool,
     /// True when this GPU was absent from the latest successful poll
@@ -161,6 +188,7 @@ impl GpuSample {
             vram_total_mib,
             temp_c,
             power_w: Some(power_w),
+            power_absence: None,
             stale: false,
             down: false,
             source,

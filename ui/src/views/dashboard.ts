@@ -197,12 +197,15 @@ function gpuStripCard(g: GpuInfo): string {
   // Peak temperature rides the value's tooltip, never inline text.
   const peakTip = g.temp_peak_c !== undefined ? ` title="Peak ${trim1(g.temp_peak_c)} °C"` : "";
   // Power: a thin meter of draw against the limit when both exist;
-  // draw alone renders as a value only; unmeasured power is
-  // "not measured" (never "N/A") and gets no sparkline either.
+  // draw alone renders as a value only; power the driver reports as
+  // N/A is "not measured" (never "N/A") and gets no sparkline
+  // either. An absence the payload does not classify as the driver
+  // state (a missing field — a bug state) renders as an em dash: it
+  // must not borrow the hardware state's wording.
   const powerMeter = g.power_w != null && g.power_limit_w !== undefined && g.power_limit_w > 0
     ? `<div class="mrow"><span></span>${meter((g.power_w / g.power_limit_w) * 100, 220, 6, C.green)}</div>` : "";
   const powerVal = g.power_w == null
-    ? "not measured"
+    ? g.power_absence === "driver_not_available" ? "not measured" : "—"
     : g.power_limit_w !== undefined ? `${trim1(g.power_w)}/${trim1(g.power_limit_w)} W` : `${trim1(g.power_w)} W`;
   // Sparklines collapse into one labeled Trends expandable (each
   // series keyed by its metric name); open state is module-level so
@@ -339,7 +342,7 @@ function consoleView(m: DashboardModel): string {
       <td>${meter(g.util_pct, 120, 8, C.blue)}</td>
       <td>${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GB</td>
       <td>${meter(vramPct, 120, 8, C.purple)}</td>
-      <td>${g.temp_c}°C</td><td>${g.power_w == null ? "not measured" : `${trim1(g.power_w)} W`}</td></tr>`;
+      <td>${g.temp_c}°C</td><td>${g.power_w == null ? (g.power_absence === "driver_not_available" ? "not measured" : "—") : `${trim1(g.power_w)} W`}</td></tr>`;
   }).join("");
   return `<div class="card" style="margin-bottom:12px"><div class="sec-title">Services</div>
     <table class="tbl"><thead><tr><th>Service</th><th>Port</th><th>Model</th><th>Health</th><th>Rate</th><th>Trend</th></tr></thead>

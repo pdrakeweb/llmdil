@@ -116,6 +116,11 @@ interface GpuSample {
   vram_total_mib: number;
   temp_c: number;
   power_w: number | null;
+  /** Why power_w is null, classified by the telemetry source:
+   *  "driver_not_available" (driver answered N/A) or "field_missing"
+   *  (no power element in the source output). Null/absent when power
+   *  was measured, and absent on older payloads. */
+  power_absence?: "driver_not_available" | "field_missing" | null;
   stale: boolean;
   /** True when the GPU was absent from the latest polls after being
    *  reported before (e.g. fallen off the bus): the store retains it
@@ -199,6 +204,7 @@ export async function getGpuTelemetry(): Promise<CallResult<GpuTelemetryData>> {
         temp_c: s.temp_c,
         temp_peak_c: s.temp_peak_c ?? undefined,
         power_w: s.power_w,
+        power_absence: s.power_absence ?? undefined,
         util_spark: Array.isArray(s.util_spark) && s.util_spark.length >= 2 ? s.util_spark : undefined,
         temp_spark: Array.isArray(s.temp_spark) && s.temp_spark.length >= 2 ? s.temp_spark : undefined,
         power_spark: Array.isArray(s.power_spark) && s.power_spark.length >= 2 ? s.power_spark : undefined,

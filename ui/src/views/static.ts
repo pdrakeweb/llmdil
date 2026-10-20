@@ -257,9 +257,16 @@ function gpuCard(g: GpuInfo, expanded: Set<string>, modelRows: GpuModelRow[] = [
     ? `<div style="margin-top:8px;font-size:11px;color:var(--text3);display:grid;gap:4px">
         ${g.models.map((m) => `<div>${icon("layers")} ${esc(m.model)} \u00b7 ${esc(m.layers)}</div>`).join("")}
       </div>` : "";
-  // Power null -> the tile is ABSENT (principle 13), never "N/A".
+  // Power: a measured draw renders with the limit alongside (the
+  // dashboard idiom). A null draw renders the "not measured" value
+  // only when the payload records the driver-N/A state
+  // (power_absence) — that wording belongs to the hardware state. A
+  // missing field (bug state) or an unclassified absence keeps the
+  // row absent (principle 13), never borrowing it.
   const powerRow = g.power_w != null
-    ? `<div class="mrow"><span class="mlabel">Power</span><span class="mval"${g.power_limit_w !== undefined ? ` title="Limit ${trim1(g.power_limit_w)} W"` : ""}>${trim1(g.power_w)} W</span></div>${powerSpark}` : "";
+    ? `<div class="mrow"><span class="mlabel">Power</span><span class="mval">${g.power_limit_w !== undefined ? `${trim1(g.power_w)} / ${trim1(g.power_limit_w)} W` : `${trim1(g.power_w)} W`}</span></div>${powerSpark}`
+    : g.power_absence === "driver_not_available"
+    ? `<div class="mrow"><span class="mlabel">Power</span><span class="mval">not measured</span></div>` : "";
   return `<div class="card" id="card-gpu-${esc(g.id)}">
       <div class="gpu-head">${dot(g.status === "down" ? "err" : g.status)} ${esc(g.name)}${pci}${staleChip}${downChip}
         <span class="spacer" style="flex:1"></span>${driver}</div>
@@ -356,7 +363,7 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
             : g.status === "down" ? ovStatusBtn("err", "err", `card-gpu-${g.id}`, `${g.name}: down — go to card`)
             : g.status === "degraded" || g.status === "starting" ? ovStatusBtn("warn", "warn", `card-gpu-${g.id}`, `${g.name}: ${g.status} — go to card`)
             : ovStatusBtn("idle", "pause", `card-gpu-${g.id}`, `${g.name}: ${g.status} — go to card`);
-          return `<div class="ov-row">${btn}<span class="ov-name">${esc(g.name)}</span><span class="ov-dim">${g.util_pct}%</span><span class="ov-dim">${fmtGb(g.vram_used_gb)} / ${fmtGb(g.vram_total_gb)} GiB</span><span class="ov-dim">${g.temp_c} \u00b0C</span><span class="ov-dim">${g.power_w == null ? "N/A" : `${g.power_w} W`}</span><span class="ov-dim">${(g.processes ?? []).length}</span></div>`;
+          return `<div class="ov-row">${btn}<span class="ov-name">${esc(g.name)}</span><span class="ov-dim">${g.util_pct}%</span><span class="ov-dim">${fmtGb(g.vram_used_gb)} / ${fmtGb(g.vram_total_gb)} GiB</span><span class="ov-dim">${g.temp_c} \u00b0C</span><span class="ov-dim">${g.power_w == null ? (g.power_absence === "driver_not_available" ? "not measured" : "N/A") : `${g.power_w} W`}</span><span class="ov-dim">${(g.processes ?? []).length}</span></div>`;
         }).join("")}</div>` : "";
     }
     const b = root.querySelector("#gpuBody");
