@@ -311,6 +311,12 @@ pub struct ProcessStatus {
     /// (re)start.
     pub restarts: u32,
     pub uptime: Option<Duration>,
+    /// Why the process last failed, when the supervisor recorded
+    /// a classified reason (today: the GPU-unavailable class,
+    /// [`DEVICE_UNAVAILABLE_REASON`]). `None` for ordinary exits
+    /// and for processes that have not failed.
+    #[serde(default)]
+    pub failure_reason: Option<String>,
 }
 
 /// Send the graceful-termination signal. Unix: SIGTERM. Windows v1: no-op —
@@ -353,6 +359,33 @@ fn append_capped(line: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {
     }
 }
 
+/// The failure reason recorded when a backend's own output shows
+/// its GPU was busy or unavailable while it loaded. One canonical
+/// string: process status carries it, and the crash-restart
+/// policy keys the no-retry rule off its presence. It is the same
+/// failure class the start preflight refuses as GPU unavailable,
+/// seen from the other side of the spawn.
+pub const DEVICE_UNAVAILABLE_REASON: &str =
+    "GPU unavailable: the device was busy or unavailable while the backend loaded";
+
+/// Output lines that mean the CUDA device itself refused the
+/// process — the busy-or-unavailable class from the planner-moe
+/// diagnosis (a card exclusively held by another process, or
+/// offline after a thermal event). Deliberately NOT the plain
+/// out-of-memory line: an oversized allocation on a healthy
+/// device is a sizing failure, which the start preflight's VRAM
+/// gate owns.
+fn device_unavailable_signature(line: &str) -> bool {
+    line.contains("CUDA-capable device(s) is/are busy or unavailable")
+        || line.contains("cudaMemGetInfo failed")
+}
+
+/// Shared cell the output readers set when a captured line
+/// matches [`device_unavailable_signature`]; first match wins.
+/// Read by the spawn watchdog (to terminate the load) and by the
+/// supervisor at reap time (to record the failure class).
+type FatalFlag = Arc<std::sync::Mutex<Option<String>>>;
+
 /// Push one completed captured line into the ring. Lossy UTF-8 (a
 /// non-UTF8 byte sequence must not kill capture), trailing CR stripped
 /// (the LF was already consumed by the splitter), truncation marked.
@@ -361,6 +394,7 @@ fn push_captured_line(
     which: LogStream,
     bytes: &[u8],
     truncated: bool,
+    fatal: Option<&FatalFlag>,
 ) {
     let text = String::from_utf8_lossy(bytes);
     let line = text.strip_suffix('\r').unwrap_or(&text);
@@ -369,6 +403,15 @@ fn push_captured_line(
     } else {
         line.to_string()
     };
+    if let Some(flag) = fatal {
+        if device_unavailable_signature(&line) {
+            if let Ok(mut slot) = flag.lock() {
+                if slot.is_none() {
+                    *slot = Some(DEVICE_UNAVAILABLE_REASON.to_string());
+                }
+            }
+        }
+    }
     if let Ok(mut r) = ring.lock() {
         r.push(LogRecord::new(which, line));
     }
@@ -378,6 +421,7 @@ fn spawn_reader<R>(
     stream: R,
     which: LogStream,
     ring: Arc<Mutex<RingBuffer<LogRecord>>>,
+    fatal: Option<FatalFlag>,
 ) -> JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -401,7 +445,13 @@ where
                     for (i, &b) in data.iter().enumerate() {
                         if b == b'\n' {
                             append_capped(&mut line, &data[start..i], &mut truncated);
-                            push_captured_line(&ring, which, &line, truncated);
+                            push_captured_line(
+                                &ring,
+                                which,
+                                &line,
+                                truncated,
+                                fatal.as_ref(),
+                            );
                             line.clear();
                             truncated = false;
                             start = i + 1;
@@ -415,9 +465,59 @@ where
         // EOF with an unterminated tail: emit what was captured (the
         // previous read_until loop did the same via its final read).
         if !line.is_empty() || truncated {
-            push_captured_line(&ring, which, &line, truncated);
+            push_captured_line(&ring, which, &line, truncated, fatal.as_ref());
         }
     })
+}
+
+/// How long after spawn the device watchdog stays armed. The
+/// failure it guards against is llama.cpp's fit-retry loop,
+/// which burns ~10.6 minutes before giving up; the window covers
+/// that plus slow cold loads with margin, then stands down — a
+/// process still loading after 20 minutes is not in the retry
+/// loop this guards, and a serving process is never killed by it.
+const DEVICE_WATCHDOG_WINDOW: Duration = Duration::from_secs(20 * 60);
+
+/// Terminate a freshly spawned backend whose output reports the
+/// CUDA device busy/unavailable, instead of letting llama.cpp's
+/// fit-retry polling loop run ~10 minutes producing nothing
+/// (planner-moe diagnosis addendum, Oct 20, 2026). Polls the
+/// shared fatal flag the output readers set; on a match it kills
+/// the process tree by pid — the child handle belongs to the
+/// supervisor's live map, and this task is deliberately decoupled
+/// from it, so termination does not wait for any app-level reap
+/// cadence. Exits when the process dies or the window lapses.
+fn spawn_device_watchdog(
+    id: String,
+    pid: u32,
+    fatal: FatalFlag,
+    ring: Arc<Mutex<RingBuffer<LogRecord>>>,
+) {
+    tokio::spawn(async move {
+        let deadline = Instant::now() + DEVICE_WATCHDOG_WINDOW;
+        loop {
+            let hit = fatal.lock().map(|f| f.is_some()).unwrap_or(false);
+            if hit {
+                tracing::warn!(
+                    process = %id,
+                    pid,
+                    "terminating backend load: GPU unavailable signature in its output"
+                );
+                if let Ok(mut r) = ring.lock() {
+                    r.push(LogRecord::new(
+                        LogStream::Stderr,
+                        format!("[supervisor] terminated: {DEVICE_UNAVAILABLE_REASON}"),
+                    ));
+                }
+                kill_pid_tree(pid);
+                return;
+            }
+            if Instant::now() >= deadline || !pid_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
 }
 
 /// A supervised child process: one live OS process with captured output.
@@ -430,6 +530,11 @@ pub struct SupervisedProcess {
     adopted_pid: Option<u32>,
     readers: Vec<JoinHandle<()>>,
     log_ring: Arc<Mutex<RingBuffer<LogRecord>>>,
+    /// Fatal-output reason recorded by this process's readers
+    /// (see [`DEVICE_UNAVAILABLE_REASON`]); empty for adopted
+    /// processes (no captured output) and for spawns the device
+    /// watchdog does not guard.
+    fatal: FatalFlag,
     state: ProcessState,
     restart_attempts: u32,
     started_at: Option<Instant>,
@@ -517,12 +622,45 @@ impl SupervisedProcess {
             }
         }
 
+        // Backend spawns (low_priority) are guarded by the device
+        // watchdog: their output readers watch for the CUDA
+        // busy/unavailable signature, and the watchdog terminates
+        // a load that hits it instead of letting llama.cpp's
+        // fit-retry loop burn ~10 minutes. Other supervised
+        // processes get neither the flag nor the watchdog.
+        let fatal: FatalFlag = Arc::new(std::sync::Mutex::new(None));
+        let reader_fatal: Option<FatalFlag> = if low_priority {
+            Some(Arc::clone(&fatal))
+        } else {
+            None
+        };
+        if low_priority {
+            if let Some(pid) = child.id() {
+                spawn_device_watchdog(
+                    id.to_string(),
+                    pid,
+                    Arc::clone(&fatal),
+                    Arc::clone(&log_ring),
+                );
+            }
+        }
+
         let mut readers = Vec::with_capacity(2);
         if let Some(out) = child.stdout.take() {
-            readers.push(spawn_reader(out, LogStream::Stdout, Arc::clone(&log_ring)));
+            readers.push(spawn_reader(
+                out,
+                LogStream::Stdout,
+                Arc::clone(&log_ring),
+                reader_fatal.clone(),
+            ));
         }
         if let Some(err) = child.stderr.take() {
-            readers.push(spawn_reader(err, LogStream::Stderr, Arc::clone(&log_ring)));
+            readers.push(spawn_reader(
+                err,
+                LogStream::Stderr,
+                Arc::clone(&log_ring),
+                reader_fatal,
+            ));
         }
 
         Ok(Self {
@@ -531,6 +669,7 @@ impl SupervisedProcess {
             adopted_pid: None,
             readers,
             log_ring,
+            fatal,
             state: ProcessState::Running,
             restart_attempts: 0,
             started_at: Some(Instant::now()),
@@ -551,6 +690,7 @@ impl SupervisedProcess {
             adopted_pid: Some(pid),
             readers: Vec::new(),
             log_ring,
+            fatal: Arc::new(std::sync::Mutex::new(None)),
             state: ProcessState::Running,
             restart_attempts: 0,
             started_at: None,
@@ -757,6 +897,14 @@ impl SupervisedProcess {
 
     pub fn log_ring(&self) -> Arc<Mutex<RingBuffer<LogRecord>>> {
         Arc::clone(&self.log_ring)
+    }
+
+    /// The fatal-output reason this process's readers recorded,
+    /// if any (see [`DEVICE_UNAVAILABLE_REASON`]). Set while the
+    /// process may still be running — the device watchdog acts on
+    /// it before the exit is reaped.
+    pub fn fatal_reason(&self) -> Option<String> {
+        self.fatal.lock().ok().and_then(|slot| slot.clone())
     }
 
     fn record_exit(&mut self, status: std::process::ExitStatus, state: ProcessState) {
@@ -1034,6 +1182,13 @@ pub struct Supervisor {
     probes: HashMap<String, Arc<dyn HealthProbe>>,
     trackers: HashMap<String, HealthTracker>,
     failed_ids: HashSet<String>,
+    /// Classified failure reasons by id, recorded at reap time
+    /// from the process's fatal-output flag (today: the
+    /// GPU-unavailable class). Keyed presence is what
+    /// `crash_delay`'s no-retry rule checks; cleared by a manual
+    /// spawn and by `unregister_spec`, like the other per-id
+    /// runtime history.
+    failure_reasons: HashMap<String, String>,
     crash_counts: HashMap<String, u32>,
     backoff: BackoffPolicy,
 }
@@ -1048,6 +1203,7 @@ impl Supervisor {
             probes: HashMap::new(),
             trackers: HashMap::new(),
             failed_ids: HashSet::new(),
+            failure_reasons: HashMap::new(),
             crash_counts: HashMap::new(),
             backoff,
         }
@@ -1081,6 +1237,7 @@ impl Supervisor {
             // re-added under the same id must start clean, not inherit a
             // stale "failed" state and restart count.
             self.failed_ids.remove(id);
+            self.failure_reasons.remove(id);
             self.crash_counts.remove(id);
             self.trackers.remove(id);
             self.dead_rings.remove(id);
@@ -1141,6 +1298,10 @@ impl Supervisor {
             self.archived_rings.insert(id.to_string(), previous);
         }
         self.failed_ids.remove(id);
+        // A manual spawn is a fresh attempt: any classified
+        // failure (and its no-retry mark) from the previous run
+        // no longer applies.
+        self.failure_reasons.remove(id);
         self.crash_counts.insert(id.to_string(), 0);
         self.trackers.entry(id.to_string()).or_default();
         Ok(())
@@ -1164,6 +1325,7 @@ impl Supervisor {
             self.archived_rings.insert(id.to_string(), previous);
         }
         self.failed_ids.remove(id);
+        self.failure_reasons.remove(id);
         self.trackers.entry(id.to_string()).or_default();
         Ok(())
     }
@@ -1239,10 +1401,18 @@ impl Supervisor {
                 .get_mut(&id)
                 .and_then(|p| p.poll_exited().ok().flatten());
             if let Some(status) = exited {
+                // Capture the fatal-output classification before
+                // the process leaves the live map: it becomes the
+                // recorded failure reason (and arms the
+                // crash-restart no-retry rule for its class).
+                let fatal = self.live.get(&id).and_then(|p| p.fatal_reason());
                 if let Some(proc) = self.live.remove(&id) {
                     self.dead_rings.insert(id.clone(), proc.log_ring());
                 }
                 self.failed_ids.insert(id.clone());
+                if let Some(reason) = fatal {
+                    self.failure_reasons.insert(id.clone(), reason);
+                }
                 tracing::warn!(
                     process = id,
                     ?status,
@@ -1261,12 +1431,28 @@ impl Supervisor {
         if !self.specs.contains_key(id) {
             return Err(SupervisorError::NotFound(id.to_string()));
         }
+        // A start that failed with the GPU-unavailable class is
+        // never re-attempted automatically: the device does not
+        // come back on a backoff timer, and each re-attempt would
+        // burn the same ~10 minutes in llama.cpp's fit-retry loop.
+        // The operator's remedy is the GPU, then a manual start
+        // (which clears the mark). Other failure classes use the
+        // budget below as before.
+        if self.failure_reasons.contains_key(id) {
+            return Err(SupervisorError::RestartBudgetExhausted(id.to_string()));
+        }
         let attempts = self.crash_counts.get(id).copied().unwrap_or(0);
         if !self.backoff.allows_retry(attempts) {
             return Err(SupervisorError::RestartBudgetExhausted(id.to_string()));
         }
         self.crash_counts.insert(id.to_string(), attempts + 1);
         Ok(self.backoff.delay_for_attempt(attempts))
+    }
+
+    /// The classified failure reason recorded for `id`, if any
+    /// (see [`DEVICE_UNAVAILABLE_REASON`]).
+    pub fn failure_reason(&self, id: &str) -> Option<&str> {
+        self.failure_reasons.get(id).map(|s| s.as_str())
     }
 
     /// Reset the crash budget for `id` after a healthy observation.
@@ -1306,6 +1492,7 @@ impl Supervisor {
                         adopted: proc.adopted_pid.is_some(),
                         restarts,
                         uptime: proc.uptime(),
+                        failure_reason: proc.fatal_reason(),
                     }
                 } else if self.failed_ids.contains(id) {
                     ProcessStatus {
@@ -1315,6 +1502,7 @@ impl Supervisor {
                         adopted: false,
                         restarts,
                         uptime: None,
+                        failure_reason: self.failure_reasons.get(id).cloned(),
                     }
                 } else {
                     ProcessStatus {
@@ -1324,6 +1512,7 @@ impl Supervisor {
                         adopted: false,
                         restarts,
                         uptime: None,
+                        failure_reason: None,
                     }
                 }
             })
@@ -2670,6 +2859,94 @@ mod tests {
         .unwrap();
         assert!(proc.is_running());
         proc.kill().await.unwrap();
+    }
+
+    #[test]
+    fn device_unavailable_signature_matches_only_the_device_class() {
+        // The two incident lines (planner-moe, Oct 20, 2026).
+        assert!(device_unavailable_signature(
+            "ggml_backend_cuda_buffer_type_alloc_buffer: allocating 598.50 MiB on device 0: \
+             cudaMalloc failed: CUDA-capable device(s) is/are busy or unavailable"
+        ));
+        assert!(device_unavailable_signature(
+            "common_fit_params: cudaMemGetInfo failed (CUDA-capable device(s) is/are busy \
+             or unavailable), returning 0/0"
+        ));
+        // A sizing failure on a healthy device is NOT this class:
+        // the start preflight's VRAM gate owns it.
+        assert!(!device_unavailable_signature(
+            "ggml_backend_cuda_buffer_type_alloc_buffer: allocating 598.50 MiB on device 0: \
+             cudaMalloc failed: out of memory"
+        ));
+        assert!(!device_unavailable_signature(
+            "llama_init_from_model: failed to initialize the context: failed to allocate \
+             buffer for rs cache"
+        ));
+        assert!(!device_unavailable_signature(
+            "srv    load_model: initializing, n_slots = 4"
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn device_unavailable_output_terminates_load_and_blocks_retry() {
+        let mut sup = Supervisor::new(test_policy());
+        let mut spec = sh_spec(
+            "gpu-dead",
+            "echo 'ggml_backend_cuda_buffer_type_alloc_buffer: allocating 598.50 MiB on \
+             device 0: cudaMalloc failed: CUDA-capable device(s) is/are busy or \
+             unavailable'; exec sleep 60",
+        );
+        spec.low_priority = true;
+        sup.register_spec(spec);
+        sup.spawn_backend("gpu-dead").await.unwrap();
+        let pid = sup
+            .status()
+            .into_iter()
+            .find(|s| s.id == "gpu-dead")
+            .and_then(|s| s.pid)
+            .unwrap();
+        // The watchdog terminates the load promptly on its own:
+        // the 60 s sleeper is gone within seconds, with no reap
+        // or app loop driving the kill. A SIGKILLed child is a
+        // zombie until reaped and still answers signal-0 liveness,
+        // so termination is read from the /proc state.
+        let terminated = |pid: u32| -> bool {
+            if !pid_alive(pid) {
+                return true;
+            }
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|s| s.contains(") Z "))
+                .unwrap_or(false)
+        };
+        wait_for(|| terminated(pid), Duration::from_secs(10)).await;
+        let dead = sup.reap_exited();
+        assert_eq!(dead.len(), 1);
+        let st = sup
+            .status()
+            .into_iter()
+            .find(|s| s.id == "gpu-dead")
+            .unwrap();
+        assert_eq!(st.state, ProcessState::Failed);
+        assert_eq!(
+            st.failure_reason.as_deref(),
+            Some(DEVICE_UNAVAILABLE_REASON)
+        );
+        assert_eq!(
+            sup.failure_reason("gpu-dead"),
+            Some(DEVICE_UNAVAILABLE_REASON)
+        );
+        // The automatic-retry policy refuses this class outright,
+        // with budget to spare (test policy allows 3 retries):
+        // the device does not come back on a backoff timer.
+        assert!(matches!(
+            sup.crash_delay("gpu-dead"),
+            Err(SupervisorError::RestartBudgetExhausted(_))
+        ));
+        // A manual spawn is a fresh attempt and clears the mark.
+        sup.spawn_backend("gpu-dead").await.unwrap();
+        assert_eq!(sup.failure_reason("gpu-dead"), None);
+        sup.stop("gpu-dead", false).await.unwrap();
     }
 
     #[tokio::test]
