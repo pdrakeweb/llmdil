@@ -4424,12 +4424,13 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
   </div>`;
 }
 
-export function renderModels(): string {
-  return `${topbar("Models")}
-  <div class="view"><div id="modelBanner"></div>
-  <div id="modelOverview"></div>
-  <div id="modelBody">${loadingHtml("Loading models…")}</div>
-  <div class="card"><h3>${icon("box")} Add a model<span class="info-tip" title="The model is added enabled, with no pinned SHA-256 — its downloads run unverified until a hash is recorded in the configuration.">${icon("info")}</span></h3>
+/** The Add Model form card, painted into #modelAddForm by
+ *  wireModels when the topbar's Add model button opens it (the
+ *  Add Backend form's host pattern). Closed = the host is empty,
+ *  so a successful submit clears and hides the form by emptying
+ *  the host; the page's pre-open state is the topbar button. */
+function modelAddFormHtml(): string {
+  return `<div class="card"><h3>${icon("box")} Add a model<span class="info-tip" title="The model is added enabled, with no pinned SHA-256 — its downloads run unverified until a hash is recorded in the configuration.">${icon("info")}</span></h3>
     <div style="display:grid;grid-template-columns:1fr 2fr;gap:10px;margin-top:10px">
       <label style="font-size:12px;color:var(--text2)">Model id<br>
         <input id="addModelId" type="text" placeholder="my-model-7b" style="${SELECT_STYLE};width:100%"></label>
@@ -4453,9 +4454,18 @@ export function renderModels(): string {
           <input id="addModelMoeDefault" type="text" inputmode="numeric" placeholder="16" style="${SELECT_STYLE};width:100%"></label>
       </div>
     </div>
-    <div class="card-actions"><button class="btn" id="addModelBtn">${icon("plus")} Add model</button></div>
+    <div class="card-actions"><button class="btn" id="addModelBtn">${icon("check")} Create model</button>
+      <button class="btn icon-only" id="addModelCancel" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
     <div id="addModelMsg" style="font-size:12px;margin-top:6px;display:none"></div>
-  </div></div>`;
+  </div>`;
+}
+
+export function renderModels(): string {
+  return `${topbar("Models", `<button class="btn" id="modelAdd" title="Add model">${icon("plus")} Add model</button>`)}
+  <div class="view"><div id="modelBanner"></div>
+  <div id="modelOverview"></div>
+  <div id="modelBody">${loadingHtml("Loading models…")}</div>
+  <div id="modelAddForm"></div></div>`;
 }
 
 export async function wireModels(root: HTMLElement): Promise<() => void> {
@@ -4554,7 +4564,7 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       lastRows = [];
       if (mov) mov.innerHTML = "";
       b.innerHTML = emptyHtml(r.live
-        ? "No models are configured. Add one with the form below."
+        ? "No models are configured. Add one with the Add model button."
         : "No model data in sample mode.");
       syncPoll();
       return;
@@ -4774,62 +4784,82 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
   root.addEventListener("click", onClick);
   root.addEventListener("click", onOvGoto);
 
-  const optToggle = root.querySelector("#addModelOptToggle") as HTMLButtonElement | null;
-  optToggle?.addEventListener("click", () => {
-    const box = root.querySelector("#addModelOptional") as HTMLElement | null;
-    if (!box) return;
-    const open = box.style.display === "none";
-    box.style.display = open ? "" : "none";
-    optToggle.setAttribute("aria-expanded", String(open));
-    optToggle.innerHTML = icon(open ? "chevD" : "chevR");
-  });
-
-  const addBtn = root.querySelector("#addModelBtn") as HTMLButtonElement | null;
-  addBtn?.addEventListener("click", async () => {
-    const msg = root.querySelector("#addModelMsg") as HTMLElement | null;
-    // The message row stays hidden until its first write.
-    if (msg) msg.style.display = "";
-    const val = (sel: string): string => (root.querySelector(sel) as HTMLInputElement | null)?.value.trim() ?? "";
-    const id = val("#addModelId");
-    const url = val("#addModelUrl");
-    if (!isTauri()) { if (msg) msg.textContent = "Sample mode: adding models runs in the installed app."; return; }
-    if (!id || !url) {
-      if (msg) { msg.style.color = "var(--err)"; msg.textContent = "Model id and source URL are required."; }
-      return;
-    }
-    const paramsRaw = val("#addModelParams");
-    let paramsB: number | undefined;
-    if (paramsRaw) {
-      const n = Number(paramsRaw);
-      if (!Number.isFinite(n) || n <= 0) {
-        if (msg) { msg.style.color = "var(--err)"; msg.textContent = "Parameters (B) must be a positive number (the model's total parameter count, e.g. 80)."; }
+  /* ---------------- Add model form ----------------
+   * Lives in #modelAddForm, outside the repainted #modelBody, so
+   * the poll never clobbers typed input (the Add Backend form's
+   * host pattern). The topbar's Add model button opens it; a
+   * successful create empties the host — the form clears and
+   * hides, returning the page to its pre-open state — while a
+   * failed create keeps the form open with the input intact. */
+  const addModelHost = root.querySelector("#modelAddForm");
+  const closeAddModelForm = (): void => { if (addModelHost) addModelHost.innerHTML = ""; };
+  const openAddModelForm = (): void => {
+    if (!addModelHost) return;
+    if (addModelHost.innerHTML) { closeAddModelForm(); return; }
+    addModelHost.innerHTML = modelAddFormHtml();
+    const optToggle = addModelHost.querySelector("#addModelOptToggle") as HTMLButtonElement | null;
+    optToggle?.addEventListener("click", () => {
+      const box = addModelHost.querySelector("#addModelOptional") as HTMLElement | null;
+      if (!box) return;
+      const open = box.style.display === "none";
+      box.style.display = open ? "" : "none";
+      optToggle.setAttribute("aria-expanded", String(open));
+      optToggle.innerHTML = icon(open ? "chevD" : "chevR");
+    });
+    addModelHost.querySelector("#addModelCancel")?.addEventListener("click", closeAddModelForm);
+    const addBtn = addModelHost.querySelector("#addModelBtn") as HTMLButtonElement | null;
+    addBtn?.addEventListener("click", async () => {
+      const msg = addModelHost.querySelector("#addModelMsg") as HTMLElement | null;
+      // The message row stays hidden until its first write.
+      if (msg) msg.style.display = "";
+      const val = (sel: string): string => (addModelHost.querySelector(sel) as HTMLInputElement | null)?.value.trim() ?? "";
+      const id = val("#addModelId");
+      const url = val("#addModelUrl");
+      if (!isTauri()) { if (msg) msg.textContent = "Sample mode: adding models runs in the installed app."; return; }
+      if (!id || !url) {
+        if (msg) { msg.style.color = "var(--err)"; msg.textContent = "Model id and source URL are required."; }
         return;
       }
-      paramsB = n;
-    }
-    const moeLayersRaw = val("#addModelMoeLayers");
-    const moeDefRaw = val("#addModelMoeDefault");
-    let moeLayers: number | undefined;
-    let moeDefault: number | undefined;
-    if (moeLayersRaw || moeDefRaw) {
-      const l = Number(moeLayersRaw);
-      const d = Number(moeDefRaw);
-      if (!moeLayersRaw || !moeDefRaw || !Number.isInteger(l) || !Number.isInteger(d) || l < 1 || d < 0 || d > l) {
-        if (msg) { msg.style.color = "var(--err)"; msg.textContent = "MoE fields: give both — MoE layers of 1 or more and a default offload between 0 and the layer count — or leave both empty for a dense model."; }
+      const paramsRaw = val("#addModelParams");
+      let paramsB: number | undefined;
+      if (paramsRaw) {
+        const n = Number(paramsRaw);
+        if (!Number.isFinite(n) || n <= 0) {
+          if (msg) { msg.style.color = "var(--err)"; msg.textContent = "Parameters (B) must be a positive number (the model's total parameter count, e.g. 80)."; }
+          return;
+        }
+        paramsB = n;
+      }
+      const moeLayersRaw = val("#addModelMoeLayers");
+      const moeDefRaw = val("#addModelMoeDefault");
+      let moeLayers: number | undefined;
+      let moeDefault: number | undefined;
+      if (moeLayersRaw || moeDefRaw) {
+        const l = Number(moeLayersRaw);
+        const d = Number(moeDefRaw);
+        if (!moeLayersRaw || !moeDefRaw || !Number.isInteger(l) || !Number.isInteger(d) || l < 1 || d < 0 || d > l) {
+          if (msg) { msg.style.color = "var(--err)"; msg.textContent = "MoE fields: give both — MoE layers of 1 or more and a default offload between 0 and the layer count — or leave both empty for a dense model."; }
+          return;
+        }
+        moeLayers = l;
+        moeDefault = d;
+      }
+      addBtn.disabled = true;
+      const r = await modelAdd(id, url, val("#addModelFile") || undefined, val("#addModelQuant") || undefined, paramsB, moeLayers, moeDefault);
+      addBtn.disabled = false;
+      if (r.error) {
+        // Failure: the form stays open with the operator's input
+        // intact and the error in the form's message row.
+        if (msg) { msg.style.color = "var(--err)"; msg.textContent = `Add failed: ${r.error}`; }
         return;
       }
-      moeLayers = l;
-      moeDefault = d;
-    }
-    addBtn.disabled = true;
-    const r = await modelAdd(id, url, val("#addModelFile") || undefined, val("#addModelQuant") || undefined, paramsB, moeLayers, moeDefault);
-    addBtn.disabled = false;
-    if (msg) {
-      msg.style.color = r.error ? "var(--err)" : "var(--text2)";
-      msg.textContent = r.error ? `Add failed: ${r.error}` : `Added ${id}.`;
-    }
-    if (!r.error) await load();
-  });
+      // Success: clear and hide the form (emptying the host drops
+      // every field with it), then repaint so the new model shows.
+      closeAddModelForm();
+      await load();
+    });
+  };
+  root.querySelector("#modelAdd")?.addEventListener("click", openAddModelForm);
 
   await load();
 
