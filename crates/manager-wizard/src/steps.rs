@@ -107,9 +107,8 @@ fn parse_semver_version(stdout: &str) -> Option<String> {
     stdout.lines().rev().find_map(|line| {
         let line = line.trim();
         let mut numeric = 0usize;
-        let mut chars = line.char_indices().peekable();
         let mut end = 0usize;
-        while let Some((i, c)) = chars.next() {
+        for (i, c) in line.char_indices() {
             if c.is_ascii_digit() {
                 end = i + c.len_utf8();
             } else if c == '.' && numeric < 3 {
@@ -219,11 +218,7 @@ impl ProgressEmitter {
         let Some(sink) = &self.sink else {
             return;
         };
-        let pct = if total > 0 {
-            Some(downloaded.saturating_mul(100) / total)
-        } else {
-            None
-        };
+        let pct = downloaded.saturating_mul(100).checked_div(total);
         let elapsed_ms = self.started.elapsed().as_millis() as u64;
         let last_ms = self.last_emit_ms.load(Ordering::Relaxed);
         let first = last_ms == u64::MAX;
@@ -2644,7 +2639,7 @@ async fn wait_for_postgres_ready_ticked(
         }
         tokio::time::sleep(POSTGRES_READY_POLL_INTERVAL).await;
         polls += 1;
-        if tick_polls > 0 && polls % tick_polls == 0 {
+        if tick_polls > 0 && polls.is_multiple_of(tick_polls) {
             streamer.stream_new(ctx, ops, &log_path, "postgres: ", log).await;
             ctx.emit_log(&format!(
                 "waiting for PostgreSQL on 127.0.0.1:{} — {:.0}s elapsed",
@@ -5009,7 +5004,7 @@ impl StartGateway {
             // every tenth, and on success: a full 120-attempt wait
             // otherwise floods the step log with near-identical
             // lines while showing nothing new.
-            let log_attempt = attempt == 1 || attempt % 10 == 0;
+            let log_attempt = attempt == 1 || attempt.is_multiple_of(10);
             match ctx.ops.http_get_with_headers(&url, &headers).await {
                 Ok(resp) if resp.status == 200 => {
                     push_log(
