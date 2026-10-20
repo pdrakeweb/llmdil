@@ -2621,6 +2621,127 @@ export async function updatesSetAuto(componentId: string, enabled: boolean): Pro
   }
 }
 
+/** App self-update state (app_update_status payload). Distinct
+ *  from the per-component pins in the config's `updates` section:
+ *  this is LLMdil's own GitHub-Releases check / stage / apply. */
+export interface AppUpdateInfo {
+  current_version: string;
+  check_enabled: boolean;
+  auto_update: boolean;
+  last_checked_unix_ms: number | null;
+  /** "up_to_date" | "update_available" | "failed" | null (never checked). */
+  last_check_outcome: string | null;
+  last_check_error: string | null;
+  available: {
+    version: string;
+    tag: string;
+    asset_name: string;
+    size_bytes: number;
+    sha256: string | null;
+  } | null;
+  staged: {
+    version: string;
+    asset_name: string;
+    sha256: string;
+    staged_at_unix_ms: number;
+  } | null;
+  last_stage_error: string | null;
+  last_apply: {
+    version: string;
+    ok: boolean;
+    message: string;
+    at_unix_ms: number;
+  } | null;
+  /** State-derived: present exactly when a staged update newer
+   *  than the running version exists. */
+  banner: {
+    version: string;
+    staged_at_unix_ms: number;
+    last_apply_error?: string;
+  } | null;
+}
+
+const SAMPLE_APP_UPDATE: AppUpdateInfo = {
+  current_version: "0.1.0-sample",
+  check_enabled: true,
+  auto_update: false,
+  last_checked_unix_ms: null,
+  last_check_outcome: null,
+  last_check_error: null,
+  available: null,
+  staged: null,
+  last_stage_error: null,
+  last_apply: null,
+  banner: null,
+};
+
+export async function getAppUpdateStatus(): Promise<CallResult<AppUpdateInfo>> {
+  if (!isTauri()) return { data: SAMPLE_APP_UPDATE, live: false };
+  try {
+    const data = await invoke<AppUpdateInfo>("app_update_status");
+    return { data, live: true };
+  } catch (e) {
+    return { data: SAMPLE_APP_UPDATE, live: true, error: errOf(e) };
+  }
+}
+
+/** Run a check now. A failed check is an outcome in the returned
+ *  state (last_check_outcome "failed"), not a call error. */
+export async function appUpdateCheck(): Promise<CallResult<AppUpdateInfo>> {
+  if (!isTauri()) return { data: SAMPLE_APP_UPDATE, live: false, error: "app_update_check is not available in sample mode" };
+  try {
+    const data = await invoke<AppUpdateInfo>("app_update_check");
+    return { data, live: true };
+  } catch (e) {
+    return { data: SAMPLE_APP_UPDATE, live: true, error: errOf(e) };
+  }
+}
+
+export async function appUpdateSetChecking(enabled: boolean): Promise<CallResult<AppUpdateInfo>> {
+  if (!isTauri()) return { data: SAMPLE_APP_UPDATE, live: false, error: "app_update_set_checking is not available in sample mode" };
+  try {
+    const data = await invoke<AppUpdateInfo>("app_update_set_checking", { enabled });
+    return { data, live: true };
+  } catch (e) {
+    return { data: SAMPLE_APP_UPDATE, live: true, error: errOf(e) };
+  }
+}
+
+export async function appUpdateSetAuto(enabled: boolean): Promise<CallResult<AppUpdateInfo>> {
+  if (!isTauri()) return { data: SAMPLE_APP_UPDATE, live: false, error: "app_update_set_auto is not available in sample mode" };
+  try {
+    const data = await invoke<AppUpdateInfo>("app_update_set_auto", { enabled });
+    return { data, live: true };
+  } catch (e) {
+    return { data: SAMPLE_APP_UPDATE, live: true, error: errOf(e) };
+  }
+}
+
+/** Download + verify + stage the available update (the running
+ *  installation is not touched; applying needs the banner's
+ *  Restart). */
+export async function appUpdateDownload(): Promise<CallResult<AppUpdateInfo>> {
+  if (!isTauri()) return { data: SAMPLE_APP_UPDATE, live: false, error: "app_update_download is not available in sample mode" };
+  try {
+    const data = await invoke<AppUpdateInfo>("app_update_download");
+    return { data, live: true };
+  } catch (e) {
+    return { data: SAMPLE_APP_UPDATE, live: true, error: errOf(e) };
+  }
+}
+
+/** Restart into the staged update: the app records the pending
+ *  apply, hands off to the detached helper, and exits. */
+export async function appUpdateRestart(): Promise<CallResult<{ ok: boolean; restarting?: boolean; version?: string }>> {
+  if (!isTauri()) return { data: { ok: false }, live: false, error: "app_update_restart is not available in sample mode" };
+  try {
+    const data = await invoke<{ ok: boolean; restarting?: boolean; version?: string }>("app_update_restart");
+    return { data, live: true };
+  } catch (e) {
+    return { data: { ok: false }, live: true, error: errOf(e) };
+  }
+}
+
 /** Fire one toast immediately, bypassing the category switches —
  *  the Settings card's delivery check. */
 export async function sendTestNotification(): Promise<CallResult<{ ok: boolean }>> {

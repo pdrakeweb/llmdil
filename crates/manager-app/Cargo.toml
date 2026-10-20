@@ -15,6 +15,9 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
 manager-config = { path = "../manager-config" }
 manager-wizard = { path = "../manager-wizard" }
 manager-supervisor = { path = "../manager-supervisor" }

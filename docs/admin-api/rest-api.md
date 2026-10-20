@@ -3,11 +3,11 @@
 Status: implemented. The API shipped with the admin-API build
 (PLAN.md §9) and this contract describes the shipped surface as of
 v0.1.40. The source of truth for routes is the operation registry —
-`crates/manager-app/src/registry.rs` (`for_each_operation!`): 115
-operations, of which 70 carry a REST route and 45 are explicit
+`crates/manager-app/src/registry.rs` (`for_each_operation!`): 123
+operations, of which 78 carry a REST route and 45 are explicit
 `None` exclusions (§6.16). Derived/composite and auth/admin routes
 are API-layer routes in `crates/manager-api` (§6.17); the full live
-surface is 109 route records (70 registry + 15 derived + 24
+surface is 117 route records (78 registry + 15 derived + 24
 auth/admin).
 Scope: an HTTP API served by the Service Manager on a dedicated **admin port**
 on the managed machine (separate from the LiteLLM gateway port), exposing the
@@ -1126,6 +1126,47 @@ implements it; the contract reserves the path.
 `updates_set_auto`. Body: `{ "enabled": true }` →
 `{ "ok", "persisted", "component_id", "auto_update" }`.
 
+#### App self-update — `GET /api/v1/app-update` — `read`
+`app_update_status`. LLMdil's own update state, distinct from the
+per-component pins above: `{ "current_version", "check_enabled",
+"auto_update", "last_checked_unix_ms", "last_check_outcome",
+"last_check_error", "available", "staged", "last_stage_error",
+"last_apply", "banner" }`. `banner` is non-null exactly when a
+SHA-256-verified installer for a newer version is staged and
+waiting on a restart. Runtime state lives in
+`<data_dir>/app-update/state.json`, never in the config.
+
+#### `POST /api/v1/app-update/check` — `control`
+`app_update_check`. Runs one check against GitHub Releases
+(drafts and prereleases are never candidates; no downgrade) and
+returns the status object. A failed check is an outcome in the
+payload (`last_check_outcome: "failed"` with `last_check_error`),
+not an HTTP error. With auto-update on, a found update is staged
+inline.
+
+#### `PUT /api/v1/app-update/checking` — `config`
+`app_update_set_checking`. Body: `{ "enabled": true }` → the
+status object. Persists `app_update.check_enabled` in the config.
+
+#### `PUT /api/v1/app-update/auto` — `config`
+`app_update_set_auto`. Body: `{ "enabled": true }` → the status
+object. Persists `app_update.auto_update` in the config.
+
+#### `POST /api/v1/app-update/download` — `control`
+`app_update_download`. Downloads the available release's
+installer into `<data_dir>/app-update/` and verifies its SHA-256
+against the digest the GitHub API publishes for the asset; only a
+verified file is recorded as staged. The running installation is
+never touched.
+
+#### `POST /api/v1/app-update/restart` — `control`
+`app_update_restart`. Records the pending apply, spawns the
+detached apply helper (this executable with
+`--llmdil-apply-update`), and exits the process. The helper waits
+for the exit, runs the staged installer silently, records the
+outcome in the state file, and relaunches. → `{ "ok",
+"restarting", "version" }`.
+
 ### 6.15 Peripheral capabilities (MCP, VS Code, WinML) — excluded from v1
 
 These app capabilities exist but sit outside the manager's core
@@ -1151,7 +1192,7 @@ operations the draft knew (`mcp_save_server`,
 
 ### 6.16 Registry exclusions — every operation with no route
 
-The registry holds 122 operations: 74 routed (§6.1–§6.14,
+The registry holds 128 operations: 80 routed (§6.1–§6.14,
 §6.18) and 48 with route `None`. A `None` route is an explicit
 exclusion, never an oversight (registry module docs); the
 complete list, grouped by reason:
