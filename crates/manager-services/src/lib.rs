@@ -480,6 +480,7 @@ mod tests {
             )],
             workdir: None,
             port: Some(8081),
+            low_priority: false,
         }
     }
 

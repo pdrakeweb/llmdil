@@ -1888,6 +1888,10 @@ fn backend_spec(
         env,
         workdir: None,
         port: Some(b.port),
+        // llama-server backends spawn below normal priority: a
+        // backend thrashing memory must yield the operator's
+        // desktop session (Part B of the start-preflight build).
+        low_priority: true,
     }
 }
 
