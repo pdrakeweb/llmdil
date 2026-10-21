@@ -13069,6 +13069,179 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+
+    // --- KV cache / flash attention integration (feature/backend-kv-fa) ---
+
+    fn planner_cache_layout() -> WeightLayout {
+        WeightLayout {
+            total_bytes: 12_120_016_960,
+            expert_bytes: None,
+            expert_bytes_by_block: None,
+            moe_layers: None,
+            kv_geometry: Some(manager_models::KvGeometry {
+                kv_layers: 16,
+                head_count_kv: 4,
+                key_length: 256,
+                value_length: 256,
+            }),
+            kv_per_token: Some(65_536),
+            rs_bytes_per_seq: Some(156_893_184),
+            basis: manager_models::MemoryBasis::Exact,
+            catalog: None,
+            green_limit_layers: None,
+        }
+    }
+
+    #[test]
+    fn selected_cache_types_price_the_requirement() {
+        // Pricing delta at the integration seam: the same layout
+        // priced through kv_bytes_per_token_for (the function
+        // backend_memory_requirement uses) at each selection.
+        let layout = planner_cache_layout();
+        assert_eq!(kv_bytes_per_token_for(&layout, None), Some(65_536));
+        assert_eq!(
+            kv_bytes_per_token_for(
+                &layout,
+                Some("--cache-type-k f16 --cache-type-v f16 --flash-attn on")
+            ),
+            Some(65_536),
+            "an explicit f16 selection prices exactly as the pre-feature default"
+        );
+        assert_eq!(
+            kv_bytes_per_token_for(
+                &layout,
+                Some("--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on")
+            ),
+            Some(34_816)
+        );
+        assert_eq!(
+            kv_bytes_per_token_for(
+                &layout,
+                Some("--cache-type-k q8_0 --cache-type-v q4_0 --flash-attn on")
+            ),
+            Some(26_624)
+        );
+        assert_eq!(
+            kv_bytes_per_token_for(
+                &layout,
+                Some("--cache-type-k q4_0 --cache-type-v q4_0 --flash-attn on")
+            ),
+            Some(18_432)
+        );
+        // The requirement totals differ by exactly the KV deltas
+        // at 32K context, 1 slot: f16 2048 MiB, q8/q8 1088, q4/q4 576.
+        let kv_mib = |raw: Option<&str>| {
+            manager_models::memory_requirement(
+                layout.total_bytes,
+                layout.expert_bytes,
+                None,
+                layout.basis,
+                manager_models::ExpertOffload::None,
+                kv_bytes_per_token_for(&layout, raw),
+                layout.moe_layers,
+                32_768,
+                layout.rs_bytes_per_seq,
+                1,
+            )
+            .kv_mib
+        };
+        assert_eq!(kv_mib(None), Some(2_048));
+        assert_eq!(
+            kv_mib(Some("--cache-type-k q8_0 --cache-type-v q8_0")),
+            Some(1_088)
+        );
+        assert_eq!(
+            kv_mib(Some("--cache-type-k q4_0 --cache-type-v q4_0")),
+            Some(576)
+        );
+        // No geometry: the f16 figure is used unchanged, never zero.
+        let mut no_geo = planner_cache_layout();
+        no_geo.kv_geometry = None;
+        assert_eq!(
+            kv_bytes_per_token_for(&no_geo, Some("--cache-type-k q4_0")),
+            Some(65_536)
+        );
+    }
+
+    #[test]
+    fn cache_selection_resolver_validates_the_wire_values() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(resolve_cache_selection(None, None, None).unwrap(), None);
+        let sel = resolve_cache_selection(s("q8_0"), s("q4_0"), s("on"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(sel.k, manager_models::CacheType::Q8_0);
+        assert_eq!(sel.v, manager_models::CacheType::Q4_0);
+        assert_eq!(sel.flash_attn, manager_models::FlashAttn::On);
+        // Partial sets are refused.
+        assert!(resolve_cache_selection(s("q8_0"), None, None).is_err());
+        assert!(resolve_cache_selection(None, s("q8_0"), s("on")).is_err());
+        // Unoffered types and bad FA spellings are refused.
+        assert!(resolve_cache_selection(s("q5_0"), s("q8_0"), s("on")).is_err());
+        assert!(resolve_cache_selection(s("q8_0"), s("q8_0"), s("banana")).is_err());
+        // The pairing llama.cpp refuses is refused here too.
+        assert!(resolve_cache_selection(s("q8_0"), s("q8_0"), s("off")).is_err());
+        assert!(resolve_cache_selection(s("f16"), s("f16"), s("off")).is_ok());
+    }
+
+    #[test]
+    fn cache_preview_reports_best_and_honest_no_fit() {
+        let layout = planner_cache_layout();
+        let targets = (Vec::new(), vec![16_384u64], vec![0u32]);
+        let sel_f16 = manager_models::CacheSelection::default();
+        // 64K: preview prices f16, best is the q8_0 rung.
+        let p = cache_preview_json(
+            &layout,
+            manager_models::ExpertOffload::None,
+            sel_f16,
+            65_536,
+            1,
+            Some(&targets),
+        );
+        assert_eq!(p["kv_mib"], 4_096);
+        assert_eq!(p["fits_current"], false);
+        assert_eq!(p["best"]["k"], "q8_0");
+        assert_eq!(p["best"]["v"], "q8_0");
+        assert_eq!(p["headroom_reserve_percent"], 5);
+        // 256K: no rung fits; best is null and the ladder's lowest
+        // rung carries the honest numbers (nothing is applied).
+        let p = cache_preview_json(
+            &layout,
+            manager_models::ExpertOffload::None,
+            sel_f16,
+            262_144,
+            1,
+            Some(&targets),
+        );
+        assert_eq!(p["best"], Value::Null);
+        assert_eq!(p["ladder"][3]["total_mib"], 11_559 + 4_608 + 150);
+        assert_eq!(p["ladder"][3]["fits"], false);
+    }
+
+    #[test]
+    fn backend_cache_info_distinguishes_pre_feature_and_custom() {
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        b.raw_flags = None;
+        let info = backend_cache_info(&b);
+        assert!(!info.present);
+        assert!(!info.custom);
+        assert_eq!(info.selection, manager_models::CacheSelection::default());
+        b.raw_flags = Some("--parallel 1".to_string());
+        assert!(!backend_cache_info(&b).present);
+        b.raw_flags = Some(
+            "--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on".to_string(),
+        );
+        let info = backend_cache_info(&b);
+        assert!(info.present);
+        assert!(!info.custom);
+        assert_eq!(info.selection.k, manager_models::CacheType::Q8_0);
+        // A short-spelling saved form is present but custom.
+        b.raw_flags = Some("-ctk q8_0".to_string());
+        let info = backend_cache_info(&b);
+        assert!(info.present);
+        assert!(info.custom);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
