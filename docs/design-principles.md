@@ -10,6 +10,7 @@ The durable reference for this app's UI. Every card and view is designed against
 2. **One section, multiple views.** Related representations of the same data are tabs inside one section, not stacked sections.
 3. **Prime real estate carries the answer as a visualization.** The top of a view is for the chart or visual that answers the question — not stat tiles or text blocks about the answer.
 4. **Density with order.** Group content by the question it answers; summary first, detail on demand through compact controls.
+17. **Pages flow, they do not scroll horizontally** (Pete, 2026-10-20). A page's objects flow — they wrap onto additional rows as the window narrows (flex-wrap, or an auto-fit grid like the card grids) — rather than overflowing into a horizontal scrollbar. Horizontal page scroll for primary content is not used. Motivating case: the Groups page (predicted-throughput design §8.1), whose group lanes sat in a single horizontally scrolling row; the lanes now wrap, the Ungrouped lane treated like any other. (Numbered 17, in adoption order, so the existing rule numbers that code comments and audits cite stay stable; it belongs with the Layout rules above.)
 
 ### Data and narrative
 
@@ -85,3 +86,4 @@ Apply to one card type. Every answer must be "no" unless noted.
 14. **Number formatting** — Does any number exceed one decimal, keep a trailing `.0`, or show decimals at magnitude ≥100?
 15. **Button form** — Does any non-destructive, non-critical action other than the surface's standard workflow action (its most likely next action) carry a word label instead of an icon only, or any destructive, operation-critical, or standard-workflow action lack its words or its icon? Does any icon-only button lack an aria-label or a tooltip naming the action? (Must be no.)
 16. **Enable/disable switch** — Is any enable/disable control anything other than the shared state switch (`enableSwitch`), or does any switch show the action a click will take instead of the entity's current state? (Must be no.)
+17. **Flow, no horizontal scroll** — Do the surface's primary objects overflow into a horizontal scrollbar instead of wrapping onto additional rows? (Must be no.)
