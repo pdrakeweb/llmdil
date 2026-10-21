@@ -339,6 +339,59 @@ const renderModelsSrc = staticSrc.split("export function renderModels")[1]?.spli
 check(renderModelsSrc.includes('id="modelAddForm"') && !renderModelsSrc.includes("addModelId"),
   "Models shell renders only the add-form host (the form itself appears on open)");
 
+// Form close on save (design rule 17, Pete 2026-10-20): saving
+// or applying a form closes it and shows the object in its new
+// state; a failed save keeps the form open with the operator's
+// input intact and the error shown. The rule is codified in the
+// design doc, and the surfaces this build fixed are pinned
+// below. The harness is static and cannot drive a DOM save to
+// success or failure, so — like the Add Model pins above — the
+// outcome behavior is pinned by handler source fragments: a
+// close/clear that appears only in (or only after) the success
+// branch, and a failure branch that returns ahead of any close
+// or repaint that would discard input.
+const designDoc = readFileSync(join(root, "..", "docs", "design-principles.md"), "utf8");
+check(designDoc.includes("17. **Saving a form closes it**"), "design doc codifies rule 17 (saving a form closes it)");
+check(designDoc.includes("17. **Form close on save**"), "design doc audit checklist carries the rule 17 item");
+check(designDoc.includes("Multi-step flows (the setup wizard) advance through steps rather than closing"),
+  "rule 17 states the wizard exclusion (no over-application to multi-step flows)");
+const groupsSrcLf = groupsSrc.replace(/\r\n/g, "\n");
+check(groupsSrcLf.includes('value="${esc(formDraft)}"'), "Groups create form renders its name input from the wire draft");
+check(groupsSrcLf.includes('if (t.id === "groupsNewName") formDraft = (t as HTMLInputElement).value'),
+  "Groups create form syncs typed input into the wire draft (repaints cannot lose it)");
+check(groupsSrcLf.includes("if (r.error) { formError = r.error; paintForm(); return; }"),
+  "Groups create failure keeps the form open with the error (draft re-renders intact)");
+check(groupsSrcLf.includes('formDraft = "";\n    setStatus(`Group ${name} created.`);'),
+  "Groups create success clears the draft and closes the form before the list repaint");
+check(staticSrcLf.includes("const patchRules = async (rules: GatewayRule[], okMsg: string): Promise<boolean>"),
+  "Gateway patchRules reports whether the save persisted");
+check(staticSrcLf.includes("const saved = await patchRules(rules,"),
+  "Gateway rule save awaits the persisted outcome before deciding to close");
+check(staticSrcLf.includes("if (saved && !disposed) {\n        ruleForm.open = false;"),
+  "Gateway rule form closes only on a persisted save (rule 17)");
+check(!staticSrcLf.includes("ruleForm.open = false;\n      await patchRules"),
+  "Gateway rule form no longer closes ahead of the save outcome");
+check(staticSrcLf.includes('if (r.error) { gwMsg(`Change not saved: ${r.error}`, true); return; }'),
+  "Gateway gwSave failure returns without a repaint (permanent-field input preserved)");
+check(staticSrcLf.includes("gwMsg(okText);\n      await load();"),
+  "Gateway gwSave success repaints the field in its new saved state");
+check(staticSrcLf.includes('if (r.error) { setMsg(`Create user failed: ${r.error}`, true); return; }'),
+  "Settings Create user failure returns without a repaint (input preserved)");
+check(staticSrcLf.includes('if (r.error) { setMsg(`Role change failed: ${r.error}`, true); return; }'),
+  "Settings role Apply failure returns without a repaint (chosen role preserved)");
+// Already-compliant baselines this build did not redo, pinned so
+// a later change cannot silently regress them: the MCP server
+// form (closes on success, draft intact on failure) and the
+// Optimize purpose editor (closes on success, draft intact on
+// failure).
+const mcpSrcFc = readFileSync(join(root, "src", "views", "mcp.ts"), "utf8").replace(/\r\n/g, "\n");
+check(mcpSrcFc.includes("closeForm();\n    await load();"), "MCP server form closes on successful save before repainting the list (baseline)");
+check(mcpSrcFc.includes("formError = r.error;\n      paintForm();"), "MCP server form failure keeps the form open with the draft intact (baseline)");
+check(optimizeSrc.replace(/\r\n/g, "\n").includes("if (r.error) { statusLine = r.error; paint(); return; }"),
+  "Optimize purpose save failure keeps the editor open with the error (baseline)");
+check(staticSrcLf.includes("closeEditSession();\n          await load();"),
+  "Backend Edit success closes the Edit session before repainting the card (baseline)");
+
 // Predicted throughput field + refresh (Oct 20, 2026): the
 // field renders on EVERY backend card (the Backends stat tile
 // and the Groups mini card), with an explicit "Not measured"
