@@ -37,6 +37,24 @@ impl KvGeometry {
             .saturating_mul((self.key_length as u64).saturating_add(self.value_length as u64))
             .saturating_mul(2)
     }
+
+    /// Bytes of KV cache per token at explicit K and V cache
+    /// types: each side is priced from its own head length at its
+    /// own type's block geometry (see [`super::cache::CacheType`]),
+    /// so a mixed selection (q8_0 K, q4_0 V) prices each side at
+    /// the rate it will actually be stored at. At (f16, f16) this
+    /// is exactly [`Self::bytes_per_token`]. Saturating, like it.
+    pub fn bytes_per_token_typed(
+        &self,
+        k: super::cache::CacheType,
+        v: super::cache::CacheType,
+    ) -> u64 {
+        let rows = (self.kv_layers as u64).saturating_mul(self.head_count_kv as u64);
+        rows.saturating_mul(
+            k.row_bytes(self.key_length as u64)
+                .saturating_add(v.row_bytes(self.value_length as u64)),
+        )
+    }
 }
 
 /// Recurrent-state geometry derived from GGUF metadata, for the
@@ -513,6 +531,38 @@ mod tests {
         let kv = layout.kv.unwrap();
         assert_eq!(kv.kv_layers, 4);
         assert_eq!(kv.bytes_per_token(), 4 * 2 * (64 + 64) * 2);
+    }
+
+    #[test]
+    fn typed_bytes_per_token_prices_each_side_at_its_type() {
+        // The planner geometry shape: 16 KV layers, 4 KV heads,
+        // 256-element K and V rows.
+        let geo = KvGeometry {
+            kv_layers: 16,
+            head_count_kv: 4,
+            key_length: 256,
+            value_length: 256,
+        };
+        use super::super::cache::CacheType::*;
+        // (f16, f16) is exactly the default figure.
+        assert_eq!(geo.bytes_per_token_typed(F16, F16), geo.bytes_per_token());
+        assert_eq!(geo.bytes_per_token(), 65_536);
+        // q8_0 rows are 272 B (34 B per 32 elements): 16*4*(272+272).
+        assert_eq!(geo.bytes_per_token_typed(Q8_0, Q8_0), 34_816);
+        // The mixed rung prices K at q8_0 and V at q4_0 (144 B rows).
+        assert_eq!(geo.bytes_per_token_typed(Q8_0, Q4_0), 26_624);
+        assert_eq!(geo.bytes_per_token_typed(Q4_0, Q4_0), 18_432);
+        // Asymmetric head lengths price from their own geometry.
+        let asym = KvGeometry {
+            kv_layers: 2,
+            head_count_kv: 1,
+            key_length: 256,
+            value_length: 128,
+        };
+        assert_eq!(
+            asym.bytes_per_token_typed(Q8_0, Q4_0),
+            2 * (272 + 72)
+        );
     }
 
     #[test]

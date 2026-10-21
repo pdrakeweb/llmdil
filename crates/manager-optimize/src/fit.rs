@@ -25,6 +25,11 @@ pub struct LayoutFacts {
     pub expert_bytes_by_block: Option<Vec<u64>>,
     pub moe_layers: Option<u32>,
     pub kv_per_token: Option<u64>,
+    /// KV geometry, when known — the input cache-type-aware KV
+    /// pricing needs. `kv_per_token` above is the same geometry
+    /// at the f16 default, and the fallback when no geometry (or
+    /// no typed pricing) is available.
+    pub kv_geometry: Option<manager_models::KvGeometry>,
     /// Recurrent-state bytes per sequence (GGUF recurrent-state
     /// geometry); None for dense models and unknown geometry.
     pub rs_bytes_per_seq: Option<u64>,
@@ -37,20 +42,30 @@ pub struct LayoutFacts {
 /// A backend's memory requirement from layout facts — the same
 /// arithmetic `backend_memory_requirement` performs in src-tauri.
 /// `n_seq` is the backend's effective slot count (the
-/// recurrent-state term is per sequence).
+/// recurrent-state term is per sequence). `cache` is the
+/// backend's selected KV cache configuration: when the facts
+/// carry KV geometry the KV term is priced at the selected
+/// types, exactly as the app-side requirement prices it;
+/// without geometry the f16 figure stands (typed pricing has
+/// nothing to price from).
 pub fn layout_requirement(
     facts: &LayoutFacts,
     offload: ExpertOffload,
+    cache: manager_models::CacheSelection,
     n_ctx: u32,
     n_seq: u32,
 ) -> MemoryRequirement {
+    let kv_per_token = match facts.kv_geometry {
+        Some(geo) => Some(geo.bytes_per_token_typed(cache.k, cache.v)),
+        None => facts.kv_per_token,
+    };
     manager_models::memory_requirement(
         facts.total_bytes,
         facts.expert_bytes,
         facts.expert_bytes_by_block.as_deref(),
         facts.basis,
         offload,
-        facts.kv_per_token,
+        kv_per_token,
         facts.moe_layers,
         n_ctx,
         facts.rs_bytes_per_seq,
@@ -221,6 +236,7 @@ pub fn others_residency(
         let req = layout_requirement(
             facts,
             offload,
+            manager_models::cache_selection(b.raw_flags.as_deref()),
             b.flags.n_ctx,
             manager_models::effective_slots(b.raw_flags.as_deref()),
         );
@@ -248,6 +264,7 @@ mod tests {
             expert_bytes_by_block: None,
             moe_layers: None,
             kv_per_token: None,
+            kv_geometry: None,
             rs_bytes_per_seq: None,
             basis: MemoryBasis::Estimate,
             ctx_max: 0,
@@ -257,7 +274,7 @@ mod tests {
 
     #[test]
     fn residency_empty_split_is_first_gpu() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, 32768, 4);
+        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4);
         assert_eq!(residency_per_gpu(&req, &[], 2), vec![12 * 1024, 0]);
         assert_eq!(
             residency_per_gpu(&req, &[0.5, 0.5], 2),
@@ -269,7 +286,7 @@ mod tests {
 
     #[test]
     fn fit_fails_when_free_vram_is_taken_by_a_running_backend() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, 32768, 4);
+        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4);
         // 16 GiB free on GPU 0, but a running backend holds 8 GiB:
         // the 12 GiB model cannot be placed.
         let out = evaluate_fit(&req, &[], &[16 * 1024, 0], &[8 * 1024, 0], &[0, 0]);
@@ -282,7 +299,7 @@ mod tests {
 
     #[test]
     fn fit_warns_when_it_only_fits_by_moving_accounted_residency() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, 32768, 4);
+        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4);
         // 16 GiB free; a STOPPED backend accounts 8 GiB. The model
         // fits now but not alongside the stopped backend.
         let out = evaluate_fit(&req, &[], &[16 * 1024, 0], &[0, 0], &[8 * 1024, 0]);
