@@ -220,6 +220,42 @@ check(groupsSrc.includes("data-group-card"), "Groups view renders backend cards"
 check(groupsSrc.includes("draggable=\"true\""), "Groups view cards are draggable");
 check(groupsSrc.includes("data-group-move"), "Groups view renders Move to menu items");
 check(groupsSrc.includes("gatewaySetBackendGroup"), "Groups view moves membership through gateway_set_backend_group");
+// Groups drag-and-drop fix (Oct 20, 2026): the failure was at the
+// window level, not the lane markup — Tauri's OS file-drop handler
+// is enabled by default and on Windows intercepts every drag in
+// the webview, so no dragover ever reached the page (the OS showed
+// the no-drop cursor everywhere). dragDropEnabled must be false —
+// the same parsed-config pin style as withGlobalTauri below. The
+// harness renders no DOM, so a synthetic dragover event cannot be
+// driven here; the acceptance path is pinned by its source
+// fragments instead: the drop attribute sits on the lane <section>
+// itself (so closest() resolves a hit anywhere in the lane), the
+// dragover handler resolves the lane through that attribute and
+// calls preventDefault, a repaint never replaces the lanes DOM
+// mid-drag (that destroys the drag source), and the poll does not
+// run while a drag is in flight.
+let dragDropDisabled = false;
+try {
+  dragDropDisabled = JSON.parse(readFileSync(join(root, "..", "src-tauri", "tauri.conf.json"), "utf8"))
+    ?.app?.windows?.[0]?.dragDropEnabled === false;
+} catch { /* unreadable/missing config fails the check below */ }
+check(dragDropDisabled, "tauri.conf.json sets dragDropEnabled=false on the main window (Tauri's default OS file-drop handler intercepts HTML5 drag-and-drop on Windows)");
+check(groupsSrc.includes('<section class="group-lane" data-group-lane-drop='), "Groups lanes carry the drop-target attribute on the lane element itself");
+check(groupsSrc.includes("function laneFromEvent"), "Groups view resolves drop lanes through a shared laneFromEvent helper");
+check(groupsSrc.includes('t.closest("[data-group-lane-drop]")'), "Groups lane resolution keys off the lane drop attribute via closest()");
+const dragOverSrc = groupsSrc.slice(groupsSrc.indexOf("function onDragOver"), groupsSrc.indexOf("function onDragLeave"));
+check(dragOverSrc.includes("laneFromEvent(ev)") && dragOverSrc.includes("ev.preventDefault()"),
+  "Groups dragover handler accepts a drag over a lane (preventDefault after lane resolution)");
+check(groupsSrc.includes('root.addEventListener("dragleave", onDragLeave)'), "Groups view clears the lane highlight on dragleave");
+check(groupsSrc.includes("paintDeferredDuringDrag"), "Groups view defers repaints requested while a drag is in flight");
+check(groupsSrc.includes("if (!disposed && !pending && !dragId) void load();"), "Groups poll repaint is suppressed while a drag is in flight");
+// Groups lanes flow (Oct 20, 2026, design-principles rule 17):
+// the lanes container wraps onto additional rows and never
+// scrolls horizontally.
+const stylesSrc = readFileSync(join(root, "src", "styles.css"), "utf8");
+const lanesRule = stylesSrc.split(".groups-lanes {")[1]?.split("}")[0] ?? "";
+check(lanesRule.includes("flex-wrap: wrap"), "Groups lanes container wraps lanes onto additional rows (flex-wrap: wrap)");
+check(!lanesRule.includes("overflow-x: auto"), "Groups lanes container has no horizontal scroll (no overflow-x: auto)");
 check(bundle.includes("#/groups"), "bundle contains the Groups route (#/groups)");
 check(readFileSync(join(root, "src", "views", "static.ts"), "utf8").includes("Edit membership"),
   "Gateway Routing card links to the Groups editor (Edit membership)");
