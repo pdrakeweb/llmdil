@@ -249,7 +249,7 @@ check(dragOverSrc.includes("laneFromEvent(ev)") && dragOverSrc.includes("ev.prev
 check(groupsSrc.includes('root.addEventListener("dragleave", onDragLeave)'), "Groups view clears the lane highlight on dragleave");
 check(groupsSrc.includes("paintDeferredDuringDrag"), "Groups view defers repaints requested while a drag is in flight");
 check(groupsSrc.includes("if (!disposed && !pending && !dragId) void load();"), "Groups poll repaint is suppressed while a drag is in flight");
-// Groups lanes flow (Oct 20, 2026, design-principles rule 17):
+// Groups lanes flow (Oct 20, 2026, design-principles rule 18):
 // the lanes container wraps onto additional rows and never
 // scrolls horizontally.
 const stylesSrc = readFileSync(join(root, "src", "styles.css"), "utf8");
