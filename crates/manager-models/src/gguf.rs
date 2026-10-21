@@ -18,7 +18,9 @@ pub struct KvGeometry {
     /// Layers that carry a KV cache. Hybrid linear-attention
     /// architectures (Qwen3-Next and relatives) keep KV in one of
     /// every `full_attention_interval` layers; the parser folds that
-    /// interval into this count.
+    /// interval into this count. MTP/nextn prediction blocks are
+    /// excluded: they are not trunk layers and the main context
+    /// holds no KV for them.
     pub kv_layers: u32,
     pub head_count_kv: u32,
     pub key_length: u32,
@@ -69,10 +71,11 @@ impl KvGeometry {
 /// elements, both held in F32 whatever the weight type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RsGeometry {
-    /// Layers carrying a recurrent state: the block count minus
+    /// Layers carrying a recurrent state: the trunk block count
+    /// (`block_count` minus any nextn prediction blocks) minus
     /// the KV layers, the complement of the parser's KV-layer
-    /// derivation, so the two counts always sum to the block
-    /// count within this parser's own arithmetic.
+    /// derivation, so the two counts always sum to the trunk
+    /// block count within this parser's own arithmetic.
     pub recr_layers: u32,
     /// Convolution-state elements per layer (`n_embd_r()`).
     pub embd_r: u32,
@@ -358,8 +361,25 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
             .and_then(|v| u32::try_from(*v).ok())
     };
     let block_count = get("block_count");
+    // Trunk blocks: `<arch>.block_count` counts every block in the
+    // file, including any MTP/nextn prediction blocks appended
+    // after the trunk (`<arch>.nextn_predict_layers`). A nextn
+    // block is not a trunk layer: llama.cpp's main context holds
+    // KV only for layers below `hparams.n_layer()` — the layer
+    // count with nextn layers excluded (the MTP draft context
+    // keeps its own single-layer cache, separately) — and it holds
+    // recurrent state only for trunk layers too. Both geometry
+    // derivations below therefore run on the trunk count, so a
+    // nextn block contributes neither KV layers nor recurrent
+    // layers. (Verified against llama.cpp b11658: `create_memory`'s
+    // hybrid filter_attn is `il < hparams.n_layer() &&
+    // !is_recr(il)`, and `n_layer()` is `n_layer_all -
+    // n_layer_nextn`.)
+    let trunk_blocks = block_count.map(|blocks| {
+        blocks.saturating_sub(get("nextn_predict_layers").unwrap_or(0))
+    });
     let kv = match (
-        block_count,
+        trunk_blocks,
         get("attention.head_count_kv"),
         get("attention.key_length"),
         get("attention.value_length"),
@@ -387,7 +407,7 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
     // llama.cpp's hparams formulas (saturating, capped at u32 —
     // a header claiming more is not a plausible geometry and
     // saturates to "enormous" downstream, never wraps small).
-    let rs = match (block_count, get("ssm.state_size"), get("ssm.inner_size")) {
+    let rs = match (trunk_blocks, get("ssm.state_size"), get("ssm.inner_size")) {
         (Some(blocks), Some(d_state), Some(d_inner)) if d_state > 0 && d_inner > 0 => {
             let kv_layers = kv.map(|k| k.kv_layers).unwrap_or(0);
             let recr_layers = blocks.saturating_sub(kv_layers);
@@ -581,6 +601,48 @@ mod tests {
         let layout = parse_gguf_layout(&b).unwrap();
         assert_eq!(layout.kv.unwrap().kv_layers, 12);
         assert_eq!(layout.kv.unwrap().bytes_per_token(), 24_576);
+    }
+
+    #[test]
+    fn nextn_block_is_not_a_kv_or_recurrent_layer() {
+        // The planner-MTP file's real shape (Qwen3.8-27B-GSQ-RCO
+        // IQ3_S-mtp, header pinned 2026-10-21): 65 blocks of which
+        // the last is the MTP/nextn prediction block, full
+        // attention every 4th trunk layer, 4 KV heads at 256/256,
+        // plus the family's SSM dimensions. Counting the nextn
+        // block as a KV layer would give ceil(65/4) = 17 layers
+        // and 69,632 B/token (2,176 MiB at n_ctx 32768); llama.cpp
+        // allocates the main context's KV for the 64 trunk layers
+        // only — 16 KV layers, 65,536 B/token (2,048 MiB) — and
+        // the recurrent state for the 48 recurrent trunk layers,
+        // exactly the base (non-MTP) planner file's figures.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&11u64.to_le_bytes());
+        w_kv_str(&mut b, "general.architecture", "testarch");
+        w_kv_u32(&mut b, "testarch.block_count", 65);
+        w_kv_u32(&mut b, "testarch.attention.head_count_kv", 4);
+        w_kv_u32(&mut b, "testarch.attention.key_length", 256);
+        w_kv_u32(&mut b, "testarch.attention.value_length", 256);
+        w_kv_u32(&mut b, "testarch.full_attention_interval", 4);
+        w_kv_u32(&mut b, "testarch.nextn_predict_layers", 1);
+        w_kv_u32(&mut b, "testarch.ssm.conv_kernel", 4);
+        w_kv_u32(&mut b, "testarch.ssm.inner_size", 6144);
+        w_kv_u32(&mut b, "testarch.ssm.state_size", 128);
+        w_kv_u32(&mut b, "testarch.ssm.group_count", 16);
+        let layout = parse_gguf_layout(&b).unwrap();
+        // The raw block count is reported as the file states it.
+        assert_eq!(layout.block_count, Some(65));
+        let kv = layout.kv.unwrap();
+        assert_eq!(kv.kv_layers, 16);
+        assert_eq!(kv.bytes_per_token(), 65_536);
+        // 65,536 B/token at n_ctx 32768 is 2,048 MiB.
+        assert_eq!(kv.bytes_per_token() * 32_768, 2_048 * 1024 * 1024);
+        let rs = layout.rs.unwrap();
+        assert_eq!(rs.recr_layers, 48);
+        assert_eq!(rs.bytes_per_seq(), 156_893_184);
     }
 
     #[test]

@@ -142,6 +142,7 @@ fn fit_verdict(total_mib: u64, free: &[u64]) -> manager_models::FitVerdict {
         enabled_by_default: false,
         expert_bytes: None,
         moe_layers: None,
+        kv_bytes_per_token: None,
         default_offload_layers: None,
         url: String::new(),
         offload_restrictions: Vec::new(),

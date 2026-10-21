@@ -255,6 +255,7 @@ mod tests {
             enabled_by_default: true,
             expert_bytes: None,
             moe_layers: None,
+            kv_bytes_per_token: None,
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
             mtp: false,

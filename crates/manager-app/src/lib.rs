@@ -3520,6 +3520,7 @@ fn download_spec_for(cfg: &AppConfig, id: &str) -> Result<manager_models::ModelS
             enabled_by_default: m.enabled,
             expert_bytes: None,
             moe_layers: m.moe_layers,
+            kv_bytes_per_token: None,
             default_offload_layers: m.default_offload_layers,
             offload_restrictions: Vec::new(),
             mtp: false,
@@ -8112,7 +8113,20 @@ fn model_for_backend<'a>(
 
 /// Cache of parsed GGUF layouts, keyed by (path, file length,
 /// mtime): a model's header is parsed once per file version, not
-/// once per poll. `None` values cache unparseable files too.
+/// once per poll. Successful parses are cached, and so are
+/// definitive parse failures — bytes the parser rejects outright
+/// (`Invalid`, `UnsupportedType`, or `Incomplete` on the complete
+/// file) will not parse on the next poll either, and re-reading a
+/// few MiB per poll to learn that again is waste. Read failures
+/// are NOT cached: a transient I/O error (the file locked or
+/// mid-replacement by a download, a briefly unavailable mount)
+/// says nothing about the file's contents, so the next poll
+/// retries and the backend self-heals to the Exact basis instead
+/// of sitting on the catalog fallback for the process lifetime
+/// (the Oct 20, 2026 planner-mtp incident: one transient parse
+/// failure, memoized as `None`, dropped the backend's KV figure
+/// until restart). Metadata failures are not cached either, for
+/// the same reason.
 #[allow(clippy::type_complexity)]
 static GGUF_LAYOUT_CACHE: std::sync::OnceLock<
     std::sync::Mutex<
@@ -8125,10 +8139,17 @@ static GGUF_LAYOUT_CACHE: std::sync::OnceLock<
 /// the tokenizer metadata dominates). Returns None for missing or
 /// unparseable files.
 fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
+    let meta = match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => return None,
+        Err(e) => {
+            tracing::debug!(
+                "gguf layout: metadata read failed for {} (error class: io): {e}",
+                path.display()
+            );
+            return None;
+        }
+    };
     let mtime = meta
         .modified()
         .ok()
@@ -8144,26 +8165,51 @@ fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
         }
     }
     let mut layout = None;
+    // Whether the outcome may be cached: true once a prefix has
+    // been read in full and the parser has given a definitive
+    // answer (a layout, or a rejection of the complete bytes).
+    let mut cacheable = false;
     for prefix in [8 * 1024 * 1024usize, 64 * 1024 * 1024, 256 * 1024 * 1024] {
         let want = (meta.len() as usize).min(prefix);
         let mut buf = vec![0u8; want];
-        let read_ok = std::fs::File::open(path)
+        if let Err(e) = std::fs::File::open(path)
             .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
-            .is_ok();
-        if !read_ok {
-            break;
+        {
+            // Transient by definition: nothing about the file's
+            // contents was learned. Log and leave the cache alone
+            // so the next poll retries.
+            tracing::debug!(
+                "gguf layout: read failed for {} (error class: io): {e}",
+                path.display()
+            );
+            return None;
         }
         match manager_models::parse_gguf_layout(&buf) {
             Ok(l) => {
                 layout = Some(l);
+                cacheable = true;
                 break;
             }
             Err(manager_models::GgufError::Incomplete) if want < meta.len() as usize => continue,
-            Err(_) => break,
+            Err(e) => {
+                let class = match e {
+                    manager_models::GgufError::Incomplete => "incomplete header",
+                    manager_models::GgufError::Invalid(_) => "invalid header",
+                    manager_models::GgufError::UnsupportedType(_) => "unsupported tensor type",
+                };
+                tracing::debug!(
+                    "gguf layout: parse failed for {} (error class: {class}): {e:?}",
+                    path.display()
+                );
+                cacheable = true;
+                break;
+            }
         }
     }
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(key, layout.clone());
+    if cacheable {
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(key, layout.clone());
+        }
     }
     layout
 }
@@ -8173,8 +8219,9 @@ fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
 /// routed-expert share, the MoE layer count, KV bytes per token,
 /// and the derivation basis. The layout comes from the downloaded
 /// GGUF when available (basis Exact), else the catalog's pins
-/// (Catalog — expert bytes and MoE layer count are both pinned, so
-/// a partial offload resolves before download), else a
+/// (Catalog — expert bytes, MoE layer count, and KV bytes per
+/// token are all pinned, so a partial offload and the KV figure
+/// resolve before download), else a
 /// parameter-count estimate (Estimate). None when the backend's
 /// model cannot be resolved.
 struct WeightLayout {
@@ -8255,7 +8302,7 @@ fn resolve_weight_layout(
             c.expert_bytes,
             None,
             None,
-            None,
+            c.kv_bytes_per_token,
             None,
             c.moe_layers,
             manager_models::MemoryBasis::Catalog,
@@ -8682,6 +8729,7 @@ pub async fn op_placement_propose(
                 enabled_by_default: m.enabled,
                 expert_bytes: None,
                 moe_layers: m.moe_layers,
+                kv_bytes_per_token: None,
                 default_offload_layers: m.default_offload_layers,
                 offload_restrictions: Vec::new(),
                 mtp: false,
@@ -11908,6 +11956,150 @@ mod tests {
         assert_eq!(req.sys_weights_mib, 14_515);
         assert_eq!(req.gpu_weights_mib, 9_582);
         assert_eq!(req.basis, manager_models::MemoryBasis::Catalog);
+    }
+
+    #[test]
+    fn catalog_arm_requirement_reports_kv_for_planner_mtp() {
+        // The Oct 20, 2026 defect: planner-mtp's card showed no KV
+        // figure. Its backend resolves through the catalog arm
+        // whenever the GGUF header does not parse (here: no file
+        // on disk at all, the pre-download shape) — the catalog
+        // arm must still supply the KV figure from the catalog's
+        // pinned geometry: 65,536 B/token, 2,048 MiB at the
+        // backend's n_ctx 32768.
+        let mut cfg = test_cfg();
+        let mut b = serve_model(
+            &mut cfg,
+            "planner",
+            "qwen3.8-27b-mtp",
+            "models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf",
+            None,
+        );
+        b.flags.n_ctx = 32_768;
+        let layout = resolve_weight_layout(&cfg, &b).unwrap();
+        assert_eq!(layout.basis, manager_models::MemoryBasis::Catalog);
+        assert_eq!(layout.kv_per_token, Some(65_536));
+        let req = backend_memory_requirement(&cfg, &b).unwrap();
+        assert_eq!(req.kv_mib, Some(2_048));
+        assert_eq!(req.basis, manager_models::MemoryBasis::Catalog);
+    }
+
+    #[test]
+    fn catalog_arm_requirement_reports_kv_for_planner_and_coder() {
+        // The same catalog-arm resolution for the base planner
+        // (65,536 B/token — the figure its downloaded file's parse
+        // reports, so the card's KV tile is identical before and
+        // after download) and the coder (24,576 B/token, 768 MiB
+        // at n_ctx 32768).
+        let mut cfg = test_cfg();
+        let mut b = serve_model(
+            &mut cfg,
+            "planner",
+            "qwen3-27b-planner",
+            "models/Qwen3.8-27B.gguf",
+            None,
+        );
+        b.flags.n_ctx = 32_768;
+        let req = backend_memory_requirement(&cfg, &b).unwrap();
+        assert_eq!(req.kv_mib, Some(2_048));
+        let mut cfg = test_cfg();
+        let mut b = serve_model(
+            &mut cfg,
+            "coder",
+            "qwen3-coder-30b",
+            "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
+            Some("-ot exps=CPU"),
+        );
+        b.flags.n_ctx = 32_768;
+        let req = backend_memory_requirement(&cfg, &b).unwrap();
+        assert_eq!(req.kv_mib, Some(768));
+    }
+
+    /// A minimal GGUF header carrying complete KV geometry and
+    /// no tensors: `blocks` blocks, `heads_kv` KV heads, key/value
+    /// lengths `klen`/`vlen` under a test architecture.
+    fn gguf_kv_header_bytes(blocks: u32, heads_kv: u32, klen: u32, vlen: u32) -> Vec<u8> {
+        fn w_str(out: &mut Vec<u8>, s: &str) {
+            out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        fn w_kv_str(out: &mut Vec<u8>, key: &str, v: &str) {
+            w_str(out, key);
+            out.extend_from_slice(&8u32.to_le_bytes());
+            w_str(out, v);
+        }
+        fn w_kv_u32(out: &mut Vec<u8>, key: &str, v: u32) {
+            w_str(out, key);
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // tensor count
+        b.extend_from_slice(&5u64.to_le_bytes()); // kv count
+        w_kv_str(&mut b, "general.architecture", "testarch");
+        w_kv_u32(&mut b, "testarch.block_count", blocks);
+        w_kv_u32(&mut b, "testarch.attention.head_count_kv", heads_kv);
+        w_kv_u32(&mut b, "testarch.attention.key_length", klen);
+        w_kv_u32(&mut b, "testarch.attention.value_length", vlen);
+        b
+    }
+
+    fn gguf_probe_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "llm-mgr-gguf-probe-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn exact_arm_requirement_reports_the_gguf_kv_figure() {
+        // A downloaded file that parses supplies the KV figure
+        // from its own header (basis Exact) — for a model the
+        // catalog does not carry at all, the header is the only
+        // possible source: 4 blocks * 2 KV heads * (64 + 64) * 2 B
+        // = 2,048 B/token, 64 MiB at n_ctx 32768.
+        let dir = gguf_probe_dir("exact");
+        std::fs::write(
+            dir.join("models").join("user.gguf"),
+            gguf_kv_header_bytes(4, 2, 64, 64),
+        )
+        .unwrap();
+        let mut cfg = test_cfg();
+        cfg.data_dir = dir.clone();
+        register_test_model(&mut cfg, "user-kv-model", "models/user.gguf");
+        let b = uncreated_backend("user-backend", "models/user.gguf", None);
+        let layout = resolve_weight_layout(&cfg, &b).unwrap();
+        assert_eq!(layout.basis, manager_models::MemoryBasis::Exact);
+        assert_eq!(layout.kv_per_token, Some(2_048));
+        let req = backend_memory_requirement(&cfg, &b).unwrap();
+        assert_eq!(req.kv_mib, Some(64));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gguf_layout_recovers_when_a_missing_or_unparseable_file_is_replaced() {
+        // Neither a missing file nor an unparseable one pins the
+        // path: once the file is replaced by a parseable header,
+        // the layout resolves. (The unparseable bytes are a
+        // different file version — different length — so this
+        // exercises the re-read path every poll takes when a
+        // download lands or a file is rewritten.)
+        let dir = gguf_probe_dir("recover");
+        let path = dir.join("models").join("probe.gguf");
+        assert!(gguf_layout_cached(&path).is_none());
+        std::fs::write(&path, b"not a gguf file at all").unwrap();
+        assert!(gguf_layout_cached(&path).is_none());
+        std::fs::write(&path, gguf_kv_header_bytes(4, 2, 64, 64)).unwrap();
+        let layout = gguf_layout_cached(&path).expect("replaced file parses");
+        assert_eq!(layout.kv.unwrap().bytes_per_token(), 2_048);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

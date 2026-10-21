@@ -96,6 +96,17 @@ pub struct ModelSpec {
     /// total blocks. `None` for dense models and when unpinned.
     #[serde(default)]
     pub moe_layers: Option<u32>,
+    /// KV-cache bytes per token at llama.cpp's default F16 cache
+    /// types, when known (derived from the file's GGUF KV geometry
+    /// — the same inputs [`gguf::parse_gguf_layout`] uses: trunk
+    /// block count with `full_attention_interval` folding and any
+    /// nextn prediction blocks excluded, `head_count_kv`, and the
+    /// key/value lengths). The memory-requirement calculation
+    /// prices a backend's KV cache from it before the file is
+    /// downloaded, and whenever the downloaded file's header
+    /// cannot be parsed. `None` when the geometry is not pinned.
+    #[serde(default)]
+    pub kv_bytes_per_token: Option<u64>,
     /// The catalog's default expert offload for a backend serving
     /// this model, in MoE layers: the most offload that is still
     /// "green" (fast) for the model. It is both the Edit Flags
@@ -240,6 +251,11 @@ pub fn curated_models() -> Vec<ModelSpec> {
             enabled_by_default: true,
             expert_bytes: Some(0),
             moe_layers: None,
+            // KV geometry from the file's GGUF header (pinned
+            // 2026-10-21): qwen35, 64 blocks, full attention every
+            // 4th layer (16 KV layers), 4 KV heads, key/value
+            // lengths 256 — 16 * 4 * (256 + 256) * 2 B.
+            kv_bytes_per_token: Some(65_536),
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
             // The real Qwen3.8-27B (Alibaba, August 2026), dense
@@ -278,6 +294,11 @@ pub fn curated_models() -> Vec<ModelSpec> {
             enabled_by_default: false,
             expert_bytes: Some(0),
             moe_layers: None,
+            // Same KV geometry as the base planner file: the
+            // header's 65th block is the nextn prediction block,
+            // which carries no KV in the main context, so the
+            // trunk is the same 64 blocks / 16 KV layers.
+            kv_bytes_per_token: Some(65_536),
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
             // The one MTP-capable catalog entry: this build
@@ -306,6 +327,11 @@ pub fn curated_models() -> Vec<ModelSpec> {
             // model's shipped design point, so the green limit is
             // the whole range.
             moe_layers: Some(48),
+            // KV geometry from the file's GGUF header (pinned
+            // 2026-10-21): qwen3next, 48 blocks, full attention
+            // every 4th layer (12 KV layers), 2 KV heads, key/value
+            // lengths 256 — 12 * 2 * (256 + 256) * 2 B.
+            kv_bytes_per_token: Some(24_576),
             default_offload_layers: Some(48),
             // Pascal guardrail (tracker #37): at --n-cpu-moe 46 on
             // a Tesla P100 (compute capability (6, 0)) the coder
@@ -338,6 +364,13 @@ pub fn curated_models() -> Vec<ModelSpec> {
             enabled_by_default: true,
             expert_bytes: Some(0),
             moe_layers: None,
+            // KV geometry from the file's GGUF header (pinned
+            // 2026-10-21): qwen2, 28 dense blocks, 4 KV heads; the
+            // header carries no key/value lengths, so the head
+            // dimension is llama.cpp's default derivation,
+            // embedding_length / head_count = 3584 / 28 = 128 —
+            // 28 * 4 * (128 + 128) * 2 B.
+            kv_bytes_per_token: Some(57_344),
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
             mtp: false,
@@ -355,6 +388,10 @@ pub fn curated_models() -> Vec<ModelSpec> {
             enabled_by_default: true,
             expert_bytes: Some(0),
             moe_layers: None,
+            // KV geometry from the file's GGUF header (pinned
+            // 2026-10-21): qwen3, 36 dense blocks, 8 KV heads,
+            // key/value lengths 128 — 36 * 8 * (128 + 128) * 2 B.
+            kv_bytes_per_token: Some(147_456),
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
             mtp: false,
@@ -388,6 +425,13 @@ pub fn curated_models() -> Vec<ModelSpec> {
             // GPU-resident remainder (~9.3 GiB of weights) fits a
             // single 16 GiB GPU alongside the non-expert weights.
             moe_layers: Some(24),
+            // KV geometry from the file's GGUF tensor directory
+            // (pinned 2026-10-21): the header carries no
+            // head_count_kv, so the pin comes from the directory —
+            // 7 blocks carry attention tensors (5, 12, 19, 26, 33,
+            // 42, 52), each attn_k/attn_v 256 wide at key/value
+            // lengths 128 (2 KV heads) — 7 * 2 * (128 + 128) * 2 B.
+            kv_bytes_per_token: Some(7_168),
             default_offload_layers: Some(16),
             offload_restrictions: Vec::new(),
             mtp: false,
@@ -1233,6 +1277,7 @@ mod tests {
             enabled_by_default: true,
             expert_bytes: None,
             moe_layers: None,
+            kv_bytes_per_token: None,
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
             mtp: false,
@@ -1253,6 +1298,7 @@ mod tests {
             enabled_by_default: true,
             expert_bytes: None,
             moe_layers: None,
+            kv_bytes_per_token: None,
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
             mtp: false,
@@ -1456,6 +1502,7 @@ mod tests {
             enabled_by_default: true,
             expert_bytes: None,
             moe_layers: None,
+            kv_bytes_per_token: None,
             default_offload_layers: None,
             offload_restrictions: Vec::new(),
             mtp: false,
@@ -1991,6 +2038,59 @@ mod tests {
             catalog_params_b("obscure-model", "https://example.com/obscure.gguf"),
             None
         );
+    }
+
+    #[test]
+    fn catalog_kv_bytes_per_token_pins_match_the_gguf_geometry() {
+        // Every curated entry pins its KV figure, computed from
+        // the publisher file's real GGUF header geometry (headers
+        // pinned 2026-10-21) with the parser's own derivation:
+        // trunk KV layers (full_attention_interval folding, nextn
+        // blocks excluded) * head_count_kv * (key + value lengths)
+        // * 2 B (F16). A catalog model therefore resolves a KV
+        // figure before download and under any parse failure.
+        let models = curated_models();
+        let get = |id: &str| models.iter().find(|m| m.id == id).unwrap();
+        // qwen35: 64 blocks, interval 4 -> 16 layers, 4 KV heads,
+        // 256/256.
+        assert_eq!(get("qwen3-27b-planner").kv_bytes_per_token, Some(65_536));
+        // The MTP build's 65th block is the nextn block: same
+        // trunk, same figure — NOT the 69,632 B/token that
+        // counting it as a KV layer would give.
+        assert_eq!(get("qwen3.8-27b-mtp").kv_bytes_per_token, Some(65_536));
+        // qwen3next: 48 blocks, interval 4 -> 12 layers, 2 KV
+        // heads, 256/256.
+        assert_eq!(get("qwen3-coder-30b").kv_bytes_per_token, Some(24_576));
+        // qwen2: 28 dense layers, 4 KV heads, head dimension
+        // 3584 / 28 = 128.
+        assert_eq!(get("qwen2.5-coder-7b").kv_bytes_per_token, Some(57_344));
+        // qwen3: 36 dense layers, 8 KV heads, 128/128.
+        assert_eq!(get("qwen3-8b").kv_bytes_per_token, Some(147_456));
+        // nemotron_h_moe: 7 attention blocks per the tensor
+        // directory, 2 KV heads (attn_k 256 wide at length 128),
+        // 128/128.
+        assert_eq!(
+            get("nemotron-3.5-lightning-30b").kv_bytes_per_token,
+            Some(7_168)
+        );
+        for m in &models {
+            assert!(m.kv_bytes_per_token.is_some(), "{}", m.id);
+        }
+        // The planner figures at the fleet's working context:
+        // 65,536 B/token * 32,768 tokens = 2,048 MiB.
+        assert_eq!(65_536u64 * 32_768, 2_048 * MIB);
+    }
+
+    #[test]
+    fn model_spec_without_kv_pin_deserializes_as_unpinned() {
+        // Specs persisted before the KV pin existed carry no
+        // kv_bytes_per_token key; the serde default keeps them
+        // readable with the figure unpinned.
+        let spec = test_spec("legacy", 1_000);
+        let mut v = serde_json::to_value(&spec).unwrap();
+        v.as_object_mut().unwrap().remove("kv_bytes_per_token");
+        let back: ModelSpec = serde_json::from_value(v).unwrap();
+        assert_eq!(back.kv_bytes_per_token, None);
     }
 
     #[test]
