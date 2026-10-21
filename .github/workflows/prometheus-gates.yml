@@ -18,6 +18,14 @@ on:
         required: false
         default: main
         type: string
+      runner:
+        description: "Runner: prometheus = self-hosted Dell (default); windows-latest = GitHub-hosted Windows"
+        required: false
+        default: prometheus
+        type: choice
+        options:
+          - prometheus
+          - windows-latest
 
 permissions:
   contents: read
@@ -29,7 +37,7 @@ concurrency:
 jobs:
   gates:
     name: Full gate set (Prometheus)
-    runs-on: [self-hosted, windows, prometheus]
+    runs-on: ${{ inputs.runner == 'windows-latest' && 'windows-latest' || fromJSON('["self-hosted", "windows", "prometheus"]') }}
     timeout-minutes: 180
     steps:
       - name: Check out ref
