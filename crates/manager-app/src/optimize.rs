@@ -575,7 +575,7 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
             expert_bytes: spec.expert_bytes,
             expert_bytes_by_block: None,
             moe_layers: spec.moe_layers,
-            kv_per_token: None,
+            kv_per_token: spec.kv_bytes_per_token,
             rs_bytes_per_seq: None,
             basis: manager_models::MemoryBasis::Catalog,
             ctx_max: spec.ctx_max,

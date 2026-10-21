@@ -3505,6 +3505,7 @@ fn download_spec_for(cfg: &AppConfig, id: &str) -> Result<manager_models::ModelS
             enabled_by_default: m.enabled,
             expert_bytes: None,
             moe_layers: m.moe_layers,
+            kv_bytes_per_token: None,
             default_offload_layers: m.default_offload_layers,
             offload_restrictions: Vec::new(),
             mtp: false,
@@ -7751,8 +7752,9 @@ fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
 /// routed-expert share, the MoE layer count, KV bytes per token,
 /// and the derivation basis. The layout comes from the downloaded
 /// GGUF when available (basis Exact), else the catalog's pins
-/// (Catalog — expert bytes and MoE layer count are both pinned, so
-/// a partial offload resolves before download), else a
+/// (Catalog — expert bytes, MoE layer count, and KV bytes per
+/// token are all pinned, so a partial offload and the KV figure
+/// resolve before download), else a
 /// parameter-count estimate (Estimate). None when the backend's
 /// model cannot be resolved.
 struct WeightLayout {
@@ -7825,7 +7827,7 @@ fn resolve_weight_layout(
             c.size_bytes,
             c.expert_bytes,
             None,
-            None,
+            c.kv_bytes_per_token,
             None,
             c.moe_layers,
             manager_models::MemoryBasis::Catalog,
@@ -8179,6 +8181,7 @@ pub async fn op_placement_propose(
                 enabled_by_default: m.enabled,
                 expert_bytes: None,
                 moe_layers: m.moe_layers,
+                kv_bytes_per_token: None,
                 default_offload_layers: m.default_offload_layers,
                 offload_restrictions: Vec::new(),
                 mtp: false,
@@ -11402,6 +11405,63 @@ mod tests {
         assert_eq!(req.sys_weights_mib, 14_515);
         assert_eq!(req.gpu_weights_mib, 9_582);
         assert_eq!(req.basis, manager_models::MemoryBasis::Catalog);
+    }
+
+    #[test]
+    fn catalog_arm_requirement_reports_kv_for_planner_mtp() {
+        // The Oct 20, 2026 defect: planner-mtp's card showed no KV
+        // figure. Its backend resolves through the catalog arm
+        // whenever the GGUF header does not parse (here: no file
+        // on disk at all, the pre-download shape) — the catalog
+        // arm must still supply the KV figure from the catalog's
+        // pinned geometry: 65,536 B/token, 2,048 MiB at the
+        // backend's n_ctx 32768.
+        let mut cfg = test_cfg();
+        let mut b = serve_model(
+            &mut cfg,
+            "planner",
+            "qwen3.8-27b-mtp",
+            "models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf",
+            None,
+        );
+        b.flags.n_ctx = 32_768;
+        let layout = resolve_weight_layout(&cfg, &b).unwrap();
+        assert_eq!(layout.basis, manager_models::MemoryBasis::Catalog);
+        assert_eq!(layout.kv_per_token, Some(65_536));
+        let req = backend_memory_requirement(&cfg, &b).unwrap();
+        assert_eq!(req.kv_mib, Some(2_048));
+        assert_eq!(req.basis, manager_models::MemoryBasis::Catalog);
+    }
+
+    #[test]
+    fn catalog_arm_requirement_reports_kv_for_planner_and_coder() {
+        // The same catalog-arm resolution for the base planner
+        // (65,536 B/token — the figure its downloaded file's parse
+        // reports, so the card's KV tile is identical before and
+        // after download) and the coder (24,576 B/token, 768 MiB
+        // at n_ctx 32768).
+        let mut cfg = test_cfg();
+        let mut b = serve_model(
+            &mut cfg,
+            "planner",
+            "qwen3-27b-planner",
+            "models/Qwen3.8-27B.gguf",
+            None,
+        );
+        b.flags.n_ctx = 32_768;
+        let req = backend_memory_requirement(&cfg, &b).unwrap();
+        assert_eq!(req.kv_mib, Some(2_048));
+        let mut cfg = test_cfg();
+        let mut b = serve_model(
+            &mut cfg,
+            "coder",
+            "qwen3-coder-30b",
+            "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
+            Some("-ot exps=CPU"),
+        );
+        b.flags.n_ctx = 32_768;
+        let req = backend_memory_requirement(&cfg, &b).unwrap();
+        assert_eq!(req.kv_mib, Some(768));
     }
 
     #[test]
