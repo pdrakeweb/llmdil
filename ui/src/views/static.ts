@@ -13,7 +13,7 @@ import {
   runWizardStep, wizardBusyMessage, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit,
   getWizardCommands,
   getGpuTelemetry, getGpuHistory, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
-  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendMtp, setBackendParallel, setBackendRawFlags, setBackendFlagsMode, getBackendLaunchCommand,
+  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendMtp, setBackendParallel, setBackendCache, backendCachePreview, setBackendRawFlags, setBackendFlagsMode, getBackendLaunchCommand,
   measurementLookup,
   optimizeMeasureBackend,
   getBackendConfig, applyBackendConfig, testBackend, testBackendToolCall, placementPropose, placementApply,
@@ -33,7 +33,7 @@ import {
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
   adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, BackendMtp, BackendOffload, BackendParallel, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, LogRow, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
+import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, BackendCache, BackendMtp, BackendOffload, BackendParallel, BackendRow, CachePreview, CacheSelectionLike, CacheTypeName, FlashAttnName, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, LogRow, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
 import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
 import type { GpuInfo, WizardStepState } from "../types";
 
@@ -1956,6 +1956,108 @@ function flagsParallelHtml(o: {
           </span></label>
         <div style="font-size:12px;color:var(--text2)"><span style="font-family:var(--mono)">${esc(parallelTokenText(v))}</span>${o.savedCustom ? `<span title="The saved flags spell parallel slots in a form the control does not write (an -np or = spelling, repeated tokens, ...). Saving from the field writes the canonical --parallel N; every other flag is preserved."> \u00b7 custom flags</span>` : ""}</div>
       </div>`;
+}
+
+/* ---------------- KV cache / flash attention ----------------
+ * The cache controls: K and V cache type selects plus the
+ * flash-attention tri-state, committing through
+ * backend_set_cache (edit form) or carried by backend_add (add
+ * form). State arrives decoded server-side (BackendCache /
+ * CachePreview) — the TS side never parses raw flags for these.
+ * The predicted footprint and the predicted-best ladder come
+ * from the preview payload, priced server-side by the same
+ * requirement model as the start gate. */
+const CACHE_TYPES: CacheTypeName[] = ["f16", "q8_0", "q4_0"];
+const FLASH_ATTN_MODES: FlashAttnName[] = ["auto", "on", "off"];
+
+/** The flag tokens a cache selection writes — the canonical
+ *  forms the app itself writes (backend_set_cache). */
+function cacheTokenText(sel: CacheSelectionLike): string {
+  return `--cache-type-k ${sel.k} --cache-type-v ${sel.v} --flash-attn ${sel.flash_attn}`;
+}
+
+/** Whether the selection is the pairing llama.cpp refuses: a
+ *  quantized V cache with flash attention off. The set op
+ *  refuses it too; the form names it before committing. */
+function cacheVQuantizedFaOff(sel: CacheSelectionLike): boolean {
+  return sel.v !== "f16" && sel.flash_attn === "off";
+}
+
+function sameCacheSelection(a: CacheSelectionLike, b: CacheSelectionLike): boolean {
+  return a.k === b.k && a.v === b.v && a.flash_attn === b.flash_attn;
+}
+
+/** The predicted-footprint line under the cache controls: the
+ *  current selection's weights / KV / state / total against the
+ *  target VRAM, and the predicted-best rung — as a button when
+ *  it differs from the current selection (the host wires the
+ *  attribute), as text when it is the current selection, and as
+ *  the honest no-fit statement (with the lowest rung's numbers)
+ *  when no rung fits at the chosen context. Numbers only;
+ *  explanation in the tooltip. */
+function cachePreviewHtml(preview: CachePreview | null, sel: CacheSelectionLike, bestAttr: string): string {
+  if (!preview) return "";
+  const gib = (mib: number): string => fmtGb(mib / 1024);
+  if (preview.kv_mib === null) {
+    return `<div style="font-size:12px;color:var(--text2);margin-top:6px">Weights: ${gib(preview.weights_mib)} GiB · KV: not priced<span class="info-tip" title="This model's KV geometry is not known, so no KV figure or predicted-best rung can be priced for it. The cache types still apply at launch.">${icon("info")}</span></div>`;
+  }
+  const targets = preview.targets && preview.targets.length
+    ? preview.targets.map((t) => `GPU ${t.gpu} ${gib(t.total_mib)} GiB`).join(" + ")
+    : "target VRAM unknown";
+  const fitText = preview.fits_current === null
+    ? ""
+    : preview.fits_current
+      ? ` · fits`
+      : ` · does not fit at this context`;
+  const parts = [`Weights: ${gib(preview.weights_mib)} GiB`, `KV: ${gib(preview.kv_mib)} GiB`];
+  if (preview.rs_mib) parts.push(`State: ${gib(preview.rs_mib)} GiB`);
+  parts.push(`Total: ${gib(preview.total_mib)} GiB vs ${targets}${fitText}`);
+  let bestHtml = "";
+  const best = preview.best;
+  if (best && !sameCacheSelection(best, sel)) {
+    bestHtml = `<div style="margin-top:6px"><button class="btn" ${bestAttr}>${icon("check")} Use predicted best: ${esc(`${best.k}/${best.v} · FA ${best.flash_attn}`)} (${gib(best.total_mib)} GiB)</button></div>`;
+  } else if (best) {
+    bestHtml = `<div style="font-size:12px;color:var(--text2);margin-top:6px">Predicted best: this selection</div>`;
+  } else if (preview.ladder.length) {
+    const lowest = preview.ladder[preview.ladder.length - 1];
+    bestHtml = `<div style="font-size:12px;color:#e3b341;margin-top:6px">No cache selection fits at this context — lowest: ${esc(`${lowest.k}/${lowest.v}`)} at ${gib(lowest.total_mib)} GiB</div>`;
+  }
+  return `<div style="font-size:12px;color:var(--text2);margin-top:6px">${esc(parts.join(" · "))}<span class="info-tip" title="Predicted footprint of the current selection, priced by the same requirement model as the start gate: GPU weights at the current offload, KV at the selected cache types and the form's context, and the recurrent-state cache when the model carries one. A selection fits when its per-GPU total is within ${preview.headroom_reserve_percent}% headroom of the target's VRAM — the reserve covers the compute buffers the requirement model does not price. Predicted best is the highest-quality rung that fits: f16, then q8_0/q8_0, then q8_0/q4_0 (V degrades before K), then q4_0/q4_0, flash attention on at every rung.">${icon("info")}</span></div>${bestHtml}`;
+}
+
+/** The cache controls block — three selects in the ctx/batch
+ *  idiom plus the token readout and the predicted-footprint
+ *  slot — shared between the Edit Flags form and the Add backend
+ *  form: one implementation, two hosts. `fieldAttr` is the data
+ *  attribute the host's draft sync reads; the preview slot's
+ *  content is rendered from `preview` for `sel` and re-rendered
+ *  by the host as previews land. */
+function flagsCacheHtml(o: {
+  sel: CacheSelectionLike;
+  savedCustom: boolean;
+  savedPresent: boolean;
+  preview: CachePreview | null;
+  fieldAttr: string;
+  bestAttr: string;
+  disabled: boolean;
+}): string {
+  const dis = o.disabled ? " disabled" : "";
+  const selHtml = (field: string, label: string, values: string[], cur: string, tip: string): string => `
+        <label style="font-size:12px;color:var(--text2)">${label}<span class="info-tip" title="${esc(tip)}">${icon("info")}</span>
+          <span style="display:flex;gap:6px;margin-top:4px">
+            <select ${o.fieldAttr}="${field}" style="${SELECT_STYLE};flex:1;min-width:0"${dis}>
+              ${values.map((v) => `<option value="${v}"${v === cur ? " selected" : ""}>${v}</option>`).join("")}
+            </select>
+          </span></label>`;
+  return `<div style="margin-top:12px">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+        ${selHtml("cache-k", "K cache type", CACHE_TYPES, o.sel.k, "The element type the key cache is stored in. f16 is full quality; q8_0 stores each element in about half the space with minimal quality loss; q4_0 in about a quarter, with more. Applies on the backend's next start.")}
+        ${selHtml("cache-v", "V cache type", CACHE_TYPES, o.sel.v, "The element type the value cache is stored in. A quantized V cache requires flash attention (auto promotes to on; off is refused by llama.cpp and by this form).")}
+        ${selHtml("flash-attn", "Flash attention", FLASH_ATTN_MODES, o.sel.flash_attn, "Flash attention computes attention in tiles, cutting memory traffic. Auto lets llama.cpp decide (and promotes to on when a quantized V cache or a tensor split requires it); on forces it; off disables it. On the pinned build it is supported on every GPU the app targets, Pascal included (generic tile kernel).")}
+      </div>
+      <div style="font-size:12px;color:var(--text2);margin-top:4px"><span style="font-family:var(--mono)">${esc(cacheTokenText(o.sel))}</span>${o.savedCustom ? `<span title="The saved flags spell the cache settings in a form the controls do not write (a -ctk or = spelling, a partial selection, ...). Saving from these controls writes the canonical tokens; every other flag is preserved."> · custom flags</span>` : ""}${o.savedPresent ? "" : `<span title="No cache tokens are saved for this backend: it runs at llama.cpp's defaults (f16/f16, flash attention auto), exactly as before these controls existed. Saving from these controls writes the tokens."> · llama.cpp defaults (no tokens saved)</span>`}</div>
+      <div data-cache-slot>${cachePreviewHtml(o.preview, o.sel, o.bestAttr)}</div>
+    </div>`;
 }
 
 /** The rated-context line under the flags fields, shared by the
