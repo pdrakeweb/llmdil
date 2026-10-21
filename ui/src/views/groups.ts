@@ -110,6 +110,12 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
   let status: { text: string; err: boolean } | null = null;
   let formOpen = false;
   let formError = "";
+  /** The create form's draft name, held outside the repainted
+   *  DOM (design rule 17): paintForm re-renders the input from
+   *  this draft, so a failed create — and the 10 s poll repaint —
+   *  keep the operator's typed name intact instead of clearing
+   *  the field. Cleared only when the form closes. */
+  let formDraft = "";
 
   const bodyEl = (): HTMLElement | null => root.querySelector("#groupsBody");
   const statusEl = (): HTMLElement | null => root.querySelector("#groupsStatus");
@@ -280,7 +286,7 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
     el.innerHTML = formOpen
       ? `<div class="card" style="margin-bottom:12px"><div class="sec-title">${icon("plus")} New group</div>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <input id="groupsNewName" type="text" placeholder="group-name" style="${INPUT_STYLE}" autocomplete="off">
+          <input id="groupsNewName" type="text" placeholder="group-name" value="${esc(formDraft)}" style="${INPUT_STYLE}" autocomplete="off">
           <button class="btn" data-group-create>${icon("check")} Create group</button>
           <button class="btn" data-group-create-cancel>Cancel</button>
         </div>
@@ -395,13 +401,16 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
 
   async function doCreate(): Promise<void> {
     const input = root.querySelector<HTMLInputElement>("#groupsNewName");
-    const name = (input?.value ?? "").trim();
+    const name = (input?.value ?? formDraft).trim();
     if (!name) { formError = "Enter a group name."; paintForm(); return; }
     const r = await gatewayCreateGroup(name);
     if (disposed) return;
     if (r.error) { formError = r.error; paintForm(); return; }
+    // Success (rule 17): the form closes and the new group lane
+    // displays in its new state through load().
     formOpen = false;
     formError = "";
+    formDraft = "";
     setStatus(`Group ${name} created.`);
     await load();
   }
@@ -421,6 +430,7 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
     if (t.closest("[data-groups-new]")) {
       formOpen = !formOpen;
       formError = "";
+      if (!formOpen) formDraft = "";
       paintForm();
       return;
     }
@@ -430,6 +440,7 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
     if (t.closest("[data-group-create-cancel]")) {
       formOpen = false;
       formError = "";
+      formDraft = "";
       paintForm();
       return;
     }
@@ -515,7 +526,16 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
     clearDropHighlights();
   }
 
+  /** Keep the create form's draft in step with the input, so a
+   *  repaint (poll or a failed create's error render) restores
+   *  the typed name from formDraft instead of losing it. */
+  function onInput(ev: Event): void {
+    const t = ev.target as HTMLElement;
+    if (t.id === "groupsNewName") formDraft = (t as HTMLInputElement).value;
+  }
+
   root.addEventListener("click", onClick);
+  root.addEventListener("input", onInput);
   root.addEventListener("keydown", onKeydown);
   root.addEventListener("dragstart", onDragStart);
   root.addEventListener("dragover", onDragOver);
