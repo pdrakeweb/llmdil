@@ -2175,7 +2175,7 @@ function applyFlagsField(
  *  panel's Model select ("" when the backend's file matches no
  *  registered model), applied through model_assign only when the
  *  panel saves — the card face carries no model control. */
-export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null; parallel: number | null; advanced: boolean; rawText: string; rawWarnings: FlagWarningLike[]; editModelId: string }
+export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null; parallel: number | null; cacheSel: CacheSelectionLike | null; cachePreview: CachePreview | null; advanced: boolean; rawText: string; rawWarnings: FlagWarningLike[]; editModelId: string }
 
 /** State for the in-card Placement form (tensor split editing,
  *  moved here from the GPUs page — Pete's direction, 2026-10-16),
@@ -2592,6 +2592,21 @@ function backendCard(
     fieldAttr: "data-flags-field",
     disabled: inFlight.has(b.id),
   }) : "";
+  // The KV cache / flash-attention controls, under the parallel
+  // field: selects committing through backend_set_cache on change
+  // (the MTP/parallel commit model), with the predicted footprint
+  // and predicted-best action rendered from the preview payload
+  // the wire layer prices for the current draft.
+  const cacheSel: CacheSelectionLike = flags?.cacheSel ?? (b.cache ? { k: b.cache.k, v: b.cache.v, flash_attn: b.cache.flash_attn } : { k: "f16", v: "f16", flash_attn: "auto" });
+  const cacheHtml = flags && b.cache ? flagsCacheHtml({
+    sel: cacheSel,
+    savedCustom: b.cache.custom && sameCacheSelection(cacheSel, b.cache),
+    savedPresent: b.cache.present,
+    preview: flags.cachePreview,
+    fieldAttr: "data-cache-field",
+    bestAttr: `data-cache-best data-cache-backend="${esc(b.id)}"`,
+    disabled: inFlight.has(b.id),
+  }) : "";
   // Advanced flags mode (tracker #60): the panel is REPLACED by
   // the raw-flags text editor — the structured controls are not
   // rendered at all, so nothing inert invites an edit the server
@@ -2630,6 +2645,7 @@ function backendCard(
       ${editModelHtml}
       ${flagsCtxBatchHtml({ ctx: flags.ctx, batch: flags.batch, ctxMax: flags.ctxMax, fieldAttr: "data-flags-field", disabled: inFlight.has(b.id) })}
       ${parallelHtml}
+      ${cacheHtml}
       ${offloadHtml}
       ${mtpHtml}
       ${flagsRatedLineHtml({ ctxMax: flags.ctxMax, modelId: flags.modelId, savedText: "Saved to the configuration immediately; applies on the backend's next start. Tensor split is set in the Placement section below." })}
@@ -2991,7 +3007,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       <div class="grid2">${sorted(sec.rows).map((row) => {
         const mdl = flagsFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const flagsArg: FlagsDraft | null = flagsFor === row.id
-          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers, offloadPendingLayers: offloadPending?.backendId === row.id ? offloadPending.layers : null, mtpPosition: flagsMtpPosition, parallel: flagsParallel, advanced: row.flags_advanced === true, rawText: flagsRawText, rawWarnings: flagsRawWarnings, editModelId: flagsEditModelId }
+          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers, offloadPendingLayers: offloadPending?.backendId === row.id ? offloadPending.layers : null, mtpPosition: flagsMtpPosition, parallel: flagsParallel, cacheSel: flagsCacheSel, cachePreview: flagsCachePreview, advanced: row.flags_advanced === true, rawText: flagsRawText, rawWarnings: flagsRawWarnings, editModelId: flagsEditModelId }
           : null;
         const pmdl = placeFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const placeArg: PlaceCardState | null = placeFor === row.id
@@ -3179,6 +3195,17 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   /** True while a parallel commit (backend_set_parallel) is in
    *  flight; the field ignores further commits until it lands. */
   let parallelCommitting = false;
+  /** The KV cache / flash-attention draft selection while the
+   *  flags form is open (the decoded saved selection at open);
+   *  commits through backend_set_cache on change, like MTP. */
+  let flagsCacheSel: CacheSelectionLike | null = null;
+  /** The last cache preview priced for the current draft
+   *  (predicted footprint + predicted-best ladder), held in wire
+   *  state so poll repaints re-render it. */
+  let flagsCachePreview: CachePreview | null = null;
+  let cacheCommitting = false;
+  let cachePreviewSeq = 0;
+  let cachePreviewTimer: number | null = null;
   /** The advanced flags editor's draft text (tracker #60): the
    *  open backend's raw flags as edited, synced on every input
    *  event so poll repaints re-render the textarea from here.
@@ -3231,9 +3258,30 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       void runPredictedLookup();
     }, 300);
   };
+  const runCachePreview = async (): Promise<void> => {
+    const id = flagsFor;
+    if (!id || !flagsCacheSel) return;
+    const seq = ++cachePreviewSeq;
+    const r = await backendCachePreview(id, { nCtx: flagsCtx, slots: flagsParallel ?? undefined, sel: flagsCacheSel });
+    if (disposed || seq !== cachePreviewSeq || flagsFor !== id || r.error || !r.data) return;
+    flagsCachePreview = r.data;
+    const slot = root.querySelector("[data-cache-slot]");
+    if (slot && flagsCacheSel) slot.innerHTML = cachePreviewHtml(flagsCachePreview, flagsCacheSel, `data-cache-best data-cache-backend="${esc(id)}"`);
+  };
+  const scheduleCachePreview = (): void => {
+    if (cachePreviewTimer !== null) window.clearTimeout(cachePreviewTimer);
+    cachePreviewTimer = window.setTimeout(() => {
+      cachePreviewTimer = null;
+      void runCachePreview();
+    }, 300);
+  };
   const closeFlagsForm = (): void => {
     flagsFor = null;
     offloadPending = null;
+    flagsCacheSel = null;
+    flagsCachePreview = null;
+    cachePreviewSeq += 1;
+    if (cachePreviewTimer !== null) { window.clearTimeout(cachePreviewTimer); cachePreviewTimer = null; }
     predictedHtml = "";
     predictedSeq += 1;
     if (predictedTimer !== null) { window.clearTimeout(predictedTimer); predictedTimer = null; }
@@ -3248,6 +3296,8 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     flagsOffloadLayers = row.offload ? row.offload.layers : null;
     flagsMtpPosition = row.mtp ? mtpPosition(row.mtp) : null;
     flagsParallel = row.parallel ? row.parallel.slots : null;
+    flagsCacheSel = row.cache ? { k: row.cache.k, v: row.cache.v, flash_attn: row.cache.flash_attn } : { k: "f16", v: "f16", flash_attn: "auto" };
+    flagsCachePreview = null;
     offloadPending = null;
     // The advanced editor opens on the backend's CURRENT saved
     // raw flags — a pure read of the row payload; opening writes
@@ -3258,6 +3308,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     predictedSeq += 1;
     paint();
     schedulePredictedLookup();
+    scheduleCachePreview();
   };
   /** Keep the draft in step with the in-card form fields. Preset
    *  selects repaint (to show or hide the Custom numeric input);
@@ -3274,6 +3325,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     flagsParallel = draft.parallel;
     if (repaint) paint();
     schedulePredictedLookup();
+    scheduleCachePreview();
   };
   root.addEventListener("change", syncFlagsDraft);
   root.addEventListener("input", syncFlagsDraft);
@@ -3557,6 +3609,87 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   };
   root.addEventListener("change", commitParallel);
 
+  /* ---------------- KV cache / flash attention ----------------
+   * Three selects (the MTP idiom): a "change" on any of them
+   * builds the full selection from the card's selects, moves the
+   * draft, refreshes the preview, and commits through
+   * backend_set_cache, which rewrites only the cache tokens in
+   * the backend's raw flags. The quantized-V + FA-off pairing is
+   * named in the form before committing (the op refuses it too).
+   * Choosing the saved selection is a no-op; a rejected commit
+   * reverts the draft to the saved selection. The predicted-best
+   * button applies the preview's best rung through the same
+   * commit path — nothing is ever applied without that click. */
+  const saveCacheSelection = async (id: string, sel: CacheSelectionLike): Promise<boolean> => {
+    if (cacheCommitting) return false;
+    cacheCommitting = true;
+    inFlight.add(id);
+    paint();
+    try {
+      const r = await setBackendCache(id, sel);
+      if (disposed) return false;
+      if (r.error) {
+        msgs.set(id, { text: `KV cache not saved: ${r.error}`, err: true });
+        paint();
+        return false;
+      }
+      if (flagsFor === id) flagsCacheSel = sel;
+      msgs.set(id, { text: `KV cache saved (${cacheTokenText(sel)}) — applies on next start.`, err: false });
+      await load();
+      schedulePredictedLookup();
+      scheduleCachePreview();
+      return true;
+    } finally {
+      cacheCommitting = false;
+      inFlight.delete(id);
+      if (!disposed) paint();
+    }
+  };
+  const commitCacheSelection = async (id: string, sel: CacheSelectionLike): Promise<void> => {
+    const row = lastRows.find((r) => r.id === id);
+    if (!row?.cache || cacheCommitting) return;
+    flagsCacheSel = sel;
+    scheduleCachePreview();
+    if (cacheVQuantizedFaOff(sel)) {
+      msgs.set(id, { text: "A quantized V cache requires flash attention: choose flash attention auto or on.", err: true });
+      flagsCacheSel = { k: row.cache.k, v: row.cache.v, flash_attn: row.cache.flash_attn };
+      paint();
+      return;
+    }
+    const saved: CacheSelectionLike = { k: row.cache.k, v: row.cache.v, flash_attn: row.cache.flash_attn };
+    if (row.cache.present && sameCacheSelection(sel, saved)) { paint(); return; }
+    const ok = await saveCacheSelection(id, sel);
+    if (!ok && !disposed) {
+      flagsCacheSel = saved;
+      paint();
+    }
+  };
+  const changeCache = async (ev: Event): Promise<void> => {
+    const t = ev.target as HTMLSelectElement;
+    if (!t.hasAttribute("data-cache-field")) return;
+    if (!flagsFor) return;
+    const card = t.closest(".backend-card");
+    if (!card) return;
+    const read = (field: string): string => (card.querySelector(`[data-cache-field="${field}"]`) as HTMLSelectElement | null)?.value ?? "";
+    const sel: CacheSelectionLike = {
+      k: read("cache-k") as CacheTypeName,
+      v: read("cache-v") as CacheTypeName,
+      flash_attn: read("flash-attn") as FlashAttnName,
+    };
+    if (!CACHE_TYPES.includes(sel.k) || !CACHE_TYPES.includes(sel.v) || !FLASH_ATTN_MODES.includes(sel.flash_attn)) return;
+    await commitCacheSelection(flagsFor, sel);
+  };
+  root.addEventListener("change", changeCache);
+  const clickCacheBest = async (ev: Event): Promise<void> => {
+    const t = (ev.target as HTMLElement).closest("[data-cache-best]") as HTMLElement | null;
+    if (!t) return;
+    const id = t.getAttribute("data-cache-backend") ?? "";
+    if (!id || id !== flagsFor || !flagsCachePreview?.best) return;
+    const best = flagsCachePreview.best;
+    await commitCacheSelection(id, { k: best.k, v: best.v, flash_attn: best.flash_attn });
+  };
+  root.addEventListener("click", clickCacheBest);
+
   /** Apply the Edit panel's model draft through model_assign,
    *  carrying the backend's current tensor split so the
    *  assignment changes the model only (the split is the
@@ -3739,6 +3872,11 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
      * them — the slider to the model's catalog default position,
      * the chips to the split creation would assign. */
     const pDraft: { ctx: number; batch: number; parallel: number | null } = { ctx: 32768, batch: 512, parallel: null };
+    /** The add form's KV cache draft: starts at the preview's
+     *  predicted-best rung for the model (the brief's starting
+     *  point for a new backend), then follows the operator's
+     *  changes to the cache selects; carried by backend_add. */
+    let pCache: CacheSelectionLike | null = null;
     let preview: BackendAddPreview | null = null;
     let offLayers: number | null = null;
     /** A released offload position the guardrail blocks, awaiting
@@ -3840,10 +3978,26 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       } else {
         placeHtml = `<div style="font-size:12px;color:var(--text2);margin-top:12px">Placement: auto<span class="info-tip" title="No GPU telemetry yet \u2014 a tensor split cannot be previewed or selected; creation leaves the split unset, as it does today.">${icon("info")}</span></div>`;
       }
+      // The cache controls for the backend being created: the
+      // draft starts at the preview's predicted-best rung; the
+      // footprint line re-prices from the ladder rung matching
+      // the draft's K/V types when the draft differs from the
+      // preview's own selection.
+      let cacheHtml = "";
+      if (preview?.cache) {
+        const sel: CacheSelectionLike = pCache ?? (preview.cache.best ? { k: preview.cache.best.k, v: preview.cache.best.v, flash_attn: preview.cache.best.flash_attn } : preview.cache.selection);
+        let renderPreview: CachePreview = preview.cache;
+        if (!sameCacheSelection(sel, preview.cache.selection)) {
+          const rung = preview.cache.ladder.find((r) => r.k === sel.k && r.v === sel.v);
+          if (rung) renderPreview = { ...preview.cache, kv_mib: rung.kv_mib, total_mib: rung.total_mib, fits_current: rung.fits, selection: sel };
+        }
+        cacheHtml = flagsCacheHtml({ sel, savedCustom: false, savedPresent: false, preview: renderPreview, fieldAttr: "data-add-cache-field", bestAttr: "data-add-cache-best", disabled: false });
+      }
       paramsEl.innerHTML = `<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
       <div style="font-size:12px;font-weight:600">${icon("gear")} Launch parameters</div>
       ${flagsCtxBatchHtml({ ctx: pDraft.ctx, batch: pDraft.batch, ctxMax, fieldAttr: "data-add-flags-field", disabled: false })}
       ${flagsParallelHtml({ value: pDraft.parallel, savedCustom: false, fieldAttr: "data-add-flags-field", disabled: false })}
+      ${cacheHtml}
       ${offloadHtml}
       ${flagsRatedLineHtml({ ctxMax, modelId: m?.id ?? null, savedText: "Saved when the backend is added; applies from its first start. Placement is set by the GPU selection below." })}
       <div data-add-predicted-slot>${addPredictedHtml}</div>
@@ -3866,13 +4020,14 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       const modelId = modelSelEl?.value ?? "";
       if (!modelId) return;
       const seq = ++previewSeq;
-      const r = await backendAddPreview(modelId, gpuTouched ? selectedGpus() : undefined);
+      const r = await backendAddPreview(modelId, gpuTouched ? selectedGpus() : undefined, pDraft.ctx, pDraft.parallel ?? undefined);
       if (disposed || seq !== previewSeq) return;
       if (r.error || !r.data) { preview = null; paintParams(); scheduleAddLookup(); return; }
       preview = r.data;
       if (modelChanged) {
         offLayers = preview.offload ? preview.offload.layers : null;
         offPending = null;
+        pCache = preview.cache ? (preview.cache.best ? { k: preview.cache.best.k, v: preview.cache.best.v, flash_attn: preview.cache.best.flash_attn } : { ...preview.cache.selection }) : null;
         resetPlacementFromPreview();
       }
       paintParams();
@@ -3939,10 +4094,24 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         void loadPreview(false);
         return;
       }
+      if (t.hasAttribute("data-add-cache-field")) {
+        const read = (f: string): string => (paramsEl.querySelector(`[data-add-cache-field="${f}"]`) as HTMLSelectElement | null)?.value ?? "";
+        const sel: CacheSelectionLike = { k: read("cache-k") as CacheTypeName, v: read("cache-v") as CacheTypeName, flash_attn: read("flash-attn") as FlashAttnName };
+        if (CACHE_TYPES.includes(sel.k) && CACHE_TYPES.includes(sel.v) && FLASH_ATTN_MODES.includes(sel.flash_attn)) { pCache = sel; paintParams(); scheduleAddLookup(); }
+        return;
+      }
       const field = t.getAttribute("data-add-flags-field");
-      if (field && applyFlagsField(pDraft, field, (t as HTMLInputElement).value, true)) { paintParams(); scheduleAddLookup(); }
+      if (field && applyFlagsField(pDraft, field, (t as HTMLInputElement).value, true)) { paintParams(); scheduleAddLookup(); void loadPreview(false); }
     });
     paramsEl?.addEventListener("click", (ev) => {
+      const bestBtn = (ev.target as HTMLElement).closest("[data-add-cache-best]") as HTMLElement | null;
+      if (bestBtn && preview?.cache?.best) {
+        const b = preview.cache.best;
+        pCache = { k: b.k, v: b.v, flash_attn: b.flash_attn };
+        paintParams();
+        scheduleAddLookup();
+        return;
+      }
       const t = (ev.target as HTMLElement).closest("[data-add-decision]") as HTMLElement | null;
       if (!t || !preview?.offload || !offPending) return;
       if (t.getAttribute("data-add-decision") === "override") {
@@ -3997,6 +4166,12 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         if (msg) msg.innerHTML = `<span style="color:var(--err)">Parallel slots must be between ${PARALLEL_MIN} and ${fmtCount(PARALLEL_MAX)}.</span>`;
         return;
       }
+      // KV cache: the pairing llama.cpp refuses cannot be carried
+      // into creation (the op refuses it too).
+      if (pCache && cacheVQuantizedFaOff(pCache)) {
+        if (msg) msg.innerHTML = `<span style="color:var(--err)">A quantized V cache requires flash attention: choose flash attention auto or on.</span>`;
+        return;
+      }
       // An undecided guardrail-blocked offload position cannot be
       // carried into creation (the op would refuse it without the
       // override): the operator decides here first.
@@ -4017,6 +4192,9 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         offloadOverride: offPending?.override ? true : undefined,
         gpuIndices: gpuTouched ? selectedGpus() : undefined,
         parallel: pDraft.parallel ?? undefined,
+        cacheK: pCache?.k,
+        cacheV: pCache?.v,
+        flashAttn: pCache?.flash_attn,
       });
       if (disposed) return;
       if (r.error) {
@@ -4035,6 +4213,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
           <div><span style="color:var(--text2)">Context:</span> ${fmtCount(pDraft.ctx)}</div>
           <div><span style="color:var(--text2)">Batch:</span> ${fmtCount(pDraft.batch)}</div>
           ${pDraft.parallel !== null ? `<div><span style="color:var(--text2)">Parallel slots:</span> ${pDraft.parallel}</div>` : ""}
+          ${pCache ? `<div><span style="color:var(--text2)">KV cache:</span> ${esc(cacheTokenText(pCache))}</div>` : ""}
           ${preview?.offload ? `<div><span style="color:var(--text2)">Offload:</span> ${esc(offloadTokenText(preview.offload, offLayers ?? preview.offload.layers))}${offPending?.override ? " (override recorded)" : ""}</div>` : ""}
           ${gpuTouched ? `<div><span style="color:var(--text2)">GPUs:</span> ${esc(selectedGpus().map((ix) => `GPU ${ix}`).join(", "))}</div>` : ""}
           <div><span style="color:var(--text2)">Activation plan:</span> recorded<span class="info-tip" title="The change is recorded in the activation plan at the top of this page — the gateway routes the new backend after the plan is executed.">${icon("info")}</span></div>
