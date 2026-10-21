@@ -2584,6 +2584,21 @@ pub async fn op_list_backends(
             });
         }
     }
+    // KV cache / flash-attention state per configured backend:
+    // the flags form's cache controls render for every backend,
+    // so — like the parallel state — this attaches to every
+    // configured row.
+    {
+        for row in backends.iter_mut() {
+            let Some(id) = row["id"].as_str() else {
+                continue;
+            };
+            let Some(b) = cfg.backends.iter().find(|b| b.id == id) else {
+                continue;
+            };
+            row["cache"] = cache_row_json(&backend_cache_info(b));
+        }
+    }
     // Predicted throughput per configured backend
     // (predicted-throughput design §7): the exact-match
     // measurement for the backend's SAVED configuration,
@@ -5138,6 +5153,9 @@ pub async fn op_backend_add(
     offload_override: Option<bool>,
     gpu_indices: Option<Vec<u32>>,
     parallel: Option<u32>,
+    cache_k: Option<String>,
+    cache_v: Option<String>,
+    flash_attn: Option<String>,
 ) -> ApiResult {
     let id = id.trim().to_string();
     let group = group.trim().to_string();
@@ -5181,6 +5199,13 @@ pub async fn op_backend_add(
     if let Some(slots) = parallel {
         validate_parallel_slots(slots)?;
     }
+    // KV cache / flash attention: validated by the same rules
+    // backend_set_cache applies, when the add form chose a
+    // selection (the predicted-best starting point it renders,
+    // or the operator's change to it). All three values together
+    // or none; the invalid quantized-V + FA-off pairing is
+    // refused by the shared resolver.
+    let cache_sel = resolve_cache_selection(cache_k, cache_v, flash_attn)?;
     // GPU inventory, fetched before the config write lock when the
     // request needs it (an explicit GPU selection to validate, or
     // an offload position to evaluate against the placed GPUs'
@@ -5308,6 +5333,16 @@ pub async fn op_backend_add(
             Some(i64::from(slots)),
         );
     }
+    // A chosen cache selection is written into the constructed
+    // backend's raw flags last (it rewrites only its own tokens),
+    // so the creation save carries it with everything else. An
+    // absent choice writes no cache tokens: creation stays
+    // byte-identical to the pre-feature shape, at llama.cpp's
+    // defaults.
+    if let Some(sel) = cache_sel {
+        backend.raw_flags =
+            manager_models::set_cache_selection(backend.raw_flags.as_deref(), Some(sel));
+    }
     new_cfg.backends.push(backend);
     if let Some(m) = new_cfg.models.iter_mut().find(|m| m.id == model_id) {
         if !m.assigned_backends.contains(&id) {
@@ -5355,6 +5390,8 @@ pub async fn op_backend_add_preview(
     _sink: &Arc<dyn EventSink>,
     model_id: String,
     gpu_indices: Option<Vec<u32>>,
+    n_ctx: Option<u32>,
+    parallel: Option<u32>,
 ) -> ApiResult {
     let cfg = state.config.read().await.clone();
     let model = cfg
@@ -5408,9 +5445,32 @@ pub async fn op_backend_add_preview(
         let eval = evaluate_backend_offload(&cfg, &backend, &gpu_inventory, &journal);
         offload_row_json(&info, eval.as_ref())
     });
+    // The cache preview for the backend creation would build:
+    // the predicted footprint and predicted-best ladder at the
+    // form's context/slot draft (the creation defaults when the
+    // form sends none), so the add form renders its KV cache
+    // controls from the same payload the Edit Flags form renders
+    // from, with the predicted-best rung as the starting point.
+    // Null when the model's layout cannot be resolved.
+    let cache = resolve_weight_layout(&cfg, &backend).map(|layout| {
+        let targets = cache_fit_targets(&backend, &gpu_inventory);
+        cache_preview_json(
+            &layout,
+            manager_models::expert_offload(backend.raw_flags.as_deref()),
+            manager_models::cache_selection(backend.raw_flags.as_deref()),
+            n_ctx.unwrap_or(backend.flags.n_ctx),
+            parallel
+                .map(|p| p.max(1))
+                .unwrap_or_else(|| {
+                    manager_models::effective_slots(backend.raw_flags.as_deref())
+                }),
+            targets.as_ref(),
+        )
+    });
     Ok(json!({
         "model_id": model_id,
         "offload": offload,
+        "cache": cache,
         "tensor_split": tensor_split,
         "split_mode": split_mode_str(split_mode),
     }))
@@ -5918,6 +5978,367 @@ pub async fn op_backend_set_parallel(
     }))
 }
 
+
+/// Parse one cache-control value from the wire: a cache type
+/// spelling the pinned build accepts among the types v1 offers.
+fn parse_cache_type(value: &str, field: &str) -> Result<manager_models::CacheType, ApiError> {
+    manager_models::CacheType::parse(value).ok_or_else(|| {
+        ApiError::InvalidInput(format!(
+            "{field} must be one of f16, q8_0, q4_0; got {value:?}"
+        ))
+    })
+}
+
+/// Parse the flash-attention value from the wire.
+fn parse_flash_attn(value: &str) -> Result<manager_models::FlashAttn, ApiError> {
+    manager_models::FlashAttn::parse(value).ok_or_else(|| {
+        ApiError::InvalidInput(format!(
+            "flash_attn must be one of auto, on, off; got {value:?}"
+        ))
+    })
+}
+
+/// Resolve a full cache selection from the three wire values:
+/// all three present parses each; all three absent is the
+/// cleared state (`None` — no cache tokens); a partial set is
+/// refused, because the writer owns the selection as a whole and
+/// a partial write would silently freeze the unmentioned members
+/// at their current values.
+fn resolve_cache_selection(
+    cache_k: Option<String>,
+    cache_v: Option<String>,
+    flash_attn: Option<String>,
+) -> Result<Option<manager_models::CacheSelection>, ApiError> {
+    match (cache_k, cache_v, flash_attn) {
+        (None, None, None) => Ok(None),
+        (Some(k), Some(v), Some(f)) => {
+            let sel = manager_models::CacheSelection {
+                k: parse_cache_type(&k, "cache_k")?,
+                v: parse_cache_type(&v, "cache_v")?,
+                flash_attn: parse_flash_attn(&f)?,
+            };
+            if sel.v_quantized_fa_off() {
+                return Err(ApiError::InvalidInput(format!(
+                    "a quantized V cache ({}) requires flash attention: llama.cpp refuses \
+                     it with --flash-attn off — choose flash_attn auto or on",
+                    sel.v.as_str()
+                )));
+            }
+            Ok(Some(sel))
+        }
+        _ => Err(ApiError::InvalidInput(
+            "cache_k, cache_v, and flash_attn are set together (or all omitted to clear)"
+                .to_string(),
+        )),
+    }
+}
+
+/// The targets a cache fit is priced against for a backend: the
+/// GPUs its placement puts it on (per [`backend_gpu_visibility`]),
+/// their total VRAM, and the tensor-split shares over exactly
+/// those GPUs, in placement order. `None` when no GPU target can
+/// be named (CPU-only placement, or a placed GPU absent from the
+/// inventory): no fit claim is made then. An unsplit placement
+/// yields a single target and an empty split (the whole total on
+/// it, [`manager_models::predicted_fits`]' convention).
+fn cache_fit_targets(
+    b: &manager_config::BackendConfig,
+    gpus: &[GpuInfo],
+) -> Option<(Vec<f32>, Vec<u64>, Vec<u32>)> {
+    let placed = match backend_gpu_visibility(b) {
+        GpuVisibility::Gpus(indices) => indices,
+        _ => return None,
+    };
+    if placed.is_empty() {
+        return None;
+    }
+    let mut totals: Vec<u64> = Vec::new();
+    for i in &placed {
+        let g = gpus
+            .iter()
+            .find(|g| g.index == *i)
+            .or_else(|| gpus.get(*i as usize))?;
+        totals.push(g.total_vram_mib);
+    }
+    // Split shares over the placed GPUs: the configured split is
+    // in inventory order, and the placed set's positions in it
+    // are the placed indices (the placement projection's
+    // convention). Shares renormalize over the placed set; a
+    // split that puts nothing on a placed GPU — or no split at
+    // all — is the unsplit case for a single placed GPU and
+    // distributes nothing (fits nothing) for several.
+    let raw: Vec<f32> = placed
+        .iter()
+        .map(|i| {
+            b.flags
+                .tensor_split
+                .get(*i as usize)
+                .copied()
+                .unwrap_or(0.0)
+        })
+        .collect();
+    let sum: f32 = raw.iter().sum();
+    let split: Vec<f32> = if sum > 0.0 {
+        raw.iter().map(|f| f / sum).collect()
+    } else if placed.len() == 1 {
+        Vec::new()
+    } else {
+        raw
+    };
+    Some((split, totals, placed))
+}
+
+/// The cache preview payload shared by backend_cache_preview and
+/// backend_add_preview: the predicted footprint of `selection`
+/// at `n_ctx` / `n_seq` under the backend's layout and offload,
+/// the full predicted-best ladder priced against the targets,
+/// and the best rung. KV figures are absent (null) when the
+/// model's KV geometry is unknown — never priced as zero.
+fn cache_preview_json(
+    layout: &WeightLayout,
+    offload: manager_models::ExpertOffload,
+    selection: manager_models::CacheSelection,
+    n_ctx: u32,
+    n_seq: u32,
+    targets: Option<&(Vec<f32>, Vec<u64>, Vec<u32>)>,
+) -> Value {
+    let kv_typed = layout
+        .kv_geometry
+        .map(|g| g.bytes_per_token_typed(selection.k, selection.v));
+    let req = manager_models::memory_requirement(
+        layout.total_bytes,
+        layout.expert_bytes,
+        layout.expert_bytes_by_block.as_deref(),
+        layout.basis,
+        offload,
+        kv_typed.or(layout.kv_per_token),
+        layout.moe_layers,
+        n_ctx,
+        layout.rs_bytes_per_seq,
+        n_seq,
+    );
+    let total_mib = req.gpu_weights_mib + req.kv_mib.unwrap_or(0) + req.rs_mib.unwrap_or(0);
+    let (ladder, best) = match (layout.kv_geometry, targets) {
+        (Some(kv), Some((split, totals, _))) => {
+            let inputs = manager_models::CacheFitInputs {
+                kv,
+                gpu_weights_mib: req.gpu_weights_mib,
+                rs_mib: req.rs_mib,
+                n_ctx,
+                split: split.clone(),
+                gpu_total_mib: totals.clone(),
+            };
+            let ladder = manager_models::price_ladder(&inputs);
+            let best = ladder.iter().find(|r| r.fits).copied();
+            (ladder, best)
+        }
+        _ => (Vec::new(), None),
+    };
+    let rung_json = |r: &manager_models::CacheRung| {
+        json!({
+            "k": r.selection.k.as_str(),
+            "v": r.selection.v.as_str(),
+            "flash_attn": r.selection.flash_attn.as_str(),
+            "kv_mib": r.kv_mib,
+            "total_mib": r.total_mib,
+            "fits": r.fits,
+        })
+    };
+    json!({
+        "selection": {
+            "k": selection.k.as_str(),
+            "v": selection.v.as_str(),
+            "flash_attn": selection.flash_attn.as_str(),
+        },
+        "v_quantized_fa_off": selection.v_quantized_fa_off(),
+        "weights_mib": req.gpu_weights_mib,
+        "sys_weights_mib": req.sys_weights_mib,
+        "kv_mib": req.kv_mib,
+        "rs_mib": req.rs_mib,
+        "total_mib": total_mib,
+        "basis": serde_json::to_value(req.basis).unwrap_or(Value::Null),
+        "targets": targets.map(|(_, totals, placed)| {
+            placed
+                .iter()
+                .zip(totals.iter())
+                .map(|(i, t)| json!({ "gpu": i, "total_mib": t }))
+                .collect::<Vec<_>>()
+        }),
+        "headroom_reserve_percent": manager_models::HEADROOM_RESERVE_PERCENT,
+        "fits_current": targets.map(|(split, totals, _)| {
+            manager_models::predicted_fits(total_mib, split, totals)
+        }),
+        "ladder": ladder.iter().map(rung_json).collect::<Vec<_>>(),
+        "best": best.map(|r| rung_json(&r)),
+    })
+}
+
+/// Preview a backend's cache configuration (the flags form's KV
+/// cache / flash-attention controls): the predicted footprint of
+/// the given selection at the given context and slot count, and
+/// the predicted-best ladder for the backend's placement. Pure
+/// preview — nothing is written. The context/slot/selection
+/// arguments default to the backend's saved values when omitted,
+/// so the form can price its current draft by sending only what
+/// changed. The selection defaults likewise (each member
+/// independently here, unlike the set op's all-or-nothing rule:
+/// a preview freezes nothing).
+pub async fn op_backend_cache_preview(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    id: String,
+    n_ctx: Option<u32>,
+    slots: Option<u32>,
+    cache_k: Option<String>,
+    cache_v: Option<String>,
+    flash_attn: Option<String>,
+) -> ApiResult {
+    // The layout resolves under the config read; the telemetry
+    // inventory is fetched after the guard drops (the telemetry
+    // accessor reads the config while initializing — it must
+    // never be called while this command holds a config guard).
+    let (layout, backend) = {
+        let cfg = state.config.read().await;
+        let b = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        let layout = resolve_weight_layout(&cfg, b).ok_or_else(|| {
+            ApiError::InvalidInput(format!(
+                "backend {id}'s model cannot be resolved; its footprint cannot be priced"
+            ))
+        })?;
+        (layout, b.clone())
+    };
+    let gpus = {
+        let store = state.telemetry().await;
+        let inventory = lock_telemetry(&store).inventory();
+        inventory
+    };
+    let offload = manager_models::expert_offload(backend.raw_flags.as_deref());
+    let saved = manager_models::cache_selection(backend.raw_flags.as_deref());
+    let eff_ctx = n_ctx.unwrap_or(backend.flags.n_ctx);
+    let eff_slots =
+        slots.unwrap_or_else(|| manager_models::effective_slots(backend.raw_flags.as_deref()));
+    let targets = cache_fit_targets(&backend, &gpus);
+    if let Some(s) = slots {
+        validate_parallel_slots(s)?;
+    }
+    let selection = manager_models::CacheSelection {
+        k: match &cache_k {
+            Some(v) => parse_cache_type(v, "cache_k")?,
+            None => saved.k,
+        },
+        v: match &cache_v {
+            Some(v) => parse_cache_type(v, "cache_v")?,
+            None => saved.v,
+        },
+        flash_attn: match &flash_attn {
+            Some(v) => parse_flash_attn(v)?,
+            None => saved.flash_attn,
+        },
+    };
+    let mut payload = cache_preview_json(
+        &layout,
+        offload,
+        selection,
+        eff_ctx,
+        eff_slots.max(1),
+        targets.as_ref(),
+    );
+    payload["backend_id"] = json!(id);
+    Ok(payload)
+}
+
+/// Set a backend's KV cache types and flash-attention mode (the
+/// flags form's cache controls): rewrite only the cache tokens
+/// in the backend's raw flags to the canonical
+/// `--cache-type-k <t> --cache-type-v <t> --flash-attn <m>` —
+/// every other flag is preserved. All three values are set
+/// together; all three omitted clears the tokens, returning the
+/// backend to llama.cpp's defaults with no cache tokens (its
+/// pre-feature state). A quantized V cache with flash attention
+/// off is refused: llama.cpp fails context creation for that
+/// pairing, so persisting it would save a backend that cannot
+/// start. Saved through the same clone-validate-save path as the
+/// other backend mutations and journaled as a backend-scope
+/// activation change with `applies: "next start"`; no restart
+/// happens here.
+pub async fn op_backend_set_cache(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    id: String,
+    cache_k: Option<String>,
+    cache_v: Option<String>,
+    flash_attn: Option<String>,
+) -> ApiResult {
+    let target = resolve_cache_selection(cache_k, cache_v, flash_attn)?;
+    let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
+    let mut new_cfg = cfg.clone();
+    let b = new_cfg
+        .backends
+        .iter_mut()
+        .find(|b| b.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+    // Advanced flags mode (tracker #60): the controls rewrite
+    // raw-flag tokens the operator owns as text in the mode.
+    ensure_backend_not_advanced(b)?;
+    let new_raw = manager_models::set_cache_selection(b.raw_flags.as_deref(), target);
+    let changed = new_raw != b.raw_flags;
+    b.raw_flags = new_raw.clone();
+    if changed {
+        // A raw-flags change invalidates the recorded tool-call
+        // probe (MCP design §7.2).
+        b.tool_call_probe = None;
+    }
+    if changed {
+        manager_config::validate(&new_cfg).map_err(ApiError::from)?;
+        let summary = match target {
+            Some(sel) => format!(
+                "Backend `{id}` KV cache set to {}/{}, flash attention {}",
+                sel.k.as_str(),
+                sel.v.as_str(),
+                sel.flash_attn.as_str()
+            ),
+            None => format!(
+                "Backend `{id}` KV cache controls cleared (llama.cpp defaults)"
+            ),
+        };
+        record_backend_change(
+            state,
+            &pre_cfg,
+            &new_cfg,
+            "backend_set_cache",
+            summary,
+            &id,
+        )
+        .await?;
+        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+        *cfg = new_cfg;
+    }
+    drop(cfg);
+    if changed {
+        ensure_backend_specs(state).await;
+    }
+    state.sync_backend_service_definition(&id).await;
+    Ok(json!({
+        "backend_id": id,
+        "selection": target.map(|sel| json!({
+            "k": sel.k.as_str(),
+            "v": sel.v.as_str(),
+            "flash_attn": sel.flash_attn.as_str(),
+        })),
+        "raw_flags": new_raw,
+        "changed": changed,
+        // `persisted` is about the desired state being on disk:
+        // after a successful save it is, and when nothing changed
+        // it already was (same note as backend_set_offload).
+        "persisted": true,
+        "applies": "next start",
+    }))
+}
 
 /// Turn a backend's advanced flags mode on or off (tracker #60).
 ///
@@ -7763,6 +8184,11 @@ struct WeightLayout {
     /// true first-N block sums, not a uniform share.
     expert_bytes_by_block: Option<Vec<u64>>,
     moe_layers: Option<u32>,
+    /// The GGUF KV geometry, when the layout came from a parse —
+    /// the input cache-type-aware KV pricing needs (each side
+    /// priced at its own type). `kv_per_token` below is the same
+    /// geometry at the f16 default.
+    kv_geometry: Option<manager_models::KvGeometry>,
     kv_per_token: Option<u64>,
     /// Recurrent-state bytes per sequence from the GGUF header's
     /// SSM geometry (hybrid architectures), same provenance as
@@ -7807,6 +8233,7 @@ fn resolve_weight_layout(
         total_bytes,
         expert_bytes,
         expert_bytes_by_block,
+        kv_geometry,
         kv_per_token,
         rs_bytes_per_seq,
         moe_layers,
@@ -7816,6 +8243,7 @@ fn resolve_weight_layout(
             l.tensor_bytes,
             Some(l.expert_bytes),
             Some(l.expert_bytes_by_block.clone()),
+            l.kv,
             l.kv.map(|k| k.bytes_per_token()),
             l.rs.map(|g| g.bytes_per_seq()),
             l.moe_block_count,
@@ -7827,6 +8255,7 @@ fn resolve_weight_layout(
             None,
             None,
             None,
+            None,
             c.moe_layers,
             manager_models::MemoryBasis::Catalog,
         ),
@@ -7834,6 +8263,7 @@ fn resolve_weight_layout(
             file_len.unwrap_or_else(|| {
                 manager_wizard::steps::estimate_model_bytes(model.params_b as f64)
             }),
+            None,
             None,
             None,
             None,
@@ -7855,6 +8285,7 @@ fn resolve_weight_layout(
         expert_bytes,
         expert_bytes_by_block,
         moe_layers,
+        kv_geometry,
         kv_per_token,
         rs_bytes_per_seq,
         basis,
@@ -7880,12 +8311,83 @@ fn backend_memory_requirement(
         layout.expert_bytes_by_block.as_deref(),
         layout.basis,
         offload,
-        layout.kv_per_token,
+        kv_bytes_per_token_for(&layout, b.raw_flags.as_deref()),
         layout.moe_layers,
         b.flags.n_ctx,
         layout.rs_bytes_per_seq,
         manager_models::effective_slots(b.raw_flags.as_deref()),
     ))
+}
+
+/// KV bytes per token for a backend under its SELECTED cache
+/// types: the layout's KV geometry priced at the types decoded
+/// from the backend's raw flags (see
+/// [`manager_models::cache_selection`]), so the requirement —
+/// and with it the start gate and every footprint figure the app
+/// shows — prices the configuration actually selected, not the
+/// f16 default. A backend with no cache tokens decodes to the
+/// f16 default and prices exactly as before this feature. When
+/// the layout carries no geometry, the f16 figure (if any) is
+/// all that exists and is used unchanged.
+fn kv_bytes_per_token_for(
+    layout: &WeightLayout,
+    raw_flags: Option<&str>,
+) -> Option<u64> {
+    match layout.kv_geometry {
+        Some(geo) => {
+            let sel = manager_models::cache_selection(raw_flags);
+            Some(geo.bytes_per_token_typed(sel.k, sel.v))
+        }
+        None => layout.kv_per_token,
+    }
+}
+
+struct CacheInfo {
+    /// The decoded (effective) cache selection.
+    selection: manager_models::CacheSelection,
+    /// Whether any cache token is present in the saved flags —
+    /// false for a pre-feature backend, whose row renders the
+    /// controls at the decoded defaults without implying a saved
+    /// setting.
+    present: bool,
+    /// True when the saved spelling is not the canonical form
+    /// for its state (a `-ctk` or `=` spelling, an
+    /// absent-member selection, ...). The same comparison as the
+    /// MTP control's `custom`.
+    custom: bool,
+}
+
+/// A backend's cache control state. Unlike the offload and MTP
+/// states this is not capability gated: the cache controls render
+/// for every configured backend, so every configured row carries
+/// it (the Parallel slots field's posture).
+fn backend_cache_info(b: &manager_config::BackendConfig) -> CacheInfo {
+    let selection = manager_models::cache_selection(b.raw_flags.as_deref());
+    let present = manager_models::cache_tokens_present(b.raw_flags.as_deref());
+    let canonical = if present {
+        manager_models::set_cache_selection(b.raw_flags.as_deref(), Some(selection))
+    } else {
+        b.raw_flags.clone()
+    };
+    let custom = token_normalized_flags(b.raw_flags.as_deref())
+        != token_normalized_flags(canonical.as_deref());
+    CacheInfo {
+        selection,
+        present,
+        custom,
+    }
+}
+
+/// The `cache` object a backend row carries: the decoded
+/// selection, its presence, and the custom-spelling marker.
+fn cache_row_json(c: &CacheInfo) -> Value {
+    json!({
+        "k": c.selection.k.as_str(),
+        "v": c.selection.v.as_str(),
+        "flash_attn": c.selection.flash_attn.as_str(),
+        "present": c.present,
+        "custom": c.custom,
+    })
 }
 
 struct OffloadInfo {
@@ -9319,6 +9821,9 @@ mod tests {
             "planner".to_string(),
             false,
             true,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -11634,6 +12139,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -11653,6 +12161,8 @@ mod tests {
             &state,
             &sink,
             "qwen3.8-27b-moe".to_string(),
+            None,
+            None,
             None,
         )
         .await
@@ -11832,6 +12342,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -11844,7 +12357,7 @@ mod tests {
             .clone();
         assert_eq!(b.raw_flags, None);
         assert!(backend_offload_info(&saved, &b).is_none());
-        let preview = op_backend_add_preview(&state, &sink, "dense-7b".to_string(), None)
+        let preview = op_backend_add_preview(&state, &sink, "dense-7b".to_string(), None, None, None)
             .await
             .unwrap();
         assert!(preview["offload"].is_null());
