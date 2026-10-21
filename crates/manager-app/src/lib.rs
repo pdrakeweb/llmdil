@@ -6183,6 +6183,7 @@ fn cache_preview_json(
 /// changed. The selection defaults likewise (each member
 /// independently here, unlike the set op's all-or-nothing rule:
 /// a preview freezes nothing).
+#[allow(clippy::too_many_arguments)] // argument list is the registry contract
 pub async fn op_backend_cache_preview(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
