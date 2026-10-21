@@ -124,6 +124,7 @@ fn requirement_of(
     Some(layout_requirement(
         facts,
         offload,
+        manager_models::cache_selection(backend.raw_flags.as_deref()),
         backend.flags.n_ctx,
         manager_models::effective_slots(backend.raw_flags.as_deref()),
     ))
@@ -944,6 +945,7 @@ mod tests {
                 expert_bytes_by_block: None,
                 moe_layers: None,
                 kv_per_token: Some(8192),
+                kv_geometry: None,
                 rs_bytes_per_seq: None,
                 basis: manager_models::MemoryBasis::Estimate,
                 ctx_max: 131072,

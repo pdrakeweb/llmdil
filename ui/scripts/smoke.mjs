@@ -32,7 +32,7 @@ const html = existsSync(indexHtml) ? readFileSync(indexHtml, "utf8") : "";
 check(/assets\/.*\.js/.test(html), "index.html references the JS bundle");
 
 const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
-for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_parallel", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
+for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
 // Nav completeness: the sidebar is generated from the ROUTES array
@@ -476,6 +476,19 @@ check(staticSrc.includes("b.rs_ram_mib != null"), "State cache tile renders only
 check(staticSrc.includes('b.state === "failed" && b.failure_reason'), "Failure line is gated on the failed state and a recorded reason");
 check(staticSrc.includes("Failure: ${esc(b.failure_reason)}"), "Backends card renders the recorded failure reason");
 check(bundle.includes("State cache"), "bundle contains the State cache tile label");
+
+// KV cache / flash attention (Oct 21, 2026): the cache controls
+// must actually render in both forms and commit through their
+// ops — the helper alone surviving the build is not the feature.
+check(staticSrc.includes("${cacheHtml}"), "Edit Flags form renders the cache controls block");
+check(staticSrc.includes('fieldAttr: "data-cache-field"'), "Edit Flags cache controls use the cache field attribute");
+check(staticSrc.includes("backendCachePreview"), "flags form prices the cache preview through backend_cache_preview");
+check(staticSrc.includes("setBackendCache"), "flags form commits cache selections through backend_set_cache");
+check(staticSrc.includes("data-cache-best"), "flags form renders the predicted-best action");
+check(staticSrc.includes("data-add-cache-field"), "Add backend form renders the cache controls");
+check(staticSrc.includes("cacheK: pCache?.k"), "Add backend form carries the cache selection into backend_add");
+check(bundle.includes("K cache type"), "bundle contains the K cache type control label");
+check(bundle.includes("Use predicted best"), "bundle contains the predicted-best action label");
 
 // Settings-pages sweep (Oct 19, 2026): every stored value rendered
 // on a settings surface carries a working control wired to its real

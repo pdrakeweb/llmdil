@@ -779,6 +779,11 @@ export interface BackendRow {
    *  not capability-gated); absent on supervisor-only orphan
    *  rows. Decoded from the backend's saved raw flags. */
   parallel?: BackendParallel;
+  /** KV cache / flash-attention state (configured rows — the
+   *  flags form's cache controls render for every backend, so
+   *  this is not capability-gated); absent on supervisor-only
+   *  orphan rows. Decoded from the backend's saved raw flags. */
+  cache?: BackendCache;
   /** The backend's persisted tool-call probe (MCP design §7.2),
    *  or null when it has never been probed — the card renders null
    *  as "not measured", never as a measured state. Absent on
@@ -872,6 +877,70 @@ export interface BackendParallel {
    *  `--parallel N` form for its state (an `-np` or `=` spelling,
    *  repeated tokens, a non-canonical position). */
   custom: boolean;
+}
+
+/** A KV cache type the cache controls offer (the pinned
+ *  llama.cpp build accepts more; v1 offers these three). */
+export type CacheTypeName = "f16" | "q8_0" | "q4_0";
+/** The pinned build's flash-attention tri-state. */
+export type FlashAttnName = "auto" | "on" | "off";
+
+/** A full cache selection: K type, V type, flash-attention mode. */
+export interface CacheSelectionLike {
+  k: CacheTypeName;
+  v: CacheTypeName;
+  flash_attn: FlashAttnName;
+}
+
+/** A backend's KV cache / flash-attention state (list_backends
+ *  payload, configured rows). Decoded server-side from the
+ *  backend's saved raw flags by the same decode pair the cache
+ *  controls write through. */
+export interface BackendCache {
+  /** The decoded K cache type (llama.cpp's f16 default when no
+   *  token is saved). */
+  k: CacheTypeName;
+  /** The decoded V cache type. */
+  v: CacheTypeName;
+  /** The decoded flash-attention mode (auto when unset). */
+  flash_attn: FlashAttnName;
+  /** Whether any cache token is present in the saved flags —
+   *  false for a pre-feature backend running at the defaults
+   *  with no tokens. */
+  present: boolean;
+  /** True when the saved spelling is not the canonical form for
+   *  its state (a `-ctk` or `=` spelling, a partial selection). */
+  custom: boolean;
+}
+
+/** One rung of the predicted-best ladder (backend_cache_preview
+ *  / backend_add_preview payloads). */
+export interface CacheRungLike extends CacheSelectionLike {
+  kv_mib: number;
+  total_mib: number;
+  fits: boolean;
+}
+
+/** The cache preview payload: the predicted footprint of one
+ *  selection plus the predicted-best ladder for the placement. */
+export interface CachePreview {
+  selection: CacheSelectionLike;
+  /** True for the pairing llama.cpp refuses (quantized V with
+   *  flash attention off); the set op rejects it. */
+  v_quantized_fa_off: boolean;
+  weights_mib: number;
+  sys_weights_mib: number;
+  /** KV MiB at the selection, or null when the model's KV
+   *  geometry is unknown (never zero-filled). */
+  kv_mib: number | null;
+  rs_mib: number | null;
+  total_mib: number;
+  basis: string;
+  targets: { gpu: number; total_mib: number }[] | null;
+  headroom_reserve_percent: number;
+  fits_current: boolean | null;
+  ladder: CacheRungLike[];
+  best: CacheRungLike | null;
 }
 
 /** list_backends — configured backends merged with live supervisor state. */
@@ -969,6 +1038,61 @@ export async function setBackendParallel(id: string, slots: number | null): Prom
   }
 }
 
+/** backend_set_cache — set a backend's KV cache types and
+ *  flash-attention mode (the flags form's cache controls). All
+ *  three values are set together and write the canonical
+ *  `--cache-type-k <t> --cache-type-v <t> --flash-attn <m>`
+ *  tokens; `sel` null clears the tokens, returning the backend
+ *  to llama.cpp's defaults with no cache tokens. Only the cache
+ *  tokens in the backend's raw flags change. A quantized V cache
+ *  with flash attention off is refused server-side (llama.cpp
+ *  fails context creation for it). Persisted immediately;
+ *  applies on the next start. */
+export async function setBackendCache(id: string, sel: CacheSelectionLike | null): Promise<CallResult<{ backend_id: string; selection: CacheSelectionLike | null; raw_flags: string | null; changed: boolean }>> {
+  if (!isTauri()) return { data: { backend_id: id, selection: sel, raw_flags: null, changed: false }, live: false };
+  try {
+    const args: Record<string, unknown> = { id };
+    if (sel) {
+      args.cacheK = sel.k;
+      args.cacheV = sel.v;
+      args.flashAttn = sel.flash_attn;
+    }
+    const data = await invoke<{ backend_id: string; selection: CacheSelectionLike | null; raw_flags: string | null; changed: boolean }>("backend_set_cache", args);
+    return { data, live: true };
+  } catch (e) {
+    return { data: { backend_id: id, selection: sel, raw_flags: null, changed: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** backend_cache_preview — price one cache selection for a
+ *  backend (the flags form's predicted footprint and
+ *  predicted-best ladder). Pure preview: nothing is written.
+ *  Omitted arguments price the backend's saved values. */
+export async function backendCachePreview(id: string, opts?: { nCtx?: number; slots?: number; sel?: CacheSelectionLike }): Promise<CallResult<CachePreview>> {
+  const empty: CachePreview = {
+    selection: { k: "f16", v: "f16", flash_attn: "auto" },
+    v_quantized_fa_off: false, weights_mib: 0, sys_weights_mib: 0,
+    kv_mib: null, rs_mib: null, total_mib: 0, basis: "estimate",
+    targets: null, headroom_reserve_percent: 5, fits_current: null,
+    ladder: [], best: null,
+  };
+  if (!isTauri()) return { data: empty, live: false };
+  try {
+    const args: Record<string, unknown> = { id };
+    if (opts?.nCtx !== undefined) args.nCtx = opts.nCtx;
+    if (opts?.slots !== undefined) args.slots = opts.slots;
+    if (opts?.sel) {
+      args.cacheK = opts.sel.k;
+      args.cacheV = opts.sel.v;
+      args.flashAttn = opts.sel.flash_attn;
+    }
+    const data = await invoke<CachePreview>("backend_cache_preview", args);
+    return { data, live: true };
+  } catch (e) {
+    return { data: empty, live: true, error: errOf(e) };
+  }
+}
+
 /** One validation warning about a raw-flags string
  *  (backend_set_raw_flags payload). Warnings never block a save:
  *  they report unknown tokens, duplicates, and malformed values
@@ -1035,6 +1159,11 @@ export async function addBackend(input: {
   offloadOverride?: boolean;
   gpuIndices?: number[];
   parallel?: number;
+  /** A chosen cache selection, written into the created
+   *  backend's raw flags; omitted writes no cache tokens. */
+  cacheK?: CacheTypeName;
+  cacheV?: CacheTypeName;
+  flashAttn?: FlashAttnName;
 }): Promise<CallResult<{ backend_id: string; group: string }>> {
   if (!isTauri()) return { data: { backend_id: input.id, group: input.group }, live: false };
   try {
@@ -1052,6 +1181,9 @@ export async function addBackend(input: {
     if (input.offloadOverride) args.offloadOverride = true;
     if (input.gpuIndices !== undefined) args.gpuIndices = input.gpuIndices;
     if (input.parallel !== undefined) args.parallel = input.parallel;
+    if (input.cacheK !== undefined) args.cacheK = input.cacheK;
+    if (input.cacheV !== undefined) args.cacheV = input.cacheV;
+    if (input.flashAttn !== undefined) args.flashAttn = input.flashAttn;
     const data = await invoke<{ backend_id: string; group: string }>("backend_add", args);
     return { data, live: true };
   } catch (e) {
@@ -1066,6 +1198,10 @@ export async function addBackend(input: {
  *  the placement creation would use. */
 export interface BackendAddPreview {
   offload: BackendOffload | null;
+  /** The cache preview for the backend creation would build
+   *  (predicted footprint + predicted-best ladder), or null when
+   *  the model's layout cannot be resolved. */
+  cache: CachePreview | null;
   tensor_split: number[];
   split_mode: string;
 }
@@ -1074,15 +1210,17 @@ export interface BackendAddPreview {
  *  state: the offload control's range/bands/guardrail for the model
  *  and the placement a creation would assign. gpuIndices previews
  *  an explicit GPU selection instead of the telemetry assignment. */
-export async function backendAddPreview(modelId: string, gpuIndices?: number[]): Promise<CallResult<BackendAddPreview>> {
-  if (!isTauri()) return { data: { offload: null, tensor_split: [], split_mode: "none" }, live: false };
+export async function backendAddPreview(modelId: string, gpuIndices?: number[], nCtx?: number, parallel?: number): Promise<CallResult<BackendAddPreview>> {
+  if (!isTauri()) return { data: { offload: null, cache: null, tensor_split: [], split_mode: "none" }, live: false };
   try {
     const args: Record<string, unknown> = { modelId };
     if (gpuIndices !== undefined) args.gpuIndices = gpuIndices;
+    if (nCtx !== undefined) args.nCtx = nCtx;
+    if (parallel !== undefined) args.parallel = parallel;
     const data = await invoke<BackendAddPreview>("backend_add_preview", args);
     return { data, live: true };
   } catch (e) {
-    return { data: { offload: null, tensor_split: [], split_mode: "none" }, live: true, error: errOf(e) };
+    return { data: { offload: null, cache: null, tensor_split: [], split_mode: "none" }, live: true, error: errOf(e) };
   }
 }
 

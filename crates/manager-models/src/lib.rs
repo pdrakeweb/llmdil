@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
+pub mod cache;
 pub mod flags;
 pub mod gguf;
 pub mod guardrails;
@@ -23,6 +24,11 @@ pub mod mtp;
 pub mod parallel;
 pub mod placement;
 
+pub use cache::{
+    cache_selection, cache_tokens_present, kv_bytes_per_token, predicted_best, predicted_fits,
+    price_ladder, set_cache_selection, CacheFitInputs, CacheRung, CacheSelection, CacheType,
+    FlashAttn, HEADROOM_RESERVE_PERCENT, PREDICTED_BEST_LADDER,
+};
 pub use flags::{raw_flag_warnings, FlagWarning};
 pub use gguf::{parse_gguf_layout, GgufError, GgufLayout, KvGeometry, RsGeometry};
 pub use guardrails::{

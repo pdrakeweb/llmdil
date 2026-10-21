@@ -74,6 +74,12 @@ fn flag_spec(name: &str) -> Option<&'static FlagSpec> {
         ("-cmoe", &FlagSpec { canonical: "--cpu-moe", reserved: false, arity: None }),
         ("--override-tensor", &FlagSpec { canonical: "--override-tensor", reserved: false, arity: MultiValue(Any) }),
         ("-ot", &FlagSpec { canonical: "--override-tensor", reserved: false, arity: MultiValue(Any) }),
+        ("--cache-type-k", &FlagSpec { canonical: "--cache-type-k", reserved: false, arity: Value(Any) }),
+        ("-ctk", &FlagSpec { canonical: "--cache-type-k", reserved: false, arity: Value(Any) }),
+        ("--cache-type-v", &FlagSpec { canonical: "--cache-type-v", reserved: false, arity: Value(Any) }),
+        ("-ctv", &FlagSpec { canonical: "--cache-type-v", reserved: false, arity: Value(Any) }),
+        ("--flash-attn", &FlagSpec { canonical: "--flash-attn", reserved: false, arity: Value(Any) }),
+        ("-fa", &FlagSpec { canonical: "--flash-attn", reserved: false, arity: Value(Any) }),
         ("--spec-type", &FlagSpec { canonical: "--spec-type", reserved: false, arity: Value(Any) }),
         ("--spec-draft-n-max", &FlagSpec { canonical: "--spec-draft-n-max", reserved: false, arity: Value(Int) }),
         ("--parallel", &FlagSpec { canonical: "--parallel", reserved: false, arity: Value(Int) }),
@@ -276,14 +282,27 @@ mod tests {
 
     #[test]
     fn unknown_flag_warns_and_consumes_a_value() {
-        let w = raw_flag_warnings(Some("--flash-attn on --parallel 1"));
+        let w = raw_flag_warnings(Some("--definitely-not-a-flag on --parallel 1"));
         assert_eq!(w.len(), 1);
-        assert_eq!(w[0].token, "--flash-attn");
+        assert_eq!(w[0].token, "--definitely-not-a-flag");
         assert!(w[0].message.contains("not a flag this app recognizes"));
         // An unknown `=` spelling warns once, on the flag.
-        let w = raw_flag_warnings(Some("--cache-type-k=q8_0"));
+        let w = raw_flag_warnings(Some("--definitely-not-a-flag=q8_0"));
         assert_eq!(w.len(), 1);
-        assert_eq!(w[0].token, "--cache-type-k=q8_0");
+        assert_eq!(w[0].token, "--definitely-not-a-flag=q8_0");
+    }
+
+    #[test]
+    fn cache_and_flash_attn_flags_are_recognized() {
+        // The cache module's tokens are this crate's own now:
+        // they warn about nothing, in pair, short, and = spellings.
+        assert!(messages("--flash-attn on --parallel 1").is_empty());
+        assert!(messages("--cache-type-k=q8_0").is_empty());
+        assert!(messages("-ctk q8_0 -ctv q4_0 -fa auto").is_empty());
+        // Aliases are the same flag for duplicates.
+        let w = raw_flag_warnings(Some("--cache-type-k q8_0 -ctk f16"));
+        assert_eq!(w.len(), 1);
+        assert!(w[0].message.contains("last value wins"));
     }
 
     #[test]
