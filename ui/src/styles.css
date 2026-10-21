@@ -568,11 +568,15 @@ table.tbl tr:last-child td { border-bottom: 0; }
 .opt-measure-actions { display: flex; gap: 8px; margin-top: 10px; }
 
 /* Groups page (predicted-throughput design §8): one lane per
-   group plus Ungrouped, lanes side by side with horizontal
-   scroll when they outnumber the width; compact backend cards
-   are the drag source, lanes the drop targets (the .dragover
-   outline is the drop affordance while a drag is over a lane). */
-.groups-lanes { display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; padding-bottom: 8px; }
+   group plus Ungrouped. Lanes FLOW — they wrap onto additional
+   rows when they outnumber the width, like the card grids on
+   the other pages, and the page never scrolls horizontally
+   (design-principles rule 17, Pete 2026-10-20; the previous
+   overflow-x: auto row was the motivating case). Compact
+   backend cards are the drag source, lanes the drop targets
+   (the .dragover outline is the drop affordance while a drag
+   is over a lane). Lanes in a row stretch to equal height. */
+.groups-lanes { display: flex; flex-wrap: wrap; gap: 12px; align-items: stretch; padding-bottom: 8px; }
 .group-lane { flex: 1 1 240px; min-width: 230px; max-width: 360px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
 .group-lane.dragover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .group-lane-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
