@@ -427,6 +427,25 @@ check(optimizeSrc.replace(/\r\n/g, "\n").includes("if (r.error) { statusLine = r
   "Optimize purpose save failure keeps the editor open with the error (baseline)");
 check(staticSrcLf.includes("closeEditSession();\n          await load();"),
   "Backend Edit success closes the Edit session before repainting the card (baseline)");
+// KV cache / flash-attention controls (v0.1.46, audited in the
+// rule 17 completion pass, Oct 21, 2026): in the Edit form they
+// are commit-on-change sub-controls in the MTP/parallel idiom —
+// a rejected commit reverts the draft to the saved selection
+// with the error on the card and the Edit session stays open;
+// a landed commit shows the saved tokens in the card message
+// and reloads. In the Add form they are draft fields: the draft
+// lives in wire state (pCache), and the refused pairing is
+// rejected at submit with the error in the form.
+check(staticSrcLf.includes("KV cache not saved: ${r.error}"),
+  "KV cache commit failure surfaces the error on the card (rule 17)");
+check(staticSrcLf.includes("if (!ok && !disposed) {\n      flagsCacheSel = saved;"),
+  "KV cache rejected commit reverts the draft to the saved selection (rule 17)");
+check(staticSrcLf.includes("KV cache saved (${cacheTokenText(sel)})"),
+  "KV cache successful commit reports the saved selection on the card (rule 17)");
+check(staticSrcLf.includes("pCache = sel; paintParams();"),
+  "Add-form KV selects sync into the wire draft (repaints cannot lose it, rule 17)");
+check((staticSrcLf.match(/A quantized V cache requires flash attention/g) || []).length >= 2,
+  "Quantized-V + flash-attention-off is named and refused in both the Edit commit path and the Add submit validation (rule 17)");
 
 // Predicted throughput field + refresh (Oct 20, 2026): the
 // field renders on EVERY backend card (the Backends stat tile
