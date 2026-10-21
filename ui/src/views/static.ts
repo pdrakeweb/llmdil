@@ -6465,17 +6465,24 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
   /** Save the full rules array through update_gateway_config (the
    *  generic gateway merge-patch — no dedicated command, design
    *  §7) and repaint with the outcome. */
-  const patchRules = async (rules: GatewayRule[], okMsg: string): Promise<void> => {
+  /** Returns true only when the change was saved (persisted):
+   *  callers with an open form close it only on a true result
+   *  (design rule 17 — a failed or non-persisted save keeps the
+   *  form open with the operator's input intact). */
+  const patchRules = async (rules: GatewayRule[], okMsg: string): Promise<boolean> => {
     const r = await updateGatewayConfig({ routing_rules: rules.map(serializeRule) });
-    if (disposed) return;
+    if (disposed) return false;
+    let saved = false;
     if (r.error) {
       gwMsg(`Routing rule change failed: ${r.error}`, true);
     } else if (!r.data.persisted) {
       gwMsg("The change was applied to the in-memory configuration only — it was not saved and will be lost when the app restarts.", true);
     } else {
       gwMsg(okMsg);
+      saved = true;
     }
     await load();
+    return saved;
   };
 
   /** Open the rule form (add when `editing` is null, else edit that
@@ -6646,8 +6653,15 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
         for (let n = 2; lastCfg.routing_rules.some((r) => r.id === id); n++) id = `context-overflow-${n}`;
         rules = [...lastCfg.routing_rules, { id, description, source: "user", enabled: true, kind, litellm_fragment: undefined, fragment_raw: undefined }];
       }
-      ruleForm.open = false;
-      await patchRules(rules, editing ? `Routing rule ${editing.id} saved.` : "Routing rule added and saved.");
+      // Rule 17: the form closes only when the save persisted.
+      // patchRules repaints from the ruleForm draft, so a failed
+      // or non-persisted save leaves the form open with the
+      // operator's input intact and the error in #gwMsg.
+      const saved = await patchRules(rules, editing ? `Routing rule ${editing.id} saved.` : "Routing rule added and saved.");
+      if (saved && !disposed) {
+        ruleForm.open = false;
+        await load();
+      }
       return;
     }
 
@@ -6818,12 +6832,21 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
       await load();
     }
 
+    /** Shared save for the Gateway view's permanent fields
+     *  (port, OpenRouter credential/cap/allowlist, per-group
+     *  fallbacks). Rule 17: on success the repaint displays the
+     *  saved value in its new state; on failure — or a
+     *  non-persisted apply — there is NO repaint, so the
+     *  operator's input stays intact in the field and the error
+     *  shows in #gwMsg (which lives outside the repainted body).
+     *  A repaint on failure would discard the typed value and
+     *  redisplay the old saved one. */
     const gwSave = async (patch: Record<string, unknown>, okText: string): Promise<void> => {
       const r = await updateGatewayConfig(patch);
       if (disposed) return;
-      if (r.error) gwMsg(`Change not saved: ${r.error}`, true);
-      else if (!r.data.persisted) gwMsg("The change was applied to the in-memory configuration only — it was not saved and will be lost when the app restarts.", true);
-      else gwMsg(okText);
+      if (r.error) { gwMsg(`Change not saved: ${r.error}`, true); return; }
+      if (!r.data.persisted) { gwMsg("The change was applied to the in-memory configuration only — it was not saved and will be lost when the app restarts.", true); return; }
+      gwMsg(okText);
       await load();
     };
 
@@ -7574,8 +7597,13 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       const roleEl = root.querySelector("#raRole") as HTMLSelectElement | null;
       const r = await adminApiCreateUser(nameEl?.value ?? "", passEl?.value ?? "", roleEl?.value ?? "viewer");
       if (disposed) return;
-      if (r.error) setMsg(`Create user failed: ${r.error}`, true);
-      else setMsg(`User ${r.data?.username ?? ""} created.`);
+      // Rule 17: a failed create keeps the operator's input —
+      // no repaint, so the username/password/role fields stay
+      // as typed and the error shows in #setMsg (outside the
+      // repainted body). Success repaints: the form clears and
+      // the new user displays in the list.
+      if (r.error) { setMsg(`Create user failed: ${r.error}`, true); return; }
+      setMsg(`User ${r.data?.username ?? ""} created.`);
       await load();
       return;
     }
@@ -7586,7 +7614,11 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       const sel = root.querySelector(`[data-ra-role-for="${id}"]`) as HTMLSelectElement | null;
       const r = await adminApiUpdateUser(id, sel?.value);
       if (disposed) return;
-      if (r.error) setMsg(`Role change failed: ${r.error}`, true);
+      // Rule 17, same as the other Settings Apply handlers: a
+      // failed save does not repaint, so the chosen role stays
+      // selected with the error shown; success repaints the
+      // user row in its new state.
+      if (r.error) { setMsg(`Role change failed: ${r.error}`, true); return; }
       await load();
       return;
     }
