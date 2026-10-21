@@ -13,7 +13,15 @@
    delete-empty ride the same path (decision D11); rename,
    strategy, fallbacks, and purpose editing are deliberately
    not here (§8.6) — the Gateway page owns the traffic view and
-   links here, and this page links back. */
+   links here, and this page links back.
+   Drag-and-drop requires the Tauri window's OS file-drop
+   handler to be OFF (dragDropEnabled: false in
+   src-tauri/tauri.conf.json): Tauri enables it by default, and
+   on Windows it intercepts every drag in the webview, so no
+   lane ever receives a dragover the page can accept — the OS
+   shows the no-drop cursor everywhere (Pete, 2026-10-20). The
+   app uses no OS file-drop surface, so disabling it loses
+   nothing. */
 
 import {
   gatewayCreateGroup, gatewayDeleteGroup, gatewaySetBackendGroup,
@@ -107,6 +115,11 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
   /** Backend id of the card being dragged (dataTransfer cannot
    *  be read during dragover, and the drop handler needs it). */
   let dragId: string | null = null;
+  /** A repaint requested while a drag is in flight is deferred
+   *  until the drag ends: paint() replaces #groupsBody's DOM,
+   *  which would destroy the drag source node mid-drag and
+   *  cancel the drag. Applied by onDragEnd / onDrop. */
+  let paintDeferredDuringDrag = false;
   let status: { text: string; err: boolean } | null = null;
   let formOpen = false;
   let formError = "";
@@ -296,6 +309,10 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
     paintForm();
     const el = bodyEl();
     if (!el) return;
+    // Never replace the lanes DOM while a drag is in flight —
+    // the dragged card is inside it, and destroying the drag
+    // source cancels the drag (see paintDeferredDuringDrag).
+    if (dragId !== null) { paintDeferredDuringDrag = true; return; }
     if (!loaded) { el.innerHTML = loadingHtml("Loading groups\u2026"); return; }
     if (loadError) { el.innerHTML = emptyHtml(`Groups unavailable: ${loadError}`); return; }
     el.innerHTML = `<div class="groups-lanes">${[...groups.map((g) => laneHtml(g)), laneHtml(null)].join("")}</div>`;
@@ -477,11 +494,49 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
       .forEach((el) => el.classList.remove("dragover"));
   }
 
+  /** The lane element an event landed in, or null. The drop
+   *  attribute is carried by the lane <section> itself, so
+   *  closest() resolves a hit anywhere in the lane — header,
+   *  cards, fallbacks line, empty space, the drop hint. The
+   *  target may be an SVG element inside an icon (its closest
+   *  exists but is not an HTMLElement), so resolve through
+   *  Element, and tolerate a target with no closest at all. */
+  function laneFromEvent(ev: Event): HTMLElement | null {
+    const t = ev.target as Element | null;
+    if (!t || typeof t.closest !== "function") return null;
+    return t.closest("[data-group-lane-drop]") as HTMLElement | null;
+  }
+
+  /** Whether a drag this page started is in flight. dragId is
+   *  the primary record; the dataTransfer type list is the
+   *  fallback (readable during dragover even though the data
+   *  itself is not) so an accepted drag stays accepted even if
+   *  module state was disturbed mid-drag. File drags carry
+   *  "Files", never "text/plain", so they are not accepted. */
+  function dragInFlight(ev: DragEvent): boolean {
+    if (dragId !== null) return true;
+    try {
+      return ev.dataTransfer?.types.includes("text/plain") ?? false;
+    } catch {
+      return false;
+    }
+  }
+
+  function applyDeferredPaint(): void {
+    if (!paintDeferredDuringDrag) return;
+    paintDeferredDuringDrag = false;
+    paint();
+  }
+
   function onDragStart(ev: DragEvent): void {
     if (disposed) return;
-    const card = (ev.target as HTMLElement).closest("[data-group-card]") as HTMLElement | null;
+    const t = ev.target as Element | null;
+    const card = t && typeof t.closest === "function"
+      ? t.closest("[data-group-card]") as HTMLElement | null
+      : null;
     if (!card) return;
     dragId = card.getAttribute("data-group-card");
+    paintDeferredDuringDrag = false;
     if (ev.dataTransfer && dragId) {
       ev.dataTransfer.setData("text/plain", dragId);
       ev.dataTransfer.effectAllowed = "move";
@@ -489,23 +544,39 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
   }
 
   function onDragOver(ev: DragEvent): void {
-    if (disposed || !dragId) return;
-    const lane = (ev.target as HTMLElement).closest("[data-group-lane-drop]") as HTMLElement | null;
+    if (disposed || !dragInFlight(ev)) return;
+    const lane = laneFromEvent(ev);
     if (!lane) return;
+    // preventDefault is what makes the lane a drop target —
+    // without it on every dragover the browser keeps the
+    // no-drop cursor and no drop event ever fires.
     ev.preventDefault();
     if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
     clearDropHighlights();
     lane.classList.add("dragover");
   }
 
+  function onDragLeave(ev: DragEvent): void {
+    if (disposed) return;
+    const lane = laneFromEvent(ev);
+    if (!lane) return;
+    // Moving between children of the same lane is not leaving
+    // it — only clear when the drag actually exits the lane, so
+    // the highlight does not flicker crossing card boundaries.
+    const next = ev.relatedTarget as Node | null;
+    if (next && lane.contains(next)) return;
+    lane.classList.remove("dragover");
+  }
+
   function onDrop(ev: DragEvent): void {
     if (disposed) return;
-    const lane = (ev.target as HTMLElement).closest("[data-group-lane-drop]") as HTMLElement | null;
+    const lane = laneFromEvent(ev);
     const id = dragId ?? ev.dataTransfer?.getData("text/plain") ?? null;
     dragId = null;
     clearDropHighlights();
-    if (!lane || !id) return;
+    if (!lane || !id) { applyDeferredPaint(); return; }
     ev.preventDefault();
+    paintDeferredDuringDrag = false;
     const key = lane.getAttribute("data-group-lane-drop")!;
     void doMove(id, key === UNGROUPED ? null : key);
   }
@@ -513,18 +584,20 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
   function onDragEnd(): void {
     dragId = null;
     clearDropHighlights();
+    applyDeferredPaint();
   }
 
   root.addEventListener("click", onClick);
   root.addEventListener("keydown", onKeydown);
   root.addEventListener("dragstart", onDragStart);
   root.addEventListener("dragover", onDragOver);
+  root.addEventListener("dragleave", onDragLeave);
   root.addEventListener("drop", onDrop);
   root.addEventListener("dragend", onDragEnd);
   paint();
   void load();
   const timer = window.setInterval(() => {
-    if (!disposed && !pending) void load();
+    if (!disposed && !pending && !dragId) void load();
   }, 10000);
   return () => {
     disposed = true;
