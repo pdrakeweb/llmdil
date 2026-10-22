@@ -81,7 +81,7 @@ interface LoadMeta { live: boolean; error?: string }
 /** Banner for a wired view: backend error, sample mode, or (GPUs) stale data. */
 function bannerHtml(r: LoadMeta, stale = false): string {
   if (r.error) return `<div class="banner" style="margin-bottom:12px">${icon("err")} Backend error \u2014 ${esc(r.error)}</div>`;
-  if (!r.live) return `<div class="banner" style="margin-bottom:12px">${icon("warn")} Sample mode \u2014 open the installed app for live data from this machine.</div>`;
+  if (!r.live) return `<div class="banner" style="margin-bottom:12px" title="Open the installed app for live data from this machine.">${icon("warn")} Sample mode</div>`;
   if (stale) return `<div class="banner" style="margin-bottom:12px">${icon("warn")} Telemetry is stale \u2014 showing the last received sample.</div>`;
   return "";
 }
@@ -301,7 +301,7 @@ function gpuCard(g: GpuInfo, expanded: Set<string>, modelRows: GpuModelRow[] = [
 
 export function renderGpus(): string {
   return `${topbar("GPUs", `
-    <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px">Telemetry poll
+    <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px" title="Sets the sampler cadence; applies on restart">Telemetry poll
       <select id="gpuPollSel" style="${SELECT_STYLE}">
         <option value="0">Off</option>
         <option value="1000">1s</option>
@@ -312,7 +312,6 @@ export function renderGpus(): string {
     <button class="btn icon-only" id="gpuSnapshot" title="Snapshot" aria-label="Save telemetry snapshot">${icon("download")}</button>`)}
   <div class="view"><div id="gpuBanner"></div>
   <div id="gpuMeta" style="font-size:12px;color:var(--text3);margin-bottom:8px"></div>
-  <div style="font-size:11px;color:var(--text3);margin-bottom:8px">This view refreshes every 2 s. The Telemetry poll control sets the sampler cadence and applies on restart.</div>
   <div id="gpuMsg" style="font-size:12px;margin-bottom:8px"></div>
   <div id="gpuOverview" style="margin-bottom:10px"></div>
   <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
@@ -8483,14 +8482,19 @@ function paintWizard(root: HTMLElement, steps: WizardStepState[], live: boolean,
     || (s.id === blockedId && !(opts.suppressAutoOpen?.has(s.id) ?? false));
   const list = root.querySelector("#wizSteps");
   if (list) {
-    list.innerHTML = `<div class="sec-title">Setup checklist <span style="color:var(--text3);font-weight:400">\u2014 runs in order</span></div>`
+    list.innerHTML = `<div class="sec-title">Setup checklist</div>`
       + eff.map((s) => wizardStepRow(s, live, stepOpen(s))).join("");
   }
-  const banner = root.querySelector("#wizBanner");
+  const banner = root.querySelector("#wizBanner") as HTMLElement | null;
   if (banner) {
+    // Rule 5: the banner carries the mode as a status value only.
+    // The operating instructions are not primary-UI content; in
+    // sample mode the one needed fact rides the banner's tooltip.
+    banner.className = live ? "banner mode-live" : "banner";
+    banner.title = live ? "" : "Open the installed app to run setup against this machine.";
     banner.innerHTML = live
-      ? `${icon("check")} Live \u2014 steps execute against this machine. A failed step pauses the run; fix the cause and retry it.`
-      : `${icon("warn")} Sample mode \u2014 open the installed app to run setup against this machine.`;
+      ? `<span class="badge-ok">${icon("check")}</span> Live`
+      : `${icon("warn")} Sample mode`;
   }
   // Busy state is painted, not remembered per element: every control
   // that can start work is disabled while a run is in flight, so the
@@ -8514,10 +8518,6 @@ export function renderWizard(): string {
       <button class="btn primary" id="runBtn">${icon("play")} Run setup</button></div>
     <div class="wiz-progress" id="wizProgress"></div>
     <div class="wiz-body">
-      <div class="wiz-side"><p>Steps run in order. A failed step pauses the run \u2014 retry it to continue.</p>
-        <div style="margin-top:14px;display:grid;gap:6px">
-          <div>${icon("shield")} checksums verified per file</div>
-          <div>${icon("server")} the gateway starts at its step; backends start before the smoke test</div></div></div>
       <div class="wiz-steps" id="wizSteps"></div>
     </div>
     <div class="wiz-foot"><button class="btn icon-only" title="Back" aria-label="Back" disabled>${icon("chevL")}</button><span class="spacer"></span>

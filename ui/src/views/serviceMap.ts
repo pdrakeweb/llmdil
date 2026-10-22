@@ -236,10 +236,12 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
   if (banner) {
     if (d.errors.length) {
       banner.style.display = "";
+      banner.title = "";
       banner.innerHTML = `${icon("warn")} backend error — showing what could be loaded: ${esc(d.errors.join("; "))}`;
     } else if (!d.live) {
       banner.style.display = "";
-      banner.innerHTML = `${icon("warn")} Sample mode — open the installed app to see this machine's topology.`;
+      banner.title = "Open the installed app to see this machine's topology.";
+      banner.innerHTML = `${icon("warn")} Sample mode`;
     } else {
       banner.style.display = "none";
     }

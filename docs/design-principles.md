@@ -14,7 +14,7 @@ The durable reference for this app's UI. Every card and view is designed against
 
 ### Data and narrative
 
-5. **Data visible, narrative in tooltips.** Visible text is numbers, labels, and chart keys; explanation and methodology live behind a tooltip or info-tip, or in a collapsed expandable.
+5. **Data visible, narrative in tooltips.** Visible text is numbers, labels, and chart keys; explanation and methodology live behind a tooltip or info-tip, or in a collapsed expandable. Explanatory narrative — text that explains how the app behaves, what will happen, methodology, rationale, or instruction or reassurance for normal operation — belongs in help surfaces, tooltips (info-tips), and documentation. Primary UI surfaces (page headers, banners, cards, inline blocks, dialogs) carry data, labels, status values, and actions only. Warning and alert styling is reserved for actual abnormal conditions that need the operator's attention or action; it is never a vehicle for explanatory narrative, normal-state information, or orientation text, including on initial launch. A normal operating state is shown as a status value or chip (e.g. "Live"), never as a sentence. Canonical violation (Pete, 2026-10-22): the setup wizard's initial-launch yellow banner "Live — steps execute against this machine. A failed step pauses the run; fix the cause and retry it." — a normal state plus operating instructions presented in warning styling; the state belongs in a status value, and any genuinely needed explanation in a tooltip.
 6. **Every visual element encodes real data.** A chart whose marks don't correspond to the values is worse than no chart — fix it or remove it.
 7. **Numbers live in one place.** A value shown in a chart is not repeated in a text block beside it; shared assumptions live in one assumptions area, not restated per section.
 8. **Multi-number data is a chart, not text.** Anything numeric that is not a single number is represented as a chart or graph where possible.
@@ -74,7 +74,7 @@ Apply to one card type. Every answer must be "no" unless noted.
 1. **Compact** — Does the card hold anything that belongs behind a tab, toggle, or expandable instead of extending the page?
 2. **One section, multiple views** — Does the card present the same data two ways as stacked blocks instead of views of one section?
 3. **Prime real estate** — Is the card's top element anything other than the visual or value that answers its question? (Must be no.)
-4. **Narrative in tooltips** — Is any explanation or methodology visible inline rather than behind a tooltip, info-tip, or collapsed expandable?
+4. **Narrative in tooltips** — Is any explanation or methodology visible inline rather than behind a tooltip, info-tip, or collapsed expandable? Does any sentence in a primary surface explain behavior rather than present data, a status, or an action? Does any warning-styled element carry explanatory narrative, normal-state information, or orientation text instead of an actual abnormal condition needing attention or action? (Must be no.)
 5. **Real data** — Does any bar, fill, gauge, segment, or color fail to correspond to an actual value?
 6. **Numbers in one place** — Is any number shown twice in the card — in a chart and in text, or in a tile and a line?
 7. **Density with order** — Is any content grouped by something other than the question it answers, or detail placed before summary?

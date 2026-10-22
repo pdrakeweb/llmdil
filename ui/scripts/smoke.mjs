@@ -625,5 +625,26 @@ for (const [name, src] of [["static.ts", staticSrcNum], ["dashboard.ts", dashSrc
     `${name} has no locale-dependent no-argument toLocaleString() on a numeric value (counts/contexts route through fmtCount)`);
 }
 
+// Rule 5 (no explanatory narrative in primary UI): the setup wizard's
+// launch banner sentence and the other always-on behavior explanations
+// removed 2026-10-22 must not return. Fully deleted texts are pinned
+// against the built bundle; texts relocated into tooltips are pinned
+// against the visible markup in the sources.
+check(!bundle.includes("steps execute against this machine"), "bundle does not contain the wizard launch banner sentence");
+check(!bundle.includes("A failed step pauses the run"), "bundle does not contain the wizard failure-instruction sentence");
+check(!bundle.includes("Steps run in order"), "bundle does not contain the wizard sidebar narrative");
+check(!bundle.includes("checksums verified per file"), "bundle does not contain the wizard sidebar methodology lines");
+check(!bundle.includes("the gateway starts at its step"), "bundle does not contain the wizard sidebar start-order line");
+check(!bundle.includes("This view refreshes every 2 s"), "bundle does not contain the GPUs view refresh narrative");
+check(!bundle.includes("runs in order"), "bundle does not contain the checklist order clause");
+check(bundle.includes("Sample mode"), "bundle contains the Sample mode status value");
+check(!allSrc.includes("Sample mode \\u2014 open the installed app") && !allSrc.includes("Sample mode — open the installed app"), "no visible sample-mode banner sentence remains in ui/src (status value + tooltip only)");
+const optSrcNar = readFileSync(join(root, "src", "views", "optimize.ts"), "utf8");
+check(!optSrcNar.includes('<span class="opt-note">Accepted experiments run'), "Optimize experiments explanation is not a visible note (button tooltips only)");
+check(!optSrcNar.includes('<p class="opt-note">Every stored measurement'), "Optimize measurements description is not a visible paragraph (info-tip only)");
+const staticSrcNar = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+check(staticSrcNar.includes('"banner mode-live"'), "wizard live mode renders as a neutral status banner, not warning styling");
+check(!staticSrcNar.includes("wiz-side"), "wizard sidebar narrative block is removed from static.ts");
+
 if (failures > 0) { console.error(`\n${failures} smoke check(s) failed`); process.exit(1); }
 console.log("\nsmoke: all checks passed");

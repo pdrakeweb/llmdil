@@ -378,6 +378,9 @@ table.tbl tr:last-child td { border-bottom: 0; }
   background: #2a2410; border: 1px solid #4a3d14; color: #e8c547;
   border-radius: 8px; padding: 8px 14px; font-size: 12px; margin-bottom: 12px;
 }
+/* A banner slot carrying only a normal-state status value (rule 5):
+   neutral styling — warning styling is for abnormal conditions. */
+.banner.mode-live { background: var(--bg2); border-color: var(--border); color: var(--text2); }
 
 /* Global activation-plan header: sits at the very top of the main
    column, above every view's title, whenever a plan is pending. */
@@ -437,8 +440,7 @@ table.tbl tr:last-child td { border-bottom: 0; }
 .segbar i { height: 8px; flex: 1; border-radius: 4px; background: #2a313c; }
 .segbar i.done { background: var(--ok); }
 .segbar i.run { background: var(--warn); }
-.wiz-body { display: grid; grid-template-columns: 240px 1fr; }
-.wiz-side { padding: 18px; border-right: 1px solid var(--border); color: var(--text2); font-size: 12px; line-height: 1.6; }
+.wiz-body { display: grid; grid-template-columns: 1fr; }
 .wiz-steps { padding: 14px 18px; display: grid; gap: 8px; }
 .step {
   display: grid; grid-template-columns: 28px 1fr auto auto; gap: 10px; align-items: center;
@@ -492,11 +494,6 @@ table.tbl tr:last-child td { border-bottom: 0; }
   .grid2 { grid-template-columns: minmax(0, 1fr); }
   .sidebar { width: 64px; flex-basis: 64px; }
   .sidebar .brand .name, .sidebar .brand .sub, .nav a span.lbl, .side-foot { display: none; }
-}
-
-@media (max-width: 900px) {
-  .wiz-body { grid-template-columns: 1fr; }
-  .wiz-side { border-right: 0; border-bottom: 1px solid var(--border); }
 }
 
 /* Optimize page */
