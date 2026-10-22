@@ -3715,7 +3715,11 @@ export function optimizeChangeSummary(item: OptimizePlanItem, shortName: (modelI
     case "group.set_fallbacks": return `Fallbacks: ${Array.isArray(c.fallbacks) && c.fallbacks.length ? (c.fallbacks as string[]).join(", ") : "none"}`;
     case "group.create": return `Members: ${Array.isArray(c.members) ? (c.members as string[]).join(", ") : ""} · Strategy: ${String(c.strategy ?? "simple-shuffle")}`;
     case "group.delete": return `Group: ${t}`;
-    case "model.add": return `Source: ${String(c.source_url ?? "")}`;
+    case "model.add": {
+      const parts = [`Source: ${String(c.source_url ?? "")}`];
+      if (typeof c.params_b === "number") parts.push(`Params: ${num(c.params_b)} B`);
+      return parts.join(" · ");
+    }
     case "model.download": return "Downloads the GGUF file";
     default: return "";
   }

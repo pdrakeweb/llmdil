@@ -628,7 +628,7 @@ Allowed kinds and their change payloads:
 - group.set_fallbacks — change: {\"fallbacks\": [\"group-name-or-openrouter\", ...]}
 - group.create — target: the new group's name. change: {\"members\": [...], \"strategy\": \"...\", \"fallbacks\": [...]}
 - group.delete — target: group name. change: {}
-- model.add — target: the new model's id. change: {\"source_url\": \"https://....gguf\", optional \"quant\", \"sha256\"} — registers the model only; it is not downloaded
+- model.add — target: the new model's id. change: {\"source_url\": \"https://....gguf\", optional \"quant\", \"sha256\", \"params_b\"} — registers the model only; it is not downloaded. \"params_b\" is the model's total parameter count in billions: include it whenever the model is not in the catalog candidates (use the \"candidates\" section's figure for a discovered candidate); a non-catalog model.add without a known params_b is invalid and cannot be applied
 - advice — change: {\"text\": \"...\"} for anything worth saying that the kinds above cannot express
 
 Constraints:

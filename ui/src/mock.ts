@@ -246,7 +246,7 @@ export function mockOptimizeState(): OptimizeState {
           rationale: "Least-busy spreads requests across group members instead of shuffling.",
           confidence: "medium",
         }),
-        item(4, "model.add", "sample-model", { source_url: "sample/sample-model-Q4_K_M.gguf", quant: "Q4_K_M" }, {
+        item(4, "model.add", "sample-model", { source_url: "sample/sample-model-Q4_K_M.gguf", quant: "Q4_K_M", params_b: 8 }, {
           rationale: "Registers a model for later evaluation; nothing is downloaded.",
           confidence: "low",
         }),
