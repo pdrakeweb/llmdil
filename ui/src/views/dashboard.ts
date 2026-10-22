@@ -88,9 +88,12 @@ function backendSparkColor(id: string): string {
 
 function serviceCard(b: BackendInfo, isGateway: boolean): string {
   const ringColor = statusColor(b.status);
-  // requests_1h / errors_1h / throughput_toks come from LiteLLM's
-  // Prometheus counters via the app's metrics poller (live since
-  // v0.1.18); health is the same window's success share and
+  // requests_1h / errors_1h come from LiteLLM's Prometheus
+  // counters via the app's metrics poller (live since v0.1.18);
+  // throughput_toks is the poller's LIVE rate over the recent
+  // window (absent when the current rate is not measured — a
+  // request in flight has no counted tokens yet); health is the
+  // trailing-hour success share and
   // vram_held_gb is joined from telemetry attribution in
   // getDashboard. Render "—" when absent instead of crashing on
   // .toFixed or presenting a fabricated measurement.

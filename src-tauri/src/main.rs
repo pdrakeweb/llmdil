@@ -230,7 +230,8 @@ fn main() {
             });
             // Gateway metrics poller: scrape LiteLLM's Prometheus
             // endpoint every 15 s into the stats store that feeds
-            // the Dashboard's request/error/throughput figures.
+            // the Dashboard's request/error figures and live
+            // throughput rate.
             // Cycles skip silently while the gateway is down.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

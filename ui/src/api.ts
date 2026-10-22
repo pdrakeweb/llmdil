@@ -417,6 +417,14 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
   const statRows = b.data.filter((x) => x.requests_1h !== undefined);
   const sumStat = (pick: (x: BackendInfo) => number | undefined): number | undefined =>
     statRows.length ? statRows.reduce((a, x) => a + (pick(x) ?? 0), 0) : undefined;
+  // Throughput sums only the backends whose live rate is actually
+  // measured: a backend whose rate is unknown (absent) contributes
+  // nothing — it is not a measured 0 — and the gateway total is
+  // absent when no backend's rate is measured.
+  const tputRows = b.data.filter((x) => x.throughput_toks !== undefined);
+  const throughputSum: number | undefined = tputRows.length
+    ? tputRows.reduce((a, x) => a + (x.throughput_toks ?? 0), 0)
+    : undefined;
   // Gateway sparkline: requests/min summed across the backends
   // that carry a series (the card captions it "Requests per
   // minute"); absent when no backend has one yet.
@@ -435,7 +443,7 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
         model: "",
         requests_1h: sumStat((x) => x.requests_1h),
         errors_1h: sumStat((x) => x.errors_1h),
-        throughput_toks: sumStat((x) => x.throughput_toks),
+        throughput_toks: throughputSum,
         spark: gatewaySpark,
       };
   // VRAM held per backend, measured from telemetry's per-process
@@ -704,9 +712,13 @@ export interface BackendRow {
    *  so it reads 0 until a restart monitor exists (v0.1.2 has none). */
   restarts: number;
   uptime_secs: number | null;
-  /** Trailing-hour gateway statistics from LiteLLM's Prometheus
-   *  counters (present only once the metrics poller has a window;
-   *  absent renders as "—", not zero). */
+  /** Gateway statistics from LiteLLM's Prometheus counters
+   *  (present only once the metrics poller has snapshots; absent
+   *  renders as "—", not zero). Requests/errors/health are the
+   *  trailing hour; throughput_toks is the LIVE rate over the
+   *  recent window — absent when the current rate is not
+   *  measured (e.g. a request is in flight and its tokens are
+   *  not counted yet), never a fabricated 0. */
   requests_1h?: number;
   errors_1h?: number;
   throughput_toks?: number;
