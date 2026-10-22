@@ -2801,7 +2801,7 @@ fn sample_response(cfg: &AppConfig) -> String {
     }
     items.push(json!({
         "kind": "model.add", "target": "sample-model",
-        "change": { "source_url": "https://example.com/models/sample-model-Q4_K_M.gguf", "quant": "Q4_K_M" },
+        "change": { "source_url": "https://example.com/models/sample-model-Q4_K_M.gguf", "quant": "Q4_K_M", "params_b": 8.0 },
         "rationale": "Sample item: model.add registers a model without downloading it — the warning on the row is standing, and the download stays a Models-view act.",
         "expected_effect": "Model registered", "confidence": "low",
     }));

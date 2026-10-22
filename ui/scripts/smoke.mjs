@@ -194,6 +194,17 @@ check(optimizeSrc.includes("data-opt-estimate"), "Optimize view renders the per-
 check(optimizeSrc.includes('data-opt-act="estimate-experiments"'), "Optimize view renders the Estimate experiments action");
 check(optimizeSrc.includes("Estimate —"), "Optimize view renders estimate figures under the Estimate label");
 
+// Optimize model.add params_b (tracker #38): the apply executor
+// forwards the plan item's params_b to modelAdd (an unknown-size,
+// non-catalog add without one is invalid at plan time and never
+// reaches apply), and the plan row's change summary shows the
+// carried count.
+check(optimizeSrc.includes('typeof c.params_b === "number" ? (c.params_b as number) : undefined'),
+  "Optimize apply forwards a model.add item's params_b to modelAdd (tracker #38)");
+const apiSrc38 = readFileSync(join(root, "src", "api.ts"), "utf8");
+check(apiSrc38.includes("Params: ${num(c.params_b)} B"),
+  "Optimize change summary shows a model.add item's carried params_b (tracker #38)");
+
 // Optimize fix bundle (Oct 19, 2026): the consulting elapsed
 // clock reads the server's recorded start (a page instance that
 // did not start the run has no local start and must not render
