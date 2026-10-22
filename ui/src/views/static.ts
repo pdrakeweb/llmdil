@@ -2459,9 +2459,9 @@ function backendCard(
       : fig !== null
         ? `${trim1(fig)} tok/s`
         : `<span style="color:var(--text3);font-weight:400">Not measured</span>`;
-    return `<div class="kv"><span class="k">Predicted throughput<span class="info-tip" title="${esc(tip)}">${icon("info")}</span></span><span class="v" style="font-size:13px">${value} ${refreshBtn}</span></div>`;
+    return `<div class="kv backend-stats-predicted"><span class="k">Predicted throughput<span class="info-tip" title="${esc(tip)}">${icon("info")}</span></span><span class="v" style="font-size:13px">${value} ${refreshBtn}</span></div>`;
   })();
-  const statsHtml = `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:8px">
+  const statsHtml = `<div class="backend-stats">
         ${statTiles
           .map(([k, v, tip]) => `<div class="kv"><span class="k">${esc(k)}${tip ? `<span class="info-tip" title="${esc(tip)}">${icon("info")}</span>` : ""}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
         ${predictedTile}
@@ -2758,8 +2758,15 @@ function backendCard(
     if (!b.flags_advanced && b.kv_ram_mib != null) stripTiles.push(["KV cache", `<span title="KV cache at the configured context">${fmtGb(b.kv_ram_mib / 1024)} GiB</span>`]);
     if (!b.flags_advanced && b.rs_ram_mib != null) stripTiles.push(["State cache", `<span title="Recurrent-state cache at the configured slot count">${fmtGb(b.rs_ram_mib / 1024)} GiB</span>`]);
   }
-  const stripHtml = `<div style="display:grid;grid-template-columns:${["2fr", ...stripTiles.slice(1).map(() => "1fr")].join(" ")};gap:10px;margin-top:8px">
-      ${stripTiles.map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${v}</span></div>`).join("")}
+  // The strip is a wrapping flex row (styles.css .backend-strip),
+  // never a single-row grid sized to the tile count: bare fr
+  // tracks cannot shrink below their tiles' min-content widths,
+  // so the full tile set (Model through State cache) overflowed
+  // the card and the last tile painted outside it (Pete's
+  // report, 2026-10-22). Wrapping grows the card to fit; the
+  // Model tile keeps its double share of a shared row.
+  const stripHtml = `<div class="backend-strip">
+      ${stripTiles.map(([k, v], i) => `<div class="kv${i === 0 ? " backend-strip-model" : ""}"><span class="k">${k}</span><span class="v" style="font-size:13px">${v}</span></div>`).join("")}
     </div>`;
   // Details expandable: everything demoted off the closed card —
   // State/PID/Uptime/Batch, the configured-split percentages, and
@@ -2808,10 +2815,10 @@ function backendCard(
       ${detailTail.length ? `<div class="logstream backend-logtail" style="margin-top:4px">${detailTail.map(logLineHtml).join("")}</div>` : `<div style="font-size:12px;color:var(--text2);margin-top:4px">None recorded</div>`}
     </div>`;
   const detailsHtml = detailsOpen ? `<div class="backend-details">
-      <div style="display:grid;grid-template-columns:repeat(${detailKv.length},1fr);gap:10px">
+      <div class="backend-detail-grid">
         ${detailKv.map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
       </div>
-      ${splitEntries.length ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Configured split: ${splitSummary}</div>` : ""}
+      ${splitEntries.length ? `<div style="font-size:12px;color:var(--text2);margin-top:6px;overflow-wrap:anywhere">Configured split: ${splitSummary}</div>` : ""}
       ${basisTip ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Basis: ${esc(b.memory_basis ?? "")}<span class="info-tip" title="${esc(basisTip)}">${icon("info")}</span></div>` : ""}
       ${logLinesHtml}
     </div>` : "";
@@ -2822,7 +2829,7 @@ function backendCard(
   // renders no line (principle 13); the header chip carries the
   // mode itself.
   const rawFlagsHtml = b.flags_advanced && b.raw_flags
-    ? `<div style="font-size:12px;color:var(--text2);margin-top:8px">Flags: <span style="font-family:var(--mono);color:var(--text)">${esc(b.raw_flags)}</span></div>`
+    ? `<div class="backend-raw-flags" style="font-size:12px;color:var(--text2);margin-top:8px">Flags: <span style="font-family:var(--mono);color:var(--text)">${esc(b.raw_flags)}</span></div>`
     : "";
   // The supervisor's recorded failure reason, in the failed
   // state only: it names the cause (e.g. the device-unavailable

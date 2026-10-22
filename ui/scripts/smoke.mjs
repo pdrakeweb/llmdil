@@ -299,6 +299,54 @@ check(backendSrc.includes('if (mres === "failed") { paint(); return; }'), "a fai
 check(bundle.includes("View all logs"), "bundle contains the View all logs menu label");
 check(bundle.includes("Latest log lines"), "bundle contains the Latest log lines caption");
 
+// Backend card tile containment (Oct 22, 2026): with the full
+// tile set present (Model, Context, GPU RAM, System RAM, KV
+// cache, State cache) the metric strip's last tile rendered
+// outside the card. The strip was a single-row grid whose bare
+// 1fr/2fr tracks are minmax(auto, fr) — no track can shrink
+// below its tile's min-content width, so the strip's minimum
+// width was the sum of every tile's min-content, wider than a
+// typical card; the same bare-fr pattern sized the stats row
+// (repeat(3,1fr)) and the Details grid (repeat(N,1fr)). The
+// strips are now wrapping flex rows (styles.css .backend-strip
+// / .backend-stats / .backend-detail-grid): tiles wrap onto
+// additional rows and the card grows to fit, tiles carry
+// min-width: 0 so a long value shrinks and wraps/ellipsizes
+// instead of forcing its strip wide, and the model value is a
+// block box so its nowrap ellipsis actually engages (its full
+// path rides the tile's tooltip). The Groups mini cards carry
+// the same containment for their narrower lane width. The
+// harness renders no DOM, so — like the pins above — these pin
+// the source/CSS fragments of the containment contract; layout
+// was additionally verified by measured bounding boxes in a
+// headless-Chromium fixture at build time (see the branch
+// report), which the static harness cannot repeat.
+check(cardFnSrc.includes('class="backend-strip"'), "backend card metric strip renders as the wrapping .backend-strip row");
+check(cardFnSrc.includes("backend-strip-model"), "backend card Model tile carries the strip's double-share class");
+check(!cardFnSrc.includes('["2fr", ...stripTiles.slice(1)'), "backend card strip no longer builds bare-fr grid tracks sized to the tile count");
+check(cardFnSrc.includes('class="backend-stats"'), "backend card stats row renders as the wrapping .backend-stats row");
+check(!cardFnSrc.includes("repeat(3,1fr)"), "backend card stats row no longer uses a fixed bare-fr 3-column grid");
+check(cardFnSrc.includes("backend-stats-predicted"), "backend card predicted-throughput tile carries the stats row's double-share class");
+check(cardFnSrc.includes('class="backend-detail-grid"'), "backend card Details tiles render as the wrapping .backend-detail-grid row");
+check(!cardFnSrc.includes("repeat(${detailKv.length},1fr)"), "backend card Details grid no longer uses bare-fr tracks sized to the field count");
+check(cardFnSrc.includes('class="backend-raw-flags"'), "backend card raw-flags line carries the wrap-anywhere containment class");
+const stripRule = stylesSrc.split(".backend-strip {")[1]?.split("}")[0] ?? "";
+check(stripRule.includes("display: flex") && stripRule.includes("flex-wrap: wrap"), "metric strip is a wrapping flex row (tiles wrap, card grows to fit)");
+const statsRule = stylesSrc.split(".backend-stats {")[1]?.split("}")[0] ?? "";
+check(statsRule.includes("display: flex") && statsRule.includes("flex-wrap: wrap"), "stats row is a wrapping flex row");
+const detailGridRule = stylesSrc.split(".backend-detail-grid {")[1]?.split("}")[0] ?? "";
+check(detailGridRule.includes("display: flex") && detailGridRule.includes("flex-wrap: wrap"), "Details tile row is a wrapping flex row");
+const kvRule = stylesSrc.split("\n.kv {")[1]?.split("}")[0] ?? "";
+check(kvRule.includes("min-width: 0"), "tiles can shrink below their content's min-content width (.kv min-width: 0)");
+check(stylesSrc.includes(".backend-model-file {\n  display: block;") || stylesSrc.split(".backend-model-file {")[1]?.split("}")[0]?.includes("display: block"),
+  "model tile value is a block box so its ellipsis truncation engages");
+check(stylesSrc.split(".group-mini-line {")[1]?.split("}")[0]?.includes("overflow-wrap: anywhere"),
+  "Groups mini-card lines wrap anywhere instead of overflowing the lane");
+check(stylesSrc.split(".group-mini-id {")[1]?.split("}")[0]?.includes("text-overflow: ellipsis"),
+  "Groups mini-card backend id truncates with an ellipsis inside the lane");
+check(bundle.includes("backend-strip"), "bundle contains the wrapping metric strip class");
+check(bundle.includes("backend-stats-predicted"), "bundle contains the predicted tile's stats class");
+
 
 // GPU power absence states: the telemetry payload classifies a null
 // power reading as the driver answering N/A (hardware state) or the

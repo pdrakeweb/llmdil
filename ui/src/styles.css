@@ -198,9 +198,9 @@ body {
 .ring .ring-label b { font-size: 15px; }
 .ring .ring-label span { font-size: 9px; color: var(--text3); }
 
-.kv { display: grid; gap: 2px; }
-.kv .k { font-size: 10px; color: var(--text3); letter-spacing: 0.04em; text-transform: uppercase; }
-.kv .v { font-size: 15px; font-weight: 600; font-family: var(--mono); }
+.kv { display: grid; gap: 2px; min-width: 0; }
+.kv .k { font-size: 10px; color: var(--text3); letter-spacing: 0.04em; text-transform: uppercase; min-width: 0; overflow-wrap: anywhere; }
+.kv .v { font-size: 15px; font-weight: 600; font-family: var(--mono); min-width: 0; overflow-wrap: anywhere; }
 .kv .v small { font-size: 11px; color: var(--text3); font-weight: 400; }
 
 .spark-wrap { margin-top: 8px; }
@@ -217,9 +217,36 @@ body {
   display: flex; align-items: center; gap: 6px; min-width: 0;
 }
 .backend-model-file {
-  font-family: var(--mono); min-width: 0; overflow: hidden;
+  display: block; font-family: var(--mono); min-width: 0; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap;
 }
+/* Backend-card tile strips (Oct 22, 2026): the tiles FLOW — they
+   wrap onto additional rows as the card narrows (design-principles
+   rule 18) instead of holding one fixed row. The previous strip
+   was a single-row grid with bare 1fr/2fr tracks: a bare fr track
+   is minmax(auto, fr), so no track could shrink below its
+   content's min-content width, the strip's minimum width was the
+   sum of every tile's min-content (~550px with the full tile
+   set), and in any narrower card the grid painted past the card
+   border — the last tile (State cache) landed outside the card.
+   Flex items here carry min-width: 0 (via .kv above), so a tile
+   can also shrink and wrap/ellipsize its value instead of
+   forcing the strip wide. No fixed height anywhere in the card:
+   wrapping grows the card vertically to fit its tiles. The card
+   itself gets no overflow clipping — the advanced-actions menu
+   is absolutely positioned inside the card and must paint over
+   the card edge. */
+.backend-strip { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+.backend-strip .kv { flex: 1 1 92px; }
+.backend-strip .kv.backend-strip-model { flex: 2 1 180px; }
+.backend-stats { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+.backend-stats .kv { flex: 1 1 140px; }
+.backend-stats .kv.backend-stats-predicted { flex: 2 1 230px; }
+.backend-detail-grid { display: flex; flex-wrap: wrap; gap: 10px; }
+.backend-detail-grid .kv { flex: 1 1 104px; }
+.backend-raw-flags { overflow-wrap: anywhere; }
+.backend-form-panel table { max-width: 100%; }
+.backend-form-panel td, .backend-form-panel th { overflow-wrap: anywhere; }
 .backend-actions { align-items: center; }
 .backend-gpus { margin-top: 8px; min-width: 0; }
 .backend-gpus-title {
@@ -578,10 +605,11 @@ table.tbl tr:last-child td { border-bottom: 0; }
 .group-lane.dragover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .group-lane-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 .group-lane-name { font-size: 13px; font-weight: 700; }
-.group-mini-card { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; cursor: grab; }
+.group-mini-card { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; cursor: grab; min-width: 0; }
 .group-mini-card:active { cursor: grabbing; }
-.group-mini-head { display: flex; align-items: center; gap: 8px; }
-.group-mini-id { font-weight: 600; font-size: 13px; }
-.group-mini-line { font-size: 12px; color: var(--text2); margin-top: 4px; }
+.group-lane-body { min-width: 0; }
+.group-mini-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.group-mini-id { font-weight: 600; font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group-mini-line { font-size: 12px; color: var(--text2); margin-top: 4px; min-width: 0; overflow-wrap: anywhere; }
 .group-ext-chip { margin-bottom: 8px; }
 .group-drop-hint { font-size: 12px; color: var(--text3); border: 1px dashed var(--border); border-radius: 8px; padding: 10px; text-align: center; }
