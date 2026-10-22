@@ -131,6 +131,18 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
    *  that failed while the operator was on another view must
    *  still surface, with the stored plan marked as previous. */
   let lastConsultError = "";
+  /** The last Estimate/Measure job's failure as this page knows
+   *  it (tracker #69): synced from the server's recorded
+   *  `job_error` on every refresh, so a job that failed while
+   *  the operator was in another window still surfaces. */
+  let lastJobError = "";
+  /** Poll timer (tracker #69): while a job is busy the page
+   *  re-reads the state payload every ~5 s, so completion and
+   *  failure are picked up without a page reload. */
+  let pollTimer: number | null = null;
+  /** Elapsed ticker for a server-described job this page
+   *  instance did not start (tracker #69). */
+  let jobTimer: number | null = null;
   let applyRunning = false;
   /** The backend this page instance is measuring (Phase 5a), and
    *  its progress timer — the server payload carries only the
@@ -749,6 +761,20 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     const consultStartMs = st.consult_started_unix_ms ?? (consultStart > 0 ? consultStart : null);
     const consultFailure = lastConsultError || st.consult_error || "";
     const measuring = st.measuring || measuringBackend !== null || estimatingBackend !== null || estimatesRunning;
+    // The Estimate/Measure job this page should render as
+    // running (tracker #69): the server's descriptor is
+    // authoritative — it names the kind, the backend, and the
+    // start for a job ANY window started. This page instance's
+    // own locals are only the fallback for the instant before
+    // its first refresh lands (and for the mock payload).
+    const serverJob = st.job ?? null;
+    const jobKind: "measure" | "estimate" | null = serverJob?.kind
+      ?? (estimatingBackend !== null ? "estimate" : measuringBackend !== null ? "measure" : null);
+    const jobBackend = serverJob?.backend_id ?? estimatingBackend ?? measuringBackend;
+    const jobStartMs: number | null = serverJob?.started_unix_ms
+      ?? (jobKind === "estimate" && estimateStart > 0 ? estimateStart
+        : jobKind === "measure" && measureStart > 0 ? measureStart : null);
+    const jobFailure = lastJobError || st.job_error || "";
     host.innerHTML = `
     <div class="card" id="optConsultCard">
       <div class="opt-consult-grid">
@@ -784,14 +810,17 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
              ${armed.has("consult") ? `<span class="opt-note">A new consultation replaces the plan and its decisions. Click again to confirm.</span>` : ""}`}
       </div>
       ${consultFailure ? `<div class="banner">${icon("err")} Consultation failed — ${esc(consultFailure)}${st.plan ? ` The plan below is the previous plan, from ${esc(fmtTime(st.plan.created_at))}.` : ""}</div>` : ""}
+      ${jobFailure && !measuring ? `<div class="banner">${icon("err")} ${esc(jobFailure)}</div>` : ""}
       ${statusLine && !st.plan ? `<div class="opt-status">${esc(statusLine)}</div>` : ""}
       ${running.length ? `<div class="opt-measurements">
         <div class="opt-field-label" style="margin-top:14px">Measured throughput</div>
         ${running.map((b) => measureRow(b, measuring)).join("")}
         ${measuring ? `<div class="opt-consult-actions">
-          ${estimatingBackend
-            ? `<span class="opt-consulting">${icon("clock")} Estimating ${esc(estimatingBackend)}${estimateStart ? ` <span id="optEstimateElapsed">${fmtElapsed(Math.floor((Date.now() - estimateStart) / 1000))}</span>` : ""} — the abbreviated benchmark: the same two prompts, one run each, reduced generation budgets.</span>`
-            : `<span class="opt-consulting">${icon("clock")} Measuring${measuringBackend ? ` ${esc(measuringBackend)}` : ""}${measureStart ? ` <span id="optMeasureElapsed">${fmtElapsed(Math.floor((Date.now() - measureStart) / 1000))}</span>` : ""} — the standardized benchmark runs two prompts, warm-up plus three measured runs each.</span>`}
+          ${jobKind === "estimate"
+            ? `<span class="opt-consulting">${icon("clock")} Estimating${jobBackend ? ` ${esc(jobBackend)}` : ""}${jobStartMs !== null ? ` <span id="optEstimateElapsed">${fmtElapsed(Math.max(0, Math.floor((Date.now() - jobStartMs) / 1000)))}</span>` : ""} — the abbreviated benchmark: the same two prompts, one run each, reduced generation budgets. On a slow, fully CPU-offloaded backend this can take several minutes — up to about 20 minutes in the worst case (about 10 minutes per prompt); a fast reference time is not typical for such backends.</span>`
+            : jobKind === "measure"
+              ? `<span class="opt-consulting">${icon("clock")} Measuring${jobBackend ? ` ${esc(jobBackend)}` : ""}${jobStartMs !== null ? ` <span id="optMeasureElapsed">${fmtElapsed(Math.max(0, Math.floor((Date.now() - jobStartMs) / 1000)))}</span>` : ""} — the standardized benchmark runs two prompts, warm-up plus three measured runs each. A single run on a slow or heavily offloaded backend can take several minutes (each run is allowed up to 10 minutes), so a full measurement can take a long time.</span>`
+              : `<span class="opt-consulting">${icon("clock")} A benchmark job is running${jobStartMs !== null ? ` <span id="optJobElapsed">${fmtElapsed(Math.max(0, Math.floor((Date.now() - jobStartMs) / 1000)))}</span>` : ""} — this page refreshes automatically while it runs.</span>`}
           <button class="btn danger" data-opt-act="cancel-job">${icon("x")} Cancel</button>
         </div>` : ""}
       </div>` : ""}
@@ -824,6 +853,30 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       window.clearInterval(elapsedTimer);
       elapsedTimer = null;
     }
+    // Same for a server-described Estimate/Measure job (tracker
+    // #69): a window that did not start the job still ticks its
+    // elapsed from the server's start time; the job ending
+    // stops the ticker. (runMeasure/runEstimate also manage
+    // their own timers; the element-id lookup keeps them from
+    // fighting — each writes the same value from the same
+    // start.)
+    if (measuring && jobStartMs !== null) {
+      if (jobTimer === null) {
+        jobTimer = window.setInterval(() => {
+          const startMs = state?.job?.started_unix_ms
+            ?? (estimatingBackend !== null && estimateStart > 0 ? estimateStart
+              : measuringBackend !== null && measureStart > 0 ? measureStart : null);
+          if (startMs === null) return;
+          for (const id of ["optEstimateElapsed", "optMeasureElapsed", "optJobElapsed"]) {
+            const el = hostEl.querySelector(`#${id}`);
+            if (el) el.textContent = fmtElapsed(Math.max(0, Math.floor((Date.now() - startMs) / 1000)));
+          }
+        }, 1000);
+      }
+    } else if (!measuring && jobTimer !== null) {
+      window.clearInterval(jobTimer);
+      jobTimer = null;
+    }
   }
 
   async function refresh(): Promise<void> {
@@ -837,6 +890,8 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       // The server's recorded failure is authoritative: it
       // survives this page not having run the consultation.
       lastConsultError = r.data.consult_error ?? "";
+      // Same for a benchmark job's failure (tracker #69).
+      lastJobError = r.data.job_error ?? "";
     }
     paint();
   }
@@ -907,14 +962,27 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     if (disposed) return;
     if (r.error) {
       if (state) state.measuring = false;
-      statusLine = r.error === "measurement cancelled"
-        ? "Measurement cancelled."
-        : `Measurement failed — ${r.error}`;
-      paint();
+      if (r.error === "measurement cancelled") {
+        statusLine = "Measurement cancelled.";
+        paint();
+        return;
+      }
+      // The server recorded the failure as `job_error`
+      // (tracker #69): re-read the state so the banner — the
+      // same surface every other window sees — carries it,
+      // instead of a page-local status line only this instance
+      // would ever show.
+      await refresh();
+      if (disposed) return;
+      if (!lastJobError) {
+        statusLine = `Measurement failed — ${r.error}`;
+        paint();
+      }
       return;
     }
     if (r.data) {
       state = r.data;
+      lastJobError = r.data.job_error ?? "";
       statusLine = "";
     }
     paint();
@@ -936,14 +1004,24 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     if (disposed) return;
     if (r.error) {
       if (state) state.measuring = false;
-      statusLine = r.error === "estimate cancelled"
-        ? "Estimate cancelled."
-        : `Estimate failed — ${r.error}`;
-      paint();
+      if (r.error === "estimate cancelled") {
+        statusLine = "Estimate cancelled.";
+        paint();
+        return;
+      }
+      // As with measurements: the server's recorded `job_error`
+      // is the failure surface (tracker #69).
+      await refresh();
+      if (disposed) return;
+      if (!lastJobError) {
+        statusLine = `Estimate failed — ${r.error}`;
+        paint();
+      }
       return;
     }
     if (r.data) {
       state = r.data;
+      lastJobError = r.data.job_error ?? "";
       statusLine = "";
     }
     paint();
@@ -1501,8 +1579,29 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   });
 
   await refresh();
+  // Polling (tracker #69): while a GPU job is busy, re-read the
+  // state payload every ~5 s so this window observes the job's
+  // completion or failure (and its recorded `job_error`)
+  // without a reload — previously the view never polled, so a
+  // window that did not start the job kept rendering stale
+  // in-progress copy forever. The poll that first sees the job
+  // finished also brings its outcome; polling then stops
+  // because `measuring` is false. A tick is skipped while the
+  // operator is editing a field, so a repaint cannot drop the
+  // caret mid-edit; the next tick retries.
+  pollTimer = window.setInterval(() => {
+    if (disposed || !state?.measuring) return;
+    const active = document.activeElement;
+    if (active && hostEl.contains(active)
+      && (active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement || active instanceof HTMLSelectElement)) {
+      return;
+    }
+    void refresh();
+  }, 5000);
   return () => {
     disposed = true;
+    if (pollTimer !== null) window.clearInterval(pollTimer);
+    if (jobTimer !== null) window.clearInterval(jobTimer);
     if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
     if (measureTimer !== null) window.clearInterval(measureTimer);
     if (estimateTimer !== null) window.clearInterval(estimateTimer);

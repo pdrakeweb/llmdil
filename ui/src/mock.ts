@@ -216,6 +216,9 @@ export function mockOptimizeState(): OptimizeState {
     consult_error: null,
     consult_error_unix_ms: null,
     measuring: false,
+    job: null,
+    job_error: null,
+    job_error_unix_ms: null,
     running_ops: {},
     plan: {
       summary: "Sample plan — generated locally; no backend was consulted.",
