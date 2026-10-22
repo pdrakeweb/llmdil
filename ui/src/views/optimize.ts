@@ -392,9 +392,8 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
           : estimatesRunning
             ? `<span class="opt-consulting">${icon("clock")} Estimating experiments <span id="optExpEstElapsed">${fmtElapsed(Math.floor((Date.now() - expEstStart) / 1000))}</span> — the abbreviated benchmark only, one at a time, same 60 min batch budget. Temp backends are cleaned up on every outcome.</span>
                <button class="btn danger" data-opt-act="cancel-job">${icon("x")} Cancel</button>`
-            : `<button class="btn primary" data-opt-act="run-experiments" ${accepted && !busy ? "" : "disabled"}>${icon("bolt")} Run experiments (${accepted})</button>
-               <button class="btn" data-opt-act="estimate-experiments" ${accepted && !busy ? "" : "disabled"}>${icon("gauge")} Estimate experiments (${accepted})</button>
-               <span class="opt-note">Accepted experiments run one at a time on a temporary backend outside every gateway group; it is stopped and removed afterwards, on every outcome. Estimate runs the abbreviated benchmark only, to screen a batch before full runs.</span>`}
+            : `<button class="btn primary" data-opt-act="run-experiments" title="Accepted experiments run one at a time on a temporary backend outside every gateway group; it is stopped and removed afterwards, on every outcome." ${accepted && !busy ? "" : "disabled"}>${icon("bolt")} Run experiments (${accepted})</button>
+               <button class="btn" data-opt-act="estimate-experiments" title="Runs the abbreviated benchmark only, to screen a batch before full runs." ${accepted && !busy ? "" : "disabled"}>${icon("gauge")} Estimate experiments (${accepted})</button>`}
       </div>
       ${resultsTable}
     </div>`;
@@ -620,8 +619,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       .map((b) => `<option value="${esc(b.id)}"${b.id === historyCompare ? " selected" : ""}>${esc(b.id)}</option>`)
       .join("");
     return `<details class="card opt-measurements">
-      <summary>Measurements</summary>
-      <p class="opt-note">Every stored measurement, grouped by model, newest first. The entry a backend's prediction resolves to is marked Current for that backend. Deleting an entry removes it from every surface at the next refresh.</p>
+      <summary>Measurements <span class="info-tip" title="Every stored measurement, grouped by model, newest first. The entry a backend's prediction resolves to is marked Current for that backend. Deleting an entry removes it from every surface at the next refresh.">${icon("info")}</span></summary>
       ${compareOpts ? `<div class="opt-consult-row"><label style="font-size:12px;color:var(--text2)">Compare against <select data-opt-history-compare style="${SELECT_STYLE}"><option value="">—</option>${compareOpts}</select></label></div>` : ""}
       ${groups.map((g) => `<div class="opt-field-label" style="margin-top:10px">${esc(g.model)}</div>${g.arr.map((e) => measurementRowHtml(e, st)).join("")}`).join("")}
     </details>`;

@@ -295,7 +295,7 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
       banner.innerHTML = meta.error
         ? `<div class="banner" style="margin-bottom:12px">${icon("err")} Backend error \u2014 ${esc(meta.error)}</div>`
         : !meta.live
-          ? `<div class="banner" style="margin-bottom:12px">${icon("warn")} Sample mode \u2014 open the installed app for live data from this machine.</div>`
+          ? `<div class="banner" style="margin-bottom:12px" title="Open the installed app for live data from this machine.">${icon("warn")} Sample mode</div>`
           : "";
     }
     // Aggregate banner (§9): shown only in the one bad state —
