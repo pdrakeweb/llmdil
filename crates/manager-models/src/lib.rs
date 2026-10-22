@@ -26,7 +26,8 @@ pub mod placement;
 
 pub use cache::{
     cache_selection, cache_tokens_present, kv_bytes_per_token, predicted_best, predicted_fits,
-    price_ladder, set_cache_selection, CacheFitInputs, CacheRung, CacheSelection, CacheType,
+    predicted_shares, price_ladder, set_cache_selection, CacheFitInputs, CacheRung, CacheSelection,
+    CacheType,
     FlashAttn, HEADROOM_RESERVE_PERCENT, PREDICTED_BEST_LADDER,
 };
 pub use flags::{raw_flag_warnings, FlagWarning};

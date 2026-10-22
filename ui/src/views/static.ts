@@ -1986,31 +1986,49 @@ function sameCacheSelection(a: CacheSelectionLike, b: CacheSelectionLike): boole
   return a.k === b.k && a.v === b.v && a.flash_attn === b.flash_attn;
 }
 
-/** The predicted-footprint line under the cache controls: the
- *  current selection's weights / KV / state / total against the
- *  target VRAM, and the predicted-best rung — as a button when
- *  it differs from the current selection (the host wires the
- *  attribute), as text when it is the current selection, and as
- *  the honest no-fit statement (with the lowest rung's numbers)
- *  when no rung fits at the chosen context. Numbers only;
- *  explanation in the tooltip. */
+/** The predicted-footprint block under the cache controls: the
+ *  current selection's footprint as structured Label: Value
+ *  rows — Weights, KV cache and State cache (each present only
+ *  when its figure exists; an unknown figure renders no row,
+ *  never a zero), the emphasized Total, then one capacity row
+ *  per placed GPU carrying that GPU's required share of its
+ *  total VRAM and its verdict as a status chip — and below it
+ *  the predicted-best rung: as a button when it differs from
+ *  the current selection (the host wires the attribute), as
+ *  text when it is the current selection, and as the honest
+ *  no-fit statement (with the lowest rung's numbers) when no
+ *  rung fits at the chosen context. Numbers only; explanation
+ *  in the tooltip. Shared by the Edit Flags form and the Add
+ *  Backend form (via flagsCacheHtml): one renderer, two hosts,
+ *  so the forms cannot diverge. */
 function cachePreviewHtml(preview: CachePreview | null, sel: CacheSelectionLike, bestAttr: string): string {
   if (!preview) return "";
   const gib = (mib: number): string => fmtGb(mib / 1024);
+  const row = (label: string, value: string, extra = ""): string => `<div>${label}: ${value}${extra}</div>`;
   if (preview.kv_mib === null) {
-    return `<div style="font-size:12px;color:var(--text2);margin-top:6px">Weights: ${gib(preview.weights_mib)} GiB · KV: not priced<span class="info-tip" title="This model's KV geometry is not known, so no KV figure or predicted-best rung can be priced for it. The cache types still apply at launch.">${icon("info")}</span></div>`;
+    // KV geometry unknown: nothing is priced beyond the weights
+    // — no KV row, no total, no capacity verdict (a total priced
+    // without KV would understate the footprint, and a fit claim
+    // on it would imply a measurement that does not exist).
+    return `<div style="font-size:12px;color:var(--text2);margin-top:6px">${row("Weights", `${gib(preview.weights_mib)} GiB`, `<span class="info-tip" title="This model's KV geometry is not known, so no KV figure or predicted-best rung can be priced for it. The cache types still apply at launch.">${icon("info")}</span>`)}</div>`;
   }
-  const targets = preview.targets && preview.targets.length
-    ? preview.targets.map((t) => `GPU ${t.gpu} ${gib(t.total_mib)} GiB`).join(" + ")
-    : "target VRAM unknown";
-  const fitText = preview.fits_current === null
-    ? ""
-    : preview.fits_current
-      ? ` · fits`
-      : ` · does not fit at this context`;
-  const parts = [`Weights: ${gib(preview.weights_mib)} GiB`, `KV: ${gib(preview.kv_mib)} GiB`];
-  if (preview.rs_mib) parts.push(`State: ${gib(preview.rs_mib)} GiB`);
-  parts.push(`Total: ${gib(preview.total_mib)} GiB vs ${targets}${fitText}`);
+  const rows = [
+    row("Weights", `${gib(preview.weights_mib)} GiB`),
+    row("KV cache", `${gib(preview.kv_mib)} GiB`),
+  ];
+  if (preview.rs_mib !== null && preview.rs_mib !== undefined) {
+    rows.push(row("State cache", `${gib(preview.rs_mib)} GiB`));
+  }
+  rows.push(`<div style="font-weight:600;color:var(--text)">Total: ${gib(preview.total_mib)} GiB<span class="info-tip" title="Predicted footprint of the current selection, priced by the same requirement model as the start gate: GPU weights at the current offload, KV at the selected cache types and the form's context, and the recurrent-state cache when the model carries one. A selection fits when its per-GPU total is within ${preview.headroom_reserve_percent}% headroom of the target's VRAM — the reserve covers the compute buffers the requirement model does not price. Predicted best is the highest-quality rung that fits: f16, then q8_0/q8_0, then q8_0/q4_0 (V degrades before K), then q4_0/q4_0, flash attention on at every rung.">${icon("info")}</span></div>`);
+  for (const t of preview.targets ?? []) {
+    const chip = t.fits === null || t.fits === undefined
+      ? ""
+      : ` <span class="chip status-tag ${t.fits ? "status-on" : "status-bad"}">${t.fits ? "Fits" : "Does not fit"}</span>`;
+    const value = t.required_mib === null || t.required_mib === undefined
+      ? `${gib(t.total_mib)} GiB`
+      : `${gib(t.required_mib)} GiB of ${gib(t.total_mib)} GiB`;
+    rows.push(row(`GPU ${t.gpu}`, value, chip));
+  }
   let bestHtml = "";
   const best = preview.best;
   if (best && !sameCacheSelection(best, sel)) {
@@ -2021,7 +2039,7 @@ function cachePreviewHtml(preview: CachePreview | null, sel: CacheSelectionLike,
     const lowest = preview.ladder[preview.ladder.length - 1];
     bestHtml = `<div style="font-size:12px;color:#e3b341;margin-top:6px">No cache selection fits at this context — lowest: ${esc(`${lowest.k}/${lowest.v}`)} at ${gib(lowest.total_mib)} GiB</div>`;
   }
-  return `<div style="font-size:12px;color:var(--text2);margin-top:6px">${esc(parts.join(" · "))}<span class="info-tip" title="Predicted footprint of the current selection, priced by the same requirement model as the start gate: GPU weights at the current offload, KV at the selected cache types and the form's context, and the recurrent-state cache when the model carries one. A selection fits when its per-GPU total is within ${preview.headroom_reserve_percent}% headroom of the target's VRAM — the reserve covers the compute buffers the requirement model does not price. Predicted best is the highest-quality rung that fits: f16, then q8_0/q8_0, then q8_0/q4_0 (V degrades before K), then q4_0/q4_0, flash attention on at every rung.">${icon("info")}</span></div>${bestHtml}`;
+  return `<div style="font-size:12px;color:var(--text2);margin-top:6px">${rows.join("")}</div>${bestHtml}`;
 }
 
 /** The cache controls block — three selects in the ctx/batch
@@ -2680,7 +2698,7 @@ function backendCard(
     const ageMs = p.snapshot_age_ms ?? null;
     return `<div style="margin-top:10px">
       ${p.down_indices && p.down_indices.length ? `<div style="font-size:12px;color:var(--err);margin-bottom:6px" title="${p.down_indices.map((i) => `GPU ${i}`).join(", ")} ${p.down_indices.length === 1 ? "is" : "are"} down and ${p.down_indices.length === 1 ? "is" : "are"} treated as having no free VRAM.">${p.down_indices.map((i) => `GPU ${i}`).join(", ")}: down — no free VRAM</div>` : ""}
-      <div style="font-size:12px"><span title="${p.fits ? "The model fits the selected GPUs with the projected split." : "The model does not fit the available VRAM with this split."}">Fit: ${p.fits ? "fits" : "does not fit"}</span><span class="info-tip" title="Projection uses model weights only; run-time allocations add overhead.">${icon("info")}</span></div>
+      <div style="font-size:12px">Fit: <span class="chip status-tag ${p.fits ? "status-on" : "status-bad"}" title="${p.fits ? "The model fits the selected GPUs with the projected split." : "The model does not fit the available VRAM with this split."}">${p.fits ? "Fits" : "Does not fit"}</span><span class="info-tip" title="Projection uses model weights only; run-time allocations add overhead.">${icon("info")}</span></div>
       <table class="dtab" style="margin-top:8px"><thead><tr><th>GPU</th><th>Fraction</th><th>Required</th>${credited ? `<th title="The weight allocation this backend already holds on the GPU. Applying the split restarts the backend, freeing it first.">Current</th><th title="Required minus current: what must fit in free VRAM.">Additional</th>` : ""}<th>Free (current)</th><th>Fit</th></tr></thead><tbody>${rows}</tbody></table>
       ${p.sys_mib ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">System RAM: ${fmtGb(p.sys_mib / 1024)} GiB<span class="info-tip" title="Routed experts under expert offload. The per-GPU figures cover the GPU-resident weights only.">${icon("info")}</span></div>` : ""}
       <div style="font-size:12px;color:var(--text2);margin-top:6px">${ageMs === null ? "Snapshot: latest" : `Snapshot age: ${Math.round(ageMs / 1000)} s`}</div></div>`;

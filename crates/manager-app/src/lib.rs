@@ -6242,11 +6242,27 @@ fn cache_preview_json(
         "rs_mib": req.rs_mib,
         "total_mib": total_mib,
         "basis": serde_json::to_value(req.basis).unwrap_or(Value::Null),
-        "targets": targets.map(|(_, totals, placed)| {
+        "targets": targets.map(|(split, totals, placed)| {
+            // Each target carries its share of the total — the
+            // same distribution predicted_fits judges — and its
+            // own verdict, so the forms render one capacity row
+            // per GPU instead of one line against joined totals.
+            let shares = manager_models::predicted_shares(total_mib, split, totals);
             placed
                 .iter()
                 .zip(totals.iter())
-                .map(|(i, t)| json!({ "gpu": i, "total_mib": t }))
+                .enumerate()
+                .map(|(pos, (i, t))| {
+                    let required = shares.as_ref().map(|s| s[pos]);
+                    json!({
+                        "gpu": i,
+                        "total_mib": t,
+                        "required_mib": required,
+                        "fits": required.map(|r| {
+                            r <= t * (100 - manager_models::HEADROOM_RESERVE_PERCENT) / 100
+                        }),
+                    })
+                })
                 .collect::<Vec<_>>()
         }),
         "headroom_reserve_percent": manager_models::HEADROOM_RESERVE_PERCENT,
@@ -13480,6 +13496,33 @@ mod tests {
         assert_eq!(p["best"]["k"], "q8_0");
         assert_eq!(p["best"]["v"], "q8_0");
         assert_eq!(p["headroom_reserve_percent"], 5);
+        // The single target carries the whole total as its
+        // required share, with its own verdict (over the 5%
+        // headroom limit here, so false like fits_current).
+        assert_eq!(p["targets"][0]["gpu"], 0);
+        assert_eq!(p["targets"][0]["total_mib"], 16_384);
+        assert_eq!(p["targets"][0]["required_mib"], 11_559 + 4_096 + 150);
+        assert_eq!(p["targets"][0]["fits"], false);
+        // Split across two targets: shares follow the split and
+        // each target's verdict is its own — the small card
+        // refuses its half while the large one takes it.
+        let split_targets = (vec![0.5, 0.5], vec![16_384u64, 4_096], vec![0u32, 3]);
+        let p = cache_preview_json(
+            &layout,
+            manager_models::ExpertOffload::None,
+            sel_f16,
+            32_768,
+            1,
+            Some(&split_targets),
+        );
+        let half = (11_559 + 2_048 + 150) / 2 + (11_559 + 2_048 + 150) % 2;
+        assert_eq!(p["targets"][0]["gpu"], 0);
+        assert_eq!(p["targets"][0]["required_mib"], half);
+        assert_eq!(p["targets"][0]["fits"], true);
+        assert_eq!(p["targets"][1]["gpu"], 3);
+        assert_eq!(p["targets"][1]["required_mib"], (11_559 + 2_048 + 150) - half);
+        assert_eq!(p["targets"][1]["fits"], false);
+        assert_eq!(p["fits_current"], false);
         // 256K: no rung fits; best is null and the ladder's lowest
         // rung carries the honest numbers (nothing is applied).
         let p = cache_preview_json(

@@ -427,25 +427,33 @@ pub const PREDICTED_BEST_LADDER: [CacheSelection; 4] = [
     },
 ];
 
-/// Whether a predicted total fits the target GPUs: distributed
-/// over them by the split (an empty split places everything on
-/// the first target; a split whose length differs from the
-/// target count distributes nothing and fits nothing — the
-/// placement projection's stale-split rule), every GPU's share
-/// must be within the headroom reserve of its total. With no
-/// targets there is nothing to fit against.
-pub fn predicted_fits(total_mib: u64, split: &[f32], gpu_total_mib: &[u64]) -> bool {
+/// The per-GPU shares of a predicted total, distributed over
+/// the target GPUs by the split (an empty split places
+/// everything on the first target; the last target takes the
+/// rounding remainder). `None` when there is nothing to
+/// distribute over (no targets) or the split cannot distribute
+/// (its length differs from the target count — the placement
+/// projection's stale-split rule). This is the distribution
+/// [`predicted_fits`] judges; the cache preview payload carries
+/// the same shares as each target's required figure.
+pub fn predicted_shares(
+    total_mib: u64,
+    split: &[f32],
+    gpu_total_mib: &[u64],
+) -> Option<Vec<u64>> {
     if gpu_total_mib.is_empty() {
-        return false;
+        return None;
     }
-    let shares: Vec<u64> = if split.is_empty() {
+    if split.is_empty() {
         let mut v = vec![0u64; gpu_total_mib.len()];
         v[0] = total_mib;
-        v
-    } else if split.len() != gpu_total_mib.len() {
-        return false;
-    } else {
-        let mut assigned = 0u64;
+        return Some(v);
+    }
+    if split.len() != gpu_total_mib.len() {
+        return None;
+    }
+    let mut assigned = 0u64;
+    Some(
         split
             .iter()
             .enumerate()
@@ -458,11 +466,21 @@ pub fn predicted_fits(total_mib: u64, split: &[f32], gpu_total_mib: &[u64]) -> b
                 assigned += share;
                 share
             })
-            .collect()
-    };
-    shares.iter().zip(gpu_total_mib.iter()).all(|(share, total)| {
-        *share <= total * (100 - HEADROOM_RESERVE_PERCENT) / 100
-    })
+            .collect(),
+    )
+}
+
+/// Whether a predicted total fits the target GPUs: every GPU's
+/// share of the total (see [`predicted_shares`]) must be within
+/// the headroom reserve of its total. With no targets there is
+/// nothing to fit against.
+pub fn predicted_fits(total_mib: u64, split: &[f32], gpu_total_mib: &[u64]) -> bool {
+    match predicted_shares(total_mib, split, gpu_total_mib) {
+        Some(shares) => shares.iter().zip(gpu_total_mib.iter()).all(|(share, total)| {
+            *share <= total * (100 - HEADROOM_RESERVE_PERCENT) / 100
+        }),
+        None => false,
+    }
 }
 
 /// Price every ladder rung against the inputs, in ladder order.
@@ -773,6 +791,29 @@ mod tests {
         assert!(PREDICTED_BEST_LADDER
             .iter()
             .all(|s| s.flash_attn == FlashAttn::On));
+    }
+
+    #[test]
+    fn predicted_shares_distribute_like_predicted_fits() {
+        // Unsplit: the whole total lands on the first target.
+        assert_eq!(predicted_shares(1_000, &[], &[16_384]), Some(vec![1_000]));
+        assert_eq!(
+            predicted_shares(1_000, &[], &[16_384, 16_384]),
+            Some(vec![1_000, 0])
+        );
+        // Split: shares follow the fractions and the last target
+        // takes the rounding remainder, so shares sum to the total.
+        assert_eq!(
+            predicted_shares(10_001, &[0.5, 0.5], &[16_384, 16_384]),
+            Some(vec![5_001, 5_000])
+        );
+        assert_eq!(
+            predicted_shares(900, &[0.25, 0.25, 0.5], &[16_384, 16_384, 16_384]),
+            Some(vec![225, 225, 450])
+        );
+        // Nothing to distribute over, and a stale split: no shares.
+        assert_eq!(predicted_shares(1_000, &[], &[]), None);
+        assert_eq!(predicted_shares(1_000, &[1.0], &[16_384, 16_384]), None);
     }
 
     #[test]
