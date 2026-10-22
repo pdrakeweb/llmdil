@@ -745,6 +745,29 @@ fn validate_one(
                 "registers the model only — the source URL and any hash are model-supplied and unverified; confirm the pinned hash in the Models view before downloading"
                     .to_string(),
             );
+            // The real model_add resolves the figure from the
+            // item, then the catalog (by id, then by source URL —
+            // tracker #32), and refuses to guess. The sim mirrors
+            // that resolution exactly (tracker #38): an item whose
+            // count no source supplies would fail at apply, so it
+            // is invalid here, at plan time, with the same message
+            // model_add would give — never masked by a placeholder.
+            // A positive value on the item itself (supplied by the
+            // consultation, grounded from a discovered candidate at
+            // parse, or edited onto the item afterwards) is the
+            // value the simulation carries, exactly as apply does.
+            let Some(params_b) = item
+                .change
+                .get("params_b")
+                .and_then(|v| v.as_f64())
+                .filter(|p| *p > 0.0)
+                .map(|p| p as f32)
+                .or_else(|| manager_models::catalog_params_b(&target, url))
+            else {
+                fail!(format!(
+                    "parameter count (params_b) is unknown for model '{target}': no value was supplied on the plan item and the model is not in the curated catalog — supply the model's total parameter count in billions (e.g. 80 for an 80B model) on the model.add item"
+                ));
+            };
             candidate.models.push(ModelConfig {
                 id: target.clone(),
                 gguf_path: std::path::PathBuf::from("models").join(file_name),
@@ -752,20 +775,7 @@ fn validate_one(
                     .map(|q| q.to_string())
                     .filter(|q| !q.is_empty())
                     .unwrap_or_else(|| "unknown".to_string()),
-                // The real model_add resolves the figure from
-                // the item, the catalog, or the source URL
-                // (tracker #32) and refuses to guess. The sim
-                // mirrors that: the item's own params_b when it
-                // carries a positive one (a discovery-chained
-                // add does), else a positive placeholder — the
-                // item's validity is about the add itself.
-                params_b: item
-                    .change
-                    .get("params_b")
-                    .and_then(|v| v.as_f64())
-                    .filter(|p| *p > 0.0)
-                    .map(|p| p as f32)
-                    .unwrap_or(1.0),
+                params_b,
                 sha256: String::new(),
                 verified_at: None,
                 verified_sha256: None,
@@ -1155,7 +1165,7 @@ mod tests {
                 1,
                 PlanKind::ModelAdd,
                 "new-model",
-                json!({"source_url": "https://example.com/new.gguf"}),
+                json!({"source_url": "https://example.com/new.gguf", "params_b": 12.0}),
                 Decision::Undecided,
             ),
             item(
@@ -1169,5 +1179,127 @@ mod tests {
         let out = validate_plan(&p, &cfg, &live);
         assert_eq!(out[0].status, ValidationStatus::Warning);
         assert_eq!(out[1].status, ValidationStatus::Invalid);
+    }
+
+    #[test]
+    fn model_add_unknown_size_without_params_b_is_invalid_at_plan_time() {
+        // Tracker #38: an unknown-size, non-catalog model.add
+        // with no params_b on the item can never apply (the real
+        // model_add refuses to guess, tracker #32), so validation
+        // must say so at plan time — the old positive placeholder
+        // let it validate as a warning and fail only at apply.
+        let cfg = cfg_with_model();
+        let live = live_for(&cfg);
+        let p = plan(vec![item(
+            1,
+            PlanKind::ModelAdd,
+            "obscure-model",
+            json!({"source_url": "https://example.com/obscure.gguf"}),
+            Decision::Undecided,
+        )]);
+        let out = validate_plan(&p, &cfg, &live);
+        assert_eq!(out[0].status, ValidationStatus::Invalid);
+        let reason = out[0].reason.clone().unwrap_or_default();
+        assert!(reason.contains("params_b"), "reason names the gap: {reason}");
+        assert!(reason.contains("obscure-model"), "reason names the model: {reason}");
+        assert!(
+            reason.contains("not in the curated catalog"),
+            "reason states the catalog miss: {reason}"
+        );
+    }
+
+    #[test]
+    fn model_add_with_consultation_params_b_validates() {
+        // Tracker #38: a consultation-supplied params_b on the
+        // item is the value validation carries — the add is
+        // actionable (the standing warning only), exactly as
+        // apply passes the same field to model_add.
+        let cfg = cfg_with_model();
+        let live = live_for(&cfg);
+        let p = plan(vec![item(
+            1,
+            PlanKind::ModelAdd,
+            "obscure-model",
+            json!({"source_url": "https://example.com/obscure.gguf", "params_b": 13.5}),
+            Decision::Undecided,
+        )]);
+        let out = validate_plan(&p, &cfg, &live);
+        assert_eq!(
+            out[0].status,
+            ValidationStatus::Warning,
+            "verdict: {:?}",
+            out[0].reason
+        );
+    }
+
+    #[test]
+    fn model_add_operator_edited_params_b_validates() {
+        // Tracker #38: an item that arrived without a count is
+        // invalid; an operator edit that puts a positive
+        // params_b on the item's change makes the same item
+        // actionable on re-validation — validation reads the
+        // item's current change, not its provenance.
+        let cfg = cfg_with_model();
+        let live = live_for(&cfg);
+        let mut p = plan(vec![item(
+            1,
+            PlanKind::ModelAdd,
+            "obscure-model",
+            json!({"source_url": "https://example.com/obscure.gguf"}),
+            Decision::Undecided,
+        )]);
+        let out = validate_plan(&p, &cfg, &live);
+        assert_eq!(out[0].status, ValidationStatus::Invalid);
+        p.items[0].change["params_b"] = json!(21.0);
+        let out = validate_plan(&p, &cfg, &live);
+        assert_eq!(
+            out[0].status,
+            ValidationStatus::Warning,
+            "verdict after edit: {:?}",
+            out[0].reason
+        );
+    }
+
+    #[test]
+    fn model_add_catalog_model_needs_no_params_b_on_the_item() {
+        // Tracker #38: catalog models are unaffected — the count
+        // resolves from the catalog by id (an unrelated URL) and
+        // by source URL (an operator-chosen id), the same two
+        // arms model_add itself uses (tracker #32).
+        let cfg = cfg_with_model();
+        let live = live_for(&cfg);
+        let spec = manager_models::curated_models()
+            .into_iter()
+            .find(|s| s.id == "qwen3-coder-30b")
+            .expect("catalog carries the coder model");
+        let p = plan(vec![
+            item(
+                1,
+                PlanKind::ModelAdd,
+                "qwen3-coder-30b",
+                json!({"source_url": "https://example.com/renamed.gguf"}),
+                Decision::Undecided,
+            ),
+            item(
+                2,
+                PlanKind::ModelAdd,
+                "my-coder-copy",
+                json!({"source_url": spec.url}),
+                Decision::Undecided,
+            ),
+        ]);
+        let out = validate_plan(&p, &cfg, &live);
+        assert_eq!(
+            out[0].status,
+            ValidationStatus::Warning,
+            "by-id verdict: {:?}",
+            out[0].reason
+        );
+        assert_eq!(
+            out[1].status,
+            ValidationStatus::Warning,
+            "by-url verdict: {:?}",
+            out[1].reason
+        );
     }
 }

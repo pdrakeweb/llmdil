@@ -701,6 +701,73 @@ fn ground_create_models(
     (out, excluded)
 }
 
+/// Ground every authored `model.add`'s parameter count in the
+/// consultation's discovered candidates (tracker #38). An
+/// authored add for a discovered candidate often names only the
+/// candidate's resolve URL — the consultant was not asked to
+/// repeat a figure the app already holds — but an unknown-size,
+/// non-catalog add without a count is invalid at validation and
+/// unappliable (model_add refuses to guess, tracker #32). When
+/// the add's source URL names a candidate from this
+/// consultation's context (its repo/file, or its file name), the
+/// candidate's real `params_b` is written onto the item, so the
+/// value the consultation grounded is the value validation and
+/// apply carry. An item that already carries a positive count
+/// keeps it — the consultant's (or a later operator edit's)
+/// value is never overwritten. Re-fingerprinted after the
+/// rewrite, as the create grounding's model_id rewrite is.
+fn ground_model_add_params(
+    items: Vec<PlanItem>,
+    context: &Value,
+    denied_fingerprints: &HashSet<String>,
+) -> Vec<PlanItem> {
+    let candidates = candidates_from_context(context);
+    if candidates.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .map(|mut item| {
+            if item.kind != PlanKind::ModelAdd {
+                return item;
+            }
+            let carried = item
+                .change
+                .get("params_b")
+                .and_then(|v| v.as_f64())
+                .filter(|p| *p > 0.0);
+            if carried.is_some() {
+                return item;
+            }
+            let url = item
+                .change
+                .get("source_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let file_name = url.rsplit('/').next().unwrap_or("");
+            let candidate = candidates.iter().find(|c| {
+                c.params_b > 0.0
+                    && (c.file == file_name
+                        || url.contains(&format!("{}/{}", c.repo_id, c.file)))
+            });
+            if let Some(c) = candidate {
+                item.change["params_b"] = json!(c.params_b);
+                item.fingerprint = fingerprint(
+                    PlanKind::ModelAdd,
+                    item.target.as_deref(),
+                    &item.change,
+                );
+                item.previously_denied = denied_fingerprints.contains(&item.fingerprint);
+                if item.previously_denied {
+                    item.decision = Decision::Denied;
+                }
+            }
+            item
+        })
+        .collect()
+}
+
 /// A synthesized `model.download` item for experiment
 /// provisioning, built like [`chained_model_add`]: fingerprint
 /// over kind + target + the empty change, the denial-memory
@@ -1662,6 +1729,13 @@ pub fn parse_plan(
     let (items, excluded_items) =
         ground_create_models(items, cfg, &context, denied_fingerprints, &mut summary);
 
+    // Ground authored model.add counts in the consultation's
+    // discovered candidates (tracker #38): an add naming a
+    // candidate's file carries that candidate's real params_b,
+    // so validation and apply see the value instead of the add
+    // failing for a count the app already knew.
+    let items = ground_model_add_params(items, &context, denied_fingerprints);
+
     // Dependency ordering: prerequisites before the items
     // that need them (registration before creation, creation
     // before routing, routing before deletes). Validation and
@@ -2098,6 +2172,72 @@ mod tests {
             crate::validate::ValidationStatus::Valid,
             "chained backend.create verdict: {:?}",
             verdicts[1].reason
+        );
+    }
+
+    #[test]
+    fn authored_model_add_carries_consultation_params_b() {
+        // Tracker #38: a consultation-supplied params_b survives
+        // parsing on the item's change — the same field apply
+        // forwards to model_add — and validation carries it, so
+        // an unknown-size, non-catalog add is actionable.
+        let cfg = cfg_one_model();
+        let r = parse_with(
+            "{\"summary\":\"s\",\"items\":[{\"kind\":\"model.add\",\"target\":\"obscure-model\",\"change\":{\"source_url\":\"https://example.com/obscure.gguf\",\"params_b\":13.5},\"rationale\":\"r\",\"confidence\":\"medium\"}]}",
+            &cfg,
+            json!({}),
+        )
+        .unwrap();
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].change["params_b"].as_f64(), Some(13.5));
+        let live = crate::validate::LiveSnapshot {
+            layouts: std::collections::HashMap::new(),
+            free_vram_mib_per_gpu: vec![16384, 16384],
+            backend_running: std::collections::HashMap::new(),
+        };
+        let verdicts = crate::validate::validate_plan(&r, &cfg, &live);
+        assert_eq!(
+            verdicts[0].status,
+            crate::validate::ValidationStatus::Warning,
+            "verdict: {:?}",
+            verdicts[0].reason
+        );
+    }
+
+    #[test]
+    fn authored_model_add_for_a_candidate_gains_its_params_b() {
+        // Tracker #38: an authored add naming a discovered
+        // candidate's file but carrying no count gains the
+        // candidate's real params_b at plan build — the
+        // consultation's grounded figure, carried on the item
+        // through validation and apply.
+        let cfg = cfg_one_model();
+        let context = json!({
+            "candidates": [{
+                "repo_id": "Qwen/Qwen3.8-27B-MoE-GGUF",
+                "file": "Qwen3.8-27B-MoE-Q4_K_M.gguf",
+                "params_b": 27.0
+            }]
+        });
+        let r = parse_with(
+            "{\"summary\":\"s\",\"items\":[{\"kind\":\"model.add\",\"target\":\"qwen3.8-27b-moe\",\"change\":{\"source_url\":\"https://huggingface.co/Qwen/Qwen3.8-27B-MoE-GGUF/resolve/main/Qwen3.8-27B-MoE-Q4_K_M.gguf\"},\"rationale\":\"r\",\"confidence\":\"medium\"}]}",
+            &cfg,
+            context,
+        )
+        .unwrap();
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].change["params_b"].as_f64(), Some(27.0));
+        let live = crate::validate::LiveSnapshot {
+            layouts: std::collections::HashMap::new(),
+            free_vram_mib_per_gpu: vec![16384, 16384],
+            backend_running: std::collections::HashMap::new(),
+        };
+        let verdicts = crate::validate::validate_plan(&r, &cfg, &live);
+        assert_eq!(
+            verdicts[0].status,
+            crate::validate::ValidationStatus::Warning,
+            "verdict: {:?}",
+            verdicts[0].reason
         );
     }
 
