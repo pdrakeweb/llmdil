@@ -36,7 +36,7 @@ export interface BackendInfo {
      `quant` has no live source. */
   health?: number; // 0-100
   quant?: string;
-  throughput_toks?: number; // tok/s over the trailing window
+  throughput_toks?: number; // live tok/s (recent window; absent = not measured)
   vram_held_gb?: number;
   requests_1h?: number;
   errors_1h?: number;

@@ -404,7 +404,8 @@ pub struct AppState {
     /// Gateway request-statistic snapshots scraped from LiteLLM's
     /// Prometheus endpoint by the background poller (see
     /// [`gateway_stats`]); `list_backends` turns them into the
-    /// Dashboard's trailing-hour request/error/throughput figures.
+    /// Dashboard's request/error figures (trailing hour) and live
+    /// throughput rate (recent window).
     gateway_stats: Mutex<gateway_stats::GatewayStatsStore>,
     /// WinML secondary-backend registry (stateful single-model rule).
     winml: OnceCell<Mutex<manager_winml::WinMlRegistry>>,
@@ -2749,17 +2750,47 @@ pub async fn op_list_backends(
     }
     // Gateway request statistics (LiteLLM Prometheus snapshots from
     // the background poller): attach the trailing-hour figures where
-    // the store has a window for the backend. Absent fields render
-    // as "—" in the UI — no stats yet is not zero stats.
+    // the store has a window for the backend, and the LIVE
+    // throughput rate where the store measured one. Absent fields
+    // render as "—" in the UI — no stats yet is not zero stats.
+    // Throughput is the recent-window live rate, NOT the
+    // trailing-hour tokens/window_secs the card carried before
+    // Oct 22, 2026: that quotient read "Throughput 0 tok/s" while
+    // a backend was actively generating (an hour's denominator
+    // over seconds of counted tokens, and no counted tokens at
+    // all while a request is still in flight — LiteLLM counts a
+    // request's tokens only when it completes).
     {
         let pairs: Vec<(String, u16)> = cfg
             .backends
             .iter()
             .map(|b| (b.id.clone(), b.port))
             .collect();
-        let stats = state.gateway_stats.lock().await;
+        let group_pairs: Vec<(String, Vec<String>)> = cfg
+            .gateway
+            .groups
+            .iter()
+            .map(|g| (g.name.clone(), g.members.clone()))
+            .collect();
+        // Backends an Optimize operation is currently driving
+        // DIRECTLY (consultation / measure / experiment traffic
+        // goes to the backend's own port, never through the
+        // gateway): the gateway sampler cannot see that
+        // generation, so its rate for the backend is not a
+        // measurement of the backend's current throughput —
+        // omit the field while the operation holds the backend
+        // instead of reporting the gateway's idle figure.
+        let direct_ops: std::collections::HashSet<String> = state
+            .optimize_running_ops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        let mut stats = state.gateway_stats.lock().await;
         let windows = stats.window_stats(&pairs);
         let series = stats.series_stats(&pairs);
+        let live = stats.live_throughput(&pairs, &group_pairs);
         for row in backends.iter_mut() {
             let Some(id) = row["id"].as_str().map(str::to_string) else {
                 continue;
@@ -2767,8 +2798,6 @@ pub async fn op_list_backends(
             if let Some(w) = windows.as_ref().and_then(|m| m.get(&id)) {
                 row["requests_1h"] = json!(w.requests);
                 row["errors_1h"] = json!(w.errors);
-                row["throughput_toks"] =
-                    json!((w.tokens as f64 / w.window_secs * 10.0).round() / 10.0);
                 // Health is the trailing-hour success share — the
                 // one per-backend percentage the app actually
                 // measures (the gateway card's ring uses the same
@@ -2778,6 +2807,20 @@ pub async fn op_list_backends(
                     let share = (w.requests - w.errors) as f64 / w.requests as f64;
                     row["health"] = json!((share * 1000.0).round() / 10.0);
                 }
+            }
+            // The live rate attaches only when it was measured:
+            // a request in flight (tokens not counted yet) or a
+            // missed token attribution leaves the field absent —
+            // unknown is not zero (design principle 12).
+            let live_rate = if direct_ops.contains(&id) {
+                None
+            } else {
+                live.as_ref()
+                    .and_then(|m| m.get(&id))
+                    .and_then(|l| l.rate)
+            };
+            if let Some(rate) = live_rate {
+                row["throughput_toks"] = json!((rate * 10.0).round() / 10.0);
             }
             if let Some(s) = series.as_ref().and_then(|m| m.get(&id)) {
                 // Dashboard sparklines: tok/s for backend rows,

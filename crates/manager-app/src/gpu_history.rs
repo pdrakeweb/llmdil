@@ -22,8 +22,10 @@
 //! older than 7 days are pruned.
 //!
 //! Throughput attribution: the per-backend token rate is the gateway
-//! stats store's latest interval rate (the same figure the Dashboard
-//! shows as a backend's throughput). Only backends with a live
+//! stats store's latest interval rate (a sibling of the live
+//! recent-window rate the Dashboard card shows — both are
+//! per-interval rates from the same snapshots, never the
+//! trailing-hour average). Only backends with a live
 //! supervised process contribute — a stopped backend's gateway
 //! counters freeze, and a frozen counter is not a measurement. A
 //! single-GPU placement attributes the full rate to that GPU; a

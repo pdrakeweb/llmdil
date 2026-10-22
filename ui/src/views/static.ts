@@ -2415,13 +2415,14 @@ function backendCard(
     </div>`;
     }
   }
-  // Gateway statistics for this backend (trailing hour, from the
-  // LiteLLM metrics window store). The card carries Throughput only:
-  // Requests (1h) and Errors (1h) already live in the view's overview
-  // list (numbers in one place, principle 6). Absent until a window
-  // reports throughput.
-  // The stat tiles: live Throughput (trailing window, present
-  // once the metrics poller has one) and Predicted throughput
+  // Gateway statistics for this backend (from the LiteLLM
+  // metrics store). The card carries Throughput only: Requests
+  // (1h) and Errors (1h) already live in the view's overview
+  // list (numbers in one place, principle 6).
+  // The stat tiles: live Throughput (the recent window's rate,
+  // present only when the poller actually measured a current
+  // rate — absent, never 0, while a request is in flight and
+  // its tokens are not counted yet) and Predicted throughput
   // (the saved configuration's exact-match measurement, design
   // §7 — generation only, the rest in the tooltip).
   const statTiles: [string, string, string | null][] = [];
@@ -5094,12 +5095,17 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
         const serving = br.data.filter((b) => b.configured && sameModelFile(b.model_file, model.gguf_path));
         if (!serving.length) continue;
         const withWin = serving.filter((b) => b.requests_1h !== undefined);
+        // Throughput sums only backends whose live rate is
+        // measured; absent when none is (unknown is not zero).
+        const withTput = serving.filter((b) => b.throughput_toks !== undefined);
         m.set(model.id, withWin.length
           ? {
               backends: serving.length,
               req: withWin.reduce((a, b) => a + (b.requests_1h ?? 0), 0),
               err: withWin.reduce((a, b) => a + (b.errors_1h ?? 0), 0),
-              toks: withWin.reduce((a, b) => a + (b.throughput_toks ?? 0), 0),
+              toks: withTput.length
+                ? withTput.reduce((a, b) => a + (b.throughput_toks ?? 0), 0)
+                : undefined,
             }
           : { backends: serving.length });
       }
@@ -6238,7 +6244,13 @@ function gatewayPaint(
     ? (() => {
         const totalReq = withWin.reduce((a, b) => a + (b.requests_1h ?? 0), 0);
         const totalErr = withWin.reduce((a, b) => a + (b.errors_1h ?? 0), 0);
-        const totalToks = withWin.reduce((a, b) => a + (b.throughput_toks ?? 0), 0);
+        // Throughput sums only backends whose live rate is
+        // measured; the row is omitted when none is (unknown is
+        // not zero).
+        const tputRows = withWin.filter((b) => b.throughput_toks !== undefined);
+        const totalToks = tputRows.length
+          ? tputRows.reduce((a, b) => a + (b.throughput_toks ?? 0), 0)
+          : undefined;
         const palette = [C.blue, C.purple, C.teal, C.amber, C.green];
         const segs = withWin.map((b, i) => ({
           pct: totalReq > 0 ? ((b.requests_1h ?? 0) / totalReq) * 100 : 0,
@@ -6258,7 +6270,7 @@ function gatewayPaint(
         <div class="legend" style="margin-top:4px">${keys}</div>
         <div style="font-size:12px;color:var(--text2);margin-top:8px">Errors (1h): <b style="color:var(--text)">${fmtCount(totalErr)}</b></div>
         <div style="margin-top:4px">${stackedBar(errSegs, 600, 4)}</div>
-        <div class="kv" style="margin-top:8px"><span class="k">Throughput</span><span class="v" style="font-size:13px">${trim1(totalToks)} tok/s</span></div>
+        ${totalToks !== undefined ? `<div class="kv" style="margin-top:8px"><span class="k">Throughput</span><span class="v" style="font-size:13px">${trim1(totalToks)} tok/s</span></div>` : ""}
       </div>`;
       })()
     : "";
