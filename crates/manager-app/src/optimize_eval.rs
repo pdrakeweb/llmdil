@@ -206,6 +206,18 @@ pub async fn op_optimize_run_baseline(state: &std::sync::Arc<crate::AppState>, _
         .find(|b| b.id == backend_id)
         .ok_or_else(|| ApiError::NotFound(format!("backend {backend_id}")))?
         .clone();
+    // Mutual exclusion (tracker #70): the baseline run is a
+    // benchmark against a real backend — it claims the backend
+    // like Measure/Estimate, so a consultation running on the
+    // same backend refuses it (and it refuses a consultation).
+    // The guard releases the record on every exit below,
+    // including cancellation and the save path.
+    let _benchmark_op_guard = crate::optimize::OptimizeOpGuard::claim(
+        state,
+        &backend_id,
+        crate::OptimizeOpFamily::Benchmark,
+        "eval-baseline",
+    )?;
     // The baseline is keyed by the backend's *current*
     // measurement fingerprint, computed from the same live
     // snapshot the state payload uses.

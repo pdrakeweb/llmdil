@@ -1124,6 +1124,33 @@ async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, _sink: &s
         )));
     }
     let cfg = state.config.read().await.clone();
+    // Mutual exclusion (tracker #70): an experiment batch runs
+    // against a real backend where it contends the same way a
+    // benchmark does — its baseline sub-run executes the
+    // screening suite against the plan's consulted backend, and
+    // the batch may stop that backend for fit — so the batch
+    // claims the consulted backend as a benchmark operation for
+    // its whole run. A consultation already running there
+    // refuses the batch, naming the running operation; a batch
+    // holding the claim refuses a consultation there. A plan
+    // with no consulted backend claims nothing (its runs target
+    // temp backends only). The guard releases the record on
+    // every exit below — completion, failure, the batch
+    // deadline (timeout), and operator cancellation alike.
+    let _benchmark_op_guard = if plan.consulted_backend.is_empty() {
+        None
+    } else {
+        Some(crate::optimize::OptimizeOpGuard::claim(
+            state,
+            &plan.consulted_backend,
+            crate::OptimizeOpFamily::Benchmark,
+            if mode == RunMode::Estimate {
+                "experiment-estimate"
+            } else {
+                "experiment"
+            },
+        )?)
+    };
     let gathered0 = crate::optimize::gather(state, &cfg).await;
     let task_id = state
         .record_task(

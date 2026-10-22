@@ -3473,6 +3473,16 @@ export interface OptimizeState {
   /** A GPU-bound Optimize job (measurement, later an
    *  experiment batch) is currently running. */
   measuring: boolean;
+  /** Per-backend running Optimize operations (tracker #70):
+   *  the mutual-exclusion record — which operation family/kind
+   *  holds each backend and when it started — that consultation
+   *  and benchmark start refusals name. Empty when none runs. */
+  running_ops: Record<string, {
+    family: "consultation" | "benchmark";
+    kind: string;
+    backend_id: string;
+    started_unix_ms: number;
+  }>;
 }
 
 /** optimize_get_state — the page's full state: purposes, context

@@ -430,6 +430,21 @@ pub struct AppState {
     /// consultation and a measurement are different jobs with
     /// different lifetimes.
     optimize_job_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Per-backend record of the currently running Optimize
+    /// operation (tracker #70): backend id -> the operation
+    /// holding that backend, in one of the two families
+    /// (consultation vs benchmark). Consulted at job start on
+    /// both paths so a consultation and a benchmark (Measure /
+    /// Estimate / eval baseline / an experiment batch's run
+    /// against its consulted backend) never run concurrently
+    /// against the same backend and store figures depressed by
+    /// contention as if they were uncontended. Entries are
+    /// claimed at job start and released on every terminal path
+    /// (completion, failure, timeout, operator cancel) through
+    /// the RAII guard in `optimize.rs`; the cancel commands also
+    /// clear the family they cancel. std Mutex: claims, releases,
+    /// and the guard's Drop are all synchronous.
+    optimize_running_ops: std::sync::Mutex<std::collections::HashMap<String, OptimizeRunningOp>>,
     /// Transition-watch state for the toast notification monitor
     /// (see [`notify`]): backend states, gateway liveness
     /// expectation, and activation-plan pending state, so
@@ -447,6 +462,43 @@ pub struct AppState {
     /// after a start that activates a saved offload change). std
     /// Mutex: synchronous insert/read only.
     offload_probes: std::sync::Mutex<std::collections::HashMap<String, OffloadProbe>>,
+}
+
+/// The two Optimize operation families that contend for a
+/// backend (tracker #70): a consultation generates against the
+/// backend while a benchmark (Measure / Estimate, a screening-eval
+/// baseline run, or an experiment batch's baseline run against
+/// its consulted backend) measures it. Within a family the
+/// existing slots already serialize (one consultation at a time;
+/// one GPU job at a time); across families the per-backend
+/// record in [`AppState`] is the serialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptimizeOpFamily {
+    Consultation,
+    Benchmark,
+}
+
+/// One running Optimize operation's per-backend record
+/// (tracker #70), carried in the Optimize state payload as
+/// `running_ops`: which family and kind of operation holds the
+/// backend, and when it started (Unix ms) — so a refusal can
+/// name the running operation and its elapsed time, including
+/// for a page instance that did not start it (the naming the
+/// tracker #69 job-state payload provides for the same reason).
+#[derive(Debug, Clone)]
+pub struct OptimizeRunningOp {
+    pub family: OptimizeOpFamily,
+    /// The operation kind: `consultation`, `measure`,
+    /// `estimate`, `eval-baseline`, `experiment`, or
+    /// `experiment-estimate`.
+    pub kind: String,
+    pub backend_id: String,
+    pub started_unix_ms: i64,
+    /// Unique token of this claim (monotonic per process): a
+    /// release clears the record only when the token matches, so
+    /// a cancelled operation's late release cannot clear a newer
+    /// operation's record on the same backend.
+    pub claim_id: u64,
 }
 
 /// One backend's offload-probe state: a start that activated a saved
@@ -545,6 +597,7 @@ impl AppState {
             optimize_consult_started_unix_ms: Mutex::new(None),
             optimize_consult_error: Mutex::new(None),
             optimize_job_abort: Mutex::new(None),
+            optimize_running_ops: std::sync::Mutex::new(std::collections::HashMap::new()),
             notify_watch: std::sync::Mutex::new(notify::NotifyWatch::default()),
             app_update_guard: Mutex::new(()),
             offload_probes: std::sync::Mutex::new(std::collections::HashMap::new()),
