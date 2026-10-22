@@ -3473,6 +3473,18 @@ export interface OptimizeState {
   /** A GPU-bound Optimize job (measurement, later an
    *  experiment batch) is currently running. */
   measuring: boolean;
+  /** The running Estimate/Measure job's descriptor (tracker
+   *  #69), recorded server-side: any page instance renders the
+   *  true job kind, backend, and elapsed from this — the shared
+   *  `measuring` boolean alone cannot distinguish an Estimate
+   *  from a Measure. Null when no such job is running. */
+  job: OptimizeJob | null;
+  /** The last Estimate/Measure job's failure, recorded
+   *  server-side when a job ends in one and cleared when a new
+   *  job starts or one succeeds — so a failure that lands while
+   *  the operator is on another view still surfaces here. */
+  job_error: string | null;
+  job_error_unix_ms: number | null;
   /** Per-backend running Optimize operations (tracker #70):
    *  the mutual-exclusion record — which operation family/kind
    *  holds each backend and when it started — that consultation
@@ -3483,6 +3495,13 @@ export interface OptimizeState {
     backend_id: string;
     started_unix_ms: number;
   }>;
+}
+
+/** One running Estimate/Measure job (tracker #69). */
+export interface OptimizeJob {
+  kind: "measure" | "estimate";
+  backend_id: string;
+  started_unix_ms: number;
 }
 
 /** optimize_get_state — the page's full state: purposes, context

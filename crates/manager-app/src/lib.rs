@@ -430,6 +430,22 @@ pub struct AppState {
     /// consultation and a measurement are different jobs with
     /// different lifetimes.
     optimize_job_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// The running Estimate/Measure job's descriptor (tracker
+    /// #69): kind, backend, and start time, recorded beside the
+    /// job slot so the state payload can tell ANY page instance
+    /// what is actually running — the payload's shared
+    /// `measuring` boolean alone cannot distinguish an Estimate
+    /// from a Measure, which is how an Estimate run rendered
+    /// with the Measure profile's copy (Oct 20, 2026).
+    optimize_job: Mutex<Option<OptimizeJobInfo>>,
+    /// The last Estimate/Measure job's failure (message + Unix
+    /// ms), following the consultation's `consult_error`
+    /// pattern: recorded when a job ends in failure, cleared
+    /// when a new job starts or one succeeds, so a failure that
+    /// lands while the operator is on another view (or in
+    /// another window) still surfaces instead of leaving stale
+    /// in-progress copy forever.
+    optimize_job_error: Mutex<Option<(String, i64)>>,
     /// Per-backend record of the currently running Optimize
     /// operation (tracker #70): backend id -> the operation
     /// holding that backend, in one of the two families
@@ -462,6 +478,19 @@ pub struct AppState {
     /// after a start that activates a saved offload change). std
     /// Mutex: synchronous insert/read only.
     offload_probes: std::sync::Mutex<std::collections::HashMap<String, OffloadProbe>>,
+}
+
+/// One running Estimate/Measure job's descriptor (tracker #69),
+/// carried in the Optimize state payload as `job`: the job kind
+/// (`"measure"` or `"estimate"`), the backend it runs against,
+/// and when it started (Unix ms) — everything a page instance
+/// that did not start the job needs to render the true
+/// in-progress state with the correct per-profile copy.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OptimizeJobInfo {
+    pub kind: String,
+    pub backend_id: String,
+    pub started_unix_ms: i64,
 }
 
 /// The two Optimize operation families that contend for a
@@ -597,6 +626,8 @@ impl AppState {
             optimize_consult_started_unix_ms: Mutex::new(None),
             optimize_consult_error: Mutex::new(None),
             optimize_job_abort: Mutex::new(None),
+            optimize_job: Mutex::new(None),
+            optimize_job_error: Mutex::new(None),
             optimize_running_ops: std::sync::Mutex::new(std::collections::HashMap::new()),
             notify_watch: std::sync::Mutex::new(notify::NotifyWatch::default()),
             app_update_guard: Mutex::new(()),

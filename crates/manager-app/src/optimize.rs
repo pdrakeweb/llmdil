@@ -220,6 +220,120 @@ async fn record_consult_success(state: &AppState) {
 }
 
 // ---------------------------------------------------------------------------
+// Estimate/Measure job record (tracker #69): the running job's
+// descriptor and the last job's failure, recorded server-side
+// for the same reason the consultation record above exists —
+// the page instance that started a job is not necessarily the
+// one looking at the page when it ends. Before this record the
+// payload carried only the shared `measuring` boolean, so a
+// second window could not tell an Estimate from a Measure (it
+// rendered the Measure profile's copy during Estimate runs),
+// had no start time for an elapsed figure, and never learned
+// that a job had failed.
+// ---------------------------------------------------------------------------
+
+/// Record a benchmark job's start: its descriptor replaces any
+/// previous one and clears the previous job's recorded failure
+/// (the `consult_error` discipline: a new run supersedes the
+/// last failure).
+pub(crate) async fn record_job_start(state: &AppState, kind: &str, backend_id: &str) -> i64 {
+    // The start time doubles as the job's identity token for
+    // its terminal records (see `job_is_current`), so it must
+    // be unique per job, not just per millisecond: a cancelled
+    // job and its replacement can start within the same
+    // millisecond. Keep it strictly increasing (skew vs the
+    // wall clock is at most a few milliseconds, immaterial for
+    // the elapsed display it also feeds).
+    static LAST_JOB_START_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let started_unix_ms = loop {
+        let prev = LAST_JOB_START_MS.load(std::sync::atomic::Ordering::Relaxed);
+        let next = chrono::Utc::now().timestamp_millis().max(prev + 1);
+        if LAST_JOB_START_MS
+            .compare_exchange(
+                prev,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            break next;
+        }
+    };
+    *state.optimize_job.lock().await = Some(crate::OptimizeJobInfo {
+        kind: kind.to_string(),
+        backend_id: backend_id.to_string(),
+        started_unix_ms,
+    });
+    *state.optimize_job_error.lock().await = None;
+    started_unix_ms
+}
+
+/// Whether the recorded descriptor is still the job that
+/// started at `started_unix_ms`: a job's terminal record only
+/// applies while its own descriptor is current. Since tracker
+/// #70 a cancel frees the backend at once, so a cancelled job's
+/// late unwind can race a newer job's start — the newer job's
+/// descriptor (and its cleared error state) must survive the
+/// older job's terminal record, the same token discipline the
+/// running-operation record's claim ids provide there.
+async fn job_is_current(state: &AppState, started_unix_ms: i64) -> bool {
+    state
+        .optimize_job
+        .lock()
+        .await
+        .as_ref()
+        .map(|j| j.started_unix_ms == started_unix_ms)
+        .unwrap_or(false)
+}
+
+/// Record a benchmark job's failure: the descriptor clears (the
+/// job is over) and the failure is kept for the payload's
+/// `job_error`, so every window surfaces it instead of stale
+/// in-progress copy.
+pub(crate) async fn record_job_failure(state: &AppState, started_unix_ms: i64, message: String) {
+    if !job_is_current(state, started_unix_ms).await {
+        return;
+    }
+    *state.optimize_job.lock().await = None;
+    *state.optimize_job_error.lock().await =
+        Some((message, chrono::Utc::now().timestamp_millis()));
+}
+
+/// Record a benchmark job's success: descriptor and recorded
+/// failure both clear.
+pub(crate) async fn record_job_success(state: &AppState, started_unix_ms: i64) {
+    if !job_is_current(state, started_unix_ms).await {
+        return;
+    }
+    *state.optimize_job.lock().await = None;
+    *state.optimize_job_error.lock().await = None;
+}
+
+/// Record a benchmark job's end without a verdict (operator
+/// cancellation): the descriptor clears; no failure is recorded
+/// — a deliberate cancel is not a failure, and the cancelling
+/// page reports it through its own return value.
+pub(crate) async fn record_job_end(state: &AppState, started_unix_ms: i64) {
+    if !job_is_current(state, started_unix_ms).await {
+        return;
+    }
+    *state.optimize_job.lock().await = None;
+}
+
+/// The `job` payload value for a descriptor: the descriptor
+/// object, or `null` when no Estimate/Measure job is running.
+pub(crate) fn job_json(job: &Option<crate::OptimizeJobInfo>) -> Value {
+    match job {
+        Some(j) => json!({
+            "kind": j.kind,
+            "backend_id": j.backend_id,
+            "started_unix_ms": j.started_unix_ms,
+        }),
+        None => Value::Null,
+    }
+}
+
 // Consultation/benchmark mutual exclusion per backend
 // (tracker #70): a single per-backend record of the currently
 // running Optimize operation family, consulted at job start on
@@ -1141,6 +1255,14 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
         "consult_error": state.optimize_consult_error.lock().await.as_ref().map(|(m, _)| m.clone()),
         "consult_error_unix_ms": state.optimize_consult_error.lock().await.as_ref().map(|(_, t)| *t),
         "measuring": state.optimize_job_abort.lock().await.is_some(),
+        // The running Estimate/Measure job's descriptor and the
+        // last such job's failure (tracker #69), following the
+        // consult_* pattern above: any page instance renders the
+        // true job kind/backend/elapsed and surfaces failures
+        // without having started (or awaited) the job itself.
+        "job": job_json(&state.optimize_job.lock().await.clone()),
+        "job_error": state.optimize_job_error.lock().await.as_ref().map(|(m, _)| m.clone()),
+        "job_error_unix_ms": state.optimize_job_error.lock().await.as_ref().map(|(_, t)| *t),
         // Per-backend running Optimize operations (tracker #70):
         // the mutual-exclusion record the start refusals name,
         // exposed so any page instance can see which operation
@@ -2138,6 +2260,7 @@ pub async fn op_optimize_measure_backend(
         }
         *slot = Some(tx);
     }
+    let job_started_ms = record_job_start(state, "measure", &backend_id).await;
     // Loopback by construction, as with consultations (§3).
     let base_url = format!("http://127.0.0.1:{}", backend.port);
     let run_model = model_id.clone();
@@ -2155,23 +2278,52 @@ pub async fn op_optimize_measure_backend(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned());
     let run_drivers = target.driver_versions.clone();
+    let log_state = state.clone();
     let run = async move {
         let mut results: Vec<BenchResult> = Vec::new();
-        for prompt in benchmark_prompts() {
+        let prompts = benchmark_prompts();
+        let prompt_count = prompts.len();
+        for (idx, prompt) in prompts.iter().enumerate() {
+            // Per-prompt progress (tracker #69): a slow run is
+            // observable in the Optimize log while it happens,
+            // not only at its terminal line.
+            opt_log1(
+                &log_state,
+                &format!(
+                    "measurement prompt {}/{} ({}): start (backend '{}', warm-up plus {} measured runs)",
+                    idx + 1,
+                    prompt_count,
+                    prompt.name,
+                    run_backend,
+                    MEASURED_RUNS
+                ),
+            );
             // Warm-up, discarded (§A.1): first-run effects after
             // a model load are not the configuration's steady
             // state.
-            results.push(
-                benchmark_one_prompt(
-                    &base_url,
-                    &run_model,
-                    &prompt,
-                    true,
-                    MEASURED_RUNS,
-                    MEASURE_RUN_TIMEOUT,
-                )
-                .await?,
+            let result = benchmark_one_prompt(
+                &base_url,
+                &run_model,
+                prompt,
+                true,
+                MEASURED_RUNS,
+                MEASURE_RUN_TIMEOUT,
+            )
+            .await?;
+            opt_log1(
+                &log_state,
+                &format!(
+                    "measurement prompt {}/{} ({}): finished (backend '{}'): generation {} tok/s, prompt {} tok/s, TTFT {} ms",
+                    idx + 1,
+                    prompt_count,
+                    prompt.name,
+                    run_backend,
+                    result.predicted_per_second.map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".to_string()),
+                    result.prompt_per_second.map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".to_string()),
+                    result.ttft_ms.map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".to_string())
+                ),
             );
+            results.push(result);
         }
         // The server's build string, recorded when obtainable
         // (§4.2); its absence never fails the measurement.
@@ -2209,6 +2361,7 @@ pub async fn op_optimize_measure_backend(
                 state,
                 &format!("measurement cancelled (backend '{backend_id}')"),
             );
+            record_job_end(state, job_started_ms).await;
             state
                 .finish_task(
                     &task_id,
@@ -2223,6 +2376,7 @@ pub async fn op_optimize_measure_backend(
                 state,
                 &format!("measurement failed: backend '{backend_id}': {e}"),
             );
+            record_job_failure(state, job_started_ms, format!("measurement failed: {e}")).await;
             state
                 .finish_task(
                     &task_id,
@@ -2255,7 +2409,11 @@ pub async fn op_optimize_measure_backend(
     }
     let mut store = MeasurementStore::load(&measurements_path(state));
     store.upsert(entry);
-    store.save(&measurements_path(state)).map_err(ApiError::InvalidInput)?;
+    if let Err(e) = store.save(&measurements_path(state)) {
+        record_job_failure(state, job_started_ms, format!("measurement failed: {e}")).await;
+        return Err(ApiError::InvalidInput(e));
+    }
+    record_job_success(state, job_started_ms).await;
     state
         .finish_task(
             &task_id,
@@ -2330,25 +2488,54 @@ pub async fn op_optimize_estimate_backend(
         }
         *slot = Some(tx);
     }
+    let job_started_ms = record_job_start(state, "estimate", &backend_id).await;
     // Loopback by construction, as with measurements (§3).
     let base_url = format!("http://127.0.0.1:{}", backend.port);
     let run_model = model_id.clone();
     let run_backend = backend_id.clone();
     let run_fingerprint = fingerprint.clone();
+    let log_state = state.clone();
     let run = async move {
         let mut results: Vec<BenchResult> = Vec::new();
-        for prompt in estimate_prompts() {
-            results.push(
-                benchmark_one_prompt(
-                    &base_url,
-                    &run_model,
-                    &prompt,
-                    false,
-                    ESTIMATE_RUNS,
-                    MEASURE_RUN_TIMEOUT,
-                )
-                .await?,
+        let prompts = estimate_prompts();
+        let prompt_count = prompts.len();
+        for (idx, prompt) in prompts.iter().enumerate() {
+            // Per-prompt progress (tracker #69), as with
+            // measurements: a slow (fully CPU-offloaded) run is
+            // observable while it happens.
+            opt_log1(
+                &log_state,
+                &format!(
+                    "estimate prompt {}/{} ({}): start (backend '{}', one run, no warm-up)",
+                    idx + 1,
+                    prompt_count,
+                    prompt.name,
+                    run_backend
+                ),
             );
+            let result = benchmark_one_prompt(
+                &base_url,
+                &run_model,
+                prompt,
+                false,
+                ESTIMATE_RUNS,
+                MEASURE_RUN_TIMEOUT,
+            )
+            .await?;
+            opt_log1(
+                &log_state,
+                &format!(
+                    "estimate prompt {}/{} ({}): finished (backend '{}'): generation {} tok/s, prompt {} tok/s, TTFT {} ms",
+                    idx + 1,
+                    prompt_count,
+                    prompt.name,
+                    run_backend,
+                    result.predicted_per_second.map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".to_string()),
+                    result.prompt_per_second.map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".to_string()),
+                    result.ttft_ms.map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".to_string())
+                ),
+            );
+            results.push(result);
         }
         let mut iter = results.into_iter();
         Ok::<EstimateEntry, String>(EstimateEntry {
@@ -2372,6 +2559,7 @@ pub async fn op_optimize_estimate_backend(
     let entry = match outcome {
         None => {
             opt_log1(state, &format!("estimate cancelled (backend '{backend_id}')"));
+            record_job_end(state, job_started_ms).await;
             state
                 .finish_task(&task_id, TaskStatus::Aborted, json!({ "backend": backend_id }))
                 .await;
@@ -2382,6 +2570,7 @@ pub async fn op_optimize_estimate_backend(
                 state,
                 &format!("estimate failed: backend '{backend_id}': {e}"),
             );
+            record_job_failure(state, job_started_ms, format!("estimate failed: {e}")).await;
             state
                 .finish_task(
                     &task_id,
@@ -2412,7 +2601,11 @@ pub async fn op_optimize_estimate_backend(
     }
     let mut store = MeasurementStore::load(&measurements_path(state));
     store.upsert_estimate(entry);
-    store.save(&measurements_path(state)).map_err(ApiError::InvalidInput)?;
+    if let Err(e) = store.save(&measurements_path(state)) {
+        record_job_failure(state, job_started_ms, format!("estimate failed: {e}")).await;
+        return Err(ApiError::InvalidInput(e));
+    }
+    record_job_success(state, job_started_ms).await;
     state
         .finish_task(
             &task_id,
@@ -3031,5 +3224,99 @@ mod tests {
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
+    }
+
+    /// Tracker #69: the `job` payload value carries the job
+    /// kind, backend, and start time — the fields a page
+    /// instance that did not start the job needs to render the
+    /// true in-progress state — and is null when no
+    /// Estimate/Measure job is running.
+    #[test]
+    fn job_json_carries_kind_backend_and_start() {
+        assert_eq!(job_json(&None), Value::Null);
+        let job = crate::OptimizeJobInfo {
+            kind: "estimate".to_string(),
+            backend_id: "coder".to_string(),
+            started_unix_ms: 1729000000000,
+        };
+        let v = job_json(&Some(job));
+        assert_eq!(v["kind"], json!("estimate"));
+        assert_eq!(v["backend_id"], json!("coder"));
+        assert_eq!(v["started_unix_ms"], json!(1729000000000i64));
+    }
+
+    fn job_test_state() -> std::sync::Arc<AppState> {
+        let cfg = AppConfig::default_config();
+        std::sync::Arc::new(AppState::new(
+            cfg,
+            PathBuf::from("/nonexistent-job-test/config.json"),
+            PathBuf::from("/nonexistent-job-test"),
+        ))
+    }
+
+    /// Tracker #69: the job record lifecycle follows the
+    /// consultation record's discipline — a start records the
+    /// descriptor and clears any previous failure, a failure
+    /// clears the descriptor and records the error for the
+    /// payload, a success clears both, and a cancellation
+    /// clears the descriptor without recording a failure.
+    #[tokio::test]
+    async fn job_record_lifecycle() {
+        let state = job_test_state();
+        let started = record_job_start(&state, "estimate", "coder").await;
+        {
+            let job = state.optimize_job.lock().await.clone();
+            let job = job.expect("a started job has a descriptor");
+            assert_eq!(job.kind, "estimate");
+            assert_eq!(job.backend_id, "coder");
+            assert!(job.started_unix_ms > 0);
+            assert!(state.optimize_job_error.lock().await.is_none());
+        }
+        record_job_failure(&state, started, "estimate failed: boom".to_string()).await;
+        assert!(state.optimize_job.lock().await.is_none());
+        {
+            let (msg, at) = state
+                .optimize_job_error
+                .lock()
+                .await
+                .clone()
+                .expect("a failed job records its error");
+            assert_eq!(msg, "estimate failed: boom");
+            assert!(at > 0);
+        }
+        // A new start supersedes the recorded failure.
+        let started2 = record_job_start(&state, "measure", "planner").await;
+        assert!(state.optimize_job_error.lock().await.is_none());
+        assert_eq!(
+            state.optimize_job.lock().await.as_ref().map(|j| j.kind.as_str()),
+            Some("measure")
+        );
+        record_job_success(&state, started2).await;
+        assert!(state.optimize_job.lock().await.is_none());
+        assert!(state.optimize_job_error.lock().await.is_none());
+        // Cancellation clears the descriptor, records no error.
+        let started3 = record_job_start(&state, "measure", "planner").await;
+        record_job_end(&state, started3).await;
+        assert!(state.optimize_job.lock().await.is_none());
+        assert!(state.optimize_job_error.lock().await.is_none());
+        // A stale job's terminal records (a cancelled job's late
+        // unwind, tracker #70's cancel-then-restart case) must
+        // not clear a newer job's descriptor or record a failure
+        // over it.
+        let stale = record_job_start(&state, "measure", "planner").await;
+        let current = record_job_start(&state, "estimate", "coder").await;
+        assert!(current > stale, "job start tokens are strictly increasing");
+        record_job_end(&state, stale).await;
+        record_job_failure(&state, stale, "stale failure".to_string()).await;
+        record_job_success(&state, stale).await;
+        {
+            let job = state.optimize_job.lock().await.clone();
+            let job = job.expect("the newer job's descriptor survives stale terminal records");
+            assert_eq!(job.kind, "estimate");
+            assert_eq!(job.started_unix_ms, current);
+            assert!(state.optimize_job_error.lock().await.is_none());
+        }
+        record_job_success(&state, current).await;
+        assert!(state.optimize_job.lock().await.is_none());
     }
 }

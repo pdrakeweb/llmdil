@@ -537,6 +537,16 @@ check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-p
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
 check(bundle.includes("__TAURI__"), "bundle contains the Tauri detection hook");
 
+// Estimate/Measure job state (tracker #69): the Optimize page
+// renders a running job from the server's descriptor (kind,
+// backend, start) and surfaces the recorded job_error, with
+// honest worst-case copy for a slow CPU-offloaded Estimate —
+// the shared `measuring` boolean alone rendered Measure copy
+// during Estimate runs and never surfaced failures.
+check(bundle.includes("job_error"), "bundle reads the Optimize job_error payload field (tracker #69)");
+check(bundle.includes("started_unix_ms"), "bundle reads the Optimize job start time (tracker #69)");
+check(bundle.includes("fully CPU-offloaded backend this can take several minutes"), "bundle carries the honest Estimate worst-case copy (tracker #69)");
+
 // The UI detects Tauri via window.__TAURI__, which Tauri only injects when
 // app.withGlobalTauri is true. Without it the installed app silently
 // degrades to sample data on every screen.
