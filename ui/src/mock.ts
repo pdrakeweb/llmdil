@@ -216,6 +216,7 @@ export function mockOptimizeState(): OptimizeState {
     consult_error: null,
     consult_error_unix_ms: null,
     measuring: false,
+    running_ops: {},
     plan: {
       summary: "Sample plan — generated locally; no backend was consulted.",
       directive: "Explore better MoE capable models for the planner",

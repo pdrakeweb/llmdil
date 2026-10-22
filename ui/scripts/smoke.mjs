@@ -458,10 +458,10 @@ check((staticSrcLf.match(/A quantized V cache requires flash attention/g) || [])
 // prediction), never the Estimate profile, and renders
 // disabled with the not-running reason for a stopped backend;
 // while a refresh runs, the field carries a Measuring elapsed
-// state. With no consultation/measurement serialization rule
-// in force, a measurement that starts while a consultation
-// targets the same backend logs the overlap (contention
-// honesty) — pinned at the Rust source.
+// state. Consultation/benchmark mutual exclusion (tracker
+// #70): a benchmark that starts while a consultation runs on
+// the same backend is refused, naming the running operation —
+// and the reverse — pinned at the Rust source.
 check(bundle.includes("predict-refresh"), "bundle contains the predicted-throughput Refresh control");
 check(staticSrc.includes('data-back-act="predict-refresh"'), "Backends card renders the predicted-throughput Refresh control");
 check(staticSrc.includes("Not measured</span>"), "Backends card renders the predicted-throughput empty state (Not measured)");
@@ -478,8 +478,9 @@ check(groupsSrc.includes("start it to refresh the prediction"), "Groups Refresh 
 check(staticSrc.includes("data-pred-elapsed"), "Backends card renders the refresh Measuring elapsed state");
 check(groupsSrc.includes("data-group-pred-elapsed"), "Groups card renders the refresh Measuring elapsed state");
 const optimizeRsSrc = readFileSync(join(root, "..", "crates", "manager-app", "src", "optimize.rs"), "utf8");
-check(optimizeRsSrc.includes("contention note"), "measurement start logs a contention note when a consultation targets the same backend");
-check(optimizeRsSrc.includes("fn consult_running_on"), "the contention match is a named predicate in the measure path");
+check(optimizeRsSrc.includes("mutual exclusion refusal"), "benchmark/consultation starts log the mutual-exclusion refusal (tracker #70)");
+check(optimizeRsSrc.includes("fn try_claim_optimize_op"), "the per-backend running-operation claim is a named predicate in the optimize paths (tracker #70)");
+check(optimizeRsSrc.includes("consultations and benchmarks on the same backend are mutually exclusive"), "the mutual-exclusion refusal names the rule and the running operation (tracker #70)");
 
 // Preflight completion (Oct 20, 2026): the backend card carries
 // the requirement's recurrent-state term as a State cache tile

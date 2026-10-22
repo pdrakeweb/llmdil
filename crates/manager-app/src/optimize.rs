@@ -219,6 +219,194 @@ async fn record_consult_success(state: &AppState) {
     *state.optimize_consult_error.lock().await = None;
 }
 
+// ---------------------------------------------------------------------------
+// Consultation/benchmark mutual exclusion per backend
+// (tracker #70): a single per-backend record of the currently
+// running Optimize operation family, consulted at job start on
+// both paths (consultation and benchmark). A benchmark refused
+// while a consultation runs on the same backend — and the
+// reverse — instead of silently storing measurements depressed
+// by contention as if they were uncontended (the Oct 20, 2026
+// Estimate-during-consultation case). Refusal only: no queueing,
+// no preemption, no automatic retry. Different backends are
+// unaffected. The record is held through an RAII guard so every
+// terminal path — completion, failure, timeout (a dropped job
+// future drops the guard), and operator cancel — clears it; the
+// cancel commands additionally clear the family they cancel, so
+// a start is allowed immediately after a cancel even before the
+// cancelled operation's future unwinds.
+// ---------------------------------------------------------------------------
+
+use crate::{OptimizeOpFamily, OptimizeRunningOp};
+
+/// The noun phrase naming one operation kind, used on both sides
+/// of a refusal ("cannot start a measurement ... : a consultation
+/// is already running ...").
+fn op_noun(kind: &str) -> String {
+    match kind {
+        "consultation" => "a consultation".to_string(),
+        "measure" => "a measurement".to_string(),
+        "estimate" => "an estimate".to_string(),
+        "eval-baseline" => "a screening-eval baseline run".to_string(),
+        "experiment" => "an experiment run".to_string(),
+        "experiment-estimate" => "an experiment estimate run".to_string(),
+        other => format!("a {other} operation"),
+    }
+}
+
+/// How long an operation has been running, in the refusal's
+/// "started ... ago" form: seconds under a minute, then
+/// minutes + seconds.
+fn op_elapsed_text(started_unix_ms: i64) -> String {
+    let elapsed_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .saturating_sub(started_unix_ms)
+        .max(0);
+    let secs = elapsed_ms / 1000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    }
+}
+
+/// The refusal for a start that would contend with the running
+/// operation recorded for the same backend: it names the running
+/// operation (kind, and its start elapsed — the record carries
+/// the start the tracker #69 job-state payload also exposes).
+fn contention_refusal(existing: &OptimizeRunningOp, new_kind: &str) -> ApiError {
+    ApiError::InvalidInput(format!(
+        "cannot start {} on backend '{}': {} is already running on that backend (started {} ago); consultations and benchmarks on the same backend are mutually exclusive so benchmark figures are not taken under contention — wait for the running operation to finish or cancel it first",
+        op_noun(new_kind),
+        existing.backend_id,
+        op_noun(&existing.kind),
+        op_elapsed_text(existing.started_unix_ms),
+    ))
+}
+
+/// Claim the per-backend running-operation record for a new
+/// operation. An existing record for the SAME backend refuses
+/// the start, whichever family holds it (within-family starts
+/// are already serialized by the consult / GPU-job slots, so a
+/// same-family record here is a second start all the same);
+/// a record for a different backend never refuses.
+pub(crate) fn try_claim_optimize_op(
+    state: &AppState,
+    backend_id: &str,
+    family: OptimizeOpFamily,
+    kind: &str,
+) -> Result<OptimizeRunningOp, ApiError> {
+    let mut ops = state
+        .optimize_running_ops
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = ops.get(backend_id) {
+        let err = contention_refusal(existing, kind);
+        if let ApiError::InvalidInput(msg) = &err {
+            opt_log1(state, &format!("mutual exclusion refusal: {msg}"));
+        }
+        return Err(err);
+    }
+    static NEXT_CLAIM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let record = OptimizeRunningOp {
+        family,
+        kind: kind.to_string(),
+        backend_id: backend_id.to_string(),
+        started_unix_ms: chrono::Utc::now().timestamp_millis(),
+        claim_id: NEXT_CLAIM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    };
+    ops.insert(backend_id.to_string(), record.clone());
+    Ok(record)
+}
+
+/// Release the record carrying the given claim token, if it is
+/// still that claim's record: a release arriving after a cancel
+/// already cleared the record (and a newer operation claimed
+/// the backend) must not clear the newer record.
+pub(crate) fn release_optimize_op(state: &AppState, backend_id: &str, claim_id: u64) {
+    let mut ops = state
+        .optimize_running_ops
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if ops
+        .get(backend_id)
+        .map(|op| op.claim_id == claim_id)
+        .unwrap_or(false)
+    {
+        ops.remove(backend_id);
+    }
+}
+
+/// Clear every running-operation record of one family (the
+/// cancel commands: the cancelled operation's own guard release
+/// then finds nothing — or a newer claim — and leaves it alone).
+pub(crate) fn clear_running_ops(state: &AppState, family: OptimizeOpFamily) {
+    let mut ops = state
+        .optimize_running_ops
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    ops.retain(|_, op| op.family != family);
+}
+
+/// The RAII hold on one claimed record: dropping it releases the
+/// record, so no exit path of a claimed operation — success,
+/// failure, an early `?`, a timeout or cancellation that drops
+/// the operation's future — can leave a stale record behind.
+pub(crate) struct OptimizeOpGuard {
+    state: std::sync::Arc<AppState>,
+    backend_id: String,
+    claim_id: u64,
+}
+
+impl OptimizeOpGuard {
+    pub(crate) fn claim(
+        state: &std::sync::Arc<AppState>,
+        backend_id: &str,
+        family: OptimizeOpFamily,
+        kind: &str,
+    ) -> Result<Self, ApiError> {
+        let record = try_claim_optimize_op(state, backend_id, family, kind)?;
+        Ok(Self {
+            state: state.clone(),
+            backend_id: record.backend_id,
+            claim_id: record.claim_id,
+        })
+    }
+}
+
+impl Drop for OptimizeOpGuard {
+    fn drop(&mut self) {
+        release_optimize_op(&self.state, &self.backend_id, self.claim_id);
+    }
+}
+
+/// The `running_ops` payload value: every backend's running
+/// Optimize operation (family, kind, start), or an empty object
+/// when none is running — the same naming the refusals use, for
+/// any page instance.
+fn running_ops_json(state: &AppState) -> Value {
+    let ops = state
+        .optimize_running_ops
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut map = serde_json::Map::new();
+    for (backend_id, op) in ops.iter() {
+        map.insert(
+            backend_id.clone(),
+            json!({
+                "family": match op.family {
+                    OptimizeOpFamily::Consultation => "consultation",
+                    OptimizeOpFamily::Benchmark => "benchmark",
+                },
+                "kind": op.kind,
+                "backend_id": op.backend_id,
+                "started_unix_ms": op.started_unix_ms,
+            }),
+        );
+    }
+    Value::Object(map)
+}
+
 pub(crate) fn measurements_path(state: &AppState) -> PathBuf {
     state.data_dir.join("optimize-measurements.json")
 }
@@ -953,6 +1141,11 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
         "consult_error": state.optimize_consult_error.lock().await.as_ref().map(|(m, _)| m.clone()),
         "consult_error_unix_ms": state.optimize_consult_error.lock().await.as_ref().map(|(_, t)| *t),
         "measuring": state.optimize_job_abort.lock().await.is_some(),
+        // Per-backend running Optimize operations (tracker #70):
+        // the mutual-exclusion record the start refusals name,
+        // exposed so any page instance can see which operation
+        // holds a backend.
+        "running_ops": running_ops_json(state),
     }))
 }
 
@@ -1365,6 +1558,24 @@ pub async fn op_optimize_consult(
         .find(|b| b.id == target)
         .ok_or_else(|| ApiError::NotFound(format!("backend {target}")))?
         .clone();
+    // Mutual exclusion (tracker #70): a live consultation claims
+    // its backend against benchmark jobs for its whole run, and a
+    // benchmark already running on that backend refuses the start
+    // here, naming the running operation. Sample consultations
+    // consult no backend, so they neither claim nor are refused.
+    // The guard releases the record on every exit below —
+    // completion, failure, parse failure, and the operator-cancel
+    // path alike (the Oct 20, 2026 cancelled-consultation case).
+    let _consult_op_guard = if sample {
+        None
+    } else {
+        Some(OptimizeOpGuard::claim(
+            state,
+            &target,
+            OptimizeOpFamily::Consultation,
+            "consultation",
+        )?)
+    };
     if !sample && gathered.running.get(&target).copied() != Some(true) {
         return Err(ApiError::InvalidInput(format!(
             "backend '{target}' is not running; consultations go to a running backend"
@@ -1733,6 +1944,12 @@ pub async fn op_optimize_cancel_consult(state: &std::sync::Arc<crate::AppState>,
     match sender {
         Some(tx) => {
             let _ = tx.send(());
+            // Mutual exclusion (tracker #70): the cancel clears
+            // the consultation's per-backend record now, so a
+            // benchmark may start on that backend immediately —
+            // the cancelled consultation's own release then finds
+            // its record gone (or a newer claim) and leaves it.
+            clear_running_ops(state, OptimizeOpFamily::Consultation);
             Ok(json!({ "cancelled": true }))
         }
         None => Ok(json!({ "cancelled": false })),
@@ -1803,22 +2020,6 @@ struct BenchmarkTarget {
     /// Driver versions of the fingerprint's GPU set, from the
     /// telemetry snapshot the inputs were resolved against.
     driver_versions: Vec<String>,
-}
-
-/// Whether a consultation is currently running against
-/// `backend_id`: its task record exists and is still Running.
-/// Consultations record their target backend in the task detail
-/// (op_optimize_consult); the abort slot alone cannot say which
-/// backend a running consultation is using.
-fn consult_running_on(
-    tasks: &HashMap<String, crate::TaskRecord>,
-    backend_id: &str,
-) -> bool {
-    tasks.values().any(|t| {
-        t.kind == "optimize-consult"
-            && t.status == TaskStatus::Running
-            && t.detail.get("backend").and_then(Value::as_str) == Some(backend_id)
-    })
 }
 
 /// Resolve the target of a benchmark job (measurement or
@@ -1896,6 +2097,14 @@ pub async fn op_optimize_measure_backend(
             ));
         }
     }
+    // Mutual exclusion (tracker #70): claim this backend for a
+    // benchmark before any work starts — a consultation running
+    // on the same backend refuses the start, naming the running
+    // operation, instead of the figures being taken under
+    // contention. The guard releases the record on every exit
+    // below (completion, failure, cancellation, save failure).
+    let _benchmark_op_guard =
+        OptimizeOpGuard::claim(state, &backend_id, OptimizeOpFamily::Benchmark, "measure")?;
     let target = benchmark_target(state, &backend_id, "measurements").await?;
     let backend = target.backend.clone();
     let fingerprint = target.fingerprint.clone();
@@ -1906,23 +2115,6 @@ pub async fn op_optimize_measure_backend(
             "measurement start: backend '{backend_id}' model '{model_id}' fingerprint {fingerprint}"
         ),
     );
-    // Contention honesty: the consultation and GPU-job families
-    // hold separate slots — no rule serializes a measurement
-    // against a consultation (the decision is Pete's and has
-    // not been taken). When the running consultation targets
-    // this same backend, the log says so: the figures are then
-    // measured under contention and read accordingly.
-    {
-        let tasks = state.tasks.lock().await;
-        if consult_running_on(&tasks, &backend_id) {
-            opt_log1(
-                state,
-                &format!(
-                    "contention note: a consultation is running on backend '{backend_id}' concurrently with this measurement — no serialization rule is in force, so the figures are measured under contention"
-                ),
-            );
-        }
-    }
     let task_id = state
         .record_task(
             "optimize-measure",
@@ -2097,6 +2289,14 @@ pub async fn op_optimize_estimate_backend(
             ));
         }
     }
+    // Mutual exclusion (tracker #70), as with measurements: an
+    // estimate is a benchmark — a consultation running on the
+    // same backend refuses its start, naming the running
+    // operation (the Oct 20, 2026 case was an Estimate started
+    // during a consultation on 'coder'). The guard releases the
+    // record on every exit below.
+    let _benchmark_op_guard =
+        OptimizeOpGuard::claim(state, &backend_id, OptimizeOpFamily::Benchmark, "estimate")?;
     let target = benchmark_target(state, &backend_id, "estimates").await?;
     let backend = target.backend.clone();
     let fingerprint = target.fingerprint.clone();
@@ -2235,6 +2435,11 @@ pub async fn op_optimize_cancel_job(state: &std::sync::Arc<crate::AppState>, _si
     match sender {
         Some(tx) => {
             let _ = tx.send(());
+            // Mutual exclusion (tracker #70): as with a cancelled
+            // consultation, the cancel clears the benchmark's
+            // per-backend record now, so a consultation may start
+            // on that backend immediately.
+            clear_running_ops(state, OptimizeOpFamily::Benchmark);
             Ok(json!({ "cancelled": true }))
         }
         None => Ok(json!({ "cancelled": false })),
@@ -2545,47 +2750,286 @@ mod tests {
         assert!(plan_item_predicted(&cfg, &it, &store, &[]).is_none());
     }
 
-    fn task(kind: &str, status: TaskStatus, backend: Option<&str>) -> crate::TaskRecord {
-        crate::TaskRecord {
-            id: "t".to_string(),
-            kind: kind.to_string(),
-            status,
-            detail: match backend {
-                Some(b) => json!({ "backend": b }),
-                None => json!({}),
-            },
-            created_ms: 0,
-        }
+    // ------------------------------------------------------------------
+    // Tracker #70: consultation/benchmark mutual exclusion.
+    // ------------------------------------------------------------------
+
+    fn mutex_test_state() -> std::sync::Arc<AppState> {
+        let cfg = AppConfig::default_config();
+        std::sync::Arc::new(AppState::new(
+            cfg,
+            PathBuf::from("/nonexistent-mutex-test/config.json"),
+            PathBuf::from("/nonexistent-mutex-test"),
+        ))
     }
 
-    /// The contention note at measurement start fires only for
-    /// a consultation that is still running against the SAME
-    /// backend: a finished consultation, another job kind, a
-    /// different backend, or a record without a backend detail
-    /// is not contention with this measurement.
+    fn mutex_sink() -> std::sync::Arc<dyn crate::EventSink> {
+        std::sync::Arc::new(crate::NoopSink)
+    }
+
+    fn running_ops_empty(state: &AppState) -> bool {
+        state
+            .optimize_running_ops
+            .lock()
+            .unwrap()
+            .is_empty()
+    }
+
+    /// Tracker #70, scope test 1: a benchmark (Measure and
+    /// Estimate alike) is refused while a consultation runs on
+    /// the same backend, with the refusal naming the running
+    /// operation; a benchmark on a DIFFERENT backend is not
+    /// refused for contention (it proceeds to the ordinary
+    /// not-running refusal in this fixture, where no backend
+    /// runs).
+    #[tokio::test]
+    async fn benchmark_refused_during_consultation() {
+        let state = mutex_test_state();
+        let sink = mutex_sink();
+        let _consult = OptimizeOpGuard::claim(
+            &state,
+            "coder",
+            OptimizeOpFamily::Consultation,
+            "consultation",
+        )
+        .expect("the first claim on a backend succeeds");
+
+        let r = op_optimize_measure_backend(&state, &sink, "coder".to_string()).await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("cannot start a measurement"), "{msg}");
+                assert!(msg.contains("a consultation is already running"), "{msg}");
+                assert!(msg.contains("'coder'"), "{msg}");
+                assert!(msg.contains("started"), "{msg}");
+            }
+            other => panic!("expected the mutual-exclusion refusal, got {other:?}"),
+        }
+        let r = op_optimize_estimate_backend(&state, &sink, "coder".to_string()).await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("cannot start an estimate"), "{msg}");
+                assert!(msg.contains("a consultation is already running"), "{msg}");
+            }
+            other => panic!("expected the mutual-exclusion refusal, got {other:?}"),
+        }
+        // The eval-baseline benchmark path refuses the same way.
+        let r = crate::optimize_eval::op_optimize_run_baseline(
+            &state,
+            &sink,
+            "coder".to_string(),
+        )
+        .await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("a consultation is already running"), "{msg}");
+            }
+            other => panic!("expected the mutual-exclusion refusal, got {other:?}"),
+        }
+        // Different backend: no contention refusal.
+        let r = op_optimize_measure_backend(&state, &sink, "planner".to_string()).await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(!msg.contains("already running on that backend"), "{msg}");
+                assert!(msg.contains("not running"), "{msg}");
+            }
+            other => panic!("expected the not-running refusal, got {other:?}"),
+        }
+        // The refused starts claimed nothing of their own.
+        assert_eq!(
+            state.optimize_running_ops.lock().unwrap().len(),
+            1,
+            "only the consultation's record remains"
+        );
+    }
+
+    /// Tracker #70, scope test 2: a consultation is refused
+    /// while a benchmark runs on the same backend, with the
+    /// refusal naming the running benchmark kind.
+    #[tokio::test]
+    async fn consultation_refused_during_benchmark() {
+        let state = mutex_test_state();
+        let sink = mutex_sink();
+        let _bench = OptimizeOpGuard::claim(
+            &state,
+            "coder",
+            OptimizeOpFamily::Benchmark,
+            "measure",
+        )
+        .expect("the first claim on a backend succeeds");
+
+        let r = op_optimize_consult(
+            &state,
+            &sink,
+            Some("coder".to_string()),
+            Some(false),
+            None,
+            None,
+        )
+        .await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("cannot start a consultation"), "{msg}");
+                assert!(msg.contains("a measurement is already running"), "{msg}");
+                assert!(msg.contains("'coder'"), "{msg}");
+            }
+            other => panic!("expected the mutual-exclusion refusal, got {other:?}"),
+        }
+        // The refused consultation claimed nothing of its own.
+        assert_eq!(state.optimize_running_ops.lock().unwrap().len(), 1);
+    }
+
+    /// Tracker #70, scope test 3: once the running operation
+    /// completes (its guard drops, as on every terminal path),
+    /// the other family may start on the same backend — and a
+    /// completed benchmark likewise frees the backend for a
+    /// consultation claim.
+    #[tokio::test]
+    async fn start_allowed_after_running_op_completes() {
+        let state = mutex_test_state();
+        {
+            let _consult = OptimizeOpGuard::claim(
+                &state,
+                "coder",
+                OptimizeOpFamily::Consultation,
+                "consultation",
+            )
+            .unwrap();
+            assert!(try_claim_optimize_op(
+                &state,
+                "coder",
+                OptimizeOpFamily::Benchmark,
+                "measure"
+            )
+            .is_err());
+        } // consultation completes: guard drop releases the record
+        assert!(running_ops_empty(&state));
+        let bench = OptimizeOpGuard::claim(
+            &state,
+            "coder",
+            OptimizeOpFamily::Benchmark,
+            "measure",
+        )
+        .expect("a benchmark may start after the consultation completes");
+        assert!(try_claim_optimize_op(
+            &state,
+            "coder",
+            OptimizeOpFamily::Consultation,
+            "consultation"
+        )
+        .is_err());
+        drop(bench); // benchmark completes
+        assert!(running_ops_empty(&state));
+        let _consult = OptimizeOpGuard::claim(
+            &state,
+            "coder",
+            OptimizeOpFamily::Consultation,
+            "consultation",
+        )
+        .expect("a consultation may start after the benchmark completes");
+    }
+
+    /// Tracker #70, scope test 4 (the Oct 20, 2026 case): a
+    /// consultation cancelled by the operator clears its record
+    /// through the cancel command, so a benchmark may start on
+    /// the same backend immediately; the same holds for a
+    /// cancelled benchmark and a following consultation. A stale
+    /// release from the cancelled operation must not clear a
+    /// newer claim on the backend.
+    #[tokio::test]
+    async fn start_allowed_after_cancel() {
+        let state = mutex_test_state();
+        let sink = mutex_sink();
+        // A live consultation on 'coder': its running-op record
+        // plus the abort sender the cancel command fires.
+        let consult = OptimizeOpGuard::claim(
+            &state,
+            "coder",
+            OptimizeOpFamily::Consultation,
+            "consultation",
+        )
+        .unwrap();
+        let consult_claim = {
+            let ops = state.optimize_running_ops.lock().unwrap();
+            ops.get("coder").unwrap().claim_id
+        };
+        let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+        *state.optimize_abort.lock().await = Some(tx);
+        let r = op_optimize_cancel_consult(&state, &sink).await.unwrap();
+        assert_eq!(r["cancelled"], json!(true));
+        assert!(
+            running_ops_empty(&state),
+            "the cancel clears the consultation's record at once"
+        );
+        // The benchmark the operator wanted to run can now claim.
+        let bench = OptimizeOpGuard::claim(
+            &state,
+            "coder",
+            OptimizeOpFamily::Benchmark,
+            "estimate",
+        )
+        .expect("an estimate may start after the consultation is cancelled");
+        // The cancelled consultation's late release (its guard
+        // dropping as its future unwinds) must not clear the
+        // newer benchmark claim.
+        drop(consult);
+        release_optimize_op(&state, "coder", consult_claim);
+        assert_eq!(state.optimize_running_ops.lock().unwrap().len(), 1);
+        drop(bench);
+        assert!(running_ops_empty(&state));
+
+        // Symmetric: a cancelled benchmark (the shared job
+        // cancel) frees its backend for a consultation.
+        let _bench = OptimizeOpGuard::claim(
+            &state,
+            "coder",
+            OptimizeOpFamily::Benchmark,
+            "measure",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+        *state.optimize_job_abort.lock().await = Some(tx);
+        let r = op_optimize_cancel_job(&state, &sink).await.unwrap();
+        assert_eq!(r["cancelled"], json!(true));
+        assert!(running_ops_empty(&state));
+        let _consult = OptimizeOpGuard::claim(
+            &state,
+            "coder",
+            OptimizeOpFamily::Consultation,
+            "consultation",
+        )
+        .expect("a consultation may start after the benchmark is cancelled");
+    }
+
+    /// The refusal names the running operation's kind AND its
+    /// elapsed time (the start the record — and the tracker #69
+    /// job-state payload — carries), not just the family.
     #[test]
-    fn consult_running_on_matches_only_the_running_consult_for_the_backend() {
-        let mut tasks = HashMap::new();
-        tasks.insert(
-            "a".to_string(),
-            task("optimize-consult", TaskStatus::Running, Some("planner")),
+    fn contention_refusal_names_kind_and_elapsed() {
+        let state = mutex_test_state();
+        let started = chrono::Utc::now().timestamp_millis() - 125_000;
+        state.optimize_running_ops.lock().unwrap().insert(
+            "coder".to_string(),
+            OptimizeRunningOp {
+                family: OptimizeOpFamily::Consultation,
+                kind: "consultation".to_string(),
+                backend_id: "coder".to_string(),
+                started_unix_ms: started,
+                claim_id: 999,
+            },
         );
-        assert!(consult_running_on(&tasks, "planner"));
-        assert!(!consult_running_on(&tasks, "coder"));
-        tasks.insert(
-            "a".to_string(),
-            task("optimize-consult", TaskStatus::Done, Some("planner")),
-        );
-        assert!(!consult_running_on(&tasks, "planner"));
-        tasks.insert(
-            "a".to_string(),
-            task("optimize-measure", TaskStatus::Running, Some("planner")),
-        );
-        assert!(!consult_running_on(&tasks, "planner"));
-        tasks.insert(
-            "a".to_string(),
-            task("optimize-consult", TaskStatus::Running, None),
-        );
-        assert!(!consult_running_on(&tasks, "planner"));
+        let err = try_claim_optimize_op(
+            &state,
+            "coder",
+            OptimizeOpFamily::Benchmark,
+            "estimate",
+        )
+        .expect_err("a running consultation refuses a benchmark claim");
+        match err {
+            ApiError::InvalidInput(msg) => {
+                assert!(msg.contains("a consultation is already running"), "{msg}");
+                assert!(msg.contains("started 2m 05s ago"), "{msg}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 }
