@@ -936,7 +936,12 @@ export interface CachePreview {
   rs_mib: number | null;
   total_mib: number;
   basis: string;
-  targets: { gpu: number; total_mib: number }[] | null;
+  /** Per placed GPU: its total VRAM, its required share of the
+   *  total (the same distribution the fit verdict judges), and
+   *  its own verdict against the headroom reserve. The share and
+   *  verdict are null only when the server could not distribute
+   *  the total over the targets. */
+  targets: { gpu: number; total_mib: number; required_mib: number | null; fits: boolean | null }[] | null;
   headroom_reserve_percent: number;
   fits_current: boolean | null;
   ladder: CacheRungLike[];

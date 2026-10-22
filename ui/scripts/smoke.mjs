@@ -547,6 +547,28 @@ check(bundle.includes("job_error"), "bundle reads the Optimize job_error payload
 check(bundle.includes("started_unix_ms"), "bundle reads the Optimize job start time (tracker #69)");
 check(bundle.includes("fully CPU-offloaded backend this can take several minutes"), "bundle carries the honest Estimate worst-case copy (tracker #69)");
 
+// Backend form memory summary (Oct 22, 2026): the cache preview's
+// predicted footprint renders as structured Label: Value rows —
+// Weights, KV cache, State cache (present only when the figure
+// exists), an emphasized Total, then one capacity row per placed
+// GPU with its required share and the verdict as a status chip.
+// The old single-string line ("Weights: … · KV: … · Total: … vs
+// GPU 0 … GiB · fits") must not return in either form (the shared
+// cachePreviewHtml renderer serves the Edit and Add forms).
+const staticSrcFit = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+check(staticSrcFit.includes("function cachePreviewHtml"), "shared cachePreviewHtml renderer exists in static.ts");
+check(staticSrcFit.includes('row("KV cache"'), "cache fit block renders the KV cache as its own row");
+check(staticSrcFit.includes('row("State cache"'), "cache fit block renders the State cache as its own row");
+check(staticSrcFit.includes("preview.rs_mib !== null"), "cache fit block renders the State cache row only when the figure exists");
+check(staticSrcFit.includes("preview.kv_mib === null"), "cache fit block keeps the unknown-KV branch (no priced total, no fit claim)");
+check(staticSrcFit.includes('t.fits ? "status-on" : "status-bad"'), "cache fit block renders the per-GPU verdict as a status chip");
+check(staticSrcFit.includes("GiB of"), "cache fit block renders each GPU's required share of its total");
+check(bundle.includes(" GiB of "), "bundle carries the per-GPU capacity phrasing (share of total)");
+check(!staticSrcFit.includes("does not fit at this context"), "cache fit block no longer appends the verdict to the one-line string");
+check(!staticSrcFit.includes("vs ${targets}"), "cache fit block no longer joins GPU totals into a 'vs' string");
+check(!bundle.includes("does not fit at this context"), "bundle no longer carries the one-line fit verdict");
+check(staticSrcFit.includes('p.fits ? "status-on" : "status-bad"'), "placement projection renders its Fit verdict as a status chip");
+
 // The UI detects Tauri via window.__TAURI__, which Tauri only injects when
 // app.withGlobalTauri is true. Without it the installed app silently
 // degrades to sample data on every screen.
