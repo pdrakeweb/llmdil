@@ -47,19 +47,23 @@ pub struct LayoutFacts {
 /// carry KV geometry the KV term is priced at the selected
 /// types, exactly as the app-side requirement prices it;
 /// without geometry the f16 figure stands (typed pricing has
-/// nothing to price from).
+/// nothing to price from). `moe_cache_mib` is the backend's
+/// decoded expert-cache size (0 when unset): it rides the
+/// requirement as its own term, with the offload position and
+/// MoE layer count the per-GPU distribution needs.
 pub fn layout_requirement(
     facts: &LayoutFacts,
     offload: ExpertOffload,
     cache: manager_models::CacheSelection,
     n_ctx: u32,
     n_seq: u32,
+    moe_cache_mib: u32,
 ) -> MemoryRequirement {
     let kv_per_token = match facts.kv_geometry {
         Some(geo) => Some(geo.bytes_per_token_typed(cache.k, cache.v)),
         None => facts.kv_per_token,
     };
-    manager_models::memory_requirement(
+    let mut req = manager_models::memory_requirement(
         facts.total_bytes,
         facts.expert_bytes,
         facts.expert_bytes_by_block.as_deref(),
@@ -70,14 +74,18 @@ pub fn layout_requirement(
         n_ctx,
         facts.rs_bytes_per_seq,
         n_seq,
-    )
+    );
+    req.moe_cache_mib = moe_cache_mib as u64;
+    req.moe_cache_offload_layers = offload.layers(facts.moe_layers.unwrap_or(0));
+    req.moe_cache_moe_layers = facts.moe_layers.unwrap_or(0);
+    req
 }
 
 /// Total GPU-resident MiB of a requirement (weights + KV when the
 /// KV geometry is known + recurrent-state cache when its geometry
-/// is known).
+/// is known + the MoE expert cache when one is set).
 pub fn gpu_total_mib(req: &MemoryRequirement) -> u64 {
-    req.gpu_weights_mib + req.kv_mib.unwrap_or(0) + req.rs_mib.unwrap_or(0)
+    req.gpu_weights_mib + req.kv_mib.unwrap_or(0) + req.rs_mib.unwrap_or(0) + req.moe_cache_mib
 }
 
 /// Distribute a requirement's GPU-resident total over the GPUs by
@@ -86,28 +94,47 @@ pub fn gpu_total_mib(req: &MemoryRequirement) -> u64 {
 /// convention). A split whose length differs from the GPU count is
 /// stale — it earns no distribution and the caller treats the
 /// backend as holding nothing accountable.
+///
+/// The expert-cache term distributes by its own rule
+/// ([`manager_models::moe_cache_shares`]), not by the tensor
+/// split: llama.cpp splits the one cache budget only among the
+/// GPUs holding offloaded layers, renormalized over them, so a
+/// partial-offload split placement can owe its whole cache to
+/// one GPU.
 pub fn residency_per_gpu(req: &MemoryRequirement, split: &[f32], n_gpus: usize) -> Vec<u64> {
     let mut out = vec![0u64; n_gpus];
     if n_gpus == 0 {
         return out;
     }
-    let total = gpu_total_mib(req);
+    let base = gpu_total_mib(req).saturating_sub(req.moe_cache_mib);
     if split.is_empty() {
-        out[0] = total;
+        out[0] = base;
+    } else if split.len() == n_gpus {
+        let mut assigned = 0u64;
+        for (i, frac) in split.iter().enumerate() {
+            let share = if i + 1 == split.len() {
+                base.saturating_sub(assigned)
+            } else {
+                (base as f64 * (*frac as f64)).round() as u64
+            };
+            out[i] = share;
+            assigned += share;
+        }
+    } else {
+        // A stale split distributes nothing — the base stays
+        // undistributed, and the cache shares nothing either
+        // (moe_cache_shares applies the same rule).
         return out;
     }
-    if split.len() != n_gpus {
-        return out;
-    }
-    let mut assigned = 0u64;
-    for (i, frac) in split.iter().enumerate() {
-        let share = if i + 1 == split.len() {
-            total.saturating_sub(assigned)
-        } else {
-            (total as f64 * (*frac as f64)).round() as u64
-        };
-        out[i] = share;
-        assigned += share;
+    let cache_shares = manager_models::moe_cache_shares(
+        req.moe_cache_mib,
+        split,
+        req.moe_cache_offload_layers,
+        req.moe_cache_moe_layers,
+        n_gpus,
+    );
+    for (i, share) in cache_shares.iter().enumerate() {
+        out[i] += share;
     }
     out
 }
@@ -240,6 +267,7 @@ pub fn others_residency(
             manager_models::cache_selection(b.raw_flags.as_deref()),
             b.flags.n_ctx,
             manager_models::effective_slots(b.raw_flags.as_deref()),
+            manager_models::moe_cache_mib(b.raw_flags.as_deref()).unwrap_or(0),
         );
         let per = residency_per_gpu(&req, &b.flags.tensor_split, n_gpus);
         let bucket = if running.get(&b.id).copied().unwrap_or(false) {
@@ -275,7 +303,7 @@ mod tests {
 
     #[test]
     fn residency_empty_split_is_first_gpu() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4);
+        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4, 0);
         assert_eq!(residency_per_gpu(&req, &[], 2), vec![12 * 1024, 0]);
         assert_eq!(
             residency_per_gpu(&req, &[0.5, 0.5], 2),
@@ -285,9 +313,88 @@ mod tests {
         assert_eq!(residency_per_gpu(&req, &[1.0], 2), vec![0, 0]);
     }
 
+    fn moe_facts() -> LayoutFacts {
+        LayoutFacts {
+            total_bytes: 12 * 1024 * manager_models::MIB,
+            expert_bytes: Some(6 * 1024 * manager_models::MIB),
+            expert_bytes_by_block: None,
+            moe_layers: Some(48),
+            kv_per_token: None,
+            kv_geometry: None,
+            rs_bytes_per_seq: None,
+            basis: MemoryBasis::Estimate,
+            ctx_max: 0,
+            params_b: 12.0,
+        }
+    }
+
+    #[test]
+    fn expert_cache_prices_into_the_requirement_and_its_shares() {
+        // Full offload: 6 GiB of experts in RAM, 6 GiB of weights
+        // on the GPUs. A 4,096 MiB cache grows the total by
+        // exactly its size and each GPU's share by its split
+        // share of it.
+        let base = layout_requirement(
+            &moe_facts(),
+            ExpertOffload::AllExperts,
+            manager_models::CacheSelection::default(),
+            32768,
+            4,
+            0,
+        );
+        let cached = layout_requirement(
+            &moe_facts(),
+            ExpertOffload::AllExperts,
+            manager_models::CacheSelection::default(),
+            32768,
+            4,
+            4096,
+        );
+        assert_eq!(gpu_total_mib(&cached) - gpu_total_mib(&base), 4096);
+        assert_eq!(residency_per_gpu(&base, &[0.5, 0.5], 2), vec![3072, 3072]);
+        assert_eq!(
+            residency_per_gpu(&cached, &[0.5, 0.5], 2),
+            vec![3072 + 2048, 3072 + 2048]
+        );
+        // Unsplit: the whole cache lands on the one GPU.
+        assert_eq!(
+            residency_per_gpu(&cached, &[], 1),
+            vec![6144 + 4096]
+        );
+    }
+
+    #[test]
+    fn expert_cache_share_follows_the_offloaded_layers_gpu() {
+        // Partial offload (first 24 of 48 layers) under a 50/50
+        // layer split: every offloaded layer sits on GPU 0, so
+        // the whole cache prices there and GPU 1's share is
+        // unchanged — the renormalization the pinned llama.cpp
+        // performs (see manager_models::moe_cache).
+        let base = layout_requirement(
+            &moe_facts(),
+            ExpertOffload::CpuMoeLayers(24),
+            manager_models::CacheSelection::default(),
+            32768,
+            4,
+            0,
+        );
+        let cached = layout_requirement(
+            &moe_facts(),
+            ExpertOffload::CpuMoeLayers(24),
+            manager_models::CacheSelection::default(),
+            32768,
+            4,
+            4096,
+        );
+        let before = residency_per_gpu(&base, &[0.5, 0.5], 2);
+        let after = residency_per_gpu(&cached, &[0.5, 0.5], 2);
+        assert_eq!(after[0] - before[0], 4096);
+        assert_eq!(after[1], before[1]);
+    }
+
     #[test]
     fn fit_fails_when_free_vram_is_taken_by_a_running_backend() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4);
+        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4, 0);
         // 16 GiB free on GPU 0, but a running backend holds 8 GiB:
         // the 12 GiB model cannot be placed.
         let out = evaluate_fit(&req, &[], &[16 * 1024, 0], &[8 * 1024, 0], &[0, 0]);
@@ -300,7 +407,7 @@ mod tests {
 
     #[test]
     fn fit_warns_when_it_only_fits_by_moving_accounted_residency() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4);
+        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4, 0);
         // 16 GiB free; a STOPPED backend accounts 8 GiB. The model
         // fits now but not alongside the stopped backend.
         let out = evaluate_fit(&req, &[], &[16 * 1024, 0], &[0, 0], &[8 * 1024, 0]);

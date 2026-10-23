@@ -336,7 +336,7 @@ pub fn fit_verdict(
     // No offload is proposed for a candidate, and with no KV or
     // recurrent-state geometry the requirement is weights-only
     // at any context and any slot count.
-    let req = layout_requirement(&facts, ExpertOffload::None, manager_models::CacheSelection::default(), 0, 1);
+    let req = layout_requirement(&facts, ExpertOffload::None, manager_models::CacheSelection::default(), 0, 1, 0);
     let zeros = vec![0u64; free_vram_mib_per_gpu.len()];
     let outcome = evaluate_fit(&req, &[], free_vram_mib_per_gpu, &zeros, &zeros);
     if !outcome.placeable {
