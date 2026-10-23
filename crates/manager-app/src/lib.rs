@@ -51,6 +51,7 @@ pub mod activation_history;
 pub mod app_update;
 pub mod gateway_stats;
 pub mod gpu_history;
+pub mod hf_forms;
 pub mod notify;
 pub mod optimize;
 pub mod optimize_eval;
@@ -64,6 +65,7 @@ pub use optimize::{
     op_optimize_validate_plan,
 };
 pub use gpu_history::op_get_gpu_history;
+pub use hf_forms::{op_model_hf_header, op_model_hf_lookup};
 pub use app_update::{
     op_app_update_check, op_app_update_download, op_app_update_restart, op_app_update_set_auto,
     op_app_update_set_checking, op_app_update_status,
@@ -3593,6 +3595,23 @@ pub async fn op_list_models(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -
         .map(|m| {
             let path = resolve_under_data_dir(&cfg.data_dir, &m.gguf_path);
             let meta = std::fs::metadata(&path).ok().filter(|md| md.is_file());
+            // The downloaded file's own parsed geometry, for
+            // the declaration editor's post-download
+            // reconciliation (Part 2, P2-D7): the local parse
+            // is ground truth for geometry once the file is on
+            // disk. Cached by (path, len, mtime) — repeat list
+            // calls do not re-read headers.
+            let file_layout = if meta.is_some() {
+                gguf_layout_cached(&path)
+            } else {
+                None
+            };
+            let catalog_moe_layers = catalog_offload.get(m.id.as_str()).and_then(|p| p.0);
+            let moe_reconcile = crate::hf_forms::moe_reconciliation(
+                m.moe_layers,
+                catalog_moe_layers,
+                file_layout.as_ref().and_then(|l| l.moe_block_count),
+            );
             let partial_meta = std::fs::metadata(manager_models::partial_path(&path))
                 .ok()
                 .filter(|md| md.is_file());
@@ -3603,6 +3622,26 @@ pub async fn op_list_models(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -
                     .or_else(|| catalog_names.get(m.id.as_str()).copied())
                     .unwrap_or(m.id.as_str()),
                 "gguf_path": m.gguf_path,
+                // The record's source URL: the Edit form's
+                // re-fetch (Part 2, P2-D8) recovers the HF repo
+                // and file from it, and offers the action only
+                // for HF resolve URLs.
+                "source_url": m.source_url,
+                // The on-disk file's parsed MoE block count and
+                // in-file MTP signal (null/false when the file
+                // is absent or unparseable — an unknown, not a
+                // zero), and the reconciliation proposal the
+                // declaration editor renders when the stored
+                // declaration disagrees with the file.
+                "file_moe_layers": file_layout.as_ref().and_then(|l| l.moe_block_count),
+                "file_nextn": file_layout.as_ref().map(|l| {
+                    l.nextn_predict_layers.map(|n| n > 0).unwrap_or(false)
+                        || l.has_nextn_tensors
+                }),
+                "moe_reconcile": moe_reconcile.map(|(declared, file)| json!({
+                    "declared": declared,
+                    "file": file,
+                })),
                 "quant": m.quant,
                 "params_b": m.params_b,
                 "sha256": m.sha256,
@@ -8384,9 +8423,12 @@ pub async fn op_model_set_mtp(
 /// model the curated catalog does not carry expert-offload
 /// controls; see [`manager_config::validate_moe_declaration`]),
 /// and an MTP capability declaration (see
-/// [`manager_models::effective_mtp`]).
-/// The model starts enabled with no pinned SHA-256 — its downloads run unverified (the Models view shows
-/// "hash not pinned") until a hash is recorded in the configuration.
+/// [`manager_models::effective_mtp`]), and optionally a
+/// SHA-256 pin (design Part 2, P2-D6 — an HF-picked add passes
+/// the picked file's `lfs.sha256` and starts pinned). Without
+/// a pin the model starts with no pinned SHA-256 — its
+/// downloads run unverified (the Models view shows "hash not
+/// pinned") until a hash is recorded in the configuration.
 #[allow(clippy::too_many_arguments)]
 pub async fn op_model_add(
     state: &Arc<AppState>,
@@ -8399,6 +8441,7 @@ pub async fn op_model_add(
     moe_layers: Option<u32>,
     default_offload_layers: Option<u32>,
     mtp: Option<bool>,
+    sha256: Option<String>,
 ) -> ApiResult {
     // Resolve everything before taking the config lock: a rejected
     // add must leave the in-memory config and the saved file
@@ -8415,6 +8458,7 @@ pub async fn op_model_add(
         moe_layers,
         default_offload_layers,
         mtp,
+        sha256,
     )?;
     let id = entry.id.clone();
     let mut cfg = state.config.write().await;
@@ -12938,6 +12982,7 @@ mod tests {
             Some(48),
             Some(16),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -13154,6 +13199,7 @@ mod tests {
             Some(48),
             Some(16),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -13346,6 +13392,7 @@ mod tests {
                 Some(48),
                 None,
                 None,
+                None,
             )
             .await,
             Err(ApiError::InvalidInput(_))
@@ -13375,6 +13422,7 @@ mod tests {
             None,
             None,
             Some(true),
+            None,
         )
         .await
         .unwrap();
@@ -13563,6 +13611,7 @@ mod tests {
             None,
             None,
             Some(7.0),
+            None,
             None,
             None,
             None,
@@ -14135,6 +14184,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
             match r {
                 Err(ApiError::InvalidInput(msg)) => {
@@ -14150,6 +14200,7 @@ mod tests {
                 None,
                 None,
                 Some(0.0),
+                None,
                 None,
                 None,
                 None,
@@ -14171,6 +14222,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("explicit params resolve");
             assert_eq!(e.id, "my-7b");
@@ -14185,7 +14237,7 @@ mod tests {
             cfg.models.push(e);
             manager_config::validate(&cfg).expect("added entry validates");
             // An explicit value wins over the catalog.
-            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, Some(9.0), None, None, None)
+            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, Some(9.0), None, None, None, None)
                 .expect("explicit params resolve");
             assert_eq!(e.params_b, 9.0);
         }
@@ -14193,13 +14245,14 @@ mod tests {
         #[test]
         fn model_add_entry_resolves_params_from_catalog() {
             // By id.
-            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, None, None, None, None)
+            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, None, None, None, None, None)
                 .expect("catalog id resolves");
             assert_eq!(e.params_b, 8.0);
             // By exact source URL under an operator-chosen id.
             let e = model_add_entry(
                 "my-qwen3-8b",
                 "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
+                None,
                 None,
                 None,
                 None,
@@ -14221,6 +14274,7 @@ mod tests {
                 Some(27.0),
                 Some(48),
                 Some(16),
+                None,
                 None,
             )
             .expect("declared pair resolves");
@@ -14249,6 +14303,7 @@ mod tests {
                             layers,
                             default,
                             None,
+                            None,
                         ),
                         Err(ApiError::InvalidInput(_))
                     ),
@@ -14268,6 +14323,7 @@ mod tests {
                 None,
                 None,
                 Some(true),
+                None,
             )
             .expect("declared entry resolves");
             assert_eq!(e.mtp, Some(true));
@@ -14285,19 +14341,85 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("undeclared entry resolves");
             assert_eq!(e.mtp, None);
         }
 
         #[test]
+        fn model_add_entry_stores_a_valid_sha256_pin() {
+            // P2-D6: an HF-picked add passes the sibling's
+            // lfs.sha256 and the record starts pinned, so the
+            // download path verifies against it (download_spec_for
+            // treats a real pin as authoritative).
+            let pin = "b".repeat(64);
+            let e = model_add_entry(
+                "picked-7b",
+                "https://huggingface.co/org/picked/resolve/main/picked-7b.gguf",
+                None,
+                None,
+                Some(7.0),
+                None,
+                None,
+                None,
+                Some(pin.clone()),
+            )
+            .expect("pinned entry resolves");
+            assert_eq!(e.sha256, pin);
+            let mut cfg = test_cfg();
+            cfg.models.push(e);
+            manager_config::validate(&cfg).expect("pinned entry validates");
+            // No pin supplied: the record starts unpinned,
+            // exactly as before Part 2.
+            let e = model_add_entry(
+                "plain-7b",
+                "https://example.com/plain.gguf",
+                None,
+                None,
+                Some(7.0),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("unpinned entry resolves");
+            assert!(e.sha256.is_empty());
+        }
+
+        #[test]
+        fn model_add_entry_refuses_a_malformed_sha256() {
+            // §P2.12: a malformed hash is refused at the add —
+            // a short or non-hex "pin" would verify nothing.
+            for bad in ["abc", "z".repeat(64).as_str(), "a".repeat(63).as_str()] {
+                assert!(
+                    matches!(
+                        model_add_entry(
+                            "picked-7b",
+                            "https://example.com/picked.gguf",
+                            None,
+                            None,
+                            Some(7.0),
+                            None,
+                            None,
+                            None,
+                            Some(bad.to_string()),
+                        ),
+                        Err(ApiError::InvalidInput(_))
+                    ),
+                    "malformed pin {bad:?} must refuse"
+                );
+            }
+        }
+
+        #[test]
         fn model_add_entry_keeps_the_existing_input_rules() {
             assert!(matches!(
-                model_add_entry("  ", "https://example.com/x.gguf", None, None, Some(1.0), None, None, None),
+                model_add_entry("  ", "https://example.com/x.gguf", None, None, Some(1.0), None, None, None, None),
                 Err(ApiError::InvalidInput(_))
             ));
             assert!(matches!(
-                model_add_entry("m", "http://example.com/x.gguf", None, None, Some(1.0), None, None, None),
+                model_add_entry("m", "http://example.com/x.gguf", None, None, Some(1.0), None, None, None, None),
                 Err(ApiError::InvalidInput(_))
             ));
             assert!(matches!(
@@ -14307,6 +14429,7 @@ mod tests {
                     Some("sub/dir.gguf".to_string()),
                     None,
                     Some(1.0),
+                    None,
                     None,
                     None,
                     None,
@@ -15544,6 +15667,7 @@ fn model_add_entry(
     moe_layers: Option<u32>,
     default_offload_layers: Option<u32>,
     mtp: Option<bool>,
+    sha256: Option<String>,
 ) -> Result<manager_config::ModelConfig, ApiError> {
     let id = id.trim().to_string();
     if id.is_empty() {
@@ -15576,6 +15700,24 @@ fn model_add_entry(
     }
     manager_config::validate_moe_declaration(moe_layers, default_offload_layers)
         .map_err(ApiError::InvalidInput)?;
+    // An optional SHA-256 pin (design Part 2, P2-D6): an
+    // HF-picked single-file add passes the sibling's lfs.sha256
+    // and the record starts pinned, so its download verifies
+    // like a catalog model's. A malformed value is refused —
+    // a pin that is not a full hash would silently verify
+    // nothing.
+    let sha256 = match sha256
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(pin) if is_real_pin(&pin) => pin,
+        Some(_) => {
+            return Err(ApiError::InvalidInput(
+                "sha256 must be a full 64-character hex SHA-256 hash".to_string(),
+            ));
+        }
+        None => String::new(),
+    };
     let params_b = params_b
         .filter(|p| *p > 0.0)
         .or_else(|| manager_models::catalog_params_b(&id, source_url))
@@ -15592,7 +15734,7 @@ fn model_add_entry(
             .filter(|q| !q.is_empty())
             .unwrap_or_else(|| "unknown".to_string()),
         params_b,
-        sha256: String::new(),
+        sha256,
         verified_at: None,
         verified_sha256: None,
         source_url: source_url.to_string(),

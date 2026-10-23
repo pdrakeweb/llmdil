@@ -1445,6 +1445,20 @@ export interface ModelRow {
    *  record: whether the model's GGUF carries an MTP head.
    *  Null when never declared. */
   mtp?: boolean | null;
+  /** The record's source URL. The Edit form's re-fetch
+   *  (design Part 2, P2-D8) recovers the HF repo and file
+   *  from it and is offered only for HF resolve URLs. */
+  source_url: string;
+  /** The on-disk file's parsed MoE block count (null when
+   *  the file is absent or unparseable — an unknown, not a
+   *  zero) and its in-file MTP signal. */
+  file_moe_layers?: number | null;
+  file_nextn?: boolean | null;
+  /** The post-download reconciliation proposal (P2-D7):
+   *  the stored MoE declaration vs the file's parsed count,
+   *  present only when they disagree and no catalog pin
+   *  governs the figure. */
+  moe_reconcile?: { declared: number; file: number } | null;
   /** The curated catalog's MTP pin for the model (null when the
    *  catalog knows neither the id nor the source URL). A pin
    *  wins over the record's declaration wherever both exist —
@@ -1562,8 +1576,11 @@ export async function modelSetEnabled(id: string, enabled: boolean): Promise<Cal
  *  (both or neither): they give a model outside the curated catalog
  *  expert-offload controls. mtp is the operator MTP capability
  *  declaration: it gives a model outside the catalog the MTP
- *  draft control. The model starts enabled with no pinned hash. */
-export async function modelAdd(id: string, sourceUrl: string, fileName?: string, quant?: string, paramsB?: number, moeLayers?: number, defaultOffloadLayers?: number, mtp?: boolean): Promise<CallResult<{ model_id: string }>> {
+ *  draft control. sha256 is the optional hash pin (design
+ *  Part 2, P2-D6): an HF-picked single-file add passes the
+ *  file's lfs.sha256 and the record starts pinned; without it
+ *  the model starts enabled with no pinned hash. */
+export async function modelAdd(id: string, sourceUrl: string, fileName?: string, quant?: string, paramsB?: number, moeLayers?: number, defaultOffloadLayers?: number, mtp?: boolean, sha256?: string): Promise<CallResult<{ model_id: string }>> {
   if (!isTauri()) return { data: { model_id: id }, live: false };
   try {
     const data = await invoke<{ model_id: string }>("model_add", {
@@ -1575,10 +1592,114 @@ export async function modelAdd(id: string, sourceUrl: string, fileName?: string,
       moeLayers: moeLayers ?? null,
       defaultOffloadLayers: defaultOffloadLayers ?? null,
       mtp: mtp ?? null,
+      sha256: sha256 ?? null,
     });
     return { data, live: true };
   } catch (e) {
     return { data: { model_id: id }, live: true, error: errOf(e) };
+  }
+}
+
+/** One quant row of an HF lookup: the file, its exact size,
+ *  the fit verdict token against the live free-VRAM snapshot,
+ *  and the prefill derivations (id slug, quant token, and —
+ *  for single-file quants — the LFS hash that pins the add). */
+export interface HfLookupQuant {
+  file: string;
+  size_bytes: number;
+  shard_count: number;
+  sha256: string | null;
+  fit: string;
+  id_slug: string;
+  quant: string | null;
+  /** The constructed resolve URL a pick prefills as the
+   *  model's source URL (§P2.5). */
+  source_url: string;
+}
+
+/** One repo row of an HF lookup (design Part 2, §P2.4). */
+export interface HfLookupRepo {
+  repo_id: string;
+  downloads: number;
+  likes: number;
+  architecture: string | null;
+  params_b: number | null;
+  ctx_max: number | null;
+  /** The curated-catalog model whose file lives in this
+   *  repo, when one does — the picker's Catalog chip. */
+  catalog_model_id: string | null;
+  quants: HfLookupQuant[];
+}
+
+/** model_hf_lookup — the Add Model form's shallow HF lookup
+ *  (P2-D2): repo rows with per-repo facts and quant files.
+ *  A failed search is an error; the manual form never
+ *  depends on it. */
+export async function modelHfLookup(query: string): Promise<CallResult<{ repos: HfLookupRepo[] }>> {
+  if (!isTauri()) return { data: { repos: [] }, live: false };
+  try {
+    const data = await invoke<{ suggest: boolean; repos: HfLookupRepo[] }>("model_hf_lookup", {
+      query,
+      suggest: null,
+    });
+    return { data: { repos: data.repos }, live: true };
+  } catch (e) {
+    return { data: { repos: [] }, live: true, error: errOf(e) };
+  }
+}
+
+/** model_hf_lookup (suggest) — the name field's type-ahead:
+ *  repo names + download counts from the same shallow
+ *  search, with no record fetches. */
+export async function modelHfSuggest(query: string): Promise<CallResult<{ repos: { repo_id: string; downloads: number }[] }>> {
+  if (!isTauri()) return { data: { repos: [] }, live: false };
+  try {
+    const data = await invoke<{ suggest: boolean; repos: { repo_id: string; downloads: number }[] }>("model_hf_lookup", {
+      query,
+      suggest: true,
+    });
+    return { data: { repos: data.repos }, live: true };
+  } catch (e) {
+    return { data: { repos: [] }, live: true, error: errOf(e) };
+  }
+}
+
+/** The parsed-header facts a pick-time read returns. */
+export interface HfHeaderFacts {
+  moe_layers: number | null;
+  block_count: number | null;
+  expert_bytes: number;
+  total_bytes: number;
+  mtp: boolean;
+  suggested_default_offload_layers: number | null;
+  needs_split: boolean;
+}
+
+/** model_hf_header's payload. `header` is null when the
+ *  range read failed for any reason — the form proceeds
+ *  without geometry prefill; the add is never blocked. */
+export interface HfHeaderResult {
+  repo_id: string;
+  file: string;
+  /** This exact file is a curated-catalog file: its pins
+   *  govern and no fetched value is prefilled over them. */
+  catalog: boolean;
+  /** The record's current lfs.sha256 for the file, when the
+   *  record reports one (the re-fetch's changed-hash check). */
+  sha256: string | null;
+  header: HfHeaderFacts | null;
+}
+
+/** model_hf_header — the pick-time GGUF header range read
+ *  (P2-D4) plus the record's current hash for the file. */
+export async function modelHfHeader(repoId: string, file: string): Promise<CallResult<HfHeaderResult>> {
+  const empty: HfHeaderResult = { repo_id: repoId, file, catalog: false, sha256: null, header: null };
+  if (!isTauri()) return { data: empty, live: false };
+  try {
+    const data = await invoke<HfHeaderResult>("model_hf_header", { repoId, file });
+    return { data, live: true };
+  } catch (e) {
+    return { data: empty, live: true, error: errOf(e) };
   }
 }
 

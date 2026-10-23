@@ -3,8 +3,8 @@
 Status: implemented. The API shipped with the admin-API build
 (PLAN.md §9) and this contract describes the shipped surface as of
 v0.1.50. The source of truth for routes is the operation registry —
-`crates/manager-app/src/registry.rs` (`for_each_operation!`): 132
-operations, of which 82 carry a REST route and 50 are explicit
+`crates/manager-app/src/registry.rs` (`for_each_operation!`): 134
+operations, of which 82 carry a REST route and 52 are explicit
 `None` exclusions (§6.16). Derived/composite and auth/admin routes
 are API-layer routes in `crates/manager-api` (§6.17); the full live
 surface is 121 route records (82 registry + 15 derived + 24
@@ -325,7 +325,8 @@ any subset of `enabled`, `model_file`, `port`, `n_ctx`, `n_batch`,
 {
   "id": "qwen3-coder-30b",
   "name": "Coder",
-  "gguf_path": "…", "quant": "UD-Q4_K_M", "params_b": 80.0,
+  "gguf_path": "…", "source_url": "https://huggingface.co/…",
+  "quant": "UD-Q4_K_M", "params_b": 80.0,
   "sha256": "3a47…", "verified_at": "2026-10-16T…Z",
   "enabled": true, "on_disk": true, "size_bytes": 49301055488,
   "downloading": false, "verifying": false, "paused": false,
@@ -334,9 +335,18 @@ any subset of `enabled`, `model_file`, `port`, `n_ctx`, `n_batch`,
   "moe_layers": null, "default_offload_layers": null,
   "catalog_moe_layers": 48, "catalog_default_offload_layers": 48,
   "mtp": null, "catalog_mtp": false,
+  "file_moe_layers": 48, "file_nextn": false, "moe_reconcile": null,
   "fit_check_available": true
 }
 ```
+
+`source_url` is the record's source URL. `file_moe_layers` and
+`file_nextn` are the on-disk file's parsed MoE block count and
+in-file MTP signal (null when the file is absent or unparseable);
+`moe_reconcile` is `{ "declared", "file" }` when the stored MoE
+declaration disagrees with the file's parsed count and no catalog
+pin governs the figure, else null — the declaration editor's
+post-download proposal (deep-discovery design Part 2, P2-D7).
 
 ### 4.4 Gateway config (`get_gateway_config`)
 
@@ -694,7 +704,8 @@ download-progress channel (§3.1).
 ```json
 { "id": "my-model", "source_url": "https://…/model.gguf",
   "file_name": "model.gguf", "quant": "Q4_K_M", "params_b": null,
-  "moe_layers": null, "default_offload_layers": null, "mtp": null }
+  "moe_layers": null, "default_offload_layers": null, "mtp": null,
+  "sha256": null }
 ```
 
 `file_name`, `quant`, `params_b` optional (file name defaults to the
@@ -713,9 +724,14 @@ it. `mtp` is the operator MTP capability declaration — the fact
 that gives a model the catalog does not carry the MTP draft
 control (backend Add/Edit and Edit Flags resolve the EFFECTIVE
 capability: the catalog's pin where the catalog knows the model,
-else this declaration); omitted or null leaves it undeclared. →
+else this declaration); omitted or null leaves it undeclared.
+`sha256` is an optional hash pin: a full 64-character hex SHA-256
+the record starts pinned with (the desktop Add Model form passes
+a Hugging Face–picked single file's `lfs.sha256`); a malformed
+value is refused with a validation error. →
 `201` `{ "model_id" }`. The model starts
-enabled with no pinned hash (unverified until a pin exists — the app
+enabled; with no pin supplied it starts with no pinned hash
+(unverified until a pin exists — the app
 treats a missing pin as "no verification possible", never as verified).
 
 #### `DELETE /api/v1/models/{id}` — `destructive`
@@ -1227,8 +1243,8 @@ operations the draft knew (`mcp_save_server`,
 
 ### 6.16 Registry exclusions — every operation with no route
 
-The registry holds 132 operations: 82 routed (§6.1–§6.14,
-§6.18) and 50 with route `None`. A `None` route is an explicit
+The registry holds 134 operations: 82 routed (§6.1–§6.14,
+§6.18) and 52 with route `None`. A `None` route is an explicit
 exclusion, never an oversight (registry module docs); the
 complete list, grouped by reason:
 
@@ -1239,6 +1255,7 @@ complete list, grouped by reason:
 | Desktop-only actions (§7.1–7.2) | `open_url` (L), `open_folder` (L) |
 | No 1:1 route — served inside a composition | `gateway_set_bind_host` (C, inside `PATCH /gateway/config`); `model_set_short_name` (C), `model_set_enabled` (C), `model_set_offload_spec` (C) and `model_set_mtp` (C), inside `PATCH /models/{id}`; `gateway_activation_complete` (L, server bookkeeping after apply/(re)start, §6.6); `gateway_activation_record_execution` (C, execution bookkeeping recorded by the desktop apply funnel, §6.6); `gateway_create_group` (C) and `gateway_delete_group` (D), served by the derived group routes (§6.5/§6.17) |
 | Desktop-only preview | `backend_add_preview` (R) — the add-backend form's placement preview; creation itself is `POST /backends` |
+| Model form helpers — desktop-only in v1 | `model_hf_lookup` (R), `model_hf_header` (R) — the Add Model form's Hugging Face lookup/pick and pick-time GGUF header read (deep-discovery design Part 2); creation itself is `POST /models` |
 | MCP — peripheral (decision 10) | `mcp_list` (R), `mcp_start_preflight` (R), `mcp_test_connection` (X), `mcp_set_exposure` (X), `mcp_save_server` (X), `mcp_delete_server` (X), `mcp_store_credential` (X), `backend_test_tool_call` (L, gateway MCP tool-call test) |
 | VS Code — peripheral (decision 10) | `vscode_install_extensions` (X), `vscode_write_config` (X) |
 | WinML — peripheral (decision 10) | `winml_probe` (R), `winml_status` (R), `winml_register` (D), `winml_unregister` (D) |

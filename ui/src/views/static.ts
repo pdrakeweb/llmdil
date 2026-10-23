@@ -20,6 +20,7 @@ import {
   addBackend, backendAddPreview, deleteBackend, modelAssign,
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
   verifyModel, deleteModel, modelSetEnabled, modelAdd, modelSetShortName, modelSetOffloadSpec, modelSetMtp,
+  modelHfLookup, modelHfSuggest, modelHfHeader,
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
   getGatewayMasterKey, setGatewayBindHost,
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
@@ -33,7 +34,7 @@ import {
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
   adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, BackendCache, BackendMoeCache, BackendMtp, BackendOffload, BackendParallel, BackendRow, CachePreview, CacheSelectionLike, CacheTypeName, FlashAttnName, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, LogRow, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
+import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, BackendCache, BackendMoeCache, BackendMtp, BackendOffload, BackendParallel, BackendRow, CachePreview, CacheSelectionLike, CacheTypeName, FlashAttnName, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, HfHeaderResult, HfLookupQuant, HfLookupRepo, LogRow, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
 import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
 import type { GpuInfo, WizardStepState } from "../types";
 
@@ -4986,7 +4987,27 @@ function modelOverviewHtml(rows: ModelRow[], stats: Map<string, { backends: numb
   return `<div class="ovlist ov-m"><div class="ov-head"><span></span><span>Model</span><span>Quant</span><span>Size</span><span>State</span><span>Serving backends</span><span>Requests (1h)</span></div>${body}</div>`;
 }
 
-function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }, rename?: { draft: string } | null, detailsOpen = false, offload?: { layers: string; def: string; moe: boolean; mtp: boolean } | null): string {
+/** Recover (repo, file) from an HF resolve URL — the inverse
+ *  of the source URL an Add Model pick constructs. The Edit
+ *  form's re-fetch (P2-D8) is offered only when this succeeds;
+ *  mirrors manager_app::hf_forms::parse_hf_source_url. */
+function parseHfSourceUrl(url: string): { repo: string; file: string } | null {
+  const schemeEnd = url.indexOf("://");
+  if (schemeEnd < 0) return null;
+  const rest = url.slice(schemeEnd + 3);
+  if (!rest.startsWith("huggingface.co/")) return null;
+  const path = rest.slice("huggingface.co/".length);
+  const idx = path.indexOf("/resolve/");
+  if (idx < 0) return null;
+  const repo = path.slice(0, idx);
+  const tail = path.slice(idx + "/resolve/".length);
+  const slash = tail.indexOf("/");
+  if (!repo.includes("/") || slash < 0) return null;
+  const file = tail.slice(slash + 1);
+  return file ? { repo, file } : null;
+}
+
+function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }, rename?: { draft: string } | null, detailsOpen = false, offload?: { layers: string; def: string; moe: boolean; mtp: boolean } | null, hfRefetch?: HfHeaderResult | null): string {
   const note = notes.get(m.id);
   const noteHtml = note
     ? `<div style="margin-top:8px;font-size:12px;color:${note.err ? "var(--err)" : "var(--text2)"}">${esc(note.text)}</div>` : "";
@@ -5078,6 +5099,30 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
    * declaration. */
   const effMtp = m.catalog_mtp ?? m.mtp ?? false;
   const mtpPinned = m.catalog_mtp != null;
+  /* Re-fetch proposals (P2-D8), rendered from the last
+   * Refresh result held by wireModels: per-field, applied
+   * explicitly, and never over a catalog pin. The changed
+   * hash is a warning line only — a re-fetch never re-pins. */
+  const hfSource = parseHfSourceUrl(m.source_url);
+  const hfRefetchHtml = ((): string => {
+    if (!offload || !hfRefetch) return "";
+    const parts: string[] = [];
+    if (hfRefetch.sha256 && hashPinned(m) && hfRefetch.sha256 !== m.sha256) {
+      parts.push(`<div style="font-size:12px;color:var(--err);margin-top:6px" title="Stored: ${esc(m.sha256)} · Fetched: ${esc(hfRefetch.sha256)}">SHA-256 changed in the repository — Stored: ${esc(m.sha256.slice(0, 16))}… · Fetched: ${esc(hfRefetch.sha256.slice(0, 16))}…</div>`);
+    }
+    const hdr = hfRefetch.header;
+    if (!hdr) {
+      parts.push(`<div style="font-size:12px;color:var(--text2);margin-top:6px">File header could not be read.</div>`);
+    } else if (!hfRefetch.catalog) {
+      if (hdr.moe_layers != null && !catalogPinned && hdr.moe_layers !== (m.moe_layers ?? null)) {
+        parts.push(`<div style="font-size:12px;color:var(--text2);margin-top:6px">MoE layers — Declared: ${m.moe_layers ?? "—"} · File: ${hdr.moe_layers} <button class="btn" data-model-act="offload-use-file" data-model-id="${esc(m.id)}" data-file-layers="${hdr.moe_layers}" style="padding:2px 8px;font-size:11px">Use file value</button></div>`);
+      }
+      if (hdr.mtp && !mtpPinned && !effMtp) {
+        parts.push(`<div style="font-size:12px;color:var(--text2);margin-top:6px">MTP — File: head present <button class="btn" data-model-act="mtp-use-file" data-model-id="${esc(m.id)}" style="padding:2px 8px;font-size:11px">Declare MTP</button></div>`);
+      }
+    }
+    return parts.join("");
+  })();
   const offloadHtml = offload ? `<div class="backend-form-panel flags-panel">
       <div style="font-size:12px;font-weight:600">Capability declarations</div>
       <div style="margin-top:6px"><label style="font-size:12px;color:var(--text2);display:flex;gap:6px;align-items:center">
@@ -5093,6 +5138,10 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
             <label style="font-size:12px;color:var(--text2)">Default offload layers<br>
               <input data-model-offload-default="${esc(m.id)}" type="text" inputmode="numeric" value="${esc(offload.def)}" placeholder="16" style="${SELECT_STYLE};width:110px"${offload.moe ? "" : " disabled"}></label>
           </div>`}
+      ${m.moe_reconcile ? `<div style="font-size:12px;color:var(--text2);margin-top:8px">MoE layers — Declared: ${m.moe_reconcile.declared} · File: ${m.moe_reconcile.file} <button class="btn" data-model-act="offload-use-file" data-model-id="${esc(m.id)}" data-file-layers="${m.moe_reconcile.file}" style="padding:2px 8px;font-size:11px">Use file value</button></div>` : ""}
+      ${m.file_nextn && !mtpPinned && !effMtp ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">MTP — File: head present <button class="btn" data-model-act="mtp-use-file" data-model-id="${esc(m.id)}" style="padding:2px 8px;font-size:11px">Declare MTP</button></div>` : ""}
+      ${hfSource && !(catalogPinned && mtpPinned) ? `<div style="margin-top:8px"><button class="btn" data-model-act="hf-refresh" data-model-id="${esc(m.id)}">${icon("search")} Refresh from Hugging Face</button></div>` : ""}
+      ${hfRefetchHtml}
       ${catalogPinned && mtpPinned
         ? `<div class="card-actions"><button class="btn icon-only" data-model-act="offload-cancel" data-model-id="${esc(m.id)}" title="Close" aria-label="Close">${icon("x")}</button></div>`
         : `<div class="card-actions"><button class="btn" data-model-act="offload-save" data-model-id="${esc(m.id)}">${icon("check")} Save declaration</button>
@@ -5163,33 +5212,42 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
  *  so a successful submit clears and hides the form by emptying
  *  the host; the page's pre-open state is the topbar button. */
 function modelAddFormHtml(): string {
-  return `<div class="card"><h3>${icon("box")} Add a model<span class="info-tip" title="The model is added enabled, with no pinned SHA-256 — its downloads run unverified until a hash is recorded in the configuration.">${icon("info")}</span></h3>
+  return `<div class="card"><h3>${icon("box")} Add a model<span class="info-tip" title="The model is added enabled. A model picked from Hugging Face starts pinned to the picked file's SHA-256; a manually entered model has no pinned SHA-256 — its downloads run unverified until a hash is recorded in the configuration.">${icon("info")}</span></h3>
+    <div style="display:grid;grid-template-columns:1fr auto;gap:10px;margin-top:10px;align-items:end">
+      <label style="font-size:12px;color:var(--text2)">Model name<br>
+        <span style="position:relative;display:block">
+          <input id="addModelName" type="text" placeholder="qwen3 coder" autocomplete="off" style="${SELECT_STYLE};width:100%">
+          <span id="addModelSuggest" style="display:none;position:absolute;left:0;right:0;top:100%;z-index:30;max-height:264px;overflow-y:auto;background:var(--panel);border:1px solid var(--border);border-radius:6px"></span>
+        </span></label>
+      <button class="btn" id="addModelLookupBtn">${icon("search")} Look up</button>
+    </div>
+    <div id="addModelPick"></div>
     <div style="display:grid;grid-template-columns:1fr 2fr;gap:10px;margin-top:10px">
-      <label style="font-size:12px;color:var(--text2)">Model id<br>
+      <label style="font-size:12px;color:var(--text2)">Model id <span id="addModelIdSrc"></span><br>
         <input id="addModelId" type="text" placeholder="my-model-7b" style="${SELECT_STYLE};width:100%"></label>
-      <label style="font-size:12px;color:var(--text2)">Source URL<br>
+      <label style="font-size:12px;color:var(--text2)">Source URL <span id="addModelUrlSrc"></span><br>
         <input id="addModelUrl" type="text" placeholder="Model download URL (.gguf)" style="${SELECT_STYLE};width:100%"></label>
     </div>
     <div style="margin-top:10px"><button class="btn" id="addModelOptToggle" aria-expanded="false" title="Optional fields" aria-label="Optional fields" style="padding:2px 8px;font-size:11px">${icon("chevR")}</button></div>
     <div id="addModelOptional" style="display:none">
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px">
-        <label style="font-size:12px;color:var(--text2)">Quant<br>
+        <label style="font-size:12px;color:var(--text2)">Quant <span id="addModelQuantSrc"></span><br>
           <input id="addModelQuant" type="text" placeholder="Q4_K_M" style="${SELECT_STYLE};width:100%"></label>
-        <label style="font-size:12px;color:var(--text2)">File name<span class="info-tip" title="Defaults to the URL's file name.">${icon("info")}</span><br>
+        <label style="font-size:12px;color:var(--text2)">File name <span id="addModelFileSrc"></span><span class="info-tip" title="Defaults to the URL's file name.">${icon("info")}</span><br>
           <input id="addModelFile" type="text" placeholder="model.gguf" style="${SELECT_STYLE};width:100%"></label>
-        <label style="font-size:12px;color:var(--text2)">Parameters (B)<span class="info-tip" title="Total parameter count in billions (e.g. 80 for an 80B model — for a mixture-of-experts model, the total, not the active count). Required for models outside the curated catalog: the count feeds memory-fit estimation and is never re-derived later.">${icon("info")}</span><br>
+        <label style="font-size:12px;color:var(--text2)">Parameters (B) <span id="addModelParamsSrc"></span><span class="info-tip" title="Total parameter count in billions (e.g. 80 for an 80B model — for a mixture-of-experts model, the total, not the active count). Required for models outside the curated catalog: the count feeds memory-fit estimation and is never re-derived later.">${icon("info")}</span><br>
           <input id="addModelParams" type="text" inputmode="decimal" placeholder="80" style="${SELECT_STYLE};width:100%"></label>
       </div>
       <div style="display:flex;gap:16px;margin-top:10px">
         <label style="font-size:12px;color:var(--text2);display:flex;gap:6px;align-items:center">
-          <input id="addModelMtp" type="checkbox"> MTP capable<span class="info-tip" title="The model's GGUF carries an MTP (multi-token prediction) head. Declaring it gives the model's backends the MTP draft control.">${icon("info")}</span></label>
+          <input id="addModelMtp" type="checkbox"> MTP capable <span id="addModelMtpSrc"></span><span class="info-tip" title="The model's GGUF carries an MTP (multi-token prediction) head. Declaring it gives the model's backends the MTP draft control.">${icon("info")}</span></label>
         <label style="font-size:12px;color:var(--text2);display:flex;gap:6px;align-items:center">
-          <input id="addModelMoe" type="checkbox"> MoE</label>
+          <input id="addModelMoe" type="checkbox"> MoE <span id="addModelMoeSrc"></span></label>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px">
-        <label style="font-size:12px;color:var(--text2)">MoE layers<span class="info-tip" title="For a mixture-of-experts (MoE) model: the number of layers carrying routed experts. Declaring this and the default offload gives the model's backends expert-offload controls — a new backend starts at the default offload and the Edit Flags slider ranges over these layers.">${icon("info")}</span><br>
+        <label style="font-size:12px;color:var(--text2)">MoE layers <span id="addModelMoeLayersSrc"></span><span class="info-tip" title="For a mixture-of-experts (MoE) model: the number of layers carrying routed experts. Declaring this and the default offload gives the model's backends expert-offload controls — a new backend starts at the default offload and the Edit Flags slider ranges over these layers.">${icon("info")}</span><br>
           <input id="addModelMoeLayers" type="text" inputmode="numeric" placeholder="48" style="${SELECT_STYLE};width:100%" disabled></label>
-        <label style="font-size:12px;color:var(--text2)">Default offload layers<span class="info-tip" title="How many MoE layers a new backend for this model offloads to system RAM by default (0 to the MoE layer count; the full count is full expert offload).">${icon("info")}</span><br>
+        <label style="font-size:12px;color:var(--text2)">Default offload layers <span id="addModelMoeDefaultSrc"></span><span class="info-tip" title="How many MoE layers a new backend for this model offloads to system RAM by default (0 to the MoE layer count; the full count is full expert offload).">${icon("info")}</span><br>
           <input id="addModelMoeDefault" type="text" inputmode="numeric" placeholder="16" style="${SELECT_STYLE};width:100%" disabled></label>
       </div>
     </div>
@@ -5227,6 +5285,10 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
   let offloadDraftDefault = "";
   let offloadDraftMoe = false;
   let offloadDraftMtp = false;
+  /** Last Hugging Face re-fetch result per model (P2-D8):
+   *  the declaration editor renders its proposals from this
+   *  until the view is left. */
+  const hfRefetchResults = new Map<string, HfHeaderResult>();
   const syncOffloadDraft = (ev: Event): void => {
     const t = ev.target as HTMLElement;
     if (t.hasAttribute("data-model-offload-layers") && t.getAttribute("data-model-offload-layers") === offloadFor) {
@@ -5341,7 +5403,7 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       || (offloadFor !== null && (!!active?.hasAttribute?.("data-model-offload-layers") || !!active?.hasAttribute?.("data-model-offload-default")));
     if (!formFocused) {
       if (mov) mov.innerHTML = modelOverviewHtml(lastRows, modelStats);
-      b.innerHTML = `<div class="cards-fluid">${lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id), renameFor === m.id ? { draft: renameDraft } : null, openModelDetails.has(m.id), offloadFor === m.id ? { layers: offloadDraftLayers, def: offloadDraftDefault, moe: offloadDraftMoe, mtp: offloadDraftMtp } : null)).join("")}</div>`;
+      b.innerHTML = `<div class="cards-fluid">${lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id), renameFor === m.id ? { draft: renameDraft } : null, openModelDetails.has(m.id), offloadFor === m.id ? { layers: offloadDraftLayers, def: offloadDraftDefault, moe: offloadDraftMoe, mtp: offloadDraftMtp } : null, hfRefetchResults.get(m.id) ?? null)).join("")}</div>`;
     }
     syncPoll();
   };
@@ -5490,6 +5552,54 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       return;
     }
 
+    if (act === "offload-use-file") {
+      // "Use file value" (P2-D7): the file's parsed MoE layer
+      // count fills the editor's layers field — a proposal in
+      // the form, persisted by Save declaration through
+      // model_set_offload_spec like any other edit. If the
+      // stored default exceeds the corrected count, Save's
+      // validation refuses and the operator adjusts the
+      // default in this same editor; nothing clamps silently.
+      const fileLayers = t.getAttribute("data-file-layers");
+      if (fileLayers) {
+        offloadDraftLayers = fileLayers;
+        offloadDraftMoe = true;
+      }
+      await load();
+      return;
+    }
+
+    if (act === "mtp-use-file") {
+      (t as HTMLButtonElement).disabled = true;
+      const r = await modelSetMtp(id, true);
+      if (r.error) {
+        notes.set(id, { text: `Declaration failed: ${r.error}`, err: true });
+      } else {
+        notes.set(id, { text: "MTP declared capable from the file's header: this model's backends gain the MTP draft control.", err: false });
+      }
+      await load();
+      return;
+    }
+
+    if (act === "hf-refresh") {
+      // Re-fetch (P2-D8): re-read this model's repo record
+      // and file header from Hugging Face and hold the
+      // result for the editor's proposal lines. Nothing is
+      // written here — proposals apply per field.
+      const row = lastRows.find((m) => m.id === id);
+      const src = row ? parseHfSourceUrl(row.source_url) : null;
+      if (!row || !src) return;
+      (t as HTMLButtonElement).disabled = true;
+      const r = await modelHfHeader(src.repo, src.file);
+      if (r.error || !r.live) {
+        notes.set(id, { text: `Refresh failed: ${r.error ?? "the re-fetch runs in the installed app."}`, err: true });
+      } else {
+        hfRefetchResults.set(id, r.data);
+      }
+      await load();
+      return;
+    }
+
     if (act === "offload-save") {
       (t as HTMLButtonElement).disabled = true;
       const row = lastRows.find((m) => m.id === id);
@@ -5602,6 +5712,258 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       (addModelHost.querySelector("#addModelMoeLayers") as HTMLInputElement | null)?.toggleAttribute("disabled", !on);
       (addModelHost.querySelector("#addModelMoeDefault") as HTMLInputElement | null)?.toggleAttribute("disabled", !on);
     });
+
+    /* ---- Hugging Face lookup, two-step pick, and prefill
+     * (deep-discovery design Part 2). The lookup is a form
+     * aid only: every field stays manually editable, and a
+     * failed or empty lookup leaves manual entry untouched.
+     * Prefill writes only into empty fields and fields still
+     * holding an unedited prefill (P2.8 rule 2); each
+     * prefilled field carries its source chip beside the
+     * label (principle 11), cleared when the operator edits
+     * the field. Nothing is stored until Create model. ---- */
+    const pickHost = addModelHost.querySelector("#addModelPick") as HTMLElement | null;
+    const nameInput = addModelHost.querySelector("#addModelName") as HTMLInputElement | null;
+    const suggestHost = addModelHost.querySelector("#addModelSuggest") as HTMLElement | null;
+    interface HfPickState { repoId: string; file: string; url: string; fileName: string; sha256: string | null }
+    let hfPick: HfPickState | null = null;
+    let lastLookup: HfLookupRepo[] = [];
+    let expandedRepo: string | null = null;
+    const prefilled = new Set<string>();
+    const fieldOf = (sel: string): HTMLInputElement | null => addModelHost.querySelector(sel) as HTMLInputElement | null;
+    const setChip = (key: string, text: string | null): void => {
+      const slot = addModelHost.querySelector(`#addModel${key}Src`) as HTMLElement | null;
+      if (slot) slot.innerHTML = text ? `<span class="chip">${esc(text)}</span>` : "";
+    };
+    const setPrefill = (sel: string, key: string, value: string, chip: string): void => {
+      const el = fieldOf(sel);
+      if (!el) return;
+      if (el.value.trim() !== "" && !prefilled.has(key)) return;
+      el.value = value;
+      prefilled.add(key);
+      setChip(key, chip);
+    };
+    const watchEdit = (sel: string, key: string): void => {
+      fieldOf(sel)?.addEventListener("input", () => { prefilled.delete(key); setChip(key, null); });
+    };
+    watchEdit("#addModelId", "Id");
+    watchEdit("#addModelUrl", "Url");
+    watchEdit("#addModelQuant", "Quant");
+    watchEdit("#addModelFile", "File");
+    watchEdit("#addModelParams", "Params");
+    watchEdit("#addModelMoeLayers", "MoeLayers");
+    watchEdit("#addModelMoeDefault", "MoeDefault");
+    fieldOf("#addModelMtp")?.addEventListener("change", () => setChip("Mtp", null));
+    addMoeCheck?.addEventListener("change", () => setChip("Moe", null));
+    const setOptionalOpen = (open: boolean): void => {
+      const box = addModelHost.querySelector("#addModelOptional") as HTMLElement | null;
+      if (!box) return;
+      box.style.display = open ? "" : "none";
+      optToggle?.setAttribute("aria-expanded", String(open));
+      if (optToggle) optToggle.innerHTML = icon(open ? "chevD" : "chevR");
+    };
+    const fitLabel = (fit: string): string => fit === "fits" ? "Fits" : fit === "fits_with_split" ? "Fits with split" : fit === "does_not_fit" ? "Does not fit" : "";
+    const quantRowHtml = (r: HfLookupRepo, q: HfLookupQuant): string => {
+      const fit = fitLabel(q.fit);
+      return `<div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">
+        <button class="btn" data-hf-quant="${esc(q.file)}" data-hf-repo="${esc(r.repo_id)}">${icon("check")} Pick</button>
+        <span style="font-size:12px;color:var(--text2)">File: ${esc(q.file)} · Size: ${esc(fmtBytes(q.size_bytes))}${fit ? ` · Fit: ${fit}` : ""}</span>
+      </div>`;
+    };
+    const renderPickList = (): void => {
+      if (!pickHost) return;
+      pickHost.innerHTML = lastLookup.map((r) => {
+        const facts = [
+          r.params_b != null ? `Params: ${trim1(r.params_b)}B` : "",
+          r.architecture ? `Architecture: ${esc(r.architecture)}` : "",
+          r.ctx_max != null ? `Rated context: ${fmtCount(r.ctx_max)}` : "",
+          `Downloads: ${fmtCount(r.downloads)}`,
+        ].filter(Boolean).join(" · ");
+        const open = expandedRepo === r.repo_id;
+        return `<div style="border:1px solid var(--border);border-radius:6px;padding:8px;margin-top:8px">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <span style="font-size:12px;color:var(--text2)">Repo:</span>
+            <button class="btn" data-hf-repo="${esc(r.repo_id)}" style="font-family:var(--mono);font-size:12px">${icon(open ? "chevD" : "chevR")} ${esc(r.repo_id)}</button>
+            ${r.catalog_model_id ? `<span class="chip">Catalog</span>` : ""}
+            <span style="font-size:12px;color:var(--text2)">${facts}</span>
+          </div>
+          ${open ? r.quants.map((q) => quantRowHtml(r, q)).join("") : ""}
+        </div>`;
+      }).join("");
+    };
+    const renderPickSummary = (note: string): void => {
+      if (!pickHost || !hfPick) return;
+      pickHost.innerHTML = `<div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+          <span style="font-size:12px;color:var(--text2)">Repo: ${esc(hfPick.repoId)} · File: ${esc(hfPick.file)}</span>
+          <button class="btn" id="addModelPickChange" style="padding:2px 8px;font-size:11px">Change</button>
+        </div>
+        ${note ? `<div style="font-size:12px;color:var(--text2);margin-top:4px">${esc(note)}</div>` : ""}`;
+      pickHost.querySelector("#addModelPickChange")?.addEventListener("click", () => {
+        expandedRepo = hfPick?.repoId ?? null;
+        renderPickList();
+      });
+    };
+    const applyPick = async (repo: HfLookupRepo, q: HfLookupQuant): Promise<void> => {
+      const url = q.source_url;
+      const fileName = q.file.split("/").pop() ?? q.file;
+      hfPick = { repoId: repo.repo_id, file: q.file, url, fileName, sha256: q.shard_count === 1 ? q.sha256 : null };
+      setPrefill("#addModelId", "Id", q.id_slug, "Hugging Face");
+      setPrefill("#addModelUrl", "Url", url, "Hugging Face");
+      setOptionalOpen(true);
+      setPrefill("#addModelFile", "File", fileName, "Hugging Face");
+      if (q.quant) setPrefill("#addModelQuant", "Quant", q.quant, "Hugging Face");
+      if (repo.params_b != null) setPrefill("#addModelParams", "Params", trim1(repo.params_b), "Hugging Face");
+      renderPickSummary("");
+      // The pick-time header read (P2-D4): geometry and the
+      // MTP signal prefill the capability declarations as
+      // proposals. Any failure leaves the form as the record
+      // prefill left it — the add is never blocked by it.
+      const hr = await modelHfHeader(repo.repo_id, q.file);
+      if (!hr.live || hr.error || !hr.data.header) {
+        renderPickSummary("File header not read — MoE/MTP not prefilled.");
+        return;
+      }
+      if (hr.data.catalog) {
+        // A catalog file's pins govern; no fetched value is
+        // prefilled over them (§P2.8 rule 1).
+        renderPickSummary("Catalog model — its figures come from the curated catalog.");
+        return;
+      }
+      const hdr = hr.data.header;
+      let note = "";
+      if (hdr.moe_layers != null) {
+        const moeBox = fieldOf("#addModelMoe");
+        if (moeBox && !moeBox.checked) {
+          moeBox.checked = true;
+          setChip("Moe", "File header");
+        }
+        fieldOf("#addModelMoeLayers")?.toggleAttribute("disabled", false);
+        fieldOf("#addModelMoeDefault")?.toggleAttribute("disabled", false);
+        setPrefill("#addModelMoeLayers", "MoeLayers", String(hdr.moe_layers), "File header");
+        if (hdr.suggested_default_offload_layers != null) {
+          setPrefill("#addModelMoeDefault", "MoeDefault", String(hdr.suggested_default_offload_layers), "Suggested");
+        }
+        if (hdr.needs_split) note = "Needs a tensor split to fit one GPU.";
+      }
+      if (hdr.mtp) {
+        const mtpBox = fieldOf("#addModelMtp");
+        if (mtpBox && !mtpBox.checked) {
+          mtpBox.checked = true;
+          setChip("Mtp", "File header");
+        }
+      }
+      renderPickSummary(note);
+    };
+    const runLookup = async (query: string, expandRepo?: string): Promise<void> => {
+      if (!pickHost) return;
+      if (!isTauri()) {
+        pickHost.innerHTML = `<div style="font-size:12px;color:var(--text2);margin-top:8px">Sample mode: the Hugging Face lookup runs in the installed app.</div>`;
+        return;
+      }
+      pickHost.innerHTML = `<div style="font-size:12px;color:var(--text2);margin-top:8px">Looking up…</div>`;
+      const r = await modelHfLookup(query);
+      if (r.error) {
+        pickHost.innerHTML = `<div style="font-size:12px;color:var(--err);margin-top:8px">Lookup failed: ${esc(r.error)}</div>`;
+        return;
+      }
+      lastLookup = r.data.repos;
+      expandedRepo = expandRepo ?? (lastLookup.length === 1 ? lastLookup[0].repo_id : null);
+      if (!lastLookup.length) {
+        pickHost.innerHTML = `<div style="font-size:12px;color:var(--text2);margin-top:8px">No repositories matched.</div>`;
+        return;
+      }
+      renderPickList();
+    };
+    addModelHost.querySelector("#addModelLookupBtn")?.addEventListener("click", () => {
+      const q = nameInput?.value.trim() ?? "";
+      if (!q) {
+        if (pickHost) pickHost.innerHTML = `<div style="font-size:12px;color:var(--err);margin-top:8px">Enter a model name to look up.</div>`;
+        return;
+      }
+      hideSuggest();
+      void runLookup(q);
+    });
+    pickHost?.addEventListener("click", (ev) => {
+      const t = ev.target as HTMLElement;
+      const quantBtn = t.closest("[data-hf-quant]") as HTMLElement | null;
+      if (quantBtn) {
+        const repo = lastLookup.find((r) => r.repo_id === quantBtn.getAttribute("data-hf-repo"));
+        const q = repo?.quants.find((x) => x.file === quantBtn.getAttribute("data-hf-quant"));
+        if (repo && q) void applyPick(repo, q);
+        return;
+      }
+      const repoBtn = t.closest("[data-hf-repo]") as HTMLElement | null;
+      if (repoBtn) {
+        const rid = repoBtn.getAttribute("data-hf-repo");
+        expandedRepo = expandedRepo === rid ? null : rid;
+        renderPickList();
+      }
+    });
+    /* Type-ahead on the name field: repo-name suggestions
+     * from the same shallow search the lookup runs (P2-D2
+     * depth), one search per 300 ms debounce window.
+     * Selecting a suggestion — pointer or keyboard — runs
+     * the full lookup for that repo. No results or a failed
+     * search simply show no dropdown; typing is never
+     * interrupted. */
+    let suggestTimer: number | null = null;
+    let suggestSeq = 0;
+    let suggestActive = -1;
+    let suggestRepos: { repo_id: string; downloads: number }[] = [];
+    const hideSuggest = (): void => {
+      if (suggestHost) suggestHost.style.display = "none";
+      suggestActive = -1;
+    };
+    const renderSuggest = (): void => {
+      if (!suggestHost) return;
+      if (!suggestRepos.length) { hideSuggest(); return; }
+      suggestHost.innerHTML = suggestRepos.map((r, i) => `<div data-hf-suggest="${esc(r.repo_id)}" style="padding:6px 8px;font-size:12px;cursor:pointer;${i === suggestActive ? "background:var(--border)" : ""}"><span style="font-family:var(--mono)">${esc(r.repo_id)}</span> <span style="color:var(--text2)">· Downloads: ${fmtCount(r.downloads)}</span></div>`).join("");
+      suggestHost.style.display = "";
+    };
+    const chooseSuggest = (repoId: string): void => {
+      if (nameInput) nameInput.value = repoId;
+      hideSuggest();
+      void runLookup(repoId, repoId);
+    };
+    nameInput?.addEventListener("input", () => {
+      if (suggestTimer !== null) window.clearTimeout(suggestTimer);
+      const q = nameInput.value.trim();
+      if (q.length < 2 || !isTauri()) { suggestRepos = []; hideSuggest(); return; }
+      suggestTimer = window.setTimeout(async () => {
+        const seq = ++suggestSeq;
+        const r = await modelHfSuggest(q);
+        if (seq !== suggestSeq) return;
+        if (r.error || !r.live) { suggestRepos = []; hideSuggest(); return; }
+        suggestRepos = r.data.repos;
+        suggestActive = -1;
+        renderSuggest();
+      }, 300);
+    });
+    nameInput?.addEventListener("keydown", (ev) => {
+      if (!suggestRepos.length || (suggestHost && suggestHost.style.display === "none")) return;
+      if (ev.key === "ArrowDown") {
+        ev.preventDefault();
+        suggestActive = Math.min(suggestActive + 1, suggestRepos.length - 1);
+        renderSuggest();
+      } else if (ev.key === "ArrowUp") {
+        ev.preventDefault();
+        suggestActive = Math.max(suggestActive - 1, 0);
+        renderSuggest();
+      } else if (ev.key === "Enter" && suggestActive >= 0) {
+        ev.preventDefault();
+        chooseSuggest(suggestRepos[suggestActive].repo_id);
+      } else if (ev.key === "Escape") {
+        hideSuggest();
+      }
+    });
+    suggestHost?.addEventListener("mousedown", (ev) => {
+      const row = (ev.target as HTMLElement).closest("[data-hf-suggest]") as HTMLElement | null;
+      if (row) {
+        ev.preventDefault();
+        chooseSuggest(row.getAttribute("data-hf-suggest") ?? "");
+      }
+    });
+    nameInput?.addEventListener("blur", () => { window.setTimeout(hideSuggest, 150); });
     const addBtn = addModelHost.querySelector("#addModelBtn") as HTMLButtonElement | null;
     addBtn?.addEventListener("click", async () => {
       const msg = addModelHost.querySelector("#addModelMsg") as HTMLElement | null;
@@ -5643,8 +6005,17 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
         moeDefault = d;
       }
       const mtpChecked = (addModelHost.querySelector("#addModelMtp") as HTMLInputElement | null)?.checked ?? false;
+      // A pick's hash pins the add only while the form still
+      // names the picked file at the picked URL (P2-D6): an
+      // operator who redirected the form at another model
+      // must not inherit the pick's pin.
+      const fileVal = val("#addModelFile");
+      let pickSha: string | undefined;
+      if (hfPick && hfPick.sha256 && url === hfPick.url && (!fileVal || fileVal === hfPick.fileName)) {
+        pickSha = hfPick.sha256;
+      }
       addBtn.disabled = true;
-      const r = await modelAdd(id, url, val("#addModelFile") || undefined, val("#addModelQuant") || undefined, paramsB, moeLayers, moeDefault, mtpChecked ? true : undefined);
+      const r = await modelAdd(id, url, fileVal || undefined, val("#addModelQuant") || undefined, paramsB, moeLayers, moeDefault, mtpChecked ? true : undefined, pickSha);
       addBtn.disabled = false;
       if (r.error) {
         // Failure: the form stays open with the operator's input
