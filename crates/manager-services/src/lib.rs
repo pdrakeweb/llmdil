@@ -258,6 +258,77 @@ pub fn gateway_definition(
     }
 }
 
+/// Service name of the Prometheus-local log receiver
+/// (`crates/manager-logreceiver`; design:
+/// DESIGN-prometheus-local.md, Oct 2026).
+pub const LOG_RECEIVER_SERVICE_NAME: &str = "llm-log-receiver";
+
+/// The log receiver's directory under the data dir: its SQLite
+/// store, its token files, and its service log files live here.
+pub fn log_receiver_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("log-receiver")
+}
+
+/// Build the definition for the log receiver service.
+///
+/// Unlike backends and the gateway, the receiver is **automatic**
+/// start and runs as `NT AUTHORITY\LocalService`: it must be up
+/// before and independently of the app (Muse reads stored logs
+/// while LLMdil is down, including logs from the run that crashed),
+/// and it needs write access to its own directory and nothing else.
+/// All of its configuration travels as literal env entries pointing
+/// at token *files* in [`log_receiver_dir`] — token values are never
+/// in the definition (the shipper's ingest token keeps its existing
+/// Credential Manager home on the app side; the service account
+/// cannot read the operator's credential store, so the receiver's
+/// copies are ACL'd files, seeded once by the deploy script).
+/// Failure actions are the design's: restart 5 s / 30 s / 5 min,
+/// counter reset after 24 h — SCM recovery replaces the retired
+/// VM-side watchdog's repair role.
+pub fn log_receiver_definition(data_dir: &Path, receiver_exe: &Path) -> ServiceDefinition {
+    let dir = log_receiver_dir(data_dir);
+    ServiceDefinition {
+        version: DEFINITION_VERSION,
+        name: LOG_RECEIVER_SERVICE_NAME.to_string(),
+        display_name: "LLMdil Log Receiver".to_string(),
+        description: "Self-hosted ingest + store for LLMdil log streaming. \
+                      Ingest on 127.0.0.1:8473; reads on the machine's tailnet \
+                      address only (port 8474, token-gated)."
+            .to_string(),
+        program: receiver_exe.to_path_buf(),
+        args: Vec::new(),
+        env: vec![
+            EnvEntry::literal(
+                "LLMDIL_LOG_RECEIVER_DB",
+                dir.join("llmdil-logs.db").to_string_lossy().into_owned(),
+            ),
+            EnvEntry::literal(
+                "LLMDIL_LOG_INGEST_TOKEN_FILE",
+                dir.join("ingest-tokens.txt").to_string_lossy().into_owned(),
+            ),
+            EnvEntry::literal(
+                "LLMDIL_LOG_READ_TOKEN_FILE",
+                dir.join("read-token.txt").to_string_lossy().into_owned(),
+            ),
+            EnvEntry::literal("LLMDIL_LOG_READ_PORT", "8474".to_string()),
+            EnvEntry::literal("LLMDIL_LOG_RETENTION_DAYS", "14".to_string()),
+            EnvEntry::literal("LLMDIL_LOG_RETENTION_CAP_MIB", "512".to_string()),
+        ],
+        workdir: Some(dir.clone()),
+        stdout_log: Some(dir.join("logs").join("receiver.stdout.log")),
+        stderr_log: Some(dir.join("logs").join("receiver.stderr.log")),
+        pid_file: None,
+        account: Some("NT AUTHORITY\\LocalService".to_string()),
+        start_mode: ServiceStartMode::Automatic,
+        failure_actions: FailureActions {
+            first_delay_secs: 5,
+            second_delay_secs: 30,
+            subsequent_delay_secs: 300,
+            reset_period_secs: 86_400,
+        },
+    }
+}
+
 /// Quote one argument for a Windows command line (the
 /// `CommandLineToArgvW` rules: quote when the value contains spaces,
 /// quotes, or a trailing backslash; double embedded quotes and the
@@ -654,6 +725,46 @@ mod tests {
         let back = read_definition(&path).expect("read");
         assert_eq!(back, def);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_receiver_definition_is_automatic_local_service() {
+        let data_dir = Path::new(r"C:\Users\pete\AppData\Roaming\local-llm-service-manager");
+        let exe = Path::new(r"C:\Users\pete\AppData\Local\LLMdil\llmdil-log-receiver.exe");
+        let def = log_receiver_definition(data_dir, exe);
+        assert_eq!(def.name, LOG_RECEIVER_SERVICE_NAME);
+        assert_eq!(def.name, "llm-log-receiver");
+        assert_eq!(def.program, exe.to_path_buf());
+        assert_eq!(def.start_mode, ServiceStartMode::Automatic);
+        assert_eq!(def.account.as_deref(), Some("NT AUTHORITY\\LocalService"));
+        assert_eq!(def.failure_actions.first_delay_secs, 5);
+        assert_eq!(def.failure_actions.second_delay_secs, 30);
+        assert_eq!(def.failure_actions.subsequent_delay_secs, 300);
+        assert_eq!(def.failure_actions.reset_period_secs, 86_400);
+        let lr = data_dir.join("log-receiver");
+        assert_eq!(def.workdir, Some(lr.clone()));
+        assert_eq!(
+            def.stdout_log,
+            Some(lr.join("logs").join("receiver.stdout.log"))
+        );
+        // Env points at files under the receiver dir; no token value
+        // (and no credential reference) ever appears in a definition.
+        let env: Vec<(&str, &str)> = def
+            .env
+            .iter()
+            .map(|e| match &e.value {
+                EnvValue::Literal { value } => (e.name.as_str(), value.as_str()),
+                other => panic!("receiver env must be literals, got {other:?}"),
+            })
+            .collect();
+        let expected_db = lr.join("llmdil-logs.db").to_string_lossy().into_owned();
+        assert!(env.contains(&("LLMDIL_LOG_RECEIVER_DB", expected_db.as_str())));
+        assert!(env.contains(&("LLMDIL_LOG_READ_PORT", "8474")));
+        assert!(env.contains(&("LLMDIL_LOG_RETENTION_CAP_MIB", "512")));
+        let json = serde_json::to_string(&def).expect("serialize");
+        assert!(!json.contains("Bearer"));
+        let back: ServiceDefinition = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back, def);
     }
 
     #[test]
