@@ -377,6 +377,11 @@ pub struct CacheFitInputs {
     /// Recurrent-state cache MiB at the effective slot count,
     /// when the model's geometry is known.
     pub rs_mib: Option<u64>,
+    /// MoE expert cache MiB (`--moe-cache-mib`) the backend
+    /// reserves: a constant addend to every rung's total (it
+    /// does not vary with the cache selection being priced).
+    /// 0 for backends that set no expert cache.
+    pub moe_cache_mib: u64,
     /// The context size the KV cache is priced at, in tokens.
     /// This is the per-slot context the requirement model prices
     /// (llama.cpp's unified KV cache holds the full context once,
@@ -494,7 +499,8 @@ pub fn price_ladder(inputs: &CacheFitInputs) -> Vec<CacheRung> {
             let total_mib = inputs
                 .gpu_weights_mib
                 .saturating_add(kv_mib)
-                .saturating_add(inputs.rs_mib.unwrap_or(0));
+                .saturating_add(inputs.rs_mib.unwrap_or(0))
+                .saturating_add(inputs.moe_cache_mib);
             CacheRung {
                 selection: *selection,
                 kv_mib,
@@ -738,6 +744,7 @@ mod tests {
             },
             gpu_weights_mib: req.gpu_weights_mib,
             rs_mib: req.rs_mib,
+            moe_cache_mib: 0,
             n_ctx,
             split: Vec::new(),
             gpu_total_mib: vec![16_384],
