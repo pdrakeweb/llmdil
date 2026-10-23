@@ -20,6 +20,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ahash"
+version = "0.8.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+dependencies = [
+ "cfg-if",
+ "once_cell",
+ "version_check",
+ "zerocopy",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -453,6 +465,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fallible-iterator"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+
+[[package]]
+name = "fallible-streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -601,9 +625,27 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+dependencies = [
+ "ahash",
+]
+
+[[package]]
+name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
+name = "hashlink"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
+dependencies = [
+ "hashbrown 0.14.5",
+]
 
 [[package]]
 name = "hmac"
@@ -854,7 +896,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
- "hashbrown",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -921,6 +963,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
+name = "libsqlite3-sys"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -976,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "manager-api"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1003,10 +1056,9 @@ dependencies = [
 
 [[package]]
 name = "manager-app"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "chrono",
- "manager-bench",
  "manager-config",
  "manager-gateway",
  "manager-logship",
@@ -1029,18 +1081,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "manager-bench"
-version = "0.1.51"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "manager-config"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "chrono",
  "serde",
@@ -1051,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "manager-gateway"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "chrono",
  "manager-config",
@@ -1063,8 +1105,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "manager-logreceiver"
+version = "0.1.50"
+dependencies = [
+ "axum",
+ "chrono",
+ "flate2",
+ "manager-services",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "manager-logship"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "chrono",
  "flate2",
@@ -1079,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "manager-mcp"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "manager-config",
  "manager-supervisor",
@@ -1091,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "manager-models"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "chrono",
  "manager-config",
@@ -1105,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "manager-mxc"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "chrono",
  "serde",
@@ -1115,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "manager-optimize"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "chrono",
  "manager-config",
@@ -1130,11 +1188,11 @@ dependencies = [
 
 [[package]]
 name = "manager-present"
-version = "0.1.51"
+version = "0.1.50"
 
 [[package]]
 name = "manager-services"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "manager-supervisor",
  "serde",
@@ -1145,7 +1203,7 @@ dependencies = [
 
 [[package]]
 name = "manager-supervisor"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1161,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "manager-telemetry"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1176,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "manager-winml"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1190,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "manager-wizard"
-version = "0.1.51"
+version = "0.1.50"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1623,6 +1681,20 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e"
+dependencies = [
+ "bitflags",
+ "fallible-iterator",
+ "fallible-streaming-iterator",
+ "hashlink",
+ "libsqlite3-sys",
+ "smallvec",
 ]
 
 [[package]]
@@ -2212,6 +2284,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2559,6 +2637,26 @@ dependencies = [
  "quote",
  "syn 3.0.6",
  "synstructure 0.14.0",
+]
+
+[[package]]
+name = "zerocopy"
+version = "0.8.63"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5fe1f8f1b06191a00962174c61aa5005e0bb391a6d80d07e24d115c01a92ed8"
+dependencies = [
+ "zerocopy-derive",
+]
+
+[[package]]
+name = "zerocopy-derive"
+version = "0.8.63"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "863ad3ac83293fb4d740aedbfdc9240dd8d1a50c1099acd76ce80ce7c7230c7f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
