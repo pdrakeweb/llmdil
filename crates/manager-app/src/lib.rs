@@ -1407,6 +1407,7 @@ async fn ensure_catalog_models(state: &AppState) {
                 display_name: None,
                 moe_layers: None,
                 default_offload_layers: None,
+                mtp: None,
             }
         })
         .collect();
@@ -3602,6 +3603,15 @@ pub async fn op_list_models(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -
                 "default_offload_layers": m.default_offload_layers,
                 "catalog_moe_layers": catalog_offload.get(m.id.as_str()).and_then(|p| p.0),
                 "catalog_default_offload_layers": catalog_offload.get(m.id.as_str()).and_then(|p| p.1),
+                // The operator's MTP declaration on the model
+                // record, and the catalog's pin for the same fact
+                // (resolved by id or source URL, like the
+                // capability itself; null when the catalog knows
+                // neither). The Models view's capability editor
+                // reads the pair — the pin wins where it exists
+                // (see manager_models::effective_mtp).
+                "mtp": m.mtp,
+                "catalog_mtp": manager_models::catalog_mtp_pin(&m.id, &m.source_url),
             })
         })
         .collect();
@@ -7987,13 +7997,50 @@ pub async fn op_model_set_offload_spec(
     }))
 }
 
+/// Set or clear a model's operator MTP declaration — the
+/// declaration that gives a model the curated catalog does not
+/// carry the MTP draft control (backend Add/Edit and Edit Flags
+/// resolve the EFFECTIVE capability; see
+/// [`manager_models::effective_mtp`]). `None` clears the
+/// declaration. No validation beyond existence: a boolean
+/// declaration has no invalid state. Catalog models keep
+/// resolving from the catalog — a declaration stored on one is
+/// shadowed by the catalog pin, never an override. Clearing a
+/// declaration does not rewrite flags already on a backend (the
+/// offload declaration's precedent): spec tokens written while
+/// the model was declared capable stay until the operator edits
+/// them; the control itself disappears with the capability.
+pub async fn op_model_set_mtp(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    id: String,
+    mtp: Option<bool>,
+) -> ApiResult {
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    let m = new_cfg
+        .models
+        .iter_mut()
+        .find(|m| m.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("model {id}")))?;
+    m.mtp = mtp;
+    manager_config::save(&new_cfg, &state.config_path)?;
+    *cfg = new_cfg;
+    Ok(json!({
+        "id": id,
+        "mtp": mtp,
+    }))
+}
+
 /// Add a model to the registry: an id, the https URL of its GGUF file,
 /// and optionally an explicit file name, quant label, parameter
 /// count (see [`model_add_entry`] for how the count is resolved and
-/// when the add is refused), and a MoE declaration (the MoE layer
+/// when the add is refused), a MoE declaration (the MoE layer
 /// count plus the default offload layers — the pair that gives a
 /// model the curated catalog does not carry expert-offload
-/// controls; see [`manager_config::validate_moe_declaration`]).
+/// controls; see [`manager_config::validate_moe_declaration`]),
+/// and an MTP capability declaration (see
+/// [`manager_models::effective_mtp`]).
 /// The model starts enabled with no pinned SHA-256 — its downloads run unverified (the Models view shows
 /// "hash not pinned") until a hash is recorded in the configuration.
 #[allow(clippy::too_many_arguments)]
@@ -8007,6 +8054,7 @@ pub async fn op_model_add(
     params_b: Option<f32>,
     moe_layers: Option<u32>,
     default_offload_layers: Option<u32>,
+    mtp: Option<bool>,
 ) -> ApiResult {
     // Resolve everything before taking the config lock: a rejected
     // add must leave the in-memory config and the saved file
@@ -8022,6 +8070,7 @@ pub async fn op_model_add(
         params_b,
         moe_layers,
         default_offload_layers,
+        mtp,
     )?;
     let id = entry.id.clone();
     let mut cfg = state.config.write().await;
@@ -8744,14 +8793,16 @@ struct MtpInfo {
 }
 
 /// A backend's MTP control state, when its model is MTP-capable.
-/// Capability is a catalog pin resolved live by model id or
-/// source URL (see [`manager_models::catalog_mtp`]) — never
+/// Capability is the EFFECTIVE capability resolved live (see
+/// [`manager_models::effective_mtp`]): the curated catalog's pin
+/// where the catalog knows the model (by id or source URL), else
+/// the operator's declaration on the model record — never
 /// inferred from a model's name or file — so a backend whose
 /// capability is unknown gets no control rather than a
 /// speculative one.
 fn backend_mtp_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> Option<MtpInfo> {
     let model = model_for_backend(cfg, b)?;
-    if !manager_models::catalog_mtp(&model.id, &model.source_url) {
+    if !manager_models::effective_mtp(&model.id, &model.source_url, model.mtp) {
         return None;
     }
     let state = manager_models::mtp_draft(b.raw_flags.as_deref());
@@ -10751,6 +10802,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         };
         // Advanced: the assignment proceeds, but neither the
         // catalog raw-flags fill (the backend's blank flags would
@@ -10849,6 +10901,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         };
         let mut cfg = test_cfg();
         cfg.models.push(nemotron);
@@ -11247,6 +11300,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
     }
 
@@ -12037,6 +12091,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         let b = cfg
             .backends
@@ -12440,6 +12495,7 @@ mod tests {
             Some(27.0),
             Some(48),
             Some(16),
+            None,
         )
         .await
         .unwrap();
@@ -12631,12 +12687,209 @@ mod tests {
                 Some(9.0),
                 Some(48),
                 None,
+                None,
             )
             .await,
             Err(ApiError::InvalidInput(_))
         ));
         let saved = manager_config::load(&state.config_path).unwrap();
         assert!(!saved.models.iter().any(|m| m.id == "bad-moe"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn user_declared_mtp_model_round_trip() {
+        // A user-added model whose GGUF carries an MTP head the
+        // curated catalog does not know about, declared at add
+        // time — the declaration path that gives it the MTP
+        // draft control (backend_mtp_info / backend_set_mtp
+        // consume the EFFECTIVE capability).
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        let r = op_model_add(
+            &state,
+            &sink,
+            "qwen3.6-27b-mtp".to_string(),
+            "https://example.com/Qwen3.6-27B-mtp.gguf".to_string(),
+            None,
+            None,
+            Some(27.0),
+            None,
+            None,
+            Some(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["model_id"], "qwen3.6-27b-mtp");
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let m = saved
+            .models
+            .iter()
+            .find(|m| m.id == "qwen3.6-27b-mtp")
+            .unwrap();
+        assert_eq!(m.mtp, Some(true));
+        // The declaration is stored in the config file; the
+        // catalog pin field of the payload is null (the catalog
+        // knows neither the id nor the URL).
+        let text = std::fs::read_to_string(&state.config_path).unwrap();
+        assert!(text.contains("\"mtp\": true"), "{text}");
+        let listed = op_list_models(&state, &sink).await.unwrap();
+        let row = listed["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == "qwen3.6-27b-mtp")
+            .unwrap()
+            .clone();
+        assert_eq!(row["mtp"], true);
+        assert_eq!(row["catalog_mtp"], serde_json::Value::Null);
+        // A backend serving it gets the MTP control, and
+        // backend_set_mtp canonicalizes the spec tokens.
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::write(
+            dir.join("models").join("Qwen3.6-27B-mtp.gguf"),
+            gguf_header_bytes(0, 4),
+        )
+        .unwrap();
+        op_backend_add(
+            &state,
+            &sink,
+            "mtp-backend".to_string(),
+            "qwen3.6-27b-mtp".to_string(),
+            8197,
+            "mtp".to_string(),
+            true,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let b = saved
+            .backends
+            .iter()
+            .find(|b| b.id == "mtp-backend")
+            .unwrap()
+            .clone();
+        assert!(backend_mtp_info(&saved, &b).is_some());
+        op_backend_set_mtp(&state, &sink, "mtp-backend".to_string(), Some(2))
+            .await
+            .unwrap();
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let flags = saved
+            .backends
+            .iter()
+            .find(|b| b.id == "mtp-backend")
+            .unwrap()
+            .raw_flags
+            .clone()
+            .unwrap();
+        assert!(flags.contains("--spec-type draft-mtp"), "{flags}");
+        assert!(flags.contains("--spec-draft-n-max 2"), "{flags}");
+        // Declaring the model not capable removes the control
+        // and the op — and does NOT rewrite the flags already on
+        // the backend (the offload declaration's precedent).
+        let r = op_model_set_mtp(&state, &sink, "qwen3.6-27b-mtp".to_string(), Some(false))
+            .await
+            .unwrap();
+        assert_eq!(r["mtp"], false);
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let b = saved
+            .backends
+            .iter()
+            .find(|b| b.id == "mtp-backend")
+            .unwrap()
+            .clone();
+        assert!(backend_mtp_info(&saved, &b).is_none());
+        assert!(matches!(
+            op_backend_set_mtp(&state, &sink, "mtp-backend".to_string(), Some(1)).await,
+            Err(ApiError::InvalidInput(_))
+        ));
+        // Clearing the declaration outright behaves the same,
+        // drops the field from the stored config entirely, and
+        // still leaves the backend's flags untouched.
+        op_model_set_mtp(&state, &sink, "qwen3.6-27b-mtp".to_string(), None)
+            .await
+            .unwrap();
+        let saved = manager_config::load(&state.config_path).unwrap();
+        assert_eq!(
+            saved
+                .models
+                .iter()
+                .find(|m| m.id == "qwen3.6-27b-mtp")
+                .unwrap()
+                .mtp,
+            None
+        );
+        let text = std::fs::read_to_string(&state.config_path).unwrap();
+        assert!(!text.contains("\"mtp\":"), "{text}");
+        let flags_after = saved
+            .backends
+            .iter()
+            .find(|b| b.id == "mtp-backend")
+            .unwrap()
+            .raw_flags
+            .clone()
+            .unwrap();
+        assert_eq!(flags_after, flags);
+        // An unknown model refuses with NotFound.
+        assert!(matches!(
+            op_model_set_mtp(&state, &sink, "nope".to_string(), Some(true)).await,
+            Err(ApiError::NotFound(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn mtp_declaration_does_not_displace_a_catalog_pin() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        // Seed the catalog models into the config (the default
+        // test config carries none until the catalog sync runs).
+        op_list_models(&state, &sink).await.unwrap();
+        // The catalog pins the coder NOT MTP-capable: a stored
+        // declaration of true is shadowed by the pin.
+        op_model_set_mtp(&state, &sink, "qwen3-coder-30b".to_string(), Some(true))
+            .await
+            .unwrap();
+        // And the pinned-capable planner build stays capable
+        // with a declaration of false stored on it.
+        op_model_set_mtp(&state, &sink, "qwen3.8-27b-mtp".to_string(), Some(false))
+            .await
+            .unwrap();
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let mut probe = saved.backends[0].clone();
+        let coder_model = saved
+            .models
+            .iter()
+            .find(|m| m.id == "qwen3-coder-30b")
+            .unwrap();
+        probe.model_file = coder_model.gguf_path.clone();
+        assert!(backend_mtp_info(&saved, &probe).is_none());
+        let mtp_model = saved
+            .models
+            .iter()
+            .find(|m| m.id == "qwen3.8-27b-mtp")
+            .unwrap();
+        probe.model_file = mtp_model.gguf_path.clone();
+        assert!(backend_mtp_info(&saved, &probe).is_some());
+        // list_models reports pin and declaration side by side.
+        let listed = op_list_models(&state, &sink).await.unwrap();
+        let rows = listed["models"].as_array().unwrap();
+        let coder_row = rows.iter().find(|v| v["id"] == "qwen3-coder-30b").unwrap();
+        assert_eq!(coder_row["catalog_mtp"], false);
+        assert_eq!(coder_row["mtp"], true);
+        let mtp_row = rows.iter().find(|v| v["id"] == "qwen3.8-27b-mtp").unwrap();
+        assert_eq!(mtp_row["catalog_mtp"], true);
+        assert_eq!(mtp_row["mtp"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12652,6 +12905,7 @@ mod tests {
             None,
             None,
             Some(7.0),
+            None,
             None,
             None,
         )
@@ -13222,6 +13476,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
             match r {
                 Err(ApiError::InvalidInput(msg)) => {
@@ -13237,6 +13492,7 @@ mod tests {
                 None,
                 None,
                 Some(0.0),
+                None,
                 None,
                 None,
             );
@@ -13256,6 +13512,7 @@ mod tests {
                 Some(7.5),
                 None,
                 None,
+                None,
             )
             .expect("explicit params resolve");
             assert_eq!(e.id, "my-7b");
@@ -13270,7 +13527,7 @@ mod tests {
             cfg.models.push(e);
             manager_config::validate(&cfg).expect("added entry validates");
             // An explicit value wins over the catalog.
-            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, Some(9.0), None, None)
+            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, Some(9.0), None, None, None)
                 .expect("explicit params resolve");
             assert_eq!(e.params_b, 9.0);
         }
@@ -13278,13 +13535,14 @@ mod tests {
         #[test]
         fn model_add_entry_resolves_params_from_catalog() {
             // By id.
-            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, None, None, None)
+            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, None, None, None, None)
                 .expect("catalog id resolves");
             assert_eq!(e.params_b, 8.0);
             // By exact source URL under an operator-chosen id.
             let e = model_add_entry(
                 "my-qwen3-8b",
                 "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
+                None,
                 None,
                 None,
                 None,
@@ -13305,6 +13563,7 @@ mod tests {
                 Some(27.0),
                 Some(48),
                 Some(16),
+                None,
             )
             .expect("declared pair resolves");
             assert_eq!(e.moe_layers, Some(48));
@@ -13331,6 +13590,7 @@ mod tests {
                             Some(27.0),
                             layers,
                             default,
+                            None,
                         ),
                         Err(ApiError::InvalidInput(_))
                     ),
@@ -13340,13 +13600,46 @@ mod tests {
         }
 
         #[test]
+        fn model_add_entry_stores_the_mtp_declaration() {
+            let e = model_add_entry(
+                "mtp-27b",
+                "https://example.com/mtp.gguf",
+                None,
+                None,
+                Some(27.0),
+                None,
+                None,
+                Some(true),
+            )
+            .expect("declared entry resolves");
+            assert_eq!(e.mtp, Some(true));
+            let mut cfg = test_cfg();
+            cfg.models.push(e);
+            manager_config::validate(&cfg).expect("declared entry validates");
+            // Undeclared stays undeclared (the field is omitted
+            // from the stored config, not written as false).
+            let e = model_add_entry(
+                "dense-7b",
+                "https://example.com/dense.gguf",
+                None,
+                None,
+                Some(7.0),
+                None,
+                None,
+                None,
+            )
+            .expect("undeclared entry resolves");
+            assert_eq!(e.mtp, None);
+        }
+
+        #[test]
         fn model_add_entry_keeps_the_existing_input_rules() {
             assert!(matches!(
-                model_add_entry("  ", "https://example.com/x.gguf", None, None, Some(1.0), None, None),
+                model_add_entry("  ", "https://example.com/x.gguf", None, None, Some(1.0), None, None, None),
                 Err(ApiError::InvalidInput(_))
             ));
             assert!(matches!(
-                model_add_entry("m", "http://example.com/x.gguf", None, None, Some(1.0), None, None),
+                model_add_entry("m", "http://example.com/x.gguf", None, None, Some(1.0), None, None, None),
                 Err(ApiError::InvalidInput(_))
             ));
             assert!(matches!(
@@ -13357,7 +13650,8 @@ mod tests {
                     None,
                     Some(1.0),
                     None,
-                    None
+                    None,
+                    None,
                 ),
                 Err(ApiError::InvalidInput(_))
             ));
@@ -13396,6 +13690,7 @@ mod tests {
                 display_name: None,
                 moe_layers: None,
                 default_offload_layers: None,
+                mtp: None,
             });
             assert!(manager_config::save(&new_cfg, &path).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), before, "file untouched");
@@ -14578,6 +14873,7 @@ async fn activation_plan_pending(state: &AppState) -> bool {
 /// fails: config validation requires a positive `params_b`, and the
 /// value feeds memory-fit estimation that nothing re-derives later,
 /// so storing a placeholder would silently corrupt fit decisions.
+#[allow(clippy::too_many_arguments)]
 fn model_add_entry(
     id: &str,
     source_url: &str,
@@ -14586,6 +14882,7 @@ fn model_add_entry(
     params_b: Option<f32>,
     moe_layers: Option<u32>,
     default_offload_layers: Option<u32>,
+    mtp: Option<bool>,
 ) -> Result<manager_config::ModelConfig, ApiError> {
     let id = id.trim().to_string();
     if id.is_empty() {
@@ -14643,6 +14940,7 @@ fn model_add_entry(
         display_name: None,
         moe_layers,
         default_offload_layers,
+        mtp,
     })
 }
 
