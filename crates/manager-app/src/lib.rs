@@ -2649,6 +2649,29 @@ pub async fn op_list_backends(
             });
         }
     }
+    // Expert-cache control state per offload-capable backend
+    // (see backend_moe_cache_info): attaches only where the
+    // offload slider's own source resolves, so the control
+    // appears for precisely the backends that can offload.
+    {
+        let moe_cache: HashMap<String, MoeCacheInfo> = cfg
+            .backends
+            .iter()
+            .filter_map(|b| backend_moe_cache_info(&cfg, b).map(|m| (b.id.clone(), m)))
+            .collect();
+        for row in backends.iter_mut() {
+            let Some(id) = row["id"].as_str() else {
+                continue;
+            };
+            let Some(m) = moe_cache.get(id) else { continue };
+            row["moe_cache"] = json!({
+                "mib": m.mib,
+                "custom": m.custom,
+                "offload_layers": m.offload_layers,
+                "moe_layers": m.moe_layers,
+            });
+        }
+    }
     // Parallel slots state per configured backend (tracker #61):
     // the flags form's Parallel slots field renders for every
     // backend, so — unlike the capability-gated offload/MTP
@@ -5602,6 +5625,7 @@ pub async fn op_backend_add_preview(
                 .unwrap_or_else(|| {
                     manager_models::effective_slots(backend.raw_flags.as_deref())
                 }),
+            manager_models::moe_cache_mib(backend.raw_flags.as_deref()).unwrap_or(0),
             targets.as_ref(),
         )
     });
@@ -6037,6 +6061,285 @@ pub async fn op_backend_set_mtp(
     }))
 }
 
+/// Resolve the Auto expert-cache size for a backend: the
+/// largest cache its cache-bearing GPUs can price right now,
+/// less the standing reserve
+/// ([`manager_models::MOE_CACHE_AUTO_RESERVE_MIB`]). Priced free
+/// space per GPU is the telemetry snapshot's measured free VRAM
+/// minus every other backend's accounted residency and this
+/// backend's own non-cache requirement share — the fit
+/// evaluator's accounting, so Auto never promises space the
+/// start gate would then refuse. Errors carry the numbers when
+/// placement or telemetry cannot price a cache, or when no
+/// positive size survives the reserve.
+async fn resolve_auto_moe_cache_mib(
+    state: &Arc<AppState>,
+    cfg: &AppConfig,
+    b: &manager_config::BackendConfig,
+    offload_layers: u32,
+    moe_layers: u32,
+) -> Result<u64, ApiError> {
+    let placed: Vec<u32> = match backend_gpu_visibility(b) {
+        GpuVisibility::Gpus(indices) => indices,
+        _ => {
+            return Err(ApiError::InvalidInput(format!(
+                "Auto cannot price an expert cache for backend {}: it is not placed on specific GPUs",
+                b.id
+            )))
+        }
+    };
+    let Some(mut req) = backend_memory_requirement(cfg, b) else {
+        return Err(ApiError::InvalidInput(format!(
+            "Auto cannot price an expert cache for backend {}: its memory requirement does not resolve",
+            b.id
+        )));
+    };
+    // Price the backend's own NON-cache requirement: an existing
+    // token is being replaced, not added to.
+    req.moe_cache_mib = 0;
+    let mut samples = {
+        let store = state.telemetry().await;
+        let snapshot = lock_telemetry(&store).snapshot();
+        snapshot
+    };
+    samples.sort_by_key(|s| s.index);
+    if samples.is_empty() {
+        return Err(ApiError::InvalidInput(format!(
+            "Auto cannot price an expert cache for backend {}: no GPU telemetry is available",
+            b.id
+        )));
+    }
+    let n = samples.len();
+    let own = manager_optimize::residency_per_gpu(&req, &b.flags.tensor_split, n);
+    let mut others = vec![0u64; n];
+    for ob in cfg.backends.iter().filter(|ob| ob.id != b.id) {
+        if let Some(or) = backend_memory_requirement(cfg, ob) {
+            let per = manager_optimize::residency_per_gpu(&or, &ob.flags.tensor_split, n);
+            for (acc, v) in others.iter_mut().zip(per.iter()) {
+                *acc = acc.saturating_add(*v);
+            }
+        }
+    }
+    // The cache lands only on cache-bearing GPUs (see
+    // moe_cache_shares); a probe budget reads the bearing set and
+    // each GPU's fraction of it.
+    const PROBE_MIB: u64 = 1_000_000;
+    let probe = manager_models::moe_cache_shares(
+        PROBE_MIB,
+        &b.flags.tensor_split,
+        offload_layers,
+        moe_layers,
+        n,
+    );
+    let mut bearing: Vec<(u64, f64)> = Vec::new();
+    let mut tightest: Option<(u32, u64, u64, u64)> = None;
+    for (pos, sample) in samples.iter().enumerate() {
+        if probe[pos] == 0 || !placed.contains(&sample.index) {
+            continue;
+        }
+        let free = sample.free_vram_mib();
+        let available = free
+            .saturating_sub(others[pos])
+            .saturating_sub(own[pos]);
+        bearing.push((available, probe[pos] as f64 / PROBE_MIB as f64));
+        let tighter = match tightest {
+            None => true,
+            Some((_, a, _, _)) => available < a,
+        };
+        if tighter {
+            tightest = Some((sample.index, available, free, others[pos].saturating_add(own[pos])));
+        }
+    }
+    match manager_models::auto_moe_cache_budget(
+        &bearing,
+        manager_models::MOE_CACHE_AUTO_RESERVE_MIB,
+    ) {
+        Some(mib) => Ok(mib),
+        None => {
+            let detail = match tightest {
+                Some((index, available, free, accounted)) => format!(
+                    "GPU {index} has {free} MiB free, of which {accounted} MiB is accounted by other backends and this backend's own requirement, leaving {available} MiB"
+                ),
+                None => "no placed GPU bears offloaded layers".to_string(),
+            };
+            Err(ApiError::InvalidInput(format!(
+                "Auto found no room for an expert cache on backend {}: {detail}; the standing reserve is {} MiB",
+                b.id,
+                manager_models::MOE_CACHE_AUTO_RESERVE_MIB
+            )))
+        }
+    }
+}
+
+/// Set a backend's MoE expert cache (`--moe-cache-mib`): rewrite
+/// only that token in the backend's raw flags — `mib` writes the
+/// canonical token, `None` (with `auto` unset) turns the cache
+/// off, and `auto: true` resolves the size from priced free VRAM
+/// (see [`resolve_auto_moe_cache_mib`]) and writes the resolved
+/// value. Every other flag is preserved. Eligibility is the
+/// offload slider's exactly ([`backend_moe_cache_info`]): a dense
+/// model has no experts to cache. A nonzero cache additionally
+/// requires a saved offload position above 0 — with no experts
+/// in system RAM there is nothing to cache — and refuses a row
+/// (tensor) split, which the pinned llama.cpp rejects the cache
+/// under; turning the cache off is always allowed, so a stranded
+/// token can always be cleared. The size is priced into the
+/// backend's memory requirement, so a start whose cache cannot
+/// fit is refused by the start gate with the numbers. Saved
+/// through the same clone-validate-save path as the other
+/// backend mutations and journaled as a backend-scope activation
+/// change with `applies: "next start"`; no restart happens here.
+pub async fn op_backend_set_moe_cache(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    id: String,
+    mib: Option<u32>,
+    auto: Option<bool>,
+) -> ApiResult {
+    let want_auto = auto == Some(true);
+    if want_auto && mib.is_some() {
+        return Err(ApiError::InvalidInput(
+            "moe-cache takes either an explicit mib or auto, not both".to_string(),
+        ));
+    }
+    // Eligibility and the static refusals resolve against the
+    // current config before the write lock, and re-resolve under
+    // it below (a concurrent model or placement change can alter
+    // every one of them — the set_offload/set_mtp shape).
+    let (offload_layers, moe_layers) = {
+        let cfg = state.config.read().await;
+        let b = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        ensure_backend_not_advanced(b)?;
+        let info = backend_moe_cache_info(&cfg, b).ok_or_else(|| {
+            ApiError::InvalidInput(format!(
+                "backend {id}'s model does not support an expert cache (it is not an offload-capable MoE model)"
+            ))
+        })?;
+        check_moe_cache_request(b, mib, want_auto, info.offload_layers)?;
+        (info.offload_layers, info.moe_layers)
+    };
+    // Auto resolves between the config reads: telemetry access
+    // must never hold the config lock (see op_backend_set_offload).
+    let resolved = if want_auto {
+        let cfg = state.config.read().await;
+        let b = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        let mib = resolve_auto_moe_cache_mib(state, &cfg, b, offload_layers, moe_layers).await?;
+        Some(u32::try_from(mib).map_err(|_| {
+            ApiError::InvalidInput(format!(
+                "Auto resolved an expert cache of {mib} MiB for backend {id}, beyond the control's range"
+            ))
+        })?)
+    } else {
+        None
+    };
+    let target: Option<u32> = if want_auto { resolved } else { mib };
+    let mut cfg = state.config.write().await;
+    let pre_cfg = cfg.clone();
+    let mut new_cfg = cfg.clone();
+    {
+        // Re-validate against the config actually being mutated.
+        let b = new_cfg
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        ensure_backend_not_advanced(b)?;
+        let info = backend_moe_cache_info(&new_cfg, b).ok_or_else(|| {
+            ApiError::InvalidInput(format!(
+                "backend {id}'s model does not support an expert cache (it is not an offload-capable MoE model)"
+            ))
+        })?;
+        check_moe_cache_request(b, target, false, info.offload_layers)?;
+    }
+    let b = new_cfg
+        .backends
+        .iter_mut()
+        .find(|b| b.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+    let new_raw = manager_models::set_moe_cache(b.raw_flags.as_deref(), target);
+    let changed = new_raw != b.raw_flags;
+    b.raw_flags = new_raw.clone();
+    if changed {
+        // A raw-flags change invalidates the recorded tool-call
+        // probe (MCP design §7.2).
+        b.tool_call_probe = None;
+    }
+    if changed {
+        manager_config::validate(&new_cfg).map_err(ApiError::from)?;
+        let summary = match target {
+            Some(n) if want_auto => {
+                format!("Backend `{id}` expert cache set to {n} MiB (Auto)")
+            }
+            Some(n) => format!("Backend `{id}` expert cache set to {n} MiB"),
+            None => format!("Backend `{id}` expert cache turned off"),
+        };
+        record_backend_change(
+            state,
+            &pre_cfg,
+            &new_cfg,
+            "backend_set_moe_cache",
+            summary,
+            &id,
+        )
+        .await?;
+        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+        *cfg = new_cfg;
+    }
+    drop(cfg);
+    if changed {
+        ensure_backend_specs(state).await;
+    }
+    state.sync_backend_service_definition(&id).await;
+    Ok(json!({
+        "backend_id": id,
+        "mib": manager_models::moe_cache_mib(new_raw.as_deref()).filter(|n| *n > 0),
+        "auto": want_auto,
+        "resolved_mib": resolved,
+        "raw_flags": new_raw,
+        "changed": changed,
+        "persisted": true,
+        "applies": "next start",
+    }))
+}
+
+/// The expert-cache request's static refusals, shared by the
+/// op's pre-lock and under-lock passes: a nonzero size (explicit,
+/// or any Auto request, which resolves to a nonzero size by
+/// construction) requires a saved offload position above 0 and a
+/// non-tensor split. Turning the cache off passes always.
+fn check_moe_cache_request(
+    b: &manager_config::BackendConfig,
+    mib: Option<u32>,
+    auto: bool,
+    offload_layers: u32,
+) -> Result<(), ApiError> {
+    let nonzero = auto || mib.is_some_and(|n| n > 0);
+    if !nonzero {
+        return Ok(());
+    }
+    if offload_layers == 0 {
+        return Err(ApiError::InvalidInput(format!(
+            "backend {} offloads 0 MoE layers: the expert cache holds the offloaded experts in GPU memory, and there are none in system RAM to cache — raise the offload above 0 first",
+            b.id
+        )));
+    }
+    if b.flags.split_mode == manager_config::SplitMode::Row {
+        return Err(ApiError::InvalidInput(format!(
+            "backend {} uses a row (tensor) split: the pinned llama.cpp refuses the expert cache under tensor parallelism",
+            b.id
+        )));
+    }
+    Ok(())
+}
+
 /// Set a backend's parallel slot count (tracker #61; the flags
 /// form's Parallel slots field): rewrite only the `--parallel`
 /// tokens in the backend's raw flags — `slots` in the control's
@@ -6238,6 +6541,7 @@ fn cache_preview_json(
     selection: manager_models::CacheSelection,
     n_ctx: u32,
     n_seq: u32,
+    moe_cache_mib: u32,
     targets: Option<&(Vec<f32>, Vec<u64>, Vec<u32>)>,
 ) -> Value {
     let kv_typed = layout
@@ -6255,7 +6559,13 @@ fn cache_preview_json(
         layout.rs_bytes_per_seq,
         n_seq,
     );
-    let total_mib = req.gpu_weights_mib + req.kv_mib.unwrap_or(0) + req.rs_mib.unwrap_or(0);
+    // The expert cache prices into the preview's totals the way
+    // it prices into the requirement: the whole MiB figure joins
+    // the total, and per-target shares distribute it by the
+    // cache's own placement (the offload-bearing GPUs), not by
+    // the plain tensor split.
+    let base_total_mib = req.gpu_weights_mib + req.kv_mib.unwrap_or(0) + req.rs_mib.unwrap_or(0);
+    let total_mib = base_total_mib + u64::from(moe_cache_mib);
     let (ladder, best) = match (layout.kv_geometry, targets) {
         (Some(kv), Some((split, totals, _))) => {
             let inputs = manager_models::CacheFitInputs {
@@ -6265,6 +6575,7 @@ fn cache_preview_json(
                 n_ctx,
                 split: split.clone(),
                 gpu_total_mib: totals.clone(),
+                moe_cache_mib: u64::from(moe_cache_mib),
             };
             let ladder = manager_models::price_ladder(&inputs);
             let best = ladder.iter().find(|r| r.fits).copied();
@@ -6293,6 +6604,7 @@ fn cache_preview_json(
         "sys_weights_mib": req.sys_weights_mib,
         "kv_mib": req.kv_mib,
         "rs_mib": req.rs_mib,
+        "moe_cache_mib": moe_cache_mib,
         "total_mib": total_mib,
         "basis": serde_json::to_value(req.basis).unwrap_or(Value::Null),
         "targets": targets.map(|(split, totals, placed)| {
@@ -6300,13 +6612,23 @@ fn cache_preview_json(
             // same distribution predicted_fits judges — and its
             // own verdict, so the forms render one capacity row
             // per GPU instead of one line against joined totals.
-            let shares = manager_models::predicted_shares(total_mib, split, totals);
+            // The expert-cache share rides its own distribution
+            // (the offload-bearing GPUs), added to the base
+            // total's plain-split share.
+            let shares = manager_models::predicted_shares(base_total_mib, split, totals);
+            let cache_shares = manager_models::moe_cache_shares(
+                u64::from(moe_cache_mib),
+                split,
+                offload.layers(layout.moe_layers.unwrap_or(0)),
+                layout.moe_layers.unwrap_or(0),
+                placed.len(),
+            );
             placed
                 .iter()
                 .zip(totals.iter())
                 .enumerate()
                 .map(|(pos, (i, t))| {
-                    let required = shares.as_ref().map(|s| s[pos]);
+                    let required = shares.as_ref().map(|s| s[pos] + cache_shares[pos]);
                     json!({
                         "gpu": i,
                         "total_mib": t,
@@ -6319,8 +6641,29 @@ fn cache_preview_json(
                 .collect::<Vec<_>>()
         }),
         "headroom_reserve_percent": manager_models::HEADROOM_RESERVE_PERCENT,
-        "fits_current": targets.map(|(split, totals, _)| {
-            manager_models::predicted_fits(total_mib, split, totals)
+        "fits_current": targets.map(|(split, totals, placed)| {
+            // The same combined distribution the targets carry:
+            // base shares by the plain split, cache shares by
+            // the cache's own placement — judged under the same
+            // headroom rule predicted_fits applies.
+            let cache_shares = manager_models::moe_cache_shares(
+                u64::from(moe_cache_mib),
+                split,
+                offload.layers(layout.moe_layers.unwrap_or(0)),
+                layout.moe_layers.unwrap_or(0),
+                placed.len(),
+            );
+            match manager_models::predicted_shares(base_total_mib, split, totals) {
+                Some(shares) => shares
+                    .iter()
+                    .zip(totals.iter())
+                    .enumerate()
+                    .all(|(pos, (share, t))| {
+                        share + cache_shares[pos]
+                            <= t * (100 - manager_models::HEADROOM_RESERVE_PERCENT) / 100
+                    }),
+                None => false,
+            }
         }),
         "ladder": ladder.iter().map(rung_json).collect::<Vec<_>>(),
         "best": best.map(|r| rung_json(&r)),
@@ -6400,6 +6743,7 @@ pub async fn op_backend_cache_preview(
         selection,
         eff_ctx,
         eff_slots.max(1),
+        manager_models::moe_cache_mib(backend.raw_flags.as_deref()).unwrap_or(0),
         targets.as_ref(),
     );
     payload["backend_id"] = json!(id);
@@ -8545,7 +8889,7 @@ fn backend_memory_requirement(
 ) -> Option<manager_models::MemoryRequirement> {
     let layout = resolve_weight_layout(cfg, b)?;
     let offload = manager_models::expert_offload(b.raw_flags.as_deref());
-    Some(manager_models::memory_requirement(
+    let mut req = manager_models::memory_requirement(
         layout.total_bytes,
         layout.expert_bytes,
         layout.expert_bytes_by_block.as_deref(),
@@ -8556,7 +8900,18 @@ fn backend_memory_requirement(
         b.flags.n_ctx,
         layout.rs_bytes_per_seq,
         manager_models::effective_slots(b.raw_flags.as_deref()),
-    ))
+    );
+    // The expert cache rides the requirement: the decoded token
+    // plus the layer geometry the requirement's per-GPU
+    // distribution needs to price it (see
+    // `manager_models::moe_cache_shares`), so every consumer of
+    // the requirement — the start gate, residency, fit, the
+    // placement projection — prices the cache the server will
+    // allocate. A backend with no token prices exactly as before.
+    req.moe_cache_mib = manager_models::moe_cache_mib(b.raw_flags.as_deref()).unwrap_or(0) as u64;
+    req.moe_cache_offload_layers = offload.layers(layout.moe_layers.unwrap_or(0));
+    req.moe_cache_moe_layers = layout.moe_layers.unwrap_or(0);
+    Some(req)
 }
 
 /// KV bytes per token for a backend under its SELECTED cache
@@ -8844,6 +9199,48 @@ fn backend_parallel_info(b: &manager_config::BackendConfig) -> ParallelInfo {
     let custom = token_normalized_flags(b.raw_flags.as_deref())
         != token_normalized_flags(canonical.as_deref());
     ParallelInfo { slots, custom }
+}
+
+struct MoeCacheInfo {
+    /// The decoded `--moe-cache-mib` value, or `None` when the
+    /// token is absent (off). A decoded 0 — the pin's own
+    /// disabled value, never written by the control — also reads
+    /// as `None`.
+    mib: Option<u32>,
+    /// True when the saved spelling is not the canonical form
+    /// for its state (an `=` spelling, a decoded 0 token). The
+    /// same comparison as the MTP control's `custom`.
+    custom: bool,
+    /// The backend's saved offload position (MoE layers on
+    /// system RAM): the UI disables the control at 0, when there
+    /// are no host-resident experts for the cache to hold.
+    offload_layers: u32,
+    /// The model's MoE layer count (the offload slider's
+    /// maximum).
+    moe_layers: u32,
+}
+
+/// A backend's expert-cache control state. Eligibility is the
+/// offload slider's exactly: the state exists iff
+/// [`backend_offload_info`] resolves (a resolvable layout with
+/// expert bytes and a MoE layer count), so the control appears
+/// for precisely the backends that can offload — MoE models only,
+/// with effectiveness resolved from the same live layout facts.
+fn backend_moe_cache_info(
+    cfg: &AppConfig,
+    b: &manager_config::BackendConfig,
+) -> Option<MoeCacheInfo> {
+    let offload = backend_offload_info(cfg, b)?;
+    let mib = manager_models::moe_cache_mib(b.raw_flags.as_deref()).filter(|n| *n > 0);
+    let canonical = manager_models::set_moe_cache(b.raw_flags.as_deref(), mib);
+    let custom = token_normalized_flags(b.raw_flags.as_deref())
+        != token_normalized_flags(canonical.as_deref());
+    Some(MoeCacheInfo {
+        mib,
+        custom,
+        offload_layers: offload.layers,
+        moe_layers: offload.moe_layers,
+    })
 }
 
 
@@ -12437,6 +12834,266 @@ mod tests {
     }
 
     #[test]
+    fn moe_cache_info_and_requirement_pricing() {
+        // The declared-MoE fixture (the offload slider's own): a
+        // 48-block MoE GGUF on disk and a model record declaring
+        // the count and a default offload.
+        let dir = std::env::temp_dir().join(format!(
+            "llm-mgr-moe-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::write(
+            dir.join("models").join("user-moe.gguf"),
+            gguf_header_bytes(48, 0),
+        )
+        .unwrap();
+        let mut cfg = test_cfg();
+        cfg.data_dir = dir.clone();
+        register_test_model(&mut cfg, "user-moe-27b", "models/user-moe.gguf");
+        cfg.models.last_mut().unwrap().moe_layers = Some(48);
+        cfg.models.last_mut().unwrap().default_offload_layers = Some(16);
+
+        // Info: eligibility is the offload slider's — present
+        // for the MoE backend, absent for a dense one.
+        let b = uncreated_backend(
+            "moe-backend",
+            "models/user-moe.gguf",
+            Some("--n-cpu-moe 16 --moe-cache-mib 4096".to_string()),
+        );
+        let info = backend_moe_cache_info(&cfg, &b).expect("MoE backend carries cache state");
+        assert_eq!(info.mib, Some(4096));
+        assert!(!info.custom);
+        assert_eq!(info.offload_layers, 16);
+        assert_eq!(info.moe_layers, 48);
+        // An `=` spelling decodes to the same state, marked custom.
+        let b_eq = uncreated_backend(
+            "moe-backend",
+            "models/user-moe.gguf",
+            Some("--n-cpu-moe 16 --moe-cache-mib=4096".to_string()),
+        );
+        let info_eq = backend_moe_cache_info(&cfg, &b_eq).unwrap();
+        assert_eq!(info_eq.mib, Some(4096));
+        assert!(info_eq.custom);
+        // No token: off, not custom.
+        let b_off = uncreated_backend(
+            "moe-backend",
+            "models/user-moe.gguf",
+            Some("--n-cpu-moe 16".to_string()),
+        );
+        let info_off = backend_moe_cache_info(&cfg, &b_off).unwrap();
+        assert_eq!(info_off.mib, None);
+        assert!(!info_off.custom);
+        // A dense backend (the default config's planner) has none.
+        let dense = cfg.backends.iter().find(|x| x.id == "planner").unwrap().clone();
+        assert!(backend_moe_cache_info(&cfg, &dense).is_none());
+
+        // Pricing: the requirement carries the cache, residency
+        // grows by exactly the cache on the single GPU, and the
+        // start gate refuses the over-card cache with the numbers
+        // while admitting the same requirement with room.
+        let req_off = backend_memory_requirement(&cfg, &b_off).unwrap();
+        assert_eq!(req_off.moe_cache_mib, 0);
+        let req_on = backend_memory_requirement(&cfg, &b).unwrap();
+        assert_eq!(req_on.moe_cache_mib, 4096);
+        assert_eq!(req_on.moe_cache_offload_layers, 16);
+        assert_eq!(req_on.moe_cache_moe_layers, 48);
+        let res_off = manager_optimize::residency_per_gpu(&req_off, &[], 1)[0];
+        let res_on = manager_optimize::residency_per_gpu(&req_on, &[], 1)[0];
+        assert_eq!(res_on, res_off + 4096);
+        let failures = vram_gate_failures(
+            &[0],
+            &[(0, res_on)],
+            &[vram_reading(0, res_on - 1, res_on - 1)],
+            &[],
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].class, VramGateClass::ExceedsTotal);
+        assert_eq!(failures[0].required_mib, res_on);
+        let failures = vram_gate_failures(
+            &[0],
+            &[(0, res_on)],
+            &[vram_reading(0, res_on + 1024, res_on + 1024)],
+            &[],
+        );
+        assert!(failures.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn backend_set_moe_cache_round_trip_and_refusals() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        op_model_add(
+            &state,
+            &sink,
+            "qwen3.8-27b-moe".to_string(),
+            "https://example.com/Qwen3.8-27B-MoE.gguf".to_string(),
+            None,
+            None,
+            Some(27.0),
+            Some(48),
+            Some(16),
+        )
+        .await
+        .unwrap();
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::write(
+            dir.join("models").join("Qwen3.8-27B-MoE.gguf"),
+            gguf_header_bytes(48, 0),
+        )
+        .unwrap();
+        op_backend_add(
+            &state,
+            &sink,
+            "moe-backend".to_string(),
+            "qwen3.8-27b-moe".to_string(),
+            8199,
+            "moe".to_string(),
+            true,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // The declared default offload (16) is in place; the cache
+        // op rewrites only its own token.
+        let r = op_backend_set_moe_cache(
+            &state,
+            &sink,
+            "moe-backend".to_string(),
+            Some(4096),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["mib"], 4096);
+        assert_eq!(r["changed"], true);
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let b = saved
+            .backends
+            .iter()
+            .find(|b| b.id == "moe-backend")
+            .unwrap();
+        assert_eq!(
+            b.raw_flags.as_deref(),
+            Some("--n-cpu-moe 16 --moe-cache-mib 4096")
+        );
+        // An explicit size and Auto at once is ambiguous input.
+        let r = op_backend_set_moe_cache(
+            &state,
+            &sink,
+            "moe-backend".to_string(),
+            Some(4096),
+            Some(true),
+        )
+        .await;
+        assert!(matches!(r, Err(ApiError::InvalidInput(_))), "{r:?}");
+        // Offload 0 refuses a nonzero cache with the reason;
+        // turning the cache off stays allowed, so a stranded
+        // token can always be cleared.
+        op_backend_set_offload(&state, &sink, "moe-backend".to_string(), 0, None)
+            .await
+            .unwrap();
+        let r = op_backend_set_moe_cache(
+            &state,
+            &sink,
+            "moe-backend".to_string(),
+            Some(8192),
+            None,
+        )
+        .await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("offloads 0 MoE layers"), "{msg}")
+            }
+            other => panic!("expected the offload-0 refusal, got {other:?}"),
+        }
+        let r = op_backend_set_moe_cache(&state, &sink, "moe-backend".to_string(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(r["mib"], Value::Null);
+        let saved = manager_config::load(&state.config_path).unwrap();
+        let b = saved
+            .backends
+            .iter()
+            .find(|b| b.id == "moe-backend")
+            .unwrap();
+        assert!(
+            !b.raw_flags.as_deref().unwrap_or("").contains("moe-cache"),
+            "{:?}",
+            b.raw_flags
+        );
+        // Auto cannot price anything in this environment (no GPU
+        // telemetry): it refuses rather than guessing a size.
+        op_backend_set_offload(&state, &sink, "moe-backend".to_string(), 16, None)
+            .await
+            .unwrap();
+        let r = op_backend_set_moe_cache(
+            &state,
+            &sink,
+            "moe-backend".to_string(),
+            None,
+            Some(true),
+        )
+        .await;
+        assert!(matches!(r, Err(ApiError::InvalidInput(_))), "{r:?}");
+        // A row (tensor) split refuses a nonzero cache: the
+        // pinned llama.cpp rejects the cache under tensor
+        // parallelism.
+        {
+            let mut cfg = state.config.write().await;
+            let b = cfg
+                .backends
+                .iter_mut()
+                .find(|b| b.id == "moe-backend")
+                .unwrap();
+            b.flags.split_mode = manager_config::SplitMode::Row;
+        }
+        let r = op_backend_set_moe_cache(
+            &state,
+            &sink,
+            "moe-backend".to_string(),
+            Some(4096),
+            None,
+        )
+        .await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("row (tensor) split"), "{msg}")
+            }
+            other => panic!("expected the row-split refusal, got {other:?}"),
+        }
+        // A dense backend has no expert cache to set.
+        let r = op_backend_set_moe_cache(
+            &state,
+            &sink,
+            "planner".to_string(),
+            Some(4096),
+            None,
+        )
+        .await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("does not support an expert cache"), "{msg}")
+            }
+            other => panic!("expected the dense refusal, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn declared_moe_model_gets_offload_info_once_its_file_parses() {
         // The slider's figures split by source: the layer count
         // and expert bytes come from the downloaded GGUF's parse;
@@ -13827,6 +14484,7 @@ mod tests {
             sel_f16,
             65_536,
             1,
+            0,
             Some(&targets),
         );
         assert_eq!(p["kv_mib"], 4_096);
@@ -13851,6 +14509,7 @@ mod tests {
             sel_f16,
             32_768,
             1,
+            0,
             Some(&split_targets),
         );
         let half = (11_559 + 2_048 + 150) / 2 + (11_559 + 2_048 + 150) % 2;
@@ -13869,6 +14528,7 @@ mod tests {
             sel_f16,
             262_144,
             1,
+            0,
             Some(&targets),
         );
         assert_eq!(p["best"], Value::Null);

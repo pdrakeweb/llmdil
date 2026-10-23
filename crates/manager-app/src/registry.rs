@@ -206,6 +206,7 @@ macro_rules! for_each_operation {
             (BackendSetMtp, backend_set_mtp, C, op_backend_set_mtp, [id: String, n_max: Option<u32>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/mtp"))),
             (BackendSetParallel, backend_set_parallel, C, op_backend_set_parallel, [id: String, slots: Option<u32>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/parallel"))),
             (BackendSetCache, backend_set_cache, C, op_backend_set_cache, [id: String, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/cache"))),
+            (BackendSetMoeCache, backend_set_moe_cache, C, op_backend_set_moe_cache, [id: String, mib: Option<u32>, auto: Option<bool>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/moe-cache"))),
             (BackendCachePreview, backend_cache_preview, R, op_backend_cache_preview, [id: String, n_ctx: Option<u32>, slots: Option<u32>, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>], None),
             // Advanced flags mode (tracker #60): the raw-flags save
             // (advanced mode only; validation warns, never blocks)
