@@ -2095,6 +2095,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         cfg.backends[0].model_file = std::path::PathBuf::from("models/qwen3-8b.gguf");
         cfg
@@ -2423,6 +2424,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         };
         cfg.backends = vec![
             backend("planner", "models/planner.gguf", 8081),
@@ -2607,6 +2609,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         let registered = vec![crate::experiment::RegisteredModelFile {
             id: "qwen3.8-27b-moe".to_string(),

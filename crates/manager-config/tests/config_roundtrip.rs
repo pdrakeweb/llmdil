@@ -37,6 +37,7 @@ fn rich_config() -> AppConfig {
         display_name: Some("Tool Runner 8B".to_string()),
         moe_layers: None,
         default_offload_layers: None,
+        mtp: None,
     });
     let backend = cfg
         .backends
@@ -64,6 +65,29 @@ fn rich_config() -> AppConfig {
 
 fn config_value(cfg: &AppConfig) -> serde_json::Value {
     serde_json::to_value(cfg).unwrap()
+}
+
+#[test]
+fn model_mtp_declaration_round_trips_and_is_omitted_when_unset() {
+    let dir = tmpdir("mtp-declaration");
+    let path = dir.join("config.json");
+    let mut cfg = rich_config();
+    // The fixture model carries no declaration: the field is
+    // omitted from the stored JSON entirely, so config files
+    // written before the field existed load unchanged.
+    save(&cfg, &path).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("\"mtp\""), "{text}");
+    let loaded = load(&path).unwrap();
+    assert_eq!(loaded.models[0].mtp, None);
+
+    // A declared value round-trips through save/load.
+    cfg.models[0].mtp = Some(true);
+    save(&cfg, &path).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"mtp\": true"), "{text}");
+    let loaded = load(&path).unwrap();
+    assert_eq!(loaded.models[0].mtp, Some(true));
 }
 
 #[test]

@@ -771,6 +771,19 @@ pub struct ModelConfig {
     /// requires it not exceed that count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_offload_layers: Option<u32>,
+    /// Operator-declared MTP (multi-token prediction) capability
+    /// for a model the curated catalog does not carry: whether the
+    /// model's GGUF carries an MTP head llama.cpp's
+    /// `--spec-type draft-mtp` can draft with. The catalog pins
+    /// the same fact on its `ModelSpec`; a user-added model can
+    /// only acquire the MTP draft control (backend Add/Edit,
+    /// Edit Flags) when the operator declares it here. `None`
+    /// when capability was never declared. A catalog pin wins
+    /// where the catalog knows the model — this field is the
+    /// fallback source, never an override of a catalog pin (see
+    /// `manager_models::effective_mtp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtp: Option<bool>,
 }
 
 /// Validate an operator-chosen model display name for
@@ -1286,6 +1299,7 @@ pub fn append_missing_catalog_models(cfg: &mut AppConfig, entries: &[CatalogMode
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         changed = true;
     }
@@ -2341,6 +2355,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         let planner = cfg.backends.iter_mut().find(|b| b.id == "planner").unwrap();
         planner.model_file = PathBuf::from("models/OldPlanner.gguf");
@@ -2415,6 +2430,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         let entry = |id: &str, enabled: bool| CatalogModelEntry {
             model_id: id.to_string(),
@@ -2465,6 +2481,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         let planner = cfg.backends.iter_mut().find(|b| b.id == "planner").unwrap();
         planner.model_file = PathBuf::from("models/OldPlanner.gguf");
@@ -2520,6 +2537,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         // The operator moved the coder backend to another model's
         // file and set their own raw flags.
@@ -2588,6 +2606,7 @@ mod tests {
                 display_name: None,
                 moe_layers: None,
                 default_offload_layers: None,
+                mtp: None,
             });
             let coder = cfg.backends.iter_mut().find(|b| b.id == "coder").unwrap();
             coder.model_file = PathBuf::from("models/OldNemotron.gguf");
@@ -2655,6 +2674,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         let backend = cfg
             .backends
@@ -3084,6 +3104,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         let catalog = vec![CatalogModelDefaults {
             model_id: "qwen3-8b".to_string(),
@@ -3129,6 +3150,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         // The operator pointed the backend at a custom file; neither
         // the file nor the model's hash/params may be rewritten. (The
