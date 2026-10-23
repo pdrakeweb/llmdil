@@ -374,6 +374,20 @@ fn redact_secret_key_values(line: &str, hits: &mut u64) -> String {
                 while k < b.len() && (b[k] == b' ' || b[k] == b'\t') {
                     k += 1;
                 }
+                // Header exception: an unquoted `Authorization:`
+                // value is a scheme word plus credential, and the
+                // dedicated header pass above owns it (it preserves
+                // the scheme). Treating the scheme word as this
+                // key's bare value would redact "Bearer" itself and
+                // leave the credential to the header pass's shape —
+                // skip; quoted (JSON) authorization values still
+                // redact below.
+                if key.eq_ignore_ascii_case("authorization")
+                    && !(k < b.len() && b[k] == b'"')
+                {
+                    i = kend.max(i + 1);
+                    continue;
+                }
                 // Value: quoted or bare.
                 if k < b.len() && b[k] == b'"' {
                     let vstart = k + 1;

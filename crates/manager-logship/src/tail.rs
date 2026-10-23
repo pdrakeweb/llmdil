@@ -16,12 +16,39 @@ use std::path::PathBuf;
 /// file.
 const FIRST_SIGHT_BYTES: u64 = 64 * 1024;
 
+/// A platform file identity (device/inode, volume/file-index)
+/// used to detect rotation even when the new file is the same
+/// size as — or larger than — the offset into the old one. `None`
+/// where the platform exposes neither (rotation then falls back
+/// to the size-regression rule alone).
+fn file_identity(meta: &fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return Some(meta.dev() ^ meta.ino().rotate_left(32));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let volume = meta.volume_serial_number()? as u64;
+        let index = meta.file_index()?;
+        return Some(volume.rotate_left(32) ^ index);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
 pub struct FileTail {
     pub source: String,
     path: PathBuf,
     prev_path: PathBuf,
     /// Byte offset into the current file; `None` until first poll.
     pub offset: Option<u64>,
+    /// Identity of the file at `offset`, for rotation detection.
+    file_id: Option<u64>,
 }
 
 impl FileTail {
@@ -31,6 +58,7 @@ impl FileTail {
             path,
             prev_path,
             offset,
+            file_id: None,
         }
     }
 
@@ -43,13 +71,20 @@ impl FileTail {
             return out;
         };
         let len = meta.len();
+        let id = file_identity(&meta);
         let mut offset = match self.offset {
             None => first_sight_offset(&self.path, len),
             Some(o) => o,
         };
-        if len < offset {
-            // Rotation (or truncation): drain the unread remainder
-            // from the .prev sibling, then start the new file at 0.
+        // Rotation: the file shrank below our offset, or it is a
+        // different file than the one the offset belongs to (a
+        // rename + recreate can leave a same-size or larger file,
+        // which size alone cannot detect).
+        let rotated = len < offset
+            || matches!((self.file_id, id), (Some(prev), Some(cur)) if prev != cur);
+        if rotated {
+            // Drain the unread remainder from the .prev sibling,
+            // then start the new file at 0.
             if let Ok(prev_meta) = fs::metadata(&self.prev_path) {
                 if prev_meta.len() > offset {
                     out.extend(read_lines(&self.prev_path, offset, prev_meta.len()));
@@ -64,6 +99,9 @@ impl FileTail {
             out.extend(lines);
         }
         self.offset = Some(offset);
+        if id.is_some() {
+            self.file_id = id;
+        }
         out
     }
 }

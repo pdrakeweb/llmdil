@@ -196,13 +196,21 @@ mod tests {
     fn spool_cap_drops_oldest_and_counts() {
         let dir = std::env::temp_dir().join(format!("logship-spool-cap-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        // Tiny cap: each 2-record segment is a few hundred bytes.
-        let mut spool = Spool::open(&dir, 300).unwrap();
-        spool.append_batch(&[rec(1), rec(2)]).unwrap();
-        let dropped = spool.append_batch(&[rec(3), rec(4)]).unwrap();
-        assert!(spool.spooled_bytes() <= 300 || spool.segment_count() == 1);
-        assert_eq!(dropped + spool.state.unreported_spool_drops, dropped);
-        assert!(dropped > 0 || spool.segment_count() == 1);
+        // Each 10-record segment is ~1.7 KB; a 1500-byte cap holds
+        // exactly one, so the second append must evict the first.
+        let mut spool = Spool::open(&dir, 1500).unwrap();
+        let batch1: Vec<WireRecord> = (1..=10).map(rec).collect();
+        let batch2: Vec<WireRecord> = (11..=20).map(rec).collect();
+        let dropped1 = spool.append_batch(&batch1).unwrap();
+        assert_eq!(dropped1, 0);
+        assert_eq!(spool.segment_count(), 1);
+        let dropped2 = spool.append_batch(&batch2).unwrap();
+        assert_eq!(dropped2, 10, "the oldest segment's records are counted");
+        assert_eq!(spool.state.unreported_spool_drops, 10);
+        assert_eq!(spool.segment_count(), 1, "only the newest segment survives");
+        let (_path, records) = spool.oldest_segment().unwrap().unwrap();
+        assert_eq!(records.len(), 10);
+        assert_eq!(records[0].seq, 11);
         let _ = fs::remove_dir_all(&dir);
     }
 }
