@@ -612,7 +612,7 @@ fn validate_one(
             let current = manager_models::expert_offload(b.raw_flags.as_deref()).layers(moe);
             let current_cache =
                 manager_models::moe_cache_mib(b.raw_flags.as_deref()).unwrap_or(0);
-            if current == layers && cache.map_or(true, |c| c == current_cache) {
+            if current == layers && cache.is_none_or(|c| c == current_cache) {
                 fail!("already satisfied".to_string());
             }
             let bm = backend_mut(&mut candidate, &target).unwrap();
