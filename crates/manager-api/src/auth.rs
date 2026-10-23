@@ -939,8 +939,7 @@ impl AuthService {
             .ok_or_else(|| AuthError::NotFound("user".into()))?;
         if user.totp_enabled {
             let ok = step_up_password
-                .map(|p| verify_password(p, &user.password_hash))
-                .unwrap_or(false);
+                .is_some_and(|p| verify_password(p, &user.password_hash));
             if !ok {
                 return Err(AuthError::InvalidCredentials);
             }
