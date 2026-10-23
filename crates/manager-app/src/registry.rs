@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 131);
+        assert_eq!(OP_SPECS.len(), 132);
     }
 
     #[test]
