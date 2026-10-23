@@ -112,7 +112,7 @@ jobs:
             Get-ChildItem $env:LOCALAPPDATA | Select-Object Name
             throw "install dir not found: $dir"
           }
-          $appExe = Get-ChildItem "$dir\*.exe" -Recurse | Where-Object { $_.Name -notlike "*ninstall*" } | Select-Object -First 1
+          $appExe = Get-ChildItem "$dir\*.exe" -Recurse | Where-Object { $_.Name -notlike "*ninstall*" -and $_.Name -notin @("llm-service-host.exe", "llmdil-log-receiver.exe") } | Select-Object -First 1
           if (-not $appExe) { throw "no application exe found under $dir" }
           Write-Host "Installed app exe: $($appExe.FullName)"
           # The bundled sidecars deploy/option surfaces rely on:
