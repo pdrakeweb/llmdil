@@ -355,6 +355,13 @@ macro_rules! for_each_operation {
             (OptimizeRunBaseline, optimize_run_baseline, L, op_optimize_run_baseline, [backend_id: String], None),
             (OptimizeRunExperiments, optimize_run_experiments, L, op_optimize_run_experiments, [], None),
             (OptimizeEstimateExperiments, optimize_estimate_experiments, L, op_optimize_estimate_experiments, [], None),
+            // Per-backend tuning (Addendum B §B.2): preview is a
+            // pure read over live state; run holds the shared
+            // job slot for the sweep; adopt writes the winner
+            // through the structured save ops.
+            (OptimizeTuningPreview, optimize_tuning_preview, R, op_optimize_tuning_preview, [backend_id: String], None),
+            (OptimizeTuningRun, optimize_tuning_run, L, op_optimize_tuning_run, [backend_id: String], None),
+            (OptimizeTuningAdopt, optimize_tuning_adopt, C, op_optimize_tuning_adopt, [sweep_id: String, adopt_anyway: Option<bool>], None),
             (VscodeInstallExtensions, vscode_install_extensions, X, op_vscode_install_extensions, [], None),
             (VscodeWriteConfig, vscode_write_config, X, op_vscode_write_config, [backup: bool], None),
             // MXC
@@ -461,7 +468,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 134);
+        assert_eq!(OP_SPECS.len(), 137);
     }
 
     #[test]
