@@ -15591,7 +15591,7 @@ mod tests {
     #[test]
     fn cache_preview_reports_best_and_honest_no_fit() {
         let layout = planner_cache_layout();
-        let targets = (Vec::new(), vec![16_384u64], vec![0u32]);
+        let targets = (Vec::new(), vec![16_384u64], vec![0u32], vec![None]);
         let sel_f16 = manager_models::CacheSelection::default();
         // 64K: preview prices f16, best is the q8_0 rung.
         let p = cache_preview_json(
@@ -15615,10 +15615,17 @@ mod tests {
         assert_eq!(p["targets"][0]["total_mib"], 16_384);
         assert_eq!(p["targets"][0]["required_mib"], 11_559 + 4_096 + 150);
         assert_eq!(p["targets"][0]["fits"], false);
+        // The three-state classification judges total VRAM, not
+        // the headroom reserve: under total is "fits" here even
+        // though the headroom verdict above is false, and the
+        // driver model rides along (unreported in this fixture).
+        assert_eq!(p["targets"][0]["fit_state"], "fits");
+        assert_eq!(p["targets"][0]["paged_mib"], 0);
+        assert_eq!(p["targets"][0]["driver_model"], Value::Null);
         // Split across two targets: shares follow the split and
         // each target's verdict is its own — the small card
         // refuses its half while the large one takes it.
-        let split_targets = (vec![0.5, 0.5], vec![16_384u64, 4_096], vec![0u32, 3]);
+        let split_targets = (vec![0.5, 0.5], vec![16_384u64, 4_096], vec![0u32, 3], vec![None, None]);
         let p = cache_preview_json(
             &layout,
             manager_models::ExpertOffload::None,
@@ -15635,6 +15642,10 @@ mod tests {
         assert_eq!(p["targets"][1]["gpu"], 3);
         assert_eq!(p["targets"][1]["required_mib"], (11_559 + 2_048 + 150) - half);
         assert_eq!(p["targets"][1]["fits"], false);
+        // Over total with no WDDM driver model reported: the
+        // three-state verdict is a hard does_not_fit, no paging.
+        assert_eq!(p["targets"][1]["fit_state"], "does_not_fit");
+        assert_eq!(p["targets"][1]["paged_mib"], 0);
         assert_eq!(p["fits_current"], false);
         // 256K: no rung fits; best is null and the ladder's lowest
         // rung carries the honest numbers (nothing is applied).
