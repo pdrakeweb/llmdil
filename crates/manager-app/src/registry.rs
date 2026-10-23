@@ -248,7 +248,15 @@ macro_rules! for_each_operation {
             (ModelSetShortName, model_set_short_name, C, op_model_set_short_name, [id: String, name: String], None),
             (ModelDelete, model_delete, D, op_model_delete, [id: String], Some(route(HttpMethod::Delete, "/api/v1/models/{id}"))),
             (ModelAssign, model_assign, C, op_model_assign, [id: String, backend_id: String, split: Vec<f32>], Some(route(HttpMethod::Post, "/api/v1/models/{id}/assign"))),
-            (ModelAdd, model_add, C, op_model_add, [id: String, source_url: String, file_name: Option<String>, quant: Option<String>, params_b: Option<f32>, moe_layers: Option<u32>, default_offload_layers: Option<u32>, mtp: Option<bool>], Some(route_created(HttpMethod::Post, "/api/v1/models"))),
+            (ModelAdd, model_add, C, op_model_add, [id: String, source_url: String, file_name: Option<String>, quant: Option<String>, params_b: Option<f32>, moe_layers: Option<u32>, default_offload_layers: Option<u32>, mtp: Option<bool>, sha256: Option<String>], Some(route_created(HttpMethod::Post, "/api/v1/models"))),
+            // Add Model form helpers (deep-discovery design
+            // Part 2, §P2.11): the shallow HF lookup behind the
+            // pick list and its type-ahead, and the pick-time
+            // GGUF header read. Read-class, desktop-only in v1
+            // (route None, documented in rest-api.md §6.16) —
+            // they serve the form, not the API surface.
+            (ModelHfLookup, model_hf_lookup, R, op_model_hf_lookup, [query: String, suggest: Option<bool>], None),
+            (ModelHfHeader, model_hf_header, R, op_model_hf_header, [repo_id: String, file: String], None),
             (ModelSetEnabled, model_set_enabled, C, op_model_set_enabled, [id: String, enabled: bool], None),
             // PATCH /models/{id} composite over this, model_set_short_name
             // and model_set_enabled (rest-api.md §6.3); no 1:1 route.
@@ -453,7 +461,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 132);
+        assert_eq!(OP_SPECS.len(), 134);
     }
 
     #[test]
