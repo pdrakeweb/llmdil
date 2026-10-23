@@ -1,6 +1,6 @@
 [package]
 name = "manager-logship"
-version = "0.1.51"
+version = "0.1.52"
 edition = "2021"
 
 # Log streaming shipper (log-streaming design, D9): tails the app's

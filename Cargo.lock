@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "manager-api"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "manager-app"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "chrono",
  "manager-bench",
@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "manager-bench"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "chrono",
  "serde",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "manager-config"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "chrono",
  "serde",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "manager-gateway"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "chrono",
  "manager-config",
@@ -1117,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "manager-logreceiver"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "axum",
  "chrono",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "manager-logship"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "chrono",
  "flate2",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "manager-mcp"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "manager-config",
  "manager-supervisor",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "manager-models"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "chrono",
  "manager-config",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "manager-mxc"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "chrono",
  "serde",
@@ -1184,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "manager-optimize"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "chrono",
  "manager-config",
@@ -1199,11 +1199,11 @@ dependencies = [
 
 [[package]]
 name = "manager-present"
-version = "0.1.51"
+version = "0.1.52"
 
 [[package]]
 name = "manager-services"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "manager-supervisor",
  "serde",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "manager-supervisor"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "manager-telemetry"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1245,7 +1245,7 @@ dependencies = [
 
 [[package]]
 name = "manager-winml"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "manager-wizard"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "async-trait",
  "chrono",

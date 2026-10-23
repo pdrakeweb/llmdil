@@ -1,6 +1,6 @@
 [package]
 name = "manager-logreceiver"
-version = "0.1.51"
+version = "0.1.52"
 edition = "2021"
 
 # Prometheus-local log receiver for LLMdil log streaming
