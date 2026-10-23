@@ -11600,6 +11600,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_assign_to_unregistered_model_fails_and_leaves_prior_config_intact() {
+        // Tracker #54 apply-dependency guard, execution layer:
+        // the Optimize apply orchestrator executes a
+        // backend.set_model through model_assign. An assign
+        // naming a model that is not registered — the state a
+        // dependent set_model is in when its chained model.add
+        // was denied or failed — is refused, and the backend's
+        // prior configuration (the model it was serving) is
+        // left exactly intact: no live-config mutation, no
+        // persisted change, no journal entry.
+        let cfg = test_cfg();
+        let (state, dir) = advanced_test_state(cfg);
+        // Pin an empty telemetry store, as the other
+        // model_assign tests do: with no GPU count polled, the
+        // split check is skipped and the refusal under test is
+        // the unregistered-model lookup itself.
+        let _ = state.telemetry.set(Arc::new(std::sync::Mutex::new(
+            TelemetryStore::new(),
+        )));
+        let sink = test_sink();
+        let before = serde_json::to_value(state.config.read().await.clone()).unwrap();
+        let prior_model_file = state
+            .config
+            .read()
+            .await
+            .backends
+            .iter()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .model_file
+            .clone();
+        let r = op_model_assign(
+            &state,
+            &sink,
+            "model-that-was-never-registered".to_string(),
+            "coder".to_string(),
+            vec![],
+        )
+        .await;
+        let err = r.expect_err("assigning an unregistered model must be refused");
+        assert!(
+            matches!(&err, ApiError::NotFound(m) if m.contains("model-that-was-never-registered")),
+            "refusal must name the unregistered model: {err}"
+        );
+        let after_cfg = state.config.read().await.clone();
+        assert_eq!(
+            serde_json::to_value(after_cfg.clone()).unwrap(),
+            before,
+            "a refused assign must leave the live config byte-identical"
+        );
+        assert_eq!(
+            after_cfg
+                .backends
+                .iter()
+                .find(|b| b.id == "coder")
+                .unwrap()
+                .model_file,
+            prior_model_file,
+            "the backend keeps serving its prior model after a refused swap"
+        );
+        assert!(
+            activation::load_journal(&state.data_dir).entries.is_empty(),
+            "a refused assign must not journal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn advanced_save_then_structured_decode_round_trip() {
         let mut cfg = test_cfg();
         serve_model(
