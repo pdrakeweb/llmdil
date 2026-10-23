@@ -201,7 +201,11 @@ mod tests {
         spool.append_batch(&[rec(1), rec(2)]).unwrap();
         let dropped = spool.append_batch(&[rec(3), rec(4)]).unwrap();
         assert!(spool.spooled_bytes() <= 300 || spool.segment_count() == 1);
-        assert_eq!(dropped + spool.state.unreported_spool_drops, dropped);
+        // The cap evicted the first segment: its 2 records are the
+        // drop, counted once — the returned count and the count
+        // accumulated for the recovery report (§6.4) agree.
+        assert_eq!(dropped, 2);
+        assert_eq!(spool.state.unreported_spool_drops, dropped);
         assert!(dropped > 0 || spool.segment_count() == 1);
         let _ = fs::remove_dir_all(&dir);
     }
