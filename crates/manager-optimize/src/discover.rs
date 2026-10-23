@@ -17,6 +17,15 @@
 //! block — distinct from the curated `catalog_candidates` —
 //! carrying provenance per entry (HF repo id, retrieved-at).
 //!
+//! The pass the op runs is the deep pool
+//! ([`HfClient::discover_deep`], deep-discovery design Part 1):
+//! conjunctive-search query variants merged into a 600-repo
+//! pool, search-layer and record-layer filters counted in a
+//! [`DiscoveryFunnel`], quant collapsing to ≤3 per repo, and a
+//! lexicographically ranked shortlist capped at 30. The shallow
+//! single-search [`HfClient::discover`] remains for the
+//! original §A.5 shape.
+//!
 //! No auth: public models only. No tool loop, no web search.
 //! The HTTP layer is thin on purpose; the parsers are pure
 //! functions over the response text so the risk-bearing logic
@@ -45,6 +54,91 @@ pub const MAX_SEARCH_REPOS: usize = 8;
 /// Cap on the directive-derived search terms (see
 /// [`search_query_for_directive`]).
 pub const MAX_QUERY_TERMS: usize = 4;
+
+// ---------------------------------------------------------------------------
+// Deep discovery pool (deep-discovery design Part 1, D1–D10)
+// ---------------------------------------------------------------------------
+
+/// Unique-repo cap on the merged search pool (D1): variant
+/// results merge by repo id up to this many repos, ordered
+/// by downloads; that order drives record fetching.
+pub const MAX_POOL_REPOS: usize = 600;
+
+/// Record-fetch depth (D1): at most this many repos have
+/// their model record fetched in one deep pass. The request
+/// budget is the binding constraint — worst case 12 search
+/// requests + 200 records ≈ 42% of HF's anonymous
+/// 500-per-5-minutes window (D10: no HF token).
+pub const MAX_RECORD_FETCHES: usize = 200;
+
+/// Cap on the query-variant set (D2): the joined query, one
+/// query per term, and the seat-family query.
+pub const MAX_QUERY_VARIANTS: usize = 6;
+
+/// Search page size for the deep pass (D3): `limit=100`
+/// pages followed via the `Link` cursor, at most
+/// [`MAX_PAGES_PER_VARIANT`] pages per variant — incremental
+/// pages are what make the early exit possible.
+pub const SEARCH_PAGE_LIMIT: usize = 100;
+pub const MAX_PAGES_PER_VARIANT: usize = 2;
+
+/// Record-fetch concurrency (D4): a `JoinSet` gated by a
+/// semaphore at this width.
+pub const DISCOVERY_CONCURRENCY: usize = 8;
+
+/// Per-request timeout for the deep pass (D4), down from the
+/// client's 30 s interactive default: at depth, a 30 s
+/// straggler under a semaphore slot is a real budget cost.
+pub const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whole-pass deadline (D4): on expiry, fetching stops and
+/// the partial result is stored (D5).
+pub const DISCOVERY_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Search-layer popularity floor (D6): a repo below this
+/// many downloads carries no usage signal.
+pub const MIN_POOL_DOWNLOADS: u64 = 1_000;
+
+/// Search-layer staleness rule (D6): `lastModified` older
+/// than this many days **and** downloads below
+/// [`STALE_DOWNLOADS`] — both conditions, so a two-year-old
+/// repo with a large audience stays a candidate.
+pub const STALE_DAYS: i64 = 730;
+pub const STALE_DOWNLOADS: u64 = 10_000;
+
+/// Per-repo candidate cap in the ranking pool and in the
+/// admitted shortlist (D7/D8): the largest `fits`, the
+/// largest `fits_with_split`, and the smallest overall.
+pub const MAX_CANDIDATES_PER_REPO: usize = 3;
+
+/// Shortlist cap (D8): the bound on the stored list, the
+/// prune surface, and the consultation candidates block
+/// (~60 tokens per entry ⇒ ≈1,800 tokens at the cap).
+pub const SHORTLIST_CAP: usize = 30;
+
+/// Minimum distinct repos in a full shortlist for the early
+/// exit (§P1.9): a cap-full shortlist of checked fits from
+/// fewer repos is not yet a real choice.
+pub const EARLY_EXIT_MIN_REPOS: usize = 10;
+
+/// Model-family vocabulary for the record-layer family
+/// filter (D6): when a query term names one of these, a
+/// record whose `gguf.architecture` starts with none of the
+/// named tokens is dropped.
+pub const FAMILY_TOKENS: &[&str] = &[
+    "qwen",
+    "llama",
+    "mistral",
+    "mixtral",
+    "gemma",
+    "phi",
+    "deepseek",
+    "nemotron",
+    "falcon",
+    "yi",
+    "glm",
+    "internlm",
+];
 
 /// Repo cap for the Add Model form's shallow lookup
 /// (deep-discovery design Part 2, P2-D2): one search at this
@@ -121,6 +215,127 @@ pub enum DiscoverError {
     Http(String),
     #[error("could not parse Hugging Face response: {0}")]
     Parse(String),
+    /// HTTP 429, or a `RateLimit` header reporting no
+    /// requests remaining: the deep pass stops fetching and
+    /// stores its partial result (D5) instead of failing or
+    /// sleeping inside the op.
+    #[error("Hugging Face rate limit reached")]
+    RateLimited,
+}
+
+/// The `rel="next"` target of an RFC 8288 `Link` header:
+/// the opaque-cursor URL the next search page is fetched
+/// from (§P1.3, D3). Header shape:
+/// `<url>; rel="next", <url>; rel="last", …`.
+pub fn parse_link_next(link_header: Option<&str>) -> Option<String> {
+    let header = link_header?;
+    for part in header.split(',') {
+        let part = part.trim();
+        let Some(rest) = part.strip_prefix('<') else {
+            continue;
+        };
+        let Some((url, params)) = rest.split_once('>') else {
+            continue;
+        };
+        if params.contains("rel=\"next\"") {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
+/// The remaining-requests figure of a `RateLimit` header
+/// (`"api";r=<remaining>;t=<seconds to reset>`, §P1.3).
+/// `Some(0)` is the deep pass's stop signal (§P1.5).
+pub fn parse_rate_limit_remaining(rate_limit_header: Option<&str>) -> Option<u64> {
+    let header = rate_limit_header?;
+    for field in header.split(';') {
+        if let Some(value) = field.trim().strip_prefix("r=") {
+            return value.trim().trim_matches('"').parse().ok();
+        }
+    }
+    None
+}
+
+/// The accounting of one deep discovery pass (§P1.10): every
+/// drop is counted, nothing is dropped silently. Stored
+/// beside the shortlist in `optimize-candidates.json` and
+/// exposed in the candidates payload; the Optimize page
+/// renders its summary (`Searched / Filtered / Kept`) with
+/// the full counter set in the line's tooltip. Counts report
+/// what was fetched only — HF sends no total match count,
+/// so no "of N total" figure exists to show.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscoveryFunnel {
+    /// Query variants actually run (of the derived set).
+    pub queries_run: usize,
+    /// Unique repos merged into the pool (cap
+    /// [`MAX_POOL_REPOS`]).
+    pub pool_repos: usize,
+    /// Repos whose model record was fetched successfully.
+    pub repos_fetched: usize,
+    /// Repos whose record fetch failed (skipped).
+    pub repos_failed: usize,
+    /// Search-layer drops: downloads below
+    /// [`MIN_POOL_DOWNLOADS`].
+    pub dropped_unpopular: usize,
+    /// Search-layer drops: stale by the §P1.6 rule.
+    pub dropped_stale: usize,
+    /// Record-layer drops: architecture contradicts a
+    /// family term the directive named.
+    pub dropped_family: usize,
+    /// Candidate drops: fit verdict `does_not_fit`, counted
+    /// per candidate after quant grouping (D8).
+    pub dropped_fit: usize,
+    /// Candidates produced by quant grouping across all
+    /// fetched records, before fit filtering and collapsing
+    /// (`does_not_fit` counted in `dropped_fit`).
+    pub quants_considered: usize,
+    /// Candidates removed by the ≤3-per-repo collapse (D7).
+    pub quants_collapsed: usize,
+    /// Candidates admitted to the shortlist (D8).
+    pub kept: usize,
+    /// The pass stopped before natural completion
+    /// (deadline or rate limit); the stored result is
+    /// partial (D5).
+    pub partial: bool,
+    /// Why the pass is partial: `"deadline"` or
+    /// `"rate_limited"`; `None` on a complete pass.
+    pub partial_reason: Option<String>,
+    /// Fetching stopped early because the shortlist was
+    /// full of checked fits from enough distinct repos
+    /// (§P1.9).
+    pub stopped_early: bool,
+}
+
+impl Default for DiscoveryFunnel {
+    fn default() -> Self {
+        Self {
+            queries_run: 0,
+            pool_repos: 0,
+            repos_fetched: 0,
+            repos_failed: 0,
+            dropped_unpopular: 0,
+            dropped_stale: 0,
+            dropped_family: 0,
+            dropped_fit: 0,
+            quants_considered: 0,
+            quants_collapsed: 0,
+            kept: 0,
+            partial: false,
+            partial_reason: None,
+            stopped_early: false,
+        }
+    }
+}
+
+/// The result of one deep discovery pass: the ranked
+/// shortlist plus its funnel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeepDiscovery {
+    pub candidates: Vec<CandidateFact>,
+    pub funnel: DiscoveryFunnel,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +350,14 @@ pub struct HfSearchHit {
     pub downloads: u64,
     #[serde(default)]
     pub likes: u64,
+    /// `lastModified` (RFC 3339): present only on
+    /// `full=true` search hits and on model records — the
+    /// default search fields do not carry it (§P1.3). The
+    /// deep pass searches with `full=true` so the
+    /// search-layer staleness filter has it without any
+    /// record fetch.
+    #[serde(default, rename = "lastModified")]
+    pub last_modified: Option<String>,
 }
 
 /// Parse a search response body into hits, capped at
@@ -215,6 +438,8 @@ struct RawModelRecord {
     downloads: u64,
     #[serde(default)]
     likes: u64,
+    #[serde(default, rename = "lastModified")]
+    last_modified: Option<String>,
     #[serde(default)]
     gguf: Option<RawGguf>,
     #[serde(default)]
@@ -229,6 +454,10 @@ pub struct HfModelFacts {
     pub repo_id: String,
     pub downloads: u64,
     pub likes: u64,
+    /// The record's `lastModified` (RFC 3339), when HF
+    /// reports it: the recency input to shortlist ranking
+    /// (§P1.8) for repos whose record was fetched.
+    pub last_modified: Option<String>,
     pub architecture: Option<String>,
     /// Total parameter count (not billions).
     pub params_total: Option<u64>,
@@ -246,6 +475,7 @@ pub fn parse_model_record(body: &str) -> Result<HfModelFacts, DiscoverError> {
         repo_id: raw.id,
         downloads: raw.downloads,
         likes: raw.likes,
+        last_modified: raw.last_modified,
         architecture: raw.gguf.as_ref().and_then(|g| g.architecture.clone()),
         params_total: raw.gguf.as_ref().and_then(|g| g.total),
         ctx_max: raw
@@ -432,6 +662,268 @@ pub fn candidates_from_model(
             retrieved_at: retrieved_at.to_string(),
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Deep pool: merge, filters, quant collapsing, ranking (Part 1)
+// ---------------------------------------------------------------------------
+
+/// One repo in the merged pool: the best facts the search
+/// layer saw for it across every variant and page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoolRepo {
+    pub repo_id: String,
+    pub downloads: u64,
+    pub last_modified: Option<String>,
+}
+
+/// Merge search hits into the pool (§P1.4): a repo hit by
+/// several variants is kept once, with the maximum
+/// `downloads` / `lastModified` seen. Insertion order is
+/// preserved for repos already present; the pool order the
+/// fetcher drives off is [`pool_order`] (downloads
+/// descending). The caller enforces [`MAX_POOL_REPOS`] by
+/// not merging past the cap.
+pub fn merge_pool_hits(pool: &mut Vec<PoolRepo>, hits: &[HfSearchHit]) {
+    for hit in hits {
+        if let Some(existing) = pool.iter_mut().find(|p| p.repo_id == hit.id) {
+            existing.downloads = existing.downloads.max(hit.downloads);
+            existing.last_modified = match (&existing.last_modified, &hit.last_modified) {
+                (Some(a), Some(b)) => Some(a.max(b).clone()),
+                (Some(a), None) => Some(a.clone()),
+                (None, b) => b.clone(),
+            };
+        } else if pool.len() < MAX_POOL_REPOS {
+            pool.push(PoolRepo {
+                repo_id: hit.id.clone(),
+                downloads: hit.downloads,
+                last_modified: hit.last_modified.clone(),
+            });
+        }
+    }
+}
+
+/// The pool in fetch order: downloads descending, repo id
+/// ascending on ties (deterministic from the same pool).
+pub fn pool_order(pool: &[PoolRepo]) -> Vec<PoolRepo> {
+    let mut ordered = pool.to_vec();
+    ordered.sort_by(|a, b| {
+        b.downloads
+            .cmp(&a.downloads)
+            .then_with(|| a.repo_id.cmp(&b.repo_id))
+    });
+    ordered
+}
+
+/// Parse an RFC 3339 timestamp to Unix seconds for the
+/// staleness and recency comparisons. Unparseable input is
+/// `None` — a repo whose recency cannot be read is never
+/// dropped as stale on a guess.
+fn rfc3339_unix(text: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
+/// The §P1.6 staleness rule: `lastModified` older than
+/// [`STALE_DAYS`] **and** downloads below
+/// [`STALE_DOWNLOADS`], judged against `now_unix`.
+pub fn is_stale(downloads: u64, last_modified: Option<&str>, now_unix: i64) -> bool {
+    if downloads >= STALE_DOWNLOADS {
+        return false;
+    }
+    match last_modified.and_then(rfc3339_unix) {
+        Some(ts) => now_unix - ts > STALE_DAYS * 86_400,
+        None => false,
+    }
+}
+
+/// Search-layer filtering (§P1.6, steps 1–2), in listed
+/// order so each drop is counted once: below the downloads
+/// floor is `dropped_unpopular`; the staleness rule is
+/// `dropped_stale`. Returns the kept repos in input order.
+pub fn search_layer_filter(
+    repos: &[PoolRepo],
+    now_unix: i64,
+    funnel: &mut DiscoveryFunnel,
+) -> Vec<PoolRepo> {
+    let mut kept = Vec::new();
+    for repo in repos {
+        if repo.downloads < MIN_POOL_DOWNLOADS {
+            funnel.dropped_unpopular += 1;
+        } else if is_stale(repo.downloads, repo.last_modified.as_deref(), now_unix) {
+            funnel.dropped_stale += 1;
+        } else {
+            kept.push(repo.clone());
+        }
+    }
+    kept
+}
+
+/// The family tokens a directive's terms name (§P1.6 step
+/// 3): a term matches a token exactly, or as a prefix
+/// followed by a digit — the versioned family names
+/// (`qwen3`, `llama3`, `gemma2`, `phi4`, `glm4`) name the
+/// family the vocabulary lists as `qwen`, `llama`, … .
+/// (Interpretation, named: the design says "any query term
+/// is a known family token"; strict equality would leave
+/// the filter inert for the versioned names directives
+/// actually use.)
+pub fn family_tokens_for_terms(terms: &[String]) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for token in FAMILY_TOKENS {
+        let named = terms.iter().any(|t| {
+            t == token
+                || t.strip_prefix(token)
+                    .is_some_and(|rest| rest.bytes().next().is_some_and(|b| b.is_ascii_digit()))
+        });
+        if named {
+            out.push(token);
+        }
+    }
+    out
+}
+
+/// The record-layer family rule (§P1.6 step 3): with no
+/// family token named, every record is kept; a record with
+/// no `gguf` architecture has nothing to contradict the
+/// directive and is kept; otherwise the architecture must
+/// start with one of the named tokens.
+pub fn family_filter_keeps(architecture: Option<&str>, family_tokens: &[&str]) -> bool {
+    if family_tokens.is_empty() {
+        return true;
+    }
+    match architecture {
+        None => true,
+        Some(arch) => {
+            let arch = arch.to_lowercase();
+            family_tokens.iter().any(|t| arch.starts_with(t))
+        }
+    }
+}
+
+/// Quant collapsing (D7): per repo, at most
+/// [`MAX_CANDIDATES_PER_REPO`] candidates enter the ranking
+/// pool — the largest-size candidate with fit `fits`, the
+/// largest-size candidate with fit `fits_with_split`, and
+/// the smallest-size candidate overall — deduplicated when
+/// one candidate fills two slots. Returns the collapsed
+/// pool and the number of candidates removed.
+pub fn collapse_candidates(candidates: &[CandidateFact]) -> (Vec<CandidateFact>, usize) {
+    let mut by_repo: BTreeMap<&str, Vec<&CandidateFact>> = BTreeMap::new();
+    for c in candidates {
+        by_repo.entry(c.repo_id.as_str()).or_default().push(c);
+    }
+    fn pick<'a>(picked: &mut Vec<&'a CandidateFact>, c: Option<&'a CandidateFact>) {
+        if let Some(c) = c {
+            if !picked.iter().any(|p| p.file == c.file) {
+                picked.push(c);
+            }
+        }
+    }
+    let mut out: Vec<CandidateFact> = Vec::new();
+    for (_, repo_candidates) in by_repo {
+        let mut picked: Vec<&CandidateFact> = Vec::new();
+        pick(
+            &mut picked,
+            repo_candidates
+                .iter()
+                .filter(|c| c.fit == FIT_FITS)
+                .max_by_key(|c| c.size_bytes)
+                .copied(),
+        );
+        pick(
+            &mut picked,
+            repo_candidates
+                .iter()
+                .filter(|c| c.fit == FIT_FITS_WITH_SPLIT)
+                .max_by_key(|c| c.size_bytes)
+                .copied(),
+        );
+        pick(
+            &mut picked,
+            repo_candidates.iter().min_by_key(|c| c.size_bytes).copied(),
+        );
+        out.extend(picked.into_iter().cloned());
+    }
+    let removed = candidates.len() - out.len();
+    (out, removed)
+}
+
+/// Fit-tier rank for the lexicographic shortlist order
+/// (§P1.8): `fits` < `fits_with_split` < `unchecked`.
+/// `does_not_fit` never reaches ranking (D8 drops it).
+fn fit_tier(fit: &str) -> u8 {
+    match fit {
+        FIT_FITS => 0,
+        FIT_FITS_WITH_SPLIT => 1,
+        _ => 2,
+    }
+}
+
+/// Rank the collapsed pool and admit the shortlist (§P1.8):
+/// lexicographic over (fit tier, downloads descending,
+/// `lastModified` descending, repo id ascending, size
+/// descending) — a deterministic total order, so a pass is
+/// reproducible from the same responses. Admission walks
+/// the ranked list, admitting a candidate while its repo
+/// has fewer than [`MAX_CANDIDATES_PER_REPO`] admitted and
+/// the shortlist has fewer than [`SHORTLIST_CAP`].
+/// `last_modified_for` supplies each repo's recency (the
+/// record's, else the pool hit's).
+pub fn rank_and_admit(
+    collapsed: &[CandidateFact],
+    last_modified_for: &dyn Fn(&str) -> Option<String>,
+) -> Vec<CandidateFact> {
+    let mut ranked: Vec<(CandidateFact, Option<i64>)> = collapsed
+        .iter()
+        .map(|c| {
+            let lm = last_modified_for(&c.repo_id);
+            (c.clone(), lm.as_deref().and_then(rfc3339_unix))
+        })
+        .collect();
+    ranked.sort_by(|(a, a_lm), (b, b_lm)| {
+        fit_tier(&a.fit)
+            .cmp(&fit_tier(&b.fit))
+            .then_with(|| b.downloads.cmp(&a.downloads))
+            .then_with(|| b_lm.cmp(a_lm))
+            .then_with(|| a.repo_id.cmp(&b.repo_id))
+            .then_with(|| b.size_bytes.cmp(&a.size_bytes))
+    });
+    let mut admitted: Vec<CandidateFact> = Vec::new();
+    let mut per_repo: BTreeMap<String, usize> = BTreeMap::new();
+    for (candidate, _) in ranked {
+        if admitted.len() >= SHORTLIST_CAP {
+            break;
+        }
+        let count = per_repo.entry(candidate.repo_id.clone()).or_insert(0);
+        if *count >= MAX_CANDIDATES_PER_REPO {
+            continue;
+        }
+        *count += 1;
+        admitted.push(candidate);
+    }
+    admitted
+}
+
+/// The §P1.9 early-exit predicate over an admitted
+/// shortlist: full ([`SHORTLIST_CAP`]), every candidate
+/// checked (`fits` / `fits_with_split` — `unchecked` never
+/// triggers the exit), from at least [`EARLY_EXIT_MIN_REPOS`]
+/// distinct repos.
+pub fn shortlist_is_full(shortlist: &[CandidateFact]) -> bool {
+    if shortlist.len() < SHORTLIST_CAP {
+        return false;
+    }
+    if !shortlist
+        .iter()
+        .all(|c| c.fit == FIT_FITS || c.fit == FIT_FITS_WITH_SPLIT)
+    {
+        return false;
+    }
+    let repos: std::collections::BTreeSet<&str> =
+        shortlist.iter().map(|c| c.repo_id.as_str()).collect();
+    repos.len() >= EARLY_EXIT_MIN_REPOS
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +1195,31 @@ fn seat_family_term(seat: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// The salient terms of a directive (steps 1–3 of
+/// [`search_query_for_directive`]'s rule), returned as a
+/// list: the deep pass's variant builder (§P1.4) needs the
+/// terms themselves, not only their join. The seat's family
+/// term is *not* part of this list — it is a query-level
+/// addition, applied by the query builders.
+pub fn search_terms_for_directive(directive: &str) -> Vec<String> {
+    let lower = directive.to_lowercase();
+    let mut terms: Vec<String> = Vec::new();
+    for token in lower.split(|c: char| !c.is_alphanumeric()) {
+        if token.is_empty()
+            || STOPWORDS.contains(&token)
+            || SEAT_WORDS.contains(&token)
+            || terms.iter().any(|t| t == token)
+        {
+            continue;
+        }
+        terms.push(token.to_string());
+        if terms.len() >= MAX_QUERY_TERMS {
+            break;
+        }
+    }
+    terms
+}
+
 /// Derive the HF search query from a directive,
 /// deterministically. The rule, in full:
 ///
@@ -725,27 +1242,48 @@ fn seat_family_term(seat: Option<&str>) -> Option<&'static str> {
 /// GGUF repos by downloads — which is the honest fallback for
 /// a directive with no model-identifying terms.
 pub fn search_query_for_directive(directive: &str) -> String {
-    let lower = directive.to_lowercase();
-    let mut terms: Vec<String> = Vec::new();
-    for token in lower.split(|c: char| !c.is_alphanumeric()) {
-        if token.is_empty()
-            || STOPWORDS.contains(&token)
-            || SEAT_WORDS.contains(&token)
-            || terms.iter().any(|t| t == token)
-        {
-            continue;
-        }
-        terms.push(token.to_string());
-        if terms.len() >= MAX_QUERY_TERMS {
-            break;
-        }
-    }
+    let mut terms = search_terms_for_directive(directive);
     if let Some(family) = seat_family_term(seat_for_directive(directive)) {
         if !terms.iter().any(|t| t == family) && terms.len() < MAX_QUERY_TERMS {
             terms.push(family.to_string());
         }
     }
     terms.join(" ")
+}
+
+/// The deep pass's query-variant set (§P1.4, D2),
+/// deduplicated, in run order, capped at
+/// [`MAX_QUERY_VARIANTS`]:
+///
+/// 1. All terms joined — today's query, seat-family term
+///    included per [`search_query_for_directive`].
+/// 2. Each salient term alone (≤ [`MAX_QUERY_TERMS`]).
+/// 3. The seat-family term alone, when the seat contributes
+///    one.
+///
+/// Why variants: HF search is conjunctive (§P1.3), so one
+/// unmatchable term in the joined query zeroes the whole
+/// pass, and a joined query can only narrow. Single-term
+/// variants recover the recall; the pool merge restores
+/// order. (Interpretation, named: the design's variant 3,
+/// "the seat-family variant", is read as the family term as
+/// its own query — the reading under which the set's cap of
+/// 6 is exactly 1 joined + 4 singles + 1 family.)
+pub fn query_variants_for_directive(directive: &str) -> Vec<String> {
+    let mut variants: Vec<String> = Vec::new();
+    let push = |q: String, variants: &mut Vec<String>| {
+        if !variants.contains(&q) && variants.len() < MAX_QUERY_VARIANTS {
+            variants.push(q);
+        }
+    };
+    push(search_query_for_directive(directive), &mut variants);
+    for term in search_terms_for_directive(directive) {
+        push(term, &mut variants);
+    }
+    if let Some(family) = seat_family_term(seat_for_directive(directive)) {
+        push(family.to_string(), &mut variants);
+    }
+    variants
 }
 
 // ---------------------------------------------------------------------------
@@ -756,7 +1294,7 @@ pub fn search_query_for_directive(directive: &str) -> String {
 /// (default [`HF_DEFAULT_BASE_URL`]) so tests run against a
 /// local mock server; production passes the default. No auth
 /// header is ever sent — public models only (§A.5).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HfClient {
     base_url: String,
     client: reqwest::Client,
@@ -966,13 +1504,35 @@ impl HfClient {
     }
 
     async fn get_text(&self, url: &str) -> Result<String, DiscoverError> {
+        Ok(self
+            .get_checked(url, Duration::from_secs(30))
+            .await?
+            .1)
+    }
+
+    /// GET with a per-request timeout, returning the
+    /// response headers beside the body (the deep pass reads
+    /// `Link` and `RateLimit` off search responses). HTTP 429
+    /// maps to [`DiscoverError::RateLimited`]; other
+    /// non-success statuses keep the excerpted-body `Http`
+    /// error.
+    async fn get_checked(
+        &self,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<(reqwest::header::HeaderMap, String), DiscoverError> {
         let resp = self
             .client
             .get(url)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|e| DiscoverError::Http(e.to_string()))?;
         let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(DiscoverError::RateLimited);
+        }
+        let headers = resp.headers().clone();
         let text = resp
             .text()
             .await
@@ -981,8 +1541,346 @@ impl HfClient {
             let excerpt: String = text.chars().take(200).collect();
             return Err(DiscoverError::Http(format!("HTTP {status}: {excerpt}")));
         }
-        Ok(text)
+        Ok((headers, text))
     }
+
+    /// The first-page URL of one deep-pass variant search
+    /// (§P1.4): `full=true` (so hits carry `lastModified` for
+    /// the search-layer filters) at [`SEARCH_PAGE_LIMIT`].
+    fn deep_search_url(&self, query: &str) -> String {
+        let mut url = reqwest::Url::parse(&format!("{}/api/models", self.base_url))
+            .expect("base URL was validated at client construction");
+        {
+            let mut pairs = url.query_pairs_mut();
+            if !query.is_empty() {
+                pairs.append_pair("search", query);
+            }
+            pairs
+                .append_pair("filter", "gguf")
+                .append_pair("sort", "downloads")
+                .append_pair("direction", "-1")
+                .append_pair("limit", &SEARCH_PAGE_LIMIT.to_string())
+                .append_pair("full", "true");
+        }
+        url.to_string()
+    }
+
+    /// Fetch one deep-pass search page by URL (the first
+    /// page from [`Self::deep_search_url`], later pages from
+    /// the previous page's `Link` cursor), with the deep
+    /// per-request timeout.
+    async fn search_page(&self, url: &str) -> Result<SearchPage, DiscoverError> {
+        let (headers, body) = self
+            .get_checked(url, DISCOVERY_REQUEST_TIMEOUT)
+            .await?;
+        let link = headers
+            .get(reqwest::header::LINK)
+            .and_then(|v| v.to_str().ok());
+        let rate_limit = headers
+            .get("ratelimit")
+            .and_then(|v| v.to_str().ok());
+        Ok(SearchPage {
+            hits: parse_search_results_capped(&body, SEARCH_PAGE_LIMIT)?,
+            next_url: parse_link_next(link),
+            rate_limit_remaining: parse_rate_limit_remaining(rate_limit),
+        })
+    }
+
+    /// One repo's record for the deep pass, with the
+    /// response's rate-limit remainder beside the result.
+    async fn model_facts_deep(
+        &self,
+        repo_id: &str,
+    ) -> (Result<HfModelFacts, DiscoverError>, Option<u64>) {
+        let url = format!("{}/api/models/{repo_id}?blobs=true", self.base_url);
+        match self.get_checked(&url, DISCOVERY_REQUEST_TIMEOUT).await {
+            Ok((headers, body)) => {
+                let remaining = parse_rate_limit_remaining(
+                    headers.get("ratelimit").and_then(|v| v.to_str().ok()),
+                );
+                (parse_model_record(&body), remaining)
+            }
+            Err(DiscoverError::RateLimited) => (Err(DiscoverError::RateLimited), Some(0)),
+            Err(e) => (Err(e), None),
+        }
+    }
+
+    /// Fetch one batch of records with bounded concurrency
+    /// (D4): a `JoinSet` gated by a semaphore at
+    /// [`DISCOVERY_CONCURRENCY`]. Returns the completed
+    /// results (unordered) and whether the pass deadline
+    /// cut the batch short — on expiry the remaining tasks
+    /// are aborted and the caller stores a partial result.
+    async fn fetch_records_batch(
+        &self,
+        repos: &[PoolRepo],
+        deadline: tokio::time::Instant,
+    ) -> (Vec<(String, Result<HfModelFacts, DiscoverError>, Option<u64>)>, bool) {
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(DISCOVERY_CONCURRENCY));
+        let mut set = tokio::task::JoinSet::new();
+        for repo in repos {
+            let client = self.clone();
+            let semaphore = semaphore.clone();
+            let repo_id = repo.repo_id.clone();
+            set.spawn(async move {
+                let _permit = semaphore
+                    .acquire()
+                    .await
+                    .expect("discovery semaphore is never closed");
+                let (result, remaining) = client.model_facts_deep(&repo_id).await;
+                (repo_id, result, remaining)
+            });
+        }
+        let mut results = Vec::new();
+        let mut deadline_hit = false;
+        loop {
+            match tokio::time::timeout_at(deadline, set.join_next()).await {
+                Ok(Some(Ok(item))) => results.push(item),
+                Ok(Some(Err(_))) => continue, // a panicked task: skip, as a failed fetch
+                Ok(None) => break,
+                Err(_) => {
+                    deadline_hit = true;
+                    set.abort_all();
+                    break;
+                }
+            }
+        }
+        (results, deadline_hit)
+    }
+
+    /// The deep discovery pass (Part 1, D1–D10): query
+    /// variants searched in pages, merged into the
+    /// 600-repo pool, filtered at the search layer, then
+    /// records fetched in page batches at bounded
+    /// concurrency up to the 200-repo depth — each record
+    /// family- and fit-filtered, its candidates collapsed
+    /// to ≤3 per repo, ranked lexicographically, and
+    /// admitted to the 30-candidate shortlist. Fetching
+    /// stops at the §P1.9 early exit, pool exhaustion, the
+    /// depth cap, the 120 s deadline, or a 429 — the last
+    /// two store a partial result with its reason (D5).
+    pub async fn discover_deep(
+        &self,
+        directive: &str,
+        free_vram_mib_per_gpu: &[u64],
+        retrieved_at: &str,
+    ) -> Result<DeepDiscovery, DiscoverError> {
+        self.discover_deep_with_deadline(
+            directive,
+            free_vram_mib_per_gpu,
+            retrieved_at,
+            DISCOVERY_DEADLINE,
+        )
+        .await
+    }
+
+    /// [`Self::discover_deep`] with a caller-chosen deadline
+    /// (the op uses [`DISCOVERY_DEADLINE`]; tests use a short
+    /// one against a delaying mock server).
+    pub async fn discover_deep_with_deadline(
+        &self,
+        directive: &str,
+        free_vram_mib_per_gpu: &[u64],
+        retrieved_at: &str,
+        deadline_after: Duration,
+    ) -> Result<DeepDiscovery, DiscoverError> {
+        let deadline = tokio::time::Instant::now() + deadline_after;
+        let now_unix = chrono::Utc::now().timestamp();
+        let terms = search_terms_for_directive(directive);
+        let family_tokens = family_tokens_for_terms(&terms);
+        let variants = query_variants_for_directive(directive);
+
+        let mut funnel = DiscoveryFunnel::default();
+        let mut pool: Vec<PoolRepo> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut kept_candidates: Vec<CandidateFact> = Vec::new();
+        let mut last_modified_by_repo: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut attempts = 0usize;
+        let mut any_variant_ok = false;
+        let mut first_error: Option<DiscoverError> = None;
+
+        'variants: for variant in &variants {
+            if tokio::time::Instant::now() >= deadline {
+                funnel.partial = true;
+                funnel.partial_reason = Some("deadline".to_string());
+                break;
+            }
+            funnel.queries_run += 1;
+            let mut page_url = Some(self.deep_search_url(variant));
+            for _page in 0..MAX_PAGES_PER_VARIANT {
+                let Some(url) = page_url.take() else { break };
+                if tokio::time::Instant::now() >= deadline {
+                    funnel.partial = true;
+                    funnel.partial_reason = Some("deadline".to_string());
+                    break 'variants;
+                }
+                let page = match self.search_page(&url).await {
+                    Ok(page) => page,
+                    Err(DiscoverError::RateLimited) => {
+                        funnel.partial = true;
+                        funnel.partial_reason = Some("rate_limited".to_string());
+                        break 'variants;
+                    }
+                    Err(e) => {
+                        // A failed variant does not fail the
+                        // pass (§P1.5); all variants failing
+                        // does, decided after the loop.
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                        break;
+                    }
+                };
+                any_variant_ok = true;
+                merge_pool_hits(&mut pool, &page.hits);
+                funnel.pool_repos = pool.len();
+
+                // This page's new repos, in pool order,
+                // through the search-layer filters.
+                let mut page_repos: Vec<PoolRepo> = Vec::new();
+                for hit in &page.hits {
+                    if seen.contains(&hit.id) {
+                        continue;
+                    }
+                    if let Some(repo) = pool.iter().find(|p| p.repo_id == hit.id) {
+                        if !page_repos.iter().any(|p: &PoolRepo| p.repo_id == repo.repo_id) {
+                            page_repos.push(repo.clone());
+                        }
+                    }
+                }
+                page_repos.sort_by(|a, b| {
+                    b.downloads
+                        .cmp(&a.downloads)
+                        .then_with(|| a.repo_id.cmp(&b.repo_id))
+                });
+                for repo in &page_repos {
+                    seen.insert(repo.repo_id.clone());
+                }
+                let survivors = search_layer_filter(&page_repos, now_unix, &mut funnel);
+
+                // The depth cap trims the batch; repos past
+                // it are simply never fetched.
+                let remaining = MAX_RECORD_FETCHES.saturating_sub(attempts);
+                let batch: Vec<PoolRepo> =
+                    survivors.into_iter().take(remaining).collect();
+                if !batch.is_empty() {
+                    let (results, deadline_hit) =
+                        self.fetch_records_batch(&batch, deadline).await;
+                    attempts += results.len();
+                    let mut rate_limited = false;
+                    // Process in batch (pool) order, not
+                    // completion order: the pass is
+                    // reproducible from the same responses.
+                    for repo in &batch {
+                        let Some((_, result, remaining)) =
+                            results.iter().find(|(id, _, _)| *id == repo.repo_id)
+                        else {
+                            continue; // aborted at the deadline
+                        };
+                        if *remaining == Some(0) {
+                            rate_limited = true;
+                        }
+                        match result {
+                            Ok(facts) => {
+                                funnel.repos_fetched += 1;
+                                if let Some(lm) = facts
+                                    .last_modified
+                                    .clone()
+                                    .or_else(|| repo.last_modified.clone())
+                                {
+                                    last_modified_by_repo.insert(repo.repo_id.clone(), lm);
+                                }
+                                if !family_filter_keeps(
+                                    facts.architecture.as_deref(),
+                                    &family_tokens,
+                                ) {
+                                    funnel.dropped_family += 1;
+                                    continue;
+                                }
+                                for candidate in candidates_from_model(
+                                    facts,
+                                    free_vram_mib_per_gpu,
+                                    retrieved_at,
+                                ) {
+                                    funnel.quants_considered += 1;
+                                    if candidate.fit == FIT_DOES_NOT_FIT {
+                                        funnel.dropped_fit += 1;
+                                    } else {
+                                        kept_candidates.push(candidate);
+                                    }
+                                }
+                            }
+                            Err(DiscoverError::RateLimited) => {
+                                funnel.repos_failed += 1;
+                                rate_limited = true;
+                            }
+                            Err(_) => {
+                                funnel.repos_failed += 1;
+                            }
+                        }
+                    }
+                    if deadline_hit {
+                        funnel.partial = true;
+                        funnel.partial_reason = Some("deadline".to_string());
+                        break 'variants;
+                    }
+                    if rate_limited {
+                        funnel.partial = true;
+                        funnel.partial_reason = Some("rate_limited".to_string());
+                        break 'variants;
+                    }
+                    // §P1.9 early exit, judged on the
+                    // shortlist as it now stands.
+                    let (collapsed_now, _) = collapse_candidates(&kept_candidates);
+                    let shortlist_now = rank_and_admit(&collapsed_now, &|repo: &str| {
+                        last_modified_by_repo.get(repo).cloned()
+                    });
+                    if shortlist_is_full(&shortlist_now) {
+                        funnel.stopped_early = true;
+                        break 'variants;
+                    }
+                }
+                if page.rate_limit_remaining == Some(0) {
+                    funnel.partial = true;
+                    funnel.partial_reason = Some("rate_limited".to_string());
+                    break 'variants;
+                }
+                if attempts >= MAX_RECORD_FETCHES || pool.len() >= MAX_POOL_REPOS {
+                    break 'variants;
+                }
+                page_url = page.next_url;
+            }
+        }
+
+        if !any_variant_ok && !funnel.partial {
+            return Err(first_error.unwrap_or_else(|| {
+                DiscoverError::Http("every search variant failed".to_string())
+            }));
+        }
+        let (collapsed, removed) = collapse_candidates(&kept_candidates);
+        funnel.quants_collapsed = removed;
+        let shortlist = rank_and_admit(&collapsed, &|repo: &str| {
+            last_modified_by_repo.get(repo).cloned()
+        });
+        funnel.kept = shortlist.len();
+        funnel.pool_repos = pool.len();
+        Ok(DeepDiscovery {
+            candidates: shortlist,
+            funnel,
+        })
+    }
+}
+
+/// One page of a deep-pass variant search: its hits (capped
+/// at [`SEARCH_PAGE_LIMIT`] by the parser as in the request),
+/// the `Link` cursor for the next page, and the `RateLimit`
+/// remainder the response reported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchPage {
+    pub hits: Vec<HfSearchHit>,
+    pub next_url: Option<String>,
+    pub rate_limit_remaining: Option<u64>,
 }
 
 #[cfg(test)]
@@ -1426,6 +2324,330 @@ mod tests {
         assert_eq!(cands[0].downloads, 42);
     }
 
+    // -- deep pool (Part 1): variants, merge, filters, collapse, rank ---------
+
+    #[test]
+    fn query_variants_cover_joined_singles_and_family() {
+        // Joined + singles; the planner seat contributes no
+        // family term, and "moe" alone deduplicates.
+        assert_eq!(
+            query_variants_for_directive("Explore better MoE capable models for the planner"),
+            vec!["moe"]
+        );
+        assert_eq!(
+            query_variants_for_directive("look for a Qwen3 instruct alternative"),
+            vec!["qwen3 instruct", "qwen3", "instruct"]
+        );
+        // A qualitative coder directive: today's query is the
+        // seat's family term; the family variant deduplicates.
+        assert_eq!(
+            query_variants_for_directive("reduce coder latency"),
+            vec!["coder"]
+        );
+        // Family term appended to the join, present as its
+        // own variant too.
+        assert_eq!(
+            query_variants_for_directive("qwen3 for the coder"),
+            vec!["qwen3 coder", "qwen3", "coder"]
+        );
+        // The cap is exactly 1 joined + 4 singles + 1 family.
+        assert_eq!(
+            query_variants_for_directive("qwen llama gemma phi for the coder"),
+            vec!["qwen llama gemma phi", "qwen", "llama", "gemma", "phi", "coder"]
+        );
+        // No salient terms and no seat: one unseeded variant.
+        assert_eq!(query_variants_for_directive("make it better please"), vec![""]);
+        // search_terms excludes the family term by contract.
+        assert_eq!(
+            search_terms_for_directive("qwen3 for the coder"),
+            vec!["qwen3"]
+        );
+    }
+
+    #[test]
+    fn search_hits_parse_last_modified_from_full_responses() {
+        let body = serde_json::json!([
+            { "id": "org/a", "downloads": 10, "lastModified": "2026-09-01T00:00:00.000Z" },
+            { "id": "org/b", "downloads": 9 },
+        ])
+        .to_string();
+        let hits = parse_search_results_capped(&body, SEARCH_PAGE_LIMIT).unwrap();
+        assert_eq!(
+            hits[0].last_modified.as_deref(),
+            Some("2026-09-01T00:00:00.000Z")
+        );
+        assert_eq!(hits[1].last_modified, None);
+    }
+
+    #[test]
+    fn pool_merge_dedupes_with_max_facts_and_caps() {
+        let hit = |id: &str, downloads: u64, lm: Option<&str>| HfSearchHit {
+            id: id.to_string(),
+            downloads,
+            likes: 0,
+            last_modified: lm.map(str::to_string),
+        };
+        let mut pool: Vec<PoolRepo> = Vec::new();
+        merge_pool_hits(
+            &mut pool,
+            &[
+                hit("org/a", 100, Some("2026-01-01T00:00:00Z")),
+                hit("org/b", 200, None),
+            ],
+        );
+        merge_pool_hits(
+            &mut pool,
+            &[
+                hit("org/a", 300, Some("2025-06-01T00:00:00Z")),
+                hit("org/c", 50, None),
+            ],
+        );
+        assert_eq!(pool.len(), 3);
+        let a = pool.iter().find(|p| p.repo_id == "org/a").unwrap();
+        assert_eq!(a.downloads, 300);
+        // The maximum lastModified seen wins, not the latest
+        // page's.
+        assert_eq!(a.last_modified.as_deref(), Some("2026-01-01T00:00:00Z"));
+        // Fetch order: downloads descending.
+        assert_eq!(
+            pool_order(&pool)
+                .iter()
+                .map(|p| p.repo_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["org/a", "org/b", "org/c"]
+        );
+        // The pool cap holds.
+        let many: Vec<HfSearchHit> = (0..(MAX_POOL_REPOS + 5))
+            .map(|i| hit(&format!("org/m{i}"), 1, None))
+            .collect();
+        let mut capped: Vec<PoolRepo> = Vec::new();
+        merge_pool_hits(&mut capped, &many);
+        assert_eq!(capped.len(), MAX_POOL_REPOS);
+    }
+
+    #[test]
+    fn search_layer_filters_unpopular_then_stale() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-23T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        let repo = |id: &str, downloads: u64, lm: Option<&str>| PoolRepo {
+            repo_id: id.to_string(),
+            downloads,
+            last_modified: lm.map(str::to_string),
+        };
+        let repos = vec![
+            repo("org/unpop", 999, Some("2026-10-01T00:00:00Z")),
+            repo("org/stale", 5_000, Some("2020-01-01T00:00:00Z")),
+            repo("org/old-big", 50_000, Some("2020-01-01T00:00:00Z")),
+            repo("org/fresh", 5_000, Some("2026-10-01T00:00:00Z")),
+            repo("org/undated", 5_000, None),
+        ];
+        let mut funnel = DiscoveryFunnel::default();
+        let kept = search_layer_filter(&repos, now, &mut funnel);
+        assert_eq!(
+            kept.iter().map(|p| p.repo_id.as_str()).collect::<Vec<_>>(),
+            vec!["org/old-big", "org/fresh", "org/undated"]
+        );
+        assert_eq!(funnel.dropped_unpopular, 1);
+        assert_eq!(funnel.dropped_stale, 1);
+        // The staleness boundary is strict: exactly 730 days
+        // is not stale; 731 is.
+        let exactly = format!(
+            "{}",
+            chrono::DateTime::from_timestamp(now - STALE_DAYS * 86_400, 0)
+                .unwrap()
+                .to_rfc3339()
+        );
+        assert!(!is_stale(5_000, Some(&exactly), now));
+        let older = format!(
+            "{}",
+            chrono::DateTime::from_timestamp(now - (STALE_DAYS + 1) * 86_400, 0)
+                .unwrap()
+                .to_rfc3339()
+        );
+        assert!(is_stale(5_000, Some(&older), now));
+    }
+
+    #[test]
+    fn family_filter_matches_versioned_terms_and_architectures() {
+        // Versioned names in the directive name the family.
+        assert_eq!(
+            family_tokens_for_terms(&["qwen3".to_string()]),
+            vec!["qwen"]
+        );
+        assert_eq!(
+            family_tokens_for_terms(&["llama3".to_string(), "moe".to_string()]),
+            vec!["llama"]
+        );
+        assert!(family_tokens_for_terms(&["moe".to_string()]).is_empty());
+        // A non-family prefix does not name a token ("yoke"
+        // is not "yi").
+        assert!(family_tokens_for_terms(&["yoke".to_string()]).is_empty());
+
+        let qwen = family_tokens_for_terms(&["qwen3".to_string()]);
+        assert!(family_filter_keeps(Some("qwen3moe"), &qwen));
+        assert!(family_filter_keeps(Some("qwen3next"), &qwen));
+        assert!(!family_filter_keeps(Some("llama"), &qwen));
+        // No architecture: nothing to contradict, kept.
+        assert!(family_filter_keeps(None, &qwen));
+        // No family named: no filter.
+        assert!(family_filter_keeps(Some("llama"), &[]));
+        // Hybrid architectures keep their family prefix.
+        let nemotron = family_tokens_for_terms(&["nemotron".to_string()]);
+        assert!(family_filter_keeps(Some("nemotron_h_moe"), &nemotron));
+        assert!(!family_filter_keeps(Some("whisper"), &nemotron));
+    }
+
+    fn cand(repo: &str, file: &str, size_mib: u64, fit: &str, downloads: u64) -> CandidateFact {
+        CandidateFact {
+            repo_id: repo.to_string(),
+            file: file.to_string(),
+            architecture: "qwen3".to_string(),
+            params_b: 8.0,
+            ctx_max: 32768,
+            size_bytes: size_mib * MIB64,
+            downloads,
+            fit: fit.to_string(),
+            retrieved_at: "t".to_string(),
+        }
+    }
+
+    #[test]
+    fn collapse_admits_exactly_the_three_specified_entries() {
+        // The bartowski shape (§P1.14 fixture 4): a
+        // quant-heavy repo — 29 quants.
+        let mut candidates: Vec<CandidateFact> = Vec::new();
+        for i in 0..24 {
+            candidates.push(cand(
+                "bartowski/big",
+                &format!("big-UQ{i}.gguf"),
+                100 + i as u64,
+                FIT_UNCHECKED,
+                7_777,
+            ));
+        }
+        candidates.push(cand("bartowski/big", "big-Q4.gguf", 4_000, FIT_FITS, 7_777));
+        candidates.push(cand("bartowski/big", "big-Q8.gguf", 9_000, FIT_FITS, 7_777));
+        candidates.push(cand("bartowski/big", "big-S1.gguf", 8_000, FIT_FITS_WITH_SPLIT, 7_777));
+        candidates.push(cand("bartowski/big", "big-S2.gguf", 12_000, FIT_FITS_WITH_SPLIT, 7_777));
+        candidates.push(cand("bartowski/big", "big-tiny.gguf", 50, FIT_UNCHECKED, 7_777));
+        assert_eq!(candidates.len(), 29);
+        let (collapsed, removed) = collapse_candidates(&candidates);
+        assert_eq!(collapsed.len(), 3);
+        assert_eq!(removed, 26);
+        let files: Vec<&str> = collapsed.iter().map(|c| c.file.as_str()).collect();
+        // Largest fits, largest fits_with_split, smallest
+        // overall.
+        assert!(files.contains(&"big-Q8.gguf"), "{files:?}");
+        assert!(files.contains(&"big-S2.gguf"), "{files:?}");
+        assert!(files.contains(&"big-tiny.gguf"), "{files:?}");
+        // One candidate filling two slots deduplicates.
+        let single = vec![cand("org/one", "one-Q4.gguf", 100, FIT_FITS, 5)];
+        let (collapsed, removed) = collapse_candidates(&single);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn rank_and_admit_orders_lexicographically_and_caps() {
+        let lm = |repo: &str| -> Option<String> {
+            match repo {
+                "org/old" => Some("2024-01-01T00:00:00Z".to_string()),
+                "org/new" => Some("2026-01-01T00:00:00Z".to_string()),
+                _ => None,
+            }
+        };
+        let candidates = vec![
+            cand("org/old", "a.gguf", 100, FIT_FITS, 500),
+            cand("org/new", "b.gguf", 100, FIT_FITS, 500),
+            cand("org/rich", "c.gguf", 100, FIT_FITS, 900),
+            cand("org/unchecked", "d.gguf", 100, FIT_UNCHECKED, 99_999),
+            cand("org/split", "e.gguf", 100, FIT_FITS_WITH_SPLIT, 99_999),
+        ];
+        let admitted = rank_and_admit(&candidates, &lm);
+        let order: Vec<&str> = admitted.iter().map(|c| c.repo_id.as_str()).collect();
+        // Tier first (fits < split < unchecked), then
+        // downloads, then recency.
+        assert_eq!(
+            order,
+            vec!["org/rich", "org/new", "org/old", "org/split", "org/unchecked"]
+        );
+        // The shortlist cap binds.
+        let many: Vec<CandidateFact> = (0..40)
+            .map(|i| {
+                cand(
+                    &format!("org/m{i}"),
+                    "m.gguf",
+                    100,
+                    FIT_FITS,
+                    1_000 + i as u64,
+                )
+            })
+            .collect();
+        assert_eq!(rank_and_admit(&many, &|_| None).len(), SHORTLIST_CAP);
+        // The per-repo cap binds inside admission too.
+        let one_repo: Vec<CandidateFact> = (0..5)
+            .map(|i| cand("org/x", &format!("x{i}.gguf"), 100 + i as u64, FIT_FITS, 10))
+            .collect();
+        assert_eq!(
+            rank_and_admit(&one_repo, &|_| None).len(),
+            MAX_CANDIDATES_PER_REPO
+        );
+    }
+
+    #[test]
+    fn full_shortlist_predicate_needs_checked_fits_from_enough_repos() {
+        let full: Vec<CandidateFact> = (0..SHORTLIST_CAP)
+            .map(|i| {
+                cand(
+                    &format!("org/r{}", i % 10),
+                    &format!("f{i}.gguf"),
+                    100,
+                    FIT_FITS,
+                    10,
+                )
+            })
+            .collect();
+        assert!(shortlist_is_full(&full));
+        // Fewer than 10 distinct repos: not full.
+        let narrow: Vec<CandidateFact> = (0..SHORTLIST_CAP)
+            .map(|i| {
+                cand(
+                    &format!("org/r{}", i % 9),
+                    &format!("f{i}.gguf"),
+                    100,
+                    FIT_FITS,
+                    10,
+                )
+            })
+            .collect();
+        assert!(!shortlist_is_full(&narrow));
+        // An unchecked entry blocks the exit.
+        let mut with_unchecked = full.clone();
+        with_unchecked[0].fit = FIT_UNCHECKED.to_string();
+        assert!(!shortlist_is_full(&with_unchecked));
+        // Below the cap: not full.
+        assert!(!shortlist_is_full(&full[..SHORTLIST_CAP - 1]));
+    }
+
+    #[test]
+    fn link_and_rate_limit_headers_parse() {
+        let link = "<https://huggingface.co/api/models?cursor=abc>; rel=\"next\", <https://huggingface.co/api/models?cursor=xyz>; rel=\"last\"";
+        assert_eq!(
+            parse_link_next(Some(link)).as_deref(),
+            Some("https://huggingface.co/api/models?cursor=abc")
+        );
+        assert_eq!(parse_link_next(Some("<https://x>; rel=\"last\"")), None);
+        assert_eq!(parse_link_next(None), None);
+        assert_eq!(
+            parse_rate_limit_remaining(Some("\"api\";r=499;t=299")),
+            Some(499)
+        );
+        assert_eq!(parse_rate_limit_remaining(Some("\"api\";r=0;t=12")), Some(0));
+        assert_eq!(parse_rate_limit_remaining(Some("garbage")), None);
+        assert_eq!(parse_rate_limit_remaining(None), None);
+    }
+
     // -- form lookup + header range read (Part 2) ------------------------------
 
     /// A synthetic GGUF header in the shape the pick-time
@@ -1659,5 +2881,324 @@ mod tests {
         });
         let client = HfClient::new(format!("http://{addr}")).unwrap();
         assert!(client.discover("moe", &[1024], "t").await.is_err());
+    }
+
+    // -- deep pass against a local mock server (Part 1, §P1.14) ---------------
+
+    fn deep_record(
+        id: &str,
+        downloads: u64,
+        last_modified: &str,
+        files: &[(&str, u64)],
+    ) -> String {
+        serde_json::json!({
+            "id": id,
+            "downloads": downloads,
+            "lastModified": last_modified,
+            "gguf": { "total": 8000000000u64, "architecture": "qwen3",
+                      "context_length": 32768, "totalFileSize": 1000u64 },
+            "siblings": files
+                .iter()
+                .map(|(name, size)| serde_json::json!({ "rfilename": name, "size": size }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
+    /// Mock HF for the deep pass (§P1.14 fixtures 1–2): the
+    /// "alpha beta" variant paginates via a `Link` cursor
+    /// (page 2 re-reports org/a1 with higher downloads — the
+    /// merge must dedupe), "alpha" returns one more repo,
+    /// "beta" fails (a failed variant must not fail the
+    /// pass). Search hits carry `lastModified` (`full=true`
+    /// shape); the pool includes one unpopular and one stale
+    /// repo the search layer must drop before any fetch.
+    async fn start_mock_hf_deep() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let base_for_link = base.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let base_for_link = base_for_link.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 16384];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_string();
+                    let param = |name: &str| -> Option<String> {
+                        path.split('?').nth(1).and_then(|q| {
+                            q.split('&').find_map(|pair| {
+                                let (k, v) = pair.split_once('=')?;
+                                (k == name).then(|| v.replace('+', " ").replace("%20", " "))
+                            })
+                        })
+                    };
+                    let mib = MIB64;
+                    let (status, extra_headers, body): (&str, String, String) =
+                        if path.contains("blobs=true") {
+                            let id = path
+                                .trim_start_matches("/api/models/")
+                                .split('?')
+                                .next()
+                                .unwrap_or("")
+                                .to_string();
+                            let record = match id.as_str() {
+                                "org/a1" => Some(deep_record(
+                                    "org/a1",
+                                    60_000,
+                                    "2026-10-01T00:00:00.000Z",
+                                    &[
+                                        ("a1-Q4.gguf", 4_000 * mib),
+                                        ("a1-Q8.gguf", 20_000 * mib),
+                                        ("a1-IQ.gguf", 1_000 * mib),
+                                    ],
+                                )),
+                                "org/oldbig" => Some(deep_record(
+                                    "org/oldbig",
+                                    20_000,
+                                    "2020-01-01T00:00:00.000Z",
+                                    &[("old-Q4.gguf", 2_000 * mib)],
+                                )),
+                                "org/a2" => Some(deep_record(
+                                    "org/a2",
+                                    30_000,
+                                    "2026-08-01T00:00:00.000Z",
+                                    &[("a2-Q4.gguf", 5_000 * mib)],
+                                )),
+                                "org/a3" => Some(deep_record(
+                                    "org/a3",
+                                    15_000,
+                                    "2026-07-01T00:00:00.000Z",
+                                    &[("a3-Q8.gguf", 6_000 * mib), ("a3-Q4.gguf", 500 * mib)],
+                                )),
+                                _ => None,
+                            };
+                            match record {
+                                Some(body) => ("200 OK", String::new(), body),
+                                None => ("404 Not Found", String::new(), String::new()),
+                            }
+                        } else if path.starts_with("/api/models") {
+                            let search = param("search").unwrap_or_default();
+                            let cursor = param("cursor");
+                            match (search.as_str(), cursor.as_deref()) {
+                                ("alpha beta", None) => {
+                                    let next = format!(
+                                        "{base_for_link}/api/models?search=alpha+beta&filter=gguf&sort=downloads&direction=-1&limit=100&full=true&cursor=p2"
+                                    );
+                                    (
+                                        "200 OK",
+                                        format!("Link: <{next}>; rel=\"next\"\r\n"),
+                                        serde_json::json!([
+                                            { "id": "org/a1", "downloads": 50000, "lastModified": "2026-09-01T00:00:00.000Z" },
+                                            { "id": "org/unpop", "downloads": 500, "lastModified": "2026-10-01T00:00:00.000Z" },
+                                            { "id": "org/stale", "downloads": 5000, "lastModified": "2020-01-01T00:00:00.000Z" },
+                                            { "id": "org/oldbig", "downloads": 20000, "lastModified": "2020-01-01T00:00:00.000Z" },
+                                        ])
+                                        .to_string(),
+                                    )
+                                }
+                                ("alpha beta", Some("p2")) => (
+                                    "200 OK",
+                                    String::new(),
+                                    serde_json::json!([
+                                        { "id": "org/a1", "downloads": 60000, "lastModified": "2026-10-01T00:00:00.000Z" },
+                                        { "id": "org/a2", "downloads": 30000, "lastModified": "2026-08-01T00:00:00.000Z" },
+                                    ])
+                                    .to_string(),
+                                ),
+                                ("alpha", _) => (
+                                    "200 OK",
+                                    String::new(),
+                                    serde_json::json!([
+                                        { "id": "org/a3", "downloads": 15000, "lastModified": "2026-07-01T00:00:00.000Z" },
+                                    ])
+                                    .to_string(),
+                                ),
+                                ("beta", _) => {
+                                    ("500 Internal Server Error", String::new(), String::new())
+                                }
+                                _ => ("200 OK", String::new(), "[]".to_string()),
+                            }
+                        } else {
+                            ("404 Not Found", String::new(), String::new())
+                        };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn discover_deep_runs_variants_pages_filters_and_ranks() {
+        let base = start_mock_hf_deep().await;
+        let client = HfClient::new(base).unwrap();
+        let out = client
+            .discover_deep("alpha beta", &[16 * 1024], "2026-10-23T00:00:00Z")
+            .await
+            .unwrap();
+        let f = &out.funnel;
+        // Three variants ran ("beta" failed without failing
+        // the pass); the pool merged 6 unique repos across
+        // both pages and both successful variants.
+        assert_eq!(f.queries_run, 3);
+        assert_eq!(f.pool_repos, 6);
+        assert_eq!(f.dropped_unpopular, 1);
+        assert_eq!(f.dropped_stale, 1);
+        assert_eq!(f.repos_fetched, 4);
+        assert_eq!(f.repos_failed, 0);
+        assert_eq!(f.quants_considered, 7);
+        assert_eq!(f.dropped_fit, 1);
+        assert_eq!(f.quants_collapsed, 0);
+        assert_eq!(f.kept, 6);
+        assert!(!f.partial, "{f:?}");
+        assert!(!f.stopped_early, "{f:?}");
+        // Ranked: fit tier, then downloads (the records'),
+        // then size. org/a1's two fits lead; its 20 GiB
+        // quant was dropped on fit.
+        let order: Vec<(&str, &str)> = out
+            .candidates
+            .iter()
+            .map(|c| (c.repo_id.as_str(), c.file.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("org/a1", "a1-Q4.gguf"),
+                ("org/a1", "a1-IQ.gguf"),
+                ("org/a2", "a2-Q4.gguf"),
+                ("org/oldbig", "old-Q4.gguf"),
+                ("org/a3", "a3-Q8.gguf"),
+                ("org/a3", "a3-Q4.gguf"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_deep_stops_on_429_and_stores_partial() {
+        // §P1.14 fixture 3: a 429 with RateLimit headers —
+        // partial pass, rate_limited, and no retry storm
+        // (exactly one request).
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter2 = counter.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let counter2 = counter2.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    counter2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = vec![0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 429 Too Many Requests\r\nRateLimit: \"api\";r=0;t=300\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        let client = HfClient::new(format!("http://{addr}")).unwrap();
+        let out = client
+            .discover_deep("alpha beta", &[1024], "t")
+            .await
+            .unwrap();
+        assert!(out.funnel.partial);
+        assert_eq!(
+            out.funnel.partial_reason.as_deref(),
+            Some("rate_limited")
+        );
+        assert_eq!(out.funnel.queries_run, 1);
+        assert!(out.candidates.is_empty());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn discover_deep_deadline_stores_partial() {
+        // §P1.14 fixture 6: the record fetch outlives the
+        // pass deadline — partial pass, reason deadline.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 16384];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_string();
+                    let body = if path.contains("blobs=true") {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        deep_record("org/slow", 50_000, "2026-10-01T00:00:00.000Z", &[])
+                    } else {
+                        serde_json::json!([
+                            { "id": "org/slow", "downloads": 50000, "lastModified": "2026-10-01T00:00:00.000Z" },
+                        ])
+                        .to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let client = HfClient::new(format!("http://{addr}")).unwrap();
+        let out = client
+            .discover_deep_with_deadline("alpha", &[1024], "t", Duration::from_millis(300))
+            .await
+            .unwrap();
+        assert!(out.funnel.partial);
+        assert_eq!(out.funnel.partial_reason.as_deref(), Some("deadline"));
+        assert_eq!(out.funnel.repos_fetched, 0);
+        assert!(out.candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discover_deep_all_variants_failing_is_an_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        let client = HfClient::new(format!("http://{addr}")).unwrap();
+        assert!(client.discover_deep("moe", &[1024], "t").await.is_err());
     }
 }

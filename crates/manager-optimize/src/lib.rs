@@ -57,13 +57,19 @@ pub use experiment::{
     BATCH_TIMEOUT_SECS, EXPERIMENT_TIMEOUT_SECS, MAX_EXPERIMENTS, TEMP_BACKEND_ID_PREFIX,
 };
 pub use discover::{
-    candidates_from_model, fit_verdict, id_slug_from_file, lookup_repo, params_b_rounded,
-    parse_model_record, parse_search_results, quant_files, quant_token_from_file_name,
-    search_query_for_directive, seat_for_directive, CandidateFact, DiscoverError, HfClient,
-    HfModelFacts, HfSearchHit, HfSibling, LookupQuant, LookupRepo, QuantFile, FIT_DOES_NOT_FIT,
-    FIT_FITS, FIT_FITS_WITH_SPLIT, FIT_UNCHECKED, HF_DEFAULT_BASE_URL,
-    HF_HEADER_RANGE_CAP_BYTES, HF_HEADER_RANGE_INITIAL_BYTES, MAX_LOOKUP_REPOS, MAX_QUERY_TERMS,
-    MAX_SEARCH_REPOS,
+    candidates_from_model, collapse_candidates, family_filter_keeps, family_tokens_for_terms,
+    fit_verdict, id_slug_from_file, is_stale, lookup_repo, merge_pool_hits, params_b_rounded,
+    parse_link_next, parse_model_record, parse_rate_limit_remaining, parse_search_results,
+    pool_order, quant_files, quant_token_from_file_name, query_variants_for_directive,
+    rank_and_admit, search_layer_filter, search_query_for_directive, search_terms_for_directive,
+    seat_for_directive, shortlist_is_full, CandidateFact, DeepDiscovery, DiscoverError,
+    DiscoveryFunnel, HfClient, HfModelFacts, HfSearchHit, HfSibling, LookupQuant, LookupRepo,
+    PoolRepo, QuantFile, SearchPage, DISCOVERY_CONCURRENCY, DISCOVERY_DEADLINE,
+    DISCOVERY_REQUEST_TIMEOUT, EARLY_EXIT_MIN_REPOS, FAMILY_TOKENS, FIT_DOES_NOT_FIT, FIT_FITS,
+    FIT_FITS_WITH_SPLIT, FIT_UNCHECKED, HF_DEFAULT_BASE_URL, HF_HEADER_RANGE_CAP_BYTES,
+    HF_HEADER_RANGE_INITIAL_BYTES, MAX_CANDIDATES_PER_REPO, MAX_LOOKUP_REPOS, MAX_PAGES_PER_VARIANT,
+    MAX_POOL_REPOS, MAX_QUERY_TERMS, MAX_QUERY_VARIANTS, MAX_RECORD_FETCHES, MAX_SEARCH_REPOS,
+    MIN_POOL_DOWNLOADS, SEARCH_PAGE_LIMIT, SHORTLIST_CAP, STALE_DAYS, STALE_DOWNLOADS,
 };
 pub use eval::{
     aggregate_results, compare, eval_suite, failed_task, output_excerpt, passes, score_task,
