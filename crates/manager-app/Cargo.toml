@@ -25,6 +25,7 @@ manager-telemetry = { path = "../manager-telemetry" }
 manager-gateway = { path = "../manager-gateway" }
 manager-models = { path = "../manager-models" }
 manager-mcp = { path = "../manager-mcp" }
+manager-logship = { path = "../manager-logship" }
 manager-optimize = { path = "../manager-optimize" }
 manager-services = { path = "../manager-services" }
 manager-mxc = { path = "../manager-mxc" }

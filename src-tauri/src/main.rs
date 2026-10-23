@@ -266,6 +266,14 @@ fn main() {
                 let sink: Arc<dyn EventSink> = Arc::new(TauriSink(handle));
                 manager_app::app_update::checker_loop(state, sink).await;
             });
+            // Log streaming shipper (log-streaming design): starts
+            // only when the deployment opted in via the
+            // `log_streaming` config section; a no-op otherwise.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<Arc<AppState>>().inner().clone();
+                manager_app::logship::start_log_streaming(&state).await;
+            });
             // Admin REST API: serve in-process while enabled (the
             // enable/disable flow itself lives in
             // admin_api_set_enabled).
