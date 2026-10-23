@@ -13,7 +13,7 @@ import {
   runWizardStep, wizardBusyMessage, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit,
   getWizardCommands,
   getGpuTelemetry, getGpuHistory, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
-  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendMtp, setBackendMoeCache, setBackendParallel, setBackendCache, backendCachePreview, setBackendRawFlags, setBackendFlagsMode, getBackendLaunchCommand,
+  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendOffloadOverride, clearBackendOffloadOverride, setBackendMtp, setBackendMoeCache, setBackendParallel, setBackendCache, backendCachePreview, setBackendRawFlags, setBackendFlagsMode, getBackendLaunchCommand,
   measurementLookup,
   optimizeMeasureBackend,
   getBackendConfig, applyBackendConfig, testBackend, testBackendToolCall, placementPropose, placementApply,
@@ -2262,6 +2262,7 @@ function backendCard(
   gpuTotalsMiB: Map<number, number>,
   detailsOpen: boolean,
   predictRefreshing: Map<string, number>,
+  confirmOverride: Set<string>,
 ): string {
   const active = b.state === "running" || b.state === "starting";
   // Buttons render disabled while this card's action is in flight.
@@ -2513,12 +2514,28 @@ function backendCard(
       // both modes; the one-click resolving action is a flags
       // write, so in advanced flags mode (tracker #60) the line
       // carries no button — the editor is the remedy, and the
-      // server refuses the structured write anyway.
+      // server refuses the structured write anyway. The deliberate
+      // override is different: it writes only the activation
+      // journal, never the flags, so its action renders in both
+      // modes — a hand-edited blocked position is exactly the case
+      // it exists for. The override is operation-critical, so it
+      // keeps words + icon and takes a confirmation step whose
+      // button names the exact position (layers + placed CC set)
+      // being overridden (the armed state, the remove button's
+      // idiom).
+      const ccs = (g.placed_ccs ?? []).join(", ") || g.compute_capability;
+      const overrideBtn = confirmOverride.has(b.id)
+        ? `<button class="btn danger armed" data-back-act="offload-override-confirm" data-back-id="${esc(b.id)}"${dis}>${icon("warn")} Confirm override: ${o.layers} of ${o.moe_layers} layers, CC ${esc(ccs)}</button>`
+        : `<button class="btn" data-back-act="offload-override-arm" data-back-id="${esc(b.id)}"${dis}>${icon("warn")} Override start block</button>`;
       lines.push(line("#ff7b72", b.flags_advanced
-        ? `Start blocked: offload ${o.layers} of ${o.moe_layers} layers is outside the verified range for this GPU`
-        : `Start blocked: offload ${o.layers} of ${o.moe_layers} layers is outside the verified range for this GPU <button class="btn" data-back-act="offload-set-verified" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Set to ${g.nearest_verified_layers} of ${o.moe_layers} layers</button>`));
+        ? `Start blocked: offload ${o.layers} of ${o.moe_layers} layers is outside the verified range for this GPU ${overrideBtn}`
+        : `Start blocked: offload ${o.layers} of ${o.moe_layers} layers is outside the verified range for this GPU <button class="btn" data-back-act="offload-set-verified" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Set to ${g.nearest_verified_layers} of ${o.moe_layers} layers</button> ${overrideBtn}`));
     } else if (o && g?.status === "blocked" && g.overridden) {
-      lines.push(line("#e3b341", `Offload override recorded: ${o.layers} of ${o.moe_layers} layers is unverified on this GPU`));
+      // The overridden state is distinct (amber, named as an
+      // override) and carries the clear action: clearing drops the
+      // journal record and the position is blocked again.
+      const ccs = (g.placed_ccs ?? []).join(", ") || g.compute_capability;
+      lines.push(line("#e3b341", `Offload override recorded: ${o.layers} of ${o.moe_layers} layers is unverified on this GPU (CC ${esc(ccs)}) <button class="btn" data-back-act="offload-override-clear" data-back-id="${esc(b.id)}"${dis}>${icon("ban")} Clear override</button>`));
     } else if (o && g?.status === "untested") {
       lines.push(line("#e3b341", `Partial offload: unverified on this GPU`));
     }
@@ -3014,6 +3031,9 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   let gatewayPort = 4000;
   /** Backend ids whose Remove button is armed for confirmation. */
   const confirmRemove = new Set<string>();
+  /** Backend ids whose guardrail Override button is armed for
+   *  confirmation (the confirm button names the exact position). */
+  const confirmOverride = new Set<string>();
   /** Gateway activation plan (saved changes awaiting a gateway
    *  restart), painted into #backPlan above the add form. */
   let lastPlan: ActivationPlanData | null = null;
@@ -3105,7 +3125,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
             busy: placeBusy,
           }
           : null;
-        return backendCard(row, openArgv, openMenus, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency, new Map(lastGpuList.map((g) => [Number(g.id), g.name])), flagsArg, flagsFor === row.id ? predictedHtml : "", placeArg, new Map(lastGpuList.map((g) => [Number(g.id), g.vram_total_gb * 1024])), openDetails.has(row.id), predictRefreshing);
+        return backendCard(row, openArgv, openMenus, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency, new Map(lastGpuList.map((g) => [Number(g.id), g.name])), flagsArg, flagsFor === row.id ? predictedHtml : "", placeArg, new Map(lastGpuList.map((g) => [Number(g.id), g.vram_total_gb * 1024])), openDetails.has(row.id), predictRefreshing, confirmOverride);
       }).join("")}</div>
       </div>`).join("");
     if (!viewRows.length && lastRows.length) b.innerHTML = emptyHtml("No backends match the current filter.");
@@ -3197,7 +3217,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       // A note belongs to the state it was produced in; when the
       // backend's state changes, the stale note goes away.
       const prev = prevStates.get(row.id);
-      if (prev !== undefined && prev !== row.state) { msgs.delete(row.id); confirmRemove.delete(row.id); }
+      if (prev !== undefined && prev !== row.state) { msgs.delete(row.id); confirmRemove.delete(row.id); confirmOverride.delete(row.id); }
       // A backend that is no longer failed gets a fresh tail fetch if it
       // fails again — unless its Details are open, where the stored
       // tail is the expansion's latest-lines data and stays.
@@ -3212,7 +3232,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       for (const map of [msgs, argvCache, logTails] as Map<string, unknown>[]) {
         for (const k of [...map.keys()]) if (!alive.has(k)) map.delete(k);
       }
-      for (const set of [confirmRemove, openArgv, openDetails, inFlight, tailsWanted, tailsFetching] as Set<string>[]) {
+      for (const set of [confirmRemove, confirmOverride, openArgv, openDetails, inFlight, tailsWanted, tailsFetching] as Set<string>[]) {
         for (const k of [...set]) if (!alive.has(k)) set.delete(k);
       }
       if (flagsFor !== null && !alive.has(flagsFor)) flagsFor = null;
@@ -4818,6 +4838,58 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       const target = row?.offload?.guardrail?.nearest_verified_layers;
       if (!row?.offload || target === undefined) return;
       await saveOffloadPosition(id, target, false);
+      return;
+    }
+
+    if (act === "offload-override-arm") {
+      // Arm the deliberate override's confirmation: the button
+      // re-renders naming the exact position (layers + placed CC
+      // set) the confirm will record. No command fires here.
+      confirmOverride.add(id);
+      paint();
+      return;
+    }
+
+    if (act === "offload-override-confirm") {
+      // Record the deliberate override for the SAVED position.
+      // The key comes from the live row (saved layers + the
+      // guardrail's placed CC set); the server re-derives it and
+      // refuses any mismatch, so a placement or position change
+      // since the arm surfaces as an error, never a wider grant.
+      const row = lastRows.find((r) => r.id === id);
+      const g = row?.offload?.guardrail;
+      if (!row?.offload || !g) { confirmOverride.delete(id); paint(); return; }
+      confirmOverride.delete(id);
+      inFlight.add(id);
+      paint();
+      try {
+        const r = await setBackendOffloadOverride(id, row.offload.layers, g.placed_ccs ?? [g.compute_capability]);
+        if (disposed) return;
+        if (r.error) msgs.set(id, { text: `Override not recorded: ${r.error}`, err: true });
+        else msgs.set(id, { text: `Offload override recorded (${row.offload.layers} of ${row.offload.moe_layers} layers) — starts proceed.`, err: false });
+        await load();
+      } finally {
+        inFlight.delete(id);
+        if (!disposed) paint();
+      }
+      return;
+    }
+
+    if (act === "offload-override-clear") {
+      // Drop the standing override: the saved position is blocked
+      // again at the next start's preflight.
+      inFlight.add(id);
+      paint();
+      try {
+        const r = await clearBackendOffloadOverride(id);
+        if (disposed) return;
+        if (r.error) msgs.set(id, { text: `Override not cleared: ${r.error}`, err: true });
+        else msgs.set(id, { text: "Offload override cleared — the saved position is blocked again.", err: false });
+        await load();
+      } finally {
+        inFlight.delete(id);
+        if (!disposed) paint();
+      }
       return;
     }
 
