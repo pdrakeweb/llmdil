@@ -3,8 +3,11 @@
 //! spool's `state.json`), so a restart resumes where it left off
 //! instead of re-shipping history. Rotation — the writers rename
 //! the current file to its `.prev` sibling past ~1 MiB — is detected
-//! by size regression: the remainder is drained from `.prev`, then
-//! the new file is read from the start.
+//! by file identity or size regression: the remainder is drained
+//! from `.prev`, then the new file is read from the start. Where
+//! no usable file identity exists, a fingerprint of the consumed
+//! region stands in: replaced bytes before the offset give the
+//! rotation away.
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -16,12 +19,77 @@ use std::path::PathBuf;
 /// file.
 const FIRST_SIGHT_BYTES: u64 = 64 * 1024;
 
+/// A platform file identity, used to detect rotation even when
+/// the new file is the same size as — or larger than — the saved
+/// offset into the old one (design §6.2: rotation is detected by
+/// file identity/size regression). Unix exposes device + inode;
+/// Windows std exposes neither a stable file index nor a volume
+/// serial (`windows_by_handle` is unstable), so the file's
+/// creation time stands in — a rotated-in file is by construction
+/// newly created. `None` where no identity is available; rotation
+/// detection then falls back to the size-regression rule alone.
+#[cfg(unix)]
+fn file_identity(meta: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.dev() ^ meta.ino().rotate_left(32))
+}
+
+#[cfg(windows)]
+fn file_identity(meta: &fs::Metadata) -> Option<u64> {
+    let created = meta.created().ok()?;
+    let nanos = created
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((nanos as u64) ^ ((nanos >> 64) as u64))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(meta: &fs::Metadata) -> Option<u64> {
+    let _ = meta;
+    None
+}
+
 pub struct FileTail {
     pub source: String,
     path: PathBuf,
     prev_path: PathBuf,
     /// Byte offset into the current file; `None` until first poll.
     pub offset: Option<u64>,
+    /// Identity of the file `offset` belongs to, for rotation
+    /// detection. In-memory only: after a restart the first poll
+    /// re-baselines it (a rotation during downtime is still caught
+    /// by the size-regression rule when the new file is smaller).
+    file_id: Option<u64>,
+    /// Fingerprint of the last bytes consumed (the region ending
+    /// at `offset`). Append-only writers never change bytes before
+    /// the offset, so a mismatch means the file was replaced —
+    /// the rotation signal that works everywhere, including
+    /// Windows, where creation timestamps of the old and new file
+    /// can fall in the same tick and compare equal. In-memory
+    /// only, re-baselined on the first poll after a restart.
+    consumed_fingerprint: Option<u64>,
+}
+
+/// How many bytes back from the offset the fingerprint covers:
+/// enough to make an accidental match across a rotation
+/// implausible, cheap to re-read on every poll.
+const FINGERPRINT_WINDOW: u64 = 4096;
+
+/// FNV-1a over the last [`FINGERPRINT_WINDOW`] bytes ending at
+/// `offset` (fewer near the start of the file; empty at 0).
+fn window_fingerprint(path: &PathBuf, offset: u64) -> Option<u64> {
+    let start = offset.saturating_sub(FINGERPRINT_WINDOW);
+    let mut f = fs::File::open(path).ok()?;
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = vec![0u8; (offset - start) as usize];
+    f.read_exact(&mut buf).ok()?;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in buf {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(h)
 }
 
 impl FileTail {
@@ -31,6 +99,8 @@ impl FileTail {
             path,
             prev_path,
             offset,
+            file_id: None,
+            consumed_fingerprint: None,
         }
     }
 
@@ -43,13 +113,30 @@ impl FileTail {
             return out;
         };
         let len = meta.len();
+        let id = file_identity(&meta);
         let mut offset = match self.offset {
             None => first_sight_offset(&self.path, len),
             Some(o) => o,
         };
-        if len < offset {
-            // Rotation (or truncation): drain the unread remainder
-            // from the .prev sibling, then start the new file at 0.
+        // Rotation (or truncation): the file shrank below our
+        // offset, or it is a different file than the one the
+        // offset belongs to — a rename + recreate can leave a
+        // same-size or larger file, which size alone cannot see.
+        // The consumed-region fingerprint is the check of last
+        // resort: it needs no platform identity at all.
+        let fingerprint_mismatch = match self.offset {
+            Some(o) if o > 0 && len >= o => matches!(
+                (self.consumed_fingerprint, window_fingerprint(&self.path, o)),
+                (Some(stored), Some(current)) if stored != current
+            ),
+            _ => false,
+        };
+        let rotated = len < offset
+            || matches!((self.file_id, id), (Some(prev), Some(cur)) if prev != cur)
+            || fingerprint_mismatch;
+        if rotated {
+            // Drain the unread remainder from the .prev sibling,
+            // then start the new file at 0.
             if let Ok(prev_meta) = fs::metadata(&self.prev_path) {
                 if prev_meta.len() > offset {
                     out.extend(read_lines(&self.prev_path, offset, prev_meta.len()));
@@ -64,6 +151,12 @@ impl FileTail {
             out.extend(lines);
         }
         self.offset = Some(offset);
+        if id.is_some() {
+            self.file_id = id;
+        }
+        // Re-baseline the fingerprint on whatever file and offset
+        // this poll settled on.
+        self.consumed_fingerprint = window_fingerprint(&self.path, offset);
         out
     }
 }
