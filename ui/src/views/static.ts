@@ -2325,6 +2325,7 @@ function backendCard(
         ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="flags" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Edit</button>` : ""}
         <button class="menu-item" role="menuitem" data-back-menu-item data-back-act="argv" data-back-id="${esc(b.id)}"${dis}>${icon("logs")} Launch command</button>
         ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="toolcall" data-back-id="${esc(b.id)}"${dis}>${icon("wrench")} Test tool calls</button>` : ""}
+        ${b.configured ? `<button class="menu-item" role="menuitem" data-back-menu-item data-back-act="tuning" data-back-id="${esc(b.id)}">${icon("gauge")} Optimize this backend</button>` : ""}
         <a class="menu-item" role="menuitem" data-back-menu-item data-back-id="${esc(b.id)}" href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1">${icon("logs")} View all logs</a>
       </div>` : ""}
     </div>`;
@@ -4453,6 +4454,14 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     }
     const id = t.getAttribute("data-back-id") ?? "";
     const act = t.getAttribute("data-back-act") ?? "";
+
+    if (act === "tuning") {
+      // Per-backend tuning (Addendum B §B.2): the sweep lives
+      // on the Optimize page; preselect this backend there.
+      try { sessionStorage.setItem("tuningBackend", id); } catch { /* storage unavailable */ }
+      location.hash = "#/optimize";
+      return;
+    }
 
     if (act === "details") {
       const opening = !openDetails.has(id);

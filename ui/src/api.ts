@@ -3708,6 +3708,86 @@ export interface OptimizeState {
     backend_id: string;
     started_unix_ms: number;
   }>;
+  /** Per-backend tuning sweeps (Addendum B §B.2): the running
+   *  sweep's progress record and the most recent finished
+   *  sweep, either possibly null. */
+  tuning: { running: TuningSweep | null; latest: TuningSweep | null };
+}
+
+/** One arm's full configuration (Addendum B §B.1), resolved:
+ *  every axis coordinate the sweep varies. */
+export interface TuningCoords {
+  gpu_indices: number[];
+  tensor_split: number[];
+  offload_layers: number | null;
+  moe_cache_mib: number | null;
+  mtp_n_max: number | null;
+  n_ctx: number;
+  cache: CacheSelectionLike;
+  parallel_slots: number;
+}
+
+/** One measured (or failed / excluded) arm of a tuning sweep. */
+export interface TuningArm {
+  index: number;
+  axis: string;
+  coords: TuningCoords;
+  status: "completed" | "failed" | "aborted_thermal" | "unverified" | "excluded";
+  detail?: string | null;
+  measured?: {
+    short: { prompt_per_second: number | null; predicted_per_second: number | null; ttft_ms: number | null };
+    long: { prompt_per_second: number | null; predicted_per_second: number | null; ttft_ms: number | null };
+  } | null;
+  residency?: { verified_exclusive: unknown } | { unverified: { reason: string } } | string | null;
+  free_vram_mib: number[];
+  temp_start_c?: number | null;
+  temp_peak_c?: number | null;
+  fingerprint?: string | null;
+}
+
+/** One tuning sweep's durable record (Addendum B §B.6). */
+export interface TuningSweep {
+  id: string;
+  backend_id: string;
+  model_id: string;
+  state: "running" | "completed" | "cancelled" | "failed";
+  started_at: string;
+  finished_at?: string | null;
+  incumbent: TuningCoords;
+  stop_list: string[];
+  arms: TuningArm[];
+  exclusions: { coords: TuningCoords; reason: string }[];
+  winner_arm?: number | null;
+  incumbent_stands: boolean;
+  confirmation?: {
+    arm_index: number;
+    reproduced: boolean;
+    gen_delta_pct?: number | null;
+    screen_passes: boolean;
+    comparison?: { screen_at_or_above_baseline: boolean } | null;
+  } | null;
+  truncated?: string | null;
+  detail?: string | null;
+  adopted: boolean;
+  adopted_anyway: boolean;
+}
+
+/** The sweep preview (Addendum B §B.2/§B.3). */
+export interface TuningPreview {
+  backend_id: string;
+  model_id: string;
+  incumbent: TuningCoords;
+  plan: {
+    backend_id: string;
+    model_id: string;
+    axes: [string, string[]][];
+    planned_arms: number;
+    stop_list: string[];
+    exclusions: { coords: TuningCoords; reason: string }[];
+    max_arms: number;
+    arm_timeout_secs: number;
+    sweep_timeout_secs: number;
+  };
 }
 
 /** One running Estimate/Measure job (tracker #69). */
@@ -3847,6 +3927,43 @@ export function optimizeRunExperiments() {
  *  optimizeCancelJob cancels it. */
 export function optimizeEstimateExperiments() {
   return optimizeStateCmd("optimize_estimate_experiments");
+}
+
+/** optimize_tuning_preview — price and plan a per-backend
+ *  tuning sweep (Addendum B §B.2/§B.3): axes and value sets,
+ *  arm count, stop list, budgets, planning exclusions. Pure
+ *  read; nothing is stopped or started. */
+export async function optimizeTuningPreview(backendId: string): Promise<CallResult<TuningPreview | null>> {
+  if (!isTauri()) return { data: null, live: false };
+  try {
+    const data = await invoke<TuningPreview>("optimize_tuning_preview", { backendId });
+    return { data, live: true };
+  } catch (e) {
+    return { data: null, live: true, error: errOf(e) };
+  }
+}
+
+/** optimize_tuning_run — start a per-backend tuning sweep
+ *  (Addendum B): parks the stop list, measures arms as temp
+ *  backends under verified residency, ranks them, and runs
+ *  the winner's confirmation arm. Long-running (up to the
+ *  90-minute sweep budget, enforced server-side); runs under
+ *  the shared GPU-job slot, so optimizeCancelJob cancels it.
+ *  Returns the refreshed state; progress rides its `tuning`
+ *  field. */
+export function optimizeTuningRun(backendId: string) {
+  return optimizeStateCmd("optimize_tuning_run", { backendId });
+}
+
+/** optimize_tuning_adopt — write a completed sweep's winning
+ *  coordinates into the backend's saved configuration through
+ *  the structured save ops (Addendum B §B.6). Nothing is
+ *  auto-applied by the sweep; this is the explicit action.
+ *  `adoptAnyway` is the explicit flip required when the
+ *  confirmation arm did not reproduce the winner or the
+ *  screening gate did not pass. */
+export function optimizeTuningAdopt(sweepId: string, adoptAnyway?: boolean) {
+  return optimizeStateCmd("optimize_tuning_adopt", { sweepId, adoptAnyway: adoptAnyway ?? null });
 }
 
 /** optimize_set_item_outcome — record an apply outcome on one item

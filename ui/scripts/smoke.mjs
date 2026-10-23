@@ -32,7 +32,7 @@ const html = existsSync(indexHtml) ? readFileSync(indexHtml, "utf8") : "";
 check(/assets\/.*\.js/.test(html), "index.html references the JS bundle");
 
 const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
-for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_moe_cache", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_set_mtp", "model_delete", "model_assign", "model_hf_lookup", "model_hf_header", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
+for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_moe_cache", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_set_mtp", "model_delete", "model_assign", "model_hf_lookup", "model_hf_header", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "optimize_tuning_preview", "optimize_tuning_run", "optimize_tuning_adopt", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
 
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
@@ -194,6 +194,18 @@ const optimizeSrc = readFileSync(join(root, "src", "views", "optimize.ts"), "utf
 check(optimizeSrc.includes("data-opt-estimate"), "Optimize view renders the per-backend Estimate button (data-opt-estimate)");
 check(optimizeSrc.includes('data-opt-act="estimate-experiments"'), "Optimize view renders the Estimate experiments action");
 check(optimizeSrc.includes("Estimate —"), "Optimize view renders estimate figures under the Estimate label");
+
+// Optimize Addendum B (per-backend tuning): the Backend tuning
+// section renders its preview/run actions, the ranked results
+// table carries the winner and adoption controls, and the
+// backend card menu carries the "Optimize this backend" entry.
+check(optimizeSrc.includes('data-opt-act="tuning-preview"'), "Optimize view renders the tuning Preview sweep action (Addendum B)");
+check(optimizeSrc.includes('data-opt-act="tuning-run"'), "Optimize view renders the tuning Run sweep action (Addendum B)");
+check(optimizeSrc.includes('data-opt-act="tuning-adopt"'), "Optimize view renders the tuning Adopt winner action (Addendum B)");
+check(optimizeSrc.includes("Incumbent stands"), "Optimize view states when the incumbent stands (Addendum B)");
+const staticSrcB = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+check(staticSrcB.includes('data-back-act="tuning"'), "Backend card menu renders the Optimize this backend action (Addendum B)");
+check(staticSrcB.includes("Optimize this backend"), "Backend card menu labels the tuning action (Addendum B)");
 
 // Optimize model.add params_b (tracker #38): the apply executor
 // forwards the plan item's params_b to modelAdd (an unknown-size,

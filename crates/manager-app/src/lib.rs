@@ -57,6 +57,7 @@ pub mod notify;
 pub mod optimize;
 pub mod optimize_eval;
 pub mod optimize_experiments;
+pub mod optimize_tuning;
 
 pub use optimize::{
     op_measurement_delete, op_measurement_lookup, op_optimize_cancel_consult,
@@ -75,6 +76,7 @@ pub use optimize_eval::op_optimize_run_baseline;
 pub use optimize_experiments::{
     op_optimize_estimate_experiments, op_optimize_run_experiments, op_optimize_set_experiment_state,
 };
+pub use optimize_tuning::{op_optimize_tuning_adopt, op_optimize_tuning_preview, op_optimize_tuning_run};
 pub mod registry;
 
 // ---------------------------------------------------------------------------
@@ -10622,6 +10624,8 @@ mod tests {
             inputs: None,
             driver_version: Vec::new(),
             llama_build: None,
+            residency: None,
+            peak_temp_c: None,
         });
         store
             .save(&optimize::measurements_path(&state))

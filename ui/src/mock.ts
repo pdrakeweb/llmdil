@@ -220,6 +220,7 @@ export function mockOptimizeState(): OptimizeState {
     job_error: null,
     job_error_unix_ms: null,
     running_ops: {},
+    tuning: { running: null, latest: null },
     plan: {
       summary: "Sample plan — generated locally; no backend was consulted.",
       directive: "Explore better MoE capable models for the planner",

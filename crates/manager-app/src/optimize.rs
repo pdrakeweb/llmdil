@@ -1277,6 +1277,11 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
         // exposed so any page instance can see which operation
         // holds a backend.
         "running_ops": running_ops_json(state),
+        // Per-backend tuning sweeps (Addendum B §B.2): the
+        // running sweep's progress record and the most recent
+        // finished sweep, so the page renders sweep state the
+        // same way it renders `consulting` and `measuring`.
+        "tuning": crate::optimize_tuning::tuning_payload(state),
     }))
 }
 
@@ -1645,6 +1650,22 @@ pub async fn op_optimize_consult(
         if slot.is_some() {
             return Err(ApiError::InvalidInput(
                 "a consultation is already running".to_string(),
+            ));
+        }
+    }
+    {
+        // Cross-family serialization (Addendum B §B.4.3,
+        // extension E2): a consultation refuses while the
+        // Optimize job slot is occupied — by a measurement, an
+        // experiment batch, or a tuning sweep — the reciprocal
+        // of the check those jobs make against this slot. A
+        // consultation is generation traffic; run during a
+        // sweep it would contend for the CPU and system RAM
+        // the sweep's arms are measuring.
+        let slot = state.optimize_job_abort.lock().await;
+        if slot.is_some() {
+            return Err(ApiError::InvalidInput(
+                "a measurement, experiment, or tuning job is already running".to_string(),
             ));
         }
     }
@@ -2354,6 +2375,8 @@ pub async fn op_optimize_measure_backend(
             inputs: Some(run_snapshot),
             driver_version: run_drivers,
             llama_build,
+            residency: None,
+            peak_temp_c: None,
         })
     };
     let outcome = tokio::select! {
@@ -2880,6 +2903,8 @@ mod tests {
             inputs: None,
             driver_version: Vec::new(),
             llama_build: None,
+            residency: None,
+            peak_temp_c: None,
         }
     }
 

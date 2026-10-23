@@ -286,7 +286,7 @@ fn fmt_rate(v: Option<f64>) -> String {
 /// record. This runs outside the experiment future, so neither
 /// cancellation nor timeout can skip it; the temp id is owned
 /// here, independently of that future.
-async fn cleanup_temp(state: &AppState, temp_id: &str) {
+pub(crate) async fn cleanup_temp(state: &AppState, temp_id: &str) {
     {
         let mut sup = state.supervisor().await.lock().await;
         sup.reap_exited();
@@ -313,7 +313,7 @@ async fn cleanup_temp(state: &AppState, temp_id: &str) {
 /// backend's loopback `/health`, polled until healthy, until
 /// the supervisor reports the process gone/failed, or until
 /// the bounded wait expires.
-async fn wait_healthy(state: &AppState, temp_id: &str, port: u16) -> Result<(), String> {
+pub(crate) async fn wait_healthy(state: &AppState, temp_id: &str, port: u16) -> Result<(), String> {
     let probe = HttpHealthProbe::new(
         format!("http://127.0.0.1:{port}/health"),
         Duration::from_secs(5),
@@ -908,6 +908,8 @@ async fn run_experiment_inner(
                 &gathered.gpu_driver_versions,
             ),
             llama_build,
+            residency: None,
+            peak_temp_c: None,
         };
         let mut store = MeasurementStore::load(&crate::optimize::measurements_path(state));
         store.upsert(entry);
@@ -1033,7 +1035,7 @@ fn record_estimate(
 /// (those running at batch start, still stopped now), via the
 /// ordinary spec registration + supervisor spawn. Returns the
 /// note stated in each of the batch's result details.
-async fn restart_stopped(state: &AppState, ids: &[String]) -> String {
+pub(crate) async fn restart_stopped(state: &AppState, ids: &[String]) -> String {
     if ids.is_empty() {
         return String::new();
     }
@@ -1519,6 +1521,8 @@ mod tests {
                 offload_layers: Some(40),
                 tensor_split: Some(vec![0.5, 0.5]),
                 moe_cache_mib: None,
+                mtp_n_max: None,
+                parallel_slots: None,
             },
             serves: "guardrail wiring test".to_string(),
             hypothesis: String::new(),
