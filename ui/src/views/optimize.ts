@@ -1383,6 +1383,22 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         return;
       }
       case "backend.set_model": {
+        // Dependency guard (tracker #54): a set_model whose
+        // chained model.add was denied, was not accepted, or
+        // failed earlier in this apply run must not execute
+        // against an unregistered model. Mirrors the
+        // backend.create executor's registration check; the
+        // throw is surfaced by runApplyPhase as this item's
+        // failure and halts the phase, so the item is blocked,
+        // not silently skipped. (model_assign on the server
+        // side independently refuses an unregistered model and
+        // is atomic, so a refused assign leaves the backend's
+        // prior configuration intact.)
+        const cfg = unwrap(await getAppConfig());
+        const models = (cfg?.models as CfgModel[] | undefined) ?? [];
+        if (!models.some((m) => m.id === str("model_id"))) {
+          throw new Error(`model '${str("model_id")}' is not registered — apply its model.add first`);
+        }
         const backends = await cfgBackends();
         const b = backends.find((x) => x.id === target);
         unwrap(await modelAssign(target, str("model_id"), b?.flags.tensor_split ?? []));

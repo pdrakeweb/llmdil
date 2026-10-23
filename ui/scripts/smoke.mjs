@@ -226,6 +226,14 @@ const apiSrc38 = readFileSync(join(root, "src", "api.ts"), "utf8");
 check(apiSrc38.includes("Params: ${num(c.params_b)} B"),
   "Optimize change summary shows a model.add item's carried params_b (tracker #38)");
 
+// Tracker #54: the backend.set_model apply executor refuses an
+// unregistered model before calling modelAssign — a set_model
+// whose chained model.add was denied or failed is blocked and
+// surfaced as the item's failure, never executed against the
+// unregistered model and never silently skipped.
+check(optimizeSrc.includes("is not registered — apply its model.add first"),
+  "Optimize set_model executor blocks an unregistered model until its model.add applies (tracker #54)");
+
 // Optimize fix bundle (Oct 19, 2026): the consulting elapsed
 // clock reads the server's recorded start (a page instance that
 // did not start the run has no local start and must not render
