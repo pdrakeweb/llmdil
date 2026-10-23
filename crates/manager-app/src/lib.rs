@@ -35,7 +35,9 @@ use manager_supervisor::{
     test_request, test_tool_call, BackoffPolicy, HealthProbe, HttpHealthProbe, LogLevelFilter, LogRecord,
     LogStream, ProcessSpec, ProcessState, Supervisor,
 };
-use manager_telemetry::{GpuInfo, GpuSample, NvidiaSmiSource, PollCadence, Poller, TelemetryStore};
+use manager_telemetry::{
+    DriverModel, GpuInfo, GpuSample, NvidiaSmiSource, PollCadence, Poller, TelemetryStore,
+};
 use manager_wizard::{
     ops::{prev_log_path, RealSystemOps},
     steps::{continue_config_yaml, default_steps, merge_env_contents, VscodeExtensions},
@@ -2126,14 +2128,18 @@ fn process_state_str(s: ProcessState) -> &'static str {
 /// (`verified_at` set). The llama-server binary and model file must
 /// exist. Errors name the missing piece and the fix, so a first Start
 /// after a skipped wizard step explains itself.
-async fn backend_start_preflight(state: &AppState, id: &str) -> Result<(), ApiError> {
+async fn backend_start_preflight(
+    state: &AppState,
+    id: &str,
+    allow_wddm_overcommit: bool,
+) -> Result<(), ApiError> {
     let cfg = state.config.read().await.clone();
     let b = cfg
         .backends
         .iter()
         .find(|b| b.id == id)
         .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
-    backend_start_preflight_for(state, &cfg, b).await
+    backend_start_preflight_for(state, &cfg, b, allow_wddm_overcommit).await
 }
 
 /// The preflight itself, against an explicit config + backend
@@ -2148,6 +2154,7 @@ pub(crate) async fn backend_start_preflight_for(
     state: &AppState,
     cfg: &AppConfig,
     b: &manager_config::BackendConfig,
+    allow_wddm_overcommit: bool,
 ) -> Result<(), ApiError> {
     if !b.enabled {
         return Err(ApiError::InvalidInput(format!(
@@ -2247,7 +2254,7 @@ pub(crate) async fn backend_start_preflight_for(
             model_path.display()
         )));
     }
-    vram_start_gate(state, cfg, b).await
+    vram_start_gate(state, cfg, b, allow_wddm_overcommit).await
 }
 
 /// One placed GPU's measured memory state, as the start gate sees
@@ -2261,6 +2268,11 @@ struct VramGateReading {
     /// it flagged down with last-known readings. A down GPU is
     /// not a full GPU — it is a device that stopped responding.
     down: bool,
+    /// The GPU's Windows driver model from the same telemetry
+    /// snapshot, when reported: WDDM GPUs can page an over-total
+    /// requirement to system RAM; TCC GPUs cannot (Pete, Oct 23,
+    /// 2026). `None` (unreported) is judged as hard-bounded.
+    driver_model: Option<DriverModel>,
 }
 
 /// Why the start gate refuses one GPU.
@@ -2293,6 +2305,47 @@ struct VramGateFailure {
     /// Zero for a GPU with no usable reading.
     free_mib: u64,
     total_mib: u64,
+    /// The failing GPU's driver model, when telemetry reported
+    /// one: an [`VramGateClass::ExceedsTotal`] failure on a WDDM
+    /// GPU is confirmable (see [`failures_are_wddm_overcommit`]).
+    driver_model: Option<DriverModel>,
+    /// MiB that will page to system RAM: the over-total excess
+    /// on a WDDM GPU; 0 otherwise.
+    paged_mib: u64,
+}
+
+/// Whether every failure is an over-total excess on a WDDM GPU —
+/// the one failure shape an operator confirmation can allow:
+/// WDDM overcommits VRAM by paging the excess to system RAM,
+/// while TCC allocations are hard-bounded by physical VRAM
+/// (Pete, Oct 23, 2026). Any other failure (a TCC or unreported
+/// GPU over total, insufficient free memory under the total, an
+/// unavailable GPU) makes the set non-confirmable as a whole.
+fn failures_are_wddm_overcommit(failures: &[VramGateFailure]) -> bool {
+    !failures.is_empty()
+        && failures.iter().all(|f| {
+            f.class == VramGateClass::ExceedsTotal
+                && f.driver_model == Some(DriverModel::Wddm)
+        })
+}
+
+/// The requirement's itemized breakdown in the gate's refusal
+/// text — weights, KV cache, state cache, expert cache — so the
+/// numbers a refusal cites are the numbers the fit surfaces
+/// itemize (the expert cache included, when one is set). Terms
+/// with no figure are omitted, never zero-filled.
+fn requirement_breakdown(req: &manager_models::MemoryRequirement) -> String {
+    let mut terms: Vec<String> = vec![format!("weights {} MiB", req.gpu_weights_mib)];
+    if let Some(kv) = req.kv_mib {
+        terms.push(format!("KV cache {kv} MiB"));
+    }
+    if let Some(rs) = req.rs_mib {
+        terms.push(format!("state cache {rs} MiB"));
+    }
+    if req.moe_cache_mib > 0 {
+        terms.push(format!("expert cache {} MiB", req.moe_cache_mib));
+    }
+    terms.join(" + ")
 }
 
 /// The pure start-gate math. Every placed GPU is judged first
@@ -2334,6 +2387,8 @@ fn vram_gate_failures(
                 required_mib: req,
                 free_mib: 0,
                 total_mib: reading.map(|r| r.total_mib).unwrap_or(0),
+                driver_model: reading.and_then(|r| r.driver_model),
+                paged_mib: 0,
             });
             continue;
         }
@@ -2350,16 +2405,25 @@ fn vram_gate_failures(
             .unwrap_or(0);
         let free = r.free_mib.saturating_add(credited);
         if req > free {
+            let class = if req > r.total_mib {
+                VramGateClass::ExceedsTotal
+            } else {
+                VramGateClass::InsufficientFree
+            };
             out.push(VramGateFailure {
                 index,
-                class: if req > r.total_mib {
-                    VramGateClass::ExceedsTotal
-                } else {
-                    VramGateClass::InsufficientFree
-                },
+                class,
                 required_mib: req,
                 free_mib: free,
                 total_mib: r.total_mib,
+                driver_model: r.driver_model,
+                paged_mib: if class == VramGateClass::ExceedsTotal
+                    && r.driver_model == Some(DriverModel::Wddm)
+                {
+                    req - r.total_mib
+                } else {
+                    0
+                },
             });
         }
     }
@@ -2390,6 +2454,7 @@ async fn vram_start_gate(
     state: &AppState,
     cfg: &AppConfig,
     b: &manager_config::BackendConfig,
+    allow_wddm_overcommit: bool,
 ) -> Result<(), ApiError> {
     let placed: Vec<u32> = match backend_gpu_visibility(b) {
         GpuVisibility::Gpus(indices) => indices,
@@ -2433,6 +2498,7 @@ async fn vram_start_gate(
             total_mib: s.vram_total_mib,
             free_mib: s.free_vram_mib(),
             down: s.down,
+            driver_model: s.driver_model,
         })
         .collect();
     let statuses: Vec<(String, ProcessState)> = {
@@ -2462,6 +2528,34 @@ async fn vram_start_gate(
     if failures.is_empty() {
         return Ok(());
     }
+    // WDDM overcommit (Pete, Oct 23, 2026): when every failure is
+    // an over-total excess on a WDDM GPU, the start is allowed
+    // once the operator has confirmed it (the card's two-click
+    // Start) — the excess pages to system RAM. Without the
+    // confirmation the gate refuses, naming the paged amount, so
+    // an unconfirmed caller (REST, a stale UI) never starts a
+    // paging backend silently. TCC and unreported GPUs never
+    // reach this branch: their failures are not all-WDDM.
+    if failures_are_wddm_overcommit(&failures) {
+        if allow_wddm_overcommit {
+            return Ok(());
+        }
+        let breakdown = requirement_breakdown(&req);
+        let parts: Vec<String> = failures
+            .iter()
+            .map(|f| {
+                format!(
+                    "GPU {} needs {} MiB ({}), which exceeds the GPU's total memory ({} MiB; {} MiB free) at this context size — {} MiB will page to system RAM on this WDDM GPU",
+                    f.index, f.required_mib, breakdown, f.total_mib, f.free_mib, f.paged_mib
+                )
+            })
+            .collect();
+        return Err(ApiError::InvalidInput(format!(
+            "backend {} cannot start without confirmation: {} — confirm the start to page the excess to system RAM, or reduce the context size or the model footprint before starting",
+            b.id,
+            parts.join("; ")
+        )));
+    }
     // Name the running app-managed backends placed on a failing
     // GPU: the known consumers of the memory that is not free.
     let consumers_on = |index: u32| -> Vec<String> {
@@ -2485,8 +2579,12 @@ async fn vram_start_gate(
             }
             VramGateClass::ExceedsTotal => {
                 parts.push(format!(
-                    "GPU {} needs {} MiB, which exceeds the GPU's total memory ({} MiB; {} MiB free) at this context size",
-                    f.index, f.required_mib, f.total_mib, f.free_mib
+                    "GPU {} needs {} MiB ({}), which exceeds the GPU's total memory ({} MiB; {} MiB free) at this context size",
+                    f.index,
+                    f.required_mib,
+                    requirement_breakdown(&req),
+                    f.total_mib,
+                    f.free_mib
                 ));
             }
             VramGateClass::InsufficientFree => {
@@ -2612,7 +2710,84 @@ pub async fn op_list_backends(
             row["sys_ram_mib"] = json!(req.sys_weights_mib);
             row["kv_ram_mib"] = json!(req.kv_mib);
             row["rs_ram_mib"] = json!(req.rs_mib);
+            // The expert-cache term of the requirement (0 when
+            // unset): the card itemizes it beside KV/state so its
+            // tiles carry the same components the start gate sums.
+            row["moe_cache_mib"] = json!(req.moe_cache_mib);
             row["memory_basis"] = serde_json::to_value(req.basis).unwrap_or(Value::Null);
+        }
+    }
+    // Three-state fit per configured backend, from the same
+    // requirement model and per-GPU distribution the start gate
+    // judges (residency_per_gpu over the telemetry inventory):
+    // each placed GPU's required share against its total VRAM and
+    // driver model. Absent when placement or inventory cannot
+    // judge the backend — no fit claim then, never a default.
+    {
+        let inventory: Vec<GpuInfo> = {
+            let store = state.telemetry().await;
+            let inventory = lock_telemetry(&store).inventory();
+            inventory
+        };
+        if !inventory.is_empty() {
+            let n = inventory.len();
+            for row in backends.iter_mut() {
+                let Some(id) = row["id"].as_str().map(str::to_string) else {
+                    continue;
+                };
+                let Some(b) = cfg.backends.iter().find(|b| b.id == id) else {
+                    continue;
+                };
+                let placed: Vec<u32> = match backend_gpu_visibility(b) {
+                    GpuVisibility::Gpus(indices) => indices,
+                    _ => continue,
+                };
+                let Some(req) = backend_memory_requirement(&cfg, b) else {
+                    continue;
+                };
+                let per_gpu =
+                    manager_optimize::residency_per_gpu(&req, &b.flags.tensor_split, n);
+                let mut states: Vec<manager_models::FitState> = Vec::new();
+                let mut per: Vec<Value> = Vec::new();
+                for &index in &placed {
+                    let Some(pos) =
+                        inventory.iter().position(|g| g.index == index)
+                    else {
+                        continue;
+                    };
+                    let gpu = &inventory[pos];
+                    let (st, paged) = manager_models::fit_state(
+                        per_gpu[pos],
+                        gpu.total_vram_mib,
+                        gpu.driver_model == Some(DriverModel::Wddm),
+                    );
+                    states.push(st);
+                    per.push(json!({
+                        "gpu": index,
+                        "required_mib": per_gpu[pos],
+                        "total_mib": gpu.total_vram_mib,
+                        "driver_model": gpu.driver_model.map(|d| match d {
+                            DriverModel::Wddm => "wddm",
+                            DriverModel::Tcc => "tcc",
+                        }),
+                        "state": st.as_str(),
+                        "paged_mib": paged,
+                    }));
+                }
+                if per.is_empty() {
+                    continue;
+                }
+                let worst = manager_models::worst_fit_state(&states);
+                let paged_total: u64 = per
+                    .iter()
+                    .map(|p| p["paged_mib"].as_u64().unwrap_or(0))
+                    .sum();
+                row["fit"] = json!({
+                    "state": worst.as_str(),
+                    "paged_mib": paged_total,
+                    "per_gpu": per,
+                });
+            }
         }
     }
     // Expert-offload slider state per configured backend whose
@@ -2981,13 +3156,18 @@ pub async fn op_list_backends(
 
 /// Start a backend (supervisor spawn, or SCM start in service mode
 /// when the backend is registered as a service). Returns a task id.
+/// `allow_wddm_overcommit` is the operator's two-click confirmation
+/// for a start whose requirement exceeds a WDDM GPU's total VRAM
+/// (the excess pages to system RAM); it never overrides a TCC
+/// refusal — see [`vram_start_gate`].
 pub async fn op_start_backend(
     state: &Arc<AppState>,
     sink: &Arc<dyn EventSink>,
     id: String,
+    allow_wddm_overcommit: Option<bool>,
 ) -> ApiResult {
     ensure_backend_specs(state).await;
-    backend_start_preflight(state, &id).await?;
+    backend_start_preflight(state, &id, allow_wddm_overcommit == Some(true)).await?;
     // Offload-probe capture: pending change + saved position,
     // before the spawn (a refused start never reaches here).
     let probe_ctx = offload_probe_context(state, &id).await;
@@ -3098,9 +3278,10 @@ pub async fn op_restart_backend(
     sink: &Arc<dyn EventSink>,
     id: String,
     graceful: bool,
+    allow_wddm_overcommit: Option<bool>,
 ) -> ApiResult {
     ensure_backend_specs(state).await;
-    backend_start_preflight(state, &id).await?;
+    backend_start_preflight(state, &id, allow_wddm_overcommit == Some(true)).await?;
     // Offload-probe capture: pending change + saved position,
     // before the restart's spawn.
     let probe_ctx = offload_probe_context(state, &id).await;
@@ -6749,7 +6930,7 @@ fn resolve_cache_selection(
 fn cache_fit_targets(
     b: &manager_config::BackendConfig,
     gpus: &[GpuInfo],
-) -> Option<(Vec<f32>, Vec<u64>, Vec<u32>)> {
+) -> Option<(Vec<f32>, Vec<u64>, Vec<u32>, Vec<Option<DriverModel>>)> {
     let placed = match backend_gpu_visibility(b) {
         GpuVisibility::Gpus(indices) => indices,
         _ => return None,
@@ -6758,12 +6939,14 @@ fn cache_fit_targets(
         return None;
     }
     let mut totals: Vec<u64> = Vec::new();
+    let mut drivers: Vec<Option<DriverModel>> = Vec::new();
     for i in &placed {
         let g = gpus
             .iter()
             .find(|g| g.index == *i)
             .or_else(|| gpus.get(*i as usize))?;
         totals.push(g.total_vram_mib);
+        drivers.push(g.driver_model);
     }
     // Split shares over the placed GPUs: the configured split is
     // in inventory order, and the placed set's positions in it
@@ -6790,7 +6973,7 @@ fn cache_fit_targets(
     } else {
         raw
     };
-    Some((split, totals, placed))
+    Some((split, totals, placed, drivers))
 }
 
 /// The cache preview payload shared by backend_cache_preview and
@@ -6806,7 +6989,7 @@ fn cache_preview_json(
     n_ctx: u32,
     n_seq: u32,
     moe_cache_mib: u32,
-    targets: Option<&(Vec<f32>, Vec<u64>, Vec<u32>)>,
+    targets: Option<&(Vec<f32>, Vec<u64>, Vec<u32>, Vec<Option<DriverModel>>)>,
 ) -> Value {
     let kv_typed = layout
         .kv_geometry
@@ -6831,7 +7014,7 @@ fn cache_preview_json(
     let base_total_mib = req.gpu_weights_mib + req.kv_mib.unwrap_or(0) + req.rs_mib.unwrap_or(0);
     let total_mib = base_total_mib + u64::from(moe_cache_mib);
     let (ladder, best) = match (layout.kv_geometry, targets) {
-        (Some(kv), Some((split, totals, _))) => {
+        (Some(kv), Some((split, totals, _, _))) => {
             let inputs = manager_models::CacheFitInputs {
                 kv,
                 gpu_weights_mib: req.gpu_weights_mib,
@@ -6871,7 +7054,7 @@ fn cache_preview_json(
         "moe_cache_mib": moe_cache_mib,
         "total_mib": total_mib,
         "basis": serde_json::to_value(req.basis).unwrap_or(Value::Null),
-        "targets": targets.map(|(split, totals, placed)| {
+        "targets": targets.map(|(split, totals, placed, drivers)| {
             // Each target carries its share of the total — the
             // same distribution predicted_fits judges — and its
             // own verdict, so the forms render one capacity row
@@ -6893,6 +7076,23 @@ fn cache_preview_json(
                 .enumerate()
                 .map(|(pos, (i, t))| {
                     let required = shares.as_ref().map(|s| s[pos] + cache_shares[pos]);
+                    // The three-state classification against the
+                    // GPU's TOTAL (the start gate's basis), beside
+                    // the headroom `fits` the ladder judges by: a
+                    // WDDM GPU over total is a paged fit, not a
+                    // hard refusal.
+                    let (state, paged) = match required {
+                        Some(r) => {
+                            let (st, pg) = manager_models::fit_state(
+                                r,
+                                *t,
+                                drivers.get(pos).copied().flatten()
+                                    == Some(DriverModel::Wddm),
+                            );
+                            (Some(st.as_str()), pg)
+                        }
+                        None => (None, 0),
+                    };
                     json!({
                         "gpu": i,
                         "total_mib": t,
@@ -6900,12 +7100,18 @@ fn cache_preview_json(
                         "fits": required.map(|r| {
                             r <= t * (100 - manager_models::HEADROOM_RESERVE_PERCENT) / 100
                         }),
+                        "driver_model": drivers.get(pos).copied().flatten().map(|d| match d {
+                            DriverModel::Wddm => "wddm",
+                            DriverModel::Tcc => "tcc",
+                        }),
+                        "fit_state": state,
+                        "paged_mib": paged,
                     })
                 })
                 .collect::<Vec<_>>()
         }),
         "headroom_reserve_percent": manager_models::HEADROOM_RESERVE_PERCENT,
-        "fits_current": targets.map(|(split, totals, placed)| {
+        "fits_current": targets.map(|(split, totals, placed, _drivers)| {
             // The same combined distribution the targets carry:
             // base shares by the plain split, cache shares by
             // the cache's own placement — judged under the same
@@ -6954,6 +7160,7 @@ pub async fn op_backend_cache_preview(
     cache_k: Option<String>,
     cache_v: Option<String>,
     flash_attn: Option<String>,
+    moe_cache_mib: Option<u32>,
 ) -> ApiResult {
     // The layout resolves under the config read; the telemetry
     // inventory is fetched after the guard drops (the telemetry
@@ -7001,13 +7208,24 @@ pub async fn op_backend_cache_preview(
             None => saved.flash_attn,
         },
     };
+    // The expert-cache size prices as a DRAFT when the caller
+    // sends one (the flags form sends its Expert cache control's
+    // current state on every preview, so toggling or resizing the
+    // cache re-prices the fit block immediately — before this
+    // parameter existed the preview read only the SAVED token,
+    // and a cache change alone never moved the figures until an
+    // unrelated field happened to re-trigger a preview; Pete's
+    // Oct 23, 2026 report). Omitted prices the saved token.
+    let eff_moe_cache_mib = moe_cache_mib.unwrap_or_else(|| {
+        manager_models::moe_cache_mib(backend.raw_flags.as_deref()).unwrap_or(0)
+    });
     let mut payload = cache_preview_json(
         &layout,
         offload,
         selection,
         eff_ctx,
         eff_slots.max(1),
-        manager_models::moe_cache_mib(backend.raw_flags.as_deref()).unwrap_or(0),
+        eff_moe_cache_mib,
         targets.as_ref(),
     );
     payload["backend_id"] = json!(id);
@@ -9529,8 +9747,11 @@ fn backend_moe_cache_info(
 /// projection plus provenance for the UI's labels: `snapshot_age_ms`
 /// (age of the telemetry snapshot the projection was computed from),
 /// `gpu_indices` (the GPU index each split fraction maps to), and
-/// `weights_only` — the projection covers model weights only, with no
-/// KV-cache or compute allowance, so "fits" is not a load guarantee.
+/// `weights_only` — true only when no backend is in scope (the
+/// projection then covers model weights only, with no KV-cache or
+/// compute allowance, so "fits" is not a load guarantee); with a
+/// backend in scope the projection prices its full requirement
+/// and `weights_only` is false.
 ///
 /// When a backend is in scope and its process is running, the fit
 /// check credits the weights that process already holds on each GPU
@@ -9604,12 +9825,16 @@ pub async fn op_placement_propose(
     };
     // Backend-scoped residency: when the caller names the serving
     // backend (the backend card's Placement form does), the
-    // projection uses that backend's memory requirement — with
-    // expert offload, the split divides only the GPU-resident
-    // weights and the system-RAM share rides along in the payload.
-    // The config read finishes before telemetry is touched (the
-    // telemetry accessor reads the config while initializing).
-    let (resident_bytes, sys_bytes, credit_cfg_split) = match &backend_id {
+    // projection prices that backend's FULL memory requirement —
+    // weights, KV cache, state cache, and the expert cache
+    // distributed by its own rule — so the panel's Required
+    // figures are the start gate's numbers (before Oct 23, 2026
+    // it projected weights only and could report "Fits" for a
+    // configuration the gate refused). The system-RAM share rides
+    // along in the payload. The config read finishes before
+    // telemetry is touched (the telemetry accessor reads the
+    // config while initializing).
+    let (full_req, resident_bytes, sys_bytes, credit_cfg_split) = match &backend_id {
         Some(bid) => {
             let cfg = state.config.read().await;
             let found = cfg.backends.iter().find(|b| &b.id == bid).and_then(|b| {
@@ -9624,16 +9849,19 @@ pub async fn op_placement_propose(
                 }
             });
             match found {
-                Some((req, split_cfg)) if req.sys_weights_mib > 0 => (
-                    Some(req.gpu_weights_mib * manager_models::MIB),
-                    req.sys_weights_mib * manager_models::MIB,
-                    Some(split_cfg),
-                ),
-                Some((_, split_cfg)) => (None, 0, Some(split_cfg)),
-                None => (None, 0, None),
+                Some((req, split_cfg)) => {
+                    let resident = if req.sys_weights_mib > 0 {
+                        Some(req.gpu_weights_mib * manager_models::MIB)
+                    } else {
+                        None
+                    };
+                    let sys = req.sys_weights_mib * manager_models::MIB;
+                    (Some(req), resident, sys, Some(split_cfg))
+                }
+                None => (None, None, 0, None),
             }
         }
-        None => (None, 0, None),
+        None => (None, None, 0, None),
     };
     // The current-allocation credit applies only while the backend's
     // process actually holds the weights: running or starting. A
@@ -9699,20 +9927,65 @@ pub async fn op_placement_propose(
         }
         _ => None,
     };
-    let projection = manager_models::propose_placement_resident(
-        &spec,
-        &split,
-        &free_mib,
-        resident_bytes,
-        sys_bytes,
-        current_split.as_deref(),
-    )
-    .map_err(ApiError::from)?;
+    // With a backend in scope the projection is the full
+    // requirement under the PROPOSED split (the expert-cache
+    // shares follow the proposed split's offloaded-layer holders,
+    // exactly as residency_per_gpu distributes them for the
+    // start gate); the credit is the same requirement under the
+    // configured split, when the backend is running. Without a
+    // backend the legacy weights-only projection stands.
+    let (projection, weights_only) = match &full_req {
+        Some(req) => {
+            let n = samples.len();
+            let required = manager_optimize::residency_per_gpu(req, &split, n);
+            let current: Vec<u64> = match (&current_split, credit_active) {
+                (Some(cur), true) => {
+                    manager_optimize::residency_per_gpu(req, cur, n)
+                }
+                _ => vec![0; n],
+            };
+            let totals: Vec<u64> = samples.iter().map(|s| s.vram_total_mib).collect();
+            let is_wddm: Vec<bool> = samples
+                .iter()
+                .map(|s| s.driver_model == Some(DriverModel::Wddm))
+                .collect();
+            (
+                manager_models::propose_placement_full(
+                    &spec,
+                    &split,
+                    &free_mib,
+                    &totals,
+                    &is_wddm,
+                    &required,
+                    &current,
+                    req.gpu_weights_mib,
+                    req.kv_mib.unwrap_or(0),
+                    req.rs_mib,
+                    req.moe_cache_mib,
+                    sys_bytes,
+                )
+                .map_err(ApiError::from)?,
+                false,
+            )
+        }
+        None => (
+            manager_models::propose_placement_resident(
+                &spec,
+                &split,
+                &free_mib,
+                resident_bytes,
+                sys_bytes,
+                current_split.as_deref(),
+            )
+            .map_err(ApiError::from)?,
+            true,
+        ),
+    };
     let mut payload = serde_json::to_value(&projection)?;
     payload["snapshot_age_ms"] = json!(snapshot_age_ms);
     payload["gpu_indices"] = json!(gpu_indices);
     payload["down_indices"] = json!(down_indices);
-    payload["weights_only"] = json!(true);
+    payload["weights_only"] = json!(weights_only);
     Ok(payload)
 }
 
@@ -11984,7 +12257,7 @@ mod tests {
             .find(|b| b.id == "coder")
             .unwrap()
             .clone();
-        match backend_start_preflight_for(state, &cfg, &b).await {
+        match backend_start_preflight_for(state, &cfg, &b, false).await {
             Err(e) => {
                 let msg = e.to_string();
                 msg.contains("outside the verified range").then_some(msg)
@@ -12617,6 +12890,7 @@ mod tests {
             total_mib,
             free_mib,
             down: false,
+            driver_model: None,
         }
     }
 
@@ -12626,6 +12900,22 @@ mod tests {
             total_mib,
             free_mib,
             down: true,
+            driver_model: None,
+        }
+    }
+
+    fn vram_reading_driver(
+        index: u32,
+        total_mib: u64,
+        free_mib: u64,
+        driver_model: DriverModel,
+    ) -> VramGateReading {
+        VramGateReading {
+            index,
+            total_mib,
+            free_mib,
+            down: false,
+            driver_model: Some(driver_model),
         }
     }
 
@@ -12815,6 +13105,105 @@ mod tests {
         );
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].class, VramGateClass::GpuUnavailable);
+    }
+
+    #[test]
+    fn vram_gate_wddm_over_total_is_confirmable_with_paged_amount() {
+        // Pete's configuration (Oct 23, 2026): 17,224 MiB required
+        // on a 16,376 MiB WDDM GPU (the expert cache is 4,096 of
+        // it — without the cache the same backend needs 13,128
+        // and passes outright). The failure carries the paged
+        // excess, and the failure set is confirmable.
+        let failures = vram_gate_failures(
+            &[0],
+            &[(0, 17_224)],
+            &[vram_reading_driver(0, 16_376, 15_098, DriverModel::Wddm)],
+            &[],
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].class, VramGateClass::ExceedsTotal);
+        assert_eq!(failures[0].paged_mib, 848);
+        assert!(failures_are_wddm_overcommit(&failures));
+        // Zero cache changes nothing about the gate's other
+        // shapes: the uncached requirement fits free and passes.
+        let failures = vram_gate_failures(
+            &[0],
+            &[(0, 13_128)],
+            &[vram_reading_driver(0, 16_376, 15_098, DriverModel::Wddm)],
+            &[],
+        );
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn vram_gate_tcc_or_unknown_over_total_is_not_confirmable() {
+        // The same excess on a TCC GPU (the P100 posture) is a
+        // hard refusal: no paged amount, not confirmable. An
+        // unreported driver model is judged the same way.
+        for reading in [
+            vram_reading_driver(0, 16_376, 15_098, DriverModel::Tcc),
+            vram_reading(0, 16_376, 15_098),
+        ] {
+            let failures = vram_gate_failures(&[0], &[(0, 17_224)], &[reading], &[]);
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].class, VramGateClass::ExceedsTotal);
+            assert_eq!(failures[0].paged_mib, 0);
+            assert!(!failures_are_wddm_overcommit(&failures));
+        }
+        // Insufficient free UNDER the total stays a hard refusal
+        // even on WDDM: paging is judged against total VRAM, not
+        // against transient free pressure.
+        let failures = vram_gate_failures(
+            &[0],
+            &[(0, 15_000)],
+            &[vram_reading_driver(0, 16_376, 10_000, DriverModel::Wddm)],
+            &[],
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].class, VramGateClass::InsufficientFree);
+        assert!(!failures_are_wddm_overcommit(&failures));
+        // A mixed set (one WDDM over-total, one unavailable) is
+        // not confirmable as a whole.
+        let failures = vram_gate_failures(
+            &[0, 1],
+            &[(0, 17_224), (1, 1024)],
+            &[
+                vram_reading_driver(0, 16_376, 15_098, DriverModel::Wddm),
+                vram_reading_down(1, 16_376, 15_098),
+            ],
+            &[],
+        );
+        assert_eq!(failures.len(), 2);
+        assert!(!failures_are_wddm_overcommit(&failures));
+    }
+
+    #[test]
+    fn requirement_breakdown_itemizes_the_expert_cache() {
+        // The refusal text's arithmetic: the itemized terms sum
+        // to the gate's required figure, expert cache included.
+        let req = manager_models::MemoryRequirement {
+            gpu_weights_mib: 10_865,
+            sys_weights_mib: 0,
+            kv_mib: Some(1_638),
+            rs_mib: Some(614),
+            moe_cache_mib: 4_096,
+            moe_cache_offload_layers: 48,
+            moe_cache_moe_layers: 64,
+            basis: manager_models::MemoryBasis::Exact,
+        };
+        assert_eq!(
+            requirement_breakdown(&req),
+            "weights 10865 MiB + KV cache 1638 MiB + state cache 614 MiB + expert cache 4096 MiB"
+        );
+        // Zero cache: no expert-cache term, nothing else changes.
+        let req = manager_models::MemoryRequirement {
+            moe_cache_mib: 0,
+            ..req
+        };
+        assert_eq!(
+            requirement_breakdown(&req),
+            "weights 10865 MiB + KV cache 1638 MiB + state cache 614 MiB"
+        );
     }
 
     #[test]

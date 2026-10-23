@@ -605,7 +605,7 @@ async fn run_arm(
     // Start preflight (the same gate every app-mediated start
     // passes): a refused arm is a failed arm with the
     // preflight's reason (§B.3).
-    if let Err(e) = crate::backend_start_preflight_for(state, &temp_cfg, &temp).await {
+    if let Err(e) = crate::backend_start_preflight_for(state, &temp_cfg, &temp, false).await {
         arm.detail = Some(format!("start preflight refused the arm: {e}"));
         return fail(&arm);
     }

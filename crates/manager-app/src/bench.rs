@@ -1215,7 +1215,7 @@ async fn run_arm(
     // -- Start preflight (§6.3): the same gate every app-mediated
     // start passes, evaluated against the cloned config carrying
     // the temp backend. Its verdicts carry the numbers.
-    if let Err(e) = crate::backend_start_preflight_for(state, &temp_cfg, &temp).await {
+    if let Err(e) = crate::backend_start_preflight_for(state, &temp_cfg, &temp, false).await {
         out.status = mb::ArmStatus::PreflightFailed;
         out.detail = Some(format!("start preflight refused this arm: {e}"));
         return out;
