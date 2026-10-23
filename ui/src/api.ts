@@ -1392,6 +1392,15 @@ export interface ModelRow {
    *  wherever both exist. */
   catalog_moe_layers?: number | null;
   catalog_default_offload_layers?: number | null;
+  /** The operator's MTP capability declaration on the model
+   *  record: whether the model's GGUF carries an MTP head.
+   *  Null when never declared. */
+  mtp?: boolean | null;
+  /** The curated catalog's MTP pin for the model (null when the
+   *  catalog knows neither the id nor the source URL). A pin
+   *  wins over the record's declaration wherever both exist —
+   *  the EFFECTIVE capability is `catalog_mtp ?? mtp ?? false`. */
+  catalog_mtp?: boolean | null;
   fit_check_available: boolean;
 }
 
@@ -1502,9 +1511,10 @@ export async function modelSetEnabled(id: string, enabled: boolean): Promise<Cal
  *  when omitted and refuses the add when no source yields a count.
  *  moeLayers/defaultOffloadLayers are the operator MoE declaration
  *  (both or neither): they give a model outside the curated catalog
- *  expert-offload controls. The model starts enabled with no
- *  pinned hash. */
-export async function modelAdd(id: string, sourceUrl: string, fileName?: string, quant?: string, paramsB?: number, moeLayers?: number, defaultOffloadLayers?: number): Promise<CallResult<{ model_id: string }>> {
+ *  expert-offload controls. mtp is the operator MTP capability
+ *  declaration: it gives a model outside the catalog the MTP
+ *  draft control. The model starts enabled with no pinned hash. */
+export async function modelAdd(id: string, sourceUrl: string, fileName?: string, quant?: string, paramsB?: number, moeLayers?: number, defaultOffloadLayers?: number, mtp?: boolean): Promise<CallResult<{ model_id: string }>> {
   if (!isTauri()) return { data: { model_id: id }, live: false };
   try {
     const data = await invoke<{ model_id: string }>("model_add", {
@@ -1515,6 +1525,7 @@ export async function modelAdd(id: string, sourceUrl: string, fileName?: string,
       paramsB: paramsB ?? null,
       moeLayers: moeLayers ?? null,
       defaultOffloadLayers: defaultOffloadLayers ?? null,
+      mtp: mtp ?? null,
     });
     return { data, live: true };
   } catch (e) {
@@ -1536,6 +1547,21 @@ export async function modelSetOffloadSpec(id: string, moeLayers: number | null, 
     return { data, live: true };
   } catch (e) {
     return { data: { id, moe_layers: moeLayers, default_offload_layers: defaultOffloadLayers }, live: true, error: errOf(e) };
+  }
+}
+
+/** model_set_mtp — set or clear a model's operator MTP
+ *  capability declaration. Pass null to clear the declaration. */
+export async function modelSetMtp(id: string, mtp: boolean | null): Promise<CallResult<{ id: string; mtp: boolean | null }>> {
+  if (!isTauri()) return { data: { id, mtp }, live: false };
+  try {
+    const data = await invoke<{ id: string; mtp: boolean | null }>("model_set_mtp", {
+      id,
+      mtp,
+    });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { id, mtp }, live: true, error: errOf(e) };
   }
 }
 
