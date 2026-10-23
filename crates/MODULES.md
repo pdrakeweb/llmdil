@@ -1,6 +1,6 @@
 # Crate map — implementation contract
 
-Rust workspace for LLMdil. Fourteen library
+Rust workspace for LLMdil. Sixteen library
 crates under `crates/` (workspace members) plus the Tauri shell in
 `src-tauri/` (excluded from the workspace; path-deps to the crates).
 The UI shell is in `ui/` (Vite + plain TypeScript; framework-independent
@@ -417,19 +417,6 @@ ranking). The stateful runners (consultation, measurements,
 experiments) live in manager-app (`optimize`, `optimize_eval`,
 `optimize_experiments`).
 
-## manager-bench — Bench design (~/workspace/llmdil-bench-design/DESIGN.md)
-
-Pure logic for the Bench page; Tauri-free. Sweep and axis types with
-cartesian expansion and validation pruning (quantized-V × flash-off,
-context-length, draft vocabulary shape), arm snapshots with
-comparability keys, llama.cpp speculative-decoding log parsing
-(aggregate acceptance lines and per-drafter TRACE statistics), the
-prompt library with compiled-in shipped defaults, the D16 shipped
-presets, the §2.1 projection, and winner computation. The stateful
-runner (temporary `bench-<n>` backends, interlock, per-arm
-preflight, prompt generation) lives in manager-app (`bench`). Bench
-results live in their own store and never feed Optimize (D10).
-
 ## manager-services — docs/windows-services-design.md
 
 Windows service supervision. Every backend and the gateway can be
@@ -442,3 +429,20 @@ rewrite (no elevation, no SCM call) and takes effect at the service's
 next start. SCM create/delete is the only elevated operation; services
 run as the user's account with Manual start. Per-backend
 `supervision.mode` = `process` (default) | `service`.
+
+## manager-logreceiver — DESIGN-prometheus-local.md (Oct 2026)
+
+The Prometheus-local log receiver: the ingest + store half of log
+streaming, running on the machine LLMdil runs on as its own
+auto-start Windows service (definition built by manager-services'
+`log_receiver_definition`; `llm-service-host.exe` is the shim; the
+service runs as LocalService with SCM restart failure actions).
+Ingest on 127.0.0.1:8473 (Bearer ingest token; the wire format is
+manager-logship's, unchanged); reads only on the machine's tailnet
+address (:8474) behind a separate read-only token — `/healthz`,
+`/v1/status`, `/v1/query`. SQLite store: records deduped on
+(machine, seq), a heartbeat row every 5 minutes (7-day prune),
+hourly retention prune at 14 days / 512 MiB. Binary
+`llmdil-log-receiver` (default mode serves; `install-service` /
+`uninstall-service` / `definition` subcommands serve the deploy
+script, `tools/prometheus/Deploy-LogReceiver.ps1`).
