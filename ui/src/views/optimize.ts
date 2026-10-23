@@ -19,7 +19,7 @@ import {
   optimizeCancelConsult, optimizeCancelJob, optimizeChangeSummary, optimizeConsult,
   optimizeDiscardPlan, optimizeDiscover, optimizeEstimateBackend, optimizeEstimateExperiments, optimizeIsDestructive, optimizeKindLabel,
   optimizeMeasureBackend, optimizeRunBaseline, optimizeRunExperiments, optimizeSavePurpose, optimizeSetExperimentState, optimizeSetItemOutcome, optimizeSetItemState,
-  setBackendOffload, stopBackend, updateBackendFlags, updateGatewayConfig,
+  setBackendMoeCache, setBackendOffload, stopBackend, updateBackendFlags, updateGatewayConfig,
 } from "../api";
 import type {
   CallResult, MeasurementInputs, OptimizeCandidate, OptimizeExperiment, OptimizeMeasurementEntry, OptimizePlanItem, OptimizeState,
@@ -1197,6 +1197,8 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         }
         const offload = numOrUndef("offload_layers");
         if (offload !== undefined) unwrap(await setBackendOffload(target, offload));
+        const moeCache = numOrUndef("moe_cache_mib");
+        if (moeCache !== undefined) unwrap(await setBackendMoeCache(target, moeCache === 0 ? null : moeCache));
         if (Array.isArray(c.tensor_split)) {
           unwrap(await applyBackendConfig(target, {
             tensor_split: c.tensor_split, split_mode: "layer",
@@ -1235,6 +1237,8 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       }
       case "backend.set_offload": {
         unwrap(await setBackendOffload(target, numOrUndef("offload_layers") ?? 0));
+        const moeCache = numOrUndef("moe_cache_mib");
+        if (moeCache !== undefined) unwrap(await setBackendMoeCache(target, moeCache === 0 ? null : moeCache));
         return;
       }
       case "backend.set_placement": {

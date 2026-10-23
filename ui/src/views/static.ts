@@ -13,7 +13,7 @@ import {
   runWizardStep, wizardBusyMessage, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit,
   getWizardCommands,
   getGpuTelemetry, getGpuHistory, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
-  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendMtp, setBackendParallel, setBackendCache, backendCachePreview, setBackendRawFlags, setBackendFlagsMode, getBackendLaunchCommand,
+  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendMtp, setBackendMoeCache, setBackendParallel, setBackendCache, backendCachePreview, setBackendRawFlags, setBackendFlagsMode, getBackendLaunchCommand,
   measurementLookup,
   optimizeMeasureBackend,
   getBackendConfig, applyBackendConfig, testBackend, testBackendToolCall, placementPropose, placementApply,
@@ -33,7 +33,7 @@ import {
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
   adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, BackendCache, BackendMtp, BackendOffload, BackendParallel, BackendRow, CachePreview, CacheSelectionLike, CacheTypeName, FlashAttnName, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, LogRow, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
+import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, BackendCache, BackendMoeCache, BackendMtp, BackendOffload, BackendParallel, BackendRow, CachePreview, CacheSelectionLike, CacheTypeName, FlashAttnName, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, LogRow, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
 import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
 import type { GpuInfo, WizardStepState } from "../types";
 
@@ -1622,6 +1622,25 @@ function mtpSavedTokenText(m: BackendMtp): string {
   return mtpTokenText(m.n_max);
 }
 
+/** The expert-cache size presets the control offers (MiB) —
+ *  the server module's MOE_CACHE_PRESETS_MIB. */
+const MOE_CACHE_PRESETS_MIB = [2048, 4096, 6144, 8192, 10240];
+
+/** The size a fresh enable commits when nothing is saved or
+ *  drafted — the server module's MOE_CACHE_DEFAULT_MIB. */
+const MOE_CACHE_DEFAULT_MIB = 4096;
+
+/** The flag form a chosen state writes (the readout once a
+ *  value is chosen, and the saved message after a commit). */
+function moeCacheTokenText(mib: number | null): string {
+  return mib == null ? "Expert cache off" : `--moe-cache-mib ${mib}`;
+}
+
+/** The readout for the SAVED state, before any change. */
+function moeCacheSavedTokenText(m: BackendMoeCache): string {
+  return moeCacheTokenText(m.mib);
+}
+
 /* ---------------- Predicted throughput (design §6, §7) -----
  * One line shape for the flags forms (Edit Flags and Add
  * Backend) and one tile for the backend card, all fed by the
@@ -2182,7 +2201,11 @@ function applyFlagsField(
  *  operator's override/snap decision in the form, else null.
  *  mtpPosition is the MTP draft control's chosen value (0 = Off,
  *  1..4 = draft tokens), null when the backend's model is not
- *  MTP-capable. parallel is the Parallel slots field's draft
+ *  MTP-capable. moeCacheOn / moeCacheMib are the expert-cache
+ *  control's draft: the switch state and the chosen size (the
+ *  size draft is retained while the switch is off, so toggling
+ *  back on restores it); the size is null when the backend has
+ *  never carried a cache and none has been chosen. parallel is the Parallel slots field's draft
  *  selection: the explicit slot count, or null for the unset
  *  state (llama.cpp's default, auto). advanced/rawText/rawWarnings
  *  carry the advanced flags editor's draft (tracker #60): while
@@ -2192,7 +2215,7 @@ function applyFlagsField(
  *  panel's Model select ("" when the backend's file matches no
  *  registered model), applied through model_assign only when the
  *  panel saves — the card face carries no model control. */
-export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null; parallel: number | null; cacheSel: CacheSelectionLike | null; cachePreview: CachePreview | null; advanced: boolean; rawText: string; rawWarnings: FlagWarningLike[]; editModelId: string }
+export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null; moeCacheOn: boolean; moeCacheMib: number | null; parallel: number | null; cacheSel: CacheSelectionLike | null; cachePreview: CachePreview | null; advanced: boolean; rawText: string; rawWarnings: FlagWarningLike[]; editModelId: string }
 
 /** State for the in-card Placement form (tensor split editing,
  *  moved here from the GPUs page — Pete's direction, 2026-10-16),
@@ -2569,6 +2592,41 @@ function backendCard(
     </div>` : "";
     return offloadSliderHtml({ offload: o, layers: n, ownerId: b.id, disabled: inFlight.has(b.id), decisionHtml });
   })() : "";
+  // The expert-cache control, directly under the offload slider
+  // in the same panel: the shared enable switch (rule 16) plus a
+  // size select in the ctx/batch selects' idiom — the presets,
+  // Auto, and the saved value as its own option when it is not a
+  // preset — whose state lives in the wire-level draft
+  // (flags.moeCacheOn / flags.moeCacheMib), with the token
+  // readout naming the flag the value writes. Rendered only for
+  // offload-capable backends (the payload carries `moe_cache` —
+  // the offload slider's eligibility). Both controls are
+  // disabled while the saved offload is 0: with no experts in
+  // system RAM there is nothing for the cache to hold, and the
+  // label's tip says so.
+  const moeCacheHtml = flags && b.moe_cache ? (() => {
+    const mc = b.moe_cache;
+    const on = flags.moeCacheOn;
+    const size = flags.moeCacheMib ?? mc.mib ?? MOE_CACHE_DEFAULT_MIB;
+    const noOffload = mc.offload_layers === 0;
+    const ctlDisabled = inFlight.has(b.id) || noOffload;
+    const tip = noOffload
+      ? "Disabled: this backend offloads 0 MoE layers, so no experts sit in system RAM for the cache to hold. Raise the offload above 0 to enable it."
+      : "Keeps the most recently used experts of the offloaded (system-RAM) layers in GPU memory and computes them there; experts not in the cache still run on the CPU. The size is priced into the backend's memory requirement, and a start that cannot fit it is refused with the numbers. The best size is empirical — the optimizer can sweep it once that support lands. Applies on the backend's next start.";
+    const sizeOptions = MOE_CACHE_PRESETS_MIB.includes(size) ? MOE_CACHE_PRESETS_MIB : [...MOE_CACHE_PRESETS_MIB, size].sort((x, y) => x - y);
+    const draftIsSaved = on === (mc.mib != null) && (!on || size === mc.mib);
+    return `<div style="margin-top:12px">
+      <div style="font-size:12px;color:var(--text2)">Expert cache<span class="info-tip" title="${esc(tip)}">${icon("info")}</span></div>
+      <div style="display:flex;gap:6px;margin-top:4px;align-items:center">
+        ${enableSwitch({ on, name: `Expert cache for ${b.id}`, attrs: `data-moe-cache-switch data-moe-cache-backend="${esc(b.id)}"`, disabled: ctlDisabled })}
+        <select data-moe-cache-select data-moe-cache-backend="${esc(b.id)}" style="${SELECT_STYLE};flex:1;min-width:0" aria-label="Expert cache size for ${esc(b.id)}"${ctlDisabled ? " disabled" : ""}>
+          ${sizeOptions.map((v) => `<option value="${v}"${v === size ? " selected" : ""}>${v} MiB</option>`).join("")}
+          <option value="auto">Auto</option>
+        </select>
+      </div>
+      <div style="font-size:12px;color:var(--text2);margin-top:4px"><span data-moe-cache-token style="font-family:var(--mono)">${esc(moeCacheSavedTokenText(mc))}</span>${mc.custom && draftIsSaved ? `<span title="The saved flags spell the expert cache in a form the control does not write (an = spelling, a 0 token, ...). Saving from this control writes the canonical token; every other flag is preserved."> · custom flags</span>` : ""}</div>
+    </div>`;
+  })() : "";
   // The MTP draft control (tracker #53), directly under the
   // offload slider in the same panel: a dropdown over
   // Off/1/2/3/4 in the ctx/batch selects' idiom (SELECT_STYLE,
@@ -2665,6 +2723,7 @@ function backendCard(
       ${parallelHtml}
       ${cacheHtml}
       ${offloadHtml}
+      ${moeCacheHtml}
       ${mtpHtml}
       ${flagsRatedLineHtml({ ctxMax: flags.ctxMax, modelId: flags.modelId, savedText: "Saved to the configuration immediately; applies on the backend's next start. Tensor split is set in the Placement section below." })}
       <div data-predicted-slot>${predictedHtml}</div>
@@ -3032,7 +3091,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       <div class="grid2">${sorted(sec.rows).map((row) => {
         const mdl = flagsFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const flagsArg: FlagsDraft | null = flagsFor === row.id
-          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers, offloadPendingLayers: offloadPending?.backendId === row.id ? offloadPending.layers : null, mtpPosition: flagsMtpPosition, parallel: flagsParallel, cacheSel: flagsCacheSel, cachePreview: flagsCachePreview, advanced: row.flags_advanced === true, rawText: flagsRawText, rawWarnings: flagsRawWarnings, editModelId: flagsEditModelId }
+          ? { ctx: flagsCtx, batch: flagsBatch, ctxMax: mdl?.ctx_max ? mdl.ctx_max : null, modelId: mdl?.id ?? null, offloadLayers: flagsOffloadLayers, offloadPendingLayers: offloadPending?.backendId === row.id ? offloadPending.layers : null, mtpPosition: flagsMtpPosition, moeCacheOn: flagsMoeCacheOn, moeCacheMib: flagsMoeCacheMib, parallel: flagsParallel, cacheSel: flagsCacheSel, cachePreview: flagsCachePreview, advanced: row.flags_advanced === true, rawText: flagsRawText, rawWarnings: flagsRawWarnings, editModelId: flagsEditModelId }
           : null;
         const pmdl = placeFor === row.id ? lastModels.find((m) => sameModelFile(row.model_file, m.gguf_path)) : undefined;
         const placeArg: PlaceCardState | null = placeFor === row.id
@@ -3211,6 +3270,17 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
    *  flight; the control ignores further commits until it
    *  lands. */
   let mtpCommitting = false;
+  /** The expert-cache control's draft while the flags form is
+   *  open: the switch state, and the chosen size — retained
+   *  while the switch is off so toggling back on restores it;
+   *  null when the backend has never carried a cache and none
+   *  has been chosen. */
+  let flagsMoeCacheOn = false;
+  let flagsMoeCacheMib: number | null = null;
+  /** True while an expert-cache commit (backend_set_moe_cache)
+   *  is in flight; the control ignores further commits until it
+   *  lands. */
+  let moeCacheCommitting = false;
   /** The Parallel slots field's draft selection while the flags
    *  form is open: the explicit --parallel count, or null for the
    *  unset state (llama.cpp's default, auto). Unlike the MTP
@@ -3303,6 +3373,8 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   const closeFlagsForm = (): void => {
     flagsFor = null;
     offloadPending = null;
+    flagsMoeCacheOn = false;
+    flagsMoeCacheMib = null;
     flagsCacheSel = null;
     flagsCachePreview = null;
     cachePreviewSeq += 1;
@@ -3320,6 +3392,8 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     flagsBatch = row.n_batch ?? 512;
     flagsOffloadLayers = row.offload ? row.offload.layers : null;
     flagsMtpPosition = row.mtp ? mtpPosition(row.mtp) : null;
+    flagsMoeCacheOn = row.moe_cache ? row.moe_cache.mib != null : false;
+    flagsMoeCacheMib = row.moe_cache ? row.moe_cache.mib : null;
     flagsParallel = row.parallel ? row.parallel.slots : null;
     flagsCacheSel = row.cache ? { k: row.cache.k, v: row.cache.v, flash_attn: row.cache.flash_attn } : { k: "f16", v: "f16", flash_attn: "auto" };
     flagsCachePreview = null;
@@ -3560,6 +3634,103 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     }
   };
   root.addEventListener("change", changeMtp);
+
+  /* ---------------- Expert cache control ----------------
+   * The switch commits immediately (the sliders' commit model):
+   * on commits the drafted size (the saved size when one exists,
+   * else the control's default); off commits null, and the size
+   * draft is retained so toggling back on restores it. The size
+   * select only drafts while the switch is off; while on, a
+   * change commits the new size, and "Auto" commits with auto
+   * set — the server resolves the size from priced free VRAM and
+   * the draft takes the resolved value. A rejected commit
+   * reverts the draft to the saved state. */
+  /** Invoke backend_set_moe_cache and report the outcome on the
+   *  card. Returns true when the value was saved. */
+  const saveMoeCache = async (id: string, mib: number | null, auto: boolean): Promise<boolean> => {
+    if (moeCacheCommitting) return false;
+    moeCacheCommitting = true;
+    inFlight.add(id);
+    paint();
+    try {
+      const r = await setBackendMoeCache(id, mib, auto || undefined);
+      if (disposed) return false;
+      if (r.error) {
+        msgs.set(id, { text: `Expert cache not saved: ${r.error}`, err: true });
+        paint();
+        return false;
+      }
+      const saved = r.data.mib;
+      if (flagsFor === id) {
+        flagsMoeCacheOn = saved != null;
+        if (saved != null) flagsMoeCacheMib = saved;
+      }
+      msgs.set(id, {
+        text: saved == null
+          ? "Expert cache turned off — applies on next start."
+          : auto
+            ? `Expert cache saved (${moeCacheTokenText(saved)}) — size resolved by Auto from priced free VRAM; applies on next start.`
+            : `Expert cache saved (${moeCacheTokenText(saved)}) — applies on next start.`,
+        err: false,
+      });
+      await load();
+      return true;
+    } finally {
+      moeCacheCommitting = false;
+      inFlight.delete(id);
+      if (!disposed) paint();
+    }
+  };
+  const revertMoeCacheDraft = (row: BackendRow): void => {
+    flagsMoeCacheOn = row.moe_cache ? row.moe_cache.mib != null : false;
+    flagsMoeCacheMib = row.moe_cache ? row.moe_cache.mib : null;
+  };
+  const clickMoeCacheSwitch = async (ev: Event): Promise<void> => {
+    const t = (ev.target as HTMLElement).closest("[data-moe-cache-switch]") as HTMLElement | null;
+    if (!t) return;
+    const id = t.getAttribute("data-moe-cache-backend") ?? "";
+    const row = lastRows.find((r) => r.id === id);
+    if (!row?.moe_cache || moeCacheCommitting) return;
+    const on = !flagsMoeCacheOn;
+    flagsMoeCacheOn = on;
+    const card = t.closest(".backend-card");
+    const token = card?.querySelector("[data-moe-cache-token]");
+    if (token) token.textContent = moeCacheTokenText(on ? (flagsMoeCacheMib ?? row.moe_cache.mib ?? MOE_CACHE_DEFAULT_MIB) : null);
+    const ok = await saveMoeCache(id, on ? (flagsMoeCacheMib ?? MOE_CACHE_DEFAULT_MIB) : null, false);
+    if (!ok && !disposed) {
+      revertMoeCacheDraft(row);
+      paint();
+    }
+  };
+  root.addEventListener("click", clickMoeCacheSwitch);
+  const changeMoeCacheSize = async (ev: Event): Promise<void> => {
+    const t = ev.target as HTMLSelectElement;
+    if (!t.hasAttribute("data-moe-cache-select")) return;
+    const id = t.getAttribute("data-moe-cache-backend") ?? "";
+    const row = lastRows.find((r) => r.id === id);
+    if (!row?.moe_cache || moeCacheCommitting) return;
+    if (t.value === "auto") {
+      const ok = await saveMoeCache(id, null, true);
+      if (!ok && !disposed) {
+        revertMoeCacheDraft(row);
+        paint();
+      }
+      return;
+    }
+    const n = Number(t.value);
+    flagsMoeCacheMib = n;
+    if (!flagsMoeCacheOn) { paint(); return; } // the size only drafts while off
+    const card = t.closest(".backend-card");
+    const token = card?.querySelector("[data-moe-cache-token]");
+    if (token) token.textContent = moeCacheTokenText(n);
+    if (n === row.moe_cache.mib) { paint(); return; } // the saved value chosen again
+    const ok = await saveMoeCache(id, n, false);
+    if (!ok && !disposed) {
+      revertMoeCacheDraft(row);
+      paint();
+    }
+  };
+  root.addEventListener("change", changeMoeCacheSize);
 
   /* ---------------- Parallel slots field (tracker #61) --------
    * The ctx/batch idiom with the sliders' commit model: the
