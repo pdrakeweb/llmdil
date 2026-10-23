@@ -29,10 +29,15 @@ fn file_identity(meta: &fs::Metadata) -> Option<u64> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        let volume = meta.volume_serial_number()? as u64;
-        let index = meta.file_index()?;
-        return Some(volume.rotate_left(32) ^ index);
+        // MetadataExt's volume_serial_number / file_index are
+        // unstable (`windows_by_handle`), so the stable identity
+        // signal is the creation time: the rename + recreate
+        // rotation this tailer tracks always produces a fresh
+        // one.
+        use std::time::UNIX_EPOCH;
+        let created = meta.created().ok()?;
+        let nanos = created.duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64;
+        return Some(nanos ^ (nanos >> 32));
     }
     #[cfg(not(any(unix, windows)))]
     {
