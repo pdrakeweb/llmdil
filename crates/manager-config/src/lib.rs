@@ -71,6 +71,16 @@ pub struct AppConfig {
     /// write can never mint or elevate an API user.
     #[serde(default)]
     pub admin_api: AdminApiConfig,
+    /// Log streaming (log-streaming design D1–D10): the in-app
+    /// shipper pushes redacted log records to a remote destination
+    /// Muse can review in near realtime. Disabled by default (D5);
+    /// the ingest token is NOT configuration — it lives in Credential
+    /// Manager under [`LOG_STREAMING_TOKEN_CRED_TARGET`] (D6), so a
+    /// config write (or a diagnostics bundle carrying the config) can
+    /// never leak it. Absent in configurations written before the
+    /// feature existed.
+    #[serde(default)]
+    pub log_streaming: LogStreamingConfig,
     /// Per-component pin / auto-update toggles.
     pub updates: UpdatePolicy,
     /// App self-update preferences (Settings → Updates & diagnostics):
@@ -940,6 +950,134 @@ impl Default for AdminApiConfig {
     }
 }
 
+/// Credential Manager target for the log-streaming ingest token
+/// (log-streaming design D6). Per-machine, write-only, revocable;
+/// entered by the operator, read by the shipper at start, never
+/// written into `config.json` and never readable back through any op.
+pub const LOG_STREAMING_TOKEN_CRED_TARGET: &str =
+    "local-llm-service-manager/log-streaming-token";
+
+/// Destination kind for log streaming (design D1/D10: exactly one
+/// destination; the wire format and redactor are identical for both).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogStreamingTransport {
+    /// The self-hosted receiver on Muse's VM (design Option B).
+    #[default]
+    Receiver,
+    /// A hosted log service's HTTPS ingestion endpoint (Option A).
+    Hosted,
+}
+
+/// Severity floor for shipped records (design §6.5). Records at or
+/// above the floor ship; errors are the top severity, so they ship
+/// at every floor. The raw severity ordering is Error > Warn > Info >
+/// Debug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogStreamingLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+}
+
+impl LogStreamingLevel {
+    /// Severity rank (higher ships first-class): a record ships when
+    /// its rank is >= the floor's rank.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Debug => 0,
+            Self::Info => 1,
+            Self::Warn => 2,
+            Self::Error => 3,
+        }
+    }
+}
+
+/// Per-source streaming toggles (design §2.3 defaults). The MVP
+/// shipper tails `wizard` and `optimize`; the remaining toggles are
+/// stored configuration for the Phase 2 sources and are honored as
+/// those taps land.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogStreamingSources {
+    /// S3 wizard file tail.
+    #[serde(default = "default_true")]
+    pub wizard: bool,
+    /// S4 optimize file tail.
+    #[serde(default = "default_true")]
+    pub optimize: bool,
+    /// S2 gateway file tails (Phase 2).
+    #[serde(default = "default_true")]
+    pub gateway: bool,
+    /// S5 app / supervisor events (Phase 2).
+    #[serde(default = "default_true")]
+    pub app: bool,
+    /// S6 service-manage file tail (Phase 2).
+    #[serde(default = "default_true")]
+    pub service_manage: bool,
+    /// S7 Admin API audit log tail (Phase 2).
+    #[serde(default = "default_true")]
+    pub audit: bool,
+    /// S1 per-backend rings, per-backend opt-in (D3, Phase 2).
+    #[serde(default)]
+    pub backends: bool,
+}
+
+impl Default for LogStreamingSources {
+    fn default() -> Self {
+        Self {
+            wizard: true,
+            optimize: true,
+            gateway: true,
+            app: true,
+            service_manage: true,
+            audit: true,
+            backends: false,
+        }
+    }
+}
+
+/// Log streaming settings (see [`AppConfig::log_streaming`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogStreamingConfig {
+    /// Master switch; default false — opt-in (D5).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Destination kind (D1).
+    #[serde(default)]
+    pub transport: LogStreamingTransport,
+    /// Destination base URL (the receiver/hosted ingest origin; the
+    /// shipper appends `/v1/batches`). Empty until the operator
+    /// configures a destination.
+    #[serde(default)]
+    pub endpoint: String,
+    /// Stable machine identity stamped on every record; defaults to
+    /// the OS hostname when unset.
+    #[serde(default)]
+    pub machine_name: Option<String>,
+    /// Severity floor for shipped records.
+    #[serde(default)]
+    pub level_floor: LogStreamingLevel,
+    /// Per-source toggles.
+    #[serde(default)]
+    pub sources: LogStreamingSources,
+}
+
+impl Default for LogStreamingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            transport: LogStreamingTransport::Receiver,
+            endpoint: String::new(),
+            machine_name: None,
+            level_floor: LogStreamingLevel::Info,
+            sources: LogStreamingSources::default(),
+        }
+    }
+}
+
 /// Per-component update pins and auto-update toggles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdatePolicy {
@@ -1172,6 +1310,7 @@ impl AppConfig {
             postgres: PostgresConfig::default(),
             supervision: SupervisionConfig::default(),
             admin_api: AdminApiConfig::default(),
+            log_streaming: LogStreamingConfig::default(),
             updates: UpdatePolicy {
                 components: HashMap::new(),
             },
