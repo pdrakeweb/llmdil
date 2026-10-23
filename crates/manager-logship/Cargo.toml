@@ -1,0 +1,27 @@
+[package]
+name = "manager-logship"
+version = "0.1.50"
+edition = "2021"
+
+# Log streaming shipper (log-streaming design, D9): tails the app's
+# own log files, redacts every line in-process (design §5), batches
+# records, and delivers them to the single configured destination,
+# spooling to disk while the destination is unreachable. Runs as one
+# background tokio task inside the LLMdil process, owned by
+# manager-app; it never blocks or fails the app (§6.6).
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+flate2 = "1"
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+
+[dev-dependencies]
+tokio = { workspace = true }

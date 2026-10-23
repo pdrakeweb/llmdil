@@ -52,6 +52,7 @@ pub mod app_update;
 pub mod gateway_stats;
 pub mod gpu_history;
 pub mod hf_forms;
+pub mod logship;
 pub mod notify;
 pub mod optimize;
 pub mod optimize_eval;
@@ -353,6 +354,10 @@ pub struct AppState {
     /// loaded from the data dir on first use, appended by the
     /// recorder loop, read by the history query op.
     gpu_history: OnceCell<std::sync::Mutex<gpu_history::GpuHistoryCell>>,
+    /// The log-streaming shipper (log-streaming design), started
+    /// once after config load when the feature is enabled; see
+    /// [`logship`].
+    logship: OnceCell<Arc<manager_logship::ShipperHandle>>,
     wizard_install: OnceCell<Mutex<Wizard>>,
     wizard_audit: OnceCell<Mutex<Wizard>>,
     /// Last setup_get_steps payload, refreshed whenever the install
@@ -609,6 +614,7 @@ impl AppState {
             telemetry: OnceCell::new(),
             telemetry_poller: OnceCell::new(),
             gpu_history: OnceCell::new(),
+            logship: OnceCell::new(),
             wizard_install: OnceCell::new(),
             wizard_audit: OnceCell::new(),
             wizard_steps_cache: RwLock::new(None),

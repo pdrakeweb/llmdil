@@ -2411,6 +2411,7 @@ dependencies = [
  "chrono",
  "manager-config",
  "manager-gateway",
+ "manager-logship",
  "manager-mcp",
  "manager-models",
  "manager-mxc",
@@ -2451,6 +2452,21 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "manager-logship"
+version = "0.1.50"
+dependencies = [
+ "chrono",
+ "flate2",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
