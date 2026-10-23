@@ -76,6 +76,8 @@ windows, and troubleshooting.
 - [`docs/usage.md`](docs/usage.md) — using the application
 - [`docs/technical-specification.md`](docs/technical-specification.md) — full
   technical specification (architecture, requirements, API, test plan, phases)
+- [`docs/testing-protocol.md`](docs/testing-protocol.md) — how changes are
+  verified (local tier + Prometheus branch gates, constrained-fix fast path)
 - [`docs/design-b-hybrid.md`](docs/design-b-hybrid.md) — approved UI design
   record (Design B base with Console and Topology alternate views)
 - [`docs/mockups/`](docs/mockups/) — rendered UI mockup galleries
