@@ -417,6 +417,19 @@ ranking). The stateful runners (consultation, measurements,
 experiments) live in manager-app (`optimize`, `optimize_eval`,
 `optimize_experiments`).
 
+## manager-bench — Bench design (~/workspace/llmdil-bench-design/DESIGN.md)
+
+Pure logic for the Bench page; Tauri-free. Sweep and axis types with
+cartesian expansion and validation pruning (quantized-V × flash-off,
+context-length, draft vocabulary shape), arm snapshots with
+comparability keys, llama.cpp speculative-decoding log parsing
+(aggregate acceptance lines and per-drafter TRACE statistics), the
+prompt library with compiled-in shipped defaults, the D16 shipped
+presets, the §2.1 projection, and winner computation. The stateful
+runner (temporary `bench-<n>` backends, interlock, per-arm
+preflight, prompt generation) lives in manager-app (`bench`). Bench
+results live in their own store and never feed Optimize (D10).
+
 ## manager-services — docs/windows-services-design.md
 
 Windows service supervision. Every backend and the gateway can be

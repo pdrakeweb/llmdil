@@ -8,6 +8,7 @@ import type { ActivationPlanData, AppUpdateInfo } from "./api";
 import { stackedBar } from "./charts";
 import { esc } from "./html";
 import { icon, type IconName } from "./icons";
+import { renderBench, wireBench } from "./views/bench";
 import { mountDashboard } from "./views/dashboard";
 import { renderGroups, wireGroups } from "./views/groups";
 import { renderMcp, wireMcp } from "./views/mcp";
@@ -35,6 +36,7 @@ const ROUTES: Route[] = [
   { hash: "#/groups", label: "Groups", icon: "groups", title: "Groups" },
   { hash: "#/mcp", label: "MCP Servers", icon: "layers", title: "MCP Servers" },
   { hash: "#/optimize", label: "Optimize", icon: "target", title: "Optimize" },
+  { hash: "#/bench", label: "Bench", icon: "gauge", title: "Bench" },
   { hash: "#/activation-plan", label: "Activation Plan", icon: "warn", title: "Activation Plan" },
   { hash: "#/settings", label: "Settings", icon: "gear", title: "Settings" },
   { hash: "#/wizard", label: "Setup Wizard", icon: "wrench", title: "Setup Wizard" },
@@ -370,6 +372,14 @@ async function render(): Promise<void> {
       view.innerHTML = renderOptimize();
       {
         const c = await wireOptimize(view);
+        if (gen !== renderGen) { c(); return; }
+        cleanup = c;
+      }
+      break;
+    case "#/bench":
+      view.innerHTML = renderBench();
+      {
+        const c = await wireBench(view);
         if (gen !== renderGen) { c(); return; }
         cleanup = c;
       }

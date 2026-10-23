@@ -3213,6 +3213,18 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     }
     const prevStates = new Map(lastRows.map((row) => [row.id, row.state]));
     lastRows = r.data;
+    // Bench adoption path (Bench design §5.2): an arm detail's
+    // "Open in backend editor" sets this key before navigating
+    // here; open that backend's flags form once, prefilled from
+    // its saved configuration, and clear the key.
+    try {
+      const wanted = sessionStorage.getItem("benchEditBackend");
+      if (wanted) {
+        sessionStorage.removeItem("benchEditBackend");
+        const row = lastRows.find((r) => r.id === wanted);
+        if (row && flagsFor !== row.id) openFlagsForm(row);
+      }
+    } catch { /* storage unavailable */ }
     for (const row of lastRows) {
       // A note belongs to the state it was produced in; when the
       // backend's state changes, the stale note goes away.

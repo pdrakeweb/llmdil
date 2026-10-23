@@ -362,6 +362,19 @@ macro_rules! for_each_operation {
             (OptimizeRunBaseline, optimize_run_baseline, L, op_optimize_run_baseline, [backend_id: String], None),
             (OptimizeRunExperiments, optimize_run_experiments, L, op_optimize_run_experiments, [], None),
             (OptimizeEstimateExperiments, optimize_estimate_experiments, L, op_optimize_estimate_experiments, [], None),
+            // Bench — desktop-only (Bench design §7, D15): sweeps
+            // launch temporary backends and stop running ones
+            // under the interlock; REST parity is deferred by
+            // name in the design.
+            (BenchPromptsList, bench_prompts_list, R, op_bench_prompts_list, [], None),
+            (BenchPromptSave, bench_prompt_save, C, op_bench_prompt_save, [entry: Value], None),
+            (BenchPromptDelete, bench_prompt_delete, D, op_bench_prompt_delete, [id: String], None),
+            (BenchPromptGenerate, bench_prompt_generate, L, op_bench_prompt_generate, [purpose: String, description: String, size: String, backend_id: Option<String>], None),
+            (BenchPromptGenerateCancel, bench_prompt_generate_cancel, L, op_bench_prompt_generate_cancel, [], None),
+            (BenchRunStart, bench_run_start, L, op_bench_run_start, [request: Value], None),
+            (BenchRunCancel, bench_run_cancel, L, op_bench_run_cancel, [sweep_id: String], None),
+            (BenchResultsList, bench_results_list, R, op_bench_results_list, [], None),
+            (BenchResultDelete, bench_result_delete, D, op_bench_result_delete, [sweep_id: String], None),
             // Per-backend tuning (Addendum B §B.2): preview is a
             // pure read over live state; run holds the shared
             // job slot for the sweep; adopt writes the winner
@@ -475,7 +488,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 139);
+        assert_eq!(OP_SPECS.len(), 148);
     }
 
     #[test]

@@ -2387,14 +2387,35 @@ pub async fn benchmark_completion(
     max_tokens: u32,
     timeout: Duration,
 ) -> Result<BenchmarkSample, SupervisorError> {
+    benchmark_completion_seeded(base_url, model, messages, temperature, max_tokens, None, timeout)
+        .await
+}
+
+/// [`benchmark_completion`] with a fixed sampling seed (Bench
+/// design §2.1: one seed across every arm of a sweep, so arms
+/// differ only in the axis under test). `seed: None` sends no
+/// seed field at all — the exact request the unseeded call has
+/// always made.
+pub async fn benchmark_completion_seeded(
+    base_url: &str,
+    model: &str,
+    messages: &[ChatMessage],
+    temperature: f32,
+    max_tokens: u32,
+    seed: Option<u32>,
+    timeout: Duration,
+) -> Result<BenchmarkSample, SupervisorError> {
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": true,
     });
+    if let Some(seed) = seed {
+        body["seed"] = serde_json::json!(seed);
+    }
     let body_str =
         serde_json::to_string(&body).map_err(|e| SupervisorError::Http(e.to_string()))?;
     let client = reqwest::Client::builder()
