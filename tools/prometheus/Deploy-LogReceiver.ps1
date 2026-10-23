@@ -32,7 +32,7 @@
     retirement).
 
 .PARAMETER ReleaseTag
-    GitHub release tag to take the binaries from (default v0.1.51).
+    GitHub release tag to take the binaries from (default v0.1.52).
 
 .PARAMETER DataDir
     LLMdil data dir (default %APPDATA%\local-llm-service-manager).
@@ -55,7 +55,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$ReleaseTag = 'v0.1.51',
+    [string]$ReleaseTag = 'v0.1.52',
     [string]$Repo = 'pdrakeweb/llmdil',
     [string]$DataDir = (Join-Path $env:APPDATA 'local-llm-service-manager'),
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'LLMdil'),

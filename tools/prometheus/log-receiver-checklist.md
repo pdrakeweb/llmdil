@@ -8,13 +8,13 @@ the old endpoint string".
 
 ## Phase 1 — deploy dark (receiver runs, shipper unchanged)
 
-1. **Update LLMdil to v0.1.51** (the release that ships the
+1. **Update LLMdil to v0.1.52** (the release that ships the
    receiver binaries as release assets).
 2. **Install Tailscale on Prometheus** and sign in (same tailnet
    as Muse's VM). Confirm the address:
    `tailscale ip -4` → a 100.64.x.x – 100.127.x.x address. Note it;
    it goes into the VM-side reader config (below).
-3. **Download the deploy assets** from the v0.1.51 release page:
+3. **Download the deploy assets** from the v0.1.52 release page:
    `Deploy-LogReceiver.ps1` and this checklist (the two `.exe`
    assets are fetched by the script itself).
 4. **Run the script elevated** (right-click → Run as
