@@ -265,7 +265,7 @@ pub fn parse_rate_limit_remaining(rate_limit_header: Option<&str>) -> Option<u64
 /// the full counter set in the line's tooltip. Counts report
 /// what was fetched only — HF sends no total match count,
 /// so no "of N total" figure exists to show.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiscoveryFunnel {
     /// Query variants actually run (of the derived set).
@@ -307,27 +307,6 @@ pub struct DiscoveryFunnel {
     /// full of checked fits from enough distinct repos
     /// (§P1.9).
     pub stopped_early: bool,
-}
-
-impl Default for DiscoveryFunnel {
-    fn default() -> Self {
-        Self {
-            queries_run: 0,
-            pool_repos: 0,
-            repos_fetched: 0,
-            repos_failed: 0,
-            dropped_unpopular: 0,
-            dropped_stale: 0,
-            dropped_family: 0,
-            dropped_fit: 0,
-            quants_considered: 0,
-            quants_collapsed: 0,
-            kept: 0,
-            partial: false,
-            partial_reason: None,
-            stopped_early: false,
-        }
-    }
 }
 
 /// The result of one deep discovery pass: the ranked
@@ -2452,19 +2431,13 @@ mod tests {
         assert_eq!(funnel.dropped_stale, 1);
         // The staleness boundary is strict: exactly 730 days
         // is not stale; 731 is.
-        let exactly = format!(
-            "{}",
-            chrono::DateTime::from_timestamp(now - STALE_DAYS * 86_400, 0)
-                .unwrap()
-                .to_rfc3339()
-        );
+        let exactly = chrono::DateTime::from_timestamp(now - STALE_DAYS * 86_400, 0)
+            .unwrap()
+            .to_rfc3339();
         assert!(!is_stale(5_000, Some(&exactly), now));
-        let older = format!(
-            "{}",
-            chrono::DateTime::from_timestamp(now - (STALE_DAYS + 1) * 86_400, 0)
-                .unwrap()
-                .to_rfc3339()
-        );
+        let older = chrono::DateTime::from_timestamp(now - (STALE_DAYS + 1) * 86_400, 0)
+            .unwrap()
+            .to_rfc3339();
         assert!(is_stale(5_000, Some(&older), now));
     }
 
