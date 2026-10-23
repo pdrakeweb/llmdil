@@ -203,6 +203,21 @@ check(optimizeSrc.includes("data-opt-estimate"), "Optimize view renders the per-
 check(optimizeSrc.includes('data-opt-act="estimate-experiments"'), "Optimize view renders the Estimate experiments action");
 check(optimizeSrc.includes("Estimate —"), "Optimize view renders estimate figures under the Estimate label");
 
+// Bench MoE offload axis + results tabs: the Run form carries
+// the expert-offload dimension for MoE backends, the results
+// metric tabs drive the arm table (per-metric columns and
+// winners, not the chart alone), and the sweep card shows the
+// prompt's identity and text.
+const benchSrc = readFileSync(join(root, "src", "views", "bench.ts"), "utf8");
+check(benchSrc.includes('data-bench-dim="offloadOn"'), "Bench Run form renders the expert-offload dimension toggle");
+check(benchSrc.includes('checkChip("offloadpos"'), "Bench Run form renders offload position chips");
+check(benchSrc.includes("offloadExprFor"), "Bench Run form maps offload positions to canonical expressions");
+check(benchSrc.includes("winnersByMetric"), "Bench results compute winners on the selected metric");
+check(benchSrc.includes("METRIC_HEADS"), "Bench results render per-metric arm table columns");
+check(benchSrc.includes("Accepted by drafter"), "Bench acceptance tab attributes accepted tokens per drafter");
+check(benchSrc.includes("Prompt text"), "Bench sweep card renders the prompt text expander");
+check(benchSrc.includes("SHA-256:"), "Bench sweep card shows the prompt's recorded SHA-256");
+
 // Optimize Addendum B (per-backend tuning): the Backend tuning
 // section renders its preview/run actions, the ranked results
 // table carries the winner and adoption controls, and the
