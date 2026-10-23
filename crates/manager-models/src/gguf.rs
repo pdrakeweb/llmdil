@@ -118,6 +118,16 @@ pub struct GgufLayout {
     /// layers, not total blocks — hybrid models (Nemotron: 24 MoE
     /// blocks of 53) need this count to price a partial offload.
     pub moe_block_count: Option<u32>,
+    /// `<arch>.nextn_predict_layers` when present: the number of
+    /// MTP/nextn prediction blocks appended after the trunk. A
+    /// model carrying them has an in-file multi-token-prediction
+    /// head (`--spec-type draft-mtp` material).
+    pub nextn_predict_layers: Option<u32>,
+    /// True when the tensor directory carries any `blk.*.nextn.*`
+    /// tensor — the on-disk counterpart of
+    /// [`GgufLayout::nextn_predict_layers`]; either signal marks
+    /// an in-file MTP head.
+    pub has_nextn_tensors: bool,
     /// KV geometry when the metadata carries it completely.
     pub kv: Option<KvGeometry>,
     /// Recurrent-state geometry when the metadata carries the
@@ -434,6 +444,8 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
         _ => None,
     };
 
+    let nextn_predict_layers = get("nextn_predict_layers");
+    let mut has_nextn_tensors = false;
     let mut tensor_bytes: u64 = 0;
     let mut expert_bytes: u64 = 0;
     let mut expert_by_block: std::collections::BTreeMap<u32, u64> =
@@ -462,6 +474,9 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
             .checked_mul(block_bytes)
             .ok_or(GgufError::Invalid("tensor size overflow"))?;
         tensor_bytes = tensor_bytes.saturating_add(size);
+        if name.contains(".nextn.") {
+            has_nextn_tensors = true;
+        }
         if is_expert_tensor(&name) {
             expert_bytes = expert_bytes.saturating_add(size);
             if let Some(idx) = name
@@ -487,6 +502,8 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
         expert_bytes_by_block,
         block_count,
         moe_block_count,
+        nextn_predict_layers,
+        has_nextn_tensors,
         kv,
         rs,
     })
@@ -643,6 +660,44 @@ mod tests {
         let rs = layout.rs.unwrap();
         assert_eq!(rs.recr_layers, 48);
         assert_eq!(rs.bytes_per_seq(), 156_893_184);
+    }
+
+    #[test]
+    fn nextn_head_is_surfaced_for_form_population() {
+        // A 48-block MoE file with one appended nextn prediction
+        // block: the shape the Add Model population reads MoE
+        // geometry and the MTP declaration from (deep-discovery
+        // design Part 2, P2-D4). block_count counts the nextn
+        // block; moe_block_count does not — the nextn block's own
+        // tensors are not routed-expert trunk tensors here.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        let tensors = 48 + 2;
+        b.extend_from_slice(&(tensors as u64).to_le_bytes());
+        b.extend_from_slice(&4u64.to_le_bytes());
+        w_kv_str(&mut b, "general.architecture", "testarch");
+        w_kv_u32(&mut b, "testarch.block_count", 49);
+        w_kv_u32(&mut b, "testarch.nextn_predict_layers", 1);
+        w_kv_u32(&mut b, "testarch.expert_count", 8);
+        for blk in 0..48 {
+            w_tensor(&mut b, &format!("blk.{blk}.ffn_gate_exps.weight"), &[256], 12);
+        }
+        w_tensor(&mut b, "blk.48.nextn.eh_proj.weight", &[16], 1);
+        w_tensor(&mut b, "blk.48.nextn.enorm.weight", &[16], 1);
+        let layout = parse_gguf_layout(&b).unwrap();
+        assert_eq!(layout.block_count, Some(49));
+        assert_eq!(layout.moe_block_count, Some(48));
+        assert_eq!(layout.expert_bytes_by_block.len(), 48);
+        assert_eq!(layout.nextn_predict_layers, Some(1));
+        assert!(layout.has_nextn_tensors);
+    }
+
+    #[test]
+    fn no_nextn_signals_on_a_plain_file() {
+        let layout = parse_gguf_layout(&sample_header()).unwrap();
+        assert_eq!(layout.nextn_predict_layers, None);
+        assert!(!layout.has_nextn_tensors);
     }
 
     #[test]
