@@ -884,18 +884,75 @@ fn cpu_offload(b: &BackendConfig) -> bool {
     ) || matches!(crate::backend_gpu_visibility(b), crate::GpuVisibility::CpuOnly)
 }
 
+/// A backend's GPU placement as the interlock judges it (§6.1).
+///
+/// This is deliberately NOT `crate::backend_gpu_visibility`:
+/// that function reports `Undetermined` for any backend whose
+/// device selection lives in raw flags and is not exactly
+/// {GPU 0}, because the LAUNCH path will not remap a raw
+/// selection it does not model (code-review 4.4) and launches it
+/// unrestricted instead. For conflict purposes a parsed raw
+/// selection is determinate evidence of where the backend runs:
+/// a backend raw-pinned to GPU 1 (`--tensor-split 0,1`,
+/// `--device CUDA1`, `--main-gpu 1`) shares no GPU with a GPU-0
+/// target, and judging it Undetermined made it conflict with
+/// every sweep on the machine. Only a selection that does not
+/// parse stays Undetermined here, and an Undetermined placement
+/// still conflicts with everything (conservative: a sweep that
+/// cannot prove isolation does not run).
+#[derive(Debug, Clone, PartialEq)]
+enum BenchPlacement {
+    CpuOnly,
+    Gpus(std::collections::BTreeSet<u32>),
+    Undetermined,
+}
+
+fn bench_placement(b: &BackendConfig) -> BenchPlacement {
+    if crate::raw_flags_pin_cpu_only(b.raw_flags.as_deref()) {
+        return BenchPlacement::CpuOnly;
+    }
+    if !b.flags.tensor_split.is_empty() {
+        // A structured split remains the source of truth and a
+        // raw selection yields to it, as in the launch path.
+        let placed: std::collections::BTreeSet<u32> = b
+            .flags
+            .tensor_split
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| **f > 0.0)
+            .map(|(i, _)| i as u32)
+            .collect();
+        return if placed.is_empty() {
+            BenchPlacement::Undetermined
+        } else {
+            BenchPlacement::Gpus(placed)
+        };
+    }
+    match crate::raw_device_selection(b.raw_flags.as_deref()) {
+        crate::RawDeviceSelection::Set(set) => BenchPlacement::Gpus(set),
+        // Unsplit with no raw selection: llama.cpp's main GPU.
+        crate::RawDeviceSelection::None => {
+            BenchPlacement::Gpus(std::collections::BTreeSet::from([0]))
+        }
+        crate::RawDeviceSelection::Unparseable => BenchPlacement::Undetermined,
+    }
+}
+
 /// The running backends that conflict with a sweep against
-/// `target` (§6.1/§6.2): any backend sharing a placed GPU, the
-/// target itself, and — when either side runs layers on the
-/// CPU — any other CPU-offload backend. An undetermined
-/// placement conflicts with everything (conservative: a sweep
-/// that cannot prove isolation does not run).
+/// `target` (§6.1/§6.2): any backend sharing a GPU with the
+/// target's placement, the target itself, and — when the TARGET
+/// runs layers on the CPU — any other CPU-offload backend (the
+/// CPU is shared by every MoE backend's experts, §3.4/§6.2; the
+/// rule binds on the target's offload, not on any running
+/// backend's). An undetermined placement conflicts with
+/// everything (conservative: a sweep that cannot prove isolation
+/// does not run).
 fn interlock_conflicts(
     cfg: &AppConfig,
     running: &HashSet<String>,
     target: &BackendConfig,
 ) -> Vec<String> {
-    let target_vis = crate::backend_gpu_visibility(target);
+    let target_place = bench_placement(target);
     let target_cpu = cpu_offload(target);
     let mut out: Vec<String> = Vec::new();
     for b in &cfg.backends {
@@ -906,13 +963,12 @@ fn interlock_conflicts(
             out.push(b.id.clone());
             continue;
         }
-        let vis = crate::backend_gpu_visibility(b);
-        let gpu_conflict = match (&target_vis, &vis) {
-            (crate::GpuVisibility::Gpus(a), crate::GpuVisibility::Gpus(bset)) => {
+        let place = bench_placement(b);
+        let gpu_conflict = match (&target_place, &place) {
+            (BenchPlacement::Gpus(a), BenchPlacement::Gpus(bset)) => {
                 a.iter().any(|g| bset.contains(g))
             }
-            (crate::GpuVisibility::CpuOnly, crate::GpuVisibility::CpuOnly) => false,
-            (crate::GpuVisibility::CpuOnly, _) | (_, crate::GpuVisibility::CpuOnly) => false,
+            (BenchPlacement::CpuOnly, _) | (_, BenchPlacement::CpuOnly) => false,
             _ => true, // Undetermined on either side
         };
         let cpu_conflict = target_cpu && cpu_offload(b);
@@ -2061,5 +2117,88 @@ mod tests {
         // A non-expert `-ot` assignment is not expert offload.
         let spec = base_arm_spec(&backend(Some("-ot blk.0.attn=CPU")));
         assert_eq!(spec.offload_expr, None);
+    }
+
+    fn placed_backend(id: &str, tensor_split: Vec<f32>, raw_flags: Option<&str>) -> BackendConfig {
+        let mut b = backend(raw_flags);
+        b.id = id.to_string();
+        b.flags.tensor_split = tensor_split;
+        b
+    }
+
+    fn cfg_with(backends: Vec<BackendConfig>) -> AppConfig {
+        let mut cfg = AppConfig::default_config();
+        cfg.backends = backends;
+        cfg
+    }
+
+    fn running(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn interlock_cross_gpu_raw_placed_backend_does_not_conflict() {
+        // Pete's case (Oct 23, 2026): the target is resident
+        // entirely on GPU 0; coder runs on GPU 1 only, its
+        // placement stated in raw flags, and it CPU-offloads its
+        // experts. Neither rule binds: the GPUs are disjoint, and
+        // the CPU-offload rule binds only when the TARGET
+        // CPU-offloads (§6.2). Before the bench-local placement
+        // reading, backend_gpu_visibility reported coder
+        // Undetermined and the interlock flagged it against every
+        // sweep.
+        let target = placed_backend("planner", vec![1.0], Some("--parallel 1"));
+        let coder = placed_backend(
+            "coder",
+            Vec::new(),
+            Some("--tensor-split 0,1 -ot exps=CPU"),
+        );
+        let cfg = cfg_with(vec![target.clone(), coder]);
+        let conflicts = interlock_conflicts(&cfg, &running(&["coder"]), &target);
+        assert!(conflicts.is_empty(), "conflicts: {conflicts:?}");
+    }
+
+    #[test]
+    fn interlock_shared_gpu_and_running_target_conflict() {
+        // An unsplit backend sits on GPU 0 by default and shares
+        // it with a GPU-0 target; the running target itself
+        // always conflicts (§6.1).
+        let target = placed_backend("planner", Vec::new(), None);
+        let other = placed_backend("chat", Vec::new(), None);
+        let cfg = cfg_with(vec![target.clone(), other]);
+        let conflicts = interlock_conflicts(&cfg, &running(&["chat", "planner"]), &target);
+        assert_eq!(conflicts, vec!["planner".to_string(), "chat".to_string()]);
+    }
+
+    #[test]
+    fn interlock_cpu_offload_target_conflicts_with_cpu_offload_backend() {
+        // Disjoint GPUs, but the target CPU-offloads, so a
+        // running CPU-offload backend shares the CPU expert
+        // resource and conflicts (§3.4/§6.2) — while a running
+        // dense backend on the other GPU does not.
+        let target = placed_backend(
+            "coder-target",
+            vec![1.0, 0.0],
+            Some("-ot exps=CPU"),
+        );
+        let moe = placed_backend("planner-moe", vec![0.0, 1.0], Some("--n-cpu-moe 24"));
+        let dense = placed_backend("planner", vec![0.0, 1.0], Some("--parallel 1"));
+        let cfg = cfg_with(vec![target.clone(), moe, dense]);
+        let conflicts =
+            interlock_conflicts(&cfg, &running(&["planner-moe", "planner"]), &target);
+        assert_eq!(conflicts, vec!["planner-moe".to_string()]);
+    }
+
+    #[test]
+    fn interlock_unparseable_placement_still_conflicts() {
+        // A device selection that does not parse stays
+        // Undetermined, and Undetermined conflicts with
+        // everything — the conservative reading is kept for the
+        // genuinely unknown case.
+        let target = placed_backend("planner", vec![1.0], None);
+        let odd = placed_backend("odd", Vec::new(), Some("--device banana"));
+        let cfg = cfg_with(vec![target.clone(), odd]);
+        let conflicts = interlock_conflicts(&cfg, &running(&["odd"]), &target);
+        assert_eq!(conflicts, vec!["odd".to_string()]);
     }
 }
