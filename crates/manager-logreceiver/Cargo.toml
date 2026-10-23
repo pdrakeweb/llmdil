@@ -1,0 +1,35 @@
+[package]
+name = "manager-logreceiver"
+version = "0.1.51"
+edition = "2021"
+
+# Prometheus-local log receiver for LLMdil log streaming
+# (DESIGN-prometheus-local.md, Oct 2026). Ported from the standalone
+# crate that ran on Muse's VM; now a workspace crate whose binary
+# ships in LLMdil releases and runs on Prometheus as its own
+# auto-start Windows service (registered through manager-services).
+# Ingest stays on 127.0.0.1:8473; reads are served only on the
+# machine's tailnet address (port 8474) behind a read-only token.
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+flate2 = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+manager-services = { path = "../manager-services" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
+[[bin]]
+name = "llmdil-log-receiver"
+path = "src/main.rs"

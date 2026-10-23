@@ -55,6 +55,25 @@ jobs:
           releaseDraft: false
           prerelease: false
 
+      # Deploy assets for the Prometheus-local log receiver
+      # (tools/prometheus/Deploy-LogReceiver.ps1 downloads these from
+      # the release; they are deliberately not in the installer).
+      - name: Build log receiver and service host binaries
+        run: |
+          cargo build --release -p manager-logreceiver --bin llmdil-log-receiver
+          cargo build --release -p manager-services --bin llm-service-host
+
+      - name: Upload deploy assets to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.ref_name }} --repo pdrakeweb/llmdil --clobber `
+            target/release/llmdil-log-receiver.exe `
+            target/release/llm-service-host.exe `
+            tools/prometheus/Deploy-LogReceiver.ps1 `
+            tools/prometheus/log-receiver-checklist.md
+
   # Install-test: download the published installer onto a fresh Windows
   # runner, silent-install it, verify the payload, launch the app briefly,
   # then silent-uninstall. Catches installer/config regressions that the

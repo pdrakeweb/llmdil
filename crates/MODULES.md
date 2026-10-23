@@ -1,6 +1,6 @@
 # Crate map — implementation contract
 
-Rust workspace for LLMdil. Fourteen library
+Rust workspace for LLMdil. Seventeen library
 crates under `crates/` (workspace members) plus the Tauri shell in
 `src-tauri/` (excluded from the workspace; path-deps to the crates).
 The UI shell is in `ui/` (Vite + plain TypeScript; framework-independent
@@ -442,3 +442,20 @@ rewrite (no elevation, no SCM call) and takes effect at the service's
 next start. SCM create/delete is the only elevated operation; services
 run as the user's account with Manual start. Per-backend
 `supervision.mode` = `process` (default) | `service`.
+
+## manager-logreceiver — DESIGN-prometheus-local.md (Oct 2026)
+
+The Prometheus-local log receiver: the ingest + store half of log
+streaming, running on the machine LLMdil runs on as its own
+auto-start Windows service (definition built by manager-services'
+`log_receiver_definition`; `llm-service-host.exe` is the shim; the
+service runs as LocalService with SCM restart failure actions).
+Ingest on 127.0.0.1:8473 (Bearer ingest token; the wire format is
+manager-logship's, unchanged); reads only on the machine's tailnet
+address (:8474) behind a separate read-only token — `/healthz`,
+`/v1/status`, `/v1/query`. SQLite store: records deduped on
+(machine, seq), a heartbeat row every 5 minutes (7-day prune),
+hourly retention prune at 14 days / 512 MiB. Binary
+`llmdil-log-receiver` (default mode serves; `install-service` /
+`uninstall-service` / `definition` subcommands serve the deploy
+script, `tools/prometheus/Deploy-LogReceiver.ps1`).
