@@ -1006,6 +1006,7 @@ name = "manager-app"
 version = "0.1.50"
 dependencies = [
  "chrono",
+ "manager-bench",
  "manager-config",
  "manager-gateway",
  "manager-logship",
@@ -1025,6 +1026,16 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "manager-bench"
+version = "0.1.50"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

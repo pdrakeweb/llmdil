@@ -216,6 +216,14 @@ fn main() {
                 let state = handle.state::<Arc<AppState>>().inner().clone();
                 manager_app::optimize_experiments::startup_sweep(&state).await;
             });
+            // Bench startup sweep: the same treatment for
+            // leftover bench-<n> temp backends and for sweep
+            // records a crash left marked running.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<Arc<AppState>>().inner().clone();
+                manager_app::bench::startup_sweep(&state).await;
+            });
             // Notification monitor: watch backend states, gateway
             // liveness, and the activation plan for the transitions
             // the toast taxonomy fires on (see notify::monitor_tick).

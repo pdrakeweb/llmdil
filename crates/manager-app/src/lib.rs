@@ -52,6 +52,7 @@ pub mod app_update;
 pub mod gateway_stats;
 pub mod gpu_history;
 pub mod hf_forms;
+pub mod bench;
 pub mod logship;
 pub mod notify;
 pub mod optimize;
@@ -75,6 +76,11 @@ pub use app_update::{
 pub use optimize_eval::op_optimize_run_baseline;
 pub use optimize_experiments::{
     op_optimize_estimate_experiments, op_optimize_run_experiments, op_optimize_set_experiment_state,
+};
+pub use bench::{
+    op_bench_prompt_delete, op_bench_prompt_generate, op_bench_prompt_generate_cancel,
+    op_bench_prompt_save, op_bench_prompts_list, op_bench_result_delete, op_bench_results_list,
+    op_bench_run_cancel, op_bench_run_start,
 };
 pub use optimize_tuning::{op_optimize_tuning_adopt, op_optimize_tuning_preview, op_optimize_tuning_run};
 pub mod registry;
@@ -440,6 +446,21 @@ pub struct AppState {
     /// consultation and a measurement are different jobs with
     /// different lifetimes.
     optimize_job_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Bench sweep cancellation slot (Bench design §6.4): the
+    /// running sweep's scoped cancel handle, owned by the sweep
+    /// rather than the task bookkeeping (D13) — the same shape
+    /// as the Optimize job slot, a separate slot because a sweep
+    /// and an Optimize job are different jobs with different
+    /// lifetimes.
+    bench_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Prompt-generation cancellation slot (Bench design §4.3):
+    /// the stored abort handle for the in-flight draft
+    /// generation, mirroring the consultation's slot.
+    bench_generate_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// The running Bench sweep's descriptor (id + progress),
+    /// read by `bench_results_list` so any page instance can
+    /// render the sweep's progress.
+    bench_job: Mutex<Option<bench::BenchJob>>,
     /// The running Estimate/Measure job's descriptor (tracker
     /// #69): kind, backend, and start time, recorded beside the
     /// job slot so the state payload can tell ANY page instance
@@ -637,6 +658,9 @@ impl AppState {
             optimize_consult_started_unix_ms: Mutex::new(None),
             optimize_consult_error: Mutex::new(None),
             optimize_job_abort: Mutex::new(None),
+            bench_abort: Mutex::new(None),
+            bench_generate_abort: Mutex::new(None),
+            bench_job: Mutex::new(None),
             optimize_job: Mutex::new(None),
             optimize_job_error: Mutex::new(None),
             optimize_running_ops: std::sync::Mutex::new(std::collections::HashMap::new()),
