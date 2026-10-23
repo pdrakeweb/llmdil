@@ -15658,7 +15658,6 @@ async fn activation_plan_pending(state: &AppState) -> bool {
 /// value feeds memory-fit estimation that nothing re-derives later,
 /// so storing a placeholder would silently corrupt fit decisions.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn model_add_entry(
     id: &str,
     source_url: &str,

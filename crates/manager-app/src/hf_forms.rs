@@ -384,7 +384,7 @@ mod tests {
         // resident bytes fit, not a fixed endpoint.
         let l = layout(48, 300_000_000, 6_000_000_000);
         let (s, split) = suggested_default_offload(&l, &[16_376]);
-        assert_eq!(split, false);
+        assert!(!split);
         let n = s.unwrap();
         let sys = manager_models::sys_bytes_by_position(
             l.expert_bytes,
