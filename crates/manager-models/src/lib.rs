@@ -172,26 +172,51 @@ pub fn catalog_params_b(id: &str, source_url: &str) -> Option<f32> {
         .map(|s| s.params_b)
 }
 
-/// Whether the curated catalog pins MTP capability for a model
-/// (see [`ModelSpec::mtp`]): an exact id match wins; otherwise an
-/// exact source-URL match — the same resolution
-/// [`catalog_params_b`] uses, so the catalog's `-mtp` build
-/// registered under an operator-chosen id still resolves. `false`
-/// when the catalog knows neither the id nor the URL: capability
-/// is a pinned fact, never a guess.
-pub fn catalog_mtp(id: &str, source_url: &str) -> bool {
+/// The curated catalog's MTP capability pin for a model (see
+/// [`ModelSpec::mtp`]): `Some(pin)` when the catalog knows the
+/// model — an exact id match wins; otherwise an exact source-URL
+/// match, the same resolution [`catalog_params_b`] uses, so the
+/// catalog's `-mtp` build registered under an operator-chosen id
+/// still resolves. `None` when the catalog knows neither the id
+/// nor the URL: the catalog pins nothing for such a model, and
+/// capability falls to the model record's own declaration (see
+/// [`effective_mtp`]).
+pub fn catalog_mtp_pin(id: &str, source_url: &str) -> Option<bool> {
     let models = curated_models();
     if let Some(spec) = models.iter().find(|s| s.id == id) {
-        return spec.mtp;
+        return Some(spec.mtp);
     }
     if source_url.is_empty() {
-        return false;
+        return None;
     }
     models
         .iter()
         .find(|s| s.url == source_url)
         .map(|s| s.mtp)
-        .unwrap_or(false)
+}
+
+/// Whether the curated catalog pins MTP capability for a model
+/// (see [`ModelSpec::mtp`]): `false` when the catalog knows
+/// neither the id nor the URL — capability is a pinned fact,
+/// never a guess.
+pub fn catalog_mtp(id: &str, source_url: &str) -> bool {
+    catalog_mtp_pin(id, source_url).unwrap_or(false)
+}
+
+/// A model's EFFECTIVE MTP capability: the curated catalog's pin
+/// where the catalog knows the model (by id or source URL), else
+/// the operator's declaration on the model record
+/// (`ModelConfig::mtp`), else not capable. The same precedence
+/// shape as the MoE figures: a catalog pin wins over the record,
+/// because the pin is a verified property of the catalog build —
+/// a declaration stored on a catalog model is shadowed by the
+/// pin, never an override. Capability is never inferred from a
+/// model's name or file.
+pub fn effective_mtp(id: &str, source_url: &str, declared: Option<bool>) -> bool {
+    match catalog_mtp_pin(id, source_url) {
+        Some(pin) => pin,
+        None => declared.unwrap_or(false),
+    }
 }
 
 /// The curated catalog's revision. Bump whenever
@@ -2011,6 +2036,32 @@ mod tests {
     }
 
     #[test]
+    fn effective_mtp_resolves_catalog_pin_then_declaration() {
+        let models = curated_models();
+        let mtp_url = models[1].url.as_str();
+        let coder_url = models[2].url.as_str();
+        // The catalog pins exactly one model capable.
+        assert_eq!(catalog_mtp_pin("qwen3.8-27b-mtp", ""), Some(true));
+        assert!(catalog_mtp("qwen3.8-27b-mtp", ""));
+        // A catalog model's pin is a fact even when it is false:
+        // the coder pins NOT capable, and a record declaration
+        // stored on it is shadowed by the pin, never an override.
+        assert_eq!(catalog_mtp_pin("qwen3-coder-30b", coder_url), Some(false));
+        assert!(!effective_mtp("qwen3-coder-30b", coder_url, Some(true)));
+        assert!(!effective_mtp("qwen3-coder-30b", coder_url, None));
+        // The pinned build registered under an operator-chosen id
+        // still resolves by source URL.
+        assert_eq!(catalog_mtp_pin("my-planner", mtp_url), Some(true));
+        assert!(effective_mtp("my-planner", mtp_url, Some(false)));
+        // A model the catalog does not know falls to the record
+        // declaration; undeclared means not capable.
+        assert_eq!(catalog_mtp_pin("user-model", "https://example.com/m.gguf"), None);
+        assert!(effective_mtp("user-model", "https://example.com/m.gguf", Some(true)));
+        assert!(!effective_mtp("user-model", "https://example.com/m.gguf", Some(false)));
+        assert!(!effective_mtp("user-model", "https://example.com/m.gguf", None));
+    }
+
+    #[test]
     fn catalog_params_b_resolves_by_id_then_url() {
         // Exact id match.
         assert_eq!(
@@ -2202,6 +2253,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         }
     }
 

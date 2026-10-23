@@ -19,7 +19,7 @@ import {
   getBackendConfig, applyBackendConfig, testBackend, testBackendToolCall, placementPropose, placementApply,
   addBackend, backendAddPreview, deleteBackend, modelAssign,
   getModels, downloadModel, cancelDownload, pauseModelDownload, resumeModelDownload,
-  verifyModel, deleteModel, modelSetEnabled, modelAdd, modelSetShortName, modelSetOffloadSpec,
+  verifyModel, deleteModel, modelSetEnabled, modelAdd, modelSetShortName, modelSetOffloadSpec, modelSetMtp,
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
   getGatewayMasterKey, setGatewayBindHost,
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
@@ -4815,7 +4815,7 @@ function modelOverviewHtml(rows: ModelRow[], stats: Map<string, { backends: numb
   return `<div class="ovlist ov-m"><div class="ov-head"><span></span><span>Model</span><span>Quant</span><span>Size</span><span>State</span><span>Serving backends</span><span>Requests (1h)</span></div>${body}</div>`;
 }
 
-function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }, rename?: { draft: string } | null, detailsOpen = false, offload?: { layers: string; def: string } | null): string {
+function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }, rename?: { draft: string } | null, detailsOpen = false, offload?: { layers: string; def: string; moe: boolean; mtp: boolean } | null): string {
   const note = notes.get(m.id);
   const noteHtml = note
     ? `<div style="margin-top:8px;font-size:12px;color:${note.err ? "var(--err)" : "var(--text2)"}">${esc(note.text)}</div>` : "";
@@ -4885,10 +4885,10 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
   // Rename is always offered: the short name is the operator's own
   // label for the model, independent of its download state.
   actions += ` <button class="btn icon-only" data-model-act="rename" data-model-id="${esc(m.id)}" title="Rename short name" aria-label="Rename short name of ${esc(m.id)}">${icon("pencil")}</button>`;
-  // The MoE offload declaration editor is always offered too: it
+  // The capability declaration editor is always offered too: it
   // is how a model outside the curated catalog acquires
-  // expert-offload controls for its backends.
-  actions += ` <button class="btn icon-only" data-model-act="offload" data-model-id="${esc(m.id)}" title="MoE offload declaration" aria-label="MoE offload declaration of ${esc(m.id)}">${icon("layers")}</button>`;
+  // expert-offload and MTP draft controls for its backends.
+  actions += ` <button class="btn icon-only" data-model-act="offload" data-model-id="${esc(m.id)}" title="Capability declarations" aria-label="Capability declarations of ${esc(m.id)}">${icon("layers")}</button>`;
   const renameHtml = rename ? `<div class="backend-form-panel flags-panel">
       <div style="font-size:12px;font-weight:600">Rename short name</div>
       <div style="display:flex;gap:6px;margin-top:6px;min-width:0">
@@ -4902,20 +4902,30 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
   const effMoeLayers = m.catalog_moe_layers ?? m.moe_layers ?? null;
   const effMoeDefault = m.catalog_default_offload_layers ?? m.default_offload_layers ?? null;
   const catalogPinned = m.catalog_moe_layers != null && m.catalog_default_offload_layers != null;
+  /* The effective MTP capability: the same precedence — the
+   * catalog's pin (where it knows the model) over the record's
+   * declaration. */
+  const effMtp = m.catalog_mtp ?? m.mtp ?? false;
+  const mtpPinned = m.catalog_mtp != null;
   const offloadHtml = offload ? `<div class="backend-form-panel flags-panel">
-      <div style="font-size:12px;font-weight:600">MoE offload declaration</div>
+      <div style="font-size:12px;font-weight:600">Capability declarations</div>
+      <div style="margin-top:6px"><label style="font-size:12px;color:var(--text2);display:flex;gap:6px;align-items:center">
+        <input data-model-mtp-check="${esc(m.id)}" type="checkbox" ${offload.mtp ? "checked" : ""}${mtpPinned ? ` disabled title="Pinned by the curated catalog"` : ""}> MTP capable</label></div>
       ${catalogPinned
-        ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">This model's offload figures come from the curated catalog — ${effMoeDefault} of ${effMoeLayers} MoE layers by default — and cannot be changed here.</div>
-          <div class="card-actions"><button class="btn icon-only" data-model-act="offload-cancel" data-model-id="${esc(m.id)}" title="Close" aria-label="Close">${icon("x")}</button></div>`
-        : `<div style="font-size:12px;color:var(--text2);margin-top:6px">Declare this model as mixture-of-experts (MoE) to give its backends expert-offload controls: a new backend starts at the default offload, and the Edit Flags slider ranges over the MoE layers. Clear both fields to remove the declaration.</div>
+        ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">This model's offload figures come from the curated catalog — ${effMoeDefault} of ${effMoeLayers} MoE layers by default — and cannot be changed here.</div>`
+        : `<div style="margin-top:8px"><label style="font-size:12px;color:var(--text2);display:flex;gap:6px;align-items:center">
+            <input data-model-moe-check="${esc(m.id)}" type="checkbox" ${offload.moe ? "checked" : ""}> MoE</label></div>
+          <div style="font-size:12px;color:var(--text2);margin-top:6px">Declare this model as mixture-of-experts (MoE) to give its backends expert-offload controls: a new backend starts at the default offload, and the Edit Flags slider ranges over the MoE layers. Uncheck MoE and save to remove the declaration.</div>
           <div style="display:flex;gap:10px;margin-top:6px;flex-wrap:wrap">
             <label style="font-size:12px;color:var(--text2)">MoE layers<br>
-              <input data-model-offload-layers="${esc(m.id)}" type="text" inputmode="numeric" value="${esc(offload.layers)}" placeholder="48" style="${SELECT_STYLE};width:110px"></label>
+              <input data-model-offload-layers="${esc(m.id)}" type="text" inputmode="numeric" value="${esc(offload.layers)}" placeholder="48" style="${SELECT_STYLE};width:110px"${offload.moe ? "" : " disabled"}></label>
             <label style="font-size:12px;color:var(--text2)">Default offload layers<br>
-              <input data-model-offload-default="${esc(m.id)}" type="text" inputmode="numeric" value="${esc(offload.def)}" placeholder="16" style="${SELECT_STYLE};width:110px"></label>
-          </div>
-          <div class="card-actions"><button class="btn" data-model-act="offload-save" data-model-id="${esc(m.id)}">${icon("check")} Save declaration</button>
-            <button class="btn icon-only" data-model-act="offload-cancel" data-model-id="${esc(m.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>`}
+              <input data-model-offload-default="${esc(m.id)}" type="text" inputmode="numeric" value="${esc(offload.def)}" placeholder="16" style="${SELECT_STYLE};width:110px"${offload.moe ? "" : " disabled"}></label>
+          </div>`}
+      ${catalogPinned && mtpPinned
+        ? `<div class="card-actions"><button class="btn icon-only" data-model-act="offload-cancel" data-model-id="${esc(m.id)}" title="Close" aria-label="Close">${icon("x")}</button></div>`
+        : `<div class="card-actions"><button class="btn" data-model-act="offload-save" data-model-id="${esc(m.id)}">${icon("check")} Save declaration</button>
+          <button class="btn icon-only" data-model-act="offload-cancel" data-model-id="${esc(m.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>`}
     </div>` : "";
   // Size carries the final size only when the file is on disk; in
   // download states the progress value carries the partial figure,
@@ -4964,6 +4974,7 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
       ${m.params_b > 0 ? `<div class="kv"><span class="k">Parameters</span><span class="v" style="font-size:12px">${trim1(m.params_b)}B</span></div>` : ""}
       ${m.ctx_max != null ? `<div class="kv"><span class="k">Context</span><span class="v" style="font-size:12px">${fmtCount(m.ctx_max)}</span></div>` : ""}
       ${effMoeLayers != null && effMoeDefault != null ? `<div class="kv"><span class="k">Expert offload</span><span class="v" style="font-size:12px">Default: ${effMoeDefault} of ${effMoeLayers} layers</span></div>` : ""}
+      ${effMtp ? `<div class="kv"><span class="k">MTP</span><span class="v" style="font-size:12px">Capable</span></div>` : ""}
     </div>
     ${statsHtml}
     <div class="card-actions">${actions}</div>
@@ -4998,11 +5009,17 @@ function modelAddFormHtml(): string {
         <label style="font-size:12px;color:var(--text2)">Parameters (B)<span class="info-tip" title="Total parameter count in billions (e.g. 80 for an 80B model — for a mixture-of-experts model, the total, not the active count). Required for models outside the curated catalog: the count feeds memory-fit estimation and is never re-derived later.">${icon("info")}</span><br>
           <input id="addModelParams" type="text" inputmode="decimal" placeholder="80" style="${SELECT_STYLE};width:100%"></label>
       </div>
+      <div style="display:flex;gap:16px;margin-top:10px">
+        <label style="font-size:12px;color:var(--text2);display:flex;gap:6px;align-items:center">
+          <input id="addModelMtp" type="checkbox"> MTP capable<span class="info-tip" title="The model's GGUF carries an MTP (multi-token prediction) head. Declaring it gives the model's backends the MTP draft control.">${icon("info")}</span></label>
+        <label style="font-size:12px;color:var(--text2);display:flex;gap:6px;align-items:center">
+          <input id="addModelMoe" type="checkbox"> MoE</label>
+      </div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px">
-        <label style="font-size:12px;color:var(--text2)">MoE layers<span class="info-tip" title="For a mixture-of-experts (MoE) model: the number of layers carrying routed experts. Declaring this and the default offload gives the model's backends expert-offload controls — a new backend starts at the default offload and the Edit Flags slider ranges over these layers. Leave both MoE fields empty for a dense model.">${icon("info")}</span><br>
-          <input id="addModelMoeLayers" type="text" inputmode="numeric" placeholder="48" style="${SELECT_STYLE};width:100%"></label>
+        <label style="font-size:12px;color:var(--text2)">MoE layers<span class="info-tip" title="For a mixture-of-experts (MoE) model: the number of layers carrying routed experts. Declaring this and the default offload gives the model's backends expert-offload controls — a new backend starts at the default offload and the Edit Flags slider ranges over these layers.">${icon("info")}</span><br>
+          <input id="addModelMoeLayers" type="text" inputmode="numeric" placeholder="48" style="${SELECT_STYLE};width:100%" disabled></label>
         <label style="font-size:12px;color:var(--text2)">Default offload layers<span class="info-tip" title="How many MoE layers a new backend for this model offloads to system RAM by default (0 to the MoE layer count; the full count is full expert offload).">${icon("info")}</span><br>
-          <input id="addModelMoeDefault" type="text" inputmode="numeric" placeholder="16" style="${SELECT_STYLE};width:100%"></label>
+          <input id="addModelMoeDefault" type="text" inputmode="numeric" placeholder="16" style="${SELECT_STYLE};width:100%" disabled></label>
       </div>
     </div>
     <div class="card-actions"><button class="btn" id="addModelBtn">${icon("check")} Create model</button>
@@ -5030,13 +5047,15 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
    *  input) so poll repaints never lose typed text. */
   let renameFor: string | null = null;
   let renameDraft = "";
-  /** Offload-declaration form state: the model whose inline MoE
-   *  declaration form is open, and its two draft fields (kept as
-   *  text, like the rename draft, so poll repaints never lose
-   *  typed text). */
+  /** Capability-declaration form state: the model whose inline
+   *  declaration form is open, and its draft fields (the MoE pair
+   *  kept as text, like the rename draft, so poll repaints never
+   *  lose typed text; the two capability checkboxes as booleans). */
   let offloadFor: string | null = null;
   let offloadDraftLayers = "";
   let offloadDraftDefault = "";
+  let offloadDraftMoe = false;
+  let offloadDraftMtp = false;
   const syncOffloadDraft = (ev: Event): void => {
     const t = ev.target as HTMLElement;
     if (t.hasAttribute("data-model-offload-layers") && t.getAttribute("data-model-offload-layers") === offloadFor) {
@@ -5047,6 +5066,23 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     }
   };
   root.addEventListener("input", syncOffloadDraft);
+  /** Checkbox drafts sync on change; toggling MoE also enables or
+   *  disables the pair's inputs in place (no repaint, so the
+   *  toggle never loses focus). */
+  const syncOffloadChecks = (ev: Event): void => {
+    const t = ev.target as HTMLElement;
+    if (t.hasAttribute("data-model-mtp-check") && t.getAttribute("data-model-mtp-check") === offloadFor) {
+      offloadDraftMtp = (t as HTMLInputElement).checked;
+    }
+    if (t.hasAttribute("data-model-moe-check") && t.getAttribute("data-model-moe-check") === offloadFor) {
+      offloadDraftMoe = (t as HTMLInputElement).checked;
+      const card = t.closest(".card");
+      card?.querySelectorAll("[data-model-offload-layers],[data-model-offload-default]").forEach((el) => {
+        (el as HTMLInputElement).disabled = !offloadDraftMoe;
+      });
+    }
+  };
+  root.addEventListener("change", syncOffloadChecks);
   /** Models whose Details expandable is open (wire state outside
    *  the repainted DOM, so poll repaints preserve it). */
   const openModelDetails = new Set<string>();
@@ -5134,7 +5170,7 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       || (offloadFor !== null && (!!active?.hasAttribute?.("data-model-offload-layers") || !!active?.hasAttribute?.("data-model-offload-default")));
     if (!formFocused) {
       if (mov) mov.innerHTML = modelOverviewHtml(lastRows, modelStats);
-      b.innerHTML = `<div class="cards-fluid">${lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id), renameFor === m.id ? { draft: renameDraft } : null, openModelDetails.has(m.id), offloadFor === m.id ? { layers: offloadDraftLayers, def: offloadDraftDefault } : null)).join("")}</div>`;
+      b.innerHTML = `<div class="cards-fluid">${lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id), renameFor === m.id ? { draft: renameDraft } : null, openModelDetails.has(m.id), offloadFor === m.id ? { layers: offloadDraftLayers, def: offloadDraftDefault, moe: offloadDraftMoe, mtp: offloadDraftMtp } : null)).join("")}</div>`;
     }
     syncPoll();
   };
@@ -5268,6 +5304,11 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       offloadFor = id;
       offloadDraftLayers = row?.moe_layers != null ? String(row.moe_layers) : "";
       offloadDraftDefault = row?.default_offload_layers != null ? String(row.default_offload_layers) : "";
+      // The checkboxes start from the EFFECTIVE capabilities
+      // (catalog pin over the record's declaration).
+      offloadDraftMoe = (row?.catalog_moe_layers ?? row?.moe_layers) != null
+        && (row?.catalog_default_offload_layers ?? row?.default_offload_layers) != null;
+      offloadDraftMtp = row?.catalog_mtp ?? row?.mtp ?? false;
       await load();
       return;
     }
@@ -5280,33 +5321,53 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
 
     if (act === "offload-save") {
       (t as HTMLButtonElement).disabled = true;
-      const layersRaw = offloadDraftLayers.trim();
-      const defRaw = offloadDraftDefault.trim();
+      const row = lastRows.find((m) => m.id === id);
+      const moePinned = row != null && row.catalog_moe_layers != null && row.catalog_default_offload_layers != null;
+      const mtpPinned = row?.catalog_mtp != null;
+      // MoE pair, validated before anything persists: checked
+      // requires both fields; unchecked clears the declaration.
       let layers: number | null = null;
       let def: number | null = null;
-      if (layersRaw || defRaw) {
+      if (!moePinned && offloadDraftMoe) {
+        const layersRaw = offloadDraftLayers.trim();
+        const defRaw = offloadDraftDefault.trim();
         const l = Number(layersRaw);
         const d = Number(defRaw);
         if (!layersRaw || !defRaw || !Number.isInteger(l) || !Number.isInteger(d) || l < 1 || d < 0 || d > l) {
-          notes.set(id, { text: "Declaration not saved: give both fields — MoE layers of 1 or more, and a default offload between 0 and the layer count (or clear both to remove the declaration).", err: true });
+          notes.set(id, { text: "Declaration not saved: MoE is checked — give both fields, MoE layers of 1 or more and a default offload between 0 and the layer count (or uncheck MoE to remove the declaration).", err: true });
           await load();
           return;
         }
         layers = l;
         def = d;
       }
-      const r = await modelSetOffloadSpec(id, layers, def);
-      if (r.error) {
-        notes.set(id, { text: `Offload declaration failed: ${r.error}`, err: true });
-      } else {
-        offloadFor = null;
-        notes.set(id, {
-          text: layers === null
-            ? "MoE offload declaration cleared."
-            : `MoE offload declared: default ${def} of ${layers} layers. New backends start at the default, and this model's backends gain the Edit Flags offload slider.`,
-          err: false,
-        });
+      const savedParts: string[] = [];
+      if (!moePinned) {
+        const r = await modelSetOffloadSpec(id, layers, def);
+        if (r.error) {
+          notes.set(id, { text: `Declaration failed: ${r.error}`, err: true });
+          await load();
+          return;
+        }
+        savedParts.push(layers === null
+          ? "MoE offload declaration cleared."
+          : `MoE offload declared: default ${def} of ${layers} layers. New backends start at the default, and this model's backends gain the Edit Flags offload slider.`);
       }
+      if (!mtpPinned) {
+        // Checked stores the declaration; unchecked clears it —
+        // either way the effective capability follows the box.
+        const r = await modelSetMtp(id, offloadDraftMtp ? true : null);
+        if (r.error) {
+          notes.set(id, { text: `Declaration failed: ${r.error}`, err: true });
+          await load();
+          return;
+        }
+        savedParts.push(offloadDraftMtp
+          ? "MTP declared capable: this model's backends gain the MTP draft control."
+          : "MTP declaration cleared.");
+      }
+      offloadFor = null;
+      if (savedParts.length) notes.set(id, { text: savedParts.join(" "), err: false });
       await load();
       return;
     }
@@ -5363,6 +5424,13 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       optToggle.innerHTML = icon(open ? "chevD" : "chevR");
     });
     addModelHost.querySelector("#addModelCancel")?.addEventListener("click", closeAddModelForm);
+    // The MoE checkbox gates the declaration pair's inputs.
+    const addMoeCheck = addModelHost.querySelector("#addModelMoe") as HTMLInputElement | null;
+    addMoeCheck?.addEventListener("change", () => {
+      const on = addMoeCheck.checked;
+      (addModelHost.querySelector("#addModelMoeLayers") as HTMLInputElement | null)?.toggleAttribute("disabled", !on);
+      (addModelHost.querySelector("#addModelMoeDefault") as HTMLInputElement | null)?.toggleAttribute("disabled", !on);
+    });
     const addBtn = addModelHost.querySelector("#addModelBtn") as HTMLButtonElement | null;
     addBtn?.addEventListener("click", async () => {
       const msg = addModelHost.querySelector("#addModelMsg") as HTMLElement | null;
@@ -5386,22 +5454,26 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
         }
         paramsB = n;
       }
-      const moeLayersRaw = val("#addModelMoeLayers");
-      const moeDefRaw = val("#addModelMoeDefault");
+      // The MoE pair is read only when its checkbox is checked;
+      // checked requires both fields (the declaration is atomic).
+      const moeChecked = (addModelHost.querySelector("#addModelMoe") as HTMLInputElement | null)?.checked ?? false;
       let moeLayers: number | undefined;
       let moeDefault: number | undefined;
-      if (moeLayersRaw || moeDefRaw) {
+      if (moeChecked) {
+        const moeLayersRaw = val("#addModelMoeLayers");
+        const moeDefRaw = val("#addModelMoeDefault");
         const l = Number(moeLayersRaw);
         const d = Number(moeDefRaw);
         if (!moeLayersRaw || !moeDefRaw || !Number.isInteger(l) || !Number.isInteger(d) || l < 1 || d < 0 || d > l) {
-          if (msg) { msg.style.color = "var(--err)"; msg.textContent = "MoE fields: give both — MoE layers of 1 or more and a default offload between 0 and the layer count — or leave both empty for a dense model."; }
+          if (msg) { msg.style.color = "var(--err)"; msg.textContent = "MoE is checked: give both fields — MoE layers of 1 or more and a default offload between 0 and the layer count."; }
           return;
         }
         moeLayers = l;
         moeDefault = d;
       }
+      const mtpChecked = (addModelHost.querySelector("#addModelMtp") as HTMLInputElement | null)?.checked ?? false;
       addBtn.disabled = true;
-      const r = await modelAdd(id, url, val("#addModelFile") || undefined, val("#addModelQuant") || undefined, paramsB, moeLayers, moeDefault);
+      const r = await modelAdd(id, url, val("#addModelFile") || undefined, val("#addModelQuant") || undefined, paramsB, moeLayers, moeDefault, mtpChecked ? true : undefined);
       addBtn.disabled = false;
       if (r.error) {
         // Failure: the form stays open with the operator's input
@@ -5426,6 +5498,7 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     root.removeEventListener("click", onOvGoto);
     root.removeEventListener("input", syncRenameDraft);
     root.removeEventListener("input", syncOffloadDraft);
+    root.removeEventListener("change", syncOffloadChecks);
     root.removeEventListener("keydown", onRenameKey);
   };
 }

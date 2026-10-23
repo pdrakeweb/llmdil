@@ -32,7 +32,7 @@ const html = existsSync(indexHtml) ? readFileSync(indexHtml, "utf8") : "";
 check(/assets\/.*\.js/.test(html), "index.html references the JS bundle");
 
 const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
-for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
+for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_set_mtp", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
 // Nav completeness: the sidebar is generated from the ROUTES array
@@ -398,6 +398,24 @@ const staticSrc = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
 check(staticSrc.includes('data-model-act="offload"'), "Models view renders the offload declaration editor button");
 check(staticSrc.includes('data-model-act="offload-save"'), "Models view renders the declaration save action");
 check(staticSrc.includes("Expert offload"), "Models view renders the Expert offload card figure");
+
+// Capability checkboxes (Oct 22, 2026): both model forms carry
+// an "MTP capable" checkbox and an "MoE" checkbox; the MoE pair
+// inputs render disabled unless the box is checked (the Add form
+// starts unchecked; the card editor's inputs follow the draft);
+// model cards render the effective MTP figure; the card editor's
+// save goes through model_set_mtp alongside the offload spec.
+check(bundle.includes("addModelMtp"), "bundle contains the Add Model MTP capable checkbox");
+check(bundle.includes("addModelMoe"), "bundle contains the Add Model MoE checkbox");
+check(bundle.includes("MTP capable"), "bundle contains the MTP capable checkbox label");
+check(staticSrc.includes('data-model-mtp-check'), "Models view renders the card editor's MTP checkbox");
+check(staticSrc.includes('data-model-moe-check'), "Models view renders the card editor's MoE checkbox");
+check(staticSrc.includes('id="addModelMoeLayers" type="text" inputmode="numeric" placeholder="48" style="${SELECT_STYLE};width:100%" disabled'), "Add Model MoE layers input starts disabled behind its checkbox");
+check(staticSrc.includes('id="addModelMoeDefault" type="text" inputmode="numeric" placeholder="16" style="${SELECT_STYLE};width:100%" disabled'), "Add Model default offload input starts disabled behind its checkbox");
+check(staticSrc.includes('" disabled"}></label>'), "card editor's MoE inputs render disabled while MoE is unchecked");
+check(staticSrc.includes('<span class="k">MTP</span>'), "Models view renders the MTP card figure");
+check(staticSrc.includes("modelSetMtp(id, offloadDraftMtp ? true : null)"), "card editor saves the MTP declaration through model_set_mtp");
+check(staticSrc.includes("mtpChecked ? true : undefined"), "Add Model submits the MTP declaration through model_add");
 
 // Add Model form UX (Oct 20, 2026): the control that made the
 // form appear and the form's submit control carried the same

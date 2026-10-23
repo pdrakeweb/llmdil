@@ -525,6 +525,7 @@ async fn run_experiment_inner(
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
     }
     temp_cfg.backends.push(temp.clone());
@@ -1472,6 +1473,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         let state = Arc::new(AppState::new(cfg.clone(), dir.join("config.json"), dir.clone()));
         // Initialize the telemetry store, then replace its

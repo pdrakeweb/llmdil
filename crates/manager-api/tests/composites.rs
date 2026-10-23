@@ -298,6 +298,64 @@ async fn model_patch_dispatches_both_fields() {
 }
 
 #[tokio::test]
+async fn model_patch_dispatches_mtp_declaration() {
+    let (ctx, _dir) = test_ctx().await;
+    let admin = seed_token(&ctx, "root", RoleName::Admin).await;
+    // model_add accepts the declaration.
+    let (status, _) = call(
+        &ctx,
+        Method::POST,
+        "/api/v1/models",
+        Some(&admin),
+        Some(json!({
+            "id": "mtp-me",
+            "source_url": "https://example.invalid/mtp-me.gguf",
+            "params_b": 7.0,
+            "mtp": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "model_add: {status}");
+    let (status, model) = call(&ctx, Method::GET, "/api/v1/models/mtp-me", Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(model["mtp"], true);
+    assert_eq!(model["catalog_mtp"], serde_json::Value::Null);
+
+    // PATCH sets it, echoes it, and null clears it.
+    let (status, body) = call(
+        &ctx,
+        Method::PATCH,
+        "/api/v1/models/mtp-me",
+        Some(&admin),
+        Some(json!({ "mtp": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mtp"], false);
+    let (status, body) = call(
+        &ctx,
+        Method::PATCH,
+        "/api/v1/models/mtp-me",
+        Some(&admin),
+        Some(json!({ "mtp": null })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mtp"], serde_json::Value::Null);
+
+    // A non-boolean value is refused.
+    let (status, _) = call(
+        &ctx,
+        Method::PATCH,
+        "/api/v1/models/mtp-me",
+        Some(&admin),
+        Some(json!({ "mtp": "yes" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn gateway_config_bind_host_split() {
     let (ctx, _dir) = test_ctx().await;
     let admin = seed_token(&ctx, "root", RoleName::Admin).await;

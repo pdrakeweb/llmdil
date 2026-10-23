@@ -785,6 +785,7 @@ fn validate_one(
                 display_name: None,
                 moe_layers: None,
                 default_offload_layers: None,
+                mtp: None,
             });
         }
         PlanKind::ModelDownload => {
@@ -935,6 +936,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         cfg.backends[0].model_file = PathBuf::from("models/qwen3-8b.gguf");
         assert!(

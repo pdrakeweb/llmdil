@@ -326,6 +326,7 @@ any subset of `enabled`, `model_file`, `port`, `n_ctx`, `n_batch`,
   "catalog_size_bytes": 49301055488, "ctx_max": 262144,
   "moe_layers": null, "default_offload_layers": null,
   "catalog_moe_layers": 48, "catalog_default_offload_layers": 48,
+  "mtp": null, "catalog_mtp": false,
   "fit_check_available": true
 }
 ```
@@ -666,7 +667,7 @@ download-progress channel (§3.1).
 ```json
 { "id": "my-model", "source_url": "https://…/model.gguf",
   "file_name": "model.gguf", "quant": "Q4_K_M", "params_b": null,
-  "moe_layers": null, "default_offload_layers": null }
+  "moe_layers": null, "default_offload_layers": null, "mtp": null }
 ```
 
 `file_name`, `quant`, `params_b` optional (file name defaults to the
@@ -681,7 +682,11 @@ not carry expert-offload controls (the creation default for its
 backends and the Edit Flags slider's green limit resolve from it;
 catalog pins win where the catalog carries them). Both or neither:
 the layer count must be positive and the default must not exceed
-it. →
+it. `mtp` is the operator MTP capability declaration — the fact
+that gives a model the catalog does not carry the MTP draft
+control (backend Add/Edit and Edit Flags resolve the EFFECTIVE
+capability: the catalog's pin where the catalog knows the model,
+else this declaration); omitted or null leaves it undeclared. →
 `201` `{ "model_id" }`. The model starts
 enabled with no pinned hash (unverified until a pin exists — the app
 treats a missing pin as "no verification possible", never as verified).
@@ -695,12 +700,14 @@ flight or any backend references the model.
 Body: any of `{ "display_name": "Coder" }` (`model_set_short_name` —
 the operator's persistent rename; empty string clears it),
 `{ "enabled": false }` (`model_set_enabled` — excludes the model
-from wizard downloads; file and config are kept), and the MoE
+from wizard downloads; file and config are kept), the MoE
 offload declaration `{ "moe_layers": 48, "default_offload_layers": 16 }`
 (`model_set_offload_spec` — the pair is applied atomically: when
 either key is present both are read, an absent key counts as null,
-and both null clears the declaration). →
-`{ "id", "name", "enabled", "moe_layers", "default_offload_layers" }`
+and both null clears the declaration), and the MTP capability
+declaration `{ "mtp": true }` (`model_set_mtp` — a boolean or
+null; null clears the declaration). →
+`{ "id", "name", "enabled", "moe_layers", "default_offload_layers", "mtp" }`
 reflecting the applied fields.
 
 #### `POST /api/v1/models/{id}/download` — `control` — **Op**
@@ -1193,8 +1200,8 @@ operations the draft knew (`mcp_save_server`,
 
 ### 6.16 Registry exclusions — every operation with no route
 
-The registry holds 128 operations: 80 routed (§6.1–§6.14,
-§6.18) and 48 with route `None`. A `None` route is an explicit
+The registry holds 131 operations: 81 routed (§6.1–§6.14,
+§6.18) and 50 with route `None`. A `None` route is an explicit
 exclusion, never an oversight (registry module docs); the
 complete list, grouped by reason:
 
@@ -1203,7 +1210,7 @@ complete list, grouped by reason:
 | Raw config patch excluded (decision 11) | `update_config` (C) |
 | Master-key value never mirrored (decision 4) | `gateway_master_key` (SDisclosure) |
 | Desktop-only actions (§7.1–7.2) | `open_url` (L), `open_folder` (L) |
-| No 1:1 route — served inside a composition | `gateway_set_bind_host` (C, inside `PATCH /gateway/config`); `model_set_short_name` (C), `model_set_enabled` (C) and `model_set_offload_spec` (C), inside `PATCH /models/{id}`; `gateway_activation_complete` (L, server bookkeeping after apply/(re)start, §6.6); `gateway_activation_record_execution` (C, execution bookkeeping recorded by the desktop apply funnel, §6.6); `gateway_create_group` (C) and `gateway_delete_group` (D), served by the derived group routes (§6.5/§6.17) |
+| No 1:1 route — served inside a composition | `gateway_set_bind_host` (C, inside `PATCH /gateway/config`); `model_set_short_name` (C), `model_set_enabled` (C), `model_set_offload_spec` (C) and `model_set_mtp` (C), inside `PATCH /models/{id}`; `gateway_activation_complete` (L, server bookkeeping after apply/(re)start, §6.6); `gateway_activation_record_execution` (C, execution bookkeeping recorded by the desktop apply funnel, §6.6); `gateway_create_group` (C) and `gateway_delete_group` (D), served by the derived group routes (§6.5/§6.17) |
 | Desktop-only preview | `backend_add_preview` (R) — the add-backend form's placement preview; creation itself is `POST /backends` |
 | MCP — peripheral (decision 10) | `mcp_list` (R), `mcp_start_preflight` (R), `mcp_test_connection` (X), `mcp_set_exposure` (X), `mcp_save_server` (X), `mcp_delete_server` (X), `mcp_store_credential` (X), `backend_test_tool_call` (L, gateway MCP tool-call test) |
 | VS Code — peripheral (decision 10) | `vscode_install_extensions` (X), `vscode_write_config` (X) |

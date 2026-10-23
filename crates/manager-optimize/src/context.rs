@@ -867,6 +867,7 @@ mod tests {
             display_name: None,
             moe_layers: None,
             default_offload_layers: None,
+            mtp: None,
         });
         let b = cfg
             .backends

@@ -7632,6 +7632,7 @@ mod tests {
                 display_name: None,
                 moe_layers: None,
                 default_offload_layers: None,
+                mtp: None,
             },
             ModelConfig {
                 id: "qwen2.5-coder-7b".to_string(),
@@ -7647,6 +7648,7 @@ mod tests {
                 display_name: None,
                 moe_layers: None,
                 default_offload_layers: None,
+                mtp: None,
             },
         ];
         c

@@ -54,18 +54,19 @@ async fn get_one(ctx: &ApiCtx, op: Op, list_key: &str, id: &str) -> Result<Value
         .ok_or_else(|| ApiError::NotFound(format!("no resource with id `{id}`")))
 }
 
-/// PATCH /api/v1/models/{id}: `display_name`, `enabled`, and/or
-/// the MoE offload declaration (`moe_layers` +
-/// `default_offload_layers`), dispatched to the single-field
-/// operations (rest-api §6.3). The offload pair is applied
-/// atomically: when either key is present, both are read (an
-/// absent key counts as null) and passed to
+/// PATCH /api/v1/models/{id}: `display_name`, `enabled`, the MoE
+/// offload declaration (`moe_layers` + `default_offload_layers`),
+/// and/or the MTP capability declaration (`mtp`), dispatched to
+/// the single-field operations (rest-api §6.3). The offload pair
+/// is applied atomically: when either key is present, both are
+/// read (an absent key counts as null) and passed to
 /// `model_set_offload_spec` — both null clears the declaration.
+/// `mtp` is a boolean or null (null clears the declaration).
 pub async fn patch_model(ctx: &ApiCtx, id: &str, body: Value) -> Result<Value, ApiError> {
     let obj = closed_object(&body)?;
     reject_unknown(
         obj,
-        &["display_name", "enabled", "moe_layers", "default_offload_layers"],
+        &["display_name", "enabled", "moe_layers", "default_offload_layers", "mtp"],
     )?;
     if obj.is_empty() {
         return Err(invalid("no fields to apply"));
@@ -117,6 +118,22 @@ pub async fn patch_model(ctx: &ApiCtx, id: &str, body: Value) -> Result<Value, A
         )
         .await?;
     }
+    if let Some(mtp) = obj.get("mtp") {
+        let mtp_arg = match mtp {
+            Value::Null => Value::Null,
+            Value::Bool(b) => json!(b),
+            _ => return Err(invalid("`mtp` must be a boolean or null")),
+        };
+        call(
+            ctx,
+            Op::ModelSetMtp,
+            json!({
+                "id": id,
+                "mtp": mtp_arg,
+            }),
+        )
+        .await?;
+    }
     let model = get_one(ctx, Op::ListModels, "models", id).await?;
     Ok(json!({
         "id": id,
@@ -124,6 +141,7 @@ pub async fn patch_model(ctx: &ApiCtx, id: &str, body: Value) -> Result<Value, A
         "enabled": model.get("enabled").cloned().unwrap_or(json!(true)),
         "moe_layers": model.get("moe_layers").cloned().unwrap_or(Value::Null),
         "default_offload_layers": model.get("default_offload_layers").cloned().unwrap_or(Value::Null),
+        "mtp": model.get("mtp").cloned().unwrap_or(Value::Null),
     }))
 }
 
