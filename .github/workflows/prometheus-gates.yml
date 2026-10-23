@@ -125,7 +125,6 @@ jobs:
           cargo build -p manager-logreceiver --bin llmdil-log-receiver
           Copy-Item target/debug/llm-service-host.exe src-tauri/binaries/llm-service-host-x86_64-pc-windows-msvc.exe
           Copy-Item target/debug/llmdil-log-receiver.exe src-tauri/binaries/llmdil-log-receiver-x86_64-pc-windows-msvc.exe
-        shell: pwsh
 
       # src-tauri is excluded from the root workspace: run inside it.
       - name: src-tauri check
