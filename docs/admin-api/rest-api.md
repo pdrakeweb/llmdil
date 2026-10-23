@@ -3,11 +3,11 @@
 Status: implemented. The API shipped with the admin-API build
 (PLAN.md §9) and this contract describes the shipped surface as of
 v0.1.50. The source of truth for routes is the operation registry —
-`crates/manager-app/src/registry.rs` (`for_each_operation!`): 134
-operations, of which 82 carry a REST route and 52 are explicit
+`crates/manager-app/src/registry.rs` (`for_each_operation!`): 139
+operations, of which 84 carry a REST route and 55 are explicit
 `None` exclusions (§6.16). Derived/composite and auth/admin routes
 are API-layer routes in `crates/manager-api` (§6.17); the full live
-surface is 121 route records (82 registry + 15 derived + 24
+surface is 123 route records (84 registry + 15 derived + 24
 auth/admin).
 Scope: an HTTP API served by the Service Manager on a dedicated **admin port**
 on the managed machine (separate from the LiteLLM gateway port), exposing the
@@ -470,7 +470,7 @@ no route.
 | Domain | Count | Endpoints |
 |---|---|---|
 | Server / status | 2 | `GET /server` (public identity), `GET /status` |
-| Backends | 19 | list, create, get, delete, config get/patch, diff preview, start/stop/restart (Op), test, flags, offload, mtp, parallel, raw flags, flags mode, group membership, launch command |
+| Backends | 21 | list, create, get, delete, config get/patch, diff preview, start/stop/restart (Op), test, flags, offload, offload override set/clear, mtp, parallel, raw flags, flags mode, group membership, launch command |
 | Models | 11 | list, create, get, delete, patch, download (Op) + pause/resume/cancel, verify (Op), assign |
 | Placement | 2 | propose, apply |
 | Gateway | 12 | status, config get/patch, generated config, start (Op), stop, groups list + CRUD (4), routing test, routing recent — plus master key specified, NOT IMPLEMENTED (§6.5) |
@@ -605,6 +605,30 @@ start; the app records the activation-plan entry.
 `{ "backend_id", "layers": 40, "raw_flags": "…", "changed": true }`.
 Only valid for offload-capable backends (the `offload` block in §4.1
 says which); otherwise `400 INVALID_INPUT`, as in the app.
+
+#### `PUT /api/v1/backends/{id}/offload-override` — `config`
+`backend_set_offload_override`. Body: `{ "layers": 46, "placed_ccs":
+["6.0"] }` → `{ "backend_id", "layers": 46, "moe_layers": 48,
+"placed_ccs": ["6.0"], "has_override": true, "overridden": true,
+"persisted": true }`. Records a deliberate guardrail override for
+the backend's SAVED offload position — the activation-journal
+record the offload guardrails define (docs/offload-guardrails.md),
+keyed to exactly (backend, layers, placed compute-capability set).
+The body names the key the caller confirmed (the saved `layers`
+and the guardrail's `placed_ccs` from §4.1); the server re-derives
+the key from the live config and placement and refuses any
+mismatch with `400 INVALID_INPUT`, as it refuses a position that
+is not guardrail-blocked — an override covers exactly the position
+it was granted for and never widens. No config or flags change;
+starts proceed under the override from now on.
+
+#### `DELETE /api/v1/backends/{id}/offload-override` — `config`
+`backend_clear_offload_override`. No body → `{ "backend_id",
+"cleared": true, "layers": 46, "moe_layers": 48, "placed_ccs":
+["6.0"], "has_override": false, "overridden": false, "persisted":
+true }`. Drops the backend's standing guardrail override; the
+saved position is blocked again at launch preflight. Idempotent:
+clearing with no record standing succeeds with `"cleared": false`.
 
 #### `PUT /api/v1/backends/{id}/mtp` — `config`
 `backend_set_mtp`. Body: `{ "n_max": 2 }` →

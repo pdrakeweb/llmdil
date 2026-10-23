@@ -78,6 +78,28 @@ comfortably.
   under. It is honored only while all three match: change the value
   or move the backend to a different GPU set and the override no
   longer applies — placement changes re-evaluate the range.
+- **Deliberate override operations.** Saving a blocked position
+  through the slider (or creating a backend at one) records the
+  override as part of that save. A blocked position that arrived
+  any other way — hand-edited flags, a model reassignment — has no
+  such save to attach to, so two operations manage the standing
+  record directly: `backend_set_offload_override` records an
+  override for the backend's *saved* position, and
+  `backend_clear_offload_override` drops it. The set operation
+  writes no config and no flags. Its caller names the exact key it
+  confirmed (layers + placed compute-capability set, as the backend
+  card renders them); the operation re-derives the key from the
+  live config and placement and refuses any mismatch, and refuses
+  a position that is not guardrail-blocked — an override covers
+  exactly the position it was granted for and never widens. On the
+  backend card, the blocked line offers the override beside the
+  set-to-verified action in both flags modes (the operation is a
+  journal write, not a flags write, so advanced mode is no bar);
+  the action takes a confirmation step whose button names the
+  exact position — layers and placed CC set — being overridden.
+  The overridden state renders distinctly on the card with the
+  clear action beside it; clearing returns the position to
+  blocked at the next start's preflight.
 - **Launch preflight.** `backend_start_preflight` evaluates the
   *effective* offload — the position decoded from the saved raw flags,
   however they got there (slider, flags editor, hand-edited config) —
@@ -104,7 +126,9 @@ comfortably.
   amber line when an override is recorded or a partial position is
   unverified, and "Offload: Custom (N of M layers)" when the saved
   flags carry the offload in a hand-written spelling rather than the
-  slider's canonical form.
+  slider's canonical form. The blocked line also carries the
+  deliberate-override action and the overridden line the clear
+  action (see Overrides above).
 - The slider readout prices positions from the same per-block byte
   sums the card's RAM figures use (`sys_bytes_by_position`), so the
   two cannot disagree at partial positions for UD quants, whose

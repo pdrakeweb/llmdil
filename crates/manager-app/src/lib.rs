@@ -5983,6 +5983,194 @@ pub async fn op_backend_set_offload(
     }))
 }
 
+/// Parse one placed compute-capability string ("6.0") for the
+/// guardrail-override operations. The override key names the placed
+/// set in exactly this spelling (the spelling `list_backends`
+/// emits in the guardrail's `placed_ccs`), so a malformed entry is
+/// refused rather than normalized into a different key.
+fn parse_placed_cc(text: &str) -> Result<(u32, u32), ApiError> {
+    let trimmed = text.trim();
+    let mut parts = trimmed.split('.');
+    let (Some(major), Some(minor), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(ApiError::InvalidInput(format!(
+            "placed compute capability {text:?} is not in \"major.minor\" form"
+        )));
+    };
+    let parse = |part: &str| {
+        part.parse::<u32>().map_err(|_| {
+            ApiError::InvalidInput(format!(
+                "placed compute capability {text:?} is not in \"major.minor\" form"
+            ))
+        })
+    };
+    Ok((parse(major)?, parse(minor)?))
+}
+
+fn format_placed_ccs(ccs: &[(u32, u32)]) -> Vec<String> {
+    ccs.iter().map(|cc| format!("{}.{}", cc.0, cc.1)).collect()
+}
+
+/// Evaluate a backend's SAVED offload position for the deliberate
+/// guardrail-override operations: resolve the backend and its
+/// offload capability from a config read, fetch the GPU inventory
+/// without holding the config lock (the telemetry accessor reads
+/// the config while initializing), and evaluate against the
+/// activation journal's standing overrides.
+async fn evaluate_saved_offload_for_override(
+    state: &Arc<AppState>,
+    id: &str,
+) -> Result<OffloadEvaluation, ApiError> {
+    let cfg = state.config.read().await.clone();
+    let b = cfg
+        .backends
+        .iter()
+        .find(|b| b.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+    let gpus = {
+        let store = state.telemetry().await;
+        let inventory = lock_telemetry(&store).inventory();
+        inventory
+    };
+    let journal = activation::load_journal(&state.data_dir);
+    evaluate_backend_offload(&cfg, b, &gpus, &journal).ok_or_else(|| {
+        ApiError::InvalidInput(format!(
+            "backend {id}'s model does not support expert offload"
+        ))
+    })
+}
+
+/// Record a deliberate guardrail override for a backend's SAVED
+/// offload position (guardrail-override UI; tracker #37 follow-on).
+///
+/// The override is a standing activation-journal record — the
+/// mechanism #37 shipped — keyed to exactly (backend, layers,
+/// placed compute-capability set). This operation writes no config
+/// and no flags: it authorizes the position the backend already
+/// carries, which is the case the slider path cannot reach (a
+/// blocked position that arrived by hand-edited flags or a model
+/// reassignment, where there is no pending slider save to attach
+/// the override to). Because there is no config mutation, the
+/// clone-validate-save discipline applies to the journal record
+/// itself: the key is derived and validated from the live config,
+/// placement, and catalog restrictions before the journal's
+/// locked load-modify-save records it, and the write is read back
+/// for coverage before success is reported.
+///
+/// Exactness is enforced at this boundary, never widened: the
+/// caller names the key it confirmed (`layers` + `placed_ccs`, as
+/// rendered on the backend card), and any mismatch with the saved
+/// position or the current placement refuses — an override granted
+/// for one layers/CC key covers no other, and a placement change
+/// since the confirmation requires a fresh confirmation. A
+/// position that is not guardrail-blocked refuses as well: an
+/// override is meaningful only for a blocked position, and
+/// recording one for a verified position would leave a standing
+/// authorization whose scope no reader could see.
+pub async fn op_backend_set_offload_override(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    id: String,
+    layers: u32,
+    placed_ccs: Vec<String>,
+) -> ApiResult {
+    let mut expected_ccs: Vec<(u32, u32)> = Vec::new();
+    for text in &placed_ccs {
+        expected_ccs.push(parse_placed_cc(text)?);
+    }
+    let eval = evaluate_saved_offload_for_override(state, &id).await?;
+    if layers != eval.layers {
+        return Err(ApiError::InvalidInput(format!(
+            "override layers {layers} do not match backend {id}'s saved offload position \
+             ({} of {} layers) — an override covers exactly the saved position; \
+             re-read the backend and confirm the position shown",
+            eval.layers, eval.moe_layers
+        )));
+    }
+    let expected_set: std::collections::BTreeSet<(u32, u32)> =
+        expected_ccs.iter().copied().collect();
+    let placed_set: std::collections::BTreeSet<(u32, u32)> =
+        eval.placed_ccs.iter().copied().collect();
+    if expected_set != placed_set {
+        return Err(ApiError::InvalidInput(format!(
+            "override placed compute-capability set [{}] does not match backend {id}'s \
+             current placement [{}] — the placement changed since the confirmation; \
+             re-read the backend and confirm the placement shown",
+            format_placed_ccs(&expected_ccs).join(", "),
+            format_placed_ccs(&eval.placed_ccs).join(", ")
+        )));
+    }
+    if eval.status != manager_models::OffloadStatus::Blocked {
+        return Err(ApiError::InvalidInput(format!(
+            "backend {id}'s saved offload position ({} of {} layers) is not \
+             guardrail-blocked on its placed GPUs — no override applies",
+            eval.layers, eval.moe_layers
+        )));
+    }
+    activation::record_offload_override(
+        &state.data_dir,
+        &id,
+        layers,
+        eval.placed_ccs.clone(),
+    )
+    .map_err(ApiError::Io)?;
+    let journal = activation::load_journal(&state.data_dir);
+    if !activation::offload_override_covers(&journal, &id, layers, &eval.placed_ccs) {
+        return Err(ApiError::Io(format!(
+            "the offload override for backend {id} was recorded but does not read back as covering its position"
+        )));
+    }
+    Ok(json!({
+        "backend_id": id,
+        "layers": layers,
+        "moe_layers": eval.moe_layers,
+        "placed_ccs": format_placed_ccs(&eval.placed_ccs),
+        "has_override": true,
+        "overridden": true,
+        "persisted": true,
+    }))
+}
+
+/// Clear a backend's standing guardrail override (guardrail-
+/// override UI; tracker #37 follow-on). After a clear, the saved
+/// position evaluates exactly as it did before the override was
+/// recorded: a blocked position is blocked again at launch
+/// preflight. Clearing is idempotent — clearing a backend with no
+/// standing override succeeds and reports `cleared: false` — and
+/// touches only the activation journal: no config, no flags.
+pub async fn op_backend_clear_offload_override(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    id: String,
+) -> ApiResult {
+    {
+        let cfg = state.config.read().await;
+        if !cfg.backends.iter().any(|b| b.id == id) {
+            return Err(ApiError::NotFound(format!("backend {id}")));
+        }
+    }
+    let had_override = activation::load_journal(&state.data_dir)
+        .offload_overrides
+        .iter()
+        .any(|o| o.backend_id == id);
+    if had_override {
+        activation::clear_offload_overrides(&state.data_dir, &id).map_err(ApiError::Io)?;
+    }
+    // Report the position's standing after the clear when the
+    // backend is offload-capable; a backend whose model carries no
+    // offload simply has nothing left to override.
+    let eval = evaluate_saved_offload_for_override(state, &id).await.ok();
+    Ok(json!({
+        "backend_id": id,
+        "cleared": had_override,
+        "layers": eval.as_ref().map(|e| e.layers),
+        "moe_layers": eval.as_ref().map(|e| e.moe_layers),
+        "placed_ccs": eval.as_ref().map(|e| format_placed_ccs(&e.placed_ccs)),
+        "has_override": false,
+        "overridden": false,
+        "persisted": true,
+    }))
+}
+
 /// Set a backend's MTP speculative decoding (tracker #53; the
 /// flags form's MTP draft control): rewrite only the MTP tokens
 /// in the backend's raw flags — `n_max` of 1..=4 enables
@@ -9139,6 +9327,11 @@ fn offload_row_json(o: &OffloadInfo, eval: Option<&OffloadEvaluation>) -> Value 
                 "nearest_verified_layers": eval.nearest_verified_layers,
                 "has_override": eval.has_override,
                 "overridden": eval.overridden,
+                // The placed compute-capability set the override
+                // key names (guardrail-override UI): the card's
+                // confirmation and the set/clear operations carry
+                // exactly this set.
+                "placed_ccs": format_placed_ccs(&eval.placed_ccs),
             }))
         } else if eval.placed_ccs.is_empty()
             && !eval.cpu_only
@@ -9158,6 +9351,7 @@ fn offload_row_json(o: &OffloadInfo, eval: Option<&OffloadEvaluation>) -> Value 
                 "nearest_verified_layers": eval.nearest_verified_layers,
                 "has_override": eval.has_override,
                 "overridden": eval.overridden,
+                "placed_ccs": format_placed_ccs(&eval.placed_ccs),
             }))
         } else {
             None
@@ -11643,6 +11837,308 @@ mod tests {
             .expect("coder backend evaluates");
         assert_eq!(eval.restricting_cc, None);
         assert_ne!(eval.status, manager_models::OffloadStatus::Blocked);
+    }
+
+    /// State for the guardrail-override op tests: the `coder`
+    /// backend serves Coder-Next at a raw-flags position, with the
+    /// telemetry inventory pinned so GPU 0 is a Pascal (6,0) card —
+    /// the #37 field configuration.
+    fn guardrail_override_test_state(
+        raw_flags: &str,
+    ) -> (Arc<AppState>, PathBuf) {
+        let mut cfg = test_cfg();
+        serve_model(
+            &mut cfg,
+            "coder",
+            "qwen3-coder-30b",
+            "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
+            Some(raw_flags),
+        );
+        // The preflight refuses a disabled backend before it ever
+        // reaches the guardrail gate; the test fleet's coder ships
+        // disabled, so enable it here.
+        cfg.backends
+            .iter_mut()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .enabled = true;
+        let (state, dir) = advanced_test_state(cfg);
+        let mut store = TelemetryStore::new();
+        let mut gpus = test_gpus();
+        gpus[0].compute_capability = (6, 0);
+        store.set_inventory(gpus);
+        let _ = state
+            .telemetry
+            .set(Arc::new(std::sync::Mutex::new(store)));
+        (state, dir)
+    }
+
+    /// The launch preflight's verdict on the guardrail alone, for
+    /// the saved `coder` backend: `Some(reason)` when the start is
+    /// refused for the guardrail reason. Later preflight gates
+    /// (llama-server presence, the model file) fail in this test
+    /// environment for unrelated reasons, so the assertion is on
+    /// the guardrail reason's presence, never on overall success.
+    async fn guardrail_preflight_reason(state: &Arc<AppState>) -> Option<String> {
+        let cfg = state.config.read().await.clone();
+        let b = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .clone();
+        match backend_start_preflight_for(state, &cfg, &b).await {
+            Err(e) => {
+                let msg = e.to_string();
+                msg.contains("outside the verified range").then_some(msg)
+            }
+            Ok(()) => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn offload_override_ops_round_trip_set_then_clear() {
+        // The deliberate-override round trip (guardrail-override
+        // UI): a saved blocked position refuses starts; setting the
+        // override for exactly that position lets the preflight's
+        // guardrail gate pass; clearing it blocks starts again.
+        let (state, dir) = guardrail_override_test_state("--n-cpu-moe 46");
+        let sink = test_sink();
+        assert!(
+            guardrail_preflight_reason(&state).await.is_some(),
+            "46 of 48 on (6,0) refuses starts before any override"
+        );
+        let r = op_backend_set_offload_override(
+            &state,
+            &sink,
+            "coder".to_string(),
+            46,
+            vec!["6.0".to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["backend_id"], "coder");
+        assert_eq!(r["layers"], 46);
+        assert_eq!(r["moe_layers"], 48);
+        assert_eq!(r["placed_ccs"], json!(["6.0"]));
+        assert_eq!(r["has_override"], true);
+        assert_eq!(r["overridden"], true);
+        // The journal record's shape: exactly the #37 key plus its
+        // RFC 3339 timestamp, and nothing else was recorded.
+        let journal = activation::load_journal(&dir);
+        assert_eq!(journal.offload_overrides.len(), 1);
+        let record = &journal.offload_overrides[0];
+        assert_eq!(record.backend_id, "coder");
+        assert_eq!(record.layers, 46);
+        assert_eq!(record.placed_ccs, vec![(6, 0)]);
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&record.ts).is_ok(),
+            "override timestamp is RFC 3339: {}",
+            record.ts
+        );
+        // The op writes no config: the backend's flags are
+        // untouched in the live config (and no config save was
+        // needed to record the override).
+        let cfg_now = state.config.read().await.clone();
+        let b = cfg_now.backends.iter().find(|b| b.id == "coder").unwrap();
+        assert_eq!(b.raw_flags.as_deref(), Some("--n-cpu-moe 46"));
+        assert!(
+            guardrail_preflight_reason(&state).await.is_none(),
+            "the overridden position passes the preflight guardrail gate"
+        );
+        let r = op_backend_clear_offload_override(&state, &sink, "coder".to_string())
+            .await
+            .unwrap();
+        assert_eq!(r["cleared"], true);
+        assert_eq!(r["has_override"], false);
+        assert_eq!(r["overridden"], false);
+        let journal = activation::load_journal(&dir);
+        assert!(journal.offload_overrides.is_empty());
+        assert!(
+            guardrail_preflight_reason(&state).await.is_some(),
+            "after the clear the position is blocked again"
+        );
+        // Clearing with nothing standing is an idempotent success.
+        let r = op_backend_clear_offload_override(&state, &sink, "coder".to_string())
+            .await
+            .unwrap();
+        assert_eq!(r["cleared"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn offload_override_set_refuses_key_mismatch() {
+        // An override is keyed to exactly (backend, layers, placed
+        // CC set): naming any other key at the set boundary refuses
+        // and records nothing, and a recorded key covers no other.
+        let (state, dir) = guardrail_override_test_state("--n-cpu-moe 46");
+        let sink = test_sink();
+        let r = op_backend_set_offload_override(
+            &state,
+            &sink,
+            "coder".to_string(),
+            45,
+            vec!["6.0".to_string()],
+        )
+        .await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("do not match"), "{msg}")
+            }
+            other => panic!("expected the layers-mismatch refusal, got {other:?}"),
+        }
+        let r = op_backend_set_offload_override(
+            &state,
+            &sink,
+            "coder".to_string(),
+            46,
+            vec!["8.6".to_string()],
+        )
+        .await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("does not match"), "{msg}")
+            }
+            other => panic!("expected the placed-CC mismatch refusal, got {other:?}"),
+        }
+        // A superset placement is a different key, not a wider one.
+        let r = op_backend_set_offload_override(
+            &state,
+            &sink,
+            "coder".to_string(),
+            46,
+            vec!["6.0".to_string(), "8.6".to_string()],
+        )
+        .await;
+        assert!(matches!(r, Err(ApiError::InvalidInput(_))), "{r:?}");
+        for bad in ["6", "6.0.1", "x.y", ""] {
+            let r = op_backend_set_offload_override(
+                &state,
+                &sink,
+                "coder".to_string(),
+                46,
+                vec![bad.to_string()],
+            )
+            .await;
+            assert!(matches!(r, Err(ApiError::InvalidInput(_))), "{bad:?}: {r:?}");
+        }
+        let journal = activation::load_journal(&dir);
+        assert!(
+            journal.offload_overrides.is_empty(),
+            "refused sets record nothing"
+        );
+        // The exact key records; neighboring keys do not cover.
+        op_backend_set_offload_override(
+            &state,
+            &sink,
+            "coder".to_string(),
+            46,
+            vec!["6.0".to_string()],
+        )
+        .await
+        .unwrap();
+        let journal = activation::load_journal(&dir);
+        assert!(activation::offload_override_covers(
+            &journal, "coder", 46, &[(6, 0)]
+        ));
+        assert!(!activation::offload_override_covers(
+            &journal, "coder", 45, &[(6, 0)]
+        ));
+        assert!(!activation::offload_override_covers(
+            &journal, "coder", 46, &[(8, 6)]
+        ));
+        assert!(!activation::offload_override_covers(
+            &journal,
+            "coder",
+            46,
+            &[(6, 0), (8, 6)]
+        ));
+        assert!(!activation::offload_override_covers(
+            &journal, "planner", 46, &[(6, 0)]
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn offload_override_set_refuses_non_blocked_and_unknown() {
+        let sink = test_sink();
+        // An endpoint position is verified on (6,0): there is
+        // nothing to override, and the op refuses rather than
+        // leaving a standing record no reader could see.
+        let (state, dir) = guardrail_override_test_state("-ot exps=CPU");
+        let r = op_backend_set_offload_override(
+            &state,
+            &sink,
+            "coder".to_string(),
+            48,
+            vec!["6.0".to_string()],
+        )
+        .await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("not guardrail-blocked"), "{msg}")
+            }
+            other => panic!("expected the non-blocked refusal, got {other:?}"),
+        }
+        let journal = activation::load_journal(&dir);
+        assert!(journal.offload_overrides.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        // Unknown backend: NotFound from both operations.
+        let (state, dir) = guardrail_override_test_state("--n-cpu-moe 46");
+        let r = op_backend_set_offload_override(
+            &state,
+            &sink,
+            "nope".to_string(),
+            46,
+            vec!["6.0".to_string()],
+        )
+        .await;
+        assert!(matches!(r, Err(ApiError::NotFound(_))), "{r:?}");
+        let r = op_backend_clear_offload_override(&state, &sink, "nope".to_string()).await;
+        assert!(matches!(r, Err(ApiError::NotFound(_))), "{r:?}");
+        // A backend whose model is not offload-capable has no
+        // position to override.
+        let r = op_backend_set_offload_override(
+            &state,
+            &sink,
+            "planner".to_string(),
+            1,
+            vec!["6.0".to_string()],
+        )
+        .await;
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("does not support expert offload"), "{msg}")
+            }
+            other => panic!("expected the dense-backend refusal, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offload_guardrail_payload_names_placed_ccs() {
+        // The card's confirmation and the override operations carry
+        // the placed-CC set the payload names.
+        let mut cfg = test_cfg();
+        let b = serve_model(
+            &mut cfg,
+            "coder",
+            "qwen3-coder-30b",
+            "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
+            Some("--n-cpu-moe 46"),
+        );
+        let mut gpus = test_gpus();
+        gpus[0].compute_capability = (6, 0);
+        let journal = activation::ActivationJournal::default();
+        let eval = evaluate_backend_offload(&cfg, &b, &gpus, &journal)
+            .expect("coder backend evaluates");
+        let info = backend_offload_info(&cfg, &b).expect("coder info");
+        let row = offload_row_json(&info, Some(&eval));
+        let guardrail = &row["guardrail"];
+        assert_eq!(guardrail["status"], "blocked");
+        assert_eq!(guardrail["placed_ccs"], json!(["6.0"]));
+        assert_eq!(guardrail["has_override"], false);
+        assert_eq!(guardrail["overridden"], false);
     }
 
     #[test]

@@ -32,7 +32,7 @@ const html = existsSync(indexHtml) ? readFileSync(indexHtml, "utf8") : "";
 check(/assets\/.*\.js/.test(html), "index.html references the JS bundle");
 
 const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
-for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_moe_cache", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_set_mtp", "model_delete", "model_assign", "model_hf_lookup", "model_hf_header", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "optimize_tuning_preview", "optimize_tuning_run", "optimize_tuning_adopt", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
+for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_offload_override", "backend_clear_offload_override", "backend_set_mtp", "backend_set_moe_cache", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_set_mtp", "model_delete", "model_assign", "model_hf_lookup", "model_hf_header", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "optimize_tuning_preview", "optimize_tuning_run", "optimize_tuning_adopt", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
 
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
@@ -168,6 +168,14 @@ check(bundle.includes("data-add-flags-field"), "bundle contains the add form's f
 check(bundle.includes("data-add-place-gpu"), "bundle contains the add form's placement chips (data-add-place-gpu)");
 check(allSrc.includes("function flagsCtxBatchHtml"), "shared flagsCtxBatchHtml renderer exists in ui/src");
 check(allSrc.includes("function offloadSliderHtml"), "shared offloadSliderHtml renderer exists in ui/src");
+
+// Guardrail-override UI (tracker #37 follow-on): the bundle-level
+// pins live here; the static-source pins live below, beside the
+// other staticSrc checks (staticSrc is read further down).
+check(bundle.includes("offload-override-clear"), "bundle carries the clear-override action");
+check(allSrc.includes("setBackendOffloadOverride"), "ui/src wires backend_set_offload_override");
+check(allSrc.includes("clearBackendOffloadOverride"), "ui/src wires backend_clear_offload_override");
+check(allSrc.includes("placed_ccs"), "ui/src carries the guardrail placed-CC set (the override key)");
 
 // View scroll contract (tracker #50): the shell never scrolls
 // (body overflow:hidden, #app height:100vh); each view's content
@@ -415,6 +423,16 @@ check(bundle.includes("Expert cache"), "bundle renders the expert cache control 
 check(staticSrc.includes("data-moe-cache-switch"), "Backends view renders the expert cache enable switch");
 check(staticSrc.includes("data-moe-cache-select"), "Backends view renders the expert cache size select");
 check(staticSrc.includes("data-moe-cache-token"), "Backends view renders the expert cache token readout");
+
+// Guardrail-override UI (tracker #37 follow-on): the backend card's
+// blocked line offers the deliberate override (arm → confirm naming
+// the exact position), and the overridden state renders distinctly
+// with its clear action.
+check(staticSrc.includes('data-back-act="offload-override-arm"'), "backend card renders the guardrail override action on the blocked line");
+check(staticSrc.includes('data-back-act="offload-override-confirm"'), "backend card renders the override confirmation step");
+check(staticSrc.includes("Confirm override:"), "override confirmation names the exact position being overridden");
+check(staticSrc.includes('data-back-act="offload-override-clear"'), "backend card renders the clear-override action on the overridden line");
+check(staticSrc.includes("Offload override recorded:"), "backend card renders the overridden state distinctly");
 
 // Capability checkboxes (Oct 22, 2026): both model forms carry
 // an "MTP capable" checkbox and an "MoE" checkbox; the MoE pair

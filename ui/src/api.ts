@@ -825,6 +825,11 @@ export interface BackendOffloadGuardrail {
   nearest_verified_layers: number;
   has_override: boolean;
   overridden: boolean;
+  /** The placed GPUs' compute capabilities ("6.0", …) — the set
+   *  an override key names, in the order the backend places on
+   *  them. The override confirmation and the set operation carry
+   *  exactly this set. */
+  placed_ccs: string[];
 }
 
 /** A backend's offload-probe state (list_backends payload). */
@@ -1045,6 +1050,51 @@ export async function setBackendOffload(id: string, layers: number, allowOverrid
     return { data, live: true };
   } catch (e) {
     return { data: { backend_id: id, layers, raw_flags: null, changed: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** The result of the deliberate guardrail-override operations. */
+export interface OffloadOverrideResult {
+  backend_id: string;
+  layers: number | null;
+  moe_layers: number | null;
+  placed_ccs: string[] | null;
+  has_override: boolean;
+  overridden: boolean;
+  /** Clear only: whether a standing record was removed. */
+  cleared?: boolean;
+  persisted: boolean;
+}
+
+/** backend_set_offload_override — record a deliberate guardrail
+ *  override for a backend's SAVED offload position (the activation
+ *  journal record #37 defined). `layers` and `placedCcs` name the
+ *  exact key the operator confirmed on the card; the server
+ *  re-derives the key from the live config and placement and
+ *  refuses any mismatch, so the override covers exactly that
+ *  position on exactly that placed compute-capability set. No
+ *  flags change. Applies to starts from now on. */
+export async function setBackendOffloadOverride(id: string, layers: number, placedCcs: string[]): Promise<CallResult<OffloadOverrideResult>> {
+  if (!isTauri()) return { data: { backend_id: id, layers, moe_layers: null, placed_ccs: placedCcs, has_override: true, overridden: true, persisted: false }, live: false };
+  try {
+    const data = await invoke<OffloadOverrideResult>("backend_set_offload_override", { id, layers, placedCcs });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { backend_id: id, layers, moe_layers: null, placed_ccs: placedCcs, has_override: false, overridden: false, persisted: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** backend_clear_offload_override — drop a backend's standing
+ *  guardrail override. The saved position then evaluates as it did
+ *  before the override: a blocked position is blocked again.
+ *  Idempotent: clearing with no record standing succeeds. */
+export async function clearBackendOffloadOverride(id: string): Promise<CallResult<OffloadOverrideResult>> {
+  if (!isTauri()) return { data: { backend_id: id, layers: null, moe_layers: null, placed_ccs: null, has_override: false, overridden: false, cleared: false, persisted: false }, live: false };
+  try {
+    const data = await invoke<OffloadOverrideResult>("backend_clear_offload_override", { id });
+    return { data, live: true };
+  } catch (e) {
+    return { data: { backend_id: id, layers: null, moe_layers: null, placed_ccs: null, has_override: false, overridden: false, cleared: false, persisted: false }, live: true, error: errOf(e) };
   }
 }
 
