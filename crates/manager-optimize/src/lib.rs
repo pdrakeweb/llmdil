@@ -56,10 +56,13 @@ pub use experiment::{
     BATCH_TIMEOUT_SECS, EXPERIMENT_TIMEOUT_SECS, MAX_EXPERIMENTS, TEMP_BACKEND_ID_PREFIX,
 };
 pub use discover::{
-    candidates_from_model, fit_verdict, parse_model_record, parse_search_results, quant_files,
+    candidates_from_model, fit_verdict, id_slug_from_file, lookup_repo, params_b_rounded,
+    parse_model_record, parse_search_results, quant_files, quant_token_from_file_name,
     search_query_for_directive, seat_for_directive, CandidateFact, DiscoverError, HfClient,
-    HfModelFacts, HfSearchHit, HfSibling, QuantFile, FIT_DOES_NOT_FIT, FIT_FITS,
-    FIT_FITS_WITH_SPLIT, FIT_UNCHECKED, HF_DEFAULT_BASE_URL, MAX_QUERY_TERMS, MAX_SEARCH_REPOS,
+    HfModelFacts, HfSearchHit, HfSibling, LookupQuant, LookupRepo, QuantFile, FIT_DOES_NOT_FIT,
+    FIT_FITS, FIT_FITS_WITH_SPLIT, FIT_UNCHECKED, HF_DEFAULT_BASE_URL,
+    HF_HEADER_RANGE_CAP_BYTES, HF_HEADER_RANGE_INITIAL_BYTES, MAX_LOOKUP_REPOS, MAX_QUERY_TERMS,
+    MAX_SEARCH_REPOS,
 };
 pub use eval::{
     aggregate_results, compare, eval_suite, failed_task, output_excerpt, passes, score_task,

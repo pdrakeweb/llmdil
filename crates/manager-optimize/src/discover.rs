@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use manager_models::{ExpertOffload, MemoryBasis};
+use manager_models::{ExpertOffload, GgufError, MemoryBasis};
 use serde::{Deserialize, Serialize};
 
 use crate::fit::{evaluate_fit, layout_requirement, LayoutFacts};
@@ -45,6 +45,27 @@ pub const MAX_SEARCH_REPOS: usize = 8;
 /// Cap on the directive-derived search terms (see
 /// [`search_query_for_directive`]).
 pub const MAX_QUERY_TERMS: usize = 4;
+
+/// Repo cap for the Add Model form's shallow lookup
+/// (deep-discovery design Part 2, P2-D2): one search at this
+/// depth plus one record fetch per repo — no pagination, no
+/// pool. The form's type-ahead uses the same search at the
+/// same depth.
+pub const MAX_LOOKUP_REPOS: usize = 25;
+
+/// First prefix size the GGUF header range read asks for, and
+/// the cap the extension ladder stops at (deep-discovery
+/// design Part 2, P2-D4). The cap is set from measurement:
+/// every curated catalog file's header — metadata plus the
+/// full tensor directory, the bytes
+/// [`manager_models::parse_gguf_layout`] consumes — was
+/// range-read on 2026-10-22 and lands between 5.8 and 11.0
+/// MiB (largest: Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf at
+/// 10,995,772 bytes). 16 MiB covers the catalog with ~45%
+/// headroom; the design records the constant as a proposal
+/// to be set from exactly this evidence.
+pub const HF_HEADER_RANGE_INITIAL_BYTES: u64 = 4 * 1024 * 1024;
+pub const HF_HEADER_RANGE_CAP_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Fit verdict tokens carried on a [`CandidateFact`]. Stable
 /// strings: the context block, the UI's labels, and later
@@ -121,9 +142,22 @@ pub struct HfSearchHit {
 /// sorted by downloads; the cap is also enforced here so a
 /// response can never widen the pre-pass.
 pub fn parse_search_results(body: &str) -> Result<Vec<HfSearchHit>, DiscoverError> {
+    parse_search_results_capped(body, MAX_SEARCH_REPOS)
+}
+
+/// [`parse_search_results`] with a caller-chosen cap: the
+/// consultation pre-pass keeps its depth of
+/// [`MAX_SEARCH_REPOS`]; the form lookup (P2-D2) asks for
+/// [`MAX_LOOKUP_REPOS`]. The cap is enforced here as well as
+/// in the request, so a response can never widen a surface
+/// past the depth it was designed for.
+pub fn parse_search_results_capped(
+    body: &str,
+    cap: usize,
+) -> Result<Vec<HfSearchHit>, DiscoverError> {
     let mut hits: Vec<HfSearchHit> = serde_json::from_str(body)
         .map_err(|e| DiscoverError::Parse(format!("search response: {e}")))?;
-    hits.truncate(MAX_SEARCH_REPOS);
+    hits.truncate(cap);
     Ok(hits)
 }
 
@@ -136,11 +170,18 @@ pub fn parse_search_results(body: &str) -> Result<Vec<HfSearchHit>, DiscoverErro
 pub struct HfSibling {
     pub rfilename: String,
     pub size_bytes: u64,
+    /// The LFS object's SHA-256 when HF reports one
+    /// (sibling `lfs.sha256`, present with `?blobs=true`):
+    /// the per-file hash available *before* any download,
+    /// which is what lets an HF-picked add start pinned
+    /// (design Part 2, P2-D6).
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawLfs {
     size: Option<u64>,
+    sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +262,7 @@ pub fn parse_model_record(body: &str) -> Result<HfModelFacts, DiscoverError> {
                     .size
                     .or_else(|| s.lfs.as_ref().and_then(|l| l.size))
                     .unwrap_or(0),
+                sha256: s.lfs.as_ref().and_then(|l| l.sha256.clone()),
                 rfilename: s.rfilename,
             })
             .collect(),
@@ -241,6 +283,10 @@ pub struct QuantFile {
     /// How many sibling files the entry sums (1 for a plain
     /// single-file quant).
     pub shard_count: usize,
+    /// The file's LFS SHA-256, for single-file quants only:
+    /// one record field cannot name N shard hashes, so a
+    /// grouped series carries none (design Part 2, P2-D6).
+    pub sha256: Option<String>,
 }
 
 /// Parse the shard suffix of a GGUF stem: `…-00001-of-00003`
@@ -272,7 +318,7 @@ fn shard_stem(stem: &str) -> Option<&str> {
 /// Entries come out sorted by file name, so the candidate
 /// order is deterministic regardless of sibling order.
 pub fn quant_files(siblings: &[HfSibling]) -> Vec<QuantFile> {
-    let mut groups: BTreeMap<String, (u64, usize)> = BTreeMap::new();
+    let mut groups: BTreeMap<String, (u64, usize, Option<String>)> = BTreeMap::new();
     for s in siblings {
         let name = s.rfilename.rsplit('/').next().unwrap_or(&s.rfilename);
         let lower = name.to_lowercase();
@@ -284,16 +330,25 @@ pub fn quant_files(siblings: &[HfSibling]) -> Vec<QuantFile> {
             Some(base) => format!("{base}.gguf"),
             None => s.rfilename.clone(),
         };
-        let entry = groups.entry(key).or_insert((0, 0));
+        let entry = groups.entry(key).or_insert((0, 0, None));
         entry.0 = entry.0.saturating_add(s.size_bytes);
         entry.1 += 1;
+        // The hash survives only while the group is a single
+        // file; the moment a second sibling joins, the entry
+        // names a series and no one hash describes it.
+        entry.2 = if entry.1 == 1 {
+            s.sha256.clone()
+        } else {
+            None
+        };
     }
     groups
         .into_iter()
-        .map(|(file, (size_bytes, shard_count))| QuantFile {
+        .map(|(file, (size_bytes, shard_count, sha256))| QuantFile {
             file,
             size_bytes,
             shard_count,
+            sha256,
         })
         .collect()
 }
@@ -377,6 +432,148 @@ pub fn candidates_from_model(
             retrieved_at: retrieved_at.to_string(),
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Form lookup + prefill mapping (deep-discovery design Part 2)
+// ---------------------------------------------------------------------------
+
+/// One repo row of the form lookup: the record's facts plus
+/// one entry per quant file, each with its fit verdict
+/// against the snapshot the lookup ran with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookupRepo {
+    pub repo_id: String,
+    pub downloads: u64,
+    pub likes: u64,
+    pub architecture: Option<String>,
+    /// Total parameter count (not billions).
+    pub params_total: Option<u64>,
+    pub ctx_max: Option<u32>,
+    pub quants: Vec<LookupQuant>,
+}
+
+/// One quant of a [`LookupRepo`], with the fit verdict the
+/// picker row shows (`File · Size · Fit`, §P2.4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookupQuant {
+    pub quant: QuantFile,
+    pub fit: String,
+}
+
+/// Assemble one lookup row from a model record: quants from
+/// the sibling grouping, fit from the same evaluator the
+/// consultation pre-pass uses.
+pub fn lookup_repo(facts: &HfModelFacts, free_vram_mib_per_gpu: &[u64]) -> LookupRepo {
+    let params_b = facts
+        .params_total
+        .map(|t| t as f32 / 1_000_000_000.0)
+        .unwrap_or(0.0);
+    let ctx_max = facts.ctx_max.unwrap_or(0);
+    LookupRepo {
+        repo_id: facts.repo_id.clone(),
+        downloads: facts.downloads,
+        likes: facts.likes,
+        architecture: facts.architecture.clone(),
+        params_total: facts.params_total,
+        ctx_max: facts.ctx_max,
+        quants: quant_files(&facts.siblings)
+            .into_iter()
+            .map(|q| LookupQuant {
+                fit: fit_verdict(q.size_bytes, ctx_max, params_b, free_vram_mib_per_gpu),
+                quant: q,
+            })
+            .collect(),
+    }
+}
+
+/// The `params_b` a pick prefills: the record's total
+/// parameter count in billions at one decimal (§P2.5; the
+/// planner family's display convention, principle 14).
+/// 79,674,391,296 → 79.7.
+pub fn params_b_rounded(params_total: u64) -> f32 {
+    ((params_total as f64 / 1_000_000_000.0) * 10.0).round() as f32 / 10.0
+}
+
+/// The model id a pick prefills, derived from the picked
+/// file's stem (§P2.5): lowercased, with runs of separator
+/// characters collapsed to single `-`. Underscores are part
+/// of quant names and survive: `Qwen3-Coder-Next-Q4_K_M.gguf`
+/// → `qwen3-coder-next-q4_k_m`.
+pub fn id_slug_from_file(file: &str) -> String {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    let stem = name
+        .strip_suffix(".gguf")
+        .or_else(|| name.strip_suffix(".GGUF"))
+        .unwrap_or(name);
+    let mut out = String::new();
+    let mut pending_dash = false;
+    for ch in stem.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            pending_dash = true;
+        }
+    }
+    out
+}
+
+/// One `-`-separated segment that names a GGUF quantization
+/// on its own: `BF16` / `F16` / `F32`, or the `Q`/`IQ` family
+/// (`Q4_K_M`, `Q8_0`, `IQ3_S`, `IQ2_XXS`, …) — a Q, an
+/// optional leading I, a digit run, an underscore, and a
+/// suffix of letters, digits, and underscores.
+fn is_quant_token(seg: &str) -> bool {
+    if matches!(seg, "BF16" | "F16" | "F32") {
+        return true;
+    }
+    let body = seg.strip_prefix('I').unwrap_or(seg);
+    let Some(rest) = body.strip_prefix('Q') else {
+        return false;
+    };
+    let Some((digits, suffix)) = rest.split_once('_') else {
+        return false;
+    };
+    !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && !suffix.is_empty()
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The quant label a pick prefills, derived locally from the
+/// file name's quant token (§P2.5): the last `-` segment that
+/// matches the GGUF quant vocabulary (one trailing non-quant
+/// segment, e.g. a `-mtp` marker, is skipped), with a `UD-`
+/// segment directly before it kept as part of the label.
+/// Derived, never authoritative — the label is a form
+/// prefill the operator can edit. No match → `None`, and the
+/// form leaves the field empty (the add defaults it to
+/// "unknown").
+pub fn quant_token_from_file_name(file: &str) -> Option<String> {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    let stem = name
+        .strip_suffix(".gguf")
+        .or_else(|| name.strip_suffix(".GGUF"))
+        .unwrap_or(name);
+    let upper = stem.to_uppercase();
+    let segs: Vec<&str> = upper.split('-').collect();
+    for back in 0..segs.len().min(2) {
+        let idx = segs.len() - 1 - back;
+        let seg = segs[idx];
+        if is_quant_token(seg) {
+            if idx > 0 && segs[idx - 1] == "UD" {
+                return Some(format!("UD-{seg}"));
+            }
+            return Some(seg.to_string());
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +782,20 @@ impl HfClient {
     /// the discovery search (§A.6). An empty query omits the
     /// `search` parameter: top GGUF repos by downloads.
     pub async fn search(&self, query: &str) -> Result<Vec<HfSearchHit>, DiscoverError> {
+        self.search_with_limit(query, MAX_SEARCH_REPOS).await
+    }
+
+    /// The search at a caller-chosen depth: the discovery
+    /// pre-pass runs at [`MAX_SEARCH_REPOS`]; the form lookup
+    /// and its type-ahead run at [`MAX_LOOKUP_REPOS`] (P2-D2).
+    /// The result is capped in the parser as well as in the
+    /// request, so the depth a surface was designed for is
+    /// the depth it gets.
+    pub async fn search_with_limit(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<HfSearchHit>, DiscoverError> {
         let mut url = reqwest::Url::parse(&format!("{}/api/models", self.base_url))
             .map_err(|e| DiscoverError::Http(format!("invalid base URL: {e}")))?;
         {
@@ -596,10 +807,124 @@ impl HfClient {
                 .append_pair("filter", "gguf")
                 .append_pair("sort", "downloads")
                 .append_pair("direction", "-1")
-                .append_pair("limit", &MAX_SEARCH_REPOS.to_string());
+                .append_pair("limit", &limit.to_string());
         }
         let body = self.get_text(url.as_str()).await?;
-        parse_search_results(&body)
+        parse_search_results_capped(&body, limit)
+    }
+
+    /// The Add Model form's shallow lookup (P2-D2): one
+    /// search at [`MAX_LOOKUP_REPOS`], then one record fetch
+    /// per repo, each assembled into a picker row with its
+    /// quant files and their fit verdicts. A repo whose
+    /// record fails is skipped, as in the discovery pre-pass;
+    /// a failed search fails the lookup — the form reports
+    /// it and manual entry carries on.
+    pub async fn lookup(
+        &self,
+        query: &str,
+        free_vram_mib_per_gpu: &[u64],
+    ) -> Result<Vec<LookupRepo>, DiscoverError> {
+        let hits = self.search_with_limit(query, MAX_LOOKUP_REPOS).await?;
+        let mut out: Vec<LookupRepo> = Vec::new();
+        for hit in &hits {
+            if let Ok(facts) = self.model_facts(&hit.id).await {
+                out.push(lookup_repo(&facts, free_vram_mib_per_gpu));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read one GGUF file's header over HTTP Range and parse
+    /// its layout (P2-D4, Option B): `GET
+    /// /{repo}/resolve/main/{file}` with a growing prefix —
+    /// [`HF_HEADER_RANGE_INITIAL_BYTES`], doubling to
+    /// [`HF_HEADER_RANGE_CAP_BYTES`] — re-parsing after each
+    /// extension until [`manager_models::parse_gguf_layout`]
+    /// completes. A server that ignores `Range` and answers
+    /// 200 is read incrementally from that same response,
+    /// never buffered whole. Any failure — transport, a
+    /// non-2xx status, a parse error, or a header past the
+    /// cap — is an `Err`: the caller treats every one as
+    /// "header unavailable" and the add falls back to the
+    /// post-download proposal (Option A); this read never
+    /// blocks an add.
+    pub async fn fetch_header(
+        &self,
+        repo_id: &str,
+        file: &str,
+    ) -> Result<manager_models::GgufLayout, DiscoverError> {
+        let url = format!("{}/{repo_id}/resolve/main/{file}", self.base_url);
+        let mut buf: Vec<u8> = Vec::new();
+        // A 200 response being consumed incrementally: the
+        // server ignored Range, so the rungs extend the read
+        // of this one body instead of re-requesting.
+        let mut streaming: Option<reqwest::Response> = None;
+        let mut stream_eof = false;
+        let mut rung = HF_HEADER_RANGE_INITIAL_BYTES;
+        loop {
+            if (buf.len() as u64) < rung && !stream_eof {
+                if let Some(resp) = streaming.as_mut() {
+                    while (buf.len() as u64) < rung {
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+                            Ok(None) => {
+                                stream_eof = true;
+                                break;
+                            }
+                            Err(e) => return Err(DiscoverError::Http(e.to_string())),
+                        }
+                    }
+                } else {
+                    let resp = self
+                        .client
+                        .get(&url)
+                        .header("Range", format!("bytes=0-{}", rung - 1))
+                        .send()
+                        .await
+                        .map_err(|e| DiscoverError::Http(e.to_string()))?;
+                    match resp.status() {
+                        reqwest::StatusCode::PARTIAL_CONTENT => {
+                            let bytes = resp
+                                .bytes()
+                                .await
+                                .map_err(|e| DiscoverError::Http(e.to_string()))?;
+                            // A short 206 body means the file
+                            // itself ends there: no rung will
+                            // ever extend it further.
+                            stream_eof = (bytes.len() as u64) < rung;
+                            buf = bytes.to_vec();
+                        }
+                        reqwest::StatusCode::OK => {
+                            streaming = Some(resp);
+                            continue;
+                        }
+                        status => {
+                            return Err(DiscoverError::Http(format!(
+                                "HTTP {status} reading the file header"
+                            )));
+                        }
+                    }
+                }
+            }
+            match manager_models::parse_gguf_layout(&buf) {
+                Ok(layout) => return Ok(layout),
+                Err(GgufError::Incomplete) => {
+                    if stream_eof || rung >= HF_HEADER_RANGE_CAP_BYTES {
+                        return Err(DiscoverError::Parse(format!(
+                            "GGUF header did not complete within the {} MiB range-read cap",
+                            HF_HEADER_RANGE_CAP_BYTES / (1024 * 1024)
+                        )));
+                    }
+                    rung = (rung * 2).min(HF_HEADER_RANGE_CAP_BYTES);
+                }
+                Err(e) => {
+                    return Err(DiscoverError::Parse(format!(
+                        "GGUF header parse failed: {e:?}"
+                    )));
+                }
+            }
+        }
     }
 
     /// `GET /api/models/{id}?blobs=true` — one repo's record:
@@ -727,6 +1052,23 @@ mod tests {
         assert_eq!(facts.ctx_max, Some(40960));
         assert_eq!(facts.total_file_size, Some(5027783488));
         assert_eq!(facts.siblings.len(), 5);
+        // The per-file LFS hash is carried through (P2-D6):
+        // present pre-download, it is what pins a picked add.
+        assert_eq!(facts.siblings[1].sha256.as_deref(), Some("d98c"));
+        assert_eq!(facts.siblings[2].sha256.as_deref(), Some("408b"));
+        assert_eq!(facts.siblings[0].sha256, None);
+    }
+
+    #[test]
+    fn search_results_capped_at_the_lookup_depth() {
+        let body = serde_json::json!((0..30)
+            .map(|i| serde_json::json!({ "id": format!("org/model-{i}"), "downloads": 1000 - i }))
+            .collect::<Vec<_>>())
+        .to_string();
+        let hits = parse_search_results_capped(&body, MAX_LOOKUP_REPOS).unwrap();
+        assert_eq!(hits.len(), MAX_LOOKUP_REPOS);
+        // The discovery cap is unaffected by the capped variant.
+        assert_eq!(parse_search_results(&body).unwrap().len(), MAX_SEARCH_REPOS);
     }
 
     #[test]
@@ -753,6 +1095,15 @@ mod tests {
         HfSibling {
             rfilename: rfilename.to_string(),
             size_bytes,
+            sha256: None,
+        }
+    }
+
+    fn sibling_sha(rfilename: &str, size_bytes: u64, sha256: &str) -> HfSibling {
+        HfSibling {
+            rfilename: rfilename.to_string(),
+            size_bytes,
+            sha256: Some(sha256.to_string()),
         }
     }
 
@@ -791,6 +1142,108 @@ mod tests {
     fn quant_files_keep_subdirectory_paths() {
         let quants = quant_files(&[sibling("q4/model-Q4.gguf", 100)]);
         assert_eq!(quants[0].file, "q4/model-Q4.gguf");
+    }
+
+    #[test]
+    fn quant_files_carry_the_single_file_hash_only() {
+        let quants = quant_files(&[
+            sibling_sha("one-Q4_K_M.gguf", 100, "aaa"),
+            sibling_sha("big-Q8_0-00001-of-00002.gguf", 100, "bbb"),
+            sibling_sha("big-Q8_0-00002-of-00002.gguf", 100, "ccc"),
+        ]);
+        assert_eq!(quants.len(), 2);
+        // Single file: the sibling's hash rides along (P2-D6).
+        let one = quants.iter().find(|q| q.file == "one-Q4_K_M.gguf").unwrap();
+        assert_eq!(one.sha256.as_deref(), Some("aaa"));
+        // Shard series: one field cannot name two hashes.
+        let big = quants.iter().find(|q| q.file == "big-Q8_0.gguf").unwrap();
+        assert_eq!(big.shard_count, 2);
+        assert_eq!(big.sha256, None);
+    }
+
+    // -- prefill mapping (Part 2, §P2.5) --------------------------------------
+
+    #[test]
+    fn id_slug_matches_the_design_example() {
+        assert_eq!(
+            id_slug_from_file("Qwen3-Coder-Next-Q4_K_M.gguf"),
+            "qwen3-coder-next-q4_k_m"
+        );
+        // Dots are separators and collapse; underscores survive.
+        assert_eq!(
+            id_slug_from_file("qwen2.5-coder-7b-instruct-q4_k_m.gguf"),
+            "qwen2-5-coder-7b-instruct-q4_k_m"
+        );
+        // Subdirectory paths reduce to the file's own stem.
+        assert_eq!(id_slug_from_file("q4/Model Q8_0.gguf"), "model-q8_0");
+    }
+
+    #[test]
+    fn quant_token_reads_the_vocabulary_forms() {
+        assert_eq!(
+            quant_token_from_file_name("Qwen3-8B-Q4_K_M.gguf").as_deref(),
+            Some("Q4_K_M")
+        );
+        assert_eq!(
+            quant_token_from_file_name("Qwen3-Coder-Next-UD-Q4_K_M.gguf").as_deref(),
+            Some("UD-Q4_K_M")
+        );
+        assert_eq!(
+            quant_token_from_file_name("model-IQ3_S.gguf").as_deref(),
+            Some("IQ3_S")
+        );
+        assert_eq!(
+            quant_token_from_file_name("model-UD-IQ2_XXS.gguf").as_deref(),
+            Some("UD-IQ2_XXS")
+        );
+        assert_eq!(
+            quant_token_from_file_name("model-BF16.gguf").as_deref(),
+            Some("BF16")
+        );
+        // Lowercase file names normalize to the label's case.
+        assert_eq!(
+            quant_token_from_file_name("qwen2.5-coder-7b-instruct-q4_k_m.gguf").as_deref(),
+            Some("Q4_K_M")
+        );
+        // A trailing -mtp marker is not the quant; the token
+        // before it is.
+        assert_eq!(
+            quant_token_from_file_name("Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf").as_deref(),
+            Some("IQ3_S")
+        );
+    }
+
+    #[test]
+    fn quant_token_unmatched_leaves_the_field_empty() {
+        assert_eq!(quant_token_from_file_name("model.gguf"), None);
+        assert_eq!(quant_token_from_file_name("model-fp16.gguf"), None);
+        assert_eq!(quant_token_from_file_name("model-7B.gguf"), None);
+    }
+
+    #[test]
+    fn params_b_rounds_to_one_decimal() {
+        // The design's worked figure: Coder-Next's total.
+        assert_eq!(params_b_rounded(79_674_391_296), 79.7);
+        assert_eq!(params_b_rounded(8_190_735_360), 8.2);
+        assert_eq!(params_b_rounded(27_000_000_000), 27.0);
+    }
+
+    #[test]
+    fn lookup_repo_rows_carry_facts_quants_and_fit() {
+        let facts = parse_model_record(&record_body()).unwrap();
+        let row = lookup_repo(&facts, &[16 * 1024]);
+        assert_eq!(row.repo_id, "Qwen/Qwen3-8B-GGUF");
+        assert_eq!(row.downloads, 594664);
+        assert_eq!(row.architecture.as_deref(), Some("qwen3"));
+        assert_eq!(row.params_total, Some(8190735360));
+        assert_eq!(row.ctx_max, Some(40960));
+        assert_eq!(row.quants.len(), 2);
+        assert_eq!(row.quants[0].quant.file, "Qwen3-8B-Q4_K_M.gguf");
+        assert_eq!(row.quants[0].quant.sha256.as_deref(), Some("d98c"));
+        assert_eq!(row.quants[0].fit, FIT_FITS);
+        // No telemetry: every fit is honestly unchecked.
+        let row = lookup_repo(&facts, &[]);
+        assert!(row.quants.iter().all(|q| q.fit == FIT_UNCHECKED));
     }
 
     // -- candidate assembly + fit ---------------------------------------------
@@ -971,6 +1424,215 @@ mod tests {
         assert_eq!(cands[0].file, "model-Q4_K_M.gguf");
         assert_eq!(cands[0].fit, FIT_FITS);
         assert_eq!(cands[0].downloads, 42);
+    }
+
+    // -- form lookup + header range read (Part 2) ------------------------------
+
+    /// A synthetic GGUF header in the shape the pick-time
+    /// parse reads: `moe_blocks` expert blocks, an optional
+    /// nextn prediction block, and a chat-template string
+    /// padding the header to a chosen size class so the
+    /// range-extension ladder has something to climb.
+    fn gguf_header(pad_to: usize, moe_blocks: u32, nextn: bool) -> Vec<u8> {
+        fn w_str(out: &mut Vec<u8>, s: &str) {
+            out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        fn w_kv_u32(out: &mut Vec<u8>, key: &str, v: u32) {
+            w_str(out, key);
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        fn w_kv_str(out: &mut Vec<u8>, key: &str, v: &str) {
+            w_str(out, key);
+            out.extend_from_slice(&8u32.to_le_bytes());
+            w_str(out, v);
+        }
+        fn w_tensor(out: &mut Vec<u8>, name: &str, dims: &[u64], ty: u32) {
+            w_str(out, name);
+            out.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for d in dims {
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+            out.extend_from_slice(&ty.to_le_bytes());
+            out.extend_from_slice(&0u64.to_le_bytes());
+        }
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        let tensors = moe_blocks + u32::from(nextn);
+        b.extend_from_slice(&(tensors as u64).to_le_bytes());
+        b.extend_from_slice(&4u64.to_le_bytes());
+        w_kv_str(&mut b, "general.architecture", "testarch");
+        w_kv_u32(&mut b, "testarch.block_count", moe_blocks + u32::from(nextn));
+        w_kv_u32(&mut b, "testarch.nextn_predict_layers", u32::from(nextn));
+        // The template value pads the header: its length
+        // prefix plus content is what the parser must walk.
+        let fixed = b.len() + 8 + 24; // key + type + length prefix, approx.
+        let pad = pad_to.saturating_sub(fixed + tensors as usize * 64);
+        w_kv_str(&mut b, "general.chat_template", &"x".repeat(pad));
+        for blk in 0..moe_blocks {
+            w_tensor(&mut b, &format!("blk.{blk}.ffn_gate_exps.weight"), &[256], 12);
+        }
+        if nextn {
+            w_tensor(&mut b, &format!("blk.{moe_blocks}.nextn.eh_proj.weight"), &[16], 1);
+        }
+        b
+    }
+
+    /// Mock HF for the form surface: the search + record
+    /// routes for one MoE+MTP repo, and resolve routes that
+    /// honor Range (counting requests), ignore it (200 with
+    /// the whole body), or serve a header past the cap.
+    async fn start_mock_hf_forms() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let range_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = range_requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 16384];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_string();
+                    let range_end = req
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                        .and_then(|l| l.split('=').nth(1))
+                        .and_then(|r| r.trim().split('-').nth(1))
+                        .and_then(|e| e.trim().parse::<usize>().ok());
+                    let (status, body): (&str, Vec<u8>) =
+                        if path.starts_with("/api/models/org/moe-mtp-gguf") {
+                            (
+                                "200 OK",
+                                serde_json::json!({
+                                    "id": "org/moe-mtp-gguf",
+                                    "downloads": 777,
+                                    "gguf": { "total": 48000000000u64, "architecture": "testarch",
+                                               "context_length": 32768, "totalFileSize": 1000u64 },
+                                    "siblings": [
+                                        { "rfilename": "model-Q4_K_M.gguf", "size": 1000u64,
+                                          "lfs": { "sha256": "feedface", "size": 1000u64 } },
+                                    ],
+                                })
+                                .to_string()
+                                .into_bytes(),
+                            )
+                        } else if path.starts_with("/api/models") {
+                            (
+                                "200 OK",
+                                serde_json::json!([
+                                    { "id": "org/moe-mtp-gguf", "downloads": 777, "likes": 5 },
+                                ])
+                                .to_string()
+                                .into_bytes(),
+                            )
+                        } else if path.starts_with("/org/moe-mtp-gguf/resolve/main/") {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let header = gguf_header(5 * MIB64 as usize, 48, true);
+                            match range_end {
+                                Some(end) => (
+                                    "206 Partial Content",
+                                    header[..(end + 1).min(header.len())].to_vec(),
+                                ),
+                                None => ("200 OK", header),
+                            }
+                        } else if path.starts_with("/org/plain-gguf/resolve/main/") {
+                            // Range ignored on purpose: the
+                            // client must stream this body.
+                            ("200 OK", gguf_header(0, 2, false))
+                        } else if path.starts_with("/org/huge-gguf/resolve/main/") {
+                            let header = gguf_header(17 * MIB64 as usize, 1, false);
+                            match range_end {
+                                Some(end) => (
+                                    "206 Partial Content",
+                                    header[..(end + 1).min(header.len())].to_vec(),
+                                ),
+                                None => ("200 OK", header),
+                            }
+                        } else {
+                            ("404 Not Found", Vec::new())
+                        };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), range_requests)
+    }
+
+    #[tokio::test]
+    async fn lookup_against_mock_server_returns_repo_rows() {
+        let (base, _) = start_mock_hf_forms().await;
+        let client = HfClient::new(base).unwrap();
+        let rows = client.lookup("moe", &[16 * 1024]).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].repo_id, "org/moe-mtp-gguf");
+        assert_eq!(rows[0].downloads, 777);
+        assert_eq!(rows[0].params_total, Some(48_000_000_000));
+        assert_eq!(rows[0].quants.len(), 1);
+        assert_eq!(rows[0].quants[0].quant.sha256.as_deref(), Some("feedface"));
+        assert_eq!(rows[0].quants[0].fit, FIT_FITS);
+    }
+
+    #[tokio::test]
+    async fn fetch_header_extends_the_range_until_the_parse_completes() {
+        let (base, counter) = start_mock_hf_forms().await;
+        let client = HfClient::new(base).unwrap();
+        // The fixture header is ~5 MiB: the 4 MiB first rung
+        // parses Incomplete, the 8 MiB rung completes it.
+        let layout = client
+            .fetch_header("org/moe-mtp-gguf", "model-Q4_K_M.gguf")
+            .await
+            .unwrap();
+        assert_eq!(layout.moe_block_count, Some(48));
+        assert_eq!(layout.block_count, Some(49));
+        assert_eq!(layout.nextn_predict_layers, Some(1));
+        assert!(layout.has_nextn_tensors);
+        assert_eq!(layout.expert_bytes_by_block.len(), 48);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_header_streams_a_range_ignoring_server() {
+        let (base, _) = start_mock_hf_forms().await;
+        let client = HfClient::new(base).unwrap();
+        let layout = client
+            .fetch_header("org/plain-gguf", "model.gguf")
+            .await
+            .unwrap();
+        assert_eq!(layout.moe_block_count, Some(2));
+        assert_eq!(layout.nextn_predict_layers, Some(0));
+        assert!(!layout.has_nextn_tensors);
+    }
+
+    #[tokio::test]
+    async fn fetch_header_past_the_cap_is_a_soft_failure() {
+        let (base, _) = start_mock_hf_forms().await;
+        let client = HfClient::new(base).unwrap();
+        // ~17 MiB of header: past the 16 MiB cap, the read
+        // gives up — an Err the op renders as "header
+        // unavailable", never a blocked add.
+        let err = client
+            .fetch_header("org/huge-gguf", "model.gguf")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DiscoverError::Parse(_)), "{err}");
     }
 
     #[tokio::test]
