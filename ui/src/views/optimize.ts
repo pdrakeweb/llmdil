@@ -19,10 +19,12 @@ import {
   optimizeCancelConsult, optimizeCancelJob, optimizeChangeSummary, optimizeConsult,
   optimizeDiscardPlan, optimizeDiscover, optimizeEstimateBackend, optimizeEstimateExperiments, optimizeIsDestructive, optimizeKindLabel,
   optimizeMeasureBackend, optimizeRunBaseline, optimizeRunExperiments, optimizeSavePurpose, optimizeSetExperimentState, optimizeSetItemOutcome, optimizeSetItemState,
+  optimizeTuningAdopt, optimizeTuningPreview, optimizeTuningRun,
   setBackendMoeCache, setBackendOffload, stopBackend, updateBackendFlags, updateGatewayConfig,
 } from "../api";
 import type {
   CallResult, MeasurementInputs, OptimizeCandidate, OptimizeExperiment, OptimizeMeasurementEntry, OptimizePlanItem, OptimizeState,
+  TuningArm, TuningCoords, TuningPreview, TuningSweep,
 } from "../api";
 import { fmtCount, trim1 } from "../charts";
 import { esc } from "../html";
@@ -184,6 +186,16 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   let expEstStart = 0;
   let expEstTimer: number | null = null;
   const candidateRemoved = new Set<string>();
+  // Backend tuning (Addendum B): the section's selected
+  // backend (the backend card's "Optimize this backend"
+  // action preselects through sessionStorage), the last
+  // preview this page computed, and its in-flight flag.
+  let tuningSel: string | null = (() => {
+    try { return sessionStorage.getItem("tuningBackend"); } catch { return null; }
+  })();
+  let tuningPreviewData: TuningPreview | null = null;
+  let tuningBusy = false;
+  let tuningError = "";
   const candidateKey = (c: OptimizeCandidate): string => `${c.repo_id}\n${c.file}`;
 
   const shortName = (modelId: string): string => {
@@ -735,6 +747,128 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     return repos;
   }
 
+
+  /** Coordinates as deltas against the incumbent (Addendum B
+   *  §B.6 Arm column): one "Label: old → new" per changed
+   *  axis; the incumbent itself renders as "Incumbent". */
+  function tuningDeltaLabels(coords: TuningCoords, incumbent: TuningCoords): string {
+    const parts: string[] = [];
+    const place = (c: TuningCoords) => c.gpu_indices.length ? `GPU ${c.gpu_indices.join("+")}` : "CPU";
+    if (coords.gpu_indices.join() !== incumbent.gpu_indices.join()
+      || coords.tensor_split.join() !== incumbent.tensor_split.join()) {
+      parts.push(`Placement: ${place(incumbent)} → ${place(coords)}`);
+    }
+    if (coords.offload_layers !== incumbent.offload_layers) {
+      parts.push(`Offload: ${incumbent.offload_layers ?? "n/a"} → ${coords.offload_layers ?? "n/a"}`);
+    }
+    if ((coords.moe_cache_mib ?? 0) !== (incumbent.moe_cache_mib ?? 0)) {
+      parts.push(`MoE cache: ${incumbent.moe_cache_mib ?? "off"} → ${coords.moe_cache_mib ?? "off"}`);
+    }
+    if (coords.mtp_n_max !== incumbent.mtp_n_max) {
+      const spec = (n: number | null) => n === null ? "off" : `n-max ${n}`;
+      parts.push(`Spec: ${spec(incumbent.mtp_n_max)} → ${spec(coords.mtp_n_max)}`);
+    }
+    if (coords.n_ctx !== incumbent.n_ctx) parts.push(`Context: ${incumbent.n_ctx} → ${coords.n_ctx}`);
+    if (coords.cache.k !== incumbent.cache.k || coords.cache.v !== incumbent.cache.v
+      || coords.cache.flash_attn !== incumbent.cache.flash_attn) {
+      parts.push(`Cache: ${incumbent.cache.k}/${incumbent.cache.v} FA ${incumbent.cache.flash_attn} → ${coords.cache.k}/${coords.cache.v} FA ${coords.cache.flash_attn}`);
+    }
+    if (coords.parallel_slots !== incumbent.parallel_slots) {
+      parts.push(`Slots: ${incumbent.parallel_slots} → ${coords.parallel_slots}`);
+    }
+    return parts.length ? parts.join(" · ") : "Incumbent";
+  }
+
+  function tuningResidency(arm: TuningArm): string {
+    const r = arm.residency;
+    if (r === "verified_exclusive") return "Verified exclusive";
+    if (r && typeof r === "object" && "unverified" in r) return "Unverified";
+    return "—";
+  }
+
+  /** Arms in ranked display order (§B.6): rankable arms by
+   *  long-prompt generation, then the rest in visit order. */
+  function tuningRanked(sweep: TuningSweep): TuningArm[] {
+    const gen = (a: TuningArm) => a.measured?.long.predicted_per_second ?? null;
+    const rankable = sweep.arms.filter((a) => a.status === "completed" && tuningResidency(a) === "Verified exclusive" && gen(a) !== null);
+    rankable.sort((x, y) => (gen(y) ?? 0) - (gen(x) ?? 0));
+    const rest = sweep.arms.filter((a) => !rankable.includes(a));
+    return [...rankable, ...rest];
+  }
+
+  function tuningSweepHtml(sweep: TuningSweep, st: OptimizeState): string {
+    const num = (x: number | null | undefined): string => x == null ? "—" : trim1(x);
+    const incumbentGen = sweep.arms.find((a) => a.axis === "incumbent")?.measured?.long.predicted_per_second ?? null;
+    const winner = sweep.winner_arm != null ? sweep.arms[sweep.winner_arm] : undefined;
+    const conf = sweep.confirmation;
+    const adoptDefault = !!(winner && !sweep.incumbent_stands && conf && conf.reproduced && conf.screen_passes);
+    const rows = tuningRanked(sweep).map((a) => {
+      const genLong = a.measured?.long.predicted_per_second ?? null;
+      const delta = genLong !== null && incumbentGen ? `${genLong >= incumbentGen ? "+" : ""}${trim1((genLong / incumbentGen - 1) * 100)}%` : "—";
+      const status = a.status === "aborted_thermal" ? "Aborted — thermal"
+        : a.status === "completed" ? "Completed"
+        : a.status === "failed" ? `Failed${a.detail ? ` — ${a.detail}` : ""}`
+        : a.status === "unverified" ? "Unverified"
+        : "Excluded";
+      return `<tr${winner && a.index === winner.index ? ` class="opt-winner-row"` : ""}>
+        <td>${esc(tuningDeltaLabels(a.coords, sweep.incumbent))}${winner && a.index === winner.index ? ` <span class="chip ok">Winner</span>` : ""}${a.axis === "incumbent" ? ` <span class="chip">Incumbent</span>` : ""}</td>
+        <td>${num(genLong)}</td>
+        <td>${num(a.measured?.long.prompt_per_second ?? a.measured?.short.prompt_per_second)}</td>
+        <td>${num(a.measured?.short.ttft_ms ?? a.measured?.long.ttft_ms)}</td>
+        <td>${delta}</td>
+        <td>${tuningResidency(a)}${a.temp_peak_c != null ? ` · peak ${trim1(a.temp_peak_c)} °C` : ""}</td>
+        <td>${esc(status)}</td>
+      </tr>`;
+    }).join("");
+    return `<div class="opt-tuning-results">
+      <div class="opt-field-label" style="margin-top:10px">Sweep results — ${esc(sweep.backend_id)}</div>
+      ${sweep.state === "running" ? `<span class="opt-consulting">${icon("clock")} Sweep running — arm ${sweep.arms.length} measured</span>
+        <button class="btn danger" data-opt-act="cancel-job">${icon("x")} Cancel</button>` : ""}
+      ${sweep.truncated ? `<div class="opt-note">${esc(sweep.truncated)}</div>` : ""}
+      ${sweep.detail ? `<div class="opt-note">${esc(sweep.detail)}</div>` : ""}
+      <table class="opt-table"><thead><tr><th>Arm</th><th>Generation tok/s</th><th>Prompt tok/s</th><th>TTFT ms</th><th>Δ</th><th>Conditions</th><th>Status</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+      ${sweep.exclusions.length ? `<div class="opt-note">Excluded at planning: ${sweep.exclusions.map((e) => `${esc(tuningDeltaLabels(e.coords, sweep.incumbent))} (${esc(e.reason)})`).join("; ")}</div>` : ""}
+      ${sweep.state === "completed" && sweep.incumbent_stands ? `<div class="opt-note">Incumbent stands — every measured arm lost to the incumbent on these axes.</div>` : ""}
+      ${sweep.state === "completed" && !sweep.incumbent_stands && conf ? `<div class="opt-note">Confirmation: ${conf.reproduced ? "reproduced" : "not reproduced — conditions drifted"}${conf.gen_delta_pct != null ? ` (${conf.gen_delta_pct >= 0 ? "+" : ""}${trim1(conf.gen_delta_pct)}%)` : ""} · Screen: ${conf.screen_passes ? "pass" : "did not pass"}</div>` : ""}
+      ${sweep.state === "completed" && !sweep.incumbent_stands && winner && !sweep.adopted
+        ? adoptDefault
+          ? `<button class="btn primary" data-opt-act="tuning-adopt" data-tune-sweep="${esc(sweep.id)}">${icon("check")} Adopt winner</button>`
+          : armed.has("tuning-adopt-anyway")
+            ? `<button class="btn danger" data-opt-act="tuning-adopt-anyway" data-tune-sweep="${esc(sweep.id)}">${icon("warn")} Confirm adopt anyway</button>
+               <span class="opt-note">The screen did not pass or the winner was not reproduced — adoption writes the winner's configuration regardless.</span>`
+            : `<button class="btn" data-opt-act="tuning-adopt-anyway-arm" data-tune-sweep="${esc(sweep.id)}">${icon("warn")} Adopt anyway…</button>`
+        : ""}
+      ${sweep.adopted ? `<span class="chip ok">Adopted${sweep.adopted_anyway ? " (anyway)" : ""}</span>` : ""}
+      ${st.measuring && sweep.state !== "running" ? "" : ""}
+    </div>`;
+  }
+
+  function tuningHtml(st: OptimizeState): string {
+    const backends = st.backends;
+    const selected = tuningSel && backends.some((b) => b.id === tuningSel) ? tuningSel : (backends[0]?.id ?? "");
+    const runningSweep = st.tuning?.running ?? null;
+    const latest = st.tuning?.latest ?? null;
+    const preview = tuningPreviewData && tuningPreviewData.backend_id === selected ? tuningPreviewData : null;
+    return `<div class="card" id="optTuningCard">
+      <div class="opt-field-label">Backend tuning</div>
+      <div class="opt-consult-row">
+        <select id="optTuningSel" style="${SELECT_STYLE}">${backends.map((b) => `<option value="${esc(b.id)}" ${b.id === selected ? "selected" : ""}>${esc(b.id)}${b.short_name ? ` · ${esc(b.short_name)}` : ""}</option>`).join("")}</select>
+        <button class="btn" data-opt-act="tuning-preview" ${tuningBusy || runningSweep ? "disabled" : ""}>${icon("search")} Preview sweep</button>
+      </div>
+      ${tuningError ? `<div class="banner">${icon("err")} ${esc(tuningError)}</div>` : ""}
+      ${preview ? `<div class="opt-tuning-preview">
+        ${preview.plan.axes.map(([axis, values]) => `<div class="opt-kv">${esc(axis)}: ${esc(values.join(" · "))}</div>`).join("")}
+        <div class="opt-kv">Arms: ${preview.plan.planned_arms} (max ${preview.plan.max_arms})</div>
+        <div class="opt-kv">Budgets: ${Math.floor(preview.plan.arm_timeout_secs / 60)} min/arm · ${Math.floor(preview.plan.sweep_timeout_secs / 60)} min/sweep</div>
+        <div class="opt-kv">Stop list: ${preview.plan.stop_list.length ? esc(preview.plan.stop_list.join(", ")) : "none"}</div>
+        ${preview.plan.exclusions.length ? `<div class="opt-note">Excluded at planning: ${preview.plan.exclusions.map((e) => `${esc(tuningDeltaLabels(e.coords, preview.incumbent))} (${esc(e.reason)})`).join("; ")}</div>` : ""}
+        <button class="btn primary" data-opt-act="tuning-run" data-tune-backend="${esc(selected)}" ${tuningBusy || st.measuring || st.consulting ? "disabled" : ""}>${icon("bolt")} Run sweep</button>
+      </div>` : ""}
+      ${runningSweep ? tuningSweepHtml(runningSweep, st) : latest ? tuningSweepHtml(latest, st) : ""}
+    </div>`;
+  }
+
   function paint(): void {
     if (disposed || !host) return;
     if (loadError) {
@@ -824,6 +958,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       </div>` : ""}
       ${screeningHtml(st, measuring)}
     </div>
+    ${tuningHtml(st)}
     <div id="optPlanHost">${planHtml(st)}</div>
     <details class="card opt-purposes">
       <summary>Per-group and per-backend purposes</summary>
@@ -1544,6 +1679,65 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       case "apply":
         void runApplyPhase(false);
         return;
+      case "tuning-preview": {
+        const sel = hostEl.querySelector<HTMLSelectElement>("#optTuningSel");
+        const backendId = sel?.value || tuningSel || "";
+        if (!backendId) return;
+        tuningSel = backendId;
+        tuningBusy = true;
+        tuningError = "";
+        paint();
+        void (async () => {
+          const r = await optimizeTuningPreview(backendId);
+          tuningBusy = false;
+          if (disposed) return;
+          if (r.error) tuningError = r.error;
+          else tuningPreviewData = r.data;
+          paint();
+        })();
+        return;
+      }
+      case "tuning-run": {
+        const backendId = t.closest<HTMLElement>("[data-tune-backend]")?.dataset.tuneBackend || tuningSel || "";
+        if (!backendId || tuningBusy) return;
+        tuningBusy = true;
+        tuningError = "";
+        paint();
+        void (async () => {
+          const r = await optimizeTuningRun(backendId);
+          tuningBusy = false;
+          if (disposed) return;
+          if (r.error) tuningError = r.error;
+          else if (r.data) state = r.data;
+          paint();
+        })();
+        return;
+      }
+      case "tuning-adopt":
+      case "tuning-adopt-anyway": {
+        const sweepId = t.closest<HTMLElement>("[data-tune-sweep]")?.dataset.tuneSweep || "";
+        if (!sweepId || tuningBusy) return;
+        const anyway = act === "tuning-adopt-anyway";
+        armed.delete("tuning-adopt-anyway");
+        tuningBusy = true;
+        tuningError = "";
+        paint();
+        void (async () => {
+          const r = await optimizeTuningAdopt(sweepId, anyway);
+          tuningBusy = false;
+          if (disposed) return;
+          if (r.error) tuningError = r.error;
+          else if (r.data) state = r.data;
+          paint();
+        })();
+        return;
+      }
+      case "tuning-adopt-anyway-arm": {
+        armed.add("tuning-adopt-anyway");
+        paint();
+        window.setTimeout(() => { armed.delete("tuning-adopt-anyway"); if (!disposed) paint(); }, 5000);
+        return;
+      }
       case "apply-destructive": {
         if (!armed.has("destructive")) {
           armed.add("destructive");
@@ -1559,6 +1753,13 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
 
   hostEl.addEventListener("change", (ev) => {
     const t = ev.target as HTMLElement;
+    if (t.id === "optTuningSel") {
+      tuningSel = (t as HTMLSelectElement).value;
+      tuningPreviewData = null;
+      tuningError = "";
+      paint();
+      return;
+    }
     const sel = t.closest<HTMLElement>("[data-opt-history-compare]");
     if (sel) {
       historyCompare = (sel as HTMLSelectElement).value || null;
@@ -1592,7 +1793,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   // operator is editing a field, so a repaint cannot drop the
   // caret mid-edit; the next tick retries.
   pollTimer = window.setInterval(() => {
-    if (disposed || !state?.measuring) return;
+    if (disposed || !(state?.measuring || state?.tuning?.running)) return;
     const active = document.activeElement;
     if (active && hostEl.contains(active)
       && (active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement || active instanceof HTMLSelectElement)) {
