@@ -6919,6 +6919,11 @@ fn resolve_cache_selection(
     }
 }
 
+/// A cache fit's per-GPU targets, in placement order: the split
+/// shares, the GPUs' total VRAM, the placed GPU indices, and
+/// their driver models (the three-state fit's paging basis).
+type CacheFitTargets = (Vec<f32>, Vec<u64>, Vec<u32>, Vec<Option<DriverModel>>);
+
 /// The targets a cache fit is priced against for a backend: the
 /// GPUs its placement puts it on (per [`backend_gpu_visibility`]),
 /// their total VRAM, and the tensor-split shares over exactly
@@ -6930,7 +6935,7 @@ fn resolve_cache_selection(
 fn cache_fit_targets(
     b: &manager_config::BackendConfig,
     gpus: &[GpuInfo],
-) -> Option<(Vec<f32>, Vec<u64>, Vec<u32>, Vec<Option<DriverModel>>)> {
+) -> Option<CacheFitTargets> {
     let placed = match backend_gpu_visibility(b) {
         GpuVisibility::Gpus(indices) => indices,
         _ => return None,
@@ -6989,7 +6994,7 @@ fn cache_preview_json(
     n_ctx: u32,
     n_seq: u32,
     moe_cache_mib: u32,
-    targets: Option<&(Vec<f32>, Vec<u64>, Vec<u32>, Vec<Option<DriverModel>>)>,
+    targets: Option<&CacheFitTargets>,
 ) -> Value {
     let kv_typed = layout
         .kv_geometry
