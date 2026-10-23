@@ -32,7 +32,7 @@ const html = existsSync(indexHtml) ? readFileSync(indexHtml, "utf8") : "";
 check(/assets\/.*\.js/.test(html), "index.html references the JS bundle");
 
 const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
-for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_moe_cache", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_set_mtp", "model_delete", "model_assign", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
+for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_mtp", "backend_set_moe_cache", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_set_mtp", "model_delete", "model_assign", "model_hf_lookup", "model_hf_header", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
 
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
@@ -421,6 +421,51 @@ check(staticSrc.includes('" disabled"}></label>'), "card editor's MoE inputs ren
 check(staticSrc.includes('<span class="k">MTP</span>'), "Models view renders the MTP card figure");
 check(staticSrc.includes("modelSetMtp(id, offloadDraftMtp ? true : null)"), "card editor saves the MTP declaration through model_set_mtp");
 check(staticSrc.includes("mtpChecked ? true : undefined"), "Add Model submits the MTP declaration through model_add");
+
+// HF form population (deep-discovery Part 2, Oct 22, 2026): the
+// Add Model form gains a name field with type-ahead and a Look
+// up button above Model id; the pick is two-step (repo row,
+// then quant row) with prefill into the form's fields, each
+// prefilled field carrying a provenance chip beside its label
+// (Hugging Face / File header / Suggested) that editing clears;
+// the pick-time header parse checks the MoE box and fills the
+// layers and checks MTP capable from the file's nextn head; a
+// sharded pick passes no hash and a single-file pick passes its
+// lfs.sha256 to model_add only while the form still names the
+// picked file. The card declaration editor gains the
+// post-download reconciliation (Declared vs File + Use file
+// value), a Declare MTP proposal for a file-borne head, and
+// Refresh from Hugging Face with per-field proposals and the
+// changed-hash warning. The lookup/prefill/header logic is
+// pinned by the Rust tests; these pins hold the UI surface and
+// that manual entry never depends on the lookup succeeding.
+check(bundle.includes("addModelName"), "bundle contains the Add Model lookup name field");
+check(bundle.includes("addModelSuggest"), "bundle contains the Add Model type-ahead dropdown host");
+check(bundle.includes("Look up"), "bundle contains the Add Model Look up action");
+check(bundle.includes("Refresh from Hugging Face"), "bundle contains the re-fetch action label");
+check(bundle.includes("Use file value"), "bundle contains the Use file value action");
+check(bundle.includes("Declared:"), "bundle renders Declared vs File figures in the declaration editor");
+check(staticSrc.includes('id="addModelLookupBtn"'), "Add Model renders the Look up button beside the name field");
+check(staticSrc.includes("modelHfSuggest"), "Add Model type-ahead queries the suggest lookup surface");
+check(staticSrc.includes('data-hf-suggest='), "Add Model renders type-ahead suggestion rows");
+check(staticSrc.includes('data-hf-repo='), "Add Model renders repo pick rows (step one of the pick)");
+check(staticSrc.includes('data-hf-quant='), "Add Model renders quant pick rows (step two of the pick)");
+check(staticSrc.includes('id="addModelPickChange"'), "the pick stays re-openable via Change beside the picked source line");
+check(staticSrc.includes('"Hugging Face"'), "record-prefilled fields carry the Hugging Face source chip");
+check(staticSrc.includes('"File header"'), "header-populated fields carry the File header source chip");
+check(staticSrc.includes('"Suggested"'), "the suggested default offload carries the Suggested source chip");
+check(staticSrc.includes("Catalog model — its figures come from the curated catalog."), "a catalog pick suppresses fetched prefill (the pins govern)");
+check(staticSrc.includes("File header not read — MoE/MTP not prefilled."), "a failed header read leaves the form unprefilled for geometry and says so");
+check(staticSrc.includes("Lookup failed:"), "a failed lookup is a visible failure in the pick area");
+check(staticSrc.includes("No repositories matched."), "an empty lookup renders its empty state");
+check(staticSrc.includes("pickSha"), "the pick's SHA-256 pin is computed for model_add from the pick state");
+check(staticSrc.includes("hfPick.url"), "the pin passes only while the form still names the picked URL");
+check(staticSrc.includes("shard_count === 1 ? q.sha256 : null"), "a sharded pick passes no hash pin (one field cannot name N shard hashes)");
+check(staticSrc.includes('data-model-act="offload-use-file"'), "card editor renders Use file value for the reconciliation and re-fetch proposals");
+check(staticSrc.includes('data-model-act="mtp-use-file"'), "card editor renders Declare MTP for a file-borne MTP head");
+check(staticSrc.includes('data-model-act="hf-refresh"'), "card editor renders Refresh from Hugging Face for HF-sourced models");
+check(staticSrc.includes("SHA-256 changed in the repository"), "a changed repository hash surfaces as a warning line, never a silent re-pin");
+check(staticSrc.includes("moe_reconcile"), "the card renders the backend-computed reconciliation proposal");
 
 // Add Model form UX (Oct 20, 2026): the control that made the
 // form appear and the form's submit control carried the same
