@@ -661,7 +661,7 @@ fn walk_gguf_facts(buf: &[u8]) -> Option<(Option<u32>, Option<u32>)> {
                     self.take(2)?;
                     Some(None)
                 }
-                4 | 5 | 6 => {
+                4..=6 => {
                     self.take(4)?;
                     Some(None)
                 }
@@ -678,7 +678,7 @@ fn walk_gguf_facts(buf: &[u8]) -> Option<(Option<u32>, Option<u32>)> {
                     }
                     Some(Some(count))
                 }
-                10 | 11 | 12 => {
+                10..=12 => {
                     self.take(8)?;
                     Some(None)
                 }
@@ -1177,12 +1177,10 @@ async fn run_arm(
             out.detail = Some(format!("temp backend {temp_id} failed to start: {e:?}"));
             return out;
         }
-        let pid = sup
-            .status()
+        sup.status()
             .into_iter()
             .find(|s| s.id == temp_id)
-            .and_then(|s| s.pid);
-        pid
+            .and_then(|s| s.pid)
     };
     if let Some(pid) = pid {
         let mut journal = load_journal(state);
