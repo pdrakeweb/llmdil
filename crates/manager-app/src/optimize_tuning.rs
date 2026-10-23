@@ -1176,8 +1176,7 @@ async fn run_sweep(
             if queue.is_empty() || queue[0].0 != axis {
                 let mut best: Option<&TuningArm> = arms
                     .iter()
-                    .filter(|a| a.rankable() && a.coords == descent.current)
-                    .next()
+                    .find(|a| a.rankable() && a.coords == descent.current)
                     .or_else(|| arms.iter().find(|a| a.axis == "incumbent"));
                 for a in arms.iter().filter(|a| a.axis == axis && a.rankable()) {
                     if best.map(|b| a.gen_long() > b.gen_long()).unwrap_or(true) {
