@@ -1106,6 +1106,60 @@ mod tests {
     }
 
     #[test]
+    fn denied_chained_add_blocks_dependent_set_model_at_validation() {
+        // Tracker #54 apply-dependency guard, validation layer:
+        // a backend.set_model whose chained model.add is DENIED
+        // must not be offered to apply as executable. Denied
+        // items do not shape the simulation, so the set_model is
+        // judged against a config where its model was never
+        // registered and is Invalid — and the UI apply queue
+        // filters Invalid items out, which blocks the item and
+        // surfaces this reason on its row. The same plan with
+        // the add accepted validates the set_model, so the
+        // dependency — not the set_model itself — is the blocker.
+        let cfg = cfg_with_model();
+        let live = live_for(&cfg);
+        let add = |decision: Decision| {
+            item(
+                1,
+                PlanKind::ModelAdd,
+                "new-model",
+                json!({"source_url": "https://example.com/new.gguf", "params_b": 12.0}),
+                decision,
+            )
+        };
+        let set_model = || {
+            item(
+                2,
+                PlanKind::BackendSetModel,
+                "tool-runner",
+                json!({"model_id": "new-model"}),
+                Decision::Accepted,
+            )
+        };
+        let denied = plan(vec![add(Decision::Denied), set_model()]);
+        let out = validate_plan(&denied, &cfg, &live);
+        assert_eq!(
+            out[1].status,
+            ValidationStatus::Invalid,
+            "set_model with a denied chained add: {:?}",
+            out[1].reason
+        );
+        assert_eq!(
+            out[1].reason.as_deref(),
+            Some("model 'new-model' is not registered")
+        );
+        let accepted = plan(vec![add(Decision::Accepted), set_model()]);
+        let out = validate_plan(&accepted, &cfg, &live);
+        assert_eq!(
+            out[1].status,
+            ValidationStatus::Valid,
+            "set_model with its add accepted: {:?}",
+            out[1].reason
+        );
+    }
+
+    #[test]
     fn sequential_items_see_each_others_effects() {
         let cfg = cfg_with_model();
         let live = live_for(&cfg);
