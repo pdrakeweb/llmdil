@@ -278,6 +278,28 @@ pub struct MemoryRequirement {
     /// of context size; dense models carry none. Absent when the
     /// geometry is unknown — never counted as zero.
     pub rs_mib: Option<u64>,
+    /// MoE expert cache (`--moe-cache-mib`): the TOTAL VRAM
+    /// budget the backend reserves for caching host-resident
+    /// experts on the GPU, across all placed GPUs (llama.cpp
+    /// splits the one budget among the devices holding offloaded
+    /// layers — see [`super::moe_cache::moe_cache_shares`] for
+    /// the per-GPU distribution consumers price). 0 when the
+    /// backend sets no cache. Set by the requirement builders
+    /// from the decoded flags, not by [`memory_requirement`]
+    /// (which prices weights/KV/state and never sees the flag).
+    #[serde(default)]
+    pub moe_cache_mib: u64,
+    /// The backend's resolved offload position (MoE layers in
+    /// system RAM) at requirement time — the distribution input
+    /// [`super::moe_cache::moe_cache_shares`] needs alongside
+    /// [`Self::moe_cache_moe_layers`]. 0 when unknown or no
+    /// offload.
+    #[serde(default)]
+    pub moe_cache_offload_layers: u32,
+    /// The model's MoE layer count at requirement time (the
+    /// distribution's layer-range basis). 0 when unknown.
+    #[serde(default)]
+    pub moe_cache_moe_layers: u32,
     pub basis: MemoryBasis,
 }
 
@@ -354,6 +376,9 @@ pub fn memory_requirement(
                     sys_weights_mib: 0,
                     kv_mib,
                     rs_mib,
+                    moe_cache_mib: 0,
+                    moe_cache_offload_layers: 0,
+                    moe_cache_moe_layers: 0,
                     basis: MemoryBasis::Estimate,
                 }
             }
@@ -384,6 +409,9 @@ pub fn memory_requirement(
                     sys_weights_mib: 0,
                     kv_mib,
                     rs_mib,
+                    moe_cache_mib: 0,
+                    moe_cache_offload_layers: 0,
+                    moe_cache_moe_layers: 0,
                     basis: MemoryBasis::Estimate,
                 }
             }
@@ -394,6 +422,9 @@ pub fn memory_requirement(
         sys_weights_mib: mib(sys_bytes),
         kv_mib,
         rs_mib,
+        moe_cache_mib: 0,
+        moe_cache_offload_layers: 0,
+        moe_cache_moe_layers: 0,
         basis,
     }
 }

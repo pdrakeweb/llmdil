@@ -127,6 +127,7 @@ fn requirement_of(
         manager_models::cache_selection(backend.raw_flags.as_deref()),
         backend.flags.n_ctx,
         manager_models::effective_slots(backend.raw_flags.as_deref()),
+        manager_models::moe_cache_mib(backend.raw_flags.as_deref()).unwrap_or(0),
     ))
 }
 
@@ -171,9 +172,12 @@ fn write_keys(item: &PlanItem) -> Vec<(String, &'static str)> {
             if item.change.get("offload_layers").is_some() {
                 keys.push(b("offload"));
             }
+            if item.change.get("moe_cache_mib").is_some() {
+                keys.push(b("moe_cache"));
+            }
         }
         PlanKind::BackendDelete => {
-            for f in ["exists", "model", "enabled", "n_ctx", "n_batch", "offload", "placement"] {
+            for f in ["exists", "model", "enabled", "n_ctx", "n_batch", "offload", "moe_cache", "placement"] {
                 keys.push(b(f));
             }
         }
@@ -186,7 +190,12 @@ fn write_keys(item: &PlanItem) -> Vec<(String, &'static str)> {
                 keys.push(b("n_batch"));
             }
         }
-        PlanKind::BackendSetOffload => keys.push(b("offload")),
+        PlanKind::BackendSetOffload => {
+            keys.push(b("offload"));
+            if item.change.get("moe_cache_mib").is_some() {
+                keys.push(b("moe_cache"));
+            }
+        }
         PlanKind::BackendSetPlacement => keys.push(b("placement")),
         PlanKind::BackendSetModel => keys.push(b("model")),
         PlanKind::BackendSetEnabled => keys.push(b("enabled")),
@@ -419,6 +428,27 @@ fn validate_one(
                     ),
                 }
             }
+            if let Some(cache) = get_u32(&item.change, "moe_cache_mib") {
+                if cache > 0 {
+                    match live.layouts.get(&model.id).and_then(|f| f.moe_layers) {
+                        Some(_) => {
+                            if get_u32(&item.change, "offload_layers").unwrap_or(0) == 0 {
+                                fail!(
+                                    "moe_cache_mib requires offload_layers above 0 in the same change: the cache holds the offloaded experts, and this create offloads none".to_string()
+                                );
+                            }
+                            raw_flags = manager_models::set_moe_cache(
+                                raw_flags.as_deref(),
+                                Some(cache),
+                            );
+                        }
+                        None => warnings.push(
+                            "moe_cache_mib cannot be encoded: the model's MoE layer count is unknown"
+                                .to_string(),
+                        ),
+                    }
+                }
+            }
             candidate.backends.push(BackendConfig {
                 id: target.clone(),
                 enabled: true,
@@ -564,8 +594,25 @@ fn validate_one(
                 ));
             };
             let layers = get_u32(&item.change, "offload_layers").unwrap_or(0);
+            let cache = get_u32(&item.change, "moe_cache_mib");
+            if let Some(c) = cache {
+                if c > 0 && layers == 0 {
+                    fail!(
+                        "moe_cache_mib requires offload_layers above 0: the cache holds the offloaded experts, and this change offloads none"
+                            .to_string()
+                    );
+                }
+                if c > 0 && b.flags.split_mode == SplitMode::Row {
+                    fail!(
+                        "moe_cache_mib is not supported with a row (tensor) split: the pinned llama.cpp refuses the expert cache under tensor parallelism"
+                            .to_string()
+                    );
+                }
+            }
             let current = manager_models::expert_offload(b.raw_flags.as_deref()).layers(moe);
-            if current == layers {
+            let current_cache =
+                manager_models::moe_cache_mib(b.raw_flags.as_deref()).unwrap_or(0);
+            if current == layers && cache.is_none_or(|c| c == current_cache) {
                 fail!("already satisfied".to_string());
             }
             let bm = backend_mut(&mut candidate, &target).unwrap();
@@ -573,6 +620,11 @@ fn validate_one(
                 bm.raw_flags.as_deref(),
                 manager_models::offload_for_layers(layers, moe),
             );
+            if let Some(c) = cache {
+                // The writer's disabled form: a 0 value removes
+                // the token the offload rewrite just preserved.
+                bm.raw_flags = manager_models::set_moe_cache(bm.raw_flags.as_deref(), Some(c));
+            }
             fit_backend = Some(target.clone());
         }
         PlanKind::BackendSetPlacement => {
@@ -1302,6 +1354,138 @@ mod tests {
             ValidationStatus::Warning,
             "by-url verdict: {:?}",
             out[1].reason
+        );
+    }
+
+    /// The dense fixture's model as an MoE model in the live
+    /// facts (48 MoE layers with expert bytes), its backend
+    /// carrying a partial offload.
+    fn moe_fixture() -> (AppConfig, LiveSnapshot) {
+        let mut cfg = cfg_with_model();
+        let mut live = live_for(&cfg);
+        let facts = live.layouts.get_mut("qwen3-8b").unwrap();
+        facts.expert_bytes = Some(20 * 1024 * manager_models::MIB);
+        facts.moe_layers = Some(48);
+        cfg.backends[0].raw_flags = Some("--n-cpu-moe 16".to_string());
+        (cfg, live)
+    }
+
+    #[test]
+    fn set_offload_cache_follows_the_control_discipline() {
+        let (cfg, live) = moe_fixture();
+        // Offload + cache together: valid, and the expected GPU
+        // total carries the cache (the same item without it
+        // prices exactly 4096 less).
+        let with = plan(vec![item(
+            1,
+            PlanKind::BackendSetOffload,
+            "tool-runner",
+            json!({"offload_layers": 24, "moe_cache_mib": 4096}),
+            Decision::Undecided,
+        )]);
+        let out = validate_plan(&with, &cfg, &live);
+        assert_eq!(out[0].status, ValidationStatus::Valid, "{:?}", out[0].reason);
+        let gpu_with = out[0].expected.gpu_ram_mib.expect("fit verdict priced").1;
+        let without = plan(vec![item(
+            1,
+            PlanKind::BackendSetOffload,
+            "tool-runner",
+            json!({"offload_layers": 24}),
+            Decision::Undecided,
+        )]);
+        let out = validate_plan(&without, &cfg, &live);
+        assert_eq!(out[0].status, ValidationStatus::Valid, "{:?}", out[0].reason);
+        let gpu_without = out[0].expected.gpu_ram_mib.expect("fit verdict priced").1;
+        assert_eq!(gpu_with, gpu_without + 4096);
+        // A cache with no offload in the same change: invalid.
+        let p = plan(vec![item(
+            1,
+            PlanKind::BackendSetOffload,
+            "tool-runner",
+            json!({"offload_layers": 0, "moe_cache_mib": 4096}),
+            Decision::Undecided,
+        )]);
+        let out = validate_plan(&p, &cfg, &live);
+        assert_eq!(out[0].status, ValidationStatus::Invalid);
+        assert!(
+            out[0].reason.as_deref().unwrap_or("").contains("offload_layers above 0"),
+            "{:?}",
+            out[0].reason
+        );
+        // A cache-only change (the saved offload restated, a new
+        // cache) is a real change, not "already satisfied"; the
+        // exact saved state (offload 16, cache 0) is.
+        let p = plan(vec![item(
+            1,
+            PlanKind::BackendSetOffload,
+            "tool-runner",
+            json!({"offload_layers": 16, "moe_cache_mib": 4096}),
+            Decision::Undecided,
+        )]);
+        let out = validate_plan(&p, &cfg, &live);
+        assert_eq!(out[0].status, ValidationStatus::Valid, "{:?}", out[0].reason);
+        let p = plan(vec![item(
+            1,
+            PlanKind::BackendSetOffload,
+            "tool-runner",
+            json!({"offload_layers": 16, "moe_cache_mib": 0}),
+            Decision::Undecided,
+        )]);
+        let out = validate_plan(&p, &cfg, &live);
+        assert_eq!(out[0].status, ValidationStatus::Invalid);
+        assert_eq!(out[0].reason.as_deref(), Some("already satisfied"));
+    }
+
+    #[test]
+    fn create_cache_requires_offload_in_the_same_change() {
+        let (cfg, live) = moe_fixture();
+        // A create naming a cache but no offload: invalid.
+        let p = plan(vec![item(
+            1,
+            PlanKind::BackendCreate,
+            "new-moe",
+            json!({"model_id": "qwen3-8b", "port": 8091, "group": "tool-runner", "moe_cache_mib": 4096}),
+            Decision::Undecided,
+        )]);
+        let out = validate_plan(&p, &cfg, &live);
+        assert_eq!(out[0].status, ValidationStatus::Invalid, "{:?}", out[0].reason);
+        assert!(
+            out[0].reason.as_deref().unwrap_or("").contains("offload_layers above 0"),
+            "{:?}",
+            out[0].reason
+        );
+        // Offload + cache together: valid.
+        let p = plan(vec![item(
+            1,
+            PlanKind::BackendCreate,
+            "new-moe",
+            json!({"model_id": "qwen3-8b", "port": 8091, "group": "tool-runner", "offload_layers": 24, "moe_cache_mib": 4096}),
+            Decision::Undecided,
+        )]);
+        let out = validate_plan(&p, &cfg, &live);
+        assert_eq!(out[0].status, ValidationStatus::Valid, "{:?}", out[0].reason);
+    }
+
+    #[test]
+    fn create_cache_on_a_dense_model_warns_like_its_offload() {
+        let cfg = cfg_with_model();
+        let live = live_for(&cfg);
+        // The model's MoE layer count is unknown (dense fixture):
+        // the cache cannot be encoded — a warning, mirroring the
+        // create-offload posture, not a failure.
+        let p = plan(vec![item(
+            1,
+            PlanKind::BackendCreate,
+            "new-dense",
+            json!({"model_id": "qwen3-8b", "port": 8091, "group": "tool-runner", "offload_layers": 4, "moe_cache_mib": 4096}),
+            Decision::Undecided,
+        )]);
+        let out = validate_plan(&p, &cfg, &live);
+        assert_eq!(out[0].status, ValidationStatus::Warning, "{:?}", out[0].reason);
+        assert!(
+            out[0].reason.as_deref().unwrap_or("").contains("moe_cache_mib cannot be encoded"),
+            "{:?}",
+            out[0].reason
         );
     }
 }

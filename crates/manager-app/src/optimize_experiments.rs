@@ -1518,6 +1518,7 @@ mod tests {
                 n_ctx: None,
                 offload_layers: Some(40),
                 tensor_split: Some(vec![0.5, 0.5]),
+                moe_cache_mib: None,
             },
             serves: "guardrail wiring test".to_string(),
             hypothesis: String::new(),

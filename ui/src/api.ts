@@ -780,6 +780,12 @@ export interface BackendRow {
    *  otherwise. The state is decoded from the backend's saved
    *  raw flags: MTP is on iff `--spec-type draft-mtp` is present. */
   mtp?: BackendMtp;
+  /** MoE expert-cache control state (configured rows whose model
+   *  is offload-capable — the offload slider's eligibility);
+   *  absent otherwise. Decoded from the backend's saved raw
+   *  flags: the cache is on iff `--moe-cache-mib N` (N > 0) is
+   *  present. */
+  moe_cache?: BackendMoeCache;
   /** Predicted throughput for the backend's SAVED
    *  configuration (predicted-throughput design §7): the
    *  exact-match measurement, in the measurement_lookup shape.
@@ -874,6 +880,26 @@ export interface BackendMtp {
    *  for its state (a bare `--spec-type draft-mtp` with no length
    *  token, an `=` spelling, ...). */
   custom: boolean;
+}
+
+/** A backend's MoE expert-cache control state (list_backends
+ *  payload). Present only when the backend is offload-capable —
+ *  the same eligibility as the offload slider (an MoE model with
+ *  a resolvable layout). Decoded server-side from the backend's
+ *  saved raw flags. */
+export interface BackendMoeCache {
+  /** The saved `--moe-cache-mib` value, or null when the cache
+   *  is off (no token, or the pin's disabled value 0). */
+  mib: number | null;
+  /** True when the saved spelling is not the canonical form
+   *  for its state (an `=` spelling, a decoded 0 token). */
+  custom: boolean;
+  /** The backend's saved offload position (MoE layers on
+   *  system RAM). The control is disabled at 0: with no experts
+   *  in system RAM there is nothing for the cache to hold. */
+  offload_layers: number;
+  /** The model's MoE layer count. */
+  moe_layers: number;
 }
 
 /** A backend's parallel-slots state (list_backends payload,
@@ -1036,6 +1062,29 @@ export async function setBackendMtp(id: string, nMax: number | null): Promise<Ca
     return { data, live: true };
   } catch (e) {
     return { data: { backend_id: id, n_max: nMax, raw_flags: null, changed: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** backend_set_moe_cache — set a backend's MoE expert cache
+ *  (`--moe-cache-mib`). A MiB value writes the canonical token;
+ *  null turns the cache off; `auto: true` (with `mib` null) asks
+ *  the server to resolve the size from priced free VRAM and
+ *  reports it as `resolved_mib` (the saved `mib` then equals
+ *  it). Only the cache token in the backend's raw flags changes.
+ *  A nonzero size requires a saved offload above 0 — the cache
+ *  holds the offloaded experts. The size is priced into the
+ *  backend's memory requirement, so a start that cannot fit it
+ *  is refused with the numbers. Persisted immediately; applies
+ *  on the next start. */
+export async function setBackendMoeCache(id: string, mib: number | null, auto?: boolean): Promise<CallResult<{ backend_id: string; mib: number | null; auto: boolean; resolved_mib: number | null; raw_flags: string | null; changed: boolean }>> {
+  if (!isTauri()) return { data: { backend_id: id, mib, auto: !!auto, resolved_mib: null, raw_flags: null, changed: false }, live: false };
+  try {
+    const args: Record<string, unknown> = { id, mib };
+    if (auto) args.auto = true;
+    const data = await invoke<{ backend_id: string; mib: number | null; auto: boolean; resolved_mib: number | null; raw_flags: string | null; changed: boolean }>("backend_set_moe_cache", args);
+    return { data, live: true };
+  } catch (e) {
+    return { data: { backend_id: id, mib, auto: !!auto, resolved_mib: null, raw_flags: null, changed: false }, live: true, error: errOf(e) };
   }
 }
 
@@ -3733,6 +3782,7 @@ export function optimizeChangeSummary(item: OptimizePlanItem, shortName: (modelI
       if (typeof c.group === "string") parts.push(`Group: ${c.group}`);
       if (typeof c.n_ctx === "number") parts.push(`Context: ${num(c.n_ctx)}`);
       if (typeof c.offload_layers === "number") parts.push(`Offload: ${num(c.offload_layers)} layers`);
+      if (typeof c.moe_cache_mib === "number") parts.push(c.moe_cache_mib === 0 ? "Expert cache: off" : `Expert cache: ${num(c.moe_cache_mib)} MiB`);
       if (split) parts.push(`Split: ${split}`);
       return parts.join(" · ");
     }
@@ -3744,7 +3794,7 @@ export function optimizeChangeSummary(item: OptimizePlanItem, shortName: (modelI
       if (typeof c.n_batch === "number") parts.push(`Batch: ${num(c.n_batch)}`);
       return parts.join(" · ");
     }
-    case "backend.set_offload": return `Offload: ${num(c.offload_layers)} layers to system RAM`;
+    case "backend.set_offload": return `Offload: ${num(c.offload_layers)} layers to system RAM${typeof c.moe_cache_mib === "number" ? (c.moe_cache_mib === 0 ? " · Expert cache: off" : ` · Expert cache: ${num(c.moe_cache_mib)} MiB`) : ""}`;
     case "backend.set_placement": return `Split: ${split}${typeof c.split_mode === "string" ? ` · Mode: ${c.split_mode}` : ""}`;
     case "backend.set_model": return `Model: ${shortName(String(c.model_id ?? ""))}`;
     case "backend.set_enabled": return c.enabled === true ? "Enable backend" : "Disable backend";

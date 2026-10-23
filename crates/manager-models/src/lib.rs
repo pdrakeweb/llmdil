@@ -20,6 +20,7 @@ pub mod flags;
 pub mod gguf;
 pub mod guardrails;
 pub mod memory;
+pub mod moe_cache;
 pub mod mtp;
 pub mod parallel;
 pub mod placement;
@@ -39,6 +40,10 @@ pub use guardrails::{
 pub use memory::{
     expert_offload, memory_requirement, offload_bands, offload_flag_string, offload_for_layers,
     set_expert_offload, sys_bytes_by_position, ExpertOffload, MemoryBasis, MemoryRequirement,
+};
+pub use moe_cache::{
+    auto_moe_cache_budget, moe_cache_mib, moe_cache_shares, set_moe_cache, MOE_CACHE_AUTO_RESERVE_MIB,
+    MOE_CACHE_DEFAULT_MIB, MOE_CACHE_PRESETS_MIB,
 };
 pub use mtp::{mtp_draft, set_mtp_draft, MtpDraft, LLAMA_CPP_N_MAX_DEFAULT};
 pub use parallel::{effective_slots, parallel_slots, set_parallel_slots};
@@ -170,6 +175,24 @@ pub fn catalog_params_b(id: &str, source_url: &str) -> Option<f32> {
         .iter()
         .find(|s| s.url == source_url)
         .map(|s| s.params_b)
+}
+
+/// The catalog's MoE layer count for a model, resolved the way
+/// [`catalog_mtp_pin`] resolves its pin: by id first, then by
+/// source URL. `None` when the model is outside the catalog or
+/// the catalog carries no MoE layer count for it (a dense model).
+pub fn catalog_moe_layers(id: &str, source_url: &str) -> Option<u32> {
+    let models = curated_models();
+    if let Some(spec) = models.iter().find(|s| s.id == id) {
+        return spec.moe_layers;
+    }
+    if source_url.is_empty() {
+        return None;
+    }
+    models
+        .iter()
+        .find(|s| s.url == source_url)
+        .and_then(|s| s.moe_layers)
 }
 
 /// The curated catalog's MTP capability pin for a model (see

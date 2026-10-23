@@ -998,6 +998,14 @@ fn plan_item_predicted(
                     );
                 }
             }
+            // The change's expert-cache value rides the same
+            // merged clone (a 0 removes the token — the writer's
+            // disabled form), so the predicted fingerprint prices
+            // the configuration the item would actually save.
+            if let Some(mib) = get_u32("moe_cache_mib") {
+                merged.raw_flags =
+                    manager_models::set_moe_cache(merged.raw_flags.as_deref(), Some(mib));
+            }
         }
         PlanKind::BackendSetModel => {
             let model_id = change.get("model_id").and_then(Value::as_str)?;
@@ -1082,6 +1090,7 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
                         &cfg,
                         &extra_candidates,
                         &plan.items,
+                        Some(&gathered.live.layouts),
                     );
                     json!({
                         "status": match ev.status {

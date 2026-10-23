@@ -609,17 +609,17 @@ exactly one JSON object and no other text:
 {\"summary\": \"one line\", \"items\": [{\"kind\": \"...\", \"target\": \"...\", \
 \"change\": {...}, \"rationale\": \"...\", \"expected_effect\": \"...\", \
 \"confidence\": \"high|medium|low\"}], \"experiments\": [{\"candidate_model_id\": \"...\", \
-\"flags\": {\"n_ctx\": N, \"offload_layers\": N, \"tensor_split\": [fractions]}, \
+\"flags\": {\"n_ctx\": N, \"offload_layers\": N, \"tensor_split\": [fractions], \"moe_cache_mib\": N}, \
 \"serves\": \"the directive or purpose need this serves\", \"hypothesis\": \"...\", \
 \"predicted\": {\"predicted_per_second\": N, \"fit\": \"...\"}, \
 \"requires_stopping\": [\"backend-id\", ...], \"run_eval\": true|false}]}
 
 Allowed kinds and their change payloads:
-- backend.create — target: the new backend's id. change: {\"model_id\": \"...\", optional \"group\", \"port\", \"n_ctx\", \"n_batch\", \"tensor_split\", \"offload_layers\"}
+- backend.create — target: the new backend's id. change: {\"model_id\": \"...\", optional \"group\", \"port\", \"n_ctx\", \"n_batch\", \"tensor_split\", \"offload_layers\", \"moe_cache_mib\"}
 - backend.delete — target: backend id. change: {}
 - backend.set_context — change: {\"n_ctx\": N}
 - backend.set_flags — change: {\"n_ctx\": N, \"n_batch\": N} (either or both)
-- backend.set_offload — change: {\"offload_layers\": N} (MoE layers whose experts move to system RAM)
+- backend.set_offload — change: {\"offload_layers\": N, optional \"moe_cache_mib\": N} (MoE layers whose experts move to system RAM; moe_cache_mib is the GPU-resident expert cache for the offloaded experts — nonzero requires offload_layers above 0 and a model whose MoE layer count is known; omit it to leave the cache unchanged, 0 turns it off)
 - backend.set_placement — change: {\"tensor_split\": [fractions], optional \"split_mode\": \"none|layer|row\"}
 - backend.set_model — change: {\"model_id\": \"...\"}
 - backend.set_enabled — change: {\"enabled\": true|false}
@@ -884,6 +884,9 @@ mod tests {
                 sys_weights_mib: 0,
                 kv_mib: Some(512),
                 rs_mib: None,
+                moe_cache_mib: 0,
+                moe_cache_offload_layers: 0,
+                moe_cache_moe_layers: 0,
                 basis: manager_models::MemoryBasis::Estimate,
             },
         );

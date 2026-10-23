@@ -2,12 +2,12 @@
 
 Status: implemented. The API shipped with the admin-API build
 (PLAN.md §9) and this contract describes the shipped surface as of
-v0.1.40. The source of truth for routes is the operation registry —
-`crates/manager-app/src/registry.rs` (`for_each_operation!`): 123
-operations, of which 78 carry a REST route and 45 are explicit
+v0.1.50. The source of truth for routes is the operation registry —
+`crates/manager-app/src/registry.rs` (`for_each_operation!`): 132
+operations, of which 82 carry a REST route and 50 are explicit
 `None` exclusions (§6.16). Derived/composite and auth/admin routes
 are API-layer routes in `crates/manager-api` (§6.17); the full live
-surface is 117 route records (78 registry + 15 derived + 24
+surface is 121 route records (82 registry + 15 derived + 24
 auth/admin).
 Scope: an HTTP API served by the Service Manager on a dedicated **admin port**
 on the managed machine (separate from the LiteLLM gateway port), exposing the
@@ -260,6 +260,8 @@ lives in the app types cited; this is the wire contract summary.)
                "green_end": 1.0, "yellow_end": 1.0 },
   "mtp": { "enabled": true, "n_max": 2, "parallel": 1,
            "custom": false },
+  "moe_cache": { "mib": 4096, "custom": false,
+                 "offload_layers": 48, "moe_layers": 48 },
   "raw_flags": "--parallel 1",
   "flags_advanced": false,
   "predicted": { "prompt_per_second": 33.5,
@@ -286,7 +288,12 @@ are never zero-filled (§1 rule 4). The `mtp` block is present only for
 MTP-capable backends (the catalog pins the capability); `n_max` is the
 explicit `--spec-draft-n-max`, or null when MTP is on without one
 (llama.cpp's default applies) or off; `parallel` is the explicit
-`--parallel` slot count, or null when unset. `configured: false` marks a
+`--parallel` slot count, or null when unset. The `moe_cache` block is
+present only for offload-capable backends (the `offload` block's
+population); `mib` is the saved `--moe-cache-mib`, or null when the
+expert cache is off, and `offload_layers` is the backend's saved
+offload position — the cache control is disabled at 0.
+`configured: false` marks a
 supervisor-only orphan process; orphans accept `stop` only. The
 `predicted` block is present only when an exact-match measurement
 exists for the backend's saved configuration (predicted-throughput
@@ -598,6 +605,26 @@ Sets the backend's MTP speculative decoding draft length
 backend's raw flags change. Only valid for MTP-capable backends
 (the `mtp` block in §4.1 says which); otherwise
 `400 INVALID_INPUT`, as in the app.
+
+#### `PUT /api/v1/backends/{id}/moe-cache` — `config`
+`backend_set_moe_cache`. Body: `{ "mib": 4096 }` →
+`{ "backend_id", "mib": 4096, "auto": false, "resolved_mib": null,
+"raw_flags": "…", "changed": true }`. Sets the backend's MoE expert
+cache (`--moe-cache-mib`): llama.cpp keeps the most recently used
+experts of the offloaded layers in GPU memory and computes them
+there. `{ "mib": null }` turns the cache off; `{ "auto": true }`
+(with `mib` null) resolves the size from priced free VRAM — the
+telemetry free space less other backends' accounted residency and
+this backend's own requirement, less a standing reserve — and the
+response's `resolved_mib` (and `mib`) carry the saved value. Only
+the cache token in the backend's raw flags changes. Only valid
+for offload-capable backends (the `moe_cache` block in §4.1 says
+which); a nonzero size additionally requires a saved offload above
+0 and a non-row split, otherwise `400 INVALID_INPUT`, as in the
+app. The size is priced into the backend's memory requirement, so
+a start whose cache cannot fit is refused with the numbers.
+Applies at the backend's next start; the app records the
+activation-plan entry.
 
 #### `PUT /api/v1/backends/{id}/parallel` — `config`
 `backend_set_parallel`. Body: `{ "slots": 1 }` →
@@ -1200,7 +1227,7 @@ operations the draft knew (`mcp_save_server`,
 
 ### 6.16 Registry exclusions — every operation with no route
 
-The registry holds 131 operations: 81 routed (§6.1–§6.14,
+The registry holds 132 operations: 82 routed (§6.1–§6.14,
 §6.18) and 50 with route `None`. A `None` route is an explicit
 exclusion, never an oversight (registry module docs); the
 complete list, grouped by reason:
