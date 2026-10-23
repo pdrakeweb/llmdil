@@ -37,9 +37,91 @@ const STRIPPED_VALUE_FLAGS: &[&str] = &[
     "-ctvd",
 ];
 
-/// Offload flags, stripped only when the arm supplies its own
-/// offload expression to append in their place.
-const OFFLOAD_VALUE_FLAGS: &[&str] = &["-ot", "--override-tensor", "-ncmoe", "--n-cpu-moe"];
+/// Whether one comma-separated `--override-tensor` assignment
+/// targets routed experts (its pattern mentions `exps`, as in
+/// `exps=CPU`) — the assignments expert offload owns. Mirrors
+/// `manager_models::set_expert_offload`'s detection, so Bench
+/// strips exactly what the app's own offload writer strips.
+fn override_part_is_expert(part: &str) -> bool {
+    part.split('=').next().unwrap_or("").contains("exps")
+}
+
+/// Remove the expert-offload tokens from `tokens`, the way the
+/// app's own offload writer removes them: the `-ncmoe` /
+/// `--n-cpu-moe` counts (pair and `=` forms), the valueless
+/// `--cpu-moe` / `-cmoe` all-experts spellings, and — inside an
+/// `-ot` / `--override-tensor` value — only the assignments
+/// whose pattern mentions `exps`; sibling assignments in the
+/// same value keep their flag. Everything else passes through
+/// verbatim and in order — in particular `--moe-cache-mib`,
+/// which is not an offload token: an arm carries the backend's
+/// cache setting exactly as saved, never stripped and never
+/// duplicated (the cache prices into the start gate, and
+/// llama.cpp refuses it on row-split backends, so rewriting
+/// must not invent or drop it).
+fn strip_offload_tokens(tokens: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i].as_str();
+        if t == "--n-cpu-moe" || t == "-ncmoe" {
+            // Skip the value token too when it parses as a count;
+            // a malformed value is left for the main walk.
+            let has_value = tokens
+                .get(i + 1)
+                .map(|v| v.parse::<u32>().is_ok())
+                .unwrap_or(false);
+            i += if has_value { 2 } else { 1 };
+            continue;
+        }
+        if t.starts_with("--n-cpu-moe=") || t.starts_with("-ncmoe=") {
+            i += 1;
+            continue;
+        }
+        if t == "--cpu-moe" || t == "-cmoe" {
+            // Valueless all-experts spelling: drop the token alone.
+            i += 1;
+            continue;
+        }
+        let (flag, inline): (&str, Option<&str>) = if t == "-ot" || t == "--override-tensor" {
+            (t, None)
+        } else if let Some(v) = t.strip_prefix("--override-tensor=") {
+            ("--override-tensor", Some(v))
+        } else if let Some(v) = t.strip_prefix("-ot=") {
+            ("-ot", Some(v))
+        } else {
+            out.push(tokens[i].clone());
+            i += 1;
+            continue;
+        };
+        let value: Option<&str> = match inline {
+            Some(v) => {
+                i += 1;
+                Some(v)
+            }
+            None => {
+                let v = tokens.get(i + 1).map(|s| s.as_str());
+                i += if v.is_some() { 2 } else { 1 };
+                v
+            }
+        };
+        let Some(value) = value else {
+            // A trailing override flag with no value is malformed
+            // but not ours to delete.
+            out.push(flag.to_string());
+            continue;
+        };
+        let kept: Vec<&str> = value
+            .split(',')
+            .filter(|part| !override_part_is_expert(part))
+            .collect();
+        if !kept.is_empty() {
+            out.push(flag.to_string());
+            out.push(kept.join(","));
+        }
+    }
+    out
+}
 
 /// The flag name of a token: the part before `=` if present.
 fn flag_name(token: &str) -> &str {
@@ -92,8 +174,7 @@ pub fn arm_raw_flags(
     let tokens: Vec<&str> = base.split_whitespace().collect();
     let mut out = strip_flags(&tokens, STRIPPED_VALUE_FLAGS);
     if arm.offload_expr.is_some() {
-        let kept: Vec<&str> = out.iter().map(|s| s.as_str()).collect();
-        out = strip_flags(&kept, OFFLOAD_VALUE_FLAGS);
+        out = strip_offload_tokens(&out);
         if let Some(expr) = &arm.offload_expr {
             out.extend(expr.split_whitespace().map(|s| s.to_string()));
         }
@@ -226,6 +307,79 @@ mod tests {
         // Without an arm offload expression the base offload is kept.
         let out = arm_raw_flags(Some("-ot exps=CPU"), &arm(), None, None);
         assert!(out.starts_with("-ot exps=CPU "), "{out}");
+    }
+
+    #[test]
+    fn offload_expr_strips_every_offload_spelling() {
+        // The valueless all-experts spellings and the short count
+        // spellings are offload tokens too (the app's offload
+        // decoder recognizes them all): an arm's own expression
+        // must not launch alongside any of them.
+        let mut a = arm();
+        a.offload_expr = Some("--n-cpu-moe 24".to_string());
+        let out = arm_raw_flags(Some("--cpu-moe --parallel 1"), &a, None, None);
+        assert_eq!(
+            out,
+            "--parallel 1 --n-cpu-moe 24 --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn auto"
+        );
+        let out = arm_raw_flags(Some("-cmoe -ncmoe=12"), &a, None, None);
+        assert_eq!(
+            out,
+            "--n-cpu-moe 24 --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn auto"
+        );
+        // The empty expression is an explicit no-offload position:
+        // it strips the base offload and appends nothing.
+        let mut none_arm = arm();
+        none_arm.offload_expr = Some(String::new());
+        let out = arm_raw_flags(Some("-ot exps=CPU --n-cpu-moe 46"), &none_arm, None, None);
+        assert_eq!(
+            out,
+            "--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn auto"
+        );
+    }
+
+    #[test]
+    fn offload_strip_keeps_non_expert_override_siblings() {
+        // An `-ot` value mixing expert and non-expert assignments:
+        // only the expert assignment is offload-owned; the sibling
+        // keeps its flag (the app's own offload writer's rule).
+        let mut a = arm();
+        a.offload_expr = Some("--n-cpu-moe 24".to_string());
+        let out = arm_raw_flags(
+            Some("-ot exps=CPU,blk.0.attn=CPU --parallel 1"),
+            &a,
+            None,
+            None,
+        );
+        assert_eq!(
+            out,
+            "-ot blk.0.attn=CPU --parallel 1 --n-cpu-moe 24 \
+             --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn auto"
+        );
+    }
+
+    #[test]
+    fn moe_cache_token_survives_arm_rewriting_exactly_once() {
+        // `--moe-cache-mib` is not an offload token: with or
+        // without an arm offload expression it passes through
+        // verbatim, in pair and `=` spellings, never duplicated.
+        let with_cache = "-ot exps=CPU --moe-cache-mib 4096 --parallel 1";
+        let out = arm_raw_flags(Some(with_cache), &arm(), None, None);
+        assert_eq!(out.matches("--moe-cache-mib").count(), 1, "{out}");
+        assert!(out.contains("--moe-cache-mib 4096"), "{out}");
+        assert!(out.contains("-ot exps=CPU"), "{out}");
+
+        let mut a = arm();
+        a.offload_expr = Some("--n-cpu-moe 24".to_string());
+        let out = arm_raw_flags(Some(with_cache), &a, None, None);
+        assert_eq!(out.matches("--moe-cache-mib").count(), 1, "{out}");
+        assert!(out.contains("--moe-cache-mib 4096"), "{out}");
+        assert!(out.contains("--n-cpu-moe 24"), "{out}");
+        assert!(!out.contains("exps=CPU"), "{out}");
+
+        let out = arm_raw_flags(Some("--moe-cache-mib=8192"), &a, None, None);
+        assert_eq!(out.matches("--moe-cache-mib").count(), 1, "{out}");
+        assert!(out.contains("--moe-cache-mib=8192"), "{out}");
     }
 
     #[test]

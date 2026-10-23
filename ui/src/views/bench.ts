@@ -12,7 +12,7 @@ import {
   getAppConfig, getBackends, getModels, isTauri,
 } from "../api";
 import type {
-  BackendRow, BenchArmRecord, BenchArmVariant, BenchPromptEntry, BenchSweepRecord,
+  BackendOffload, BackendRow, BenchArmRecord, BenchArmVariant, BenchPromptEntry, BenchSweepRecord,
   BenchSweepRequest, ModelRow,
 } from "../api";
 import { fmtCount, stackedBar, trim1 } from "../charts";
@@ -79,13 +79,54 @@ function armLabel(v: BenchArmVariant): string {
   else if (spec === "ngram-mod") parts.push(`ngram-mod n-min ${v.ngram_n_min ?? 16}`);
   else if (spec === "draft-simple") parts.push(`draft n-max ${v.draft_n_max ?? 3}`);
   else if (spec === "combined") parts.push(`combined n-min ${v.ngram_n_min ?? 16} · draft n-max ${v.draft_n_max ?? 3}`);
-  if (v.offload_expr) parts.push(`Offload ${v.offload_expr}`);
+  if (v.offload_expr != null) parts.push(v.offload_expr === "" ? "Offload none" : `Offload ${v.offload_expr}`);
   return parts.length ? parts.join(" · ") : "Baseline configuration";
 }
 
-/** The two client-knowable pruning rules (§3.2); the server's
+/** The canonical offload expression for a position (mirrors
+ *  manager-bench's offload_expr_for_layers): 0 layers → no offload
+ *  (the empty string, deliberately not null — the arm sets the
+ *  position), all layers → full expert offload, otherwise the
+ *  partial --n-cpu-moe spelling. */
+function offloadExprFor(layers: number, moeLayers: number): string {
+  if (layers <= 0) return "";
+  if (layers >= moeLayers) return "-ot exps=CPU";
+  return `--n-cpu-moe ${layers}`;
+}
+
+/** The position an offload expression names, in layers (null when
+ *  the expression is a custom form the preview cannot judge). */
+function offloadLayersOf(expr: string, moeLayers: number): number | null {
+  const t = expr.trim();
+  if (t === "") return 0;
+  const ncmoe = /^(?:--n-cpu-moe|-ncmoe)[=\s](\d+)$/.exec(t);
+  if (ncmoe) return Math.min(Number(ncmoe[1]), moeLayers);
+  if (/^(?:--cpu-moe|-cmoe)$/.test(t)) return moeLayers;
+  if (/^-ot\s+(.+)$/.test(t)) {
+    const parts = t.replace(/^-ot\s+/, "").split(",").map((p) => p.trim());
+    return parts.length && parts.every((p) => /^exps\s*=\s*CPU$/i.test(p)) ? moeLayers : null;
+  }
+  return null;
+}
+
+/** Sweep positions offered for an MoE backend: no offload,
+ *  quarter steps of the MoE layer count, full offload, plus the
+ *  backend's current position when it is not already one of them. */
+function offloadChoices(off: BackendOffload): number[] {
+  const m = off.moe_layers;
+  const set = new Set<number>([0, Math.round(m / 4), Math.round(m / 2), Math.round((3 * m) / 4), m, off.layers]);
+  return [...set].sort((a, b) => a - b);
+}
+
+function offloadPosLabel(n: number, off: BackendOffload): string {
+  if (n === 0) return "No offload";
+  if (n === off.moe_layers) return "All experts";
+  return `-ncmoe ${n}`;
+}
+
+/** The client-knowable pruning rules (§3.2); the server's
  *  validation remains authoritative at run time. */
-function pruneReason(v: BenchArmVariant, requestDraftModelId: string | null): string | null {
+function pruneReason(v: BenchArmVariant, requestDraftModelId: string | null, off: BackendOffload | null = null): string | null {
   const cv = v.cache_v ?? null;
   if ((cv === "q8_0" || cv === "q4_0") && v.flash_attn === "off") {
     return "Quantized V cache with flash attention off — llama.cpp refuses this pairing";
@@ -93,6 +134,19 @@ function pruneReason(v: BenchArmVariant, requestDraftModelId: string | null): st
   const spec = v.spec ?? "none";
   if ((spec === "draft-simple" || spec === "combined") && !(v.draft_model_id ?? requestDraftModelId)) {
     return "Draft speculative kind without a draft model";
+  }
+  // The endpoints-only offload guardrail, mirrored for the preview:
+  // a catalog pin forbids partial expert offload on the placed
+  // GPU's compute capability, so a swept partial position prunes.
+  // Arms without an offload variant sit at the backend's current
+  // position, which is judged the same way (the bench temp carries
+  // no journaled override). The server's prune is authoritative.
+  if (off?.guardrail && off.guardrail.allowed === "endpoints_only"
+    && off.guardrail.placed_ccs.includes(off.guardrail.compute_capability)) {
+    const position = v.offload_expr != null ? offloadLayersOf(v.offload_expr, off.moe_layers) : off.layers;
+    if (position != null && position > 0 && position < off.moe_layers) {
+      return `Partial expert offload is forbidden on compute capability ${off.guardrail.compute_capability} — only no offload or full expert offload is permitted; nearest permitted position: ${off.layers >= off.moe_layers / 2 ? off.moe_layers : 0} of ${off.moe_layers} layers`;
+    }
   }
   return null;
 }
@@ -166,20 +220,6 @@ function originChip(origin: string): string {
 
 function depthKey(a: BenchArmRecord): string {
   return a.spec?.depth != null ? String(a.spec.depth) : "—";
-}
-
-/** Winning arm index per depth condition: highest median gen tok/s
- *  among measured arms in the condition (§5.2). */
-function winnersByDepth(s: BenchSweepRecord): Map<string, number> {
-  const best = new Map<string, { idx: number; gen: number }>();
-  for (const a of s.arms) {
-    const gen = a.summary?.median_gen_tps;
-    if (a.status !== "measured" || gen == null) continue;
-    const k = depthKey(a);
-    const cur = best.get(k);
-    if (!cur || gen > cur.gen) best.set(k, { idx: a.index, gen });
-  }
-  return new Map([...best.entries()].map(([k, v]) => [k, v.idx]));
 }
 
 /* ---------------- Horizontal bars chart ----------------
@@ -267,6 +307,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     depthOn: true, depths: new Set<number>([8192]),
     specOn: false, specs: new Set<string>(["none"]),
     nmins: new Set<number>([16]),
+    offloadOn: false, offloadPositions: new Set<number>(),
   };
   let interlock: { names: string[]; message: string; request: BenchSweepRequest } | null = null;
   let runBusy = false;
@@ -334,14 +375,26 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
       }
       if (variants.length) out.push(variants);
     }
+    const off = selOffload();
+    if (off && dims.offloadOn && dims.offloadPositions.size) {
+      out.push([...dims.offloadPositions].sort((a, b) => a - b)
+        .map((n) => ({ offload_expr: offloadExprFor(n, off.moe_layers) })));
+    }
     return out;
+  }
+
+  /** The selected backend's MoE offload state (null for dense
+   *  backends): the Run form's Offload dimension and the preview
+   *  prune mirror read it. */
+  function selOffload(): BackendOffload | null {
+    return backends.find((b) => b.id === selBackend)?.offload ?? null;
   }
 
   function previewArms(): { variant: BenchArmVariant; label: string; pruned: string | null }[] {
     const variants = preset === "custom"
       ? expandDims(buildDims() ?? [])
       : presetArms(preset, draftModelId, draftNMax, draftDevice);
-    return variants.map((v) => ({ variant: v, label: armLabel(v), pruned: pruneReason(v, draftModelId || null) }));
+    return variants.map((v) => ({ variant: v, label: armLabel(v), pruned: pruneReason(v, draftModelId || null, selOffload()) }));
   }
 
   function buildRequest(stopIds: string[]): BenchSweepRequest {
@@ -431,6 +484,10 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
           ${dims.specOn ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">${SPEC_VALUES.map((s) => checkChip("spec", s, dims.specs.has(s), s)).join("")}</div>` : ""}
           ${showNmin ? `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px"><span style="font-size:12px;color:var(--text2)">n-min:</span>${NMIN_VALUES.map((n) => checkChip("nmin", String(n), dims.nmins.has(n), String(n))).join("")}</div>` : ""}
         </div>
+        ${selOffload() ? `<div>
+          <label style="font-size:12px"><input type="checkbox" data-bench-dim="offloadOn"${dims.offloadOn ? " checked" : ""}> Expert offload${infoTip("MoE expert-offload positions, in MoE layers on the CPU. The axis sweeps --n-cpu-moe values between no offload and full expert offload; positions a catalog guardrail forbids are pruned in the preview and by the server.")}</label>
+          ${dims.offloadOn ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">${offloadChoices(selOffload()!).map((n) => checkChip("offloadpos", String(n), dims.offloadPositions.has(n), offloadPosLabel(n, selOffload()!))).join("")}</div>` : ""}
+        </div>` : ""}
       </div>
     </div>` : "";
 
@@ -451,6 +508,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
         ${backs.length
           ? `<select id="benchBackendSel" style="${SELECT_STYLE};width:100%">${backendOpts}</select>`
           : `<div class="opt-note">No enabled backends</div>`}
+        ${selOffload() ? `<div style="margin-top:6px">${kv("Offload", `${selOffload()!.layers} of ${selOffload()!.moe_layers} MoE layers`)}</div>` : ""}
         <div class="opt-field-label" style="margin-top:10px">Prompt</div>
         ${prompts.length
           ? `<select id="benchPromptSel" style="${SELECT_STYLE};width:100%">${promptOpts}</select>`
@@ -513,6 +571,37 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     return m === "ttft" ? "ms" : m === "acceptance" ? "tok" : "tok/s";
   }
 
+  /** Winning arm index per depth condition on the selected
+   *  metric (§5.2): the highest value wins, except TTFT, where
+   *  the lowest time wins. */
+  function winnersByMetric(s: BenchSweepRecord, m: Metric): Map<string, number> {
+    const best = new Map<string, { idx: number; val: number }>();
+    for (const a of s.arms) {
+      if (a.status !== "measured") continue;
+      const val = metricValue(a, m);
+      if (val == null) continue;
+      const k = depthKey(a);
+      const cur = best.get(k);
+      if (!cur || (m === "ttft" ? val < cur.val : val > cur.val)) best.set(k, { idx: a.index, val });
+    }
+    return new Map([...best.entries()].map(([k, v]) => [k, v.idx]));
+  }
+
+  /** Accepted/generated token totals per drafter kind across an
+   *  arm's runs — the per-drafter attribution the run records
+   *  carry, aggregated for display. */
+  function drafterTotalsOf(a: BenchArmRecord): Map<string, { gen: number; acc: number }> {
+    const totals = new Map<string, { gen: number; acc: number }>();
+    for (const r of a.runs ?? []) {
+      for (const d of r.drafters ?? []) {
+        const cur = totals.get(d.kind) ?? { gen: 0, acc: 0 };
+        cur.gen += d.gen_tokens; cur.acc += d.acc_tokens;
+        totals.set(d.kind, cur);
+      }
+    }
+    return totals;
+  }
+
   function comparabilityDiffs(a: BenchSweepRecord, b: BenchSweepRecord): string[] {
     const diffs: string[] = [];
     if (a.model.sha256 !== b.model.sha256) diffs.push("Model");
@@ -534,14 +623,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
       <td>${r.generated_tokens == null ? "—" : fmtCount(r.generated_tokens)}</td>
       <td>${r.acceptance_rate == null ? "—" : trim1(r.acceptance_rate * 100) + " %"}</td>
       <td>${fmtNum(r.mean_accepted_len)}</td></tr>`).join("");
-    const drafterTotals = new Map<string, { gen: number; acc: number }>();
-    for (const r of a.runs ?? []) {
-      for (const d of r.drafters ?? []) {
-        const cur = drafterTotals.get(d.kind) ?? { gen: 0, acc: 0 };
-        cur.gen += d.gen_tokens; cur.acc += d.acc_tokens;
-        drafterTotals.set(d.kind, cur);
-      }
-    }
+    const drafterTotals = drafterTotalsOf(a);
     const totalAcc = [...drafterTotals.values()].reduce((sum, d) => sum + d.acc, 0);
     const palette = ["var(--accent)", "var(--purple)", "var(--teal)", "var(--warn)"];
     const drafterBar = drafterTotals.size && totalAcc > 0
@@ -568,41 +650,75 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
 
   function sweepCardHtml(s: BenchSweepRecord): string {
     const metric: Metric = sweepMetric.get(s.id) ?? "gen";
-    const winners = winnersByDepth(s);
+    const winners = winnersByMetric(s, metric);
     const baseline = s.arms[s.baseline_arm_index];
-    const baselineGen = baseline?.summary?.median_gen_tps ?? null;
+    const baselineVal = baseline ? metricValue(baseline, metric) : null;
     const hasSpec = s.arms.some((a) => a.spec?.spec && a.spec.spec !== "none");
     const delKey = `sweep:${s.id}`;
     const isArmed = armed.has(delKey);
+    // The metric tabs drive the whole card — chart, winner lines,
+    // and the arm table's metric columns — not the chart alone.
+    const deltaPct = (v: number | null): string =>
+      v == null || baselineVal == null || baselineVal === 0 ? "—"
+        : `${v >= baselineVal ? "+" : ""}${trim1(((v / baselineVal) - 1) * 100)} %`;
     const chartItems: BarItem[] = s.arms.map((a) => ({
       label: a.label,
       value: metricValue(a, metric),
       baseline: a.index === s.baseline_arm_index,
-      winner: winners.get(depthKey(a)) === a.index && metric === "gen",
+      winner: winners.get(depthKey(a)) === a.index,
       dim: a.status !== "measured",
     }));
     const winnerLines = [...winners.entries()].map(([depth, idx]) => {
       const a = s.arms.find((x) => x.index === idx);
       if (!a) return "";
-      const gen = a.summary?.median_gen_tps;
-      const delta = gen != null && baselineGen ? `${gen >= baselineGen ? "+" : ""}${trim1(((gen / baselineGen) - 1) * 100)} %` : "—";
-      return kv(`Winner${depth !== "—" ? ` (depth ${fmtCount(Number(depth))})` : ""}`, `${a.label} · Δ vs baseline: ${delta}`);
+      const v = metricValue(a, metric);
+      const delta = a.index === s.baseline_arm_index ? "the baseline arm" : `Δ vs baseline: ${deltaPct(v)}`;
+      return kv(`Winner${depth !== "—" ? ` (depth ${fmtCount(Number(depth))})` : ""}`, `${a.label} · ${fmtNum(v)} ${metricUnit(metric)} · ${delta}`);
     }).join("");
     const armRows = s.arms.map((a) => {
-      const gen = a.summary?.median_gen_tps ?? null;
-      const delta = a.index === s.baseline_arm_index ? "Baseline"
-        : gen != null && baselineGen ? `${gen >= baselineGen ? "+" : ""}${trim1(((gen / baselineGen) - 1) * 100)} %` : "—";
-      return `<tr>
-        <td>${esc(a.label)}${a.index === s.baseline_arm_index ? ` <span class="chip">Baseline</span>` : ""}${winners.get(depthKey(a)) === a.index ? ` <span class="chip" style="color:var(--ok)">Winner</span>` : ""}</td>
-        <td>${armStatusChip(a)}</td>
-        <td>${fmtNum(a.summary?.median_gen_tps)}</td>
-        <td>${fmtNum(a.summary?.median_prompt_tps)}</td>
-        <td>${fmtNum(a.summary?.median_ttft_ms)}</td>
+      const delta = a.index === s.baseline_arm_index ? "Baseline" : deltaPct(metricValue(a, metric));
+      const head = `<td>${esc(a.label)}${a.index === s.baseline_arm_index ? ` <span class="chip">Baseline</span>` : ""}${winners.get(depthKey(a)) === a.index ? ` <span class="chip" style="color:var(--ok)">Winner</span>` : ""}</td>
+        <td>${armStatusChip(a)}</td>`;
+      if (metric === "gen") {
+        return `<tr>${head}
+          <td>${fmtNum(a.summary?.median_gen_tps)}</td>
+          <td>${fmtVram(a.peak_vram_mib)}</td>
+          <td>${delta}</td></tr>`;
+      }
+      if (metric === "prompt") {
+        return `<tr>${head}
+          <td>${fmtNum(a.summary?.median_prompt_tps)}</td>
+          <td>${delta}</td></tr>`;
+      }
+      if (metric === "ttft") {
+        return `<tr>${head}
+          <td>${fmtNum(a.summary?.median_ttft_ms)}</td>
+          <td>${delta}</td></tr>`;
+      }
+      const drafters = [...drafterTotalsOf(a).entries()]
+        .map(([kind, d]) => `${esc(kind)}: ${fmtCount(d.acc)}`).join(" · ");
+      return `<tr>${head}
         <td>${a.summary?.mean_acceptance_rate == null ? "—" : trim1(a.summary.mean_acceptance_rate * 100) + " %"}</td>
         <td>${fmtNum(a.summary?.mean_accepted_len)}</td>
-        <td>${fmtVram(a.peak_vram_mib)}</td>
-        <td>${delta}</td></tr>`;
+        <td>${drafters || "—"}</td></tr>`;
     }).join("");
+    const METRIC_HEADS: Record<Metric, string[]> = {
+      gen: ["Gen tok/s", "Peak VRAM", "Δ vs baseline"],
+      prompt: ["Prompt tok/s", "Δ vs baseline"],
+      ttft: ["TTFT ms", "Δ vs baseline"],
+      acceptance: ["Acceptance", "Mean len", "Accepted by drafter"],
+    };
+    const headRow = `<tr><th>Arm</th><th>Status</th>${METRIC_HEADS[metric].map((h) => `<th>${h}</th>`).join("")}</tr>`;
+    // The prompt the sweep used: the record carries its identity
+    // (id, recorded SHA-256); the text comes from the library entry
+    // while that entry still matches the recorded hash.
+    const promptEntry = prompts.find((p) => p.id === s.prompt_id);
+    const promptKey = `prompt:${s.id}`;
+    const promptBodyHtml = !promptEntry
+      ? `<div class="opt-note">This prompt is no longer in the library — the sweep recorded its name, id, and SHA-256 only.</div>`
+      : promptEntry.sha256 !== s.prompt_sha256
+        ? `<div class="opt-note">The library prompt has been edited since this sweep; the exact text used is not retained in the record (recorded SHA-256 ${esc(s.prompt_sha256.slice(0, 12))}…, current ${esc(promptEntry.sha256.slice(0, 12))}…).</div>`
+        : `<div style="white-space:pre-wrap;font-family:var(--mono);font-size:11px;max-height:260px;overflow:auto">${esc(promptEntry.body)}</div>`;
     const stopped = s.interlock?.stopped_confirmed ?? [];
     const durationMin = s.ended_ms != null ? trim1((s.ended_ms - s.started_ms) / 60000) : null;
     return `<div class="opt-row" style="margin-bottom:12px">
@@ -614,20 +730,22 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
         <span style="flex:1"></span>
         <button class="btn icon-only${isArmed ? " danger armed" : ""}" data-bench-act="delete-sweep" data-sweep="${esc(s.id)}" title="${isArmed ? "Click again to delete this sweep" : "Delete sweep"}" aria-label="Delete sweep">${icon("trash")}</button>
       </div>
-      <div class="opt-counts">Arms: ${s.arms.length}${s.projected_minutes != null ? ` · Projected: ~${trim1(s.projected_minutes)} min` : ""}${durationMin != null ? ` · Actual: ${durationMin} min` : ""} · llama build: ${esc(s.llama_build)} · Prompt tokens: ${s.prompt_tokens == null ? "—" : fmtCount(s.prompt_tokens)}</div>
+      <div class="opt-counts">Arms: ${s.arms.length}${s.projected_minutes != null ? ` · Projected: ~${trim1(s.projected_minutes)} min` : ""}${durationMin != null ? ` · Actual: ${durationMin} min` : ""} · llama build: ${esc(s.llama_build)}</div>
+      <div class="opt-counts">Prompt: ${esc(s.prompt_name)} · ID: ${esc(s.prompt_id)} · SHA-256: ${esc(s.prompt_sha256.slice(0, 12))}… · Tokens: ${s.prompt_tokens == null ? "—" : fmtCount(s.prompt_tokens)}</div>
+      <details class="opt-why" data-bench-details="${esc(promptKey)}"${openArmDetails.has(promptKey) ? " open" : ""}><summary>Prompt text</summary><div style="margin-top:6px">${promptBodyHtml}</div></details>
       ${stopped.length ? `<div class="opt-note">Stopped: ${esc(stopped.join(", "))} <a href="#/backends">Backends</a>${infoTip("Bench never restarts backends it stopped — restart them from the Backends view.")}</div>` : ""}
       ${s.status === "running" ? `<div class="opt-row-main" style="margin-top:6px">
           <span class="opt-consulting">${icon("clock")} Arm: ${(s.progress?.arm_index ?? 0) + 1} of ${s.progress?.arm_count ?? s.arms.length} · Phase: ${esc(s.progress?.phase ?? "—")} · Run: ${s.progress?.run ?? "—"} of 3 · Elapsed: ${fmtElapsed(s.progress?.elapsed_ms ?? (Date.now() - s.started_ms))}</span>
           <button class="btn danger" data-bench-act="cancel-run" data-sweep="${esc(s.id)}">${icon("x")} Cancel</button>
         </div>` : ""}
-      <div class="viewsel" role="group" aria-label="Chart metric" style="margin-top:8px">
+      <div class="viewsel" role="group" aria-label="Result metric" style="margin-top:8px">
         ${(["gen", "prompt", "ttft"] as Metric[]).map((m) => `<button data-bench-metric="${esc(s.id)}:${m}" class="${metric === m ? "active" : ""}">${m === "gen" ? "Generation" : m === "prompt" ? "Prompt" : "TTFT"}</button>`).join("")}
         ${hasSpec ? `<button data-bench-metric="${esc(s.id)}:acceptance" class="${metric === "acceptance" ? "active" : ""}">Acceptance</button>` : ""}
       </div>
       <div style="font-size:11px;color:var(--text3);margin-top:4px">${esc(s.prompt_name)} · Temp: ${trim1(s.temperature)}</div>
       ${barsChart(chartItems, metricUnit(metric))}
       ${winnerLines}
-      <div style="overflow-x:auto"><table class="tbl" style="margin-top:8px;min-width:760px"><thead><tr><th>Arm</th><th>Status</th><th>Gen tok/s</th><th>Prompt tok/s</th><th>TTFT ms</th><th>Acceptance</th><th>Mean len</th><th>Peak VRAM</th><th>Δ vs baseline</th></tr></thead><tbody>${armRows}</tbody></table></div>
+      <div style="overflow-x:auto"><table class="tbl" style="margin-top:8px;min-width:760px"><thead>${headRow}</thead><tbody>${armRows}</tbody></table></div>
       ${s.arms.map((a) => armDetailHtml(s, a)).join("")}
     </div>`;
   }
@@ -776,7 +894,11 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
       }
     }
     const backs = enabledBackends();
-    if (!backs.some((b) => b.id === selBackend)) selBackend = backs[0]?.id ?? "";
+    if (!backs.some((b) => b.id === selBackend)) {
+      selBackend = backs[0]?.id ?? "";
+      const off = selOffload();
+      dims.offloadPositions = new Set(off ? [off.layers] : []);
+    }
     if (!prompts.some((p) => p.id === selPrompt)) selPrompt = autoPromptFor(selBackend);
     if (!models.some((m) => m.id === draftModelId)) {
       draftModelId = models.find((m) => /1\.7b|draft/i.test(`${m.id} ${m.name}`))?.id ?? "";
@@ -1054,6 +1176,11 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
       selPrompt = autoPromptFor(selBackend);
       baselineIdx = 0;
       interlock = null;
+      // The offload axis re-seeds at the newly selected backend's
+      // current position (its position is the natural baseline of
+      // the axis); a dense backend clears it.
+      const off = selOffload();
+      dims.offloadPositions = new Set(off ? [off.layers] : []);
       paint();
       return;
     }
@@ -1114,6 +1241,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
       if (kind === "depth") { const n = Number(value); if (checked) dims.depths.add(n); else dims.depths.delete(n); }
       if (kind === "spec") { if (checked) dims.specs.add(value); else dims.specs.delete(value); correctness = null; }
       if (kind === "nmin") { const n = Number(value); if (checked) dims.nmins.add(n); else dims.nmins.delete(n); }
+      if (kind === "offloadpos") { const n = Number(value); if (checked) dims.offloadPositions.add(n); else dims.offloadPositions.delete(n); }
       baselineIdx = 0;
       paint();
     }

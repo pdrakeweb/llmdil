@@ -24,8 +24,9 @@ pub mod prompts;
 pub mod results;
 
 pub use arm::{
-    expand, preset_combined, preset_kv, preset_spec, project_minutes, prune_arms, ArmOutcome,
-    ArmSpec, ArmVariant, CacheType, DraftDevice, FlashAttn, PresetSweep, PruneContext, SpecKind,
+    expand, offload_expr_for_layers, offload_layers_of, preset_combined, preset_kv, preset_spec,
+    project_minutes, prune_arms, ArmOutcome, ArmSpec, ArmVariant, CacheType, DraftDevice,
+    FlashAttn, OffloadGuardrail, PresetSweep, PruneContext, SpecKind,
 };
 pub use comparability::{
     comparability_key, differing_fields, prompt_sha256, KeyInputs, ModelIdentity, RUNNER_KIND,
