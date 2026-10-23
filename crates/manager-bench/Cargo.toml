@@ -1,0 +1,10 @@
+[package]
+name = "manager-bench"
+version = "0.1.50"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
