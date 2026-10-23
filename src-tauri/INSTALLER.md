@@ -21,6 +21,16 @@ Language: English only, no language selector. Start Menu folder
 "LLMdil" is created; a desktop shortcut is created only when the
 Finish page's **Create desktop shortcut** box is checked.
 
+## Bundled sidecars
+
+`bundle.externalBin` in `tauri.conf.json` bundles two binaries
+beside the app executable in the install dir: `llm-service-host.exe`
+(the service shim) and `llmdil-log-receiver.exe` (the log receiver,
+deployed from Settings → Supervision → Log receiver). Build
+pipelines stage them under `binaries/` with the target-triple
+suffix before any src-tauri build step — see
+[`binaries/README.md`](binaries/README.md).
+
 ## Uninstall: user data is kept by default
 
 The uninstaller always removes app binaries. User data in
@@ -28,6 +38,11 @@ The uninstaller always removes app binaries. User data in
 models, managed Python env) is **kept** unless the user answers "Yes" to the
 removal prompt (`NSIS_HOOK_PREUNINSTALL` in
 [`installer-hooks.nsi`](installer-hooks.nsi); the prompt defaults to "No").
+The same hook attempts to remove the log receiver service (running
+the bundled receiver's `remove` subcommand elevated) when one is
+registered; a declined prompt or a silent uninstall leaves the
+registration in place with an instruction for removing it manually
+instead of failing the uninstall.
 
 ## Silent install flags (built into NSIS)
 

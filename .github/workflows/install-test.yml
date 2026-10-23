@@ -49,6 +49,12 @@ jobs:
           $appExe = Get-ChildItem "$dir\*.exe" -Recurse | Where-Object { $_.Name -notlike "*ninstall*" } | Select-Object -First 1
           if (-not $appExe) { throw "no application exe found under $dir" }
           Write-Host "Installed app exe: $($appExe.FullName)"
+          # The bundled sidecars deploy/option surfaces rely on:
+          # the service host shim and the log receiver.
+          foreach ($sidecar in @("llm-service-host.exe", "llmdil-log-receiver.exe")) {
+            if (-not (Test-Path "$dir\$sidecar")) { throw "bundled sidecar missing from install: $sidecar" }
+            Write-Host "Bundled sidecar present: $sidecar"
+          }
           echo "APP_EXE=$($appExe.FullName)" >> $env:GITHUB_ENV
 
       - name: Launch smoke test

@@ -44,6 +44,18 @@ jobs:
         run: npm run build
         working-directory: ui
 
+      # The installer bundles the service host and the log receiver
+      # as Tauri externalBin sidecars (tauri.conf.json); stage the
+      # release builds under src-tauri/binaries with the
+      # target-triple suffix Tauri expects before tauri-action runs.
+      - name: Stage bundled sidecar binaries
+        run: |
+          cargo build --release -p manager-services --bin llm-service-host
+          cargo build --release -p manager-logreceiver --bin llmdil-log-receiver
+          Copy-Item target/release/llm-service-host.exe src-tauri/binaries/llm-service-host-x86_64-pc-windows-msvc.exe
+          Copy-Item target/release/llmdil-log-receiver.exe src-tauri/binaries/llmdil-log-receiver-x86_64-pc-windows-msvc.exe
+        shell: pwsh
+
       - name: Build installer and publish release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -55,23 +67,15 @@ jobs:
           releaseDraft: false
           prerelease: false
 
-      # Deploy assets for the Prometheus-local log receiver
-      # (tools/prometheus/Deploy-LogReceiver.ps1 downloads these from
-      # the release; they are deliberately not in the installer).
-      - name: Build log receiver and service host binaries
-        run: |
-          cargo build --release -p manager-logreceiver --bin llmdil-log-receiver
-          cargo build --release -p manager-services --bin llm-service-host
-
-      - name: Upload deploy assets to the release
+      # The log receiver's deploy checklist ships as a release asset
+      # (the receiver itself deploys from inside the app — Settings →
+      # Supervision → Log receiver — and needs no loose binaries).
+      - name: Upload deploy checklist to the release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload ${{ github.ref_name }} --repo pdrakeweb/llmdil --clobber `
-            target/release/llmdil-log-receiver.exe `
-            target/release/llm-service-host.exe `
-            tools/prometheus/Deploy-LogReceiver.ps1 `
             tools/prometheus/log-receiver-checklist.md
 
   # Install-test: download the published installer onto a fresh Windows
@@ -111,6 +115,12 @@ jobs:
           $appExe = Get-ChildItem "$dir\*.exe" -Recurse | Where-Object { $_.Name -notlike "*ninstall*" } | Select-Object -First 1
           if (-not $appExe) { throw "no application exe found under $dir" }
           Write-Host "Installed app exe: $($appExe.FullName)"
+          # The bundled sidecars deploy/option surfaces rely on:
+          # the service host shim and the log receiver.
+          foreach ($sidecar in @("llm-service-host.exe", "llmdil-log-receiver.exe")) {
+            if (-not (Test-Path "$dir\$sidecar")) { throw "bundled sidecar missing from install: $sidecar" }
+            Write-Host "Bundled sidecar present: $sidecar"
+          }
           echo "APP_EXE=$($appExe.FullName)" >> $env:GITHUB_ENV
 
       - name: Launch smoke test

@@ -43,5 +43,40 @@
   Pop $0
   IfFileExists "$APPDATA\local-llm-service-manager\*.*" 0 +2
   RMDir /r "$APPDATA\local-llm-service-manager"
+  ; --- Uninstall: remove the log receiver service ------------------
+  ; The Prometheus-local log receiver (Settings → Supervision → Log
+  ; receiver) is an auto-start Windows service registered against
+  ; the bundled llmdil-log-receiver.exe and llm-service-host.exe in
+  ; $INSTDIR; leaving the registration behind would strand a broken
+  ; service pointing at files this uninstall removes. Service
+  ; removal needs elevation the per-user uninstaller does not have,
+  ; so when the service is present this block runs the receiver's
+  ; own `remove` subcommand elevated (one UAC prompt, via
+  ; PowerShell's Start-Process -Verb RunAs) and re-checks. A
+  ; declined prompt leaves the registration in place with an
+  ; explicit warning rather than failing the uninstall. Silent
+  ; uninstalls cannot elevate: they skip the attempt and log the
+  ; same instruction. The receiver's data (store + tokens in
+  ; %APPDATA%\local-llm-service-manager\log-receiver) is user data,
+  ; governed by the prompt above like everything else there.
+  ; Relative jumps only, per this file's convention. Instruction
+  ; map: +14 from the IfFileExists lands past the block; the first
+  ; IntCmp (+11) and the second (+4) land at the same place; the
+  ; IfSilent (+9) lands on the silent DetailPrint; the Goto (+2)
+  ; skips it.
+  IfFileExists "$INSTDIR\llmdil-log-receiver.exe" 0 +14
+  nsExec::Exec '"$SYSDIR\sc.exe" query "llm-log-receiver"'
+  Pop $0
+  IntCmp $0 1060 +11
+  IfSilent +9
+  DetailPrint "Removing the LLMdil Log Receiver service ..."
+  nsExec::Exec '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath $\'$INSTDIR\llmdil-log-receiver.exe$\' -ArgumentList $\'remove$\' -Verb RunAs -Wait"'
+  Pop $0
+  nsExec::Exec '"$SYSDIR\sc.exe" query "llm-log-receiver"'
+  Pop $0
+  IntCmp $0 1060 +4
+  MessageBox MB_OK|MB_ICONEXCLAMATION "The LLMdil Log Receiver service could not be removed (the elevation prompt may have been declined).$\n$\nIt is registered against files this uninstall is removing. Remove it from an elevated command prompt with:$\n$\nsc.exe delete llm-log-receiver"
+  Goto +2
+  DetailPrint "Log receiver service is registered: a silent uninstall cannot elevate to remove it, and it points at files being removed. Remove it from an elevated command prompt with: sc.exe delete llm-log-receiver"
 !macroend
 
