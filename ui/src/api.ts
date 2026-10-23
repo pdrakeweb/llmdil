@@ -763,6 +763,16 @@ export interface BackendRow {
   sys_ram_mib?: number;
   kv_ram_mib?: number | null;
   rs_ram_mib?: number | null;
+  /** MoE expert-cache term of the requirement (`--moe-cache-mib`),
+   *  MiB — 0 when the backend sets no cache. Itemized on the card
+   *  beside the KV/state figures so the card's components are the
+   *  start gate's components. */
+  moe_cache_mib?: number;
+  /** Three-state fit of the backend's requirement against its
+   *  placed GPUs' total VRAM and driver models (server-computed
+   *  from the same requirement model as the start gate). Absent
+   *  when placement or telemetry cannot judge the backend. */
+  fit?: BackendFit;
   /** The supervisor's recorded reason for the backend's last
    *  spawn/load failure, when one was recorded (e.g. the
    *  device-unavailable fail-fast verdict); null otherwise. */
@@ -907,6 +917,30 @@ export interface BackendMoeCache {
   moe_layers: number;
 }
 
+/** The three-state fit classification shared by every fit
+ *  surface: within total VRAM, over total only by WDDM paging,
+ *  or over total on a hard-bounded (TCC / unreported) GPU. */
+export type FitStateName = "fits" | "wddm_paged" | "does_not_fit";
+
+/** One placed GPU's fit row (list_backends `fit.per_gpu`). */
+export interface BackendFitGpu {
+  gpu: number;
+  required_mib: number;
+  total_mib: number;
+  driver_model: "wddm" | "tcc" | null;
+  state: FitStateName;
+  /** MiB paging to system RAM (WDDM-paged GPUs only; else 0). */
+  paged_mib: number;
+}
+
+/** A backend's three-state fit (list_backends payload): the worst
+ *  per-GPU state, the total paged amount, and the per-GPU rows. */
+export interface BackendFit {
+  state: FitStateName;
+  paged_mib: number;
+  per_gpu: BackendFitGpu[];
+}
+
 /** A backend's parallel-slots state (list_backends payload,
  *  configured rows). Decoded server-side from the backend's
  *  saved raw flags by the same decode pair the Parallel slots
@@ -977,14 +1011,20 @@ export interface CachePreview {
    *  geometry is unknown (never zero-filled). */
   kv_mib: number | null;
   rs_mib: number | null;
+  /** MoE expert-cache MiB priced into `total_mib` (the draft
+   *  value the form sent, or the saved token) — itemized in the
+   *  fit block so the rows sum to the total. */
+  moe_cache_mib: number;
   total_mib: number;
   basis: string;
   /** Per placed GPU: its total VRAM, its required share of the
    *  total (the same distribution the fit verdict judges), and
    *  its own verdict against the headroom reserve. The share and
    *  verdict are null only when the server could not distribute
-   *  the total over the targets. */
-  targets: { gpu: number; total_mib: number; required_mib: number | null; fits: boolean | null }[] | null;
+   *  the total over the targets. `fit_state` is the three-state
+   *  classification against total VRAM (the start gate's basis)
+   *  and `paged_mib` the WDDM paging amount for that GPU. */
+  targets: { gpu: number; total_mib: number; required_mib: number | null; fits: boolean | null; driver_model?: "wddm" | "tcc" | null; fit_state?: FitStateName | null; paged_mib?: number }[] | null;
   headroom_reserve_percent: number;
   fits_current: boolean | null;
   ladder: CacheRungLike[];
@@ -1005,10 +1045,15 @@ export async function getBackends(): Promise<CallResult<BackendRow[]>> {
 async function backendAction(
   cmd: "start_backend" | "stop_backend" | "restart_backend",
   id: string,
+  allowWddmOvercommit?: boolean,
 ): Promise<CallResult<{ task_id: string; backend_id: string }>> {
   if (!isTauri()) return { data: { task_id: "sample-task", backend_id: id }, live: false };
   try {
     const args: Record<string, unknown> = cmd === "start_backend" ? { id } : { id, graceful: true };
+    // The WDDM-overcommit confirmation (the card's armed second
+    // click) rides only when set, preserving the previous invoke
+    // shape for unconfirmed starts.
+    if (allowWddmOvercommit) args.allowWddmOvercommit = true;
     const data = await invoke<{ task_id: string; backend_id: string }>(cmd, args);
     return { data, live: true };
   } catch (e) {
@@ -1016,9 +1061,9 @@ async function backendAction(
   }
 }
 
-export function startBackend(id: string) { return backendAction("start_backend", id); }
+export function startBackend(id: string, allowWddmOvercommit?: boolean) { return backendAction("start_backend", id, allowWddmOvercommit); }
 export function stopBackend(id: string) { return backendAction("stop_backend", id); }
-export function restartBackend(id: string) { return backendAction("restart_backend", id); }
+export function restartBackend(id: string, allowWddmOvercommit?: boolean) { return backendAction("restart_backend", id, allowWddmOvercommit); }
 
 /** backend_update_flags — change a backend's context length and
  *  batch size. Persisted immediately; applies on the next start. */
@@ -1184,11 +1229,11 @@ export async function setBackendCache(id: string, sel: CacheSelectionLike | null
  *  backend (the flags form's predicted footprint and
  *  predicted-best ladder). Pure preview: nothing is written.
  *  Omitted arguments price the backend's saved values. */
-export async function backendCachePreview(id: string, opts?: { nCtx?: number; slots?: number; sel?: CacheSelectionLike }): Promise<CallResult<CachePreview>> {
+export async function backendCachePreview(id: string, opts?: { nCtx?: number; slots?: number; sel?: CacheSelectionLike; moeCacheMib?: number }): Promise<CallResult<CachePreview>> {
   const empty: CachePreview = {
     selection: { k: "f16", v: "f16", flash_attn: "auto" },
     v_quantized_fa_off: false, weights_mib: 0, sys_weights_mib: 0,
-    kv_mib: null, rs_mib: null, total_mib: 0, basis: "estimate",
+    kv_mib: null, rs_mib: null, moe_cache_mib: 0, total_mib: 0, basis: "estimate",
     targets: null, headroom_reserve_percent: 5, fits_current: null,
     ladder: [], best: null,
   };
@@ -1197,6 +1242,7 @@ export async function backendCachePreview(id: string, opts?: { nCtx?: number; sl
     const args: Record<string, unknown> = { id };
     if (opts?.nCtx !== undefined) args.nCtx = opts.nCtx;
     if (opts?.slots !== undefined) args.slots = opts.slots;
+    if (opts?.moeCacheMib !== undefined) args.moeCacheMib = opts.moeCacheMib;
     if (opts?.sel) {
       args.cacheK = opts.sel.k;
       args.cacheV = opts.sel.v;
@@ -3293,7 +3339,9 @@ export async function modelAssign(backendId: string, modelId: string, split: num
 
 /** placement_propose result (manager-models' PlacementProjection plus
  *  the snapshot metadata the command adds): per-GPU rows in split order.
- *  The fit math is weights-only — see the GPUs view's labels. */
+ *  With a backend in scope the per-GPU figures are its FULL
+ *  requirement (weights + KV + state + expert cache) and
+ *  `weights_only` is false; without one they are weights only. */
 export interface PlacementProjectionData {
   model_id: string;
   /** The evaluated per-GPU fractions (sums to 1.0). */
@@ -3324,7 +3372,9 @@ export interface PlacementProjectionData {
   /** Indices of GPUs currently down (absent from telemetry polls);
    *  the projection treats them as having no free VRAM. */
   down_indices?: number[];
-  /** Always true: the projection covers model weights only. */
+  /** True when the projection covers model weights only (no
+   *  backend in scope); false when `per_gpu_mib` is the backend's
+   *  full requirement. */
   weights_only?: boolean;
   /** Weights resident in system RAM under the serving backend's
    *  expert offload, MiB (0/absent when no backend was in scope);
@@ -3333,6 +3383,20 @@ export interface PlacementProjectionData {
   /** The weight total the projection divided: the full model size,
    *  or its GPU-resident share under expert offload. */
   gpu_weights_mib?: number;
+  /** Full-requirement projections: the KV cache term, MiB. */
+  kv_mib?: number;
+  /** Full-requirement projections: the state cache term, MiB. */
+  rs_mib?: number | null;
+  /** Full-requirement projections: the expert-cache total, MiB
+   *  (its per-GPU shares are inside `per_gpu_mib`). */
+  moe_cache_mib?: number;
+  /** Total VRAM per GPU, MiB, in split order. */
+  gpu_total_mib?: number[];
+  /** Per-GPU three-state fit classification of the required
+   *  figure against total VRAM, in split order. */
+  fit_states?: FitStateName[];
+  /** Per-GPU paged amount, MiB (WDDM-paged GPUs only). */
+  paged_mib?: number[];
 }
 
 /** placement_propose — project a tensor split for a catalog model onto

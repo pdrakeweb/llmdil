@@ -48,7 +48,8 @@ pub use moe_cache::{
 pub use mtp::{mtp_draft, set_mtp_draft, MtpDraft, LLAMA_CPP_N_MAX_DEFAULT};
 pub use parallel::{effective_slots, parallel_slots, set_parallel_slots};
 pub use placement::{
-    apply_placement, propose_placement, propose_placement_resident, validate_split,
+    apply_placement, propose_placement, propose_placement_full, propose_placement_resident,
+    validate_split,
     PlacementProjection,
 };
 
@@ -499,6 +500,74 @@ pub enum FitVerdict {
     FitsWithSplit { split: Vec<f32> },
     /// Does not fit even split across all GPUs.
     TooLarge { needed_mib: u64, free_mib: u64 },
+}
+
+/// The three-state fit classification every fit surface renders
+/// (Pete, Oct 23, 2026): a requirement within a GPU's total VRAM
+/// fits; a requirement over total VRAM on a **WDDM** GPU fits only
+/// by paging the excess to system RAM (the Windows display driver
+/// overcommits VRAM); the same excess on a **TCC** GPU — or a GPU
+/// whose driver model is unreported, judged conservatively as
+/// hard-bounded — does not fit. The classification is against the
+/// GPU's TOTAL memory: free-memory pressure from other backends
+/// is a separate, transient refusal the start gate keeps distinct
+/// ([`FitState`] never upgrades an insufficient-free case).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FitState {
+    Fits,
+    /// Over total VRAM on a WDDM GPU: starts only with the
+    /// operator's confirmation; the paged amount rides the
+    /// payloads separately (see [`fit_state`]).
+    WddmPaged,
+    DoesNotFit,
+}
+
+impl FitState {
+    /// The wire spelling (`fits` / `wddm_paged` / `does_not_fit`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FitState::Fits => "fits",
+            FitState::WddmPaged => "wddm_paged",
+            FitState::DoesNotFit => "does_not_fit",
+        }
+    }
+
+    /// Severity rank for worst-of aggregation across GPUs:
+    /// a hard refusal outranks a paged fit, which outranks a fit.
+    pub fn rank(&self) -> u8 {
+        match self {
+            FitState::Fits => 0,
+            FitState::WddmPaged => 1,
+            FitState::DoesNotFit => 2,
+        }
+    }
+}
+
+/// Classify one GPU's requirement against its total VRAM, given
+/// whether telemetry reports the GPU's driver as WDDM. Returns
+/// the state and the paged amount (MiB that will page to system
+/// RAM — nonzero only for [`FitState::WddmPaged`]). An unknown
+/// driver model passes `is_wddm: false`: unreported is judged as
+/// hard-bounded, never as pageable.
+pub fn fit_state(required_mib: u64, total_mib: u64, is_wddm: bool) -> (FitState, u64) {
+    if required_mib <= total_mib {
+        (FitState::Fits, 0)
+    } else if is_wddm {
+        (FitState::WddmPaged, required_mib - total_mib)
+    } else {
+        (FitState::DoesNotFit, 0)
+    }
+}
+
+/// The worst [`FitState`] across per-GPU states (empty = fits:
+/// no GPU was judged, the no-telemetry posture).
+pub fn worst_fit_state(states: &[FitState]) -> FitState {
+    states
+        .iter()
+        .copied()
+        .max_by_key(|s| s.rank())
+        .unwrap_or(FitState::Fits)
 }
 
 /// Recommend a placement for `spec` given per-GPU free VRAM.
@@ -1968,6 +2037,33 @@ mod tests {
                 free_mib: 0
             }
         ));
+    }
+
+    #[test]
+    fn fit_state_three_states_and_worst_aggregation() {
+        // Within total: fits on either driver model, nothing paged.
+        assert_eq!(fit_state(16_376, 16_376, true), (FitState::Fits, 0));
+        assert_eq!(fit_state(13_128, 16_376, false), (FitState::Fits, 0));
+        // Over total on WDDM: paged by exactly the excess.
+        assert_eq!(
+            fit_state(17_224, 16_376, true),
+            (FitState::WddmPaged, 848)
+        );
+        // Over total on TCC — and on an unreported driver model,
+        // which the caller passes as not-WDDM: does not fit.
+        assert_eq!(
+            fit_state(17_224, 16_376, false),
+            (FitState::DoesNotFit, 0)
+        );
+        assert_eq!(
+            worst_fit_state(&[FitState::Fits, FitState::WddmPaged]),
+            FitState::WddmPaged
+        );
+        assert_eq!(
+            worst_fit_state(&[FitState::WddmPaged, FitState::DoesNotFit]),
+            FitState::DoesNotFit
+        );
+        assert_eq!(worst_fit_state(&[]), FitState::Fits);
     }
 
     // -- catalog + registry tests ---------------------------------------------

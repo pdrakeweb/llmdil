@@ -192,9 +192,9 @@ macro_rules! for_each_operation {
             (UpdateConfig, update_config, C, op_update_config, [patch: Value], None),
             // Backends
             (ListBackends, list_backends, R, op_list_backends, [], Some(route(HttpMethod::Get, "/api/v1/backends"))),
-            (StartBackend, start_backend, L, op_start_backend, [id: String], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/start"))),
+            (StartBackend, start_backend, L, op_start_backend, [id: String, allow_wddm_overcommit: Option<bool>], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/start"))),
             (StopBackend, stop_backend, L, op_stop_backend, [id: String, graceful: bool], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/stop"))),
-            (RestartBackend, restart_backend, L, op_restart_backend, [id: String, graceful: bool], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/restart"))),
+            (RestartBackend, restart_backend, L, op_restart_backend, [id: String, graceful: bool, allow_wddm_overcommit: Option<bool>], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/restart"))),
             (TestBackend, test_backend, L, op_test_backend, [id: String, prompt: String], Some(route(HttpMethod::Post, "/api/v1/backends/{id}/test"))),
             (BackendGetConfig, backend_get_config, SConfig, op_backend_get_config, [id: String], Some(route(HttpMethod::Get, "/api/v1/backends/{id}/config"))),
             (BackendPreviewDiff, backend_preview_diff, R, op_backend_preview_diff, [id: String, patch: Value], Some(route(HttpMethod::Post, "/api/v1/backends/{id}/config/preview-diff"))),
@@ -214,7 +214,7 @@ macro_rules! for_each_operation {
             (BackendSetParallel, backend_set_parallel, C, op_backend_set_parallel, [id: String, slots: Option<u32>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/parallel"))),
             (BackendSetCache, backend_set_cache, C, op_backend_set_cache, [id: String, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/cache"))),
             (BackendSetMoeCache, backend_set_moe_cache, C, op_backend_set_moe_cache, [id: String, mib: Option<u32>, auto: Option<bool>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/moe-cache"))),
-            (BackendCachePreview, backend_cache_preview, R, op_backend_cache_preview, [id: String, n_ctx: Option<u32>, slots: Option<u32>, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>], None),
+            (BackendCachePreview, backend_cache_preview, R, op_backend_cache_preview, [id: String, n_ctx: Option<u32>, slots: Option<u32>, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>, moe_cache_mib: Option<u32>], None),
             // Advanced flags mode (tracker #60): the raw-flags save
             // (advanced mode only; validation warns, never blocks)
             // and the mode flip itself (writes no flags).

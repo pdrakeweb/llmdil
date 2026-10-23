@@ -687,7 +687,7 @@ async fn run_experiment_inner(
     // preflight's reason instead of spawning at that position —
     // before any journal record or spec registration, so a
     // refused experiment leaves nothing to clean up.
-    if let Err(e) = crate::backend_start_preflight_for(state, &temp_cfg, &temp).await {
+    if let Err(e) = crate::backend_start_preflight_for(state, &temp_cfg, &temp, false).await {
         return InnerOutcome::failed(
             format!("start preflight refused the experiment's temp backend: {e}"),
             preflight,
@@ -1059,7 +1059,7 @@ pub(crate) async fn restart_stopped(state: &AppState, ids: &[String]) -> String 
         // backend whose saved position the guardrails now block
         // is not relaunched unpreflighted; the refusal is stated
         // in the note like any other restart failure.
-        if let Err(e) = crate::backend_start_preflight(state, id).await {
+        if let Err(e) = crate::backend_start_preflight(state, id, false).await {
             failed.push(format!("{id} (start preflight refused the restart: {e})"));
             continue;
         }
