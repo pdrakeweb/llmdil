@@ -645,11 +645,25 @@ pub async fn handle_revoke_session(
     axum::Json(json!({ "ok": true })).into_response()
 }
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct TotpEnrollBody {
+    /// Step-up for replacing a live TOTP factor (code-review B-6):
+    /// the account password. Absent/ignored for first enrollment.
+    pub password: Option<String>,
+}
+
 pub async fn handle_totp_enroll(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(p): axum::Extension<Principal>,
+    body: Option<axum::Json<TotpEnrollBody>>,
 ) -> Response {
-    match ctx.auth.totp_begin_enrollment(&p.user_id, &p.username).await {
+    let step_up = body.and_then(|axum::Json(b)| b.password);
+    match ctx
+        .auth
+        .totp_begin_enrollment(&p.user_id, &p.username, step_up.as_deref())
+        .await
+    {
         Ok((secret, uri)) => {
             axum::Json(json!({ "secret": secret, "otpauth_uri": uri })).into_response()
         }

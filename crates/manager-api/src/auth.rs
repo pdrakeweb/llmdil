@@ -217,6 +217,19 @@ struct Enrollment {
     expires_ms: i64,
 }
 
+/// A TOTP secret from `totp_begin_enrollment` that has not been
+/// confirmed yet (code-review B-6). It lives only in this in-memory
+/// map — never in the credential store — so an unconfirmed
+/// re-enrollment cannot overwrite or invalidate the live factor,
+/// and it expires [`PENDING_TOTP_TTL_MS`] after it was issued.
+struct PendingTotp {
+    secret: String,
+    expires_ms: i64,
+}
+
+/// How long an unconfirmed TOTP enrollment stays valid.
+const PENDING_TOTP_TTL_MS: i64 = 10 * 60 * 1000;
+
 pub struct AuthService {
     store: Arc<UserStore>,
     creds: Arc<dyn CredentialStore>,
@@ -224,7 +237,7 @@ pub struct AuthService {
     ip_failures: Mutex<HashMap<String, Vec<i64>>>,
     challenges: Mutex<HashMap<String, TotpChallenge>>,
     enrollments: Mutex<HashMap<String, Enrollment>>,
-    pending_totp: Mutex<HashMap<String, String>>,
+    pending_totp: Mutex<HashMap<String, PendingTotp>>,
 }
 
 impl AuthService {
@@ -900,29 +913,51 @@ impl AuthService {
 
     // -- TOTP enrollment ----------------------------------------------------
 
-    /// Begin TOTP enrollment: a fresh secret is generated into the
-    /// credential store as the pending secret and returned with its
-    /// otpauth URI (shown once as a QR at the desktop / authenticator
-    /// entry). Nothing is enabled until `totp_verify_enrollment`.
+    /// Begin TOTP enrollment: a fresh secret is generated and
+    /// returned with its otpauth URI (shown once as a QR at the
+    /// desktop / authenticator entry). The secret is held only as
+    /// an expiring in-memory pending entry (code-review B-6): it is
+    /// written to the credential store — becoming the live factor —
+    /// only when `totp_verify_enrollment` confirms it, so starting
+    /// a re-enrollment can never overwrite or invalidate a live
+    /// factor before the replacement is proven.
+    ///
+    /// Replacing a live factor additionally requires step-up:
+    /// when the user already has TOTP enabled, `step_up_password`
+    /// must be the account password (the same step-up
+    /// `totp_disable` requires). First enrollment needs none.
     pub async fn totp_begin_enrollment(
         &self,
         user_id: &str,
         username: &str,
+        step_up_password: Option<&str>,
     ) -> Result<(String, String), AuthError> {
+        let user = self
+            .store
+            .read(|f| f.users.iter().find(|u| u.id == user_id).cloned())
+            .await
+            .ok_or_else(|| AuthError::NotFound("user".into()))?;
+        if user.totp_enabled {
+            let ok = step_up_password
+                .map(|p| verify_password(p, &user.password_hash))
+                .unwrap_or(false);
+            if !ok {
+                return Err(AuthError::InvalidCredentials);
+            }
+        }
         let mut secret_bytes = [0u8; 20];
         for i in 0..5 {
             let b = uuid::Uuid::new_v4().into_bytes();
             secret_bytes[i * 4..i * 4 + 4].copy_from_slice(&b[..4]);
         }
         let secret = base32_encode(&secret_bytes);
-        self.creds
-            .write(&totp_target(user_id), &secret)
-            .await
-            .map_err(|_| AuthError::Internal)?;
-        self.pending_totp
-            .lock()
-            .await
-            .insert(user_id.to_string(), secret.clone());
+        self.pending_totp.lock().await.insert(
+            user_id.to_string(),
+            PendingTotp {
+                secret: secret.clone(),
+                expires_ms: now_ms() + PENDING_TOTP_TTL_MS,
+            },
+        );
         let uri = format!(
             "otpauth://totp/LLMdil:{username}?secret={secret}&issuer=LLMdil&digits=6&period=30"
         );
@@ -930,29 +965,43 @@ impl AuthService {
     }
 
     /// Confirm enrollment with a code from the authenticator. On
-    /// success TOTP is enabled and 8 single-use recovery codes are
-    /// returned (shown once, stored hashed).
+    /// success the pending secret is promoted into the credential
+    /// store as the live factor, TOTP is enabled, and 8 single-use
+    /// recovery codes are returned (shown once, stored hashed).
+    /// An expired pending enrollment is refused and dropped.
     pub async fn totp_verify_enrollment(
         &self,
         user_id: &str,
         code: &str,
     ) -> Result<Vec<String>, AuthError> {
         let pending = self.pending_totp.lock().await.remove(user_id);
-        let Some(secret_b32) = pending else {
+        let Some(pending) = pending else {
             return Err(AuthError::InvalidInput(
                 "no TOTP enrollment in progress".into(),
             ));
         };
+        if pending.expires_ms <= now_ms() {
+            return Err(AuthError::InvalidInput(
+                "TOTP enrollment expired; begin enrollment again".into(),
+            ));
+        }
+        let secret_b32 = pending.secret.clone();
         let secret = base32_decode(&secret_b32).ok_or(AuthError::Internal)?;
         if !totp_verify(&secret, code.trim(), now_ms() / 1000) {
             // Restore the pending enrollment so the user can retry
-            // with the same secret within this session.
+            // with the same secret until it expires.
             self.pending_totp
                 .lock()
                 .await
-                .insert(user_id.to_string(), secret_b32);
+                .insert(user_id.to_string(), pending);
             return Err(AuthError::InvalidCredentials);
         }
+        // Promotion point: only now does the new secret become the
+        // live credential (code-review B-6).
+        self.creds
+            .write(&totp_target(user_id), &secret_b32)
+            .await
+            .map_err(|_| AuthError::Internal)?;
         let codes: Vec<String> = (0..8).map(|_| recovery_code()).collect();
         let hashes: Vec<String> = codes
             .iter()
@@ -1228,7 +1277,10 @@ mod tests {
             .create_user("carol", "a-unique-passphrase", RoleName::Viewer)
             .await
             .unwrap();
-        let (secret_b32, uri) = svc.totp_begin_enrollment(&user.id, "carol").await.unwrap();
+        let (secret_b32, uri) = svc
+            .totp_begin_enrollment(&user.id, "carol", None)
+            .await
+            .unwrap();
         assert!(uri.starts_with("otpauth://totp/LLMdil:carol"));
         let secret = base32_decode(&secret_b32).unwrap();
         let code = format!("{:06}", totp_at(&secret, now_ms() / 1000));
@@ -1270,6 +1322,97 @@ mod tests {
             .complete_totp_login(&challenge_id, &codes[0], "127.0.0.1")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn totp_reenrollment_requires_step_up_and_keeps_live_factor_until_verified() {
+        // Code-review B-6: beginning a re-enrollment must neither
+        // proceed without a password step-up nor touch the live
+        // factor; the pending secret replaces it only on verify.
+        let svc = service().await;
+        let user = svc
+            .create_user("erin", "a-unique-passphrase", RoleName::Viewer)
+            .await
+            .unwrap();
+        let (old_b32, _) = svc
+            .totp_begin_enrollment(&user.id, "erin", None)
+            .await
+            .unwrap();
+        let old_secret = base32_decode(&old_b32).unwrap();
+        let code = format!("{:06}", totp_at(&old_secret, now_ms() / 1000));
+        svc.totp_verify_enrollment(&user.id, &code).await.unwrap();
+        assert_eq!(
+            svc.creds.read(&totp_target(&user.id)).await.as_deref(),
+            Some(old_b32.as_str())
+        );
+        // No step-up, and a wrong password, are both refused.
+        assert!(svc
+            .totp_begin_enrollment(&user.id, "erin", None)
+            .await
+            .is_err());
+        assert!(svc
+            .totp_begin_enrollment(&user.id, "erin", Some("wrong-passphrase"))
+            .await
+            .is_err());
+        // With the password, a pending secret is issued — and the
+        // live credential is still the old one.
+        let (new_b32, _) = svc
+            .totp_begin_enrollment(&user.id, "erin", Some("a-unique-passphrase"))
+            .await
+            .unwrap();
+        assert_ne!(new_b32, old_b32);
+        assert_eq!(
+            svc.creds.read(&totp_target(&user.id)).await.as_deref(),
+            Some(old_b32.as_str()),
+            "begin must not overwrite the live factor"
+        );
+        let stored = svc
+            .store
+            .read(|f| f.users.iter().find(|u| u.id == user.id).cloned())
+            .await
+            .unwrap();
+        let old_code = format!("{:06}", totp_at(&old_secret, now_ms() / 1000));
+        assert!(svc.verify_user_totp(&stored, &old_code).await);
+        // Verifying the pending enrollment promotes the new secret.
+        let new_secret = base32_decode(&new_b32).unwrap();
+        let new_code = format!("{:06}", totp_at(&new_secret, now_ms() / 1000));
+        svc.totp_verify_enrollment(&user.id, &new_code)
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.creds.read(&totp_target(&user.id)).await.as_deref(),
+            Some(new_b32.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn totp_pending_enrollment_expires() {
+        // Code-review B-6: an unconfirmed enrollment expires and
+        // never reaches the credential store.
+        let svc = service().await;
+        let user = svc
+            .create_user("frank", "a-unique-passphrase", RoleName::Viewer)
+            .await
+            .unwrap();
+        let (secret_b32, _) = svc
+            .totp_begin_enrollment(&user.id, "frank", None)
+            .await
+            .unwrap();
+        assert!(svc.creds.read(&totp_target(&user.id)).await.is_none());
+        svc.pending_totp
+            .lock()
+            .await
+            .get_mut(&user.id)
+            .unwrap()
+            .expires_ms = now_ms() - 1;
+        let secret = base32_decode(&secret_b32).unwrap();
+        let code = format!("{:06}", totp_at(&secret, now_ms() / 1000));
+        let err = svc
+            .totp_verify_enrollment(&user.id, &code)
+            .await
+            .expect_err("expired pending enrollment must be refused");
+        assert!(matches!(err, AuthError::InvalidInput(_)), "{err:?}");
+        assert!(svc.creds.read(&totp_target(&user.id)).await.is_none());
     }
 
     #[tokio::test]
