@@ -2295,15 +2295,39 @@ fn postgres_zip_path(data_dir: &Path, pin: &PostgresPin) -> PathBuf {
 
 /// Transform a fully built gateway spawn command into the service
 /// launch spec for its definition. The argv and non-secret env carry
-/// over verbatim; the three secret-bearing values become credential
+/// over verbatim; the secret-bearing values become credential
 /// references the service host resolves at start, so a secret value
 /// is never written into the definition file: the master key and the
 /// OpenRouter key by their Credential Manager targets, `DATABASE_URL`
-/// as the composable Postgres form (password credential + port).
+/// as the composable Postgres form (password credential + port), and
+/// every armed gateway MCP server's credential under each of its
+/// env-key names by that server's `cred_ref` target (code-review
+/// B-7). The MCP mapping is safe for arbitrary env names because
+/// the spawn env only carries an MCP env key when the arming pass
+/// resolved that server's credential into it, and the service host
+/// resolves any `CredentialRef` entry generically by target
+/// (`manager_services::resolve_env` is not name-locked).
 fn gateway_launch_spec(
     cmd: &PlannedCommand,
     config: &AppConfig,
 ) -> manager_services::LaunchSpec {
+    // Env-key name -> Credential Manager target, for every
+    // gateway-exposed MCP server that names a credential. The first
+    // server wins on a shared env-key name (the spawn env itself
+    // holds only one value per name, from the same iteration).
+    let mut mcp_cred_refs: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
+    for server in &config.mcp.servers {
+        if server.exposure != manager_config::McpExposure::Gateway {
+            continue;
+        }
+        let Some(target) = server.cred_ref.as_deref() else {
+            continue;
+        };
+        for key in &server.env_keys {
+            mcp_cred_refs.entry(key.as_str()).or_insert(target);
+        }
+    }
     let mut env: Vec<manager_services::EnvEntry> = cmd
         .env
         .iter()
@@ -2323,7 +2347,10 @@ fn gateway_launch_spec(
                 Some(target) => manager_services::EnvEntry::credential_ref(name, target),
                 None => manager_services::EnvEntry::literal(name, value.clone()),
             },
-            _ => manager_services::EnvEntry::literal(name, value.clone()),
+            _ => match mcp_cred_refs.get(name.as_str()) {
+                Some(target) => manager_services::EnvEntry::credential_ref(name, target),
+                None => manager_services::EnvEntry::literal(name, value.clone()),
+            },
         })
         .collect();
     env.sort_by(|a, b| a.name.cmp(&b.name));
@@ -7563,6 +7590,63 @@ mod tests {
         let mut h = Sha256::new();
         h.update(bytes);
         format!("{:x}", h.finalize())
+    }
+
+    #[test]
+    fn gateway_launch_spec_maps_mcp_credentials_to_references() {
+        // Code-review B-7: an armed gateway MCP server's credential
+        // must reach the service definition as a credential
+        // reference, never as a plaintext literal; non-secret env
+        // and local-exposure servers' keys stay literal.
+        let mut config = AppConfig::default_config();
+        let brave_target = config
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.id == "brave_search")
+            .and_then(|s| s.cred_ref.clone())
+            .expect("curated brave server names a credential");
+        config.mcp.servers.push(manager_config::McpServerConfig {
+            id: "local_only".to_string(),
+            env_keys: vec!["LOCAL_ONLY_KEY".to_string()],
+            cred_ref: Some("local-llm-service-manager/local-only".to_string()),
+            exposure: manager_config::McpExposure::Local,
+            ..Default::default()
+        });
+        let mut cmd = PlannedCommand::new(vec!["pythonw.exe".to_string()]);
+        cmd.env
+            .insert("BRAVE_API_KEY".to_string(), "sentinel-mcp-value".to_string());
+        cmd.env
+            .insert("LOCAL_ONLY_KEY".to_string(), "local-value".to_string());
+        cmd.env
+            .insert("PLAIN_SETTING".to_string(), "plain".to_string());
+        let spec = gateway_launch_spec(&cmd, &config);
+        let brave = spec
+            .env
+            .iter()
+            .find(|e| e.name == "BRAVE_API_KEY")
+            .expect("brave env entry present");
+        assert_eq!(
+            brave.value,
+            manager_services::EnvValue::CredentialRef { target: brave_target }
+        );
+        let local = spec
+            .env
+            .iter()
+            .find(|e| e.name == "LOCAL_ONLY_KEY")
+            .expect("local env entry present");
+        assert_eq!(
+            local.value,
+            manager_services::EnvValue::Literal {
+                value: "local-value".to_string()
+            }
+        );
+        let serialized = serde_json::to_string(&spec.env).unwrap();
+        assert!(
+            !serialized.contains("sentinel-mcp-value"),
+            "MCP credential value must not appear in the definition env: {serialized}"
+        );
+        assert!(serialized.contains("plain"));
     }
 
     fn test_gpus() -> Vec<GpuDescriptor> {
