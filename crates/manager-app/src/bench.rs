@@ -836,6 +836,19 @@ fn base_arm_spec(target: &BackendConfig) -> mb::ArmSpec {
         }
         i += 1;
     }
+    // The target's effective expert offload, decoded from its
+    // raw flags and re-spelled in the canonical form the app
+    // itself writes: an MoE backend's arms record the position
+    // they run at (the arm label names it), and the offload
+    // dimension sweeps positions from this base. The launch
+    // rewrite strips the base's expert tokens and appends this
+    // expression, so the launched position is the same one —
+    // only its spelling is canonical. `None` when the backend
+    // offloads nothing: its arms carry no offload expression
+    // and the base tokens pass through untouched.
+    let offload_expr = manager_models::offload_flag_string(manager_models::expert_offload(
+        target.raw_flags.as_deref(),
+    ));
     mb::ArmSpec {
         cache_k,
         cache_v,
@@ -849,7 +862,7 @@ fn base_arm_spec(target: &BackendConfig) -> mb::ArmSpec {
         draft_device: mb::DraftDevice::TargetGpu,
         draft_cache_k: mb::CacheType::Q8_0,
         draft_cache_v: mb::CacheType::Q8_0,
-        offload_expr: None,
+        offload_expr,
     }
 }
 
@@ -1593,10 +1606,63 @@ pub async fn op_bench_run_start(
         }
         None => (None, None),
     };
+    // Offload guardrail facts for pruning (§3.2 rule 5): when
+    // the target's model carries catalog offload restrictions,
+    // the positions the guardrail blocks on the target's
+    // placement are computed with the same evaluation the start
+    // preflight uses, so blocked positions prune here with the
+    // reason instead of failing one temp-backend start per arm.
+    // A journaled override the target may carry does NOT extend
+    // to bench temporaries — the preflight evaluates the temp's
+    // own id, which no override names — so positions are judged
+    // unoverridden, exactly as the preflight will judge them.
+    // Nothing is pruned when no restriction governs the
+    // placement (the allowed set then covers every position).
+    let gpu_inventory = {
+        let store = state.telemetry().await;
+        let gpus = crate::lock_telemetry(&store).inventory();
+        gpus
+    };
+    let offload_guardrail = crate::backend_offload_info(&cfg, &target).and_then(|info| {
+        if info.restrictions.is_empty() {
+            return None;
+        }
+        let (placed_ccs, cpu_only) = crate::placed_offload_placement(&target, &gpu_inventory);
+        let allowed_layers: Vec<u32> = (0..=info.moe_layers)
+            .filter(|&layers| {
+                manager_models::offload_status(
+                    &info.restrictions,
+                    layers,
+                    info.moe_layers,
+                    &placed_ccs,
+                    cpu_only,
+                ) != manager_models::OffloadStatus::Blocked
+            })
+            .collect();
+        if allowed_layers.len() as u32 == info.moe_layers + 1 {
+            return None;
+        }
+        let compute_capability = placed_ccs
+            .iter()
+            .copied()
+            .find(|cc| {
+                info.restrictions
+                    .iter()
+                    .any(|r| r.compute_capability == *cc)
+            })
+            .or_else(|| info.restrictions.first().map(|r| r.compute_capability))?;
+        Some(mb::OffloadGuardrail {
+            moe_layers: info.moe_layers,
+            allowed_layers,
+            compute_capability,
+            inherited_layers: Some(info.layers),
+        })
+    });
     let prune_ctx = mb::PruneContext {
         model_ctx_len,
         target_vocab,
         draft_vocab,
+        offload_guardrail,
     };
     let mut outcomes = mb::prune_arms(arms, &prune_ctx);
     // Glue rule (§2.1): an arm whose depth plus the measured
@@ -1682,9 +1748,7 @@ pub async fn op_bench_run_start(
     } else {
         0
     };
-    let store = state.telemetry().await;
-    let machine_gpus: Vec<String> = crate::lock_telemetry(&store)
-        .inventory()
+    let machine_gpus: Vec<String> = gpu_inventory
         .iter()
         .map(|g| format!("{} (GPU {})", g.name, g.index))
         .collect();
@@ -1935,4 +1999,67 @@ pub async fn op_bench_result_delete(
     }
     save_results(state, &results);
     Ok(results_payload(state, &results))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backend(raw_flags: Option<&str>) -> BackendConfig {
+        BackendConfig {
+            id: "bench-target".to_string(),
+            enabled: true,
+            model_file: PathBuf::from("models/target.gguf"),
+            port: 8090,
+            flags: manager_config::ServerFlags {
+                n_ctx: 65536,
+                n_batch: 512,
+                tensor_split: Vec::new(),
+                split_mode: manager_config::SplitMode::None,
+            },
+            raw_flags: raw_flags.map(|s| s.to_string()),
+            flags_advanced: false,
+            restart_policy: manager_config::RestartPolicy {
+                max_retries: 5,
+                backoff_base_secs: 2,
+            },
+            overrides_global: false,
+            tool_call_probe: None,
+            purpose: String::new(),
+        }
+    }
+
+    #[test]
+    fn base_arm_captures_the_targets_offload_position() {
+        // The coder pattern: full expert offload is recorded on
+        // the base arm, so every arm snapshot names the position
+        // it runs at.
+        let spec = base_arm_spec(&backend(Some("-ot exps=CPU --parallel 1")));
+        assert_eq!(spec.offload_expr.as_deref(), Some("-ot exps=CPU"));
+        assert_eq!(spec.n_ctx, 65536);
+        // The partial pattern records its layer count.
+        let spec = base_arm_spec(&backend(Some("--n-cpu-moe 24")));
+        assert_eq!(spec.offload_expr.as_deref(), Some("--n-cpu-moe 24"));
+    }
+
+    #[test]
+    fn base_arm_canonicalizes_offload_spellings() {
+        // Every spelling the decoder recognizes lands on the one
+        // canonical expression for its position.
+        let spec = base_arm_spec(&backend(Some("--cpu-moe")));
+        assert_eq!(spec.offload_expr.as_deref(), Some("-ot exps=CPU"));
+        let spec = base_arm_spec(&backend(Some("-ncmoe=46")));
+        assert_eq!(spec.offload_expr.as_deref(), Some("--n-cpu-moe 46"));
+    }
+
+    #[test]
+    fn base_arm_without_offload_carries_no_expression() {
+        let spec = base_arm_spec(&backend(Some("--parallel 1")));
+        assert_eq!(spec.offload_expr, None);
+        let spec = base_arm_spec(&backend(None));
+        assert_eq!(spec.offload_expr, None);
+        // A non-expert `-ot` assignment is not expert offload.
+        let spec = base_arm_spec(&backend(Some("-ot blk.0.attn=CPU")));
+        assert_eq!(spec.offload_expr, None);
+    }
 }

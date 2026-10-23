@@ -371,6 +371,150 @@ pub struct PruneContext {
     pub target_vocab: Option<u32>,
     /// The selected draft model's vocabulary size, when known.
     pub draft_vocab: Option<u32>,
+    /// The offload guardrail governing the target's placement,
+    /// when its model carries one (tracker #37's catalog
+    /// restrictions, evaluated at validation time).
+    #[serde(default)]
+    pub offload_guardrail: Option<OffloadGuardrail>,
+}
+
+/// The offload guardrail facts pruning judges an arm's offload
+/// position against: the target model's catalog restriction
+/// blocks some positions on the placed architecture (the
+/// endpoints-only rule for Qwen3-Coder-Next on Pascal is the
+/// pinned case). The glue computes the allowed set with the same
+/// evaluation the launch preflight uses, so a position pruned
+/// here is exactly a position the preflight would refuse — the
+/// prune exists so the refusal surfaces at validation (D11)
+/// instead of costing one temp-backend start per arm.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OffloadGuardrail {
+    /// MoE layers in total for the target model.
+    pub moe_layers: u32,
+    /// The offload positions (MoE layers on system RAM) the
+    /// guardrail allows on the placed architecture, ascending.
+    /// A determinate position not listed here is blocked.
+    pub allowed_layers: Vec<u32>,
+    /// The restricting architecture, named in the prune reason.
+    pub compute_capability: (u32, u32),
+    /// The target backend's saved offload position: arms that do
+    /// not sweep the offload axis run at this position, so it is
+    /// judged too. `None` = unknown, and an arm that leaves the
+    /// axis alone is then never pruned on this rule.
+    pub inherited_layers: Option<u32>,
+}
+
+/// The canonical offload expression for a position (`layers` of
+/// `moe_layers` MoE layers on system RAM), in the spelling the app
+/// itself writes for that position: position 0 is the empty
+/// expression — an arm carrying it strips the base backend's
+/// offload tokens and appends none; the full position is
+/// `-ot exps=CPU`; anything between is `--n-cpu-moe N`.
+pub fn offload_expr_for_layers(layers: u32, moe_layers: u32) -> String {
+    if layers == 0 || moe_layers == 0 {
+        String::new()
+    } else if layers >= moe_layers {
+        "-ot exps=CPU".to_string()
+    } else {
+        format!("--n-cpu-moe {layers}")
+    }
+}
+
+/// The offload position (MoE layers on system RAM) an offload
+/// expression selects, when it has a determinate one: the empty
+/// expression is position 0; the all-experts spellings
+/// (`--cpu-moe` / `-cmoe`, or an `-ot` value whose assignments are
+/// all `exps=CPU`) are the full position; a `-ncmoe` /
+/// `--n-cpu-moe` count is that count, clamped to `moe_layers`
+/// (llama.cpp treats a count past the end as all). Anything else —
+/// a verbatim `-ot` expression mixing expert and non-expert
+/// assignments, an `exps` assignment to a non-CPU buffer, an
+/// unrecognized token — has no determinate position: `None`, and
+/// pruning never judges it (the design allows the backend's own
+/// `-ot` expression verbatim; the start preflight remains the
+/// backstop for those arms).
+pub fn offload_layers_of(expr: &str, moe_layers: u32) -> Option<u32> {
+    let tokens: Vec<&str> = expr.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Some(0);
+    }
+    let mut layers: Option<u32> = None;
+    let mut all_experts = false;
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if t == "--cpu-moe" || t == "-cmoe" {
+            all_experts = true;
+            i += 1;
+            continue;
+        }
+        if t == "--n-cpu-moe" || t == "-ncmoe" {
+            let v = tokens.get(i + 1)?.parse::<u32>().ok()?;
+            layers = Some(v);
+            i += 2;
+            continue;
+        }
+        if let Some(v) = t
+            .strip_prefix("--n-cpu-moe=")
+            .or_else(|| t.strip_prefix("-ncmoe="))
+        {
+            layers = Some(v.parse::<u32>().ok()?);
+            i += 1;
+            continue;
+        }
+        let assignment = if t == "-ot" || t == "--override-tensor" {
+            i += 1;
+            tokens.get(i).copied()
+        } else {
+            t.strip_prefix("--override-tensor=")
+                .or_else(|| t.strip_prefix("-ot="))
+        };
+        if let Some(list) = assignment {
+            for part in list.split(',') {
+                let (pattern, buffer) = part.split_once('=')?;
+                if !pattern.contains("exps") {
+                    // A non-expert assignment: the expression is
+                    // a verbatim custom one, not a pure position.
+                    return None;
+                }
+                if !buffer.eq_ignore_ascii_case("CPU") {
+                    return None;
+                }
+            }
+            all_experts = true;
+            i += 1;
+            continue;
+        }
+        return None;
+    }
+    if all_experts {
+        return Some(moe_layers);
+    }
+    Some(layers.unwrap_or(0).min(moe_layers))
+}
+
+/// The allowed position nearest to `layers` in an ascending
+/// allowed set; a distance tie resolves to the higher position
+/// (full offload is the restricted model's design point — the
+/// same tie rule as the catalog guardrail's snap).
+fn nearest_allowed_position(allowed: &[u32], layers: u32) -> u32 {
+    let mut best: Option<u32> = None;
+    for &candidate in allowed {
+        best = Some(match best {
+            None => candidate,
+            Some(current) => {
+                let d_new = candidate.abs_diff(layers);
+                let d_cur = current.abs_diff(layers);
+                if d_new < d_cur || (d_new == d_cur && candidate > current) {
+                    candidate
+                } else {
+                    current
+                }
+            }
+        });
+    }
+    best.unwrap_or(layers)
 }
 
 /// The outcome of pruning one arm: ready to run, or pruned with the
@@ -432,6 +576,40 @@ pub fn prune_arms(arms: Vec<ArmSpec>, ctx: &PruneContext) -> Vec<ArmOutcome> {
                             reason: format!(
                                 "draft model vocabulary size {draft} does not match target \
                                  vocabulary size {target}"
+                            ),
+                            spec: arm,
+                        };
+                    }
+                }
+            }
+            // (5) Offload guardrail (tracker #37, evaluated at
+            // validation): an arm whose offload position the
+            // target model's catalog restriction blocks on the
+            // placed architecture would be refused by the start
+            // preflight — prune it here with the reason instead of
+            // spending a temp-backend start on it. Arms that do
+            // not sweep the axis run at the backend's saved
+            // position, so that position is judged too; an arm
+            // whose expression has no determinate position (a
+            // verbatim custom `-ot`) is never pruned on this rule.
+            if let Some(g) = &ctx.offload_guardrail {
+                let position = match &arm.offload_expr {
+                    Some(expr) => offload_layers_of(expr, g.moe_layers),
+                    None => g.inherited_layers,
+                };
+                if let Some(layers) = position {
+                    if !g.allowed_layers.contains(&layers) {
+                        let nearest = nearest_allowed_position(&g.allowed_layers, layers);
+                        return ArmOutcome::Pruned {
+                            reason: format!(
+                                "offload of {layers} of {} layers is outside the verified \
+                                 range for this GPU (compute capability {}.{}) — pruned by \
+                                 the offload guardrail; the nearest verified position is \
+                                 {nearest} of {} layers",
+                                g.moe_layers,
+                                g.compute_capability.0,
+                                g.compute_capability.1,
+                                g.moe_layers
                             ),
                             spec: arm,
                         };
@@ -802,6 +980,115 @@ mod tests {
         };
         assert!(matches!(
             prune_arms(vec![arm], &ctx)[0],
+            ArmOutcome::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn offload_position_spellings_round_trip() {
+        // Canonical expressions for the endpoints and a partial
+        // position, in the spellings the app itself writes.
+        assert_eq!(offload_expr_for_layers(0, 48), "");
+        assert_eq!(offload_expr_for_layers(48, 48), "-ot exps=CPU");
+        assert_eq!(offload_expr_for_layers(60, 48), "-ot exps=CPU");
+        assert_eq!(offload_expr_for_layers(24, 48), "--n-cpu-moe 24");
+        // Every spelling the decoder recognizes resolves back to
+        // its position.
+        assert_eq!(offload_layers_of("", 48), Some(0));
+        assert_eq!(offload_layers_of("-ot exps=CPU", 48), Some(48));
+        assert_eq!(offload_layers_of("--cpu-moe", 48), Some(48));
+        assert_eq!(offload_layers_of("-cmoe", 48), Some(48));
+        assert_eq!(offload_layers_of("--n-cpu-moe 46", 48), Some(46));
+        assert_eq!(offload_layers_of("-ncmoe=12", 48), Some(12));
+        // A count past the end clamps to the full position.
+        assert_eq!(offload_layers_of("--n-cpu-moe 60", 48), Some(48));
+        // Verbatim/custom expressions have no determinate
+        // position: a mixed `-ot`, an `exps` assignment to a
+        // non-CPU buffer, an unrelated token.
+        assert_eq!(offload_layers_of("-ot exps=CPU,blk.0.attn=CPU", 48), None);
+        assert_eq!(offload_layers_of("-ot exps=GPU", 48), None);
+        assert_eq!(offload_layers_of("--parallel 1", 48), None);
+    }
+
+    fn guardrail_ctx(inherited: Option<u32>) -> PruneContext {
+        // The pinned case: Qwen3-Coder-Next, 48 MoE layers,
+        // endpoints only on compute capability (6, 0).
+        PruneContext {
+            offload_guardrail: Some(OffloadGuardrail {
+                moe_layers: 48,
+                allowed_layers: vec![0, 48],
+                compute_capability: (6, 0),
+                inherited_layers: inherited,
+            }),
+            ..PruneContext::default()
+        }
+    }
+
+    #[test]
+    fn prune_offload_guardrail_blocks_partial_positions() {
+        let mut arm = base();
+        arm.offload_expr = Some("--n-cpu-moe 46".to_string());
+        let out = prune_arms(vec![arm], &guardrail_ctx(Some(48)));
+        match &out[0] {
+            ArmOutcome::Pruned { reason, .. } => {
+                assert!(reason.contains("46 of 48"), "{reason}");
+                assert!(reason.contains("6.0"), "{reason}");
+                // 46 is nearer the full endpoint than 0.
+                assert!(reason.contains("48 of 48"), "{reason}");
+            }
+            ArmOutcome::Ready(_) => panic!("expected pruning"),
+        }
+        // The endpoints are allowed positions.
+        for expr in ["", "-ot exps=CPU", "--cpu-moe"] {
+            let mut arm = base();
+            arm.offload_expr = Some(expr.to_string());
+            assert!(
+                matches!(
+                    prune_arms(vec![arm], &guardrail_ctx(Some(48)))[0],
+                    ArmOutcome::Ready(_)
+                ),
+                "expr {expr:?} must be allowed"
+            );
+        }
+        // A verbatim custom expression has no determinate
+        // position and is never pruned on this rule.
+        let mut arm = base();
+        arm.offload_expr = Some("-ot exps=CPU,blk.0.attn=CPU".to_string());
+        assert!(matches!(
+            prune_arms(vec![arm], &guardrail_ctx(Some(48)))[0],
+            ArmOutcome::Ready(_)
+        ));
+        // No guardrail context: a partial position is untouched.
+        let mut arm = base();
+        arm.offload_expr = Some("--n-cpu-moe 46".to_string());
+        assert!(matches!(
+            prune_arms(vec![arm], &PruneContext::default())[0],
+            ArmOutcome::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn prune_offload_guardrail_judges_the_inherited_position() {
+        // An arm that does not sweep the axis runs at the
+        // backend's saved position: a blocked saved position
+        // prunes it, an allowed one does not.
+        let arm = base();
+        assert_eq!(arm.offload_expr, None);
+        let out = prune_arms(vec![arm.clone()], &guardrail_ctx(Some(46)));
+        match &out[0] {
+            ArmOutcome::Pruned { reason, .. } => {
+                assert!(reason.contains("46 of 48"), "{reason}")
+            }
+            ArmOutcome::Ready(_) => panic!("expected pruning"),
+        }
+        assert!(matches!(
+            prune_arms(vec![arm.clone()], &guardrail_ctx(Some(48)))[0],
+            ArmOutcome::Ready(_)
+        ));
+        // Unknown saved position: the arm is never pruned on
+        // this rule.
+        assert!(matches!(
+            prune_arms(vec![arm], &guardrail_ctx(None))[0],
             ArmOutcome::Ready(_)
         ));
     }
