@@ -173,13 +173,14 @@ fn normalize_change(kind: PlanKind, change: &Value) -> ChangeVerdict {
             "n_batch",
             "tensor_split",
             "offload_layers",
+            "moe_cache_mib",
         ],
         PlanKind::BackendDelete | PlanKind::GroupDelete | PlanKind::ModelDownload => {
             return ChangeVerdict::Ok(json!({}));
         }
         PlanKind::BackendSetContext => &["n_ctx"],
         PlanKind::BackendSetFlags => &["n_ctx", "n_batch"],
-        PlanKind::BackendSetOffload => &["offload_layers"],
+        PlanKind::BackendSetOffload => &["offload_layers", "moe_cache_mib"],
         PlanKind::BackendSetPlacement => &["tensor_split", "split_mode"],
         PlanKind::BackendSetModel => &["model_id"],
         PlanKind::BackendSetEnabled => &["enabled"],
@@ -228,6 +229,9 @@ fn normalize_change(kind: PlanKind, change: &Value) -> ChangeVerdict {
             if let Some(n) = opt_u32(obj, "offload_layers", &mut ok) {
                 out.insert("offload_layers".into(), json!(n));
             }
+            if let Some(n) = opt_u32(obj, "moe_cache_mib", &mut ok) {
+                out.insert("moe_cache_mib".into(), json!(n));
+            }
         }
         PlanKind::BackendSetContext => match req_u32(obj, "n_ctx") {
             Some(n) => {
@@ -249,12 +253,17 @@ fn normalize_change(kind: PlanKind, change: &Value) -> ChangeVerdict {
                 return ChangeVerdict::Drop;
             }
         }
-        PlanKind::BackendSetOffload => match req_u32(obj, "offload_layers") {
-            Some(n) => {
-                out.insert("offload_layers".into(), json!(n));
+        PlanKind::BackendSetOffload => {
+            match req_u32(obj, "offload_layers") {
+                Some(n) => {
+                    out.insert("offload_layers".into(), json!(n));
+                }
+                None => return ChangeVerdict::Drop,
             }
-            None => return ChangeVerdict::Drop,
-        },
+            if let Some(n) = opt_u32(obj, "moe_cache_mib", &mut ok) {
+                out.insert("moe_cache_mib".into(), json!(n));
+            }
+        }
         PlanKind::BackendSetPlacement => {
             match req_f32_vec(obj, "tensor_split") {
                 Some(v) => {
@@ -1411,6 +1420,12 @@ fn parse_experiments(
             if fo.contains_key("offload_layers") {
                 match fo.get("offload_layers").and_then(as_u32) {
                     Some(n) => flags.offload_layers = Some(n),
+                    None => flags_ok = false,
+                }
+            }
+            if fo.contains_key("moe_cache_mib") {
+                match fo.get("moe_cache_mib").and_then(as_u32) {
+                    Some(n) => flags.moe_cache_mib = Some(n),
                     None => flags_ok = false,
                 }
             }
@@ -2579,7 +2594,7 @@ mod tests {
         let extra = vec![
             "Qwen/Qwen3.8-27B-MoE-GGUF/Qwen3.8-27B-MoE-Q4_K_M.gguf".to_string(),
         ];
-        let ev = crate::experiment::validate_experiment_for_plan(exp, &cfg, &extra, &plan.items);
+        let ev = crate::experiment::validate_experiment_for_plan(exp, &cfg, &extra, &plan.items, None);
         assert_eq!(ev.status, ValidationStatus::Valid, "E1 verdict: {:?}", ev.reason);
 
         // Accepting the experiment accepts its provisioning
@@ -2662,6 +2677,7 @@ mod tests {
             &cfg,
             &[],
             &plan.items,
+            None,
         );
         assert_eq!(ev_before.status, ValidationStatus::Invalid);
 
@@ -2691,7 +2707,7 @@ mod tests {
         );
         // After repair the experiment validates exactly as the
         // freshly built plan's does.
-        let ev = crate::experiment::validate_experiment_for_plan(exp, &cfg, &[], &plan.items);
+        let ev = crate::experiment::validate_experiment_for_plan(exp, &cfg, &[], &plan.items, None);
         assert_eq!(
             ev.status,
             ValidationStatus::Valid,
@@ -2739,7 +2755,7 @@ mod tests {
             "summary states it: {}",
             r.summary
         );
-        let ev = crate::experiment::validate_experiment_for_plan(exp, &cfg, &[], &r.items);
+        let ev = crate::experiment::validate_experiment_for_plan(exp, &cfg, &[], &r.items, None);
         assert_eq!(ev.status, crate::validate::ValidationStatus::Invalid);
         let reason = ev.reason.unwrap();
         assert!(reason.contains("not a registered model"), "{reason}");

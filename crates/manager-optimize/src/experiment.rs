@@ -23,7 +23,7 @@
 //! on this platform; everything it decides that can be decided
 //! purely is decided here.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use manager_config::{AppConfig, BackendConfig, RestartPolicy, ServerFlags, SplitMode};
@@ -64,6 +64,14 @@ pub struct ExperimentFlags {
     pub offload_layers: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tensor_split: Option<Vec<f32>>,
+    /// MoE expert cache (`--moe-cache-mib`) for the temp
+    /// backend, alongside `offload_layers`: the cache holds the
+    /// offloaded experts, so a nonzero value is only meaningful
+    /// (and only valid — see [`validate_experiment`]) with an
+    /// offload position above 0 on a model whose MoE layer count
+    /// is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe_cache_mib: Option<u32>,
 }
 
 /// The model's prediction for one proposal: prose-grade numbers
@@ -309,10 +317,72 @@ fn candidate_problem(
     }
 }
 
+/// The candidate's MoE layer count as validation can resolve
+/// it: the live layouts first (the GGUF-resolved facts the app
+/// gathered — the count an experiment run would encode
+/// against), then the model record's own declaration, then the
+/// catalog pin. `None` when no source knows one — a dense
+/// model, or a candidate validation cannot resolve facts for.
+fn candidate_moe_layers(
+    candidate: &str,
+    cfg: &AppConfig,
+    layouts: Option<&HashMap<String, crate::fit::LayoutFacts>>,
+) -> Option<u32> {
+    if let Some(layouts) = layouts {
+        if let Some(moe) = layouts.get(candidate).and_then(|f| f.moe_layers) {
+            return Some(moe);
+        }
+    }
+    if let Some(m) = cfg.models.iter().find(|m| m.id == candidate) {
+        return m
+            .moe_layers
+            .or_else(|| manager_models::catalog_moe_layers(&m.id, &m.source_url));
+    }
+    manager_models::catalog_moe_layers(candidate, "")
+}
+
+/// The expert-cache problems in one proposal's flags, under the
+/// same discipline as the backend control (and the set op): a
+/// nonzero cache needs a known MoE layer count and an offload
+/// position above 0 in the same flags — with no experts in
+/// system RAM there is nothing for the cache to hold. An absent
+/// offload is an offload of 0 (the temp backend's default), and
+/// a 0 cache is the disabled value, never a problem.
+fn moe_cache_problems(
+    proposal: &ExperimentProposal,
+    cfg: &AppConfig,
+    layouts: Option<&HashMap<String, crate::fit::LayoutFacts>>,
+) -> Vec<String> {
+    let Some(mib) = proposal.flags.moe_cache_mib else {
+        return Vec::new();
+    };
+    if mib == 0 {
+        return Vec::new();
+    }
+    let candidate = proposal.candidate_model_id.trim();
+    if candidate_moe_layers(candidate, cfg, layouts).is_none() {
+        return vec![format!(
+            "moe_cache_mib cannot be encoded for candidate '{candidate}': its MoE layer count is unknown"
+        )];
+    }
+    if proposal.flags.offload_layers.unwrap_or(0) == 0 {
+        return vec![
+            "moe_cache_mib requires offload_layers above 0 in the same flags: the cache holds the offloaded experts, and these flags offload none"
+                .to_string(),
+        ];
+    }
+    Vec::new()
+}
+
 /// The non-candidate problems (flags and `requires_stopping`
 /// ids), shared by both validation entry points.
-fn non_candidate_problems(proposal: &ExperimentProposal, cfg: &AppConfig) -> Vec<String> {
+fn non_candidate_problems(
+    proposal: &ExperimentProposal,
+    cfg: &AppConfig,
+    layouts: Option<&HashMap<String, crate::fit::LayoutFacts>>,
+) -> Vec<String> {
     let mut problems: Vec<String> = Vec::new();
+    problems.extend(moe_cache_problems(proposal, cfg, layouts));
     if let Some(n) = proposal.flags.n_ctx {
         if n == 0 {
             problems.push("n_ctx must be greater than 0".to_string());
@@ -366,6 +436,7 @@ pub fn validate_experiment(
     proposal: &ExperimentProposal,
     cfg: &AppConfig,
     extra_candidate_ids: &[String],
+    layouts: Option<&HashMap<String, crate::fit::LayoutFacts>>,
 ) -> ExperimentValidation {
     let mut problems: Vec<String> = Vec::new();
     let candidate = proposal.candidate_model_id.trim();
@@ -374,7 +445,7 @@ pub fn validate_experiment(
     } else if let Some(p) = candidate_problem(candidate, cfg, extra_candidate_ids) {
         problems.push(p);
     }
-    problems.extend(non_candidate_problems(proposal, cfg));
+    problems.extend(non_candidate_problems(proposal, cfg, layouts));
     verdict(problems)
 }
 
@@ -393,6 +464,7 @@ pub fn validate_experiment_for_plan(
     cfg: &AppConfig,
     extra_candidate_ids: &[String],
     items: &[crate::plan::PlanItem],
+    layouts: Option<&HashMap<String, crate::fit::LayoutFacts>>,
 ) -> ExperimentValidation {
     let mut problems: Vec<String> = Vec::new();
     let candidate = proposal.candidate_model_id.trim();
@@ -419,7 +491,7 @@ pub fn validate_experiment_for_plan(
             }
         }
     }
-    problems.extend(non_candidate_problems(proposal, cfg));
+    problems.extend(non_candidate_problems(proposal, cfg, layouts));
     verdict(problems)
 }
 
@@ -667,13 +739,21 @@ pub fn temp_backend_config(
     moe_layers: Option<u32>,
 ) -> BackendConfig {
     let split = proposal.flags.tensor_split.clone().unwrap_or_default();
-    let raw_flags = proposal.flags.offload_layers.and_then(|n| {
+    let mut raw_flags = proposal.flags.offload_layers.and_then(|n| {
         let offload = match moe_layers {
             Some(moe) => manager_models::offload_for_layers(n, moe),
             None => manager_models::ExpertOffload::CpuMoeLayers(n),
         };
         manager_models::set_expert_offload(None, offload)
     });
+    // The expert cache rides the offload encoding: validation
+    // has already refused a nonzero cache without an offload
+    // position on a known-MoE candidate, so here the token is
+    // simply written alongside the offload tokens it serves
+    // (a 0 value writes nothing — the writer's disabled form).
+    if let Some(mib) = proposal.flags.moe_cache_mib {
+        raw_flags = manager_models::set_moe_cache(raw_flags.as_deref(), Some(mib));
+    }
     BackendConfig {
         id: temp_backend_id(proposal.id),
         enabled: true,
@@ -917,7 +997,7 @@ mod tests {
             "qwen3-coder-30b",       // curated catalog id
             "Qwen/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf", // HF form
         ] {
-            let v = validate_experiment(&proposal(cand), &c, &[]);
+            let v = validate_experiment(&proposal(cand), &c, &[], None);
             assert_eq!(v.status, ValidationStatus::Valid, "{cand}: {:?}", v.reason);
         }
         // A candidates-block entry (repo/file) also resolves.
@@ -925,10 +1005,11 @@ mod tests {
             &proposal("Qwen/Qwen3-30B-A3B-GGUF"),
             &c,
             &["Qwen/Qwen3-30B-A3B-GGUF".to_string()],
+            None,
         );
         assert_eq!(v.status, ValidationStatus::Valid);
         // An invented id does not.
-        let v = validate_experiment(&proposal("totally-invented"), &c, &[]);
+        let v = validate_experiment(&proposal("totally-invented"), &c, &[], None);
         assert_eq!(v.status, ValidationStatus::Invalid);
     }
 
@@ -939,7 +1020,7 @@ mod tests {
         p.flags.n_ctx = Some(0);
         p.flags.tensor_split = Some(vec![0.5, 0.4]);
         p.requires_stopping = vec!["ghost".to_string()];
-        let v = validate_experiment(&p, &c, &[]);
+        let v = validate_experiment(&p, &c, &[], None);
         assert_eq!(v.status, ValidationStatus::Invalid);
         let reason = v.reason.unwrap();
         assert!(reason.contains("n_ctx"), "{reason}");
@@ -950,9 +1031,88 @@ mod tests {
         p.flags.tensor_split = Some(vec![0.5, 0.5]);
         p.requires_stopping = vec!["coder".to_string()];
         assert_eq!(
-            validate_experiment(&p, &c, &[]).status,
+            validate_experiment(&p, &c, &[], None).status,
             ValidationStatus::Valid
         );
+    }
+
+    #[test]
+    fn validation_refuses_an_expert_cache_without_offload_or_a_known_moe_count() {
+        let c = cfg();
+        // A candidate with no known MoE layer count (registered,
+        // undeclared, outside the catalog): the cache cannot be
+        // encoded — refused even with an offload position named.
+        let mut p = proposal("my-model");
+        p.flags.offload_layers = Some(4);
+        p.flags.moe_cache_mib = Some(4096);
+        let v = validate_experiment(&p, &c, &[], None);
+        assert_eq!(v.status, ValidationStatus::Invalid);
+        assert!(
+            v.reason.unwrap().contains("MoE layer count is unknown"),
+            "the refusal names the unknown count"
+        );
+        // An MoE candidate whose flags offload nothing — absent
+        // offload and an explicit 0 alike: nothing to cache.
+        for offload in [None, Some(0)] {
+            let mut p = proposal("qwen3-coder-30b");
+            p.flags.offload_layers = offload;
+            p.flags.moe_cache_mib = Some(4096);
+            let v = validate_experiment(&p, &c, &[], None);
+            assert_eq!(v.status, ValidationStatus::Invalid, "offload={offload:?}");
+            assert!(
+                v.reason.unwrap().contains("offload_layers above 0"),
+                "the refusal names the missing offload"
+            );
+        }
+        // MoE candidate + offload + cache: valid. A 0 cache is
+        // the disabled value and is never a problem.
+        let mut p = proposal("qwen3-coder-30b");
+        p.flags.offload_layers = Some(48);
+        p.flags.moe_cache_mib = Some(4096);
+        assert_eq!(
+            validate_experiment(&p, &c, &[], None).status,
+            ValidationStatus::Valid
+        );
+        let mut p = proposal("qwen3-coder-30b");
+        p.flags.moe_cache_mib = Some(0);
+        assert_eq!(
+            validate_experiment(&p, &c, &[], None).status,
+            ValidationStatus::Valid
+        );
+    }
+
+    #[test]
+    fn temp_backend_carries_the_expert_cache_token() {
+        // Full offload + cache: the token rides the all-experts
+        // form the offload encoding writes.
+        let mut p = proposal("qwen3-coder-30b");
+        p.flags.offload_layers = Some(48);
+        p.flags.moe_cache_mib = Some(8192);
+        let temp = temp_backend_config(&p, PathBuf::from("models/coder.gguf"), 18099, Some(48));
+        assert_eq!(
+            temp.raw_flags.as_deref(),
+            Some("-ot exps=CPU --moe-cache-mib 8192")
+        );
+        // Partial offload keeps its spelling and gains the token.
+        let mut p = proposal("qwen3-coder-30b");
+        p.flags.offload_layers = Some(24);
+        p.flags.moe_cache_mib = Some(4096);
+        let temp = temp_backend_config(&p, PathBuf::from("models/coder.gguf"), 18099, Some(48));
+        assert_eq!(
+            temp.raw_flags.as_deref(),
+            Some("--n-cpu-moe 24 --moe-cache-mib 4096")
+        );
+        // No cache in the flags: no token. A 0 cache writes none
+        // either (the writer's disabled form).
+        let mut p = proposal("qwen3-coder-30b");
+        p.flags.offload_layers = Some(48);
+        let temp = temp_backend_config(&p, PathBuf::from("models/coder.gguf"), 18099, Some(48));
+        assert_eq!(temp.raw_flags.as_deref(), Some("-ot exps=CPU"));
+        let mut p = proposal("qwen3-coder-30b");
+        p.flags.offload_layers = Some(48);
+        p.flags.moe_cache_mib = Some(0);
+        let temp = temp_backend_config(&p, PathBuf::from("models/coder.gguf"), 18099, Some(48));
+        assert_eq!(temp.raw_flags.as_deref(), Some("-ot exps=CPU"));
     }
 
     #[test]
