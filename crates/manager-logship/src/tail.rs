@@ -3,8 +3,9 @@
 //! spool's `state.json`), so a restart resumes where it left off
 //! instead of re-shipping history. Rotation — the writers rename
 //! the current file to its `.prev` sibling past ~1 MiB — is detected
-//! by file identity or size regression: the remainder is drained
-//! from `.prev`, then the new file is read from the start.
+//! by file identity, a leading-bytes content probe, or size
+//! regression: the remainder is drained from `.prev`, then the new
+//! file is read from the start.
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -15,6 +16,27 @@ use std::path::PathBuf;
 /// debugging session that just enabled streaming, not the whole
 /// file.
 const FIRST_SIGHT_BYTES: u64 = 64 * 1024;
+
+/// How many leading bytes the content probe hashes.
+const PROBE_BYTES: u64 = 64;
+
+/// FNV-1a over the file's first `n` bytes. Append-stable: appends
+/// never change a file's leading bytes, while a rotated-in file
+/// with different leading content hashes differently. This is the
+/// rotation signal that survives Windows NTFS creation-time
+/// tunneling, which can hand a recreated file its predecessor's
+/// creation time and defeat the `created()` identity below.
+fn probe_hash(path: &PathBuf, n: u64) -> Option<u64> {
+    let mut f = fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; n as usize];
+    f.read_exact(&mut buf).ok()?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in buf {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(hash)
+}
 
 /// A platform file identity, used to detect rotation even when
 /// the new file is the same size as — or larger than — the saved
@@ -58,6 +80,9 @@ pub struct FileTail {
     /// re-baselines it (a rotation during downtime is still caught
     /// by the size-regression rule when the new file is smaller).
     file_id: Option<u64>,
+    /// (probed length, hash) of the current file's leading bytes;
+    /// a second, platform-independent rotation signal.
+    probe: Option<(u64, u64)>,
 }
 
 impl FileTail {
@@ -68,6 +93,7 @@ impl FileTail {
             prev_path,
             offset,
             file_id: None,
+            probe: None,
         }
     }
 
@@ -89,8 +115,16 @@ impl FileTail {
         // offset, or it is a different file than the one the
         // offset belongs to — a rename + recreate can leave a
         // same-size or larger file, which size alone cannot see.
+        let probe_stale = match self.probe {
+            Some((plen, phash)) => {
+                len < plen
+                    || (len >= plen && probe_hash(&self.path, plen).is_some_and(|h| h != phash))
+            }
+            None => false,
+        };
         let rotated = len < offset
-            || matches!((self.file_id, id), (Some(prev), Some(cur)) if prev != cur);
+            || matches!((self.file_id, id), (Some(prev), Some(cur)) if prev != cur)
+            || probe_stale;
         if rotated {
             // Drain the unread remainder from the .prev sibling,
             // then start the new file at 0.
@@ -100,6 +134,7 @@ impl FileTail {
                 }
             }
             offset = 0;
+            self.probe = None;
         }
         if len > offset {
             let lines = read_lines(&self.path, offset, len);
@@ -110,6 +145,21 @@ impl FileTail {
         self.offset = Some(offset);
         if id.is_some() {
             self.file_id = id;
+        }
+        // Refresh the probe from the file as it now stands (after
+        // a rotation this is the new file). Grow the probed window
+        // up to PROBE_BYTES as the file grows.
+        if len > 0 {
+            let want = len.min(PROBE_BYTES);
+            let stale = match self.probe {
+                Some((plen, _)) => plen < want,
+                None => true,
+            };
+            if stale {
+                if let Some(h) = probe_hash(&self.path, want) {
+                    self.probe = Some((want, h));
+                }
+            }
         }
         out
     }
