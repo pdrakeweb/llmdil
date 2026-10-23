@@ -768,6 +768,20 @@ check(!staticSrcFit.includes("vs ${targets}"), "cache fit block no longer joins 
 check(!bundle.includes("does not fit at this context"), "bundle no longer carries the one-line fit verdict");
 check(staticSrcFit.includes('p.fits ? "status-on" : "status-bad"'), "placement projection renders its Fit verdict as a status chip");
 
+// MoE expert-cache fit consistency (Oct 23, 2026): the cache is
+// itemized wherever weights/KV/state are, the preview prices the
+// Expert cache control's draft so toggling it alone re-prices,
+// and a WDDM paged fit starts only through the armed two-click
+// confirm carrying the overcommit flag.
+check(staticSrcFit.includes('row("Expert cache"'), "cache fit block itemizes the Expert cache as its own row");
+check(staticSrcFit.includes("preview.moe_cache_mib"), "cache fit block reads the preview's expert-cache figure");
+check(staticSrcFit.includes('"wddm_paged"'), "fit surfaces render the WDDM paged state");
+check(staticSrcFit.includes("GiB paged"), "fit surfaces state the paged amount");
+check(staticSrcFit.includes("moeCacheMib: moeDraft"), "cache preview sends the Expert cache control's draft");
+check(staticSrcFit.includes("armedWddmStart"), "backend card arms the WDDM paged Start for the two-click confirm");
+check(staticSrcFit.includes("startBackend(id, allow)"), "the confirmed start carries the overcommit flag");
+check(apiSrc.includes("moe_cache_mib"), "api types carry the expert-cache figure");
+
 // The UI detects Tauri via window.__TAURI__, which Tauri only injects when
 // app.withGlobalTauri is true. Without it the installed app silently
 // degrades to sample data on every screen.

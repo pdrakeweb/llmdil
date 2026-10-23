@@ -2040,11 +2040,30 @@ function cachePreviewHtml(preview: CachePreview | null, sel: CacheSelectionLike,
   if (preview.rs_mib !== null && preview.rs_mib !== undefined) {
     rows.push(row("State cache", `${gib(preview.rs_mib)} GiB`));
   }
+  // The expert cache is itemized whenever one is priced, so the
+  // rows sum to the Total (before Oct 23, 2026 the cache rode the
+  // total silently and the itemized rows fell short by exactly
+  // its size).
+  if (preview.moe_cache_mib) {
+    rows.push(row("Expert cache", `${gib(preview.moe_cache_mib)} GiB`));
+  }
   rows.push(`<div style="font-weight:600;color:var(--text)">Total: ${gib(preview.total_mib)} GiB<span class="info-tip" title="Predicted footprint of the current selection, priced by the same requirement model as the start gate: GPU weights at the current offload, KV at the selected cache types and the form's context, and the recurrent-state cache when the model carries one. A selection fits when its per-GPU total is within ${preview.headroom_reserve_percent}% headroom of the target's VRAM — the reserve covers the compute buffers the requirement model does not price. Predicted best is the highest-quality rung that fits: f16, then q8_0/q8_0, then q8_0/q4_0 (V degrades before K), then q4_0/q4_0, flash attention on at every rung.">${icon("info")}</span></div>`);
   for (const t of preview.targets ?? []) {
-    const chip = t.fits === null || t.fits === undefined
-      ? ""
-      : ` <span class="chip status-tag ${t.fits ? "status-on" : "status-bad"}">${t.fits ? "Fits" : "Does not fit"}</span>`;
+    // The capacity chip is the three-state classification
+    // against total VRAM (the start gate's basis) when the
+    // server carries it: a WDDM GPU over total is a paged fit
+    // with its amount, never a plain "Does not fit" the gate
+    // would allow on confirmation — and never a plain "Fits"
+    // the gate would refuse.
+    const chip = t.fit_state === "wddm_paged"
+      ? ` <span class="chip status-tag status-transition">Fits — ${gib(t.paged_mib ?? 0)} GiB paged</span>`
+      : t.fit_state === "does_not_fit"
+        ? ` <span class="chip status-tag status-bad">Does not fit</span>`
+        : t.fit_state === "fits"
+          ? ` <span class="chip status-tag status-on">Fits</span>`
+          : t.fits === null || t.fits === undefined
+            ? ""
+            : ` <span class="chip status-tag ${t.fits ? "status-on" : "status-bad"}">${t.fits ? "Fits" : "Does not fit"}</span>`;
     const value = t.required_mib === null || t.required_mib === undefined
       ? `${gib(t.total_mib)} GiB`
       : `${gib(t.required_mib)} GiB of ${gib(t.total_mib)} GiB`;
@@ -2264,6 +2283,7 @@ function backendCard(
   detailsOpen: boolean,
   predictRefreshing: Map<string, number>,
   confirmOverride: Set<string>,
+  armedWddmStart: Set<string>,
 ): string {
   const active = b.state === "running" || b.state === "starting";
   // Buttons render disabled while this card's action is in flight.
@@ -2271,8 +2291,15 @@ function backendCard(
   // survives the repaints a poll or a log-tail fetch triggers.
   const dis = inFlight.has(b.id) ? " disabled" : "";
   const stopBtn = `<button class="btn" data-back-act="stop" data-back-id="${esc(b.id)}"${dis}>${icon("pause")} Stop</button>`;
-  const restartBtn = `<button class="btn" data-back-act="restart" data-back-id="${esc(b.id)}"${dis}>${icon("restart")} Restart</button>`;
-  const startBtn = `<button class="btn" data-back-act="start" data-back-id="${esc(b.id)}"${dis}>${icon("play")} Start</button>`;
+  const restartBtn = `<button class="btn${b.fit?.state === "wddm_paged" && armedWddmStart.has(b.id) ? " armed" : ""}" data-back-act="restart" data-back-id="${esc(b.id)}"${dis}>${icon("restart")} Restart</button>`;
+  // A WDDM paged fit starts only through the two-click confirm
+  // (the delete-confirm idiom): the first click arms the button,
+  // the second starts with the overcommit flag. The armed label
+  // states the paged amount and nothing else.
+  const wddmPaged = b.fit?.state === "wddm_paged";
+  const startBtn = wddmPaged
+    ? `<button class="btn${armedWddmStart.has(b.id) ? " armed" : ""}" data-back-act="start" data-back-id="${esc(b.id)}" title="${armedWddmStart.has(b.id) ? "Confirm start with paging" : "Start (pages to system RAM)"}"${dis}>${icon("play")} ${armedWddmStart.has(b.id) ? `Start — ${fmtGb((b.fit?.paged_mib ?? 0) / 1024)} GiB paged` : "Start"}</button>`
+    : `<button class="btn" data-back-act="start" data-back-id="${esc(b.id)}"${dis}>${icon("play")} Start</button>`;
   const testBtn = `<button class="btn icon-only" data-back-act="test" data-back-id="${esc(b.id)}" title="Test backend" aria-label="Test ${esc(b.id)}"${dis}>${icon("bolt")}</button>`;
   // The tool-call probe (MCP design §7.2) and the go-to-logs link
   // (tracker #47) are NOT card-face buttons: the wrench read as an
@@ -2771,16 +2798,38 @@ function backendCard(
       const gi = p.gpu_indices && p.gpu_indices[i] !== undefined ? p.gpu_indices[i] : i;
       const gname = place.gpus.find((g) => g.index === gi)?.name ?? `GPU ${gi}`;
       const free = p.free_mib && p.free_mib[i] !== undefined ? `${fmtCount(p.free_mib[i])} MiB` : "\u2014";
-      const fit = frac === 0 ? "not used" : p.per_gpu_fits[i] ? "fits" : "does not fit";
+      // With a backend in scope the row's state is the three-state
+      // classification of the full requirement against total VRAM;
+      // the weights-only projection keeps its free-VRAM wording.
+      const st = p.fit_states?.[i];
+      const fit = frac === 0 ? "not used"
+        : st === "wddm_paged" ? `fits — ${fmtCount(p.paged_mib?.[i] ?? 0)} MiB paged`
+        : st === "does_not_fit" ? "does not fit"
+        : st === "fits" ? "fits"
+        : p.per_gpu_fits[i] ? "fits" : "does not fit";
       const creditCells = credited ? `<td>${fmtCount(p.current_mib?.[i] ?? 0)} MiB</td><td>${fmtCount(p.additional_mib?.[i] ?? p.per_gpu_mib[i])} MiB</td>` : "";
       return `<tr><td>${esc(gname)}</td><td>${Math.round(frac * 100)}%</td><td>${fmtCount(p.per_gpu_mib[i])} MiB</td>${creditCells}<td>${free}</td><td>${fit}</td></tr>`;
     }).join("");
     const ageMs = p.snapshot_age_ms ?? null;
+    // The headline chip is the worst three-state classification
+    // when the projection carries one (a backend in scope).
+    const worstState = (p.fit_states ?? []).includes("does_not_fit") ? "does_not_fit"
+      : (p.fit_states ?? []).includes("wddm_paged") ? "wddm_paged"
+      : p.fit_states?.length ? "fits" : null;
+    const pagedTotal = (p.paged_mib ?? []).reduce((a, v) => a + v, 0);
+    const fitChip = worstState === "wddm_paged"
+      ? `<span class="chip status-tag status-transition" title="The requirement exceeds total VRAM on a WDDM GPU; the excess pages to system RAM and the start asks for confirmation.">Fits — ${fmtGb(pagedTotal / 1024)} GiB paged</span>`
+      : worstState === "does_not_fit"
+        ? `<span class="chip status-tag status-bad" title="The requirement exceeds the selected GPUs' total VRAM with this split.">Does not fit</span>`
+        : worstState === "fits"
+          ? `<span class="chip status-tag status-on" title="The backend's full requirement fits the selected GPUs with the projected split.">Fits</span>`
+          : `<span class="chip status-tag ${p.fits ? "status-on" : "status-bad"}" title="${p.fits ? "The model fits the selected GPUs with the projected split." : "The model does not fit the available VRAM with this split."}">${p.fits ? "Fits" : "Does not fit"}</span>`;
     return `<div style="margin-top:10px">
       ${p.down_indices && p.down_indices.length ? `<div style="font-size:12px;color:var(--err);margin-bottom:6px" title="${p.down_indices.map((i) => `GPU ${i}`).join(", ")} ${p.down_indices.length === 1 ? "is" : "are"} down and ${p.down_indices.length === 1 ? "is" : "are"} treated as having no free VRAM.">${p.down_indices.map((i) => `GPU ${i}`).join(", ")}: down — no free VRAM</div>` : ""}
-      <div style="font-size:12px">Fit: <span class="chip status-tag ${p.fits ? "status-on" : "status-bad"}" title="${p.fits ? "The model fits the selected GPUs with the projected split." : "The model does not fit the available VRAM with this split."}">${p.fits ? "Fits" : "Does not fit"}</span><span class="info-tip" title="Projection uses model weights only; run-time allocations add overhead.">${icon("info")}</span></div>
-      <table class="dtab" style="margin-top:8px"><thead><tr><th>GPU</th><th>Fraction</th><th>Required</th>${credited ? `<th title="The weight allocation this backend already holds on the GPU. Applying the split restarts the backend, freeing it first.">Current</th><th title="Required minus current: what must fit in free VRAM.">Additional</th>` : ""}<th>Free (current)</th><th>Fit</th></tr></thead><tbody>${rows}</tbody></table>
-      ${p.sys_mib ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">System RAM: ${fmtGb(p.sys_mib / 1024)} GiB<span class="info-tip" title="Routed experts under expert offload. The per-GPU figures cover the GPU-resident weights only.">${icon("info")}</span></div>` : ""}
+      <div style="font-size:12px">Fit: ${fitChip}<span class="info-tip" title="${p.weights_only === false ? "Projection prices the backend's full requirement: weights, KV cache, state cache, and the expert cache on the GPUs holding offloaded layers." : "Projection uses model weights only; run-time allocations add overhead."}">${icon("info")}</span></div>
+      <table class="dtab" style="margin-top:8px"><thead><tr><th>GPU</th><th>Fraction</th><th>Required</th>${credited ? `<th title="The allocation this backend already holds on the GPU. Applying the split restarts the backend, freeing it first.">Current</th><th title="Required minus current: what must fit in free VRAM.">Additional</th>` : ""}<th>Free (current)</th><th>Fit</th></tr></thead><tbody>${rows}</tbody></table>
+      ${p.moe_cache_mib ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Expert cache: ${fmtGb(p.moe_cache_mib / 1024)} GiB<span class="info-tip" title="The --moe-cache-mib budget, already inside the per-GPU Required figures: it lands only on the GPUs holding offloaded layers.">${icon("info")}</span></div>` : ""}
+      ${p.sys_mib ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">System RAM: ${fmtGb(p.sys_mib / 1024)} GiB<span class="info-tip" title="Routed experts under expert offload. The per-GPU figures cover the GPU-resident requirement.">${icon("info")}</span></div>` : ""}
       <div style="font-size:12px;color:var(--text2);margin-top:6px">${ageMs === null ? "Snapshot: latest" : `Snapshot age: ${Math.round(ageMs / 1000)} s`}</div></div>`;
   })() : "";
   const placeHtml = place ? `<div class="backend-form-panel placement-panel">
@@ -2837,7 +2886,17 @@ function backendCard(
     if (b.sys_ram_mib !== undefined) stripTiles.push(["System RAM", `${fmtGb(b.sys_ram_mib / 1024)} GiB`]);
     if (!b.flags_advanced && b.kv_ram_mib != null) stripTiles.push(["KV cache", `<span title="KV cache at the configured context">${fmtGb(b.kv_ram_mib / 1024)} GiB</span>`]);
     if (!b.flags_advanced && b.rs_ram_mib != null) stripTiles.push(["State cache", `<span title="Recurrent-state cache at the configured slot count">${fmtGb(b.rs_ram_mib / 1024)} GiB</span>`]);
+    if (!b.flags_advanced && b.moe_cache_mib) stripTiles.push(["Expert cache", `<span title="MoE expert cache (--moe-cache-mib) priced into the requirement">${fmtGb(b.moe_cache_mib / 1024)} GiB</span>`]);
   }
+  // The three-state fit verdict for the saved configuration, from
+  // the server's requirement model (the start gate's numbers):
+  // one chip, with the paged amount when the fit is a WDDM paged
+  // fit. Absent when the server could not judge the backend.
+  const fitHtml = b.fit ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Fit: ${b.fit.state === "wddm_paged"
+    ? `<span class="chip status-tag status-transition">Fits — ${fmtGb(b.fit.paged_mib / 1024)} GiB paged</span>`
+    : b.fit.state === "does_not_fit"
+      ? `<span class="chip status-tag status-bad">Does not fit</span>`
+      : `<span class="chip status-tag status-on">Fits</span>`}</div>` : "";
   // The strip is a wrapping flex row (styles.css .backend-strip),
   // never a single-row grid sized to the tile count: bare fr
   // tracks cannot shrink below their tiles' min-content widths,
@@ -2929,6 +2988,7 @@ function backendCard(
         <span class="chip status-tag ${stateTagClass(b.state)}">${esc(b.state)}</span></h3>
       ${failureHtml}
       ${stripHtml}
+      ${fitHtml}
       ${gpuHtml}
       ${statsHtml}
       ${rawFlagsHtml}
@@ -3032,6 +3092,11 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   let gatewayPort = 4000;
   /** Backend ids whose Remove button is armed for confirmation. */
   const confirmRemove = new Set<string>();
+  /** Backends whose WDDM-paged Start is armed (first click done);
+   *  the second click starts with the overcommit confirmation.
+   *  Cleared on state change and whenever the fit stops being a
+   *  paged fit — the delete-confirm lifecycle. */
+  const armedWddmStart = new Set<string>();
   /** Backend ids whose guardrail Override button is armed for
    *  confirmation (the confirm button names the exact position). */
   const confirmOverride = new Set<string>();
@@ -3126,7 +3191,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
             busy: placeBusy,
           }
           : null;
-        return backendCard(row, openArgv, openMenus, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency, new Map(lastGpuList.map((g) => [Number(g.id), g.name])), flagsArg, flagsFor === row.id ? predictedHtml : "", placeArg, new Map(lastGpuList.map((g) => [Number(g.id), g.vram_total_gb * 1024])), openDetails.has(row.id), predictRefreshing, confirmOverride);
+        return backendCard(row, openArgv, openMenus, argvCache, msgs, logTails, inFlight, lastModels, confirmRemove, residency, new Map(lastGpuList.map((g) => [Number(g.id), g.name])), flagsArg, flagsFor === row.id ? predictedHtml : "", placeArg, new Map(lastGpuList.map((g) => [Number(g.id), g.vram_total_gb * 1024])), openDetails.has(row.id), predictRefreshing, confirmOverride, armedWddmStart);
       }).join("")}</div>
       </div>`).join("");
     if (!viewRows.length && lastRows.length) b.innerHTML = emptyHtml("No backends match the current filter.");
@@ -3230,7 +3295,10 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       // A note belongs to the state it was produced in; when the
       // backend's state changes, the stale note goes away.
       const prev = prevStates.get(row.id);
-      if (prev !== undefined && prev !== row.state) { msgs.delete(row.id); confirmRemove.delete(row.id); confirmOverride.delete(row.id); }
+      if (prev !== undefined && prev !== row.state) { msgs.delete(row.id); confirmRemove.delete(row.id); confirmOverride.delete(row.id); armedWddmStart.delete(row.id); }
+      // A config change that ends the paged fit disarms the
+      // confirmation with it.
+      if (row.fit?.state !== "wddm_paged") armedWddmStart.delete(row.id);
       // A backend that is no longer failed gets a fresh tail fetch if it
       // fails again — unless its Details are open, where the stored
       // tail is the expansion's latest-lines data and stays.
@@ -3245,7 +3313,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       for (const map of [msgs, argvCache, logTails] as Map<string, unknown>[]) {
         for (const k of [...map.keys()]) if (!alive.has(k)) map.delete(k);
       }
-      for (const set of [confirmRemove, confirmOverride, openArgv, openDetails, inFlight, tailsWanted, tailsFetching] as Set<string>[]) {
+      for (const set of [confirmRemove, confirmOverride, armedWddmStart, openArgv, openDetails, inFlight, tailsWanted, tailsFetching] as Set<string>[]) {
         for (const k of [...set]) if (!alive.has(k)) set.delete(k);
       }
       if (flagsFor !== null && !alive.has(flagsFor)) flagsFor = null;
@@ -3392,7 +3460,14 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     const id = flagsFor;
     if (!id || !flagsCacheSel) return;
     const seq = ++cachePreviewSeq;
-    const r = await backendCachePreview(id, { nCtx: flagsCtx, slots: flagsParallel ?? undefined, sel: flagsCacheSel });
+    // The Expert cache control's DRAFT prices with the preview
+    // (its saved token does not change until the control's own
+    // commit lands, and a cache change alone must move the fit
+    // figures immediately — Pete's Oct 23, 2026 report).
+    const moeDraft = flagsMoeCacheOn
+      ? (flagsMoeCacheMib ?? MOE_CACHE_DEFAULT_MIB)
+      : 0;
+    const r = await backendCachePreview(id, { nCtx: flagsCtx, slots: flagsParallel ?? undefined, sel: flagsCacheSel, moeCacheMib: moeDraft });
     if (disposed || seq !== cachePreviewSeq || flagsFor !== id || r.error || !r.data) return;
     flagsCachePreview = r.data;
     const slot = root.querySelector("[data-cache-slot]");
@@ -3709,6 +3784,11 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         err: false,
       });
       await load();
+      // A cache change re-prices the flags fit block at once —
+      // toggling or resizing the Expert cache must move the fit
+      // figures by itself, not only when an unrelated field
+      // happens to re-trigger a preview (Pete, Oct 23, 2026).
+      scheduleCachePreview();
       return true;
     } finally {
       moeCacheCommitting = false;
@@ -3728,6 +3808,10 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     if (!row?.moe_cache || moeCacheCommitting) return;
     const on = !flagsMoeCacheOn;
     flagsMoeCacheOn = on;
+    // The toggle alone re-prices the fit block: the preview
+    // carries the control's draft, so the figures move before
+    // the save even lands.
+    scheduleCachePreview();
     const card = t.closest(".backend-card");
     const token = card?.querySelector("[data-moe-cache-token]");
     if (token) token.textContent = moeCacheTokenText(on ? (flagsMoeCacheMib ?? row.moe_cache.mib ?? MOE_CACHE_DEFAULT_MIB) : null);
@@ -3754,6 +3838,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     }
     const n = Number(t.value);
     flagsMoeCacheMib = n;
+    scheduleCachePreview();
     if (!flagsMoeCacheOn) { paint(); return; } // the size only drafts while off
     const card = t.closest(".backend-card");
     const token = card?.querySelector("[data-moe-cache-token]");
@@ -4983,7 +5068,27 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         paint();
         return;
       }
-      const fn = act === "start" ? startBackend : act === "stop" ? stopBackend : act === "restart" ? restartBackend : null;
+      if (act === "start" || act === "restart") {
+        // WDDM paged fits start only through the two-click
+        // confirm: the first click arms and states the paged
+        // amount; the second click carries the confirmation to
+        // the gate. Any other fit starts directly.
+        const row = lastRows.find((r) => r.id === id);
+        if (row?.fit?.state === "wddm_paged" && !armedWddmStart.has(id)) {
+          armedWddmStart.add(id);
+          msgs.set(id, { text: `${fmtGb(row.fit.paged_mib / 1024)} GiB will page to system RAM. Click ${act === "start" ? "Start" : "Restart"} again to confirm.`, err: false });
+          paint();
+          return;
+        }
+        const allow = armedWddmStart.has(id) || undefined;
+        armedWddmStart.delete(id);
+        const r = act === "start" ? await startBackend(id, allow) : await restartBackend(id, allow);
+        if (r.error) msgs.set(id, { text: `${act} failed: ${r.error}`, err: true });
+        else msgs.delete(id);
+        await load();
+        return;
+      }
+      const fn = act === "stop" ? stopBackend : null;
       if (!fn) return;
       const r = await fn(id);
       if (r.error) msgs.set(id, { text: `${act} failed: ${r.error}`, err: true });
