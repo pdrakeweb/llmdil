@@ -637,16 +637,15 @@ impl Descent {
                     push(c, &mut out);
                 }
             }
-            "slots" => {
-                // Free only on spec-off arms (§B.1 coupling).
-                if self.current.mtp_n_max.is_none() {
-                    for slots in slot_values(inputs) {
-                        let mut c = self.current.clone();
-                        c.parallel_slots = slots;
-                        push(c, &mut out);
-                    }
+            // Free only on spec-off arms (§B.1 coupling).
+            "slots" if self.current.mtp_n_max.is_none() => {
+                for slots in slot_values(inputs) {
+                    let mut c = self.current.clone();
+                    c.parallel_slots = slots;
+                    push(c, &mut out);
                 }
             }
+            "slots" => {}
             _ => {}
         }
         out
