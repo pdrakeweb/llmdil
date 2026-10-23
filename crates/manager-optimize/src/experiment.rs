@@ -72,6 +72,22 @@ pub struct ExperimentFlags {
     /// is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moe_cache_mib: Option<u32>,
+    /// MTP draft length (`--spec-draft-n-max`) for the temp
+    /// backend (Addendum B extension E1): `Some(n)` composes
+    /// draft-mtp at that length through `set_mtp_draft`;
+    /// absent leaves the temp backend's flags without a spec
+    /// setting. Meaningful only for a candidate whose catalog
+    /// entry carries an MTP head — validation refuses it
+    /// otherwise, the same capability pin the spec axis of a
+    /// tuning sweep resolves (§B.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtp_n_max: Option<u32>,
+    /// Slot count (`--parallel`) for the temp backend
+    /// (Addendum B extension E1), composed through
+    /// `set_parallel_slots`. Absent leaves the launcher
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_slots: Option<u32>,
 }
 
 /// The model's prediction for one proposal: prose-grade numbers
@@ -383,6 +399,36 @@ fn non_candidate_problems(
 ) -> Vec<String> {
     let mut problems: Vec<String> = Vec::new();
     problems.extend(moe_cache_problems(proposal, cfg, layouts));
+    // Addendum B extension E1: an MTP draft length is only
+    // encodable for a candidate the catalog (or the model
+    // record's declaration) pins as MTP-capable — capability is
+    // the pin, never inferred (§B.1) — and within the control's
+    // range; a slot count must be at least 1.
+    if let Some(n) = proposal.flags.mtp_n_max {
+        if !(manager_models::mtp::MTP_N_MAX_MIN..=manager_models::mtp::MTP_N_MAX_MAX).contains(&n)
+        {
+            problems.push(format!(
+                "mtp_n_max {n} is outside the draft-length range {}..={}",
+                manager_models::mtp::MTP_N_MAX_MIN,
+                manager_models::mtp::MTP_N_MAX_MAX
+            ));
+        }
+        let candidate = proposal.candidate_model_id.trim();
+        let capable = match cfg.models.iter().find(|m| m.id == candidate) {
+            Some(m) => manager_models::effective_mtp(&m.id, &m.source_url, m.mtp),
+            None => manager_models::catalog_mtp(candidate, ""),
+        };
+        if !capable {
+            problems.push(format!(
+                "mtp_n_max cannot be encoded for candidate '{candidate}': its catalog entry carries no MTP head"
+            ));
+        }
+    }
+    if let Some(slots) = proposal.flags.parallel_slots {
+        if slots == 0 {
+            problems.push("parallel_slots must be at least 1".to_string());
+        }
+    }
     if let Some(n) = proposal.flags.n_ctx {
         if n == 0 {
             problems.push("n_ctx must be greater than 0".to_string());
@@ -753,6 +799,19 @@ pub fn temp_backend_config(
     // (a 0 value writes nothing — the writer's disabled form).
     if let Some(mib) = proposal.flags.moe_cache_mib {
         raw_flags = manager_models::set_moe_cache(raw_flags.as_deref(), Some(mib));
+    }
+    // Addendum B extension E1: the spec and slot writers ride
+    // the same composition, after the offload/cache tokens the
+    // writers preserve verbatim.
+    if let Some(n) = proposal.flags.mtp_n_max {
+        raw_flags = manager_models::set_mtp_draft(
+            raw_flags.as_deref(),
+            manager_models::MtpDraft::On(Some(n)),
+        );
+    }
+    if let Some(slots) = proposal.flags.parallel_slots {
+        raw_flags =
+            manager_models::set_parallel_slots(raw_flags.as_deref(), Some(i64::from(slots)));
     }
     BackendConfig {
         id: temp_backend_id(proposal.id),

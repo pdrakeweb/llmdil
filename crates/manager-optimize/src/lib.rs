@@ -38,6 +38,7 @@ pub mod measure;
 pub mod parse;
 pub mod plan;
 pub mod probe;
+pub mod tuning;
 pub mod validate;
 
 pub use context::{
@@ -85,4 +86,13 @@ pub use plan::{
     config_fingerprint, ApplyOutcome, Confidence, Decision, ExcludedItem, Plan, PlanItem, PlanKind,
 };
 pub use probe::{probe_hardware, HardwareProbe};
+pub use tuning::{
+    adopt_is_default, cache_fa_offered, cache_ladder, context_cache_values, context_values,
+    moe_cache_values, offload_values, placement_values, plan_filter, planned_arm_count,
+    rank_arms, slot_values, spec_values, thermal_tripped, tuning_temp_backend, winner_index,
+    ArmPricing, ArmStatus, Descent, ResidencyVerdict, SweepPlan, SweepState, TuningArm,
+    TuningConfirmation, TuningCoords, TuningExclusion, TuningGpu, TuningInputs, TuningStore,
+    TuningSweep, AXIS_ORDER, THERMAL_ABORT_C, THERMAL_ABORT_STREAK, TUNING_ARM_TIMEOUT_SECS,
+    TUNING_MAX_ARMS, TUNING_SWEEP_TIMEOUT_SECS,
+};
 pub use validate::{validate_plan, ItemValidation, LiveSnapshot, ValidationStatus};

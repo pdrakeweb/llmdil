@@ -376,6 +376,19 @@ pub struct MeasurementEntry {
     /// benchmark time, when obtainable; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llama_build: Option<String>,
+    /// Residency verdict under which the figure was measured
+    /// (Addendum B extension E4): `verified_exclusive` or
+    /// `unverified`, recorded by tuning-sweep arms so a figure
+    /// surfaced later carries the conditions it was measured
+    /// under, not just the configuration. Absent on entries no
+    /// sweep produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residency: Option<String>,
+    /// Peak GPU temperature (°C) observed during the
+    /// measurement (Addendum B extension E4); absent when no
+    /// temperature was sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_temp_c: Option<f32>,
 }
 
 /// One backend configuration's ESTIMATE (tracker #56): the
@@ -996,6 +1009,8 @@ mod tests {
             inputs: None,
             driver_version: Vec::new(),
             llama_build: None,
+            residency: None,
+            peak_temp_c: None,
         }
     }
 
