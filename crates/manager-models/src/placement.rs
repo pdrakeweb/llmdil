@@ -55,6 +55,36 @@ pub struct PlacementProjection {
     /// offload applies.
     #[serde(default)]
     pub gpu_weights_mib: u64,
+    /// Full-requirement projections only (see
+    /// [`propose_placement_full`]): the KV cache term of the
+    /// requirement the per-GPU figures price, MiB. 0 on the
+    /// weights-only path.
+    #[serde(default)]
+    pub kv_mib: u64,
+    /// Full-requirement projections only: the recurrent-state
+    /// cache term, MiB, when the model's geometry is known.
+    #[serde(default)]
+    pub rs_mib: Option<u64>,
+    /// Full-requirement projections only: the MoE expert-cache
+    /// term (`--moe-cache-mib`), MiB — the total budget, whose
+    /// per-GPU shares are already inside `per_gpu_mib`.
+    #[serde(default)]
+    pub moe_cache_mib: u64,
+    /// Total VRAM per GPU in split order, for the three-state
+    /// classification the UI renders. Empty on payloads from
+    /// before the full-requirement projection.
+    #[serde(default)]
+    pub gpu_total_mib: Vec<u64>,
+    /// Per-GPU three-state fit classification (see
+    /// [`super::fit_state`]) of `per_gpu_mib` against
+    /// `gpu_total_mib`, in split order. Empty on the
+    /// weights-only path.
+    #[serde(default)]
+    pub fit_states: Vec<super::FitState>,
+    /// Per-GPU paged amount (MiB paging to system RAM) for GPUs
+    /// classified [`crate::FitState::WddmPaged`]; 0 elsewhere.
+    #[serde(default)]
+    pub paged_mib: Vec<u64>,
 }
 
 /// Validate a tensor split: non-empty, `len == n_gpus`, every fraction in
@@ -202,6 +232,114 @@ pub fn propose_placement_resident(
         verdict,
         sys_mib: sys_bytes.div_ceil(MIB),
         gpu_weights_mib: needed_mib,
+        kv_mib: 0,
+        rs_mib: None,
+        moe_cache_mib: 0,
+        gpu_total_mib: Vec::new(),
+        fit_states: Vec::new(),
+        paged_mib: Vec::new(),
+    })
+}
+
+/// Project a split using a backend's FULL memory requirement —
+/// weights + KV cache + recurrent-state cache + the MoE expert
+/// cache, already distributed per GPU by the caller through the
+/// requirement model (`manager_optimize::residency_per_gpu`, so
+/// the expert cache lands only on the GPUs holding offloaded
+/// layers). This is the projection the backend card's Placement
+/// panel renders when a backend is in scope: its Required
+/// figures are the same numbers the start gate judges, so its
+/// verdict cannot say "Fits" for a configuration the gate will
+/// refuse on total VRAM.
+///
+/// `required_mib` / `current_mib` are per-GPU, in split order:
+/// the requirement under the proposed split, and the running
+/// backend's requirement under its configured split (the restart
+/// credit basis — the start gate credits a restart's own full
+/// residency the same way). `gpu_total_mib` and `is_wddm` are the
+/// placed GPUs' totals and driver models, driving the three-state
+/// classification ([`super::fit_state`]): `fits` holds when no
+/// GPU is [`crate::FitState::DoesNotFit`] (a WDDM-paged GPU still
+/// counts as fittable — the start then needs the operator's
+/// confirmation, which the panel's state names).
+#[allow(clippy::too_many_arguments)]
+pub fn propose_placement_full(
+    spec: &ModelSpec,
+    split: &[f32],
+    free_vram_mib_per_gpu: &[u64],
+    gpu_total_mib: &[u64],
+    is_wddm: &[bool],
+    required_mib: &[u64],
+    current_mib: &[u64],
+    gpu_weights_mib: u64,
+    kv_mib: u64,
+    rs_mib: Option<u64>,
+    moe_cache_mib: u64,
+    sys_bytes: u64,
+) -> Result<PlacementProjection, ModelError> {
+    validate_split(split, free_vram_mib_per_gpu.len())?;
+    let n = split.len();
+    let pick = |v: &[u64]| -> Vec<u64> {
+        (0..n).map(|i| v.get(i).copied().unwrap_or(0)).collect()
+    };
+    let required = pick(required_mib);
+    let current = pick(current_mib);
+    let totals = pick(gpu_total_mib);
+    let additional_mib: Vec<u64> = required
+        .iter()
+        .zip(current.iter())
+        .map(|(req, cur)| req.saturating_sub(*cur))
+        .collect();
+    let mut fit_states: Vec<super::FitState> = Vec::with_capacity(n);
+    let mut paged_mib: Vec<u64> = Vec::with_capacity(n);
+    for i in 0..n {
+        let (state, paged) = super::fit_state(
+            required[i],
+            totals[i],
+            is_wddm.get(i).copied().unwrap_or(false),
+        );
+        fit_states.push(state);
+        paged_mib.push(paged);
+    }
+    let per_gpu_fits: Vec<bool> = fit_states
+        .iter()
+        .map(|s| *s != crate::FitState::DoesNotFit)
+        .collect();
+    let fits = per_gpu_fits.iter().all(|b| *b);
+    // The recommendation verdict judges the requirement total
+    // against free VRAM plus the credited current residency, the
+    // same basis as the weights-only projection.
+    let total_required: u64 = required.iter().sum();
+    let adjusted_free: Vec<u64> = free_vram_mib_per_gpu
+        .iter()
+        .zip(current.iter())
+        .map(|(free, cur)| free.saturating_add(*cur))
+        .collect();
+    let mut resized = spec.clone();
+    resized.size_bytes = total_required.saturating_mul(MIB);
+    let verdict = fit_check(&resized, &adjusted_free);
+    Ok(PlacementProjection {
+        model_id: spec.id.clone(),
+        split: split.to_vec(),
+        per_gpu_mib: required,
+        free_mib: free_vram_mib_per_gpu.to_vec(),
+        current_mib: current,
+        additional_mib,
+        per_gpu_fits,
+        fits,
+        verdict,
+        sys_mib: sys_bytes.div_ceil(MIB),
+        // The requirement's own weights term, passed in rather
+        // than derived: the per-GPU required figures can carry a
+        // small compute allowance beyond the four itemized terms,
+        // and deriving would fold it into "weights".
+        gpu_weights_mib,
+        kv_mib,
+        rs_mib,
+        moe_cache_mib,
+        gpu_total_mib: totals,
+        fit_states,
+        paged_mib,
     })
 }
 
@@ -384,6 +522,80 @@ mod tests {
         assert_eq!(p.current_mib, vec![0, 0]);
         assert_eq!(p.additional_mib, vec![10, 0]);
         assert!(!p.fits);
+    }
+
+    #[test]
+    fn propose_full_prices_the_expert_cache_into_required() {
+        // Pete's configuration (Oct 23, 2026), in MiB: weights
+        // 10,865 + KV 1,638 + state 614 + expert cache 4,096,
+        // plus the requirement's small compute allowance, =
+        // 17,224 required on GPU 0 (16,376 total, WDDM). The
+        // weights-only projection called this "fits" at 10,865;
+        // the full projection classifies it as a WDDM paged fit
+        // with 848 MiB paged — the start gate's own numbers.
+        let p = propose_placement_full(
+            &spec(),
+            &[1.0],
+            &[15_098],
+            &[16_376],
+            &[true],
+            &[17_224],
+            &[0],
+            10_865,
+            1_638,
+            Some(614),
+            4_096,
+            0,
+        )
+        .unwrap();
+        assert_eq!(p.per_gpu_mib, vec![17_224]);
+        assert_eq!(p.moe_cache_mib, 4_096);
+        assert_eq!(p.kv_mib, 1_638);
+        assert_eq!(p.rs_mib, Some(614));
+        assert_eq!(p.gpu_weights_mib, 10_865);
+        assert_eq!(p.fit_states, vec![crate::FitState::WddmPaged]);
+        assert_eq!(p.paged_mib, vec![848]);
+        assert!(p.fits, "a paged fit is fittable, with confirmation");
+        // The same requirement on a TCC GPU does not fit.
+        let p = propose_placement_full(
+            &spec(),
+            &[1.0],
+            &[15_098],
+            &[16_376],
+            &[false],
+            &[17_224],
+            &[0],
+            10_865,
+            1_638,
+            Some(614),
+            4_096,
+            0,
+        )
+        .unwrap();
+        assert_eq!(p.fit_states, vec![crate::FitState::DoesNotFit]);
+        assert!(!p.fits);
+        // Zero cache: the requirement without the cache term
+        // (13,128) fits the card outright on either driver model.
+        for wddm in [true, false] {
+            let p = propose_placement_full(
+                &spec(),
+                &[1.0],
+                &[15_098],
+                &[16_376],
+                &[wddm],
+                &[13_128],
+                &[0],
+                10_865,
+                1_638,
+                Some(614),
+                0,
+                0,
+            )
+            .unwrap();
+            assert_eq!(p.fit_states, vec![crate::FitState::Fits]);
+            assert_eq!(p.paged_mib, vec![0]);
+            assert!(p.fits);
+        }
     }
 
     #[test]
