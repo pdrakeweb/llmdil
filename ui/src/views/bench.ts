@@ -282,6 +282,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
   let genPurpose = "coder";
   let genDescription = "";
   let genSize: "short" | "standard" = "standard";
+  let genBackendId = "";
   let generating = false;
   let genCancelArmed = false;
   let genStart = 0;
@@ -559,7 +560,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
         ${runRows ? `<table class="tbl" style="margin-top:8px"><thead><tr><th>Run</th><th>Prompt tok/s</th><th>Gen tok/s</th><th>TTFT ms</th><th>Prompt tok</th><th>Gen tok</th><th>Acceptance</th><th>Mean len</th></tr></thead><tbody>${runRows}</tbody></table>` : ""}
         ${drafterBar}
         <div class="card-actions">
-          <a class="btn" href="#/backends?backend=${encodeURIComponent(s.backend_id)}">${icon("pencil")} Open in backend editor</a>
+          <a class="btn" href="#/backends" data-bench-act="open-editor" data-backend="${esc(s.backend_id)}">${icon("pencil")} Open in backend editor</a>
         </div>
       </div>
     </details>`;
@@ -671,6 +672,10 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
         <select id="benchGenSize" style="${SELECT_STYLE}" aria-label="Generate size">
           <option value="short"${genSize === "short" ? " selected" : ""}>Short</option>
           <option value="standard"${genSize === "standard" ? " selected" : ""}>Standard</option>
+        </select>
+        <select id="benchGenBackend" style="${SELECT_STYLE}" aria-label="Generate backend">
+          <option value=""${genBackendId === "" ? " selected" : ""}>Best running</option>
+          ${backends.filter((b) => b.state === "running").map((b) => `<option value="${esc(b.id)}"${genBackendId === b.id ? " selected" : ""}>${esc(b.id)}</option>`).join("")}
         </select>
         ${generating
           ? `<span class="opt-consulting">${icon("clock")} Generating <span id="benchGenElapsed">${genElapsed}</span></span>
@@ -823,7 +828,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
       if (el) el.textContent = fmtElapsed(Date.now() - genStart);
     }, 1000);
     const cancelled = (): boolean => genCancelArmed;
-    const r = await benchPromptGenerate(genPurpose.trim() || "general", genDescription.trim(), genSize);
+    const r = await benchPromptGenerate(genPurpose.trim() || "general", genDescription.trim(), genSize, genBackendId || undefined);
     if (genTimer !== null) { window.clearInterval(genTimer); genTimer = null; }
     generating = false;
     if (disposed) return;
@@ -922,6 +927,13 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     if (!actEl) return;
     const act = actEl.dataset.benchAct;
     switch (act) {
+      case "open-editor": {
+        // The Backends view consumes this key on load and opens
+        // the backend's flags form (Bench design §5.2 adoption
+        // path); the anchor's own href does the navigation.
+        try { sessionStorage.setItem("benchEditBackend", actEl.dataset.backend ?? ""); } catch { /* storage unavailable */ }
+        return;
+      }
       case "run":
         void doRun([]);
         return;
@@ -1058,6 +1070,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     if (t.id === "benchDraftNMax") { draftNMax = Number((t as HTMLSelectElement).value) || 3; paint(); return; }
     if (t.id === "benchDraftDevice") { draftDevice = (t as HTMLSelectElement).value; paint(); return; }
     if (t.id === "benchGenSize") { genSize = (t as HTMLSelectElement).value as "short" | "standard"; return; }
+    if (t.id === "benchGenBackend") { genBackendId = (t as HTMLSelectElement).value; return; }
 
     const baselineRadio = t.closest<HTMLElement>("[data-bench-baseline]");
     if (baselineRadio) {

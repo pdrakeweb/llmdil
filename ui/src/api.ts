@@ -4273,10 +4273,10 @@ export async function benchPromptDelete(id: string): Promise<CallResult<{ prompt
 /** bench_prompt_generate — draft a prompt with a running backend
  *  (§4.3). Long-running; bench_prompt_generate_cancel fires its
  *  scoped cancellation handle. The draft is returned unsaved. */
-export async function benchPromptGenerate(purpose: string, description: string, size: "short" | "standard"): Promise<CallResult<{ text: string; backend_id: string; model: string }>> {
+export async function benchPromptGenerate(purpose: string, description: string, size: "short" | "standard", backendId?: string): Promise<CallResult<{ text: string; backend_id: string; model: string }>> {
   if (!isTauri()) return { data: { text: "", backend_id: "", model: "" }, live: false };
   try {
-    const data = await invoke<{ text: string; backend_id: string; model: string }>("bench_prompt_generate", { purpose, description, size });
+    const data = await invoke<{ text: string; backend_id: string; model: string }>("bench_prompt_generate", { purpose, description, size, backend_id: backendId ?? null });
     return { data, live: true };
   } catch (e) {
     return { data: { text: "", backend_id: "", model: "" }, live: true, error: errOf(e) };
