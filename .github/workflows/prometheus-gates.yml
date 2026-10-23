@@ -115,6 +115,18 @@ jobs:
       - name: Workspace clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # tauri.conf.json declares the service host and the log
+      # receiver as externalBin sidecars; the src-tauri steps below
+      # (build.rs validates the paths) need the staged binaries,
+      # named with the target-triple suffix Tauri expects.
+      - name: Stage bundled sidecar binaries
+        run: |
+          cargo build -p manager-services --bin llm-service-host
+          cargo build -p manager-logreceiver --bin llmdil-log-receiver
+          Copy-Item target/debug/llm-service-host.exe src-tauri/binaries/llm-service-host-x86_64-pc-windows-msvc.exe
+          Copy-Item target/debug/llmdil-log-receiver.exe src-tauri/binaries/llmdil-log-receiver-x86_64-pc-windows-msvc.exe
+        shell: pwsh
+
       # src-tauri is excluded from the root workspace: run inside it.
       - name: src-tauri check
         run: cargo check --all-targets

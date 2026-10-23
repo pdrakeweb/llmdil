@@ -26,6 +26,10 @@
   "bundle": {
     "active": true,
     "category": "DeveloperTool",
+    "externalBin": [
+      "binaries/llm-service-host",
+      "binaries/llmdil-log-receiver"
+    ],
     "copyright": "Copyright 2026 pdrakeweb",
     "longDescription": "LLMdil installs, configures, supervises and monitors a local LLM serving stack (llama.cpp backends, LiteLLM gateway, GPU telemetry, model library, MXC sandbox policies) on a Windows workstation.",
     "publisher": "pdrakeweb",
@@ -57,5 +61,5 @@
   },
   "identifier": "com.pdrakeweb.llm-manager",
   "productName": "LLMdil",
-  "version": "0.1.52"
+  "version": "0.1.53"
 }

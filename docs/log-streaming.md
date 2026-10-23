@@ -15,8 +15,11 @@ identically in the interactive app and in Session 0 service mode.
 - Transport: the self-hosted receiver (Option B) — crate
   `manager-logreceiver`, running on the same machine as the app as
   its own auto-start Windows service (registered through
-  `manager-services`; deploy:
-  `tools/prometheus/Deploy-LogReceiver.ps1`). Ingest is localhost;
+  `manager-services`). The receiver binary ships inside the LLMdil
+  installer beside the app; deployment is driven from the app
+  (Settings → Supervision → Log receiver → Deploy, one UAC
+  prompt) — `tools/prometheus/Deploy-LogReceiver.ps1` remains only
+  as a thin wrapper over the same path. Ingest is localhost;
   Muse reads the store remotely over Tailscale (see "Read
   surface" below). The receiver was originally hosted on Muse's
   VM behind a Cloudflare tunnel hostname; that deployment retired
@@ -30,12 +33,17 @@ identically in the interactive app and in Session 0 service mode.
 
 ## Enabling (config file + credential + receiver service)
 
-1. Deploy the receiver service on this machine:
-   `tools/prometheus/Deploy-LogReceiver.ps1` (elevated) installs
-   the service, seeds its token files under
-   `<data_dir>/log-receiver/`, and verifies ingest + read-back with
-   a synthetic record. The receiver's ingest token is seeded from
-   the same Credential Manager value the shipper uses (step 2).
+1. Deploy the receiver service on this machine: Settings →
+   Supervision → Log receiver → **Deploy** (one UAC prompt;
+   Repair re-runs the same path). It seeds the token files under
+   `<data_dir>/log-receiver/`, registers and starts the service,
+   adds the read listener's firewall rule, and verifies localhost
+   ingest health. The receiver's ingest token is seeded from the
+   same Credential Manager value the shipper uses (step 2). The
+   shipper endpoint flip to `http://127.0.0.1:8473` is the separate
+   Flip action on the same card — Deploy never flips. Remove (and
+   uninstalling LLMdil, which attempts the same removal) reverses
+   the deployment; the store and tokens stay in the data dir.
 2. Store the per-machine ingest token in Windows Credential
    Manager under the target
    `local-llm-service-manager/log-streaming-token` (D6 — the token
@@ -60,8 +68,9 @@ identically in the interactive app and in Session 0 service mode.
 
 The receiver's second listener binds the machine's tailnet IPv4
 (100.64.0.0/10) on port 8474 — never the LAN, never a public
-route — and requires a separate read-only Bearer token (seeded by
-the deploy script to `<data_dir>/log-receiver/read-token.txt`).
+route — and requires a separate read-only Bearer token (generated
+by the deploy to `<data_dir>/log-receiver/read-token.txt` and
+shown once in the app for Secure Vault filing).
 Endpoints, all GET, all JSON:
 
 - `/healthz` — `{ok, records, db_bytes, last_heartbeat_utc}`.

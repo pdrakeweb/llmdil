@@ -337,6 +337,14 @@ macro_rules! for_each_operation {
             (ServicesList, services_list, R, op_services_list, [], None),
             (ServicesRegister, services_register, D, op_services_register, [target: String, password: Option<String>], None),
             (ServicesUnregister, services_unregister, D, op_services_unregister, [target: String], None),
+            // Log receiver — desktop-only (deployment runs the
+            // bundled receiver binary elevated through the shell's
+            // runas pattern; the endpoint flip is a separate
+            // deliberate op, never bundled into deploy).
+            (LogReceiverStatus, log_receiver_status, R, op_log_receiver_status, [], None),
+            (LogReceiverDeploy, log_receiver_deploy, D, op_log_receiver_deploy, [], None),
+            (LogReceiverRemove, log_receiver_remove, D, op_log_receiver_remove, [], None),
+            (LogReceiverFlipEndpoint, log_receiver_flip_endpoint, C, op_log_receiver_flip_endpoint, [], None),
             // Optimize — desktop-only in v1 (consultation spends local
             // backend capacity; plan state lives beside the config).
             (OptimizeGetState, optimize_get_state, R, op_optimize_get_state, [], None),
@@ -488,7 +496,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 148);
+        assert_eq!(OP_SPECS.len(), 152);
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub mod gateway_stats;
 pub mod gpu_history;
 pub mod hf_forms;
 pub mod bench;
+pub mod log_receiver;
 pub mod logship;
 pub mod notify;
 pub mod optimize;
@@ -76,6 +77,10 @@ pub use app_update::{
 pub use optimize_eval::op_optimize_run_baseline;
 pub use optimize_experiments::{
     op_optimize_estimate_experiments, op_optimize_run_experiments, op_optimize_set_experiment_state,
+};
+pub use log_receiver::{
+    op_log_receiver_deploy, op_log_receiver_flip_endpoint, op_log_receiver_remove,
+    op_log_receiver_status,
 };
 pub use bench::{
     op_bench_prompt_delete, op_bench_prompt_generate, op_bench_prompt_generate_cancel,

@@ -2834,6 +2834,80 @@ export async function servicesUnregister(target: string): Promise<CallResult<{ o
   }
 }
 
+/* ---------------- Log receiver (Prometheus-local) ---------------- */
+
+/** log_receiver_status payload: deployment state of the bundled
+ *  log receiver service and the shipper's endpoint. */
+export interface LogReceiverInfo {
+  service_name: string;
+  registered: boolean;
+  /** SCM state, null when not registered. */
+  state: string | null;
+  pid: number | null;
+  receiver_exe: string;
+  receiver_present: boolean;
+  data_dir: string;
+  ingest_token_seeded: boolean;
+  read_token_seeded: boolean;
+  endpoint: string;
+  endpoint_is_local: boolean;
+  streaming_enabled: boolean;
+}
+
+const LR_SAMPLE: LogReceiverInfo = {
+  service_name: "llm-log-receiver", registered: false, state: null, pid: null,
+  receiver_exe: "", receiver_present: false, data_dir: "",
+  ingest_token_seeded: false, read_token_seeded: false,
+  endpoint: "", endpoint_is_local: false, streaming_enabled: false,
+};
+
+export async function logReceiverStatus(): Promise<CallResult<LogReceiverInfo>> {
+  if (!isTauri()) return { data: LR_SAMPLE, live: false };
+  try {
+    const data = await invoke<LogReceiverInfo>("log_receiver_status");
+    return { data, live: true };
+  } catch (e) {
+    return { data: LR_SAMPLE, live: true, error: errOf(e) };
+  }
+}
+
+/** Deploy or repair the log receiver service (one UAC prompt).
+ *  `read_token_new` is set exactly once — on the deploy that
+ *  generated the read token — for Secure Vault filing. */
+export async function logReceiverDeploy(): Promise<CallResult<{ ok: boolean; service_name: string; read_token_new: string | null }>> {
+  if (!isTauri()) return { data: { ok: false, service_name: "", read_token_new: null }, live: false, error: "log_receiver_deploy is not available in sample mode" };
+  try {
+    const data = await invoke<{ ok: boolean; service_name: string; read_token_new: string | null }>("log_receiver_deploy");
+    return { data, live: true };
+  } catch (e) {
+    return { data: { ok: false, service_name: "", read_token_new: null }, live: true, error: errOf(e) };
+  }
+}
+
+/** Remove the log receiver service + its firewall rule (one UAC
+ *  prompt). The store and token files stay in the data directory. */
+export async function logReceiverRemove(): Promise<CallResult<{ ok: boolean; service_name: string }>> {
+  if (!isTauri()) return { data: { ok: false, service_name: "" }, live: false, error: "log_receiver_remove is not available in sample mode" };
+  try {
+    const data = await invoke<{ ok: boolean; service_name: string }>("log_receiver_remove");
+    return { data, live: true };
+  } catch (e) {
+    return { data: { ok: false, service_name: "" }, live: true, error: errOf(e) };
+  }
+}
+
+/** Flip the shipper endpoint to the local receiver. Backs up
+ *  config.json first (path in `backup`); applies on app restart. */
+export async function logReceiverFlipEndpoint(): Promise<CallResult<{ ok: boolean; endpoint: string; already: boolean; backup: string | null }>> {
+  if (!isTauri()) return { data: { ok: false, endpoint: "", already: false, backup: null }, live: false, error: "log_receiver_flip_endpoint is not available in sample mode" };
+  try {
+    const data = await invoke<{ ok: boolean; endpoint: string; already: boolean; backup: string | null }>("log_receiver_flip_endpoint");
+    return { data, live: true };
+  } catch (e) {
+    return { data: { ok: false, endpoint: "", already: false, backup: null }, live: true, error: errOf(e) };
+  }
+}
+
 export async function getAppConfig(): Promise<CallResult<Record<string, unknown> | null>> {
   if (!isTauri()) return { data: null, live: false };
   try {

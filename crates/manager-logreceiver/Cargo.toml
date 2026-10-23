@@ -1,6 +1,6 @@
 [package]
 name = "manager-logreceiver"
-version = "0.1.52"
+version = "0.1.53"
 edition = "2021"
 
 # Prometheus-local log receiver for LLMdil log streaming
@@ -28,6 +28,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
 ] }
 
 [[bin]]
