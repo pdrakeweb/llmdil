@@ -203,6 +203,13 @@ macro_rules! for_each_operation {
             (BackendAddPreview, backend_add_preview, R, op_backend_add_preview, [model_id: String, gpu_indices: Option<Vec<u32>>, n_ctx: Option<u32>, parallel: Option<u32>], None),
             (BackendUpdateFlags, backend_update_flags, C, op_backend_update_flags, [id: String, n_ctx: u32, n_batch: u32], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/flags"))),
             (BackendSetOffload, backend_set_offload, C, op_backend_set_offload, [id: String, layers: u32, allow_override: Option<bool>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/offload"))),
+            // Deliberate guardrail overrides for the SAVED position
+            // (guardrail-override UI; tracker #37 follow-on): set
+            // names the exact key it confirms (layers + placed CC
+            // set) and the op re-derives and refuses any mismatch;
+            // clear drops the backend's standing record.
+            (BackendSetOffloadOverride, backend_set_offload_override, C, op_backend_set_offload_override, [id: String, layers: u32, placed_ccs: Vec<String>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/offload-override"))),
+            (BackendClearOffloadOverride, backend_clear_offload_override, C, op_backend_clear_offload_override, [id: String], Some(route(HttpMethod::Delete, "/api/v1/backends/{id}/offload-override"))),
             (BackendSetMtp, backend_set_mtp, C, op_backend_set_mtp, [id: String, n_max: Option<u32>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/mtp"))),
             (BackendSetParallel, backend_set_parallel, C, op_backend_set_parallel, [id: String, slots: Option<u32>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/parallel"))),
             (BackendSetCache, backend_set_cache, C, op_backend_set_cache, [id: String, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/cache"))),
@@ -468,7 +475,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 137);
+        assert_eq!(OP_SPECS.len(), 139);
     }
 
     #[test]
