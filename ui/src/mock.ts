@@ -188,9 +188,15 @@ export function mockOptimizeState(): OptimizeState {
     candidates: {
       directive: "Explore better MoE capable models for the planner",
       retrieved_at: new Date().toISOString(),
+      funnel: {
+        queries_run: 3, pool_repos: 214, repos_fetched: 200, repos_failed: 2,
+        dropped_unpopular: 61, dropped_stale: 38, dropped_family: 12, dropped_fit: 50,
+        quants_considered: 1980, quants_collapsed: 1710, kept: 30,
+        partial: false, partial_reason: null, stopped_early: true,
+      },
       items: [
         { repo_id: "Qwen/Qwen3-30B-A3B-GGUF", file: "Qwen3-30B-A3B-Q4_K_M.gguf", architecture: "qwen3moe", params_b: 30.5, ctx_max: 40960, size_bytes: 18600000000, downloads: 812345, fit: "fits_with_split", retrieved_at: new Date().toISOString() },
-        { repo_id: "unsloth/Qwen3-Coder-Next-GGUF", file: "Qwen3-Coder-Next-UD-Q4_K_M.gguf", architecture: "qwen3moe", params_b: 80, ctx_max: 262144, size_bytes: 49301055488, downloads: 456789, fit: "does_not_fit", retrieved_at: new Date().toISOString() },
+        { repo_id: "unsloth/Qwen3-Coder-Next-GGUF", file: "Qwen3-Coder-Next-UD-Q4_K_M.gguf", architecture: "qwen3moe", params_b: 80, ctx_max: 262144, size_bytes: 49301055488, downloads: 456789, fit: "unchecked", retrieved_at: new Date().toISOString() },
       ],
     },
     eval_baseline: {

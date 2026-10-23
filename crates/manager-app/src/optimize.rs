@@ -21,8 +21,8 @@ use manager_optimize::{
     benchmark_prompts, build_context, build_prompts, config_fingerprint, consult_default,
     default_purpose_seed, estimate_prompts, estimate_tokens, headline_figures, measurement_facts,
     measurement_fingerprint, parse_plan, probe_hardware, validate_plan, BackendMeasured,
-    BenchResult, BenchmarkPrompt, CandidateFact, ConsultCandidate, Decision, EstimateEntry,
-    HardwareContext, HfClient, ItemValidation, LayoutFacts, LiveSnapshot, MeasureInputs,
+    BenchResult, BenchmarkPrompt, CandidateFact, ConsultCandidate, Decision, DiscoveryFunnel,
+    EstimateEntry, HardwareContext, HfClient, ItemValidation, LayoutFacts, LiveSnapshot, MeasureInputs,
     MeasurementEntry, MeasurementFingerprintInputs, MeasurementInputs, MeasurementSource,
     MeasurementStore, Plan, PlanItem, PlanKind, TrafficWindow, ValidationStatus,
     BENCHMARK_TEMPERATURE, ESTIMATE_RUNS, MEASURED_RUNS,
@@ -543,6 +543,11 @@ struct CandidatesFile {
     retrieved_at: String,
     #[serde(default)]
     candidates: Vec<CandidateFact>,
+    /// The deep pass's funnel (deep-discovery design Part 1,
+    /// §P1.10): absent on files written before the deep pass
+    /// existed — old files load unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    funnel: Option<DiscoveryFunnel>,
 }
 
 fn candidates_path(state: &AppState) -> PathBuf {
@@ -562,18 +567,44 @@ fn save_candidates_file(state: &AppState, file: &CandidatesFile) -> Result<(), S
 }
 
 /// The payload form of the stored candidates: the list with the
-/// directive it belongs to and its retrieval time, or `null`
-/// when no discovery has run (or a run found nothing).
+/// directive it belongs to, its retrieval time, and the
+/// pass's funnel (§P1.10), or `null` when no discovery has
+/// run (or a pre-deep-pass run found nothing). A deep pass
+/// that kept nothing still reports — its funnel, partial
+/// marker included, is the result.
 fn candidates_json(file: &CandidatesFile) -> Value {
-    if file.candidates.is_empty() {
+    if file.candidates.is_empty() && file.funnel.is_none() {
         Value::Null
     } else {
         json!({
             "directive": file.directive,
             "retrieved_at": file.retrieved_at,
             "items": file.candidates,
+            "funnel": file.funnel,
         })
     }
+}
+
+/// One-line funnel summary for the optimize.log (§P1.10):
+/// the log is how a run gets reviewed after the fact.
+fn funnel_log_line(funnel: &DiscoveryFunnel) -> String {
+    format!(
+        "discovery funnel: queries_run={} pool_repos={} repos_fetched={} repos_failed={} dropped_unpopular={} dropped_stale={} dropped_family={} dropped_fit={} quants_considered={} quants_collapsed={} kept={} partial={} partial_reason={} stopped_early={}",
+        funnel.queries_run,
+        funnel.pool_repos,
+        funnel.repos_fetched,
+        funnel.repos_failed,
+        funnel.dropped_unpopular,
+        funnel.dropped_stale,
+        funnel.dropped_family,
+        funnel.dropped_fit,
+        funnel.quants_considered,
+        funnel.quants_collapsed,
+        funnel.kept,
+        funnel.partial,
+        funnel.partial_reason.as_deref().unwrap_or("none"),
+        funnel.stopped_early,
+    )
 }
 
 /// The measurement-fingerprint inputs for one backend (§A.1),
@@ -2054,18 +2085,23 @@ pub async fn op_optimize_discover(
         opt_log1(state, &format!("discovery failed: {e}"));
         ApiError::InvalidInput(format!("candidate discovery failed: {e}"))
     })?;
-    let candidates = client
-        .discover(&directive, &free_vram, &retrieved_at)
+    let discovery = client
+        .discover_deep(&directive, &free_vram, &retrieved_at)
         .await
         .map_err(|e| {
             opt_log1(state, &format!("discovery failed: {e}"));
             ApiError::InvalidInput(format!("candidate discovery failed: {e}"))
         })?;
+    let candidates = discovery.candidates;
+    let funnel = discovery.funnel;
     {
-        let mut lines = vec![opt_log_line(&format!(
-            "discovery result: {} candidates",
-            candidates.len()
-        ))];
+        let mut lines = vec![
+            opt_log_line(&format!(
+                "discovery result: {} candidates",
+                candidates.len()
+            )),
+            opt_log_line(&funnel_log_line(&funnel)),
+        ];
         for c in &candidates {
             lines.push(opt_log_line(&format!(
                 "discovery candidate: {}/{} params_b={} size_bytes={} fit={}",
@@ -2080,6 +2116,7 @@ pub async fn op_optimize_discover(
             directive,
             retrieved_at,
             candidates,
+            funnel: Some(funnel),
         },
     )
     .map_err(ApiError::InvalidInput)?;
@@ -2876,6 +2913,54 @@ fn sample_response(cfg: &AppConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deep-discovery Part 1 (§P1.10/§P1.14): a pre-deep-pass
+    /// candidates file (no `funnel`) still loads, and the
+    /// payload carries the funnel beside the items when a
+    /// deep pass wrote one — including a partial pass that
+    /// kept nothing.
+    #[test]
+    fn candidates_file_funnel_is_additive() {
+        let old: CandidatesFile = serde_json::from_str(
+            r#"{"directive":"d","retrieved_at":"t","candidates":[]}"#,
+        )
+        .unwrap();
+        assert!(old.funnel.is_none());
+        // No candidates and no funnel: still the null payload.
+        assert_eq!(candidates_json(&old), Value::Null);
+
+        let funnel = DiscoveryFunnel {
+            queries_run: 3,
+            pool_repos: 6,
+            repos_fetched: 4,
+            kept: 0,
+            partial: true,
+            partial_reason: Some("rate_limited".to_string()),
+            ..Default::default()
+        };
+        let file = CandidatesFile {
+            directive: "d".to_string(),
+            retrieved_at: "t".to_string(),
+            candidates: Vec::new(),
+            funnel: Some(funnel.clone()),
+        };
+        let payload = candidates_json(&file);
+        assert_eq!(payload["items"], json!([]));
+        assert_eq!(payload["funnel"]["pool_repos"], json!(6));
+        assert_eq!(payload["funnel"]["partial"], json!(true));
+        assert_eq!(
+            payload["funnel"]["partial_reason"],
+            json!("rate_limited")
+        );
+        // The stored file round-trips with the funnel intact.
+        let text = serde_json::to_string(&file).unwrap();
+        let back: CandidatesFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.funnel, Some(funnel));
+        // The log line carries every counter.
+        let line = funnel_log_line(&back.funnel.unwrap());
+        assert!(line.contains("pool_repos=6"), "{line}");
+        assert!(line.contains("partial_reason=rate_limited"), "{line}");
+    }
 
     fn bench(gen: f64) -> BenchResult {
         BenchResult {

@@ -3649,6 +3649,28 @@ export interface OptimizeCandidate {
   retrieved_at: string;
 }
 
+/** One deep discovery pass's accounting (deep-discovery
+ *  Part 1, §P1.10): every filter drop counted; `partial` with
+ *  its reason when the pass stopped early on the deadline or
+ *  the rate limit. HF sends no total match count, so the
+ *  funnel reports fetched counts only. */
+export interface OptimizeDiscoveryFunnel {
+  queries_run: number;
+  pool_repos: number;
+  repos_fetched: number;
+  repos_failed: number;
+  dropped_unpopular: number;
+  dropped_stale: number;
+  dropped_family: number;
+  dropped_fit: number;
+  quants_considered: number;
+  quants_collapsed: number;
+  kept: number;
+  partial: boolean;
+  partial_reason: string | null;
+  stopped_early: boolean;
+}
+
 /** The stored discovery set: the candidates plus the directive
  *  they were gathered for (a consultation only receives them
  *  when its directive matches). */
@@ -3656,6 +3678,9 @@ export interface OptimizeCandidates {
   directive: string;
   retrieved_at: string;
   items: OptimizeCandidate[];
+  /** The pass's funnel, or null for a set stored before the
+   *  deep pass existed. */
+  funnel: OptimizeDiscoveryFunnel | null;
 }
 
 /** Passed/total for one screening-suite score line (overall

@@ -505,6 +505,25 @@ check(staticSrc.includes('data-model-act="hf-refresh"'), "card editor renders Re
 check(staticSrc.includes("SHA-256 changed in the repository"), "a changed repository hash surfaces as a warning line, never a silent re-pin");
 check(staticSrc.includes("moe_reconcile"), "the card renders the backend-computed reconciliation proposal");
 
+// Deep discovery pool (deep-discovery Part 1, Oct 22, 2026):
+// the stored candidates note line gains the pass funnel —
+// Searched / Filtered / Kept in Label: Value form, an amber
+// Partial marker when the pass was partial, and the full
+// counter set in the line's tooltip. The selection logic
+// itself (variants, pool merge, filters, collapse, ranking,
+// deadline/rate-limit partials) is pinned by the Rust tests
+// in manager-optimize's discover.rs and manager-app's
+// funnel payload test; these pins hold the UI surface.
+check(optimizeSrc.includes("funnelNote(stored)"), "Optimize candidates line renders the discovery funnel segment");
+check(optimizeSrc.includes("Searched:"), "Optimize candidates line shows the funnel Searched figure");
+check(optimizeSrc.includes("Filtered:"), "Optimize candidates line shows the funnel Filtered figure");
+check(optimizeSrc.includes("Kept:"), "Optimize candidates line shows the funnel Kept figure");
+check(optimizeSrc.includes("Partial"), "Optimize candidates line marks a partial pass");
+check(optimizeSrc.includes("repos_fetched"), "Optimize funnel tooltip carries the fetched counter");
+check(optimizeSrc.includes("quants_collapsed"), "Optimize funnel tooltip carries the collapsed counter");
+check(optimizeSrc.includes("Discovery kept no candidates for this directive."), "Optimize renders the empty deep-pass result distinctly from a pruned list");
+check(bundle.includes("Searched:"), "bundle renders the funnel summary in the candidates line");
+
 // Add Model form UX (Oct 20, 2026): the control that made the
 // form appear and the form's submit control carried the same
 // label, and a successful submit left the filled form on screen.

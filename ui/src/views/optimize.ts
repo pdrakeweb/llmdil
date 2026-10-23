@@ -23,7 +23,7 @@ import {
   setBackendMoeCache, setBackendOffload, stopBackend, updateBackendFlags, updateGatewayConfig,
 } from "../api";
 import type {
-  CallResult, MeasurementInputs, OptimizeCandidate, OptimizeExperiment, OptimizeMeasurementEntry, OptimizePlanItem, OptimizeState,
+  CallResult, MeasurementInputs, OptimizeCandidate, OptimizeCandidates, OptimizeExperiment, OptimizeMeasurementEntry, OptimizePlanItem, OptimizeState,
   TuningArm, TuningCoords, TuningPreview, TuningSweep,
 } from "../api";
 import { fmtCount, trim1 } from "../charts";
@@ -651,6 +651,33 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
    *  the stored, operator-prunable candidate list. The list is
    *  the exact set a consultation with the same directive draws
    *  from, minus the pruned entries. */
+  /** The funnel segment of the candidates note line
+   *  (deep-discovery Part 1, §P1.11): Searched / Filtered /
+   *  Kept in Label: Value form, a Partial marker in amber
+   *  when the pass was partial (principle 11), and the full
+   *  counter set in the line's tooltip (principle 5). */
+  function funnelNote(stored: OptimizeCandidates): string {
+    const f = stored.funnel;
+    if (!f) return "";
+    const filtered = f.dropped_unpopular + f.dropped_stale + f.dropped_family + f.dropped_fit;
+    const counters = [
+      `Queries: ${f.queries_run}`,
+      `Pool: ${f.pool_repos}`,
+      `Fetched: ${f.repos_fetched}`,
+      `Failed: ${f.repos_failed}`,
+      `Dropped (downloads): ${f.dropped_unpopular}`,
+      `Dropped (stale): ${f.dropped_stale}`,
+      `Dropped (family): ${f.dropped_family}`,
+      `Dropped (fit): ${f.dropped_fit}`,
+      `Quants: ${f.quants_considered}`,
+      `Collapsed: ${f.quants_collapsed}`,
+      `Kept: ${f.kept}`,
+      ...(f.partial ? [`Partial: ${f.partial_reason === "rate_limited" ? "Rate limited" : "Deadline"}`] : []),
+      ...(f.stopped_early ? ["Stopped: Shortlist full"] : []),
+    ].join(" · ");
+    return ` · <span title="${esc(counters)}">Searched: ${f.pool_repos} repos · Filtered: ${filtered} · Kept: ${f.kept}</span>${f.partial ? ` · <span class="opt-warning">${icon("warn")} Partial</span>` : ""}`;
+  }
+
   function candidatesHtml(st: OptimizeState): string {
     const directiveText = (directiveDraft ?? st.last_directive ?? "").trim();
     const stored = st.candidates;
@@ -664,9 +691,11 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         <button class="btn" id="optDiscoverBtn" data-opt-act="discover" ${discovering ? "disabled" : ""}>${icon("search")} ${discovering ? "Finding candidates…" : "Find candidates"}</button>
       </div>
       ${stored ? `<div class="opt-field-label" style="margin-top:10px">Candidates</div>
-        <div class="opt-note">Directive: ${esc(stored.directive)} · Retrieved: ${esc(fmtTime(stored.retrieved_at))} · Shown: ${visible.length} of ${stored.items.length}</div>
+        <div class="opt-note">Directive: ${esc(stored.directive)} · Retrieved: ${esc(fmtTime(stored.retrieved_at))} · Shown: ${visible.length} of ${stored.items.length}${funnelNote(stored)}</div>
         ${stored.directive !== directiveText ? `<div class="opt-note">These candidates were gathered for a different directive — a consultation only receives candidates gathered for its own directive.</div>` : ""}
-        ${rows || `<div class="opt-note">All candidates pruned — the consultation will carry no candidates block.</div>`}` : ""}
+        ${rows || (stored.items.length === 0
+          ? `<div class="opt-note">Discovery kept no candidates for this directive.</div>`
+          : `<div class="opt-note">All candidates pruned — the consultation will carry no candidates block.</div>`)}` : ""}
     </div>`;
   }
 
