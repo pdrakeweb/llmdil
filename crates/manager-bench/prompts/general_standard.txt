@@ -1,0 +1,132 @@
+How an air-source heat pump heats a house in winter
+
+An air-source heat pump does not make heat the way a furnace does.
+A furnace burns fuel or runs current through a resistance element
+and converts nearly all of that energy into heat inside the house.
+A heat pump instead moves heat: it extracts thermal energy from
+the outdoor air — air that feels cold to a person still contains
+a great deal of thermal energy — and delivers that energy
+indoors. Because the machine is transporting heat rather than
+generating it, it can deliver two to four units of heat for every
+unit of electricity it consumes. That ratio is called the
+coefficient of performance, or COP. A resistance heater has a COP
+of exactly 1. A heat pump at a COP of 3 delivers the same warmth
+as a resistance heater while drawing a third of the power.
+
+The mechanism is a refrigeration cycle, the same cycle a kitchen
+refrigerator or an air conditioner runs, arranged so the useful
+side is the indoor side. Four components do the work. The
+compressor squeezes a refrigerant gas, raising its pressure and
+temperature. The hot, high-pressure gas flows through a coil —
+indoors, in heating mode — where a fan blows room air across it;
+the refrigerant gives up heat to the room and condenses into a
+liquid, which is why this coil is called the condenser when
+heating. The liquid then passes through an expansion valve, which
+drops its pressure abruptly, and with the pressure its
+temperature, until the refrigerant is colder than the outdoor
+air. In the outdoor coil — the evaporator, in heating mode — the
+cold refrigerant absorbs heat from the outside air, boils back
+into a gas, and returns to the compressor to repeat the cycle. A
+reversing valve swaps the roles of the two coils for summer
+cooling, which is why one machine can both heat and cool.
+
+Why capacity falls as the weather gets colder is a direct
+consequence of the physics. Colder outdoor air carries less
+extractable heat per cubic metre, and the compressor must work
+across a wider temperature lift — from a colder evaporating
+temperature to the same warm condensing temperature — which
+reduces both the mass of refrigerant it can move effectively and
+the COP it can achieve. A typical modern unit rated at 36,000
+BTU per hour at 8 °C outdoors might deliver only about 22,000 to
+26,000 BTU per hour at −12 °C, at a COP near 2 instead of 3.5.
+Cold-climate models fight this with larger outdoor coils, vapor
+injection compressors that squeeze in two stages, and controls
+that keep the compressor running continuously at variable speed
+rather than cycling, and they hold useful capacity down to
+−20 °C or below — but no air-source machine escapes the trend,
+only softens it.
+
+Because capacity falls with temperature while a house's heat loss
+rises with temperature difference, the two curves cross. Below
+that crossover, called the balance point, the heat pump alone
+cannot hold the indoor temperature, and a backup heat source
+takes up the difference: electric resistance strips, called
+auxiliary heat, or a gas furnace in a dual-fuel arrangement.
+Good controls stage the backup in only as far as needed and only
+below the balance point, because every unit of heat from
+resistance backup arrives at a COP of 1; a system that calls for
+auxiliary heat too eagerly gives back much of the efficiency the
+heat pump was bought for. The economic balance point — where
+heat-pump heat costs the same per unit as the backup fuel — is a
+separate figure that depends on electricity and gas prices, and
+it, not the thermal balance point, decides the switchover in a
+dual-fuel system.
+
+Frost is the other winter complication. The outdoor coil runs
+colder than the outdoor air, so moisture from the air freezes on
+it, insulating it and blocking airflow. The machine periodically
+runs a defrost cycle: it reverses briefly into cooling mode,
+sending hot refrigerant to the outdoor coil to melt the frost,
+while auxiliary heat tempers the cool air this would otherwise
+blow indoors. Defrost cycles are normal, brief, and more frequent
+in humid air near freezing than in colder, drier air — the
+frostiest conditions are around −2 °C to +3 °C with high
+humidity, not the coldest nights of the year. Steam rising from
+the outdoor unit during defrost is meltwater evaporating, not a
+fault, though a unit that defrosts every few minutes for long
+stretches, or never defrosts and ices solid, needs service.
+
+Sizing and installation decide more of a system's real
+performance than the nameplate does. An oversized single-stage
+unit short-cycles in mild weather, wearing the compressor and
+dehumidifying poorly in summer; an undersized one leans on
+backup heat all winter. Ductwork sized for an old furnace's hot,
+fast air may deliver a heat pump's larger volume of gentler air
+noisily or unevenly, and refrigerant charge, airflow across the
+indoor coil, and thermostat configuration each move delivered
+COP by amounts homeowners can feel on a bill. This is why two
+houses with identical outdoor units can report very different
+winter electricity use: the machine is one component of a system
+whose other components are the ducts, the envelope, and the
+controls.
+
+The envelope belongs in the same discussion. Every improvement
+in insulation and air sealing lowers the house's heat-loss curve,
+which pushes the balance point to a colder temperature, shrinks
+the hours the backup heat runs, and can let a smaller, cheaper
+heat pump serve the house. In that sense a heat pump purchase
+and an attic-insulation purchase are not competing uses of the
+same money so much as two halves of one decision, and the order
+matters: reduce the load first, then size the machine to the
+reduced load.
+
+----------------------------------------------------------------
+Question
+----------------------------------------------------------------
+
+Using only the passage above, answer all four parts:
+
+1. A homeowner's installer says: "On the coldest nights this
+   unit will use more electricity per unit of heat than on a
+   mild autumn day, even though it is the same machine and
+   nothing is wrong with it." Explain, in terms the passage
+   gives, why that is expected — name at least two distinct
+   mechanisms.
+
+2. The same house has its attic insulation doubled and its air
+   leaks sealed. Nothing about the heat pump changes. According
+   to the passage, what happens to the balance point, what
+   happens to the hours the backup heat runs, and why might the
+   homeowner have been able to buy a smaller unit if the
+   envelope work had come first?
+
+3. A neighbor insists that "a heat pump that steams outdoors on
+   a damp 0 °C evening is broken." Correct the claim using the
+   passage: what is the steam, when does the behavior behind it
+   happen most, and what two patterns WOULD suggest a real
+   fault?
+
+4. Explain the difference between the thermal balance point and
+   the economic balance point as the passage defines them, and
+   state which one governs switchover in a dual-fuel system and
+   why.
