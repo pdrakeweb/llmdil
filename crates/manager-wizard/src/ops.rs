@@ -671,6 +671,19 @@ impl RealSystemOps {
     }
 }
 
+/// Windows creation flags for a windowless detached spawn:
+/// CREATE_NO_WINDOW alone. DETACHED_PROCESS must NOT be combined
+/// with it: Windows ignores CREATE_NO_WINDOW when combined with
+/// DETACHED_PROCESS, leaving a console-less child whose console
+/// children each open a visible window (the gateway's Prisma query
+/// engine window, 2026-11-02). A named helper so a test pins the
+/// combination — the flags themselves are not observable from
+/// outside the spawned process.
+#[cfg(windows)]
+fn windowless_creation_flags() -> u32 {
+    0x08000000
+}
+
 #[async_trait]
 impl SystemOps for RealSystemOps {
     fn note_step_started(&self) {
@@ -823,12 +836,26 @@ impl SystemOps for RealSystemOps {
         for (k, v) in &cmd.env {
             c.env(k, v);
         }
-        // Detach from this process group so the child outlives the wizard.
+        // The child must outlive the wizard, but that is a property
+        // of process lifetime, not of DETACHED_PROCESS: no job
+        // object is used, so the child survives the parent's exit
+        // either way, and the GUI app has no console from which a
+        // console-control event could reach it. CREATE_NO_WINDOW
+        // alone is what keeps the child — and, critically, the
+        // child's own console children — windowless: it gives the
+        // child a console that exists but has no window, which its
+        // children inherit, while combining it with DETACHED_PROCESS
+        // makes Windows ignore CREATE_NO_WINDOW entirely (and a
+        // detached child has no console to hand down, so every
+        // console grandchild gets a fresh visible window — the
+        // Prisma query engine window reported 2026-11-02). The
+        // service shim already uses CREATE_NO_WINDOW alone; this
+        // aligns the process-mode spawn with it.
         #[cfg(windows)]
         {
-            // CREATE_NO_WINDOW | DETACHED_PROCESS (tokio Command:
-            // creation_flags is inherent on Windows, no std import).
-            c.creation_flags(0x08000000 | 0x00000008);
+            // CREATE_NO_WINDOW (tokio Command: creation_flags is
+            // inherent on Windows, no std import).
+            c.creation_flags(windowless_creation_flags());
         }
         #[cfg(not(windows))]
         {
@@ -1806,6 +1833,18 @@ mod tests {
         let expected = format!("{:x}", reference.finalize());
         assert_eq!(ops.sha256_file(&path).await.unwrap(), expected);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windowless_spawn_flags_are_create_no_window_alone() {
+        // Regression 2026-11-02: spawn_detached once combined
+        // CREATE_NO_WINDOW with DETACHED_PROCESS, which Windows
+        // documents as ignoring CREATE_NO_WINDOW — the gateway's
+        // Prisma query engine child then opened a visible console
+        // window for the gateway's lifetime.
+        assert_eq!(windowless_creation_flags(), 0x08000000);
+        assert_eq!(windowless_creation_flags() & 0x00000008, 0);
     }
 
     /// Regression (S6): `spawn_detached` must deliver `PlannedCommand.env`

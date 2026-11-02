@@ -149,7 +149,10 @@ pub struct ServiceDefinition {
     pub name: String,
     pub display_name: String,
     pub description: String,
-    /// The real program the shim spawns (llama-server, pythonw).
+    /// The real program the shim spawns (llama-server, python.exe
+    /// for the gateway — pythonw would leave the gateway's console
+    /// children, notably the Prisma query engine, with no hidden
+    /// console to inherit).
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<EnvEntry>,

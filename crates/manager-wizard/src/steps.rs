@@ -2377,12 +2377,13 @@ fn gateway_launch_spec(
 pub fn gateway_service_launch(config: &AppConfig, data_dir: &Path) -> manager_services::LaunchSpec {
     let venv = data_dir.join("python").join("venv");
     let python = if cfg!(windows) {
-        let windowless = venv.join("Scripts").join("pythonw.exe");
-        if windowless.exists() {
-            windowless
-        } else {
-            venv.join("Scripts").join("python.exe")
-        }
+        // Same interpreter choice as StartGateway::gateway_python:
+        // python.exe, not pythonw — the GUI-subsystem interpreter
+        // cannot hand a hidden console to the gateway's console
+        // children (notably the Prisma query engine), so it would
+        // keep the visible-engine-window defect this spec exists
+        // to avoid. See that function's comment.
+        venv.join("Scripts").join("python.exe")
     } else {
         venv.join("bin").join("python")
     };
@@ -2520,27 +2521,29 @@ async fn postgres_log_tail(ops: &dyn SystemOps, data_dir: &Path) -> String {
     }
 }
 
-/// pg_ctl's own start-wait bound (`-t`), in seconds. At expiry
-/// pg_ctl reports "server did not start in time" and exits,
-/// leaving the postmaster starting in the background — the caller
-/// polls for readiness itself (see [`ensure_postgres_running`]).
-/// Before this bound existed, the only limit on a slow postmaster
-/// startup was the command runner's generic 600 s cap, whose tree
-/// kill then killed the starting postmaster itself (field report
-/// 2026-10-18).
-const PG_CTL_START_WAIT_SECS: u64 = 120;
-/// Runner budget for the pg_ctl start command: above pg_ctl's own
-/// `-t` bound with headroom, so pg_ctl's own report — not the
-/// runner's tree kill — is what ends a slow start.
-const POSTGRES_START_COMMAND_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+/// Runner budget for the pg_ctl launch invocation. `pg_ctl start
+/// --no-wait` returns as soon as the postmaster process exists, so
+/// this bounds a wedged launch only — never a starting postmaster
+/// (see [`ensure_postgres_running`]): the readiness wait below is
+/// a poll, not a command budget, and its expiry kills nothing.
+const POSTGRES_LAUNCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 /// Readiness poll cadence (the historical poll slept 500 ms).
 const POSTGRES_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-/// After a clean pg_ctl exit, readiness is expected promptly (the
-/// historical 30 × 500 ms poll).
-const POSTGRES_CLEAN_START_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
-/// After pg_ctl stops waiting (its `-t` bound) the postmaster
-/// keeps starting; readiness may still be this far out (crash
-/// recovery over a large WAL backlog).
+/// How long to wait for the postmaster to write `postmaster.pid`
+/// after a successful launch before concluding the launch did not
+/// actually start a server. The pid file is one of the first things
+/// the postmaster writes, so this is a grace for slow process
+/// creation under load, not a second readiness window: once the pid
+/// exists, the settle wait below takes over with its postmaster
+/// requirement engaged.
+const POSTGRES_PID_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Readiness window after launch. This restates the previous
+/// success envelope exactly — the old 180 s runner budget plus the
+/// old 120 s settle poll — as a single kill-free poll window:
+/// expiry stops polling and reports with the log tail; it kills
+/// nothing, so it cannot reintroduce the tracker #43 failure mode
+/// (a budget kill taking down a recovering postmaster). Crash
+/// recovery over a large WAL backlog is what needs this length.
 const POSTGRES_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 /// How long to wait for an already-running postmaster (found via
 /// `postmaster.pid`) to reach readiness before reporting it stuck.
@@ -2549,21 +2552,22 @@ const POSTGRES_ADOPT_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// The `pg_ctl start` command for the app-managed server, shared
 /// by the runtime start ([`ensure_postgres_running`]), the install
 /// step's plan, and the start-gateway manual block, so all three
-/// run and show the same command.
+/// run and show the same command. `--no-wait`: pg_ctl returns as
+/// soon as the postmaster process exists and the caller polls
+/// `pg_isready` itself (PostgreSQL docs: with waiting disabled,
+/// "the server log file or an external monitoring system would
+/// have to be used to check the progress and success"). Blocking
+/// on pg_ctl's own wait cost every cold start the full wait budget:
+/// pg_ctl demonstrably survived its `-t 120` bound to the 180 s
+/// runner kill on 2026-11-02 while the server was already ready
+/// 177 ms after that kill — nothing probed readiness during the
+/// wait, so the wait measured nothing and saved nothing.
 fn postgres_start_command(data_dir: &Path, port: u16) -> PlannedCommand {
     let port_opt = format!("-p {port} -h 127.0.0.1");
     let log_arg = postgres_log_path(data_dir).display().to_string();
     pg_ctl_command(
         data_dir,
-        &[
-            "-l",
-            &log_arg,
-            "-o",
-            &port_opt,
-            "-t",
-            &PG_CTL_START_WAIT_SECS.to_string(),
-            "start",
-        ],
+        &["-l", &log_arg, "-o", &port_opt, "--no-wait", "start"],
     )
 }
 
@@ -2787,32 +2791,30 @@ pub async fn ensure_postgres_running(
             }
         }
     }
-    // pg_ctl's wait is bounded twice over: its own `-t` (see
-    // postgres_start_command) and the runner budget above it, set
-    // so pg_ctl's report — not the runner's tree kill — ends a slow
-    // start. The old invocation carried neither bound: a slow
-    // postmaster startup ran into the command runner's generic
-    // 600 s cap, the resulting tree kill killed the starting
-    // postmaster itself (guaranteeing another crash recovery on
-    // the next attempt), and the failure on that path carried no
-    // server log tail (field report 2026-10-18: "timed out after
-    // 600s and was stopped", undiagnosable from the outcome).
-    // Every failure below now carries the tail.
+    // Launch, don't wait: `pg_ctl start --no-wait` returns once the
+    // postmaster process exists, and readiness is the pg_isready
+    // poll below. The previous shape blocked on pg_ctl's own wait
+    // (`-t` 120 under a 180 s runner budget) and paid the full
+    // budget on every slow cold start — pg_ctl survived its `-t`
+    // bound to the runner kill on 2026-11-02 while the server was
+    // already ready 177 ms later, because nothing probed readiness
+    // during the wait. The old shape also carried the tracker #43
+    // hazard in miniature: a budget expiry tree-kills the waiter,
+    // and only platform luck kept the postmaster alive. Here there
+    // is no waiter to kill: the launch returns in milliseconds, the
+    // poll kills nothing on expiry, and a fast FATAL still fails
+    // fast via the postmaster requirement below.
+    let launched = std::time::Instant::now();
     let start = postgres_start_command(data_dir, config.postgres.port);
-    let start_failure = match run_command_logged(
-        ctx,
-        log,
-        &start,
-        Some(POSTGRES_START_COMMAND_BUDGET),
-    )
-    .await
+    let start_failure = match run_command_logged(ctx, log, &start, Some(POSTGRES_LAUNCH_BUDGET))
+        .await
     {
         Ok(out) if out.exit_code == 0 => {
             push_log(
                 ctx,
                 log,
                 format!(
-                    "PostgreSQL started on 127.0.0.1:{} (log: {})",
+                    "PostgreSQL launch accepted on 127.0.0.1:{} (pg_ctl --no-wait, polling readiness; log: {})",
                     config.postgres.port,
                     postgres_log_path(data_dir).display()
                 ),
@@ -2826,33 +2828,60 @@ pub async fn ensure_postgres_running(
         )),
         Err(e) => Some(e.to_string()),
     };
-    // The definitive signal, either way. After a clean pg_ctl exit
-    // the server should already answer (the historical brief
-    // poll). After a pg_ctl failure the postmaster may still be
-    // starting — pg_ctl stops waiting at its `-t` bound while
-    // startup continues in the background — so poll longer, but
-    // stop early when no postmaster exists anymore (a fast FATAL
-    // must not burn the window).
-    let wait = wait_for_postgres_ready(
-        ctx,
-        data_dir,
-        if start_failure.is_none() {
-            POSTGRES_CLEAN_START_WAIT
-        } else {
-            POSTGRES_SETTLE_WAIT
-        },
-        start_failure.is_some(),
-        log,
-    )
-    .await;
+    // After a successful launch the postmaster may not have written
+    // `postmaster.pid` yet when the first poll runs; the postmaster
+    // requirement below would misread that as a dead start. Allow
+    // the start a short grace to show either signal of life — a
+    // live pid file, or a ready probe (a server answering
+    // `pg_isready` is up regardless of pid-file timing) — then
+    // engage the requirement: a launch that produces neither
+    // signal fails here, with the tail, instead of burning the
+    // whole settle window.
+    if start_failure.is_none() {
+        let grace_started = std::time::Instant::now();
+        loop {
+            let pid_alive = matches!(
+                read_postmaster_pid(ops, data_dir).await,
+                Some(pid) if ops.process_alive(pid)
+            );
+            if pid_alive || postgres_ready(ops, config, data_dir).await {
+                break;
+            }
+            if grace_started.elapsed() >= POSTGRES_PID_GRACE {
+                let tail = postgres_log_tail(ops, data_dir).await;
+                return Err(format!(
+                    "PostgreSQL launch reported success but no postmaster appeared within {} s — server log tail:\n{tail}",
+                    POSTGRES_PID_GRACE.as_secs()
+                ));
+            }
+            tokio::time::sleep(POSTGRES_READY_POLL_INTERVAL).await;
+        }
+    }
+    // The definitive signal, either way. After a launch failure
+    // the postmaster may still be starting — a previous attempt's
+    // server, or one this launch forked before failing — so poll
+    // with the postmaster requirement: it adopts a live starter
+    // and exits fast when no postmaster exists (a fast FATAL must
+    // not burn the window).
+    let wait = wait_for_postgres_ready(ctx, data_dir, POSTGRES_SETTLE_WAIT, true, log).await;
     match wait {
         PostgresWait::Ready => {
             if start_failure.is_some() {
                 push_log(
                     ctx,
                     log,
-                    "PostgreSQL became ready after pg_ctl stopped waiting — startup completed in the background"
+                    "PostgreSQL became ready after pg_ctl launch returned without confirming — startup completed in the background"
                         .to_string(),
+                );
+            } else {
+                push_log(
+                    ctx,
+                    log,
+                    format!(
+                        "PostgreSQL ready on 127.0.0.1:{} after {:.0}s",
+                        config.postgres.port,
+                        launched.elapsed().as_secs_f64()
+                    ),
                 );
             }
             Ok(url)
@@ -3816,17 +3845,26 @@ impl StartGateway {
     /// the creation flags hold, no window appears, and the pid is
     /// the server itself.
     ///
-    /// On Windows pythonw.exe (the GUI-subsystem interpreter) is
-    /// preferred when the venv provides one: it cannot own a console
-    /// window at all. Stdio is always redirected to the gateway log
-    /// files, which pythonw requires.
+    /// On Windows the console-subsystem interpreter (python.exe)
+    /// is used, NOT pythonw.exe: a GUI-subsystem process cannot own
+    /// a console, so every console-subsystem child it spawns — the
+    /// Prisma query engine the gateway's database client starts —
+    /// gets a fresh visible console window from Windows, for the
+    /// gateway's lifetime. python.exe spawned with CREATE_NO_WINDOW
+    /// alone gets a console that exists but has no window, and
+    /// console children inherit that hidden console instead of
+    /// opening their own. The gateway itself stays invisible either
+    /// way (its stdio is redirected to the gateway log files), but
+    /// only the python.exe shape keeps its children invisible too.
+    /// This reverses the 2026-10-15 pythonw preference on that
+    /// evidence: pythonw solved the gateway's own window and
+    /// created its children's.
     fn gateway_python(&self, ctx: &WizardContext) -> PathBuf {
         let venv = self.venv_dir(ctx);
         if cfg!(windows) {
-            let windowless = venv.join("Scripts").join("pythonw.exe");
-            if windowless.exists() {
-                return windowless;
-            }
+            // python.exe, not pythonw: see the comment above — the
+            // GUI-subsystem interpreter cannot hand a hidden console
+            // to the gateway's console children.
             venv.join("Scripts").join("python.exe")
         } else {
             venv.join("bin").join("python")
@@ -12150,9 +12188,10 @@ mod tests {
             "pg_ctl start ran: {:?}",
             ops.executed_commands()
         );
-        // The start command carries pg_ctl's own wait bound.
-        assert!(start.argv.iter().any(|a| a == "-t"), "{:?}", start.argv);
-        assert!(start.argv.iter().any(|a| a == "120"), "{:?}", start.argv);
+        // The start command launches without waiting: readiness is
+        // polled by the caller, not by pg_ctl's own wait.
+        assert!(start.argv.iter().any(|a| a == "--no-wait"), "{:?}", start.argv);
+        assert!(!start.argv.iter().any(|a| a == "-t"), "{:?}", start.argv);
     }
 
     #[tokio::test]
@@ -12199,7 +12238,7 @@ mod tests {
         ops.with_command_failure(
             &argv_refs(&start.argv),
             -1,
-            "timed out after 180s and was stopped",
+            "timed out after 60s and was stopped",
         );
         ops.with_file(
             postgres_log_path(&data_dir),
@@ -12212,9 +12251,98 @@ mod tests {
         let err = ensure_postgres_running(&ctx, &mut log)
             .await
             .expect_err("the start must fail");
-        assert!(err.contains("timed out after 180s"), "{err}");
+        assert!(err.contains("timed out after 60s"), "{err}");
         assert!(err.contains("server log tail"), "{err}");
         assert!(err.contains("the database system is starting up"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn postgres_nowait_launch_polls_to_ready_and_reports_elapsed() {
+        // The 2026-11-02 shape, inverted: pg_ctl launches without
+        // waiting and the caller polls to ready. The launch command
+        // carries --no-wait and no -t; the log shows a launch
+        // acceptance line and then a measured ready line — never
+        // the misleading "command failed … timed out" line the old
+        // waiter shape produced on the recovered path.
+        let ops = Arc::new(FakeSystemOps::new());
+        let data_dir = PathBuf::from("/data");
+        // A dead pid file: the stale block removes it and the flow
+        // reaches the pg_ctl launch (a live pid would take the adopt
+        // path and never run pg_ctl). The grace then proceeds via
+        // the ready probe, and the settle poll confirms readiness.
+        let pid_path = postmaster_pid_path(&data_dir);
+        ops.with_file(pid_path, b"4242\n".to_vec());
+        let isready = pg_isready_argv(&data_dir);
+        ops.with_command_sequence(
+            &argv_refs(&isready),
+            vec![pg_not_ready_output(), pg_ready_output()],
+        );
+        let cfg = test_config_with_models();
+        let ctx = pg_ctx(&ops, cfg, &data_dir);
+        let mut log = Vec::new();
+        let url = ensure_postgres_running(&ctx, &mut log)
+            .await
+            .expect("the launch must poll to ready");
+        assert!(
+            url.contains("127.0.0.1:54329/litellm"),
+            "the start returns the LiteLLM database URL: {url}"
+        );
+        let start = postgres_start_command(&data_dir, 54329);
+        assert!(
+            ops.executed_commands().contains(&start.argv),
+            "the launch command must run"
+        );
+        assert!(
+            start.argv.iter().any(|a| a == "--no-wait"),
+            "{:?}",
+            start.argv
+        );
+        assert!(log.iter().any(|l| l.contains("launch accepted")), "{log:?}");
+        assert!(
+            log.iter()
+                .any(|l| l.contains("PostgreSQL ready on 127.0.0.1:54329 after")),
+            "{log:?}"
+        );
+        assert!(!log.iter().any(|l| l.contains("command failed")), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn postgres_nowait_launch_without_postmaster_fails_after_grace() {
+        // A launch that reports success but produces no postmaster
+        // (no pid file, no ready probe) fails at the end of the pid
+        // grace — with the log tail — instead of burning the whole
+        // settle window. Costs ~10 s of real sleeps (the grace).
+        let ops = Arc::new(FakeSystemOps::new());
+        let data_dir = PathBuf::from("/data");
+        let isready = pg_isready_argv(&data_dir);
+        ops.with_command(&argv_refs(&isready), pg_not_ready_output());
+        let cfg = test_config_with_models();
+        let ctx = pg_ctx(&ops, cfg, &data_dir);
+        let mut log = Vec::new();
+        let err = ensure_postgres_running(&ctx, &mut log)
+            .await
+            .expect_err("a launch with no postmaster must fail");
+        assert!(err.contains("no postmaster appeared"), "{err}");
+        assert!(err.contains("server log tail"), "{err}");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn gateway_python_is_console_interpreter_on_windows() {
+        // Regression 2026-11-02: pythonw (GUI subsystem) cannot own
+        // a console, so its console children (the Prisma query
+        // engine) each opened a visible console window. python.exe
+        // with CREATE_NO_WINDOW alone gives a hidden console that
+        // children inherit.
+        let ops = Arc::new(FakeSystemOps::new());
+        let ctx = ctx_with(ops, RunMode::Install);
+        let step = StartGateway::default();
+        let python = step.gateway_python(&ctx);
+        let name = python
+            .file_name()
+            .expect("an interpreter path")
+            .to_string_lossy();
+        assert_eq!(name, "python.exe", "{}", python.display());
     }
 
     #[tokio::test]
