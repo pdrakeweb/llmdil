@@ -1,6 +1,6 @@
 [package]
 name = "manager-api"
-version = "0.1.55"
+version = "0.1.56"
 edition = "2021"
 
 # Admin REST API (admin-api plan phase 1): the axum surface over

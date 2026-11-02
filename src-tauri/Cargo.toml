@@ -1,6 +1,6 @@
 [package]
 name = "local-llm-service-manager"
-version = "0.1.55"
+version = "0.1.56"
 edition = "2021"
 
 # NOTE: excluded from the Cargo workspace (see root Cargo.toml `exclude`).
