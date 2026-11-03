@@ -1,0 +1,30 @@
+The text between the markers is the design notes for a small job-queue system. Read all of it, then answer the questions at the end using only what the notes say. Where the notes contradict themselves, point out the contradiction instead of picking a side silently.
+
+----- NOTES BEGIN -----
+The queue stores jobs in SQLite. Each job row has: id, kind, payload (JSON text), state, attempts, created_at, run_after, claimed_by, claimed_at, and last_error.
+
+Job states are: queued, claimed, done, failed, dead. A job moves queued -> claimed when a worker picks it up. A worker that crashes while holding a job leaves it in claimed; a reaper process moves claimed jobs back to queued when claimed_at is older than 90 seconds. The reaper runs every 30 seconds.
+
+There are three job kinds: email, report, and webhook. Email jobs retry up to 5 times, report jobs retry up to 3 times, webhook jobs retry up to 7 times. Retry backoff is exponential: delay = 30 seconds * 2^attempts, capped at 30 minutes. When a job exhausts its retries it moves to dead and an operator is paged. Webhook jobs are the exception: when a webhook job exhausts its retries it moves to failed, not dead, and nobody is paged, because webhook endpoints belong to customers and failures are usually on their side.
+
+Workers poll every 2 seconds. There are at most 4 workers. A worker claims a job by updating the row inside a transaction that first reads the row with SELECT ... FOR UPDATE; note that SQLite has no FOR UPDATE, so the claim instead uses a single UPDATE ... WHERE state='queued' AND run_after <= now, and checks the affected-row count: 1 means the claim succeeded, 0 means another worker got there first.
+
+Priority: jobs have no priority field. Kind determines order loosely: workers prefer report jobs, then email, then webhook, all else equal. But run_after always wins over kind preference: a job whose run_after is in the future is never claimed early, no matter its kind.
+
+Deduplication: producers may pass an idempotency key. If a job with the same key exists in state queued or claimed, the new submission is dropped. If the existing job is done, failed, or dead, a new job with the same key is accepted.
+
+Payloads are capped at 64 KB. Jobs larger than that are rejected at submission. The notes from the March review say the cap is 256 KB. (The implementation follows the 64 KB figure.)
+
+Retention: done jobs are deleted after 7 days, failed jobs after 30 days, dead jobs are never deleted automatically. A nightly job at 03:00 deletes expired rows. The retention job itself is a job of kind report, submitted by cron, so a dead retention job would page the operator under the retry rules above.
+
+Timestamps are stored as Unix epoch seconds (integers). claimed_at is nullable. run_after defaults to created_at. All workers and the reaper read the same clock source; the system assumes clock skew between machines is under 5 seconds, while the claim lease is 90 seconds.
+
+One more rule from the April review: email jobs must never run on weekends. The scheduler checks day-of-week at claim time, not at submission time. Report and webhook jobs have no such restriction.
+----- NOTES END -----
+
+Questions:
+1. A webhook job has failed 6 times and its last attempt just failed. What state is it in, how many attempts remain, and will anyone be paged if it exhausts its retries? Explain which rules you used.
+2. A worker crashes 10 seconds after claiming an email job on a Saturday. Walk through exactly what happens to that job over the next two minutes, naming every rule that applies (lease, reaper timing, weekend rule).
+3. Find the contradiction in the notes about payload size. State both figures, and say which one the notes say the implementation follows.
+4. If the retention job itself goes dead, what happens operationally? Trace it through the rules.
+5. A producer submits a job with an idempotency key that matches a job currently in state failed. Is the new job accepted? Why?
