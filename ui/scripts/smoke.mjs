@@ -347,6 +347,8 @@ check(cardFnSrc.indexOf('class="card-actions backend-actions"') >= 0
 check(cardFnSrc.includes('["Tool calls"'), "Details carries the tool-call state");
 check(cardFnSrc.includes('["Offload Layers"'), "Details carries the Offload Layers field");
 check(cardFnSrc.includes("Latest log lines"), "Details carries the latest-log-lines block");
+check((cardFnSrc.split('href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1"').length - 1) >= 3,
+  "the menu, the Details latest-lines caption, and the failed-block caption each link to this backend's filtered Logs view");
 check(backendSrc.includes("openDetails.has(row.id)"), "log tails fetch for backends whose Details are open");
 check(backendSrc.includes("const closeEditSession"), "a successful Edit save closes the whole Edit surface (closeEditSession)");
 check((backendSrc.split("closeEditSession();").length - 1) >= 3, "both Edit saves and the Edit toggle close through closeEditSession");
