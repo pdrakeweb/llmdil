@@ -1,0 +1,140 @@
+name: Prometheus Gates
+
+# Full LLMdil gate set on Pete's self-hosted runner (Dell Precision 7865,
+# "Prometheus"). Exists so the gates that cannot run on the Linux VM —
+# above all the src-tauri test binary, which cannot link there — run
+# natively on Windows, and so Linux-side local compiles are needed only
+# when absolutely necessary.
+#
+# v1: workflow_dispatch only. No push/PR triggers until the flow is
+# proven; Pete or a chat dispatches runs explicitly.
+# The runner is a single machine: one job, sequential steps.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to check out and gate (branch, tag, or SHA)"
+        required: false
+        default: main
+        type: string
+      runner:
+        description: "Runner: prometheus = self-hosted Dell (default); windows-latest = GitHub-hosted Windows"
+        required: false
+        default: prometheus
+        type: choice
+        options:
+          - prometheus
+          - windows-latest
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prometheus-gates
+  cancel-in-progress: false
+
+jobs:
+  gates:
+    name: Full gate set (Prometheus)
+    runs-on: ${{ inputs.runner == 'windows-latest' && 'windows-latest' || fromJSON('["self-hosted", "windows", "prometheus"]') }}
+    timeout-minutes: 180
+    steps:
+      - name: Check out ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      # No toolchain-install step: the host toolchain is provisioned by
+      # tools/prometheus/Install-BuildToolchain.ps1. Verify it here in
+      # PowerShell — the previous dtolnay step declared shell: bash
+      # internally, which this runner cannot resolve — and fail loudly
+      # if any component (incl. clippy / rustfmt) is missing.
+      - name: Verify Rust toolchain
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustc --version
+          if ($LASTEXITCODE -ne 0) { throw 'rustc --version failed' }
+          cargo --version
+          if ($LASTEXITCODE -ne 0) { throw 'cargo --version failed' }
+          cargo clippy --version
+          if ($LASTEXITCODE -ne 0) { throw 'cargo clippy --version failed' }
+          cargo fmt --version
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt --version failed' }
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Toolchain versions
+        run: |
+          git --version
+          rustc --version
+          cargo --version
+          node --version
+          npm --version
+
+      - name: Rust cache (workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: prometheus-workspace
+          # On this self-hosted runner CARGO_HOME is the machine toolchain;
+          # cache-bin cleanup deletes the host cargo/rustc proxies after every successful job.
+          cache-bin: false
+
+      - name: Rust cache (src-tauri)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: prometheus-srctauri
+          # On this self-hosted runner CARGO_HOME is the machine toolchain;
+          # cache-bin cleanup deletes the host cargo/rustc proxies after every successful job.
+          cache-bin: false
+
+      # UI first: src-tauri's cargo check embeds ../ui/dist, so the UI
+      # build must exist before any src-tauri step (mirrors local gates).
+      - name: UI install
+        run: npm ci
+        working-directory: ui
+
+      - name: UI build
+        run: npm run build
+        working-directory: ui
+
+      - name: UI smoke
+        run: npm run smoke
+        working-directory: ui
+
+      - name: Workspace tests
+        run: cargo test --workspace
+
+      - name: Workspace clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # tauri.conf.json declares the service host and the log
+      # receiver as externalBin sidecars; the src-tauri steps below
+      # (build.rs validates the paths) need the staged binaries,
+      # named with the target-triple suffix Tauri expects.
+      - name: Stage bundled sidecar binaries
+        run: |
+          cargo build -p manager-services --bin llm-service-host
+          cargo build -p manager-logreceiver --bin llmdil-log-receiver
+          Copy-Item target/debug/llm-service-host.exe src-tauri/binaries/llm-service-host-x86_64-pc-windows-msvc.exe
+          Copy-Item target/debug/llmdil-log-receiver.exe src-tauri/binaries/llmdil-log-receiver-x86_64-pc-windows-msvc.exe
+
+      # src-tauri is excluded from the root workspace: run inside it.
+      - name: src-tauri check
+        run: cargo check --all-targets
+        working-directory: src-tauri
+
+      - name: src-tauri clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: src-tauri
+
+      - name: src-tauri tests
+        run: cargo test
+        working-directory: src-tauri
