@@ -116,6 +116,7 @@ macro_rules! tauri_handler {
             admin_api_get_pairing,
             admin_api_create_enrollment,
             admin_api_regenerate_cert,
+            admin_api_apply_firewall_rule,
             admin_api_get_audit
         ]
     };
@@ -708,6 +709,26 @@ async fn admin_api_regenerate_cert(
             }
         }
     }
+    admin_api_get_status(app, state, slot, auth).await
+}
+
+/// Apply the Admin API's firewall rule on demand: create or repair
+/// the expected inbound rule (one elevation prompt when a change is
+/// actually needed; a no-op when the rule already matches). The
+/// settings page offers this button only when the rule is missing
+/// or differs from expected; when the rule is already correct the
+/// button is hidden, so the no-op path never prompts.
+#[tauri::command]
+async fn admin_api_apply_firewall_rule(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    slot: State<'_, ApiServerSlot>,
+    auth: State<'_, AdminAuth>,
+) -> Result<Value, String> {
+    let (_, port) = admin_api_settings(state.inner(), &app).await?;
+    manager_api::firewall::ensure(port)
+        .await
+        .map_err(|e| format!("firewall rule failed: {e}"))?;
     admin_api_get_status(app, state, slot, auth).await
 }
 
