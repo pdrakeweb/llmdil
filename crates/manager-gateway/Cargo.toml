@@ -1,0 +1,13 @@
+[package]
+name = "manager-gateway"
+version = "0.1.57"
+edition = "2021"
+
+[dependencies]
+manager-config = { path = "../manager-config" }
+manager-models = { path = "../manager-models" }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
