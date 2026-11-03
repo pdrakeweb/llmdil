@@ -2395,12 +2395,12 @@ function backendCard(
   if (b.state === "failed" && !detailsOpen) {
     const tail = logTails.get(b.id);
     // An empty tail renders no block at all (principle 13) — the
-    // full log is one menu click away ("View all logs" in the
-    // Other-actions menu). The caption's qualifier rides its
+    // full log is one click away (View all logs beside the
+    // caption). The caption's qualifier rides its
     // info-tip. The stored tail holds 5 lines (the Details
     // block's count); this diagnostic block keeps its last 3.
     const lines = tail && tail.length
-      ? `<div style="margin-top:8px;font-size:11px;color:var(--text3)">Latest output<span class="info-tip" title="stderr preferred — that is where llama-server reports load failures">${icon("info")}</span></div><div class="logstream" style="margin-top:4px">${tail.slice(-3).map(logLineHtml).join("")}</div>`
+      ? `<div style="margin-top:8px;font-size:11px;color:var(--text3);display:flex;align-items:baseline;gap:8px">Latest output<span class="info-tip" title="stderr preferred — that is where llama-server reports load failures">${icon("info")}</span><a href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1" style="margin-left:auto">View all logs</a></div><div class="logstream" style="margin-top:4px">${tail.slice(-3).map(logLineHtml).join("")}</div>`
       : "";
     logsBlock = lines;
   }
@@ -2945,13 +2945,16 @@ function backendCard(
       : "Not applicable"]);
   }
   // Latest log lines: the stored tail for this backend (the same
-  // get_logs records behind the menu's View all logs, with the
+  // get_logs records behind View all logs, with the
   // failed block's stderr preference). The block renders only
   // once a fetch has landed — an unfetched tail omits it
   // (principle 13); a fetched-but-empty tail states the fact.
+  // The caption carries its own View all logs link to the
+  // Logs view filtered to this backend (same href as the
+  // card menu's item), so the full set is one click away.
   const detailTail = logTails.get(b.id);
   const logLinesHtml = detailTail === undefined ? "" : `<div style="margin-top:10px">
-      <div style="font-size:11px;color:var(--text3)">Latest log lines<span class="info-tip" title="The backend's most recent log lines, newest last — the same records the Logs view shows for this backend. The full log is under View all logs in the card's menu.">${icon("info")}</span></div>
+      <div style="font-size:11px;color:var(--text3);display:flex;align-items:baseline;gap:8px">Latest log lines<span class="info-tip" title="The backend's most recent log lines, newest last — the same records the Logs view shows for this backend.">${icon("info")}</span><a href="#/logs?scope=${esc(encodeURIComponent(b.id))}&follow=1" style="margin-left:auto">View all logs</a></div>
       ${detailTail.length ? `<div class="logstream backend-logtail" style="margin-top:4px">${detailTail.map(logLineHtml).join("")}</div>` : `<div style="font-size:12px;color:var(--text2);margin-top:4px">None recorded</div>`}
     </div>`;
   const detailsHtml = detailsOpen ? `<div class="backend-details">
