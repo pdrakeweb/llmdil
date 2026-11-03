@@ -56,6 +56,29 @@ pub fn fingerprint_of_der(der: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Resolve the process crypto provider, installing rustls' own
+/// feature-selected default if nothing installed one yet.
+/// `CryptoProvider::get_default()` alone returns None until the
+/// first `ClientConfig::builder()` call installs the default, so
+/// code that reads the provider directly (this verifier, and the
+/// pinned config below) must go through here instead of
+/// `get_default()` — otherwise behavior depends on which code
+/// ran first in the process (this bit the unit tests: the
+/// supported-schemes test failed on Prometheus when it ran before
+/// any config-building test, while passing locally when it ran
+/// after one). Building a throwaway `ClientConfig::builder()` is
+/// what triggers rustls' own installation; dropping the builder
+/// afterward is harmless.
+fn crypto_provider() -> Arc<CryptoProvider> {
+    if let Some(p) = CryptoProvider::get_default() {
+        return p.clone();
+    }
+    let _ = rustls::ClientConfig::builder();
+    CryptoProvider::get_default()
+        .expect("rustls crypto provider")
+        .clone()
+}
+
 /// rustls server-certificate verifier that trusts exactly one
 /// certificate: the one whose DER SHA-256 matches `expected`.
 #[derive(Debug)]
@@ -82,9 +105,7 @@ impl FingerprintVerifier {
         // for the pinned certificate (TLS 1.2 tries them in
         // sequence; TLS 1.3 tries only the first — accepting a
         // valid one under either rule is never a forgery).
-        let provider = CryptoProvider::get_default().ok_or(
-            TlsError::InvalidCertificate(CertificateError::BadSignature),
-        )?;
+        let provider = crypto_provider();
         let algs = provider
             .signature_verification_algorithms
             .mapping
@@ -149,14 +170,11 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         // The provider's own scheme list: exactly the schemes
-        // verify_signature can check. No provider means no schemes
-        // (fail closed — no handshake can proceed).
-        CryptoProvider::get_default()
-            .map(|p| {
-                p.signature_verification_algorithms
-                    .supported_schemes()
-            })
-            .unwrap_or_default()
+        // verify_signature can check (resolved via
+        // crypto_provider(), never a possibly-uninstalled default).
+        crypto_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -164,7 +182,7 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
 /// nothing else. The default crypto provider (ring, the only one
 /// enabled in this workspace) supplies the TLS stack.
 pub fn pinned_client_config(expected: [u8; 32]) -> rustls::ClientConfig {
-    let provider = CryptoProvider::get_default().expect("crypto provider");
+    let provider = crypto_provider();
     rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .expect("protocol versions")
