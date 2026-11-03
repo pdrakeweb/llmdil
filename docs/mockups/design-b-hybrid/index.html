@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Design B Hybrid mockups — Local LLM Service Manager</title>
+<style>
+:root{
+  --bg:#12151a; --panel:#1b1f26; --border:#2b313b;
+  --text:#e8ebf0; --text2:#a7b0bf; --text3:#6d7686; --accent:#4a9eff;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;background:var(--bg);color:var(--text);padding:32px;font-variant-numeric:tabular-nums}
+.wrap{max-width:1400px;margin:0 auto}
+h1{font-size:20px;font-weight:600;margin-bottom:6px}
+.sub{color:var(--text3);margin-bottom:28px;font-size:13px;max-width:900px;line-height:1.5}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:24px}
+.item{background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.item .cap{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:baseline;gap:10px}
+.item .cap .n{font-family:ui-monospace,Consolas,monospace;color:var(--accent);font-size:12px}
+.item .cap .t{font-weight:600;font-size:14px}
+.item .cap .v{margin-left:auto;font-size:11px;color:var(--text3);border:1px solid var(--border);border-radius:4px;padding:2px 8px;white-space:nowrap}
+.item img{display:block;width:100%;height:auto}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Design B Hybrid — final window set: mockups</h1>
+  <div class="sub">15 windows · 1600×1000 viewport captures · dark theme. Design B selected Oct 8, 2026 as the base — all 8 of its original windows are preserved. Data windows add a per-window View selector (Appliance | Console | Topology) switching presentation of the same data; the Service Map is a new first-class window. From design-b-hybrid.md.</div>
+  <div class="grid">
+    <div class="item"><div class="cap"><span class="n">01</span><span class="t">Setup wizard — auto-run checklist, completion bar, re-run audit</span><span class="v">Appliance</span></div><img src="01-setup-wizard.png" alt="Setup wizard"></div>
+    <div class="item"><div class="cap"><span class="n">02</span><span class="t">Dashboard — health gauge cards, GPU rings, throughput chart</span><span class="v">Appliance</span></div><img src="02-dashboard-appliance.png" alt="Dashboard appliance view"></div>
+    <div class="item"><div class="cap"><span class="n">03</span><span class="t">Dashboard — dense service and GPU tables, event lines</span><span class="v">Console</span></div><img src="03-dashboard-console.png" alt="Dashboard console view"></div>
+    <div class="item"><div class="cap"><span class="n">04</span><span class="t">Dashboard — cluster node map, clients through GPUs</span><span class="v">Topology</span></div><img src="04-dashboard-topology.png" alt="Dashboard topology view"></div>
+    <div class="item"><div class="cap"><span class="n">05</span><span class="t">Service Map — full cluster topology, event timeline</span><span class="v">Topology</span></div><img src="05-service-map.png" alt="Service map"></div>
+    <div class="item"><div class="cap"><span class="n">06</span><span class="t">GPUs — radial gauges, sparkline strips, placement map</span><span class="v">Appliance</span></div><img src="06-gpus-appliance.png" alt="GPUs appliance view"></div>
+    <div class="item"><div class="cap"><span class="n">07</span><span class="t">GPUs — console tables, process attribution, tensor splits</span><span class="v">Console</span></div><img src="07-gpus-console.png" alt="GPUs console view"></div>
+    <div class="item"><div class="cap"><span class="n">08</span><span class="t">Backend detail — stat tiles, TTFT chart, health ticks</span><span class="v">Appliance</span></div><img src="08-backend-appliance.png" alt="Backend detail appliance view"></div>
+    <div class="item"><div class="cap"><span class="n">09</span><span class="t">Backend — request-flow graph for planner :8081</span><span class="v">Topology</span></div><img src="09-backend-graph.png" alt="Backend graph view"></div>
+    <div class="item"><div class="cap"><span class="n">10</span><span class="t">Models — fit bars, per-GPU fit, checksum status</span><span class="v">Appliance</span></div><img src="10-models.png" alt="Models"></div>
+    <div class="item"><div class="cap"><span class="n">11</span><span class="t">Logs — icon rows, level-distribution bar, task drawer</span><span class="v">Appliance</span></div><img src="11-logs-appliance.png" alt="Logs appliance view"></div>
+    <div class="item"><div class="cap"><span class="n">12</span><span class="t">Logs — dense text stream with level-distribution strip</span><span class="v">Console</span></div><img src="12-logs-console.png" alt="Logs console view"></div>
+    <div class="item"><div class="cap"><span class="n">13</span><span class="t">Gateway — rule cards, model groups, latency sparklines</span><span class="v">Appliance</span></div><img src="13-gateway-appliance.png" alt="Gateway appliance view"></div>
+    <div class="item"><div class="cap"><span class="n">14</span><span class="t">Gateway — routing flow: rules to groups to backends</span><span class="v">Topology</span></div><img src="14-gateway-routing-map.png" alt="Gateway routing map"></div>
+    <div class="item"><div class="cap"><span class="n">15</span><span class="t">Settings / MXC — policy tiles, shield chips, learning mode</span><span class="v">Appliance</span></div><img src="15-settings-mxc.png" alt="Settings and MXC policies"></div>
+  </div>
+</div>
+</body>
+</html>
