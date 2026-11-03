@@ -311,23 +311,29 @@ decline = a surfaced warning with a manual path — here, the Settings
 register action itself):
 
 1. Settings → Supervision, Register on a service row: the app writes
-   the current definition, stages the account password in a
-   transient credential (target
-   `local-llm-service-manager/service-account-password`), and runs
+   the current definition and runs
    `llm-service-host register --definition <path>` elevated — one
-   UAC prompt.
-2. The helper (elevated token, same user) reads and deletes the
-   transient credential, creates the service with the account +
-   password (SCM stores the password as an LSA secret; the account
-   receives "Log on as a service"), sets description + failure
-   actions, and sets the service DACL: SYSTEM and Administrators
-   full; **the operator's own SID: query, start, stop** — so
-   day-to-day lifecycle from the app is unelevated, while
-   create/delete/change-config remain admin-only. The helper appends
-   its outcome to `<data_dir>/logs/service-manage.log` (an elevated
-   process's stderr is invisible to the app) and exits non-zero on
-   failure; the app surfaces the exit code and clears the staged
-   credential on every path.
+   UAC prompt. The app never asks for the password: there is no
+   LLMdil password field, and no password crosses the app boundary.
+2. The helper (elevated token, same user) prompts for the account
+   password with the Windows system credential dialog
+   (`CredUIPromptForCredentialsW`: password-only — the definition's
+   account is prefilled and the user-name field is omitted — nothing
+   persisted, dialog always shown) and passes it straight to SCM,
+   which stores it as an LSA secret; the account receives "Log on
+   as a service". The password lives only in the helper between the
+   dialog and the SCM call and is zeroed in memory on every path
+   (dialog buffer, intermediate buffer, and the SCM call buffer).
+   The helper then sets description + failure actions, and sets the
+   service DACL: SYSTEM and Administrators full; **the operator's
+   own SID: query, start, stop** — so day-to-day lifecycle from the
+   app is unelevated, while create/delete/change-config remain
+   admin-only. The helper appends its outcome to
+   `<data_dir>/logs/service-manage.log` (an elevated process's
+   stderr is invisible to the app) and exits non-zero on failure;
+   the app surfaces the exit code. Cancelling the credential dialog
+   is a clean failure ("credential prompt cancelled"), not a
+   registration attempt.
 3. Unregister is the same shape: `llm-service-host unregister
    --name <name>`, elevated.
 

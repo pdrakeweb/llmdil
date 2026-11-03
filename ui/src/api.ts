@@ -2858,12 +2858,12 @@ export async function updateAppConfig(patch: Record<string, unknown>): Promise<C
 }
 
 /** Register one service (backend id or "gateway") via the elevated
- *  helper. The account password is handed over through a transient
- *  credential the helper deletes; it is never persisted by the app. */
-export async function servicesRegister(target: string, password: string): Promise<CallResult<{ ok: boolean; service_name: string; account: string }>> {
+ *  helper. The helper prompts for the account password with the
+ *  Windows system credential dialog; the app never sees it. */
+export async function servicesRegister(target: string): Promise<CallResult<{ ok: boolean; service_name: string; account: string }>> {
   if (!isTauri()) return { data: { ok: false, service_name: "", account: "" }, live: false, error: "services_register is not available in sample mode" };
   try {
-    const data = await invoke<{ ok: boolean; service_name: string; account: string }>("services_register", { target, password });
+    const data = await invoke<{ ok: boolean; service_name: string; account: string }>("services_register", { target });
     return { data, live: true };
   } catch (e) {
     return { data: { ok: false, service_name: "", account: "" }, live: true, error: errOf(e) };

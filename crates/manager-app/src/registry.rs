@@ -335,7 +335,7 @@ macro_rules! for_each_operation {
             // Windows services — desktop-only (SCM elevation is a
             // shell concern in v1).
             (ServicesList, services_list, R, op_services_list, [], None),
-            (ServicesRegister, services_register, D, op_services_register, [target: String, password: Option<String>], None),
+            (ServicesRegister, services_register, D, op_services_register, [target: String], None),
             (ServicesUnregister, services_unregister, D, op_services_unregister, [target: String], None),
             // Log receiver — desktop-only (deployment runs the
             // bundled receiver binary elevated through the shell's

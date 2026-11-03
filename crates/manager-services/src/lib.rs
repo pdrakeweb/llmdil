@@ -32,13 +32,6 @@ pub const DEFINITION_VERSION: u32 = 1;
 /// Service name of the gateway service.
 pub const GATEWAY_SERVICE_NAME: &str = "llm-gateway";
 
-/// Credential target the app uses to hand the service account's
-/// password to one elevated `register` run of `llm-service-host`.
-/// Written by the Settings register action, read and deleted by the
-/// helper; the durable copy of the password is the SCM's LSA secret.
-pub const SERVICE_ACCOUNT_PASSWORD_CRED_TARGET: &str =
-    "local-llm-service-manager/service-account-password";
-
 /// Service name for a backend id (`llm-backend-<id>`).
 pub fn backend_service_name(backend_id: &str) -> String {
     format!("llm-backend-{backend_id}")

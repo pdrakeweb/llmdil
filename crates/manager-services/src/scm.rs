@@ -345,7 +345,7 @@ mod windows_impl {
             let display_w = wide(&def.display_name);
             let image_w = wide(image_path);
             let account_w = def.account.as_deref().map(wide);
-            let password_w = password.map(wide);
+            let mut password_w = password.map(wide);
             let start_type = match def.start_mode {
                 ServiceStartMode::Manual => SERVICE_DEMAND_START,
                 ServiceStartMode::Automatic => SERVICE_AUTO_START,
@@ -373,6 +373,13 @@ mod windows_impl {
                         .unwrap_or(std::ptr::null()),
                 )
             };
+            // SCM has copied the password into its LSA secret by now
+            // (or the call failed); never leave it in this buffer.
+            if let Some(pw) = password_w.as_mut() {
+                for u in pw.iter_mut() {
+                    unsafe { std::ptr::write_volatile(u, 0) };
+                }
+            }
             if handle.is_null() {
                 return Err(scm_error("CreateServiceW"));
             }

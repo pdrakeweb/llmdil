@@ -14,18 +14,15 @@
 //! - `register --definition <path>` / `unregister --name <name>`:
 //!   the management operations that need an administrator token. The
 //!   app invokes them through its existing elevated-helper pattern
-//!   (`runas`). `register` reads the account password from the
-//!   transient credential the app wrote for this one operation and
-//!   deletes that credential before exiting; the durable copy is the
-//!   SCM's LSA secret.
+//!   (`runas`). `register` prompts for the account password with the
+//!   Windows system credential dialog (CredUI) in this elevated
+//!   process and passes it straight to SCM; the password never
+//!   crosses the app boundary, is never written to config or logs,
+//!   and is zeroed in memory once SCM has it. The durable copy is
+//!   the SCM's LSA secret.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-
-/// The transient password-handoff credential target (defined in the
-/// library so the app and this helper share one spelling).
-#[cfg(windows)]
-use manager_services::SERVICE_ACCOUNT_PASSWORD_CRED_TARGET;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -100,22 +97,23 @@ fn cmd_register(args: &[String]) -> u8 {
     #[cfg(windows)]
     {
         use manager_services::ServiceControl;
-        let password = cred_read(SERVICE_ACCOUNT_PASSWORD_CRED_TARGET);
-        // The transient credential is single-use: remove it whether
-        // or not registration succeeds.
-        cred_delete(SERVICE_ACCOUNT_PASSWORD_CRED_TARGET);
-        if password.is_none() {
-            return fail(format!(
-                "account password credential '{SERVICE_ACCOUNT_PASSWORD_CRED_TARGET}' not found; \
-                 enter the account password in Settings before registering"
-            ));
-        }
+        // The password is collected here, in the elevated helper, by
+        // the Windows system credential dialog — never by an LLMdil
+        // field, never staged through a credential, never logged.
+        let password = match prompt_service_account_password(&def) {
+            CredentialPrompt::Ok(password) => password,
+            CredentialPrompt::Cancelled => {
+                return fail("credential prompt cancelled".to_string());
+            }
+            CredentialPrompt::Failed(msg) => return fail(msg),
+        };
         let host_exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => return fail(format!("could not locate llm-service-host.exe: {e}")),
         };
         let image_path = def.image_path(&host_exe, &def_path);
-        match manager_services::scm::platform_control().register(&def, &image_path, password.as_deref()) {
+        // `password` drops (zeroed) when this block ends, on every path.
+        match manager_services::scm::platform_control().register(&def, &image_path, Some(password.as_str())) {
             Ok(()) => {
                 if let Some(dir) = &data_dir {
                     manage_log(dir, &format!("registered {} as {}", def.name, def.account.as_deref().unwrap_or("?")));
@@ -230,11 +228,163 @@ fn decode_credential_blob(blob: &[u8]) -> Option<String> {
         .map(|s| s.trim_end_matches('\0').to_string())
 }
 
+/// A password held as UTF-8 bytes that are overwritten (volatile, so
+/// the writes survive optimization) when the value drops. The
+/// password for service registration lives only in this buffer
+/// between the CredUI dialog and the SCM call.
 #[cfg(windows)]
-fn cred_delete(target: &str) {
-    use windows_sys::Win32::Security::Credentials::{CredDeleteW, CRED_TYPE_GENERIC};
-    let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe { CredDeleteW(wide.as_ptr(), CRED_TYPE_GENERIC, 0) };
+struct SecretString {
+    bytes: Vec<u8>,
+}
+
+#[cfg(windows)]
+impl SecretString {
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes).unwrap_or("")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        for b in self.bytes.iter_mut() {
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+    }
+}
+
+#[cfg(windows)]
+enum CredentialPrompt {
+    Ok(SecretString),
+    Cancelled,
+    Failed(String),
+}
+
+/// NUL-terminated UTF-16 for a Win32 `W` API.
+#[cfg(windows)]
+fn wide_null(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Read a NUL-terminated UTF-16 buffer as a String (up to the first
+/// NUL; empty when the buffer holds nothing).
+#[cfg(windows)]
+fn utf16_to_string(buf: &[u16]) -> String {
+    let end = buf.iter().position(|&u| u == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..end])
+}
+
+/// Prompt for the service account's password with the Windows system
+/// credential dialog (`CredUIPromptForCredentialsW`, credui.dll) in
+/// this elevated process. The dialog is password-only: the account
+/// from the definition is prefilled, and
+/// `CREDUI_FLAGS_EXCLUDE_CERTIFICATES` omits the user-name field for
+/// a prefilled name, so the user types nothing but the password and
+/// cannot register under a different account by editing the name.
+/// `DO_NOT_PERSIST` means CredUI stores nothing (no save checkbox);
+/// `ALWAYS_SHOW_UI` forces the dialog even if a credential for the
+/// target exists. The returned password is moved into a
+/// [`SecretString`] and the raw dialog buffer is zeroed immediately;
+/// the caller passes it only to SCM and drops it on every path.
+#[cfg(windows)]
+fn prompt_service_account_password(
+    def: &manager_services::ServiceDefinition,
+) -> CredentialPrompt {
+    use windows_sys::Win32::Foundation::{ERROR_CANCELLED, NO_ERROR};
+    use windows_sys::Win32::Security::Credentials::{
+        CredUIPromptForCredentialsW, CREDUI_FLAGS_ALWAYS_SHOW_UI, CREDUI_FLAGS_DO_NOT_PERSIST,
+        CREDUI_FLAGS_EXCLUDE_CERTIFICATES, CREDUI_FLAGS_GENERIC_CREDENTIALS, CREDUI_INFOW,
+        CREDUI_MAX_USERNAME_LENGTH,
+    };
+
+    // wincred.h values; windows-sys 0.61 does not export the
+    // password-length constant, so it is spelled out here.
+    const CREDUI_MAX_PASSWORD_LENGTH: usize = 256;
+
+    let account = def.account.clone().unwrap_or_default();
+    let caption = wide_null("LLMdil service registration");
+    let message = wide_null(&format!(
+        "Enter the Windows password for {account} to register the {} service. \
+         LLMdil does not keep this password; Windows stores it as the service's logon credential.",
+        def.name
+    ));
+    let target = wide_null(&def.name);
+    let mut info: CREDUI_INFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<CREDUI_INFOW>() as u32;
+    // hwndParent stays NULL (no parent window in this helper) and
+    // hbmBanner stays NULL: the plain system dialog.
+    info.pszMessageText = message.as_ptr();
+    info.pszCaptionText = caption.as_ptr();
+
+    let mut username_buf = vec![0u16; CREDUI_MAX_USERNAME_LENGTH as usize + 1];
+    for (i, u) in account.encode_utf16().enumerate() {
+        if i >= username_buf.len() - 1 {
+            break;
+        }
+        username_buf[i] = u;
+    }
+    let mut password_buf = vec![0u16; CREDUI_MAX_PASSWORD_LENGTH + 1];
+    let mut save: windows_sys::Win32::Foundation::BOOL = 0;
+    // Win32 argument order: username buffer first, password second.
+    let rc = unsafe {
+        CredUIPromptForCredentialsW(
+            &info,
+            target.as_ptr(),
+            std::ptr::null(),
+            0,
+            username_buf.as_mut_ptr(),
+            username_buf.len() as u32,
+            password_buf.as_mut_ptr(),
+            password_buf.len() as u32,
+            &mut save,
+            CREDUI_FLAGS_GENERIC_CREDENTIALS
+                | CREDUI_FLAGS_ALWAYS_SHOW_UI
+                | CREDUI_FLAGS_DO_NOT_PERSIST
+                | CREDUI_FLAGS_EXCLUDE_CERTIFICATES,
+        )
+    };
+    if rc == ERROR_CANCELLED {
+        return CredentialPrompt::Cancelled;
+    }
+    if rc != NO_ERROR {
+        return CredentialPrompt::Failed(format!(
+            "credential prompt failed (CredUI error {rc})"
+        ));
+    }
+    let username = utf16_to_string(&username_buf);
+    let mut password_units: Vec<u16> = {
+        let end = password_buf
+            .iter()
+            .position(|&u| u == 0)
+            .unwrap_or(password_buf.len());
+        password_buf[..end].to_vec()
+    };
+    // Zero the raw dialog buffer before doing anything else with it.
+    for u in password_buf.iter_mut() {
+        unsafe { std::ptr::write_volatile(u, 0) };
+    }
+    if username.to_lowercase() != account.to_lowercase() {
+        return CredentialPrompt::Failed(format!(
+            "credential prompt returned account '{username}', expected '{account}'"
+        ));
+    }
+    let Ok(password) = String::from_utf16(&password_units) else {
+        return CredentialPrompt::Failed(
+            "credential prompt returned a password that is not valid UTF-16".to_string(),
+        );
+    };
+    // The String now owns the only copy; zero the intermediate units.
+    for u in password_units.iter_mut() {
+        unsafe { std::ptr::write_volatile(u, 0) };
+    }
+    if password.is_empty() {
+        return CredentialPrompt::Failed(
+            "no password was entered in the credential prompt".to_string(),
+        );
+    }
+    CredentialPrompt::Ok(SecretString {
+        bytes: password.into_bytes(),
+    })
 }
 
 #[cfg(windows)]

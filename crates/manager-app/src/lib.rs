@@ -16016,14 +16016,15 @@ pub async fn op_services_list(
 /// Register one service (`target`: a backend id, or "gateway").
 /// Builds the current definition, then runs the elevated helper
 /// (`llm-service-host register`) through the app's existing runas
-/// pattern; the account password reaches the helper through a
-/// transient credential the helper deletes (and this command
-/// overwrites afterwards either way).
+/// pattern. The helper collects the account password itself with
+/// the Windows system credential dialog (CredUI) and passes it
+/// straight to SCM — the password never crosses this command's
+/// boundary, is never typed into an LLMdil field, and is never
+/// written to config or logs.
 pub async fn op_services_register(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
     target: String,
-    password: Option<String>,
 ) -> ApiResult {
     let host = require_service_host()?;
     let cfg = state.config.read().await.clone();
@@ -16055,20 +16056,6 @@ pub async fn op_services_register(
     let service_name = def.name.clone();
     let def_path = manager_services::write_definition(&state.data_dir, &def)
         .map_err(|e| ApiError::Services(e.to_string()))?;
-    let password = password.unwrap_or_default();
-    if !password.is_empty() {
-        <RealSystemOps as manager_wizard::SystemOps>::credential_write(
-            &RealSystemOps::default(),
-            manager_services::SERVICE_ACCOUNT_PASSWORD_CRED_TARGET,
-            &password,
-        )
-        .await
-        .map_err(|e| {
-            ApiError::Services(format!(
-                "could not stage the account password: {e}"
-            ))
-        })?;
-    }
     let cmd = manager_wizard::PlannedCommand::new(vec![
         host.display().to_string(),
         "register".to_string(),
@@ -16076,21 +16063,11 @@ pub async fn op_services_register(
         def_path.display().to_string(),
     ]);
     let outcome =
-        <RealSystemOps as manager_wizard::SystemOps>::run_elevated(&RealSystemOps::default(), &cmd).await;
-    if !password.is_empty() {
-        // The helper deletes the credential on any run; if the
-        // elevation was declined the helper never ran, so clear the
-        // staged value here (an empty write reads back as absent).
-        let _ = <RealSystemOps as manager_wizard::SystemOps>::credential_write(
-            &RealSystemOps::default(),
-            manager_services::SERVICE_ACCOUNT_PASSWORD_CRED_TARGET,
-            "",
-        )
-        .await;
-    }
+        <RealSystemOps as manager_wizard::SystemOps>::run_elevated(&RealSystemOps::default(), &cmd)
+            .await;
     let out = outcome.map_err(|e| {
         ApiError::Services(format!(
-            "elevated registration could not run (was the prompt declined?): {e}"
+            "elevated registration could not run (was a prompt declined?): {e}"
         ))
     })?;
     if out.exit_code != 0 {

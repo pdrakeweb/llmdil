@@ -8323,18 +8323,14 @@ function supervisionInner(svcR: { data: ServicesInfo; error?: string; live: bool
       <span style="display:flex;align-items:center;gap:10px"><span>${esc(state)}</span>${btn}</span></div>`;
   }).join("");
   const anyUnregistered = info.services.some((s) => !s.registered);
-  const pwdRow = anyUnregistered
-    ? `<div style="display:flex;align-items:center;gap:10px;margin-top:10px;font-size:12px">
-        <span class="k">Account password</span>
-        <input type="password" id="svcPwd" autocomplete="off" style="flex:1" placeholder="Windows password for ${esc(info.account ?? "the service account")}">
-      </div>
-      <div style="font-size:11px;color:var(--text3);margin-top:4px">Registration runs elevated (one UAC prompt per service). Windows stores the password as the service's logon credential; the app does not keep it.</div>`
+  const regNote = anyUnregistered
+    ? `<div style="font-size:11px;color:var(--text3);margin-top:10px">Registration runs elevated (one UAC prompt per service); Windows then asks for the account password in its own credential dialog. Windows stores the password as the service's logon credential; the app does not keep it.</div>`
     : "";
   return `${settingsRows(rows)}
     <div class="card-actions">${["process", "service"].map((m) =>
       `<button class="btn${mode === m ? " primary" : ""}" data-sup-mode="${m}">${m === "process" ? "Process" : "Service"}</button>`).join("")}</div>
     <div style="margin-top:10px">${svcRows}</div>
-    ${pwdRow}`;
+    ${regNote}`;
 }
 
 /** The Log receiver block on the Supervision tab: deployment state
@@ -9158,14 +9154,9 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     const regBtn = t.closest("[data-svc-register]") as HTMLButtonElement | null;
     if (regBtn) {
       const target = regBtn.getAttribute("data-svc-register") ?? "";
-      const pwd = (root.querySelector("#svcPwd") as HTMLInputElement | null)?.value ?? "";
-      if (!pwd) {
-        setMsg("Enter the account password before registering.", true);
-        return;
-      }
       regBtn.disabled = true;
-      setMsg(`Registering ${target} — approve the elevation prompt…`);
-      const r = await servicesRegister(target, pwd);
+      setMsg(`Registering ${target} — approve the elevation prompt, then enter the account password in the Windows credential dialog…`);
+      const r = await servicesRegister(target);
       if (disposed) return;
       if (r.error) {
         setMsg(`Registration of ${target} failed: ${r.error}`, true);
