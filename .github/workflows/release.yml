@@ -1,0 +1,141 @@
+name: Release
+
+# Release autobuild: pushing a v* tag builds the Windows NSIS installer and
+# creates the GitHub Release with the bundle attached. tauri-action handles
+# release creation + asset upload when it runs on a tag push.
+#
+# NOTE: no updater artifacts in v1 — tauri-plugin-updater is not wired up,
+# so no updater JSON is produced or expected (see spec §12).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install UI dependencies
+        run: npm ci
+        working-directory: ui
+
+      - name: Build UI
+        run: npm run build
+        working-directory: ui
+
+      # The installer bundles the service host and the log receiver
+      # as Tauri externalBin sidecars (tauri.conf.json); stage the
+      # release builds under src-tauri/binaries with the
+      # target-triple suffix Tauri expects before tauri-action runs.
+      - name: Stage bundled sidecar binaries
+        run: |
+          cargo build --release -p manager-services --bin llm-service-host
+          cargo build --release -p manager-logreceiver --bin llmdil-log-receiver
+          Copy-Item target/release/llm-service-host.exe src-tauri/binaries/llm-service-host-x86_64-pc-windows-msvc.exe
+          Copy-Item target/release/llmdil-log-receiver.exe src-tauri/binaries/llmdil-log-receiver-x86_64-pc-windows-msvc.exe
+        shell: pwsh
+
+      - name: Build installer and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: src-tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: "LLMdil ${{ github.ref_name }}"
+          releaseDraft: false
+          prerelease: false
+
+      # The log receiver's deploy checklist ships as a release asset
+      # (the receiver itself deploys from inside the app — Settings →
+      # Supervision → Log receiver — and needs no loose binaries).
+      - name: Upload deploy checklist to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.ref_name }} --repo pdrakeweb/llmdil --clobber `
+            tools/prometheus/log-receiver-checklist.md
+
+  # Install-test: download the published installer onto a fresh Windows
+  # runner, silent-install it, verify the payload, launch the app briefly,
+  # then silent-uninstall. Catches installer/config regressions that the
+  # build alone cannot.
+  test-install:
+    needs: release-windows
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Download installer from release
+        run: gh release download ${{ github.ref_name }} --repo pdrakeweb/llmdil --pattern "*-setup.exe" --dir installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Silent install
+        timeout-minutes: 10
+        run: |
+          $exe = Get-ChildItem installer\*-setup.exe | Select-Object -First 1
+          # Clear Mark-of-the-Web so SmartScreen doesn't block the unsigned installer
+          Unblock-File -Path $exe.FullName
+          Write-Host "Installing $($exe.FullName)"
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList "/S" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer exited with code $($p.ExitCode)" }
+
+      - name: Verify installation
+        run: |
+          $dir = "$env:LOCALAPPDATA\LLMdil"
+          if (-not (Test-Path $dir)) {
+            Write-Host "Expected dir missing; LOCALAPPDATA contains:"
+            Get-ChildItem $env:LOCALAPPDATA | Select-Object Name
+            throw "install dir not found: $dir"
+          }
+          $appExe = Get-ChildItem "$dir\*.exe" -Recurse | Where-Object { $_.Name -notlike "*ninstall*" -and $_.Name -notin @("llm-service-host.exe", "llmdil-log-receiver.exe") } | Select-Object -First 1
+          if (-not $appExe) { throw "no application exe found under $dir" }
+          Write-Host "Installed app exe: $($appExe.FullName)"
+          # The bundled sidecars deploy/option surfaces rely on:
+          # the service host shim and the log receiver.
+          foreach ($sidecar in @("llm-service-host.exe", "llmdil-log-receiver.exe")) {
+            if (-not (Test-Path "$dir\$sidecar")) { throw "bundled sidecar missing from install: $sidecar" }
+            Write-Host "Bundled sidecar present: $sidecar"
+          }
+          echo "APP_EXE=$($appExe.FullName)" >> $env:GITHUB_ENV
+
+      - name: Launch smoke test
+        run: |
+          $p = Start-Process -FilePath "$env:APP_EXE" -PassThru
+          Start-Sleep -Seconds 20
+          if ($p.HasExited) { throw "app exited within 20s with code $($p.ExitCode)" }
+          Write-Host "App stayed alive for 20s (pid $($p.Id))"
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+
+      - name: Silent uninstall
+        run: |
+          $un = Get-ChildItem "$env:LOCALAPPDATA\LLMdil\uninstall.exe" -Recurse | Select-Object -First 1
+          if (-not $un) { throw "uninstaller not found" }
+          $p = Start-Process -FilePath $un.FullName -ArgumentList "/S" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "uninstaller exited with code $($p.ExitCode)" }
+          if (Test-Path "$env:LOCALAPPDATA\LLMdil") { throw "install dir still present after uninstall" }
+          Write-Host "Uninstall clean"
