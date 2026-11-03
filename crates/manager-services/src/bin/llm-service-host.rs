@@ -324,7 +324,7 @@ fn prompt_service_account_password(
         username_buf[i] = u;
     }
     let mut password_buf = vec![0u16; CREDUI_MAX_PASSWORD_LENGTH + 1];
-    let mut save: windows_sys::Win32::Foundation::BOOL = 0;
+    let mut save: windows_sys::core::BOOL = 0;
     // Win32 argument order: username buffer first, password second.
     let rc = unsafe {
         CredUIPromptForCredentialsW(
