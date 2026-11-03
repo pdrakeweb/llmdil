@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Design A — Graphic Mockups</title>
+<style>
+  :root{
+    --bg:#1e1e1e; --panel:#252526; --border:#3e3e42; --text:#cccccc;
+    --muted:#858585; --faint:#6a6a6a; --accent:#3794ff;
+    --sans:system-ui,"Segoe UI",-apple-system,sans-serif;
+    --mono:ui-monospace,"Cascadia Mono","DejaVu Sans Mono",Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;
+       font-variant-numeric:tabular-nums;padding:36px 40px 60px}
+  h1{font-size:20px;font-weight:600}
+  .sub{color:var(--muted);font-size:13px;margin-top:6px;max-width:860px;line-height:1.6}
+  .sub .mono{font-family:var(--mono);font-size:12px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-top:30px;max-width:1560px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:6px;overflow:hidden}
+  .card img{display:block;width:100%;height:auto;border-bottom:1px solid var(--border)}
+  .card .meta{padding:12px 16px 14px}
+  .card .n{font-weight:600;font-size:14px}
+  .card .n .num{color:var(--faint);font-family:var(--mono);font-weight:400;margin-right:8px}
+  .card .d{color:var(--muted);font-size:12.5px;margin-top:4px;line-height:1.55}
+  .foot{margin-top:34px;color:var(--faint);font-size:12px;font-family:var(--mono)}
+  @media (max-width:1100px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<h1>Design A — Dense Developer Console · Graphic Mockups</h1>
+<p class="sub">Visual mockups for the eight windows in <span class="mono">design-a.md</span>, rendered at 1600×1000.
+Dark developer aesthetic, 13px dense type, tabular numerals, status vocabulary ok / degraded / failed / starting / stopped.
+Data reflects the actual stack: Dell Precision 7865, RTX A4000 16GB + 2× Tesla P100 16GB,
+Qwen3.8-27B / Qwen3-Coder-30B / Qwen2.5-Coder-7B / Qwen3-8B, LiteLLM gateway, Windows ML backend, MXC policies.</p>
+
+<div class="grid">
+  <div class="card">
+    <img src="01-stack-provision.png" alt="Stack Provision">
+    <div class="meta"><div class="n"><span class="num">01</span>Stack Provision</div>
+    <div class="d">First-run setup wizard: ordered dependency chain (prerequisites → binaries → models → integrations → health check), per-step status with detected-vs-required versions, live run log, GPU fit strip, exportable run report.</div></div>
+  </div>
+  <div class="card">
+    <img src="02-service-console.png" alt="Service Console">
+    <div class="meta"><div class="n"><span class="num">02</span>Service Console</div>
+    <div class="d">Main dashboard: flat services table (status, endpoint, model, GPU, VRAM, uptime, tok/s sparklines, inline actions), GPU strip with per-process VRAM attribution, task drawer, slide-in context panel with Summary / Config / Logs / Test tabs.</div></div>
+  </div>
+  <div class="card">
+    <img src="03-gpu-detail.png" alt="GPU Detail">
+    <div class="meta"><div class="n"><span class="num">03</span>GPU Detail</div>
+    <div class="d">Per-GPU hardware view: 60s metric charts, readout block (driver, CUDA, clocks, PCIe, fan N/A stated explicitly), process attribution with unmanaged-process kill, tensor-split placement map, compare overlay.</div></div>
+  </div>
+  <div class="card">
+    <img src="04-model-library.png" alt="Model Library">
+    <div class="meta"><div class="n"><span class="num">04</span>Model Library</div>
+    <div class="d">GGUF management: storage summary, per-model rows (quant, size, role, placement, fit-check, loaded status), expandable detail (source, checksum, layer map, used-by), download queue with pause/resume and fit-check gate.</div></div>
+  </div>
+  <div class="card">
+    <img src="05-logs.png" alt="Logs">
+    <div class="meta"><div class="n"><span class="num">05</span>Logs</div>
+    <div class="d">First-class log surface: process filter rail with line counts, level filters, merged stream with per-process tags, errors-only toggle, ring-buffer paging, export and clear-buffer controls.</div></div>
+  </div>
+  <div class="card">
+    <img src="06-settings.png" alt="Settings">
+    <div class="meta"><div class="n"><span class="num">06</span>Settings</div>
+    <div class="d">Defaults tab: global-default → per-backend override chain with validated fields, changed-from-default and restart-required markers, inline validation errors that block save, read-only override summary.</div></div>
+  </div>
+  <div class="card">
+    <img src="07-mxc-policies.png" alt="MXC Policies">
+    <div class="meta"><div class="n"><span class="num">07</span>MXC Policies</div>
+    <div class="d">Sandbox policy editor: policy-set list, structured rule rows (tool pattern, scope, decision, conditions), simulate-before-deploy with verdicts, recent-decisions audit trail, dry-run toggle, versioned deploys.</div></div>
+  </div>
+  <div class="card">
+    <img src="08-history.png" alt="History">
+    <div class="meta"><div class="n"><span class="num">08</span>History</div>
+    <div class="d">Auditable past: drift alerts for components off pinned versions, timeline of provisioning runs, updates, repairs and config changes with actor, duration, per-run logs and rollback.</div></div>
+  </div>
+</div>
+
+<p class="foot">sources: graphics/src/design-a/*.html · rendered 2026-10-08 · viewport 1600×1000</p>
+
+</body>
+</html>

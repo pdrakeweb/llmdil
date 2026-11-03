@@ -1,0 +1,344 @@
+/* Built-in sample data used when the UI is NOT running under Tauri
+   (plain browser). Mirrors the values in the approved mockups so the
+   layout can be evaluated without a backend. */
+
+import { walk } from "./charts";
+import type { GpuHistoryData, OptimizeExperiment, OptimizePlanItem, OptimizeState, OptimizeValidation } from "./api";
+import type { BackendInfo, DashboardModel, GpuInfo, WizardStepState } from "./types";
+
+export function mockBackends(): BackendInfo[] {
+  return [
+    { id: "gateway", name: "gateway", port: 4000, status: "ok", health: 100, model: "", quant: "",
+      throughput_toks: 0, vram_held_gb: 0, requests_1h: 1284, errors_1h: 0, spark: walk(40, 32, 8, 7) },
+    { id: "planner", name: "planner", port: 8081, status: "ok", health: 92, model: "Qwen3.8-27B", quant: "Q4_K_M",
+      throughput_toks: 8.4, vram_held_gb: 10.2, requests_1h: 0, errors_1h: 0, spark: walk(40, 8.4, 2.5, 11) },
+    { id: "coder-30b", name: "coder-30b", port: 8082, status: "ok", health: 96, model: "Qwen3-Coder-30B", quant: "Q4_K_M",
+      throughput_toks: 22.6, vram_held_gb: 18.6, requests_1h: 0, errors_1h: 0, spark: walk(40, 22.6, 5, 21) },
+    { id: "coder-7b", name: "coder-7b", port: 8083, status: "ok", health: 88, model: "Qwen2.5-Coder-7B", quant: "Q5_K_M",
+      throughput_toks: 41.2, vram_held_gb: 5.8, requests_1h: 0, errors_1h: 0, spark: walk(40, 41.2, 7, 31) },
+    { id: "tool-runner", name: "tool-runner", port: 8084, status: "starting", health: 60, model: "Qwen3-8B", quant: "Q8_0",
+      throughput_toks: 0, vram_held_gb: 1.1, requests_1h: 0, errors_1h: 0, spark: walk(40, 1, 1, 41) },
+  ];
+}
+
+export function mockGpus(): GpuInfo[] {
+  return [
+    { id: "a4000", name: "RTX A4000", pci: "01:00.0", driver: "581.42", status: "ok",
+      util_pct: 62, vram_used_gb: 9.8, vram_total_gb: 16, temp_c: 71, temp_peak_c: 74,
+      power_w: 118, power_limit_w: 140,
+      util_spark: walk(60, 62, 10, 101), temp_spark: walk(60, 71, 3, 102), power_spark: walk(60, 118, 12, 103),
+      processes: [
+        { process: "llama-server", pid: 4212, vram_mib: 6144, backend: "planner" },
+        { process: "llama-server", pid: 4388, vram_mib: 3898, backend: "coder-30b" },
+      ],
+      models: [
+        { model: "qwen3.8-27b", layers: "16/28 layers" },
+        { model: "qwen3-coder-30b", layers: "20/44 layers" },
+      ] },
+    { id: "p100-0", name: "Tesla P100-0", pci: "41:00.0", driver: "581.42", status: "ok",
+      util_pct: 45, vram_used_gb: 7.2, vram_total_gb: 16, temp_c: 68, temp_peak_c: 70,
+      power_w: 210, power_limit_w: 250,
+      util_spark: walk(60, 45, 12, 111), temp_spark: walk(60, 68, 3, 112), power_spark: walk(60, 210, 15, 113),
+      processes: [
+        { process: "llama-server", pid: 4212, vram_mib: 4210, backend: "planner" },
+        { process: "llama-server", pid: 4388, vram_mib: 3166, backend: "coder-30b" },
+      ],
+      models: [
+        { model: "qwen3.8-27b", layers: "12/28 layers" },
+        { model: "qwen3-coder-30b", layers: "16/44 layers" },
+      ] },
+    { id: "p100-1", name: "Tesla P100-1", pci: "81:00.0", driver: "581.42", status: "ok",
+      util_pct: 12, vram_used_gb: 1.1, vram_total_gb: 16, temp_c: 54, temp_peak_c: 61,
+      power_w: 68, power_limit_w: 250,
+      util_spark: walk(60, 12, 8, 121), temp_spark: walk(60, 54, 3, 122), power_spark: walk(60, 68, 10, 123),
+      processes: [
+        { process: "llama-server", pid: 4550, vram_mib: 1126, backend: "tool-runner" },
+      ],
+      models: [
+        { model: "qwen3-coder-30b", layers: "8/44 layers" },
+        { model: "qwen3-8b", layers: "32/32 layers" },
+      ] },
+  ];
+}
+
+/** Sample-mode GPU history: two GPUs over the requested range,
+ *  with an app-off gap in the middle, no throughput before the gap
+ *  (no backend running), and the P100's power unmeasured throughout
+ *  (driver [N/A]) — the shapes the history charts must render
+ *  honestly: gaps as gaps, absent values as absent. */
+export function mockGpuHistory(range: string): GpuHistoryData {
+  const span = range === "1h" ? 3_600_000 : range === "7d" ? 7 * 24 * 3_600_000 : 24 * 3_600_000;
+  const step = Math.max(15_000, Math.round(span / 240));
+  const now = Date.now();
+  const start = now - span;
+  const mk = (seed: number, tempBase: number, utilBase: number, tpsBase: number, withPower: boolean) => {
+    const temps = walk(240, tempBase, 3, seed);
+    const utils = walk(240, utilBase, 14, seed + 1);
+    const tps = walk(240, tpsBase, 3, seed + 2);
+    const pws = walk(240, 120, 14, seed + 3);
+    const points = [];
+    for (let i = 0; i < 240; i++) {
+      const ts = start + i * step;
+      // App-off gap: no points at all for the middle fifth.
+      if (i >= 96 && i < 144) continue;
+      points.push({
+        ts_ms: ts,
+        temp_c: temps[i],
+        util_pct: Math.max(0, Math.min(100, utils[i])),
+        // No backend running before the gap: throughput unmeasured.
+        throughput_toks: i < 96 ? null : Math.max(0, tps[i]),
+        power_w: withPower ? pws[i] : null,
+      });
+    }
+    return points;
+  };
+  return {
+    range,
+    gpus: [
+      { index: 0, name: "RTX A4000", interval_ms: step, points: mk(201, 66, 55, 21, true) },
+      { index: 1, name: "Tesla P100-PCIE-16GB", interval_ms: step, points: mk(211, 58, 30, 12, false) },
+    ],
+  };
+}
+
+export function mockDashboard(): DashboardModel {
+  const all = mockBackends();
+  const [gateway, ...backends] = all;
+  return {
+    gateway,
+    backends,
+    gpus: mockGpus(),
+    placement: [
+      { model: "qwen3.8-27b", backendId: "planner", backendStatus: "ok", segments: [{ gpu: "a4000", pct: 60, frac: 0.6 }, { gpu: "p100-0", pct: 40, frac: 0.4 }] },
+      { model: "qwen3-coder-30b", backendId: "coder-30b", backendStatus: "ok", segments: [{ gpu: "a4000", pct: 45, frac: 0.45 }, { gpu: "p100-0", pct: 35, frac: 0.35 }, { gpu: "p100-1", pct: 20, frac: 0.2 }] },
+      { model: "qwen2.5-coder-7b", backendId: "coder-7b", backendStatus: "ok", segments: [{ gpu: "p100-0", pct: 100, frac: 1 }] },
+      { model: "qwen3-8b", backendId: "tool-runner", backendStatus: "starting", segments: [{ gpu: "p100-1", pct: 100, frac: 1 }] },
+    ],
+    gatewayUp: true,
+    gatewayStrategy: "least-busy",
+    stale: false,
+    updatedAt: Date.now(),
+  };
+}
+
+export function mockWizardSteps(): WizardStepState[] {
+  return [
+    { id: "detect", name: "Detect hardware & drivers", detail: "A4000 + 2× P100 · NVIDIA 581.42", state: "done", duration: "18s" },
+    { id: "llamacpp", name: "Install llama.cpp CUDA build", detail: "b7721 · CUDA 12.8 · D:\\llm\\llama.cpp\\", state: "done", duration: "2m 04s" },
+    { id: "tensorsplit", name: "Configure tensor-split", detail: "27B — 60/40 · 30B — 45/35/20", state: "done", duration: "6s" },
+    { id: "models", name: "Download models + verify", detail: "4 GGUF · 46.5 GB · sha256 each", state: "done", duration: "11m 32s", note: "1 retry" },
+    { id: "gateway", name: "Start LiteLLM gateway", detail: ":4000 · 4 model groups", state: "done", duration: "9s" },
+    { id: "vscode", name: "Install VS Code extensions", detail: "Continue.dev · Cline", state: "running", note: "installing…" },
+    { id: "mcp", name: "Configure MCP servers", detail: "GitHub · Google Drive", state: "queued" },
+    { id: "winml", name: "Register Windows ML backend", detail: "WinMLServer :8090 · secondary", state: "queued" },
+    { id: "mxc", name: "Apply MXC policies", detail: "Learning mode · 11 rules", state: "queued" },
+    { id: "smoke", name: "Smoke-test inference", detail: "planner → coder → gateway", state: "queued" },
+  ];
+}
+
+export const GPU_COLORS: Record<string, string> = {
+  a4000: "#4a9eff",
+  "p100-0": "#a371f7",
+  "p100-1": "#39c5cf",
+};
+
+/** Sample Optimize page state for browser mode: the consult card
+ *  figures and a stored sample plan exercising the row states
+ *  (valid / warning / invalid, a denied delete, an advice row). */
+export function mockOptimizeState(): OptimizeState {
+  const item = (
+    id: number, kind: string, target: string | null,
+    change: Record<string, unknown>, extra: Partial<OptimizePlanItem> = {},
+  ): OptimizePlanItem => ({
+    id, fingerprint: `sample-${id}`, kind, target, change,
+    advice_text: null, rationale: "", expected_effect: "", confidence: "medium",
+    decision: "undecided", previously_denied: false, apply_outcome: null, apply_error: null,
+    ...extra,
+  });
+  const validation = (status: "valid" | "warning" | "invalid", reason: string | null = null,
+    gpu: [number, number] | null = null, sys: [number, number] | null = null, note: string | null = null): OptimizeValidation => ({
+    status, reason, expected: { gpu_ram_mib: gpu, sys_ram_mib: sys, note },
+  });
+  return {
+    purpose: "",
+    last_directive: "Explore better MoE capable models for the planner",
+    purpose_is_seed: true,
+    purpose_seed: "Local inference served to the LAN through one gateway. Groups: planner (Qwen3.8-27B Planner); coder (Qwen3-Coder-Next-80B).",
+    groups: [
+      { name: "planner", purpose: "" },
+      { name: "coder", purpose: "" },
+      { name: "coder-fast", purpose: "" },
+      { name: "tool-runner", purpose: "" },
+    ],
+    backends: [
+      { id: "planner", purpose: "", running: true, enabled: true, model_id: "qwen3-27b-planner", short_name: "Qwen3.8-27B Planner", measured: { prompt_per_second: 812, predicted_per_second: 21.8, ttft_ms: 240, age_secs: 3600 }, estimated: { prompt_per_second: 798, predicted_per_second: 21.1, ttft_ms: 255, age_secs: 7200 }, current_fingerprint: "sample-fingerprint-planner", current_inputs: { n_ctx: 32768, n_batch: 512, offload: "none", tensor_split: [1, 0], split_mode: "layer", raw_flags: "", gpus: ["0:NVIDIA RTX A4000"] } },
+      { id: "coder", purpose: "", running: true, enabled: true, model_id: "qwen3-coder-30b", short_name: "Qwen3-Coder-Next-80B", measured: null, estimated: { prompt_per_second: 640, predicted_per_second: 18.4, ttft_ms: 410, age_secs: 1800 }, current_fingerprint: "sample-fingerprint-coder", current_inputs: { n_ctx: 32768, n_batch: 512, offload: "all_experts", tensor_split: [0, 1], split_mode: "layer", raw_flags: "-ot exps=CPU", gpus: ["1:Tesla P100-PCIE-16GB"] } },
+      { id: "coder-fast", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null, estimated: null, current_fingerprint: null, current_inputs: null },
+      { id: "tool-runner", purpose: "", running: false, enabled: false, model_id: null, short_name: null, measured: null, estimated: null, current_fingerprint: null, current_inputs: null },
+    ],
+    measurements: [],
+    context_summary: {
+      gpus: 2, backends: 4, groups: 4, models: 3,
+      measured_blocks: ["backend running state and per-process VRAM", "gateway traffic"],
+      traffic_window_label: "1 h",
+    },
+    context: { sample: true },
+    default_backend: "planner",
+    better_backend: null,
+    candidates: {
+      directive: "Explore better MoE capable models for the planner",
+      retrieved_at: new Date().toISOString(),
+      funnel: {
+        queries_run: 3, pool_repos: 214, repos_fetched: 200, repos_failed: 2,
+        dropped_unpopular: 61, dropped_stale: 38, dropped_family: 12, dropped_fit: 50,
+        quants_considered: 1980, quants_collapsed: 1710, kept: 30,
+        partial: false, partial_reason: null, stopped_early: true,
+      },
+      items: [
+        { repo_id: "Qwen/Qwen3-30B-A3B-GGUF", file: "Qwen3-30B-A3B-Q4_K_M.gguf", architecture: "qwen3moe", params_b: 30.5, ctx_max: 40960, size_bytes: 18600000000, downloads: 812345, fit: "fits_with_split", retrieved_at: new Date().toISOString() },
+        { repo_id: "unsloth/Qwen3-Coder-Next-GGUF", file: "Qwen3-Coder-Next-UD-Q4_K_M.gguf", architecture: "qwen3moe", params_b: 80, ctx_max: 262144, size_bytes: 49301055488, downloads: 456789, fit: "unchecked", retrieved_at: new Date().toISOString() },
+      ],
+    },
+    eval_baseline: {
+      backend_id: "planner",
+      config_fingerprint: "sample-fingerprint",
+      suite_version: 1,
+      run_at: new Date(Date.now() - 3600_000).toISOString(),
+      overall: { passed: 11, total: 12 },
+      per_category: {
+        instruction_following: { passed: 3, total: 3 },
+        factual_recall: { passed: 2, total: 2 },
+        arithmetic_reasoning: { passed: 2, total: 2 },
+        code_adjacent: { passed: 1, total: 2 },
+        summarization: { passed: 1, total: 1 },
+        tool_call_formatting: { passed: 1, total: 1 },
+        long_context_retrieval: { passed: 1, total: 1 },
+      },
+      stale: false,
+      caveat: "Screening suite — a small fixed set of checkable tasks. It screens out regressions; it is not a benchmark and does not rank models generally.",
+    },
+    consulting: false,
+    consult_started_unix_ms: null,
+    consult_error: null,
+    consult_error_unix_ms: null,
+    measuring: false,
+    job: null,
+    job_error: null,
+    job_error_unix_ms: null,
+    running_ops: {},
+    tuning: { running: null, latest: null },
+    plan: {
+      summary: "Sample plan — generated locally; no backend was consulted.",
+      directive: "Explore better MoE capable models for the planner",
+      consulted_backend: "planner",
+      created_at: new Date().toISOString(),
+      config_hash: "sample",
+      dropped_invalid: 1,
+      truncated: 0,
+      dropped_fragments: ["{\"kind\":\"backend.set_offload\",\"target\":\"coder\",\"change\":{\"offload_layers\":\"most\"}}"],
+      raw_response: "{\"summary\": \"Sample plan\", \"items\": [ ... ]}",
+      context: { sample: true },
+      config_stale: false,
+      sample: true,
+      items: [
+        item(1, "backend.set_context", "planner", { n_ctx: 65536 }, {
+          rationale: "Planner requests regularly approach the current 32K context; doubling it doubles the KV cache, which the A4000 has room for.",
+          confidence: "high",
+        }),
+        item(2, "backend.set_offload", "coder", { offload_layers: 48 }, {
+          rationale: "Moving all MoE layers to system RAM frees the P100 entirely; system RAM is plentiful on this machine.",
+          confidence: "medium",
+        }),
+        item(3, "group.set_strategy", "coder", { strategy: "least-busy" }, {
+          rationale: "Least-busy spreads requests across group members instead of shuffling.",
+          confidence: "medium",
+        }),
+        item(4, "model.add", "sample-model", { source_url: "sample/sample-model-Q4_K_M.gguf", quant: "Q4_K_M", params_b: 8 }, {
+          rationale: "Registers a model for later evaluation; nothing is downloaded.",
+          confidence: "low",
+        }),
+        item(5, "backend.delete", "coder-fast", {}, {
+          rationale: "The coder-fast backend has never run; removing it simplifies the layout.",
+          decision: "denied",
+          confidence: "low",
+        }),
+        item(6, "advice", null, {}, {
+          advice_text: "Consider enabling the tool-runner backend before routing tool calls through the coder group; the seat exists in the layout but is disabled.",
+        }),
+      ],
+      validations: [
+        validation("valid", null, [9216, 17408], null),
+        validation("warning", "fits now, but not alongside every configured backend when all are running", [44032, 2048], [40960, 45056]),
+        validation("valid"),
+        validation("warning", "registers the model only — the source URL and any hash are model-supplied and unverified; confirm the pinned hash in the Models view before downloading"),
+        validation("valid", null, null, null, "Backend will be stopped and removed"),
+        validation("valid"),
+      ],
+      experiments: [
+        {
+          id: 1, fingerprint: "sample-exp-1", candidate_model_id: "Qwen/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf",
+          flags: { n_ctx: 32768, tensor_split: [0.5, 0.5] },
+          serves: "Explore better MoE capable models for the planner",
+          hypothesis: "A 30B MoE with 3B active parameters should generate faster than the dense 27B at similar quality.",
+          predicted: { predicted_per_second: 35, fit: "alongside running backends" },
+          requires_stopping: [], run_eval: true, decision: "accepted", previously_denied: false,
+          estimate: {
+            short: { prompt_per_second: 655, predicted_per_second: 35.8, ttft_ms: 205, runs: [] },
+            long: { prompt_per_second: 890, predicted_per_second: 33.5, ttft_ms: 860, runs: [] },
+            batch_id: "sample-estimate-batch", temp_backend_id: "opt-exp-1",
+            preflight: "fits alongside the backends staying running: needs 18432 MiB GPU RAM, 24576 MiB free after their residency",
+            detail: "Estimate only — abbreviated benchmark (one run per prompt, reduced generation budgets). Confirm with a full experiment run before acting on it.",
+            estimated_at: new Date(Date.now() - 900_000).toISOString(),
+          },
+          result: {
+            experiment_id: 1, candidate_model_id: "Qwen/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf", batch_id: "sample-batch",
+            status: "completed",
+            detail: "Measured on opt-exp-1: generation 34.6 tok/s (short), 32.9 tok/s (long). Screen: 11/12 overall. Delta vs baseline: +0 passed overall; screen at/above baseline: true.",
+            measured: {
+              short: { prompt_per_second: 640, predicted_per_second: 34.6, ttft_ms: 190, runs: [] },
+              long: { prompt_per_second: 905, predicted_per_second: 32.9, ttft_ms: 840, runs: [] },
+            },
+            eval: {
+              backend_id: "opt-exp-1", suite_version: 1, run_at: new Date().toISOString(), results: [],
+              scores: {
+                overall: { passed: 11, total: 12 },
+                per_category: {
+                  instruction_following: { passed: 3, total: 3 },
+                  factual_recall: { passed: 2, total: 2 },
+                  arithmetic_reasoning: { passed: 2, total: 2 },
+                  code_adjacent: { passed: 1, total: 2 },
+                  summarization: { passed: 1, total: 1 },
+                  tool_call_formatting: { passed: 1, total: 1 },
+                  long_context_retrieval: { passed: 1, total: 1 },
+                },
+              },
+            },
+            comparison: {
+              overall: { baseline: { passed: 11, total: 12 }, candidate: { passed: 11, total: 12 }, delta_passed: 0, delta_fraction: 0 },
+              per_category: {},
+              screen_at_or_above_baseline: true,
+              any_category_zero_that_baseline_passes: false,
+              zero_categories_that_baseline_passes: [],
+            },
+            preflight: "fits alongside the backends staying running: needs 18432 MiB GPU RAM, 24576 MiB free after their residency",
+            started_at: new Date(Date.now() - 600_000).toISOString(),
+            finished_at: new Date(Date.now() - 300_000).toISOString(),
+          },
+        } as OptimizeExperiment,
+        {
+          id: 2, fingerprint: "sample-exp-2", candidate_model_id: "qwen3-coder-30b",
+          flags: { n_ctx: 65536, offload_layers: 24 },
+          serves: "Explore better MoE capable models for the planner",
+          hypothesis: "The catalog coder model with half its MoE layers offloaded may beat the planner's rates.",
+          predicted: { predicted_per_second: 28, fit: "only after stopping coder" },
+          requires_stopping: ["coder"], run_eval: false, decision: "denied", previously_denied: false,
+          result: null,
+          estimate: null,
+        } as OptimizeExperiment,
+      ],
+      experiment_validations: [validation("valid"), validation("valid")],
+      experiments_dropped_invalid: 1,
+      experiments_truncated: 0,
+    },
+  };
+}

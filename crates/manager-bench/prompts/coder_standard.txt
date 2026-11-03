@@ -1,0 +1,503 @@
+The file below is `session_cache.rs`, a complete module from a Rust
+workspace that manages inference-session state. Read it in full; the
+task after the file refers to its types, names, and test style.
+
+//! Session state for a local inference server: a bounded LRU cache of
+//! per-session prompt prefixes, plus a ring buffer of recent request
+//! latencies used by the status page.
+//!
+//! The cache is deliberately simple: entries live in a `Vec` ordered
+//! from most-recently-used (front) to least-recently-used (back), and a
+//! `HashMap` from session id to position keeps lookups cheap at the
+//! session counts this server sees (hundreds, not millions). Moves are
+//! O(n) in the number of live sessions, which is accepted and measured;
+//! if session counts ever grow past a few thousand, this module is the
+//! place to swap in a linked-list arena without changing the API.
+
+use std::collections::HashMap;
+use std::hash::Hash;
+
+/// A cached prompt prefix for one session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionEntry {
+    /// Opaque session identifier assigned by the gateway.
+    pub session_id: String,
+    /// The token ids of the cached prefix.
+    pub prefix_tokens: Vec<u32>,
+    /// Wall-clock milliseconds when the entry was stored.
+    pub stored_ms: i64,
+    /// Wall-clock milliseconds of the most recent hit.
+    pub last_hit_ms: i64,
+    /// How many requests have reused this prefix.
+    pub hit_count: u64,
+}
+
+/// Bounded LRU cache keyed by session id.
+#[derive(Debug)]
+pub struct SessionCache {
+    capacity: usize,
+    entries: Vec<SessionEntry>,
+    index: HashMap<String, usize>,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl SessionCache {
+    /// Create a cache holding at most `capacity` entries. A capacity of
+    /// zero is legal and stores nothing: every `put` is dropped and
+    /// every `get` misses.
+    pub fn new(capacity: usize) -> Self {
+        SessionCache {
+            capacity,
+            entries: Vec::new(),
+            index: HashMap::new(),
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        }
+    }
+
+    /// The maximum number of entries this cache can hold.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// The number of entries currently stored.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the cache currently stores nothing.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Total cache hits since construction.
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Total cache misses since construction.
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// Total entries evicted to make room since construction.
+    pub fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Hit ratio in `0.0..=1.0`, or `None` before the first lookup.
+    pub fn hit_ratio(&self) -> Option<f64> {
+        let lookups = self.hits + self.misses;
+        if lookups == 0 {
+            None
+        } else {
+            Some(self.hits as f64 / lookups as f64)
+        }
+    }
+
+    /// Look up `session_id`. On a hit the entry moves to the
+    /// most-recently-used position, its `hit_count` and `last_hit_ms`
+    /// are updated, and a clone of it is returned. On a miss the miss
+    /// counter is incremented and `None` is returned.
+    pub fn get(&mut self, session_id: &str, now_ms: i64) -> Option<SessionEntry> {
+        let pos = match self.index.get(session_id) {
+            Some(&pos) => pos,
+            None => {
+                self.misses += 1;
+                return None;
+            }
+        };
+        self.hits += 1;
+        let mut entry = self.entries.remove(pos);
+        entry.hit_count += 1;
+        entry.last_hit_ms = now_ms;
+        self.entries.insert(0, entry);
+        self.rebuild_index();
+        self.entries.first().cloned()
+    }
+
+    /// Look up `session_id` without changing recency or counters.
+    pub fn peek(&self, session_id: &str) -> Option<&SessionEntry> {
+        self.index
+            .get(session_id)
+            .and_then(|&pos| self.entries.get(pos))
+    }
+
+    /// Whether `session_id` is currently cached.
+    pub fn contains(&self, session_id: &str) -> bool {
+        self.index.contains_key(session_id)
+    }
+
+    /// Insert or replace the entry for `entry.session_id`. A replaced
+    /// entry keeps its original `hit_count`. The entry lands at the
+    /// most-recently-used position; if the cache then exceeds its
+    /// capacity, least-recently-used entries are evicted until it fits.
+    /// Returns the evicted session ids, oldest first.
+    pub fn put(&mut self, mut entry: SessionEntry) -> Vec<String> {
+        if self.capacity == 0 {
+            return Vec::new();
+        }
+        if let Some(&pos) = self.index.get(&entry.session_id) {
+            let old = self.entries.remove(pos);
+            entry.hit_count = old.hit_count;
+        }
+        self.entries.insert(0, entry);
+        let mut evicted = Vec::new();
+        while self.entries.len() > self.capacity {
+            if let Some(tail) = self.entries.pop() {
+                self.evictions += 1;
+                evicted.push(tail.session_id);
+            }
+        }
+        self.rebuild_index();
+        evicted
+    }
+
+    /// Remove the entry for `session_id`, returning it if present.
+    pub fn remove(&mut self, session_id: &str) -> Option<SessionEntry> {
+        let pos = self.index.get(session_id).copied()?;
+        let entry = self.entries.remove(pos);
+        self.rebuild_index();
+        Some(entry)
+    }
+
+    /// Drop every entry. Counters are kept: they describe the cache's
+    /// lifetime, not its current contents.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.index.clear();
+    }
+
+    /// Total prefix tokens currently held across all entries.
+    pub fn total_prefix_tokens(&self) -> usize {
+        self.entries.iter().map(|e| e.prefix_tokens.len()).sum()
+    }
+
+    /// Session ids ordered most-recently-used first.
+    pub fn session_ids_by_recency(&self) -> Vec<&str> {
+        self.entries.iter().map(|e| e.session_id.as_str()).collect()
+    }
+
+    /// Drop entries whose last hit (or store time, if never hit) is
+    /// older than `max_idle_ms` relative to `now_ms`. Returns the
+    /// dropped session ids in recency order.
+    pub fn expire_idle(&mut self, now_ms: i64, max_idle_ms: i64) -> Vec<String> {
+        let mut dropped = Vec::new();
+        self.entries.retain(|e| {
+            let last_active = if e.hit_count > 0 {
+                e.last_hit_ms
+            } else {
+                e.stored_ms
+            };
+            let idle = now_ms.saturating_sub(last_active) > max_idle_ms;
+            if idle {
+                dropped.push(e.session_id.clone());
+            }
+            !idle
+        });
+        if !dropped.is_empty() {
+            self.rebuild_index();
+        }
+        dropped
+    }
+
+    fn rebuild_index(&mut self) {
+        self.index.clear();
+        for (pos, entry) in self.entries.iter().enumerate() {
+            self.index.insert(entry.session_id.clone(), pos);
+        }
+    }
+}
+
+/// Fixed-size ring buffer of request-latency samples (milliseconds).
+/// When the buffer is full, each new sample overwrites the oldest one.
+#[derive(Debug, Clone)]
+pub struct LatencyRing {
+    samples: Vec<f64>,
+    head: usize,
+    count: usize,
+}
+
+impl LatencyRing {
+    /// Create a ring holding at most `capacity` samples. Panics if
+    /// `capacity` is zero: a zero-sample ring can answer no question
+    /// the status page asks, so it is a programming error.
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "LatencyRing capacity must be positive");
+        LatencyRing {
+            samples: vec![0.0; capacity],
+            head: 0,
+            count: 0,
+        }
+    }
+
+    /// The maximum number of samples the ring can hold.
+    pub fn capacity(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// The number of samples currently held.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether the ring holds no samples.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Whether the ring has overwritten at least one old sample.
+    pub fn is_full(&self) -> bool {
+        self.count == self.samples.len()
+    }
+
+    /// Record one latency sample.
+    pub fn push(&mut self, ms: f64) {
+        self.samples[self.head] = ms;
+        self.head = (self.head + 1) % self.samples.len();
+        if self.count < self.samples.len() {
+            self.count += 1;
+        }
+    }
+
+    /// All held samples, oldest first.
+    pub fn samples_oldest_first(&self) -> Vec<f64> {
+        let cap = self.samples.len();
+        let start = if self.count < cap {
+            0
+        } else {
+            self.head
+        };
+        (0..self.count)
+            .map(|i| self.samples[(start + i) % cap])
+            .collect()
+    }
+
+    /// The most recent sample, if any.
+    pub fn latest(&self) -> Option<f64> {
+        if self.count == 0 {
+            None
+        } else {
+            let cap = self.samples.len();
+            Some(self.samples[(self.head + cap - 1) % cap])
+        }
+    }
+
+    /// Arithmetic mean of the held samples, if any.
+    pub fn mean(&self) -> Option<f64> {
+        if self.count == 0 {
+            None
+        } else {
+            Some(self.samples_oldest_first().iter().sum::<f64>() / self.count as f64)
+        }
+    }
+
+    /// Smallest held sample, if any.
+    pub fn min(&self) -> Option<f64> {
+        self.samples_oldest_first()
+            .into_iter()
+            .reduce(f64::min)
+    }
+
+    /// Largest held sample, if any.
+    pub fn max(&self) -> Option<f64> {
+        self.samples_oldest_first()
+            .into_iter()
+            .reduce(f64::max)
+    }
+
+    /// Approximate percentile by the nearest-rank method over the held
+    /// samples: `percentile(50.0)` is the median, `percentile(95.0)`
+    /// the p95 the status page quotes. `p` is clamped to `0.0..=100.0`.
+    /// Returns `None` when the ring is empty.
+    pub fn percentile(&self, p: f64) -> Option<f64> {
+        if self.count == 0 {
+            return None;
+        }
+        let mut sorted = self.samples_oldest_first();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p = p.clamp(0.0, 100.0);
+        let rank = (p / 100.0 * sorted.len() as f64).ceil() as usize;
+        let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+        Some(sorted[idx])
+    }
+
+    /// Fraction of held samples at or under `budget_ms`, in
+    /// `0.0..=1.0` — the share of requests meeting the latency budget.
+    /// Returns `None` when the ring is empty.
+    pub fn within_budget_fraction(&self, budget_ms: f64) -> Option<f64> {
+        if self.count == 0 {
+            None
+        } else {
+            let inside = self
+                .samples_oldest_first()
+                .iter()
+                .filter(|&&s| s <= budget_ms)
+                .count();
+            Some(inside as f64 / self.count as f64)
+        }
+    }
+}
+
+/// Generic helper kept from an earlier iteration of this module: the
+/// sum of a hash map's values, used by the status aggregation below.
+pub fn total_sessions_by_backend<K: Eq + Hash>(map: &HashMap<K, usize>) -> usize {
+    map.values().sum()
+}
+
+/// One line of the status page's session summary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusSummary {
+    pub live_sessions: usize,
+    pub total_prefix_tokens: usize,
+    pub hit_ratio: Option<f64>,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+}
+
+/// Build the status summary from the cache and the latency ring.
+pub fn summarize(cache: &SessionCache, ring: &LatencyRing) -> StatusSummary {
+    StatusSummary {
+        live_sessions: cache.len(),
+        total_prefix_tokens: cache.total_prefix_tokens(),
+        hit_ratio: cache.hit_ratio(),
+        p50_ms: ring.percentile(50.0),
+        p95_ms: ring.percentile(95.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, tokens: &[u32], stored_ms: i64) -> SessionEntry {
+        SessionEntry {
+            session_id: id.to_string(),
+            prefix_tokens: tokens.to_vec(),
+            stored_ms,
+            last_hit_ms: stored_ms,
+            hit_count: 0,
+        }
+    }
+
+    #[test]
+    fn get_miss_counts_and_returns_none() {
+        let mut cache = SessionCache::new(2);
+        assert_eq!(cache.get("absent", 100), None);
+        assert_eq!(cache.misses(), 1);
+        assert_eq!(cache.hit_ratio(), Some(0.0));
+    }
+
+    #[test]
+    fn put_then_get_hits_and_counts() {
+        let mut cache = SessionCache::new(2);
+        cache.put(entry("a", &[1, 2, 3], 10));
+        let got = cache.get("a", 25).expect("a was just stored");
+        assert_eq!(got.prefix_tokens, vec![1, 2, 3]);
+        assert_eq!(got.hit_count, 1);
+        assert_eq!(got.last_hit_ms, 25);
+        assert_eq!(cache.hit_ratio(), Some(1.0));
+    }
+
+    #[test]
+    fn least_recently_used_entry_is_evicted_first() {
+        let mut cache = SessionCache::new(2);
+        cache.put(entry("a", &[1], 1));
+        cache.put(entry("b", &[2], 2));
+        cache.get("a", 3);
+        let evicted = cache.put(entry("c", &[3], 4));
+        assert_eq!(evicted, vec!["b".to_string()]);
+        assert!(cache.contains("a"));
+        assert!(cache.contains("c"));
+        assert_eq!(cache.evictions(), 1);
+    }
+
+    #[test]
+    fn replacing_an_entry_keeps_its_hit_count() {
+        let mut cache = SessionCache::new(2);
+        cache.put(entry("a", &[1], 1));
+        cache.get("a", 2);
+        cache.get("a", 3);
+        cache.put(entry("a", &[9, 9], 4));
+        assert_eq!(cache.peek("a").map(|e| e.hit_count), Some(2));
+        assert_eq!(cache.peek("a").map(|e| e.prefix_tokens.len()), Some(2));
+    }
+
+    #[test]
+    fn zero_capacity_cache_stores_nothing() {
+        let mut cache = SessionCache::new(0);
+        assert!(cache.put(entry("a", &[1], 1)).is_empty());
+        assert_eq!(cache.get("a", 2), None);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn ring_overwrites_oldest_samples_when_full() {
+        let mut ring = LatencyRing::new(3);
+        for ms in [10.0, 20.0, 30.0, 40.0] {
+            ring.push(ms);
+        }
+        assert_eq!(ring.samples_oldest_first(), vec![20.0, 30.0, 40.0]);
+        assert_eq!(ring.latest(), Some(40.0));
+        assert_eq!(ring.mean(), Some(30.0));
+    }
+
+    #[test]
+    fn ring_percentiles_use_nearest_rank() {
+        let mut ring = LatencyRing::new(4);
+        for ms in [40.0, 10.0, 30.0, 20.0] {
+            ring.push(ms);
+        }
+        assert_eq!(ring.percentile(50.0), Some(20.0));
+        assert_eq!(ring.percentile(95.0), Some(40.0));
+        assert_eq!(ring.within_budget_fraction(25.0), Some(0.5));
+    }
+
+    #[test]
+    fn summarize_reports_cache_and_ring_together() {
+        let mut cache = SessionCache::new(4);
+        cache.put(entry("a", &[1, 2], 1));
+        let mut ring = LatencyRing::new(2);
+        ring.push(12.0);
+        let summary = summarize(&cache, &ring);
+        assert_eq!(summary.live_sessions, 1);
+        assert_eq!(summary.total_prefix_tokens, 2);
+        assert_eq!(summary.p95_ms, Some(12.0));
+    }
+}
+
+----------------------------------------------------------------
+Task
+----------------------------------------------------------------
+
+The file above is `session_cache.rs` from a Rust workspace. Extend
+it, working in the file's own style and reusing its types and naming:
+
+1. Add a public method `SessionCache::evict_to_token_budget` that
+   drops least-recently-used entries until `total_prefix_tokens`
+   is at or below a budget passed as a parameter, and returns the
+   evicted session ids in the order they were evicted. It must not
+   evict the most-recently-used entry even when that entry alone
+   exceeds the budget, and it must keep the cache's counters and
+   index consistent, following the same patterns the existing
+   methods use.
+
+2. Add a public function `budget_report` that takes a
+   `&SessionCache` and a `&LatencyRing` and returns a new struct
+   `BudgetReport` (define it next to `StatusSummary`, with the same
+   derive set) carrying: the summary `summarize` already produces,
+   the fraction of latency samples within a 250 ms budget, and the
+   number of prefix tokens that `evict_to_token_budget` would have
+   to free to reach a 100,000-token budget — computed without
+   mutating the cache.
+
+Output the new method, the new struct and function, and the unit
+tests for them, written in the file's existing test style and
+reusing the `entry` helper: cover eviction order, the
+most-recently-used entry surviving an impossible budget, an
+already-within-budget cache evicting nothing, and `budget_report`
+on an empty cache and an empty ring. Then give a one-paragraph
+explanation of where each piece belongs in the file and why.
