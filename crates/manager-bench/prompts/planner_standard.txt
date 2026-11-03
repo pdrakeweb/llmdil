@@ -1,0 +1,85 @@
+Workshop migration plan — constrained scheduling problem
+
+A two-person workshop is moving its fabrication work from a rented
+unit (Unit A) to a larger owned building (Unit B) over a three-week
+window. The landlord requires Unit A to be fully empty by the end of
+day 21. Unit B cannot accept equipment until its electrical work is
+signed off. Produce a day-by-day plan that satisfies every constraint
+below, and answer the questions at the end.
+
+People and availability
+- Mara (electrician, workshop lead): works days 1–21 except Sundays
+  (days 7, 14, 21). Only Mara may do electrical work or sign off a
+  machine's reconnection.
+- Devon (machinist): works days 1–21 except days 10–12 (booked
+  elsewhere). Only Devon may move the CNC mill or recalibrate it.
+- Sam (general help): works any day, but can only do tasks marked
+  "anyone", and only one task at a time.
+- No person does more than one task per day. A task that needs two
+  people occupies both of them for its whole duration.
+
+Equipment and tasks (duration in whole days; dependencies must finish
+the day before a dependent task starts)
+
+  #  Task                                      Dur.  Who       Depends on
+  1  Pack hand tools and benches               2     anyone    —
+  2  Disconnect CNC mill                        1     Devon     —
+  3  Move CNC mill to Unit B                    1     Devon+Sam 2
+  4  Disconnect lathe                           1     anyone    —
+  5  Move lathe to Unit B                       1     Sam       4
+  6  Unit B: install 3-phase feed               3     Mara      —
+  7  Unit B: electrical inspection              1     Mara      6
+  8  Unit B: place and level CNC mill           1     Devon     3, 7
+  9  Reconnect and test CNC mill                2     Mara      8
+ 10  Recalibrate CNC mill                       1     Devon     9
+ 11  Unit B: place and level lathe              1     anyone    5, 7
+ 12  Reconnect and test lathe                   1     Mara      11
+ 13  Move dust collector                        1     Sam       —
+ 14  Install dust ducting in Unit B             2     anyone    13, 7
+ 15  Move workbenches and cabinets              2     Sam       1
+ 16  Repaint Unit B floor (needs empty floor)   2     anyone    7
+ 17  Final clean of Unit A                      1     anyone    3, 5, 13, 15
+ 18  Landlord walkthrough of Unit A             1     Mara      17
+
+Hard constraints
+- Floor painting (task 16) must finish before any equipment is placed
+  in Unit B (tasks 8 and 11), because placed equipment cannot be
+  moved again once levelled. This overrides the dependency column
+  where they disagree.
+- The CNC mill and lathe may not be moved on the same day (one truck).
+- Task 7 (inspection) can only happen on a weekday, and the inspector
+  needs Mara present for the whole day.
+- At most one "Move" task (3, 5, 13, 15) per day — one truck.
+- Production commitment: the lathe must be reconnected and tested
+  (task 12 complete) by the end of day 15, because a customer job
+  starts on the lathe on day 16.
+
+Soft goals, in priority order
+1. Finish everything as early as possible.
+2. Subject to that, minimize Mara's idle days in the final week,
+   because she is also covering support calls then.
+3. Subject to that, prefer moving the dust collector (task 13) before
+   the workbenches (task 15), so ducting measurements can be taken
+   while Unit B is still mostly empty.
+
+Questions
+1. Give the day-by-day schedule: for each day 1–21, list who does
+   what, or "idle". Every task above must appear exactly once, with
+   its full duration on consecutive days by the same person (or pair).
+2. State the day the whole move completes (task 18 done) and show
+   that no earlier completion is possible: identify the critical
+   chain of tasks and availabilities that forces that date.
+3. Verify the production commitment: on which day does task 12
+   finish, and how much slack does it have?
+4. If Devon loses one further day — day 5 — which tasks move, and
+   does the completion date change? If it does not, explain which
+   slack absorbed the loss; if it does, give the new date and the
+   new critical chain.
+5. List every constraint you used that is stated in this prompt
+   outside the dependency column, so a checker can confirm none were
+   silently dropped.
+
+Format the schedule as a table with one row per day and columns
+Day | Mara | Devon | Sam. Keep the reasoning for questions 2–4
+tight: name tasks by number and day, do not restate the whole
+schedule.
