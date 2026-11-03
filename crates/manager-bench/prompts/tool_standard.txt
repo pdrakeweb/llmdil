@@ -1,0 +1,74 @@
+Tool-use exercise — emit an ordered sequence of function calls
+
+You have the following tools. Emit calls in the JSON form shown,
+one per block, in the order the work must happen. Do not invent
+arguments: every value you use must come from the scenario data
+below or from an earlier call's stated result.
+
+Tools
+
+1. search_flights(origin, destination, date, passengers)
+   Returns flight options with ids, times, and prices.
+2. get_seat_map(flight_id)
+   Returns the seat map for one flight; seats have ids and a
+   window/aisle/middle kind.
+3. hold_seats(flight_id, seat_ids, hold_minutes)
+   Holds specific seats; returns a hold code.
+4. book_hotel(city, check_in, check_out, rooms, max_nightly_rate)
+   Returns the cheapest matching hotel with an id, or none.
+5. reserve_hotel(hotel_id, guest_name, check_in, check_out)
+   Reserves the hotel; returns a confirmation code.
+6. rent_car(location, pickup_date, return_date, car_class)
+   Returns a rental option id and total price.
+7. add_calendar_event(title, start_iso, end_iso, location, notes)
+   Adds an event; returns an event id.
+8. send_message(to, subject, body)
+   Sends a message; returns a message id.
+
+Scenario
+
+Julia is flying from Cleveland (CLE) to Chicago (ORD) on
+2026-11-14 for a two-day conference and returning on 2026-11-16.
+She is traveling alone. Conference sessions run 09:00–17:00 on
+2026-11-15 and 09:00–13:00 on 2026-11-16, at the McCormick Place
+convention center. She wants:
+
+- The earliest outbound flight on 2026-11-14 that lands before
+  14:00, so she can attend a 16:00 pre-conference workshop.
+- A window seat on the outbound flight.
+- A hotel in Chicago for 2026-11-14 to 2026-11-16 (2 nights),
+  1 room, nightly rate at most $180.
+- A compact rental car picked up at ORD on arrival and returned
+  at ORD before the return flight.
+- The return flight is already booked separately — do NOT search
+  for or book a return flight.
+- A calendar event for the outbound flight and one for the
+  16:00 workshop on 2026-11-14.
+- A message to julia@example.com summarizing the flight, the seat,
+  the hotel confirmation, and the car total.
+
+Stated results you may rely on as the calls return
+
+- search_flights(CLE, ORD, 2026-11-14, 1) returns three options:
+  F101 departs 06:05, lands 06:40, $129; F205 departs 09:20, lands
+  10:05, $154; F312 departs 13:45, lands 14:30, $118. (All times
+  local; Chicago is one hour behind Cleveland.)
+- get_seat_map for the chosen flight shows window seats 12A and
+  14F free; 12A is marked extra-legroom at no extra charge.
+- hold_seats with a 60-minute hold returns hold code H-8842.
+- book_hotel returns hotel HTL-77, "Lakeshore Suites", $162/night,
+  or nothing if the rate cap is set below $162.
+- reserve_hotel returns confirmation code CONF-5521.
+- rent_car for a compact at ORD returns option CAR-9, total $148.
+
+Task
+
+Emit the full ordered call sequence that accomplishes everything
+Julia asked for, choosing arguments from the scenario and the
+stated results. After the calls, add a short section titled
+"Checks" listing: which flight you chose and why the other two
+fail her stated conditions; why the hotel call's rate cap is the
+value it is; and anything you deliberately did NOT do because she
+did not ask for it. If any step cannot be completed from the
+given data, say which one and stop that branch rather than
+inventing values.

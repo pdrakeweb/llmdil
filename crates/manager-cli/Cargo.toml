@@ -1,0 +1,28 @@
+[package]
+name = "manager-cli"
+version = "0.1.56"
+edition = "2021"
+
+# CLI/TUI client for the LLMdil Admin API. Serves as the Stage 2 test
+# client (pairing + read verification from a second LAN machine) and
+# as an ongoing operator tool. Talks only to the API surface audited
+# in Stage 1 (124 live routes); it changes no server behavior.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+# NOTE: package rustls-webpki exposes library name `webpki`; import
+# it as `webpki::...` in code, not `rustls_webpki::...`.
+rustls-webpki = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
