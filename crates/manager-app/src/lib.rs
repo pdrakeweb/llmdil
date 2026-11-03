@@ -429,6 +429,12 @@ pub struct AppState {
     /// Dashboard's request/error figures (trailing hour) and live
     /// throughput rate (recent window).
     gateway_stats: Mutex<gateway_stats::GatewayStatsStore>,
+    /// Per-backend llama-server `/slots` snapshots polled directly
+    /// from each backend's own port by the background poller (see
+    /// [`gateway_stats::DirectSlotsStore`]); `list_backends`
+    /// prefers this live rate over the gateway rate, and falls
+    /// back when a backend's `/slots` is unavailable.
+    direct_slots: Mutex<gateway_stats::DirectSlotsStore>,
     /// WinML secondary-backend registry (stateful single-model rule).
     winml: OnceCell<Mutex<manager_winml::WinMlRegistry>>,
     /// Shared cancellation slot for the Optimize consultation (the
@@ -660,6 +666,7 @@ impl AppState {
             mcp_modes: Mutex::new(HashMap::new()),
             routing_log: Mutex::new(manager_gateway::RoutingLog::default()),
             gateway_stats: Mutex::new(gateway_stats::GatewayStatsStore::default()),
+            direct_slots: Mutex::new(gateway_stats::DirectSlotsStore::default()),
             winml: OnceCell::new(),
             optimize_abort: Mutex::new(None),
             optimize_consult_started_unix_ms: Mutex::new(None),
@@ -3004,20 +3011,17 @@ pub async fn op_list_backends(
             .iter()
             .map(|b| (b.id.clone(), b.port))
             .collect();
-        let group_pairs: Vec<(String, Vec<String>)> = cfg
-            .gateway
-            .groups
-            .iter()
-            .map(|g| (g.name.clone(), g.members.clone()))
-            .collect();
         // Backends an Optimize operation is currently driving
         // DIRECTLY (consultation / measure / experiment traffic
         // goes to the backend's own port, never through the
         // gateway): the gateway sampler cannot see that
         // generation, so its rate for the backend is not a
         // measurement of the backend's current throughput —
-        // omit the field while the operation holds the backend
-        // instead of reporting the gateway's idle figure.
+        // omit the gateway fallback while the operation holds
+        // the backend instead of reporting the gateway's idle
+        // figure. The direct /slots rate below is NOT omitted:
+        // it polls the backend itself, so it sees direct-drive
+        // generation exactly as it sees gateway traffic.
         let direct_ops: std::collections::HashSet<String> = state
             .optimize_running_ops
             .lock()
@@ -3025,10 +3029,21 @@ pub async fn op_list_backends(
             .keys()
             .cloned()
             .collect();
+        // Direct /slots live rates first: the direct store is
+        // read (and its lock released) before the gateway store
+        // is locked, so this block never holds both locks in
+        // the opposite order anywhere else.
+        let direct_rates: std::collections::HashMap<String, Option<f64>> = {
+            let direct = state.direct_slots.lock().await;
+            pairs
+                .iter()
+                .map(|(id, _)| (id.clone(), direct.live_rate(id)))
+                .collect()
+        };
         let mut stats = state.gateway_stats.lock().await;
         let windows = stats.window_stats(&pairs);
         let series = stats.series_stats(&pairs);
-        let live = stats.live_throughput(&pairs, &group_pairs);
+        let live = stats.live_throughput(&pairs);
         for row in backends.iter_mut() {
             let Some(id) = row["id"].as_str().map(str::to_string) else {
                 continue;
@@ -3046,16 +3061,19 @@ pub async fn op_list_backends(
                     row["health"] = json!((share * 1000.0).round() / 10.0);
                 }
             }
-            // The live rate attaches only when it was measured:
-            // a request in flight (tokens not counted yet) or a
-            // missed token attribution leaves the field absent —
-            // unknown is not zero (design principle 12).
-            let live_rate = if direct_ops.contains(&id) {
-                None
-            } else {
-                live.as_ref()
-                    .and_then(|m| m.get(&id))
-                    .and_then(|l| l.rate)
+            // Tile precedence (Nov 3, 2026 throughput fix):
+            // the direct /slots rate when it was measured, the
+            // gateway live rate as fallback, absent otherwise.
+            // A missed token attribution leaves the field
+            // absent — unknown is not zero (design principle
+            // 12). During a direct-drive Optimize op the
+            // gateway fallback is skipped (the gateway cannot
+            // see that traffic), but the direct rate still
+            // attaches: it polls the backend itself.
+            let live_rate = match direct_rates.get(&id).copied().flatten() {
+                Some(rate) => Some(rate),
+                None if direct_ops.contains(&id) => None,
+                None => live.as_ref().and_then(|m| m.get(&id)).and_then(|l| l.rate),
             };
             if let Some(rate) = live_rate {
                 row["throughput_toks"] = json!((rate * 10.0).round() / 10.0);
@@ -8507,6 +8525,86 @@ pub async fn poll_gateway_metrics_once(state: &AppState) {
         let snap = gateway_stats::parse_metrics(&body, std::time::Instant::now());
         state.gateway_stats.lock().await.record(snap);
     }
+}
+
+/// One direct-`/slots` poll cycle: for every configured backend,
+/// GET its llama-server `/slots` endpoint and record the
+/// processing slots' `n_decoded` counters (see
+/// [`gateway_stats::DirectSlotsStore`]). Runs on the same 15 s
+/// loop as [`poll_gateway_metrics_once`].
+///
+/// No authentication: app-spawned backends run with no
+/// `--api-key`, and the health probe already GETs `/health`
+/// unauthenticated. A missing or failed fetch (backend down,
+/// port unanswered, `/slots` disabled with
+/// `--slots-endpoint-disable`, non-200, unparseable body)
+/// records no snapshot for that backend: its direct rate goes
+/// stale and the tile falls back to the gateway rate — an
+/// unavailable signal is never rendered as 0. Any failure
+/// skips that backend's cycle silently, as with the gateway
+/// poller.
+pub async fn poll_direct_slots_once(state: &AppState) {
+    let backends: Vec<(String, u16)> = {
+        let cfg = state.config.read().await;
+        cfg.backends
+            .iter()
+            .map(|b| (b.id.clone(), b.port))
+            .collect()
+    };
+    let bodies = tokio::task::spawn_blocking(move || {
+        backends
+            .iter()
+            .map(|(id, port)| (id.clone(), fetch_backend_slots(*port)))
+            .collect::<Vec<(String, Option<String>)>>()
+    })
+    .await
+    .unwrap_or_default();
+    let now = std::time::Instant::now();
+    let mut store = state.direct_slots.lock().await;
+    for (id, body) in bodies {
+        if let Some(body) = body {
+            if let Some(snap) = gateway_stats::parse_slots(&body, now) {
+                store.record(&id, snap);
+            }
+        }
+    }
+}
+
+/// Fetch one backend's `/slots` body over plain HTTP on
+/// localhost, no authorization header. Status must be 200 and
+/// the body must decode cleanly (same strict response decoding
+/// as the gateway metrics fetch — a truncated body is None,
+/// never a partial slot list, which would read as a counter
+/// drop and overcount). Any transport failure is None.
+fn fetch_backend_slots(port: u16) -> Option<String> {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800)).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+    stream
+        .write_all(b"GET /slots HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > 8 * 1024 * 1024 {
+                    return None;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let resp = decode_metrics_response(&raw)?;
+    if resp.status != 200 {
+        return None;
+    }
+    Some(resp.body)
 }
 
 /// Preview the generated LiteLLM config.yaml — plus, when a typed

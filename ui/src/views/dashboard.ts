@@ -91,8 +91,9 @@ function serviceCard(b: BackendInfo, isGateway: boolean): string {
   // requests_1h / errors_1h come from LiteLLM's Prometheus
   // counters via the app's metrics poller (live since v0.1.18);
   // throughput_toks is the poller's LIVE rate over the recent
-  // window (absent when the current rate is not measured — a
-  // request in flight has no counted tokens yet); health is the
+  // window: the backend's own /slots rate when available, the
+  // gateway live rate as fallback (absent when the current rate
+  // is not measured); health is the
   // trailing-hour success share and
   // vram_held_gb is joined from telemetry attribution in
   // getDashboard. Render "—" when absent instead of crashing on
@@ -330,8 +331,11 @@ function consoleView(m: DashboardModel): string {
   const svcRows = allServices(m).map((b) => {
     // health/throughput/requests ride the metrics poller; show "—"
     // when absent (the old expression printed "undefined req/h"
-    // and could not render).
-    const rate = b.throughput_toks
+    // and could not render). The throughput test must be
+    // presence, not truthiness: a measured 0 tok/s is falsy in
+    // JS, and the old test fell through to the req/h display
+    // instead of rendering "0 tok/s".
+    const rate = b.throughput_toks !== undefined
       ? `${trim1(b.throughput_toks)} tok/s`
       : b.requests_1h !== undefined ? `${fmtCount(b.requests_1h)} req/h` : "—";
     return `<tr>

@@ -33,7 +33,7 @@ import {
   logReceiverStatus, logReceiverDeploy, logReceiverRemove, logReceiverFlipEndpoint,
   adminApiGetStatus, adminApiSetEnabled, adminApiListUsers, adminApiCreateUser,
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
-  adminApiRegenerateCert, adminApiApplyFirewallRule, adminApiGetAudit,
+  adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
 import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, BackendCache, BackendMoeCache, BackendMtp, BackendOffload, BackendParallel, BackendRow, CachePreview, CacheSelectionLike, CacheTypeName, FlashAttnName, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, HfHeaderResult, HfLookupQuant, HfLookupRepo, LogReceiverInfo, LogRow, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
 import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
@@ -2473,10 +2473,11 @@ function backendCard(
   // metrics store). The card carries Throughput only: Requests
   // (1h) and Errors (1h) already live in the view's overview
   // list (numbers in one place, principle 6).
-  // The stat tiles: live Throughput (the recent window's rate,
-  // present only when the poller actually measured a current
-  // rate — absent, never 0, while a request is in flight and
-  // its tokens are not counted yet) and Predicted throughput
+  // The stat tiles: live Throughput (the recent window's rate:
+  // the backend's own /slots rate when available, the gateway
+  // live rate as fallback — present only when the poller
+  // actually measured a current rate, absent, never 0, when
+  // neither signal is available) and Predicted throughput
   // (the saved configuration's exact-match measurement, design
   // §7 — generation only, the rest in the tooltip).
   const statTiles: [string, string, string | null][] = [];
@@ -8623,8 +8624,7 @@ function remoteAccessHtml(
     ${settingsRows(rows)}
     ${status.note ? `<div style="font-size:12px;color:var(--err);margin-top:6px">${esc(status.note)}</div>` : ""}
     <div class="card-actions" style="margin-top:10px">${enableSwitch({ on: status.enabled, name: "Admin API", attrs: "data-ra-toggle" })}
-    <button class="btn" data-ra-regen>Regenerate certificate</button>${status.firewall === "missing" || status.firewall === "drifted" ? `
-    <button class="btn" data-ra-firewall-apply>Apply firewall rule</button>` : ""}</div>
+    <button class="btn" data-ra-regen>Regenerate certificate</button></div>
     <div style="font-size:12px;color:var(--text2);margin-top:16px">${users.length === 0 ? "First administrator" : "Users"}<span class="info-tip" title="Roles: viewer reads status; operator runs backends and the gateway; configurator also edits configuration; admin manages users and the API itself. Passwords need at least 12 characters.">${icon("info")}</span></div>
     ${userRows}
     <div style="display:flex;gap:6px;align-items:center;margin-top:8px;flex-wrap:wrap">
@@ -8755,19 +8755,6 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       if (disposed) return;
       if (r.error) setMsg(`Certificate regeneration failed: ${r.error}`, true);
       else setMsg("Certificate regenerated. Paired devices must pair again.");
-      await load();
-      return;
-    }
-
-    const raFwApply = t.closest("[data-ra-firewall-apply]") as HTMLButtonElement | null;
-    if (raFwApply) {
-      // No confirm dialog: the elevation prompt is the confirmation
-      // (it appears only when a change is actually needed).
-      raFwApply.disabled = true;
-      const r = await adminApiApplyFirewallRule();
-      if (disposed) return;
-      if (r.error) setMsg(`Firewall rule failed: ${r.error}`, true);
-      else setMsg("Firewall rule applied: allowed local subnet + Tailscale.");
       await load();
       return;
     }

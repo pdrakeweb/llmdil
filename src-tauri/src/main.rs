@@ -116,7 +116,6 @@ macro_rules! tauri_handler {
             admin_api_get_pairing,
             admin_api_create_enrollment,
             admin_api_regenerate_cert,
-            admin_api_apply_firewall_rule,
             admin_api_get_audit
         ]
     };
@@ -240,13 +239,18 @@ fn main() {
             // Gateway metrics poller: scrape LiteLLM's Prometheus
             // endpoint every 15 s into the stats store that feeds
             // the Dashboard's request/error figures and live
-            // throughput rate.
-            // Cycles skip silently while the gateway is down.
+            // throughput rate. The same loop also polls each
+            // backend's llama-server `/slots` directly: the
+            // gateway counters move only on completion, so a
+            // backend mid-generation needs its own live rate
+            // (Nov 3, 2026 throughput fix). Cycles skip silently
+            // while the gateway (or a backend's `/slots`) is down.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<Arc<AppState>>().inner().clone();
                 loop {
                     manager_app::poll_gateway_metrics_once(&state).await;
+                    manager_app::poll_direct_slots_once(&state).await;
                     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 }
             });
@@ -704,26 +708,6 @@ async fn admin_api_regenerate_cert(
             }
         }
     }
-    admin_api_get_status(app, state, slot, auth).await
-}
-
-/// Apply the Admin API's firewall rule on demand: create or repair
-/// the expected inbound rule (one elevation prompt when a change is
-/// actually needed; a no-op when the rule already matches). The
-/// settings page offers this button only when the rule is missing
-/// or differs from expected; when the rule is already correct the
-/// button is hidden, so the no-op path never prompts.
-#[tauri::command]
-async fn admin_api_apply_firewall_rule(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
-    slot: State<'_, ApiServerSlot>,
-    auth: State<'_, AdminAuth>,
-) -> Result<Value, String> {
-    let (_, port) = admin_api_settings(state.inner(), &app).await?;
-    manager_api::firewall::ensure(port)
-        .await
-        .map_err(|e| format!("firewall rule failed: {e}"))?;
     admin_api_get_status(app, state, slot, auth).await
 }
 

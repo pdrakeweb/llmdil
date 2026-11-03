@@ -22,12 +22,22 @@
 //!
 //! Limits (by design): the cumulative counters move only when a
 //! request COMPLETES, so a request still in flight contributes no
-//! tokens yet. Any rate derived from these counters must say so:
-//! the live rate below returns "not measured" (absent) while a
-//! backend has requests in flight and no completions in the live
-//! window, rather than a fabricated 0 — and it is computed over a
-//! short recent window, because dividing a few seconds of
-//! generation by a trailing hour renders a live backend as
+//! tokens yet — and LiteLLM's `litellm_in_flight_requests` gauge
+//! cannot fill that gap per backend: it is a bare, label-free,
+//! worker-scoped number (no `model` label is ever attached), so
+//! any per-backend reading of it is a false attribution (the
+//! Nov 3, 2026 throughput-0 diagnosis: the Oct 22 fix's in-flight
+//! guard assumed a labeled gauge LiteLLM never emits, and its
+//! per-backend branch is retired here). The gauge is recorded
+//! only as a gateway-wide total, never per backend. The live
+//! mid-generation rate instead comes from the backends
+//! themselves: [`DirectSlotsStore`] polls each backend's
+//! llama-server `/slots` endpoint (see below) and derives tok/s
+//! from `n_decoded` deltas while slots are processing. The
+//! gateway live rate below is the fallback when a backend's
+//! `/slots` is unavailable, and it is computed over a short
+//! recent window, because dividing a few seconds of generation
+//! by a trailing hour renders a live backend as
 //! "Throughput 0 tok/s" (the Oct 22, 2026 field bug this module's
 //! `live_throughput` fixes; the trailing-hour figures remain
 //! requests/errors/health only).
@@ -44,13 +54,13 @@ pub struct MetricsSnapshot {
     /// Deployment model label (`openai/<backend-id>`) -> total
     /// tokens (input + output summed at parse time).
     pub tokens: HashMap<String, u64>,
-    /// In-flight requests by the raw `model` label of
-    /// `litellm_in_flight_requests` (the requested model: a group
-    /// name in this app's generated config, or `openai/<id>`).
-    /// The gauge exists so a backend whose current request has
-    /// not completed — and therefore has counted no tokens yet —
-    /// can be told apart from a backend that is genuinely idle.
-    pub in_flight: HashMap<String, f64>,
+    /// Gateway-wide total of `litellm_in_flight_requests` across
+    /// all exposition lines. The gauge carries no labels, so this
+    /// number is scoped to the gateway worker, never to a backend
+    /// or group: it must never be attributed per backend (see the
+    /// module docs). It is recorded for diagnostics only; the
+    /// per-backend live rate does not use it.
+    pub in_flight_total: f64,
 }
 
 /// Trailing-window figures for one backend.
@@ -78,9 +88,14 @@ pub struct BackendWindow {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LiveThroughput {
     /// Tokens per second over the live window, or None when the
-    /// current rate is not measured (a request in flight whose
-    /// tokens are not counted yet, or a missed attribution) —
-    /// absent renders as no tile, never as 0.
+    /// current rate is not measured (a missed attribution) —
+    /// absent renders as no tile, never as 0. Note this gateway
+    /// rate alone cannot tell a mid-generation backend from an
+    /// idle one (the counters move only on completion, and the
+    /// in-flight gauge is gateway-wide, not per backend); the
+    /// tile precedence in `list_backends` prefers the direct
+    /// `/slots` rate ([`DirectSlotsStore`]) when it is available,
+    /// and this rate is only its fallback.
     pub rate: Option<f64>,
     /// Requests completed in the live window but the backend's
     /// token series was absent from both snapshots: the
@@ -198,27 +213,25 @@ impl GatewayStatsStore {
     /// dilutes seconds of live generation to a rounded 0.0 —
     /// the Oct 22, 2026 "Throughput 0 tok/s while generating"
     /// bug. `backends` maps backend id -> port (as in
-    /// `window_stats`); `groups` maps group name -> member
-    /// references (backend ids or `host:port`) and attributes
-    /// the in-flight gauge, whose `model` label carries the
-    /// requested (group) name.
+    /// `window_stats`).
     ///
     /// Per backend the result is a [`LiveThroughput`]: a
     /// measured rate when tokens moved in the window; a
-    /// measured 0 when nothing moved and nothing is in flight;
-    /// ABSENT (`rate: None` — unknown is not zero, design
-    /// principle 12) when a request is in flight and no tokens
-    /// have been counted yet (LiteLLM counts a request's tokens
-    /// only when it completes, so the current rate is genuinely
-    /// unmeasured, not zero), or when attribution missed (see
-    /// the struct). Returns None overall until two snapshots
+    /// measured 0 when nothing moved; ABSENT (`rate: None` —
+    /// unknown is not zero, design principle 12) when
+    /// attribution missed (see the struct). This gateway rate
+    /// is only the fallback behind the direct `/slots` rate
+    /// ([`DirectSlotsStore`]): on its own it cannot tell a
+    /// mid-generation backend from an idle one, because
+    /// LiteLLM counts a request's tokens only when it
+    /// completes and the in-flight gauge is gateway-wide, not
+    /// per backend. Returns None overall until two snapshots
     /// span at least [`LIVE_MIN_SPAN`], and when the latest
     /// snapshot is stale (the poller has stopped landing
     /// scrapes — a frozen rate is not a live one).
     pub fn live_throughput(
         &mut self,
         backends: &[(String, u16)],
-        groups: &[(String, Vec<String>)],
     ) -> Option<HashMap<String, LiveThroughput>> {
         if self.snapshots.len() < 2 {
             return None;
@@ -265,26 +278,10 @@ impl GatewayStatsStore {
                 .copied()
                 .unwrap_or((0, 0));
             let successes_delta = delta(ls, bs);
-            // In-flight for this backend: gauge series whose
-            // label names the backend itself (`planner` or
-            // `openai/planner`), or a group containing it.
-            let in_flight: f64 = latest
-                .in_flight
-                .iter()
-                .filter(|(label, _)| {
-                    let name = label.strip_prefix("openai/").unwrap_or(label);
-                    name == id
-                        || groups.iter().any(|(gname, members)| {
-                            gname == name
-                                && members.iter().any(|m| {
-                                    m == id
-                                        || m.rsplit(':').next() == Some(port.to_string().as_str())
-                                            && m.contains(':')
-                                })
-                        })
-                })
-                .map(|(_, v)| *v)
-                .sum();
+            // No per-backend in-flight term: the gauge is
+            // gateway-wide and label-free (see the module docs),
+            // so attributing any of it to this backend would
+            // fabricate the generating/idle distinction.
             let token_series_seen =
                 latest.tokens.contains_key(&model) || baseline.tokens.contains_key(&model);
             let attribution_missed = tokens_delta == 0 && successes_delta > 0 && !token_series_seen;
@@ -302,7 +299,7 @@ impl GatewayStatsStore {
             }
             let rate = if tokens_delta > 0 {
                 Some(tokens_delta as f64 / span_secs)
-            } else if in_flight > 0.0 || attribution_missed {
+            } else if attribution_missed {
                 None
             } else {
                 Some(0.0)
@@ -383,6 +380,137 @@ impl GatewayStatsStore {
     }
 }
 
+/// One llama-server `/slots` scrape for one backend: the
+/// `n_decoded` counter of every slot currently processing.
+/// Slots that are idle (or absent from the response) are not
+/// recorded: an idle slot decodes nothing, and a slot that
+/// finished between polls contributes nothing further — its
+/// completion tokens are the gateway counters' job, and the
+/// direct rate's job is the generation in progress now.
+#[derive(Debug, Clone)]
+pub struct SlotsSnapshot {
+    pub at: Instant,
+    /// Slot id -> tokens decoded so far by that slot's current
+    /// request.
+    pub decoded: HashMap<u64, u64>,
+}
+
+/// Per-backend live token rate polled directly from each
+/// backend's llama-server `/slots` endpoint, on the same 15 s
+/// cadence as the gateway poller (the caller polls and records;
+/// this store only holds snapshots and derives rates).
+///
+/// Why this exists: the gateway's counters move only when a
+/// request completes, so a backend mid-generation shows zero
+/// counted tokens for the whole generation. `/slots` reports
+/// `n_decoded` while generation is in progress, so the delta
+/// over the same [`LIVE_WINDOW`] window is a genuine live rate.
+/// A failed or missing `/slots` fetch records no snapshot: the
+/// rate then goes stale (past [`LIVE_STALE_AFTER`]) and the
+/// caller falls back to the gateway rate — an unavailable
+/// signal renders as "—" via that fallback's absence, never as
+/// a fabricated 0. No authentication is used: app-spawned
+/// backends run with no `--api-key`, and the health probe
+/// already GETs `/health` unauthenticated.
+#[derive(Debug, Default)]
+pub struct DirectSlotsStore {
+    snapshots: HashMap<String, VecDeque<SlotsSnapshot>>,
+}
+
+impl DirectSlotsStore {
+    pub fn record(&mut self, backend_id: &str, snap: SlotsSnapshot) {
+        let ring = self.snapshots.entry(backend_id.to_string()).or_default();
+        while let Some(front) = ring.front() {
+            if snap.at.duration_since(front.at) > RETENTION {
+                ring.pop_front();
+            } else {
+                break;
+            }
+        }
+        ring.push_back(snap);
+    }
+
+    /// The live direct rate for one backend, in tokens per
+    /// second over the recent [`LIVE_WINDOW`], or None when it
+    /// is not measured: fewer than two snapshots, a covered
+    /// span below [`LIVE_MIN_SPAN`], or a latest snapshot older
+    /// than [`LIVE_STALE_AFTER`] (the poller stopped landing
+    /// successful `/slots` fetches for this backend).
+    ///
+    /// Delta rule, per slot id (the same reset-tolerant rule as
+    /// the gateway counters): a slot present in both the
+    /// baseline and latest snapshots contributes
+    /// `latest - baseline`, or `latest` alone when the counter
+    /// decreased — a decreased counter means the slot was
+    /// reused for a new request, which started from zero. A
+    /// slot present only in the latest snapshot contributes
+    /// its full count (its request started from zero inside
+    /// the window, or before the first snapshot of it). A slot
+    /// present only in the baseline contributes nothing: it
+    /// finished, and its remaining tokens are unobserved.
+    pub fn live_rate(&self, backend_id: &str) -> Option<f64> {
+        let ring = self.snapshots.get(backend_id)?;
+        if ring.len() < 2 {
+            return None;
+        }
+        let latest = ring.back()?;
+        if latest.at.elapsed() > LIVE_STALE_AFTER {
+            return None;
+        }
+        let target = latest.at.checked_sub(LIVE_WINDOW).unwrap_or(latest.at);
+        let baseline = match ring.iter().rev().find(|s| s.at <= target) {
+            Some(b) if !std::ptr::eq(b, latest) => b,
+            _ => ring.front()?,
+        };
+        if std::ptr::eq(baseline, latest) {
+            return None;
+        }
+        let span_secs = latest.at.duration_since(baseline.at).as_secs_f64();
+        if span_secs < LIVE_MIN_SPAN.as_secs_f64() {
+            return None;
+        }
+        let mut tokens: u64 = 0;
+        for (slot, now) in &latest.decoded {
+            let then = baseline.decoded.get(slot).copied().unwrap_or(0);
+            tokens += if *now >= then { now - then } else { *now };
+        }
+        Some(tokens as f64 / span_secs)
+    }
+}
+
+/// Parse a llama-server `/slots` JSON body into a snapshot
+/// (timestamp left at the epoch placeholder; the caller stamps
+/// it). The body is a JSON array of slot objects; only slots
+/// with `is_processing: true` and an integer `n_decoded`
+/// contribute. Anything else — a non-array body, a slot
+/// without those fields, a malformed entry — yields no
+/// snapshot (None), never a partial one: a partial snapshot
+/// would read as a counter drop and overcount on the next
+/// poll. Returns None (not an empty snapshot) when the body
+/// is not a JSON array at all, so the caller can tell an
+/// unavailable endpoint from an idle backend: an idle backend
+/// answers with an array whose slots are all non-processing
+/// and records an empty (measured-idle) snapshot.
+pub fn parse_slots(body: &str, at: Instant) -> Option<SlotsSnapshot> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let slots = parsed.as_array()?;
+    let mut decoded = HashMap::new();
+    for slot in slots {
+        let obj = slot.as_object()?;
+        if obj
+            .get("is_processing")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            continue;
+        }
+        let id = obj.get("id").and_then(serde_json::Value::as_u64)?;
+        let n = obj.get("n_decoded").and_then(serde_json::Value::as_u64)?;
+        decoded.insert(id, n);
+    }
+    Some(SlotsSnapshot { at, decoded })
+}
+
 /// Sparkline series for one backend (see
 /// [`GatewayStatsStore::series_stats`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -405,7 +533,7 @@ pub fn parse_metrics(text: &str, at: Instant) -> MetricsSnapshot {
         at,
         deployments: HashMap::new(),
         tokens: HashMap::new(),
-        in_flight: HashMap::new(),
+        in_flight_total: 0.0,
     };
     for line in text.lines() {
         let line = line.trim();
@@ -438,10 +566,13 @@ pub fn parse_metrics(text: &str, at: Instant) -> MetricsSnapshot {
                 *snap.tokens.entry(model).or_insert(0) += value;
             }
             "litellm_in_flight_requests" => {
-                let Some(model) = label_value(labels, "model") else {
-                    continue;
-                };
-                *snap.in_flight.entry(model).or_insert(0.0) += value as f64;
+                // The gauge carries no labels in real LiteLLM
+                // exposition (a bare `litellm_in_flight_requests
+                // <n>` line); sum every line into the
+                // gateway-wide total and never key it by a
+                // label — there is no per-backend number here.
+                let _ = labels;
+                snap.in_flight_total += value as f64;
             }
             _ => {}
         }
@@ -527,7 +658,7 @@ litellm_deployment_failure_responses_total{api_base=\"http://127.0.0.1:8082/v1\"
 litellm_input_tokens_metric_total{model=\"openai/planner\",requested_model=\"planner\"} 12000.0
 litellm_output_tokens_metric_total{model=\"openai/planner\"} 3400.0
 litellm_input_tokens_metric_total{model=\"openai/coder\"} 500.0
-litellm_in_flight_requests{model=\"planner\"} 2.0
+litellm_in_flight_requests 2.0
 ";
 
     #[test]
@@ -544,8 +675,9 @@ litellm_in_flight_requests{model=\"planner\"} 2.0
         // Input + output summed per model label; _created ignored.
         assert_eq!(snap.tokens.get("openai/planner"), Some(&15400));
         assert_eq!(snap.tokens.get("openai/coder"), Some(&500));
-        // The in-flight gauge parses under its raw model label.
-        assert_eq!(snap.in_flight.get("planner"), Some(&2.0));
+        // The in-flight gauge is bare and label-free: it parses
+        // into the gateway-wide total, never a per-backend map.
+        assert_eq!(snap.in_flight_total, 2.0);
     }
 
     #[test]
@@ -556,7 +688,7 @@ litellm_in_flight_requests{model=\"planner\"} 2.0
             at,
             deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (success, failure))]),
             tokens: HashMap::from([("openai/planner".into(), tokens)]),
-            in_flight: HashMap::new(),
+            in_flight_total: 0.0,
         };
         store.record(mk(t0, 10, 1, 1000));
         // 30 minutes later: still inside the hour, baseline stays t0.
@@ -580,7 +712,7 @@ litellm_in_flight_requests{model=\"planner\"} 2.0
             at,
             deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (success, 0))]),
             tokens: HashMap::new(),
-            in_flight: HashMap::new(),
+            in_flight_total: 0.0,
         };
         store.record(mk(t0, 100));
         store.record(mk(t0 + Duration::from_secs(3500), 160));
@@ -602,7 +734,7 @@ litellm_in_flight_requests{model=\"planner\"} 2.0
             at,
             deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (success, 0))]),
             tokens: HashMap::new(),
-            in_flight: HashMap::new(),
+            in_flight_total: 0.0,
         };
         store.record(mk(t0, 900));
         store.record(mk(t0 + Duration::from_secs(60), 7));
@@ -620,7 +752,7 @@ litellm_in_flight_requests{model=\"planner\"} 2.0
             at,
             deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (success, failure))]),
             tokens: HashMap::from([("openai/planner".into(), tokens)]),
-            in_flight: HashMap::new(),
+            in_flight_total: 0.0,
         };
         store.record(mk(t0, 10, 0, 600));
         // 60 s later: +30 successes, +6 failures, +3600 tokens.
@@ -642,25 +774,17 @@ litellm_in_flight_requests{model=\"planner\"} 2.0
             at: Instant::now(),
             deployments: HashMap::new(),
             tokens: HashMap::new(),
-            in_flight: HashMap::new(),
+            in_flight_total: 0.0,
         });
         assert!(store.window_stats(&[("planner".into(), 8081)]).is_none());
     }
 
-    fn live_snap(
-        at: Instant,
-        success: u64,
-        tokens: u64,
-        in_flight: &[(&str, f64)],
-    ) -> MetricsSnapshot {
+    fn live_snap(at: Instant, success: u64, tokens: u64) -> MetricsSnapshot {
         MetricsSnapshot {
             at,
             deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (success, 0))]),
             tokens: HashMap::from([("openai/planner".into(), tokens)]),
-            in_flight: in_flight
-                .iter()
-                .map(|(k, v)| (k.to_string(), *v))
-                .collect(),
+            in_flight_total: 0.0,
         }
     }
 
@@ -681,16 +805,13 @@ litellm_in_flight_requests{model=\"planner\"} 2.0
         let t0 = Instant::now();
         let at = |secs: u64| t0 + Duration::from_secs(secs);
         let mut store = GatewayStatsStore::default();
-        store.record(live_snap(at(0), 40, 100_000, &[]));
-        store.record(live_snap(at(100), 40, 100_000, &[]));
-        store.record(live_snap(at(3580), 40, 100_000, &[]));
-        store.record(live_snap(at(3640), 44, 100_750, &[]));
-        store.record(live_snap(at(3700), 48, 101_500, &[("planner", 1.0)]));
+        store.record(live_snap(at(0), 40, 100_000));
+        store.record(live_snap(at(100), 40, 100_000));
+        store.record(live_snap(at(3580), 40, 100_000));
+        store.record(live_snap(at(3640), 44, 100_750));
+        store.record(live_snap(at(3700), 48, 101_500));
         let live = store
-            .live_throughput(
-                &[("planner".into(), 8081)],
-                &[("planner".into(), vec!["planner".into()])],
-            )
+            .live_throughput(&[("planner".into(), 8081)])
             .expect("fresh snapshots spanning the live window");
         assert_eq!(live["planner"].rate, Some(12.5));
         assert!(!live["planner"].attribution_missed);
@@ -705,46 +826,117 @@ litellm_in_flight_requests{model=\"planner\"} 2.0
     }
 
     #[test]
-    fn live_rate_is_unknown_while_a_request_is_in_flight() {
-        // A single long request, still generating: LiteLLM has
-        // counted none of its tokens (counters move on
-        // completion), so the current rate is NOT measured —
-        // absent, never the old fabricated 0. The gauge label
-        // names the backend directly here.
+    fn gateway_wide_in_flight_does_not_mask_a_per_backend_rate() {
+        // The retired per-backend branch read the gateway-wide,
+        // label-free gauge as if it belonged to one backend.
+        // Re-scoped: a nonzero gateway-wide total must NOT make
+        // any single backend's gateway rate unmeasured — the
+        // gauge cannot say which backend (if any) is generating.
+        // Mid-generation distinction is the direct /slots
+        // store's job (tests below), not this gauge's.
         let t0 = Instant::now();
         let at = |secs: u64| t0 + Duration::from_secs(secs);
         let mut store = GatewayStatsStore::default();
-        store.record(live_snap(at(0), 40, 100_000, &[]));
-        store.record(live_snap(at(60), 40, 100_000, &[("planner", 1.0)]));
-        store.record(live_snap(at(120), 40, 100_000, &[("planner", 1.0)]));
+        for secs in [0, 60, 120] {
+            let mut snap = live_snap(at(secs), 40, 100_000);
+            snap.in_flight_total = 2.0;
+            store.record(snap);
+        }
         let live = store
-            .live_throughput(&[("planner".into(), 8081)], &[])
+            .live_throughput(&[("planner".into(), 8081)])
             .expect("snapshots");
-        assert_eq!(live["planner"].rate, None);
+        assert_eq!(
+            live["planner"].rate,
+            Some(0.0),
+            "gateway-wide in-flight is not a per-backend signal"
+        );
         assert!(!live["planner"].attribution_missed);
     }
 
     #[test]
-    fn live_rate_attributes_in_flight_by_group_membership() {
-        // The gauge's model label carries the requested (group)
-        // name, not the backend id: a group whose members include
-        // the backend attributes its in-flight requests to it.
+    fn direct_slots_rate_comes_from_processing_slot_deltas() {
+        // The Nov 3, 2026 case: a backend mid-generation, whose
+        // gateway counters have not moved (no completion yet),
+        // reads a live rate from /slots: slot 0 decodes 600
+        // tokens over the 120 s window = 5.0 tok/s, while an
+        // idle slot's entry is ignored.
         let t0 = Instant::now();
         let at = |secs: u64| t0 + Duration::from_secs(secs);
-        let mut store = GatewayStatsStore::default();
-        store.record(live_snap(at(0), 40, 100_000, &[]));
-        store.record(live_snap(at(120), 40, 100_000, &[("chat", 2.0)]));
-        let groups = [("chat".to_string(), vec!["planner".to_string()])];
-        let live = store
-            .live_throughput(&[("planner".into(), 8081)], &groups)
-            .expect("snapshots");
-        assert_eq!(live["planner"].rate, None, "group in-flight makes the rate unmeasured");
-        // A group the backend is not a member of does not.
-        let groups = [("chat".to_string(), vec!["coder".to_string()])];
-        let live = store
-            .live_throughput(&[("planner".into(), 8081)], &groups)
-            .expect("snapshots");
-        assert_eq!(live["planner"].rate, Some(0.0), "no in-flight, no tokens: a measured idle 0");
+        let mut store = DirectSlotsStore::default();
+        let snap = |secs: u64, decoded: &[(u64, u64)]| SlotsSnapshot {
+            at: at(secs),
+            decoded: decoded.iter().map(|(k, v)| (*k, *v)).collect(),
+        };
+        store.record("planner", snap(0, &[(0, 100)]));
+        store.record("planner", snap(120, &[(0, 700)]));
+        assert_eq!(store.live_rate("planner"), Some(5.0));
+        // Idle backend: processing slots absent from both
+        // snapshots, but the snapshots themselves landed — a
+        // measured 0, not unknown.
+        let mut idle = DirectSlotsStore::default();
+        idle.record("planner", snap(0, &[]));
+        idle.record("planner", snap(120, &[]));
+        assert_eq!(idle.live_rate("planner"), Some(0.0));
+    }
+
+    #[test]
+    fn direct_slots_rate_handles_slot_reuse_resets() {
+        // Slot 0 finishes one request and is reused for another
+        // inside the window: its counter drops (900 -> 50), and
+        // the delta counts from zero (50), not as a negative
+        // or as the drop — the same reset rule as the gateway
+        // counters.
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut store = DirectSlotsStore::default();
+        let snap = |secs: u64, decoded: &[(u64, u64)]| SlotsSnapshot {
+            at: at(secs),
+            decoded: decoded.iter().map(|(k, v)| (*k, *v)).collect(),
+        };
+        store.record("planner", snap(0, &[(0, 900)]));
+        store.record("planner", snap(120, &[(0, 50)]));
+        assert_eq!(store.live_rate("planner"), Some(50.0 / 120.0));
+    }
+
+    #[test]
+    fn direct_slots_rate_is_absent_without_a_usable_window() {
+        // One snapshot only, and a too-short span, both leave
+        // the rate unmeasured — the caller falls back to the
+        // gateway rate, which may itself be absent ("—").
+        let t0 = Instant::now();
+        let mut store = DirectSlotsStore::default();
+        let snap = |secs: u64, decoded: &[(u64, u64)]| SlotsSnapshot {
+            at: t0 + Duration::from_secs(secs),
+            decoded: decoded.iter().map(|(k, v)| (*k, *v)).collect(),
+        };
+        store.record("planner", snap(0, &[(0, 10)]));
+        assert_eq!(store.live_rate("planner"), None);
+        store.record("planner", snap(15, &[(0, 200)]));
+        assert_eq!(
+            store.live_rate("planner"),
+            None,
+            "span below the 30 s minimum"
+        );
+    }
+
+    #[test]
+    fn parse_slots_counts_processing_slots_only() {
+        let t0 = Instant::now();
+        let body = r#"[{"id":0,"n_decoded":123,"is_processing":true},{"id":1,"n_decoded":999,"is_processing":false},{"id":2,"n_decoded":5,"is_processing":true}]"#;
+        let snap = parse_slots(body, t0).expect("array body parses");
+        assert_eq!(snap.decoded.get(&0), Some(&123));
+        assert_eq!(snap.decoded.get(&2), Some(&5));
+        assert!(!snap.decoded.contains_key(&1), "idle slots decode nothing");
+        // An idle backend answers an array with no processing
+        // slots: an empty snapshot (measured idle), not None.
+        let idle = parse_slots(r#"[{"id":0,"n_decoded":0,"is_processing":false}]"#, t0)
+            .expect("idle array parses");
+        assert!(idle.decoded.is_empty());
+        // A non-array body (error page, disabled endpoint
+        // HTML, truncated JSON) is unavailable, not idle.
+        assert!(parse_slots("not json", t0).is_none());
+        assert!(parse_slots(r#"{"error":"slots disabled"}"#, t0).is_none());
+        assert!(parse_slots(r#"[{"id":0,"is_processing":true}]"#, t0).is_none());
     }
 
     #[test]
@@ -760,13 +952,13 @@ litellm_in_flight_requests{model=\"planner\"} 2.0
             at,
             deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (success, 0))]),
             tokens: HashMap::new(),
-            in_flight: HashMap::new(),
+            in_flight_total: 0.0,
         };
         let mut store = GatewayStatsStore::default();
         store.record(mk(t0, 40));
         store.record(mk(t0 + Duration::from_secs(120), 47));
         let live = store
-            .live_throughput(&[("planner".into(), 8081)], &[])
+            .live_throughput(&[("planner".into(), 8081)])
             .expect("snapshots");
         assert_eq!(live["planner"].rate, None);
         assert!(live["planner"].attribution_missed);
@@ -778,21 +970,17 @@ litellm_in_flight_requests{model=\"planner\"} 2.0
         // Two snapshots 15 s apart: span below the minimum, so a
         // single completion burst cannot read as a spike rate.
         let mut store = GatewayStatsStore::default();
-        store.record(live_snap(now, 40, 100_000, &[]));
-        store.record(live_snap(now + Duration::from_secs(15), 41, 100_300, &[]));
-        assert!(store
-            .live_throughput(&[("planner".into(), 8081)], &[])
-            .is_none());
+        store.record(live_snap(now, 40, 100_000));
+        store.record(live_snap(now + Duration::from_secs(15), 41, 100_300));
+        assert!(store.live_throughput(&[("planner".into(), 8081)]).is_none());
         // Snapshots exist and span enough, but the latest is
         // 100 s old — past the staleness bound: the poller
         // stopped landing scrapes, and a frozen figure is not a
         // live rate.
         let mut store = GatewayStatsStore::default();
-        store.record(live_snap(now - Duration::from_secs(200), 40, 100_000, &[]));
-        store.record(live_snap(now - Duration::from_secs(100), 41, 100_300, &[]));
-        assert!(store
-            .live_throughput(&[("planner".into(), 8081)], &[])
-            .is_none());
+        store.record(live_snap(now - Duration::from_secs(200), 40, 100_000));
+        store.record(live_snap(now - Duration::from_secs(100), 41, 100_300));
+        assert!(store.live_throughput(&[("planner".into(), 8081)]).is_none());
     }
 
     #[test]
@@ -802,12 +990,11 @@ litellm_in_flight_requests{model=\"planner\"} 2.0
         // since is inside the window.
         let t0 = Instant::now();
         let mut store = GatewayStatsStore::default();
-        store.record(live_snap(t0, 40, 90_000, &[]));
-        store.record(live_snap(t0 + Duration::from_secs(120), 3, 600, &[]));
+        store.record(live_snap(t0, 40, 90_000));
+        store.record(live_snap(t0 + Duration::from_secs(120), 3, 600));
         let live = store
-            .live_throughput(&[("planner".into(), 8081)], &[])
+            .live_throughput(&[("planner".into(), 8081)])
             .expect("snapshots");
         assert_eq!(live["planner"].rate, Some(5.0));
     }
 }
-
