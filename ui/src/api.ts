@@ -4646,6 +4646,16 @@ export async function adminApiRegenerateCert(): Promise<CallResult<AdminApiStatu
   }
 }
 
+export async function adminApiApplyFirewallRule(): Promise<CallResult<AdminApiStatus>> {
+  if (!isTauri()) return { data: emptyStatus, live: false, error: "admin_api_apply_firewall_rule is not available in sample mode" };
+  try {
+    const data = await invoke<AdminApiStatus>("admin_api_apply_firewall_rule");
+    return { data, live: true };
+  } catch (e) {
+    return { data: emptyStatus, live: true, error: errOf(e) };
+  }
+}
+
 export async function adminApiGetAudit(limit = 20): Promise<CallResult<AdminApiAuditEntry[]>> {
   if (!isTauri()) return { data: [], live: false };
   try {
