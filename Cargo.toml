@@ -29,3 +29,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 async-trait = "0.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# CLI/TUI client (manager-cli)
+clap = { version = "4", features = ["derive", "env"] }
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+rustls-webpki = { version = "0.103", features = ["ring"] }
