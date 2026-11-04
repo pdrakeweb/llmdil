@@ -6,6 +6,10 @@ name: Release
 #
 # NOTE: no updater artifacts in v1 — tauri-plugin-updater is not wired up,
 # so no updater JSON is produced or expected (see spec §12).
+#
+# NOTE: the CLI/TUI client (manager-cli) ships as a SEPARATE release
+# asset below, never bundled into the installer payload (Pete, Nov 3,
+# 2026). The installer bundles only its explicit externalBin sidecars.
 
 on:
   push:
@@ -66,6 +70,20 @@ jobs:
           releaseName: "LLMdil ${{ github.ref_name }}"
           releaseDraft: false
           prerelease: false
+
+      # The CLI/TUI client ships as a SEPARATE release asset, never
+      # bundled into the installer payload (Pete, Nov 3, 2026): a
+      # standalone operator tool, downloaded and run directly.
+      - name: Build and upload CLI asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo build --release -p manager-cli
+          $ver = "${{ github.ref_name }}".TrimStart("v")
+          $asset = "LLMdil-cli_${ver}_x64.exe"
+          Copy-Item target/release/manager-cli.exe $asset
+          gh release upload ${{ github.ref_name }} --repo pdrakeweb/llmdil --clobber $asset
 
       # The log receiver's deploy checklist ships as a release asset
       # (the receiver itself deploys from inside the app — Settings →
