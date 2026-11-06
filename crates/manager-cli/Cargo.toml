@@ -1,6 +1,6 @@
 [package]
 name = "manager-cli"
-version = "0.1.59"
+version = "0.1.60"
 edition = "2021"
 
 # CLI/TUI client for the LLMdil Admin API. Serves as the Stage 2 test
