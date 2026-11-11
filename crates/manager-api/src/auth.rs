@@ -16,8 +16,9 @@ use tokio::sync::Mutex;
 use manager_wizard::SystemOps;
 
 use crate::users::{
-    generate_token, hash_password, hash_token, now_ms, password_policy_error, verify_password,
-    ApiToken, RoleName, Session, User, UserStore, ACCESS_TTL_MS, REFRESH_TTL_MS,
+    generate_token, hash_password, hash_token, now_ms, password_policy_error,
+    verify_password_async, ApiToken, RoleName, Session, User, UserStore, ACCESS_TTL_MS,
+    REFRESH_TTL_MS,
 };
 use manager_app::registry::Role;
 
@@ -191,6 +192,11 @@ fn totp_target(user_id: &str) -> String {
 // The service
 // ---------------------------------------------------------------------------
 
+/// Longest username `create_user` accepts. Login refuses longer
+/// names before any per-account bookkeeping, so an unauthenticated
+/// client cannot grow the lockout map or the audit log with
+/// megabyte-sized usernames (finding SEC-05).
+pub const MAX_USERNAME_LEN: usize = 64;
 const LOCK_THRESHOLD: usize = 5;
 const LOCK_WINDOW_MS: i64 = 15 * 60 * 1000;
 const LOCK_BASE_MS: i64 = 15 * 60 * 1000;
@@ -269,8 +275,27 @@ impl AuthService {
 
     async fn record_failure(&self, username_key: &str, source_ip: &str) {
         let now = now_ms();
+        self.record_account_failure(username_key).await;
+        let mut ips = self.ip_failures.lock().await;
+        ips.retain(|ip, v| ip == source_ip || v.iter().any(|t| now - t < LOCK_WINDOW_MS));
+        let v = ips.entry(source_ip.to_string()).or_default();
+        v.retain(|t| now - t < LOCK_WINDOW_MS);
+        v.push(now);
+    }
+
+    async fn record_account_failure(&self, username_key: &str) {
+        let now = now_ms();
         {
             let mut guard = self.lockouts.lock().await;
+            // Prune entries with no live failures and no live lock so
+            // the map stays bounded by recent activity (SEC-05). The
+            // escalation counter of a pruned entry restarts, which only
+            // happens after a full quiet window with no lock in force.
+            guard.retain(|k, st| {
+                k == username_key
+                    || st.locked_until_ms > now
+                    || st.failures.iter().any(|t| now - t < LOCK_WINDOW_MS)
+            });
             let st = guard.entry(username_key.to_string()).or_default();
             st.failures.retain(|t| now - t < LOCK_WINDOW_MS);
             st.failures.push(now);
@@ -281,10 +306,15 @@ impl AuthService {
                 st.failures.clear();
             }
         }
-        let mut ips = self.ip_failures.lock().await;
-        let v = ips.entry(source_ip.to_string()).or_default();
-        v.retain(|t| now - t < LOCK_WINDOW_MS);
-        v.push(now);
+    }
+
+    /// Record a failed step-up password check (password change, TOTP
+    /// disable, TOTP re-enrollment) against the account lockout
+    /// (finding SEC-04): these
+    /// endpoints otherwise offered unlimited password guessing to any
+    /// holder of a bearer token.
+    async fn record_step_up_failure(&self, username: &str) {
+        self.record_account_failure(&username.to_lowercase()).await;
     }
 
     async fn ip_throttled(&self, source_ip: &str) -> bool {
@@ -310,6 +340,14 @@ impl AuthService {
         device_name: &str,
         source_ip: &str,
     ) -> Result<LoginOutcome, AuthError> {
+        if username.len() > MAX_USERNAME_LEN {
+            // No account can have this name. Same cost and answer as an
+            // unknown user, but no per-account bookkeeping (SEC-05).
+            let _ = verify_password_async(password, crate::users::dummy_hash()).await;
+            let mut ips = self.ip_failures.lock().await;
+            ips.entry(source_ip.to_string()).or_default().push(now_ms());
+            return Err(AuthError::InvalidCredentials);
+        }
         let key = username.to_lowercase();
         let locked = self.is_locked(&key).await;
         let throttled = self.ip_throttled(source_ip).await;
@@ -319,11 +357,12 @@ impl AuthService {
             .await;
 
         // Pay the argon2 cost in every path (dummy hash for unknown
-        // users) so timing does not enumerate accounts.
+        // users) so timing does not enumerate accounts. Off the async
+        // workers (SEC-06).
         let verified = match &user {
-            Some(u) => verify_password(password, &u.password_hash),
+            Some(u) => verify_password_async(password, &u.password_hash).await,
             None => {
-                let _ = verify_password(password, crate::users::dummy_hash());
+                let _ = verify_password_async(password, crate::users::dummy_hash()).await;
                 false
             }
         };
@@ -336,8 +375,12 @@ impl AuthService {
             }
         };
 
-        self.record_success(&key).await;
         if user.totp_enabled {
+            // The lockout counter is NOT reset here: the password is
+            // only the first factor. Resetting at this stage let an
+            // attacker holding the password alternate login / one TOTP
+            // guess forever without ever reaching the lock threshold
+            // (finding SEC-02). It resets when tokens are issued.
             let challenge_id = generate_token();
             self.challenges.lock().await.insert(
                 challenge_id.clone(),
@@ -349,6 +392,7 @@ impl AuthService {
             );
             return Ok(LoginOutcome::TotpRequired { challenge_id });
         }
+        self.record_success(&key).await;
         let pair = self.create_session(&user.id, device_name).await?;
         Ok(LoginOutcome::Tokens {
             pair,
@@ -374,19 +418,44 @@ impl AuthService {
             .read(|f| f.users.iter().find(|u| u.id == challenge.user_id).cloned())
             .await
             .ok_or(AuthError::InvalidCredentials)?;
-        if user.disabled {
+        let key = user.username.to_lowercase();
+        // A lock that engaged after the password stage (TOTP guesses
+        // count toward it, SEC-02) also stops the second stage.
+        if user.disabled || self.is_locked(&key).await {
             return Err(AuthError::InvalidCredentials);
         }
         if self.verify_user_totp(&user, code).await {
             // Re-insert nothing: the challenge is consumed on success
             // and on failure (one guess per challenge; the client
             // logs in again for another).
+            self.record_success(&key).await;
             let pair = self.create_session(&user.id, &challenge.device_name).await?;
             return Ok((pair, UserView::from(&user)));
         }
         self.record_failure(&user.username.to_lowercase(), source_ip)
             .await;
         Err(AuthError::InvalidCredentials)
+    }
+
+    /// Step-up password check for a signed-in user (TOTP disable):
+    /// counts failures against the account lockout and refuses while
+    /// the account is locked (SEC-04), verifying off the async workers
+    /// (SEC-06).
+    pub async fn verify_step_up(&self, user_id: &str, password: &str) -> bool {
+        let user = self
+            .store
+            .read(|f| f.users.iter().find(|u| u.id == user_id).cloned())
+            .await;
+        let Some(user) = user else {
+            return false;
+        };
+        if !self.is_locked(&user.username.to_lowercase()).await
+            && verify_password_async(password, &user.password_hash).await
+        {
+            return true;
+        }
+        self.record_step_up_failure(&user.username).await;
+        false
     }
 
     /// Verify a TOTP or recovery code for a user. Recovery codes are
@@ -670,7 +739,10 @@ impl AuthService {
             .read(|f| f.users.iter().find(|u| u.id == user_id).cloned())
             .await
             .ok_or(AuthError::NotFound("user".into()))?;
-        if !verify_password(current, &user.password_hash) {
+        if self.is_locked(&user.username.to_lowercase()).await
+            || !verify_password_async(current, &user.password_hash).await
+        {
+            self.record_step_up_failure(&user.username).await;
             return Err(AuthError::InvalidCredentials);
         }
         if let Some(e) = password_policy_error(new_password, &user.username) {
@@ -938,9 +1010,14 @@ impl AuthService {
             .await
             .ok_or_else(|| AuthError::NotFound("user".into()))?;
         if user.totp_enabled {
-            let ok = step_up_password
-                .is_some_and(|p| verify_password(p, &user.password_hash));
+            let ok = match step_up_password {
+                Some(p) if !self.is_locked(&user.username.to_lowercase()).await => {
+                    verify_password_async(p, &user.password_hash).await
+                }
+                _ => false,
+            };
             if !ok {
+                self.record_step_up_failure(&user.username).await;
                 return Err(AuthError::InvalidCredentials);
             }
         }
@@ -1247,6 +1324,169 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, AuthError::InvalidCredentials);
+    }
+
+    /// Enable TOTP for `user_id` with a fixed secret; returns the
+    /// secret bytes.
+    async fn enable_totp(svc: &AuthService, user_id: &str) -> Vec<u8> {
+        let secret = b"0123456789abcdefghij".to_vec();
+        svc.creds
+            .write(&totp_target(user_id), &base32_encode(&secret))
+            .await
+            .unwrap();
+        let uid = user_id.to_string();
+        svc.store
+            .mutate::<_, AuthError>(|f| {
+                f.users
+                    .iter_mut()
+                    .find(|u| u.id == uid)
+                    .unwrap()
+                    .totp_enabled = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        secret
+    }
+
+    /// SEC-02 (docs/code-review-v0.1.60.md): a correct password must
+    /// not reset the lockout while the second factor is still pending,
+    /// so TOTP guessing reaches the lock threshold.
+    #[tokio::test]
+    async fn totp_guessing_locks_the_account() {
+        let svc = service().await;
+        let user = svc
+            .create_user("carol", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        let secret = enable_totp(&svc, &user.id).await;
+        let now = now_ms() / 1000;
+        let valid: Vec<u32> = (-1..=1).map(|d| totp_at(&secret, now + d * 30)).collect();
+        let wrong = (0..1_000_000u32).find(|c| !valid.contains(c)).unwrap();
+        let wrong = format!("{wrong:06}");
+        for _ in 0..LOCK_THRESHOLD {
+            let LoginOutcome::TotpRequired { challenge_id } = svc
+                .login("carol", "a-unique-passphrase", "phone", "10.0.0.1")
+                .await
+                .unwrap()
+            else {
+                panic!("expected a TOTP challenge");
+            };
+            let err = svc
+                .complete_totp_login(&challenge_id, &wrong, "10.0.0.1")
+                .await
+                .unwrap_err();
+            assert_eq!(err, AuthError::InvalidCredentials);
+        }
+        // Locked: even the correct password is refused.
+        let err = svc
+            .login("carol", "a-unique-passphrase", "phone", "10.0.0.2")
+            .await
+            .unwrap_err();
+        assert_eq!(err, AuthError::InvalidCredentials);
+    }
+
+    /// SEC-02: a successful second factor clears the counter, and a
+    /// lock engaged after the password stage stops the TOTP stage.
+    #[tokio::test]
+    async fn totp_success_resets_and_lock_blocks_second_stage() {
+        let svc = service().await;
+        let user = svc
+            .create_user("dave", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        let secret = enable_totp(&svc, &user.id).await;
+        let LoginOutcome::TotpRequired { challenge_id } = svc
+            .login("dave", "a-unique-passphrase", "phone", "10.0.0.1")
+            .await
+            .unwrap()
+        else {
+            panic!("expected a TOTP challenge");
+        };
+        // Lock the account between the stages.
+        for _ in 0..LOCK_THRESHOLD {
+            svc.record_account_failure("dave").await;
+        }
+        let code = format!("{:06}", totp_at(&secret, now_ms() / 1000));
+        let err = svc
+            .complete_totp_login(&challenge_id, &code, "10.0.0.1")
+            .await
+            .unwrap_err();
+        assert_eq!(err, AuthError::InvalidCredentials);
+        // Unlocked: the full flow succeeds and clears the record.
+        svc.lockouts.lock().await.clear();
+        svc.record_account_failure("dave").await;
+        let LoginOutcome::TotpRequired { challenge_id } = svc
+            .login("dave", "a-unique-passphrase", "phone", "10.0.0.1")
+            .await
+            .unwrap()
+        else {
+            panic!("expected a TOTP challenge");
+        };
+        let code = format!("{:06}", totp_at(&secret, now_ms() / 1000));
+        svc.complete_totp_login(&challenge_id, &code, "10.0.0.1")
+            .await
+            .unwrap();
+        assert!(!svc.lockouts.lock().await.contains_key("dave"));
+    }
+
+    /// SEC-05: oversized usernames are refused before any per-account
+    /// bookkeeping, and stale lockout entries are pruned.
+    #[tokio::test]
+    async fn oversized_usernames_do_not_grow_the_lockout_map() {
+        let svc = service().await;
+        for i in 0..3 {
+            let name = format!("{i}{}", "x".repeat(10_000));
+            let err = svc
+                .login(&name, "whatever-password", "phone", "10.0.0.9")
+                .await
+                .unwrap_err();
+            assert_eq!(err, AuthError::InvalidCredentials);
+        }
+        assert!(svc.lockouts.lock().await.is_empty());
+        // An expired entry is pruned on the next failure.
+        svc.lockouts.lock().await.insert(
+            "stale".to_string(),
+            LockState {
+                failures: vec![now_ms() - LOCK_WINDOW_MS - 1],
+                ..Default::default()
+            },
+        );
+        svc.record_account_failure("fresh").await;
+        let map = svc.lockouts.lock().await;
+        assert!(!map.contains_key("stale"));
+        assert!(map.contains_key("fresh"));
+    }
+
+    /// SEC-04: wrong current-password guesses on the change-password
+    /// path count toward the account lockout.
+    #[tokio::test]
+    async fn change_password_guesses_lock_the_account() {
+        let svc = service().await;
+        let user = svc
+            .create_user("erin", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        for _ in 0..LOCK_THRESHOLD {
+            let err = svc
+                .change_password(&user.id, "not-the-password", "another-unique-phrase", None)
+                .await
+                .unwrap_err();
+            assert_eq!(err, AuthError::InvalidCredentials);
+        }
+        assert!(svc.is_locked("erin").await);
+        // While locked, even the right current password is refused.
+        let err = svc
+            .change_password(
+                &user.id,
+                "a-unique-passphrase",
+                "another-unique-phrase",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, AuthError::InvalidCredentials);
+        assert!(!svc.verify_step_up(&user.id, "a-unique-passphrase").await);
     }
 
     #[tokio::test]

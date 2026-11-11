@@ -352,6 +352,19 @@ fn source_ip(ip: &SourceIp) -> String {
     ip.0.clone()
 }
 
+/// Account self-service (password change, TOTP enroll/verify/disable)
+/// requires an interactive session. An API token is a delegated,
+/// role-capped credential; letting it rotate the owner's password or
+/// enroll a second factor only its holder knows turned a leaked
+/// operator token into an account takeover (finding SEC-04).
+fn refuse_api_token(p: &Principal) -> Option<Response> {
+    (p.auth_type == crate::auth::AuthType::ApiToken).then(|| {
+        auth_error_response(&AuthError::Forbidden(
+            "account self-service requires a signed-in session, not an API token".into(),
+        ))
+    })
+}
+
 fn auth_error_response(e: &AuthError) -> Response {
     match e {
         AuthError::InvalidCredentials => error_response_raw(
@@ -420,9 +433,12 @@ fn audit_auth(
     result: &str,
     request_id: &str,
 ) {
+    // The actor of a failed login is attacker-chosen text; cap it so
+    // the audit log cannot be grown by megabyte usernames (SEC-05).
+    let actor: String = actor.chars().take(crate::auth::MAX_USERNAME_LEN).collect();
     ctx.audit.append(&AuditEntry {
         ts_ms: now_ms(),
-        actor: actor.to_string(),
+        actor,
         auth_type: auth_type.to_string(),
         source_ip: ip.to_string(),
         action: action.to_string(),
@@ -592,6 +608,9 @@ pub async fn handle_change_password(
     axum::Extension(p): axum::Extension<Principal>,
     axum::Json(body): axum::Json<PasswordBody>,
 ) -> Response {
+    if let Some(r) = refuse_api_token(&p) {
+        return r;
+    }
     let keep = if p.auth_type == crate::auth::AuthType::Session {
         Some(p.session_id.as_str())
     } else {
@@ -667,6 +686,9 @@ pub async fn handle_totp_enroll(
     axum::Extension(p): axum::Extension<Principal>,
     body: Option<axum::Json<TotpEnrollBody>>,
 ) -> Response {
+    if let Some(r) = refuse_api_token(&p) {
+        return r;
+    }
     let step_up = body.and_then(|axum::Json(b)| b.password);
     match ctx
         .auth
@@ -691,6 +713,9 @@ pub async fn handle_totp_verify(
     axum::Extension(p): axum::Extension<Principal>,
     axum::Json(body): axum::Json<TotpVerifyBody>,
 ) -> Response {
+    if let Some(r) = refuse_api_token(&p) {
+        return r;
+    }
     match ctx.auth.totp_verify_enrollment(&p.user_id, &body.code).await {
         Ok(codes) => axum::Json(json!({ "recovery_codes": codes })).into_response(),
         Err(e) => auth_error_response(&e),
@@ -708,17 +733,12 @@ pub async fn handle_totp_disable(
     axum::Extension(p): axum::Extension<Principal>,
     axum::Json(body): axum::Json<TotpDisableBody>,
 ) -> Response {
-    let ok = ctx
-        .users
-        .read(|f| {
-            f.users
-                .iter()
-                .find(|u| u.id == p.user_id)
-                .map(|u| crate::users::verify_password(&body.password, &u.password_hash))
-                .unwrap_or(false)
-        })
-        .await;
-    if !ok {
+    if let Some(r) = refuse_api_token(&p) {
+        return r;
+    }
+    // Verified outside the user-store lock, off the async workers,
+    // and counted against the account lockout (SEC-04 / SEC-06).
+    if !ctx.auth.verify_step_up(&p.user_id, &body.password).await {
         return auth_error_response(&AuthError::InvalidCredentials);
     }
     match ctx.auth.totp_disable(&p.user_id).await {

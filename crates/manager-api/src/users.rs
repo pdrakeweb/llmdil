@@ -265,6 +265,31 @@ pub fn verify_password(password: &str, phc: &str) -> bool {
         .is_ok()
 }
 
+/// Concurrent argon2 verifications allowed (finding SEC-06,
+/// `docs/code-review-v0.1.60.md`). Each verify costs 64 MiB and
+/// hundreds of milliseconds of CPU; capping them keeps a login flood
+/// from claiming every blocking thread and all memory headroom.
+static ARGON2_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// [`verify_password`] off the async workers (finding SEC-06).
+///
+/// The API shares the app's tokio runtime (one worker per CPU), so an
+/// inline argon2 verify stalls supervision, Tauri commands and every
+/// other request for its duration — a few concurrent unauthenticated
+/// logins froze the app. This runs the verify on the blocking pool
+/// behind a small global semaphore. A panicked or cancelled verify
+/// counts as a mismatch (fail closed).
+pub async fn verify_password_async(password: &str, phc: &str) -> bool {
+    let Ok(_permit) = ARGON2_PERMITS.acquire().await else {
+        return false;
+    };
+    let password = password.to_string();
+    let phc = phc.to_string();
+    tokio::task::spawn_blocking(move || verify_password(&password, &phc))
+        .await
+        .unwrap_or(false)
+}
+
 /// A hash of a fixed nonsense password with the plan's parameters,
 /// computed once; login verifies against it for unknown usernames so
 /// the timing does not enumerate users. The result is discarded.
