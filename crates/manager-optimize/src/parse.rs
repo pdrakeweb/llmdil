@@ -35,17 +35,19 @@ pub enum ParseError {
     NoItems,
 }
 
-/// Extract the first balanced `{...}` object from response text.
-/// Code fences and surrounding prose are expected. String literals
-/// and escapes are tracked so braces inside strings do not count.
-pub fn extract_json_object(text: &str) -> Option<String> {
+/// Most `{` positions [`json_object_candidates`] will try as an
+/// object start; bounds the quadratic worst case on brace-heavy text.
+const MAX_OBJECT_STARTS: usize = 256;
+
+/// The balanced `{...}` span starting at byte `start` (which must be a
+/// `{`), tracking string literals and escapes so braces inside strings
+/// do not count. `None` when the text ends before the span closes.
+fn balanced_object_at(text: &str, start: usize) -> Option<&str> {
     let bytes = text.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{')?;
     let mut depth = 0i32;
     let mut in_string = false;
     let mut escaped = false;
-    for i in start..bytes.len() {
-        let b = bytes[i];
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
         if in_string {
             if escaped {
                 escaped = false;
@@ -62,13 +64,36 @@ pub fn extract_json_object(text: &str) -> Option<String> {
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(text[start..=i].to_string());
+                    // `{`/`}` are ASCII, so both ends are char
+                    // boundaries even in multibyte text.
+                    return Some(&text[start..=i]);
                 }
             }
             _ => {}
         }
     }
     None
+}
+
+/// Every balanced `{...}` span in `text` that parses as a JSON object,
+/// in order of its opening brace (finding P-8,
+/// docs/code-review-v0.1.60.md). Trying each `{` — not only the first —
+/// is what lets the salvage survive prose such as "use the {ctx}
+/// setting" or a stray unbalanced `{` ahead of the fenced plan, which
+/// previously failed the whole consultation as `NoJsonObject`.
+pub fn json_object_candidates(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices('{')
+        .take(MAX_OBJECT_STARTS)
+        .filter_map(move |(start, _)| balanced_object_at(text, start))
+        .filter(|cand| serde_json::from_str::<Value>(cand).is_ok_and(|v| v.is_object()))
+}
+
+/// Extract the first balanced `{...}` span from response text that
+/// parses as a JSON object. Code fences and surrounding prose are
+/// expected. String literals and escapes are tracked so braces inside
+/// strings do not count.
+pub fn extract_json_object(text: &str) -> Option<String> {
+    json_object_candidates(text).next().map(str::to_string)
 }
 
 enum ChangeVerdict {
@@ -210,6 +235,13 @@ fn normalize_change(kind: PlanKind, change: &Value) -> ChangeVerdict {
                 out.insert("group".into(), json!(g));
             }
             if let Some(p) = opt_u32(obj, "port", &mut ok) {
+                // A TCP port is 1..=65535. opt_u32 admits up to u32::MAX,
+                // and later `as u16` casts silently truncated 73617 to
+                // 8081 (the plan showed one port, apply used another)
+                // and 65536 to 0 (finding P-7).
+                if p == 0 || u16::try_from(p).is_err() {
+                    return ChangeVerdict::Drop;
+                }
                 out.insert("port".into(), json!(p));
             }
             if let Some(n) = opt_u32(obj, "n_ctx", &mut ok) {
@@ -1552,9 +1584,20 @@ pub fn parse_plan(
     directive: &str,
     now: DateTime<Utc>,
 ) -> Result<Plan, ParseError> {
-    let object_text = extract_json_object(response).ok_or(ParseError::NoJsonObject)?;
-    let root: Value =
-        serde_json::from_str(&object_text).map_err(|_| ParseError::NoJsonObject)?;
+    // Prefer the first object that carries an `items` array (the plan),
+    // so an unrelated JSON object quoted in the prose ahead of it does
+    // not win; fall back to the first object (which then fails as
+    // `NoItems`, as before).
+    let mut candidates = json_object_candidates(response)
+        .map(|t| serde_json::from_str::<Value>(t).expect("candidates are parseable JSON objects"));
+    let first = candidates.next().ok_or(ParseError::NoJsonObject)?;
+    let root: Value = if first.get("items").is_some_and(Value::is_array) {
+        first
+    } else {
+        candidates
+            .find(|v| v.get("items").is_some_and(Value::is_array))
+            .unwrap_or(first)
+    };
     let summary = root
         .get("summary")
         .and_then(|v| v.as_str())
@@ -1869,6 +1912,54 @@ mod tests {
         assert_eq!(r.items[0].kind, PlanKind::BackendSetContext);
         assert_eq!(r.items[0].confidence, Confidence::High);
         assert_eq!(r.items[0].decision, Decision::Undecided);
+    }
+
+    /// P-8: prose braces or an unrelated object before the plan no
+    /// longer fail the consultation.
+    #[test]
+    fn plan_survives_braces_and_objects_in_prose() {
+        let plan = "{\"summary\":\"s\",\"items\":[{\"kind\":\"backend.set_context\",\"target\":\"coder\",\"change\":{\"n_ctx\":65536},\"rationale\":\"r\",\"confidence\":\"high\"}]}";
+        for prefix in [
+            "Use the {ctx} setting.\n```json\n",
+            "a { b unbalanced ...\n",
+            "Current: {\"n_ctx\": 32768}. Plan:\n",
+            "Größe {ü} — plan:\n",
+        ] {
+            let r = parse(&format!("{prefix}{plan}\n```"))
+                .unwrap_or_else(|e| panic!("{prefix:?}: {e:?}"));
+            assert_eq!(r.items.len(), 1, "{prefix:?}");
+        }
+        assert_eq!(
+            extract_json_object("x {y} {\"a\":1}").as_deref(),
+            Some("{\"a\":1}")
+        );
+    }
+
+    /// P-7: an out-of-range port drops the create instead of being
+    /// truncated to a different port.
+    #[test]
+    fn out_of_range_port_drops_the_create() {
+        // Control: the same create with a valid port survives.
+        let ok = parse(
+            "{\"items\":[{\"kind\":\"backend.create\",\"target\":\"x-new\",\"change\":{\"model_id\":\"qwen3-8b\",\"port\":8090},\"rationale\":\"r\"}]}",
+        )
+        .unwrap();
+        assert!(
+            ok.items.iter().any(|i| i.kind == PlanKind::BackendCreate),
+            "control create must survive: {:?}",
+            ok.dropped_fragments
+        );
+        for port in [0u64, 65536, 73617] {
+            let r = parse(&format!(
+                "{{\"items\":[{{\"kind\":\"backend.create\",\"target\":\"x-new\",\"change\":{{\"model_id\":\"qwen3-8b\",\"port\":{port}}},\"rationale\":\"r\"}}]}}"
+            ))
+            .unwrap();
+            assert!(
+                r.items.iter().all(|i| i.kind != PlanKind::BackendCreate),
+                "port {port} must not survive as a create"
+            );
+            assert_eq!(r.dropped_invalid, 1, "port {port}");
+        }
     }
 
     #[test]

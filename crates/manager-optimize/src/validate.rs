@@ -81,8 +81,13 @@ impl ItemValidation {
 fn get_u32(change: &Value, key: &str) -> Option<u32> {
     change.get(key).and_then(|v| v.as_u64()).map(|n| n as u32)
 }
+/// A u16 field; out-of-range values read as absent rather than being
+/// truncated (`73617 as u16` is 8081 — finding P-7).
 fn get_u16(change: &Value, key: &str) -> Option<u16> {
-    change.get(key).and_then(|v| v.as_u64()).map(|n| n as u16)
+    change
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u16::try_from(n).ok())
 }
 fn get_bool(change: &Value, key: &str) -> Option<bool> {
     change.get(key).and_then(|v| v.as_bool())
