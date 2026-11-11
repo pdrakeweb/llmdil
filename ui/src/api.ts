@@ -1082,7 +1082,9 @@ export async function updateBackendFlags(id: string, nCtx: number, nBatch: numbe
  *  the model's full MoE layer count = the `-ot exps=CPU` form).
  *  Only the offload tokens in the backend's raw flags change.
  *  Persisted immediately; applies on the next start. When
- *  `allowOverride` is true it is sent as `allow_override`, recording
+ *  `allowOverride` is true it is sent as `allowOverride` (Tauri 2
+ *  binds the Rust `allow_override` parameter from the camelCase key;
+ *  the snake_case key was silently dropped, code review v0.1.60 UI-4), recording
  *  an explicit override for a guardrail-blocked position; the
  *  argument is omitted entirely when falsy, preserving the previous
  *  invoke shape for other callers. */
@@ -1090,7 +1092,7 @@ export async function setBackendOffload(id: string, layers: number, allowOverrid
   if (!isTauri()) return { data: { backend_id: id, layers, raw_flags: null, changed: false }, live: false };
   try {
     const args: Record<string, unknown> = { id, layers };
-    if (allowOverride) args.allow_override = true;
+    if (allowOverride) args.allowOverride = true;
     const data = await invoke<{ backend_id: string; layers: number; raw_flags: string | null; changed: boolean }>("backend_set_offload", args);
     return { data, live: true };
   } catch (e) {
@@ -4439,7 +4441,7 @@ export async function benchPromptDelete(id: string): Promise<CallResult<{ prompt
 export async function benchPromptGenerate(purpose: string, description: string, size: "short" | "standard", backendId?: string): Promise<CallResult<{ text: string; backend_id: string; model: string }>> {
   if (!isTauri()) return { data: { text: "", backend_id: "", model: "" }, live: false };
   try {
-    const data = await invoke<{ text: string; backend_id: string; model: string }>("bench_prompt_generate", { purpose, description, size, backend_id: backendId ?? null });
+    const data = await invoke<{ text: string; backend_id: string; model: string }>("bench_prompt_generate", { purpose, description, size, backendId: backendId ?? null });
     return { data, live: true };
   } catch (e) {
     return { data: { text: "", backend_id: "", model: "" }, live: true, error: errOf(e) };
@@ -4475,7 +4477,7 @@ export async function benchRunStart(request: BenchSweepRequest): Promise<CallRes
 export async function benchRunCancel(sweepId: string): Promise<CallResult<Record<string, never>>> {
   if (!isTauri()) return { data: {}, live: false };
   try {
-    const data = await invoke<Record<string, never>>("bench_run_cancel", { sweep_id: sweepId });
+    const data = await invoke<Record<string, never>>("bench_run_cancel", { sweepId });
     return { data: data ?? {}, live: true };
   } catch (e) {
     return { data: {}, live: true, error: errOf(e) };
@@ -4498,7 +4500,7 @@ export async function benchResultsList(): Promise<CallResult<{ sweeps: BenchSwee
 export async function benchResultDelete(sweepId: string): Promise<CallResult<{ sweeps: BenchSweepRecord[] }>> {
   if (!isTauri()) return { data: { sweeps: [] }, live: false };
   try {
-    const data = await invoke<{ sweeps: BenchSweepRecord[] }>("bench_result_delete", { sweep_id: sweepId });
+    const data = await invoke<{ sweeps: BenchSweepRecord[] }>("bench_result_delete", { sweepId });
     return { data: { sweeps: Array.isArray(data.sweeps) ? data.sweeps : [] }, live: true };
   } catch (e) {
     return { data: { sweeps: [] }, live: true, error: errOf(e) };

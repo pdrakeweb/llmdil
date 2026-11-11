@@ -120,6 +120,45 @@ for (const file of walkTs(join(root, "src"))) {
     if (!invokedAt.has(m[1])) invokedAt.set(m[1], `${rel}:${lineOf(m.index)}`);
   }
 }
+// Invoke argument keys (code review v0.1.60 UI-1..UI-4): Tauri 2 binds
+// a Rust command parameter `sweep_id` from the camelCase JS key
+// `sweepId`. A snake_case top-level key never binds — a required
+// parameter fails with "missing required key", an Option silently
+// becomes None. Flag snake_case top-level keys in literal invoke
+// argument objects and `args.<snake_case> =` assignments. Nested
+// objects (e.g. `{ request }` payloads) are serde values and keep
+// their Rust field names, so only depth-1 keys are checked.
+const snakeArgs = [];
+for (const file of walkTs(join(root, "src"))) {
+  const src = readFileSync(file, "utf8");
+  const rel = file.slice(root.length + 1);
+  const lineOf = (idx) => src.slice(0, idx).split("\n").length;
+  for (const m of src.matchAll(/\binvoke\b(?:<[^(]*?>)?\(\s*"[a-z][a-z0-9_]*"\s*,\s*\{/g)) {
+    let depth = 1;
+    let i = m.index + m[0].length;
+    let seg = "";
+    const top = [];
+    for (; i < src.length && depth > 0; i++) {
+      const c = src[i];
+      if (c === "{" || c === "[" || c === "(") depth++;
+      else if (c === "}" || c === "]" || c === ")") depth--;
+      if (depth === 1 || (depth === 0 && c === "}")) seg += c;
+      else if (depth === 2 && (c === "{" || c === "[" || c === "(")) seg += c;
+    }
+    for (const part of seg.split(",")) {
+      const km = /^\s*([A-Za-z_$][\w$]*)\s*(?::|$|\})/.exec(part);
+      if (km && km[1].includes("_")) top.push(km[1]);
+    }
+    for (const k of top) snakeArgs.push(`${k} at ${rel}:${lineOf(m.index)}`);
+  }
+  for (const m of src.matchAll(/\bargs\.([a-z][a-z0-9]*_[a-z0-9_]*)\s*=/g)) {
+    snakeArgs.push(`args.${m[1]} at ${rel}:${lineOf(m.index)}`);
+  }
+}
+check(snakeArgs.length === 0,
+  "invoke argument keys are camelCase (Tauri 2 binds snake_case Rust params from camelCase keys)" +
+  (snakeArgs.length ? ` — snake_case: ${snakeArgs.join(", ")}` : ""));
+
 const unregistered = [...invokedAt].filter(([name]) => !registered.has(name));
 check(unregistered.length === 0,
   `every invoked command name is registered (${invokedAt.size} invoked, ${registered.size} registered)` +
