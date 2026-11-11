@@ -358,6 +358,13 @@ pub struct AppState {
     config: RwLock<AppConfig>,
     config_path: PathBuf,
     data_dir: PathBuf,
+    /// How the startup config load went (finding F2): set once by the
+    /// shell right after construction from
+    /// `manager_config::load_for_startup`, reported by `get_status` as
+    /// `config_load` so the UI can flag a `.bak` fallback or a run on
+    /// built-in defaults. `None` for states built without that call
+    /// (tests, tools).
+    config_load: std::sync::Mutex<Option<Value>>,
     supervisor: OnceCell<Mutex<Supervisor>>,
     /// The telemetry store is owned by the poll loop (single writer); the
     /// Arc is shared with the Poller built in `telemetry()`. The std Mutex
@@ -646,6 +653,7 @@ impl AppState {
             config: RwLock::new(config),
             config_path,
             data_dir,
+            config_load: std::sync::Mutex::new(None),
             supervisor: OnceCell::new(),
             telemetry: OnceCell::new(),
             telemetry_poller: OnceCell::new(),
@@ -682,6 +690,27 @@ impl AppState {
             app_update_guard: Mutex::new(()),
             offload_probes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Record the startup config-load outcome (finding F2) for
+    /// `get_status`. `source` is the `manager_config::ConfigSource`;
+    /// `error` the primary load error; `preserved` the
+    /// `*.corrupt-<unix-ms>` copies made before anything could save.
+    pub fn set_config_load_state(
+        &self,
+        source: manager_config::ConfigSource,
+        error: Option<String>,
+        preserved: &[PathBuf],
+    ) {
+        let v = json!({
+            "source": source,
+            "error": error,
+            "preserved": preserved
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        });
+        *self.config_load.lock().unwrap_or_else(|p| p.into_inner()) = Some(v);
     }
 
     fn next_task_id(&self) -> String {
@@ -1505,14 +1534,25 @@ fn merge_json(base: &mut Value, patch: Value) {
 /// Overall service status snapshot.
 pub async fn op_get_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
     let cfg = state.config.read().await;
-    Ok(json!({
+    let mut v = json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "backends_configured": cfg.backends.len(),
         "gateway_port": cfg.gateway.port,
         "winml_enabled": cfg.winml.enabled,
         "mxc_mode": cfg.mxc.mode,
-    }))
+    });
+    // Additive field (finding F2): present only when the shell recorded
+    // the startup load outcome.
+    if let Some(load) = state
+        .config_load
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+    {
+        v["config_load"] = load;
+    }
+    Ok(v)
 }
 
 /// Full application configuration, plus `config_path`: the file the
@@ -11095,6 +11135,28 @@ mod tests {
 
     fn test_sink() -> Arc<dyn EventSink> {
         Arc::new(NoopSink)
+    }
+
+    /// F2 (docs/code-review-v0.1.60.md): `get_status` carries the
+    /// startup config-load outcome once the shell records it, and
+    /// omits the field otherwise.
+    #[tokio::test]
+    async fn get_status_reports_config_load_outcome() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        let v = op_get_status(&state, &sink).await.unwrap();
+        assert!(v.get("config_load").is_none(), "{v}");
+        state.set_config_load_state(
+            manager_config::ConfigSource::Defaults,
+            Some("bad json".to_string()),
+            &[dir.join("config.json.corrupt-1")],
+        );
+        let v = op_get_status(&state, &sink).await.unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["config_load"]["source"], "defaults");
+        assert_eq!(v["config_load"]["error"], "bad json");
+        assert_eq!(v["config_load"]["preserved"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Code review B-3: user creation refuses the reserved

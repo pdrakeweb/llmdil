@@ -259,7 +259,15 @@ async function renderSideFoot(): Promise<void> {
   const gwRow = gw.error
     ? `<div class="row"><span class="dot err"></span> LiteLLM status unknown</div>`
     : `<div class="row"><span class="dot ${gw.data.up ? "ok" : "err"}"></span> LiteLLM :${gw.data.port}${gw.data.up ? "" : " · down"}</div>`;
+  // Abnormal-condition row only (design rule 5): the config came from
+  // the .bak copy or from built-in defaults (code review v0.1.60 F2).
+  // Details (error, preserved copies) live in the tooltip.
+  const cl = s.data.config_load;
+  const cfgRow = cl && (cl.source === "backup" || cl.source === "defaults")
+    ? `<div class="row" title="${esc([cl.error ?? "", ...cl.preserved.map((p) => `Preserved: ${p}`)].filter(Boolean).join("\n"))}"><span class="dot err"></span> Config: ${cl.source === "backup" ? "restored from .bak" : "defaults (load failed)"}</div>`
+    : "";
   el.innerHTML = `
+    ${cfgRow}
     ${gwRow}
     <div class="row"><span class="dot ${b.data.length && up === b.data.length ? "ok" : "warn"}"></span> ${up}/${b.data.length} backends up</div>
     <div class="row"><span class="dot warn"></span> MXC · ${mxc ? esc(mxc) : "unknown"}</div>`;

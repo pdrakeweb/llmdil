@@ -10,6 +10,16 @@ export type Status = "ok" | "degraded" | "starting" | "down" | "idle";
 export interface StatusResponse {
   status: string;
   version: string;
+  /** Startup config-load outcome (code review v0.1.60 F2); absent in
+   *  mock data and older shells. `backup`: config.json was unreadable
+   *  and config.json.bak was used. `defaults`: neither loaded, the app
+   *  runs on built-in defaults. Unreadable files were copied to
+   *  `preserved` before anything saved over them. */
+  config_load?: {
+    source: "primary" | "backup" | "first_run" | "defaults";
+    error: string | null;
+    preserved: string[];
+  };
 }
 
 export interface BackendInfo {

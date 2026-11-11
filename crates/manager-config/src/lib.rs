@@ -1617,6 +1617,137 @@ pub fn load_detailed(path: &PathBuf) -> Result<LoadReport, ConfigError> {
     }
 }
 
+/// Where the configuration the app started with came from
+/// (see [`load_for_startup`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigSource {
+    /// The primary `config.json` loaded cleanly.
+    Primary,
+    /// The primary failed; the `.bak` last-known-good copy was used.
+    Backup,
+    /// Neither file exists: a first run on built-in defaults.
+    FirstRun,
+    /// At least one file exists but neither loaded: running on built-in
+    /// defaults. The unreadable files were preserved (see
+    /// [`preserve_unreadable`]) before anything could save over them.
+    Defaults,
+}
+
+/// Result of [`load_for_startup`].
+#[derive(Debug)]
+pub struct StartupLoad {
+    pub config: AppConfig,
+    pub source: ConfigSource,
+    /// The primary file's load error when `source` is `Backup` or
+    /// `Defaults`.
+    pub error: Option<String>,
+    /// Copies made of unreadable files (`*.corrupt-<unix-ms>`).
+    pub preserved: Vec<PathBuf>,
+}
+
+/// Startup load: [`load_detailed`] plus the preservation the app shell
+/// needs before anything can save (finding F2 in
+/// `docs/code-review-v0.1.60.md`).
+///
+/// Every save rotates the current primary over `.bak`, and startup
+/// itself saves (catalog seeding, setup reconciliation). So a shell that
+/// silently fell back would destroy the evidence: the corrupt primary
+/// becomes `.bak`, then is overwritten by the next save. This function
+/// copies whatever could not be loaded aside first:
+///
+/// - `Backup`: the unreadable primary (if it exists) is preserved; the
+///   `.bak` that loaded is not (it is the config now in memory).
+/// - `Defaults`: both the primary and the `.bak` (whichever exist).
+/// - `FirstRun`: nothing exists, nothing to preserve.
+///
+/// A failed copy is not fatal (the app still has to start); it is
+/// reported in `error` alongside the load error.
+pub fn load_for_startup(path: &Path) -> StartupLoad {
+    let path_buf = path.to_path_buf();
+    match load_detailed(&path_buf) {
+        Ok(report) if !report.used_backup => StartupLoad {
+            config: report.config,
+            source: ConfigSource::Primary,
+            error: None,
+            preserved: Vec::new(),
+        },
+        Ok(report) => {
+            let primary_err = load_one(&path_buf)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "primary config failed to load".to_string());
+            let (preserved, copy_err) =
+                preserve_unreadable(std::slice::from_ref(&path_buf), now_unix_ms());
+            StartupLoad {
+                config: report.config,
+                source: ConfigSource::Backup,
+                error: Some(join_errors(primary_err, copy_err)),
+                preserved,
+            }
+        }
+        Err(e) => {
+            let bak = bak_path(path);
+            if !path.exists() && !bak.exists() {
+                return StartupLoad {
+                    config: AppConfig::default_config(),
+                    source: ConfigSource::FirstRun,
+                    error: None,
+                    preserved: Vec::new(),
+                };
+            }
+            let (preserved, copy_err) = preserve_unreadable(&[path_buf, bak], now_unix_ms());
+            StartupLoad {
+                config: AppConfig::default_config(),
+                source: ConfigSource::Defaults,
+                error: Some(join_errors(e.to_string(), copy_err)),
+                preserved,
+            }
+        }
+    }
+}
+
+fn join_errors(load_err: String, copy_err: Option<String>) -> String {
+    match copy_err {
+        Some(c) => format!("{load_err}; {c}"),
+        None => load_err,
+    }
+}
+
+fn now_unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Copy each existing file in `files` to `<file>.corrupt-<unix_ms>`
+/// beside it (copy, not move: the original stays where a manual repair
+/// expects it). Missing files are skipped. Returns the copies made and,
+/// if any copy failed, a description of the failures.
+pub fn preserve_unreadable(files: &[PathBuf], unix_ms: u128) -> (Vec<PathBuf>, Option<String>) {
+    let mut made = Vec::new();
+    let mut failures = Vec::new();
+    for f in files {
+        if !f.exists() {
+            continue;
+        }
+        let mut dest = f.as_os_str().to_owned();
+        dest.push(format!(".corrupt-{unix_ms}"));
+        let dest = PathBuf::from(dest);
+        match fs::copy(f, &dest) {
+            Ok(_) => made.push(dest),
+            Err(e) => failures.push(format!(
+                "could not preserve {} as {}: {e}",
+                f.display(),
+                dest.display()
+            )),
+        }
+    }
+    let err = (!failures.is_empty()).then(|| failures.join("; "));
+    (made, err)
+}
+
 /// Validate and save the config.
 ///
 /// The existing file (if any) is rotated to `.bak` first; the new file is
@@ -4011,8 +4142,32 @@ mod tests {
 
 #[cfg(test)]
 mod startup_load_tests {
-    //! F1 regression tests (`docs/code-review-v0.1.60.md`).
+    //! F1 / F2 regression tests (`docs/code-review-v0.1.60.md`).
     use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "manager-config-startup-{}-{}-{}",
+            name,
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn corrupt_files_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".corrupt-"))
+            .collect();
+        v.sort();
+        v
+    }
 
     #[test]
     fn default_config_pins_litellm() {
@@ -4059,5 +4214,101 @@ mod startup_load_tests {
                 .as_deref(),
             Some("1.104.2")
         );
+    }
+
+    #[test]
+    fn startup_first_run_preserves_nothing() {
+        let dir = scratch("first-run");
+        let r = load_for_startup(&dir.join("config.json"));
+        assert_eq!(r.source, ConfigSource::FirstRun);
+        assert!(r.error.is_none());
+        assert!(r.preserved.is_empty());
+        assert!(corrupt_files_in(&dir).is_empty());
+    }
+
+    #[test]
+    fn startup_primary_ok_preserves_nothing() {
+        let dir = scratch("primary");
+        let path = dir.join("config.json");
+        save(&AppConfig::default_config(), &path).unwrap();
+        let r = load_for_startup(&path);
+        assert_eq!(r.source, ConfigSource::Primary);
+        assert!(r.preserved.is_empty());
+        assert!(corrupt_files_in(&dir).is_empty());
+    }
+
+    #[test]
+    fn startup_backup_fallback_preserves_corrupt_primary() {
+        let dir = scratch("backup");
+        let path = dir.join("config.json");
+        save(&AppConfig::default_config(), &path).unwrap();
+        save(&AppConfig::default_config(), &path).unwrap(); // creates .bak
+        fs::write(&path, b"{ not json").unwrap();
+        let r = load_for_startup(&path);
+        assert_eq!(r.source, ConfigSource::Backup);
+        assert!(r.error.is_some());
+        assert_eq!(r.preserved.len(), 1);
+        assert_eq!(fs::read(&r.preserved[0]).unwrap(), b"{ not json");
+        // The original stays in place.
+        assert_eq!(fs::read(&path).unwrap(), b"{ not json");
+        // A later save (startup seeding) cannot destroy the evidence.
+        save(&r.config, &path).unwrap();
+        save(&r.config, &path).unwrap();
+        assert_eq!(fs::read(&r.preserved[0]).unwrap(), b"{ not json");
+    }
+
+    #[test]
+    fn startup_defaults_preserves_both_unreadable_files_before_any_save() {
+        let dir = scratch("defaults");
+        let path = dir.join("config.json");
+        fs::write(&path, b"primary garbage").unwrap();
+        fs::write(bak_path(&path), b"bak garbage").unwrap();
+        let r = load_for_startup(&path);
+        assert_eq!(r.source, ConfigSource::Defaults);
+        assert!(r.error.is_some());
+        assert_eq!(r.preserved.len(), 2);
+        let names = corrupt_files_in(&dir);
+        assert!(
+            names.iter().any(|n| n.starts_with("config.json.corrupt-")),
+            "{names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("config.json.bak.corrupt-")),
+            "{names:?}"
+        );
+        // The defaults path then saves (catalog seeding) twice — the
+        // rotation that used to overwrite both originals.
+        save(&r.config, &path).unwrap();
+        save(&r.config, &path).unwrap();
+        let mut contents: Vec<Vec<u8>> = r.preserved.iter().map(|p| fs::read(p).unwrap()).collect();
+        contents.sort();
+        assert_eq!(
+            contents,
+            vec![b"bak garbage".to_vec(), b"primary garbage".to_vec()]
+        );
+    }
+
+    #[test]
+    fn startup_defaults_with_only_corrupt_bak() {
+        let dir = scratch("only-bak");
+        let path = dir.join("config.json");
+        fs::write(bak_path(&path), b"bak garbage").unwrap();
+        let r = load_for_startup(&path);
+        assert_eq!(r.source, ConfigSource::Defaults);
+        assert_eq!(r.preserved.len(), 1);
+        assert_eq!(fs::read(&r.preserved[0]).unwrap(), b"bak garbage");
+    }
+
+    #[test]
+    fn preserve_unreadable_skips_missing_and_names_by_timestamp() {
+        let dir = scratch("preserve");
+        let a = dir.join("a.json");
+        fs::write(&a, b"x").unwrap();
+        let (made, err) = preserve_unreadable(&[a.clone(), dir.join("missing.json")], 1234);
+        assert!(err.is_none());
+        assert_eq!(made, vec![dir.join("a.json.corrupt-1234")]);
+        assert_eq!(fs::read(&a).unwrap(), b"x", "copy, not move");
     }
 }
