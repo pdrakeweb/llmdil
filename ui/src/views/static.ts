@@ -670,14 +670,18 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
   const gpuFilterInput = root.querySelector("#gpuFilter") as HTMLInputElement | null;
   gpuSortSel?.addEventListener("change", () => { gpuSort = gpuSortSel.value; paintBody(); });
   gpuFilterInput?.addEventListener("input", () => { gpuFilter = gpuFilterInput.value; paintBody(); });
-  root.addEventListener("click", (ev) => {
+  // Named so the cleanup can remove it: `root` is the persistent #view
+  // container (code review v0.1.60 UI-7).
+  const onProcToggle = (ev: Event): void => {
+    if (disposed) return;
     const t = (ev.target as HTMLElement).closest("[data-proc-toggle]");
     if (!t) return;
     const key = t.getAttribute("data-proc-toggle") ?? "";
     if (!key) return;
     if (expandedProcs.has(key)) expandedProcs.delete(key); else expandedProcs.add(key);
     paintBody();
-  });
+  };
+  root.addEventListener("click", onProcToggle);
   root.addEventListener("click", onOvGoto);
 
   // Initialize the poll select from the configured interval, bucketed
@@ -710,6 +714,7 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     disposed = true;
     window.clearInterval(timer);
     window.clearInterval(histTimer);
+    root.removeEventListener("click", onProcToggle);
     root.removeEventListener("click", onOvGoto);
     root.removeEventListener("click", onHistRange);
     refreshBtn?.removeEventListener("click", onRefresh);
@@ -5135,6 +5140,17 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     root.removeEventListener("input", syncOffloadDraft);
     root.removeEventListener("change", commitOffload);
     root.removeEventListener("change", syncPlaceDraft);
+    // `root` is the persistent #view container, so every listener
+    // wireBackends adds must be removed here or it survives the visit
+    // and fires (with stale closures) on every later visit (code
+    // review v0.1.60 UI-5).
+    root.removeEventListener("input", syncRawDraft);
+    root.removeEventListener("change", changeMtp);
+    root.removeEventListener("click", clickMoeCacheSwitch);
+    root.removeEventListener("change", changeMoeCacheSize);
+    root.removeEventListener("change", commitParallel);
+    root.removeEventListener("change", changeCache);
+    root.removeEventListener("click", clickCacheBest);
     refreshBtn?.removeEventListener("click", onRefresh);
   };
 }
@@ -5548,6 +5564,9 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
    *  progress and the terminal state (complete, verified, failed)
    *  reach the view; stop when nothing is in flight. */
   const syncPoll = (): void => {
+    // A load that resolves after the view was left must not start a
+    // poll the (already-run) cleanup can never clear (UI-8).
+    if (disposed) return;
     const any = downloading.size > 0 || lastRows.some((m) => m.downloading || m.verifying);
     if (any && pollTimer === null) {
       pollTimer = window.setInterval(() => { void load(); }, 2000);
@@ -5561,7 +5580,12 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     const r = await getModels();
     if (disposed) return;
     const br = await getBackends();
-    if (!disposed && !br.error) {
+    // Re-check after the second await too: a navigation away and back
+    // while list_backends was in flight left this disposed instance
+    // painting into the new view and starting a poll interval nothing
+    // cleared (code review v0.1.60 UI-8).
+    if (disposed) return;
+    if (!br.error) {
       const m = new Map<string, { backends: number; req?: number; err?: number; toks?: number }>();
       for (const model of r.data) {
         const serving = br.data.filter((b) => b.configured && sameModelFile(b.model_file, model.gguf_path));

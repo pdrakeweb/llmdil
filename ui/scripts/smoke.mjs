@@ -159,6 +159,33 @@ check(snakeArgs.length === 0,
   "invoke argument keys are camelCase (Tauri 2 binds snake_case Rust params from camelCase keys)" +
   (snakeArgs.length ? ` — snake_case: ${snakeArgs.join(", ")}` : ""));
 
+// View listener hygiene (code review v0.1.60 UI-5..UI-7): a view's
+// `root` is the persistent #view container, so every
+// root.addEventListener in a view must have a matching
+// root.removeEventListener (same event, same named handler) in that
+// file, and anonymous handlers (which cannot be removed) are refused.
+const leakyListeners = [];
+for (const file of walkTs(join(root, "src", "views"))) {
+  const src = readFileSync(file, "utf8");
+  const rel = file.slice(root.length + 1);
+  const lineOf = (idx) => src.slice(0, idx).split("\n").length;
+  const removed = new Set(
+    [...src.matchAll(/\broot\.removeEventListener\(\s*"([a-z]+)"\s*,\s*([A-Za-z_$][\w$]*)\s*[,)]/g)]
+      .map((m) => `${m[1]}:${m[2]}`),
+  );
+  for (const m of src.matchAll(/\broot\.addEventListener\(\s*"([a-z]+)"\s*,\s*([^,)]+)/g)) {
+    const handler = m[2].trim();
+    if (!/^[A-Za-z_$][\w$]*$/.test(handler)) {
+      leakyListeners.push(`anonymous ${m[1]} at ${rel}:${lineOf(m.index)}`);
+    } else if (!removed.has(`${m[1]}:${handler}`)) {
+      leakyListeners.push(`${m[1]}:${handler} at ${rel}:${lineOf(m.index)}`);
+    }
+  }
+}
+check(leakyListeners.length === 0,
+  "every view root listener is removed in its cleanup" +
+  (leakyListeners.length ? ` — not removed: ${leakyListeners.join(", ")}` : ""));
+
 const unregistered = [...invokedAt].filter(([name]) => !registered.has(name));
 check(unregistered.length === 0,
   `every invoked command name is registered (${invokedAt.size} invoked, ${registered.size} registered)` +
