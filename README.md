@@ -8,7 +8,7 @@ supervises, and monitors a local LLM serving stack on a single workstation.
 Target machine: Dell Precision 7865 — Threadripper PRO 5945WX, RTX A4000 16 GB
 + 2× Tesla P100 16 GB, Windows 11 Pro.
 
-Current release: **v0.1.40** (October 18, 2026).
+Current release: **v0.1.60** (November 6, 2026).
 
 ## What it does
 
@@ -99,11 +99,13 @@ cd ui; npm install; npm run build
 
 Repository layout:
 
-- `crates/` — Rust workspace: `manager-config`, `manager-wizard`,
+- `crates/` — Rust workspace (18 crates): `manager-config`, `manager-wizard`,
   `manager-supervisor`, `manager-telemetry`, `manager-gateway`,
   `manager-models`, `manager-mxc`, `manager-winml`, `manager-api`,
   `manager-app`, `manager-mcp`, `manager-optimize`, `manager-present`,
-  `manager-services`
+  `manager-services`, `manager-bench`, `manager-cli` (the `llmdil-cli`
+  Admin API client), `manager-logship` (log-streaming shipper), and
+  `manager-logreceiver` (the Prometheus-local log receiver service)
 - `src-tauri/` — Tauri 2 application shell and command/event API
 - `ui/` — frontend
 - `.github/workflows/` — CI (tests) and release autobuild (Windows installer)

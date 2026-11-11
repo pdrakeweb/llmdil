@@ -2,11 +2,11 @@
 
 Status: historical design record. UI design approved Oct 8, 2026
 ([`design-b-hybrid.md`](design-b-hybrid.md)); the system was built from this
-spec and first shipped as v0.1.0. Current shipped version: **v0.1.40**
-(Oct 18, 2026). This document is retained as the record of what was approved
+spec and first shipped as v0.1.0. Current shipped version: **v0.1.60**
+(Nov 6, 2026). This document is retained as the record of what was approved
 and why; where it differs from the shipped product, the code and the as-built
 docs govern — the operation registry
-(`crates/manager-app/src/registry.rs`, 108 operations at v0.1.40),
+(`crates/manager-app/src/registry.rs`, 152 operations at v0.1.60),
 [`docs/admin-api/rest-api.md`](admin-api/rest-api.md), and
 [`crates/MODULES.md`](../crates/MODULES.md).
 
