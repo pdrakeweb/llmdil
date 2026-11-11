@@ -654,7 +654,7 @@ impl RealSystemOps {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(false);
-        let child = c.spawn().map_err(|e| WizardError::CommandFailed {
+        let mut child = c.spawn().map_err(|e| WizardError::CommandFailed {
             argv: cmd.argv.clone(),
             code: -1,
             stderr: format!("spawn failed: {e}"),
@@ -662,18 +662,33 @@ impl RealSystemOps {
         let mut guard = TreeKillGuard {
             pid: child.id().filter(|p| pid_is_signalable(*p)),
         };
-        let out = match tokio::time::timeout(budget, child.wait_with_output()).await {
-            Ok(Ok(out)) => out,
+        // Wait for the CHILD to exit, not for its pipes to close
+        // (finding PL-M3, docs/code-review-v0.1.60.md).
+        // `wait_with_output` waited for EOF on stdout/stderr, and a
+        // descendant that inherited the pipe write ends keeps them open
+        // for its whole life — `pg_ctl --no-wait start` hands them to
+        // `cmd /C postgres` and the postmaster, so every PostgreSQL
+        // start sat out its full 60 s budget and was then logged as a
+        // timed-out launch. The pipes are drained on reader tasks; once
+        // the child has exited they get a short grace period, and output
+        // still held open by a descendant is returned as read so far.
+        let stdout_buf = spawn_pipe_reader(child.stdout.take());
+        let stderr_buf = spawn_pipe_reader(child.stderr.take());
+        let status = match tokio::time::timeout(budget, child.wait()).await {
+            Ok(Ok(status)) => status,
             Ok(Err(e)) => {
+                stdout_buf.1.abort();
+                stderr_buf.1.abort();
                 return Err(WizardError::CommandFailed {
                     argv: cmd.argv.clone(),
                     code: -1,
                     stderr: format!("wait failed: {e}"),
-                })
+                });
             }
             Err(_) => {
-                // The wait future is dropped with the child handle;
-                // the armed guard kills the tree.
+                // The armed guard kills the tree when it drops.
+                stdout_buf.1.abort();
+                stderr_buf.1.abort();
                 return Err(WizardError::CommandFailed {
                     argv: cmd.argv.clone(),
                     code: -1,
@@ -681,11 +696,15 @@ impl RealSystemOps {
                 });
             }
         };
+        // The child exited: its descendants (a started server) are
+        // meant to outlive it, so the tree is not killed.
         guard.disarm();
+        let stdout = finish_pipe_reader(stdout_buf).await;
+        let stderr = finish_pipe_reader(stderr_buf).await;
         Ok(CommandOutput {
-            exit_code: out.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            exit_code: status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     }
 
@@ -696,6 +715,52 @@ impl RealSystemOps {
     fn cancel_flag(&self) -> Arc<AtomicBool> {
         self.step_cancel.clone()
     }
+}
+
+/// How long [`RealSystemOps::run_child`] keeps reading a child's pipes
+/// after the child itself has exited. Output a command writes before
+/// exiting is already in the pipe; this only bounds the wait for EOF
+/// when a descendant inherited the write end (PL-M3).
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+type PipeReader = (Arc<std::sync::Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>);
+
+/// Read `pipe` to EOF on a task, appending to a shared buffer as data
+/// arrives so an aborted read keeps everything read so far.
+fn spawn_pipe_reader<R>(pipe: Option<R>) -> PipeReader
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = buf.clone();
+    let task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let Some(mut pipe) = pipe else { return };
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => sink
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extend_from_slice(&chunk[..n]),
+            }
+        }
+    });
+    (buf, task)
+}
+
+/// Give a pipe reader [`PIPE_DRAIN_GRACE`] to reach EOF, then stop it
+/// and return what it read.
+async fn finish_pipe_reader((buf, mut task): PipeReader) -> Vec<u8> {
+    if tokio::time::timeout(PIPE_DRAIN_GRACE, &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+    }
+    let out = std::mem::take(&mut *buf.lock().unwrap_or_else(|p| p.into_inner()));
+    out
 }
 
 /// Windows creation flags for a windowless detached spawn:
@@ -1758,6 +1823,35 @@ mod tests {
         assert!(format!("{err}").contains("timed out"), "{err}");
         assert!(
             started.elapsed() < Duration::from_secs(10),
+            "returned after {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// PL-M3 (docs/code-review-v0.1.60.md): a command whose
+    /// background descendant inherits its stdout (the `pg_ctl
+    /// --no-wait start` shape) returns when the command itself exits,
+    /// with the output it wrote, instead of waiting for the pipe to
+    /// close and timing out. The descendant is left running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_command_returns_on_child_exit_when_grandchild_holds_pipes() {
+        let ops = RealSystemOps::default();
+        let cmd = PlannedCommand::new(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 20 & echo started; echo warn >&2; exit 0".to_string(),
+        ]);
+        let started = std::time::Instant::now();
+        let out = ops
+            .run_command_with_timeout(&cmd, Duration::from_secs(10))
+            .await
+            .expect("the command exited 0; it must not be reported as timed out");
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.stdout.trim(), "started");
+        assert_eq!(out.stderr.trim(), "warn");
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
             "returned after {:?}",
             started.elapsed()
         );
