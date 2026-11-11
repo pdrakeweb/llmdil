@@ -599,17 +599,34 @@ mod windows_host {
         unsafe { SetServiceStatus(handle, &status) };
     }
 
+    /// Security attributes marking a handle inheritable. The child's
+    /// stdio handles MUST be inheritable: `STARTF_USESTDHANDLES` +
+    /// `bInheritHandles = TRUE` only pass handles created with
+    /// `bInheritHandle = TRUE`. With a null pointer (as before) the
+    /// child received handle values that did not exist in its process,
+    /// so every service-mode stdout/stderr log stayed empty, and a later
+    /// handle the child opened could alias the dead value and receive
+    /// its stdout writes (finding PL-M1, docs/code-review-v0.1.60.md).
+    fn inheritable() -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        }
+    }
+
     fn append_handle(path: &Path) -> Option<HANDLE> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let path_w = wide(&path.to_string_lossy());
+        let sa = inheritable();
         let handle = unsafe {
             CreateFileW(
                 path_w.as_ptr(),
                 FILE_APPEND_DATA,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null_mut::<SECURITY_ATTRIBUTES>(),
+                &sa,
                 OPEN_ALWAYS,
                 0,
                 std::ptr::null_mut(),
@@ -624,12 +641,13 @@ mod windows_host {
 
     fn nul_handle() -> HANDLE {
         let path_w = wide("NUL");
+        let sa = inheritable();
         unsafe {
             CreateFileW(
                 path_w.as_ptr(),
                 FILE_GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null_mut::<SECURITY_ATTRIBUTES>(),
+                &sa,
                 OPEN_EXISTING,
                 0,
                 std::ptr::null_mut(),
@@ -663,17 +681,28 @@ mod windows_host {
 
         // Environment: the service's own environment overlaid with
         // the definition's entries.
-        let mut env_map: Vec<(String, String)> = std::env::vars().collect();
+        // `vars_os`, not `vars`: `std::env::vars()` panics on any
+        // non-Unicode variable, which would kill the shim before it
+        // reports a status (PL-n2). Values are passed through as
+        // UTF-16 unchanged.
+        use std::os::windows::ffi::OsStrExt;
+        let mut env_map: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+            std::env::vars_os().collect();
         for (k, v) in resolved {
-            if let Some(slot) = env_map.iter_mut().find(|(ek, _)| ek.eq_ignore_ascii_case(&k)) {
-                slot.1 = v;
+            if let Some(slot) = env_map
+                .iter_mut()
+                .find(|(ek, _)| ek.to_string_lossy().eq_ignore_ascii_case(&k))
+            {
+                slot.1 = v.into();
             } else {
-                env_map.push((k, v));
+                env_map.push((k.into(), v.into()));
             }
         }
         let mut env_block: Vec<u16> = Vec::new();
         for (k, v) in &env_map {
-            env_block.extend(format!("{k}={v}").encode_utf16());
+            env_block.extend(k.encode_wide());
+            env_block.push(u16::from(b'='));
+            env_block.extend(v.encode_wide());
             env_block.push(0);
         }
         env_block.push(0);
