@@ -37,6 +37,12 @@ use crate::{
     TelemetrySourceKind,
 };
 
+/// Upper bound on one `nvidia-smi --query` run. A healthy query takes
+/// well under a second per GPU; this is generous enough for a slow
+/// multi-GPU box and short enough that a hung driver surfaces as a
+/// poll error within a few ticks.
+pub const SMI_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// `nvidia-smi --query --xml-format` source (load-bearing fallback).
 pub struct NvidiaSmiSource {
     pub nvidia_smi_path: PathBuf,
@@ -49,10 +55,26 @@ impl NvidiaSmiSource {
         }
     }
 
-    /// Spawn `nvidia-smi --query --xml-format` and capture stdout.
+    /// Spawn `nvidia-smi --query --xml-format` and capture stdout,
+    /// bounded by [`SMI_QUERY_TIMEOUT`].
     pub async fn run_query(&self) -> Result<String, TelemetryError> {
+        self.run_query_within(SMI_QUERY_TIMEOUT).await
+    }
+
+    /// [`Self::run_query`] with an explicit bound (finding P-3,
+    /// `docs/code-review-v0.1.60.md`). nvidia-smi is known to hang
+    /// during driver installs/updates, TDRs and when a GPU falls off
+    /// the bus; unbounded, that stalled the poll loop for good (GPUs
+    /// only went stale, no poll error was ever recorded) and
+    /// `PollHandle::stop` waited on it forever. On expiry the child is
+    /// killed (`kill_on_drop`) and the tick reports `SmiFailed`.
+    async fn run_query_within(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<String, TelemetryError> {
         let mut cmd = tokio::process::Command::new(&self.nvidia_smi_path);
         cmd.args(["--query", "--xml-format"]);
+        cmd.kill_on_drop(true);
         // The poller spawns this from a GUI process every tick; on
         // Windows a console child without CREATE_NO_WINDOW opens a
         // visible console window each time (focus-stealing flash).
@@ -62,12 +84,21 @@ impl NvidiaSmiSource {
             // inherently on Windows; no trait import needed).
             cmd.creation_flags(0x08000000);
         }
-        let output = cmd.output().await.map_err(|e| {
-            TelemetryError::SmiFailed(format!(
-                "failed to spawn {}: {e}",
-                self.nvidia_smi_path.display()
-            ))
-        })?;
+        let output = tokio::time::timeout(timeout, cmd.output())
+            .await
+            .map_err(|_| {
+                TelemetryError::SmiFailed(format!(
+                    "{} did not finish within {}s and was killed",
+                    self.nvidia_smi_path.display(),
+                    timeout.as_secs_f32()
+                ))
+            })?
+            .map_err(|e| {
+                TelemetryError::SmiFailed(format!(
+                    "failed to spawn {}: {e}",
+                    self.nvidia_smi_path.display()
+                ))
+            })?;
         if !output.status.success() {
             return Err(TelemetryError::SmiFailed(format!(
                 "exit {}: {}",
@@ -1018,6 +1049,36 @@ mod tests {
         let (samples, procs) = NvidiaSmiSource::parse_xml_with_processes(xml).expect("must parse");
         assert_eq!(samples[0].driver_model, Some(DriverModel::Tcc));
         assert_eq!(procs[0].vram_mib, Some(11264));
+    }
+
+    /// P-3: a hung nvidia-smi is killed at the bound and reported as a
+    /// poll error instead of stalling the poll loop forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_query_times_out_on_a_hung_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "manager-telemetry-smi-hang-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("nvidia-smi");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let src = NvidiaSmiSource::new(&script);
+        let started = std::time::Instant::now();
+        let err = src
+            .run_query_within(std::time::Duration::from_millis(300))
+            .await
+            .expect_err("a hung query must fail");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(matches!(err, TelemetryError::SmiFailed(_)));
+        assert!(err.to_string().contains("did not finish"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

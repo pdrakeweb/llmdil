@@ -172,17 +172,40 @@ pub fn server_config(material: &TlsMaterial) -> io::Result<Arc<rustls::ServerCon
     Ok(Arc::new(config))
 }
 
+/// Longest a client may take to complete the TLS handshake.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Most handshakes in flight at once; beyond this the listener stops
+/// accepting until one finishes or times out.
+const MAX_PENDING_HANDSHAKES: usize = 64;
+
+type Handshake = Option<(
+    tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    std::net::SocketAddr,
+)>;
+
 /// An axum listener that terminates TLS per connection.
+///
+/// Handshakes run as concurrent tasks, each bounded by
+/// `HANDSHAKE_TIMEOUT` (10 s), and `accept` yields whichever completes first
+/// (finding SEC-07, `docs/code-review-v0.1.60.md`). axum calls
+/// `accept` one connection at a time, so a handshake awaited inline
+/// let a single client that opened TCP and never sent a ClientHello
+/// block every other connection indefinitely — an unauthenticated DoS
+/// from the LAN or tailnet.
 pub struct TlsListener {
     listener: tokio::net::TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
+    handshakes: tokio::task::JoinSet<Handshake>,
 }
 
 impl TlsListener {
+    /// Wrap a bound TCP listener; no handshake work starts until `accept`.
     pub fn new(listener: tokio::net::TcpListener, config: Arc<rustls::ServerConfig>) -> Self {
         Self {
             listener,
             acceptor: tokio_rustls::TlsAcceptor::from(config),
+            handshakes: tokio::task::JoinSet::new(),
         }
     }
 }
@@ -193,17 +216,32 @@ impl axum::serve::Listener for TlsListener {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            match self.listener.accept().await {
-                Ok((stream, addr)) => match self.acceptor.accept(stream).await {
-                    Ok(tls) => return (tls, addr),
-                    // A failed handshake (port scan, plaintext probe)
-                    // drops that connection only, never the listener.
-                    Err(_) => continue,
-                },
-                Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue;
+            let can_accept = self.handshakes.len() < MAX_PENDING_HANDSHAKES;
+            tokio::select! {
+                Some(done) = self.handshakes.join_next(), if !self.handshakes.is_empty() => {
+                    // A failed or timed-out handshake (port scan,
+                    // plaintext probe, idle socket) drops that
+                    // connection only, never the listener.
+                    if let Ok(Some(conn)) = done {
+                        return conn;
+                    }
                 }
+                res = self.listener.accept(), if can_accept => match res {
+                    Ok((stream, addr)) => {
+                        let acceptor = self.acceptor.clone();
+                        self.handshakes.spawn(async move {
+                            match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+                                .await
+                            {
+                                Ok(Ok(tls)) => Some((tls, addr)),
+                                _ => None,
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                },
             }
         }
     }
@@ -216,6 +254,44 @@ impl axum::serve::Listener for TlsListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-07: an idle TCP connection that never sends a ClientHello
+    /// must not stop the listener from completing other handshakes.
+    #[tokio::test]
+    async fn idle_connection_does_not_block_other_handshakes() {
+        let dir = std::env::temp_dir().join(format!(
+            "manager-api-tls-idle-{}-{}",
+            std::process::id(),
+            crate::users::now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = load_or_generate(&dir).unwrap();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let listener = TlsListener::new(tcp, server_config(&m).unwrap());
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        // The idle client: connects, sends nothing, stays open.
+        let _idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get(format!("https://{addr}/")).send(),
+        )
+        .await;
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+        let resp = got
+            .expect("TLS request blocked behind an idle connection")
+            .unwrap();
+        assert_eq!(resp.text().await.unwrap(), "ok");
+    }
 
     #[test]
     fn generated_material_is_self_consistent() {

@@ -442,12 +442,17 @@ pub fn error_mapping(e: &ApiError) -> (axum::http::StatusCode, &'static str, &'s
     }
 }
 
+/// Map an `ApiError` onto the JSON error envelope. The message passes through
+/// [`sanitize`] first, so machine paths never reach a remote client.
 pub fn error_response(ctx: &ApiCtx, e: &ApiError, details: Option<Value>) -> Response {
     let (status, code, kind) = error_mapping(e);
     let message = sanitize(&e.to_string(), &ctx.data_dir);
     error_response_raw(status, code, kind, &message, details)
 }
 
+/// Build the error envelope `{"error": {code, kind, message, details}}` directly. Unlike
+/// [`error_response`] this does not sanitize: `message` must already be safe to show a
+/// remote client.
 pub fn error_response_raw(
     status: axum::http::StatusCode,
     code: &str,

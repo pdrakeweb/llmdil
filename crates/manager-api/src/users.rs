@@ -19,7 +19,9 @@ use tokio::sync::RwLock;
 
 pub use manager_app::registry::Role;
 
+/// File name of the store inside the data dir. Must never go into a diagnostics bundle.
 pub const STORE_FILE: &str = "admin-users.json";
+/// Schema version written to new store files (not yet checked on load).
 pub const STORE_VERSION: u32 = 1;
 
 /// Access-token lifetime: 60 minutes (all roles, decision 8).
@@ -36,6 +38,8 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// One API account as persisted, including its password and recovery-code hashes. Never
+/// serialize it to a client; use [`crate::auth::UserView`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: String,
@@ -69,6 +73,7 @@ pub enum RoleName {
 }
 
 impl RoleName {
+    /// The authorization role this stored role grants.
     pub fn to_role(self) -> Role {
         match self {
             RoleName::Viewer => Role::Viewer,
@@ -78,6 +83,7 @@ impl RoleName {
         }
     }
 
+    /// Inverse of [`Self::to_role`].
     pub fn from_role(r: Role) -> Self {
         match r {
             Role::Viewer => RoleName::Viewer,
@@ -87,6 +93,7 @@ impl RoleName {
         }
     }
 
+    /// Stable lowercase form used in the store file and on the wire.
     pub fn as_str(self) -> &'static str {
         match self {
             RoleName::Viewer => "viewer",
@@ -96,6 +103,7 @@ impl RoleName {
         }
     }
 
+    /// Parse the wire form: exact lowercase match only, `None` for anything else.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "viewer" => Some(Self::Viewer),
@@ -107,6 +115,8 @@ impl RoleName {
     }
 }
 
+/// One per-device login session. Only token hashes are stored. `revoked` is terminal, and
+/// expired or revoked sessions stay in the file until their user is deleted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -128,6 +138,8 @@ pub struct Session {
     pub revoked: bool,
 }
 
+/// An admin-issued, role-bound API credential. Its value is shown once at creation and
+/// only the SHA-256 is stored; validation also requires the owning user to be enabled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiToken {
     pub id: String,
@@ -147,6 +159,8 @@ pub struct ApiToken {
     pub revoked: bool,
 }
 
+/// On-disk shape of `admin-users.json`. Change it only through [`UserStore::mutate`], so
+/// every change is persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsersFile {
     pub version: u32,
@@ -169,6 +183,8 @@ impl Default for UsersFile {
     }
 }
 
+/// Errors loading or persisting the user store. The auth layer collapses them into an
+/// opaque internal error.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("io error: {0}")]
@@ -177,6 +193,9 @@ pub enum StoreError {
     Corrupt(String),
 }
 
+/// The `admin-users.json` store: an in-memory copy behind an async `RwLock`, rewritten in
+/// full (temp file + rename) on every mutation. The write lock is held across the disk
+/// write, so mutations are serialized and readers never see an unpersisted change.
 pub struct UserStore {
     path: PathBuf,
     inner: RwLock<UsersFile>,
@@ -207,6 +226,7 @@ impl UserStore {
         })
     }
 
+    /// Where the store file lives (a placeholder for [`Self::in_memory`]).
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -256,6 +276,8 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
     Ok(argon.hash_password(password.as_bytes(), &salt)?.to_string())
 }
 
+/// Check `password` against an argon2 PHC string; a malformed hash is a mismatch (fail
+/// closed). Blocking and expensive: async callers use [`verify_password_async`].
 pub fn verify_password(password: &str, phc: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(phc) else {
         return false;
@@ -263,6 +285,31 @@ pub fn verify_password(password: &str, phc: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
+}
+
+/// Concurrent argon2 verifications allowed (finding SEC-06,
+/// `docs/code-review-v0.1.60.md`). Each verify costs 64 MiB and
+/// hundreds of milliseconds of CPU; capping them keeps a login flood
+/// from claiming every blocking thread and all memory headroom.
+static ARGON2_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// [`verify_password`] off the async workers (finding SEC-06).
+///
+/// The API shares the app's tokio runtime (one worker per CPU), so an
+/// inline argon2 verify stalls supervision, Tauri commands and every
+/// other request for its duration — a few concurrent unauthenticated
+/// logins froze the app. This runs the verify on the blocking pool
+/// behind a small global semaphore. A panicked or cancelled verify
+/// counts as a mismatch (fail closed).
+pub async fn verify_password_async(password: &str, phc: &str) -> bool {
+    let Ok(_permit) = ARGON2_PERMITS.acquire().await else {
+        return false;
+    };
+    let password = password.to_string();
+    let phc = phc.to_string();
+    tokio::task::spawn_blocking(move || verify_password(&password, &phc))
+        .await
+        .unwrap_or(false)
 }
 
 /// A hash of a fixed nonsense password with the plan's parameters,
@@ -346,7 +393,8 @@ pub fn password_policy_error(password: &str, username: &str) -> Option<String> {
 // Token helpers
 // ---------------------------------------------------------------------------
 
-/// A fresh opaque token: 256 bits, base64url, shown to the caller
+/// A fresh opaque token: 32 bytes from two UUID v4s (244 random bits;
+/// the version/variant bits are fixed), base64url, shown to the caller
 /// once; only its SHA-256 is stored.
 pub fn generate_token() -> String {
     let a = uuid::Uuid::new_v4().into_bytes();
@@ -357,6 +405,8 @@ pub fn generate_token() -> String {
     base64url(&bytes)
 }
 
+/// Lowercase hex SHA-256 of a token or recovery code — the only form stored. Unsalted is
+/// fine because the inputs are high-entropy; lookups compare hashes, never raw values.
 pub fn hash_token(token: &str) -> String {
     let digest = sha2::Sha256::digest(token.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()

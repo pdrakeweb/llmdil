@@ -124,12 +124,30 @@ impl ApiClient {
     /// shown by the LLMdil UI's "Certificate SHA-256" row). `base`
     /// is the API base URL without a trailing slash, e.g.
     /// `https://192.168.5.23:47821`.
+    ///
+    /// Only `https://` bases are accepted, the client refuses plaintext
+    /// and does not follow redirects (finding SEC-09,
+    /// `docs/code-review-v0.1.60.md`): the pin lives in the TLS config,
+    /// so an `http://` base (a typo in `--base-url` or
+    /// `LLMDIL_BASE_URL`) silently bypassed it and sent the password or
+    /// bearer token in cleartext.
     pub fn new(base: &str, fingerprint_hex: &str) -> Result<Self, ApiError> {
+        if !base
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        {
+            return Err(ApiError::Input(format!(
+                "the API base URL must start with https:// (got {base:?}); \
+                 certificate pinning only applies to TLS connections"
+            )));
+        }
         let fp = parse_fingerprint(fingerprint_hex)
             .map_err(ApiError::Input)?;
         let config = pinned_client_config(fp);
         let http = Client::builder()
             .use_preconfigured_tls(config)
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(ApiError::Transport)?;
         Ok(Self {
@@ -438,6 +456,21 @@ pub enum LoginOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-09: plaintext base URLs are refused; https is accepted in
+    /// any case.
+    #[test]
+    fn api_client_requires_https_base() {
+        let fp = "ab".repeat(32);
+        for bad in ["http://127.0.0.1:47821", "127.0.0.1:47821", "ftp://x", ""] {
+            assert!(
+                matches!(ApiClient::new(bad, &fp), Err(ApiError::Input(_))),
+                "{bad:?} must be refused"
+            );
+        }
+        assert!(ApiClient::new("https://127.0.0.1:47821", &fp).is_ok());
+        assert!(ApiClient::new("HTTPS://host:1/", &fp).is_ok());
+    }
 
     #[test]
     fn poll_delay_is_1s_then_5s() {

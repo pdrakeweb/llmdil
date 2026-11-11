@@ -1,14 +1,16 @@
 # Crate map — implementation contract
 
-Rust workspace for LLMdil. Seventeen library
-crates under `crates/` (workspace members) plus the Tauri shell in
+Rust workspace for LLMdil. Eighteen crates under `crates/` (workspace
+members, `members = ["crates/*"]`; `manager-cli` and
+`manager-logreceiver` also build binaries) plus the Tauri shell in
 `src-tauri/` (excluded from the workspace; path-deps to the crates).
 The UI shell is in `ui/` (Vite + plain TypeScript; framework-independent
 Tauri command boundary per spec).
 
 This map was written at scaffold time and is kept current as the crate
-inventory: the workspace is fully implemented (862 workspace tests at
-v0.1.40), and the function lists below describe the implemented API
+inventory: the workspace is fully implemented (1,263 workspace tests as
+measured by `cargo test --workspace` on Nov 11, 2026 — v0.1.60 plus the
+v0.1.60 deep-review fixes: 1,262 pass, 1 ignored), and the function lists below describe the implemented API
 surface, not stubs. Conventions: every crate exposes its public API
 from `src/lib.rs`. Shared versions live in the root
 `[workspace.dependencies]`. Spec references below are to
@@ -459,3 +461,28 @@ hourly retention prune at 14 days / 512 MiB. Binary
 `llmdil-log-receiver` (default mode serves; `install-service` /
 `uninstall-service` / `definition` subcommands serve the deploy
 script, `tools/prometheus/Deploy-LogReceiver.ps1`).
+
+## manager-logship — log-streaming design (D9)
+
+The log-streaming shipper, owned by manager-app and started after
+config load when `log_streaming.enabled` is set. Tails the app's own
+log files, redacts every line in-process before anything is serialized
+(`Redactor`: literal secrets known at start, `Authorization` headers,
+`sk-` keys, URI userinfo, and secret-named key/value pairs in JSON,
+query-string, DSN and Python-repr shapes), batches `WireRecord`s and
+delivers them to the single configured destination (the
+manager-logreceiver service), spooling to disk while it is unreachable
+(`DEFAULT_SPOOL_CAP_BYTES`). Failure-isolated: it cannot block or fail
+the app. Public API: `spawn(ShipperConfig) -> ShipperHandle`,
+`ShipperStatus`, `Redactor`, `WireRecord`, `classify_level`,
+`default_machine_name`.
+
+## manager-cli — Admin API client (`llmdil-cli`)
+
+Library + binary (`src/lib.rs` shared by the CLI and its TUI). The
+client side of the Admin API: `ApiClient` (login incl. TOTP, token
+refresh, operation calls), certificate pinning (`pinning`: the server's
+leaf certificate SHA-256 must match the fingerprint the LLMdil UI
+shows; a mismatch aborts the connection, and only `https://` base URLs
+are accepted). Hard rules: no secret is ever a command-line argument
+(environment or stdin only); tokens live in memory only.

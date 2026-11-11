@@ -358,6 +358,13 @@ pub struct AppState {
     config: RwLock<AppConfig>,
     config_path: PathBuf,
     data_dir: PathBuf,
+    /// How the startup config load went (finding F2): set once by the
+    /// shell right after construction from
+    /// `manager_config::load_for_startup`, reported by `get_status` as
+    /// `config_load` so the UI can flag a `.bak` fallback or a run on
+    /// built-in defaults. `None` for states built without that call
+    /// (tests, tools).
+    config_load: std::sync::Mutex<Option<Value>>,
     supervisor: OnceCell<Mutex<Supervisor>>,
     /// The telemetry store is owned by the poll loop (single writer); the
     /// Arc is shared with the Poller built in `telemetry()`. The std Mutex
@@ -416,9 +423,15 @@ pub struct AppState {
     /// `mcp-<id>`); pruning and orphan-surfacing in the backend commands
     /// must only ever touch ids in this set.
     backend_spec_ids: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// MCP server modes, overlaid on `manager_mcp::default_servers()`.
-    /// (No MCP section exists in `AppConfig` yet; modes are in-memory until
-    /// one lands.)
+    /// Session-only MCP process modes, overlaid on
+    /// `manager_mcp::default_servers()` by [`AppState::mcp_servers`].
+    /// Nothing writes it any more: the persisted registry is
+    /// `AppConfig.mcp` (exposure lives there, see
+    /// [`AppState::mcp_registry`]). The local-process path still builds
+    /// its `ServerSpec`s from the built-in defaults through this overlay,
+    /// so only the built-in servers can be spawned locally; deriving the
+    /// specs from `AppConfig.mcp` is an open design item (review
+    /// v0.1.60 PS-5).
     mcp_modes: Mutex<HashMap<String, manager_mcp::McpMode>>,
     /// Recent gateway routing decisions (spec §14 `gateway_recent_requests`).
     /// Every `gateway_test_routing` trace records here.
@@ -646,6 +659,7 @@ impl AppState {
             config: RwLock::new(config),
             config_path,
             data_dir,
+            config_load: std::sync::Mutex::new(None),
             supervisor: OnceCell::new(),
             telemetry: OnceCell::new(),
             telemetry_poller: OnceCell::new(),
@@ -682,6 +696,27 @@ impl AppState {
             app_update_guard: Mutex::new(()),
             offload_probes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Record the startup config-load outcome (finding F2) for
+    /// `get_status`. `source` is the `manager_config::ConfigSource`;
+    /// `error` the primary load error; `preserved` the
+    /// `*.corrupt-<unix-ms>` copies made before anything could save.
+    pub fn set_config_load_state(
+        &self,
+        source: manager_config::ConfigSource,
+        error: Option<String>,
+        preserved: &[PathBuf],
+    ) {
+        let v = json!({
+            "source": source,
+            "error": error,
+            "preserved": preserved
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        });
+        *self.config_load.lock().unwrap_or_else(|p| p.into_inner()) = Some(v);
     }
 
     fn next_task_id(&self) -> String {
@@ -1121,8 +1156,9 @@ impl AppState {
     }
 
     /// The persisted MCP registry (`AppConfig.mcp`) — the source of
-    /// truth since MCP Phase 1 (design §3/§10.1). The session-only
-    /// `mcp_modes` overlay is deleted; exposure is persisted.
+    /// truth since MCP Phase 1 (design §3/§10.1); exposure is persisted
+    /// here. (The session-only `mcp_modes` overlay still exists but is
+    /// never written; see the field's doc.)
     async fn mcp_registry(&self) -> Vec<manager_config::McpServerConfig> {
         self.config.read().await.mcp.servers.clone()
     }
@@ -1193,10 +1229,25 @@ impl AppState {
     /// effort: a missing or invalid file keeps the current config —
     /// validity was enforced when the file was saved, and a wedged
     /// file must not take the session down.
+    /// Re-read config.json after a wizard step or audit (steps may
+    /// write it directly). Two guards (finding PS-3,
+    /// docs/code-review-v0.1.60.md):
+    ///
+    /// - The write lock is taken BEFORE reading the file, so an
+    ///   in-flight mutator (which holds the write lock across its save)
+    ///   finishes first; reading outside the lock could install a file
+    ///   read before that mutator saved, reverting its change in memory
+    ///   and, on the next save, on disk.
+    /// - A load that only succeeded via the `.bak` fallback is not
+    ///   installed: the primary is briefly absent during a save's
+    ///   rotation, and `.bak` is the previous config by construction.
     async fn reload_config_from_disk(&self) {
         let path = self.data_dir.join("config.json");
-        if let Ok(cfg) = manager_config::load(&path) {
-            *self.config.write().await = cfg;
+        let mut live = self.config.write().await;
+        if let Ok(report) = manager_config::load_detailed(&path) {
+            if !report.used_backup {
+                *live = report.config;
+            }
         }
     }
 
@@ -1505,14 +1556,25 @@ fn merge_json(base: &mut Value, patch: Value) {
 /// Overall service status snapshot.
 pub async fn op_get_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
     let cfg = state.config.read().await;
-    Ok(json!({
+    let mut v = json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "backends_configured": cfg.backends.len(),
         "gateway_port": cfg.gateway.port,
         "winml_enabled": cfg.winml.enabled,
         "mxc_mode": cfg.mxc.mode,
-    }))
+    });
+    // Additive field (finding F2): present only when the shell recorded
+    // the startup load outcome.
+    if let Some(load) = state
+        .config_load
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+    {
+        v["config_load"] = load;
+    }
+    Ok(v)
 }
 
 /// Full application configuration, plus `config_path`: the file the
@@ -4048,6 +4110,14 @@ pub async fn op_download_model(
     .map_err(ApiError::from)?;
     let watcher_handle = handle.clone();
     downloads.insert(id.clone(), handle);
+    // Release `downloads` before taking any other lock below (finding
+    // PS-1, docs/code-review-v0.1.60.md): op_list_models takes
+    // config.read() then downloads, so waiting for config.write() while
+    // still holding downloads deadlocked the whole app (tokio's RwLock
+    // then queues every later reader behind the parked writer). The
+    // check-and-insert above is complete; the entry now guards against
+    // a second worker for this model.
+    drop(downloads);
     // Starting a new attempt clears the previous terminal outcome and
     // any earlier verification stamp: until this attempt's file passes
     // verification the model counts as unverified (the start
@@ -4653,6 +4723,11 @@ pub async fn op_update_gateway_config(
     let mut v = serde_json::to_value(&new_cfg.gateway)?;
     merge_json(&mut v, patch);
     new_cfg.gateway = serde_json::from_value(v)?;
+    // Validate before journaling, like the other journaling sites: an
+    // invalid patch used to write a "Gateway configuration changed"
+    // entry and then fail the save, leaving a phantom pending change
+    // that cancel refused (finding PS-6, docs/code-review-v0.1.60.md).
+    manager_config::validate(&new_cfg).map_err(ApiError::from)?;
     record_gateway_change(
         state,
         &pre_cfg,
@@ -11097,6 +11172,106 @@ mod tests {
         Arc::new(NoopSink)
     }
 
+    /// PS-6 (docs/code-review-v0.1.60.md): an invalid gateway patch is
+    /// refused before it can journal a phantom activation-plan entry.
+    #[tokio::test]
+    async fn invalid_gateway_patch_journals_nothing() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        // Seeding enables the default fleet, so the groups render into
+        // the gateway YAML and a change to them is journal-worthy.
+        ensure_catalog_models(&state).await;
+        let mut groups = serde_json::to_value(&state.config.read().await.gateway.groups).unwrap();
+        groups[0]["fallbacks"] = json!(["no-such-backend"]);
+        let patch = json!({ "groups": groups });
+        assert!(op_update_gateway_config(&state, &sink, patch)
+            .await
+            .is_err());
+        let journal = activation::load_journal(&state.data_dir);
+        assert!(journal.entries.is_empty(), "{:?}", journal.entries.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PS-5 (docs/code-review-v0.1.60.md): changing the exposure of a
+    /// persisted MCP server that has no built-in local-process spec
+    /// (the curated `brave_search`) must not panic.
+    #[tokio::test]
+    async fn mcp_set_exposure_on_curated_server_does_not_panic() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        let id = state
+            .config
+            .read()
+            .await
+            .mcp
+            .servers
+            .iter()
+            .map(|s| s.id.clone())
+            .find(|id| !manager_mcp::default_servers().iter().any(|d| &d.id == id))
+            .expect("a persisted server outside the built-in local specs");
+        let v = op_mcp_set_exposure(&state, &sink, id.clone(), "disabled".to_string())
+            .await
+            .unwrap();
+        assert_eq!(v["persisted"], true);
+        let err = op_mcp_set_exposure(&state, &sink, id.clone(), "local".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no local process definition"),
+            "{err}"
+        );
+        // The exposure itself was persisted.
+        let cfg = state.config.read().await;
+        let s = cfg.mcp.servers.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(s.exposure, manager_config::McpExposure::Local);
+        drop(cfg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PS-3 (docs/code-review-v0.1.60.md): a reload that could only
+    /// read the `.bak` copy (primary missing mid-rotation, or corrupt)
+    /// must not replace the live config with the previous one.
+    #[tokio::test]
+    async fn reload_from_disk_ignores_backup_fallback() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let mut on_disk = state.config.read().await.clone();
+        on_disk.optimize_purpose = "from-bak".to_string();
+        manager_config::save(&on_disk, &state.config_path).unwrap();
+        manager_config::save(&on_disk, &state.config_path).unwrap(); // .bak = from-bak
+        std::fs::write(&state.config_path, b"{ torn").unwrap();
+        state.config.write().await.optimize_purpose = "live".to_string();
+        state.reload_config_from_disk().await;
+        assert_eq!(state.config.read().await.optimize_purpose, "live");
+        // A clean primary still reloads.
+        on_disk.optimize_purpose = "from-primary".to_string();
+        manager_config::save(&on_disk, &state.config_path).unwrap();
+        state.reload_config_from_disk().await;
+        assert_eq!(state.config.read().await.optimize_purpose, "from-primary");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F2 (docs/code-review-v0.1.60.md): `get_status` carries the
+    /// startup config-load outcome once the shell records it, and
+    /// omits the field otherwise.
+    #[tokio::test]
+    async fn get_status_reports_config_load_outcome() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        let v = op_get_status(&state, &sink).await.unwrap();
+        assert!(v.get("config_load").is_none(), "{v}");
+        state.set_config_load_state(
+            manager_config::ConfigSource::Defaults,
+            Some("bad json".to_string()),
+            &[dir.join("config.json.corrupt-1")],
+        );
+        let v = op_get_status(&state, &sink).await.unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["config_load"]["source"], "defaults");
+        assert_eq!(v["config_load"]["error"], "bad json");
+        assert_eq!(v["config_load"]["preserved"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Code review B-3: user creation refuses the reserved
     /// `opt-exp-*` experiment namespace, naming the reservation.
     #[tokio::test]
@@ -11579,8 +11754,30 @@ mod tests {
             .unwrap();
         let loaded = manager_config::load(&state.config_path).unwrap();
         let comp = loaded.updates.components.get("litellm").unwrap();
-        assert_eq!(comp.pinned_version, None);
+        // LiteLLM is never left unpinned (finding F1,
+        // docs/code-review-v0.1.60.md): the unpin persists, and the
+        // load-time backfill restores the default pin. The auto flag is
+        // the operator's and round-trips untouched.
+        assert_eq!(
+            comp.pinned_version.as_deref(),
+            Some(manager_config::DEFAULT_LITELLM_PIN)
+        );
         assert!(comp.auto_update);
+        // Unpin round-trips as None for components without a default pin.
+        op_updates_pin(
+            &state,
+            &sink,
+            "llamacpp".to_string(),
+            Some("b1".to_string()),
+        )
+        .await
+        .unwrap();
+        op_updates_pin(&state, &sink, "llamacpp".to_string(), None)
+            .await
+            .unwrap();
+        let loaded = manager_config::load(&state.config_path).unwrap();
+        let comp = loaded.updates.components.get("llamacpp").unwrap();
+        assert_eq!(comp.pinned_version, None);
 
         // Gateway patch: port, the OpenRouter tier fields, and one
         // group's fallback chain (the full groups array rides
@@ -12703,6 +12900,61 @@ mod tests {
         assert!(split_for_gpu_selection(&[], &[0]).is_err());
         assert!(split_for_gpu_selection(&[0, 1], &[]).is_err());
         assert!(split_for_gpu_selection(&[0, 1], &[2]).is_err());
+    }
+
+    /// PS-1 (docs/code-review-v0.1.60.md): `op_download_model` must
+    /// not hold the `downloads` lock while it waits for
+    /// `config.write()`. `op_list_models` takes `config.read()` then
+    /// `downloads`, so holding both in the opposite order deadlocked the
+    /// app. The test parks the download op on the supervisor lock (it
+    /// then holds `downloads`), takes a config read guard the way
+    /// list_models does, releases the supervisor, and asserts the
+    /// `downloads` lock becomes available while the read guard is still
+    /// held — i.e. the op released it before asking for the write lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn download_model_releases_downloads_lock_before_config_write() {
+        let mut cfg = test_cfg();
+        register_test_model(&mut cfg, "deadlock-probe", "models/deadlock-probe.gguf");
+        cfg.models.last_mut().unwrap().source_url =
+            "https://127.0.0.1:1/deadlock-probe.gguf".to_string();
+        let (state, dir) = advanced_test_state(cfg);
+        // Seed the catalog first so the op's own seeding pass is a
+        // no-op write that cannot interleave with the guards below.
+        ensure_catalog_models(&state).await;
+        let sup_guard = state.supervisor().await.lock().await;
+        let op_state = state.clone();
+        let op = tokio::spawn(async move {
+            let sink = test_sink();
+            op_download_model(&op_state, &sink, "deadlock-probe".to_string()).await
+        });
+        // Wait until the op holds `downloads` (it is parked on the
+        // supervisor lock we hold).
+        let mut parked = false;
+        for _ in 0..200 {
+            if state.downloads.try_lock().is_err() {
+                parked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(parked, "download op never took the downloads lock");
+        let read_guard = state.config.read().await;
+        drop(sup_guard);
+        let got =
+            tokio::time::timeout(std::time::Duration::from_secs(5), state.downloads.lock()).await;
+        let released = got.is_ok();
+        drop(got);
+        drop(read_guard);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), op)
+            .await
+            .expect("download op finished")
+            .unwrap();
+        assert!(
+            released,
+            "op_download_model held `downloads` while waiting for config.write()"
+        );
+        assert!(r.is_ok(), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn register_test_model(cfg: &mut AppConfig, model_id: &str, file: &str) {
@@ -16156,10 +16408,24 @@ pub async fn op_mcp_set_exposure(
         previous
     };
     let servers = state.mcp_servers().await;
-    let server = servers
-        .iter()
-        .find(|s| s.id == id)
-        .expect("exposure was just persisted for a known server");
+    // The local-process specs come from the built-in defaults (see the
+    // `mcp_modes` field doc), so a persisted server outside them (the
+    // curated brave_search / web_fetch, operator-added servers) has no
+    // spec. That used to `expect` and panic the command (finding PS-5,
+    // docs/code-review-v0.1.60.md). Such a server was never spawned
+    // locally, so leaving Local has nothing to stop; entering Local
+    // cannot spawn it and says so.
+    let Some(server) = servers.iter().find(|s| s.id == id) else {
+        if exposure == manager_config::McpExposure::Local
+            && previous_exposure != manager_config::McpExposure::Local
+        {
+            return Err(ApiError::Mcp(format!(
+                "exposure saved, but mcp server {id} has no local process definition \
+                 in this version, so it was not started; use gateway exposure instead"
+            )));
+        }
+        return Ok(json!({ "id": id, "exposure": exposure, "persisted": true }));
+    };
     if exposure == manager_config::McpExposure::Local
         && previous_exposure != manager_config::McpExposure::Local
     {

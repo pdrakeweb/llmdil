@@ -3699,17 +3699,24 @@ impl StartGateway {
         )
     }
 
+    /// The pip requirement for the gateway venv. Always version-pinned
+    /// (finding F1, `docs/code-review-v0.1.60.md`): the operator's
+    /// `updates.components["litellm"].pinned_version` when set, else
+    /// [`manager_config::DEFAULT_LITELLM_PIN`]. Loaded configs get the
+    /// default backfilled by `manager_config::migrate`; the fallback here
+    /// covers a context built from a config that never went through it,
+    /// so no code path installs whatever PyPI serves that day.
     fn litellm_spec(&self, ctx: &WizardContext) -> String {
-        match ctx
+        let pin = ctx
             .config
             .updates
             .components
-            .get("litellm")
+            .get(manager_config::LITELLM_COMPONENT)
             .and_then(|c| c.pinned_version.as_deref())
-        {
-            Some(v) => format!("litellm[proxy]=={v}"),
-            None => "litellm[proxy]".to_string(),
-        }
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(manager_config::DEFAULT_LITELLM_PIN);
+        format!("litellm[proxy]=={pin}")
     }
 
     fn venv_command(&self, ctx: &WizardContext, uv: &std::path::Path) -> PlannedCommand {
@@ -4234,7 +4241,16 @@ impl StartGateway {
         let Some(old_pid) = recorded else {
             return Ok(());
         };
-        if ctx.ops.process_alive(old_pid) {
+        if ctx.ops.process_alive(old_pid) && ctx.ops.process_is_gateway(old_pid) == Some(false) {
+            // The recorded pid now names another program (the old
+            // gateway died, e.g. across a reboot, and Windows reused
+            // the pid). `kill_process` is `taskkill /T /F`: killing it
+            // would take down that program's whole tree (PL-M4).
+            log.push(format!(
+                "recorded gateway pid {old_pid} now belongs to another program; \
+                 treating the pid file as stale"
+            ));
+        } else if ctx.ops.process_alive(old_pid) {
             if let Err(e) = ctx.ops.kill_process(old_pid) {
                 return Err(StepOutcome::failed(
                     format!(
@@ -8817,6 +8833,44 @@ mod tests {
 
     // --- StartGateway ---
 
+    /// F1 (docs/code-review-v0.1.60.md): the gateway venv's LiteLLM
+    /// requirement is always version-pinned — the default config's
+    /// pin, an operator pin, or (for a context whose config lost the
+    /// component or its pin) the built-in default — never bare
+    /// `litellm[proxy]`.
+    #[test]
+    fn litellm_spec_is_always_pinned() {
+        let step = StartGateway::default();
+        let ops = Arc::new(FakeSystemOps::new());
+        let default_pin = format!("litellm[proxy]=={}", manager_config::DEFAULT_LITELLM_PIN);
+
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        assert_eq!(step.litellm_spec(&ctx), default_pin);
+
+        let mut cfg = test_config_with_models();
+        cfg.updates.components.clear();
+        let ctx = WizardContext::new(cfg, PathBuf::from("/data"), RunMode::Install, ops.clone());
+        assert_eq!(step.litellm_spec(&ctx), default_pin);
+
+        let mut cfg = test_config_with_models();
+        cfg.updates
+            .components
+            .get_mut("litellm")
+            .expect("default config carries the litellm component")
+            .pinned_version = Some("   ".to_string());
+        let ctx = WizardContext::new(cfg, PathBuf::from("/data"), RunMode::Install, ops.clone());
+        assert_eq!(step.litellm_spec(&ctx), default_pin);
+
+        let mut cfg = test_config_with_models();
+        cfg.updates
+            .components
+            .get_mut("litellm")
+            .unwrap()
+            .pinned_version = Some("1.104.2".to_string());
+        let ctx = WizardContext::new(cfg, PathBuf::from("/data"), RunMode::Install, ops);
+        assert_eq!(step.litellm_spec(&ctx), "litellm[proxy]==1.104.2");
+    }
+
     #[tokio::test]
     async fn start_gateway_install_spawns_and_healthchecks() {
         let _guard = PathGuard::set_to(&path_dir_with_uv(true));
@@ -9371,6 +9425,64 @@ mod tests {
             .file_bytes(&PathBuf::from("/data/gateway.pid"))
             .expect("pid file written");
         assert_eq!(String::from_utf8(pid_file).unwrap(), "4242");
+    }
+
+    /// PL-M4 (docs/code-review-v0.1.60.md): a recorded gateway pid
+    /// that now belongs to another program (pid reuse after a reboot)
+    /// is treated as stale, never force-killed.
+    #[tokio::test]
+    async fn start_gateway_does_not_kill_a_recycled_gateway_pid() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        ops.with_file(PathBuf::from("/data/gateway.pid"), b"7777".to_vec());
+        ops.with_live_pid(7777);
+        ops.with_process_image(7777, "explorer.exe");
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+            db_sustain_ms: 0,
+        };
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(ops.killed_pids().is_empty(), "{:?}", ops.killed_pids());
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("belongs to another program")),
+            "{out:?}"
+        );
+        let pid_file = ops
+            .file_bytes(&PathBuf::from("/data/gateway.pid"))
+            .expect("pid file written");
+        assert_eq!(String::from_utf8(pid_file).unwrap(), "4242");
+    }
+
+    /// PL-M4: the recorded gateway (image python.exe) is still stopped.
+    #[tokio::test]
+    async fn start_gateway_stops_previous_gateway_with_matching_image() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        ops.with_file(PathBuf::from("/data/gateway.pid"), b"7777".to_vec());
+        ops.with_live_pid(7777);
+        ops.with_process_image(7777, "python.exe");
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        let step = StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+            db_sustain_ms: 0,
+        };
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert_eq!(ops.killed_pids(), vec![7777]);
     }
 
     #[tokio::test]

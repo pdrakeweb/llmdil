@@ -67,6 +67,9 @@ pub enum HealthStatus {
 /// Pluggable health probe: HTTP endpoint, port-open check, etc.
 #[async_trait]
 pub trait HealthProbe: Send + Sync {
+    /// Observe the target once. An unreachable or failing target is an `Ok` observation
+    /// (`Unhealthy`/`Degraded`), not an `Err`; feed results through [`HealthTracker`]
+    /// rather than acting on a single one.
     async fn probe(&self) -> Result<HealthStatus, SupervisorError>;
 }
 
@@ -82,6 +85,7 @@ pub struct HttpHealthProbe {
 }
 
 impl HttpHealthProbe {
+    /// A probe of `url`, each request bounded by `timeout`.
     pub fn new(url: impl Into<String>, timeout: Duration) -> Self {
         Self {
             url: url.into(),
@@ -126,6 +130,8 @@ pub struct HealthTracker {
 }
 
 impl HealthTracker {
+    /// Starts out displaying `Healthy`, so a fresh process reads healthy until three
+    /// consecutive failed probes.
     pub fn new() -> Self {
         Self {
             consecutive_failures: 0,
@@ -155,6 +161,7 @@ impl HealthTracker {
         self.displayed.clone()
     }
 
+    /// The current debounced status, without feeding an observation.
     pub fn displayed(&self) -> &HealthStatus {
         &self.displayed
     }
@@ -214,6 +221,8 @@ pub struct LogRecord {
 }
 
 impl LogRecord {
+    /// A record stamped now; `source` and `archived` are left for
+    /// [`Supervisor::logs_query`] to fill.
     pub fn new(stream: LogStream, line: impl Into<String>) -> Self {
         Self {
             ts: Utc::now(),
@@ -234,6 +243,8 @@ pub struct RingBuffer<T> {
 }
 
 impl<T> RingBuffer<T> {
+    /// A ring holding at most `capacity` items (clamped to at least 1). Preallocates at most
+    /// 1024 slots, so a large capacity costs nothing until it fills.
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
         Self {
@@ -242,6 +253,7 @@ impl<T> RingBuffer<T> {
         }
     }
 
+    /// Append `item`, evicting the oldest when full.
     pub fn push(&mut self, item: T) {
         if self.buf.len() >= self.capacity {
             self.buf.pop_front();
@@ -249,14 +261,17 @@ impl<T> RingBuffer<T> {
         self.buf.push_back(item);
     }
 
+    /// Items currently held (never more than [`Self::capacity`]).
     pub fn len(&self) -> usize {
         self.buf.len()
     }
 
+    /// True when the ring holds no items.
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
 
+    /// The bound, after clamping to at least 1.
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -779,7 +794,10 @@ impl SupervisedProcess {
                     format!("drain timed out after {timeout:?}; killing process"),
                 );
                 tracing::warn!(process = self.id, "drain timed out; killing");
-                let _ = child.kill().await;
+                // start_kill, not kill(): tokio's `Child::kill` also
+                // awaits the exit with no bound, which would defeat the
+                // bounded reap below (finding PL-m3).
+                let _ = child.start_kill();
                 // The kill is best-effort: if the child still will not die,
                 // report DrainTimeout instead of hanging the supervisor on
                 // wait() forever.
@@ -817,10 +835,21 @@ impl SupervisedProcess {
             Some(c) => c,
         };
         // May already be dead; ignore the error and reap regardless.
-        let _ = child.kill().await;
-        match child.wait().await {
-            Ok(status) => self.record_exit(status, ProcessState::Stopped),
-            Err(_) => self.record_exit_unknown(),
+        // The reap is bounded like `drain`'s (finding PL-m3,
+        // docs/code-review-v0.1.60.md): a process stuck in a driver call
+        // (a GPU TDR, say) may not die on TerminateProcess, and an
+        // unbounded wait here held the whole Supervisor lock — freezing
+        // list_backends, start/stop and the notify monitor. `stop()`
+        // marks the id failed on DrainTimeout.
+        let _ = child.start_kill();
+        match tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) => self.record_exit(status, ProcessState::Stopped),
+            Ok(Err(_)) => self.record_exit_unknown(),
+            Err(_) => {
+                self.record_exit_unknown();
+                self.abort_readers();
+                return Err(SupervisorError::DrainTimeout(self.id.clone()));
+            }
         }
         self.abort_readers();
         tracing::info!(process = self.id, "killed");
@@ -864,14 +893,18 @@ impl SupervisedProcess {
         self.restart_attempts = 0;
     }
 
+    /// The supervisor key this process runs under.
     pub fn id(&self) -> &str {
         &self.id
     }
 
+    /// Last recorded lifecycle state. Changes only through the supervisor's own calls
+    /// (spawn, stop, [`Self::poll_exited`]), not by watching the OS process.
     pub fn state(&self) -> ProcessState {
         self.state
     }
 
+    /// OS pid of the spawned child, or the adopted pid. `None` once a child is reaped.
     pub fn pid(&self) -> Option<u32> {
         self.child
             .as_ref()
@@ -879,22 +912,30 @@ impl SupervisedProcess {
             .or(self.adopted_pid)
     }
 
+    /// True while a child handle or an adopted pid is held. For an adopted process this is
+    /// bookkeeping, not a liveness check.
     pub fn is_running(&self) -> bool {
         self.child.is_some() || self.adopted_pid.is_some()
     }
 
+    /// Time since this supervisor spawned the process. `None` for an adopted process (start
+    /// time unknown) and once a stop or kill has recorded the exit.
     pub fn uptime(&self) -> Option<Duration> {
         self.started_at.map(|t| t.elapsed())
     }
 
+    /// Crash restarts used from the current budget; reset by [`Self::note_healthy`].
     pub fn restart_attempts(&self) -> u32 {
         self.restart_attempts
     }
 
+    /// Exit status from the most recent reap, if one was observed.
     pub fn last_exit(&self) -> Option<std::process::ExitStatus> {
         self.last_exit
     }
 
+    /// A shared handle to the log ring. The stream readers keep appending to it, and the
+    /// supervisor retains it after exit so the logs stay queryable.
     pub fn log_ring(&self) -> Arc<Mutex<RingBuffer<LogRecord>>> {
         Arc::clone(&self.log_ring)
     }
@@ -1194,6 +1235,7 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
+    /// An empty supervisor; `backoff` governs every crash restart.
     pub fn new(backoff: BackoffPolicy) -> Self {
         Self {
             specs: HashMap::new(),
@@ -1209,6 +1251,7 @@ impl Supervisor {
         }
     }
 
+    /// The crash-restart policy in force.
     pub fn backoff(&self) -> &BackoffPolicy {
         &self.backoff
     }
@@ -1246,6 +1289,7 @@ impl Supervisor {
         removed
     }
 
+    /// Ids of all registered specs, sorted for a stable display order.
     pub fn spec_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.specs.keys().cloned().collect();
         ids.sort();

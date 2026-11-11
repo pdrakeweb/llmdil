@@ -1,11 +1,11 @@
 //! Admin REST API for the Local LLM Service Manager (LLMdil).
 //!
-//! Phase 1 surface: the router generated from manager-app's
-//! operation registry, identity + read endpoints, the error
-//! envelope, and a TLS (or loopback-plaintext dev) listener with an
-//! explicit lifecycle. Authentication lands in phase 2 — until then
-//! the only supported bind is loopback, enforced in [`ApiServer::start`]
-//! for plaintext and by the caller's enablement flow for TLS.
+//! Surface: the router generated from manager-app's operation
+//! registry, identity + read endpoints, the error envelope,
+//! authentication and user administration ([`auth`], [`auth_routes`]),
+//! and a TLS (or loopback-plaintext dev) listener with an explicit
+//! lifecycle. A plaintext listener must bind loopback — enforced in
+//! [`ApiServer::start`] and [`ApiServer::start_ctx`]; LAN binds need TLS.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -51,6 +51,8 @@ pub struct BroadcastSink {
 }
 
 impl BroadcastSink {
+    /// A sink with a 256-event buffer. Emitting with no subscribers is not an error; a
+    /// subscriber more than 256 events behind loses the oldest (`RecvError::Lagged`).
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(256);
         Self { tx }
@@ -179,6 +181,7 @@ pub struct ApiOptions {
     pub tls: Option<TlsMaterial>,
 }
 
+/// Why [`ApiServer::start`] or [`ApiServer::start_ctx`] refused to serve.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiStartError {
     #[error("plaintext API bind must be loopback (got {0}); use TLS for LAN binds")]

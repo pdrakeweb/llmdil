@@ -108,7 +108,9 @@ require **no** decomposition task.
 - `src-tauri/tauri.conf.json` → `app.withGlobalTauri: true` **must stay true**. The UI detects
   Tauri via `window.__TAURI__.core.invoke`; removing it silently degrades every view to mock data.
 - The operation registry is the single source of truth. Any change must keep
-  `OP_SPECS.len() == 130` (until a task explicitly adds/removes ops) and keep every existing
+  `OP_SPECS.len()` at its current asserted value (130 when these tasks were
+  written; 152 at v0.1.60 — the `assert_eq!` in `registry.rs` is authoritative)
+  (until a task explicitly adds/removes ops) and keep every existing
   `name`, argument, route, and `CapClass` unchanged.
 - The registry's drift tests in `crates/manager-app/src/registry.rs`
   (`names_and_routes_are_unique`, `every_spec_round_trips_through_lookup`,

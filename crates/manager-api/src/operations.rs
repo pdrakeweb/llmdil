@@ -23,6 +23,8 @@ use serde_json::{json, Value};
 
 use crate::users::now_ms;
 
+/// In-memory records for the asynchronous endpoints plus exported diagnostics bundles.
+/// Process-lifetime only: nothing is persisted and records are never evicted.
 pub struct OperationStore {
     ops: Mutex<HashMap<String, Value>>,
     bundles: Mutex<HashMap<String, PathBuf>>,
@@ -35,6 +37,7 @@ impl Default for OperationStore {
 }
 
 impl OperationStore {
+    /// An empty store.
     pub fn new() -> Self {
         Self {
             ops: Mutex::new(HashMap::new()),
@@ -121,6 +124,7 @@ impl OperationStore {
         record["finished_ms"] = json!(now_ms());
     }
 
+    /// Snapshot of one record by id.
     pub fn get(&self, id: &str) -> Option<Value> {
         self.ops.lock().unwrap().get(id).cloned()
     }
@@ -145,6 +149,8 @@ impl OperationStore {
         Some(record.clone())
     }
 
+    /// The file a completed diagnostics export registered under `bundle_id`. Ids are
+    /// server-assigned UUIDs, so a client can never name an arbitrary path.
     pub fn bundle_path(&self, bundle_id: &str) -> Option<PathBuf> {
         self.bundles.lock().unwrap().get(bundle_id).cloned()
     }

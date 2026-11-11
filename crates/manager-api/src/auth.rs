@@ -16,8 +16,9 @@ use tokio::sync::Mutex;
 use manager_wizard::SystemOps;
 
 use crate::users::{
-    generate_token, hash_password, hash_token, now_ms, password_policy_error, verify_password,
-    ApiToken, RoleName, Session, User, UserStore, ACCESS_TTL_MS, REFRESH_TTL_MS,
+    generate_token, hash_password, hash_token, now_ms, password_policy_error,
+    verify_password_async, ApiToken, RoleName, Session, User, UserStore, ACCESS_TTL_MS,
+    REFRESH_TTL_MS,
 };
 use manager_app::registry::Role;
 
@@ -25,6 +26,8 @@ use manager_app::registry::Role;
 // Principals and errors
 // ---------------------------------------------------------------------------
 
+/// How a principal authenticated. Recorded in the audit log, and gates account
+/// self-service: API tokens may not change passwords or TOTP (SEC-04).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthType {
     Session,
@@ -32,6 +35,7 @@ pub enum AuthType {
 }
 
 impl AuthType {
+    /// Stable wire and audit spelling (`session`, `api_token`).
     pub fn as_str(self) -> &'static str {
         match self {
             AuthType::Session => "session",
@@ -51,6 +55,8 @@ pub struct Principal {
     pub session_id: String,
 }
 
+/// Failures from [`AuthService`], mapped one-to-one onto HTTP error envelopes by the auth
+/// routes. `Internal` deliberately carries no detail, so store errors never reach clients.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthError {
     /// Unknown user, wrong password, disabled account, or locked
@@ -76,6 +82,8 @@ impl From<crate::users::StoreError> for AuthError {
     }
 }
 
+/// A freshly issued access/refresh pair. The token strings exist only here — the store
+/// keeps their SHA-256 — so this is the one chance to hand them to the client.
 #[derive(Debug, Clone)]
 pub struct TokenPair {
     pub access_token: String,
@@ -85,6 +93,8 @@ pub struct TokenPair {
     pub refresh_expires_ms: i64,
 }
 
+/// Result of the password stage of [`AuthService::login`]: tokens directly or, for a
+/// TOTP-enabled account, a single-use challenge for [`AuthService::complete_totp_login`].
 #[derive(Debug, Clone)]
 pub enum LoginOutcome {
     Tokens {
@@ -96,6 +106,8 @@ pub enum LoginOutcome {
     },
 }
 
+/// The client-safe projection of a [`User`]: no password hash, recovery-code hashes or
+/// other secret material. Response bodies use this, never `User`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UserView {
     pub id: String,
@@ -130,8 +142,12 @@ impl From<&User> for UserView {
 /// touch `admin-users.json`.
 #[async_trait::async_trait]
 pub trait CredentialStore: Send + Sync {
+    /// The secret stored under `target`, or `None` when there is none. Never log it.
     async fn read(&self, target: &str) -> Option<String>;
+    /// Store `secret` under `target`, replacing any existing value.
     async fn write(&self, target: &str, secret: &str) -> Result<(), String>;
+    /// Remove the secret under `target`. Best-effort and infallible: callers disable the
+    /// factor in the user store first, so a leftover secret is never consulted.
     async fn delete(&self, target: &str);
 }
 
@@ -191,6 +207,11 @@ fn totp_target(user_id: &str) -> String {
 // The service
 // ---------------------------------------------------------------------------
 
+/// Longest username `create_user` accepts. Login refuses longer
+/// names before any per-account bookkeeping, so an unauthenticated
+/// client cannot grow the lockout map or the audit log with
+/// megabyte-sized usernames (finding SEC-05).
+pub const MAX_USERNAME_LEN: usize = 64;
 const LOCK_THRESHOLD: usize = 5;
 const LOCK_WINDOW_MS: i64 = 15 * 60 * 1000;
 const LOCK_BASE_MS: i64 = 15 * 60 * 1000;
@@ -230,6 +251,10 @@ struct PendingTotp {
 /// How long an unconfirmed TOTP enrollment stays valid.
 const PENDING_TOTP_TTL_MS: i64 = 10 * 60 * 1000;
 
+/// Credential checks and account lifecycle over a [`UserStore`]. Lockout counters, TOTP
+/// login challenges, enrollment codes and pending TOTP secrets live in memory per
+/// instance (lost on restart), so a process must share ONE instance — see
+/// [`crate::ApiCtx::with_auth`].
 pub struct AuthService {
     store: Arc<UserStore>,
     creds: Arc<dyn CredentialStore>,
@@ -241,6 +266,8 @@ pub struct AuthService {
 }
 
 impl AuthService {
+    /// A service with empty in-memory state, returned in an `Arc` because the HTTP handlers
+    /// and the desktop shell share it.
     pub fn new(store: Arc<UserStore>, creds: Arc<dyn CredentialStore>) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -253,6 +280,7 @@ impl AuthService {
         })
     }
 
+    /// The backing user store; `ApiCtx` reads users and sessions through the same instance.
     pub fn store(&self) -> &Arc<UserStore> {
         &self.store
     }
@@ -269,8 +297,27 @@ impl AuthService {
 
     async fn record_failure(&self, username_key: &str, source_ip: &str) {
         let now = now_ms();
+        self.record_account_failure(username_key).await;
+        let mut ips = self.ip_failures.lock().await;
+        ips.retain(|ip, v| ip == source_ip || v.iter().any(|t| now - t < LOCK_WINDOW_MS));
+        let v = ips.entry(source_ip.to_string()).or_default();
+        v.retain(|t| now - t < LOCK_WINDOW_MS);
+        v.push(now);
+    }
+
+    async fn record_account_failure(&self, username_key: &str) {
+        let now = now_ms();
         {
             let mut guard = self.lockouts.lock().await;
+            // Prune entries with no live failures and no live lock so
+            // the map stays bounded by recent activity (SEC-05). The
+            // escalation counter of a pruned entry restarts, which only
+            // happens after a full quiet window with no lock in force.
+            guard.retain(|k, st| {
+                k == username_key
+                    || st.locked_until_ms > now
+                    || st.failures.iter().any(|t| now - t < LOCK_WINDOW_MS)
+            });
             let st = guard.entry(username_key.to_string()).or_default();
             st.failures.retain(|t| now - t < LOCK_WINDOW_MS);
             st.failures.push(now);
@@ -281,10 +328,15 @@ impl AuthService {
                 st.failures.clear();
             }
         }
-        let mut ips = self.ip_failures.lock().await;
-        let v = ips.entry(source_ip.to_string()).or_default();
-        v.retain(|t| now - t < LOCK_WINDOW_MS);
-        v.push(now);
+    }
+
+    /// Record a failed step-up password check (password change, TOTP
+    /// disable, TOTP re-enrollment) against the account lockout
+    /// (finding SEC-04): these
+    /// endpoints otherwise offered unlimited password guessing to any
+    /// holder of a bearer token.
+    async fn record_step_up_failure(&self, username: &str) {
+        self.record_account_failure(&username.to_lowercase()).await;
     }
 
     async fn ip_throttled(&self, source_ip: &str) -> bool {
@@ -303,6 +355,10 @@ impl AuthService {
 
     // -- login ----------------------------------------------------------
 
+    /// Password stage of login. Unknown users, wrong passwords, disabled or locked accounts
+    /// and IP-throttled sources all yield `InvalidCredentials` after the same argon2 cost;
+    /// each failure counts toward the account lockout and the per-IP throttle. A TOTP account
+    /// gets a 5-minute challenge instead of tokens, and its lockout is not reset yet.
     pub async fn login(
         &self,
         username: &str,
@@ -310,6 +366,14 @@ impl AuthService {
         device_name: &str,
         source_ip: &str,
     ) -> Result<LoginOutcome, AuthError> {
+        if username.len() > MAX_USERNAME_LEN {
+            // No account can have this name. Same cost and answer as an
+            // unknown user, but no per-account bookkeeping (SEC-05).
+            let _ = verify_password_async(password, crate::users::dummy_hash()).await;
+            let mut ips = self.ip_failures.lock().await;
+            ips.entry(source_ip.to_string()).or_default().push(now_ms());
+            return Err(AuthError::InvalidCredentials);
+        }
         let key = username.to_lowercase();
         let locked = self.is_locked(&key).await;
         let throttled = self.ip_throttled(source_ip).await;
@@ -319,11 +383,12 @@ impl AuthService {
             .await;
 
         // Pay the argon2 cost in every path (dummy hash for unknown
-        // users) so timing does not enumerate accounts.
+        // users) so timing does not enumerate accounts. Off the async
+        // workers (SEC-06).
         let verified = match &user {
-            Some(u) => verify_password(password, &u.password_hash),
+            Some(u) => verify_password_async(password, &u.password_hash).await,
             None => {
-                let _ = verify_password(password, crate::users::dummy_hash());
+                let _ = verify_password_async(password, crate::users::dummy_hash()).await;
                 false
             }
         };
@@ -336,8 +401,12 @@ impl AuthService {
             }
         };
 
-        self.record_success(&key).await;
         if user.totp_enabled {
+            // The lockout counter is NOT reset here: the password is
+            // only the first factor. Resetting at this stage let an
+            // attacker holding the password alternate login / one TOTP
+            // guess forever without ever reaching the lock threshold
+            // (finding SEC-02). It resets when tokens are issued.
             let challenge_id = generate_token();
             self.challenges.lock().await.insert(
                 challenge_id.clone(),
@@ -349,6 +418,7 @@ impl AuthService {
             );
             return Ok(LoginOutcome::TotpRequired { challenge_id });
         }
+        self.record_success(&key).await;
         let pair = self.create_session(&user.id, device_name).await?;
         Ok(LoginOutcome::Tokens {
             pair,
@@ -374,19 +444,44 @@ impl AuthService {
             .read(|f| f.users.iter().find(|u| u.id == challenge.user_id).cloned())
             .await
             .ok_or(AuthError::InvalidCredentials)?;
-        if user.disabled {
+        let key = user.username.to_lowercase();
+        // A lock that engaged after the password stage (TOTP guesses
+        // count toward it, SEC-02) also stops the second stage.
+        if user.disabled || self.is_locked(&key).await {
             return Err(AuthError::InvalidCredentials);
         }
         if self.verify_user_totp(&user, code).await {
             // Re-insert nothing: the challenge is consumed on success
             // and on failure (one guess per challenge; the client
             // logs in again for another).
+            self.record_success(&key).await;
             let pair = self.create_session(&user.id, &challenge.device_name).await?;
             return Ok((pair, UserView::from(&user)));
         }
         self.record_failure(&user.username.to_lowercase(), source_ip)
             .await;
         Err(AuthError::InvalidCredentials)
+    }
+
+    /// Step-up password check for a signed-in user (TOTP disable):
+    /// counts failures against the account lockout and refuses while
+    /// the account is locked (SEC-04), verifying off the async workers
+    /// (SEC-06).
+    pub async fn verify_step_up(&self, user_id: &str, password: &str) -> bool {
+        let user = self
+            .store
+            .read(|f| f.users.iter().find(|u| u.id == user_id).cloned())
+            .await;
+        let Some(user) = user else {
+            return false;
+        };
+        if !self.is_locked(&user.username.to_lowercase()).await
+            && verify_password_async(password, &user.password_hash).await
+        {
+            return true;
+        }
+        self.record_step_up_failure(&user.username).await;
+        false
     }
 
     /// Verify a TOTP or recovery code for a user. Recovery codes are
@@ -422,6 +517,9 @@ impl AuthService {
 
     // -- sessions -------------------------------------------------------
 
+    /// Mint a new per-device session. Performs no credential check of its own: callers must
+    /// already have authenticated the user (password, TOTP or enrollment code). Only the
+    /// token hashes are persisted.
     pub async fn create_session(
         &self,
         user_id: &str,
@@ -498,12 +596,23 @@ impl AuthService {
         let refresh = generate_token();
         let pair = self
             .store
-            .mutate::<Option<TokenPair>, AuthError>(|f| {
+            .mutate::<Result<TokenPair, AuthError>, AuthError>(|f| {
                 let Some(s) = f.sessions.iter_mut().find(|s| s.id == session_id) else {
-                    return Ok(None);
+                    return Ok(Err(AuthError::InvalidCredentials));
                 };
                 if s.revoked || s.refresh_expires_ms <= now {
-                    return Ok(None);
+                    return Ok(Err(AuthError::InvalidCredentials));
+                }
+                // Re-check under the write lock (finding SEC-12,
+                // docs/code-review-v0.1.60.md): the lookup above ran
+                // under a read lock, so a concurrent refresh with the
+                // same token may have rotated it since. That is reuse
+                // of a now-retired token — revoke the family, exactly
+                // as the read-side reuse check does, instead of letting
+                // both callers rotate successfully.
+                if s.refresh_hash != hash {
+                    s.revoked = true;
+                    return Ok(Err(AuthError::SessionRevoked));
                 }
                 s.retired_refresh_hashes.push(s.refresh_hash.clone());
                 s.access_hash = hash_token(&access);
@@ -511,7 +620,7 @@ impl AuthService {
                 s.access_expires_ms = now + ACCESS_TTL_MS;
                 s.refresh_expires_ms = now + REFRESH_TTL_MS;
                 s.last_used_ms = now;
-                Ok(Some(TokenPair {
+                Ok(Ok(TokenPair {
                     access_token: access.clone(),
                     refresh_token: refresh.clone(),
                     session_id: s.id.clone(),
@@ -519,8 +628,7 @@ impl AuthService {
                     refresh_expires_ms: s.refresh_expires_ms,
                 }))
             })
-            .await?
-            .ok_or(AuthError::InvalidCredentials)?;
+            .await??;
         let user = self
             .store
             .read(|f| {
@@ -628,6 +736,8 @@ impl AuthService {
             .await;
     }
 
+    /// Mark a session revoked; its access and refresh tokens stop validating at once. An
+    /// unknown id is a silent no-op, so callers scoping by owner must check ownership first.
     pub async fn revoke_session(&self, session_id: &str) -> Result<(), AuthError> {
         let sid = session_id.to_string();
         self.store
@@ -640,6 +750,8 @@ impl AuthService {
             .await
     }
 
+    /// Revoke every session of `user_id` except `except` (the caller's own, on password
+    /// change). Best-effort: a store write failure is swallowed. API tokens are untouched.
     pub async fn revoke_user_sessions(&self, user_id: &str, except: Option<&str>) {
         let uid = user_id.to_string();
         let except = except.map(str::to_string);
@@ -658,6 +770,9 @@ impl AuthService {
 
     // -- passwords ------------------------------------------------------
 
+    /// Self-service password change. The current password is a step-up check counted
+    /// against the account lockout (SEC-04); the new one must pass [`password_policy_error`].
+    /// On success clears must-change and revokes every other session, keeping `keep_session`.
     pub async fn change_password(
         &self,
         user_id: &str,
@@ -670,7 +785,10 @@ impl AuthService {
             .read(|f| f.users.iter().find(|u| u.id == user_id).cloned())
             .await
             .ok_or(AuthError::NotFound("user".into()))?;
-        if !verify_password(current, &user.password_hash) {
+        if self.is_locked(&user.username.to_lowercase()).await
+            || !verify_password_async(current, &user.password_hash).await
+        {
+            self.record_step_up_failure(&user.username).await;
             return Err(AuthError::InvalidCredentials);
         }
         if let Some(e) = password_policy_error(new_password, &user.username) {
@@ -721,6 +839,9 @@ impl AuthService {
 
     // -- user administration ---------------------------------------------
 
+    /// Create an enabled account without TOTP or a must-change flag. The username is trimmed,
+    /// must be 1..=[`MAX_USERNAME_LEN`] bytes and unique ignoring ASCII case; the password
+    /// must pass the policy.
     pub async fn create_user(
         &self,
         username: &str,
@@ -784,6 +905,9 @@ impl AuthService {
         Ok(())
     }
 
+    /// Change a user's role and/or disabled flag. Demoting or disabling the last enabled
+    /// admin is refused. Any role change or disable revokes all the user's sessions at once,
+    /// and a disabled user's API tokens stop validating too.
     pub async fn update_user(
         &self,
         user_id: &str,
@@ -821,6 +945,8 @@ impl AuthService {
         Ok(view)
     }
 
+    /// Delete a user with their sessions, API tokens and TOTP secret. Refused for
+    /// self-deletion and for the last enabled admin.
     pub async fn delete_user(&self, actor_id: &str, user_id: &str) -> Result<(), AuthError> {
         if actor_id == user_id {
             return Err(AuthError::Forbidden("a user cannot delete themself".into()));
@@ -848,6 +974,9 @@ impl AuthService {
 
     // -- API tokens --------------------------------------------------------
 
+    /// Issue an API token for an existing, enabled user, capped at operator role (viewer or
+    /// operator only). Returns the metadata and the token value, which is never retrievable
+    /// again — only its hash is stored. `expires_days = None` never expires.
     pub async fn create_api_token(
         &self,
         issuer: &Principal,
@@ -892,6 +1021,8 @@ impl AuthService {
         Ok((cloned, value))
     }
 
+    /// Revoke an API token by id; it stops validating on the next request. Permanent: there
+    /// is no un-revoke.
     pub async fn revoke_api_token(&self, token_id: &str) -> Result<(), AuthError> {
         let tid = token_id.to_string();
         let found = self
@@ -938,9 +1069,14 @@ impl AuthService {
             .await
             .ok_or_else(|| AuthError::NotFound("user".into()))?;
         if user.totp_enabled {
-            let ok = step_up_password
-                .is_some_and(|p| verify_password(p, &user.password_hash));
+            let ok = match step_up_password {
+                Some(p) if !self.is_locked(&user.username.to_lowercase()).await => {
+                    verify_password_async(p, &user.password_hash).await
+                }
+                _ => false,
+            };
             if !ok {
+                self.record_step_up_failure(&user.username).await;
                 return Err(AuthError::InvalidCredentials);
             }
         }
@@ -1020,6 +1156,9 @@ impl AuthService {
         Ok(codes)
     }
 
+    /// Turn TOTP off, dropping recovery codes, any pending enrollment and the stored secret.
+    /// Performs no step-up itself: callers must verify the password first
+    /// ([`Self::verify_step_up`]).
     pub async fn totp_disable(&self, user_id: &str) -> Result<(), AuthError> {
         let uid = user_id.to_string();
         self.store
@@ -1062,6 +1201,9 @@ impl AuthService {
         Ok(code)
     }
 
+    /// Exchange a one-time enrollment code for a new session on `device_name`. The code is
+    /// consumed by any attempt that names it, even an expired one; an unknown code or a
+    /// disabled user yields `InvalidCredentials`.
     pub async fn redeem_enrollment_code(
         &self,
         code: &str,
@@ -1092,6 +1234,7 @@ impl AuthService {
 // TOTP (RFC 6238, HMAC-SHA1, 30 s step, 6 digits, ±1 step)
 // ---------------------------------------------------------------------------
 
+/// RFC 6238 TOTP value (HMAC-SHA1, 30 s step, 6 digits) at `unix_secs`.
 pub fn totp_at(secret: &[u8], unix_secs: i64) -> u32 {
     let counter = (unix_secs / 30) as u64;
     let msg = counter.to_be_bytes();
@@ -1108,6 +1251,9 @@ pub fn totp_at(secret: &[u8], unix_secs: i64) -> u32 {
     binary % 1_000_000
 }
 
+/// Accept `code` if it matches the previous, current or next 30 s step (±1 step of clock
+/// skew); non-numeric input is rejected. There is no replay tracking: a code stays valid
+/// for its whole window.
 pub fn totp_verify(secret: &[u8], code: &str, unix_secs: i64) -> bool {
     let Ok(code_num) = code.parse::<u32>() else {
         return false;
@@ -1138,6 +1284,7 @@ fn recovery_code() -> String {
 
 const B32: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
+/// RFC 4648 base32 without padding (the otpauth `secret` form).
 pub fn base32_encode(bytes: &[u8]) -> String {
     let mut out = String::new();
     let mut buffer: u32 = 0;
@@ -1156,6 +1303,8 @@ pub fn base32_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Inverse of [`base32_encode`]. Uppercase alphabet only; `=` and whitespace are skipped
+/// and any other character yields `None`.
 pub fn base32_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut buffer: u32 = 0;
@@ -1247,6 +1396,198 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, AuthError::InvalidCredentials);
+    }
+
+    /// Enable TOTP for `user_id` with a fixed secret; returns the
+    /// secret bytes.
+    async fn enable_totp(svc: &AuthService, user_id: &str) -> Vec<u8> {
+        let secret = b"0123456789abcdefghij".to_vec();
+        svc.creds
+            .write(&totp_target(user_id), &base32_encode(&secret))
+            .await
+            .unwrap();
+        let uid = user_id.to_string();
+        svc.store
+            .mutate::<_, AuthError>(|f| {
+                f.users
+                    .iter_mut()
+                    .find(|u| u.id == uid)
+                    .unwrap()
+                    .totp_enabled = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        secret
+    }
+
+    /// SEC-12: concurrent refreshes with the same refresh token yield
+    /// at most one rotation. (The interleaving is not forced, so this
+    /// can only expose the race, never fail spuriously.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_refresh_rotates_at_most_once() {
+        let svc = service().await;
+        let user = svc
+            .create_user("frank", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            let pair = svc.create_session(&user.id, "phone").await.unwrap();
+            let tasks: Vec<_> = (0..8)
+                .map(|_| {
+                    let svc = svc.clone();
+                    let token = pair.refresh_token.clone();
+                    tokio::spawn(async move { svc.refresh(&token).await.is_ok() })
+                })
+                .collect();
+            let mut ok = 0;
+            for t in tasks {
+                if t.await.unwrap() {
+                    ok += 1;
+                }
+            }
+            assert!(ok <= 1, "{ok} concurrent rotations of one refresh token");
+        }
+    }
+
+    /// SEC-02 (docs/code-review-v0.1.60.md): a correct password must
+    /// not reset the lockout while the second factor is still pending,
+    /// so TOTP guessing reaches the lock threshold.
+    #[tokio::test]
+    async fn totp_guessing_locks_the_account() {
+        let svc = service().await;
+        let user = svc
+            .create_user("carol", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        let secret = enable_totp(&svc, &user.id).await;
+        let now = now_ms() / 1000;
+        let valid: Vec<u32> = (-1..=1).map(|d| totp_at(&secret, now + d * 30)).collect();
+        let wrong = (0..1_000_000u32).find(|c| !valid.contains(c)).unwrap();
+        let wrong = format!("{wrong:06}");
+        for _ in 0..LOCK_THRESHOLD {
+            let LoginOutcome::TotpRequired { challenge_id } = svc
+                .login("carol", "a-unique-passphrase", "phone", "10.0.0.1")
+                .await
+                .unwrap()
+            else {
+                panic!("expected a TOTP challenge");
+            };
+            let err = svc
+                .complete_totp_login(&challenge_id, &wrong, "10.0.0.1")
+                .await
+                .unwrap_err();
+            assert_eq!(err, AuthError::InvalidCredentials);
+        }
+        // Locked: even the correct password is refused.
+        let err = svc
+            .login("carol", "a-unique-passphrase", "phone", "10.0.0.2")
+            .await
+            .unwrap_err();
+        assert_eq!(err, AuthError::InvalidCredentials);
+    }
+
+    /// SEC-02: a successful second factor clears the counter, and a
+    /// lock engaged after the password stage stops the TOTP stage.
+    #[tokio::test]
+    async fn totp_success_resets_and_lock_blocks_second_stage() {
+        let svc = service().await;
+        let user = svc
+            .create_user("dave", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        let secret = enable_totp(&svc, &user.id).await;
+        let LoginOutcome::TotpRequired { challenge_id } = svc
+            .login("dave", "a-unique-passphrase", "phone", "10.0.0.1")
+            .await
+            .unwrap()
+        else {
+            panic!("expected a TOTP challenge");
+        };
+        // Lock the account between the stages.
+        for _ in 0..LOCK_THRESHOLD {
+            svc.record_account_failure("dave").await;
+        }
+        let code = format!("{:06}", totp_at(&secret, now_ms() / 1000));
+        let err = svc
+            .complete_totp_login(&challenge_id, &code, "10.0.0.1")
+            .await
+            .unwrap_err();
+        assert_eq!(err, AuthError::InvalidCredentials);
+        // Unlocked: the full flow succeeds and clears the record.
+        svc.lockouts.lock().await.clear();
+        svc.record_account_failure("dave").await;
+        let LoginOutcome::TotpRequired { challenge_id } = svc
+            .login("dave", "a-unique-passphrase", "phone", "10.0.0.1")
+            .await
+            .unwrap()
+        else {
+            panic!("expected a TOTP challenge");
+        };
+        let code = format!("{:06}", totp_at(&secret, now_ms() / 1000));
+        svc.complete_totp_login(&challenge_id, &code, "10.0.0.1")
+            .await
+            .unwrap();
+        assert!(!svc.lockouts.lock().await.contains_key("dave"));
+    }
+
+    /// SEC-05: oversized usernames are refused before any per-account
+    /// bookkeeping, and stale lockout entries are pruned.
+    #[tokio::test]
+    async fn oversized_usernames_do_not_grow_the_lockout_map() {
+        let svc = service().await;
+        for i in 0..3 {
+            let name = format!("{i}{}", "x".repeat(10_000));
+            let err = svc
+                .login(&name, "whatever-password", "phone", "10.0.0.9")
+                .await
+                .unwrap_err();
+            assert_eq!(err, AuthError::InvalidCredentials);
+        }
+        assert!(svc.lockouts.lock().await.is_empty());
+        // An expired entry is pruned on the next failure.
+        svc.lockouts.lock().await.insert(
+            "stale".to_string(),
+            LockState {
+                failures: vec![now_ms() - LOCK_WINDOW_MS - 1],
+                ..Default::default()
+            },
+        );
+        svc.record_account_failure("fresh").await;
+        let map = svc.lockouts.lock().await;
+        assert!(!map.contains_key("stale"));
+        assert!(map.contains_key("fresh"));
+    }
+
+    /// SEC-04: wrong current-password guesses on the change-password
+    /// path count toward the account lockout.
+    #[tokio::test]
+    async fn change_password_guesses_lock_the_account() {
+        let svc = service().await;
+        let user = svc
+            .create_user("erin", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        for _ in 0..LOCK_THRESHOLD {
+            let err = svc
+                .change_password(&user.id, "not-the-password", "another-unique-phrase", None)
+                .await
+                .unwrap_err();
+            assert_eq!(err, AuthError::InvalidCredentials);
+        }
+        assert!(svc.is_locked("erin").await);
+        // While locked, even the right current password is refused.
+        let err = svc
+            .change_password(
+                &user.id,
+                "a-unique-passphrase",
+                "another-unique-phrase",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, AuthError::InvalidCredentials);
+        assert!(!svc.verify_step_up(&user.id, "a-unique-passphrase").await);
     }
 
     #[tokio::test]

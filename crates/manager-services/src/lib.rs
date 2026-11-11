@@ -81,6 +81,7 @@ pub struct EnvEntry {
 }
 
 impl EnvEntry {
+    /// A literal value, written into the definition file as-is — never for secrets.
     pub fn literal(name: &str, value: String) -> Self {
         Self {
             name: name.to_string(),
@@ -88,6 +89,8 @@ impl EnvEntry {
         }
     }
 
+    /// A value the shim reads from Credential Manager target `target` at service start; a
+    /// missing credential fails the start.
     pub fn credential_ref(name: &str, target: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -455,7 +458,7 @@ pub struct ServiceStatus {
     pub pid: Option<u32>,
     /// The shim's child pid, when the definition carries a pid file
     /// and the shim has written it (the gateway). Filled in by
-    /// [`scm::query`] callers that know the definition; the SCM itself
+    /// `ServiceControl::query` callers that know the definition; the SCM itself
     /// only reports the service's own pid.
     pub child_pid: Option<u32>,
     pub win32_exit_code: u32,
@@ -479,15 +482,18 @@ impl ServiceStatus {
 }
 
 /// Operations the app performs against the SCM. Implemented for real
-/// on Windows ([`scm::WindowsServiceControl`]); elsewhere
+/// on Windows (`scm::WindowsServiceControl`); elsewhere
 /// ([`scm::UnsupportedServiceControl`]) every operation fails with
 /// [`ServiceError::Unsupported`].
 pub trait ServiceControl: Send + Sync {
     /// Status of one service; `NotInstalled` is a state, not an error.
     fn query(&self, name: &str) -> Result<ServiceStatus, ServiceError>;
+    /// Whether the service exists in the SCM; derived from [`Self::query`].
     fn is_registered(&self, name: &str) -> Result<bool, ServiceError> {
         Ok(!matches!(self.query(name)?.state, ServiceState::NotInstalled))
     }
+    /// Ask the SCM to start the service. An already-running service counts as success.
+    /// Returns once the SCM accepts the request, not when the service reaches `Running`.
     fn start(&self, name: &str) -> Result<(), ServiceError>;
     /// Request a stop. Returns once the SCM has accepted the control;
     /// the service may still be `StopPending` — callers that need the

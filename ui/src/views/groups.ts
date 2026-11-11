@@ -623,5 +623,16 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
     disposed = true;
     window.clearInterval(timer);
     stopPredictTicker();
+    // `root` is the persistent #view container: listeners left here
+    // pin this visit's closure and run on every later click and drag
+    // (code review v0.1.60 UI-6).
+    root.removeEventListener("click", onClick);
+    root.removeEventListener("input", onInput);
+    root.removeEventListener("keydown", onKeydown);
+    root.removeEventListener("dragstart", onDragStart);
+    root.removeEventListener("dragover", onDragOver);
+    root.removeEventListener("dragleave", onDragLeave);
+    root.removeEventListener("drop", onDrop);
+    root.removeEventListener("dragend", onDragEnd);
   };
 }

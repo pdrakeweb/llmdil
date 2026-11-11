@@ -22,6 +22,7 @@ pub fn rule_name(port: u16) -> String {
 /// CGNAT range.
 pub const REMOTE_SCOPES: &str = "localsubnet,100.64.0.0/10";
 
+/// State of the API port's firewall rule, as reported by the status check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirewallStatus {
     /// Rule present with the expected scope and port.
@@ -96,14 +97,17 @@ fn classify_output(raw: &str, port: u16) -> FirewallStatus {
     let mut direction: Option<&str> = None;
     let mut action: Option<&str> = None;
     let mut profiles: Option<&str> = None;
+    let mut enabled: Option<&str> = None;
+    let mut rule_blocks = 0usize;
     for line in text.lines() {
         let Some((field, value)) = parse_field(line) else {
             continue;
         };
-        // First occurrence wins: `show rule name=...` can return
-        // several same-named rules; the first block is the rule
-        // netsh lists for the name.
+        // First occurrence wins for the field values; a second
+        // same-named rule is itself drift (below).
         match field {
+            "rule name" => rule_blocks += 1,
+            "enabled" if enabled.is_none() => enabled = Some(value),
             "localport" if local_port.is_none() => local_port = Some(value),
             "remoteip" if remote_ip.is_none() => remote_ip = Some(value),
             "direction" if direction.is_none() => direction = Some(value),
@@ -113,10 +117,23 @@ fn classify_output(raw: &str, port: u16) -> FirewallStatus {
         }
     }
     let port_ok = local_port == Some(want_port.as_str());
+    // Exactly the two intended scopes (finding SEC-11,
+    // docs/code-review-v0.1.60.md): a containment check accepted a rule
+    // widened with `Any` or a WAN range as Ok, so `ensure()` never
+    // repaired it.
     let remote_ok = remote_ip.is_some_and(|v| {
-        let scopes: Vec<&str> = v.split(',').map(str::trim).collect();
-        scopes.contains(&"localsubnet") && scopes.contains(&"100.64.0.0/10")
+        let mut scopes: Vec<&str> = v.split(',').map(str::trim).collect();
+        scopes.sort_unstable();
+        scopes.dedup();
+        let mut want: Vec<&str> = REMOTE_SCOPES.split(',').collect();
+        want.sort_unstable();
+        scopes == want
     });
+    // One rule, and it is enabled: a disabled rule admits nothing, and
+    // a second same-named rule may carry a wider scope that netsh does
+    // not list first.
+    let single_ok = rule_blocks <= 1;
+    let enabled_ok = enabled == Some("yes");
     let direction_ok = direction == Some("in");
     let action_ok = action == Some("allow");
     let profiles_ok = profiles.is_some_and(|v| {
@@ -125,7 +142,7 @@ fn classify_output(raw: &str, port: u16) -> FirewallStatus {
             .iter()
             .all(|p| have.contains(p))
     });
-    if port_ok && remote_ok && direction_ok && action_ok && profiles_ok {
+    if port_ok && remote_ok && direction_ok && action_ok && profiles_ok && single_ok && enabled_ok {
         FirewallStatus::Ok
     } else {
         FirewallStatus::Drifted
@@ -324,6 +341,43 @@ Ok.
     #[test]
     fn status_drifted_when_profile_not_any() {
         let dump = with_field(VERBATIM_DUMP, "Profiles", "Private");
+        assert_eq!(classify_output(&dump, 47821), FirewallStatus::Drifted);
+    }
+
+    /// SEC-11: a scope widened beyond the two intended entries is
+    /// drift, not Ok.
+    #[test]
+    fn status_drifted_when_scope_widened() {
+        for wide in [
+            "LocalSubnet,100.64.0.0/10,Any",
+            "Any",
+            "LocalSubnet,100.64.0.0/10,0.0.0.0-255.255.255.255",
+        ] {
+            let dump = with_field(VERBATIM_DUMP, "RemoteIP", wide);
+            assert_eq!(
+                classify_output(&dump, 47821),
+                FirewallStatus::Drifted,
+                "{wide}"
+            );
+        }
+        // Order and case do not matter.
+        let dump = with_field(VERBATIM_DUMP, "RemoteIP", "100.64.0.0/10,LOCALSUBNET");
+        assert_eq!(classify_output(&dump, 47821), FirewallStatus::Ok);
+    }
+
+    /// SEC-11: a disabled rule is drift.
+    #[test]
+    fn status_drifted_when_disabled() {
+        let dump = with_field(VERBATIM_DUMP, "Enabled", "No");
+        assert_eq!(classify_output(&dump, 47821), FirewallStatus::Drifted);
+    }
+
+    /// SEC-11: a second same-named rule (only the first block's fields
+    /// were read) is drift.
+    #[test]
+    fn status_drifted_when_rule_duplicated() {
+        let second = with_field(VERBATIM_DUMP, "RemoteIP", "Any");
+        let dump = format!("{}\n{}", VERBATIM_DUMP.trim_end_matches("Ok.\n"), second);
         assert_eq!(classify_output(&dump, 47821), FirewallStatus::Drifted);
     }
 

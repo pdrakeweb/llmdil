@@ -156,25 +156,32 @@ fn main() {
             }
         })
         .setup(|app| {
-            // Load the persisted config; `manager_config::load` falls back
-            // to the `.bak` last-known-good copy on parse/validation
-            // failure (spec §10). First run (or total corruption) falls
-            // back to defaults with a stderr banner.
+            // Load the persisted config (finding F2,
+            // docs/code-review-v0.1.60.md). `load_for_startup` falls
+            // back to the `.bak` last-known-good copy on parse or
+            // validation failure (spec §10), and to built-in defaults
+            // when both fail — and in both fallback cases it first copies
+            // the unreadable file(s) to `*.corrupt-<unix-ms>`, because
+            // startup itself saves (catalog seeding, setup
+            // reconciliation) and every save rotates the primary over
+            // `.bak`. The outcome is recorded on AppState so `get_status`
+            // reports it to the UI (eprintln! is invisible in the
+            // windowless release build).
             let data_dir = manager_config::default_data_dir();
             let config_path = data_dir.join("config.json");
-            let config = match manager_config::load(&config_path) {
-                Ok(cfg) => cfg,
-                Err(e) => {
-                    eprintln!(
-                        "config load failed ({e}); using defaults: {}",
-                        config_path.display()
-                    );
-                    manager_config::AppConfig::default_config()
-                }
-            };
+            let startup = manager_config::load_for_startup(&config_path);
+            if let Some(e) = &startup.error {
+                eprintln!(
+                    "config load fell back to {:?} ({e}): {}",
+                    startup.source,
+                    config_path.display()
+                );
+            }
+            let config = startup.config;
             let admin_api = config.admin_api.clone();
             let api_data_dir = data_dir.clone();
             let app_state = Arc::new(AppState::new(config, config_path, data_dir));
+            app_state.set_config_load_state(startup.source, startup.error, &startup.preserved);
             app.manage(app_state.clone());
             app.manage(ApiServerSlot {
                 server: std::sync::Mutex::new(None),

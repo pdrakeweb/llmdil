@@ -252,6 +252,89 @@ async fn unauthenticated_is_refused_everywhere_but_public() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// SEC-01 (docs/code-review-v0.1.60.md): axum runs the GET handler
+/// for HEAD, so every GET route must refuse an unauthenticated HEAD
+/// exactly as it refuses GET, and apply the same role guard.
+#[tokio::test]
+async fn head_requests_get_the_get_guard() {
+    let (ctx, dir, tokens) = ctx_with_users().await;
+    let (router, records) = build_router(ctx);
+    let mut checked = 0;
+    for r in &records {
+        if r.method != "GET" || r.path == "/api/v1/server" {
+            continue;
+        }
+        let uri = fill_template(r.path);
+        let st = status(&router, "HEAD", &uri, None, None).await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "HEAD {} without a token",
+            r.path
+        );
+        checked += 1;
+    }
+    assert!(checked > 30, "too few GET routes checked: {checked}");
+    // Role guard: a viewer token may not HEAD an admin-only route.
+    let st = status(
+        &router,
+        "HEAD",
+        "/api/v1/admin/users",
+        Some(&tokens[0]),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let st = status(
+        &router,
+        "HEAD",
+        "/api/v1/admin/users",
+        Some(&tokens[3]),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SEC-04 (docs/code-review-v0.1.60.md): an API token may not use the
+/// account self-service endpoints (password change, TOTP enroll /
+/// verify / disable); a session token for the same user still can.
+#[tokio::test]
+async fn api_tokens_cannot_use_account_self_service() {
+    let (ctx, dir, tokens) = ctx_with_users().await;
+    let admin = ctx.auth.validate_bearer(&tokens[3]).await.unwrap();
+    let (_meta, api_token) = ctx
+        .auth
+        .create_api_token(&admin, &admin.user_id, "script", RoleName::Operator, None)
+        .await
+        .unwrap();
+    let (router, _) = build_router(ctx);
+    for (path, body) in [
+        (
+            "/api/v1/auth/password",
+            r#"{"current_password":"x","new_password":"y"}"#,
+        ),
+        ("/api/v1/auth/totp/enroll", "{}"),
+        ("/api/v1/auth/totp/verify", r#"{"code":"123456"}"#),
+        ("/api/v1/auth/totp/disable", r#"{"password":"x"}"#),
+    ] {
+        let st = status(&router, "POST", path, Some(&api_token), Some(body)).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "API token on {path}");
+    }
+    // The owner's session can still begin enrollment.
+    let st = status(
+        &router,
+        "POST",
+        "/api/v1/auth/totp/enroll",
+        Some(&tokens[3]),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn http_login_refresh_reuse_flow() {
     let (ctx, dir, _tokens) = ctx_with_users().await;
