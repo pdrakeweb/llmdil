@@ -567,12 +567,23 @@ impl AuthService {
         let refresh = generate_token();
         let pair = self
             .store
-            .mutate::<Option<TokenPair>, AuthError>(|f| {
+            .mutate::<Result<TokenPair, AuthError>, AuthError>(|f| {
                 let Some(s) = f.sessions.iter_mut().find(|s| s.id == session_id) else {
-                    return Ok(None);
+                    return Ok(Err(AuthError::InvalidCredentials));
                 };
                 if s.revoked || s.refresh_expires_ms <= now {
-                    return Ok(None);
+                    return Ok(Err(AuthError::InvalidCredentials));
+                }
+                // Re-check under the write lock (finding SEC-12,
+                // docs/code-review-v0.1.60.md): the lookup above ran
+                // under a read lock, so a concurrent refresh with the
+                // same token may have rotated it since. That is reuse
+                // of a now-retired token — revoke the family, exactly
+                // as the read-side reuse check does, instead of letting
+                // both callers rotate successfully.
+                if s.refresh_hash != hash {
+                    s.revoked = true;
+                    return Ok(Err(AuthError::SessionRevoked));
                 }
                 s.retired_refresh_hashes.push(s.refresh_hash.clone());
                 s.access_hash = hash_token(&access);
@@ -580,7 +591,7 @@ impl AuthService {
                 s.access_expires_ms = now + ACCESS_TTL_MS;
                 s.refresh_expires_ms = now + REFRESH_TTL_MS;
                 s.last_used_ms = now;
-                Ok(Some(TokenPair {
+                Ok(Ok(TokenPair {
                     access_token: access.clone(),
                     refresh_token: refresh.clone(),
                     session_id: s.id.clone(),
@@ -588,8 +599,7 @@ impl AuthService {
                     refresh_expires_ms: s.refresh_expires_ms,
                 }))
             })
-            .await?
-            .ok_or(AuthError::InvalidCredentials)?;
+            .await??;
         let user = self
             .store
             .read(|f| {
@@ -1347,6 +1357,35 @@ mod tests {
             .await
             .unwrap();
         secret
+    }
+
+    /// SEC-12: concurrent refreshes with the same refresh token yield
+    /// at most one rotation. (The interleaving is not forced, so this
+    /// can only expose the race, never fail spuriously.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_refresh_rotates_at_most_once() {
+        let svc = service().await;
+        let user = svc
+            .create_user("frank", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            let pair = svc.create_session(&user.id, "phone").await.unwrap();
+            let tasks: Vec<_> = (0..8)
+                .map(|_| {
+                    let svc = svc.clone();
+                    let token = pair.refresh_token.clone();
+                    tokio::spawn(async move { svc.refresh(&token).await.is_ok() })
+                })
+                .collect();
+            let mut ok = 0;
+            for t in tasks {
+                if t.await.unwrap() {
+                    ok += 1;
+                }
+            }
+            assert!(ok <= 1, "{ok} concurrent rotations of one refresh token");
+        }
     }
 
     /// SEC-02 (docs/code-review-v0.1.60.md): a correct password must
