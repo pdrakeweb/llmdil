@@ -4088,6 +4088,14 @@ pub async fn op_download_model(
     .map_err(ApiError::from)?;
     let watcher_handle = handle.clone();
     downloads.insert(id.clone(), handle);
+    // Release `downloads` before taking any other lock below (finding
+    // PS-1, docs/code-review-v0.1.60.md): op_list_models takes
+    // config.read() then downloads, so waiting for config.write() while
+    // still holding downloads deadlocked the whole app (tokio's RwLock
+    // then queues every later reader behind the parked writer). The
+    // check-and-insert above is complete; the entry now guards against
+    // a second worker for this model.
+    drop(downloads);
     // Starting a new attempt clears the previous terminal outcome and
     // any earlier verification stamp: until this attempt's file passes
     // verification the model counts as unverified (the start
@@ -12787,6 +12795,61 @@ mod tests {
         assert!(split_for_gpu_selection(&[], &[0]).is_err());
         assert!(split_for_gpu_selection(&[0, 1], &[]).is_err());
         assert!(split_for_gpu_selection(&[0, 1], &[2]).is_err());
+    }
+
+    /// PS-1 (docs/code-review-v0.1.60.md): `op_download_model` must
+    /// not hold the `downloads` lock while it waits for
+    /// `config.write()`. `op_list_models` takes `config.read()` then
+    /// `downloads`, so holding both in the opposite order deadlocked the
+    /// app. The test parks the download op on the supervisor lock (it
+    /// then holds `downloads`), takes a config read guard the way
+    /// list_models does, releases the supervisor, and asserts the
+    /// `downloads` lock becomes available while the read guard is still
+    /// held — i.e. the op released it before asking for the write lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn download_model_releases_downloads_lock_before_config_write() {
+        let mut cfg = test_cfg();
+        register_test_model(&mut cfg, "deadlock-probe", "models/deadlock-probe.gguf");
+        cfg.models.last_mut().unwrap().source_url =
+            "https://127.0.0.1:1/deadlock-probe.gguf".to_string();
+        let (state, dir) = advanced_test_state(cfg);
+        // Seed the catalog first so the op's own seeding pass is a
+        // no-op write that cannot interleave with the guards below.
+        ensure_catalog_models(&state).await;
+        let sup_guard = state.supervisor().await.lock().await;
+        let op_state = state.clone();
+        let op = tokio::spawn(async move {
+            let sink = test_sink();
+            op_download_model(&op_state, &sink, "deadlock-probe".to_string()).await
+        });
+        // Wait until the op holds `downloads` (it is parked on the
+        // supervisor lock we hold).
+        let mut parked = false;
+        for _ in 0..200 {
+            if state.downloads.try_lock().is_err() {
+                parked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(parked, "download op never took the downloads lock");
+        let read_guard = state.config.read().await;
+        drop(sup_guard);
+        let got =
+            tokio::time::timeout(std::time::Duration::from_secs(5), state.downloads.lock()).await;
+        let released = got.is_ok();
+        drop(got);
+        drop(read_guard);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), op)
+            .await
+            .expect("download op finished")
+            .unwrap();
+        assert!(
+            released,
+            "op_download_model held `downloads` while waiting for config.write()"
+        );
+        assert!(r.is_ok(), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn register_test_model(cfg: &mut AppConfig, model_id: &str, file: &str) {
