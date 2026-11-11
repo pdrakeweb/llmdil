@@ -3699,17 +3699,24 @@ impl StartGateway {
         )
     }
 
+    /// The pip requirement for the gateway venv. Always version-pinned
+    /// (finding F1, `docs/code-review-v0.1.60.md`): the operator's
+    /// `updates.components["litellm"].pinned_version` when set, else
+    /// [`manager_config::DEFAULT_LITELLM_PIN`]. Loaded configs get the
+    /// default backfilled by `manager_config::migrate`; the fallback here
+    /// covers a context built from a config that never went through it,
+    /// so no code path installs whatever PyPI serves that day.
     fn litellm_spec(&self, ctx: &WizardContext) -> String {
-        match ctx
+        let pin = ctx
             .config
             .updates
             .components
-            .get("litellm")
+            .get(manager_config::LITELLM_COMPONENT)
             .and_then(|c| c.pinned_version.as_deref())
-        {
-            Some(v) => format!("litellm[proxy]=={v}"),
-            None => "litellm[proxy]".to_string(),
-        }
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(manager_config::DEFAULT_LITELLM_PIN);
+        format!("litellm[proxy]=={pin}")
     }
 
     fn venv_command(&self, ctx: &WizardContext, uv: &std::path::Path) -> PlannedCommand {
@@ -8816,6 +8823,44 @@ mod tests {
     }
 
     // --- StartGateway ---
+
+    /// F1 (docs/code-review-v0.1.60.md): the gateway venv's LiteLLM
+    /// requirement is always version-pinned — the default config's
+    /// pin, an operator pin, or (for a context whose config lost the
+    /// component or its pin) the built-in default — never bare
+    /// `litellm[proxy]`.
+    #[test]
+    fn litellm_spec_is_always_pinned() {
+        let step = StartGateway::default();
+        let ops = Arc::new(FakeSystemOps::new());
+        let default_pin = format!("litellm[proxy]=={}", manager_config::DEFAULT_LITELLM_PIN);
+
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        assert_eq!(step.litellm_spec(&ctx), default_pin);
+
+        let mut cfg = test_config_with_models();
+        cfg.updates.components.clear();
+        let ctx = WizardContext::new(cfg, PathBuf::from("/data"), RunMode::Install, ops.clone());
+        assert_eq!(step.litellm_spec(&ctx), default_pin);
+
+        let mut cfg = test_config_with_models();
+        cfg.updates
+            .components
+            .get_mut("litellm")
+            .expect("default config carries the litellm component")
+            .pinned_version = Some("   ".to_string());
+        let ctx = WizardContext::new(cfg, PathBuf::from("/data"), RunMode::Install, ops.clone());
+        assert_eq!(step.litellm_spec(&ctx), default_pin);
+
+        let mut cfg = test_config_with_models();
+        cfg.updates
+            .components
+            .get_mut("litellm")
+            .unwrap()
+            .pinned_version = Some("1.104.2".to_string());
+        let ctx = WizardContext::new(cfg, PathBuf::from("/data"), RunMode::Install, ops);
+        assert_eq!(step.litellm_spec(&ctx), "litellm[proxy]==1.104.2");
+    }
 
     #[tokio::test]
     async fn start_gateway_install_spawns_and_healthchecks() {

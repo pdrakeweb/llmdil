@@ -27,6 +27,24 @@ pub use diff::{apply_config_diff, diff_config, BackendPatch, ConfigDiff, FieldCh
 /// Current config schema version.
 pub const CURRENT_VERSION: u32 = 1;
 
+/// Default LiteLLM pin for the gateway venv (finding F1 in
+/// `docs/code-review-v0.1.60.md`).
+///
+/// The wizard installs `litellm[proxy]==<pin>` when
+/// `updates.components["litellm"].pinned_version` is set and an
+/// unpinned `litellm[proxy]` (whatever PyPI serves that day) when it is
+/// not. An unpinned install is a supply-chain hazard — LiteLLM 1.107.0
+/// was published malicious on Oct 21, 2026 — so the default config
+/// carries this pin and [`migrate`] backfills it into any loaded config
+/// whose litellm component has no pin. 1.105.1 is the version installed
+/// and verified on Prometheus; the wizard's prisma-client-py pin
+/// comments are written against LiteLLM 1.104/1.105. To move LiteLLM
+/// forward, set a newer explicit pin (clearing it re-backfills this one).
+pub const DEFAULT_LITELLM_PIN: &str = "1.105.1";
+
+/// Component key of the LiteLLM gateway in [`UpdatePolicy::components`].
+pub const LITELLM_COMPONENT: &str = "litellm";
+
 /// Tolerance for tensor_split sum-to-1.0 checks.
 const SPLIT_SUM_EPSILON: f32 = 1e-4;
 
@@ -1312,7 +1330,14 @@ impl AppConfig {
             admin_api: AdminApiConfig::default(),
             log_streaming: LogStreamingConfig::default(),
             updates: UpdatePolicy {
-                components: HashMap::new(),
+                components: HashMap::from([(
+                    LITELLM_COMPONENT.to_string(),
+                    ComponentUpdate {
+                        pinned_version: Some(DEFAULT_LITELLM_PIN.to_string()),
+                        auto_update: false,
+                        last_checked: None,
+                    },
+                )]),
             },
             app_update: AppUpdateConfig::default(),
             notifications: NotificationConfig::default(),
@@ -2014,7 +2039,36 @@ pub fn migrate(raw: serde_json::Value) -> Result<AppConfig, ConfigError> {
         }
         cfg.mcp_curated_seeded = true;
     }
+    backfill_litellm_pin(&mut cfg);
     Ok(cfg)
+}
+
+/// Load-time backfill for [`DEFAULT_LITELLM_PIN`] (finding F1).
+///
+/// Sets the pin only when the litellm component is absent or carries no
+/// `pinned_version`; an operator's explicit pin (older or newer) is left
+/// untouched, as are the component's other fields. Returns whether the
+/// config changed. The change reaches disk on the next save; until then
+/// the in-memory config (which the wizard reads) already carries it.
+pub fn backfill_litellm_pin(cfg: &mut AppConfig) -> bool {
+    let entry = cfg
+        .updates
+        .components
+        .entry(LITELLM_COMPONENT.to_string())
+        .or_insert_with(|| ComponentUpdate {
+            pinned_version: None,
+            auto_update: false,
+            last_checked: None,
+        });
+    let unpinned = entry
+        .pinned_version
+        .as_deref()
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true);
+    if unpinned {
+        entry.pinned_version = Some(DEFAULT_LITELLM_PIN.to_string());
+    }
+    unpinned
 }
 
 /// Default data directory: `%APPDATA%\local-llm-service-manager`
@@ -3952,5 +4006,58 @@ mod tests {
         assert!(!back.enabled && !back.failures && back.operations && back.activation);
         // The default whole-config shape still validates.
         assert!(validate(&AppConfig::default_config()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod startup_load_tests {
+    //! F1 regression tests (`docs/code-review-v0.1.60.md`).
+    use super::*;
+
+    #[test]
+    fn default_config_pins_litellm() {
+        let cfg = AppConfig::default_config();
+        let c = cfg.updates.components.get(LITELLM_COMPONENT).unwrap();
+        assert_eq!(c.pinned_version.as_deref(), Some(DEFAULT_LITELLM_PIN));
+        assert!(!c.auto_update);
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn migrate_backfills_litellm_pin_only_when_unpinned() {
+        // Component absent entirely (file written before F1).
+        let mut raw = serde_json::to_value(AppConfig::default_config()).unwrap();
+        raw["updates"]["components"] = serde_json::json!({});
+        let cfg = migrate(raw).unwrap();
+        assert_eq!(
+            cfg.updates.components[LITELLM_COMPONENT]
+                .pinned_version
+                .as_deref(),
+            Some(DEFAULT_LITELLM_PIN)
+        );
+
+        // Component present but unpinned: pin set, other fields kept.
+        let mut raw = serde_json::to_value(AppConfig::default_config()).unwrap();
+        raw["updates"]["components"] = serde_json::json!({
+            "litellm": {"pinned_version": null, "auto_update": true, "last_checked": null},
+            "llamacpp": {"pinned_version": null, "auto_update": false, "last_checked": null}
+        });
+        let cfg = migrate(raw).unwrap();
+        let l = &cfg.updates.components[LITELLM_COMPONENT];
+        assert_eq!(l.pinned_version.as_deref(), Some(DEFAULT_LITELLM_PIN));
+        assert!(l.auto_update, "only the pin is backfilled");
+        // Other components are not pinned by the backfill.
+        assert_eq!(cfg.updates.components["llamacpp"].pinned_version, None);
+
+        // An explicit operator pin is never overwritten.
+        let mut raw = serde_json::to_value(AppConfig::default_config()).unwrap();
+        raw["updates"]["components"]["litellm"]["pinned_version"] = serde_json::json!("1.104.2");
+        let cfg = migrate(raw).unwrap();
+        assert_eq!(
+            cfg.updates.components[LITELLM_COMPONENT]
+                .pinned_version
+                .as_deref(),
+            Some("1.104.2")
+        );
     }
 }

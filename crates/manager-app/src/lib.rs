@@ -11579,8 +11579,30 @@ mod tests {
             .unwrap();
         let loaded = manager_config::load(&state.config_path).unwrap();
         let comp = loaded.updates.components.get("litellm").unwrap();
-        assert_eq!(comp.pinned_version, None);
+        // LiteLLM is never left unpinned (finding F1,
+        // docs/code-review-v0.1.60.md): the unpin persists, and the
+        // load-time backfill restores the default pin. The auto flag is
+        // the operator's and round-trips untouched.
+        assert_eq!(
+            comp.pinned_version.as_deref(),
+            Some(manager_config::DEFAULT_LITELLM_PIN)
+        );
         assert!(comp.auto_update);
+        // Unpin round-trips as None for components without a default pin.
+        op_updates_pin(
+            &state,
+            &sink,
+            "llamacpp".to_string(),
+            Some("b1".to_string()),
+        )
+        .await
+        .unwrap();
+        op_updates_pin(&state, &sink, "llamacpp".to_string(), None)
+            .await
+            .unwrap();
+        let loaded = manager_config::load(&state.config_path).unwrap();
+        let comp = loaded.updates.components.get("llamacpp").unwrap();
+        assert_eq!(comp.pinned_version, None);
 
         // Gateway patch: port, the OpenRouter tier fields, and one
         // group's fallback chain (the full groups array rides
