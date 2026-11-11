@@ -423,9 +423,15 @@ pub struct AppState {
     /// `mcp-<id>`); pruning and orphan-surfacing in the backend commands
     /// must only ever touch ids in this set.
     backend_spec_ids: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// MCP server modes, overlaid on `manager_mcp::default_servers()`.
-    /// (No MCP section exists in `AppConfig` yet; modes are in-memory until
-    /// one lands.)
+    /// Session-only MCP process modes, overlaid on
+    /// `manager_mcp::default_servers()` by [`AppState::mcp_servers`].
+    /// Nothing writes it any more: the persisted registry is
+    /// `AppConfig.mcp` (exposure lives there, see
+    /// [`AppState::mcp_registry`]). The local-process path still builds
+    /// its `ServerSpec`s from the built-in defaults through this overlay,
+    /// so only the built-in servers can be spawned locally; deriving the
+    /// specs from `AppConfig.mcp` is an open design item (review
+    /// v0.1.60 PS-5).
     mcp_modes: Mutex<HashMap<String, manager_mcp::McpMode>>,
     /// Recent gateway routing decisions (spec §14 `gateway_recent_requests`).
     /// Every `gateway_test_routing` trace records here.
@@ -1150,8 +1156,9 @@ impl AppState {
     }
 
     /// The persisted MCP registry (`AppConfig.mcp`) — the source of
-    /// truth since MCP Phase 1 (design §3/§10.1). The session-only
-    /// `mcp_modes` overlay is deleted; exposure is persisted.
+    /// truth since MCP Phase 1 (design §3/§10.1); exposure is persisted
+    /// here. (The session-only `mcp_modes` overlay still exists but is
+    /// never written; see the field's doc.)
     async fn mcp_registry(&self) -> Vec<manager_config::McpServerConfig> {
         self.config.read().await.mcp.servers.clone()
     }
@@ -11160,6 +11167,42 @@ mod tests {
         Arc::new(NoopSink)
     }
 
+    /// PS-5 (docs/code-review-v0.1.60.md): changing the exposure of a
+    /// persisted MCP server that has no built-in local-process spec
+    /// (the curated `brave_search`) must not panic.
+    #[tokio::test]
+    async fn mcp_set_exposure_on_curated_server_does_not_panic() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        let id = state
+            .config
+            .read()
+            .await
+            .mcp
+            .servers
+            .iter()
+            .map(|s| s.id.clone())
+            .find(|id| !manager_mcp::default_servers().iter().any(|d| &d.id == id))
+            .expect("a persisted server outside the built-in local specs");
+        let v = op_mcp_set_exposure(&state, &sink, id.clone(), "disabled".to_string())
+            .await
+            .unwrap();
+        assert_eq!(v["persisted"], true);
+        let err = op_mcp_set_exposure(&state, &sink, id.clone(), "local".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no local process definition"),
+            "{err}"
+        );
+        // The exposure itself was persisted.
+        let cfg = state.config.read().await;
+        let s = cfg.mcp.servers.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(s.exposure, manager_config::McpExposure::Local);
+        drop(cfg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// PS-3 (docs/code-review-v0.1.60.md): a reload that could only
     /// read the `.bak` copy (primary missing mid-rotation, or corrupt)
     /// must not replace the live config with the previous one.
@@ -16340,10 +16383,24 @@ pub async fn op_mcp_set_exposure(
         previous
     };
     let servers = state.mcp_servers().await;
-    let server = servers
-        .iter()
-        .find(|s| s.id == id)
-        .expect("exposure was just persisted for a known server");
+    // The local-process specs come from the built-in defaults (see the
+    // `mcp_modes` field doc), so a persisted server outside them (the
+    // curated brave_search / web_fetch, operator-added servers) has no
+    // spec. That used to `expect` and panic the command (finding PS-5,
+    // docs/code-review-v0.1.60.md). Such a server was never spawned
+    // locally, so leaving Local has nothing to stop; entering Local
+    // cannot spawn it and says so.
+    let Some(server) = servers.iter().find(|s| s.id == id) else {
+        if exposure == manager_config::McpExposure::Local
+            && previous_exposure != manager_config::McpExposure::Local
+        {
+            return Err(ApiError::Mcp(format!(
+                "exposure saved, but mcp server {id} has no local process definition \
+                 in this version, so it was not started; use gateway exposure instead"
+            )));
+        }
+        return Ok(json!({ "id": id, "exposure": exposure, "persisted": true }));
+    };
     if exposure == manager_config::McpExposure::Local
         && previous_exposure != manager_config::McpExposure::Local
     {
