@@ -11577,9 +11577,20 @@ mod tests {
         op_updates_set_auto(&state, &sink, "litellm".to_string(), true)
             .await
             .unwrap();
+        // The unpin is saved as written ...
+        assert_eq!(
+            state.config.read().await.updates.components["litellm"].pinned_version,
+            None
+        );
+        // ... and a reload backfills LiteLLM's default pin (code
+        // review v0.1.60, F1): an unpinned LiteLLM never survives a
+        // load, so the gateway venv cannot silently track "latest".
         let loaded = manager_config::load(&state.config_path).unwrap();
         let comp = loaded.updates.components.get("litellm").unwrap();
-        assert_eq!(comp.pinned_version, None);
+        assert_eq!(
+            comp.pinned_version.as_deref(),
+            Some(manager_config::DEFAULT_LITELLM_PIN)
+        );
         assert!(comp.auto_update);
 
         // Gateway patch: port, the OpenRouter tier fields, and one

@@ -27,6 +27,24 @@ pub use diff::{apply_config_diff, diff_config, BackendPatch, ConfigDiff, FieldCh
 /// Current config schema version.
 pub const CURRENT_VERSION: u32 = 1;
 
+/// The `updates.components` key of the LiteLLM gateway package.
+pub const LITELLM_COMPONENT_ID: &str = "litellm";
+
+/// The LiteLLM release the gateway venv installs when the operator has
+/// not pinned another one (code review v0.1.60, finding F1).
+///
+/// Why a default pin exists at all: an unpinned `litellm[proxy]`
+/// requirement resolves to whatever PyPI serves at install time, and
+/// LiteLLM 1.107.0 on PyPI was a malicious release (Oct 21, 2026). The
+/// gateway runs with the master key, the Postgres password, and every
+/// armed MCP credential in its environment, so "latest" is not an
+/// acceptable default. 1.105.1 is the release installed and verified on
+/// Prometheus, and the wizard's prisma-client-py pin
+/// (`manager_wizard::PRISMA_PINNED_VERSION`) is written against the
+/// LiteLLM 1.104/1.105 PrismaWrapper. Moving the gateway to a newer
+/// LiteLLM is an explicit pin change, never a side effect of a re-run.
+pub const DEFAULT_LITELLM_PIN: &str = "1.105.1";
+
 /// Tolerance for tensor_split sum-to-1.0 checks.
 const SPLIT_SUM_EPSILON: f32 = 1e-4;
 
@@ -1115,9 +1133,49 @@ impl Default for AppUpdateConfig {
 /// Update policy for one component (llama.cpp build, LiteLLM, models, ...).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentUpdate {
+    /// Exact version the wizard installs (`None` = the installer's
+    /// latest). For LiteLLM a `None` is backfilled at load to
+    /// [`DEFAULT_LITELLM_PIN`] — see [`backfill_litellm_pin`].
     pub pinned_version: Option<String>,
     pub auto_update: bool,
     pub last_checked: Option<DateTime<Utc>>,
+}
+
+/// The LiteLLM component entry a fresh or backfilled configuration
+/// carries: pinned to [`DEFAULT_LITELLM_PIN`], not auto-updated.
+fn default_litellm_component() -> ComponentUpdate {
+    ComponentUpdate {
+        pinned_version: Some(DEFAULT_LITELLM_PIN.to_string()),
+        auto_update: false,
+        last_checked: None,
+    }
+}
+
+/// Load-time backfill for finding F1: give the LiteLLM component the
+/// default pin when it has none. A missing component entry gains the
+/// default entry; an entry whose `pinned_version` is `None` (or blank)
+/// gains [`DEFAULT_LITELLM_PIN`] and keeps its other fields; an entry
+/// that already names a version — any version, including one older or
+/// newer than the default — is the operator's choice and is left
+/// alone. Returns true when anything changed.
+///
+/// Consequence by design: an explicit "unpin" does not survive a
+/// reload; it falls back to the default pin rather than to "latest".
+/// Moving LiteLLM is done by pinning the wanted version.
+pub fn backfill_litellm_pin(cfg: &mut AppConfig) -> bool {
+    match cfg.updates.components.get_mut(LITELLM_COMPONENT_ID) {
+        None => {
+            cfg.updates
+                .components
+                .insert(LITELLM_COMPONENT_ID.to_string(), default_litellm_component());
+            true
+        }
+        Some(c) if c.pinned_version.as_deref().map(str::trim).unwrap_or("").is_empty() => {
+            c.pinned_version = Some(DEFAULT_LITELLM_PIN.to_string());
+            true
+        }
+        Some(_) => false,
+    }
 }
 
 /// Notification preferences (Windows toast notifications).
@@ -1312,7 +1370,13 @@ impl AppConfig {
             admin_api: AdminApiConfig::default(),
             log_streaming: LogStreamingConfig::default(),
             updates: UpdatePolicy {
-                components: HashMap::new(),
+                // F1: a fresh configuration pins LiteLLM (see
+                // DEFAULT_LITELLM_PIN); older files are backfilled in
+                // `migrate` through `backfill_litellm_pin`.
+                components: HashMap::from([(
+                    LITELLM_COMPONENT_ID.to_string(),
+                    default_litellm_component(),
+                )]),
             },
             app_update: AppUpdateConfig::default(),
             notifications: NotificationConfig::default(),
@@ -2014,6 +2078,11 @@ pub fn migrate(raw: serde_json::Value) -> Result<AppConfig, ConfigError> {
         }
         cfg.mcp_curated_seeded = true;
     }
+    // Supply-chain backfill (code review v0.1.60, F1): a file written
+    // before the default LiteLLM pin existed, or one whose LiteLLM
+    // component carries no pin, gets the default pin. It persists on
+    // the next save.
+    backfill_litellm_pin(&mut cfg);
     Ok(cfg)
 }
 
