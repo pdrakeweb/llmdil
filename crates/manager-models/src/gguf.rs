@@ -268,7 +268,12 @@ fn read_meta_value(
 }
 
 /// ggml element type geometry: (block size in elements, bytes per
-/// block) by type id, per ggml.h's `ggml_type_size` table.
+/// block) by type id, per the `block_*` structs in ggml-common.h
+/// (`ggml_type_size`). Each byte count is the struct's `sizeof`:
+/// e.g. `block_iq3_xxs` = 2 B `d` + `qs[3*QK_K/8]` = 98, and
+/// `block_iq1_s` = 2 B `d` + `qs[QK_K/8]` + `qh[QK_K/32]` (u16) = 50.
+/// A wrong entry silently misprices every tensor of that type in the
+/// "Exact" memory requirement (finding P-1, docs/code-review-v0.1.60.md).
 fn type_geometry(ty: u32) -> Option<(u64, u64)> {
     Some(match ty {
         0 => (1, 4),      // F32
@@ -284,11 +289,11 @@ fn type_geometry(ty: u32) -> Option<(u64, u64)> {
         12 => (256, 144), // Q4_K
         13 => (256, 176), // Q5_K
         14 => (256, 210), // Q6_K
-        15 => (256, 256), // Q8_K
+        15 => (256, 292), // Q8_K: f32 d + qs[256] + i16 bsums[16]
         16 => (256, 66),  // IQ2_XXS
         17 => (256, 74),  // IQ2_XS
-        18 => (256, 50),  // IQ3_XXS
-        19 => (256, 52),  // IQ1_S
+        18 => (256, 98),  // IQ3_XXS
+        19 => (256, 50),  // IQ1_S
         20 => (32, 18),   // IQ4_NL
         21 => (256, 110), // IQ3_S
         22 => (256, 82),  // IQ2_S
@@ -300,6 +305,8 @@ fn type_geometry(ty: u32) -> Option<(u64, u64)> {
         28 => (1, 8),     // F64
         29 => (256, 56),  // IQ1_M
         30 => (1, 2),     // BF16
+        34 => (256, 54),  // TQ1_0
+        35 => (256, 66),  // TQ2_0
         39 => (32, 17),   // MXFP4
         _ => return None,
     })
@@ -553,6 +560,32 @@ mod tests {
         w_tensor(&mut b, "blk.0.ffn_down.3.weight", &[32], 8); // Q8_0 per-expert: 34 B
         w_tensor(&mut b, "blk.0.ffn_gate_shexp.weight", &[16], 1); // F16 shared: 32 B, NOT expert
         b
+    }
+
+    /// P-1: per-type block sizes match ggml-common.h's block structs
+    /// for the types the table previously got wrong or lacked.
+    #[test]
+    fn quant_block_sizes_match_ggml() {
+        for (ty, want) in [
+            (18u32, 98u64), // IQ3_XXS
+            (19, 50),       // IQ1_S
+            (15, 292),      // Q8_K
+            (34, 54),       // TQ1_0
+            (35, 66),       // TQ2_0
+            (16, 66),       // IQ2_XXS (unchanged)
+            (21, 110),      // IQ3_S (unchanged)
+            (29, 56),       // IQ1_M (unchanged)
+        ] {
+            let mut b = Vec::new();
+            b.extend_from_slice(b"GGUF");
+            b.extend_from_slice(&3u32.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            w_kv_str(&mut b, "general.architecture", "testarch");
+            w_tensor(&mut b, "blk.0.attn_q.weight", &[256], ty);
+            let layout = parse_gguf_layout(&b).unwrap();
+            assert_eq!(layout.tensor_bytes, want, "type {ty}");
+        }
     }
 
     #[test]
