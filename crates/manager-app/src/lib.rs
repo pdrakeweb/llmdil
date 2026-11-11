@@ -1222,10 +1222,25 @@ impl AppState {
     /// effort: a missing or invalid file keeps the current config —
     /// validity was enforced when the file was saved, and a wedged
     /// file must not take the session down.
+    /// Re-read config.json after a wizard step or audit (steps may
+    /// write it directly). Two guards (finding PS-3,
+    /// docs/code-review-v0.1.60.md):
+    ///
+    /// - The write lock is taken BEFORE reading the file, so an
+    ///   in-flight mutator (which holds the write lock across its save)
+    ///   finishes first; reading outside the lock could install a file
+    ///   read before that mutator saved, reverting its change in memory
+    ///   and, on the next save, on disk.
+    /// - A load that only succeeded via the `.bak` fallback is not
+    ///   installed: the primary is briefly absent during a save's
+    ///   rotation, and `.bak` is the previous config by construction.
     async fn reload_config_from_disk(&self) {
         let path = self.data_dir.join("config.json");
-        if let Ok(cfg) = manager_config::load(&path) {
-            *self.config.write().await = cfg;
+        let mut live = self.config.write().await;
+        if let Ok(report) = manager_config::load_detailed(&path) {
+            if !report.used_backup {
+                *live = report.config;
+            }
         }
     }
 
@@ -11143,6 +11158,28 @@ mod tests {
 
     fn test_sink() -> Arc<dyn EventSink> {
         Arc::new(NoopSink)
+    }
+
+    /// PS-3 (docs/code-review-v0.1.60.md): a reload that could only
+    /// read the `.bak` copy (primary missing mid-rotation, or corrupt)
+    /// must not replace the live config with the previous one.
+    #[tokio::test]
+    async fn reload_from_disk_ignores_backup_fallback() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let mut on_disk = state.config.read().await.clone();
+        on_disk.optimize_purpose = "from-bak".to_string();
+        manager_config::save(&on_disk, &state.config_path).unwrap();
+        manager_config::save(&on_disk, &state.config_path).unwrap(); // .bak = from-bak
+        std::fs::write(&state.config_path, b"{ torn").unwrap();
+        state.config.write().await.optimize_purpose = "live".to_string();
+        state.reload_config_from_disk().await;
+        assert_eq!(state.config.read().await.optimize_purpose, "live");
+        // A clean primary still reloads.
+        on_disk.optimize_purpose = "from-primary".to_string();
+        manager_config::save(&on_disk, &state.config_path).unwrap();
+        state.reload_config_from_disk().await;
+        assert_eq!(state.config.read().await.optimize_purpose, "from-primary");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// F2 (docs/code-review-v0.1.60.md): `get_status` carries the

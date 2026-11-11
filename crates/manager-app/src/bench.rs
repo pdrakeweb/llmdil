@@ -213,7 +213,13 @@ pub async fn startup_sweep(state: &AppState) {
     // written to the config, but a leftover entry must never be
     // started or routed as a real backend.
     {
-        let cfg = state.config.read().await.clone();
+        // Hold the write lock across clone, save and install, like
+        // every other config mutator: a read-clone-release-save let a
+        // concurrent startup save (catalog seeding) land in between
+        // and be overwritten by this stale clone (finding PS-2,
+        // docs/code-review-v0.1.60.md).
+        let mut live = state.config.write().await;
+        let cfg = live.clone();
         if cfg.backends.iter().any(|b| is_bench_temp_id(&b.id)) {
             let mut new_cfg = cfg.clone();
             let removed: Vec<String> = new_cfg
@@ -230,7 +236,7 @@ pub async fn startup_sweep(state: &AppState) {
                 m.assigned_backends.retain(|b| !removed.contains(b));
             }
             if manager_config::save(&new_cfg, &state.config_path).is_ok() {
-                *state.config.write().await = new_cfg;
+                *live = new_cfg;
                 eprintln!(
                     "bench: startup sweep removed leftover temp backends from config: {}",
                     removed.join(", ")

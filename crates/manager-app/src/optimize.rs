@@ -1620,7 +1620,12 @@ pub async fn op_optimize_save_purpose(
     target: Option<String>,
     text: String,
 ) -> crate::ApiResult {
-    let mut new_cfg = state.config.read().await.clone();
+    // Write lock across clone, save and install (finding PS-2,
+    // docs/code-review-v0.1.60.md): cloning under a read lock and
+    // installing later overwrote any config change that landed in
+    // between (e.g. the download watcher's verified_at stamp).
+    let mut live = state.config.write().await;
+    let mut new_cfg = live.clone();
     match scope.as_str() {
         "deployment" => new_cfg.optimize_purpose = text,
         "backend" => {
@@ -1650,7 +1655,8 @@ pub async fn op_optimize_save_purpose(
     }
     manager_config::save(&new_cfg, &state.config_path)
         .map_err(ApiError::from)?;
-    *state.config.write().await = new_cfg;
+    *live = new_cfg;
+    drop(live);
     state_payload(state).await
 }
 
