@@ -273,13 +273,38 @@ pub fn gateway_pid_path(data_dir: &Path) -> PathBuf {
     data_dir.join("gateway.pid")
 }
 
+/// Executable image of the gateway process recorded in `gateway.pid`
+/// on Windows (the venv's `Scripts\python.exe`).
+pub const GATEWAY_PROCESS_IMAGE: &str = "python.exe";
+
+/// Whether `pid` is a gateway interpreter (finding PL-M4,
+/// `docs/code-review-v0.1.60.md`): its image is `python.exe` on
+/// Windows. `Some(false)` means a live process of another image — the
+/// recorded pid was recycled (after a reboot, say) and must not be
+/// killed with `taskkill /T /F`; `None` means the platform cannot tell
+/// (always off Windows, where the gateway is a development path only
+/// and a dev interpreter's command name varies), and callers proceed
+/// as before.
+pub fn process_is_gateway(pid: u32) -> Option<bool> {
+    #[cfg(windows)]
+    {
+        process_image_is(pid, GATEWAY_PROCESS_IMAGE)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Stop the gateway process recorded in `<data_dir>/gateway.pid`.
 ///
 /// Returns `Ok(true)` when a live recorded process was terminated,
 /// `Ok(false)` when there was nothing to stop (no pid file, an
-/// unparsable pid, or the process already gone). The pid file is
-/// removed in both cases; it is kept only when the kill itself fails,
-/// so a retry still knows which pid to target.
+/// unparsable pid, the process already gone, or a live pid that is not
+/// a gateway interpreter — a recycled pid, never killed). The pid file
+/// is removed in those cases; it is kept only when the kill itself
+/// fails, so a retry still knows which pid to target.
 pub fn stop_gateway(data_dir: &Path) -> Result<bool, String> {
     let pid_path = gateway_pid_path(data_dir);
     let text = match std::fs::read_to_string(&pid_path) {
@@ -289,7 +314,9 @@ pub fn stop_gateway(data_dir: &Path) -> Result<bool, String> {
     };
     let pid: Option<u32> = text.trim().parse().ok();
     let stopped = match pid {
-        Some(pid) if process_alive(pid) => {
+        // `taskkill /T /F` on a recycled pid would take down an
+        // unrelated program and its whole tree (PL-M4).
+        Some(pid) if process_alive(pid) && process_is_gateway(pid) != Some(false) => {
             kill_process(pid).map_err(|e| format!("could not stop gateway (pid {pid}): {e}"))?;
             true
         }
@@ -910,6 +937,10 @@ impl SystemOps for RealSystemOps {
 
     fn process_image_is(&self, pid: u32, image: &str) -> Option<bool> {
         process_image_is(pid, image)
+    }
+
+    fn process_is_gateway(&self, pid: u32) -> Option<bool> {
+        process_is_gateway(pid)
     }
 
     fn kill_process(&self, pid: u32) -> std::io::Result<()> {

@@ -661,6 +661,15 @@ pub trait SystemOps: Send + Sync {
     fn process_image_is(&self, _pid: u32, _image: &str) -> Option<bool> {
         None
     }
+    /// Whether `pid` is (still) a gateway interpreter process — the
+    /// guard before force-killing a pid read from `gateway.pid`
+    /// (finding PL-M4, `docs/code-review-v0.1.60.md`). Same
+    /// tri-state as [`Self::process_image_is`]: only `Some(false)`
+    /// (a live process of another image, i.e. a recycled pid) means
+    /// "do not kill". The default checks the Windows image name.
+    fn process_is_gateway(&self, pid: u32) -> Option<bool> {
+        self.process_image_is(pid, crate::ops::GATEWAY_PROCESS_IMAGE)
+    }
     /// Terminate the process with `pid`. On Windows the whole process
     /// tree dies with it (`taskkill /T`); the recorded gateway pid is
     /// the server process itself, so a bare termination suffices
