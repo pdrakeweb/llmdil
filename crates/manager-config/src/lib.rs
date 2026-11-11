@@ -9,8 +9,9 @@
 //! fails the primary error is returned. A missing file is an I/O error —
 //! callers fall back to [`AppConfig::default_config`] on first run.
 //!
-//! Saving: [`validate`] first, then rotate the existing file to `.bak`,
-//! then atomic write (temp file + rename).
+//! Saving: [`validate`] first, then write + fsync a temp file, copy the
+//! existing file to `.bak`, and rename the temp over the primary — so
+//! `config.json` exists at every instant (see [`save`]).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -1748,34 +1749,74 @@ pub fn preserve_unreadable(files: &[PathBuf], unix_ms: u128) -> (Vec<PathBuf>, O
     (made, err)
 }
 
+/// Serializes [`save`] process-wide. Saves share fixed temp names
+/// (`config.json.tmp`, `config.json.bak.tmp`), so two concurrent saves
+/// could interleave the rotation and the renames (finding PS-2,
+/// docs/code-review-v0.1.60.md); callers hold AppState's config lock
+/// too, but not every writer goes through it (wizard steps, tools).
+static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Validate and save the config.
 ///
-/// The existing file (if any) is rotated to `.bak` first; the new file is
-/// written atomically (temp file + rename). The config is validated *before*
-/// anything is written, so a failed save never clobbers the last-known-good
-/// copy.
+/// The config is validated *before* anything is written, so a failed
+/// save never clobbers the last-known-good copy. Order (finding PS-7,
+/// docs/code-review-v0.1.60.md), chosen so `config.json` exists at
+/// every instant and a crash or failure leaves either the old or the
+/// new file in place, never neither:
+///
+/// 1. write the new JSON to `config.json.tmp` and fsync it;
+/// 2. copy the current `config.json` to `.bak` (via a temp + rename);
+/// 3. rename the temp over `config.json` (`fs::rename` replaces the
+///    destination atomically on both Windows — `MoveFileExW` with
+///    `MOVEFILE_REPLACE_EXISTING` — and POSIX).
+///
+/// The previous order (rotate the primary to `.bak` first, then write)
+/// left no `config.json` at all whenever the write failed (disk full, a
+/// locked temp file), and the remove-then-rename it used could destroy
+/// `.bak` on a failed rename.
 pub fn save(config: &AppConfig, path: &PathBuf) -> Result<(), ConfigError> {
     validate(config)?;
+    let _serialized = SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
     let json = serde_json::to_string_pretty(config)?;
+    let tmp = tmp_path(path);
+    if let Err(e) = write_synced(&tmp, json.as_bytes()) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     if path.exists() {
         let bak = bak_path(path);
-        replace_file(path, &bak).map_err(|e| {
-            ConfigError::BackupFailed(format!(
-                "could not rotate {} to {}: {e}",
+        let bak_tmp = tmp_path(&bak);
+        let rotated = fs::copy(path, &bak_tmp).and_then(|_| fs::rename(&bak_tmp, &bak));
+        if let Err(e) = rotated {
+            let _ = fs::remove_file(&bak_tmp);
+            let _ = fs::remove_file(&tmp);
+            return Err(ConfigError::BackupFailed(format!(
+                "could not copy {} to {}: {e}",
                 path.display(),
                 bak.display()
-            ))
-        })?;
+            )));
+        }
     }
-    let tmp = tmp_path(path);
-    fs::write(&tmp, json)?;
-    replace_file(&tmp, path)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
+}
+
+/// Write `bytes` to `path` and flush them to stable storage, so the
+/// rename that publishes the file can never expose a zero-length or
+/// partial config after a power loss.
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = fs::File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 /// Structural validation. Collects every problem found and reports them
@@ -2514,15 +2555,6 @@ fn tmp_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".tmp");
     PathBuf::from(s)
-}
-
-/// Move `src` onto `dst`, replacing `dst` (portable across Windows/POSIX —
-/// `fs::rename` alone does not replace on Windows).
-fn replace_file(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
-    if dst.exists() {
-        fs::remove_file(dst)?;
-    }
-    fs::rename(src, dst)
 }
 
 #[cfg(test)]
@@ -4299,6 +4331,58 @@ mod startup_load_tests {
         assert_eq!(r.source, ConfigSource::Defaults);
         assert_eq!(r.preserved.len(), 1);
         assert_eq!(fs::read(&r.preserved[0]).unwrap(), b"bak garbage");
+    }
+
+    /// PS-7: a save that fails to write never removes the primary.
+    #[test]
+    fn failed_save_keeps_the_primary_and_bak() {
+        let dir = scratch("save-fail");
+        let path = dir.join("config.json");
+        let mut cfg = AppConfig::default_config();
+        cfg.optimize_purpose = "first".to_string();
+        save(&cfg, &path).unwrap();
+        cfg.optimize_purpose = "second".to_string();
+        save(&cfg, &path).unwrap();
+        let primary_before = fs::read(&path).unwrap();
+        let bak_before = fs::read(bak_path(&path)).unwrap();
+        // Make the temp write fail: the temp path is a directory.
+        fs::create_dir_all(tmp_path(&path)).unwrap();
+        cfg.optimize_purpose = "third".to_string();
+        assert!(save(&cfg, &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), primary_before);
+        assert_eq!(fs::read(bak_path(&path)).unwrap(), bak_before);
+        fs::remove_dir_all(tmp_path(&path)).unwrap();
+        // And a later save works and rotates normally.
+        save(&cfg, &path).unwrap();
+        assert_eq!(fs::read(bak_path(&path)).unwrap(), primary_before);
+        assert_eq!(load(&path).unwrap().optimize_purpose, "third");
+    }
+
+    /// PS-2: concurrent saves from many threads never leave a torn or
+    /// missing file; the result is one of the saved configs.
+    #[test]
+    fn concurrent_saves_leave_a_whole_file() {
+        let dir = scratch("save-race");
+        let path = dir.join("config.json");
+        save(&AppConfig::default_config(), &path).unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut cfg = AppConfig::default_config();
+                    cfg.optimize_purpose = format!("writer-{i}");
+                    for _ in 0..10 {
+                        save(&cfg, &path).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let loaded = load_detailed(&path).unwrap();
+        assert!(!loaded.used_backup);
+        assert!(loaded.config.optimize_purpose.starts_with("writer-"));
     }
 
     #[test]
