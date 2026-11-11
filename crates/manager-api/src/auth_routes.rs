@@ -189,6 +189,8 @@ pub struct RequestId(pub String);
 #[derive(Debug, Clone)]
 pub struct SourceIp(pub String);
 
+/// State for [`auth_middleware`]: the API context and the class table from
+/// [`route_class_table`], built once when the router is constructed.
 #[derive(Clone)]
 pub struct AuthMwState {
     pub ctx: Arc<ApiCtx>,
@@ -448,6 +450,7 @@ fn audit_auth(
     });
 }
 
+/// Body of `POST /api/v1/auth/login`; unknown fields are rejected.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoginBody {
@@ -457,6 +460,9 @@ pub struct LoginBody {
     pub device_name: Option<String>,
 }
 
+/// POST /api/v1/auth/login. Every outcome — tokens, TOTP required, failure — is audited
+/// here, because the middleware audits only authenticated mutations. Failures all answer
+/// the same 401.
 pub async fn handle_login(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(ip): axum::Extension<SourceIp>,
@@ -486,6 +492,7 @@ pub async fn handle_login(
     }
 }
 
+/// Body of `POST /api/v1/auth/totp`: the login challenge and a TOTP or recovery code.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TotpBody {
@@ -493,6 +500,8 @@ pub struct TotpBody {
     pub code: String,
 }
 
+/// POST /api/v1/auth/totp: second login step. One guess per challenge; after a failure
+/// the client logs in again.
 pub async fn handle_totp(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(ip): axum::Extension<SourceIp>,
@@ -509,12 +518,15 @@ pub async fn handle_totp(
     }
 }
 
+/// Body of `POST /api/v1/auth/refresh`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RefreshBody {
     pub refresh_token: String,
 }
 
+/// POST /api/v1/auth/refresh: rotate the refresh token. Reuse of a retired token (theft
+/// signal) revokes the session family and is audited; other failures are a plain 401.
 pub async fn handle_refresh(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(ip): axum::Extension<SourceIp>,
@@ -532,6 +544,7 @@ pub async fn handle_refresh(
     }
 }
 
+/// Body of `POST /api/v1/enroll`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnrollBody {
@@ -540,6 +553,8 @@ pub struct EnrollBody {
     pub device_name: Option<String>,
 }
 
+/// POST /api/v1/enroll: redeem a desktop-issued enrollment code for a session (201).
+/// Public route, so success and failure are both audited here.
 pub async fn handle_enroll(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(ip): axum::Extension<SourceIp>,
@@ -560,6 +575,7 @@ pub async fn handle_enroll(
     }
 }
 
+/// GET /api/v1/auth/me: the caller's user record and how they authenticated.
 pub async fn handle_me(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(p): axum::Extension<Principal>,
@@ -579,6 +595,8 @@ pub async fn handle_me(
     }
 }
 
+/// POST /api/v1/auth/logout: revoke the caller's own session. API tokens cannot log out;
+/// only an admin revokes them.
 pub async fn handle_logout(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(p): axum::Extension<Principal>,
@@ -596,6 +614,7 @@ pub async fn handle_logout(
     axum::Json(json!({ "ok": true })).into_response()
 }
 
+/// Body of `POST /api/v1/auth/password`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PasswordBody {
@@ -603,6 +622,8 @@ pub struct PasswordBody {
     pub new_password: String,
 }
 
+/// POST /api/v1/auth/password. Session-only; revokes the user's other sessions but keeps
+/// the one making the request.
 pub async fn handle_change_password(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(p): axum::Extension<Principal>,
@@ -626,6 +647,8 @@ pub async fn handle_change_password(
     }
 }
 
+/// GET /api/v1/auth/sessions: the caller's unrevoked sessions (metadata only, never token
+/// hashes), flagging the current one. Expired-but-unrevoked sessions are included.
 pub async fn handle_list_sessions(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(p): axum::Extension<Principal>,
@@ -653,6 +676,8 @@ pub async fn handle_list_sessions(
     axum::Json(json!({ "sessions": sessions })).into_response()
 }
 
+/// DELETE /api/v1/auth/sessions/{id}: revoke one of the caller's own sessions. Another
+/// user's session id answers 404, so ids are not confirmed across accounts.
 pub async fn handle_revoke_session(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(p): axum::Extension<Principal>,
@@ -673,6 +698,7 @@ pub async fn handle_revoke_session(
     axum::Json(json!({ "ok": true })).into_response()
 }
 
+/// Optional body of `POST /api/v1/auth/totp/enroll`.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct TotpEnrollBody {
@@ -681,6 +707,8 @@ pub struct TotpEnrollBody {
     pub password: Option<String>,
 }
 
+/// POST /api/v1/auth/totp/enroll: start (re-)enrollment, returning the secret and otpauth
+/// URI. Session-only; replacing a live factor needs the password (code-review B-6).
 pub async fn handle_totp_enroll(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(p): axum::Extension<Principal>,
@@ -702,12 +730,15 @@ pub async fn handle_totp_enroll(
     }
 }
 
+/// Body of `POST /api/v1/auth/totp/verify`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TotpVerifyBody {
     pub code: String,
 }
 
+/// POST /api/v1/auth/totp/verify: confirm enrollment and return the recovery codes,
+/// shown only this once. Session-only.
 pub async fn handle_totp_verify(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(p): axum::Extension<Principal>,
@@ -722,12 +753,14 @@ pub async fn handle_totp_verify(
     }
 }
 
+/// Body of `POST /api/v1/auth/totp/disable`: the account password, as step-up.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TotpDisableBody {
     pub password: String,
 }
 
+/// POST /api/v1/auth/totp/disable. Session-only, with a password step-up first.
 pub async fn handle_totp_disable(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(p): axum::Extension<Principal>,
@@ -749,6 +782,7 @@ pub async fn handle_totp_disable(
 
 // -- admin: users -----------------------------------------------------------
 
+/// GET /api/v1/admin/users: every account as a [`UserView`] (no secret material).
 pub async fn handle_admin_list_users(State(ctx): State<Arc<ApiCtx>>) -> Response {
     let users = ctx
         .users
@@ -757,6 +791,7 @@ pub async fn handle_admin_list_users(State(ctx): State<Arc<ApiCtx>>) -> Response
     axum::Json(json!({ "users": users })).into_response()
 }
 
+/// Body of `POST /api/v1/admin/users`; `role` is a [`RoleName`] wire string.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateUserBody {
@@ -765,6 +800,7 @@ pub struct CreateUserBody {
     pub role: String,
 }
 
+/// POST /api/v1/admin/users (201). Unknown roles and policy violations answer 400.
 pub async fn handle_admin_create_user(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Json(body): axum::Json<CreateUserBody>,
@@ -785,6 +821,7 @@ pub async fn handle_admin_create_user(
     }
 }
 
+/// Body of `PATCH /api/v1/admin/users/{id}`; absent fields are left unchanged.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateUserBody {
@@ -792,6 +829,8 @@ pub struct UpdateUserBody {
     pub disabled: Option<bool>,
 }
 
+/// PATCH /api/v1/admin/users/{id}. The last-admin guard and session revocation are
+/// enforced by [`crate::auth::AuthService::update_user`], not here.
 pub async fn handle_admin_update_user(
     State(ctx): State<Arc<ApiCtx>>,
     Path(id): Path<String>,
@@ -814,6 +853,8 @@ pub async fn handle_admin_update_user(
     }
 }
 
+/// DELETE /api/v1/admin/users/{id}. The caller cannot delete themself, and the last
+/// enabled admin cannot be deleted.
 pub async fn handle_admin_delete_user(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(p): axum::Extension<Principal>,
@@ -825,6 +866,8 @@ pub async fn handle_admin_delete_user(
     }
 }
 
+/// POST /api/v1/admin/users/{id}/reset-password: returns a temporary password once; the
+/// user must change it, and all their sessions are revoked.
 pub async fn handle_admin_reset_password(
     State(ctx): State<Arc<ApiCtx>>,
     Path(id): Path<String>,
@@ -838,6 +881,8 @@ pub async fn handle_admin_reset_password(
     }
 }
 
+/// GET /api/v1/admin/users/{id}/sessions: one user's unrevoked sessions (metadata only).
+/// An unknown user id yields an empty list, not 404.
 pub async fn handle_admin_list_user_sessions(
     State(ctx): State<Arc<ApiCtx>>,
     Path(id): Path<String>,
@@ -862,6 +907,8 @@ pub async fn handle_admin_list_user_sessions(
     axum::Json(json!({ "sessions": sessions })).into_response()
 }
 
+/// DELETE /api/v1/admin/users/{id}/sessions/{session_id}. Answers 404 unless the session
+/// belongs to that user.
 pub async fn handle_admin_revoke_user_session(
     State(ctx): State<Arc<ApiCtx>>,
     Path((user_id, session_id)): Path<(String, String)>,
@@ -883,6 +930,8 @@ pub async fn handle_admin_revoke_user_session(
 
 // -- admin: API tokens --------------------------------------------------------
 
+/// GET /api/v1/admin/api-tokens: metadata for every token, revoked ones included; never
+/// the values or hashes.
 pub async fn handle_admin_list_tokens(State(ctx): State<Arc<ApiCtx>>) -> Response {
     let tokens = ctx
         .users
@@ -908,6 +957,8 @@ pub async fn handle_admin_list_tokens(State(ctx): State<Arc<ApiCtx>>) -> Respons
     axum::Json(json!({ "api_tokens": tokens })).into_response()
 }
 
+/// Body of `POST /api/v1/admin/api-tokens`. `role` must be viewer or operator; omit
+/// `expires_days` for a token that never expires.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateTokenBody {
@@ -918,6 +969,8 @@ pub struct CreateTokenBody {
     pub expires_days: Option<i64>,
 }
 
+/// POST /api/v1/admin/api-tokens (201). The response carries the token value — the only
+/// time it is ever returned.
 pub async fn handle_admin_create_token(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(p): axum::Extension<Principal>,
@@ -953,6 +1006,7 @@ pub async fn handle_admin_create_token(
     }
 }
 
+/// DELETE /api/v1/admin/api-tokens/{id}; takes effect on the token's next request.
 pub async fn handle_admin_revoke_token(
     State(ctx): State<Arc<ApiCtx>>,
     Path(id): Path<String>,
@@ -963,6 +1017,7 @@ pub async fn handle_admin_revoke_token(
     }
 }
 
+/// Body of `POST /api/v1/admin/enrollment-codes`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateEnrollmentBody {
@@ -987,6 +1042,9 @@ pub async fn handle_admin_audit(
         .into_response()
 }
 
+/// POST /api/v1/admin/enrollment-codes (201): a one-time pairing code for an enabled
+/// user, valid 10 minutes. The returned `expires_ms` is computed here, after the code was
+/// stored, so it can trail the service's real expiry by a few milliseconds.
 pub async fn handle_admin_create_enrollment(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Json(body): axum::Json<CreateEnrollmentBody>,

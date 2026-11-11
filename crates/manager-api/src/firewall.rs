@@ -22,6 +22,7 @@ pub fn rule_name(port: u16) -> String {
 /// CGNAT range.
 pub const REMOTE_SCOPES: &str = "localsubnet,100.64.0.0/10";
 
+/// State of the API port's firewall rule, as reported by the status check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirewallStatus {
     /// Rule present with the expected scope and port.

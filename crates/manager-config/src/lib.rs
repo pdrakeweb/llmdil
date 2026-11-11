@@ -2243,13 +2243,14 @@ pub fn backfill_litellm_pin(cfg: &mut AppConfig) -> bool {
     unpinned
 }
 
-/// Default data directory: `%APPDATA%\local-llm-service-manager`
-/// (falls back to `~/.local-llm-service-manager` off-Windows).
 /// Serde default for [`GatewayConfig::bind_host`]: all interfaces.
 pub fn default_gateway_bind_host() -> String {
     "0.0.0.0".to_string()
 }
 
+/// Default data directory: `%APPDATA%\local-llm-service-manager`
+/// (falls back to `$HOME/.local-llm-service-manager` when `APPDATA` is
+/// unset, and to a relative `.local-llm-service-manager` when neither is).
 pub fn default_data_dir() -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
         PathBuf::from(appdata).join("local-llm-service-manager")

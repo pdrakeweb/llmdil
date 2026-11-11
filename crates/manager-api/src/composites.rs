@@ -279,11 +279,6 @@ pub async fn gateway_start(ctx: &ApiCtx) -> Result<Value, ApiError> {
     .await
 }
 
-/// POST /api/v1/activation-plan/apply: the one server-side
-/// composition (PLAN.md §3.6). Restarts the plan's stale backends,
-/// then — when the gateway has pending changes — optionally drains,
-/// stops the gateway, runs the start-gateway step, and performs
-/// the completion bookkeeping server-side.
 /// Validate an apply body (closed object, mode in {drain, now})
 /// and return the mode. Split out so the HTTP handler can refuse
 /// a malformed request synchronously, before the operation is
@@ -301,6 +296,12 @@ pub fn validate_apply_body(body: &Value) -> Result<String, ApiError> {
     Ok(mode.to_string())
 }
 
+/// POST /api/v1/activation-plan/apply: the one server-side
+/// composition (PLAN.md §3.6). Restarts the plan's stale backends,
+/// then — when the gateway has pending changes — optionally drains,
+/// stops the gateway, runs the start-gateway step, and performs
+/// the completion bookkeeping server-side. Steps run in order and
+/// stop at the first failure; completed restarts are not rolled back.
 pub async fn activation_apply(ctx: &ApiCtx, body: Value) -> Result<Value, ApiError> {
     let mode = validate_apply_body(&body)?;
     let mode = mode.as_str();

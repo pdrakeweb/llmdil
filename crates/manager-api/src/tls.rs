@@ -187,7 +187,7 @@ type Handshake = Option<(
 /// An axum listener that terminates TLS per connection.
 ///
 /// Handshakes run as concurrent tasks, each bounded by
-/// [`HANDSHAKE_TIMEOUT`], and `accept` yields whichever completes first
+/// `HANDSHAKE_TIMEOUT` (10 s), and `accept` yields whichever completes first
 /// (finding SEC-07, `docs/code-review-v0.1.60.md`). axum calls
 /// `accept` one connection at a time, so a handshake awaited inline
 /// let a single client that opened TCP and never sent a ClientHello
@@ -200,6 +200,7 @@ pub struct TlsListener {
 }
 
 impl TlsListener {
+    /// Wrap a bound TCP listener; no handshake work starts until `accept`.
     pub fn new(listener: tokio::net::TcpListener, config: Arc<rustls::ServerConfig>) -> Self {
         Self {
             listener,

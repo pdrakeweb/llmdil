@@ -26,6 +26,8 @@ use manager_app::registry::Role;
 // Principals and errors
 // ---------------------------------------------------------------------------
 
+/// How a principal authenticated. Recorded in the audit log, and gates account
+/// self-service: API tokens may not change passwords or TOTP (SEC-04).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthType {
     Session,
@@ -33,6 +35,7 @@ pub enum AuthType {
 }
 
 impl AuthType {
+    /// Stable wire and audit spelling (`session`, `api_token`).
     pub fn as_str(self) -> &'static str {
         match self {
             AuthType::Session => "session",
@@ -52,6 +55,8 @@ pub struct Principal {
     pub session_id: String,
 }
 
+/// Failures from [`AuthService`], mapped one-to-one onto HTTP error envelopes by the auth
+/// routes. `Internal` deliberately carries no detail, so store errors never reach clients.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthError {
     /// Unknown user, wrong password, disabled account, or locked
@@ -77,6 +82,8 @@ impl From<crate::users::StoreError> for AuthError {
     }
 }
 
+/// A freshly issued access/refresh pair. The token strings exist only here — the store
+/// keeps their SHA-256 — so this is the one chance to hand them to the client.
 #[derive(Debug, Clone)]
 pub struct TokenPair {
     pub access_token: String,
@@ -86,6 +93,8 @@ pub struct TokenPair {
     pub refresh_expires_ms: i64,
 }
 
+/// Result of the password stage of [`AuthService::login`]: tokens directly or, for a
+/// TOTP-enabled account, a single-use challenge for [`AuthService::complete_totp_login`].
 #[derive(Debug, Clone)]
 pub enum LoginOutcome {
     Tokens {
@@ -97,6 +106,8 @@ pub enum LoginOutcome {
     },
 }
 
+/// The client-safe projection of a [`User`]: no password hash, recovery-code hashes or
+/// other secret material. Response bodies use this, never `User`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UserView {
     pub id: String,
@@ -131,8 +142,12 @@ impl From<&User> for UserView {
 /// touch `admin-users.json`.
 #[async_trait::async_trait]
 pub trait CredentialStore: Send + Sync {
+    /// The secret stored under `target`, or `None` when there is none. Never log it.
     async fn read(&self, target: &str) -> Option<String>;
+    /// Store `secret` under `target`, replacing any existing value.
     async fn write(&self, target: &str, secret: &str) -> Result<(), String>;
+    /// Remove the secret under `target`. Best-effort and infallible: callers disable the
+    /// factor in the user store first, so a leftover secret is never consulted.
     async fn delete(&self, target: &str);
 }
 
@@ -236,6 +251,10 @@ struct PendingTotp {
 /// How long an unconfirmed TOTP enrollment stays valid.
 const PENDING_TOTP_TTL_MS: i64 = 10 * 60 * 1000;
 
+/// Credential checks and account lifecycle over a [`UserStore`]. Lockout counters, TOTP
+/// login challenges, enrollment codes and pending TOTP secrets live in memory per
+/// instance (lost on restart), so a process must share ONE instance — see
+/// [`crate::ApiCtx::with_auth`].
 pub struct AuthService {
     store: Arc<UserStore>,
     creds: Arc<dyn CredentialStore>,
@@ -247,6 +266,8 @@ pub struct AuthService {
 }
 
 impl AuthService {
+    /// A service with empty in-memory state, returned in an `Arc` because the HTTP handlers
+    /// and the desktop shell share it.
     pub fn new(store: Arc<UserStore>, creds: Arc<dyn CredentialStore>) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -259,6 +280,7 @@ impl AuthService {
         })
     }
 
+    /// The backing user store; `ApiCtx` reads users and sessions through the same instance.
     pub fn store(&self) -> &Arc<UserStore> {
         &self.store
     }
@@ -333,6 +355,10 @@ impl AuthService {
 
     // -- login ----------------------------------------------------------
 
+    /// Password stage of login. Unknown users, wrong passwords, disabled or locked accounts
+    /// and IP-throttled sources all yield `InvalidCredentials` after the same argon2 cost;
+    /// each failure counts toward the account lockout and the per-IP throttle. A TOTP account
+    /// gets a 5-minute challenge instead of tokens, and its lockout is not reset yet.
     pub async fn login(
         &self,
         username: &str,
@@ -491,6 +517,9 @@ impl AuthService {
 
     // -- sessions -------------------------------------------------------
 
+    /// Mint a new per-device session. Performs no credential check of its own: callers must
+    /// already have authenticated the user (password, TOTP or enrollment code). Only the
+    /// token hashes are persisted.
     pub async fn create_session(
         &self,
         user_id: &str,
@@ -707,6 +736,8 @@ impl AuthService {
             .await;
     }
 
+    /// Mark a session revoked; its access and refresh tokens stop validating at once. An
+    /// unknown id is a silent no-op, so callers scoping by owner must check ownership first.
     pub async fn revoke_session(&self, session_id: &str) -> Result<(), AuthError> {
         let sid = session_id.to_string();
         self.store
@@ -719,6 +750,8 @@ impl AuthService {
             .await
     }
 
+    /// Revoke every session of `user_id` except `except` (the caller's own, on password
+    /// change). Best-effort: a store write failure is swallowed. API tokens are untouched.
     pub async fn revoke_user_sessions(&self, user_id: &str, except: Option<&str>) {
         let uid = user_id.to_string();
         let except = except.map(str::to_string);
@@ -737,6 +770,9 @@ impl AuthService {
 
     // -- passwords ------------------------------------------------------
 
+    /// Self-service password change. The current password is a step-up check counted
+    /// against the account lockout (SEC-04); the new one must pass [`password_policy_error`].
+    /// On success clears must-change and revokes every other session, keeping `keep_session`.
     pub async fn change_password(
         &self,
         user_id: &str,
@@ -803,6 +839,9 @@ impl AuthService {
 
     // -- user administration ---------------------------------------------
 
+    /// Create an enabled account without TOTP or a must-change flag. The username is trimmed,
+    /// must be 1..=[`MAX_USERNAME_LEN`] bytes and unique ignoring ASCII case; the password
+    /// must pass the policy.
     pub async fn create_user(
         &self,
         username: &str,
@@ -866,6 +905,9 @@ impl AuthService {
         Ok(())
     }
 
+    /// Change a user's role and/or disabled flag. Demoting or disabling the last enabled
+    /// admin is refused. Any role change or disable revokes all the user's sessions at once,
+    /// and a disabled user's API tokens stop validating too.
     pub async fn update_user(
         &self,
         user_id: &str,
@@ -903,6 +945,8 @@ impl AuthService {
         Ok(view)
     }
 
+    /// Delete a user with their sessions, API tokens and TOTP secret. Refused for
+    /// self-deletion and for the last enabled admin.
     pub async fn delete_user(&self, actor_id: &str, user_id: &str) -> Result<(), AuthError> {
         if actor_id == user_id {
             return Err(AuthError::Forbidden("a user cannot delete themself".into()));
@@ -930,6 +974,9 @@ impl AuthService {
 
     // -- API tokens --------------------------------------------------------
 
+    /// Issue an API token for an existing, enabled user, capped at operator role (viewer or
+    /// operator only). Returns the metadata and the token value, which is never retrievable
+    /// again — only its hash is stored. `expires_days = None` never expires.
     pub async fn create_api_token(
         &self,
         issuer: &Principal,
@@ -974,6 +1021,8 @@ impl AuthService {
         Ok((cloned, value))
     }
 
+    /// Revoke an API token by id; it stops validating on the next request. Permanent: there
+    /// is no un-revoke.
     pub async fn revoke_api_token(&self, token_id: &str) -> Result<(), AuthError> {
         let tid = token_id.to_string();
         let found = self
@@ -1107,6 +1156,9 @@ impl AuthService {
         Ok(codes)
     }
 
+    /// Turn TOTP off, dropping recovery codes, any pending enrollment and the stored secret.
+    /// Performs no step-up itself: callers must verify the password first
+    /// ([`Self::verify_step_up`]).
     pub async fn totp_disable(&self, user_id: &str) -> Result<(), AuthError> {
         let uid = user_id.to_string();
         self.store
@@ -1149,6 +1201,9 @@ impl AuthService {
         Ok(code)
     }
 
+    /// Exchange a one-time enrollment code for a new session on `device_name`. The code is
+    /// consumed by any attempt that names it, even an expired one; an unknown code or a
+    /// disabled user yields `InvalidCredentials`.
     pub async fn redeem_enrollment_code(
         &self,
         code: &str,
@@ -1179,6 +1234,7 @@ impl AuthService {
 // TOTP (RFC 6238, HMAC-SHA1, 30 s step, 6 digits, ±1 step)
 // ---------------------------------------------------------------------------
 
+/// RFC 6238 TOTP value (HMAC-SHA1, 30 s step, 6 digits) at `unix_secs`.
 pub fn totp_at(secret: &[u8], unix_secs: i64) -> u32 {
     let counter = (unix_secs / 30) as u64;
     let msg = counter.to_be_bytes();
@@ -1195,6 +1251,9 @@ pub fn totp_at(secret: &[u8], unix_secs: i64) -> u32 {
     binary % 1_000_000
 }
 
+/// Accept `code` if it matches the previous, current or next 30 s step (±1 step of clock
+/// skew); non-numeric input is rejected. There is no replay tracking: a code stays valid
+/// for its whole window.
 pub fn totp_verify(secret: &[u8], code: &str, unix_secs: i64) -> bool {
     let Ok(code_num) = code.parse::<u32>() else {
         return false;
@@ -1225,6 +1284,7 @@ fn recovery_code() -> String {
 
 const B32: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
+/// RFC 4648 base32 without padding (the otpauth `secret` form).
 pub fn base32_encode(bytes: &[u8]) -> String {
     let mut out = String::new();
     let mut buffer: u32 = 0;
@@ -1243,6 +1303,8 @@ pub fn base32_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Inverse of [`base32_encode`]. Uppercase alphabet only; `=` and whitespace are skipped
+/// and any other character yields `None`.
 pub fn base32_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut buffer: u32 = 0;

@@ -10,6 +10,8 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
+/// One audit-log line. Identities and outcomes only — never passwords, tokens or key
+/// material. `actor` is attacker-chosen text for failed logins, so callers cap its length.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEntry {
     pub ts_ms: i64,
@@ -22,12 +24,16 @@ pub struct AuditEntry {
     pub request_id: String,
 }
 
+/// Append-only JSONL audit log. Appends are serialized by an in-process mutex so concurrent
+/// requests never interleave partial lines; nothing in the API rewrites or truncates it.
 pub struct AuditLog {
     path: PathBuf,
     lock: Mutex<()>,
 }
 
 impl AuditLog {
+    /// Log at `<data_dir>/logs/admin-api-audit.jsonl`. Touches no files: the directory and
+    /// file are created on the first append.
     pub fn new(data_dir: &std::path::Path) -> Self {
         Self {
             path: data_dir.join("logs").join("admin-api-audit.jsonl"),
@@ -35,6 +41,7 @@ impl AuditLog {
         }
     }
 
+    /// The JSONL file this log appends to.
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
