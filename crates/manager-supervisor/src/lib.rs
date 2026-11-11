@@ -779,7 +779,10 @@ impl SupervisedProcess {
                     format!("drain timed out after {timeout:?}; killing process"),
                 );
                 tracing::warn!(process = self.id, "drain timed out; killing");
-                let _ = child.kill().await;
+                // start_kill, not kill(): tokio's `Child::kill` also
+                // awaits the exit with no bound, which would defeat the
+                // bounded reap below (finding PL-m3).
+                let _ = child.start_kill();
                 // The kill is best-effort: if the child still will not die,
                 // report DrainTimeout instead of hanging the supervisor on
                 // wait() forever.
@@ -817,10 +820,21 @@ impl SupervisedProcess {
             Some(c) => c,
         };
         // May already be dead; ignore the error and reap regardless.
-        let _ = child.kill().await;
-        match child.wait().await {
-            Ok(status) => self.record_exit(status, ProcessState::Stopped),
-            Err(_) => self.record_exit_unknown(),
+        // The reap is bounded like `drain`'s (finding PL-m3,
+        // docs/code-review-v0.1.60.md): a process stuck in a driver call
+        // (a GPU TDR, say) may not die on TerminateProcess, and an
+        // unbounded wait here held the whole Supervisor lock — freezing
+        // list_backends, start/stop and the notify monitor. `stop()`
+        // marks the id failed on DrainTimeout.
+        let _ = child.start_kill();
+        match tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) => self.record_exit(status, ProcessState::Stopped),
+            Ok(Err(_)) => self.record_exit_unknown(),
+            Err(_) => {
+                self.record_exit_unknown();
+                self.abort_readers();
+                return Err(SupervisorError::DrainTimeout(self.id.clone()));
+            }
         }
         self.abort_readers();
         tracing::info!(process = self.id, "killed");
