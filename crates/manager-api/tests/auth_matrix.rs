@@ -252,6 +252,51 @@ async fn unauthenticated_is_refused_everywhere_but_public() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// SEC-01 (docs/code-review-v0.1.60.md): axum runs the GET handler
+/// for HEAD, so every GET route must refuse an unauthenticated HEAD
+/// exactly as it refuses GET, and apply the same role guard.
+#[tokio::test]
+async fn head_requests_get_the_get_guard() {
+    let (ctx, dir, tokens) = ctx_with_users().await;
+    let (router, records) = build_router(ctx);
+    let mut checked = 0;
+    for r in &records {
+        if r.method != "GET" || r.path == "/api/v1/server" {
+            continue;
+        }
+        let uri = fill_template(r.path);
+        let st = status(&router, "HEAD", &uri, None, None).await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "HEAD {} without a token",
+            r.path
+        );
+        checked += 1;
+    }
+    assert!(checked > 30, "too few GET routes checked: {checked}");
+    // Role guard: a viewer token may not HEAD an admin-only route.
+    let st = status(
+        &router,
+        "HEAD",
+        "/api/v1/admin/users",
+        Some(&tokens[0]),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let st = status(
+        &router,
+        "HEAD",
+        "/api/v1/admin/users",
+        Some(&tokens[3]),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn http_login_refresh_reuse_flow() {
     let (ctx, dir, _tokens) = ctx_with_users().await;

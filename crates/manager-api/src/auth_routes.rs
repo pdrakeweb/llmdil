@@ -213,7 +213,16 @@ pub async fn auth_middleware(
         .unwrap_or_else(|| "unknown".to_string());
     req.extensions_mut().insert(SourceIp(source_ip.clone()));
 
-    let class = resolve_template(&mw.table, &method, &path).copied();
+    // axum routes HEAD to the GET handler (the body is stripped, the
+    // handler still runs), but the class table only lists GET. Resolve
+    // HEAD as GET so it gets GET's guard instead of falling through
+    // unauthenticated (finding SEC-01, docs/code-review-v0.1.60.md).
+    let class_method = if method == Method::HEAD {
+        Method::GET
+    } else {
+        method.clone()
+    };
+    let class = resolve_template(&mw.table, &class_method, &path).copied();
     let mut principal: Option<Principal> = None;
     if let Some(class) = class {
         if class != AuthClass::Public {
