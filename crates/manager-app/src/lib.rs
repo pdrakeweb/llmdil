@@ -4723,6 +4723,11 @@ pub async fn op_update_gateway_config(
     let mut v = serde_json::to_value(&new_cfg.gateway)?;
     merge_json(&mut v, patch);
     new_cfg.gateway = serde_json::from_value(v)?;
+    // Validate before journaling, like the other journaling sites: an
+    // invalid patch used to write a "Gateway configuration changed"
+    // entry and then fail the save, leaving a phantom pending change
+    // that cancel refused (finding PS-6, docs/code-review-v0.1.60.md).
+    manager_config::validate(&new_cfg).map_err(ApiError::from)?;
     record_gateway_change(
         state,
         &pre_cfg,
@@ -11165,6 +11170,26 @@ mod tests {
 
     fn test_sink() -> Arc<dyn EventSink> {
         Arc::new(NoopSink)
+    }
+
+    /// PS-6 (docs/code-review-v0.1.60.md): an invalid gateway patch is
+    /// refused before it can journal a phantom activation-plan entry.
+    #[tokio::test]
+    async fn invalid_gateway_patch_journals_nothing() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        // Seeding enables the default fleet, so the groups render into
+        // the gateway YAML and a change to them is journal-worthy.
+        ensure_catalog_models(&state).await;
+        let mut groups = serde_json::to_value(&state.config.read().await.gateway.groups).unwrap();
+        groups[0]["fallbacks"] = json!(["no-such-backend"]);
+        let patch = json!({ "groups": groups });
+        assert!(op_update_gateway_config(&state, &sink, patch)
+            .await
+            .is_err());
+        let journal = activation::load_journal(&state.data_dir);
+        assert!(journal.entries.is_empty(), "{:?}", journal.entries.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// PS-5 (docs/code-review-v0.1.60.md): changing the exposure of a
