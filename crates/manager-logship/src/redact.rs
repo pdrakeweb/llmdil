@@ -360,9 +360,10 @@ fn redact_secret_key_values(line: &str, hits: &mut u64) -> String {
                 kend += 1;
             }
             let key = &line[kstart..kend];
-            // Optional closing quote for JSON keys.
+            // Optional closing quote: JSON (`"key":`) or Python repr
+            // (`'key':`) keys (finding SEC-10).
             let mut j = kend;
-            if j < b.len() && b[j] == b'"' {
+            if j < b.len() && matches!(b[j], b'"' | b'\'') {
                 j += 1;
             }
             let mut k = j;
@@ -390,13 +391,19 @@ fn redact_secret_key_values(line: &str, hits: &mut u64) -> String {
                     i = kend.max(i + 1);
                     continue;
                 }
-                // Value: quoted or bare.
-                if k < b.len() && b[k] == b'"' {
+                // Value: quoted (double or single quotes, the latter
+                // being Python kwargs/repr — LiteLLM's debug format)
+                // or bare. A quoted value runs to its matching quote,
+                // skipping backslash-escaped characters, so `"ab\"cd"`
+                // redacts whole (finding SEC-10).
+                if k < b.len() && matches!(b[k], b'"' | b'\'') {
+                    let quote = b[k];
                     let vstart = k + 1;
                     let mut vend = vstart;
-                    while vend < b.len() && b[vend] != b'"' {
-                        vend += 1;
+                    while vend < b.len() && b[vend] != quote {
+                        vend += if b[vend] == b'\\' { 2 } else { 1 };
                     }
+                    let vend = vend.min(b.len());
                     if vend > vstart {
                         out.push_str(&line[copied..vstart]);
                         out.push_str(REDACTED);
@@ -449,6 +456,32 @@ mod tests {
         let (out, counts) = red.redact("connecting with master-key-value-1234 ok");
         assert_eq!(out, format!("connecting with {REDACTED} ok"));
         assert_eq!(counts.literal_lines, 1);
+    }
+
+    /// SEC-10 (docs/code-review-v0.1.60.md): single-quoted keys and
+    /// values (Python repr / kwargs) and escaped quotes inside a quoted
+    /// value are redacted whole.
+    #[test]
+    fn python_repr_and_escaped_quotes_redact() {
+        assert_eq!(
+            r("{'password': 'hunter2hunter2', 'model': 'x'}"),
+            format!("{{'password': '{REDACTED}', 'model': 'x'}}")
+        );
+        assert_eq!(
+            r("call(password='hunter2hunter2', api_key='abcdefgh12')"),
+            format!("call(password='{REDACTED}', api_key='{REDACTED}')")
+        );
+        assert_eq!(
+            r(r#"{"token": "ab\"cdefgh", "n": 1}"#),
+            format!(r#"{{"token": "{REDACTED}", "n": 1}}"#)
+        );
+        // An unterminated quoted value redacts to the end of the line.
+        assert_eq!(r("token='abcdefgh"), format!("token='{REDACTED}"));
+        // Multibyte text around and inside values stays well-formed.
+        assert_eq!(
+            r("é password='pä\\'ss' ü"),
+            format!("é password='{REDACTED}' ü")
+        );
     }
 
     #[test]
