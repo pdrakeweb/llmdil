@@ -571,21 +571,25 @@ impl AuthService {
         let code = code.trim();
         // Recovery codes first (they are longer than 6 digits).
         if code.len() > 6 {
+            // Check and consume in one step under the store's write
+            // lock, against the live record rather than the caller's
+            // snapshot, so two concurrent submissions of one recovery
+            // code cannot both pass (same shape as the SEC-15 TOTP
+            // replay guard). A failed store write refuses the code.
             let hash = hash_token(&code.to_uppercase());
-            if user.recovery_code_hashes.iter().any(|h| h == &hash) {
-                let user_id = user.id.clone();
-                let _ = self
-                    .store
-                    .mutate::<_, AuthError>(|f| {
-                        if let Some(u) = f.users.iter_mut().find(|u| u.id == user_id) {
-                            u.recovery_code_hashes.retain(|h| h != &hash);
-                        }
-                        Ok(())
-                    })
-                    .await;
-                return true;
-            }
-            return false;
+            let user_id = user.id.clone();
+            return self
+                .store
+                .mutate::<_, AuthError>(|f| {
+                    let Some(u) = f.users.iter_mut().find(|u| u.id == user_id) else {
+                        return Ok(false);
+                    };
+                    let before = u.recovery_code_hashes.len();
+                    u.recovery_code_hashes.retain(|h| h != &hash);
+                    Ok(u.recovery_code_hashes.len() < before)
+                })
+                .await
+                .unwrap_or(false);
         }
         let Some(secret_b32) = self.creds.read(&totp_target(&user.id)).await else {
             return false;
@@ -2131,6 +2135,64 @@ mod tests {
             .await
             .last_totp_step
             .is_none());
+    }
+
+    /// A recovery code is consumed atomically: concurrent uses of one
+    /// code against the same (pre-use) snapshot accept exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_recovery_code_use_accepts_once() {
+        let svc = service().await;
+        let user = svc
+            .create_user("rhea", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        for round in 0..20 {
+            let code = recovery_code();
+            let uid = user.id.clone();
+            let hash = hash_token(&code.to_uppercase());
+            svc.store
+                .mutate::<_, AuthError>(|f| {
+                    let u = f.users.iter_mut().find(|u| u.id == uid).unwrap();
+                    u.totp_enabled = true;
+                    u.recovery_code_hashes = vec![hash, "other".into()];
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            // Every task checks against the same snapshot, taken while
+            // the code is still unused (the old check-then-act read it).
+            let snapshot = svc
+                .store
+                .read(|f| f.users.iter().find(|u| u.id == user.id).cloned().unwrap())
+                .await;
+            let tasks: Vec<_> = (0..8)
+                .map(|_| {
+                    let svc = svc.clone();
+                    let snapshot = snapshot.clone();
+                    let code = code.clone();
+                    tokio::spawn(async move { svc.verify_user_totp(&snapshot, &code).await })
+                })
+                .collect();
+            let mut accepted = 0;
+            for t in tasks {
+                if t.await.unwrap() {
+                    accepted += 1;
+                }
+            }
+            assert_eq!(accepted, 1, "round {round}: {accepted} acceptances");
+            let left = svc
+                .store
+                .read(|f| {
+                    f.users
+                        .iter()
+                        .find(|u| u.id == user.id)
+                        .unwrap()
+                        .recovery_code_hashes
+                        .clone()
+                })
+                .await;
+            assert_eq!(left, vec!["other".to_string()]);
+        }
     }
 
     /// SEC-15: a user record written before `last_totp_step` existed
