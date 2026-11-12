@@ -148,29 +148,19 @@ pub fn litellm_version_meets_mcp_floor(version: &str) -> Option<bool> {
 /// or logs.
 pub const LITELLM_MASTER_KEY_CRED_TARGET: &str = "local-llm-service-manager/litellm-master-key";
 
-/// Generate a new gateway master key: `sk-` plus the hex SHA-256 of
-/// OS-seeded hasher state mixed with the current time and the pid.
+/// Generate a new gateway master key: `sk-` plus 64 lowercase hex
+/// characters (256 bits) drawn from the OS CSPRNG (SEC-N1; the
+/// format is unchanged from the earlier SipHash-derived keys).
 /// The key is a localhost bearer secret; it is stored only in
 /// Windows Credential Manager (and, by design, in client configs the
 /// user applies, e.g. the editor config) and injected into the
 /// gateway process's environment at spawn.
 pub fn generate_master_key() -> String {
-    use sha2::Digest;
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut h1 = RandomState::new().build_hasher();
-    h1.write_u128(nanos);
-    h1.write_u32(std::process::id());
-    let mut h2 = RandomState::new().build_hasher();
-    h2.write_u128(nanos ^ 0x9e37_79b9_7f4a_7c15);
-    h2.write_u64(h1.finish());
-    let seed = format!("{}:{}", h1.finish(), h2.finish());
-    let digest = sha2::Sha256::digest(seed.as_bytes());
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let mut bytes = [0u8; 32];
+    // The OS CSPRNG failing means the platform cannot produce a
+    // secret at all; refusing loudly beats minting a guessable key.
+    getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable");
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     format!("sk-{hex}")
 }
 
@@ -195,7 +185,7 @@ pub async fn ensure_gateway_master_key(ops: &dyn SystemOps) -> Result<String, Wi
 /// server's password.
 pub const POSTGRES_PASSWORD_CRED_TARGET: &str = "local-llm-service-manager/postgres-password";
 
-/// Generate a PostgreSQL password: the same digest construction as
+/// Generate a PostgreSQL password: the same CSPRNG construction as
 /// the master key, without the `sk-` prefix. Hex output is URL-safe,
 /// so the value can be embedded in `DATABASE_URL` verbatim (no
 /// percent-encoding) and used raw for `initdb --pwfile` and
@@ -3129,5 +3119,27 @@ mod tests {
             assert_eq!(caps, ["tool_use"]);
         }
         assert!(!yaml.contains("sk-"), "no literal key material: {yaml}");
+    }
+
+    /// SEC-N1: the master key keeps its `sk-` + 64 lowercase hex
+    /// format, and successive keys differ (CSPRNG-drawn, not a
+    /// time/pid-seeded hash).
+    #[test]
+    fn master_key_format_is_unchanged_and_keys_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let key = generate_master_key();
+            let hex = key.strip_prefix("sk-").expect("sk- prefix");
+            assert_eq!(hex.len(), 64, "{key}");
+            assert!(
+                hex.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "{key}"
+            );
+            assert!(seen.insert(key), "duplicate key generated");
+        }
+        let pw = generate_postgres_password();
+        assert_eq!(pw.len(), 64);
+        assert!(!pw.starts_with("sk-"));
     }
 }

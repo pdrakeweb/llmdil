@@ -214,6 +214,9 @@ const LOCK_MAX_MS: i64 = 60 * 60 * 1000;
 const IP_FAILURE_LIMIT: usize = 30;
 const CHALLENGE_TTL_MS: i64 = 5 * 60 * 1000;
 const ENROLLMENT_TTL_MS: i64 = 10 * 60 * 1000;
+/// Minimum interval between persisted last-used updates for one
+/// session or API token (SEC-14: no store rewrite per request).
+const LAST_USED_WRITE_INTERVAL_MS: i64 = 60_000;
 
 #[derive(Default)]
 struct LockState {
@@ -258,6 +261,10 @@ pub struct AuthService {
     challenges: Mutex<HashMap<String, TotpChallenge>>,
     enrollments: Mutex<HashMap<String, Enrollment>>,
     pending_totp: Mutex<HashMap<String, PendingTotp>>,
+    /// Where lockout events are recorded (SEC-13). Attached by
+    /// [`crate::ApiCtx::with_auth`]; `None` (tests, desktop before the
+    /// server first starts) records nothing.
+    audit: std::sync::Mutex<Option<Arc<crate::audit::AuditLog>>>,
 }
 
 impl AuthService {
@@ -272,7 +279,55 @@ impl AuthService {
             challenges: Mutex::new(HashMap::new()),
             enrollments: Mutex::new(HashMap::new()),
             pending_totp: Mutex::new(HashMap::new()),
+            audit: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Record lockout events in `log` from now on (SEC-13). Called by
+    /// [`crate::ApiCtx::with_auth`]; the latest attachment wins.
+    pub fn attach_audit(&self, log: Arc<crate::audit::AuditLog>) {
+        *self.audit.lock().unwrap_or_else(|e| e.into_inner()) = Some(log);
+    }
+
+    /// Audit an account lock engaging. Never fails the caller.
+    fn audit_lock(&self, username_key: &str, source_ip: &str, locked_for_ms: i64) {
+        let log = self.audit.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(log) = log else {
+            return;
+        };
+        // Bounded by MAX_USERNAME_LEN on the login path already; cap
+        // again so no caller can grow the log (SEC-05).
+        let actor: String = username_key.chars().take(MAX_USERNAME_LEN).collect();
+        log.append(&crate::audit::AuditEntry {
+            ts_ms: now_ms(),
+            actor: actor.clone(),
+            auth_type: "session".to_string(),
+            source_ip: source_ip.to_string(),
+            action: "account_locked".to_string(),
+            target: Some(actor),
+            result: format!("locked_for_{}s", locked_for_ms / 1000),
+            request_id: uuid::Uuid::new_v4().to_string(),
+        });
+    }
+
+    /// The username a pending TOTP login challenge belongs to, without
+    /// consuming it, so the second login step can be audited under
+    /// the right actor (SEC-13). `None` for an unknown challenge.
+    pub async fn totp_challenge_username(&self, challenge_id: &str) -> Option<String> {
+        let user_id = self
+            .challenges
+            .lock()
+            .await
+            .get(challenge_id)
+            .map(|c| c.user_id.clone())?;
+        self.store
+            .read(|f| {
+                f.users
+                    .iter()
+                    .find(|u| u.id == user_id)
+                    .map(|u| u.username.clone())
+            })
+            .await
     }
 
     /// The backing user store; `ApiCtx` reads users and sessions through the same instance.
@@ -292,7 +347,9 @@ impl AuthService {
 
     async fn record_failure(&self, username_key: &str, source_ip: &str) {
         let now = now_ms();
-        self.record_account_failure(username_key).await;
+        if let Some(locked_for) = self.record_account_failure(username_key).await {
+            self.audit_lock(username_key, source_ip, locked_for);
+        }
         let mut ips = self.ip_failures.lock().await;
         ips.retain(|ip, v| ip == source_ip || v.iter().any(|t| now - t < LOCK_WINDOW_MS));
         let v = ips.entry(source_ip.to_string()).or_default();
@@ -300,7 +357,9 @@ impl AuthService {
         v.push(now);
     }
 
-    async fn record_account_failure(&self, username_key: &str) {
+    /// Count one failure against the account; returns the lock
+    /// duration (ms) when this failure engaged a lock.
+    async fn record_account_failure(&self, username_key: &str) -> Option<i64> {
         let now = now_ms();
         {
             let mut guard = self.lockouts.lock().await;
@@ -321,8 +380,10 @@ impl AuthService {
                 st.locked_until_ms = now + backoff;
                 st.lock_count += 1;
                 st.failures.clear();
+                return Some(backoff);
             }
         }
+        None
     }
 
     /// Record a failed step-up password check (password change, TOTP
@@ -331,7 +392,12 @@ impl AuthService {
     /// endpoints otherwise offered unlimited password guessing to any
     /// holder of a bearer token.
     async fn record_step_up_failure(&self, username: &str) {
-        self.record_account_failure(&username.to_lowercase()).await;
+        let key = username.to_lowercase();
+        if let Some(locked_for) = self.record_account_failure(&key).await {
+            // Step-ups come from an authenticated principal; the
+            // service layer does not see its source address.
+            self.audit_lock(&key, "unknown", locked_for);
+        }
     }
 
     async fn ip_throttled(&self, source_ip: &str) -> bool {
@@ -514,7 +580,32 @@ impl AuthService {
         let Some(secret) = base32_decode(&secret_b32) else {
             return false;
         };
-        totp_verify(&secret, code, now_ms() / 1000)
+        // Replay guard (SEC-15): accept only a step after the last
+        // accepted one, checked and recorded under the store's write
+        // lock so two concurrent submissions of one code cannot both
+        // pass. Earliest acceptable step first, so clock skew burns
+        // as few future steps as possible.
+        let steps = totp_matching_steps(&secret, code, now_ms() / 1000);
+        if steps.is_empty() {
+            return false;
+        }
+        let user_id = user.id.clone();
+        self.store
+            .mutate::<_, AuthError>(|f| {
+                let Some(u) = f.users.iter_mut().find(|u| u.id == user_id) else {
+                    return Ok(false);
+                };
+                let after = u.last_totp_step.unwrap_or(i64::MIN);
+                match steps.iter().copied().find(|s| *s > after) {
+                    Some(step) => {
+                        u.last_totp_step = Some(step);
+                        Ok(true)
+                    }
+                    None => Ok(false),
+                }
+            })
+            .await
+            .unwrap_or(false)
     }
 
     // -- sessions -------------------------------------------------------
@@ -537,6 +628,7 @@ impl AuthService {
             access_hash: hash_token(&access),
             refresh_hash: hash_token(&refresh),
             retired_refresh_hashes: Vec::new(),
+            retired_refresh_ms: Vec::new(),
             created_ms: now,
             access_expires_ms: now + ACCESS_TTL_MS,
             refresh_expires_ms: now + REFRESH_TTL_MS,
@@ -616,7 +708,7 @@ impl AuthService {
                     s.revoked = true;
                     return Ok(Err(AuthError::SessionRevoked));
                 }
-                s.retired_refresh_hashes.push(s.refresh_hash.clone());
+                s.retire_refresh_hash(now);
                 s.access_hash = hash_token(&access);
                 s.refresh_hash = hash_token(&refresh);
                 s.access_expires_ms = now + ACCESS_TTL_MS;
@@ -704,7 +796,7 @@ impl AuthService {
                 f.sessions
                     .iter()
                     .find(|s| s.id == session_id)
-                    .map(|s| now - s.last_used_ms > 60_000)
+                    .map(|s| now - s.last_used_ms > LAST_USED_WRITE_INTERVAL_MS)
                     .unwrap_or(false)
             })
             .await;
@@ -722,8 +814,28 @@ impl AuthService {
         }
     }
 
+    /// Record API-token use, throttled like [`Self::touch_session`]
+    /// (SEC-14): `admin-users.json` is rewritten at most once per
+    /// [`LAST_USED_WRITE_INTERVAL_MS`] per token, not on every request.
     async fn touch_api_token(&self, token_id: &str) {
         let now = now_ms();
+        let stale = self
+            .store
+            .read(|f| {
+                f.api_tokens
+                    .iter()
+                    .find(|t| t.id == token_id)
+                    .map(|t| {
+                        t.last_used_ms
+                            .map(|last| now - last > LAST_USED_WRITE_INTERVAL_MS)
+                            .unwrap_or(true)
+                    })
+                    .unwrap_or(false)
+            })
+            .await;
+        if !stale {
+            return;
+        }
         let tid = token_id.to_string();
         let _ = self
             .store
@@ -868,6 +980,7 @@ impl AuthService {
             must_change_password: false,
             totp_enabled: false,
             recovery_code_hashes: Vec::new(),
+            last_totp_step: None,
             created_ms: now,
             updated_ms: now,
         };
@@ -1149,6 +1262,7 @@ impl AuthService {
             .mutate::<_, AuthError>(|f| {
                 if let Some(u) = f.users.iter_mut().find(|u| u.id == uid) {
                     u.totp_enabled = true;
+                    u.last_totp_step = None;
                     u.recovery_code_hashes = hashes;
                     u.updated_ms = now_ms();
                 }
@@ -1167,6 +1281,7 @@ impl AuthService {
             .mutate::<_, AuthError>(|f| {
                 if let Some(u) = f.users.iter_mut().find(|u| u.id == uid) {
                     u.totp_enabled = false;
+                    u.last_totp_step = None;
                     u.recovery_code_hashes.clear();
                     u.updated_ms = now_ms();
                 }
@@ -1253,9 +1368,25 @@ pub fn totp_at(secret: &[u8], unix_secs: i64) -> u32 {
     binary % 1_000_000
 }
 
+/// The 30 s time-steps (ascending) among previous, current and next whose TOTP value is
+/// `code`; empty for a wrong or non-numeric code. Login uses this with the per-user
+/// last-accepted step to refuse replays (SEC-15).
+pub fn totp_matching_steps(secret: &[u8], code: &str, unix_secs: i64) -> Vec<i64> {
+    // Same acceptance as `totp_verify`.
+    let Ok(code_num) = code.parse::<u32>() else {
+        return Vec::new();
+    };
+    let base = unix_secs.div_euclid(30);
+    [-1i64, 0, 1]
+        .iter()
+        .map(|d| base + d)
+        .filter(|step| totp_at(secret, step * 30) == code_num)
+        .collect()
+}
+
 /// Accept `code` if it matches the previous, current or next 30 s step (±1 step of clock
-/// skew); non-numeric input is rejected. There is no replay tracking: a code stays valid
-/// for its whole window.
+/// skew); non-numeric input is rejected. Stateless: login replay protection lives in
+/// [`AuthService::verify_user_totp`] (SEC-15); enrollment confirmation uses this directly.
 pub fn totp_verify(secret: &[u8], code: &str, unix_secs: i64) -> bool {
     let Ok(code_num) = code.parse::<u32>() else {
         return false;
@@ -1267,9 +1398,13 @@ pub fn totp_verify(secret: &[u8], code: &str, unix_secs: i64) -> bool {
 }
 
 fn recovery_code() -> String {
-    // XXXX-XXXX from a Crockford-style alphabet.
+    // XXXX-XXXX from a Crockford-style alphabet. Every character is
+    // drawn from the OS CSPRNG (SEC-N2): the earlier UUID-v4 source
+    // pinned character 7 to the version nibble (16 of 32 values).
+    // 32 divides 256, so `% 32` is unbiased: 40 bits per code.
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    let bytes = uuid::Uuid::new_v4().into_bytes();
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable");
     let pick = |i: usize| ALPHABET[(bytes[i] % 32) as usize] as char;
     format!(
         "{}{}{}{}-{}{}{}{}",
@@ -1800,5 +1935,236 @@ mod tests {
         assert_eq!(view.username, "dave");
         assert!(svc.validate_bearer(&pair.access_token).await.is_some());
         assert!(svc.redeem_enrollment_code(&code, "pixel").await.is_err());
+    }
+
+    /// SEC-15: an accepted TOTP code cannot be replayed within the
+    /// ±1-step window, nor can a code for an earlier step; the guard
+    /// is persisted on the user and reset by re-enrollment.
+    #[tokio::test]
+    async fn totp_codes_cannot_be_replayed() {
+        let svc = service().await;
+        let user = svc
+            .create_user("ivy", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        let secret = enable_totp(&svc, &user.id).await;
+        let now = now_ms() / 1000;
+        let step = now.div_euclid(30);
+        let fetch = |svc: Arc<AuthService>, id: String| async move {
+            svc.store
+                .read(|f| f.users.iter().find(|u| u.id == id).cloned().unwrap())
+                .await
+        };
+        let current = format!("{:06}", totp_at(&secret, now));
+        let stored = fetch(svc.clone(), user.id.clone()).await;
+        assert!(svc.verify_user_totp(&stored, &current).await);
+        let stored = fetch(svc.clone(), user.id.clone()).await;
+        assert!(stored.last_totp_step.unwrap() >= step);
+        // Same code again: refused.
+        assert!(!svc.verify_user_totp(&stored, &current).await);
+        // The previous step's code (still inside the window): refused.
+        let previous = format!("{:06}", totp_at(&secret, now - 30));
+        if previous != current {
+            assert!(!svc.verify_user_totp(&stored, &previous).await);
+        }
+        // The next step's code is still acceptable once.
+        let next = format!("{:06}", totp_at(&secret, now + 30));
+        if next != current {
+            assert!(svc.verify_user_totp(&stored, &next).await);
+            assert!(!svc.verify_user_totp(&stored, &next).await);
+        }
+        // Over the login flow: a replayed code fails the second stage.
+        svc.store
+            .mutate::<_, AuthError>(|f| {
+                f.users[0].last_totp_step = None;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for expect_ok in [true, false] {
+            let LoginOutcome::TotpRequired { challenge_id } = svc
+                .login("ivy", "a-unique-passphrase", "phone", "10.0.0.1")
+                .await
+                .unwrap()
+            else {
+                panic!("expected a TOTP challenge");
+            };
+            let res = svc
+                .complete_totp_login(&challenge_id, &current, "10.0.0.1")
+                .await;
+            assert_eq!(res.is_ok(), expect_ok);
+        }
+        // Disabling TOTP clears the guard.
+        svc.totp_disable(&user.id).await.unwrap();
+        assert!(fetch(svc.clone(), user.id.clone())
+            .await
+            .last_totp_step
+            .is_none());
+    }
+
+    /// SEC-15: a user record written before `last_totp_step` existed
+    /// still loads, with no replay state.
+    #[test]
+    fn user_without_last_totp_step_deserializes() {
+        let json = r#"{"id":"u","username":"a","password_hash":"h","role":"viewer","created_ms":0,"updated_ms":0}"#;
+        let u: User = serde_json::from_str(json).unwrap();
+        assert!(u.last_totp_step.is_none());
+    }
+
+    /// SEC-14: API-token use updates `last_used_ms` at most once per
+    /// interval, so a busy token does not rewrite the store per request.
+    #[tokio::test]
+    async fn api_token_last_used_is_throttled() {
+        let svc = service().await;
+        let admin = svc
+            .create_user("root", "a-unique-passphrase", RoleName::Admin)
+            .await
+            .unwrap();
+        let issuer = Principal {
+            user_id: admin.id.clone(),
+            username: "root".into(),
+            role: Role::Admin,
+            auth_type: AuthType::Session,
+            session_id: "s".into(),
+        };
+        let (meta, value) = svc
+            .create_api_token(&issuer, &admin.id, "ci", RoleName::Viewer, None)
+            .await
+            .unwrap();
+        let last_used = |svc: Arc<AuthService>, id: String| async move {
+            svc.store
+                .read(|f| {
+                    f.api_tokens
+                        .iter()
+                        .find(|t| t.id == id)
+                        .unwrap()
+                        .last_used_ms
+                })
+                .await
+        };
+        // First use is recorded.
+        svc.validate_bearer(&value).await.unwrap();
+        assert!(last_used(svc.clone(), meta.id.clone()).await.is_some());
+        // A recent use: no rewrite.
+        let recent = now_ms() - LAST_USED_WRITE_INTERVAL_MS / 2;
+        let set = |svc: Arc<AuthService>, id: String, at: i64| async move {
+            svc.store
+                .mutate::<_, AuthError>(|f| {
+                    f.api_tokens
+                        .iter_mut()
+                        .find(|t| t.id == id)
+                        .unwrap()
+                        .last_used_ms = Some(at);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        };
+        set(svc.clone(), meta.id.clone(), recent).await;
+        svc.validate_bearer(&value).await.unwrap();
+        assert_eq!(last_used(svc.clone(), meta.id.clone()).await, Some(recent));
+        // A stale use: refreshed.
+        let stale = now_ms() - LAST_USED_WRITE_INTERVAL_MS - 1_000;
+        set(svc.clone(), meta.id.clone(), stale).await;
+        svc.validate_bearer(&value).await.unwrap();
+        assert!(last_used(svc.clone(), meta.id.clone()).await.unwrap() > stale);
+    }
+
+    /// SEC-14: refresh rotation records when each hash was retired.
+    #[tokio::test]
+    async fn refresh_rotation_records_retirement_times() {
+        let svc = service().await;
+        let user = svc
+            .create_user("hank", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        let pair = svc.create_session(&user.id, "phone").await.unwrap();
+        let (pair2, _) = svc.refresh(&pair.refresh_token).await.unwrap();
+        svc.refresh(&pair2.refresh_token).await.unwrap();
+        let (hashes, times) = svc
+            .store
+            .read(|f| {
+                let s = &f.sessions[0];
+                (
+                    s.retired_refresh_hashes.clone(),
+                    s.retired_refresh_ms.clone(),
+                )
+            })
+            .await;
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(times.len(), 2);
+        // Reuse detection still works on a recently retired token.
+        assert_eq!(
+            svc.refresh(&pair.refresh_token).await.unwrap_err(),
+            AuthError::SessionRevoked
+        );
+    }
+
+    /// SEC-13: a lock engaging is audited (login path with the source
+    /// IP, step-up path too); failures below the threshold are not
+    /// lock events.
+    #[tokio::test]
+    async fn lockout_events_are_audited() {
+        let dir = std::env::temp_dir().join(format!(
+            "manager-api-lock-audit-{}-{}",
+            std::process::id(),
+            generate_token()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = Arc::new(crate::audit::AuditLog::new(&dir));
+        let svc = service().await;
+        svc.attach_audit(log.clone());
+        for _ in 0..LOCK_THRESHOLD - 1 {
+            svc.record_failure("mallory-target", "10.1.2.3").await;
+        }
+        assert!(log.read_recent(0, 10).is_empty());
+        svc.record_failure("mallory-target", "10.1.2.3").await;
+        let user = svc
+            .create_user("gina", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        for _ in 0..LOCK_THRESHOLD {
+            assert!(!svc.verify_step_up(&user.id, "not-the-password").await);
+        }
+        let entries = log.read_recent(0, 10);
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0]["action"], "account_locked");
+        assert_eq!(entries[0]["actor"], "gina");
+        assert_eq!(entries[1]["action"], "account_locked");
+        assert_eq!(entries[1]["actor"], "mallory-target");
+        assert_eq!(entries[1]["source_ip"], "10.1.2.3");
+        assert_eq!(
+            entries[1]["result"],
+            format!("locked_for_{}s", LOCK_BASE_MS / 1000)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-N2: recovery/enrollment codes keep the XXXX-XXXX format and
+    /// every character position spans the full 32-symbol alphabet (the
+    /// UUID-v4 source pinned position 7 to 16 values).
+    #[test]
+    fn recovery_code_uses_full_alphabet_in_every_position() {
+        const ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        let mut seen: Vec<std::collections::HashSet<char>> = vec![Default::default(); 9];
+        for _ in 0..4000 {
+            let code = recovery_code();
+            assert_eq!(code.len(), 9, "{code}");
+            for (i, c) in code.chars().enumerate() {
+                if i == 4 {
+                    assert_eq!(c, '-', "{code}");
+                } else {
+                    assert!(ALPHABET.contains(c), "{code}");
+                    seen[i].insert(c);
+                }
+            }
+        }
+        for (i, s) in seen.iter().enumerate() {
+            if i != 4 {
+                // 4000 uniform draws miss a symbol with negligible odds;
+                // a 16-value position can never exceed 16.
+                assert!(s.len() > 16, "position {i} saw only {} values", s.len());
+            }
+        }
     }
 }

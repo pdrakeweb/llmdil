@@ -58,6 +58,12 @@ pub struct User {
     pub recovery_code_hashes: Vec<String>,
     pub created_ms: i64,
     pub updated_ms: i64,
+    /// The 30 s TOTP time-step of the last accepted login code
+    /// (SEC-15). A code for this step or an earlier one is refused,
+    /// so a code cannot be replayed inside the ±1-step window.
+    /// Reset when TOTP is (re-)enrolled or disabled.
+    #[serde(default)]
+    pub last_totp_step: Option<i64>,
 }
 
 /// Role as stored/serialized. Mirrors `manager_app::registry::Role`
@@ -115,8 +121,9 @@ impl RoleName {
     }
 }
 
-/// One per-device login session. Only token hashes are stored. `revoked` is terminal, and
-/// expired or revoked sessions stay in the file until their user is deleted.
+/// One per-device login session. Only token hashes are stored. `revoked` is terminal.
+/// A session whose refresh token has expired (revoked or not) is pruned on the next
+/// store write, as are retired refresh hashes older than [`REFRESH_TTL_MS`] (SEC-14).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -130,6 +137,13 @@ pub struct Session {
     /// is treated as theft: the whole session family is revoked.
     #[serde(default)]
     pub retired_refresh_hashes: Vec<String>,
+    /// When each retired refresh hash was rotated out, aligned with
+    /// the tail of `retired_refresh_hashes` (SEC-14). Files written
+    /// before this field existed have fewer times than hashes; the
+    /// untimed (oldest) hashes are treated as retired at the next
+    /// prune, so they are kept a full [`REFRESH_TTL_MS`] from then.
+    #[serde(default)]
+    pub retired_refresh_ms: Vec<i64>,
     pub created_ms: i64,
     pub access_expires_ms: i64,
     pub refresh_expires_ms: i64,
@@ -170,6 +184,52 @@ pub struct UsersFile {
     pub sessions: Vec<Session>,
     #[serde(default)]
     pub api_tokens: Vec<ApiToken>,
+}
+
+impl Session {
+    /// Retire the current refresh hash at `now` (rotation).
+    pub fn retire_refresh_hash(&mut self, now: i64) {
+        self.align_retired_times(now);
+        self.retired_refresh_hashes.push(self.refresh_hash.clone());
+        self.retired_refresh_ms.push(now);
+    }
+
+    /// Make `retired_refresh_ms` exactly as long as the hash list:
+    /// missing (legacy, oldest) times become `now`; surplus times are
+    /// dropped from the front.
+    fn align_retired_times(&mut self, now: i64) {
+        let n = self.retired_refresh_hashes.len();
+        let m = self.retired_refresh_ms.len();
+        if m > n {
+            self.retired_refresh_ms.drain(..m - n);
+        } else if m < n {
+            let mut times = vec![now; n - m];
+            times.append(&mut self.retired_refresh_ms);
+            self.retired_refresh_ms = times;
+        }
+    }
+}
+
+impl UsersFile {
+    /// Drop state that can no longer authenticate anything (SEC-14):
+    /// sessions whose refresh token has expired — every token of the
+    /// family, current or retired, expired no later than that — and
+    /// retired refresh hashes rotated out more than [`REFRESH_TTL_MS`]
+    /// ago (the token itself expired before then). Reuse detection is
+    /// unaffected for any token that could still have been valid.
+    pub fn prune(&mut self, now: i64) {
+        self.sessions.retain(|s| s.refresh_expires_ms > now);
+        for s in &mut self.sessions {
+            s.align_retired_times(now);
+            let hashes = std::mem::take(&mut s.retired_refresh_hashes);
+            let times = std::mem::take(&mut s.retired_refresh_ms);
+            (s.retired_refresh_hashes, s.retired_refresh_ms) = hashes
+                .into_iter()
+                .zip(times)
+                .filter(|(_, t)| now - t < REFRESH_TTL_MS)
+                .unzip();
+        }
+    }
 }
 
 impl Default for UsersFile {
@@ -243,13 +303,16 @@ impl UserStore {
         Ok(())
     }
 
-    /// Run a mutation against the store and persist the result.
+    /// Run a mutation against the store and persist the result. Dead
+    /// sessions and stale retired refresh hashes are pruned on every
+    /// write ([`UsersFile::prune`]).
     pub async fn mutate<T, E>(&self, f: impl FnOnce(&mut UsersFile) -> Result<T, E>) -> Result<T, E>
     where
         E: From<StoreError>,
     {
         let mut guard = self.inner.write().await;
         let out = f(&mut guard)?;
+        guard.prune(now_ms());
         self.persist(&guard).await.map_err(E::from)?;
         Ok(out)
     }
@@ -524,6 +587,7 @@ mod tests {
                     must_change_password: false,
                     totp_enabled: false,
                     recovery_code_hashes: vec![],
+                    last_totp_step: None,
                     created_ms: now_ms(),
                     updated_ms: now_ms(),
                 });
@@ -536,5 +600,73 @@ mod tests {
         let name = reloaded.read(|f| f.users[0].username.clone()).await;
         assert_eq!(name, "alice");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn session(id: &str, refresh_expires_ms: i64, revoked: bool) -> Session {
+        Session {
+            id: id.into(),
+            user_id: "u1".into(),
+            device_name: "d".into(),
+            access_hash: format!("a-{id}"),
+            refresh_hash: format!("r-{id}"),
+            retired_refresh_hashes: vec![],
+            retired_refresh_ms: vec![],
+            created_ms: 0,
+            access_expires_ms: refresh_expires_ms,
+            refresh_expires_ms,
+            last_used_ms: 0,
+            revoked,
+        }
+    }
+
+    /// SEC-14: writes prune sessions whose refresh token expired and
+    /// retired refresh hashes older than the refresh TTL; live
+    /// sessions (revoked or not) and recent retirements are kept, and
+    /// legacy untimed hashes are kept a full TTL from first prune.
+    #[tokio::test]
+    async fn writes_prune_dead_sessions_and_stale_retired_hashes() {
+        let now = now_ms();
+        let store = UserStore::in_memory();
+        store
+            .mutate::<_, StoreError>(|f| {
+                f.sessions.push(session("expired", now - 1, false));
+                f.sessions.push(session("expired-revoked", now - 1, true));
+                f.sessions.push(session("live-revoked", now + 60_000, true));
+                let mut live = session("live", now + 60_000, false);
+                live.retired_refresh_hashes = vec!["legacy".into(), "old".into(), "recent".into()];
+                live.retired_refresh_ms = vec![now - REFRESH_TTL_MS - 1, now - 1_000];
+                f.sessions.push(live);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (ids, hashes, times) = store
+            .read(|f| {
+                let ids: Vec<String> = f.sessions.iter().map(|s| s.id.clone()).collect();
+                let live = f.sessions.iter().find(|s| s.id == "live").unwrap();
+                (
+                    ids,
+                    live.retired_refresh_hashes.clone(),
+                    live.retired_refresh_ms.clone(),
+                )
+            })
+            .await;
+        assert_eq!(ids, vec!["live-revoked".to_string(), "live".to_string()]);
+        // The two timed entries align with the tail ("old", "recent");
+        // the untimed "legacy" hash is stamped now and kept.
+        assert_eq!(hashes, vec!["legacy".to_string(), "recent".to_string()]);
+        assert_eq!(times.len(), 2);
+        assert!(times[0] >= now);
+        assert_eq!(times[1], now - 1_000);
+    }
+
+    /// SEC-14: a store file written before `retired_refresh_ms`
+    /// existed still loads.
+    #[test]
+    fn session_without_retirement_times_deserializes() {
+        let json = r#"{"id":"s","user_id":"u","device_name":"d","access_hash":"a","refresh_hash":"r","retired_refresh_hashes":["x"],"created_ms":0,"access_expires_ms":0,"refresh_expires_ms":0,"last_used_ms":0}"#;
+        let s: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(s.retired_refresh_hashes, vec!["x".to_string()]);
+        assert!(s.retired_refresh_ms.is_empty());
     }
 }

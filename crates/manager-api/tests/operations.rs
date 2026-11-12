@@ -55,6 +55,7 @@ async fn seed_token(ctx: &Arc<ApiCtx>, username: &str, role: RoleName) -> String
         must_change_password: false,
         totp_enabled: false,
         recovery_code_hashes: vec![],
+        last_totp_step: None,
         created_ms: manager_api::users::now_ms(),
         updated_ms: manager_api::users::now_ms(),
     };

@@ -139,6 +139,8 @@ impl ApiCtx {
         let events = Arc::new(BroadcastSink::new());
         let sink: Arc<dyn EventSink> = events.clone();
         let audit = Arc::new(AuditLog::new(&data_dir));
+        // Lockout events happen inside the auth service (SEC-13).
+        auth.attach_audit(audit.clone());
         Arc::new(Self {
             app,
             sink,

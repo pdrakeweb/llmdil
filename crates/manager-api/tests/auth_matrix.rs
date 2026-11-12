@@ -58,6 +58,7 @@ async fn ctx_with_users() -> (Arc<ApiCtx>, std::path::PathBuf, [String; 4]) {
             must_change_password: false,
             totp_enabled: false,
             recovery_code_hashes: vec![],
+            last_totp_step: None,
             created_ms: now_ms(),
             updated_ms: now_ms(),
         };
