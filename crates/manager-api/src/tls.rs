@@ -75,10 +75,8 @@ impl CertSans {
                     return None;
                 }
                 sans.dns.push(d.to_string());
-            } else if let Some(ip) = part.strip_prefix("ip:") {
-                sans.ips.push(ip.parse().ok()?);
             } else {
-                return None;
+                sans.ips.push(part.strip_prefix("ip:")?.parse().ok()?);
             }
         }
         Some(sans)
