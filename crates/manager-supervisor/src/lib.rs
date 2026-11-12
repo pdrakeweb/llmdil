@@ -234,12 +234,24 @@ impl LogRecord {
     }
 }
 
+/// A follower's position in one process's captured output, for
+/// [`Supervisor::logs_since`]: which ring it was reading and how
+/// many of that ring's pushes it has seen. Opaque to callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogCursor {
+    ring: usize,
+    seen: u64,
+}
+
 /// Fixed-capacity ring buffer (default 10k lines per scope, spec §2.4).
 /// When full, the oldest record is evicted on push.
 #[derive(Debug)]
 pub struct RingBuffer<T> {
     buf: VecDeque<T>,
     capacity: usize,
+    /// Items ever pushed — monotonic, unaffected by eviction. The
+    /// position a follower resumes from (see [`Self::since`]).
+    pushed: u64,
 }
 
 impl<T> RingBuffer<T> {
@@ -250,6 +262,7 @@ impl<T> RingBuffer<T> {
         Self {
             buf: VecDeque::with_capacity(capacity.min(1024)),
             capacity,
+            pushed: 0,
         }
     }
 
@@ -259,6 +272,21 @@ impl<T> RingBuffer<T> {
             self.buf.pop_front();
         }
         self.buf.push_back(item);
+        self.pushed += 1;
+    }
+
+    /// Items ever pushed (monotonic; eviction does not lower it).
+    pub fn pushed(&self) -> u64 {
+        self.pushed
+    }
+
+    /// The items pushed after the first `seen` pushes that are still
+    /// held, oldest first — what a follower that last saw
+    /// [`Self::pushed`] `== seen` has not read yet. Items evicted in
+    /// between are gone; a `seen` beyond `pushed` yields nothing.
+    pub fn since(&self, seen: u64) -> impl Iterator<Item = &T> {
+        let fresh = self.pushed.saturating_sub(seen).min(self.buf.len() as u64) as usize;
+        self.buf.iter().skip(self.buf.len() - fresh)
     }
 
     /// Items currently held (never more than [`Self::capacity`]).
@@ -1583,6 +1611,58 @@ impl Supervisor {
             .or_else(|| self.dead_rings.get(id).cloned())
     }
 
+    /// Follow one process's captured output: the records pushed since
+    /// `cursor`, oldest first, and the cursor to pass next time.
+    /// `None` starts from everything the current ring still holds.
+    ///
+    /// A respawn replaces the ring (the old one becomes the archived
+    /// previous run): the follower first gets what it had not yet
+    /// read of the old run, then the new run from its first line.
+    /// Returned records are stamped with `source`, like
+    /// [`Self::logs_query`]. With no ring for `id` the result is
+    /// empty and the cursor resets.
+    pub fn logs_since(
+        &self,
+        id: &str,
+        cursor: Option<LogCursor>,
+    ) -> (Vec<LogRecord>, Option<LogCursor>) {
+        let key = |ring: &Arc<Mutex<RingBuffer<LogRecord>>>| Arc::as_ptr(ring) as usize;
+        let stamp = |rec: &LogRecord, archived: bool| {
+            let mut rec = rec.clone();
+            rec.source = id.to_string();
+            rec.archived = archived;
+            rec
+        };
+        let current = self.current_ring(id);
+        let mut out = Vec::new();
+        let mut seen = 0;
+        if let Some(c) = cursor {
+            if current.as_ref().map(key) == Some(c.ring) {
+                seen = c.seen;
+            } else if let Some(old) = self.archived_rings.get(id).filter(|r| key(r) == c.ring) {
+                if let Ok(guard) = old.lock() {
+                    out.extend(guard.since(c.seen).map(|r| stamp(r, true)));
+                }
+            }
+        }
+        let Some(ring) = current else {
+            return (out, None);
+        };
+        let Ok(guard) = ring.lock() else {
+            return (out, cursor);
+        };
+        if seen > guard.pushed() {
+            // Not the ring the cursor was taken from after all.
+            seen = 0;
+        }
+        out.extend(guard.since(seen).map(|r| stamp(r, false)));
+        let next = LogCursor {
+            ring: key(&ring),
+            seen: guard.pushed(),
+        };
+        (out, Some(next))
+    }
+
     /// Every retained log scope, sorted by id: live processes, retained
     /// rings of stopped ones, and ids with an archived previous run.
     /// Drives the Logs view's scope picker — including scopes whose
@@ -2819,6 +2899,68 @@ mod tests {
         let st = sup.status().into_iter().find(|s| s.id == "ext").unwrap();
         assert_eq!(st.state, ProcessState::Failed);
         assert_eq!(st.pid, None);
+    }
+
+    #[test]
+    fn ring_buffer_since_follows_pushes_across_eviction() {
+        let mut ring = RingBuffer::new(3);
+        assert_eq!(ring.since(0).count(), 0);
+        ring.push(1);
+        ring.push(2);
+        assert_eq!(ring.since(0).copied().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(ring.since(1).copied().collect::<Vec<_>>(), vec![2]);
+        assert_eq!(ring.since(ring.pushed()).count(), 0);
+        // Evicted items are gone; the count stays monotonic.
+        for v in 3..=6 {
+            ring.push(v);
+        }
+        assert_eq!(ring.pushed(), 6);
+        assert_eq!(ring.since(2).copied().collect::<Vec<_>>(), vec![4, 5, 6]);
+        assert_eq!(ring.since(5).copied().collect::<Vec<_>>(), vec![6]);
+        assert_eq!(ring.since(99).count(), 0);
+    }
+
+    /// `logs_since` hands a follower each line exactly once, in
+    /// order, and across a respawn finishes the old run (now the
+    /// archived ring) before starting the new one.
+    #[test]
+    fn logs_since_follows_a_process_across_respawn() {
+        let lines = |recs: &[LogRecord]| recs.iter().map(|r| r.line.clone()).collect::<Vec<_>>();
+        let push = |ring: &Arc<Mutex<RingBuffer<LogRecord>>>, line: &str| {
+            ring.lock()
+                .unwrap()
+                .push(LogRecord::new(LogStream::Stdout, line));
+        };
+        let mut sup = Supervisor::new(test_policy());
+        // No ring yet: nothing, and no cursor.
+        assert_eq!(sup.logs_since("b", None).1, None);
+
+        let first = Arc::new(Mutex::new(RingBuffer::new(16)));
+        sup.dead_rings.insert("b".to_string(), Arc::clone(&first));
+        push(&first, "a1");
+        push(&first, "a2");
+        let (recs, cursor) = sup.logs_since("b", None);
+        assert_eq!(lines(&recs), vec!["a1", "a2"]);
+        assert!(recs.iter().all(|r| r.source == "b" && !r.archived));
+        let (recs, cursor) = sup.logs_since("b", cursor);
+        assert!(recs.is_empty());
+
+        // One more line from the old run, then a respawn: the old
+        // ring is archived and a fresh ring takes the id.
+        push(&first, "a3");
+        let previous = sup.dead_rings.remove("b").unwrap();
+        sup.archived_rings.insert("b".to_string(), previous);
+        let second = Arc::new(Mutex::new(RingBuffer::new(16)));
+        sup.dead_rings.insert("b".to_string(), Arc::clone(&second));
+        push(&second, "b1");
+        let (recs, cursor) = sup.logs_since("b", cursor);
+        assert_eq!(lines(&recs), vec!["a3", "b1"]);
+        assert!(recs[0].archived && !recs[1].archived);
+
+        push(&second, "b2");
+        let (recs, cursor) = sup.logs_since("b", cursor);
+        assert_eq!(lines(&recs), vec!["b2"]);
+        assert!(sup.logs_since("b", cursor).0.is_empty());
     }
 
     #[test]
