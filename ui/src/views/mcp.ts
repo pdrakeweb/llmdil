@@ -166,6 +166,11 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
     if (s.cred_ref) {
       lines.push(line("Credential", s.credential_present ? "present" : "missing"));
     }
+    // A Local server's process that exited on its own (PS-5): shown,
+    // not auto-restarted — toggling the server off and on starts it.
+    if (s.exposure === "local" && s.process_state === "failed") {
+      lines.push(line("Process", `<span style="color:var(--err)">exited unexpectedly</span>`));
+    }
     // Tools are known only after a Test this session returned a
     // list (principle 12: unmeasured renders as absent, not 0).
     if (result && result.tools) lines.push(line("Tools", String(result.tools.length)));

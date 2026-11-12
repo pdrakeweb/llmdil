@@ -57,6 +57,7 @@ pub mod gpu_history;
 pub mod hf_forms;
 pub mod log_receiver;
 pub mod logship;
+mod mcp_local;
 pub mod notify;
 pub mod optimize;
 pub mod optimize_eval;
@@ -434,14 +435,11 @@ pub struct AppState {
     /// `mcp-<id>`); pruning and orphan-surfacing in the backend commands
     /// must only ever touch ids in this set.
     backend_spec_ids: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Session-only MCP process modes, overlaid on
-    /// `manager_mcp::default_servers()` by [`AppState::mcp_servers`].
-    /// Nothing writes it any more: the persisted registry is
-    /// `AppConfig.mcp` (exposure lives there, see
-    /// [`AppState::mcp_registry`]). The local-process path still builds
-    /// its `ServerSpec`s from the built-in defaults through this overlay,
-    /// so only the built-in servers can be spawned locally; deriving the
-    /// specs from `AppConfig.mcp` is an open design item (review
+    /// Session-only MCP process modes, overlaid on the specs derived
+    /// from `AppConfig.mcp` by [`AppState::mcp_servers`]. Nothing
+    /// writes it any more: the persisted registry is `AppConfig.mcp`
+    /// (exposure lives there, see [`AppState::mcp_registry`]), and
+    /// Local processes are spawned from it by `mcp_local` (review
     /// v0.1.60 PS-5).
     mcp_modes: Mutex<HashMap<String, manager_mcp::McpMode>>,
     /// Recent gateway routing decisions (spec §14 `gateway_recent_requests`).
@@ -1298,10 +1296,14 @@ impl AppState {
         *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
 
-    /// MCP server registry with in-memory mode overrides applied.
+    /// Runtime views of the persisted MCP registry, in registry order
+    /// (one per `AppConfig.mcp` entry), with in-memory mode overrides
+    /// applied. Derived from config since PS-5, so curated and
+    /// operator-added servers have specs like the built-in two.
     async fn mcp_servers(&self) -> Vec<manager_mcp::ServerSpec> {
+        let specs = manager_mcp::server_specs_from_config(&self.config.read().await.mcp);
         let modes = self.mcp_modes.lock().await;
-        manager_mcp::default_servers()
+        specs
             .into_iter()
             .map(|mut s| {
                 if let Some(m) = modes.get(&s.id) {
@@ -10415,9 +10417,16 @@ pub async fn op_diagnostics_export_bundle(
 pub async fn op_mcp_list(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
     let registry = state.mcp_registry().await;
     let servers = state.mcp_servers().await;
-    let statuses = {
-        let sup = state.supervisor().await.lock().await;
-        manager_mcp::list_status(&sup, &servers)
+    let (statuses, process_states) = {
+        let mut sup = state.supervisor().await.lock().await;
+        // Reap first so a Local server that exited on its own shows
+        // as failed instead of running (PS-5 crash visibility).
+        sup.reap_exited();
+        let states: HashMap<String, ProcessState> = servers
+            .iter()
+            .map(|s| (s.id.clone(), mcp_local::process_state(&sup, &s.id)))
+            .collect();
+        (manager_mcp::list_status(&sup, &servers), states)
     };
     let running: HashMap<String, bool> =
         statuses.iter().map(|s| (s.id.clone(), s.running)).collect();
@@ -10455,6 +10464,10 @@ pub async fn op_mcp_list(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> A
                 metered: cfg.metered,
                 rpm_limit: cfg.rpm_limit,
                 running: running.get(&cfg.id).copied().unwrap_or(false),
+                process_state: process_states
+                    .get(&cfg.id)
+                    .copied()
+                    .unwrap_or(ProcessState::Stopped),
                 credential_present: present,
                 credential_status: if present {
                     "present".to_string()
@@ -10600,8 +10613,14 @@ pub async fn op_mcp_test_connection(
             Ok(json!({ "id": id, "ok": false, "detail": "server disabled" }))
         }
         manager_mcp::McpMode::Local => {
+            // A Local entry that cannot run locally (PS-5: http
+            // transport, empty command, ...) says why.
+            if let Err(e) = manager_mcp::local::local_launch(entry) {
+                return Ok(json!({ "id": id, "ok": false, "detail": e.to_string() }));
+            }
             let running = {
-                let sup = state.supervisor().await.lock().await;
+                let mut sup = state.supervisor().await.lock().await;
+                sup.reap_exited();
                 manager_mcp::list_status(&sup, std::slice::from_ref(server))
                     .into_iter()
                     .next()
@@ -16021,6 +16040,10 @@ struct McpListEntry {
     /// Local servers are ever spawned, so this is meaningful
     /// (and only ever true) for them.
     pub running: bool,
+    /// The supervised process's state (`stopped` | `running` |
+    /// `failed` ...): `failed` once a Local server that exited on its
+    /// own was reaped (PS-5 crash visibility; additive field).
+    pub process_state: ProcessState,
     /// Credential presence over the accepted targets (see
     /// `credential_target_found`): true when any accepted target
     /// exists.
@@ -16304,7 +16327,7 @@ pub async fn op_mcp_set_exposure(
             )))
         }
     };
-    let previous_exposure = {
+    let (previous_exposure, entry) = {
         let mut cfg = state.config.write().await;
         let mut new_cfg = cfg.clone();
         let server = new_cfg
@@ -16315,43 +16338,30 @@ pub async fn op_mcp_set_exposure(
             .ok_or_else(|| ApiError::NotFound(format!("mcp server {id}")))?;
         let previous = server.exposure;
         server.exposure = exposure;
+        let entry = server.clone();
         manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
         *cfg = new_cfg;
-        previous
+        (previous, entry)
     };
-    let servers = state.mcp_servers().await;
-    // The local-process specs come from the built-in defaults (see the
-    // `mcp_modes` field doc), so a persisted server outside them (the
-    // curated brave_search / web_fetch, operator-added servers) has no
-    // spec. That used to `expect` and panic the command (finding PS-5,
-    // docs/code-review-v0.1.60.md). Such a server was never spawned
-    // locally, so leaving Local has nothing to stop; entering Local
-    // cannot spawn it and says so.
-    let Some(server) = servers.iter().find(|s| s.id == id) else {
-        if exposure == manager_config::McpExposure::Local
-            && previous_exposure != manager_config::McpExposure::Local
-        {
-            return Err(ApiError::Mcp(format!(
-                "exposure saved, but mcp server {id} has no local process definition \
-                 in this version, so it was not started; use gateway exposure instead"
-            )));
-        }
-        return Ok(json!({ "id": id, "exposure": exposure, "persisted": true }));
-    };
+    // The local process is derived from the registry entry (PS-5,
+    // docs/code-review-v0.1.60.md; `mcp_local`), so every persisted
+    // server — built-in, curated or operator-added — is handled the
+    // same way. Entering Local runs every spawn check; an entry that
+    // cannot run locally keeps its saved exposure and says why.
     if exposure == manager_config::McpExposure::Local
         && previous_exposure != manager_config::McpExposure::Local
     {
-        let mut sup = state.supervisor().await.lock().await;
-        manager_mcp::spawn_local(&mut sup, server)
-            .await
-            .map_err(ApiError::from)?;
+        mcp_local::start(state, &entry).await.map_err(|e| match e {
+            mcp_local::StartError::Spec(e) => ApiError::Mcp(format!(
+                "exposure saved, but mcp server {id} has no local process definition \
+                 that can run ({e}), so it was not started"
+            )),
+            mcp_local::StartError::Spawn(e) => e,
+        })?;
     } else if previous_exposure == manager_config::McpExposure::Local
         && exposure != manager_config::McpExposure::Local
     {
-        let mut sup = state.supervisor().await.lock().await;
-        manager_mcp::stop_local(&mut sup, server)
-            .await
-            .map_err(ApiError::from)?;
+        mcp_local::stop(state, &id).await?;
     }
     Ok(json!({ "id": id, "exposure": exposure, "persisted": true }))
 }
@@ -16368,15 +16378,31 @@ pub async fn op_mcp_save_server(
     server: manager_config::McpServerConfig,
 ) -> ApiResult {
     let id = server.id.clone();
-    let mut cfg = state.config.write().await;
-    let mut new_cfg = cfg.clone();
-    match new_cfg.mcp.servers.iter_mut().find(|s| s.id == id) {
-        Some(existing) => *existing = server,
-        None => new_cfg.mcp.servers.push(server),
+    // PS-5: a Local definition must be one the app can spawn (stdio,
+    // non-empty allowlisted command, no banned arg, no relative or
+    // install-dir-escaping command path); refused before anything is
+    // stored. Runtime state (credential, command on PATH) is reported
+    // in-band by `reconcile_after_save`.
+    if server.exposure == manager_config::McpExposure::Local {
+        manager_mcp::local::local_launch(&server).map_err(|e| {
+            ApiError::InvalidInput(format!("mcp server {id} cannot run locally: {e}"))
+        })?;
     }
-    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
-    *cfg = new_cfg;
-    Ok(json!({ "id": id, "persisted": true }))
+    let previous = {
+        let mut cfg = state.config.write().await;
+        let mut new_cfg = cfg.clone();
+        let previous = match new_cfg.mcp.servers.iter_mut().find(|s| s.id == id) {
+            Some(existing) => Some(std::mem::replace(existing, server.clone())),
+            None => {
+                new_cfg.mcp.servers.push(server.clone());
+                None
+            }
+        };
+        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+        *cfg = new_cfg;
+        previous
+    };
+    mcp_local::reconcile_after_save(state, previous.as_ref(), &server).await
 }
 
 /// Remove an MCP server from the persisted registry. If it was
@@ -16387,17 +16413,12 @@ pub async fn op_mcp_delete_server(
     _sink: &Arc<dyn EventSink>,
     id: String,
 ) -> ApiResult {
-    let servers = state.mcp_servers().await;
-    let server = servers
-        .iter()
-        .find(|s| s.id == id)
-        .ok_or_else(|| ApiError::NotFound(format!("mcp server {id}")))?;
-    if server.mode == manager_mcp::McpMode::Local {
-        let mut sup = state.supervisor().await.lock().await;
-        manager_mcp::stop_local(&mut sup, server)
-            .await
-            .map_err(ApiError::from)?;
+    if !state.mcp_registry().await.iter().any(|s| s.id == id) {
+        return Err(ApiError::NotFound(format!("mcp server {id}")));
     }
+    // Any live process for the id is stopped first, whatever the
+    // entry's exposure (PS-5: no orphan outlives its definition).
+    mcp_local::forget(state, &id).await?;
     let mut cfg = state.config.write().await;
     let mut new_cfg = cfg.clone();
     new_cfg.mcp.servers.retain(|s| s.id != id);
