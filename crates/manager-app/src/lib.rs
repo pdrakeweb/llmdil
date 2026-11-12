@@ -11091,17 +11091,27 @@ mod tests {
         cfg
     }
 
-    /// An AppState over a temp dir for the advanced-flags op
-    /// tests (tracker #60): config file and data dir in scratch
-    /// space, so saves and the activation journal land there.
-    fn advanced_test_state(cfg: AppConfig) -> (Arc<AppState>, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "llm-mgr-advanced-flags-{}",
+    /// A fresh scratch directory name: pid + a process-wide counter +
+    /// the clock. The clock alone collided between tests started in
+    /// parallel, letting two tests share (and one delete) a data dir.
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{n}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        ))
+    }
+
+    /// An AppState over a temp dir for the advanced-flags op
+    /// tests (tracker #60): config file and data dir in scratch
+    /// space, so saves and the activation journal land there.
+    fn advanced_test_state(cfg: AppConfig) -> (Arc<AppState>, PathBuf) {
+        let dir = unique_test_dir("llm-mgr-advanced-flags");
         std::fs::create_dir_all(&dir).unwrap();
         let mut cfg = cfg;
         cfg.data_dir = dir.clone();
@@ -11118,13 +11128,7 @@ mod tests {
     /// length + mtime, so a changed file is parsed afresh).
     #[test]
     fn gguf_layout_incomplete_at_last_rung_is_cached() {
-        let dir = std::env::temp_dir().join(format!(
-            "llm-mgr-p4-gguf-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = unique_test_dir("llm-mgr-p4-gguf");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("crafted.gguf");
         // GGUF v3, 0 tensors, 1 metadata pair whose key claims 1000
@@ -11197,13 +11201,7 @@ mod tests {
     /// matching the disk, instead of running on unsaved seeded rows.
     #[tokio::test]
     async fn ensure_catalog_models_failed_save_leaves_memory_unchanged() {
-        let dir = std::env::temp_dir().join(format!(
-            "llm-mgr-ps8-seed-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = unique_test_dir("llm-mgr-ps8-seed");
         std::fs::create_dir_all(&dir).unwrap();
         let mut cfg = test_cfg();
         cfg.data_dir = dir.clone();
