@@ -214,6 +214,9 @@ const LOCK_MAX_MS: i64 = 60 * 60 * 1000;
 const IP_FAILURE_LIMIT: usize = 30;
 const CHALLENGE_TTL_MS: i64 = 5 * 60 * 1000;
 const ENROLLMENT_TTL_MS: i64 = 10 * 60 * 1000;
+/// Minimum interval between persisted last-used updates for one
+/// session or API token (SEC-14: no store rewrite per request).
+const LAST_USED_WRITE_INTERVAL_MS: i64 = 60_000;
 
 #[derive(Default)]
 struct LockState {
@@ -600,6 +603,7 @@ impl AuthService {
             access_hash: hash_token(&access),
             refresh_hash: hash_token(&refresh),
             retired_refresh_hashes: Vec::new(),
+            retired_refresh_ms: Vec::new(),
             created_ms: now,
             access_expires_ms: now + ACCESS_TTL_MS,
             refresh_expires_ms: now + REFRESH_TTL_MS,
@@ -679,7 +683,7 @@ impl AuthService {
                     s.revoked = true;
                     return Ok(Err(AuthError::SessionRevoked));
                 }
-                s.retired_refresh_hashes.push(s.refresh_hash.clone());
+                s.retire_refresh_hash(now);
                 s.access_hash = hash_token(&access);
                 s.refresh_hash = hash_token(&refresh);
                 s.access_expires_ms = now + ACCESS_TTL_MS;
@@ -767,7 +771,7 @@ impl AuthService {
                 f.sessions
                     .iter()
                     .find(|s| s.id == session_id)
-                    .map(|s| now - s.last_used_ms > 60_000)
+                    .map(|s| now - s.last_used_ms > LAST_USED_WRITE_INTERVAL_MS)
                     .unwrap_or(false)
             })
             .await;
@@ -785,8 +789,28 @@ impl AuthService {
         }
     }
 
+    /// Record API-token use, throttled like [`Self::touch_session`]
+    /// (SEC-14): `admin-users.json` is rewritten at most once per
+    /// [`LAST_USED_WRITE_INTERVAL_MS`] per token, not on every request.
     async fn touch_api_token(&self, token_id: &str) {
         let now = now_ms();
+        let stale = self
+            .store
+            .read(|f| {
+                f.api_tokens
+                    .iter()
+                    .find(|t| t.id == token_id)
+                    .map(|t| {
+                        t.last_used_ms
+                            .map(|last| now - last > LAST_USED_WRITE_INTERVAL_MS)
+                            .unwrap_or(true)
+                    })
+                    .unwrap_or(false)
+            })
+            .await;
+        if !stale {
+            return;
+        }
         let tid = token_id.to_string();
         let _ = self
             .store
@@ -1867,6 +1891,95 @@ mod tests {
         assert_eq!(view.username, "dave");
         assert!(svc.validate_bearer(&pair.access_token).await.is_some());
         assert!(svc.redeem_enrollment_code(&code, "pixel").await.is_err());
+    }
+
+    /// SEC-14: API-token use updates `last_used_ms` at most once per
+    /// interval, so a busy token does not rewrite the store per request.
+    #[tokio::test]
+    async fn api_token_last_used_is_throttled() {
+        let svc = service().await;
+        let admin = svc
+            .create_user("root", "a-unique-passphrase", RoleName::Admin)
+            .await
+            .unwrap();
+        let issuer = Principal {
+            user_id: admin.id.clone(),
+            username: "root".into(),
+            role: Role::Admin,
+            auth_type: AuthType::Session,
+            session_id: "s".into(),
+        };
+        let (meta, value) = svc
+            .create_api_token(&issuer, &admin.id, "ci", RoleName::Viewer, None)
+            .await
+            .unwrap();
+        let last_used = |svc: Arc<AuthService>, id: String| async move {
+            svc.store
+                .read(|f| {
+                    f.api_tokens
+                        .iter()
+                        .find(|t| t.id == id)
+                        .unwrap()
+                        .last_used_ms
+                })
+                .await
+        };
+        // First use is recorded.
+        svc.validate_bearer(&value).await.unwrap();
+        assert!(last_used(svc.clone(), meta.id.clone()).await.is_some());
+        // A recent use: no rewrite.
+        let recent = now_ms() - LAST_USED_WRITE_INTERVAL_MS / 2;
+        let set = |svc: Arc<AuthService>, id: String, at: i64| async move {
+            svc.store
+                .mutate::<_, AuthError>(|f| {
+                    f.api_tokens
+                        .iter_mut()
+                        .find(|t| t.id == id)
+                        .unwrap()
+                        .last_used_ms = Some(at);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        };
+        set(svc.clone(), meta.id.clone(), recent).await;
+        svc.validate_bearer(&value).await.unwrap();
+        assert_eq!(last_used(svc.clone(), meta.id.clone()).await, Some(recent));
+        // A stale use: refreshed.
+        let stale = now_ms() - LAST_USED_WRITE_INTERVAL_MS - 1_000;
+        set(svc.clone(), meta.id.clone(), stale).await;
+        svc.validate_bearer(&value).await.unwrap();
+        assert!(last_used(svc.clone(), meta.id.clone()).await.unwrap() > stale);
+    }
+
+    /// SEC-14: refresh rotation records when each hash was retired.
+    #[tokio::test]
+    async fn refresh_rotation_records_retirement_times() {
+        let svc = service().await;
+        let user = svc
+            .create_user("hank", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        let pair = svc.create_session(&user.id, "phone").await.unwrap();
+        let (pair2, _) = svc.refresh(&pair.refresh_token).await.unwrap();
+        svc.refresh(&pair2.refresh_token).await.unwrap();
+        let (hashes, times) = svc
+            .store
+            .read(|f| {
+                let s = &f.sessions[0];
+                (
+                    s.retired_refresh_hashes.clone(),
+                    s.retired_refresh_ms.clone(),
+                )
+            })
+            .await;
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(times.len(), 2);
+        // Reuse detection still works on a recently retired token.
+        assert_eq!(
+            svc.refresh(&pair.refresh_token).await.unwrap_err(),
+            AuthError::SessionRevoked
+        );
     }
 
     /// SEC-13: a lock engaging is audited (login path with the source
