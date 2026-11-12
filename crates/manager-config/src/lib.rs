@@ -2335,13 +2335,34 @@ fn validate_split(backend_id: &str, flags: &ServerFlags, errors: &mut Vec<String
 }
 
 /// Stdio commands LiteLLM allows for MCP servers; the manager mirrors
-/// the list at save time (MCP design §3.2 / §5.1).
-const MCP_STDIO_COMMAND_ALLOWLIST: &[&str] =
+/// the list at save time (MCP design §3.2 / §5.1). Public because the
+/// app's local-process spawn path re-checks it at spawn time (review
+/// v0.1.60 PS-5).
+pub const MCP_STDIO_COMMAND_ALLOWLIST: &[&str] =
     &["npx", "uvx", "python", "python3", "node", "docker", "deno"];
 
 /// Banned MCP server args (MCP design §3.2): rejected at save, never
-/// stripped, so the operator sees the refusal.
-const MCP_BANNED_ARGS: &[&str] = &["--allow-private-ips", "--ignore-robots-txt"];
+/// stripped, so the operator sees the refusal. Public for the same
+/// spawn-time re-check as [`MCP_STDIO_COMMAND_ALLOWLIST`].
+pub const MCP_BANNED_ARGS: &[&str] = &["--allow-private-ips", "--ignore-robots-txt"];
+
+/// The banned token `arg` matches, if any: the token itself or its
+/// `token=value` form (MCP design §3.2). Shared by save-time
+/// validation and the spawn-time re-check.
+pub fn mcp_banned_arg(arg: &str) -> Option<&'static str> {
+    MCP_BANNED_ARGS.iter().copied().find(|banned| {
+        arg == *banned
+            || arg
+                .strip_prefix(banned)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
+}
+
+/// True when `command`'s basename (see [`mcp_command_basename`]) is in
+/// [`MCP_STDIO_COMMAND_ALLOWLIST`].
+pub fn mcp_stdio_command_allowed(command: &str) -> bool {
+    MCP_STDIO_COMMAND_ALLOWLIST.contains(&mcp_command_basename(command).as_str())
+}
 
 /// True when `id` matches `^[a-z][a-z0-9_]*$` (hand-rolled: this crate
 /// has no regex dependency, and the alphabet is small).
@@ -2361,7 +2382,7 @@ fn is_valid_mcp_server_id(id: &str) -> bool {
 /// extension (`.exe` / `.cmd` / `.bat`) removed. So `npx`,
 /// `C:\tools\npx.cmd`, `/usr/local/bin/NPX.EXE`, and `npx.exe` all
 /// normalise to `npx`.
-fn mcp_command_basename(command: &str) -> String {
+pub fn mcp_command_basename(command: &str) -> String {
     let base = command
         .rsplit(['/', '\\'])
         .next()
@@ -2445,13 +2466,11 @@ fn validate_mcp_servers(mcp: &McpConfig, errors: &mut Vec<String>) {
             errors.push(format!("duplicate mcp server id {:?}", s.id));
         }
         for arg in &s.args {
-            for banned in MCP_BANNED_ARGS {
-                if arg == banned || arg.starts_with(&format!("{banned}=")) {
-                    errors.push(format!(
-                        "mcp server {:?}: arg {banned:?} is banned and is rejected, not stripped",
-                        s.id
-                    ));
-                }
+            if let Some(banned) = mcp_banned_arg(arg) {
+                errors.push(format!(
+                    "mcp server {:?}: arg {banned:?} is banned and is rejected, not stripped",
+                    s.id
+                ));
             }
         }
         match s.transport {
