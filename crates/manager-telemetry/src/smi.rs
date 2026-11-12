@@ -296,23 +296,45 @@ struct ParsedDoc {
 /// unknown cards yield (0, 0) = unknown (see [`GpuInfo`]).
 fn compute_capability_for(product_name: &str) -> (u32, u32) {
     let n = product_name.to_ascii_lowercase();
-    if n.contains("p100") {
+    // Model numbers match on a token boundary (P-11b): a plain
+    // substring test let "a100" match "RTX A1000" and "p40" match
+    // "P4000".
+    let has = |token: &str| contains_model_token(&n, token);
+    if has("p100") {
         (6, 0)
-    } else if n.contains("p40") || n.contains("titan xp") {
+    } else if has("p40") || has("titan xp") {
         (6, 1)
-    } else if n.contains("v100") {
+    } else if has("v100") {
         (7, 0)
-    } else if n.contains("t4") {
+    } else if has("t4") {
         (7, 5)
-    } else if n.contains("a100") {
+    } else if has("a100") {
         (8, 0)
-    } else if n.contains("a4000") || n.contains("a5000") || n.contains("a6000") {
+    } else if has("a4000") || has("a5000") || has("a6000") {
         (8, 6)
-    } else if n.contains("4090") || n.contains("4080") || n.contains("4070") {
+    } else if has("4090") || has("4080") || has("4070") {
         (8, 9)
     } else {
         (0, 0)
     }
+}
+
+/// True when `token` occurs in `haystack` with no letter or digit
+/// directly before it and no digit directly after it: "a100" matches
+/// "nvidia a100-sxm4-80gb" and "tesla v100s" keeps "v100", but "a100"
+/// does not match "rtx a1000".
+fn contains_model_token(haystack: &str, token: &str) -> bool {
+    haystack.match_indices(token).any(|(i, _)| {
+        let before_ok = haystack[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric());
+        let after_ok = haystack[i + token.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_digit());
+        before_ok && after_ok
+    })
 }
 
 // --- value helpers: "N/A" -> None, unit suffixes stripped ---
@@ -1015,6 +1037,21 @@ mod tests {
         assert_eq!(compute_capability_for("Tesla P100-PCIE-16GB"), (6, 0));
         assert_eq!(compute_capability_for("Tesla V100-SXM2-32GB"), (7, 0));
         assert_eq!(compute_capability_for("Some Future Card X9000"), (0, 0));
+    }
+
+    /// P-11b (docs/code-review-v0.1.60.md): model numbers match on a
+    /// token boundary, so "RTX A1000" is not an A100 (nor "P4000" a
+    /// P40), while real A100 / V100S / T4 names still map.
+    #[test]
+    fn compute_capability_matches_model_tokens_only() {
+        assert_eq!(compute_capability_for("NVIDIA RTX A1000"), (0, 0));
+        assert_eq!(compute_capability_for("Quadro P4000"), (0, 0));
+        assert_eq!(compute_capability_for("NVIDIA A100-SXM4-80GB"), (8, 0));
+        assert_eq!(compute_capability_for("NVIDIA A100 80GB PCIe"), (8, 0));
+        assert_eq!(compute_capability_for("Tesla V100S-PCIE-32GB"), (7, 0));
+        assert_eq!(compute_capability_for("Tesla T4"), (7, 5));
+        assert_eq!(compute_capability_for("Tesla P40"), (6, 1));
+        assert_eq!(compute_capability_for("NVIDIA GeForce RTX 4090"), (8, 9));
     }
 
     #[test]
