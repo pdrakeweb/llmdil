@@ -19,9 +19,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub mod config_edit;
 pub mod fake;
 pub mod ops;
 pub mod steps;
+
+pub use config_edit::{apply_config_edits, AppliedEdits, ConfigEdit, ConfigEditMode};
 
 pub use ops::{gateway_pid_path, stop_gateway};
 
@@ -284,6 +287,11 @@ pub struct WizardContext {
     /// Live progress sink (see [`StepLogSink`]); `None` outside the
     /// app shell (unit tests, one-shot CLI runs).
     pub log_sink: Option<StepLogSink>,
+    /// Who persists the [`ConfigEdit`]s a step makes (see
+    /// [`ConfigEditMode`]). The app shell sets
+    /// [`ConfigEditMode::ReturnToCaller`] and applies
+    /// [`StepOutcome::config_edits`] under its config lock.
+    pub config_edit_mode: ConfigEditMode,
 }
 
 impl WizardContext {
@@ -299,7 +307,14 @@ impl WizardContext {
             mode,
             ops,
             log_sink: None,
+            config_edit_mode: ConfigEditMode::default(),
         }
+    }
+
+    /// Set who persists step config edits (see [`ConfigEditMode`]).
+    pub fn with_config_edit_mode(mut self, mode: ConfigEditMode) -> Self {
+        self.config_edit_mode = mode;
+        self
     }
 
     /// Attach a live progress sink (see [`StepLogSink`]).
@@ -361,6 +376,15 @@ pub struct StepOutcome {
     /// persisted by older builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_command: Option<String>,
+    /// Configuration changes the step made (code-review PS-4; see
+    /// [`config_edit`]). Under [`ConfigEditMode::ReturnToCaller`] the
+    /// caller applies them under its config lock — on a failed
+    /// outcome too (a model verified before a later failure keeps its
+    /// stamp). Under [`ConfigEditMode::SaveToDisk`] the step has
+    /// already persisted them and they are informational. Absent on
+    /// the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_edits: Vec<ConfigEdit>,
 }
 
 impl StepOutcome {
@@ -371,6 +395,7 @@ impl StepOutcome {
             log_tail,
             duration_ms: 0,
             manual_command: None,
+            config_edits: Vec::new(),
         }
     }
 
@@ -381,6 +406,7 @@ impl StepOutcome {
             log_tail,
             duration_ms: 0,
             manual_command: None,
+            config_edits: Vec::new(),
         }
     }
 
@@ -391,6 +417,7 @@ impl StepOutcome {
             log_tail: Vec::new(),
             duration_ms: 0,
             manual_command: None,
+            config_edits: Vec::new(),
         }
     }
 
@@ -1377,6 +1404,10 @@ pub struct Wizard {
     notes: HashMap<String, String>,
     mode: RunMode,
     started_at: Option<Instant>,
+    /// Config edits returned by steps run under
+    /// [`ConfigEditMode::ReturnToCaller`], in run order, keyed by step
+    /// id; drained by [`Wizard::take_config_edits`].
+    pending_config_edits: Vec<(String, Vec<ConfigEdit>)>,
 }
 
 impl Wizard {
@@ -1407,7 +1438,36 @@ impl Wizard {
             notes,
             mode,
             started_at: None,
+            pending_config_edits: Vec::new(),
         })
+    }
+
+    /// Drain the config edits that steps run since the last call
+    /// returned under [`ConfigEditMode::ReturnToCaller`], as
+    /// `(step id, edits)` in run order. The caller applies them under
+    /// its config lock and reports a failed application with
+    /// [`Wizard::fail_step`].
+    pub fn take_config_edits(&mut self) -> Vec<(String, Vec<ConfigEdit>)> {
+        std::mem::take(&mut self.pending_config_edits)
+    }
+
+    /// Record a step as failed after it ran — the caller could not
+    /// persist the step's config edits. The step's report keeps its
+    /// log, gains `log_line`, and carries `message`.
+    pub fn fail_step(&mut self, id: &str, message: String, log_line: String) {
+        if self.find(id).is_none() {
+            return;
+        }
+        self.states.insert(id.to_string(), StepState::Failed);
+        if let Some(report) = self.reports.get_mut(id) {
+            report.state = StepState::Failed;
+            report.message = message;
+            report.log_tail.push(log_line);
+            if report.log_tail.len() > LOG_TAIL_LINES {
+                let drop = report.log_tail.len() - LOG_TAIL_LINES;
+                report.log_tail.drain(..drop);
+            }
+        }
     }
 
     /// Step ids in declaration order.
@@ -1824,6 +1884,12 @@ impl Wizard {
         };
         // Runner-measured wall time is authoritative.
         outcome.duration_ms = started.elapsed().as_millis() as u64;
+        if ctx.config_edit_mode == ConfigEditMode::ReturnToCaller
+            && !outcome.config_edits.is_empty()
+        {
+            self.pending_config_edits
+                .push((id.to_string(), outcome.config_edits.clone()));
+        }
         // The report (UI display, persisted wizard state) carries
         // only the display tail; the outcome keeps the full log for
         // the caller's log persistence.
