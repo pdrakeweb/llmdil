@@ -6,8 +6,9 @@
 //! [`FakeSystemOps`](crate::fake::FakeSystemOps).
 
 use crate::{
-    checksums_match, is_pinned_hash, CommandOutput, PlannedCommand, RunMode, StepLogSink,
-    StepOutcome, SystemOps, WizardContext, WizardError, WizardStep,
+    apply_config_edits, checksums_match, is_pinned_hash, CommandOutput, ConfigEdit, ConfigEditMode,
+    PlannedCommand, RunMode, StepLogSink, StepOutcome, SystemOps, WizardContext, WizardError,
+    WizardStep,
 };
 use async_trait::async_trait;
 use manager_config::{
@@ -1643,23 +1644,11 @@ impl ConfigureTensorSplit {
             });
         }
         let assigned = assign_splits(&inputs, vrams);
-        // Persist into the on-disk config (the pattern
-        // DownloadModels::stamp_verified_at documents: steps receive
-        // a snapshot clone, so placement must be written to
-        // <data_dir>/config.json to exist at all; the app reloads the
-        // file after each wizard step). Base: the persisted config
-        // when it loads, else the context snapshot.
-        let config_path = ctx.data_dir.join("config.json");
-        let mut config = match manager_config::load(&config_path) {
-            Ok(cfg) => cfg,
-            Err(_) if ctx.data_dir.is_dir() => ctx.config.clone(),
-            Err(e) => {
-                return Ok(StepOutcome::failed(
-                    format!("could not load the persisted config to write splits: {e}"),
-                    log,
-                ))
-            }
-        };
+        // Steps receive a snapshot clone, so placement is returned as
+        // typed config edits (code-review PS-4) and persisted by
+        // `deliver_config_edits`: by the app under its config lock,
+        // or by this step itself when no app shell owns the config.
+        let mut edits: Vec<ConfigEdit> = Vec::new();
         let mut changed = 0usize;
         for (b, result) in enabled.iter().zip(assigned.iter()) {
             let Some((split, mode)) = result else {
@@ -1673,10 +1662,11 @@ impl ConfigureTensorSplit {
                 ));
                 continue;
             }
-            if let Some(target) = config.backends.iter_mut().find(|x| x.id == b.id) {
-                target.flags.tensor_split = split.clone();
-                target.flags.split_mode = *mode;
-            }
+            edits.push(ConfigEdit::BackendPlacement {
+                backend_id: b.id.clone(),
+                tensor_split: split.clone(),
+                split_mode: *mode,
+            });
             changed += 1;
             log.push(format!(
                 "{}: split [{}] assigned (model ~{} GB)",
@@ -1690,31 +1680,27 @@ impl ConfigureTensorSplit {
             ));
         }
         if changed > 0 {
-            if let Err(e) = manager_config::validate(&config) {
+            // Pre-check against the snapshot; whoever persists the
+            // edits validates the real target again on save.
+            let mut check = ctx.config.clone();
+            apply_config_edits(&mut check, &edits);
+            if let Err(e) = manager_config::validate(&check) {
                 return Ok(StepOutcome::failed(
                     format!("computed splits failed validation: {e}"),
                     log,
                 ));
             }
-            if let Err(e) = manager_config::save(&config, &config_path) {
-                return Ok(StepOutcome::failed(
-                    format!("could not save splits to {}: {e}", config_path.display()),
-                    log,
-                ));
-            }
-            log.push(format!(
-                "saved placement for {changed} backend(s) to {}",
-                config_path.display()
-            ));
         }
-        Ok(StepOutcome::done(
+        let mut outcome = StepOutcome::done(
             format!(
                 "tensor splits set for {} enabled backend(s) across {} GPUs ({changed} updated)",
                 enabled.len(),
                 vrams.len()
             ),
             log,
-        ))
+        );
+        outcome.config_edits = edits;
+        Ok(deliver_config_edits(ctx, outcome, true))
     }
 
     fn run_audit(&self, ctx: &WizardContext, vrams: &[u64]) -> StepOutcome {
@@ -1904,6 +1890,28 @@ impl WizardStep for DownloadModels {
         Some("model checksum mismatch → re-download?")
     }
     async fn run(&self, ctx: &WizardContext) -> Result<StepOutcome, WizardError> {
+        // Verified-at stamps are collected as typed config edits
+        // (code-review PS-4) and delivered on every exit — a model
+        // verified before a later failure keeps its stamp.
+        let mut edits: Vec<ConfigEdit> = Vec::new();
+        let mut outcome = match self.run_collecting(ctx, &mut edits).await {
+            Ok(outcome) => outcome,
+            Err(e) if edits.is_empty() => return Err(e),
+            // Same conversion the runner applies to a step error, so
+            // the edits gathered before it are not lost.
+            Err(e) => StepOutcome::failed(format!("step error: {e}"), vec![format!("{e:?}")]),
+        };
+        outcome.config_edits = edits;
+        Ok(deliver_config_edits(ctx, outcome, false))
+    }
+}
+
+impl DownloadModels {
+    async fn run_collecting(
+        &self,
+        ctx: &WizardContext,
+        edits: &mut Vec<ConfigEdit>,
+    ) -> Result<StepOutcome, WizardError> {
         if ctx.config.models.is_empty() {
             return Ok(StepOutcome::done(
                 "no models configured; nothing to download",
@@ -2007,7 +2015,7 @@ impl WizardStep for DownloadModels {
                         }
                     }
                     if pinned {
-                        Self::stamp_verified_at(ctx, &model.id, &model.sha256, &mut log);
+                        Self::stamp_verified_at(edits, &model.id, &model.sha256);
                         verified += 1;
                     } else {
                         unverified += 1;
@@ -2074,7 +2082,7 @@ impl WizardStep for DownloadModels {
                     match ctx.ops.sha256_file(&dest).await {
                         Ok(h) if verify(&h) => {
                             log.push(format!("{}: checksum verified", model.id));
-                            Self::stamp_verified_at(ctx, &model.id, &model.sha256, &mut log);
+                            Self::stamp_verified_at(edits, &model.id, &model.sha256);
                             verified += 1;
                         }
                         Ok(h) => {
@@ -2106,58 +2114,158 @@ impl WizardStep for DownloadModels {
     }
 }
 
+/// The base for a step's load-modify-save of `<data_dir>/config.json`
+/// (see [`persisted_config_base`]).
+enum PersistedBase {
+    /// The persisted primary file loaded cleanly.
+    Loaded(AppConfig),
+    /// Fresh install: the data dir exists but neither `config.json`
+    /// nor `config.json.bak` does, so the context snapshot (the
+    /// caller's current config) is the base.
+    FirstRun(AppConfig),
+    /// No data dir on disk (unit tests drive steps with a fictional
+    /// data dir): there is no persisted config to write.
+    NoDataDir,
+}
+
+/// Choose the base a step edits before saving `<data_dir>/config.json`.
+///
+/// Code-review PS-4: the context snapshot may be minutes old, so it
+/// is a valid base ONLY when no persisted config exists at all (a
+/// fresh install). A file that exists but does not load — a parse
+/// error, a validation failure, any I/O error other than "not found",
+/// or a primary that only loaded through its `.bak` fallback (a save
+/// would rotate the unreadable primary over the good `.bak`) — is an
+/// error: the step must fail and save nothing over it.
+fn persisted_config_base(ctx: &WizardContext) -> Result<PersistedBase, String> {
+    let config_path = ctx.data_dir.join("config.json");
+    let mut bak = config_path.as_os_str().to_owned();
+    bak.push(".bak");
+    let bak = PathBuf::from(bak);
+    match manager_config::load_detailed(&config_path) {
+        Ok(report) if !report.used_backup => Ok(PersistedBase::Loaded(report.config)),
+        Ok(_) => Err(format!(
+            "{} could not be loaded (only its .bak copy loads); refusing to save over it",
+            config_path.display()
+        )),
+        Err(manager_config::ConfigError::Io(e))
+            if e.kind() == std::io::ErrorKind::NotFound && !bak.exists() =>
+        {
+            if ctx.data_dir.is_dir() {
+                Ok(PersistedBase::FirstRun(ctx.config.clone()))
+            } else {
+                Ok(PersistedBase::NoDataDir)
+            }
+        }
+        Err(e) => Err(format!(
+            "{} could not be loaded ({e}); refusing to save over it",
+            config_path.display()
+        )),
+    }
+}
+
+/// Persist a step's [`StepOutcome::config_edits`] according to
+/// [`WizardContext::config_edit_mode`].
+///
+/// - [`ConfigEditMode::ReturnToCaller`]: the outcome is returned
+///   unchanged; the caller applies the edits under its config lock.
+/// - [`ConfigEditMode::SaveToDisk`]: load `<data_dir>/config.json`
+///   (see [`persisted_config_base`]), apply, save. A file that does
+///   not load fails the step and saves nothing. For a failed save or
+///   no data dir on disk, `required` decides: fail the step (the
+///   placement step — its edits are its whole result), or log and
+///   leave the edits unpersisted (verified-at stamps are best-effort
+///   here, as they always were: the verification itself succeeded).
+///
+/// A failure here keeps an outcome that already failed on its own
+/// message (the persistence error joins its log).
+fn deliver_config_edits(
+    ctx: &WizardContext,
+    mut outcome: StepOutcome,
+    required: bool,
+) -> StepOutcome {
+    if outcome.config_edits.is_empty() || ctx.config_edit_mode == ConfigEditMode::ReturnToCaller {
+        return outcome;
+    }
+    let config_path = ctx.data_dir.join("config.json");
+    let mut config = match persisted_config_base(ctx) {
+        Ok(PersistedBase::Loaded(cfg)) | Ok(PersistedBase::FirstRun(cfg)) => cfg,
+        Ok(PersistedBase::NoDataDir) if required => {
+            return fail_outcome(
+                outcome,
+                format!(
+                    "could not save config edits: data directory {} does not exist",
+                    ctx.data_dir.display()
+                ),
+            )
+        }
+        Ok(PersistedBase::NoDataDir) => return outcome,
+        Err(e) => return fail_outcome(outcome, format!("config edits not saved: {e}")),
+    };
+    let applied = apply_config_edits(&mut config, &outcome.config_edits);
+    outcome.log_tail.extend(applied.log);
+    if applied.applied == 0 {
+        return outcome;
+    }
+    match manager_config::save(&config, &config_path) {
+        Ok(()) => {
+            outcome.log_tail.push(format!(
+                "saved {} config edit(s) to {}",
+                applied.applied,
+                config_path.display()
+            ));
+            outcome
+        }
+        Err(e) => {
+            let message = format!(
+                "could not save config edits to {}: {e}",
+                config_path.display()
+            );
+            if required {
+                fail_outcome(outcome, message)
+            } else {
+                outcome.log_tail.push(message);
+                outcome
+            }
+        }
+    }
+}
+
+/// Mark `outcome` failed with `message`, unless it already failed —
+/// then its own message stands and `message` joins its log.
+fn fail_outcome(mut outcome: StepOutcome, message: String) -> StepOutcome {
+    outcome.log_tail.push(message.clone());
+    if outcome.state != crate::StepState::Failed {
+        outcome.state = crate::StepState::Failed;
+        outcome.message = message;
+    }
+    outcome
+}
+
 impl DownloadModels {
-    /// Stamp `verified_at` for one model this run just verified into
-    /// the persisted config.
+    /// Record a `verified_at` stamp for one model this run just
+    /// verified, as a typed config edit.
     ///
     /// Steps receive a snapshot clone of the app config
     /// (`WizardContext::config` is built fresh by the caller and steps
     /// run through `&WizardContext`), so the stamp cannot ride back
-    /// through `ctx.config` — nothing a step does to it reaches the
-    /// saved `AppConfig`. The persisted config lives at
-    /// `<data_dir>/config.json` (the path the app loads at startup);
-    /// it is the base when it loads. On a first run, when nothing has
-    /// saved that file yet, the context config is the base instead —
-    /// it is the caller's current config, cloned for this step run,
-    /// so saving it back persists exactly what the app would save
-    /// later, plus the stamp. When there is no real data dir on disk
-    /// (unit tests drive the step with fake ops and a fictional data
-    /// dir) there is no persisted config to stamp and this is a no-op.
-    ///
-    /// Best-effort: failures are logged, never failed into the step
-    /// outcome. The verification itself already succeeded; an
-    /// unstamped model simply stays gated until something else
-    /// verifies it.
-    fn stamp_verified_at(
-        ctx: &WizardContext,
-        model_id: &str,
-        verified_sha256: &str,
-        log: &mut Vec<String>,
-    ) {
-        let config_path = ctx.data_dir.join("config.json");
-        let mut config = match manager_config::load(&config_path) {
-            Ok(cfg) => cfg,
-            Err(_) if ctx.data_dir.is_dir() => ctx.config.clone(),
-            Err(_) => return,
-        };
-        let Some(model) = config.models.iter_mut().find(|m| m.id == model_id) else {
-            return;
-        };
-        model.verified_at = Some(chrono::Utc::now());
-        // The stamp records WHICH pinned hash the file was verified
-        // against; the audit's verified-by-stamp shortcut trusts a
-        // stamp only while that still equals the current pin.
-        model.verified_sha256 = Some(verified_sha256.to_string());
-        match manager_config::save(&config, &config_path) {
-            Ok(()) => log.push(format!(
-                "{model_id}: verified_at stamped in {}",
-                config_path.display()
-            )),
-            Err(e) => log.push(format!(
-                "{model_id}: could not stamp verified_at in {}: {e}",
-                config_path.display()
-            )),
-        }
+    /// through `ctx.config`. It is returned as a
+    /// [`ConfigEdit::ModelVerified`] (code-review PS-4) and persisted
+    /// by [`deliver_config_edits`]: by the app under its config lock,
+    /// or — with no app shell — into `<data_dir>/config.json` (the
+    /// path the app loads at startup), never over a file that failed
+    /// to load. A model deleted while the step ran is skipped when the
+    /// edit is applied.
+    fn stamp_verified_at(edits: &mut Vec<ConfigEdit>, model_id: &str, verified_sha256: &str) {
+        edits.push(ConfigEdit::ModelVerified {
+            model_id: model_id.to_string(),
+            verified_at: chrono::Utc::now(),
+            // The stamp records WHICH pinned hash the file was
+            // verified against; the audit's verified-by-stamp
+            // shortcut trusts a stamp only while that still equals
+            // the current pin.
+            verified_sha256: verified_sha256.to_string(),
+        });
     }
 
     /// Fail when the models still needing download exceed the free space on
@@ -8739,6 +8847,161 @@ mod tests {
             bad.verified_at.is_none(),
             "mismatching model must not be stamped"
         );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // --- PS-4: never save a snapshot over an unloadable config.json ---
+
+    const GARBAGE_CONFIG: &[u8] = b"{ this is not json";
+
+    /// Fixture for the placement step: enabled backends whose model
+    /// needs a split on the three test GPUs (see
+    /// `tensor_split_install_persists_splits_and_audit_validates`).
+    fn split_test_config() -> AppConfig {
+        let mut config = test_config_with_models();
+        for b in config.backends.iter_mut() {
+            b.model_file = if b.id == "coder-fast" {
+                PathBuf::from("models/qwen2.5-coder-7b.gguf")
+            } else {
+                PathBuf::from("models/qwen3-8b.gguf")
+            };
+            b.raw_flags = None;
+        }
+        for m in config.models.iter_mut() {
+            if m.gguf_path.ends_with("qwen3-8b.gguf") {
+                m.id = "qwen3-coder-30b".to_string();
+            }
+        }
+        config
+    }
+
+    #[tokio::test]
+    async fn download_models_unloadable_config_fails_and_is_not_overwritten() {
+        let data_dir = stamp_test_dir("ps4-garbage");
+        let config_path = data_dir.join("config.json");
+        std::fs::write(&config_path, GARBAGE_CONFIG).unwrap();
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_download(
+            "https://example.com/qwen3-8b.gguf",
+            b"gguf-8b-bytes".to_vec(),
+        );
+        ops.with_download(
+            "https://example.com/qwen2.5-coder-7b.gguf",
+            b"gguf-7b-bytes".to_vec(),
+        );
+        let ctx = WizardContext::new(stamp_test_config(), data_dir.clone(), RunMode::Install, ops);
+        let out = DownloadModels.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(
+            out.message.contains("could not be loaded"),
+            "{}",
+            out.message
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            GARBAGE_CONFIG,
+            "the unloadable file must not be overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn tensor_split_unloadable_config_fails_and_is_not_overwritten() {
+        let data_dir = stamp_test_dir("ps4-split-garbage");
+        let config_path = data_dir.join("config.json");
+        std::fs::write(&config_path, GARBAGE_CONFIG).unwrap();
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_gpus(test_gpus());
+        let ctx = WizardContext::new(split_test_config(), data_dir.clone(), RunMode::Install, ops);
+        let out = ConfigureTensorSplit.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(
+            out.message.contains("could not be loaded"),
+            "{}",
+            out.message
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), GARBAGE_CONFIG);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn tensor_split_return_to_caller_leaves_disk_alone() {
+        let data_dir = stamp_test_dir("ps4-split-return");
+        let config_path = data_dir.join("config.json");
+        // Even an unloadable file is irrelevant: the step never reads
+        // or writes config.json when the caller owns persistence.
+        std::fs::write(&config_path, GARBAGE_CONFIG).unwrap();
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_gpus(test_gpus());
+        let config = split_test_config();
+        let ctx = WizardContext::new(config.clone(), data_dir.clone(), RunMode::Install, ops)
+            .with_config_edit_mode(ConfigEditMode::ReturnToCaller);
+        let out = ConfigureTensorSplit.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let enabled = config.backends.iter().filter(|b| b.enabled).count();
+        assert_eq!(out.config_edits.len(), enabled, "{:?}", out.config_edits);
+        for edit in &out.config_edits {
+            match edit {
+                ConfigEdit::BackendPlacement { tensor_split, .. } => {
+                    assert_eq!(tensor_split.len(), 3)
+                }
+                other => panic!("unexpected edit {other:?}"),
+            }
+        }
+        assert_eq!(std::fs::read(&config_path).unwrap(), GARBAGE_CONFIG);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn download_models_return_to_caller_returns_stamps_without_saving() {
+        let data_dir = stamp_test_dir("ps4-dl-return");
+        let config_path = data_dir.join("config.json");
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_download(
+            "https://example.com/qwen3-8b.gguf",
+            b"gguf-8b-bytes".to_vec(),
+        );
+        // The second model fails verification: the first model's
+        // stamp still rides back on the failed outcome.
+        ops.with_download(
+            "https://example.com/qwen2.5-coder-7b.gguf",
+            b"tampered-bytes".to_vec(),
+        );
+        let ctx = WizardContext::new(stamp_test_config(), data_dir.clone(), RunMode::Install, ops)
+            .with_config_edit_mode(ConfigEditMode::ReturnToCaller);
+        let out = DownloadModels.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert_eq!(out.config_edits.len(), 1, "{:?}", out.config_edits);
+        match &out.config_edits[0] {
+            ConfigEdit::ModelVerified {
+                model_id,
+                verified_sha256,
+                ..
+            } => {
+                assert_eq!(model_id, "qwen3-8b");
+                assert!(!verified_sha256.is_empty());
+            }
+            other => panic!("unexpected edit {other:?}"),
+        }
+        assert!(!config_path.exists(), "the step must not write config.json");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn tensor_split_absent_config_seeds_from_snapshot() {
+        let data_dir = stamp_test_dir("ps4-split-fresh");
+        let config_path = data_dir.join("config.json");
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_gpus(test_gpus());
+        let ctx = WizardContext::new(split_test_config(), data_dir.clone(), RunMode::Install, ops);
+        let out = ConfigureTensorSplit.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let saved = manager_config::load(&config_path).unwrap();
+        assert!(saved
+            .backends
+            .iter()
+            .filter(|b| b.enabled)
+            .all(|b| !b.flags.tensor_split.is_empty()));
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
