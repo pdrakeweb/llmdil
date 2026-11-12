@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use manager_logship::shipper::{SourceState, SourceStatus};
-use manager_logship::{ShipLevel, ShipperConfig, ShipperHandle};
+use manager_logship::{RecordTap, ShipLevel, ShipperConfig, ShipperHandle, TapRecord};
 
 const INGEST: &str = "SOURCESINGESTTOKEN1a2b3c";
 
@@ -126,6 +126,7 @@ impl Rig {
             tail_gateway: false,
             tail_service_manage: false,
             tail_audit: false,
+            app_events: false,
             ..ShipperConfig::default()
         }
     }
@@ -363,5 +364,176 @@ async fn audit_tail_ships_json_verbatim_with_outcome_levels() {
     assert_eq!(level_of("req-5"), "warn");
     // Untouched records are byte-identical to what the API wrote.
     assert!(audit.iter().any(|r| r["line"] == ok.as_str()));
+    rig.finish(&handle).await;
+}
+
+fn app_event(line: &str) -> TapRecord {
+    TapRecord {
+        source: "app".to_string(),
+        stream: "stdout".to_string(),
+        level: None,
+        line: line.to_string(),
+    }
+}
+
+async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// S5: records offered on the in-process feed ship as source `app`,
+/// redacted like any tailed line, with the producer's level when it
+/// gives one. A record from a source that is not enabled is not
+/// shipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_events_ship_from_the_in_process_feed() {
+    const KEY: &str = "sk-APPEVENTSECRET2b3c4d5e";
+    let rig = Rig::new("appevents");
+    let tap = RecordTap::new();
+    let handle = manager_logship::spawn(ShipperConfig {
+        app_events: true,
+        tap: Some(tap.clone()),
+        ..rig.config()
+    });
+    wait_until("the shipper to subscribe", || tap.is_active()).await;
+
+    tap.send(app_event(
+        r#"backend-status {"event":"started","id":"planner"}"#,
+    ));
+    tap.send(app_event(&format!(
+        r#"wizard-progress {{"state":"failed","message":"bad api_key={KEY}"}}"#
+    )));
+    tap.send(TapRecord {
+        level: Some(ShipLevel::Warn),
+        ..app_event("toast: Backend crashed — planner exited")
+    });
+    // Not an enabled source: must not ship.
+    tap.send(TapRecord {
+        source: "backend:planner".to_string(),
+        ..app_event("llama-server listening")
+    });
+
+    let records = rig.wait_for(3).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let records = if rig.capture.records().len() > records.len() {
+        rig.capture.records()
+    } else {
+        records
+    };
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(by_source(&records, "app").len(), 3);
+    assert_absent(&records, &[KEY]);
+    let level = |needle: &str| {
+        records
+            .iter()
+            .find(|r| r["line"].as_str().unwrap().contains(needle))
+            .unwrap_or_else(|| panic!("no record containing {needle}"))["level"]
+            .clone()
+    };
+    assert_eq!(level("backend-status"), "info");
+    assert_eq!(level("wizard-progress"), "error");
+    assert_eq!(level("toast:"), "warn");
+
+    let rows = handle.status().sources;
+    assert_eq!(row(&rows, "app").state, SourceState::Active);
+    assert_eq!(row(&rows, "app").records, 3);
+    rig.finish(&handle).await;
+}
+
+/// The sender is never blocked: a burst far past the feed's buffer
+/// returns immediately, and the shipper reports the overflow as ONE
+/// synthetic warning record carrying the dropped count — shipped
+/// even when the level floor would filter a warning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lagged_feed_ships_one_warning_with_the_dropped_count() {
+    let rig = Rig::new("lagged");
+    let tap = RecordTap::new();
+    let handle = manager_logship::spawn(ShipperConfig {
+        app_events: true,
+        tap: Some(tap.clone()),
+        level_floor: ShipLevel::Error,
+        ..rig.config()
+    });
+    wait_until("the shipper to subscribe", || tap.is_active()).await;
+
+    // Let the shipper finish a poll, then burst between two polls.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let burst = RecordTap::CAPACITY + 500;
+    let sending = Instant::now();
+    for n in 0..burst {
+        tap.send(app_event(&format!("telemetry noise {n}")));
+    }
+    assert!(
+        sending.elapsed() < Duration::from_secs(2),
+        "sending must never wait on the shipper"
+    );
+
+    wait_until("the lag to be counted", || {
+        handle.status().dropped_events > 0
+    })
+    .await;
+    rig.wait_for(1).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let records = rig.capture.records();
+    let dropped = handle.status().dropped_events;
+    // The burst itself is info-level and filtered by the error
+    // floor; the loss report ships regardless. One overflow episode
+    // is one record (a poll landing mid-burst can split the burst
+    // into two episodes, so the counts are summed).
+    let warnings = by_source(&records, "shipper");
+    assert!(
+        (1..=2).contains(&warnings.len()),
+        "one warning per overflow episode, not one per record: {records:?}"
+    );
+    let mut reported = 0u64;
+    for w in &warnings {
+        assert_eq!(w["level"], "warn");
+        let line = w["line"].as_str().unwrap();
+        assert!(line.contains("in-process record(s) were dropped"), "{line}");
+        reported += line
+            .split_whitespace()
+            .find_map(|t| t.parse::<u64>().ok())
+            .expect("the warning carries the dropped count");
+    }
+    assert_eq!(reported, dropped);
+    assert!(dropped >= 500, "at least the overflow was dropped: {dropped}");
+    assert!(by_source(&records, "app").is_empty());
+    rig.finish(&handle).await;
+}
+
+/// A disabled tap-fed source is not subscribed at all, and an
+/// enabled one with no feed says so instead of claiming to ship.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_app_source_is_not_subscribed() {
+    let rig = Rig::new("appoff");
+    let tap = RecordTap::new();
+    let handle = manager_logship::spawn(ShipperConfig {
+        app_events: false,
+        tap: Some(tap.clone()),
+        ..rig.config()
+    });
+    wait_until("status rows", || !handle.status().sources.is_empty()).await;
+    assert!(!tap.is_active(), "a disabled source must not subscribe");
+    assert_eq!(
+        row(&handle.status().sources, "app").state,
+        SourceState::Disabled
+    );
+    handle.shutdown();
+
+    let rig2 = Rig::new("appnofeed");
+    let handle2 = manager_logship::spawn(ShipperConfig {
+        app_events: true,
+        tap: None,
+        ..rig2.config()
+    });
+    wait_until("status rows", || !handle2.status().sources.is_empty()).await;
+    assert_eq!(
+        row(&handle2.status().sources, "app").state,
+        SourceState::Unavailable
+    );
+    rig2.finish(&handle2).await;
     rig.finish(&handle).await;
 }

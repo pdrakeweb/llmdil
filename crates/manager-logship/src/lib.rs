@@ -18,6 +18,7 @@ pub mod secrets;
 pub mod shipper;
 pub mod spool;
 pub mod tail;
+pub mod tap;
 
 pub use record::{audit_level, classify_level, ShipLevel, WireRecord};
 pub use redact::Redactor;
@@ -25,6 +26,7 @@ pub use shipper::{
     spawn, ShipperConfig, ShipperHandle, ShipperStatus, SourceState, SourceStatus,
 };
 pub use spool::DEFAULT_SPOOL_CAP_BYTES;
+pub use tap::{RecordTap, TapRecord};
 
 /// The deployment's machine identity when none is configured: the
 /// OS hostname (`COMPUTERNAME` on Windows, `HOSTNAME` elsewhere),

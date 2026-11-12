@@ -25,6 +25,7 @@ use crate::record::{audit_level, classify_level, ShipLevel, WireRecord, WIRE_VER
 use crate::redact::Redactor;
 use crate::spool::{Spool, DEFAULT_SPOOL_CAP_BYTES};
 use crate::tail::FileTail;
+use crate::tap::RecordTap;
 
 /// Bounded queue capacity in records (design D9).
 pub const QUEUE_CAPACITY: usize = 1024;
@@ -57,6 +58,13 @@ pub struct ShipperConfig {
     /// verbatim (through redaction); the level comes from the
     /// record's `result`.
     pub tail_audit: bool,
+    /// S5: app / supervisor events, offered on [`Self::tap`] as
+    /// source `app`.
+    pub app_events: bool,
+    /// The in-process record feed. The shipper subscribes only when
+    /// a tap-fed source is enabled, and accepts only records whose
+    /// source is enabled.
+    pub tap: Option<RecordTap>,
     /// Literal secret values for redaction layer 1.
     pub literal_secrets: Vec<String>,
     pub spool_cap_bytes: u64,
@@ -76,6 +84,8 @@ impl Default for ShipperConfig {
             tail_gateway: true,
             tail_service_manage: true,
             tail_audit: true,
+            app_events: true,
+            tap: None,
             literal_secrets: Vec::new(),
             spool_cap_bytes: DEFAULT_SPOOL_CAP_BYTES,
         }
@@ -93,6 +103,9 @@ pub enum SourceState {
     Disabled,
     /// Enabled, but none of its log files exist (yet).
     FileMissing,
+    /// Enabled, but this process gave the shipper no in-process
+    /// feed to subscribe to.
+    Unavailable,
 }
 
 /// One source's row in [`ShipperStatus::sources`].
@@ -120,6 +133,16 @@ struct PlannedSource {
     source: String,
     enabled: bool,
     files: Vec<TailFile>,
+    /// Fed by the in-process tap (instead of, or as well as, files).
+    tapped: bool,
+}
+
+/// Source name of app / supervisor events on the tap (S5).
+pub const APP_SOURCE: &str = "app";
+
+/// Whether a tap record from `source` is one this config ships.
+fn tap_accepts(config: &ShipperConfig, source: &str) -> bool {
+    source == APP_SOURCE && config.app_events
 }
 
 /// Every source for `config`, in report order.
@@ -133,6 +156,7 @@ fn source_plan(config: &ShipperConfig) -> Vec<PlannedSource> {
             stream: "stdout",
             path: logs.join(file),
         }],
+        tapped: false,
     };
     let pair = |source: &str, enabled: bool, stem: &str| PlannedSource {
         source: source.to_string(),
@@ -145,6 +169,7 @@ fn source_plan(config: &ShipperConfig) -> Vec<PlannedSource> {
                 path: logs.join(format!("{stem}.{stream}.log")),
             })
             .collect(),
+        tapped: false,
     };
     vec![
         single("wizard", config.tail_wizard, "wizard.log"),
@@ -156,6 +181,12 @@ fn source_plan(config: &ShipperConfig) -> Vec<PlannedSource> {
             "service-manage.log",
         ),
         single(AUDIT_SOURCE, config.tail_audit, "admin-api-audit.jsonl"),
+        PlannedSource {
+            source: APP_SOURCE.to_string(),
+            enabled: config.app_events,
+            files: Vec::new(),
+            tapped: true,
+        },
     ]
 }
 
@@ -203,8 +234,10 @@ impl Intake {
         stream: &str,
         level: ShipLevel,
         line: &str,
+        // The shipper's own loss reports ship at every floor.
+        bypass_floor: bool,
     ) {
-        if level.rank() < self.level_floor.rank() {
+        if !bypass_floor && level.rank() < self.level_floor.rank() {
             return;
         }
         let (line, counts) = self.redactor.redact(line);
@@ -249,6 +282,9 @@ pub struct ShipperStatus {
     pub delivered: u64,
     pub dropped_queue: u64,
     pub dropped_spool: u64,
+    /// In-process records lost because the shipper fell behind the
+    /// feed (each episode is also shipped as a warning record).
+    pub dropped_events: u64,
     pub literal_redacted_lines: u64,
     pub pattern_redactions: u64,
     pub last_delivered: Option<String>,
@@ -398,6 +434,14 @@ async fn run_loop(
         }
     }
 
+    // Subscribe to the in-process feed only when a tap-fed source
+    // is enabled: a disabled source is not subscribed.
+    let mut tap_rx = config
+        .tap
+        .as_ref()
+        .filter(|_| plan.iter().any(|s| s.tapped && s.enabled))
+        .map(|tap| tap.subscribe());
+
     let started = intake.started;
     let mut queue: VecDeque<WireRecord> = VecDeque::new();
     let mut batch: Vec<WireRecord> = Vec::new();
@@ -435,11 +479,58 @@ async fn run_loop(
                     &tail.stream,
                     level,
                     &line,
+                    false,
                 );
             }
         }
         if dirty_offsets {
             let _ = spool.save_state();
+        }
+
+        // --- In-process feed: drain what is buffered, at most one
+        // queue's worth per pass. `try_recv` never waits, and the
+        // senders never wait on us: falling behind surfaces here
+        // as `Lagged(n)`, shipped as one warning record.
+        if let Some(rx) = tap_rx.as_mut() {
+            use tokio::sync::broadcast::error::TryRecvError;
+            for _ in 0..QUEUE_CAPACITY {
+                match rx.try_recv() {
+                    Ok(rec) => {
+                        if !tap_accepts(&config, &rec.source) {
+                            continue;
+                        }
+                        let level = rec
+                            .level
+                            .unwrap_or_else(|| source_level(&rec.source, &rec.line));
+                        intake.admit(
+                            &mut spool,
+                            &status,
+                            &mut queue,
+                            &rec.source,
+                            &rec.stream,
+                            level,
+                            &rec.line,
+                            false,
+                        );
+                    }
+                    Err(TryRecvError::Lagged(n)) => {
+                        set_status(&status, |s| s.dropped_events += n);
+                        intake.admit(
+                            &mut spool,
+                            &status,
+                            &mut queue,
+                            "shipper",
+                            "stdout",
+                            ShipLevel::Warn,
+                            &format!(
+                                "shipper: {n} in-process record(s) were dropped because the shipper fell behind the event feed"
+                            ),
+                            true,
+                        );
+                    }
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                }
+            }
         }
 
         // --- Per-source status rows. -----------------------------
@@ -449,8 +540,12 @@ async fn run_loop(
                 source: src.source.clone(),
                 state: if !src.enabled {
                     SourceState::Disabled
-                } else if tails.iter().any(|t| t.source == src.source && t.present) {
+                } else if tails.iter().any(|t| t.source == src.source && t.present)
+                    || (src.tapped && tap_rx.is_some())
+                {
                     SourceState::Active
+                } else if src.files.is_empty() {
+                    SourceState::Unavailable
                 } else {
                     SourceState::FileMissing
                 },
