@@ -3,7 +3,8 @@
 //! Secrets rule (hard): no secret is ever a command-line argument.
 //! Tokens arrive via `LLMDIL_API_TOKEN` / `LLMDIL_API_REFRESH_TOKEN`
 //! or `--token-stdin`; passwords via `LLMDIL_API_PASSWORD` or
-//! `--password-stdin`; enrollment codes via `LLMDIL_ENROLL_CODE` or
+//! `--password-stdin` (a new password for `auth password` via
+//! `LLMDIL_API_NEW_PASSWORD` or `--new-password-stdin`); enrollment codes via `LLMDIL_ENROLL_CODE` or
 //! `--code-stdin`; TOTP codes via `LLMDIL_TOTP_CODE` or
 //! `--totp-stdin`. Only one `--*-stdin` flag per invocation: stdin
 //! is read once, first line, newline trimmed. Tokens are held in
@@ -26,6 +27,10 @@ use serde_json::Value;
 const TOKEN_ENV: &str = "LLMDIL_API_TOKEN";
 const REFRESH_ENV: &str = "LLMDIL_API_REFRESH_TOKEN";
 const PASSWORD_ENV: &str = "LLMDIL_API_PASSWORD";
+const NEW_PASSWORD_ENV: &str = "LLMDIL_API_NEW_PASSWORD";
+/// Printed when the server answers PASSWORD_CHANGE_REQUIRED (SEC-03).
+const PASSWORD_CHANGE_HINT: &str =
+    "password change required: run `llmdil-cli auth password` (this account was reset by an admin)";
 const ENROLL_ENV: &str = "LLMDIL_ENROLL_CODE";
 const TOTP_ENV: &str = "LLMDIL_TOTP_CODE";
 
@@ -214,6 +219,21 @@ enum AuthCommand {
         /// LLMDIL_API_REFRESH_TOKEN
         #[arg(long)]
         token_stdin: bool,
+    },
+    /// Change the signed-in account's password (required after an
+    /// admin reset). Current password from LLMDIL_API_PASSWORD or
+    /// --password-stdin; new password from LLMDIL_API_NEW_PASSWORD or
+    /// --new-password-stdin. The session stays signed in; the
+    /// account's other sessions are revoked.
+    Password {
+        /// Read the current password from stdin instead of
+        /// LLMDIL_API_PASSWORD
+        #[arg(long)]
+        password_stdin: bool,
+        /// Read the new password from stdin instead of
+        /// LLMDIL_API_NEW_PASSWORD
+        #[arg(long)]
+        new_password_stdin: bool,
     },
 }
 
@@ -546,16 +566,15 @@ async fn run_auth(cli: &Cli, auth: &AuthCommand) -> Result<(), ApiError> {
         } => {
             let password = secret_from(*password_stdin, PASSWORD_ENV, "password")?;
             let mut client = public_client(cli)?;
-            match client.login(username, &password, Some(device_name)).await? {
-                LoginOutcome::Pair(pair) => {
-                    println!("{}", serde_json::to_string(&pair).unwrap());
-                }
+            let pair = match client.login(username, &password, Some(device_name)).await? {
+                LoginOutcome::Pair(pair) => pair,
                 LoginOutcome::TotpRequired { challenge_id } => {
                     let code = totp_code(*totp_stdin)?;
-                    let pair = client.totp(&challenge_id, &code).await?;
-                    println!("{}", serde_json::to_string(&pair).unwrap());
+                    client.totp(&challenge_id, &code).await?
                 }
-            }
+            };
+            println!("{}", serde_json::to_string(&pair).unwrap());
+            warn_if_must_change(&pair);
         }
         AuthCommand::Totp {
             challenge_id,
@@ -565,6 +584,19 @@ async fn run_auth(cli: &Cli, auth: &AuthCommand) -> Result<(), ApiError> {
             let mut client = public_client(cli)?;
             let pair = client.totp(challenge_id, &code).await?;
             println!("{}", serde_json::to_string(&pair).unwrap());
+            warn_if_must_change(&pair);
+        }
+        AuthCommand::Password {
+            password_stdin,
+            new_password_stdin,
+        } => {
+            let current = secret_from(*password_stdin, PASSWORD_ENV, "current password")?;
+            let new_password = secret_from(*new_password_stdin, NEW_PASSWORD_ENV, "new password")?;
+            let mut client = authed_client(cli)?;
+            client.change_password(&current, &new_password).await?;
+            eprintln!(
+                "password changed; this session stays signed in, other sessions were revoked"
+            );
         }
         AuthCommand::Me => {
             let mut client = authed_client(cli)?;
@@ -597,6 +629,14 @@ async fn run_auth(cli: &Cli, auth: &AuthCommand) -> Result<(), ApiError> {
         }
     }
     Ok(())
+}
+
+/// After a login whose account is flagged must-change (SEC-03), say
+/// what to do next on stderr (stdout carries the token pair).
+fn warn_if_must_change(pair: &manager_cli::TokenPair) {
+    if pair.must_change_password {
+        eprintln!("{PASSWORD_CHANGE_HINT}");
+    }
 }
 
 /// TOTP code resolution for the login flow: stdin flag, env var,
@@ -720,6 +760,10 @@ async fn main() {
             );
             std::process::exit(0);
         }
+        Err(ApiError::Api(body)) if body.code == "PASSWORD_CHANGE_REQUIRED" => {
+            eprintln!("error: {PASSWORD_CHANGE_HINT}");
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("error: {e}");
             std::process::exit(1);
@@ -739,6 +783,10 @@ fn stdin_secret_count(cli: &Cli) -> usize {
             } => usize::from(*password_stdin) + usize::from(*totp_stdin),
             AuthCommand::Totp { code_stdin, .. } => usize::from(*code_stdin),
             AuthCommand::Refresh { token_stdin } => usize::from(*token_stdin),
+            AuthCommand::Password {
+                password_stdin,
+                new_password_stdin,
+            } => usize::from(*password_stdin) + usize::from(*new_password_stdin),
             _ => 0,
         };
     }

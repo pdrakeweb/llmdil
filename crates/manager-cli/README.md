@@ -36,6 +36,7 @@ written to disk or a config file. Tokens live in memory only.
 | Access token | `LLMDIL_API_TOKEN` | `--token-stdin` |
 | Refresh token | `LLMDIL_API_REFRESH_TOKEN` | (refresh command: `--token-stdin`) |
 | Password | `LLMDIL_API_PASSWORD` | `--password-stdin` |
+| New password (`auth password`) | `LLMDIL_API_NEW_PASSWORD` | `--new-password-stdin` |
 | Enrollment code | `LLMDIL_ENROLL_CODE` | `--code-stdin` |
 | TOTP code | `LLMDIL_TOTP_CODE` | `--totp-stdin` |
 
@@ -105,8 +106,23 @@ ops | op <id> | op-poll <id> | op-abort <id>
 activation | activation-apply [--mode now|drain] [--yes] | activation-history
 auth enroll | auth login --username <u> | auth totp --challenge-id <id>
 auth me | auth logout | auth sessions | auth session-revoke <id> | auth refresh
+auth password
 tui
 ```
+
+After an admin password reset, logging in with the temporary
+password yields a short (15-minute) session that can only change
+the password: every other command fails with `PASSWORD_CHANGE_REQUIRED`
+and the CLI prints `password change required: run llmdil-cli auth
+password`. Change it with the access token from that login:
+
+```
+LLMDIL_API_TOKEN=<access> LLMDIL_API_PASSWORD=<temporary> \
+  llmdil-cli ... auth password --new-password-stdin <<< "$NEW_PASSWORD"
+```
+
+The session stays signed in afterwards; the account's other
+sessions are revoked.
 
 Control commands return a 202 operation record and poll it to
 a terminal state on the API cadence (1 s for the first 10 s,
