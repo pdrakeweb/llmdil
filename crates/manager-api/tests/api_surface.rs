@@ -32,6 +32,7 @@ async fn admin_token(ctx: &Arc<ApiCtx>) -> String {
         must_change_password: false,
         totp_enabled: false,
         recovery_code_hashes: vec![],
+        last_totp_step: None,
         created_ms: manager_api::users::now_ms(),
         updated_ms: manager_api::users::now_ms(),
     };

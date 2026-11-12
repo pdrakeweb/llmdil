@@ -580,7 +580,32 @@ impl AuthService {
         let Some(secret) = base32_decode(&secret_b32) else {
             return false;
         };
-        totp_verify(&secret, code, now_ms() / 1000)
+        // Replay guard (SEC-15): accept only a step after the last
+        // accepted one, checked and recorded under the store's write
+        // lock so two concurrent submissions of one code cannot both
+        // pass. Earliest acceptable step first, so clock skew burns
+        // as few future steps as possible.
+        let steps = totp_matching_steps(&secret, code, now_ms() / 1000);
+        if steps.is_empty() {
+            return false;
+        }
+        let user_id = user.id.clone();
+        self.store
+            .mutate::<_, AuthError>(|f| {
+                let Some(u) = f.users.iter_mut().find(|u| u.id == user_id) else {
+                    return Ok(false);
+                };
+                let after = u.last_totp_step.unwrap_or(i64::MIN);
+                match steps.iter().copied().find(|s| *s > after) {
+                    Some(step) => {
+                        u.last_totp_step = Some(step);
+                        Ok(true)
+                    }
+                    None => Ok(false),
+                }
+            })
+            .await
+            .unwrap_or(false)
     }
 
     // -- sessions -------------------------------------------------------
@@ -955,6 +980,7 @@ impl AuthService {
             must_change_password: false,
             totp_enabled: false,
             recovery_code_hashes: Vec::new(),
+            last_totp_step: None,
             created_ms: now,
             updated_ms: now,
         };
@@ -1236,6 +1262,7 @@ impl AuthService {
             .mutate::<_, AuthError>(|f| {
                 if let Some(u) = f.users.iter_mut().find(|u| u.id == uid) {
                     u.totp_enabled = true;
+                    u.last_totp_step = None;
                     u.recovery_code_hashes = hashes;
                     u.updated_ms = now_ms();
                 }
@@ -1254,6 +1281,7 @@ impl AuthService {
             .mutate::<_, AuthError>(|f| {
                 if let Some(u) = f.users.iter_mut().find(|u| u.id == uid) {
                     u.totp_enabled = false;
+                    u.last_totp_step = None;
                     u.recovery_code_hashes.clear();
                     u.updated_ms = now_ms();
                 }
@@ -1340,9 +1368,25 @@ pub fn totp_at(secret: &[u8], unix_secs: i64) -> u32 {
     binary % 1_000_000
 }
 
+/// The 30 s time-steps (ascending) among previous, current and next whose TOTP value is
+/// `code`; empty for a wrong or non-numeric code. Login uses this with the per-user
+/// last-accepted step to refuse replays (SEC-15).
+pub fn totp_matching_steps(secret: &[u8], code: &str, unix_secs: i64) -> Vec<i64> {
+    // Same acceptance as `totp_verify`.
+    let Ok(code_num) = code.parse::<u32>() else {
+        return Vec::new();
+    };
+    let base = unix_secs.div_euclid(30);
+    [-1i64, 0, 1]
+        .iter()
+        .map(|d| base + d)
+        .filter(|step| totp_at(secret, step * 30) == code_num)
+        .collect()
+}
+
 /// Accept `code` if it matches the previous, current or next 30 s step (±1 step of clock
-/// skew); non-numeric input is rejected. There is no replay tracking: a code stays valid
-/// for its whole window.
+/// skew); non-numeric input is rejected. Stateless: login replay protection lives in
+/// [`AuthService::verify_user_totp`] (SEC-15); enrollment confirmation uses this directly.
 pub fn totp_verify(secret: &[u8], code: &str, unix_secs: i64) -> bool {
     let Ok(code_num) = code.parse::<u32>() else {
         return false;
@@ -1891,6 +1935,80 @@ mod tests {
         assert_eq!(view.username, "dave");
         assert!(svc.validate_bearer(&pair.access_token).await.is_some());
         assert!(svc.redeem_enrollment_code(&code, "pixel").await.is_err());
+    }
+
+    /// SEC-15: an accepted TOTP code cannot be replayed within the
+    /// ±1-step window, nor can a code for an earlier step; the guard
+    /// is persisted on the user and reset by re-enrollment.
+    #[tokio::test]
+    async fn totp_codes_cannot_be_replayed() {
+        let svc = service().await;
+        let user = svc
+            .create_user("ivy", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        let secret = enable_totp(&svc, &user.id).await;
+        let now = now_ms() / 1000;
+        let step = now.div_euclid(30);
+        let fetch = |svc: Arc<AuthService>, id: String| async move {
+            svc.store
+                .read(|f| f.users.iter().find(|u| u.id == id).cloned().unwrap())
+                .await
+        };
+        let current = format!("{:06}", totp_at(&secret, now));
+        let stored = fetch(svc.clone(), user.id.clone()).await;
+        assert!(svc.verify_user_totp(&stored, &current).await);
+        let stored = fetch(svc.clone(), user.id.clone()).await;
+        assert!(stored.last_totp_step.unwrap() >= step);
+        // Same code again: refused.
+        assert!(!svc.verify_user_totp(&stored, &current).await);
+        // The previous step's code (still inside the window): refused.
+        let previous = format!("{:06}", totp_at(&secret, now - 30));
+        if previous != current {
+            assert!(!svc.verify_user_totp(&stored, &previous).await);
+        }
+        // The next step's code is still acceptable once.
+        let next = format!("{:06}", totp_at(&secret, now + 30));
+        if next != current {
+            assert!(svc.verify_user_totp(&stored, &next).await);
+            assert!(!svc.verify_user_totp(&stored, &next).await);
+        }
+        // Over the login flow: a replayed code fails the second stage.
+        svc.store
+            .mutate::<_, AuthError>(|f| {
+                f.users[0].last_totp_step = None;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for expect_ok in [true, false] {
+            let LoginOutcome::TotpRequired { challenge_id } = svc
+                .login("ivy", "a-unique-passphrase", "phone", "10.0.0.1")
+                .await
+                .unwrap()
+            else {
+                panic!("expected a TOTP challenge");
+            };
+            let res = svc
+                .complete_totp_login(&challenge_id, &current, "10.0.0.1")
+                .await;
+            assert_eq!(res.is_ok(), expect_ok);
+        }
+        // Disabling TOTP clears the guard.
+        svc.totp_disable(&user.id).await.unwrap();
+        assert!(fetch(svc.clone(), user.id.clone())
+            .await
+            .last_totp_step
+            .is_none());
+    }
+
+    /// SEC-15: a user record written before `last_totp_step` existed
+    /// still loads, with no replay state.
+    #[test]
+    fn user_without_last_totp_step_deserializes() {
+        let json = r#"{"id":"u","username":"a","password_hash":"h","role":"viewer","created_ms":0,"updated_ms":0}"#;
+        let u: User = serde_json::from_str(json).unwrap();
+        assert!(u.last_totp_step.is_none());
     }
 
     /// SEC-14: API-token use updates `last_used_ms` at most once per

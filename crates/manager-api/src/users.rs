@@ -58,6 +58,12 @@ pub struct User {
     pub recovery_code_hashes: Vec<String>,
     pub created_ms: i64,
     pub updated_ms: i64,
+    /// The 30 s TOTP time-step of the last accepted login code
+    /// (SEC-15). A code for this step or an earlier one is refused,
+    /// so a code cannot be replayed inside the ±1-step window.
+    /// Reset when TOTP is (re-)enrolled or disabled.
+    #[serde(default)]
+    pub last_totp_step: Option<i64>,
 }
 
 /// Role as stored/serialized. Mirrors `manager_app::registry::Role`
@@ -581,6 +587,7 @@ mod tests {
                     must_change_password: false,
                     totp_enabled: false,
                     recovery_code_hashes: vec![],
+                    last_totp_step: None,
                     created_ms: now_ms(),
                     updated_ms: now_ms(),
                 });
