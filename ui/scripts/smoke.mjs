@@ -804,11 +804,20 @@ check(settingsSrc.includes("updateAppConfig("), "Settings wires generic config e
 // never read as shipping.
 check(settingsSrc.includes("data-lr-shipper"), "Settings renders the per-source log shipper block (data-lr-shipper)");
 check(settingsSrc.includes("info.shipper ? logShipperInner(info.shipper)"), "Log receiver card renders the shipper block from the status payload");
-for (const state of ["active", "disabled", "file_missing", "waiting", "unavailable", "not_running"]) {
+for (const state of ["active", "disabled", "file_missing", "waiting", "unavailable", "local_only", "not_running"]) {
   check(new RegExp(`\\b${state}: "`).test(settingsSrc), `Log shipper block words the '${state}' source state`);
 }
 check(/disabled: "off[^"]*not shipped"/.test(settingsSrc), "A disabled log source reads as not shipped");
 check(settingsSrc.includes("data-lr-shipper-pending"), "Log shipper block flags saved settings that await a restart");
+// Every log source has a working switch wired to the config, and a
+// shipper that is on but cannot start says why.
+for (const key of ["wizard", "optimize", "gateway", "service_manage", "audit", "app", "backends"]) {
+  check(new RegExp(`\{ key: "${key}", source: "`).test(settingsSrc), `Log shipper block renders a switch for the '${key}' source`);
+}
+check(settingsSrc.includes('data-lr-source="'), "Log source switches carry their config key (data-lr-source)");
+check(settingsSrc.includes("updateAppConfig({ log_streaming: { sources: { [key]: !on } } })"), "Log source switches save through updateAppConfig");
+check(settingsSrc.includes("data-lr-shipper-note"), "Log shipper block shows why an enabled shipper is not running");
+check(!settingsSrc.includes("the change applies when LLMdil restarts"), "The endpoint flip no longer claims to need an app restart");
 
 check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");
