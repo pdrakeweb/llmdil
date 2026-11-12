@@ -462,7 +462,16 @@ by name, payloads by target id only.
      At enable time the server generates a self-signed cert
      (SANs: machine hostname, LAN IP, Tailscale IP, `prometheus`
      mDNS-style alias where available; 2-year validity, regenerated
-     on demand from the desktop UI). The desktop Remote Access page
+     on demand from the desktop UI). As built (SEC-08): later starts
+     load the stored key and certificate; a new one is generated only
+     when the material is missing, unreadable/corrupt (including
+     `sans.txt`), mismatched (key vs. certificate), or expired /
+     within 30 days of expiry — each branch logged and reported as
+     `cert_source` in the Remote Access status. A changed LAN or
+     Tailscale address never regenerates (pinned clients do not check
+     names); it shows as informational `san_drift` beside the
+     Regenerate button, the only path that changes the key or SANs.
+     rcgen's default validity (to year 4096) is used, not 2 years. The desktop Remote Access page
      shows the cert fingerprint and a QR code encoding
      `{ base_url, cert_sha256 }`; the Android app scans it at
      pairing and pins the fingerprint (TOFU with an out-of-band

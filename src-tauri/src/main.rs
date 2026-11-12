@@ -45,6 +45,9 @@ use manager_app::{registry::Op, AppState, EventSink};
 pub struct ApiServerSlot {
     pub server: std::sync::Mutex<Option<manager_api::ApiServer>>,
     pub note: std::sync::Mutex<Option<String>>,
+    /// Why the listener's certificate is the one it is (SEC-08):
+    /// `CertSource::as_str()` plus the regeneration detail, if any.
+    pub cert: std::sync::Mutex<Option<(&'static str, Option<String>)>>,
 }
 
 /// The auth service shared by the API server and the desktop's
@@ -192,6 +195,7 @@ fn main() {
             app.manage(ApiServerSlot {
                 server: std::sync::Mutex::new(None),
                 note: std::sync::Mutex::new(None),
+                cert: std::sync::Mutex::new(None),
             });
             // The API user store + auth service, shared between the
             // HTTP server and this shell's admin commands.
@@ -318,6 +322,7 @@ fn main() {
                         api_data_dir,
                         auth.inner().0.clone(),
                         admin_api.port,
+                        slot.inner(),
                     )
                     .await;
                     match note {
@@ -369,15 +374,19 @@ fn main() {
 
 /// Start the API on all interfaces with TLS and reconcile the
 /// scoped firewall rule. Shared by app startup and the settings
-/// page's enable action.
+/// page's enable action. The stored certificate is reused (SEC-08);
+/// why it is the one in use is recorded in `slot.cert` for status.
 async fn start_admin_api(
     app_state: Arc<AppState>,
     data_dir: std::path::PathBuf,
     auth: Arc<AuthService>,
     port: u16,
+    slot: &ApiServerSlot,
 ) -> Result<manager_api::ApiServer, String> {
-    let tls = manager_api::tls::ensure_cert(&data_dir, &cert_sans())
+    let load = manager_api::tls::ensure_cert(&data_dir, &cert_sans())
         .map_err(|e| format!("TLS setup failed: {e}"))?;
+    *slot.cert.lock().unwrap() = Some((load.source.as_str(), load.detail.clone()));
+    let tls = load.material;
     let ctx = manager_api::ApiCtx::with_auth(app_state, data_dir, auth);
     let server = manager_api::ApiServer::start_ctx(
         ctx,
@@ -507,6 +516,29 @@ async fn admin_api_get_status(
         manager_api::firewall::FirewallStatus::Unsupported => "unsupported",
         manager_api::firewall::FirewallStatus::Error(_) => "error",
     };
+    // SEC-08: the stored certificate is reused across starts; report
+    // why it is the one in use and (informational, non-blocking) which
+    // current addresses it does not list.
+    let (cert_source, cert_detail) = slot
+        .inner()
+        .cert
+        .lock()
+        .unwrap()
+        .clone()
+        .map(|(s, d)| (Some(s), d))
+        .unwrap_or((None, None));
+    let cert_not_after_ms = manager_api::tls::stored_cert(&data_dir).map(|c| c.not_after_ms);
+    let san_drift: Vec<String> = if cert_not_after_ms.is_some() {
+        let current = tauri::async_runtime::spawn_blocking(cert_sans)
+            .await
+            .map_err(|e| e.to_string())?;
+        manager_api::tls::san_drift(&data_dir, &current)
+            .iter()
+            .map(|ip| ip.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(json!({
         "enabled": enabled,
         "running": running,
@@ -514,6 +546,11 @@ async fn admin_api_get_status(
         "bind": "0.0.0.0",
         "base_url": if running { Value::String(lan_base_url(port)) } else { Value::Null },
         "cert_sha256": manager_api::tls::stored_fingerprint(&data_dir),
+        "cert_source": cert_source,
+        "cert_detail": cert_detail,
+        "cert_not_after_ms": cert_not_after_ms,
+        "san_drift": !san_drift.is_empty(),
+        "san_drift_ips": san_drift,
         "firewall": firewall,
         "note": note,
         "user_count": users,
@@ -545,7 +582,15 @@ async fn admin_api_set_enabled(
     .map_err(|e| e.to_string())?;
     if enabled {
         let data_dir = st.data_dir().to_path_buf();
-        match start_admin_api(st.clone(), data_dir, auth.inner().0.clone(), port).await {
+        match start_admin_api(
+            st.clone(),
+            data_dir,
+            auth.inner().0.clone(),
+            port,
+            slot.inner(),
+        )
+        .await
+        {
             Ok(server) => {
                 *slot.inner().server.lock().unwrap() = Some(server);
                 *slot.inner().note.lock().unwrap() = None;
@@ -700,17 +745,29 @@ async fn admin_api_regenerate_cert(
     let st = state.inner().clone();
     let (_, port) = admin_api_settings(&st, &app).await?;
     let data_dir = st.data_dir().to_path_buf();
+    // The only path that changes the key or the SANs (SEC-08): the
+    // current addresses are taken here, at the operator's request.
     manager_api::tls::regenerate(&data_dir, &cert_sans())
         .map_err(|e| format!("certificate regeneration failed: {e}"))?;
+    *slot.inner().cert.lock().unwrap() = Some((
+        manager_api::tls::CertSource::RegeneratedByOperator.as_str(),
+        None,
+    ));
     let running = slot.inner().server.lock().unwrap().is_some();
     if running {
         let old = slot.inner().server.lock().unwrap().take();
         if let Some(old) = old {
             old.shutdown().await;
         }
-        match start_admin_api(st, data_dir, auth.inner().0.clone(), port).await {
+        match start_admin_api(st, data_dir, auth.inner().0.clone(), port, slot.inner()).await {
             Ok(server) => {
                 *slot.inner().server.lock().unwrap() = Some(server);
+                // The restart loaded the material regenerated above;
+                // keep reporting why it changed.
+                *slot.inner().cert.lock().unwrap() = Some((
+                    manager_api::tls::CertSource::RegeneratedByOperator.as_str(),
+                    None,
+                ));
             }
             Err(e) => {
                 *slot.inner().note.lock().unwrap() = Some(e.clone());
