@@ -320,7 +320,10 @@ any user exists. Rules:
 ### 3.7 TOTP (optional second factor)
 
 Recommendation: **implement TOTP as an optional per-user second
-factor in v1, not required.** Enrollment: user scans a QR (secret
+factor in v1, not required.** Enrollment (as built: from a signed-in
+session, never an API token, with the account password as step-up
+for first enrollment and re-enrollment alike — SEC-04; failures count
+toward the lockout): user scans a QR (secret
 generated server-side and stored in the OS credential store —
 never in the user store file, as built; see §4), 8 single-use
 recovery codes shown once and stored hashed. When enabled for a

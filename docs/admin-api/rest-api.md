@@ -1347,6 +1347,12 @@ the user changes the password:
   clears the flag; the calling session stays valid (and becomes
   refreshable) and the account's other sessions are revoked.
 
+**TOTP enrollment step-up (SEC-04).** `POST /auth/totp/enroll` takes
+`{ "password": "<account password>" }` for first enrollment as well as
+for replacing a live factor; a missing or wrong password answers 401
+`INVALID_CREDENTIALS` and counts toward the account lockout. A
+must-change account gets `PASSWORD_CHANGE_REQUIRED` first.
+
 ### 6.18 Measurements
 
 The Optimize measurement store (predicted-throughput design §11):

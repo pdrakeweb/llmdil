@@ -400,7 +400,7 @@ impl AuthService {
     }
 
     /// Record a failed step-up password check (password change, TOTP
-    /// disable, TOTP re-enrollment) against the account lockout
+    /// disable, TOTP enrollment) against the account lockout
     /// (finding SEC-04): these
     /// endpoints otherwise offered unlimited password guessing to any
     /// holder of a bearer token.
@@ -1239,10 +1239,14 @@ impl AuthService {
     /// a re-enrollment can never overwrite or invalidate a live
     /// factor before the replacement is proven.
     ///
-    /// Replacing a live factor additionally requires step-up:
-    /// when the user already has TOTP enabled, `step_up_password`
-    /// must be the account password (the same step-up
-    /// `totp_disable` requires). First enrollment needs none.
+    /// Every enrollment — first or replacing a live factor — requires
+    /// step-up: `step_up_password` must be the account password (the
+    /// same step-up `totp_disable` requires). A missing or wrong
+    /// password counts toward the account lockout, and a locked
+    /// account is refused (SEC-04): a stolen session alone must not be
+    /// able to bind a second factor only its holder knows. An account
+    /// that must change its password is refused before the step-up
+    /// (SEC-03).
     pub async fn totp_begin_enrollment(
         &self,
         user_id: &str,
@@ -1254,17 +1258,18 @@ impl AuthService {
             .read(|f| f.users.iter().find(|u| u.id == user_id).cloned())
             .await
             .ok_or_else(|| AuthError::NotFound("user".into()))?;
-        if user.totp_enabled {
-            let ok = match step_up_password {
-                Some(p) if !self.is_locked(&user.username.to_lowercase()).await => {
-                    verify_password_async(p, &user.password_hash).await
-                }
-                _ => false,
-            };
-            if !ok {
-                self.record_step_up_failure(&user.username).await;
-                return Err(AuthError::InvalidCredentials);
+        if user.must_change_password {
+            return Err(AuthError::PasswordChangeRequired);
+        }
+        let ok = match step_up_password {
+            Some(p) if !self.is_locked(&user.username.to_lowercase()).await => {
+                verify_password_async(p, &user.password_hash).await
             }
+            _ => false,
+        };
+        if !ok {
+            self.record_step_up_failure(&user.username).await;
+            return Err(AuthError::InvalidCredentials);
         }
         let mut secret_bytes = [0u8; 20];
         for i in 0..5 {
@@ -1823,7 +1828,7 @@ mod tests {
             .await
             .unwrap();
         let (secret_b32, uri) = svc
-            .totp_begin_enrollment(&user.id, "carol", None)
+            .totp_begin_enrollment(&user.id, "carol", Some("a-unique-passphrase"))
             .await
             .unwrap();
         assert!(uri.starts_with("otpauth://totp/LLMdil:carol"));
@@ -1880,7 +1885,7 @@ mod tests {
             .await
             .unwrap();
         let (old_b32, _) = svc
-            .totp_begin_enrollment(&user.id, "erin", None)
+            .totp_begin_enrollment(&user.id, "erin", Some("a-unique-passphrase"))
             .await
             .unwrap();
         let old_secret = base32_decode(&old_b32).unwrap();
@@ -1930,6 +1935,60 @@ mod tests {
         );
     }
 
+    /// SEC-04: first enrollment needs the password step-up too; a
+    /// missing or wrong password counts toward the lockout, and a
+    /// must-change account is refused before any step-up.
+    #[tokio::test]
+    async fn first_totp_enrollment_requires_step_up() {
+        let svc = service().await;
+        let user = svc
+            .create_user("gwen", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.totp_begin_enrollment(&user.id, "gwen", None)
+                .await
+                .unwrap_err(),
+            AuthError::InvalidCredentials
+        );
+        assert_eq!(svc.lockouts.lock().await["gwen"].failures.len(), 1);
+        for _ in 1..LOCK_THRESHOLD {
+            assert_eq!(
+                svc.totp_begin_enrollment(&user.id, "gwen", Some("not-the-password"))
+                    .await
+                    .unwrap_err(),
+                AuthError::InvalidCredentials
+            );
+        }
+        assert!(svc.is_locked("gwen").await);
+        // Locked: even the right password is refused, and nothing is pending.
+        assert!(svc
+            .totp_begin_enrollment(&user.id, "gwen", Some("a-unique-passphrase"))
+            .await
+            .is_err());
+        assert!(!svc.pending_totp.lock().await.contains_key(&user.id));
+        svc.lockouts.lock().await.clear();
+        svc.totp_begin_enrollment(&user.id, "gwen", Some("a-unique-passphrase"))
+            .await
+            .unwrap();
+        assert!(svc.pending_totp.lock().await.contains_key(&user.id));
+
+        // A must-change account gets PasswordChangeRequired first, and
+        // the attempt is not a step-up failure.
+        let flagged = svc
+            .create_user("hal", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        svc.admin_reset_password(&flagged.id).await.unwrap();
+        assert_eq!(
+            svc.totp_begin_enrollment(&flagged.id, "hal", Some("whatever"))
+                .await
+                .unwrap_err(),
+            AuthError::PasswordChangeRequired
+        );
+        assert!(!svc.lockouts.lock().await.contains_key("hal"));
+    }
+
     #[tokio::test]
     async fn totp_pending_enrollment_expires() {
         // Code-review B-6: an unconfirmed enrollment expires and
@@ -1940,7 +1999,7 @@ mod tests {
             .await
             .unwrap();
         let (secret_b32, _) = svc
-            .totp_begin_enrollment(&user.id, "frank", None)
+            .totp_begin_enrollment(&user.id, "frank", Some("a-unique-passphrase"))
             .await
             .unwrap();
         assert!(svc.creds.read(&totp_target(&user.id)).await.is_none());

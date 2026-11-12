@@ -871,17 +871,20 @@ pub async fn handle_revoke_session(
     axum::Json(json!({ "ok": true })).into_response()
 }
 
-/// Optional body of `POST /api/v1/auth/totp/enroll`.
+/// Body of `POST /api/v1/auth/totp/enroll`. The body and the field stay
+/// syntactically optional so a missing password is an
+/// `INVALID_CREDENTIALS` step-up failure counted toward the lockout,
+/// not a 400 that would escape it.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct TotpEnrollBody {
-    /// Step-up for replacing a live TOTP factor (code-review B-6):
-    /// the account password. Absent/ignored for first enrollment.
+    /// Step-up: the account password, required for first enrollment
+    /// (SEC-04) and for replacing a live factor (code-review B-6).
     pub password: Option<String>,
 }
 
 /// POST /api/v1/auth/totp/enroll: start (re-)enrollment, returning the secret and otpauth
-/// URI. Session-only; replacing a live factor needs the password (code-review B-6).
+/// URI. Session-only; always needs the account password as step-up (SEC-04, B-6).
 pub async fn handle_totp_enroll(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(p): axum::Extension<Principal>,

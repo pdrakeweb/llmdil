@@ -323,16 +323,29 @@ async fn api_tokens_cannot_use_account_self_service() {
         let st = status(&router, "POST", path, Some(&api_token), Some(body)).await;
         assert_eq!(st, StatusCode::FORBIDDEN, "API token on {path}");
     }
-    // The owner's session can still begin enrollment.
+    // The owner's session can still begin enrollment — with the
+    // password step-up, which first enrollment needs too (SEC-04).
     let st = status(
         &router,
         "POST",
         "/api/v1/auth/totp/enroll",
         Some(&tokens[3]),
-        Some("{}"),
+        Some(r#"{"password":"a-unique-passphrase"}"#),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
+    // Without it, or with a wrong one: 401.
+    for body in ["{}", r#"{"password":"not-the-password"}"#] {
+        let st = status(
+            &router,
+            "POST",
+            "/api/v1/auth/totp/enroll",
+            Some(&tokens[3]),
+            Some(body),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "body {body}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
