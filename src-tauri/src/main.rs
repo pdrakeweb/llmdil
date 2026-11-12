@@ -149,7 +149,13 @@ fn main() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();
                 let slot = app.state::<ApiServerSlot>();
-                if slot.inner().server.lock().map(|s| s.is_some()).unwrap_or(false) {
+                if slot
+                    .inner()
+                    .server
+                    .lock()
+                    .map(|s| s.is_some())
+                    .unwrap_or(false)
+                {
                     api.prevent_close();
                     let _ = window.hide();
                 }
@@ -189,15 +195,16 @@ fn main() {
             });
             // The API user store + auth service, shared between the
             // HTTP server and this shell's admin commands.
-            let users = match tauri::async_runtime::block_on(manager_api::UserStore::load(
-                &api_data_dir,
-            )) {
-                Ok(store) => store,
-                Err(e) => {
-                    eprintln!("admin api: user store failed to load ({e}); using an empty store");
-                    manager_api::UserStore::in_memory()
-                }
-            };
+            let users =
+                match tauri::async_runtime::block_on(manager_api::UserStore::load(&api_data_dir)) {
+                    Ok(store) => store,
+                    Err(e) => {
+                        eprintln!(
+                            "admin api: user store failed to load ({e}); using an empty store"
+                        );
+                        manager_api::UserStore::in_memory()
+                    }
+                };
             let creds: Arc<dyn CredentialStore> = Arc::new(WizardCredentialStore);
             let auth = AuthService::new(users, creds);
             app.manage(AdminAuth(auth.clone()));
@@ -442,13 +449,9 @@ fn tailscale_ip() -> Option<std::net::IpAddr> {
     text.lines().next()?.trim().parse().ok()
 }
 
-
 /// The current `admin_api` settings, read through the app's own
 /// config operation.
-async fn admin_api_settings(
-    st: &Arc<AppState>,
-    app: &AppHandle,
-) -> Result<(bool, u16), String> {
+async fn admin_api_settings(st: &Arc<AppState>, app: &AppHandle) -> Result<(bool, u16), String> {
     let sink: Arc<dyn EventSink> = Arc::new(TauriSink(app.clone()));
     let cfg = manager_app::registry::dispatch(st, &sink, Op::GetConfig, json!({}))
         .await
@@ -483,15 +486,20 @@ async fn admin_api_get_status(
     let data_dir = state.inner().data_dir().to_path_buf();
     let running = slot.inner().server.lock().unwrap().is_some();
     let note = slot.inner().note.lock().unwrap().clone();
-    let (users, admins) = auth.inner().0.store().read(|f| {
-        (
-            f.users.len(),
-            f.users
-                .iter()
-                .filter(|u| u.role == RoleName::Admin && !u.disabled)
-                .count(),
-        )
-    }).await;
+    let (users, admins) = auth
+        .inner()
+        .0
+        .store()
+        .read(|f| {
+            (
+                f.users.len(),
+                f.users
+                    .iter()
+                    .filter(|u| u.role == RoleName::Admin && !u.disabled)
+                    .count(),
+            )
+        })
+        .await;
     let firewall = match manager_api::firewall::status(port).await {
         manager_api::firewall::FirewallStatus::Ok => "ok",
         manager_api::firewall::FirewallStatus::Missing => "missing",
@@ -553,17 +561,14 @@ async fn admin_api_set_enabled(
             server.shutdown().await;
         }
         if let Err(e) = manager_api::firewall::remove(port).await {
-            *slot.inner().note.lock().unwrap() =
-                Some(format!("firewall rule removal failed: {e}"));
+            *slot.inner().note.lock().unwrap() = Some(format!("firewall rule removal failed: {e}"));
         }
     }
     admin_api_get_status(app, state, slot, auth).await
 }
 
 #[tauri::command]
-async fn admin_api_list_users(
-    auth: State<'_, AdminAuth>,
-) -> Result<Value, String> {
+async fn admin_api_list_users(auth: State<'_, AdminAuth>) -> Result<Value, String> {
     let users = auth
         .inner()
         .0
@@ -571,7 +576,10 @@ async fn admin_api_list_users(
         .read(|f| {
             f.users
                 .iter()
-                .map(|u| serde_json::to_value(manager_api::auth::UserView::from(u)).unwrap_or(Value::Null))
+                .map(|u| {
+                    serde_json::to_value(manager_api::auth::UserView::from(u))
+                        .unwrap_or(Value::Null)
+                })
                 .collect::<Vec<_>>()
         })
         .await;
@@ -585,8 +593,7 @@ async fn admin_api_create_user(
     password: String,
     role: String,
 ) -> Result<Value, String> {
-    let role = RoleName::parse(&role)
-        .ok_or_else(|| format!("unknown role `{role}`"))?;
+    let role = RoleName::parse(&role).ok_or_else(|| format!("unknown role `{role}`"))?;
     let view = auth
         .inner()
         .0
@@ -604,9 +611,7 @@ async fn admin_api_update_user(
     disabled: Option<bool>,
 ) -> Result<Value, String> {
     let role = match role {
-        Some(r) => Some(
-            RoleName::parse(&r).ok_or_else(|| format!("unknown role `{r}`"))?,
-        ),
+        Some(r) => Some(RoleName::parse(&r).ok_or_else(|| format!("unknown role `{r}`"))?),
         None => None,
     };
     let view = auth
@@ -619,10 +624,7 @@ async fn admin_api_update_user(
 }
 
 #[tauri::command]
-async fn admin_api_delete_user(
-    auth: State<'_, AdminAuth>,
-    id: String,
-) -> Result<Value, String> {
+async fn admin_api_delete_user(auth: State<'_, AdminAuth>, id: String) -> Result<Value, String> {
     // The desktop operator is the local administrator; the actor id
     // is a sentinel that is never a user id, so the self-delete
     // guard cannot trip here — the last-admin guard still applies.
@@ -635,10 +637,7 @@ async fn admin_api_delete_user(
 }
 
 #[tauri::command]
-async fn admin_api_reset_password(
-    auth: State<'_, AdminAuth>,
-    id: String,
-) -> Result<Value, String> {
+async fn admin_api_reset_password(auth: State<'_, AdminAuth>, id: String) -> Result<Value, String> {
     let temp = auth
         .inner()
         .0
