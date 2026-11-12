@@ -8368,32 +8368,71 @@ const LOG_SOURCE_STATE_TEXT: Record<string, string> = {
   file_missing: "on, but its log file does not exist yet",
   waiting: "on, nothing captured yet",
   unavailable: "on, but no event feed in this process",
-  not_running: "on in config — shipper not running",
+  local_only: "on, but held: ships only to a local (loopback) endpoint",
+  not_running: "on — shipper not running",
 };
 
+/** The log-streaming source switches, in card order: the key under
+ *  `log_streaming.sources` in the config, and the source name the
+ *  shipper reports (and stamps on the wire). */
+const LOG_SOURCE_SWITCHES: { key: string; source: string; tip: string }[] = [
+  { key: "wizard", source: "wizard", tip: "Setup wizard step output (logs/wizard.log)." },
+  { key: "optimize", source: "optimize", tip: "Optimize pipeline output (logs/optimize.log)." },
+  { key: "gateway", source: "gateway", tip: "The gateway's stdout and stderr (logs/gateway.stdout.log, logs/gateway.stderr.log)." },
+  { key: "service_manage", source: "service-manage", tip: "The elevated service helper's outcomes (logs/service-manage.log)." },
+  { key: "audit", source: "audit", tip: "The Admin API audit log (logs/admin-api-audit.jsonl). Records carry usernames and source addresses, so this source ships only when the endpoint is on this machine." },
+  { key: "app", source: "app", tip: "App events: operation events and backend, gateway and activation state changes." },
+  { key: "backends", source: "backends", tip: "Each backend's own output, as backend:<id>. Off by default: model servers are verbose. One switch for every backend." },
+];
+
+function logSourceStateText(state: string, records: number): string {
+  return `${LOG_SOURCE_STATE_TEXT[state] ?? state}${records > 0 ? ` · ${records} record${records === 1 ? "" : "s"}` : ""}`;
+}
+
 /** The Log shipper block under the Log receiver card: the shipper's
- *  state and one row per source, so a source that is toggled on but
- *  not actually shipping (file missing, shipper not running) reads
- *  as exactly that. Source toggles live in config.json and are read
- *  when the app starts. */
+ *  state, then one row per source with its switch and what it is
+ *  actually doing — so a source that is on but not shipping (file
+ *  missing, held, shipper not running) reads as exactly that. A
+ *  switch saves `log_streaming.sources` through update_config and
+ *  the shipper restarts with it at once; nothing waits for an app
+ *  restart. */
 function logShipperInner(shipper: LogShipperInfo): string {
   const summary = shipper.running
     ? `${shipper.state} · ${shipper.delivered ?? 0} delivered · ${shipper.queued ?? 0} queued`
-    : "not running";
+    : (shipper.configured?.enabled ? "not running" : "off (log_streaming.enabled is false)");
   const dropped = (shipper.dropped_queue ?? 0) + (shipper.dropped_spool ?? 0) + (shipper.dropped_events ?? 0);
-  const rows: SettingsRow[] = [
+  const head: SettingsRow[] = [
     { key: "Shipper", value: summary },
     ...(dropped > 0 ? [{ key: "Dropped", value: `${shipper.dropped_queue ?? 0} queue · ${shipper.dropped_spool ?? 0} spool · ${shipper.dropped_events ?? 0} events` } as SettingsRow] : []),
-    ...shipper.sources.map((s) => ({
-      key: s.source,
-      value: `${LOG_SOURCE_STATE_TEXT[s.state] ?? s.state}${s.records > 0 ? ` · ${s.records} record${s.records === 1 ? "" : "s"}` : ""}`,
-    })),
   ];
-  const pending = shipper.restart_pending
-    ? `<div data-lr-shipper-pending style="font-size:12px;color:var(--warn);margin-top:6px">Saved log-streaming settings differ from what the shipper started with. They apply when LLMdil restarts.</div>`
+  const rowOf = (source: string) => shipper.sources.find((r) => r.source === source);
+  const perBackend = shipper.sources.filter((r) => r.source.startsWith("backend:"));
+  const configured = shipper.configured?.sources;
+  const switchRows = LOG_SOURCE_SWITCHES.map((sw) => {
+    const row = rowOf(sw.source);
+    // Per-backend logs report one row per backend (listed below);
+    // the switch row itself says only whether the source is on.
+    const stateText = row
+      ? logSourceStateText(row.state, row.records)
+      : (sw.source === "backends" && perBackend.length > 0 ? `on — ${perBackend.length} backend${perBackend.length === 1 ? "" : "s"} below` : "");
+    const on = configured ? configured[sw.key] === true : (row ? row.state !== "disabled" : false);
+    const control = configured
+      ? enableSwitch({ on, name: `Log source ${sw.source}`, attrs: `data-lr-source="${esc(sw.key)}"` })
+      : "";
+    return `<div style="display:flex;justify-content:space-between;gap:16px;align-items:center"><span class="k">${esc(sw.source)}<span class="info-tip" title="${esc(sw.tip)}">${icon("info")}</span></span><span class="v" style="font-size:12px;text-align:right;display:inline-flex;align-items:center;gap:10px"><span data-lr-source-state="${esc(sw.key)}">${esc(stateText)}</span>${control}</span></div>`;
+  }).join("");
+  const backendRows: SettingsRow[] = perBackend.map((r) => ({ key: r.source, value: logSourceStateText(r.state, r.records) }));
+  const note = shipper.note
+    ? `<div data-lr-shipper-note style="font-size:12px;color:var(--err);margin-top:6px">Log streaming is on but the shipper is not running: ${esc(shipper.note)}</div>`
     : "";
-  return `<div data-lr-shipper style="font-size:12px;color:var(--text2);margin-top:16px">Log shipper<span class="info-tip" title="One row per log-streaming source. Only a source marked shipping is being sent to the receiver. Source toggles are the log_streaming.sources section of config.json and are read when the app starts.">${icon("info")}</span></div>
-    ${settingsRows(rows)}
+  const pending = shipper.restart_pending
+    ? `<div data-lr-shipper-pending style="font-size:12px;color:var(--warn);margin-top:6px">Saved log-streaming settings differ from what the shipper is running with. Restart LLMdil to apply them.</div>`
+    : "";
+  return `<div data-lr-shipper style="font-size:12px;color:var(--text2);margin-top:16px">Log shipper<span class="info-tip" title="One row per log-streaming source. Only a source marked shipping is being sent to the receiver. A switch saves the source's setting and the shipper restarts with it at once; lines already read are kept and delivered. Plain http:// is accepted only for an endpoint on this machine.">${icon("info")}</span></div>
+    ${settingsRows(head)}
+    ${note}
+    <div class="kv" style="gap:10px;margin-top:10px">${switchRows}</div>
+    ${backendRows.length ? `<div style="margin-top:10px">${settingsRows(backendRows)}</div>` : ""}
     ${pending}`;
 }
 
@@ -8401,8 +8440,8 @@ function logShipperInner(shipper: LogShipperInfo): string {
  *  of the Prometheus-local log receiver service (bundled in the
  *  installer beside the app) and its three deliberate actions —
  *  Deploy/Repair and Remove run the receiver's own subcommands
- *  elevated; Flip endpoint is a separate config save that applies
- *  on restart. A read token generated by the deploy that just ran
+ *  elevated; Flip endpoint is a separate config save, and the
+ *  shipper restarts onto the new endpoint at once. A read token generated by the deploy that just ran
  *  shows once here, for Secure Vault filing. */
 function logReceiverInner(
   lrR: { data: LogReceiverInfo; error?: string; live: boolean },
@@ -8432,7 +8471,7 @@ function logReceiverInner(
     ? ""
     : `<button class="btn" data-lr-flip ${info.registered ? "" : "disabled"}>Flip endpoint to local receiver</button>`;
   const shipperHtml = info.shipper ? logShipperInner(info.shipper) : "";
-  return `<div style="font-size:12px;color:var(--text2);margin-top:16px">Log receiver<span class="info-tip" title="The log-streaming receiver runs on this machine as its own auto-start Windows service (LocalService). Ingest is on 127.0.0.1:8473; reads are served only on the machine's Tailscale address (port 8474, read-token gated). Deploy seeds its token files from the same Credential Manager ingest token the shipper uses, registers the service, and adds the firewall rule — one UAC prompt. Flipping the endpoint is separate and applies when the app restarts.">${icon("info")}</span></div>
+  return `<div style="font-size:12px;color:var(--text2);margin-top:16px">Log receiver<span class="info-tip" title="The log-streaming receiver runs on this machine as its own auto-start Windows service (LocalService). Ingest is on 127.0.0.1:8473; reads are served only on the machine's Tailscale address (port 8474, read-token gated). Deploy seeds its token files from the same Credential Manager ingest token the shipper uses, registers the service, and adds the firewall rule — one UAC prompt. Flipping the endpoint is separate; the shipper restarts onto it at once.">${icon("info")}</span></div>
     ${settingsRows(rows)}
     <div class="card-actions" style="margin-top:8px">${deployBtn}${removeBtn}${flipBtn}</div>
     ${shipperHtml}
@@ -9289,9 +9328,22 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       return;
     }
 
+    const lrSource = t.closest("[data-lr-source]") as HTMLButtonElement | null;
+    if (lrSource) {
+      const key = lrSource.getAttribute("data-lr-source") ?? "";
+      const on = lrSource.getAttribute("aria-checked") === "true";
+      lrSource.disabled = true;
+      const r = await updateAppConfig({ log_streaming: { sources: { [key]: !on } } });
+      if (disposed) return;
+      if (r.error) setMsg(`Log source change not saved: ${r.error}`, true);
+      else setMsg(`Log source ${key} ${on ? "off" : "on"} — saved and applied.`);
+      await load();
+      return;
+    }
+
     const lrFlip = t.closest("[data-lr-flip]") as HTMLButtonElement | null;
     if (lrFlip) {
-      if (!confirm("Set the log streaming endpoint to the local receiver (http://127.0.0.1:8473)? config.json is backed up first; the change applies when LLMdil restarts.")) return;
+      if (!confirm("Set the log streaming endpoint to the local receiver (http://127.0.0.1:8473)? config.json is backed up first, and the shipper restarts onto the new endpoint at once.")) return;
       lrFlip.disabled = true;
       const r = await logReceiverFlipEndpoint();
       if (disposed) return;
@@ -9302,7 +9354,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       }
       setMsg(r.data.already
         ? "The endpoint already points at the local receiver."
-        : `Endpoint set to ${r.data.endpoint} (backup: ${r.data.backup ?? "none"}). Restart LLMdil to apply.`);
+        : `Endpoint set to ${r.data.endpoint} (backup: ${r.data.backup ?? "none"}). The shipper now uses it.`);
       await load();
       return;
     }

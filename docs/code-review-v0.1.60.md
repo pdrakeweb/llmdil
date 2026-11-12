@@ -72,7 +72,7 @@ Runner-up Majors worth triage next: the Admin API TLS listener blocked by one id
 
 **SEC-15. TOTP codes replayable within the ±1-step window.** `auth.rs:1111-1119`. **Deferred** (hardening; small, but adds per-user state worth designing with SEC-03).
 
-**SEC-16. Log-streaming endpoint may be plain `http://`.** `crates/manager-logship/src/shipper.rs:437-445`; no scheme validation on `log_streaming.endpoint`. **Needs Pete's decision**: refusing non-loopback `http://` changes accepted config values.
+**SEC-16. Log-streaming endpoint may be plain `http://`.** `crates/manager-logship/src/shipper.rs:437-445`; no scheme validation on `log_streaming.endpoint`. **Decided (Nov 12, 2026): refuse.** Fixed after this review: plain `http://` is accepted only for a loopback endpoint; the shipper does not start otherwise, and says why on the Log receiver card (`crates/manager-logship/src/endpoint.rs`, docs/log-streaming.md "Endpoint policy"). The config value is still accepted and saved. Tests: `non_loopback_http_is_refused`, `non_loopback_http_endpoint_is_refused`, `saved_settings_apply_live_and_a_plain_http_endpoint_is_refused`.
 
 ### Nits
 
@@ -257,7 +257,7 @@ All other invoke argument keys (backend action family, `backend_add`/preview, mo
 1. **SEC-03** — enforce `must_change_password` (new `PASSWORD_CHANGE_REQUIRED` 403 in the API contract; CLI/UI must route to change-password after a reset).
 2. **SEC-04 (remainder)** — require password step-up for first TOTP enrollment (client flow change).
 3. **SEC-08** — stop regenerating the TLS certificate on SAN drift at startup; refresh SANs only via Regenerate.
-4. **SEC-16** — refuse non-loopback `http://` log-streaming endpoints.
+4. ~~**SEC-16** — refuse non-loopback `http://` log-streaming endpoints.~~ Decided and fixed (see SEC-16 above).
 5. **PS-4** — how wizard steps should persist config edits (return edits to the app vs. a locked save callback; fail the step instead of saving a snapshot over an unloadable file).
 6. **PS-5 (remainder)** — derive MCP local-process specs from `AppConfig.mcp` (exposure → mode mapping).
 7. **PS-6 (remainder) / PS-10** — journal rollback on a failed save, and which fields activation cancel compares/restores.

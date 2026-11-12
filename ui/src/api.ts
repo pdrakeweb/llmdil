@@ -2908,7 +2908,8 @@ export interface LogReceiverInfo {
 /** One log-streaming source's row: `active` (tailed or subscribed,
  *  input exists), `disabled` (toggled off — not shipping),
  *  `file_missing` (enabled, its log file does not exist),
- *  `waiting` (a backend with nothing captured yet), `unavailable`
+ *  `waiting` (a backend with nothing captured yet), `local_only`
+ *  (on, but held: ships only to a loopback endpoint), `unavailable`
  *  (enabled, no in-process feed), `not_running` (enabled in the
  *  config, but the shipper itself is not running). */
 export interface LogShipperSource {
@@ -2924,9 +2925,16 @@ export interface LogShipperInfo {
   running: boolean;
   /** starting | connected | spooling | not_running */
   state: string;
-  /** A saved source toggle (or the master switch) differs from what
-   *  the running shipper started with; it applies at restart. */
+  /** A saved setting still differs from what the running shipper
+   *  started with. Saved settings apply as they are saved, so this
+   *  is normally false. */
   restart_pending: boolean;
+  /** Why streaming is on but no shipper is running (refused
+   *  endpoint, missing token, …); null otherwise. */
+  note?: string | null;
+  /** The saved switches, for the card's editor: the master switch
+   *  and each key of `log_streaming.sources`. */
+  configured?: { enabled: boolean; sources: Record<string, boolean> };
   queued?: number;
   spooled_bytes?: number;
   delivered?: number;

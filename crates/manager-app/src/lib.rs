@@ -376,10 +376,14 @@ pub struct AppState {
     /// loaded from the data dir on first use, appended by the
     /// recorder loop, read by the history query op.
     gpu_history: OnceCell<std::sync::Mutex<gpu_history::GpuHistoryCell>>,
-    /// The log-streaming shipper (log-streaming design), started
-    /// once after config load when the feature is enabled; see
+    /// The log-streaming shipper (log-streaming design) and what it
+    /// was started with; started after config load when the feature
+    /// is enabled and restarted when its settings are saved. See
     /// [`logship`].
-    logship: OnceCell<Arc<manager_logship::ShipperHandle>>,
+    logship: std::sync::Mutex<logship::LogshipSlot>,
+    /// Serializes [`logship::apply_log_streaming`]: one start / stop /
+    /// restart of the shipper at a time.
+    logship_apply: Mutex<()>,
     /// The shipper's in-process record feed (app events, process-mode
     /// backend output). Exists from startup so sinks can be wrapped
     /// before the shipper starts; sending is a no-op until a shipper
@@ -669,7 +673,8 @@ impl AppState {
             telemetry: OnceCell::new(),
             telemetry_poller: OnceCell::new(),
             gpu_history: OnceCell::new(),
-            logship: OnceCell::new(),
+            logship: std::sync::Mutex::new(logship::LogshipSlot::default()),
+            logship_apply: Mutex::new(()),
             logship_tap: manager_logship::RecordTap::new(),
             wizard_install: OnceCell::new(),
             wizard_audit: OnceCell::new(),
@@ -1670,6 +1675,10 @@ pub async fn op_update_config(
     manager_config::save(&new_cfg, &state.config_path)
         .map_err(ApiError::from)?;
     *cfg = new_cfg;
+    drop(cfg);
+    // Saved log-streaming settings apply now, not at the next start
+    // (a no-op unless they changed).
+    logship::apply_log_streaming(state).await;
     Ok(json!({ "ok": true, "persisted": true }))
 }
 
