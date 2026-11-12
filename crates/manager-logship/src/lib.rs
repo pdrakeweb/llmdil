@@ -24,9 +24,7 @@ pub mod tap;
 
 pub use record::{audit_level, classify_level, ShipLevel, WireRecord};
 pub use redact::Redactor;
-pub use shipper::{
-    spawn, ShipperConfig, ShipperHandle, ShipperStatus, SourceState, SourceStatus,
-};
+pub use shipper::{spawn, ShipperConfig, ShipperHandle, ShipperStatus, SourceState, SourceStatus};
 pub use spool::DEFAULT_SPOOL_CAP_BYTES;
 pub use tap::{RecordTap, TapRecord};
 
