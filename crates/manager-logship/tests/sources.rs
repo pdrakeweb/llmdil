@@ -124,6 +124,7 @@ impl Rig {
             tail_wizard: false,
             tail_optimize: false,
             tail_gateway: false,
+            tail_service_manage: false,
             ..ShipperConfig::default()
         }
     }
@@ -258,5 +259,49 @@ async fn enabled_source_without_files_reports_file_missing() {
     }
     let rows = handle.status().sources;
     assert_eq!(row(&rows, "gateway").state, SourceState::FileMissing);
+    rig.finish(&handle).await;
+}
+
+/// S6: `service-manage.log` is append-only and never rotated by its
+/// writer (the elevated service helper). It ships as source
+/// `service-manage`, and an operator truncating it mid-run neither
+/// re-ships old lines nor loses the new ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_manage_tail_ships_and_survives_truncation() {
+    let rig = Rig::new("svcmanage");
+    let path = rig.logs().join("service-manage.log");
+    write_lines(
+        &path,
+        &[
+            "[1762900000] register llm-backend-planner: ok",
+            "[1762900001] register llm-gateway: failed (access denied)",
+        ],
+    );
+    let handle = manager_logship::spawn(ShipperConfig {
+        tail_service_manage: true,
+        ..rig.config()
+    });
+    let records = rig.wait_for(2).await;
+    assert_eq!(by_source(&records, "service-manage").len(), 2);
+    assert!(records
+        .iter()
+        .any(|r| r["level"] == "error" && r["line"].as_str().unwrap().contains("llm-gateway")));
+
+    // Truncated in place and written again.
+    write_lines(&path, &["[1762900100] unregister llm-gateway: ok"]);
+    let records = rig.wait_for(3).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let records = if rig.capture.records().len() > records.len() {
+        rig.capture.records()
+    } else {
+        records
+    };
+    assert_eq!(records.len(), 3, "no re-ship, no loss: {records:?}");
+    assert!(records
+        .iter()
+        .any(|r| r["line"].as_str().unwrap().contains("unregister llm-gateway")));
+    let rows = handle.status().sources;
+    assert_eq!(row(&rows, "service-manage").state, SourceState::Active);
+    assert_eq!(row(&rows, "service-manage").records, 3);
     rig.finish(&handle).await;
 }

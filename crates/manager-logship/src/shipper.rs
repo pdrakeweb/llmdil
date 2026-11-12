@@ -50,6 +50,9 @@ pub struct ShipperConfig {
     /// S2: `gateway.stdout.log` / `gateway.stderr.log`, shipped as
     /// source `gateway` with the file's stream.
     pub tail_gateway: bool,
+    /// S6: `service-manage.log`, the elevated service helper's own
+    /// outcome log (`llm-service-host`, under `<data_dir>/logs`).
+    pub tail_service_manage: bool,
     /// Literal secret values for redaction layer 1.
     pub literal_secrets: Vec<String>,
     pub spool_cap_bytes: u64,
@@ -67,6 +70,7 @@ impl Default for ShipperConfig {
             tail_wizard: true,
             tail_optimize: true,
             tail_gateway: true,
+            tail_service_manage: true,
             literal_secrets: Vec::new(),
             spool_cap_bytes: DEFAULT_SPOOL_CAP_BYTES,
         }
@@ -141,6 +145,11 @@ fn source_plan(config: &ShipperConfig) -> Vec<PlannedSource> {
         single("wizard", config.tail_wizard, "wizard.log"),
         single("optimize", config.tail_optimize, "optimize.log"),
         pair("gateway", config.tail_gateway, "gateway"),
+        single(
+            "service-manage",
+            config.tail_service_manage,
+            "service-manage.log",
+        ),
     ]
 }
 
