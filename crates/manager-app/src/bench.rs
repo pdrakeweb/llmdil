@@ -1329,7 +1329,7 @@ async fn run_arm(
                         .filter_map(|p| p.vram_mib)
                         .sum();
                     if total > 0 {
-                        let mut slot = peak.lock().unwrap();
+                        let mut slot = peak.lock().unwrap_or_else(|e| e.into_inner());
                         *slot = Some(slot.map(|p| p.max(total)).unwrap_or(total));
                     }
                 }
@@ -1400,7 +1400,7 @@ async fn run_arm(
     if let Some(handle) = sampler {
         let _ = handle.await;
     }
-    out.peak_vram_mib = *peak.lock().unwrap();
+    out.peak_vram_mib = *peak.lock().unwrap_or_else(|e| e.into_inner());
     out.first_output = first_output;
     match failure {
         Some(f) => {

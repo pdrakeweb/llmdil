@@ -296,23 +296,45 @@ struct ParsedDoc {
 /// unknown cards yield (0, 0) = unknown (see [`GpuInfo`]).
 fn compute_capability_for(product_name: &str) -> (u32, u32) {
     let n = product_name.to_ascii_lowercase();
-    if n.contains("p100") {
+    // Model numbers match on a token boundary (P-11b): a plain
+    // substring test let "a100" match "RTX A1000" and "p40" match
+    // "P4000".
+    let has = |token: &str| contains_model_token(&n, token);
+    if has("p100") {
         (6, 0)
-    } else if n.contains("p40") || n.contains("titan xp") {
+    } else if has("p40") || has("titan xp") {
         (6, 1)
-    } else if n.contains("v100") {
+    } else if has("v100") {
         (7, 0)
-    } else if n.contains("t4") {
+    } else if has("t4") {
         (7, 5)
-    } else if n.contains("a100") {
+    } else if has("a100") {
         (8, 0)
-    } else if n.contains("a4000") || n.contains("a5000") || n.contains("a6000") {
+    } else if has("a4000") || has("a5000") || has("a6000") {
         (8, 6)
-    } else if n.contains("4090") || n.contains("4080") || n.contains("4070") {
+    } else if has("4090") || has("4080") || has("4070") {
         (8, 9)
     } else {
         (0, 0)
     }
+}
+
+/// True when `token` occurs in `haystack` with no letter or digit
+/// directly before it and no digit directly after it: "a100" matches
+/// "nvidia a100-sxm4-80gb" and "tesla v100s" keeps "v100", but "a100"
+/// does not match "rtx a1000".
+fn contains_model_token(haystack: &str, token: &str) -> bool {
+    haystack.match_indices(token).any(|(i, _)| {
+        let before_ok = haystack[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric());
+        let after_ok = haystack[i + token.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_digit());
+        before_ok && after_ok
+    })
 }
 
 // --- value helpers: "N/A" -> None, unit suffixes stripped ---
@@ -373,7 +395,12 @@ fn required<T>(
 
 fn parse_document(xml: &str) -> Result<ParsedDoc, TelemetryError> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // Not trimmed per event: quick-xml 0.38 splits a leaf's text at
+    // every entity reference (`R&amp;D` arrives as Text "R",
+    // GeneralRef "amp", Text "D"), and per-event trimming would eat
+    // whitespace beside a reference. A leaf's pieces are accumulated
+    // in `leaf_text` and trimmed once, at its end tag (P-9).
+    reader.config_mut().trim_text(false);
 
     let mut stack: Vec<String> = Vec::new();
     let mut driver_version = String::from("unknown");
@@ -385,11 +412,17 @@ fn parse_document(xml: &str) -> Result<ParsedDoc, TelemetryError> {
     let mut proc_fields: Option<HashMap<String, String>> = None;
     let mut proc_list: Vec<ProcessSample> = Vec::new();
     let mut order: u32 = 0;
+    // Text of the innermost open element, valid while that element
+    // has had no child (`in_leaf`): text + resolved entity pieces.
+    let mut leaf_text = String::new();
+    let mut in_leaf = false;
 
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
+                leaf_text.clear();
+                in_leaf = true;
                 let name = name_of(e.name())?;
                 if name == "gpu" {
                     gpu_id_attr = attr_of(&e, "id").unwrap_or_default();
@@ -402,28 +435,52 @@ fn parse_document(xml: &str) -> Result<ParsedDoc, TelemetryError> {
             }
             Ok(Event::Empty(e)) => {
                 // Self-closing element: no text; nothing to record.
+                // It is a child, so the enclosing element is no leaf.
+                in_leaf = false;
                 let _ = name_of(e.name())?;
             }
             Ok(Event::Text(e)) => {
-                let text = e.xml_content().map(|c| c.into_owned()).unwrap_or_default();
-                if stack.len() >= 2 && stack[0] == "nvidia_smi_log" && stack[1] == "driver_version"
-                {
-                    driver_version = text.trim().to_string();
-                } else if stack.len() >= 2 && stack[0] == "nvidia_smi_log" && stack[1] == "gpu" {
-                    if stack.iter().any(|s| s == "process_info") {
-                        if let Some(pf) = proc_fields.as_mut() {
-                            if let Some(leaf) = stack.last() {
-                                pf.insert(leaf.clone(), text);
+                if in_leaf {
+                    if let Ok(c) = e.xml_content() {
+                        leaf_text.push_str(&c);
+                    }
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if in_leaf {
+                    if let Ok(Some(ch)) = e.resolve_char_ref() {
+                        leaf_text.push(ch);
+                    } else if let Ok(name) = e.decode() {
+                        match quick_xml::escape::resolve_predefined_entity(&name) {
+                            Some(resolved) => leaf_text.push_str(resolved),
+                            // Unknown entity: keep it verbatim rather
+                            // than dropping the text around it.
+                            None => {
+                                leaf_text.push('&');
+                                leaf_text.push_str(&name);
+                                leaf_text.push(';');
                             }
                         }
-                    } else if let Some(gf) = gpu_fields.as_mut() {
-                        // Key is the path relative to <gpu>, e.g. "pci/pci_bus".
-                        let rel = stack[2..].join("/");
-                        gf.insert(rel, text);
                     }
                 }
             }
             Ok(Event::End(e)) => {
+                if in_leaf {
+                    in_leaf = false;
+                    let text = leaf_text.trim().to_string();
+                    leaf_text.clear();
+                    // Whitespace-only text recorded nothing before
+                    // (trimmed events were dropped); keep that.
+                    if !text.is_empty() {
+                        record_leaf_text(
+                            &stack,
+                            text,
+                            &mut driver_version,
+                            proc_fields.as_mut(),
+                            gpu_fields.as_mut(),
+                        );
+                    }
+                }
                 let name = name_of(e.name())?;
                 if name == "process_info" {
                     if let Some(pf) = proc_fields.take() {
@@ -484,6 +541,29 @@ fn parse_document(xml: &str) -> Result<ParsedDoc, TelemetryError> {
         driver_version,
         gpus,
     })
+}
+
+/// File a finished leaf's text under its element path: the driver
+/// version, a process field (keyed by leaf name), or a GPU field
+/// (keyed by the path relative to `<gpu>`, e.g. "pci/pci_bus").
+fn record_leaf_text(
+    stack: &[String],
+    text: String,
+    driver_version: &mut String,
+    proc_fields: Option<&mut HashMap<String, String>>,
+    gpu_fields: Option<&mut HashMap<String, String>>,
+) {
+    if stack.len() >= 2 && stack[0] == "nvidia_smi_log" && stack[1] == "driver_version" {
+        *driver_version = text;
+    } else if stack.len() >= 2 && stack[0] == "nvidia_smi_log" && stack[1] == "gpu" {
+        if stack.iter().any(|s| s == "process_info") {
+            if let (Some(pf), Some(leaf)) = (proc_fields, stack.last()) {
+                pf.insert(leaf.clone(), text);
+            }
+        } else if let Some(gf) = gpu_fields {
+            gf.insert(stack[2..].join("/"), text);
+        }
+    }
 }
 
 fn name_of(name: quick_xml::name::QName<'_>) -> Result<String, TelemetryError> {
@@ -959,6 +1039,21 @@ mod tests {
         assert_eq!(compute_capability_for("Some Future Card X9000"), (0, 0));
     }
 
+    /// P-11b (docs/code-review-v0.1.60.md): model numbers match on a
+    /// token boundary, so "RTX A1000" is not an A100 (nor "P4000" a
+    /// P40), while real A100 / V100S / T4 names still map.
+    #[test]
+    fn compute_capability_matches_model_tokens_only() {
+        assert_eq!(compute_capability_for("NVIDIA RTX A1000"), (0, 0));
+        assert_eq!(compute_capability_for("Quadro P4000"), (0, 0));
+        assert_eq!(compute_capability_for("NVIDIA A100-SXM4-80GB"), (8, 0));
+        assert_eq!(compute_capability_for("NVIDIA A100 80GB PCIe"), (8, 0));
+        assert_eq!(compute_capability_for("Tesla V100S-PCIE-32GB"), (7, 0));
+        assert_eq!(compute_capability_for("Tesla T4"), (7, 5));
+        assert_eq!(compute_capability_for("Tesla P40"), (6, 1));
+        assert_eq!(compute_capability_for("NVIDIA GeForce RTX 4090"), (8, 9));
+    }
+
     #[test]
     fn index_falls_back_to_document_order() {
         let xml = r#"<?xml version="1.0" ?><nvidia_smi_log>
@@ -1054,6 +1149,27 @@ mod tests {
         let (samples, procs) = NvidiaSmiSource::parse_xml_with_processes(xml).expect("must parse");
         assert_eq!(samples[0].driver_model, Some(DriverModel::Tcc));
         assert_eq!(procs[0].vram_mib, Some(11264));
+    }
+
+    /// P-9 (docs/code-review-v0.1.60.md): text around entity references
+    /// (quick-xml 0.38 GeneralRef events) is kept, not overwritten by
+    /// the last piece, and whitespace beside a reference survives.
+    #[test]
+    fn entity_references_keep_surrounding_text() {
+        let xml = r#"<?xml version="1.0" ?><nvidia_smi_log>
+<driver_version>581.57</driver_version>
+<gpu id="00000000:01:00.0">
+<product_name>Card &amp; Co &#65;4000</product_name><uuid>GPU-a</uuid>
+<fb_memory_usage><total>8192 MiB</total><used>0 MiB</used></fb_memory_usage>
+<utilization><gpu_util>0 %</gpu_util></utilization>
+<temperature><gpu_temp>30 C</gpu_temp></temperature>
+<gpu_power_readings><power_draw>20.00 W</power_draw></gpu_power_readings>
+<processes><process_info><pid>4321</pid><process_name>C:\R&amp;D\llama-server.exe</process_name><used_memory>1024 MiB</used_memory></process_info></processes>
+</gpu></nvidia_smi_log>"#;
+        let (samples, procs) = NvidiaSmiSource::parse_xml_with_processes(xml).expect("must parse");
+        assert_eq!(samples[0].name, "Card & Co A4000");
+        assert_eq!(procs[0].name, r"C:\R&D\llama-server.exe");
+        assert_eq!(procs[0].pid, 4321);
     }
 
     /// P-3: a hung nvidia-smi is killed at the bound and reported as a

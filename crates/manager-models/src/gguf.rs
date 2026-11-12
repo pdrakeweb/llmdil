@@ -402,8 +402,13 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
     ) {
         (Some(blocks), Some(heads), Some(klen), Some(vlen)) => {
             let interval = get("full_attention_interval").unwrap_or(0);
+            // llama.cpp (src/models/qwen3next.cpp, load_arch_hparams):
+            // `is_recr_impl[i] = (i < n_layer()) && ((i + 1) %
+            // full_attn_interval != 0)` — the full-attention (KV)
+            // trunk layers are the 4th, 8th, …, so their count is
+            // floor(trunk / interval), not the ceiling (P-11a).
             let kv_layers = if interval > 1 {
-                blocks.div_ceil(interval)
+                blocks / interval
             } else {
                 blocks
             };
@@ -649,6 +654,27 @@ mod tests {
         let layout = parse_gguf_layout(&b).unwrap();
         assert_eq!(layout.kv.unwrap().kv_layers, 12);
         assert_eq!(layout.kv.unwrap().bytes_per_token(), 24_576);
+    }
+
+    /// P-11a (docs/code-review-v0.1.60.md): with a block count that is
+    /// not a multiple of the interval, llama.cpp's full-attention
+    /// layers are those with `(i + 1) % interval == 0` — 10 blocks at
+    /// interval 4 carry KV in layers 3 and 7 only (2, not ceil = 3).
+    #[test]
+    fn full_attention_interval_counts_floor_of_trunk() {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&6u64.to_le_bytes());
+        w_kv_str(&mut b, "general.architecture", "testarch");
+        w_kv_u32(&mut b, "testarch.block_count", 10);
+        w_kv_u32(&mut b, "testarch.attention.head_count_kv", 2);
+        w_kv_u32(&mut b, "testarch.attention.key_length", 256);
+        w_kv_u32(&mut b, "testarch.attention.value_length", 256);
+        w_kv_u32(&mut b, "testarch.full_attention_interval", 4);
+        let layout = parse_gguf_layout(&b).unwrap();
+        assert_eq!(layout.kv.unwrap().kv_layers, 2);
     }
 
     #[test]

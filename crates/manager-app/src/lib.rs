@@ -1352,6 +1352,22 @@ fn is_real_pin(sha: &str) -> bool {
     sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Apply `mutate` to a clone of the live configuration, save the
+/// clone, and install it only when the save succeeded (PS-8): a
+/// failed save leaves memory exactly as it was, so memory and disk
+/// never diverge.
+fn mutate_save_install(
+    live: &mut AppConfig,
+    path: &PathBuf,
+    mutate: impl FnOnce(&mut AppConfig),
+) -> Result<(), manager_config::ConfigError> {
+    let mut next = live.clone();
+    mutate(&mut next);
+    manager_config::save(&next, path)?;
+    *live = next;
+    Ok(())
+}
+
 /// Seed the model config from the curated catalog on first run: the
 /// Models view and the download path operate on configured models, so
 /// without seeding a fresh install would show an empty list even
@@ -1387,7 +1403,10 @@ async fn ensure_catalog_models(state: &AppState) {
             _ => None,
         }
     };
-    let mut cfg = state.config.write().await;
+    // PS-8: work on a clone; `install_seeded` installs it only when
+    // no save was needed or the save succeeded.
+    let mut live = state.config.write().await;
+    let mut cfg = live.clone();
     let mut dirty = false;
     if !cfg.defaults_repaired {
         let catalog: Vec<manager_config::CatalogModelDefaults> = manager_models::curated_models()
@@ -1476,18 +1495,14 @@ async fn ensure_catalog_models(state: &AppState) {
         dirty = true;
     }
     if cfg.catalog_seeded {
-        if dirty {
-            let _ = manager_config::save(&cfg, &state.config_path);
-        }
+        install_seeded(&mut live, cfg, dirty, &state.config_path);
         return;
     }
     if !cfg.models.is_empty() {
         cfg.catalog_seeded = true;
         // The catalog sync above keys off catalog_seeded, so it
         // applies from the next launch for this config.
-        if dirty {
-            let _ = manager_config::save(&cfg, &state.config_path);
-        }
+        install_seeded(&mut live, cfg, dirty, &state.config_path);
         return;
     }
     cfg.models = manager_models::curated_models()
@@ -1542,9 +1557,22 @@ async fn ensure_catalog_models(state: &AppState) {
     }
     cfg.catalog_seeded = true;
     cfg.catalog_revision = manager_models::CATALOG_REVISION;
-    // Best effort: the seeded entries are live in memory either way; a
-    // failed save only means the seeding repeats on the next launch.
-    let _ = manager_config::save(&cfg, &state.config_path);
+    // A failed save leaves memory unseeded too (PS-8), so memory and
+    // disk agree; the seeding repeats on the next launch.
+    install_seeded(&mut live, cfg, true, &state.config_path);
+}
+
+/// The commit step of [`ensure_catalog_models`] (PS-8): install
+/// `next` directly when nothing needs saving (the in-memory-only
+/// flag updates), otherwise only after a successful save.
+fn install_seeded(live: &mut AppConfig, next: AppConfig, needs_save: bool, path: &PathBuf) {
+    if needs_save {
+        if let Err(e) = manager_config::save(&next, path) {
+            eprintln!("catalog seeding: could not save the configuration: {e}");
+            return;
+        }
+    }
+    *live = next;
 }
 
 /// Deep-merge a JSON patch into a base value (objects merge recursively).
@@ -2255,7 +2283,12 @@ pub(crate) async fn backend_start_preflight_for(
                 m.id
             )));
         }
-        if state.verifying_downloads.lock().unwrap().contains(&m.id) {
+        if state
+            .verifying_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&m.id)
+        {
             return Err(ApiError::InvalidInput(format!(
                 "SHA-256 verification is still running for model {}.",
                 m.id
@@ -4189,12 +4222,21 @@ pub async fn op_download_model(
                             Ok(true) => {
                                 verified = true;
                                 let mut cfg = st.config.write().await;
-                                if let Some(m) = cfg.models.iter_mut().find(|m| m.id == watcher_id)
+                                // PS-8: installed only once saved.
+                                if let Err(e) =
+                                    mutate_save_install(&mut cfg, &st.config_path, |cfg| {
+                                        if let Some(m) =
+                                            cfg.models.iter_mut().find(|m| m.id == watcher_id)
+                                        {
+                                            m.verified_at = Some(chrono::Utc::now());
+                                            m.verified_sha256 = Some(sha.clone());
+                                        }
+                                    })
                                 {
-                                    m.verified_at = Some(chrono::Utc::now());
-                                    m.verified_sha256 = Some(sha.clone());
+                                    eprintln!(
+                                        "download watcher: could not save the verification of {watcher_id}: {e}"
+                                    );
                                 }
-                                let _ = manager_config::save(&cfg, &st.config_path);
                                 (None, false)
                             }
                             Ok(false) => {
@@ -4203,13 +4245,27 @@ pub async fn op_download_model(
                                 match tokio::fs::remove_file(&watcher_dest).await {
                                     Ok(()) => {
                                         let mut cfg = st.config.write().await;
-                                        if let Some(m) =
-                                            cfg.models.iter_mut().find(|m| m.id == watcher_id)
-                                        {
-                                            m.verified_at = None;
-                                            m.verified_sha256 = None;
+                                        // PS-8: installed only once saved;
+                                        // the recorded verification failure
+                                        // gates start either way.
+                                        if let Err(e) = mutate_save_install(
+                                            &mut cfg,
+                                            &st.config_path,
+                                            |cfg| {
+                                                if let Some(m) = cfg
+                                                    .models
+                                                    .iter_mut()
+                                                    .find(|m| m.id == watcher_id)
+                                                {
+                                                    m.verified_at = None;
+                                                    m.verified_sha256 = None;
+                                                }
+                                            },
+                                        ) {
+                                            eprintln!(
+                                                "download watcher: could not save the cleared verification of {watcher_id}: {e}"
+                                            );
                                         }
-                                        let _ = manager_config::save(&cfg, &st.config_path);
                                         (
                                             Some(
                                                 "SHA-256 mismatch after download — file removed; \
@@ -8724,22 +8780,30 @@ pub async fn op_model_verify_checksum(
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
     let ok = verify_result?;
-    {
+    let save_err = {
         let mut cfg = state.config.write().await;
-        if let Some(m) = cfg.models.iter_mut().find(|m| m.id == id) {
-            // The stamp and the hash it verified against move
-            // together (code-review 2.4).
-            if ok {
-                m.verified_at = Some(chrono::Utc::now());
-                m.verified_sha256 = Some(sha.clone());
-            } else {
-                m.verified_at = None;
-                m.verified_sha256 = None;
+        mutate_save_install(&mut cfg, &state.config_path, |cfg| {
+            if let Some(m) = cfg.models.iter_mut().find(|m| m.id == id) {
+                // The stamp and the hash it verified against move
+                // together (code-review 2.4).
+                if ok {
+                    m.verified_at = Some(chrono::Utc::now());
+                    m.verified_sha256 = Some(sha.clone());
+                } else {
+                    m.verified_at = None;
+                    m.verified_sha256 = None;
+                }
             }
-        }
-        manager_config::save(&cfg, &state.config_path)?;
-    }
+        })
+        .err()
+    };
+    // A failed save leaves the in-memory stamps untouched (PS-8);
+    // a mismatch still records its start gate below, so the
+    // backend stays fail-closed even when the save failed.
     if ok {
+        if let Some(e) = save_err {
+            return Err(e.into());
+        }
         // A passing manual verify clears the start gate recorded by an
         // earlier failed verification.
         state.download_outcomes.lock().await.remove(&id);
@@ -8757,6 +8821,9 @@ pub async fn op_model_verify_checksum(
                 verification_failure: true,
             },
         );
+        if let Some(e) = save_err {
+            return Err(e.into());
+        }
     }
     Ok(json!({ "id": id, "ok": ok }))
 }
@@ -9234,6 +9301,15 @@ static GGUF_LAYOUT_CACHE: std::sync::OnceLock<
 /// the tokenizer metadata dominates). Returns None for missing or
 /// unparseable files.
 fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
+    gguf_layout_cached_with(path, &GGUF_PREFIX_RUNGS)
+}
+
+/// The prefix lengths [`gguf_layout_cached`] reads, shortest first.
+const GGUF_PREFIX_RUNGS: [usize; 3] = [8 * 1024 * 1024, 64 * 1024 * 1024, 256 * 1024 * 1024];
+
+/// [`gguf_layout_cached`] over an explicit prefix ladder (tests use
+/// a short one).
+fn gguf_layout_cached_with(path: &PathBuf, rungs: &[usize]) -> Option<manager_models::GgufLayout> {
     let meta = match std::fs::metadata(path) {
         Ok(m) if m.is_file() => m,
         Ok(_) => return None,
@@ -9260,11 +9336,13 @@ fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
         }
     }
     let mut layout = None;
-    // Whether the outcome may be cached: true once a prefix has
-    // been read in full and the parser has given a definitive
-    // answer (a layout, or a rejection of the complete bytes).
-    let mut cacheable = false;
-    for prefix in [8 * 1024 * 1024usize, 64 * 1024 * 1024, 256 * 1024 * 1024] {
+    // Every exit from this loop that does not return early is
+    // definitive and cached: a layout, a rejection of the complete
+    // bytes, or (P-4) a header still `Incomplete` at the largest
+    // rung — the next poll would re-read and re-allocate every rung
+    // only to learn the same thing. The (len, mtime) key drops the
+    // entry as soon as the file changes.
+    for &prefix in rungs {
         let want = (meta.len() as usize).min(prefix);
         let mut buf = vec![0u8; want];
         if let Err(e) =
@@ -9282,7 +9360,6 @@ fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
         match manager_models::parse_gguf_layout(&buf) {
             Ok(l) => {
                 layout = Some(l);
-                cacheable = true;
                 break;
             }
             Err(manager_models::GgufError::Incomplete) if want < meta.len() as usize => continue,
@@ -9296,15 +9373,12 @@ fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
                     "gguf layout: parse failed for {} (error class: {class}): {e:?}",
                     path.display()
                 );
-                cacheable = true;
                 break;
             }
         }
     }
-    if cacheable {
-        if let Ok(mut guard) = cache.lock() {
-            guard.insert(key, layout.clone());
-        }
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, layout.clone());
     }
     layout
 }
@@ -11036,17 +11110,27 @@ mod tests {
         cfg
     }
 
-    /// An AppState over a temp dir for the advanced-flags op
-    /// tests (tracker #60): config file and data dir in scratch
-    /// space, so saves and the activation journal land there.
-    fn advanced_test_state(cfg: AppConfig) -> (Arc<AppState>, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "llm-mgr-advanced-flags-{}",
+    /// A fresh scratch directory name: pid + a process-wide counter +
+    /// the clock. The clock alone collided between tests started in
+    /// parallel, letting two tests share (and one delete) a data dir.
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{n}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        ))
+    }
+
+    /// An AppState over a temp dir for the advanced-flags op
+    /// tests (tracker #60): config file and data dir in scratch
+    /// space, so saves and the activation journal land there.
+    fn advanced_test_state(cfg: AppConfig) -> (Arc<AppState>, PathBuf) {
+        let dir = unique_test_dir("llm-mgr-advanced-flags");
         std::fs::create_dir_all(&dir).unwrap();
         let mut cfg = cfg;
         cfg.data_dir = dir.clone();
@@ -11056,6 +11140,148 @@ mod tests {
 
     fn test_sink() -> Arc<dyn EventSink> {
         Arc::new(NoopSink)
+    }
+
+    /// P-4 (docs/code-review-v0.1.60.md): a header still `Incomplete`
+    /// at the largest prefix rung is cached as a failure (keyed by
+    /// length + mtime, so a changed file is parsed afresh).
+    #[test]
+    fn gguf_layout_incomplete_at_last_rung_is_cached() {
+        let dir = unique_test_dir("llm-mgr-p4-gguf");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("crafted.gguf");
+        // GGUF v3, 0 tensors, 1 metadata pair whose key claims 1000
+        // bytes: incomplete at every prefix of this 64-byte file.
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&1000u64.to_le_bytes());
+        bytes.resize(64, b'k');
+        std::fs::write(&path, &bytes).unwrap();
+        let entries_for = |p: &PathBuf| -> Vec<u64> {
+            GGUF_LAYOUT_CACHE
+                .get()
+                .map(|c| {
+                    c.lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|((kp, _, _), v)| kp == p && v.is_none())
+                        .map(|((_, len, _), _)| *len)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert!(gguf_layout_cached_with(&path, &[16, 32]).is_none());
+        assert_eq!(entries_for(&path), vec![64]);
+        // A changed file (new length) is a new key, parsed afresh.
+        bytes.resize(80, b'k');
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(gguf_layout_cached_with(&path, &[16, 32]).is_none());
+        let mut lens = entries_for(&path);
+        lens.sort_unstable();
+        assert_eq!(lens, vec![64, 80]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A config path whose parent is a regular file: every save to it
+    /// fails (the parent directory cannot be created).
+    fn unsavable_config_path(dir: &std::path::Path) -> PathBuf {
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        blocker.join("config.json")
+    }
+
+    /// PS-8 (docs/code-review-v0.1.60.md): a failed save leaves the
+    /// live configuration exactly as it was; a successful one installs
+    /// the mutation.
+    #[test]
+    fn mutate_save_install_installs_only_on_successful_save() {
+        let (_state, dir) = advanced_test_state(test_cfg());
+        let mut live = test_cfg();
+        live.data_dir = dir.clone();
+        let before = serde_json::to_value(&live).unwrap();
+        let bad = unsavable_config_path(&dir);
+        let r = mutate_save_install(&mut live, &bad, |c| c.catalog_revision += 7);
+        assert!(r.is_err());
+        assert_eq!(serde_json::to_value(&live).unwrap(), before);
+        let good = dir.join("config.json");
+        let rev = live.catalog_revision;
+        mutate_save_install(&mut live, &good, |c| c.catalog_revision += 7).unwrap();
+        assert_eq!(live.catalog_revision, rev + 7);
+        assert_eq!(
+            manager_config::load(&good).unwrap().catalog_revision,
+            rev + 7
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PS-8: catalog seeding whose save fails leaves memory unseeded,
+    /// matching the disk, instead of running on unsaved seeded rows.
+    #[tokio::test]
+    async fn ensure_catalog_models_failed_save_leaves_memory_unchanged() {
+        let dir = unique_test_dir("llm-mgr-ps8-seed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = test_cfg();
+        cfg.data_dir = dir.clone();
+        assert!(cfg.models.is_empty() && !cfg.catalog_seeded);
+        let before = serde_json::to_value(&cfg).unwrap();
+        let state = Arc::new(AppState::new(cfg, unsavable_config_path(&dir), dir.clone()));
+        ensure_catalog_models(&state).await;
+        let after = serde_json::to_value(&*state.config.read().await).unwrap();
+        assert_eq!(after, before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PS-12 (docs/code-review-v0.1.60.md): a poisoned
+    /// `verifying_downloads` lock must not panic the start preflight;
+    /// the gate still reports the in-flight verification.
+    #[tokio::test]
+    async fn start_preflight_tolerates_poisoned_verifying_lock() {
+        let mut cfg = test_cfg();
+        cfg.backends
+            .iter_mut()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .enabled = true;
+        let (state, dir) = advanced_test_state(cfg);
+        // Seed the catalog so the coder backend's model is a known row.
+        ensure_catalog_models(&state).await;
+        let cfg = state.config.read().await.clone();
+        let b = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .clone();
+        let target = resolve_under_data_dir(&cfg.data_dir, &b.model_file);
+        let model_id = cfg
+            .models
+            .iter()
+            .find(|m| resolve_under_data_dir(&cfg.data_dir, &m.gguf_path) == target)
+            .expect("the coder backend's model is in the catalog")
+            .id
+            .clone();
+        state
+            .verifying_downloads
+            .lock()
+            .unwrap()
+            .insert(model_id.clone());
+        let poisoner = Arc::clone(&state);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.verifying_downloads.lock().unwrap();
+            panic!("poison the verifying_downloads lock");
+        })
+        .join();
+        assert!(state.verifying_downloads.is_poisoned());
+        let err = backend_start_preflight_for(&state, &cfg, &b, false)
+            .await
+            .expect_err("a model under verification refuses the start");
+        assert!(
+            err.to_string().contains("verification is still running"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// PS-6 (docs/code-review-v0.1.60.md): an invalid gateway patch is
@@ -16140,13 +16366,15 @@ pub async fn op_backend_test_tool_call(
         }
     };
     let mut cfg = state.config.write().await;
-    if let Some(b) = cfg.backends.iter_mut().find(|b| b.id == id) {
-        b.tool_call_probe = Some(manager_config::ToolCallProbe {
-            outcome,
-            at_ms: now_ms(),
-        });
-    }
-    manager_config::save(&cfg, &state.config_path).map_err(ApiError::from)?;
+    mutate_save_install(&mut cfg, &state.config_path, |cfg| {
+        if let Some(b) = cfg.backends.iter_mut().find(|b| b.id == id) {
+            b.tool_call_probe = Some(manager_config::ToolCallProbe {
+                outcome,
+                at_ms: now_ms(),
+            });
+        }
+    })
+    .map_err(ApiError::from)?;
     drop(cfg);
     Ok(serde_json::to_value(&result)?)
 }
