@@ -860,6 +860,24 @@ truth:
   WinML) are likewise unimplemented over REST per decision 10;
   the "every endpoint implemented" sentence above covers the v1
   committed surface only.
+- **MCP spawn rules bind any future MCP-config endpoint** (review
+  v0.1.60 PS-5). Local-exposure MCP servers are now spawned from
+  `AppConfig.mcp`, so whoever can write an MCP server definition
+  chooses a program the app runs. Any future Admin API endpoint
+  that writes MCP server config must go through the existing ops
+  (`mcp_save_server` / `mcp_set_exposure` / `mcp_delete_server`)
+  or `manager_mcp::local::prepare_spawn`, and so adopt their
+  rules: Local means stdio with a non-empty command (anything else
+  is an explicit error); the program is launched directly, never
+  through a shell; a bare command is resolved from absolute `PATH`
+  entries (Windows: `PATHEXT` extensions only, so `npx` is
+  `npx.cmd`); a command path must be absolute and inside a known
+  install directory; the stdio allowlist and banned args are
+  re-checked at spawn, not only at save; credential values are read
+  only at spawn, go only into the child's environment, and never
+  appear in logs, errors, or the supervisor's retained spec; and
+  editing or deleting a running Local server stops its process
+  first. See `docs/mcp-capabilities-design.md` §5.1.
 - `GET /api/v1/events` (SSE) is an API-layer derived route, not a
   registry operation; the audit-log read path is
   `GET /api/v1/admin/audit` (§3.4's `GET /admin/audit` omits the
