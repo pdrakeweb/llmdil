@@ -388,7 +388,7 @@ pub fn memory_requirement(
                 match expert_bytes_by_block {
                     // The first `share` MoE blocks' true byte sum.
                     Some(blocks) if blocks.len() == layers as usize => {
-                        blocks[..share as usize].iter().sum::<u64>()
+                        saturating_sum(&blocks[..share as usize])
                     }
                     _ => {
                         // Uniform-share approximation: exact only
@@ -398,7 +398,7 @@ pub fn memory_requirement(
                         if share > 0 && share < layers && basis == MemoryBasis::Exact {
                             basis = MemoryBasis::Estimate;
                         }
-                        (e.min(total_bytes) * share as u64) / layers as u64
+                        uniform_share(e.min(total_bytes), share, layers)
                     }
                 }
             }
@@ -456,12 +456,36 @@ pub fn sys_bytes_by_position(
         Some(blocks) if blocks.len() == moe_layers as usize => Some(blocks),
         _ => None,
     };
-    (0..=moe_layers)
-        .map(|n| match blocks {
-            Some(blocks) => blocks[..n as usize].iter().sum(),
-            None => expert_bytes * n as u64 / moe_layers as u64,
-        })
-        .collect()
+    match blocks {
+        // Running prefix sums: O(n), where re-summing each prefix was
+        // O(n²) on a crafted header with many expert blocks (P-10).
+        Some(blocks) => std::iter::once(0)
+            .chain(blocks.iter().scan(0u64, |acc, &b| {
+                *acc = acc.saturating_add(b);
+                Some(*acc)
+            }))
+            .collect(),
+        None => (0..=moe_layers)
+            .map(|n| uniform_share(expert_bytes, n, moe_layers))
+            .collect(),
+    }
+}
+
+/// Sum of `bytes`, saturating at `u64::MAX` instead of overflowing
+/// (header-derived block sizes are untrusted input; P-10).
+fn saturating_sum(bytes: &[u64]) -> u64 {
+    bytes.iter().fold(0u64, |acc, &b| acc.saturating_add(b))
+}
+
+/// `bytes * share / layers`, computed in 128 bits so a large byte
+/// total cannot overflow the product (P-10). The result never
+/// exceeds `bytes` when `share <= layers`.
+fn uniform_share(bytes: u64, share: u32, layers: u32) -> u64 {
+    if layers == 0 {
+        return 0;
+    }
+    let v = (bytes as u128 * share as u128) / layers as u128;
+    u64::try_from(v).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -1045,5 +1069,63 @@ mod tests {
         assert_eq!(r.gpu_weights_mib, 49 * 1024);
         assert_eq!(r.sys_weights_mib, 0);
         assert_eq!(r.basis, MemoryBasis::Estimate);
+    }
+
+    /// P-10 (docs/code-review-v0.1.60.md): header-derived sums that
+    /// would overflow u64 saturate instead of panicking (debug) or
+    /// wrapping (release), on both the uniform-share and the
+    /// per-block paths.
+    #[test]
+    fn huge_header_sums_do_not_overflow() {
+        let r = memory_requirement(
+            u64::MAX,
+            Some(u64::MAX),
+            None,
+            MemoryBasis::Exact,
+            ExpertOffload::CpuMoeLayers(3),
+            None,
+            Some(4),
+            0,
+            None,
+            1,
+        );
+        let three_quarters = ((u64::MAX as u128 * 3) / 4) as u64;
+        assert_eq!(r.sys_weights_mib, mib(three_quarters));
+        let blocks = [u64::MAX, u64::MAX, 7];
+        let r = memory_requirement(
+            u64::MAX,
+            Some(u64::MAX),
+            Some(&blocks),
+            MemoryBasis::Exact,
+            ExpertOffload::CpuMoeLayers(2),
+            None,
+            Some(3),
+            0,
+            None,
+            1,
+        );
+        assert_eq!(r.sys_weights_mib, mib(u64::MAX));
+        assert_eq!(
+            sys_bytes_by_position(u64::MAX, Some(&blocks), 3),
+            vec![0, u64::MAX, u64::MAX, u64::MAX]
+        );
+        assert_eq!(
+            sys_bytes_by_position(u64::MAX, None, 2),
+            vec![0, u64::MAX / 2, u64::MAX]
+        );
+    }
+
+    /// P-10: the per-position table is the blocks' prefix sums, and a
+    /// large block count builds it in linear time (a quadratic re-sum
+    /// over 200k blocks would be ~2·10¹⁰ additions).
+    #[test]
+    fn sys_bytes_by_position_is_prefix_sums_at_scale() {
+        let n: u32 = 200_000;
+        let blocks: Vec<u64> = (1..=n as u64).collect();
+        let table = sys_bytes_by_position(0, Some(&blocks), n);
+        assert_eq!(table.len(), n as usize + 1);
+        assert_eq!(table[0], 0);
+        assert_eq!(table[3], 6);
+        assert_eq!(table[n as usize], n as u64 * (n as u64 + 1) / 2);
     }
 }
