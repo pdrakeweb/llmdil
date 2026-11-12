@@ -49,6 +49,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
 pub mod activation;
+pub mod activation_cancel;
 pub mod activation_history;
 pub mod app_update;
 pub mod bench;
@@ -4834,7 +4835,7 @@ pub async fn op_update_gateway_config(
     // entry and then fail the save, leaving a phantom pending change
     // that cancel refused (finding PS-6, docs/code-review-v0.1.60.md).
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
-    record_gateway_change(
+    let journaled = record_gateway_change(
         state,
         &pre_cfg,
         &new_cfg,
@@ -4843,7 +4844,7 @@ pub async fn op_update_gateway_config(
         false,
     )
     .await?;
-    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+    save_journaled(state, &new_cfg, &journaled)?;
     *cfg = new_cfg;
     Ok(json!({ "ok": true, "persisted": true }))
 }
@@ -4872,7 +4873,7 @@ async fn record_gateway_change(
     kind: &str,
     summary: String,
     force: bool,
-) -> Result<(), ApiError> {
+) -> Result<activation::JournalRecords, ApiError> {
     if !force {
         // Compare what a gateway start would WRITE, before and
         // after: the armed-only MCP view on both sides (presence
@@ -4899,7 +4900,7 @@ async fn record_gateway_change(
             let before_py = manager_gateway::generate_routing_callback(&before_cfg);
             let after_py = manager_gateway::generate_routing_callback(&after_cfg);
             if before_py == after_py {
-                return Ok(());
+                return Ok(activation::JournalRecords::none());
             }
         }
     }
@@ -4919,6 +4920,7 @@ async fn record_gateway_change(
         &configured,
         &running,
     )
+    .map(activation::JournalRecords::one)
     .map_err(ApiError::Io)
 }
 
@@ -4936,7 +4938,7 @@ async fn record_backend_change(
     kind: &str,
     summary: String,
     backend_id: &str,
-) -> Result<(), ApiError> {
+) -> Result<activation::JournalRecords, ApiError> {
     let started_at = backend_start_times(state).await;
     let running = backend_running_ids(state).await;
     let configured: std::collections::HashSet<String> =
@@ -4953,7 +4955,58 @@ async fn record_backend_change(
         &configured,
         &running,
     )
+    .map(activation::JournalRecords::one)
     .map_err(ApiError::Io)
+}
+
+/// Persist a configuration whose change was journaled ahead of the
+/// save (record-before-save, code-review 4.3), rolling the journal
+/// back when the save fails (PS-6): the entries this command
+/// recorded are removed by id, so a failed save leaves no phantom
+/// pending change behind while every other writer's entries and
+/// offload overrides stay (see [`activation::remove_entries`]).
+fn save_journaled(
+    state: &AppState,
+    cfg: &AppConfig,
+    journaled: &activation::JournalRecords,
+) -> Result<(), ApiError> {
+    if let Err(e) = manager_config::save(cfg, &state.config_path) {
+        roll_back_journal(state, journaled);
+        return Err(ApiError::from(e));
+    }
+    Ok(())
+}
+
+/// Fold a further record of the same command into `journaled`; when
+/// that record failed, roll back what the command had already
+/// journaled before propagating the error (PS-6).
+fn chain_journaled(
+    state: &AppState,
+    journaled: &mut activation::JournalRecords,
+    next: Result<activation::JournalRecords, ApiError>,
+) -> Result<(), ApiError> {
+    match next {
+        Ok(records) => {
+            journaled.extend(records);
+            Ok(())
+        }
+        Err(e) => {
+            roll_back_journal(state, journaled);
+            Err(e)
+        }
+    }
+}
+
+/// Best-effort rollback: a failure leaves the phantom entry in
+/// place — the safe direction of the record-before-save contract
+/// (a plan asking for a restart nobody needed) — and is logged.
+fn roll_back_journal(state: &AppState, journaled: &activation::JournalRecords) {
+    if let Err(err) = journaled.roll_back(&state.data_dir) {
+        eprintln!(
+            "activation journal: could not roll back {} entries after a failed save: {err}",
+            journaled.ids().len()
+        );
+    }
 }
 
 /// The advanced-flags-mode refusal (tracker #60): while a backend
@@ -5433,7 +5486,7 @@ pub async fn op_backend_apply_config(
         }
         let diff =
             manager_config::apply_config_diff(&mut new_cfg, &id, &patch).map_err(ApiError::from)?;
-        record_gateway_change(
+        let mut journaled = record_gateway_change(
             state,
             &pre_cfg,
             &new_cfg,
@@ -5446,7 +5499,7 @@ pub async fn op_backend_apply_config(
         // gateway does with it, the backend process itself only
         // picks its settings up at its next (re)start.
         if !diff.changes.is_empty() {
-            record_backend_change(
+            let backend_record = record_backend_change(
                 state,
                 &pre_cfg,
                 &new_cfg,
@@ -5454,9 +5507,10 @@ pub async fn op_backend_apply_config(
                 format!("Backend `{id}` settings changed"),
                 &id,
             )
-            .await?;
+            .await;
+            chain_journaled(state, &mut journaled, backend_record)?;
         }
-        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+        save_journaled(state, &new_cfg, &journaled)?;
         *cfg = new_cfg;
         diff
     };
@@ -5954,7 +6008,7 @@ pub async fn op_backend_add(
         }
     }
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
-    record_gateway_change(
+    let journaled = record_gateway_change(
         state,
         &pre_cfg,
         &new_cfg,
@@ -5963,7 +6017,7 @@ pub async fn op_backend_add(
         false,
     )
     .await?;
-    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+    save_journaled(state, &new_cfg, &journaled)?;
     *cfg = new_cfg;
     drop(cfg);
     if let Some((layers, placed_ccs)) = offload_override_to_record {
@@ -6104,7 +6158,7 @@ pub async fn op_backend_update_flags(
     b.flags.n_ctx = n_ctx;
     b.flags.n_batch = n_batch;
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
-    if changed {
+    let journaled = if changed {
         record_backend_change(
             state,
             &pre_cfg,
@@ -6113,9 +6167,11 @@ pub async fn op_backend_update_flags(
             format!("Backend `{id}` context/batch changed"),
             &id,
         )
-        .await?;
-    }
-    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+        .await?
+    } else {
+        activation::JournalRecords::none()
+    };
+    save_journaled(state, &new_cfg, &journaled)?;
     *cfg = new_cfg;
     drop(cfg);
     ensure_backend_specs(state).await;
@@ -6310,7 +6366,7 @@ pub async fn op_backend_set_offload(
                 format!("Backend `{id}` expert offload set to {n} of {moe_layers} MoE layers")
             }
         };
-        record_backend_change(
+        let journaled = record_backend_change(
             state,
             &pre_cfg,
             &new_cfg,
@@ -6319,7 +6375,7 @@ pub async fn op_backend_set_offload(
             &id,
         )
         .await?;
-        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+        save_journaled(state, &new_cfg, &journaled)?;
         *cfg = new_cfg;
     }
     drop(cfg);
@@ -6641,8 +6697,10 @@ pub async fn op_backend_set_mtp(
             Some(n) => format!("Backend `{id}` MTP draft set to {n} tokens"),
             None => format!("Backend `{id}` MTP draft turned off"),
         };
-        record_backend_change(state, &pre_cfg, &new_cfg, "backend_set_mtp", summary, &id).await?;
-        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+        let journaled =
+            record_backend_change(state, &pre_cfg, &new_cfg, "backend_set_mtp", summary, &id)
+                .await?;
+        save_journaled(state, &new_cfg, &journaled)?;
         *cfg = new_cfg;
     }
     drop(cfg);
@@ -6886,7 +6944,7 @@ pub async fn op_backend_set_moe_cache(
             Some(n) => format!("Backend `{id}` expert cache set to {n} MiB"),
             None => format!("Backend `{id}` expert cache turned off"),
         };
-        record_backend_change(
+        let journaled = record_backend_change(
             state,
             &pre_cfg,
             &new_cfg,
@@ -6895,7 +6953,7 @@ pub async fn op_backend_set_moe_cache(
             &id,
         )
         .await?;
-        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+        save_journaled(state, &new_cfg, &journaled)?;
         *cfg = new_cfg;
     }
     drop(cfg);
@@ -6990,7 +7048,7 @@ pub async fn op_backend_set_parallel(
                 format!("Backend `{id}` parallel slots returned to the llama.cpp default (auto)")
             }
         };
-        record_backend_change(
+        let journaled = record_backend_change(
             state,
             &pre_cfg,
             &new_cfg,
@@ -6999,7 +7057,7 @@ pub async fn op_backend_set_parallel(
             &id,
         )
         .await?;
-        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+        save_journaled(state, &new_cfg, &journaled)?;
         *cfg = new_cfg;
     }
     drop(cfg);
@@ -7445,8 +7503,10 @@ pub async fn op_backend_set_cache(
             ),
             None => format!("Backend `{id}` KV cache controls cleared (llama.cpp defaults)"),
         };
-        record_backend_change(state, &pre_cfg, &new_cfg, "backend_set_cache", summary, &id).await?;
-        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+        let journaled =
+            record_backend_change(state, &pre_cfg, &new_cfg, "backend_set_cache", summary, &id)
+                .await?;
+        save_journaled(state, &new_cfg, &journaled)?;
         *cfg = new_cfg;
     }
     drop(cfg);
@@ -7575,7 +7635,7 @@ pub async fn op_backend_set_raw_flags(
         // probe (MCP design §7.2).
         b.tool_call_probe = None;
         manager_config::validate(&new_cfg).map_err(ApiError::from)?;
-        record_backend_change(
+        let journaled = record_backend_change(
             state,
             &pre_cfg,
             &new_cfg,
@@ -7584,7 +7644,7 @@ pub async fn op_backend_set_raw_flags(
             &id,
         )
         .await?;
-        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+        save_journaled(state, &new_cfg, &journaled)?;
         *cfg = new_cfg;
     }
     drop(cfg);
@@ -7647,7 +7707,7 @@ pub async fn op_backend_delete(
         m.assigned_backends.retain(|b| b != &id);
     }
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
-    record_gateway_change(
+    let journaled = record_gateway_change(
         state,
         &pre_cfg,
         &new_cfg,
@@ -7656,7 +7716,7 @@ pub async fn op_backend_delete(
         false,
     )
     .await?;
-    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+    save_journaled(state, &new_cfg, &journaled)?;
     *cfg = new_cfg;
     drop(cfg);
     ensure_backend_specs(state).await;
@@ -7751,7 +7811,7 @@ pub async fn op_gateway_set_backend_group(
             Some(name) => format!("Backend `{id}` moved to group `{name}`"),
             None => format!("Backend `{id}` removed from all groups (ungrouped)"),
         };
-        record_gateway_change(
+        let journaled = record_gateway_change(
             state,
             &pre_cfg,
             &new_cfg,
@@ -7760,7 +7820,7 @@ pub async fn op_gateway_set_backend_group(
             false,
         )
         .await?;
-        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+        save_journaled(state, &new_cfg, &journaled)?;
         *cfg = new_cfg;
     }
     Ok(json!({
@@ -7821,7 +7881,7 @@ pub async fn op_gateway_create_group(
         purpose: String::new(),
     });
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
-    record_gateway_change(
+    let journaled = record_gateway_change(
         state,
         &pre_cfg,
         &new_cfg,
@@ -7830,7 +7890,7 @@ pub async fn op_gateway_create_group(
         false,
     )
     .await?;
-    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+    save_journaled(state, &new_cfg, &journaled)?;
     *cfg = new_cfg;
     Ok(json!({ "name": name, "persisted": true }))
 }
@@ -7867,7 +7927,7 @@ pub async fn op_gateway_delete_group(
     }
     new_cfg.gateway.groups.remove(pos);
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
-    record_gateway_change(
+    let journaled = record_gateway_change(
         state,
         &pre_cfg,
         &new_cfg,
@@ -7876,7 +7936,7 @@ pub async fn op_gateway_delete_group(
         false,
     )
     .await?;
-    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+    save_journaled(state, &new_cfg, &journaled)?;
     *cfg = new_cfg;
     Ok(json!({ "name": name, "deleted": true, "persisted": true }))
 }
@@ -8144,12 +8204,17 @@ pub async fn op_gateway_activation_plan(
 /// Cancel the pending activation plan's changes: restore the
 /// configuration snapshot taken before the first pending change.
 /// Refused when the configuration has changed through another path
-/// since (the restore would discard that change too).
+/// since (the restore would discard that change too) — background
+/// bookkeeping stamps excepted — or when a security-relevant section
+/// would be rolled back (PS-10; field classification in
+/// [`activation_cancel`]). Order: live state and the gateway probe
+/// without the config lock → guard under the write lock → restore →
+/// save → clear the journal; a crash between the save and the clear
+/// self-heals on the next cancel ([`activation::CancelPlan::StaleJournal`]).
 pub async fn op_gateway_activation_cancel(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
 ) -> ApiResult {
-    let mut cfg = state.config.write().await;
     // Live-state resolution with the real start times, running set,
     // and gateway probe: entries whose changes are already live
     // (their backends restarted) or already effective (their
@@ -8157,16 +8222,29 @@ pub async fn op_gateway_activation_cancel(
     // and must not be "cancelled" (code-review 4.1; Pete's report,
     // 2026-10-17 — cancel was the only resolution offered for an
     // already-effective change, and it reverted the edit).
+    //
+    // Gathered WITHOUT the config write lock (PS-10): the supervisor
+    // lock and the ~2.5 s gateway probe used to run under it,
+    // stalling every config reader and writer meanwhile. The guard
+    // (activation::cancel_plan) then runs under the write lock, after
+    // the probe, so it judges exactly the configuration the restore
+    // replaces — a change that landed during the probe is seen.
+    let (probe_host, port) = {
+        let cfg = state.config.read().await;
+        (
+            manager_wizard::steps::gateway_probe_host(&cfg),
+            cfg.gateway.port,
+        )
+    };
     let started_at = backend_start_times(state).await;
     let running = backend_running_ids(state).await;
-    let configured: std::collections::HashSet<String> =
-        cfg.backends.iter().map(|b| b.id.clone()).collect();
-    let probe_host = manager_wizard::steps::gateway_probe_host(&cfg);
-    let port = cfg.gateway.port;
     let up = tokio::task::spawn_blocking(move || probe_gateway(&probe_host, port))
         .await
         .unwrap_or(false);
-    let restored = match activation::cancel_target(
+    let mut cfg = state.config.write().await;
+    let configured: std::collections::HashSet<String> =
+        cfg.backends.iter().map(|b| b.id.clone()).collect();
+    let restored = match activation::cancel_plan(
         &state.data_dir,
         &cfg,
         &started_at,
@@ -8174,8 +8252,28 @@ pub async fn op_gateway_activation_cancel(
         &running,
         up,
     ) {
-        Ok(Some(restored)) => restored,
-        Ok(None) => return Ok(json!({ "cancelled": false, "reason": "no pending changes" })),
+        Ok(activation::CancelPlan::Restore(restored)) => *restored,
+        Ok(activation::CancelPlan::Nothing) => {
+            return Ok(json!({ "cancelled": false, "reason": "no pending changes" }))
+        }
+        Ok(activation::CancelPlan::StaleJournal) => {
+            // Self-heal (PS-10): the configuration already equals
+            // the snapshot — an earlier cancel saved the restore and
+            // stopped before clearing the journal. Clearing it is
+            // the only step left.
+            activation::clear_journal(&state.data_dir).map_err(ApiError::InvalidInput)?;
+            drop(cfg);
+            {
+                let mut watch = state.notify_watch.lock().unwrap_or_else(|e| e.into_inner());
+                watch.activation_cancelled = true;
+            }
+            return Ok(json!({
+                "cancelled": true,
+                "already_restored": true,
+                "reason": "the configuration already matched the pre-change snapshot; \
+                           the stale pending-change record was cleared",
+            }));
+        }
         Err(msg) => return Err(ApiError::InvalidInput(msg)),
     };
     manager_config::validate(&restored).map_err(ApiError::from)?;
@@ -8533,7 +8631,7 @@ pub async fn op_gateway_set_bind_host(
     let mut new_cfg = cfg.clone();
     new_cfg.gateway.bind_host = host.clone();
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
-    record_gateway_change(
+    let journaled = record_gateway_change(
         state,
         &pre_cfg,
         &new_cfg,
@@ -8542,7 +8640,7 @@ pub async fn op_gateway_set_bind_host(
         true,
     )
     .await?;
-    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+    save_journaled(state, &new_cfg, &journaled)?;
     *cfg = new_cfg;
     Ok(json!({ "bind_host": host, "restart_required": true }))
 }
@@ -9224,7 +9322,7 @@ pub async fn op_model_assign(
     // when the generated YAML actually differs), and the backend
     // loads the new model at its next (re)start (backend scope).
     // Recorded before the save, per the journal ordering rule.
-    record_gateway_change(
+    let mut journaled = record_gateway_change(
         state,
         &pre_cfg,
         &cfg,
@@ -9233,7 +9331,7 @@ pub async fn op_model_assign(
         false,
     )
     .await?;
-    record_backend_change(
+    let backend_record = record_backend_change(
         state,
         &pre_cfg,
         &cfg,
@@ -9241,8 +9339,9 @@ pub async fn op_model_assign(
         format!("Backend `{backend_id}` now serves model `{id}`"),
         &backend_id,
     )
-    .await?;
-    manager_config::save(&cfg, &state.config_path)?;
+    .await;
+    chain_journaled(state, &mut journaled, backend_record)?;
+    save_journaled(state, &cfg, &journaled)?;
     // Commit point: every fallible step has succeeded, so the
     // working clone becomes the live config.
     *guard = cfg;
@@ -10344,8 +10443,9 @@ pub async fn op_placement_apply(
         // backend-scope plan entry per target (the gateway YAML
         // does not carry splits, so no gateway entry is created
         // for this change).
+        let mut journaled = activation::JournalRecords::none();
         for bid in &backend_ids {
-            record_backend_change(
+            let record = record_backend_change(
                 state,
                 &pre_cfg,
                 &new_cfg,
@@ -10353,11 +10453,12 @@ pub async fn op_placement_apply(
                 format!("Backend `{bid}` tensor split changed"),
                 bid,
             )
-            .await?;
+            .await;
+            chain_journaled(state, &mut journaled, record)?;
         }
         // Persist — without the save, the applied split silently
         // vanished on app restart while the command reported success.
-        manager_config::save(&new_cfg, &state.config_path)?;
+        save_journaled(state, &new_cfg, &journaled)?;
         *cfg = new_cfg;
         Ok(())
     })
@@ -16460,6 +16561,108 @@ mod tests {
         let info = backend_cache_info(&b);
         assert!(info.present);
         assert!(info.custom);
+    }
+
+    /// PS-6: a journaling command whose config save fails after the
+    /// entry was recorded removes exactly that entry — an earlier
+    /// entry and a standing offload override written by another
+    /// command stay.
+    #[tokio::test]
+    async fn failed_save_rolls_back_only_its_journal_entry() {
+        let dir = unique_test_dir("llm-mgr-ps6-rollback");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = test_cfg();
+        cfg.data_dir = dir.clone();
+        // The config path is a directory: save's backup rotation
+        // cannot copy it, so every save fails after journaling.
+        let config_path = dir.join("config-is-a-directory");
+        std::fs::create_dir_all(&config_path).unwrap();
+        let state = Arc::new(AppState::new(cfg.clone(), config_path, dir.clone()));
+        let mut earlier_post = cfg.clone();
+        earlier_post.gateway.port += 1;
+        let configured: std::collections::HashSet<String> =
+            cfg.backends.iter().map(|b| b.id.clone()).collect();
+        let earlier = activation::record_change(
+            &dir,
+            &cfg,
+            &earlier_post,
+            "gateway_config",
+            "earlier change".to_string(),
+            "gateway",
+            Vec::new(),
+            &std::collections::HashMap::new(),
+            &configured,
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+        activation::record_offload_override(&dir, "coder", 24, vec![(8, 9)]).unwrap();
+        let host_before = state.config.read().await.gateway.bind_host.clone();
+        let new_host = if host_before == "127.0.0.1" {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
+        let r = op_gateway_set_bind_host(&state, &test_sink(), new_host.to_string()).await;
+        assert!(r.is_err(), "the save must fail: {r:?}");
+        assert_eq!(
+            state.config.read().await.gateway.bind_host,
+            host_before,
+            "a failed save leaves the live config unchanged"
+        );
+        let journal = activation::load_journal(&dir);
+        assert_eq!(
+            journal
+                .entries
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![earlier.as_str()],
+            "only the failed command's entry is rolled back"
+        );
+        assert!(
+            activation::offload_override_covers(&journal, "coder", 24, &[(8, 9)]),
+            "the other command's offload override survives the rollback"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PS-10 self-heal: a cancel that saved the restored config but
+    /// stopped before clearing the journal leaves the configuration
+    /// equal to the snapshot; the next cancel clears the stale
+    /// journal instead of refusing forever.
+    #[tokio::test]
+    async fn activation_cancel_clears_a_stale_journal() {
+        let cfg = test_cfg();
+        let (state, dir) = advanced_test_state(cfg);
+        let current = state.config.read().await.clone();
+        let mut after = current.clone();
+        after.gateway.port += 1;
+        let configured: std::collections::HashSet<String> =
+            current.backends.iter().map(|b| b.id.clone()).collect();
+        activation::record_change(
+            &dir,
+            &current,
+            &after,
+            "gateway_config",
+            "cancelled before the crash".to_string(),
+            "gateway",
+            Vec::new(),
+            &std::collections::HashMap::new(),
+            &configured,
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+        activation::record_offload_override(&dir, "coder", 24, vec![(8, 9)]).unwrap();
+        let r = op_gateway_activation_cancel(&state, &test_sink())
+            .await
+            .unwrap();
+        assert_eq!(r["cancelled"], true, "{r}");
+        assert_eq!(r["already_restored"], true, "{r}");
+        let journal = activation::load_journal(&dir);
+        assert!(journal.entries.is_empty());
+        assert!(journal.snapshot.is_none());
+        assert_eq!(journal.offload_overrides.len(), 1, "overrides are kept");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
