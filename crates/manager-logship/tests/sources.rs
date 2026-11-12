@@ -127,6 +127,7 @@ impl Rig {
             tail_service_manage: false,
             tail_audit: false,
             app_events: false,
+            backends: None,
             ..ShipperConfig::default()
         }
     }
@@ -499,7 +500,10 @@ async fn lagged_feed_ships_one_warning_with_the_dropped_count() {
             .expect("the warning carries the dropped count");
     }
     assert_eq!(reported, dropped);
-    assert!(dropped >= 500, "at least the overflow was dropped: {dropped}");
+    assert!(
+        dropped >= 500,
+        "at least the overflow was dropped: {dropped}"
+    );
     assert!(by_source(&records, "app").is_empty());
     rig.finish(&handle).await;
 }
@@ -512,6 +516,7 @@ async fn disabled_app_source_is_not_subscribed() {
     let tap = RecordTap::new();
     let handle = manager_logship::spawn(ShipperConfig {
         app_events: false,
+        backends: None,
         tap: Some(tap.clone()),
         ..rig.config()
     });
@@ -535,5 +540,106 @@ async fn disabled_app_source_is_not_subscribed() {
         SourceState::Unavailable
     );
     rig2.finish(&handle2).await;
+    rig.finish(&handle).await;
+}
+
+/// S1 is opt-in: with the toggle off nothing about a backend is
+/// tailed or accepted, even with its files present and records on
+/// the feed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backends_off_ships_nothing_from_backends() {
+    let rig = Rig::new("backendsoff");
+    write_lines(
+        &rig.logs().join("backend-planner.stdout.log"),
+        &["llama-server: model loaded"],
+    );
+    write_lines(&rig.logs().join("wizard.log"), &["=== step one ==="]);
+    let tap = RecordTap::new();
+    let handle = manager_logship::spawn(ShipperConfig {
+        tail_wizard: true,
+        app_events: true,
+        tap: Some(tap.clone()),
+        backends: None,
+        ..rig.config()
+    });
+    wait_until("the shipper to subscribe", || tap.is_active()).await;
+    tap.send(TapRecord {
+        source: "backend:planner".to_string(),
+        ..app_event("llama-server: slot 0 released")
+    });
+    let records = rig.wait_for(1).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let records = if rig.capture.records().len() > records.len() {
+        rig.capture.records()
+    } else {
+        records
+    };
+    assert_eq!(records.len(), 1, "only the wizard line ships: {records:?}");
+    assert_eq!(records[0]["source"], "wizard");
+    let rows = handle.status().sources;
+    assert_eq!(row(&rows, "backends").state, SourceState::Disabled);
+    assert!(rows.iter().all(|r| !r.source.starts_with("backend:")));
+    rig.finish(&handle).await;
+}
+
+/// S1 on: a service-mode backend ships from its `backend-<id>` log
+/// files (with streams), a process-mode backend ships from the feed,
+/// both as `backend:<id>`, both redacted; a configured backend with
+/// neither is `waiting`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backends_on_ships_service_files_and_process_feed() {
+    const HFTOKEN: &str = "BACKENDHFTOKEN6c7d8e9f";
+    let rig = Rig::new("backendson");
+    write_lines(
+        &rig.logs().join("backend-svc.stdout.log"),
+        &["llama-server: listening on 127.0.0.1:8081"],
+    );
+    write_lines(
+        &rig.logs().join("backend-svc.stderr.log"),
+        &[&format!("fetching model with hf_token={HFTOKEN}")],
+    );
+    let tap = RecordTap::new();
+    let handle = manager_logship::spawn(ShipperConfig {
+        tap: Some(tap.clone()),
+        backends: Some(vec![
+            "svc".to_string(),
+            "proc".to_string(),
+            "idle".to_string(),
+        ]),
+        ..rig.config()
+    });
+    wait_until("the shipper to subscribe", || tap.is_active()).await;
+    tap.send(TapRecord {
+        source: "backend:proc".to_string(),
+        stream: "stderr".to_string(),
+        level: None,
+        line: "llama-server: error: failed to load model".to_string(),
+    });
+    // The app source is off in this config: not accepted.
+    tap.send(app_event("backend-status {}"));
+
+    let records = rig.wait_for(3).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let records = if rig.capture.records().len() > records.len() {
+        rig.capture.records()
+    } else {
+        records
+    };
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert_absent(&records, &[HFTOKEN]);
+    let svc = by_source(&records, "backend:svc");
+    assert_eq!(svc.len(), 2);
+    assert!(svc.iter().any(|r| r["stream"] == "stdout"));
+    assert!(svc.iter().any(|r| r["stream"] == "stderr"));
+    let proc = by_source(&records, "backend:proc");
+    assert_eq!(proc.len(), 1);
+    assert_eq!(proc[0]["stream"], "stderr");
+    assert_eq!(proc[0]["level"], "error");
+
+    let rows = handle.status().sources;
+    assert_eq!(row(&rows, "backend:svc").state, SourceState::Active);
+    assert_eq!(row(&rows, "backend:proc").state, SourceState::Active);
+    assert_eq!(row(&rows, "backend:idle").state, SourceState::Waiting);
+    assert_eq!(row(&rows, "app").state, SourceState::Disabled);
     rig.finish(&handle).await;
 }

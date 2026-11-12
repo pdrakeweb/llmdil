@@ -9,6 +9,7 @@
 //! written to the local `shipper.log` and never fails the app: a
 //! deployment that never opts in behaves exactly as before.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use manager_config::LogStreamingLevel;
@@ -21,7 +22,7 @@ use crate::{AppState, EventSink};
 
 /// Start the shipper if the deployment has opted in. Idempotent:
 /// a second call after a successful start is a no-op.
-pub async fn start_log_streaming(state: &AppState) {
+pub async fn start_log_streaming(state: &Arc<AppState>) {
     if state.logship.get().is_some() {
         return;
     }
@@ -98,10 +99,100 @@ pub async fn start_log_streaming(state: &AppState) {
         tail_audit: ls.sources.audit,
         app_events: ls.sources.app,
         tap: Some(state.logship_tap.clone()),
+        // S1 is opt-in (D3). The config has no per-backend switch,
+        // so the one toggle covers every configured backend.
+        backends: ls
+            .sources
+            .backends
+            .then(|| cfg.backends.iter().map(|b| b.id.clone()).collect()),
         literal_secrets: literals,
         spool_cap_bytes: manager_logship::DEFAULT_SPOOL_CAP_BYTES,
     });
-    let _ = state.logship.set(Arc::new(handle));
+    let handle = Arc::new(handle);
+    if ls.sources.backends {
+        tokio::spawn(pump_backend_rings(Arc::clone(state), Arc::clone(&handle)));
+    }
+    let _ = state.logship.set(handle);
+}
+
+// ---------------------------------------------------------------------------
+// S1: per-backend output, process mode
+// ---------------------------------------------------------------------------
+
+/// How often the backend rings are followed.
+const RING_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How much of a ring that already holds output ships when the pump
+/// first sees it at startup: recent context, not the whole 10k-line
+/// ring (the file tails' first-sight rule, in lines).
+const RING_FIRST_SIGHT_LINES: usize = 200;
+
+/// Follow the supervisor's per-backend rings and offer new lines to
+/// the shipper as `backend:<id>`. Process mode only produces lines
+/// here: a service-mode backend's output goes to its log files (which
+/// the shipper tails) and its adopted ring stays empty, so no line
+/// ships twice. Runs only when `sources.backends` is on, and stops
+/// with the shipper.
+async fn pump_backend_rings(state: Arc<AppState>, handle: Arc<manager_logship::ShipperHandle>) {
+    let mut cursors = HashMap::new();
+    let mut first_pass = true;
+    while !handle.is_shut_down() {
+        // Idle until the shipper has subscribed; cursors do not
+        // advance meanwhile, so nothing is skipped.
+        if state.logship_tap.is_active() {
+            let ids: Vec<String> = state
+                .backend_spec_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned()
+                .collect();
+            let fresh = {
+                let sup = state.supervisor().await.lock().await;
+                follow_rings(&sup, &ids, &mut cursors, first_pass)
+            };
+            first_pass = false;
+            for record in fresh {
+                state.logship_tap.send(record);
+            }
+        }
+        tokio::time::sleep(RING_POLL).await;
+    }
+}
+
+/// One pass over the rings of `ids`: every line captured since the
+/// last pass, as feed records, advancing `cursors`.
+fn follow_rings(
+    sup: &manager_supervisor::Supervisor,
+    ids: &[String],
+    cursors: &mut HashMap<String, manager_supervisor::LogCursor>,
+    first_pass: bool,
+) -> Vec<TapRecord> {
+    let mut out = Vec::new();
+    for id in ids {
+        let (mut records, next) = sup.logs_since(id, cursors.get(id).copied());
+        match next {
+            Some(cursor) => cursors.insert(id.clone(), cursor),
+            None => cursors.remove(id),
+        };
+        if first_pass && records.len() > RING_FIRST_SIGHT_LINES {
+            records.drain(..records.len() - RING_FIRST_SIGHT_LINES);
+        }
+        let source = manager_logship::shipper::backend_source(id);
+        out.extend(records.into_iter().map(|r| {
+            TapRecord {
+                source: source.clone(),
+                stream: match r.stream {
+                    manager_supervisor::LogStream::Stdout => "stdout",
+                    manager_supervisor::LogStream::Stderr => "stderr",
+                }
+                .to_string(),
+                level: None,
+                line: r.line,
+            }
+        }));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +388,63 @@ mod tests {
         let blob = json!({ "blob": "a".repeat(3 * MAX_EVENT_PAYLOAD_CHARS) });
         let huge = event_record("x", &blob).unwrap();
         assert!(huge.line.chars().count() <= MAX_EVENT_PAYLOAD_CHARS + 8);
+    }
+
+    /// The ring pump's pass: a backend's captured lines come out
+    /// once each as `backend:<id>` records with their stream, and a
+    /// ring that already holds a lot at first sight ships only its
+    /// recent tail.
+    #[tokio::test]
+    async fn follow_rings_offers_each_backend_line_once() {
+        use manager_supervisor::{BackoffPolicy, ProcessSpec, Supervisor};
+        let mut sup = Supervisor::new(BackoffPolicy {
+            base: std::time::Duration::from_millis(100),
+            max: std::time::Duration::from_secs(1),
+            max_retries: 0,
+        });
+        let echo = "for /L %i in (1,1,250) do @echo pumped line %i";
+        let (program, args) = if cfg!(windows) {
+            ("cmd", vec!["/C".to_string(), echo.to_string()])
+        } else {
+            let sh = "i=1; while [ $i -le 250 ]; do echo pumped line $i; i=$((i+1)); done";
+            ("sh", vec!["-c".to_string(), sh.to_string()])
+        };
+        sup.register_spec(ProcessSpec {
+            id: "planner".into(),
+            program: program.into(),
+            args,
+            env: vec![],
+            workdir: None,
+            port: None,
+            low_priority: false,
+        });
+        sup.spawn_backend("planner").await.unwrap();
+        // Wait for the whole burst to be captured.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while sup
+            .logs_query("planner", None, Some("pumped line 250"), 1)
+            .total_matching
+            == 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "echo output not captured"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let ids = vec!["planner".to_string(), "never-ran".to_string()];
+        let mut cursors = HashMap::new();
+        // First pass at startup: only the recent tail of the ring.
+        let first = follow_rings(&sup, &ids, &mut cursors, true);
+        assert_eq!(first.len(), RING_FIRST_SIGHT_LINES);
+        assert!(first
+            .iter()
+            .all(|r| r.source == "backend:planner" && r.stream == "stdout"));
+        assert!(first.last().unwrap().line.contains("pumped line 250"));
+        // Nothing new: nothing offered again.
+        assert!(follow_rings(&sup, &ids, &mut cursors, false).is_empty());
+        let _ = sup.stop("planner", false).await;
     }
 
     /// The wrapped sink forwards every event unchanged, and offers

@@ -65,6 +65,11 @@ pub struct ShipperConfig {
     /// a tap-fed source is enabled, and accepts only records whose
     /// source is enabled.
     pub tap: Option<RecordTap>,
+    /// S1 (opt-in, D3): per-backend output as source `backend:<id>`.
+    /// `None` is off. `Some(ids)` tails each listed backend's
+    /// service-mode files (`backend-<id>.stdout.log` / `.stderr.log`)
+    /// and accepts `backend:*` records on the tap (process mode).
+    pub backends: Option<Vec<String>>,
     /// Literal secret values for redaction layer 1.
     pub literal_secrets: Vec<String>,
     pub spool_cap_bytes: u64,
@@ -86,6 +91,7 @@ impl Default for ShipperConfig {
             tail_audit: true,
             app_events: true,
             tap: None,
+            backends: None,
             literal_secrets: Vec::new(),
             spool_cap_bytes: DEFAULT_SPOOL_CAP_BYTES,
         }
@@ -103,6 +109,10 @@ pub enum SourceState {
     Disabled,
     /// Enabled, but none of its log files exist (yet).
     FileMissing,
+    /// Enabled and subscribed, with nothing captured yet: a backend
+    /// that has no service log file and has not produced output in
+    /// this process since the shipper started.
+    Waiting,
     /// Enabled, but this process gave the shipper no in-process
     /// feed to subscribe to.
     Unavailable,
@@ -140,9 +150,18 @@ struct PlannedSource {
 /// Source name of app / supervisor events on the tap (S5).
 pub const APP_SOURCE: &str = "app";
 
+/// Prefix of a per-backend source name (S1): `backend:<id>`.
+pub const BACKEND_SOURCE_PREFIX: &str = "backend:";
+
+/// The source name of one backend's output.
+pub fn backend_source(id: &str) -> String {
+    format!("{BACKEND_SOURCE_PREFIX}{id}")
+}
+
 /// Whether a tap record from `source` is one this config ships.
 fn tap_accepts(config: &ShipperConfig, source: &str) -> bool {
-    source == APP_SOURCE && config.app_events
+    (source == APP_SOURCE && config.app_events)
+        || (source.starts_with(BACKEND_SOURCE_PREFIX) && config.backends.is_some())
 }
 
 /// Every source for `config`, in report order.
@@ -171,7 +190,7 @@ fn source_plan(config: &ShipperConfig) -> Vec<PlannedSource> {
             .collect(),
         tapped: false,
     };
-    vec![
+    let mut plan = vec![
         single("wizard", config.tail_wizard, "wizard.log"),
         single("optimize", config.tail_optimize, "optimize.log"),
         pair("gateway", config.tail_gateway, "gateway"),
@@ -187,7 +206,26 @@ fn source_plan(config: &ShipperConfig) -> Vec<PlannedSource> {
             files: Vec::new(),
             tapped: true,
         },
-    ]
+    ];
+    // S1: one source per backend, fed both ways — the service host's
+    // files (service mode) and the tap (process mode). Whichever
+    // mode a backend runs in, only one of the two produces lines.
+    match &config.backends {
+        Some(ids) if !ids.is_empty() => {
+            for id in ids {
+                let mut src = pair(&backend_source(id), true, &format!("backend-{id}"));
+                src.tapped = true;
+                plan.push(src);
+            }
+        }
+        other => plan.push(PlannedSource {
+            source: "backends".to_string(),
+            enabled: other.is_some(),
+            files: Vec::new(),
+            tapped: true,
+        }),
+    }
+    plan
 }
 
 /// The rotation sibling the app's writers use: `<file>.prev`.
@@ -304,6 +342,12 @@ impl ShipperHandle {
 
     pub fn shutdown(&self) {
         let _ = self.shutdown.send(true);
+    }
+
+    /// Whether [`Self::shutdown`] has been requested (tasks feeding
+    /// the shipper stop with it).
+    pub fn is_shut_down(&self) -> bool {
+        *self.shutdown.borrow()
     }
 }
 
@@ -534,24 +578,49 @@ async fn run_loop(
         }
 
         // --- Per-source status rows. -----------------------------
-        let rows: Vec<SourceStatus> = plan
+        let mut rows: Vec<SourceStatus> = plan
             .iter()
-            .map(|src| SourceStatus {
-                source: src.source.clone(),
-                state: if !src.enabled {
+            .map(|src| {
+                let records = intake.counts.get(&src.source).copied().unwrap_or(0);
+                let subscribed = src.tapped && tap_rx.is_some();
+                let state = if !src.enabled {
                     SourceState::Disabled
-                } else if tails.iter().any(|t| t.source == src.source && t.present)
-                    || (src.tapped && tap_rx.is_some())
-                {
+                } else if tails.iter().any(|t| t.source == src.source && t.present) {
                     SourceState::Active
                 } else if src.files.is_empty() {
-                    SourceState::Unavailable
-                } else {
+                    // Fed by the tap alone.
+                    if subscribed {
+                        SourceState::Active
+                    } else {
+                        SourceState::Unavailable
+                    }
+                } else if !subscribed {
                     SourceState::FileMissing
-                },
-                records: intake.counts.get(&src.source).copied().unwrap_or(0),
+                } else if records > 0 {
+                    SourceState::Active
+                } else {
+                    SourceState::Waiting
+                };
+                SourceStatus {
+                    source: src.source.clone(),
+                    state,
+                    records,
+                }
             })
             .collect();
+        // Backends that appeared after the plan was built (added to
+        // the config since the shipper started) and are shipping.
+        for (source, records) in &intake.counts {
+            if source.starts_with(BACKEND_SOURCE_PREFIX)
+                && !rows.iter().any(|r| &r.source == source)
+            {
+                rows.push(SourceStatus {
+                    source: source.clone(),
+                    state: SourceState::Active,
+                    records: *records,
+                });
+            }
+        }
         set_status(&status, |s| s.sources = rows);
 
         // --- Batching: spool drains first, then the live queue. --
