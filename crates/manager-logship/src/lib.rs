@@ -19,7 +19,7 @@ pub mod shipper;
 pub mod spool;
 pub mod tail;
 
-pub use record::{classify_level, ShipLevel, WireRecord};
+pub use record::{audit_level, classify_level, ShipLevel, WireRecord};
 pub use redact::Redactor;
 pub use shipper::{
     spawn, ShipperConfig, ShipperHandle, ShipperStatus, SourceState, SourceStatus,

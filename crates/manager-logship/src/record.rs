@@ -62,6 +62,34 @@ pub fn classify_level(line: &str) -> ShipLevel {
     ShipLevel::Info
 }
 
+/// Level of an Admin API audit line (`admin-api-audit.jsonl`, S7).
+/// The record carries its outcome in `result`: an HTTP status for
+/// mutations (5xx error, 4xx warn, otherwise info) or an auth
+/// outcome word (`ok` / `totp_required` are info; every other word —
+/// `invalid_credentials`, `refresh_reuse_detected`, … — is a refused
+/// or suspicious attempt and ships as warn). A line that is not an
+/// audit record, or carries no `result`, falls back to
+/// [`classify_level`].
+pub fn audit_level(line: &str) -> ShipLevel {
+    let result = serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(str::to_string));
+    let Some(result) = result else {
+        return classify_level(line);
+    };
+    if let Ok(status) = result.parse::<u16>() {
+        return match status {
+            500.. => ShipLevel::Error,
+            400..=499 => ShipLevel::Warn,
+            _ => ShipLevel::Info,
+        };
+    }
+    match result.as_str() {
+        "ok" | "totp_required" => ShipLevel::Info,
+        _ => ShipLevel::Warn,
+    }
+}
+
 /// One shipped log record (design §6.3 wire format).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireRecord {
@@ -99,6 +127,25 @@ mod tests {
         assert_eq!(classify_level("trace: enter fn"), ShipLevel::Debug);
         assert_eq!(classify_level("info: ready"), ShipLevel::Info);
         assert_eq!(classify_level("=== step start ==="), ShipLevel::Info);
+    }
+
+    #[test]
+    fn audit_level_follows_the_recorded_outcome() {
+        let line = |result: &str| {
+            format!(
+                r#"{{"ts_ms":1,"actor":"alice","auth_type":"session","source_ip":"127.0.0.1","action":"POST /api/v1/backends/{{id}}/start","target":"planner","result":"{result}","request_id":"r1"}}"#
+            )
+        };
+        assert_eq!(audit_level(&line("202")), ShipLevel::Info);
+        assert_eq!(audit_level(&line("ok")), ShipLevel::Info);
+        assert_eq!(audit_level(&line("totp_required")), ShipLevel::Info);
+        assert_eq!(audit_level(&line("403")), ShipLevel::Warn);
+        assert_eq!(audit_level(&line("invalid_credentials")), ShipLevel::Warn);
+        assert_eq!(audit_level(&line("refresh_reuse")), ShipLevel::Warn);
+        assert_eq!(audit_level(&line("500")), ShipLevel::Error);
+        // Not an audit record: the line heuristic applies.
+        assert_eq!(audit_level("write failed: disk full"), ShipLevel::Error);
+        assert_eq!(audit_level(r#"{"no_result":true}"#), ShipLevel::Info);
     }
 
     #[test]

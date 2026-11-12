@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tokio::sync::watch;
 
-use crate::record::{classify_level, ShipLevel, WireRecord, WIRE_VERSION};
+use crate::record::{audit_level, classify_level, ShipLevel, WireRecord, WIRE_VERSION};
 use crate::redact::Redactor;
 use crate::spool::{Spool, DEFAULT_SPOOL_CAP_BYTES};
 use crate::tail::FileTail;
@@ -53,6 +53,10 @@ pub struct ShipperConfig {
     /// S6: `service-manage.log`, the elevated service helper's own
     /// outcome log (`llm-service-host`, under `<data_dir>/logs`).
     pub tail_service_manage: bool,
+    /// S7: `admin-api-audit.jsonl`. Lines are JSON records and ship
+    /// verbatim (through redaction); the level comes from the
+    /// record's `result`.
+    pub tail_audit: bool,
     /// Literal secret values for redaction layer 1.
     pub literal_secrets: Vec<String>,
     pub spool_cap_bytes: u64,
@@ -71,6 +75,7 @@ impl Default for ShipperConfig {
             tail_optimize: true,
             tail_gateway: true,
             tail_service_manage: true,
+            tail_audit: true,
             literal_secrets: Vec::new(),
             spool_cap_bytes: DEFAULT_SPOOL_CAP_BYTES,
         }
@@ -150,6 +155,7 @@ fn source_plan(config: &ShipperConfig) -> Vec<PlannedSource> {
             config.tail_service_manage,
             "service-manage.log",
         ),
+        single(AUDIT_SOURCE, config.tail_audit, "admin-api-audit.jsonl"),
     ]
 }
 
@@ -160,9 +166,17 @@ fn prev_sibling(path: &std::path::Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// The level of one line from `source`.
-fn source_level(_source: &str, line: &str) -> ShipLevel {
-    classify_level(line)
+/// Source name of the Admin API audit log tail (S7).
+const AUDIT_SOURCE: &str = "audit";
+
+/// The level of one line from `source`: audit records carry their
+/// outcome, everything else is classified by the line heuristic.
+fn source_level(source: &str, line: &str) -> ShipLevel {
+    if source == AUDIT_SOURCE {
+        audit_level(line)
+    } else {
+        classify_level(line)
+    }
 }
 
 /// Redacts, sequences and enqueues records — the one path every

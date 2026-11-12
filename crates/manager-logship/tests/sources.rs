@@ -125,6 +125,7 @@ impl Rig {
             tail_optimize: false,
             tail_gateway: false,
             tail_service_manage: false,
+            tail_audit: false,
             ..ShipperConfig::default()
         }
     }
@@ -297,11 +298,70 @@ async fn service_manage_tail_ships_and_survives_truncation() {
         records
     };
     assert_eq!(records.len(), 3, "no re-ship, no loss: {records:?}");
-    assert!(records
-        .iter()
-        .any(|r| r["line"].as_str().unwrap().contains("unregister llm-gateway")));
+    assert!(records.iter().any(|r| r["line"]
+        .as_str()
+        .unwrap()
+        .contains("unregister llm-gateway")));
     let rows = handle.status().sources;
     assert_eq!(row(&rows, "service-manage").state, SourceState::Active);
     assert_eq!(row(&rows, "service-manage").records, 3);
+    rig.finish(&handle).await;
+}
+
+/// S7: audit lines are JSON records. They ship verbatim (still one
+/// parseable object per line), their level comes from the recorded
+/// outcome rather than from words in the line, and a secret-shaped
+/// attacker-chosen actor is redacted like anything else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_tail_ships_json_verbatim_with_outcome_levels() {
+    const HOSTILE: &str = "sk-AUDITHOSTILEACTOR5f6a7b8c";
+    let entry = |actor: &str, action: &str, result: &str, id: &str| {
+        format!(
+            r#"{{"ts_ms":1762900000000,"actor":"{actor}","auth_type":"session","source_ip":"127.0.0.1","action":"{action}","target":null,"result":"{result}","request_id":"{id}"}}"#
+        )
+    };
+    let ok = entry("alice", "POST /api/v1/backends/{id}/start", "202", "req-1");
+    // "error" appears in the action path: the outcome (200) decides.
+    let benign = entry("alice", "GET /api/v1/errors", "200", "req-2");
+    let denied = entry("bob", "POST /api/v1/config", "403", "req-3");
+    let failed = entry("alice", "POST /api/v1/backends/{id}/start", "500", "req-4");
+    let hostile = entry(
+        HOSTILE,
+        "POST /api/v1/auth/login",
+        "invalid_credentials",
+        "req-5",
+    );
+
+    let rig = Rig::new("audit");
+    write_lines(
+        &rig.logs().join("admin-api-audit.jsonl"),
+        &[&ok, &benign, &denied, &failed, &hostile],
+    );
+    let handle = manager_logship::spawn(ShipperConfig {
+        tail_audit: true,
+        ..rig.config()
+    });
+    let records = rig.wait_for(5).await;
+    let audit = by_source(&records, "audit");
+    assert_eq!(audit.len(), 5);
+    assert_absent(&records, &[HOSTILE]);
+
+    let level_of = |id: &str| -> String {
+        let rec = audit
+            .iter()
+            .find(|r| r["line"].as_str().unwrap().contains(id))
+            .unwrap_or_else(|| panic!("no audit record {id}"));
+        let doc: serde_json::Value =
+            serde_json::from_str(rec["line"].as_str().unwrap()).expect("audit line stays JSON");
+        assert_eq!(doc["request_id"], id);
+        rec["level"].as_str().unwrap().to_string()
+    };
+    assert_eq!(level_of("req-1"), "info");
+    assert_eq!(level_of("req-2"), "info");
+    assert_eq!(level_of("req-3"), "warn");
+    assert_eq!(level_of("req-4"), "error");
+    assert_eq!(level_of("req-5"), "warn");
+    // Untouched records are byte-identical to what the API wrote.
+    assert!(audit.iter().any(|r| r["line"] == ok.as_str()));
     rig.finish(&handle).await;
 }
