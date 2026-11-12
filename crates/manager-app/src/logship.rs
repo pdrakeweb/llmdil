@@ -1,16 +1,17 @@
 //! Log-streaming startup, in-process sources and status
 //! (log-streaming design §6.1, §6.5; docs/log-streaming.md).
 //!
-//! The shipper (crate `manager-logship`) starts once, after config
-//! load, when `log_streaming.enabled` is set and a destination
-//! endpoint is configured. Enablement is the config-file section
-//! plus the Credential Manager token (D6); the source toggles are
-//! read here, at start. This module also feeds the shipper the
-//! sources that have no file to tail — app events and process-mode
-//! backend output — and builds the per-source status the Log
-//! receiver card shows. Every failure to start is
-//! written to the local `shipper.log` and never fails the app: a
-//! deployment that never opts in behaves exactly as before.
+//! The shipper (crate `manager-logship`) starts after config load
+//! when `log_streaming.enabled` is set and the destination endpoint
+//! passes the endpoint policy, and is restarted whenever its saved
+//! settings change (`apply_log_streaming`). Enablement is the
+//! config-file section plus the Credential Manager token (D6). This
+//! module also feeds the shipper the sources that have no file to
+//! tail — app events and process-mode backend output — and builds
+//! the per-source status the Log receiver card shows. Every failure
+//! to start is written to the local `shipper.log`, surfaced on that
+//! card, and never fails the app: a deployment that never opts in
+//! behaves exactly as before.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,32 +24,125 @@ use serde_json::Value;
 
 use crate::{AppState, EventSink};
 
-/// Start the shipper if the deployment has opted in. Idempotent:
-/// a second call after a successful start is a no-op.
+/// The running shipper and what it was started with (held in
+/// `AppState` behind a std Mutex: every access is a short,
+/// synchronous read or swap).
+#[derive(Default)]
+pub(crate) struct LogshipSlot {
+    handle: Option<Arc<manager_logship::ShipperHandle>>,
+    /// The settings the running shipper was started with
+    /// ([`applied_settings`]); `apply_log_streaming` is a no-op while
+    /// the saved config still matches.
+    applied: Option<Value>,
+    /// Why streaming is enabled but no shipper is running (refused
+    /// endpoint, missing token, …). Shown on the Log receiver card.
+    note: Option<String>,
+}
+
+/// How long a settings change waits for the previous shipper to
+/// stop: longer than its HTTP timeout (15 s), so an in-flight POST
+/// can finish or fail.
+const SHIPPER_STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Everything the shipper is configured from, as one comparable
+/// value: the `log_streaming` section, plus the backend ids when
+/// per-backend logs are on (their file tails are per id).
+fn applied_settings(cfg: &manager_config::AppConfig) -> Value {
+    let backends: Vec<&str> = if cfg.log_streaming.sources.backends {
+        cfg.backends.iter().map(|b| b.id.as_str()).collect()
+    } else {
+        Vec::new()
+    };
+    serde_json::json!({
+        "log_streaming": serde_json::to_value(&cfg.log_streaming).unwrap_or(Value::Null),
+        "backends": backends,
+    })
+}
+
+/// Start the shipper at app start if the deployment has opted in.
 pub async fn start_log_streaming(state: &Arc<AppState>) {
-    if state.logship.get().is_some() {
-        return;
-    }
+    apply_log_streaming(state).await;
+}
+
+/// Bring the shipper in line with the saved config: start it, stop
+/// it, or restart it with new settings. Called at app start and
+/// after every config save, so a saved `log_streaming` change takes
+/// effect without restarting LLMdil. A no-op when a shipper is
+/// already running with the saved settings. Never fails the caller:
+/// a shipper that cannot start leaves a note for the status surface
+/// and a line in `shipper.log`.
+///
+/// Restarting loses nothing: the old shipper parks what it holds in
+/// the spool as it stops, tail offsets persist, and the new shipper
+/// starts only after the old one has ended (two shippers on one
+/// spool would reuse sequence numbers).
+pub async fn apply_log_streaming(state: &Arc<AppState>) {
+    let _one_at_a_time = state.logship_apply.lock().await;
     let cfg = state.config.read().await.clone();
+    let wanted = applied_settings(&cfg);
+    let previous = {
+        let mut slot = state.logship.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.handle.is_some() && slot.applied.as_ref() == Some(&wanted) {
+            return;
+        }
+        slot.applied = None;
+        slot.handle.take()
+    };
+    let log = |line: &str| manager_logship::shipper::append_shipper_log(&state.data_dir, line);
+    if let Some(old) = previous {
+        if !old.shutdown_and_wait(SHIPPER_STOP_LIMIT).await {
+            let note = "the previous shipper did not stop in time; restart LLMdil to apply \
+                        the log streaming settings";
+            log(note);
+            set_note(state, Some(note.to_string()));
+            return;
+        }
+        log("shipper stopped to apply changed log streaming settings");
+    }
+    match spawn_shipper(state, &cfg).await {
+        Ok(handle) => {
+            let mut slot = state.logship.lock().unwrap_or_else(|e| e.into_inner());
+            slot.applied = handle.is_some().then_some(wanted);
+            slot.handle = handle;
+            slot.note = None;
+        }
+        Err(reason) => {
+            log(&format!("log streaming is enabled but the shipper was not started: {reason}"));
+            set_note(state, Some(reason));
+        }
+    }
+}
+
+fn set_note(state: &AppState, note: Option<String>) {
+    state
+        .logship
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .note = note;
+}
+
+/// Spawn a shipper for `cfg`. `Ok(None)` when streaming is off;
+/// `Err` is the operator-facing reason it is on but cannot start.
+async fn spawn_shipper(
+    state: &Arc<AppState>,
+    cfg: &manager_config::AppConfig,
+) -> Result<Option<Arc<manager_logship::ShipperHandle>>, String> {
     let ls = &cfg.log_streaming;
     if !ls.enabled {
-        return;
+        return Ok(None);
     }
-    let log = |line: &str| manager_logship::shipper::append_shipper_log(&state.data_dir, line);
-    if ls.endpoint.trim().is_empty() {
-        log("log streaming is enabled but no endpoint is configured; shipper not started");
-        return;
-    }
+    // SEC-16: plain http:// only to a loopback endpoint.
+    manager_logship::check_endpoint(&ls.endpoint)?;
     let ops = manager_wizard::ops::RealSystemOps::default();
     let Some(token) = ops
         .credential_read(manager_config::LOG_STREAMING_TOKEN_CRED_TARGET)
         .await
     else {
-        log(
-            "log streaming is enabled but the ingest token credential \
-             (local-llm-service-manager/log-streaming-token) is missing; shipper not started",
+        return Err(
+            "the ingest token credential (local-llm-service-manager/log-streaming-token) \
+             is missing"
+                .to_string(),
         );
-        return;
     };
 
     // Redaction layer 1 (design §5.2): the deployment's known
@@ -115,7 +209,7 @@ pub async fn start_log_streaming(state: &Arc<AppState>) {
     if ls.sources.backends {
         tokio::spawn(pump_backend_rings(Arc::clone(state), Arc::clone(&handle)));
     }
-    let _ = state.logship.set(handle);
+    Ok(Some(handle))
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +394,14 @@ fn event_record(event: &str, payload: &Value) -> Option<TapRecord> {
 /// The shipper's status counters, when it is running (surfaced on
 /// the Log receiver card's status payload).
 pub fn log_streaming_status(state: &AppState) -> Option<ShipperStatus> {
-    state.logship.get().map(|h| h.status())
+    let slot = state.logship.lock().unwrap_or_else(|e| e.into_inner());
+    slot.handle.as_ref().map(|h| h.status())
+}
+
+/// Why streaming is enabled but no shipper is running, if so.
+pub fn log_streaming_note(state: &AppState) -> Option<String> {
+    let slot = state.logship.lock().unwrap_or_else(|e| e.into_inner());
+    slot.note.clone()
 }
 
 /// The `shipper` object of the `log_receiver_status` payload: what
@@ -308,19 +409,34 @@ pub fn log_streaming_status(state: &AppState) -> Option<ShipperStatus> {
 /// never implies a source ships when it does not.
 ///
 /// Running: the shipper's own rows (`active` / `disabled` /
-/// `file_missing` / `waiting` / `unavailable`, with record counts)
-/// and counters. Not running (streaming off, no endpoint, no token):
-/// every source is listed from the config as `disabled` or
-/// `not_running`. The shipper reads the config once, at start, so
-/// `restart_pending` reports a saved toggle that differs from what
-/// the running shipper was started with.
+/// `file_missing` / `waiting` / `unavailable` / `local_only`, with
+/// record counts) and counters. Not running (streaming off, or on
+/// but unable to start — `note` says why): every source is listed
+/// from the config as `disabled` or `not_running`. `configured`
+/// carries the saved switches for the card's editor. Saved changes
+/// apply as they are saved (`apply_log_streaming`), so
+/// `restart_pending` is normally false: it reports a saved toggle
+/// that still differs from what the running shipper started with.
 pub fn shipper_surface(
     cfg: &manager_config::LogStreamingConfig,
     status: Option<&ShipperStatus>,
+    note: Option<&str>,
 ) -> Value {
     use manager_logship::shipper::BACKEND_SOURCE_PREFIX;
     use manager_logship::SourceState;
     let s = &cfg.sources;
+    let configured = serde_json::json!({
+        "enabled": cfg.enabled,
+        "sources": {
+            "wizard": s.wizard,
+            "optimize": s.optimize,
+            "gateway": s.gateway,
+            "service_manage": s.service_manage,
+            "audit": s.audit,
+            "app": s.app,
+            "backends": s.backends,
+        },
+    });
     // The config toggle behind a status row's source name.
     let toggle = |source: &str| match source {
         "wizard" => s.wizard,
@@ -353,7 +469,9 @@ pub fn shipper_surface(
         return serde_json::json!({
             "running": false,
             "state": "not_running",
-            "restart_pending": cfg.enabled,
+            "restart_pending": false,
+            "note": note,
+            "configured": configured,
             "sources": sources,
         });
     };
@@ -366,6 +484,8 @@ pub fn shipper_surface(
         "running": true,
         "state": status.state,
         "restart_pending": restart_pending,
+        "note": note,
+        "configured": configured,
         "queued": status.queued,
         "spooled_bytes": status.spooled_bytes,
         "delivered": status.delivered,
@@ -379,7 +499,8 @@ pub fn shipper_surface(
 
 /// Shut the shipper down (app shutdown path).
 pub fn stop_log_streaming(state: &AppState) {
-    if let Some(h) = state.logship.get() {
+    let slot = state.logship.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = slot.handle.as_ref() {
         h.shutdown();
     }
 }
@@ -482,18 +603,28 @@ mod tests {
         };
 
         // Not running, streaming off: nothing ships, nothing pending.
-        let off = shipper_surface(&cfg, None);
+        let off = shipper_surface(&cfg, None, None);
         assert_eq!(off["running"], false);
         assert_eq!(off["restart_pending"], false);
+        assert_eq!(off["note"], Value::Null);
         for source in ["wizard", "optimize", "gateway", "audit", "app"] {
             assert_eq!(state_of(&off, source), "not_running");
         }
         assert_eq!(state_of(&off, "service-manage"), "not_running");
         assert_eq!(state_of(&off, "backends"), "disabled");
+        // The saved switches ride along for the card's editor.
+        assert_eq!(off["configured"]["enabled"], false);
+        assert_eq!(off["configured"]["sources"]["service_manage"], true);
+        assert_eq!(off["configured"]["sources"]["backends"], false);
 
-        // Enabled in the config but no shipper: it starts at restart.
+        // Enabled in the config but unable to start: the reason is
+        // carried, and nothing claims to ship.
         cfg.enabled = true;
-        assert_eq!(shipper_surface(&cfg, None)["restart_pending"], true);
+        let blocked = shipper_surface(&cfg, None, Some("no endpoint is configured"));
+        assert_eq!(blocked["running"], false);
+        assert_eq!(blocked["note"], "no endpoint is configured");
+        assert_eq!(blocked["configured"]["enabled"], true);
+        assert_eq!(state_of(&blocked, "gateway"), "not_running");
 
         // Running: the shipper's own rows, verbatim.
         let row = |source: &str, state| SourceStatus {
@@ -515,7 +646,7 @@ mod tests {
             ],
             ..ShipperStatus::default()
         };
-        let on = shipper_surface(&cfg, Some(&status));
+        let on = shipper_surface(&cfg, Some(&status), None);
         assert_eq!(on["running"], true);
         assert_eq!(on["state"], "connected");
         assert_eq!(on["dropped_events"], 2);
@@ -527,13 +658,107 @@ mod tests {
         // A toggle saved since the shipper started is flagged — in
         // both directions.
         let pending = |cfg: &manager_config::LogStreamingConfig| {
-            shipper_surface(cfg, Some(&status))["restart_pending"].clone()
+            shipper_surface(cfg, Some(&status), None)["restart_pending"].clone()
         };
         cfg.sources.audit = false;
         assert_eq!(pending(&cfg), true);
         cfg.sources.audit = true;
         cfg.sources.backends = true;
         assert_eq!(pending(&cfg), true);
+        cfg.sources.backends = false;
+
+        // A source held on the machine by policy is on, not pending.
+        let held = ShipperStatus {
+            sources: vec![row("audit", SourceState::LocalOnly)],
+            ..ShipperStatus::default()
+        };
+        let v = shipper_surface(&cfg, Some(&held), None);
+        assert_eq!(state_of(&v, "audit"), "local_only");
+        assert_eq!(v["restart_pending"], false);
+    }
+
+    fn apply_test_state(name: &str) -> (Arc<AppState>, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("llmdil-logship-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = manager_config::AppConfig::default_config();
+        cfg.data_dir = dir.clone();
+        let state = Arc::new(AppState::new(cfg, dir.join("config.json"), dir.clone()));
+        (state, dir)
+    }
+
+    /// Saving `log_streaming` settings applies them at once — no app
+    /// restart. SEC-16: enabling streaming toward a non-loopback
+    /// `http://` endpoint is saved, but the shipper is refused and
+    /// the status carries the reason; turning streaming off again
+    /// clears it. (The refusal comes before the token is read, so
+    /// this never touches the credential store.)
+    #[tokio::test]
+    async fn saved_settings_apply_live_and_a_plain_http_endpoint_is_refused() {
+        let (state, dir) = apply_test_state("sec16");
+        let sink: Arc<dyn EventSink> = Arc::new(crate::NoopSink);
+        let surface = |state: &Arc<AppState>, cfg: &manager_config::AppConfig| {
+            shipper_surface(
+                &cfg.log_streaming,
+                log_streaming_status(state).as_ref(),
+                log_streaming_note(state).as_deref(),
+            )
+        };
+
+        // Off: nothing running, no note.
+        apply_log_streaming(&state).await;
+        assert!(log_streaming_status(&state).is_none());
+        assert!(log_streaming_note(&state).is_none());
+
+        let patch = serde_json::json!({ "log_streaming": {
+            "enabled": true,
+            "endpoint": "http://192.0.2.10:8473",
+        }});
+        crate::op_update_config(&state, &sink, patch).await.unwrap();
+        assert!(log_streaming_status(&state).is_none(), "refused: not running");
+        let note = log_streaming_note(&state).expect("the refusal is surfaced");
+        assert!(note.contains("loopback"), "{note}");
+        let cfg = state.config.read().await.clone();
+        let v = surface(&state, &cfg);
+        assert_eq!(v["running"], false);
+        assert_eq!(v["configured"]["enabled"], true);
+        assert!(v["note"].as_str().unwrap().contains("https://"));
+        let log = std::fs::read_to_string(dir.join("logs").join("shipper.log")).unwrap();
+        assert!(log.contains("shipper was not started"), "{log}");
+
+        // A source switch saved while it cannot run is still saved.
+        let patch = serde_json::json!({ "log_streaming": { "sources": { "gateway": false } } });
+        crate::op_update_config(&state, &sink, patch).await.unwrap();
+        let cfg = state.config.read().await.clone();
+        assert_eq!(surface(&state, &cfg)["configured"]["sources"]["gateway"], false);
+
+        // Off again: the note goes with it.
+        let patch = serde_json::json!({ "log_streaming": { "enabled": false } });
+        crate::op_update_config(&state, &sink, patch).await.unwrap();
+        assert!(log_streaming_note(&state).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn applied_settings_change_with_what_the_shipper_is_built_from() {
+        let mut cfg = manager_config::AppConfig::default_config();
+        let base = applied_settings(&cfg);
+        // Unrelated config does not restart the shipper.
+        cfg.winml.enabled = !cfg.winml.enabled;
+        assert_eq!(applied_settings(&cfg), base);
+        // A source switch, the endpoint, or the floor does.
+        cfg.log_streaming.sources.audit = false;
+        assert_ne!(applied_settings(&cfg), base);
+        cfg.log_streaming.sources.audit = true;
+        cfg.log_streaming.endpoint = "http://127.0.0.1:8473".to_string();
+        assert_ne!(applied_settings(&cfg), base);
+        // Backend ids matter only while per-backend logs are on.
+        let mut with_backends = manager_config::AppConfig::default_config();
+        with_backends.log_streaming.sources.backends = true;
+        let on = applied_settings(&with_backends);
+        with_backends.backends.pop();
+        assert_ne!(applied_settings(&with_backends), on);
     }
 
     /// The ring pump's pass: a backend's captured lines come out

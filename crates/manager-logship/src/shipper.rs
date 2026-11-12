@@ -500,10 +500,7 @@ async fn run_loop(
     // endpoint policy refuses. The app checks before spawning; this
     // is the same check where the POST is made.
     if let Err(reason) = check_endpoint(&config.endpoint) {
-        append_shipper_log(
-            &config.data_dir,
-            &format!("shipper not started: {reason}"),
-        );
+        append_shipper_log(&config.data_dir, &format!("shipper not started: {reason}"));
         return;
     }
     let endpoint = format!(
