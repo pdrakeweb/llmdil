@@ -9,11 +9,15 @@
 //! written to the local `shipper.log` and never fails the app: a
 //! deployment that never opts in behaves exactly as before.
 
-use manager_config::LogStreamingLevel;
-use manager_logship::{ShipLevel, ShipperConfig, ShipperStatus};
-use manager_wizard::SystemOps as _;
+use std::sync::Arc;
 
-use crate::AppState;
+use manager_config::LogStreamingLevel;
+use manager_logship::shipper::APP_SOURCE;
+use manager_logship::{RecordTap, ShipLevel, ShipperConfig, ShipperStatus, TapRecord};
+use manager_wizard::SystemOps as _;
+use serde_json::Value;
+
+use crate::{AppState, EventSink};
 
 /// Start the shipper if the deployment has opted in. Idempotent:
 /// a second call after a successful start is a no-op.
@@ -92,14 +96,115 @@ pub async fn start_log_streaming(state: &AppState) {
         tail_gateway: ls.sources.gateway,
         tail_service_manage: ls.sources.service_manage,
         tail_audit: ls.sources.audit,
+        app_events: ls.sources.app,
+        tap: Some(state.logship_tap.clone()),
         literal_secrets: literals,
         spool_cap_bytes: manager_logship::DEFAULT_SPOOL_CAP_BYTES,
     });
-    let _ = state.logship.set(std::sync::Arc::new(handle));
+    let _ = state.logship.set(Arc::new(handle));
 }
 
-/// The shipper's status counters, when it is running (Phase 2's
-/// `log_streaming_status` op reads these).
+// ---------------------------------------------------------------------------
+// S5: app / supervisor events
+// ---------------------------------------------------------------------------
+
+/// Longest event payload shipped, in characters. Events are small
+/// JSON values; the cap only bounds a pathological one.
+const MAX_EVENT_PAYLOAD_CHARS: usize = 4096;
+
+/// An [`EventSink`] that offers every event it forwards to the
+/// shipper's in-process feed as a source-`app` record. The feed
+/// never blocks and costs nothing while no shipper is subscribed,
+/// so the wrapped sink behaves exactly as before.
+struct TapSink {
+    inner: Arc<dyn EventSink>,
+    tap: RecordTap,
+}
+
+impl EventSink for TapSink {
+    fn emit(&self, event: &str, payload: Value) {
+        if self.tap.is_active() {
+            if let Some(record) = event_record(event, &payload) {
+                self.tap.send(record);
+            }
+        }
+        self.inner.emit(event, payload);
+    }
+
+    fn toast(&self, title: &str, body: &str) -> Result<(), String> {
+        // Toasts are recorded at the `notify` choke point, before
+        // the operator's notification switches, not here.
+        self.inner.toast(title, body)
+    }
+}
+
+/// Wrap `inner` so the events it carries also reach the shipper.
+/// The registry's `dispatch` wraps the sink of every operation; a
+/// shell that hands a sink to a background loop directly (not
+/// through `dispatch`) wraps it with this.
+pub fn tap_sink(state: &AppState, inner: Arc<dyn EventSink>) -> Arc<dyn EventSink> {
+    Arc::new(TapSink {
+        inner,
+        tap: state.logship_tap.clone(),
+    })
+}
+
+/// Offer one app-level line (source `app`) to the shipper: state
+/// transitions the app observes outside any event — today the
+/// notification monitor's (backend died, gateway down, activation
+/// resolved), recorded whether or not the toast itself is allowed.
+pub(crate) fn offer_app_line(
+    state: &AppState,
+    level: Option<ShipLevel>,
+    line: impl FnOnce() -> String,
+) {
+    if state.logship_tap.is_active() {
+        state.logship_tap.send(TapRecord {
+            source: APP_SOURCE.to_string(),
+            stream: "stdout".to_string(),
+            level,
+            line: line(),
+        });
+    }
+}
+
+/// One UI event as a shipped record: `<event> <payload JSON>`.
+/// Telemetry samples are gauges on a timer, not log events — they
+/// stay out. Download progress ticks ship at debug (below the
+/// default floor); everything else takes its level from the outcome
+/// fields the payload carries, so a payload key merely *named*
+/// `error` (and null) does not make an event an error.
+fn event_record(event: &str, payload: &Value) -> Option<TapRecord> {
+    use crate::events;
+    if event == events::TELEMETRY_UPDATE || event == events::TELEMETRY_TICK {
+        return None;
+    }
+    let level = if event == events::DOWNLOAD_PROGRESS {
+        ShipLevel::Debug
+    } else {
+        let outcome: Vec<&str> = [
+            "state", "status", "event", "outcome", "result", "level", "error",
+        ]
+        .iter()
+        .filter_map(|k| payload.get(k).and_then(Value::as_str))
+        .collect();
+        manager_logship::classify_level(&outcome.join(" "))
+    };
+    let mut body = payload.to_string();
+    if body.chars().count() > MAX_EVENT_PAYLOAD_CHARS {
+        body = body.chars().take(MAX_EVENT_PAYLOAD_CHARS).collect();
+        body.push('…');
+    }
+    Some(TapRecord {
+        source: APP_SOURCE.to_string(),
+        stream: "stdout".to_string(),
+        level: Some(level),
+        line: format!("{event} {body}"),
+    })
+}
+
+/// The shipper's status counters, when it is running (surfaced on
+/// the Log receiver card's status payload).
 pub fn log_streaming_status(state: &AppState) -> Option<ShipperStatus> {
     state.logship.get().map(|h| h.status())
 }
@@ -152,5 +257,74 @@ mod tests {
         let mut plain = Vec::new();
         expand_literal("plain-secret", &mut plain);
         assert_eq!(plain, vec!["plain-secret".to_string()]);
+    }
+
+    #[test]
+    fn events_convert_to_app_records() {
+        use serde_json::json;
+        let rec = event_record(
+            crate::events::BACKEND_STATUS,
+            &json!({ "id": "planner", "event": "started" }),
+        )
+        .unwrap();
+        assert_eq!(rec.source, "app");
+        assert_eq!(rec.level, Some(ShipLevel::Info));
+        assert!(rec.line.starts_with("backend-status {"), "{}", rec.line);
+        assert!(rec.line.contains(r#""event":"started""#));
+        assert!(rec.line.contains(r#""id":"planner""#));
+
+        // A failed step is an error; a null `error` key is not.
+        let failed = event_record(
+            crate::events::WIZARD_PROGRESS,
+            &json!({ "task_id": "t1", "state": "failed", "message": "exit 1" }),
+        )
+        .unwrap();
+        assert_eq!(failed.level, Some(ShipLevel::Error));
+        let idle = json!({ "error": null, "phase": "idle" });
+        let clean = event_record("app_update_changed", &idle).unwrap();
+        assert_eq!(clean.level, Some(ShipLevel::Info));
+
+        // Progress ticks are debug; telemetry samples never ship.
+        let tick = event_record(
+            crate::events::DOWNLOAD_PROGRESS,
+            &json!({ "model_id": "m", "downloaded_bytes": 1 }),
+        )
+        .unwrap();
+        assert_eq!(tick.level, Some(ShipLevel::Debug));
+        assert!(event_record(crate::events::TELEMETRY_UPDATE, &json!({ "samples": [] })).is_none());
+
+        // A pathological payload is bounded.
+        let blob = json!({ "blob": "a".repeat(3 * MAX_EVENT_PAYLOAD_CHARS) });
+        let huge = event_record("x", &blob).unwrap();
+        assert!(huge.line.chars().count() <= MAX_EVENT_PAYLOAD_CHARS + 8);
+    }
+
+    /// The wrapped sink forwards every event unchanged, and offers
+    /// it to the feed only while a shipper is subscribed.
+    #[test]
+    fn tap_sink_forwards_and_offers() {
+        use serde_json::json;
+        struct Recording(std::sync::Mutex<Vec<(String, Value)>>);
+        impl EventSink for Recording {
+            fn emit(&self, event: &str, payload: Value) {
+                self.0.lock().unwrap().push((event.to_string(), payload));
+            }
+        }
+        let inner = Arc::new(Recording(Default::default()));
+        let tap = RecordTap::new();
+        let sink = TapSink {
+            inner: inner.clone(),
+            tap: tap.clone(),
+        };
+        // No subscriber: forwarded, nothing offered.
+        sink.emit("backend-status", json!({ "id": "a", "event": "started" }));
+        let mut rx = tap.subscribe();
+        sink.emit("backend-status", json!({ "id": "a", "event": "stopped" }));
+        sink.emit(crate::events::TELEMETRY_UPDATE, json!({ "samples": [] }));
+        assert_eq!(inner.0.lock().unwrap().len(), 3);
+        let offered = rx.try_recv().unwrap();
+        assert!(offered.line.contains("stopped"));
+        // Telemetry and pre-subscribe events were not offered.
+        assert!(rx.try_recv().is_err());
     }
 }

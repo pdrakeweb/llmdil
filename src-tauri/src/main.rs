@@ -284,7 +284,10 @@ fn main() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<Arc<AppState>>().inner().clone();
-                let sink: Arc<dyn EventSink> = Arc::new(TauriSink(handle));
+                // Not dispatched through the registry, so its events
+                // are offered to the log shipper explicitly.
+                let sink: Arc<dyn EventSink> =
+                    manager_app::logship::tap_sink(&state, Arc::new(TauriSink(handle)));
                 manager_app::app_update::checker_loop(state, sink).await;
             });
             // Log streaming shipper (log-streaming design): starts
