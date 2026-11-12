@@ -300,7 +300,15 @@ any user exists. Rules:
 - **Reset by admin**: an admin sets a temporary password for a
   user; the account is flagged must-change, all sessions revoked,
   and the temporary password works only to reach the change-
-  password endpoint. Audited.
+  password endpoint. Audited. As built (SEC-03): the reset also
+  revokes the user's API tokens, in the same store write; a
+  flagged login (TOTP step included) gets a 15-minute session;
+  every route except `POST /auth/password`, `POST /auth/logout`
+  and `GET /auth/me` answers 403 `PASSWORD_CHANGE_REQUIRED` for
+  the flagged user's sessions and API tokens, refresh is refused,
+  and each refusal is audited. The desktop's local admin commands
+  (Tauri IPC, not HTTP) are not gated — the desktop is the local
+  admin, and it has no self-service password or TOTP commands.
 - **Local reset**: if every admin is locked out, the desktop app
   (local access = physical access = already root on this machine)
   offers password reset for any account. This is the recovery path
@@ -312,7 +320,10 @@ any user exists. Rules:
 ### 3.7 TOTP (optional second factor)
 
 Recommendation: **implement TOTP as an optional per-user second
-factor in v1, not required.** Enrollment: user scans a QR (secret
+factor in v1, not required.** Enrollment (as built: from a signed-in
+session, never an API token, with the account password as step-up
+for first enrollment and re-enrollment alike — SEC-04; failures count
+toward the lockout): user scans a QR (secret
 generated server-side and stored in the OS credential store —
 never in the user store file, as built; see §4), 8 single-use
 recovery codes shown once and stored hashed. When enabled for a
@@ -451,7 +462,16 @@ by name, payloads by target id only.
      At enable time the server generates a self-signed cert
      (SANs: machine hostname, LAN IP, Tailscale IP, `prometheus`
      mDNS-style alias where available; 2-year validity, regenerated
-     on demand from the desktop UI). The desktop Remote Access page
+     on demand from the desktop UI). As built (SEC-08): later starts
+     load the stored key and certificate; a new one is generated only
+     when the material is missing, unreadable/corrupt (including
+     `sans.txt`), mismatched (key vs. certificate), or expired /
+     within 30 days of expiry — each branch logged and reported as
+     `cert_source` in the Remote Access status. A changed LAN or
+     Tailscale address never regenerates (pinned clients do not check
+     names); it shows as informational `san_drift` beside the
+     Regenerate button, the only path that changes the key or SANs.
+     rcgen's default validity (to year 4096) is used, not 2 years. The desktop Remote Access page
      shows the cert fingerprint and a QR code encoding
      `{ base_url, cert_sha256 }`; the Android app scans it at
      pairing and pins the fingerprint (TOFU with an out-of-band

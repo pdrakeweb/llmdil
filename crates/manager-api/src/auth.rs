@@ -53,6 +53,10 @@ pub struct Principal {
     pub auth_type: AuthType,
     /// Session id, or the API token id for token principals.
     pub session_id: String,
+    /// The account's must-change-password flag, read from the user
+    /// store at validation time (SEC-03). While set, the middleware
+    /// admits only change-password, logout and `/auth/me`.
+    pub must_change_password: bool,
 }
 
 /// Failures from [`AuthService`], mapped one-to-one onto HTTP error envelopes by the auth
@@ -72,6 +76,11 @@ pub enum AuthError {
     Forbidden(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// The account carries the must-change-password flag (set by an
+    /// admin reset); only change-password, logout and `/auth/me` are
+    /// open to it (SEC-03, auth plan §3.6).
+    #[error("password change required")]
+    PasswordChangeRequired,
     #[error("internal error")]
     Internal,
 }
@@ -214,6 +223,10 @@ const LOCK_MAX_MS: i64 = 60 * 60 * 1000;
 const IP_FAILURE_LIMIT: usize = 30;
 const CHALLENGE_TTL_MS: i64 = 5 * 60 * 1000;
 const ENROLLMENT_TTL_MS: i64 = 10 * 60 * 1000;
+/// Lifetime of both tokens of a session minted for an account that
+/// must change its password (SEC-03): long enough to change it, never
+/// the 30-day refresh lifetime of a normal session.
+pub const MUST_CHANGE_SESSION_TTL_MS: i64 = 15 * 60 * 1000;
 /// Minimum interval between persisted last-used updates for one
 /// session or API token (SEC-14: no store rewrite per request).
 const LAST_USED_WRITE_INTERVAL_MS: i64 = 60_000;
@@ -387,7 +400,7 @@ impl AuthService {
     }
 
     /// Record a failed step-up password check (password change, TOTP
-    /// disable, TOTP re-enrollment) against the account lockout
+    /// disable, TOTP enrollment) against the account lockout
     /// (finding SEC-04): these
     /// endpoints otherwise offered unlimited password guessing to any
     /// holder of a bearer token.
@@ -558,21 +571,25 @@ impl AuthService {
         let code = code.trim();
         // Recovery codes first (they are longer than 6 digits).
         if code.len() > 6 {
+            // Check and consume in one step under the store's write
+            // lock, against the live record rather than the caller's
+            // snapshot, so two concurrent submissions of one recovery
+            // code cannot both pass (same shape as the SEC-15 TOTP
+            // replay guard). A failed store write refuses the code.
             let hash = hash_token(&code.to_uppercase());
-            if user.recovery_code_hashes.iter().any(|h| h == &hash) {
-                let user_id = user.id.clone();
-                let _ = self
-                    .store
-                    .mutate::<_, AuthError>(|f| {
-                        if let Some(u) = f.users.iter_mut().find(|u| u.id == user_id) {
-                            u.recovery_code_hashes.retain(|h| h != &hash);
-                        }
-                        Ok(())
-                    })
-                    .await;
-                return true;
-            }
-            return false;
+            let user_id = user.id.clone();
+            return self
+                .store
+                .mutate::<_, AuthError>(|f| {
+                    let Some(u) = f.users.iter_mut().find(|u| u.id == user_id) else {
+                        return Ok(false);
+                    };
+                    let before = u.recovery_code_hashes.len();
+                    u.recovery_code_hashes.retain(|h| h != &hash);
+                    Ok(u.recovery_code_hashes.len() < before)
+                })
+                .await
+                .unwrap_or(false);
         }
         let Some(secret_b32) = self.creds.read(&totp_target(&user.id)).await else {
             return false;
@@ -612,7 +629,8 @@ impl AuthService {
 
     /// Mint a new per-device session. Performs no credential check of its own: callers must
     /// already have authenticated the user (password, TOTP or enrollment code). Only the
-    /// token hashes are persisted.
+    /// token hashes are persisted. An account flagged must-change-password gets a short
+    /// session ([`MUST_CHANGE_SESSION_TTL_MS`] for both tokens) instead of 30 days (SEC-03).
     pub async fn create_session(
         &self,
         user_id: &str,
@@ -621,38 +639,56 @@ impl AuthService {
         let access = generate_token();
         let refresh = generate_token();
         let now = now_ms();
-        let session = Session {
-            id: uuid::Uuid::new_v4().to_string(),
-            user_id: user_id.to_string(),
-            device_name: device_name.to_string(),
-            access_hash: hash_token(&access),
-            refresh_hash: hash_token(&refresh),
-            retired_refresh_hashes: Vec::new(),
-            retired_refresh_ms: Vec::new(),
-            created_ms: now,
-            access_expires_ms: now + ACCESS_TTL_MS,
-            refresh_expires_ms: now + REFRESH_TTL_MS,
-            last_used_ms: now,
-            revoked: false,
-        };
-        let pair = TokenPair {
-            access_token: access,
-            refresh_token: refresh,
-            session_id: session.id.clone(),
-            access_expires_ms: session.access_expires_ms,
-            refresh_expires_ms: session.refresh_expires_ms,
-        };
+        let uid = user_id.to_string();
+        let device = device_name.to_string();
         self.store
             .mutate::<_, AuthError>(|f| {
+                let must_change = f
+                    .users
+                    .iter()
+                    .find(|u| u.id == uid)
+                    .map(|u| u.must_change_password)
+                    .unwrap_or(false);
+                let (access_ttl, refresh_ttl) = if must_change {
+                    (
+                        ACCESS_TTL_MS.min(MUST_CHANGE_SESSION_TTL_MS),
+                        MUST_CHANGE_SESSION_TTL_MS,
+                    )
+                } else {
+                    (ACCESS_TTL_MS, REFRESH_TTL_MS)
+                };
+                let session = Session {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    user_id: uid,
+                    device_name: device,
+                    access_hash: hash_token(&access),
+                    refresh_hash: hash_token(&refresh),
+                    retired_refresh_hashes: Vec::new(),
+                    retired_refresh_ms: Vec::new(),
+                    created_ms: now,
+                    access_expires_ms: now + access_ttl,
+                    refresh_expires_ms: now + refresh_ttl,
+                    last_used_ms: now,
+                    revoked: false,
+                };
+                let pair = TokenPair {
+                    access_token: access.clone(),
+                    refresh_token: refresh.clone(),
+                    session_id: session.id.clone(),
+                    access_expires_ms: session.access_expires_ms,
+                    refresh_expires_ms: session.refresh_expires_ms,
+                };
                 f.sessions.push(session);
-                Ok(())
+                Ok(pair)
             })
-            .await?;
-        Ok(pair)
+            .await
     }
 
     /// Rotate a refresh token. Presenting a retired token revokes
-    /// the whole session family (theft detection).
+    /// the whole session family (theft detection). A disabled account
+    /// is refused, and an account flagged must-change-password gets
+    /// `PasswordChangeRequired` without rotating (SEC-03): refresh is a
+    /// public route, so the middleware gate never sees it.
     pub async fn refresh(&self, refresh_token: &str) -> Result<(TokenPair, UserView), AuthError> {
         let hash = hash_token(refresh_token);
         let now = now_ms();
@@ -708,6 +744,15 @@ impl AuthService {
                     s.revoked = true;
                     return Ok(Err(AuthError::SessionRevoked));
                 }
+                // The owner's live record decides, under the same lock.
+                match f.users.iter().find(|u| u.id == s.user_id) {
+                    Some(u) if u.disabled => return Ok(Err(AuthError::InvalidCredentials)),
+                    Some(u) if u.must_change_password => {
+                        return Ok(Err(AuthError::PasswordChangeRequired))
+                    }
+                    Some(_) => {}
+                    None => return Ok(Err(AuthError::InvalidCredentials)),
+                }
                 s.retire_refresh_hash(now);
                 s.access_hash = hash_token(&access);
                 s.refresh_hash = hash_token(&refresh);
@@ -738,6 +783,24 @@ impl AuthService {
         Ok((pair, UserView::from(&user)))
     }
 
+    /// The username owning the session a (current or retired) refresh
+    /// token belongs to, for auditing refused refreshes. `None` when
+    /// the token matches no session.
+    pub async fn refresh_token_owner(&self, refresh_token: &str) -> Option<String> {
+        let hash = hash_token(refresh_token);
+        self.store
+            .read(|f| {
+                let s = f.sessions.iter().find(|s| {
+                    s.refresh_hash == hash || s.retired_refresh_hashes.iter().any(|h| h == &hash)
+                })?;
+                f.users
+                    .iter()
+                    .find(|u| u.id == s.user_id)
+                    .map(|u| u.username.clone())
+            })
+            .await
+    }
+
     /// Validate a bearer credential (session access token or API
     /// token) into a principal. Records last use.
     pub async fn validate_bearer(&self, token: &str) -> Option<Principal> {
@@ -762,6 +825,7 @@ impl AuthService {
                 role: user.role.to_role(),
                 auth_type: AuthType::Session,
                 session_id,
+                must_change_password: user.must_change_password,
             });
         }
         // API token?
@@ -783,6 +847,7 @@ impl AuthService {
                 role: role.to_role(),
                 auth_type: AuthType::ApiToken,
                 session_id: token_id,
+                must_change_password: user.must_change_password,
             });
         }
         None
@@ -863,12 +928,17 @@ impl AuthService {
     }
 
     /// Revoke every session of `user_id` except `except` (the caller's own, on password
-    /// change). Best-effort: a store write failure is swallowed. API tokens are untouched.
-    pub async fn revoke_user_sessions(&self, user_id: &str, except: Option<&str>) {
+    /// change). API tokens are untouched. A store write failure is returned rather than
+    /// swallowed: the in-memory revocation has taken effect, but the caller must not report
+    /// success for a revocation that may not survive a restart.
+    pub async fn revoke_user_sessions(
+        &self,
+        user_id: &str,
+        except: Option<&str>,
+    ) -> Result<(), AuthError> {
         let uid = user_id.to_string();
         let except = except.map(str::to_string);
-        let _ = self
-            .store
+        self.store
             .mutate::<_, AuthError>(|f| {
                 for s in f.sessions.iter_mut() {
                     if s.user_id == uid && except.as_deref() != Some(&s.id) {
@@ -877,7 +947,7 @@ impl AuthService {
                 }
                 Ok(())
             })
-            .await;
+            .await
     }
 
     // -- passwords ------------------------------------------------------
@@ -918,13 +988,14 @@ impl AuthService {
                 Ok(())
             })
             .await?;
-        self.revoke_user_sessions(user_id, keep_session).await;
-        Ok(())
+        self.revoke_user_sessions(user_id, keep_session).await
     }
 
     /// Admin reset: a generated temporary password, must-change set,
-    /// all sessions revoked. Returns the temporary password (shown
-    /// once to the admin).
+    /// and every session AND API token of the user revoked (SEC-03) —
+    /// in one store write, so a failed write reaches the admin instead
+    /// of a reported reset whose revocations were lost. Returns the
+    /// temporary password (shown once to the admin).
     pub async fn admin_reset_password(&self, user_id: &str) -> Result<String, AuthError> {
         let temp = generate_token()[..16].to_string();
         let hash = hash_password(&temp).map_err(|_| AuthError::Internal)?;
@@ -932,20 +1003,24 @@ impl AuthService {
         let found = self
             .store
             .mutate::<bool, AuthError>(|f| {
-                if let Some(u) = f.users.iter_mut().find(|u| u.id == uid) {
-                    u.password_hash = hash;
-                    u.must_change_password = true;
-                    u.updated_ms = now_ms();
-                    Ok(true)
-                } else {
-                    Ok(false)
+                let Some(u) = f.users.iter_mut().find(|u| u.id == uid) else {
+                    return Ok(false);
+                };
+                u.password_hash = hash;
+                u.must_change_password = true;
+                u.updated_ms = now_ms();
+                for s in f.sessions.iter_mut().filter(|s| s.user_id == uid) {
+                    s.revoked = true;
                 }
+                for t in f.api_tokens.iter_mut().filter(|t| t.user_id == uid) {
+                    t.revoked = true;
+                }
+                Ok(true)
             })
             .await?;
         if !found {
             return Err(AuthError::NotFound("user".into()));
         }
-        self.revoke_user_sessions(user_id, None).await;
         Ok(temp)
     }
 
@@ -1055,7 +1130,7 @@ impl AuthService {
             .ok_or(AuthError::NotFound("user".into()))?;
         // Role change or disable revokes sessions immediately.
         if role.is_some() || disabled == Some(true) {
-            self.revoke_user_sessions(user_id, None).await;
+            self.revoke_user_sessions(user_id, None).await?;
         }
         Ok(view)
     }
@@ -1168,10 +1243,14 @@ impl AuthService {
     /// a re-enrollment can never overwrite or invalidate a live
     /// factor before the replacement is proven.
     ///
-    /// Replacing a live factor additionally requires step-up:
-    /// when the user already has TOTP enabled, `step_up_password`
-    /// must be the account password (the same step-up
-    /// `totp_disable` requires). First enrollment needs none.
+    /// Every enrollment — first or replacing a live factor — requires
+    /// step-up: `step_up_password` must be the account password (the
+    /// same step-up `totp_disable` requires). A missing or wrong
+    /// password counts toward the account lockout, and a locked
+    /// account is refused (SEC-04): a stolen session alone must not be
+    /// able to bind a second factor only its holder knows. An account
+    /// that must change its password is refused before the step-up
+    /// (SEC-03).
     pub async fn totp_begin_enrollment(
         &self,
         user_id: &str,
@@ -1183,17 +1262,18 @@ impl AuthService {
             .read(|f| f.users.iter().find(|u| u.id == user_id).cloned())
             .await
             .ok_or_else(|| AuthError::NotFound("user".into()))?;
-        if user.totp_enabled {
-            let ok = match step_up_password {
-                Some(p) if !self.is_locked(&user.username.to_lowercase()).await => {
-                    verify_password_async(p, &user.password_hash).await
-                }
-                _ => false,
-            };
-            if !ok {
-                self.record_step_up_failure(&user.username).await;
-                return Err(AuthError::InvalidCredentials);
+        if user.must_change_password {
+            return Err(AuthError::PasswordChangeRequired);
+        }
+        let ok = match step_up_password {
+            Some(p) if !self.is_locked(&user.username.to_lowercase()).await => {
+                verify_password_async(p, &user.password_hash).await
             }
+            _ => false,
+        };
+        if !ok {
+            self.record_step_up_failure(&user.username).await;
+            return Err(AuthError::InvalidCredentials);
         }
         let mut secret_bytes = [0u8; 20];
         for i in 0..5 {
@@ -1752,7 +1832,7 @@ mod tests {
             .await
             .unwrap();
         let (secret_b32, uri) = svc
-            .totp_begin_enrollment(&user.id, "carol", None)
+            .totp_begin_enrollment(&user.id, "carol", Some("a-unique-passphrase"))
             .await
             .unwrap();
         assert!(uri.starts_with("otpauth://totp/LLMdil:carol"));
@@ -1809,7 +1889,7 @@ mod tests {
             .await
             .unwrap();
         let (old_b32, _) = svc
-            .totp_begin_enrollment(&user.id, "erin", None)
+            .totp_begin_enrollment(&user.id, "erin", Some("a-unique-passphrase"))
             .await
             .unwrap();
         let old_secret = base32_decode(&old_b32).unwrap();
@@ -1859,6 +1939,60 @@ mod tests {
         );
     }
 
+    /// SEC-04: first enrollment needs the password step-up too; a
+    /// missing or wrong password counts toward the lockout, and a
+    /// must-change account is refused before any step-up.
+    #[tokio::test]
+    async fn first_totp_enrollment_requires_step_up() {
+        let svc = service().await;
+        let user = svc
+            .create_user("gwen", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.totp_begin_enrollment(&user.id, "gwen", None)
+                .await
+                .unwrap_err(),
+            AuthError::InvalidCredentials
+        );
+        assert_eq!(svc.lockouts.lock().await["gwen"].failures.len(), 1);
+        for _ in 1..LOCK_THRESHOLD {
+            assert_eq!(
+                svc.totp_begin_enrollment(&user.id, "gwen", Some("not-the-password"))
+                    .await
+                    .unwrap_err(),
+                AuthError::InvalidCredentials
+            );
+        }
+        assert!(svc.is_locked("gwen").await);
+        // Locked: even the right password is refused, and nothing is pending.
+        assert!(svc
+            .totp_begin_enrollment(&user.id, "gwen", Some("a-unique-passphrase"))
+            .await
+            .is_err());
+        assert!(!svc.pending_totp.lock().await.contains_key(&user.id));
+        svc.lockouts.lock().await.clear();
+        svc.totp_begin_enrollment(&user.id, "gwen", Some("a-unique-passphrase"))
+            .await
+            .unwrap();
+        assert!(svc.pending_totp.lock().await.contains_key(&user.id));
+
+        // A must-change account gets PasswordChangeRequired first, and
+        // the attempt is not a step-up failure.
+        let flagged = svc
+            .create_user("hal", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        svc.admin_reset_password(&flagged.id).await.unwrap();
+        assert_eq!(
+            svc.totp_begin_enrollment(&flagged.id, "hal", Some("whatever"))
+                .await
+                .unwrap_err(),
+            AuthError::PasswordChangeRequired
+        );
+        assert!(!svc.lockouts.lock().await.contains_key("hal"));
+    }
+
     #[tokio::test]
     async fn totp_pending_enrollment_expires() {
         // Code-review B-6: an unconfirmed enrollment expires and
@@ -1869,7 +2003,7 @@ mod tests {
             .await
             .unwrap();
         let (secret_b32, _) = svc
-            .totp_begin_enrollment(&user.id, "frank", None)
+            .totp_begin_enrollment(&user.id, "frank", Some("a-unique-passphrase"))
             .await
             .unwrap();
         assert!(svc.creds.read(&totp_target(&user.id)).await.is_none());
@@ -1906,6 +2040,7 @@ mod tests {
             role: Role::Admin,
             auth_type: AuthType::Session,
             session_id: "s".into(),
+            must_change_password: false,
         };
         let (meta, value) = svc
             .create_api_token(&issuer, &viewer.id, "pixel", RoleName::Viewer, None)
@@ -2002,6 +2137,64 @@ mod tests {
             .is_none());
     }
 
+    /// A recovery code is consumed atomically: concurrent uses of one
+    /// code against the same (pre-use) snapshot accept exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_recovery_code_use_accepts_once() {
+        let svc = service().await;
+        let user = svc
+            .create_user("rhea", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        for round in 0..20 {
+            let code = recovery_code();
+            let uid = user.id.clone();
+            let hash = hash_token(&code.to_uppercase());
+            svc.store
+                .mutate::<_, AuthError>(|f| {
+                    let u = f.users.iter_mut().find(|u| u.id == uid).unwrap();
+                    u.totp_enabled = true;
+                    u.recovery_code_hashes = vec![hash, "other".into()];
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            // Every task checks against the same snapshot, taken while
+            // the code is still unused (the old check-then-act read it).
+            let snapshot = svc
+                .store
+                .read(|f| f.users.iter().find(|u| u.id == user.id).cloned().unwrap())
+                .await;
+            let tasks: Vec<_> = (0..8)
+                .map(|_| {
+                    let svc = svc.clone();
+                    let snapshot = snapshot.clone();
+                    let code = code.clone();
+                    tokio::spawn(async move { svc.verify_user_totp(&snapshot, &code).await })
+                })
+                .collect();
+            let mut accepted = 0;
+            for t in tasks {
+                if t.await.unwrap() {
+                    accepted += 1;
+                }
+            }
+            assert_eq!(accepted, 1, "round {round}: {accepted} acceptances");
+            let left = svc
+                .store
+                .read(|f| {
+                    f.users
+                        .iter()
+                        .find(|u| u.id == user.id)
+                        .unwrap()
+                        .recovery_code_hashes
+                        .clone()
+                })
+                .await;
+            assert_eq!(left, vec!["other".to_string()]);
+        }
+    }
+
     /// SEC-15: a user record written before `last_totp_step` existed
     /// still loads, with no replay state.
     #[test]
@@ -2026,6 +2219,7 @@ mod tests {
             role: Role::Admin,
             auth_type: AuthType::Session,
             session_id: "s".into(),
+            must_change_password: false,
         };
         let (meta, value) = svc
             .create_api_token(&issuer, &admin.id, "ci", RoleName::Viewer, None)

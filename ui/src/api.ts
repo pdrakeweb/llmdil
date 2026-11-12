@@ -4566,6 +4566,20 @@ export interface AdminApiStatus {
   bind: string;
   base_url: string | null;
   cert_sha256: string | null;
+  /** Why the listener's certificate is the one in use (SEC-08):
+   *  loaded | generated_missing | regenerated_key_mismatch |
+   *  regenerated_expiring | regenerated_corrupt |
+   *  regenerated_by_operator; null before the API first starts.
+   *  Optional: older shells do not send it. */
+  cert_source?: string | null;
+  /** What was wrong when the shell regenerated on its own. */
+  cert_detail?: string | null;
+  cert_not_after_ms?: number | null;
+  /** Informational: current machine addresses the certificate does
+   *  not list. Never acted on automatically — pinned clients ignore
+   *  SANs; only Regenerate (which forces a re-pair) updates them. */
+  san_drift?: boolean;
+  san_drift_ips?: string[];
   firewall: string;
   note: string | null;
   user_count: number;
@@ -4584,7 +4598,8 @@ export interface AdminApiUser {
 
 const emptyStatus: AdminApiStatus = {
   enabled: false, running: false, port: 47821, bind: "0.0.0.0",
-  base_url: null, cert_sha256: null, firewall: "unsupported",
+  base_url: null, cert_sha256: null, cert_source: null, cert_detail: null,
+  cert_not_after_ms: null, san_drift: false, san_drift_ips: [], firewall: "unsupported",
   note: null, user_count: 0, admin_count: 0,
 };
 

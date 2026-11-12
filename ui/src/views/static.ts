@@ -8672,6 +8672,30 @@ function settingsPaint(
 }
 
 
+/** Certificate lifecycle notes under the Regenerate button (SEC-08):
+ *  why the shell generated a new certificate on its own, and the
+ *  informational SAN drift. Drift never regenerates by itself —
+ *  paired devices pin the fingerprint, not the addresses — so it is
+ *  only a hint that Regenerate (which forces a re-pair) would pick up
+ *  the new addresses. Renders nothing when there is nothing to say. */
+function certNotes(status: AdminApiStatus): string {
+  const notes: string[] = [];
+  const why: Record<string, string> = {
+    generated_missing: "A new certificate was generated because none was stored.",
+    regenerated_key_mismatch: "The certificate was regenerated because the stored key did not match it. Paired devices must pair again.",
+    regenerated_expiring: "The certificate was regenerated because it had expired or was about to. Paired devices must pair again.",
+    regenerated_corrupt: "The certificate was regenerated because the stored files were unreadable. Paired devices must pair again.",
+  };
+  const reason = status.cert_source ? why[status.cert_source] : undefined;
+  if (reason) {
+    notes.push(`<div style="font-size:12px;color:var(--warn);margin-top:6px">${esc(reason)}${status.cert_detail ? ` (${esc(status.cert_detail)})` : ""}</div>`);
+  }
+  if (status.san_drift && status.san_drift_ips && status.san_drift_ips.length) {
+    notes.push(`<div style="font-size:12px;color:var(--text2);margin-top:6px">Not in the certificate: ${status.san_drift_ips.map(esc).join(", ")}<span class="info-tip" title="This machine has addresses the certificate does not list (for example after a DHCP change or Tailscale coming up). Paired devices pin the certificate fingerprint, not the address, so they keep working. Regenerate only if a client needs the new address in the certificate; every paired device must then pair again.">${icon("info")}</span></div>`);
+  }
+  return notes.join("");
+}
+
 /** Remote Access tab: the admin API's state, its users, and
  *  device pairing. Values are Label: Value rows with copy buttons
  *  (the global [data-copy-value] handler serves them); state the
@@ -8726,6 +8750,7 @@ function remoteAccessHtml(
     ${status.note ? `<div style="font-size:12px;color:var(--err);margin-top:6px">${esc(status.note)}</div>` : ""}
     <div class="card-actions" style="margin-top:10px">${enableSwitch({ on: status.enabled, name: "Admin API", attrs: "data-ra-toggle" })}
     <button class="btn" data-ra-regen>Regenerate certificate</button></div>
+    ${certNotes(status)}
     <div style="font-size:12px;color:var(--text2);margin-top:16px">${users.length === 0 ? "First administrator" : "Users"}<span class="info-tip" title="Roles: viewer reads status; operator runs backends and the gateway; configurator also edits configuration; admin manages users and the API itself. Passwords need at least 12 characters.">${icon("info")}</span></div>
     ${userRows}
     <div style="display:flex;gap:6px;align-items:center;margin-top:8px;flex-wrap:wrap">

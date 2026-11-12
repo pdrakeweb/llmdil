@@ -53,6 +53,11 @@ pub struct TokenPair {
     pub refresh_token: String,
     #[serde(default = "default_token_type")]
     pub token_type: String,
+    /// Set when the account was reset by an admin and must change its
+    /// password before anything but `auth password` works (SEC-03).
+    /// Absent from older servers, hence the default.
+    #[serde(default)]
+    pub must_change_password: bool,
 }
 
 fn default_token_type() -> String {
@@ -400,6 +405,25 @@ impl ApiClient {
             .map_err(|e| ApiError::Input(format!("enroll response did not parse: {e}")))
     }
 
+    /// `POST /api/v1/auth/password`: change the signed-in account's
+    /// password (session tokens only; the server refuses API tokens).
+    /// The current session stays valid and the must-change flag clears.
+    pub async fn change_password(
+        &mut self,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), ApiError> {
+        self.post(
+            "/api/v1/auth/password",
+            serde_json::json!({
+                "current_password": current_password,
+                "new_password": new_password,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub async fn refresh(&mut self, refresh_token: &str) -> Result<TokenPair, ApiError> {
         let value = self
             .request_json(
@@ -491,6 +515,7 @@ mod tests {
             access_token: "secret-access".into(),
             refresh_token: "secret-refresh".into(),
             token_type: "Bearer".into(),
+            must_change_password: false,
         };
         let redacted = pair.debug_redacted();
         assert!(!redacted.contains("secret-access"));
