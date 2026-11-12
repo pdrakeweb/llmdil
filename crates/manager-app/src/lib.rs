@@ -9299,6 +9299,15 @@ static GGUF_LAYOUT_CACHE: std::sync::OnceLock<
 /// the tokenizer metadata dominates). Returns None for missing or
 /// unparseable files.
 fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
+    gguf_layout_cached_with(path, &GGUF_PREFIX_RUNGS)
+}
+
+/// The prefix lengths [`gguf_layout_cached`] reads, shortest first.
+const GGUF_PREFIX_RUNGS: [usize; 3] = [8 * 1024 * 1024, 64 * 1024 * 1024, 256 * 1024 * 1024];
+
+/// [`gguf_layout_cached`] over an explicit prefix ladder (tests use
+/// a short one).
+fn gguf_layout_cached_with(path: &PathBuf, rungs: &[usize]) -> Option<manager_models::GgufLayout> {
     let meta = match std::fs::metadata(path) {
         Ok(m) if m.is_file() => m,
         Ok(_) => return None,
@@ -9325,11 +9334,13 @@ fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
         }
     }
     let mut layout = None;
-    // Whether the outcome may be cached: true once a prefix has
-    // been read in full and the parser has given a definitive
-    // answer (a layout, or a rejection of the complete bytes).
-    let mut cacheable = false;
-    for prefix in [8 * 1024 * 1024usize, 64 * 1024 * 1024, 256 * 1024 * 1024] {
+    // Every exit from this loop that does not return early is
+    // definitive and cached: a layout, a rejection of the complete
+    // bytes, or (P-4) a header still `Incomplete` at the largest
+    // rung — the next poll would re-read and re-allocate every rung
+    // only to learn the same thing. The (len, mtime) key drops the
+    // entry as soon as the file changes.
+    for &prefix in rungs {
         let want = (meta.len() as usize).min(prefix);
         let mut buf = vec![0u8; want];
         if let Err(e) =
@@ -9347,7 +9358,6 @@ fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
         match manager_models::parse_gguf_layout(&buf) {
             Ok(l) => {
                 layout = Some(l);
-                cacheable = true;
                 break;
             }
             Err(manager_models::GgufError::Incomplete) if want < meta.len() as usize => continue,
@@ -9361,15 +9371,12 @@ fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
                     "gguf layout: parse failed for {} (error class: {class}): {e:?}",
                     path.display()
                 );
-                cacheable = true;
                 break;
             }
         }
     }
-    if cacheable {
-        if let Ok(mut guard) = cache.lock() {
-            guard.insert(key, layout.clone());
-        }
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, layout.clone());
     }
     layout
 }
@@ -11104,6 +11111,54 @@ mod tests {
 
     fn test_sink() -> Arc<dyn EventSink> {
         Arc::new(NoopSink)
+    }
+
+    /// P-4 (docs/code-review-v0.1.60.md): a header still `Incomplete`
+    /// at the largest prefix rung is cached as a failure (keyed by
+    /// length + mtime, so a changed file is parsed afresh).
+    #[test]
+    fn gguf_layout_incomplete_at_last_rung_is_cached() {
+        let dir = std::env::temp_dir().join(format!(
+            "llm-mgr-p4-gguf-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("crafted.gguf");
+        // GGUF v3, 0 tensors, 1 metadata pair whose key claims 1000
+        // bytes: incomplete at every prefix of this 64-byte file.
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&1000u64.to_le_bytes());
+        bytes.resize(64, b'k');
+        std::fs::write(&path, &bytes).unwrap();
+        let entries_for = |p: &PathBuf| -> Vec<u64> {
+            GGUF_LAYOUT_CACHE
+                .get()
+                .map(|c| {
+                    c.lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|((kp, _, _), v)| kp == p && v.is_none())
+                        .map(|((_, len, _), _)| *len)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert!(gguf_layout_cached_with(&path, &[16, 32]).is_none());
+        assert_eq!(entries_for(&path), vec![64]);
+        // A changed file (new length) is a new key, parsed afresh.
+        bytes.resize(80, b'k');
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(gguf_layout_cached_with(&path, &[16, 32]).is_none());
+        let mut lens = entries_for(&path);
+        lens.sort_unstable();
+        assert_eq!(lens, vec![64, 80]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A config path whose parent is a regular file: every save to it
