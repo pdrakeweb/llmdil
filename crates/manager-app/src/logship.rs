@@ -300,6 +300,80 @@ pub fn log_streaming_status(state: &AppState) -> Option<ShipperStatus> {
     state.logship.get().map(|h| h.status())
 }
 
+/// The `shipper` object of the `log_receiver_status` payload: what
+/// the shipper is doing, source by source, so the Settings card
+/// never implies a source ships when it does not.
+///
+/// Running: the shipper's own rows (`active` / `disabled` /
+/// `file_missing` / `waiting` / `unavailable`, with record counts)
+/// and counters. Not running (streaming off, no endpoint, no token):
+/// every source is listed from the config as `disabled` or
+/// `not_running`. The shipper reads the config once, at start, so
+/// `restart_pending` reports a saved toggle that differs from what
+/// the running shipper was started with.
+pub fn shipper_surface(
+    cfg: &manager_config::LogStreamingConfig,
+    status: Option<&ShipperStatus>,
+) -> Value {
+    use manager_logship::shipper::BACKEND_SOURCE_PREFIX;
+    use manager_logship::SourceState;
+    let s = &cfg.sources;
+    // The config toggle behind a status row's source name.
+    let toggle = |source: &str| match source {
+        "wizard" => s.wizard,
+        "optimize" => s.optimize,
+        "gateway" => s.gateway,
+        "service-manage" => s.service_manage,
+        "audit" => s.audit,
+        APP_SOURCE => s.app,
+        other => (other == "backends" || other.starts_with(BACKEND_SOURCE_PREFIX)) && s.backends,
+    };
+    let Some(status) = status else {
+        let sources: Vec<Value> = [
+            "wizard",
+            "optimize",
+            "gateway",
+            "service-manage",
+            "audit",
+            APP_SOURCE,
+            "backends",
+        ]
+        .iter()
+        .map(|source| {
+            serde_json::json!({
+                "source": source,
+                "state": if toggle(source) { "not_running" } else { "disabled" },
+                "records": 0,
+            })
+        })
+        .collect();
+        return serde_json::json!({
+            "running": false,
+            "state": "not_running",
+            "restart_pending": cfg.enabled,
+            "sources": sources,
+        });
+    };
+    let restart_pending = !cfg.enabled
+        || status
+            .sources
+            .iter()
+            .any(|row| (row.state != SourceState::Disabled) != toggle(&row.source));
+    serde_json::json!({
+        "running": true,
+        "state": status.state,
+        "restart_pending": restart_pending,
+        "queued": status.queued,
+        "spooled_bytes": status.spooled_bytes,
+        "delivered": status.delivered,
+        "dropped_queue": status.dropped_queue,
+        "dropped_spool": status.dropped_spool,
+        "dropped_events": status.dropped_events,
+        "last_delivered": status.last_delivered,
+        "sources": status.sources,
+    })
+}
+
 /// Shut the shipper down (app shutdown path).
 pub fn stop_log_streaming(state: &AppState) {
     if let Some(h) = state.logship.get() {
@@ -388,6 +462,75 @@ mod tests {
         let blob = json!({ "blob": "a".repeat(3 * MAX_EVENT_PAYLOAD_CHARS) });
         let huge = event_record("x", &blob).unwrap();
         assert!(huge.line.chars().count() <= MAX_EVENT_PAYLOAD_CHARS + 8);
+    }
+
+    #[test]
+    fn shipper_surface_reports_every_source_honestly() {
+        use manager_logship::{SourceState, SourceStatus};
+        let mut cfg = manager_config::LogStreamingConfig::default();
+        let state_of = |v: &Value, source: &str| {
+            v["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["source"] == source)
+                .unwrap_or_else(|| panic!("no row for {source}"))["state"]
+                .clone()
+        };
+
+        // Not running, streaming off: nothing ships, nothing pending.
+        let off = shipper_surface(&cfg, None);
+        assert_eq!(off["running"], false);
+        assert_eq!(off["restart_pending"], false);
+        for source in ["wizard", "optimize", "gateway", "audit", "app"] {
+            assert_eq!(state_of(&off, source), "not_running");
+        }
+        assert_eq!(state_of(&off, "service-manage"), "not_running");
+        assert_eq!(state_of(&off, "backends"), "disabled");
+
+        // Enabled in the config but no shipper: it starts at restart.
+        cfg.enabled = true;
+        assert_eq!(shipper_surface(&cfg, None)["restart_pending"], true);
+
+        // Running: the shipper's own rows, verbatim.
+        let row = |source: &str, state| SourceStatus {
+            source: source.to_string(),
+            state,
+            records: 3,
+        };
+        let status = ShipperStatus {
+            state: "connected".to_string(),
+            dropped_events: 2,
+            sources: vec![
+                row("wizard", SourceState::Active),
+                row("gateway", SourceState::FileMissing),
+                row("audit", SourceState::Active),
+                row("app", SourceState::Active),
+                row("optimize", SourceState::Active),
+                row("service-manage", SourceState::Active),
+                row("backends", SourceState::Disabled),
+            ],
+            ..ShipperStatus::default()
+        };
+        let on = shipper_surface(&cfg, Some(&status));
+        assert_eq!(on["running"], true);
+        assert_eq!(on["state"], "connected");
+        assert_eq!(on["dropped_events"], 2);
+        assert_eq!(state_of(&on, "gateway"), "file_missing");
+        assert_eq!(state_of(&on, "backends"), "disabled");
+        assert_eq!(on["sources"][0]["records"], 3);
+        assert_eq!(on["restart_pending"], false);
+
+        // A toggle saved since the shipper started is flagged — in
+        // both directions.
+        let pending = |cfg: &manager_config::LogStreamingConfig| {
+            shipper_surface(cfg, Some(&status))["restart_pending"].clone()
+        };
+        cfg.sources.audit = false;
+        assert_eq!(pending(&cfg), true);
+        cfg.sources.audit = true;
+        cfg.sources.backends = true;
+        assert_eq!(pending(&cfg), true);
     }
 
     /// The ring pump's pass: a backend's captured lines come out
