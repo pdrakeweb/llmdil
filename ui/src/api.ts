@@ -2285,6 +2285,10 @@ export interface McpServerRow {
   metered: boolean;
   rpm_limit: number | null;
   running: boolean;
+  /** Supervised-process state ("stopped" | "running" | "failed" ...);
+   *  "failed" once a Local server exited on its own. Optional: older
+   *  backends do not send it. */
+  process_state?: string;
   credential_present: boolean;
   /** "present" | "missing" — the §9 card wording. */
   credential_status: string;
