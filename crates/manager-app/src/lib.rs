@@ -2253,7 +2253,12 @@ pub(crate) async fn backend_start_preflight_for(
                 m.id
             )));
         }
-        if state.verifying_downloads.lock().unwrap().contains(&m.id) {
+        if state
+            .verifying_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&m.id)
+        {
             return Err(ApiError::InvalidInput(format!(
                 "SHA-256 verification is still running for model {}.",
                 m.id
@@ -11037,6 +11042,57 @@ mod tests {
 
     fn test_sink() -> Arc<dyn EventSink> {
         Arc::new(NoopSink)
+    }
+
+    /// PS-12 (docs/code-review-v0.1.60.md): a poisoned
+    /// `verifying_downloads` lock must not panic the start preflight;
+    /// the gate still reports the in-flight verification.
+    #[tokio::test]
+    async fn start_preflight_tolerates_poisoned_verifying_lock() {
+        let mut cfg = test_cfg();
+        cfg.backends
+            .iter_mut()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .enabled = true;
+        let (state, dir) = advanced_test_state(cfg);
+        // Seed the catalog so the coder backend's model is a known row.
+        ensure_catalog_models(&state).await;
+        let cfg = state.config.read().await.clone();
+        let b = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == "coder")
+            .unwrap()
+            .clone();
+        let target = resolve_under_data_dir(&cfg.data_dir, &b.model_file);
+        let model_id = cfg
+            .models
+            .iter()
+            .find(|m| resolve_under_data_dir(&cfg.data_dir, &m.gguf_path) == target)
+            .expect("the coder backend's model is in the catalog")
+            .id
+            .clone();
+        state
+            .verifying_downloads
+            .lock()
+            .unwrap()
+            .insert(model_id.clone());
+        let poisoner = Arc::clone(&state);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.verifying_downloads.lock().unwrap();
+            panic!("poison the verifying_downloads lock");
+        })
+        .join();
+        assert!(state.verifying_downloads.is_poisoned());
+        let err = backend_start_preflight_for(&state, &cfg, &b, false)
+            .await
+            .expect_err("a model under verification refuses the start");
+        assert!(
+            err.to_string().contains("verification is still running"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// PS-6 (docs/code-review-v0.1.60.md): an invalid gateway patch is
