@@ -1561,6 +1561,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "flate2",
+ "getrandom 0.3.4",
  "jsonc-parser",
  "libc",
  "manager-config",
