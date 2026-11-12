@@ -99,10 +99,14 @@ pub fn suggested_default_offload(
         return (None, false);
     };
     let largest_bytes = largest_mib * 1024 * 1024;
-    let sys = manager_models::sys_bytes_by_position(
+    // Position N is written as `--n-cpu-moe N`, which llama.cpp
+    // resolves by block index: price it from the tensor index when
+    // the parse carried one (the same table the slider shows).
+    let sys = manager_models::memory::sys_bytes_by_position_with_tensors(
         layout.expert_bytes,
         Some(&layout.expert_bytes_by_block),
         moe_layers,
+        (!layout.expert_tensors.is_empty()).then_some(&*layout.expert_tensors),
     );
     for n in 0..=moe_layers {
         let gpu_bytes = layout.tensor_bytes.saturating_sub(sys[n as usize]);
@@ -362,6 +366,7 @@ mod tests {
             tensor_bytes: dense_bytes + expert_bytes,
             expert_bytes,
             expert_bytes_by_block: vec![per_block; moe_blocks as usize],
+            expert_tensors: Default::default(),
             block_count: Some(moe_blocks),
             moe_block_count: (moe_blocks > 0).then_some(moe_blocks),
             nextn_predict_layers: None,

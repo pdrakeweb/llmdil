@@ -6309,6 +6309,10 @@ pub async fn op_backend_set_offload(
             manager_models::ExpertOffload::CpuMoeLayers(n) => {
                 format!("Backend `{id}` expert offload set to {n} of {moe_layers} MoE layers")
             }
+            // offload_for_layers never selects operator patterns.
+            manager_models::ExpertOffload::TensorOverrides => {
+                format!("Backend `{id}` expert offload set by tensor overrides")
+            }
         };
         record_backend_change(
             state,
@@ -7154,7 +7158,7 @@ fn cache_preview_json(
     let kv_typed = layout
         .kv_geometry
         .map(|g| g.bytes_per_token_typed(selection.k, selection.v));
-    let req = manager_models::memory_requirement(
+    let req = manager_models::memory::memory_requirement_with_tensors(
         layout.total_bytes,
         layout.expert_bytes,
         layout.expert_bytes_by_block.as_deref(),
@@ -7165,6 +7169,8 @@ fn cache_preview_json(
         n_ctx,
         layout.rs_bytes_per_seq,
         n_seq,
+        layout.expert_tensors.as_deref(),
+        layout.raw_flags.as_deref(),
     );
     // The expert cache prices into the preview's totals the way
     // it prices into the requirement: the whole MiB figure joins
@@ -9458,6 +9464,14 @@ struct WeightLayout {
     /// layout came from one — partial offload is priced from the
     /// true first-N block sums, not a uniform share.
     expert_bytes_by_block: Option<Vec<u64>>,
+    /// The routed-expert tensor index (names and sizes) from the
+    /// GGUF parse, when the layout came from one and the model has
+    /// experts: operator `-ot` patterns and `--n-cpu-moe`'s
+    /// block-index rule are priced against it (P-5).
+    expert_tensors: Option<std::sync::Arc<[manager_models::gguf::ExpertTensor]>>,
+    /// The backend raw flags this layout was resolved for — the
+    /// override list `expert_tensors` is evaluated under.
+    raw_flags: Option<String>,
     moe_layers: Option<u32>,
     /// The GGUF KV geometry, when the layout came from a parse —
     /// the input cache-type-aware KV pricing needs (each side
@@ -9555,10 +9569,18 @@ fn resolve_weight_layout(
         .as_ref()
         .and_then(|c| c.default_offload_layers)
         .or(model.default_offload_layers);
+    // The tensor index rides only with a parse that found experts:
+    // a dense file prices offload exactly as before.
+    let expert_tensors = layout
+        .as_ref()
+        .map(|l| l.expert_tensors.clone())
+        .filter(|t| !t.is_empty());
     Some(WeightLayout {
         total_bytes,
         expert_bytes,
         expert_bytes_by_block,
+        expert_tensors,
+        raw_flags: b.raw_flags.clone(),
         moe_layers,
         kv_geometry,
         kv_per_token,
@@ -9580,7 +9602,7 @@ fn backend_memory_requirement(
 ) -> Option<manager_models::MemoryRequirement> {
     let layout = resolve_weight_layout(cfg, b)?;
     let offload = manager_models::expert_offload(b.raw_flags.as_deref());
-    let mut req = manager_models::memory_requirement(
+    let mut req = manager_models::memory::memory_requirement_with_tensors(
         layout.total_bytes,
         layout.expert_bytes,
         layout.expert_bytes_by_block.as_deref(),
@@ -9591,6 +9613,8 @@ fn backend_memory_requirement(
         b.flags.n_ctx,
         layout.rs_bytes_per_seq,
         manager_models::effective_slots(b.raw_flags.as_deref()),
+        layout.expert_tensors.as_deref(),
+        b.raw_flags.as_deref(),
     );
     // The expert cache rides the requirement: the decoded token
     // plus the layer geometry the requirement's per-GPU
@@ -9729,10 +9753,11 @@ fn backend_offload_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> O
         .as_ref()
         .map(|c| c.offload_restrictions.clone())
         .unwrap_or_default();
-    let sys_bytes_by_position = manager_models::sys_bytes_by_position(
+    let sys_bytes_by_position = manager_models::memory::sys_bytes_by_position_with_tensors(
         expert_bytes,
         layout.expert_bytes_by_block.as_deref(),
         moe_layers,
+        layout.expert_tensors.as_deref(),
     );
     Some(OffloadInfo {
         moe_layers,
@@ -14576,6 +14601,91 @@ mod tests {
         b
     }
 
+    /// A GGUF header whose first `dense_lead` blocks are dense and
+    /// whose next `moe_blocks` blocks each carry one 1 MiB routed
+    /// expert tensor (262,144 F32 elements), so offloaded bytes
+    /// read directly as whole MiB.
+    fn gguf_lead_dense_header(dense_lead: u32, moe_blocks: u32) -> Vec<u8> {
+        fn w_str(out: &mut Vec<u8>, s: &str) {
+            out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        fn w_tensor(out: &mut Vec<u8>, name: &str, elems: u64) {
+            w_str(out, name);
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&elems.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&0u64.to_le_bytes());
+        }
+        let total = dense_lead + moe_blocks;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&(total as u64).to_le_bytes());
+        b.extend_from_slice(&2u64.to_le_bytes());
+        w_str(&mut b, "general.architecture");
+        b.extend_from_slice(&8u32.to_le_bytes());
+        w_str(&mut b, "testarch");
+        w_str(&mut b, "testarch.block_count");
+        b.extend_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(&total.to_le_bytes());
+        for i in 0..dense_lead {
+            w_tensor(&mut b, &format!("blk.{i}.ffn_gate.weight"), 262_144);
+        }
+        for i in dense_lead..total {
+            w_tensor(&mut b, &format!("blk.{i}.ffn_gate_exps.weight"), 262_144);
+        }
+        b
+    }
+
+    #[test]
+    fn requirement_prices_ot_block_ranges_and_n_cpu_moe_block_indices() {
+        // P-5 and the --n-cpu-moe check (review item 11), through
+        // the app's own requirement and slider table: 3 leading
+        // dense blocks then 37 MoE blocks, 1 MiB of experts each.
+        let dir = gguf_probe_dir("p5");
+        std::fs::write(
+            dir.join("models").join("lead-dense.gguf"),
+            gguf_lead_dense_header(3, 37),
+        )
+        .unwrap();
+        let mut cfg = test_cfg();
+        cfg.data_dir = dir.clone();
+        register_test_model(&mut cfg, "lead-dense-moe", "models/lead-dense.gguf");
+        cfg.models.last_mut().unwrap().moe_layers = Some(37);
+        cfg.models.last_mut().unwrap().default_offload_layers = Some(10);
+        let req = |raw: &str| {
+            let b = uncreated_backend(
+                "lead-dense",
+                "models/lead-dense.gguf",
+                Some(raw.to_string()),
+            );
+            backend_memory_requirement(&cfg, &b).unwrap()
+        };
+        // Block-range -ot recipe: blocks 0..=19 match, of which
+        // 3..=19 carry experts — 17 MiB, not all 37.
+        let r = req(r#"-ot "blk\.([0-9]|1[0-9])\.ffn_.*_exps\.=CPU""#);
+        assert_eq!(r.sys_weights_mib, 17);
+        assert_eq!(r.gpu_weights_mib, 3 + 20);
+        assert_eq!(r.basis, manager_models::MemoryBasis::Exact);
+        // An uncompilable pattern: all on the GPU, Estimate.
+        let r = req(r"-ot blk\.(?!0).*_exps=CPU");
+        assert_eq!(r.sys_weights_mib, 0);
+        assert_eq!(r.basis, manager_models::MemoryBasis::Estimate);
+        // --n-cpu-moe 10 is a block-index bound: blocks 3..=9.
+        assert_eq!(req("--n-cpu-moe 10").sys_weights_mib, 7);
+        // The slider table agrees with the requirement.
+        let b = uncreated_backend(
+            "lead-dense",
+            "models/lead-dense.gguf",
+            Some("--n-cpu-moe 10".to_string()),
+        );
+        let info = backend_offload_info(&cfg, &b).unwrap();
+        assert_eq!(info.sys_bytes_by_position[10], 7 * 1024 * 1024);
+        assert_eq!(info.sys_bytes_by_position[37], 37 * 1024 * 1024);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn model_default_raw_flags_render_declared_defaults() {
         let mut cfg = test_cfg();
@@ -16249,6 +16359,8 @@ mod tests {
             total_bytes: 12_120_016_960,
             expert_bytes: None,
             expert_bytes_by_block: None,
+            expert_tensors: None,
+            raw_flags: None,
             moe_layers: None,
             kv_geometry: Some(manager_models::KvGeometry {
                 kv_layers: 16,

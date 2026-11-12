@@ -12,7 +12,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::gguf::ExpertTensor;
 use super::MIB;
+
+pub mod overrides;
 
 /// How a [`MemoryRequirement`] was derived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,9 +39,25 @@ pub enum ExpertOffload {
     /// All routed experts on the CPU (`-ot exps=CPU` and spellings
     /// of the same override, or `--cpu-moe` / `-cmoe`).
     AllExperts,
-    /// Experts of the first N layers on the CPU (`--n-cpu-moe N`,
-    /// `-ncmoe N`).
+    /// `--n-cpu-moe N` / `-ncmoe N`: llama.cpp moves the experts of
+    /// blocks with BLOCK INDEX `< N` to the CPU — leading dense
+    /// blocks count toward N — and repeated flags accumulate (the
+    /// effective bound is the largest). See [`overrides`] for the
+    /// source this follows. Without the model's tensor names the
+    /// requirement still approximates it as the first N MoE blocks.
     CpuMoeLayers(u32),
+    /// `-ot` / `--override-tensor` patterns that place SOME but not
+    /// all routed experts on the CPU (a block-range recipe such as
+    /// `blk\.([0-9]|1[0-9])\.ffn_.*_exps\.=CPU`, an
+    /// `ffn_(up|down)_exps` subset, a device override taking
+    /// precedence over a later CPU one), or a pattern this crate
+    /// cannot compile. Resolved against the model's tensor names by
+    /// [`memory_requirement_with_tensors`]; unresolvable otherwise
+    /// (all weights on the GPU at [`MemoryBasis::Estimate`]). Has
+    /// no canonical spelling: the offload slider shows it as a
+    /// custom setting at the full position, as it did before this
+    /// variant existed.
+    TensorOverrides,
 }
 
 impl ExpertOffload {
@@ -51,6 +70,9 @@ impl ExpertOffload {
             ExpertOffload::None => 0,
             ExpertOffload::AllExperts => moe_layers,
             ExpertOffload::CpuMoeLayers(n) => (*n).min(moe_layers),
+            // No layer position describes a pattern set; the slider
+            // keeps the full position it showed these as before.
+            ExpertOffload::TensorOverrides => moe_layers,
         }
     }
 }
@@ -78,6 +100,10 @@ pub fn offload_flag_string(offload: ExpertOffload) -> Option<String> {
         ExpertOffload::AllExperts => Some("-ot exps=CPU".to_string()),
         ExpertOffload::CpuMoeLayers(0) => None,
         ExpertOffload::CpuMoeLayers(n) => Some(format!("--n-cpu-moe {n}")),
+        // Operator patterns have no canonical form; callers that
+        // re-launch with "the same offload" keep the original
+        // tokens instead.
+        ExpertOffload::TensorOverrides => None,
     }
 }
 
@@ -166,11 +192,20 @@ pub fn set_expert_offload(raw_flags: Option<&str>, offload: ExpertOffload) -> Op
             out.push(flag.to_string());
             continue;
         };
-        let kept: Vec<&str> = value
-            .split(',')
-            .filter(|part| !override_part_is_expert(part))
+        // Split as llama.cpp's operators mean it (P-5): shell quotes
+        // stripped, commas inside `{m,n}` / `[...]` / `(...)` kept
+        // with their pattern.
+        let parts = overrides::split_overrides(overrides::strip_quotes(value));
+        let kept: Vec<&str> = parts
+            .iter()
+            .copied()
+            .filter(|part| !override_part_is_expert(overrides::strip_quotes(part)))
             .collect();
-        if !kept.is_empty() {
+        if kept.len() == parts.len() {
+            // Nothing removed: keep the operator's spelling verbatim.
+            out.push(flag.to_string());
+            out.push(value.to_string());
+        } else if !kept.is_empty() {
             out.push(flag.to_string());
             out.push(kept.join(","));
         }
@@ -193,69 +228,35 @@ pub fn set_expert_offload(raw_flags: Option<&str>, offload: ExpertOffload) -> Op
     }
 }
 
-/// Detect expert offload in raw llama-server flags. Recognizes
-/// `--override-tensor` / `-ot` assignments whose pattern mentions
-/// `exps` with a CPU buffer (the `-ot exps=CPU` form the app itself
-/// writes, plus `=` spellings), `--cpu-moe` / `-cmoe` (all experts
-/// on the CPU), and `--n-cpu-moe N` / `-ncmoe N` (first N layers).
+/// Detect expert offload in raw llama-server flags: every
+/// tensor-buffer override — `--override-tensor` / `-ot` lists
+/// (space or `=` spelling, repeatable, shell quotes stripped, split
+/// on top-level commas only), `--cpu-moe` / `-cmoe`, and
+/// `--n-cpu-moe N` / `-ncmoe N` — collected in command-line order
+/// and evaluated with llama.cpp's first-match precedence (see
+/// [`overrides`] for the verified source rules) against
+/// representative expert tensor names:
 ///
-/// When both an all-experts spelling and a layer count are present
-/// the all-experts setting wins regardless of order: llama.cpp
-/// applies both, and `-ot exps=CPU` / `--cpu-moe` already put every
-/// expert tensor on the CPU, leaving nothing for the layer count
-/// to move. A repeated layer count resolves to the last one, the
-/// same sequential-parse rule llama.cpp follows.
+/// - every expert lands on the CPU: [`ExpertOffload::AllExperts`]
+///   (`-ot exps=CPU`, `--cpu-moe`, or either alongside a layer
+///   count — order does not matter when everything is CPU);
+/// - only `--n-cpu-moe` bounds move experts:
+///   [`ExpertOffload::CpuMoeLayers`] with the LARGEST bound
+///   (llama.cpp appends one override set per flag, so repeats
+///   accumulate);
+/// - `-ot` patterns place some but not all experts (or a pattern
+///   cannot be compiled): [`ExpertOffload::TensorOverrides`];
+/// - nothing moves to the CPU: [`ExpertOffload::None`].
 pub fn expert_offload(raw_flags: Option<&str>) -> ExpertOffload {
     let Some(raw) = raw_flags else {
         return ExpertOffload::None;
     };
-    let tokens: Vec<&str> = raw.split_whitespace().collect();
-    let mut layers: Option<u32> = None;
-    let mut i = 0;
-    while i < tokens.len() {
-        let t = tokens[i];
-        if t == "--cpu-moe" || t == "-cmoe" {
-            return ExpertOffload::AllExperts;
-        }
-        let assignment = if t == "-ot" || t == "--override-tensor" {
-            i += 1;
-            tokens.get(i).copied()
-        } else {
-            t.strip_prefix("--override-tensor=")
-                .or_else(|| t.strip_prefix("-ot="))
-        };
-        if let Some(list) = assignment {
-            for part in list.split(',') {
-                if let Some((pattern, buffer)) = part.split_once('=') {
-                    if pattern.contains("exps") && buffer.eq_ignore_ascii_case("CPU") {
-                        return ExpertOffload::AllExperts;
-                    }
-                }
-            }
-        }
-        if t == "--n-cpu-moe" || t == "-ncmoe" {
-            if let Some(v) = tokens.get(i + 1) {
-                if let Ok(n) = v.parse::<u32>() {
-                    if n > 0 {
-                        layers = Some(n);
-                    }
-                }
-            }
-        } else if let Some(v) = t
-            .strip_prefix("--n-cpu-moe=")
-            .or_else(|| t.strip_prefix("-ncmoe="))
-        {
-            if let Ok(n) = v.parse::<u32>() {
-                if n > 0 {
-                    layers = Some(n);
-                }
-            }
-        }
-        i += 1;
-    }
-    match layers {
-        Some(n) => ExpertOffload::CpuMoeLayers(n),
-        None => ExpertOffload::None,
+    match overrides::classify(raw) {
+        overrides::Classified::None => ExpertOffload::None,
+        overrides::Classified::AllExperts => ExpertOffload::AllExperts,
+        overrides::Classified::BlockBound(0) => ExpertOffload::None,
+        overrides::Classified::BlockBound(n) => ExpertOffload::CpuMoeLayers(n),
+        overrides::Classified::Partial => ExpertOffload::TensorOverrides,
     }
 }
 
@@ -415,7 +416,32 @@ pub fn memory_requirement(
                 }
             }
         },
+        // Operator patterns need the model's tensor names
+        // ([`memory_requirement_with_tensors`]); without them the
+        // split is unresolvable: all on the GPU, Estimate.
+        ExpertOffload::TensorOverrides => {
+            return all_on_gpu_estimate(total_bytes, kv_mib, rs_mib);
+        }
     };
+    split_requirement(total_bytes, sys_bytes, kv_mib, rs_mib, basis)
+}
+
+/// The degradation result: every weight on the GPU, `Estimate`.
+fn all_on_gpu_estimate(
+    total_bytes: u64,
+    kv_mib: Option<u64>,
+    rs_mib: Option<u64>,
+) -> MemoryRequirement {
+    split_requirement(total_bytes, 0, kv_mib, rs_mib, MemoryBasis::Estimate)
+}
+
+fn split_requirement(
+    total_bytes: u64,
+    sys_bytes: u64,
+    kv_mib: Option<u64>,
+    rs_mib: Option<u64>,
+    basis: MemoryBasis,
+) -> MemoryRequirement {
     MemoryRequirement {
         gpu_weights_mib: mib(total_bytes - sys_bytes.min(total_bytes)),
         sys_weights_mib: mib(sys_bytes),
@@ -469,6 +495,102 @@ pub fn sys_bytes_by_position(
             .map(|n| uniform_share(expert_bytes, n, moe_layers))
             .collect(),
     }
+}
+
+/// [`memory_requirement`] with the model's routed-expert tensor
+/// index (from the GGUF header, [`super::GgufLayout::expert_tensors`])
+/// and the backend's raw flags, so offloads that depend on WHICH
+/// tensors move are priced from the tensors themselves:
+///
+/// - [`ExpertOffload::TensorOverrides`]: every override in
+///   `raw_flags` is evaluated against the real tensor names with
+///   llama.cpp's first-match precedence and the bytes of the expert
+///   tensors placed on the CPU are summed (P-5). A pattern that
+///   cannot be compiled degrades to all-on-GPU at
+///   [`MemoryBasis::Estimate`]; one that matches nothing moves
+///   nothing.
+/// - [`ExpertOffload::CpuMoeLayers`]`(n)`: the experts of blocks
+///   with block index `< n` — llama.cpp's `--n-cpu-moe` rule (see
+///   [`overrides`]), under which leading dense blocks count toward
+///   `n` — rather than the first `n` MoE blocks.
+///
+/// Every other case, and every case without a tensor index
+/// (`expert_tensors` `None`, e.g. a catalog-pinned layout before
+/// download), is exactly [`memory_requirement`].
+#[allow(clippy::too_many_arguments)]
+pub fn memory_requirement_with_tensors(
+    total_bytes: u64,
+    expert_bytes: Option<u64>,
+    expert_bytes_by_block: Option<&[u64]>,
+    basis: MemoryBasis,
+    offload: ExpertOffload,
+    kv_bytes_per_token: Option<u64>,
+    moe_layers: Option<u32>,
+    n_ctx: u32,
+    rs_bytes_per_seq: Option<u64>,
+    n_seq: u32,
+    expert_tensors: Option<&[ExpertTensor]>,
+    raw_flags: Option<&str>,
+) -> MemoryRequirement {
+    let legacy = || {
+        memory_requirement(
+            total_bytes,
+            expert_bytes,
+            expert_bytes_by_block,
+            basis,
+            offload,
+            kv_bytes_per_token,
+            moe_layers,
+            n_ctx,
+            rs_bytes_per_seq,
+            n_seq,
+        )
+    };
+    let Some(tensors) = expert_tensors else {
+        return legacy();
+    };
+    let kv_mib = kv_bytes_per_token.map(|per| mib(per.saturating_mul(n_ctx as u64)));
+    let rs_mib = rs_bytes_per_seq.map(|per| mib(per.saturating_mul(n_seq.max(1) as u64)));
+    let sys_bytes = match offload {
+        ExpertOffload::TensorOverrides => {
+            match raw_flags.map(|raw| overrides::resolve_cpu_bytes(raw, tensors)) {
+                Some(Ok(bytes)) => bytes,
+                // No flags to resolve, or a pattern that does not
+                // compile: unresolvable.
+                _ => return all_on_gpu_estimate(total_bytes, kv_mib, rs_mib),
+            }
+        }
+        ExpertOffload::CpuMoeLayers(n) => overrides::block_bound_bytes(tensors, n),
+        ExpertOffload::None | ExpertOffload::AllExperts => return legacy(),
+    };
+    split_requirement(total_bytes, sys_bytes, kv_mib, rs_mib, basis)
+}
+
+/// [`sys_bytes_by_position`] with the model's routed-expert tensor
+/// index, mirroring [`memory_requirement_with_tensors`]: a partial
+/// position `k` (`0 < k < moe_layers`) is written as
+/// `--n-cpu-moe k`, which llama.cpp resolves by BLOCK INDEX, so
+/// entry `k` sums the experts of blocks with index `< k`; the full
+/// position is written as `-ot exps=CPU` and stays
+/// `expert_bytes`. Without an index this is exactly
+/// [`sys_bytes_by_position`].
+pub fn sys_bytes_by_position_with_tensors(
+    expert_bytes: u64,
+    expert_bytes_by_block: Option<&[u64]>,
+    moe_layers: u32,
+    expert_tensors: Option<&[ExpertTensor]>,
+) -> Vec<u64> {
+    let Some(tensors) = expert_tensors else {
+        return sys_bytes_by_position(expert_bytes, expert_bytes_by_block, moe_layers);
+    };
+    if moe_layers == 0 {
+        return vec![0];
+    }
+    let mut out = overrides::block_bound_prefix_bytes(tensors, moe_layers);
+    if let Some(last) = out.last_mut() {
+        *last = expert_bytes;
+    }
+    out
 }
 
 /// Sum of `bytes`, saturating at `u64::MAX` instead of overflowing
@@ -1127,5 +1249,338 @@ mod tests {
         assert_eq!(table[0], 0);
         assert_eq!(table[3], 6);
         assert_eq!(table[n as usize], n as u64 * (n as u64 + 1) / 2);
+    }
+
+    // --- P-5: -ot patterns priced against the tensor index ---------
+
+    /// A 40-block MoE model, every block carrying up/gate/down
+    /// stacked experts; `up` and `gate` are 1 GiB each, `down`
+    /// 2 GiB (4 GiB per block, 160 GiB of experts in all), plus
+    /// 10 GiB of dense weights. Leading dense blocks are modeled
+    /// by `first_moe`: blocks below it carry no experts.
+    fn moe_tensors(first_moe: u32, blocks: u32) -> Vec<ExpertTensor> {
+        (first_moe..blocks)
+            .flat_map(|b| {
+                [("up", GIB), ("gate", GIB), ("down", 2 * GIB)]
+                    .into_iter()
+                    .map(move |(k, bytes)| ExpertTensor {
+                        name: format!("blk.{b}.ffn_{k}_exps.weight"),
+                        bytes,
+                    })
+            })
+            .collect()
+    }
+
+    fn price(raw: &str, tensors: &[ExpertTensor]) -> MemoryRequirement {
+        let expert: u64 = tensors.iter().map(|t| t.bytes).sum();
+        memory_requirement_with_tensors(
+            expert + 10 * GIB,
+            Some(expert),
+            None,
+            MemoryBasis::Exact,
+            expert_offload(Some(raw)),
+            None,
+            None,
+            4096,
+            None,
+            1,
+            Some(tensors),
+            Some(raw),
+        )
+    }
+
+    #[test]
+    fn block_range_recipe_prices_only_matched_blocks() {
+        let t = moe_tensors(0, 40);
+        // The common recipe: experts of blocks 0..=19 on the CPU.
+        let raw = r"-ot blk\.([0-9]|1[0-9])\.ffn_.*_exps\.=CPU";
+        assert_eq!(expert_offload(Some(raw)), ExpertOffload::TensorOverrides);
+        let r = price(raw, &t);
+        assert_eq!(r.sys_weights_mib, 20 * 4 * 1024);
+        assert_eq!(r.gpu_weights_mib, (20 * 4 + 10) * 1024);
+        assert_eq!(r.basis, MemoryBasis::Exact);
+        // The legacy entry point cannot see tensor names: the
+        // split is unresolvable, so all-on-GPU at Estimate (never
+        // the old "all experts" answer).
+        let legacy = memory_requirement(
+            170 * GIB,
+            Some(160 * GIB),
+            None,
+            MemoryBasis::Exact,
+            ExpertOffload::TensorOverrides,
+            None,
+            Some(40),
+            4096,
+            None,
+            1,
+        );
+        assert_eq!(legacy.sys_weights_mib, 0);
+        assert_eq!(legacy.gpu_weights_mib, 170 * 1024);
+        assert_eq!(legacy.basis, MemoryBasis::Estimate);
+    }
+
+    #[test]
+    fn quoted_and_unquoted_overrides_price_the_same() {
+        let t = moe_tensors(0, 40);
+        let bare = price(r"-ot blk\.([0-9]|1[0-9])\.ffn_.*_exps\.=CPU", &t);
+        for raw in [
+            r#"-ot "blk\.([0-9]|1[0-9])\.ffn_.*_exps\.=CPU""#,
+            r"-ot 'blk\.([0-9]|1[0-9])\.ffn_.*_exps\.=CPU'",
+            r#"--override-tensor="blk\.([0-9]|1[0-9])\.ffn_.*_exps\.=CPU""#,
+            r"--override-tensor=blk\.([0-9]|1[0-9])\.ffn_.*_exps\.=CPU",
+            r"--threads 8 --override-tensor blk\.([0-9]|1[0-9])\.ffn_.*_exps\.=CPU",
+        ] {
+            assert_eq!(price(raw, &t), bare, "{raw}");
+        }
+        // The canonical all-experts form, quoted, is still
+        // all-experts.
+        assert_eq!(
+            expert_offload(Some(r#"-ot "exps=CPU""#)),
+            ExpertOffload::AllExperts
+        );
+    }
+
+    #[test]
+    fn quantifier_commas_do_not_split_overrides() {
+        use overrides::{parse_override_rules, split_overrides, OverrideRule};
+        assert_eq!(
+            split_overrides(r"blk\.[0-9]{1,3}\.ffn_up_exps=CPU,attn=CUDA0"),
+            vec![r"blk\.[0-9]{1,3}\.ffn_up_exps=CPU", "attn=CUDA0"]
+        );
+        assert_eq!(
+            split_overrides(r"a[,]b=CPU,c\,d=CPU,(e|f,g)=CPU"),
+            vec![r"a[,]b=CPU", r"c\,d=CPU", "(e|f,g)=CPU"]
+        );
+        // Exactly one digit in 1..=3 between `blk.` and `.`:
+        // blocks 1, 2 and 3.
+        let raw = r"-ot blk\.[1-3]{1,1}\.ffn_.*_exps=CPU";
+        assert_eq!(
+            parse_override_rules(raw),
+            vec![OverrideRule::Pattern {
+                pattern: r"blk\.[1-3]{1,1}\.ffn_.*_exps".to_string(),
+                cpu: true
+            }]
+        );
+        let t = moe_tensors(0, 40);
+        assert_eq!(price(raw, &t).sys_weights_mib, 3 * 4 * 1024);
+        // A `{m,n}` range with a second override after it.
+        let raw = r"-ot blk\.(1|2){1,2}\.ffn_.*_exps=CPU,attn=CUDA0";
+        // blk.1, blk.2, blk.11, blk.12, blk.21, blk.22.
+        assert_eq!(price(raw, &t).sys_weights_mib, 6 * 4 * 1024);
+    }
+
+    #[test]
+    fn first_match_precedence_keeps_earlier_device_overrides() {
+        let t = moe_tensors(0, 40);
+        // blk.0 matches the CUDA0 override first: its experts stay
+        // on the GPU; every other block's go to the CPU.
+        let raw = r"-ot blk\.0\..*=CUDA0,exps=CPU";
+        assert_eq!(expert_offload(Some(raw)), ExpertOffload::TensorOverrides);
+        assert_eq!(price(raw, &t).sys_weights_mib, 39 * 4 * 1024);
+        // Reversed, `exps=CPU` matches first everywhere.
+        let raw = r"-ot exps=CPU,blk\.0\..*=CUDA0";
+        assert_eq!(expert_offload(Some(raw)), ExpertOffload::AllExperts);
+        // Precedence spans flags: an -ot device override ahead of
+        // --cpu-moe keeps blk.0 on the GPU, and one ahead of
+        // --n-cpu-moe likewise.
+        let raw = r"-ot blk\.0\..*=CUDA0 --cpu-moe";
+        assert_eq!(price(raw, &t).sys_weights_mib, 39 * 4 * 1024);
+        let raw = r"-ot blk\.0\..*=CUDA0 --n-cpu-moe 4";
+        assert_eq!(price(raw, &t).sys_weights_mib, 3 * 4 * 1024);
+        // Repeated -ot flags append in order.
+        let raw = r"-ot blk\.0\..*=CUDA0 -ot exps=CPU";
+        assert_eq!(price(raw, &t).sys_weights_mib, 39 * 4 * 1024);
+    }
+
+    #[test]
+    fn invalid_pattern_is_all_on_gpu_estimate() {
+        let t = moe_tensors(0, 40);
+        // Lookahead and backreferences are not supported by the
+        // linear-time engine; neither is an unbalanced group.
+        for raw in [
+            r"-ot blk\.(?!0\.).*_exps=CPU",
+            r"-ot (blk)\.\1.*_exps=CPU",
+            r"-ot blk\.(0.*_exps=CPU",
+        ] {
+            assert_eq!(
+                expert_offload(Some(raw)),
+                ExpertOffload::TensorOverrides,
+                "{raw}"
+            );
+            let r = price(raw, &t);
+            assert_eq!(r.sys_weights_mib, 0, "{raw}");
+            assert_eq!(r.gpu_weights_mib, 170 * 1024, "{raw}");
+            assert_eq!(r.basis, MemoryBasis::Estimate, "{raw}");
+        }
+        // An over-long pattern is refused the same way.
+        let long = format!("-ot {}exps=CPU", "a?".repeat(5000));
+        assert_eq!(price(&long, &t).basis, MemoryBasis::Estimate);
+        // An uncompilable DEVICE override with no CPU override
+        // anywhere moves nothing to the CPU whatever it matches.
+        assert_eq!(
+            expert_offload(Some(r"-ot blk\.(?!0).*=CUDA0")),
+            ExpertOffload::None
+        );
+    }
+
+    #[test]
+    fn pattern_matching_no_tensor_moves_nothing() {
+        let t = moe_tensors(0, 40);
+        let raw = r"-ot blk\.(0|1)\.ffn_up_exps=CPU";
+        let r = price(raw, &moe_tensors(5, 40));
+        assert_eq!(r.sys_weights_mib, 0);
+        assert_eq!(r.basis, MemoryBasis::Exact);
+        // The same pattern against a model that has those blocks.
+        assert_eq!(price(raw, &t).sys_weights_mib, 2 * 1024);
+    }
+
+    #[test]
+    fn up_down_subset_is_not_all_experts() {
+        let t = moe_tensors(0, 40);
+        let raw = r"-ot ffn_(up|down)_exps=CPU";
+        assert_eq!(expert_offload(Some(raw)), ExpertOffload::TensorOverrides);
+        // up (1 GiB) + down (2 GiB) of every block; gate stays.
+        assert_eq!(price(raw, &t).sys_weights_mib, 40 * 3 * 1024);
+        assert_eq!(price(raw, &t).gpu_weights_mib, (40 + 10) * 1024);
+    }
+
+    #[test]
+    fn rewrite_respects_quotes_and_quantifier_commas() {
+        // The slider's rewrite removes the expert override whole —
+        // never leaving a `{1` fragment behind — and keeps a
+        // sibling device override.
+        assert_eq!(
+            set_expert_offload(
+                Some(r#"-ot "blk\.[0-9]{1,2}\.ffn_.*_exps=CPU,attn=CUDA0""#),
+                ExpertOffload::CpuMoeLayers(4)
+            )
+            .as_deref(),
+            Some("-ot attn=CUDA0 --n-cpu-moe 4")
+        );
+        // A pattern set has no canonical spelling: the canonical
+        // rewrite drops it, so the slider marks the row custom.
+        let raw = r"-ot blk\.([0-9]|1[0-9])\.ffn_.*_exps\.=CPU";
+        assert_eq!(offload_flag_string(ExpertOffload::TensorOverrides), None);
+        assert_eq!(
+            set_expert_offload(Some(raw), ExpertOffload::TensorOverrides),
+            None
+        );
+        assert_eq!(ExpertOffload::TensorOverrides.layers(40), 40);
+    }
+
+    // --- item 11: --n-cpu-moe counts BLOCK indices -----------------
+
+    #[test]
+    fn n_cpu_moe_counts_block_indices_including_leading_dense_blocks() {
+        // Blocks 0..=2 are dense; experts start at block 3.
+        // llama.cpp's `--n-cpu-moe 5` appends `blk\.<i>` + exps
+        // overrides for i in 0..5: only blocks 3 and 4 carry
+        // experts, so 2 blocks move — not the first 5 MoE blocks.
+        let t = moe_tensors(3, 40);
+        let r = price("--n-cpu-moe 5", &t);
+        assert_eq!(r.sys_weights_mib, 2 * 4 * 1024);
+        assert_eq!(r.basis, MemoryBasis::Exact);
+        // A bound inside the dense prefix moves nothing.
+        assert_eq!(price("--n-cpu-moe 3", &t).sys_weights_mib, 0);
+        // A bound past the last block moves everything.
+        assert_eq!(price("-ncmoe 99", &t).sys_weights_mib, 37 * 4 * 1024);
+    }
+
+    #[test]
+    fn n_cpu_moe_repeats_accumulate_to_the_largest_bound() {
+        let t = moe_tensors(0, 40);
+        assert_eq!(
+            expert_offload(Some("--n-cpu-moe 9 --n-cpu-moe 3")),
+            ExpertOffload::CpuMoeLayers(9)
+        );
+        assert_eq!(
+            price("--n-cpu-moe 9 --n-cpu-moe 3", &t).sys_weights_mib,
+            9 * 4 * 1024
+        );
+    }
+
+    #[test]
+    fn n_cpu_moe_block_index_has_no_prefix_collisions() {
+        // `blk\.1` + `\.ffn_…` must not match block 10..19.
+        let t = moe_tensors(0, 40);
+        assert_eq!(price("--n-cpu-moe 2", &t).sys_weights_mib, 2 * 4 * 1024);
+        assert_eq!(
+            overrides::exps_block_index("blk.12.ffn_up_exps.weight"),
+            Some(12)
+        );
+        assert_eq!(
+            overrides::exps_block_index("blk.03.ffn_up_exps.weight"),
+            None
+        );
+        assert_eq!(
+            overrides::exps_block_index("blk.3.ffn_up_shexp.weight"),
+            None
+        );
+        assert_eq!(
+            overrides::exps_block_index("blk.3.ffn_gate_up_exps.weight"),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn position_table_with_tensors_follows_block_indices() {
+        // Leading dense blocks 0..=1, 6 MoE blocks (2..=7): slider
+        // position k writes `--n-cpu-moe k`, so the table entry for
+        // k is what that flag really moves; the full position
+        // writes `-ot exps=CPU` and is every expert.
+        let t = moe_tensors(2, 8);
+        let expert: u64 = t.iter().map(|t| t.bytes).sum();
+        let table = sys_bytes_by_position_with_tensors(expert, None, 6, Some(&t));
+        assert_eq!(table.len(), 7);
+        assert_eq!(table[0], 0);
+        assert_eq!(table[2], 0);
+        assert_eq!(table[3], 4 * GIB);
+        assert_eq!(table[5], 3 * 4 * GIB);
+        assert_eq!(table[6], expert);
+        // Every partial entry agrees with the requirement.
+        for k in 1..6u32 {
+            let r = price(&format!("--n-cpu-moe {k}"), &t);
+            assert_eq!(r.sys_weights_mib, mib(table[k as usize]), "k={k}");
+        }
+        // Without an index the legacy table is unchanged.
+        assert_eq!(
+            sys_bytes_by_position_with_tensors(expert, None, 6, None),
+            sys_bytes_by_position(expert, None, 6)
+        );
+    }
+
+    #[test]
+    fn with_tensors_leaves_other_cases_to_the_legacy_requirement() {
+        let t = moe_tensors(0, 40);
+        for raw in ["", "-ot exps=CPU", "--cpu-moe", "--threads 8"] {
+            let off = expert_offload(Some(raw));
+            let legacy = memory_requirement(
+                170 * GIB,
+                Some(160 * GIB),
+                None,
+                MemoryBasis::Exact,
+                off,
+                None,
+                Some(40),
+                4096,
+                None,
+                1,
+            );
+            let with = memory_requirement_with_tensors(
+                170 * GIB,
+                Some(160 * GIB),
+                None,
+                MemoryBasis::Exact,
+                off,
+                None,
+                Some(40),
+                4096,
+                None,
+                1,
+                Some(&t),
+                Some(raw),
+            );
+            assert_eq!(with, legacy, "{raw:?}");
+        }
     }
 }

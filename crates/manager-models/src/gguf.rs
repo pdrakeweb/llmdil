@@ -95,6 +95,17 @@ impl RsGeometry {
     }
 }
 
+/// One routed-expert tensor from the GGUF tensor directory: its
+/// name exactly as the header spells it (`blk.N.ffn_up_exps.weight`)
+/// and its data size. `--override-tensor` patterns are regexes over
+/// tensor names, so pricing a partial `-ot` offload needs the names,
+/// not only the per-block sums.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertTensor {
+    pub name: String,
+    pub bytes: u64,
+}
+
 /// The memory layout of one GGUF file, from its header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GgufLayout {
@@ -111,6 +122,14 @@ pub struct GgufLayout {
     /// prices from this, since per-block sizes are not uniform in
     /// dynamically-quantized files. Empty for dense models.
     pub expert_bytes_by_block: Vec<u64>,
+    /// Every routed-expert tensor (the tensors [`is_expert_tensor`]
+    /// counts into [`GgufLayout::expert_bytes`]), in directory
+    /// order, with its name: the index `--override-tensor` patterns
+    /// and `--n-cpu-moe`'s block-index rule are resolved against
+    /// (see [`super::memory::memory_requirement_with_tensors`]).
+    /// Shared behind an `Arc` because layouts are cached and cloned
+    /// per request. Empty for dense models.
+    pub expert_tensors: std::sync::Arc<[ExpertTensor]>,
     /// `<arch>.block_count` when present.
     pub block_count: Option<u32>,
     /// Number of blocks that carry routed-expert tensors, when any
@@ -461,6 +480,7 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
     let mut has_nextn_tensors = false;
     let mut tensor_bytes: u64 = 0;
     let mut expert_bytes: u64 = 0;
+    let mut expert_tensors: Vec<ExpertTensor> = Vec::new();
     let mut expert_by_block: std::collections::BTreeMap<u32, u64> =
         std::collections::BTreeMap::new();
     for _ in 0..tensor_count {
@@ -500,6 +520,7 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
                 let entry = expert_by_block.entry(idx).or_insert(0);
                 *entry = entry.saturating_add(size);
             }
+            expert_tensors.push(ExpertTensor { name, bytes: size });
         }
     }
     let moe_block_count = if expert_by_block.is_empty() {
@@ -513,6 +534,7 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
         tensor_bytes,
         expert_bytes,
         expert_bytes_by_block,
+        expert_tensors: expert_tensors.into(),
         block_count,
         moe_block_count,
         nextn_predict_layers,
@@ -592,6 +614,30 @@ mod tests {
             let layout = parse_gguf_layout(&b).unwrap();
             assert_eq!(layout.tensor_bytes, want, "type {ty}");
         }
+    }
+
+    /// P-5: the expert tensors are indexed by name and size, in
+    /// directory order — the input `-ot` pattern pricing matches
+    /// against. Non-expert tensors (embeddings, shared experts)
+    /// are not in it.
+    #[test]
+    fn records_expert_tensor_index() {
+        let layout = parse_gguf_layout(&sample_header()).unwrap();
+        assert_eq!(
+            &*layout.expert_tensors,
+            &[
+                ExpertTensor {
+                    name: "blk.0.ffn_gate_exps.weight".to_string(),
+                    bytes: 144
+                },
+                ExpertTensor {
+                    name: "blk.0.ffn_down.3.weight".to_string(),
+                    bytes: 34
+                },
+            ]
+        );
+        let sum: u64 = layout.expert_tensors.iter().map(|t| t.bytes).sum();
+        assert_eq!(sum, layout.expert_bytes);
     }
 
     #[test]

@@ -684,6 +684,8 @@ fn offload_label(offload: ExpertOffload) -> String {
         ExpertOffload::None => "none".to_string(),
         ExpertOffload::AllExperts => "all_experts".to_string(),
         ExpertOffload::CpuMoeLayers(n) => format!("cpu_moe_layers:{n}"),
+        // The patterns themselves are in the fingerprint's raw flags.
+        ExpertOffload::TensorOverrides => "tensor_overrides".to_string(),
     }
 }
 

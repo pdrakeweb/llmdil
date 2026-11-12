@@ -214,6 +214,7 @@ fn offload_json(backend: &BackendConfig, moe_layers: Option<u32>) -> Value {
         manager_models::ExpertOffload::CpuMoeLayers(n) => {
             json!({ "setting": "cpu_moe_layers", "layers": n })
         }
+        manager_models::ExpertOffload::TensorOverrides => json!({ "setting": "tensor_overrides" }),
     };
     if let Some(moe) = moe_layers {
         v["offloaded_layers"] = json!(offload.layers(moe));
