@@ -17,7 +17,17 @@ on:
       - "v*"
 
 jobs:
+  # The full PR gate set (gates.yml: version drift incl. tag == version,
+  # fmt, clippy -D warnings, UI build + smoke, Linux + Windows tests,
+  # src-tauri clippy/tests, launch smoke). The installer is only built
+  # and published when every gate is green.
+  gates:
+    uses: ./.github/workflows/gates.yml
+    permissions:
+      contents: read
+
   release-windows:
+    needs: gates
     runs-on: windows-latest
     permissions:
       contents: write
