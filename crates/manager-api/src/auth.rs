@@ -258,6 +258,10 @@ pub struct AuthService {
     challenges: Mutex<HashMap<String, TotpChallenge>>,
     enrollments: Mutex<HashMap<String, Enrollment>>,
     pending_totp: Mutex<HashMap<String, PendingTotp>>,
+    /// Where lockout events are recorded (SEC-13). Attached by
+    /// [`crate::ApiCtx::with_auth`]; `None` (tests, desktop before the
+    /// server first starts) records nothing.
+    audit: std::sync::Mutex<Option<Arc<crate::audit::AuditLog>>>,
 }
 
 impl AuthService {
@@ -272,7 +276,55 @@ impl AuthService {
             challenges: Mutex::new(HashMap::new()),
             enrollments: Mutex::new(HashMap::new()),
             pending_totp: Mutex::new(HashMap::new()),
+            audit: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Record lockout events in `log` from now on (SEC-13). Called by
+    /// [`crate::ApiCtx::with_auth`]; the latest attachment wins.
+    pub fn attach_audit(&self, log: Arc<crate::audit::AuditLog>) {
+        *self.audit.lock().unwrap_or_else(|e| e.into_inner()) = Some(log);
+    }
+
+    /// Audit an account lock engaging. Never fails the caller.
+    fn audit_lock(&self, username_key: &str, source_ip: &str, locked_for_ms: i64) {
+        let log = self.audit.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(log) = log else {
+            return;
+        };
+        // Bounded by MAX_USERNAME_LEN on the login path already; cap
+        // again so no caller can grow the log (SEC-05).
+        let actor: String = username_key.chars().take(MAX_USERNAME_LEN).collect();
+        log.append(&crate::audit::AuditEntry {
+            ts_ms: now_ms(),
+            actor: actor.clone(),
+            auth_type: "session".to_string(),
+            source_ip: source_ip.to_string(),
+            action: "account_locked".to_string(),
+            target: Some(actor),
+            result: format!("locked_for_{}s", locked_for_ms / 1000),
+            request_id: uuid::Uuid::new_v4().to_string(),
+        });
+    }
+
+    /// The username a pending TOTP login challenge belongs to, without
+    /// consuming it, so the second login step can be audited under
+    /// the right actor (SEC-13). `None` for an unknown challenge.
+    pub async fn totp_challenge_username(&self, challenge_id: &str) -> Option<String> {
+        let user_id = self
+            .challenges
+            .lock()
+            .await
+            .get(challenge_id)
+            .map(|c| c.user_id.clone())?;
+        self.store
+            .read(|f| {
+                f.users
+                    .iter()
+                    .find(|u| u.id == user_id)
+                    .map(|u| u.username.clone())
+            })
+            .await
     }
 
     /// The backing user store; `ApiCtx` reads users and sessions through the same instance.
@@ -292,7 +344,9 @@ impl AuthService {
 
     async fn record_failure(&self, username_key: &str, source_ip: &str) {
         let now = now_ms();
-        self.record_account_failure(username_key).await;
+        if let Some(locked_for) = self.record_account_failure(username_key).await {
+            self.audit_lock(username_key, source_ip, locked_for);
+        }
         let mut ips = self.ip_failures.lock().await;
         ips.retain(|ip, v| ip == source_ip || v.iter().any(|t| now - t < LOCK_WINDOW_MS));
         let v = ips.entry(source_ip.to_string()).or_default();
@@ -300,7 +354,9 @@ impl AuthService {
         v.push(now);
     }
 
-    async fn record_account_failure(&self, username_key: &str) {
+    /// Count one failure against the account; returns the lock
+    /// duration (ms) when this failure engaged a lock.
+    async fn record_account_failure(&self, username_key: &str) -> Option<i64> {
         let now = now_ms();
         {
             let mut guard = self.lockouts.lock().await;
@@ -321,8 +377,10 @@ impl AuthService {
                 st.locked_until_ms = now + backoff;
                 st.lock_count += 1;
                 st.failures.clear();
+                return Some(backoff);
             }
         }
+        None
     }
 
     /// Record a failed step-up password check (password change, TOTP
@@ -331,7 +389,12 @@ impl AuthService {
     /// endpoints otherwise offered unlimited password guessing to any
     /// holder of a bearer token.
     async fn record_step_up_failure(&self, username: &str) {
-        self.record_account_failure(&username.to_lowercase()).await;
+        let key = username.to_lowercase();
+        if let Some(locked_for) = self.record_account_failure(&key).await {
+            // Step-ups come from an authenticated principal; the
+            // service layer does not see its source address.
+            self.audit_lock(&key, "unknown", locked_for);
+        }
     }
 
     async fn ip_throttled(&self, source_ip: &str) -> bool {
@@ -1804,6 +1867,46 @@ mod tests {
         assert_eq!(view.username, "dave");
         assert!(svc.validate_bearer(&pair.access_token).await.is_some());
         assert!(svc.redeem_enrollment_code(&code, "pixel").await.is_err());
+    }
+
+    /// SEC-13: a lock engaging is audited (login path with the source
+    /// IP, step-up path too); failures below the threshold are not
+    /// lock events.
+    #[tokio::test]
+    async fn lockout_events_are_audited() {
+        let dir = std::env::temp_dir().join(format!(
+            "manager-api-lock-audit-{}-{}",
+            std::process::id(),
+            generate_token()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = Arc::new(crate::audit::AuditLog::new(&dir));
+        let svc = service().await;
+        svc.attach_audit(log.clone());
+        for _ in 0..LOCK_THRESHOLD - 1 {
+            svc.record_failure("mallory-target", "10.1.2.3").await;
+        }
+        assert!(log.read_recent(0, 10).is_empty());
+        svc.record_failure("mallory-target", "10.1.2.3").await;
+        let user = svc
+            .create_user("gina", "a-unique-passphrase", RoleName::Operator)
+            .await
+            .unwrap();
+        for _ in 0..LOCK_THRESHOLD {
+            assert!(!svc.verify_step_up(&user.id, "not-the-password").await);
+        }
+        let entries = log.read_recent(0, 10);
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0]["action"], "account_locked");
+        assert_eq!(entries[0]["actor"], "gina");
+        assert_eq!(entries[1]["action"], "account_locked");
+        assert_eq!(entries[1]["actor"], "mallory-target");
+        assert_eq!(entries[1]["source_ip"], "10.1.2.3");
+        assert_eq!(
+            entries[1]["result"],
+            format!("locked_for_{}s", LOCK_BASE_MS / 1000)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-N2: recovery/enrollment codes keep the XXXX-XXXX format and

@@ -554,20 +554,46 @@ pub struct TotpBody {
 }
 
 /// POST /api/v1/auth/totp: second login step. One guess per challenge; after a failure
-/// the client logs in again.
+/// the client logs in again. Public route, so success and failure are both audited
+/// here (SEC-13): TOTP logins and TOTP guesses are recorded like password logins.
 pub async fn handle_totp(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(ip): axum::Extension<SourceIp>,
     axum::Json(body): axum::Json<TotpBody>,
 ) -> Response {
     let ip = source_ip(&ip);
+    let rid = uuid::Uuid::new_v4().to_string();
+    // Resolve the actor before the attempt consumes the challenge.
+    let challenged = ctx.auth.totp_challenge_username(&body.challenge_id).await;
     match ctx
         .auth
         .complete_totp_login(&body.challenge_id, &body.code, &ip)
         .await
     {
-        Ok((pair, user)) => axum::Json(tokens_body(&pair, &user)).into_response(),
-        Err(e) => auth_error_response(&e),
+        Ok((pair, user)) => {
+            audit_auth(
+                &ctx,
+                &user.username,
+                "session",
+                &ip,
+                "POST /api/v1/auth/totp",
+                "ok",
+                &rid,
+            );
+            axum::Json(tokens_body(&pair, &user)).into_response()
+        }
+        Err(e) => {
+            audit_auth(
+                &ctx,
+                challenged.as_deref().unwrap_or("unknown"),
+                "session",
+                &ip,
+                "POST /api/v1/auth/totp",
+                "invalid_credentials",
+                &rid,
+            );
+            auth_error_response(&e)
+        }
     }
 }
 
