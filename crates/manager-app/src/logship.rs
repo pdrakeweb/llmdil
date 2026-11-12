@@ -107,18 +107,16 @@ pub async fn apply_log_streaming(state: &Arc<AppState>) {
             slot.note = None;
         }
         Err(reason) => {
-            log(&format!("log streaming is enabled but the shipper was not started: {reason}"));
+            log(&format!(
+                "log streaming is enabled but the shipper was not started: {reason}"
+            ));
             set_note(state, Some(reason));
         }
     }
 }
 
 fn set_note(state: &AppState, note: Option<String>) {
-    state
-        .logship
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .note = note;
+    state.logship.lock().unwrap_or_else(|e| e.into_inner()).note = note;
 }
 
 /// Spawn a shipper for `cfg`. `Ok(None)` when streaming is off;
@@ -716,7 +714,10 @@ mod tests {
             "endpoint": "http://192.0.2.10:8473",
         }});
         crate::op_update_config(&state, &sink, patch).await.unwrap();
-        assert!(log_streaming_status(&state).is_none(), "refused: not running");
+        assert!(
+            log_streaming_status(&state).is_none(),
+            "refused: not running"
+        );
         let note = log_streaming_note(&state).expect("the refusal is surfaced");
         assert!(note.contains("loopback"), "{note}");
         let cfg = state.config.read().await.clone();
@@ -731,7 +732,10 @@ mod tests {
         let patch = serde_json::json!({ "log_streaming": { "sources": { "gateway": false } } });
         crate::op_update_config(&state, &sink, patch).await.unwrap();
         let cfg = state.config.read().await.clone();
-        assert_eq!(surface(&state, &cfg)["configured"]["sources"]["gateway"], false);
+        assert_eq!(
+            surface(&state, &cfg)["configured"]["sources"]["gateway"],
+            false
+        );
 
         // Off again: the note goes with it.
         let patch = serde_json::json!({ "log_streaming": { "enabled": false } });
