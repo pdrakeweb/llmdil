@@ -799,6 +799,16 @@ check(settingsSrc.includes("data-group-fallbacks-save"), "Gateway view renders p
 check(settingsSrc.includes("updatesSetAuto("), "Settings wires component auto-update through updatesSetAuto");
 check(settingsSrc.includes("updatesPin("), "Settings wires component pins through updatesPin");
 check(settingsSrc.includes("updateAppConfig("), "Settings wires generic config editors through updateAppConfig");
+// Log streaming: the Log receiver card lists every source with what
+// it is actually doing — a source that is on but not shipping must
+// never read as shipping.
+check(settingsSrc.includes("data-lr-shipper"), "Settings renders the per-source log shipper block (data-lr-shipper)");
+check(settingsSrc.includes("info.shipper ? logShipperInner(info.shipper)"), "Log receiver card renders the shipper block from the status payload");
+for (const state of ["active", "disabled", "file_missing", "waiting", "unavailable", "not_running"]) {
+  check(new RegExp(`\\b${state}: "`).test(settingsSrc), `Log shipper block words the '${state}' source state`);
+}
+check(/disabled: "off[^"]*not shipped"/.test(settingsSrc), "A disabled log source reads as not shipped");
+check(settingsSrc.includes("data-lr-shipper-pending"), "Log shipper block flags saved settings that await a restart");
 
 check(!bundle.includes("live data wiring pending"), "bundle contains no wiring-pending mock banner");
 check(!bundle.includes("not wired to a backend command yet"), "bundle contains no unwired-control message");

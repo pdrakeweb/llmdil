@@ -2900,6 +2900,41 @@ export interface LogReceiverInfo {
   endpoint: string;
   endpoint_is_local: boolean;
   streaming_enabled: boolean;
+  /** What the log shipper is doing, per source. Absent from
+   *  payloads produced before the per-source status existed. */
+  shipper?: LogShipperInfo;
+}
+
+/** One log-streaming source's row: `active` (tailed or subscribed,
+ *  input exists), `disabled` (toggled off — not shipping),
+ *  `file_missing` (enabled, its log file does not exist),
+ *  `waiting` (a backend with nothing captured yet), `unavailable`
+ *  (enabled, no in-process feed), `not_running` (enabled in the
+ *  config, but the shipper itself is not running). */
+export interface LogShipperSource {
+  source: string;
+  state: string;
+  /** Records queued from this source since the shipper started. */
+  records: number;
+}
+
+/** The `shipper` object of the log_receiver_status payload. The
+ *  counters are present only while the shipper runs. */
+export interface LogShipperInfo {
+  running: boolean;
+  /** starting | connected | spooling | not_running */
+  state: string;
+  /** A saved source toggle (or the master switch) differs from what
+   *  the running shipper started with; it applies at restart. */
+  restart_pending: boolean;
+  queued?: number;
+  spooled_bytes?: number;
+  delivered?: number;
+  dropped_queue?: number;
+  dropped_spool?: number;
+  dropped_events?: number;
+  last_delivered?: string | null;
+  sources: LogShipperSource[];
 }
 
 const LR_SAMPLE: LogReceiverInfo = {

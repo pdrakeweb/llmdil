@@ -35,7 +35,7 @@ import {
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
   adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, BackendCache, BackendMoeCache, BackendMtp, BackendOffload, BackendParallel, BackendRow, CachePreview, CacheSelectionLike, CacheTypeName, FlashAttnName, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, HfHeaderResult, HfLookupQuant, HfLookupRepo, LogReceiverInfo, LogRow, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
+import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, BackendCache, BackendMoeCache, BackendMtp, BackendOffload, BackendParallel, BackendRow, CachePreview, CacheSelectionLike, CacheTypeName, FlashAttnName, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, HfHeaderResult, HfLookupQuant, HfLookupRepo, LogReceiverInfo, LogRow, LogShipperInfo, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
 import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
 import type { GpuInfo, WizardStepState } from "../types";
 
@@ -8360,6 +8360,43 @@ function supervisionInner(svcR: { data: ServicesInfo; error?: string; live: bool
     ${regNote}`;
 }
 
+/** What one log-streaming source state means, in the card's words.
+ *  Only `active` claims the source is shipping. */
+const LOG_SOURCE_STATE_TEXT: Record<string, string> = {
+  active: "shipping",
+  disabled: "off — not shipped",
+  file_missing: "on, but its log file does not exist yet",
+  waiting: "on, nothing captured yet",
+  unavailable: "on, but no event feed in this process",
+  not_running: "on in config — shipper not running",
+};
+
+/** The Log shipper block under the Log receiver card: the shipper's
+ *  state and one row per source, so a source that is toggled on but
+ *  not actually shipping (file missing, shipper not running) reads
+ *  as exactly that. Source toggles live in config.json and are read
+ *  when the app starts. */
+function logShipperInner(shipper: LogShipperInfo): string {
+  const summary = shipper.running
+    ? `${shipper.state} · ${shipper.delivered ?? 0} delivered · ${shipper.queued ?? 0} queued`
+    : "not running";
+  const dropped = (shipper.dropped_queue ?? 0) + (shipper.dropped_spool ?? 0) + (shipper.dropped_events ?? 0);
+  const rows: SettingsRow[] = [
+    { key: "Shipper", value: summary },
+    ...(dropped > 0 ? [{ key: "Dropped", value: `${shipper.dropped_queue ?? 0} queue · ${shipper.dropped_spool ?? 0} spool · ${shipper.dropped_events ?? 0} events` } as SettingsRow] : []),
+    ...shipper.sources.map((s) => ({
+      key: s.source,
+      value: `${LOG_SOURCE_STATE_TEXT[s.state] ?? s.state}${s.records > 0 ? ` · ${s.records} record${s.records === 1 ? "" : "s"}` : ""}`,
+    })),
+  ];
+  const pending = shipper.restart_pending
+    ? `<div data-lr-shipper-pending style="font-size:12px;color:var(--warn);margin-top:6px">Saved log-streaming settings differ from what the shipper started with. They apply when LLMdil restarts.</div>`
+    : "";
+  return `<div data-lr-shipper style="font-size:12px;color:var(--text2);margin-top:16px">Log shipper<span class="info-tip" title="One row per log-streaming source. Only a source marked shipping is being sent to the receiver. Source toggles are the log_streaming.sources section of config.json and are read when the app starts.">${icon("info")}</span></div>
+    ${settingsRows(rows)}
+    ${pending}`;
+}
+
 /** The Log receiver block on the Supervision tab: deployment state
  *  of the Prometheus-local log receiver service (bundled in the
  *  installer beside the app) and its three deliberate actions —
@@ -8394,9 +8431,11 @@ function logReceiverInner(
   const flipBtn = info.endpoint_is_local
     ? ""
     : `<button class="btn" data-lr-flip ${info.registered ? "" : "disabled"}>Flip endpoint to local receiver</button>`;
+  const shipperHtml = info.shipper ? logShipperInner(info.shipper) : "";
   return `<div style="font-size:12px;color:var(--text2);margin-top:16px">Log receiver<span class="info-tip" title="The log-streaming receiver runs on this machine as its own auto-start Windows service (LocalService). Ingest is on 127.0.0.1:8473; reads are served only on the machine's Tailscale address (port 8474, read-token gated). Deploy seeds its token files from the same Credential Manager ingest token the shipper uses, registers the service, and adds the firewall rule — one UAC prompt. Flipping the endpoint is separate and applies when the app restarts.">${icon("info")}</span></div>
     ${settingsRows(rows)}
     <div class="card-actions" style="margin-top:8px">${deployBtn}${removeBtn}${flipBtn}</div>
+    ${shipperHtml}
     ${newToken ? `<div style="margin-top:10px">${settingsRows([{ key: "Read token (new)", value: newToken, copy: newToken, tip: "Shown once. File Muse's copy through the Secure Vault; the receiver's copy is in its data directory." }])}</div>` : ""}`;
 }
 
