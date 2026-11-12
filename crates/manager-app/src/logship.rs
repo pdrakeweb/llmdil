@@ -154,7 +154,13 @@ async fn spawn_shipper(
         manager_wizard::LITELLM_MASTER_KEY_CRED_TARGET,
         manager_wizard::POSTGRES_PASSWORD_CRED_TARGET,
     ];
-    if let Some(r) = cfg.gateway.openrouter.cred_ref.as_deref().filter(|r| !r.is_empty()) {
+    if let Some(r) = cfg
+        .gateway
+        .openrouter
+        .cred_ref
+        .as_deref()
+        .filter(|r| !r.is_empty())
+    {
         targets.push(r);
     }
     for target in targets {

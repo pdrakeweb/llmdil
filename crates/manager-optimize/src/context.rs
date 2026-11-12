@@ -407,8 +407,7 @@ pub fn build_context(
     // no served prompts, no log lines.
     let mut measured = json!({});
     if !measure.backend_states.is_empty() {
-        let mut rows: Vec<(&String, &BackendMeasured)> =
-            measure.backend_states.iter().collect();
+        let mut rows: Vec<(&String, &BackendMeasured)> = measure.backend_states.iter().collect();
         rows.sort_by(|a, b| a.0.cmp(b.0));
         measured["backends"] = Value::Array(
             rows.iter()
@@ -479,8 +478,7 @@ pub fn build_context(
                 v
             }).collect::<Vec<_>>(),
         });
-        meta.measured_blocks
-            .push("measured throughput".to_string());
+        meta.measured_blocks.push("measured throughput".to_string());
     }
     // Discovered candidates (addendum A.5, Phase 5c): the
     // pre-pass's vetted, fit-checked HF facts, distinct from
@@ -545,14 +543,9 @@ pub fn build_context(
                 })
                 .collect(),
         );
-        meta.measured_blocks
-            .push("experiment results".to_string());
+        meta.measured_blocks.push("experiment results".to_string());
     }
-    if measured
-        .as_object()
-        .map(|o| !o.is_empty())
-        .unwrap_or(false)
-    {
+    if measured.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
         doc["measured"] = measured;
     }
 
@@ -890,16 +883,14 @@ mod tests {
                 basis: manager_models::MemoryBasis::Estimate,
             },
         );
-        measure
-            .backend_states
-            .insert(
-                "tool-runner".to_string(),
-                BackendMeasured {
-                    state: "running".to_string(),
-                    uptime_secs: Some(60),
-                    process_vram: vec![(0, None), (1, Some(4200))],
-                },
-            );
+        measure.backend_states.insert(
+            "tool-runner".to_string(),
+            BackendMeasured {
+                state: "running".to_string(),
+                uptime_secs: Some(60),
+                process_vram: vec![(0, None), (1, Some(4200))],
+            },
+        );
         let (doc, meta) = build_context(&cfg, &measure, "0.1.33", "tool-runner");
         let backend = doc["backends"]
             .as_array()
@@ -1012,12 +1003,18 @@ mod tests {
         assert_eq!(r["basis"], json!("measured"));
         assert_eq!(r["generation_per_second"]["short"], json!(35.0));
         assert_eq!(r["screen"]["overall"]["passed"], json!(11));
-        assert!(meta.measured_blocks.iter().any(|b| b == "experiment results"));
+        assert!(meta
+            .measured_blocks
+            .iter()
+            .any(|b| b == "experiment results"));
         // The system prompt states the experiments contract and
         // the §A.4 replacement-claim instruction verbatim-ish.
         let (system, _user) = build_prompts("P", "", &doc, &meta);
         assert!(system.contains("\"experiments\" array"), "{system}");
-        assert!(system.contains("the run itself never downloads"), "{system}");
+        assert!(
+            system.contains("the run itself never downloads"),
+            "{system}"
+        );
         assert!(system.contains("screen at/above baseline, no baseline-passing category at zero, and higher measured speed"), "{system}");
     }
 
@@ -1072,7 +1069,10 @@ mod tests {
         let (system, _user) = build_prompts("MY PURPOSE", "", &doc, &meta);
         assert!(system.contains("\"candidates\" section"), "{system}");
         assert!(system.contains("Hugging Face"), "{system}");
-        assert!(system.contains("distinct from the curated catalog"), "{system}");
+        assert!(
+            system.contains("distinct from the curated catalog"),
+            "{system}"
+        );
         assert!(system.contains("fit verdict"), "{system}");
     }
 

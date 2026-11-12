@@ -97,13 +97,8 @@ pub struct TokenPair {
 /// TOTP-enabled account, a single-use challenge for [`AuthService::complete_totp_login`].
 #[derive(Debug, Clone)]
 pub enum LoginOutcome {
-    Tokens {
-        pair: TokenPair,
-        user: UserView,
-    },
-    TotpRequired {
-        challenge_id: String,
-    },
+    Tokens { pair: TokenPair, user: UserView },
+    TotpRequired { challenge_id: String },
 }
 
 /// The client-safe projection of a [`User`]: no password hash, recovery-code hashes or
@@ -379,7 +374,12 @@ impl AuthService {
         let throttled = self.ip_throttled(source_ip).await;
         let user = self
             .store
-            .read(|f| f.users.iter().find(|u| u.username.eq_ignore_ascii_case(username)).cloned())
+            .read(|f| {
+                f.users
+                    .iter()
+                    .find(|u| u.username.eq_ignore_ascii_case(username))
+                    .cloned()
+            })
             .await;
 
         // Pay the argon2 cost in every path (dummy hash for unknown
@@ -455,7 +455,9 @@ impl AuthService {
             // and on failure (one guess per challenge; the client
             // logs in again for another).
             self.record_success(&key).await;
-            let pair = self.create_session(&user.id, &challenge.device_name).await?;
+            let pair = self
+                .create_session(&user.id, &challenge.device_name)
+                .await?;
             return Ok((pair, UserView::from(&user)));
         }
         self.record_failure(&user.username.to_lowercase(), source_ip)
@@ -650,16 +652,16 @@ impl AuthService {
         let hash = hash_token(token);
         let now = now_ms();
         // Session access token?
-        let session_user = self
-            .store
-            .read(|f| {
-                let s = f.sessions.iter().find(|s| {
-                    s.access_hash == hash && !s.revoked && s.access_expires_ms > now
-                })?;
-                let u = f.users.iter().find(|u| u.id == s.user_id && !u.disabled)?;
-                Some((s.id.clone(), u.clone()))
-            })
-            .await;
+        let session_user =
+            self.store
+                .read(|f| {
+                    let s = f.sessions.iter().find(|s| {
+                        s.access_hash == hash && !s.revoked && s.access_expires_ms > now
+                    })?;
+                    let u = f.users.iter().find(|u| u.id == s.user_id && !u.disabled)?;
+                    Some((s.id.clone(), u.clone()))
+                })
+                .await;
         if let Some((session_id, user)) = session_user {
             self.touch_session(&session_id).await;
             return Some(Principal {
@@ -675,9 +677,7 @@ impl AuthService {
             .store
             .read(|f| {
                 let t = f.api_tokens.iter().find(|t| {
-                    t.hash == hash
-                        && !t.revoked
-                        && t.expires_ms.map(|e| e > now).unwrap_or(true)
+                    t.hash == hash && !t.revoked && t.expires_ms.map(|e| e > now).unwrap_or(true)
                 })?;
                 let u = f.users.iter().find(|u| u.id == t.user_id && !u.disabled)?;
                 Some((t.id.clone(), t.role, u.clone()))
@@ -850,7 +850,9 @@ impl AuthService {
     ) -> Result<UserView, AuthError> {
         let username = username.trim().to_string();
         if username.is_empty() || username.len() > 64 {
-            return Err(AuthError::InvalidInput("username is empty or too long".into()));
+            return Err(AuthError::InvalidInput(
+                "username is empty or too long".into(),
+            ));
         }
         if let Some(e) = password_policy_error(password, &username) {
             return Err(AuthError::InvalidInput(e));
@@ -1598,10 +1600,7 @@ mod tests {
             .await
             .unwrap();
         // Last enabled admin cannot be disabled or demoted.
-        assert!(svc
-            .update_user(&admin.id, None, Some(true))
-            .await
-            .is_err());
+        assert!(svc.update_user(&admin.id, None, Some(true)).await.is_err());
         assert!(svc
             .update_user(&admin.id, Some(RoleName::Viewer), None)
             .await
@@ -1797,10 +1796,7 @@ mod tests {
             .await
             .unwrap();
         let code = svc.create_enrollment_code(&user.id).await.unwrap();
-        let (pair, view) = svc
-            .redeem_enrollment_code(&code, "pixel")
-            .await
-            .unwrap();
+        let (pair, view) = svc.redeem_enrollment_code(&code, "pixel").await.unwrap();
         assert_eq!(view.username, "dave");
         assert!(svc.validate_bearer(&pair.access_token).await.is_some());
         assert!(svc.redeem_enrollment_code(&code, "pixel").await.is_err());

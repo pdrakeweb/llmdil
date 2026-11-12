@@ -200,10 +200,7 @@ pub struct LaunchSpec {
 /// the app's log dir (the supervisor's in-memory rings cannot capture
 /// a process the app did not spawn).
 pub fn backend_definition(spec: &ProcessSpec, log_dir: &Path) -> ServiceDefinition {
-    let port_note = spec
-        .port
-        .map(|p| format!(", port {p}"))
-        .unwrap_or_default();
+    let port_note = spec.port.map(|p| format!(", port {p}")).unwrap_or_default();
     ServiceDefinition {
         version: DEFINITION_VERSION,
         name: backend_service_name(&spec.id),
@@ -333,10 +330,7 @@ pub fn log_receiver_definition(data_dir: &Path, receiver_exe: &Path) -> ServiceD
 /// quotes, or a trailing backslash; double embedded quotes and the
 /// backslashes that precede them).
 pub fn quote_arg(arg: &str) -> String {
-    if !arg.is_empty()
-        && !arg.contains([' ', '\t', '"'])
-        && !arg.ends_with('\\')
-    {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) && !arg.ends_with('\\') {
         return arg.to_string();
     }
     let mut out = String::with_capacity(arg.len() + 2);
@@ -411,11 +405,9 @@ pub fn resolve_env(
         match &entry.value {
             EnvValue::Literal { value } => out.push((entry.name.clone(), value.clone())),
             EnvValue::CredentialRef { target } => {
-                let value = read_cred(target).ok_or_else(|| {
-                    ServiceError::CredentialMissing {
-                        name: entry.name.clone(),
-                        target: target.clone(),
-                    }
+                let value = read_cred(target).ok_or_else(|| ServiceError::CredentialMissing {
+                    name: entry.name.clone(),
+                    target: target.clone(),
                 })?;
                 out.push((entry.name.clone(), value));
             }
@@ -474,9 +466,9 @@ impl ServiceStatus {
             ServiceState::StartPending => ProcessState::Starting,
             ServiceState::StopPending => ProcessState::Stopping,
             ServiceState::Paused => ProcessState::Failed,
-            ServiceState::Stopped
-            | ServiceState::NotInstalled
-            | ServiceState::Unknown(_) => ProcessState::Stopped,
+            ServiceState::Stopped | ServiceState::NotInstalled | ServiceState::Unknown(_) => {
+                ProcessState::Stopped
+            }
         }
     }
 }
@@ -490,7 +482,10 @@ pub trait ServiceControl: Send + Sync {
     fn query(&self, name: &str) -> Result<ServiceStatus, ServiceError>;
     /// Whether the service exists in the SCM; derived from [`Self::query`].
     fn is_registered(&self, name: &str) -> Result<bool, ServiceError> {
-        Ok(!matches!(self.query(name)?.state, ServiceState::NotInstalled))
+        Ok(!matches!(
+            self.query(name)?.state,
+            ServiceState::NotInstalled
+        ))
     }
     /// Ask the SCM to start the service. An already-running service counts as success.
     /// Returns once the SCM accepts the request, not when the service reaches `Running`.
@@ -561,7 +556,10 @@ mod tests {
     fn backend_definition_mirrors_the_spec() {
         let def = backend_definition(&sample_spec(), Path::new(r"C:\data\logs"));
         assert_eq!(def.name, "llm-backend-planner");
-        assert_eq!(def.program, PathBuf::from(r"C:\data\llamacpp\llama-server.exe"));
+        assert_eq!(
+            def.program,
+            PathBuf::from(r"C:\data\llamacpp\llama-server.exe")
+        );
         assert_eq!(def.args.len(), 6);
         assert_eq!(
             def.env,
@@ -598,8 +596,8 @@ mod tests {
                 EnvEntry {
                     name: "DATABASE_URL".to_string(),
                     value: EnvValue::DatabaseUrl {
-                        password_credential:
-                            "local-llm-service-manager/postgres-password".to_string(),
+                        password_credential: "local-llm-service-manager/postgres-password"
+                            .to_string(),
                         port: 54329,
                     },
                 },
@@ -687,7 +685,8 @@ mod tests {
         let resolved = resolve_env(&def, |_| None).expect("no-db resolve");
         assert!(resolved.is_empty());
         // A missing hard credential reference fails the start.
-        def.env.push(EnvEntry::credential_ref("LITELLM_MASTER_KEY", "target/key"));
+        def.env
+            .push(EnvEntry::credential_ref("LITELLM_MASTER_KEY", "target/key"));
         let err = resolve_env(&def, |_| None).expect_err("must fail");
         assert!(matches!(err, ServiceError::CredentialMissing { .. }));
     }
@@ -696,7 +695,10 @@ mod tests {
     fn quote_arg_follows_windows_rules() {
         assert_eq!(quote_arg("plain"), "plain");
         assert_eq!(quote_arg(r"C:\path\file.exe"), r"C:\path\file.exe");
-        assert_eq!(quote_arg(r"C:\Program Files\app.exe"), r#""C:\Program Files\app.exe""#);
+        assert_eq!(
+            quote_arg(r"C:\Program Files\app.exe"),
+            r#""C:\Program Files\app.exe""#
+        );
         assert_eq!(quote_arg(r"C:\trailing\"), r#""C:\trailing\\""#);
         assert_eq!(quote_arg("a\"b"), r#""a\"b""#);
         assert_eq!(quote_arg(""), "\"\"");
@@ -717,10 +719,8 @@ mod tests {
 
     #[test]
     fn definition_files_round_trip_through_disk() {
-        let dir = std::env::temp_dir().join(format!(
-            "manager-services-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("manager-services-test-{}", std::process::id()));
         let def = backend_definition(&sample_spec(), Path::new("logs"));
         let path = write_definition(&dir, &def).expect("write");
         assert_eq!(path, definition_path(&dir, "llm-backend-planner"));
@@ -778,10 +778,25 @@ mod tests {
             child_pid: None,
             win32_exit_code: 0,
         };
-        assert_eq!(status(ServiceState::Running).process_state(), ProcessState::Running);
-        assert_eq!(status(ServiceState::StartPending).process_state(), ProcessState::Starting);
-        assert_eq!(status(ServiceState::StopPending).process_state(), ProcessState::Stopping);
-        assert_eq!(status(ServiceState::Stopped).process_state(), ProcessState::Stopped);
-        assert_eq!(status(ServiceState::NotInstalled).process_state(), ProcessState::Stopped);
+        assert_eq!(
+            status(ServiceState::Running).process_state(),
+            ProcessState::Running
+        );
+        assert_eq!(
+            status(ServiceState::StartPending).process_state(),
+            ProcessState::Starting
+        );
+        assert_eq!(
+            status(ServiceState::StopPending).process_state(),
+            ProcessState::Stopping
+        );
+        assert_eq!(
+            status(ServiceState::Stopped).process_state(),
+            ProcessState::Stopped
+        );
+        assert_eq!(
+            status(ServiceState::NotInstalled).process_state(),
+            ProcessState::Stopped
+        );
     }
 }

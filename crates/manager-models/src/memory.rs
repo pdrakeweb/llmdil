@@ -363,8 +363,7 @@ pub fn memory_requirement(
     n_seq: u32,
 ) -> MemoryRequirement {
     let kv_mib = kv_bytes_per_token.map(|per| mib(per.saturating_mul(n_ctx as u64)));
-    let rs_mib = rs_bytes_per_seq
-        .map(|per| mib(per.saturating_mul(n_seq.max(1) as u64)));
+    let rs_mib = rs_bytes_per_seq.map(|per| mib(per.saturating_mul(n_seq.max(1) as u64)));
     let mut basis = basis;
     let sys_bytes: u64 = match offload {
         ExpertOffload::None => 0,

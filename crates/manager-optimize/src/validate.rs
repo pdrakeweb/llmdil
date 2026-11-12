@@ -110,7 +110,11 @@ fn get_f32_vec(change: &Value, key: &str) -> Vec<f32> {
     change
         .get(key)
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -182,7 +186,16 @@ fn write_keys(item: &PlanItem) -> Vec<(String, &'static str)> {
             }
         }
         PlanKind::BackendDelete => {
-            for f in ["exists", "model", "enabled", "n_ctx", "n_batch", "offload", "moe_cache", "placement"] {
+            for f in [
+                "exists",
+                "model",
+                "enabled",
+                "n_ctx",
+                "n_batch",
+                "offload",
+                "moe_cache",
+                "placement",
+            ] {
                 keys.push(b(f));
             }
         }
@@ -391,12 +404,7 @@ fn validate_one(
                 fail!(format!("backend '{target}' already exists"));
             }
             let model_id = get_str(&item.change, "model_id").unwrap_or_default();
-            let Some(model) = candidate
-                .models
-                .iter()
-                .find(|m| m.id == model_id)
-                .cloned()
-            else {
+            let Some(model) = candidate.models.iter().find(|m| m.id == model_id).cloned() else {
                 fail!(format!(
                     "model '{model_id}' is not registered; add it before creating a backend on it"
                 ));
@@ -615,8 +623,7 @@ fn validate_one(
                 }
             }
             let current = manager_models::expert_offload(b.raw_flags.as_deref()).layers(moe);
-            let current_cache =
-                manager_models::moe_cache_mib(b.raw_flags.as_deref()).unwrap_or(0);
+            let current_cache = manager_models::moe_cache_mib(b.raw_flags.as_deref()).unwrap_or(0);
             if current == layers && cache.is_none_or(|c| c == current_cache) {
                 fail!("already satisfied".to_string());
             }
@@ -674,12 +681,7 @@ fn validate_one(
             };
             req_before = requirement_of(live, &pre, &b);
             let model_id = get_str(&item.change, "model_id").unwrap_or_default();
-            let Some(model) = candidate
-                .models
-                .iter()
-                .find(|m| m.id == model_id)
-                .cloned()
-            else {
+            let Some(model) = candidate.models.iter().find(|m| m.id == model_id).cloned() else {
                 fail!(format!("model '{model_id}' is not registered"));
             };
             if resolve_model(&candidate, &b).map(|m| m.id.as_str()) == Some(model_id) {
@@ -1266,7 +1268,10 @@ mod tests {
             out[0].reason
         );
         let reason = out[0].reason.clone().unwrap_or_default();
-        assert!(reason.contains("fallback chain of: tool-runner"), "{reason}");
+        assert!(
+            reason.contains("fallback chain of: tool-runner"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -1313,8 +1318,14 @@ mod tests {
         let out = validate_plan(&p, &cfg, &live);
         assert_eq!(out[0].status, ValidationStatus::Invalid);
         let reason = out[0].reason.clone().unwrap_or_default();
-        assert!(reason.contains("params_b"), "reason names the gap: {reason}");
-        assert!(reason.contains("obscure-model"), "reason names the model: {reason}");
+        assert!(
+            reason.contains("params_b"),
+            "reason names the gap: {reason}"
+        );
+        assert!(
+            reason.contains("obscure-model"),
+            "reason names the model: {reason}"
+        );
         assert!(
             reason.contains("not in the curated catalog"),
             "reason states the catalog miss: {reason}"
@@ -1443,7 +1454,12 @@ mod tests {
             Decision::Undecided,
         )]);
         let out = validate_plan(&with, &cfg, &live);
-        assert_eq!(out[0].status, ValidationStatus::Valid, "{:?}", out[0].reason);
+        assert_eq!(
+            out[0].status,
+            ValidationStatus::Valid,
+            "{:?}",
+            out[0].reason
+        );
         let gpu_with = out[0].expected.gpu_ram_mib.expect("fit verdict priced").1;
         let without = plan(vec![item(
             1,
@@ -1453,7 +1469,12 @@ mod tests {
             Decision::Undecided,
         )]);
         let out = validate_plan(&without, &cfg, &live);
-        assert_eq!(out[0].status, ValidationStatus::Valid, "{:?}", out[0].reason);
+        assert_eq!(
+            out[0].status,
+            ValidationStatus::Valid,
+            "{:?}",
+            out[0].reason
+        );
         let gpu_without = out[0].expected.gpu_ram_mib.expect("fit verdict priced").1;
         assert_eq!(gpu_with, gpu_without + 4096);
         // A cache with no offload in the same change: invalid.
@@ -1467,7 +1488,11 @@ mod tests {
         let out = validate_plan(&p, &cfg, &live);
         assert_eq!(out[0].status, ValidationStatus::Invalid);
         assert!(
-            out[0].reason.as_deref().unwrap_or("").contains("offload_layers above 0"),
+            out[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("offload_layers above 0"),
             "{:?}",
             out[0].reason
         );
@@ -1482,7 +1507,12 @@ mod tests {
             Decision::Undecided,
         )]);
         let out = validate_plan(&p, &cfg, &live);
-        assert_eq!(out[0].status, ValidationStatus::Valid, "{:?}", out[0].reason);
+        assert_eq!(
+            out[0].status,
+            ValidationStatus::Valid,
+            "{:?}",
+            out[0].reason
+        );
         let p = plan(vec![item(
             1,
             PlanKind::BackendSetOffload,
@@ -1507,9 +1537,18 @@ mod tests {
             Decision::Undecided,
         )]);
         let out = validate_plan(&p, &cfg, &live);
-        assert_eq!(out[0].status, ValidationStatus::Invalid, "{:?}", out[0].reason);
+        assert_eq!(
+            out[0].status,
+            ValidationStatus::Invalid,
+            "{:?}",
+            out[0].reason
+        );
         assert!(
-            out[0].reason.as_deref().unwrap_or("").contains("offload_layers above 0"),
+            out[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("offload_layers above 0"),
             "{:?}",
             out[0].reason
         );
@@ -1522,7 +1561,12 @@ mod tests {
             Decision::Undecided,
         )]);
         let out = validate_plan(&p, &cfg, &live);
-        assert_eq!(out[0].status, ValidationStatus::Valid, "{:?}", out[0].reason);
+        assert_eq!(
+            out[0].status,
+            ValidationStatus::Valid,
+            "{:?}",
+            out[0].reason
+        );
     }
 
     #[test]
@@ -1540,9 +1584,18 @@ mod tests {
             Decision::Undecided,
         )]);
         let out = validate_plan(&p, &cfg, &live);
-        assert_eq!(out[0].status, ValidationStatus::Warning, "{:?}", out[0].reason);
+        assert_eq!(
+            out[0].status,
+            ValidationStatus::Warning,
+            "{:?}",
+            out[0].reason
+        );
         assert!(
-            out[0].reason.as_deref().unwrap_or("").contains("moe_cache_mib cannot be encoded"),
+            out[0]
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("moe_cache_mib cannot be encoded"),
             "{:?}",
             out[0].reason
         );

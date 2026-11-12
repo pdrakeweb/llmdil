@@ -119,8 +119,7 @@ impl TuningCoords {
     /// axes omitted. An empty result is the incumbent itself.
     pub fn delta_labels(&self, incumbent: &TuningCoords) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        if self.gpu_indices != incumbent.gpu_indices
-            || self.tensor_split != incumbent.tensor_split
+        if self.gpu_indices != incumbent.gpu_indices || self.tensor_split != incumbent.tensor_split
         {
             out.push(format!(
                 "Placement: {} → {}",
@@ -296,13 +295,7 @@ pub fn offload_values(inputs: &TuningInputs) -> Vec<u32> {
         return Vec::new();
     };
     let mut out: Vec<u32> = Vec::new();
-    for v in [
-        0,
-        l.div_ceil(4),
-        l.div_ceil(2),
-        (3 * l).div_ceil(4),
-        l,
-    ] {
+    for v in [0, l.div_ceil(4), l.div_ceil(2), (3 * l).div_ceil(4), l] {
         if !out.contains(&v) {
             out.push(v);
         }
@@ -587,7 +580,12 @@ impl Descent {
         let mut out: Vec<TuningCoords> = Vec::new();
         let mut push = |c: TuningCoords, out: &mut Vec<TuningCoords>| {
             let key = c.fingerprint_key();
-            if c == self.current || self.visited.contains(&key) || out.iter().any(|o: &TuningCoords| o.fingerprint_key() == key) {
+            if c == self.current
+                || self.visited.contains(&key)
+                || out
+                    .iter()
+                    .any(|o: &TuningCoords| o.fingerprint_key() == key)
+            {
                 return;
             }
             self.visited.push(key);
@@ -806,7 +804,9 @@ pub fn rank_arms(arms: &[TuningArm]) -> Vec<usize> {
                     .unwrap_or(f64::MAX),
             )
         };
-        key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal)
+        key(b)
+            .partial_cmp(&key(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut rest: Vec<usize> = arms
         .iter()
@@ -911,7 +911,12 @@ pub fn adopt_is_default(sweep: &TuningSweep) -> bool {
     let Some(winner) = sweep.winner_arm else {
         return false;
     };
-    if sweep.arms.get(winner).map(|a| a.coords == sweep.incumbent).unwrap_or(true) {
+    if sweep
+        .arms
+        .get(winner)
+        .map(|a| a.coords == sweep.incumbent)
+        .unwrap_or(true)
+    {
         return false;
     }
     match &sweep.confirmation {
@@ -953,11 +958,17 @@ impl TuningStore {
     }
 
     pub fn latest_for(&self, backend_id: &str) -> Option<&TuningSweep> {
-        self.sweeps.iter().rev().find(|s| s.backend_id == backend_id)
+        self.sweeps
+            .iter()
+            .rev()
+            .find(|s| s.backend_id == backend_id)
     }
 
     pub fn running(&self) -> Option<&TuningSweep> {
-        self.sweeps.iter().rev().find(|s| s.state == SweepState::Running)
+        self.sweeps
+            .iter()
+            .rev()
+            .find(|s| s.state == SweepState::Running)
     }
 }
 
@@ -1004,10 +1015,13 @@ pub fn tuning_temp_backend(
     }
     raw = manager_models::set_moe_cache(raw.as_deref(), coords.moe_cache_mib);
     raw = match coords.mtp_n_max {
-        Some(n) => manager_models::set_mtp_draft(raw.as_deref(), manager_models::MtpDraft::On(Some(n))),
+        Some(n) => {
+            manager_models::set_mtp_draft(raw.as_deref(), manager_models::MtpDraft::On(Some(n)))
+        }
         None => manager_models::set_mtp_draft(raw.as_deref(), manager_models::MtpDraft::Off),
     };
-    raw = manager_models::set_parallel_slots(raw.as_deref(), Some(i64::from(coords.parallel_slots)));
+    raw =
+        manager_models::set_parallel_slots(raw.as_deref(), Some(i64::from(coords.parallel_slots)));
     raw = manager_models::set_cache_selection(raw.as_deref(), Some(coords.cache));
     temp.raw_flags = raw;
     temp
@@ -1045,10 +1059,7 @@ mod tests {
             moe_layers: Some(48),
             mtp_capable: true,
             ctx_max: 262144,
-            gpus: vec![
-                gpu(0, 16384, (8, 6), true),
-                gpu(1, 16384, (6, 0), false),
-            ],
+            gpus: vec![gpu(0, 16384, (8, 6), true), gpu(1, 16384, (6, 0), false)],
             predicted_cache: Some(CacheSelection {
                 k: CacheType::Q8_0,
                 v: CacheType::Q4_0,
@@ -1133,25 +1144,41 @@ mod tests {
                 },
             })
         };
-        let arm = |index: usize, status: ArmStatus, residency: Option<ResidencyVerdict>, gen: f64| {
-            TuningArm {
-                index,
-                axis: "spec".to_string(),
-                coords: inputs().incumbent.clone(),
-                status,
-                detail: None,
-                measured: measured(gen),
-                residency,
-                free_vram_mib: vec![],
-                temp_start_c: None,
-                temp_peak_c: None,
-                fingerprint: None,
-            }
-        };
+        let arm =
+            |index: usize, status: ArmStatus, residency: Option<ResidencyVerdict>, gen: f64| {
+                TuningArm {
+                    index,
+                    axis: "spec".to_string(),
+                    coords: inputs().incumbent.clone(),
+                    status,
+                    detail: None,
+                    measured: measured(gen),
+                    residency,
+                    free_vram_mib: vec![],
+                    temp_start_c: None,
+                    temp_peak_c: None,
+                    fingerprint: None,
+                }
+            };
         let arms = vec![
-            arm(0, ArmStatus::Completed, Some(ResidencyVerdict::VerifiedExclusive), 22.5),
-            arm(1, ArmStatus::Completed, Some(ResidencyVerdict::VerifiedExclusive), 29.5),
-            arm(2, ArmStatus::Completed, Some(ResidencyVerdict::Unverified { reason: "x".into() }), 99.0),
+            arm(
+                0,
+                ArmStatus::Completed,
+                Some(ResidencyVerdict::VerifiedExclusive),
+                22.5,
+            ),
+            arm(
+                1,
+                ArmStatus::Completed,
+                Some(ResidencyVerdict::VerifiedExclusive),
+                29.5,
+            ),
+            arm(
+                2,
+                ArmStatus::Completed,
+                Some(ResidencyVerdict::Unverified { reason: "x".into() }),
+                99.0,
+            ),
             arm(3, ArmStatus::Failed, None, 0.0),
         ];
         let order = rank_arms(&arms);

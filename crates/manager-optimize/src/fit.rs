@@ -220,7 +220,11 @@ pub fn evaluate_fit(
         fit_verdict(total, &adj_running),
         manager_models::FitVerdict::TooLarge { .. }
     );
-    let adj_all = sub(free_vram_mib_per_gpu, others_running, Some(others_accounted));
+    let adj_all = sub(
+        free_vram_mib_per_gpu,
+        others_running,
+        Some(others_accounted),
+    );
     let fits_with_all = !matches!(
         fit_verdict(total, &adj_all),
         manager_models::FitVerdict::TooLarge { .. }
@@ -303,7 +307,14 @@ mod tests {
 
     #[test]
     fn residency_empty_split_is_first_gpu() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4, 0);
+        let req = layout_requirement(
+            &facts(),
+            ExpertOffload::None,
+            manager_models::CacheSelection::default(),
+            32768,
+            4,
+            0,
+        );
         assert_eq!(residency_per_gpu(&req, &[], 2), vec![12 * 1024, 0]);
         assert_eq!(
             residency_per_gpu(&req, &[0.5, 0.5], 2),
@@ -357,10 +368,7 @@ mod tests {
             vec![3072 + 2048, 3072 + 2048]
         );
         // Unsplit: the whole cache lands on the one GPU.
-        assert_eq!(
-            residency_per_gpu(&cached, &[], 1),
-            vec![6144 + 4096]
-        );
+        assert_eq!(residency_per_gpu(&cached, &[], 1), vec![6144 + 4096]);
     }
 
     #[test]
@@ -394,7 +402,14 @@ mod tests {
 
     #[test]
     fn fit_fails_when_free_vram_is_taken_by_a_running_backend() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4, 0);
+        let req = layout_requirement(
+            &facts(),
+            ExpertOffload::None,
+            manager_models::CacheSelection::default(),
+            32768,
+            4,
+            0,
+        );
         // 16 GiB free on GPU 0, but a running backend holds 8 GiB:
         // the 12 GiB model cannot be placed.
         let out = evaluate_fit(&req, &[], &[16 * 1024, 0], &[8 * 1024, 0], &[0, 0]);
@@ -407,7 +422,14 @@ mod tests {
 
     #[test]
     fn fit_warns_when_it_only_fits_by_moving_accounted_residency() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4, 0);
+        let req = layout_requirement(
+            &facts(),
+            ExpertOffload::None,
+            manager_models::CacheSelection::default(),
+            32768,
+            4,
+            0,
+        );
         // 16 GiB free; a STOPPED backend accounts 8 GiB. The model
         // fits now but not alongside the stopped backend.
         let out = evaluate_fit(&req, &[], &[16 * 1024, 0], &[0, 0], &[8 * 1024, 0]);

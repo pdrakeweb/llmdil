@@ -1325,19 +1325,14 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
 ///   from the fetch server's docs (§6.2).
 ///
 /// Any other server id gets no literals.
-fn curated_env_literals(
-    server: &manager_config::McpServerConfig,
-) -> Vec<(String, String)> {
+fn curated_env_literals(server: &manager_config::McpServerConfig) -> Vec<(String, String)> {
     match server.id.as_str() {
         "brave_search" => {
             let tools: Vec<&str> = match &server.allowed_tools {
                 Some(tools) => tools.iter().map(String::as_str).collect(),
                 None => manager_config::BRAVE_DEFAULT_ALLOWED_TOOLS.to_vec(),
             };
-            vec![(
-                "BRAVE_MCP_ENABLED_TOOLS".to_string(),
-                tools.join(","),
-            )]
+            vec![("BRAVE_MCP_ENABLED_TOOLS".to_string(), tools.join(","))]
         }
         "web_fetch" => vec![("PYTHONIOENCODING".to_string(), "utf-8".to_string())],
         _ => Vec::new(),
@@ -1709,9 +1704,7 @@ mod tests {
             "{yaml}"
         );
         assert!(
-            yaml.contains(
-                "    allowed_tools: [brave_web_search, brave_llm_context]\n"
-            ),
+            yaml.contains("    allowed_tools: [brave_web_search, brave_llm_context]\n"),
             "{yaml}"
         );
     }
@@ -1731,7 +1724,10 @@ mod tests {
         let section = yaml.split("  remote_tools:\n").nth(1).unwrap();
         assert!(!section.contains("command:"), "{section}");
         assert!(!section.contains("allowed_tools:"), "{section}");
-        assert!(section.contains("available_on_public_internet: false"), "{section}");
+        assert!(
+            section.contains("available_on_public_internet: false"),
+            "{section}"
+        );
     }
 
     #[test]
@@ -2660,9 +2656,8 @@ mod tests {
         let coder = table.groups.iter().find(|g| g.name == "coder").unwrap();
         assert_eq!(coder.hard_tokens, 262144);
         // An absolute optimal_tokens override wins for every group.
-        if let Some(manager_config::RoutingRuleKind::ContextOverflow {
-            optimal_tokens, ..
-        }) = &mut cfg.gateway.routing_rules[0].kind
+        if let Some(manager_config::RoutingRuleKind::ContextOverflow { optimal_tokens, .. }) =
+            &mut cfg.gateway.routing_rules[0].kind
         {
             *optimal_tokens = Some(40960);
         }
@@ -2699,18 +2694,24 @@ mod tests {
         let mut rule = overflow_rule("planner");
         rule.enabled = false;
         disabled.gateway.routing_rules.push(rule);
-        assert_eq!(generate_config_yaml(&disabled).expect("generate"), base_yaml);
+        assert_eq!(
+            generate_config_yaml(&disabled).expect("generate"),
+            base_yaml
+        );
         assert!(generate_routing_callback(&disabled).is_none());
 
         let mut legacy = base.clone();
-        legacy.gateway.routing_rules.push(manager_config::RoutingRule {
-            id: "legacy".to_string(),
-            description: "old fragment rule".to_string(),
-            enabled: true,
-            kind: None,
-            litellm_fragment: Some(serde_json::json!({"x": 1})),
-            source: "user".to_string(),
-        });
+        legacy
+            .gateway
+            .routing_rules
+            .push(manager_config::RoutingRule {
+                id: "legacy".to_string(),
+                description: "old fragment rule".to_string(),
+                enabled: true,
+                kind: None,
+                litellm_fragment: Some(serde_json::json!({"x": 1})),
+                source: "user".to_string(),
+            });
         assert_eq!(generate_config_yaml(&legacy).expect("generate"), base_yaml);
         assert!(generate_routing_callback(&legacy).is_none());
     }
@@ -2754,10 +2755,8 @@ mod tests {
             return;
         }
         let py = generate_routing_callback(&routing_fixture()).expect("callback");
-        let dir = std::env::temp_dir().join(format!(
-            "llmdil-routing-hook-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("llmdil-routing-hook-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let result = run_hook_driver(&dir, &py);
@@ -2766,10 +2765,7 @@ mod tests {
         assert_hook_results(&results);
     }
 
-    fn run_hook_driver(
-        dir: &std::path::Path,
-        py: &str,
-    ) -> Result<serde_json::Value, String> {
+    fn run_hook_driver(dir: &std::path::Path, py: &str) -> Result<serde_json::Value, String> {
         std::fs::write(dir.join("llmdil_routing.py"), py).map_err(|e| e.to_string())?;
         std::fs::write(dir.join("driver.py"), HOOK_DRIVER_PY).map_err(|e| e.to_string())?;
         // py_compile gate (design §6.4): the generated file must be
@@ -2827,7 +2823,10 @@ mod tests {
         // Under hard, over optimal: advisory inserted after the
         // leading system message, model untouched (§4.4 ex. 1).
         assert_eq!(r["advisory"]["model"], "coder");
-        assert_eq!(r["advisory"]["roles"], serde_json::json!(["system", "system", "user"]));
+        assert_eq!(
+            r["advisory"]["roles"],
+            serde_json::json!(["system", "system", "user"])
+        );
         let note = r["advisory"]["note"].as_str().unwrap();
         assert!(note.contains("41,024"), "note carries need: {note}");
         assert!(note.contains("32,768"), "note carries optimal: {note}");

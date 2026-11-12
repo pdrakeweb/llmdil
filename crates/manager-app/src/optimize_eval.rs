@@ -190,7 +190,11 @@ pub async fn run_eval_suite(backend_id: &str, base_url: &str, model: &str) -> Ev
 /// kind `optimize-eval-baseline`, so it is cancellable through
 /// `optimize_cancel_job` and never overlaps a measurement or an
 /// experiment batch.
-pub async fn op_optimize_run_baseline(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>, backend_id: String) -> crate::ApiResult {
+pub async fn op_optimize_run_baseline(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
+    backend_id: String,
+) -> crate::ApiResult {
     {
         let slot = state.optimize_job_abort.lock().await;
         if slot.is_some() {
@@ -288,7 +292,9 @@ pub async fn op_optimize_run_baseline(state: &std::sync::Arc<crate::AppState>, _
                     json!({ "backend": backend_id }),
                 )
                 .await;
-            return Err(ApiError::InvalidInput("screening eval cancelled".to_string()));
+            return Err(ApiError::InvalidInput(
+                "screening eval cancelled".to_string(),
+            ));
         }
         Some(record) => record,
     };

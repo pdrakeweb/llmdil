@@ -19,9 +19,7 @@ async fn test_ctx() -> (Arc<ApiCtx>, std::path::PathBuf) {
     test_ctx_with_config(manager_config::AppConfig::default_config()).await
 }
 
-async fn test_ctx_with_config(
-    cfg: manager_config::AppConfig,
-) -> (Arc<ApiCtx>, std::path::PathBuf) {
+async fn test_ctx_with_config(cfg: manager_config::AppConfig) -> (Arc<ApiCtx>, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "llm-api-composites-{}",
         std::time::SystemTime::now()
@@ -227,7 +225,14 @@ async fn concurrent_group_creates_all_land() {
     for h in handles {
         assert_eq!(h.await.unwrap(), StatusCode::CREATED);
     }
-    let (status, body) = call(&ctx, Method::GET, "/api/v1/gateway/groups", Some(&admin), None).await;
+    let (status, body) = call(
+        &ctx,
+        Method::GET,
+        "/api/v1/gateway/groups",
+        Some(&admin),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let names: Vec<&str> = body["groups"]
         .as_array()
@@ -236,7 +241,10 @@ async fn concurrent_group_creates_all_land() {
         .filter_map(|g| g["name"].as_str())
         .collect();
     for i in 0..8 {
-        assert!(names.contains(&format!("cg-{i}").as_str()), "lost update: {names:?}");
+        assert!(
+            names.contains(&format!("cg-{i}").as_str()),
+            "lost update: {names:?}"
+        );
     }
 }
 
@@ -271,7 +279,14 @@ async fn model_patch_dispatches_both_fields() {
     assert_eq!(body["id"], "patch-me");
     assert_eq!(body["enabled"], false);
 
-    let (status, model) = call(&ctx, Method::GET, "/api/v1/models/patch-me", Some(&admin), None).await;
+    let (status, model) = call(
+        &ctx,
+        Method::GET,
+        "/api/v1/models/patch-me",
+        Some(&admin),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(model["enabled"], false);
     assert_eq!(model["name"], "Patched");
@@ -316,7 +331,14 @@ async fn model_patch_dispatches_mtp_declaration() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "model_add: {status}");
-    let (status, model) = call(&ctx, Method::GET, "/api/v1/models/mtp-me", Some(&admin), None).await;
+    let (status, model) = call(
+        &ctx,
+        Method::GET,
+        "/api/v1/models/mtp-me",
+        Some(&admin),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(model["mtp"], true);
     assert_eq!(model["catalog_mtp"], serde_json::Value::Null);
@@ -370,7 +392,14 @@ async fn gateway_config_bind_host_split() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["bind_host"], "0.0.0.0");
     assert_eq!(body["restart_required"], true);
-    let (status, cfg) = call(&ctx, Method::GET, "/api/v1/gateway/config", Some(&admin), None).await;
+    let (status, cfg) = call(
+        &ctx,
+        Method::GET,
+        "/api/v1/gateway/config",
+        Some(&admin),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(cfg["bind_host"], "0.0.0.0");
 
@@ -499,6 +528,13 @@ async fn admin_audit_readback() {
         "audit entries: {entries:?}"
     );
     // Operator cannot read the audit log.
-    let (status, _) = call(&ctx, Method::GET, "/api/v1/admin/audit", Some(&operator), None).await;
+    let (status, _) = call(
+        &ctx,
+        Method::GET,
+        "/api/v1/admin/audit",
+        Some(&operator),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }

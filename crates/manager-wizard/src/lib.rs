@@ -1048,7 +1048,11 @@ pub const MCP_TOOL_CALL_DETAIL_MAX_CHARS: usize = 200;
 /// object, never null (a null is a documented 500). This is the one
 /// place the body is constructed, so a Phase 5 on-machine finding
 /// about the shape changes exactly one function.
-pub fn mcp_tool_call_body(server_id: &str, tool_name: &str, arguments: serde_json::Value) -> String {
+pub fn mcp_tool_call_body(
+    server_id: &str,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> String {
     serde_json::json!({
         "server_id": server_id,
         "name": tool_name,
@@ -1081,7 +1085,10 @@ pub fn summarize_mcp_tool_call_response(status: u16, body: &str) -> (bool, Strin
         return (false, truncate_excerpt(&format!("tool call error: {err}")));
     }
     if status != 200 {
-        return (false, truncate_excerpt(&format!("tool call failed: HTTP {status}")));
+        return (
+            false,
+            truncate_excerpt(&format!("tool call failed: HTTP {status}")),
+        );
     }
     (true, truncate_excerpt(body.trim()))
 }
@@ -2248,7 +2255,10 @@ mod tests {
         // Suffix / prefix forms parse tolerantly.
         assert_eq!(litellm_version_meets_mcp_floor("v1.83.7"), Some(true));
         assert_eq!(litellm_version_meets_mcp_floor("1.83.7-stable"), Some(true));
-        assert_eq!(litellm_version_meets_mcp_floor("v1.105.1-stable"), Some(true));
+        assert_eq!(
+            litellm_version_meets_mcp_floor("v1.105.1-stable"),
+            Some(true)
+        );
         assert_eq!(litellm_version_meets_mcp_floor(" 1.83.6 "), Some(false));
         // Missing trailing components read as zero.
         assert_eq!(litellm_version_meets_mcp_floor("1.83"), Some(false));
@@ -2293,10 +2303,7 @@ mod tests {
             gateway_spawn_state_json(&fp, "yaml: true\n", Some("1.105.1")),
         )
         .unwrap();
-        assert_eq!(
-            recorded_litellm_version(&dir).as_deref(),
-            Some("1.105.1")
-        );
+        assert_eq!(recorded_litellm_version(&dir).as_deref(), Some("1.105.1"));
         // A record whose probe found nothing returns None.
         std::fs::write(
             gateway_spawn_state_path(&dir),
@@ -2477,7 +2484,9 @@ mod tests {
         let fp_moved =
             gateway_spawn_fingerprint(&moved, true, Some("sk-master"), None, &armed_moved);
         assert_ne!(fp_moved.searxng_hash, fp.searxng_hash);
-        assert!(!gateway_config_is_current(&moved, &dir, &fp_moved, |_| true));
+        assert!(!gateway_config_is_current(&moved, &dir, &fp_moved, |_| {
+            true
+        }));
         // Disabling entirely likewise drifts from the recorded spawn.
         let mut off = cfg.clone();
         off.mcp.searxng.enabled = false;
@@ -2547,7 +2556,12 @@ mod tests {
         let armed_changed = armed_gateway_mcp_servers(&changed, |_| true);
         let fp_changed =
             gateway_spawn_fingerprint(&changed, true, Some("sk-master"), None, &armed_changed);
-        assert!(!gateway_config_is_current(&changed, &dir, &fp_changed, |_| true));
+        assert!(!gateway_config_is_current(
+            &changed,
+            &dir,
+            &fp_changed,
+            |_| true
+        ));
 
         // Disabling the rule while the file remains: drift.
         let mut off = cfg.clone();
@@ -2568,9 +2582,7 @@ mod tests {
         // Registered list: array of objects, array of strings,
         // envelope object.
         assert_eq!(
-            parse_mcp_registered_server_ids(
-                r#"[{"server_id":"brave_search"},{"id":"web_fetch"}]"#
-            ),
+            parse_mcp_registered_server_ids(r#"[{"server_id":"brave_search"},{"id":"web_fetch"}]"#),
             vec!["brave_search", "web_fetch"]
         );
         assert_eq!(
@@ -2587,10 +2599,7 @@ mod tests {
             parse_mcp_tool_names(r#"{"tools":[{"name":"brave_web_search"}]}"#),
             vec!["brave_web_search"]
         );
-        assert_eq!(
-            parse_mcp_tool_names(r#"[{"name":"fetch"}]"#),
-            vec!["fetch"]
-        );
+        assert_eq!(parse_mcp_tool_names(r#"[{"name":"fetch"}]"#), vec!["fetch"]);
         assert!(parse_mcp_tool_names(r#"{"tools":[]}"#).is_empty());
         // Error envelope.
         assert_eq!(
@@ -2658,7 +2667,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["server_id"], "brave_search");
         assert_eq!(parsed["name"], "brave_web_search");
-        assert_eq!(parsed["arguments"], serde_json::json!({ "query": "llmdil" }));
+        assert_eq!(
+            parsed["arguments"],
+            serde_json::json!({ "query": "llmdil" })
+        );
         // The generic constructor keeps the same shape.
         let body = mcp_tool_call_body("srv", "tool", serde_json::json!({}));
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -2671,8 +2683,7 @@ mod tests {
         assert_eq!(detail.chars().count(), MCP_TOOL_CALL_DETAIL_MAX_CHARS + 1);
         // Error envelope and non-200 are failures carrying the
         // gateway's text.
-        let (ok, detail) =
-            summarize_mcp_tool_call_response(200, r#"{"error":{"message":"boom"}}"#);
+        let (ok, detail) = summarize_mcp_tool_call_response(200, r#"{"error":{"message":"boom"}}"#);
         assert!(!ok);
         assert!(detail.contains("boom"), "{detail}");
         let (ok, detail) = summarize_mcp_tool_call_response(500, "oops");

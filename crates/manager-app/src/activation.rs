@@ -175,9 +175,7 @@ fn save_journal(data_dir: &Path, journal: &ActivationJournal) -> Result<(), Stri
 /// When the running gateway's configuration was generated: the
 /// mtime of the YAML the start-gateway step last wrote. Entries at
 /// or before this instant were resolved by that start.
-pub(crate) fn gateway_config_written_at(
-    data_dir: &Path,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn gateway_config_written_at(data_dir: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
     let meta = std::fs::metadata(gateway_yaml_path(data_dir)).ok()?;
     let modified = meta.modified().ok()?;
     Some(chrono::DateTime::<chrono::Utc>::from(modified))
@@ -575,7 +573,11 @@ pub fn offload_override_covers(
     journal.offload_overrides.iter().any(|o| {
         o.backend_id == backend_id
             && o.layers == layers
-            && o.placed_ccs.iter().copied().collect::<std::collections::BTreeSet<_>>() == want
+            && o.placed_ccs
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                == want
     })
 }
 
@@ -1271,7 +1273,12 @@ litellm_deployment_success_responses_total 9.0
         record_offload_override(&dir, "coder", 46, vec![(6, 0), (8, 6)]).unwrap();
         let journal = load_journal(&dir);
         // Order does not matter: the same set reversed still covers.
-        assert!(offload_override_covers(&journal, "coder", 46, &[(8, 6), (6, 0)]));
+        assert!(offload_override_covers(
+            &journal,
+            "coder",
+            46,
+            &[(8, 6), (6, 0)]
+        ));
         assert!(!offload_override_covers(&journal, "coder", 46, &[(6, 0)]));
         assert!(!offload_override_covers(&journal, "coder", 46, &[(8, 6)]));
         assert!(!offload_override_covers(&journal, "coder", 46, &[]));
@@ -1322,10 +1329,8 @@ litellm_deployment_success_responses_total 9.0
     }
 
     fn drift_test_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "activation-drift-{label}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("activation-drift-{label}-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("gateway")).unwrap();
         dir
     }
@@ -1351,8 +1356,7 @@ litellm_deployment_success_responses_total 9.0
             .mcp
             .servers
             .iter()
-            .any(|s| s.exposure == manager_config::McpExposure::Gateway
-                && !s.env_keys.is_empty()));
+            .any(|s| s.exposure == manager_config::McpExposure::Gateway && !s.env_keys.is_empty()));
         // The file a start writes while the server is unarmed.
         let unarmed = manager_wizard::config_with_armed_gateway_mcp_servers(&cfg, |_| false);
         let yaml = manager_gateway::generate_config_yaml(&unarmed).unwrap();
@@ -1464,10 +1468,12 @@ litellm_deployment_success_responses_total 9.0
             post.backends.iter().map(|b| b.id.clone()).collect();
         let running: std::collections::HashSet<String> =
             ["coder".to_string()].into_iter().collect();
-        let started_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
-            [("coder".to_string(), chrono::Utc::now() - chrono::Duration::seconds(60))]
-                .into_iter()
-                .collect();
+        let started_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> = [(
+            "coder".to_string(),
+            chrono::Utc::now() - chrono::Duration::seconds(60),
+        )]
+        .into_iter()
+        .collect();
         record_change(
             &dir,
             &pre,
@@ -1646,10 +1652,7 @@ litellm_deployment_success_responses_total 9.0
         // synthesized drift item.
         let mut changes: Vec<serde_json::Value> = Vec::new();
         if drift {
-            changes.push(drift_plan_change(
-                &detail,
-                gateway_config_written_at(&dir),
-            ));
+            changes.push(drift_plan_change(&detail, gateway_config_written_at(&dir)));
         }
         assert_eq!(changes.len(), 1, "a pending plan never has zero items");
         assert_eq!(changes[0]["kind"], "gateway_drift");

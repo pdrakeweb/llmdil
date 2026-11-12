@@ -170,11 +170,8 @@ impl ArmSpec {
     /// Short human label naming the non-default axes, e.g.
     /// `q8_0/q8_0 · FA on · depth 30,720 · combined (n-min 16, draft n-max 3)`.
     pub fn label(&self) -> String {
-        let mut parts: Vec<String> = vec![format!(
-            "{}/{}",
-            self.cache_k.flag(),
-            self.cache_v.flag()
-        )];
+        let mut parts: Vec<String> =
+            vec![format!("{}/{}", self.cache_k.flag(), self.cache_v.flag())];
         match self.flash_attn {
             FlashAttn::Auto => {}
             FlashAttn::On => parts.push("FA on".to_string()),
@@ -1102,8 +1099,9 @@ mod tests {
         let kv = preset_kv();
         let arms = expand(&base(), &kv.dimensions);
         assert!(arms.iter().all(|a| a.depth == 8192));
-        assert!(arms.iter().any(|a| a.cache_k == CacheType::F16
-            && a.cache_v == CacheType::Q8_0));
+        assert!(arms
+            .iter()
+            .any(|a| a.cache_k == CacheType::F16 && a.cache_v == CacheType::Q8_0));
         assert_eq!(preset_combined().prompt_id, None);
     }
 
@@ -1159,7 +1157,10 @@ mod tests {
             serde_json::to_string(&DraftDevice::TargetGpu).expect("ser"),
             "\"target_gpu\""
         );
-        assert_eq!(SpecKind::Combined.spec_type_arg(), Some("ngram-mod,draft-simple"));
+        assert_eq!(
+            SpecKind::Combined.spec_type_arg(),
+            Some("ngram-mod,draft-simple")
+        );
         assert_eq!(SpecKind::None.spec_type_arg(), None);
         assert!(CacheType::Q4_0.quantized());
         assert!(!CacheType::F16.quantized());

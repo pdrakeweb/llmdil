@@ -392,9 +392,8 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
     // hybrid filter_attn is `il < hparams.n_layer() &&
     // !is_recr(il)`, and `n_layer()` is `n_layer_all -
     // n_layer_nextn`.)
-    let trunk_blocks = block_count.map(|blocks| {
-        blocks.saturating_sub(get("nextn_predict_layers").unwrap_or(0))
-    });
+    let trunk_blocks =
+        block_count.map(|blocks| blocks.saturating_sub(get("nextn_predict_layers").unwrap_or(0)));
     let kv = match (
         trunk_blocks,
         get("attention.head_count_kv"),
@@ -437,8 +436,10 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
                 let embd_s = cap((d_state as u64).saturating_mul(d_inner as u64));
                 let embd_r = cap(
                     (if d_conv > 0 { d_conv - 1 } else { 0 } as u64).saturating_mul(
-                        (d_inner as u64)
-                            .saturating_add(2u64.saturating_mul(n_group as u64).saturating_mul(d_state as u64)),
+                        (d_inner as u64).saturating_add(
+                            2u64.saturating_mul(n_group as u64)
+                                .saturating_mul(d_state as u64),
+                        ),
                     ),
                 );
                 Some(RsGeometry {
@@ -629,10 +630,7 @@ mod tests {
             key_length: 256,
             value_length: 128,
         };
-        assert_eq!(
-            asym.bytes_per_token_typed(Q8_0, Q4_0),
-            2 * (272 + 72)
-        );
+        assert_eq!(asym.bytes_per_token_typed(Q8_0, Q4_0), 2 * (272 + 72));
     }
 
     #[test]
@@ -714,7 +712,12 @@ mod tests {
         w_kv_u32(&mut b, "testarch.nextn_predict_layers", 1);
         w_kv_u32(&mut b, "testarch.expert_count", 8);
         for blk in 0..48 {
-            w_tensor(&mut b, &format!("blk.{blk}.ffn_gate_exps.weight"), &[256], 12);
+            w_tensor(
+                &mut b,
+                &format!("blk.{blk}.ffn_gate_exps.weight"),
+                &[256],
+                12,
+            );
         }
         w_tensor(&mut b, "blk.48.nextn.eh_proj.weight", &[16], 1);
         w_tensor(&mut b, "blk.48.nextn.enorm.weight", &[16], 1);

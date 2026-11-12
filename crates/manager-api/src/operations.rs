@@ -59,10 +59,7 @@ impl OperationStore {
             "finished_ms": null,
             "error": null,
         });
-        self.ops
-            .lock()
-            .unwrap()
-            .insert(id.clone(), record.clone());
+        self.ops.lock().unwrap().insert(id.clone(), record.clone());
         (id, record)
     }
 
@@ -93,7 +90,9 @@ impl OperationStore {
             }
         }
         let mut ops = self.ops.lock().unwrap();
-        let Some(record) = ops.get_mut(id) else { return };
+        let Some(record) = ops.get_mut(id) else {
+            return;
+        };
         if record["status"] == "aborted" {
             return;
         }
@@ -114,7 +113,9 @@ impl OperationStore {
     /// payload as the detail (the wizard-step busy outcome).
     pub fn fail_with_detail(&self, id: &str, message: &str, detail: Value) {
         let mut ops = self.ops.lock().unwrap();
-        let Some(record) = ops.get_mut(id) else { return };
+        let Some(record) = ops.get_mut(id) else {
+            return;
+        };
         if record["status"] == "aborted" {
             return;
         }

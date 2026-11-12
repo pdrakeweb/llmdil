@@ -28,8 +28,7 @@ pub mod placement;
 pub use cache::{
     cache_selection, cache_tokens_present, kv_bytes_per_token, predicted_best, predicted_fits,
     predicted_shares, price_ladder, set_cache_selection, CacheFitInputs, CacheRung, CacheSelection,
-    CacheType,
-    FlashAttn, HEADROOM_RESERVE_PERCENT, PREDICTED_BEST_LADDER,
+    CacheType, FlashAttn, HEADROOM_RESERVE_PERCENT, PREDICTED_BEST_LADDER,
 };
 pub use flags::{raw_flag_warnings, FlagWarning};
 pub use gguf::{parse_gguf_layout, GgufError, GgufLayout, KvGeometry, RsGeometry};
@@ -42,15 +41,14 @@ pub use memory::{
     set_expert_offload, sys_bytes_by_position, ExpertOffload, MemoryBasis, MemoryRequirement,
 };
 pub use moe_cache::{
-    auto_moe_cache_budget, moe_cache_mib, moe_cache_shares, set_moe_cache, MOE_CACHE_AUTO_RESERVE_MIB,
-    MOE_CACHE_DEFAULT_MIB, MOE_CACHE_PRESETS_MIB,
+    auto_moe_cache_budget, moe_cache_mib, moe_cache_shares, set_moe_cache,
+    MOE_CACHE_AUTO_RESERVE_MIB, MOE_CACHE_DEFAULT_MIB, MOE_CACHE_PRESETS_MIB,
 };
 pub use mtp::{mtp_draft, set_mtp_draft, MtpDraft, LLAMA_CPP_N_MAX_DEFAULT};
 pub use parallel::{effective_slots, parallel_slots, set_parallel_slots};
 pub use placement::{
     apply_placement, propose_placement, propose_placement_full, propose_placement_resident,
-    validate_split,
-    PlacementProjection,
+    validate_split, PlacementProjection,
 };
 
 /// Bytes in one MiB.
@@ -213,10 +211,7 @@ pub fn catalog_mtp_pin(id: &str, source_url: &str) -> Option<bool> {
     if source_url.is_empty() {
         return None;
     }
-    models
-        .iter()
-        .find(|s| s.url == source_url)
-        .map(|s| s.mtp)
+    models.iter().find(|s| s.url == source_url).map(|s| s.mtp)
 }
 
 /// Whether the curated catalog pins MTP capability for a model
@@ -2045,16 +2040,10 @@ mod tests {
         assert_eq!(fit_state(16_376, 16_376, true), (FitState::Fits, 0));
         assert_eq!(fit_state(13_128, 16_376, false), (FitState::Fits, 0));
         // Over total on WDDM: paged by exactly the excess.
-        assert_eq!(
-            fit_state(17_224, 16_376, true),
-            (FitState::WddmPaged, 848)
-        );
+        assert_eq!(fit_state(17_224, 16_376, true), (FitState::WddmPaged, 848));
         // Over total on TCC — and on an unreported driver model,
         // which the caller passes as not-WDDM: does not fit.
-        assert_eq!(
-            fit_state(17_224, 16_376, false),
-            (FitState::DoesNotFit, 0)
-        );
+        assert_eq!(fit_state(17_224, 16_376, false), (FitState::DoesNotFit, 0));
         assert_eq!(
             worst_fit_state(&[FitState::Fits, FitState::WddmPaged]),
             FitState::WddmPaged
@@ -2174,10 +2163,25 @@ mod tests {
         assert!(effective_mtp("my-planner", mtp_url, Some(false)));
         // A model the catalog does not know falls to the record
         // declaration; undeclared means not capable.
-        assert_eq!(catalog_mtp_pin("user-model", "https://example.com/m.gguf"), None);
-        assert!(effective_mtp("user-model", "https://example.com/m.gguf", Some(true)));
-        assert!(!effective_mtp("user-model", "https://example.com/m.gguf", Some(false)));
-        assert!(!effective_mtp("user-model", "https://example.com/m.gguf", None));
+        assert_eq!(
+            catalog_mtp_pin("user-model", "https://example.com/m.gguf"),
+            None
+        );
+        assert!(effective_mtp(
+            "user-model",
+            "https://example.com/m.gguf",
+            Some(true)
+        ));
+        assert!(!effective_mtp(
+            "user-model",
+            "https://example.com/m.gguf",
+            Some(false)
+        ));
+        assert!(!effective_mtp(
+            "user-model",
+            "https://example.com/m.gguf",
+            None
+        ));
     }
 
     #[test]

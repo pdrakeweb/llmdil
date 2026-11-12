@@ -96,10 +96,11 @@ pub fn regenerate(data_dir: &Path, sans: &CertSans) -> io::Result<TlsMaterial> {
 }
 
 fn generate_with_sans(sans: &CertSans) -> io::Result<TlsMaterial> {
-    let mut params =
-        rcgen::CertificateParams::new(sans.dns.clone()).map_err(io::Error::other)?;
+    let mut params = rcgen::CertificateParams::new(sans.dns.clone()).map_err(io::Error::other)?;
     for ip in &sans.ips {
-        params.subject_alt_names.push(rcgen::SanType::IpAddress(*ip));
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress(*ip));
     }
     params.distinguished_name = {
         let mut dn = rcgen::DistinguishedName::new();

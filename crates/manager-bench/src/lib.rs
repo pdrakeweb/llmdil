@@ -33,9 +33,7 @@ pub use comparability::{
 };
 pub use flags::arm_raw_flags;
 pub use logs::{parse_acceptance_line, parse_statistics_line, AcceptanceSample, DrafterStats};
-pub use prompts::{
-    padding_blocks, shipped_prompts, PromptEntry, PromptLibrary, PromptOrigin,
-};
+pub use prompts::{padding_blocks, shipped_prompts, PromptEntry, PromptLibrary, PromptOrigin};
 pub use results::{
     condition_winners, median, summarize, ArmRecord, ArmStatus, ArmSummary, BenchResults,
     ConditionWinner, DrafterAgg, InterlockRecord, RunRow, SweepRecord,

@@ -903,9 +903,7 @@ impl SystemOps for RealSystemOps {
         {
             Err(WizardError::IoError {
                 path: PathBuf::from("scm"),
-                reason: format!(
-                    "service supervision requires Windows (service '{name}')"
-                ),
+                reason: format!("service supervision requires Windows (service '{name}')"),
             })
         }
     }

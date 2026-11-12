@@ -19,12 +19,12 @@ use manager_app::{AppState, EventSink};
 use crate::operations::OperationStore;
 
 pub mod audit;
-pub mod firewall;
+pub mod auth;
 pub mod auth_routes;
 pub mod composites;
-pub mod operations;
-pub mod auth;
+pub mod firewall;
 pub mod http;
+pub mod operations;
 pub mod tls;
 pub mod users;
 
@@ -195,9 +195,9 @@ pub enum ApiStartError {
 #[derive(Debug, Clone, Copy)]
 pub struct PeerAddr(pub SocketAddr);
 
-impl axum::extract::connect_info::Connected<
-    axum::serve::IncomingStream<'_, tokio::net::TcpListener>,
-> for PeerAddr
+impl
+    axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>>
+    for PeerAddr
 {
     fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
         PeerAddr(*stream.remote_addr())
@@ -237,10 +237,7 @@ impl ApiServer {
 
     /// Start from a prepared context (shared user store with the
     /// desktop shell).
-    pub async fn start_ctx(
-        ctx: Arc<ApiCtx>,
-        options: ApiOptions,
-    ) -> Result<Self, ApiStartError> {
+    pub async fn start_ctx(ctx: Arc<ApiCtx>, options: ApiOptions) -> Result<Self, ApiStartError> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         if options.tls.is_none() && !options.bind.is_loopback() {
             return Err(ApiStartError::PlaintextNotLoopback(options.bind));

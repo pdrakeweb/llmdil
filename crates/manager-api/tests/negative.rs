@@ -86,7 +86,10 @@ async fn call_raw(
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 fn bearer(token: &str) -> Vec<(&str, String)> {
@@ -95,7 +98,9 @@ fn bearer(token: &str) -> Vec<(&str, String)> {
 
 fn assert_envelope(body: &Value, code: &str) {
     assert_eq!(body["error"]["code"], code, "body: {body}");
-    assert!(body["error"]["message"].as_str().is_some_and(|m| !m.is_empty()));
+    assert!(body["error"]["message"]
+        .as_str()
+        .is_some_and(|m| !m.is_empty()));
 }
 
 #[tokio::test]
@@ -136,7 +141,14 @@ async fn expired_and_revoked_sessions_are_refused() {
     let (user_id, token) = seed(&ctx, "victim", RoleName::Admin).await;
 
     // Sanity: the fresh token works.
-    let (status, _) = call_raw(&ctx, Method::GET, "/api/v1/status", &bearer(&token), Body::empty()).await;
+    let (status, _) = call_raw(
+        &ctx,
+        Method::GET,
+        "/api/v1/status",
+        &bearer(&token),
+        Body::empty(),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // Expire the session in the store.
@@ -149,7 +161,14 @@ async fn expired_and_revoked_sessions_are_refused() {
         })
         .await
         .unwrap();
-    let (status, body) = call_raw(&ctx, Method::GET, "/api/v1/status", &bearer(&token), Body::empty()).await;
+    let (status, body) = call_raw(
+        &ctx,
+        Method::GET,
+        "/api/v1/status",
+        &bearer(&token),
+        Body::empty(),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_envelope(&body, "UNAUTHENTICATED");
 
@@ -182,7 +201,14 @@ async fn disabled_user_tokens_die() {
         })
         .await
         .unwrap();
-    let (status, _) = call_raw(&ctx, Method::GET, "/api/v1/status", &bearer(&token), Body::empty()).await;
+    let (status, _) = call_raw(
+        &ctx,
+        Method::GET,
+        "/api/v1/status",
+        &bearer(&token),
+        Body::empty(),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -193,7 +219,14 @@ async fn role_escalation_attempts_are_refused() {
     let (_oid, operator) = seed(&ctx, "o", RoleName::Operator).await;
 
     // Viewer reaching for user administration.
-    let (status, body) = call_raw(&ctx, Method::GET, "/api/v1/admin/users", &bearer(&viewer), Body::empty()).await;
+    let (status, body) = call_raw(
+        &ctx,
+        Method::GET,
+        "/api/v1/admin/users",
+        &bearer(&viewer),
+        Body::empty(),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_envelope(&body, "FORBIDDEN");
     // Operator reaching for a config write.

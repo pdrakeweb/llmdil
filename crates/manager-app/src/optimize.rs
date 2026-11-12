@@ -22,9 +22,9 @@ use manager_optimize::{
     default_purpose_seed, estimate_prompts, estimate_tokens, headline_figures, measurement_facts,
     measurement_fingerprint, parse_plan, probe_hardware, validate_plan, BackendMeasured,
     BenchResult, BenchmarkPrompt, CandidateFact, ConsultCandidate, Decision, DiscoveryFunnel,
-    EstimateEntry, HardwareContext, HfClient, ItemValidation, LayoutFacts, LiveSnapshot, MeasureInputs,
-    MeasurementEntry, MeasurementFingerprintInputs, MeasurementInputs, MeasurementSource,
-    MeasurementStore, Plan, PlanItem, PlanKind, TrafficWindow, ValidationStatus,
+    EstimateEntry, HardwareContext, HfClient, ItemValidation, LayoutFacts, LiveSnapshot,
+    MeasureInputs, MeasurementEntry, MeasurementFingerprintInputs, MeasurementInputs,
+    MeasurementSource, MeasurementStore, Plan, PlanItem, PlanKind, TrafficWindow, ValidationStatus,
     BENCHMARK_TEMPERATURE, ESTIMATE_RUNS, MEASURED_RUNS,
 };
 use manager_supervisor::ProcessState;
@@ -121,10 +121,7 @@ fn context_manifest_lines(context: &Value, system_prompt: &str, user_prompt: &st
                 .filter_map(|c| {
                     let repo = c.get("repo_id")?.as_str()?;
                     let file = c.get("file")?.as_str()?;
-                    let params = c
-                        .get("params_b")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
+                    let params = c.get("params_b").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     Some(format!("{repo}/{file} (params_b {params})"))
                 })
                 .collect()
@@ -296,8 +293,7 @@ pub(crate) async fn record_job_failure(state: &AppState, started_unix_ms: i64, m
         return;
     }
     *state.optimize_job.lock().await = None;
-    *state.optimize_job_error.lock().await =
-        Some((message, chrono::Utc::now().timestamp_millis()));
+    *state.optimize_job_error.lock().await = Some((message, chrono::Utc::now().timestamp_millis()));
 }
 
 /// Record a benchmark job's success: descriptor and recorded
@@ -773,9 +769,7 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
                     name: s.name.clone(),
                     vram_total_mib: s.vram_total_mib,
                     vram_used_mib: s.vram_used_mib,
-                    driver_model: s
-                        .driver_model
-                        .map(|d| format!("{d:?}").to_lowercase()),
+                    driver_model: s.driver_model.map(|d| format!("{d:?}").to_lowercase()),
                 })
                 .collect(),
             ram_total_mib: probe.ram_total_mib,
@@ -824,11 +818,7 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
         .iter()
         .map(|b| (b.id.clone(), b.port))
         .collect();
-    let windows = state
-        .gateway_stats
-        .lock()
-        .await
-        .window_stats(&pairs);
+    let windows = state.gateway_stats.lock().await.window_stats(&pairs);
     let mut errors_1h: HashMap<String, u64> = HashMap::new();
     if let Some(windows) = &windows {
         let rows: Vec<(String, u64, u64, u64)> = cfg
@@ -853,10 +843,7 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
     // Measured throughput (§A.1): every configured backend's
     // current fingerprint, then the store's facts against them —
     // current entries plus superseded ones labeled as such.
-    let gpu_pairs: Vec<(u32, String)> = samples
-        .iter()
-        .map(|s| (s.index, s.name.clone()))
-        .collect();
+    let gpu_pairs: Vec<(u32, String)> = samples.iter().map(|s| (s.index, s.name.clone())).collect();
     let mut fingerprints: HashMap<String, String> = HashMap::new();
     let mut input_sets: HashMap<String, MeasurementFingerprintInputs> = HashMap::new();
     for b in &cfg.backends {
@@ -904,18 +891,20 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
         }
     }
     for spec in manager_models::curated_models() {
-        layouts.entry(spec.id.clone()).or_insert_with(|| LayoutFacts {
-            total_bytes: spec.size_bytes,
-            expert_bytes: spec.expert_bytes,
-            expert_bytes_by_block: None,
-            moe_layers: spec.moe_layers,
-            kv_per_token: spec.kv_bytes_per_token,
-            kv_geometry: None,
-            rs_bytes_per_seq: None,
-            basis: manager_models::MemoryBasis::Catalog,
-            ctx_max: spec.ctx_max,
-            params_b: spec.params_b,
-        });
+        layouts
+            .entry(spec.id.clone())
+            .or_insert_with(|| LayoutFacts {
+                total_bytes: spec.size_bytes,
+                expert_bytes: spec.expert_bytes,
+                expert_bytes_by_block: None,
+                moe_layers: spec.moe_layers,
+                kv_per_token: spec.kv_bytes_per_token,
+                kv_geometry: None,
+                rs_bytes_per_seq: None,
+                basis: manager_models::MemoryBasis::Catalog,
+                ctx_max: spec.ctx_max,
+                params_b: spec.params_b,
+            });
     }
     let mut free: Vec<(u32, u64)> = samples
         .iter()
@@ -1080,8 +1069,7 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
     let plan_json = file.plan.as_ref().map(|plan| {
         let validations = validate_plan(plan, &cfg, &gathered.live);
         let mut v = serde_json::to_value(plan).unwrap_or(Value::Null);
-        let mut validation_values: Vec<Value> =
-            validations.iter().map(validation_json).collect();
+        let mut validation_values: Vec<Value> = validations.iter().map(validation_json).collect();
         for (item, value) in plan.items.iter().zip(validation_values.iter_mut()) {
             if let Some(p) = plan_item_predicted(&cfg, item, &measure_store, &gpu_pairs) {
                 value["predicted"] = p;
@@ -1188,10 +1176,7 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
         .filter_map(|b| {
             let fp = gathered.fingerprints.get(&b.id)?;
             let winner = store.lookup(fp)?;
-            let idx = store
-                .entries
-                .iter()
-                .position(|e| std::ptr::eq(e, winner))?;
+            let idx = store.entries.iter().position(|e| std::ptr::eq(e, winner))?;
             Some((b.id.clone(), idx))
         })
         .collect();
@@ -1411,19 +1396,17 @@ async fn resolve_lookup_backend(
             if let Some(layers) = req.offload_layers {
                 if let Some(info) = crate::backend_offload_info(cfg, &merged) {
                     if layers != info.layers {
-                        let target =
-                            manager_models::offload_for_layers(layers, info.moe_layers);
-                        merged.raw_flags = manager_models::set_expert_offload(
-                            merged.raw_flags.as_deref(),
-                            target,
-                        );
+                        let target = manager_models::offload_for_layers(layers, info.moe_layers);
+                        merged.raw_flags =
+                            manager_models::set_expert_offload(merged.raw_flags.as_deref(), target);
                     }
                 }
             }
             if let Some(pos) = req.mtp_position {
                 if let Some(info) = crate::backend_mtp_info(cfg, &merged) {
                     let decoded = if info.enabled {
-                        info.n_max.unwrap_or(manager_models::LLAMA_CPP_N_MAX_DEFAULT)
+                        info.n_max
+                            .unwrap_or(manager_models::LLAMA_CPP_N_MAX_DEFAULT)
                     } else {
                         0
                     };
@@ -1450,9 +1433,7 @@ async fn resolve_lookup_backend(
         return Ok(merged);
     }
     let model_id = req.model_id.as_deref().ok_or_else(|| {
-        ApiError::InvalidInput(
-            "measurement_lookup needs a backend_id or a model_id".to_string(),
-        )
+        ApiError::InvalidInput("measurement_lookup needs a backend_id or a model_id".to_string())
     })?;
     let model = cfg
         .models
@@ -1606,7 +1587,10 @@ pub async fn op_measurement_delete(
 
 /// Full page state: purposes, context summary + document, the
 /// stored plan with live validation states.
-pub async fn op_optimize_get_state(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
+pub async fn op_optimize_get_state(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
+) -> crate::ApiResult {
     state_payload(state).await
 }
 
@@ -1653,8 +1637,7 @@ pub async fn op_optimize_save_purpose(
             )))
         }
     }
-    manager_config::save(&new_cfg, &state.config_path)
-        .map_err(ApiError::from)?;
+    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
     *live = new_cfg;
     drop(live);
     state_payload(state).await
@@ -1736,11 +1719,7 @@ pub async fn op_optimize_consult(
         .or_else(|| default_running.clone())
         .or(best_overall)
         .or_else(|| cfg.backends.first().map(|b| b.id.clone()))
-        .ok_or_else(|| {
-            ApiError::InvalidInput(
-                "no backends are configured".to_string(),
-            )
-        })?;
+        .ok_or_else(|| ApiError::InvalidInput("no backends are configured".to_string()))?;
     let backend = cfg
         .backends
         .iter()
@@ -1770,12 +1749,8 @@ pub async fn op_optimize_consult(
             "backend '{target}' is not running; consultations go to a running backend"
         )));
     }
-    let (context, meta) = build_context(
-        &cfg,
-        &gathered.measure,
-        env!("CARGO_PKG_VERSION"),
-        &target,
-    );
+    let (context, meta) =
+        build_context(&cfg, &gathered.measure, env!("CARGO_PKG_VERSION"), &target);
     let purpose = if cfg.optimize_purpose.trim().is_empty() {
         default_purpose_seed(&cfg)
     } else {
@@ -1796,7 +1771,11 @@ pub async fn op_optimize_consult(
                 format!("'{directive}'")
             }
         ))];
-        lines.extend(context_manifest_lines(&context, &system_prompt, &user_prompt));
+        lines.extend(context_manifest_lines(
+            &context,
+            &system_prompt,
+            &user_prompt,
+        ));
         opt_log(state, &lines);
     }
 
@@ -1886,11 +1865,7 @@ pub async fn op_optimize_consult(
                 record_consult_failure(state, "consultation cancelled by operator".to_string())
                     .await;
                 state
-                    .finish_task(
-                        &task_id,
-                        TaskStatus::Aborted,
-                        json!({ "backend": target }),
-                    )
+                    .finish_task(&task_id, TaskStatus::Aborted, json!({ "backend": target }))
                     .await;
                 return Err(ApiError::InvalidInput("consultation cancelled".to_string()));
             }
@@ -1907,9 +1882,7 @@ pub async fn op_optimize_consult(
                         json!({ "error": e.to_string() }),
                     )
                     .await;
-                return Err(ApiError::InvalidInput(format!(
-                    "consultation failed: {e}"
-                )));
+                return Err(ApiError::InvalidInput(format!("consultation failed: {e}")));
             }
             Some(Ok(result)) => {
                 // Response diagnostics (Oct 19, 2026): the raw
@@ -2131,7 +2104,10 @@ pub async fn op_optimize_discover(
 
 /// Cancel the running consultation (design §1.2): fires the
 /// scoped abort handle, which drops the in-flight request.
-pub async fn op_optimize_cancel_consult(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
+pub async fn op_optimize_cancel_consult(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
+) -> crate::ApiResult {
     let sender = {
         let mut slot = state.optimize_abort.lock().await;
         slot.take()
@@ -2408,8 +2384,12 @@ pub async fn op_optimize_measure_backend(
             model_id: run_model,
             measured_at: chrono::Utc::now().to_rfc3339(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            short: iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
-            long: iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
+            short: iter
+                .next()
+                .unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
+            long: iter
+                .next()
+                .unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
             source: Some(MeasurementSource::Benchmark),
             origin_backend_id: None,
             model_file: run_model_file,
@@ -2453,21 +2433,16 @@ pub async fn op_optimize_measure_backend(
             );
             record_job_failure(state, job_started_ms, format!("measurement failed: {e}")).await;
             state
-                .finish_task(
-                    &task_id,
-                    TaskStatus::Failed,
-                    json!({ "error": e.clone() }),
-                )
+                .finish_task(&task_id, TaskStatus::Failed, json!({ "error": e.clone() }))
                 .await;
-            return Err(ApiError::InvalidInput(format!(
-                "measurement failed: {e}"
-            )));
+            return Err(ApiError::InvalidInput(format!("measurement failed: {e}")));
         }
         Some(Ok(entry)) => entry,
     };
     {
         let rate = |v: Option<f64>| {
-            v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".to_string())
+            v.map(|x| format!("{x:.1}"))
+                .unwrap_or_else(|| "n/a".to_string())
         };
         opt_log1(
             state,
@@ -2619,8 +2594,12 @@ pub async fn op_optimize_estimate_backend(
             model_id: run_model,
             estimated_at: chrono::Utc::now().to_rfc3339(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            short: iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
-            long: iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
+            short: iter
+                .next()
+                .unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
+            long: iter
+                .next()
+                .unwrap_or_else(|| BenchResult::from_runs(Vec::new())),
         })
     };
     let outcome = tokio::select! {
@@ -2633,10 +2612,17 @@ pub async fn op_optimize_estimate_backend(
     }
     let entry = match outcome {
         None => {
-            opt_log1(state, &format!("estimate cancelled (backend '{backend_id}')"));
+            opt_log1(
+                state,
+                &format!("estimate cancelled (backend '{backend_id}')"),
+            );
             record_job_end(state, job_started_ms).await;
             state
-                .finish_task(&task_id, TaskStatus::Aborted, json!({ "backend": backend_id }))
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Aborted,
+                    json!({ "backend": backend_id }),
+                )
                 .await;
             return Err(ApiError::InvalidInput("estimate cancelled".to_string()));
         }
@@ -2647,11 +2633,7 @@ pub async fn op_optimize_estimate_backend(
             );
             record_job_failure(state, job_started_ms, format!("estimate failed: {e}")).await;
             state
-                .finish_task(
-                    &task_id,
-                    TaskStatus::Failed,
-                    json!({ "error": e.clone() }),
-                )
+                .finish_task(&task_id, TaskStatus::Failed, json!({ "error": e.clone() }))
                 .await;
             return Err(ApiError::InvalidInput(format!("estimate failed: {e}")));
         }
@@ -2659,7 +2641,8 @@ pub async fn op_optimize_estimate_backend(
     };
     {
         let rate = |v: Option<f64>| {
-            v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".to_string())
+            v.map(|x| format!("{x:.1}"))
+                .unwrap_or_else(|| "n/a".to_string())
         };
         opt_log1(
             state,
@@ -2695,7 +2678,10 @@ pub async fn op_optimize_estimate_backend(
 /// or an experiment batch in a later sub-phase): fires the
 /// shared job slot's abort handle, which drops the job's
 /// in-flight benchmark future.
-pub async fn op_optimize_cancel_job(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
+pub async fn op_optimize_cancel_job(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
+) -> crate::ApiResult {
     let sender = {
         let mut slot = state.optimize_job_abort.lock().await;
         slot.take()
@@ -2778,11 +2764,7 @@ pub async fn op_optimize_set_item_outcome(
         "applied" => manager_optimize::ApplyOutcome::Applied,
         "failed" => manager_optimize::ApplyOutcome::Failed,
         "not_attempted" => manager_optimize::ApplyOutcome::NotAttempted,
-        other => {
-            return Err(ApiError::InvalidInput(format!(
-                "unknown outcome '{other}'"
-            )))
-        }
+        other => return Err(ApiError::InvalidInput(format!("unknown outcome '{other}'"))),
     };
     let mut file = load_plan_file_current(state).await;
     let plan = file
@@ -2823,13 +2805,19 @@ pub async fn op_optimize_set_item_outcome(
 /// Re-validate the stored plan against live state. Validation
 /// states are derived on every state read, so this simply
 /// returns the refreshed payload.
-pub async fn op_optimize_validate_plan(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
+pub async fn op_optimize_validate_plan(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
+) -> crate::ApiResult {
     state_payload(state).await
 }
 
 /// Discard the stored plan and its decisions (§1.2). Denial
 /// memory is kept: those were explicit operator decisions.
-pub async fn op_optimize_discard_plan(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
+pub async fn op_optimize_discard_plan(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
+) -> crate::ApiResult {
     let mut file = load_plan_file(state);
     file.plan = None;
     file.sample = false;
@@ -2927,10 +2915,9 @@ mod tests {
     /// kept nothing.
     #[test]
     fn candidates_file_funnel_is_additive() {
-        let old: CandidatesFile = serde_json::from_str(
-            r#"{"directive":"d","retrieved_at":"t","candidates":[]}"#,
-        )
-        .unwrap();
+        let old: CandidatesFile =
+            serde_json::from_str(r#"{"directive":"d","retrieved_at":"t","candidates":[]}"#)
+                .unwrap();
         assert!(old.funnel.is_none());
         // No candidates and no funnel: still the null payload.
         assert_eq!(candidates_json(&old), Value::Null);
@@ -2954,10 +2941,7 @@ mod tests {
         assert_eq!(payload["items"], json!([]));
         assert_eq!(payload["funnel"]["pool_repos"], json!(6));
         assert_eq!(payload["funnel"]["partial"], json!(true));
-        assert_eq!(
-            payload["funnel"]["partial_reason"],
-            json!("rate_limited")
-        );
+        assert_eq!(payload["funnel"]["partial_reason"], json!("rate_limited"));
         // The stored file round-trips with the funnel intact.
         let text = serde_json::to_string(&file).unwrap();
         let back: CandidatesFile = serde_json::from_str(&text).unwrap();
@@ -3086,11 +3070,7 @@ mod tests {
     }
 
     fn running_ops_empty(state: &AppState) -> bool {
-        state
-            .optimize_running_ops
-            .lock()
-            .unwrap()
-            .is_empty()
+        state.optimize_running_ops.lock().unwrap().is_empty()
     }
 
     /// Tracker #70, scope test 1: a benchmark (Measure and
@@ -3131,12 +3111,8 @@ mod tests {
             other => panic!("expected the mutual-exclusion refusal, got {other:?}"),
         }
         // The eval-baseline benchmark path refuses the same way.
-        let r = crate::optimize_eval::op_optimize_run_baseline(
-            &state,
-            &sink,
-            "coder".to_string(),
-        )
-        .await;
+        let r = crate::optimize_eval::op_optimize_run_baseline(&state, &sink, "coder".to_string())
+            .await;
         match r {
             Err(ApiError::InvalidInput(msg)) => {
                 assert!(msg.contains("a consultation is already running"), "{msg}");
@@ -3167,13 +3143,9 @@ mod tests {
     async fn consultation_refused_during_benchmark() {
         let state = mutex_test_state();
         let sink = mutex_sink();
-        let _bench = OptimizeOpGuard::claim(
-            &state,
-            "coder",
-            OptimizeOpFamily::Benchmark,
-            "measure",
-        )
-        .expect("the first claim on a backend succeeds");
+        let _bench =
+            OptimizeOpGuard::claim(&state, "coder", OptimizeOpFamily::Benchmark, "measure")
+                .expect("the first claim on a backend succeeds");
 
         let r = op_optimize_consult(
             &state,
@@ -3212,22 +3184,14 @@ mod tests {
                 "consultation",
             )
             .unwrap();
-            assert!(try_claim_optimize_op(
-                &state,
-                "coder",
-                OptimizeOpFamily::Benchmark,
-                "measure"
-            )
-            .is_err());
+            assert!(
+                try_claim_optimize_op(&state, "coder", OptimizeOpFamily::Benchmark, "measure")
+                    .is_err()
+            );
         } // consultation completes: guard drop releases the record
         assert!(running_ops_empty(&state));
-        let bench = OptimizeOpGuard::claim(
-            &state,
-            "coder",
-            OptimizeOpFamily::Benchmark,
-            "measure",
-        )
-        .expect("a benchmark may start after the consultation completes");
+        let bench = OptimizeOpGuard::claim(&state, "coder", OptimizeOpFamily::Benchmark, "measure")
+            .expect("a benchmark may start after the consultation completes");
         assert!(try_claim_optimize_op(
             &state,
             "coder",
@@ -3279,13 +3243,9 @@ mod tests {
             "the cancel clears the consultation's record at once"
         );
         // The benchmark the operator wanted to run can now claim.
-        let bench = OptimizeOpGuard::claim(
-            &state,
-            "coder",
-            OptimizeOpFamily::Benchmark,
-            "estimate",
-        )
-        .expect("an estimate may start after the consultation is cancelled");
+        let bench =
+            OptimizeOpGuard::claim(&state, "coder", OptimizeOpFamily::Benchmark, "estimate")
+                .expect("an estimate may start after the consultation is cancelled");
         // The cancelled consultation's late release (its guard
         // dropping as its future unwinds) must not clear the
         // newer benchmark claim.
@@ -3297,13 +3257,9 @@ mod tests {
 
         // Symmetric: a cancelled benchmark (the shared job
         // cancel) frees its backend for a consultation.
-        let _bench = OptimizeOpGuard::claim(
-            &state,
-            "coder",
-            OptimizeOpFamily::Benchmark,
-            "measure",
-        )
-        .unwrap();
+        let _bench =
+            OptimizeOpGuard::claim(&state, "coder", OptimizeOpFamily::Benchmark, "measure")
+                .unwrap();
         let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
         *state.optimize_job_abort.lock().await = Some(tx);
         let r = op_optimize_cancel_job(&state, &sink).await.unwrap();
@@ -3335,13 +3291,8 @@ mod tests {
                 claim_id: 999,
             },
         );
-        let err = try_claim_optimize_op(
-            &state,
-            "coder",
-            OptimizeOpFamily::Benchmark,
-            "estimate",
-        )
-        .expect_err("a running consultation refuses a benchmark claim");
+        let err = try_claim_optimize_op(&state, "coder", OptimizeOpFamily::Benchmark, "estimate")
+            .expect_err("a running consultation refuses a benchmark claim");
         match err {
             ApiError::InvalidInput(msg) => {
                 assert!(msg.contains("a consultation is already running"), "{msg}");
@@ -3413,7 +3364,12 @@ mod tests {
         let started2 = record_job_start(&state, "measure", "planner").await;
         assert!(state.optimize_job_error.lock().await.is_none());
         assert_eq!(
-            state.optimize_job.lock().await.as_ref().map(|j| j.kind.as_str()),
+            state
+                .optimize_job
+                .lock()
+                .await
+                .as_ref()
+                .map(|j| j.kind.as_str()),
             Some("measure")
         );
         record_job_success(&state, started2).await;

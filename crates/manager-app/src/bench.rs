@@ -287,8 +287,7 @@ pub async fn startup_sweep(state: &AppState) {
                 if arm.status == mb::ArmStatus::Running || arm.status == mb::ArmStatus::Pending {
                     arm.status = mb::ArmStatus::Cancelled;
                     arm.detail = Some(
-                        "sweep interrupted by an app restart; this arm never completed"
-                            .to_string(),
+                        "sweep interrupted by an app restart; this arm never completed".to_string(),
                     );
                 }
             }
@@ -375,7 +374,11 @@ fn unique_prompt_id(lib: &mb::PromptLibrary, name: &str) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-    let base = if slug.is_empty() { "prompt".to_string() } else { slug };
+    let base = if slug.is_empty() {
+        "prompt".to_string()
+    } else {
+        slug
+    };
     if lib.entries.iter().all(|e| e.id != base) {
         return base;
     }
@@ -454,15 +457,11 @@ pub async fn op_bench_prompt_generate(
                 .filter(|b| running.contains(&b.id))
                 .collect();
             candidates.sort_by_key(|b| std::cmp::Reverse(b.flags.n_ctx));
-            candidates
-                .first()
-                .copied()
-                .cloned()
-                .ok_or_else(|| {
-                    ApiError::InvalidInput(
-                        "no backend is running; generation never starts a backend".to_string(),
-                    )
-                })?
+            candidates.first().copied().cloned().ok_or_else(|| {
+                ApiError::InvalidInput(
+                    "no backend is running; generation never starts a backend".to_string(),
+                )
+            })?
         }
     };
     let task_id = state
@@ -621,10 +620,7 @@ fn gguf_header_facts(path: &PathBuf) -> (Option<u32>, Option<u32>) {
     // Headers with a full token array run to a few MB; cap the
     // walk so a hostile file cannot make it read unboundedly.
     let mut buf = Vec::new();
-    let _ = file
-        .by_ref()
-        .take(64 * 1024 * 1024)
-        .read_to_end(&mut buf);
+    let _ = file.by_ref().take(64 * 1024 * 1024).read_to_end(&mut buf);
     parse_gguf_facts(&buf)
 }
 
@@ -696,9 +692,10 @@ fn walk_gguf_facts(buf: &[u8]) -> Option<(Option<u32>, Option<u32>)> {
                 0 => Some(self.take(1)?[0] as u64),
                 2 => Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?) as u64),
                 4 => Some(self.u32()? as u64),
-                5 => Some(self.take(4).map(|b| {
-                    i32::from_le_bytes(b.try_into().unwrap()) as u64
-                })?),
+                5 => Some(
+                    self.take(4)
+                        .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as u64)?,
+                ),
                 10 => self.u64(),
                 11 => Some(self.u64()?),
                 _ => {
@@ -887,7 +884,10 @@ fn cpu_offload(b: &BackendConfig) -> bool {
     !matches!(
         manager_models::expert_offload(b.raw_flags.as_deref()),
         manager_models::ExpertOffload::None
-    ) || matches!(crate::backend_gpu_visibility(b), crate::GpuVisibility::CpuOnly)
+    ) || matches!(
+        crate::backend_gpu_visibility(b),
+        crate::GpuVisibility::CpuOnly
+    )
 }
 
 /// A backend's GPU placement as the interlock judges it (§6.1).
@@ -1094,7 +1094,10 @@ fn newest_log_record(
     sup: &manager_supervisor::Supervisor,
     temp_id: &str,
 ) -> Option<manager_supervisor::LogRecord> {
-    sup.logs_query(temp_id, None, None, 1).records.into_iter().next()
+    sup.logs_query(temp_id, None, None, 1)
+        .records
+        .into_iter()
+        .next()
 }
 
 /// Parse one request window's lines into a run row.
@@ -1157,7 +1160,13 @@ struct SweepCtx {
     draft_device_arg: Option<String>,
 }
 
-async fn set_progress(state: &AppState, arm_index: usize, arm_count: usize, phase: &str, run: usize) {
+async fn set_progress(
+    state: &AppState,
+    arm_index: usize,
+    arm_count: usize,
+    phase: &str,
+    run: usize,
+) {
     if let Ok(mut slot) = state.bench_job.try_lock() {
         if let Some(job) = slot.as_mut() {
             job.progress.arm_index = arm_index;
@@ -1340,7 +1349,14 @@ async fn run_arm(
         .chain((0..mb::MEASURED_RUNS).map(|_| (false, mb::MEASURED_MAX_TOKENS, "measuring")))
         .collect();
     for (step, (warmup, cap, phase)) in phases.iter().enumerate() {
-        set_progress(state, arm_index, arm_count, phase, if *warmup { 0 } else { step }).await;
+        set_progress(
+            state,
+            arm_index,
+            arm_count,
+            phase,
+            if *warmup { 0 } else { step },
+        )
+        .await;
         let before = {
             let sup = state.supervisor().await.lock().await;
             newest_log_record(&sup, &temp_id)
@@ -1487,8 +1503,7 @@ async fn execute_sweep(
                 match data {
                     None => {
                         arm_rec.status = mb::ArmStatus::Cancelled;
-                        arm_rec.detail =
-                            Some("sweep cancelled by the operator".to_string());
+                        arm_rec.detail = Some("sweep cancelled by the operator".to_string());
                         record.partial = true;
                     }
                     Some(data) => {
@@ -1658,9 +1673,7 @@ pub async fn op_bench_run_start(
     let (draft_path, draft_vocab) = match &draft_model_id {
         Some(id) => {
             let entry = cfg.models.iter().find(|m| &m.id == id).ok_or_else(|| {
-                ApiError::InvalidInput(format!(
-                    "draft model '{id}' is not a registered model"
-                ))
+                ApiError::InvalidInput(format!("draft model '{id}' is not a registered model"))
             })?;
             let abs = crate::resolve_under_data_dir(&cfg.data_dir, &entry.gguf_path);
             let (_, vocab) = gguf_header_facts(&abs);
@@ -1817,9 +1830,7 @@ pub async fn op_bench_run_start(
     let model_identity = mb::ModelIdentity {
         path: model_abs.to_string_lossy().into_owned(),
         size_bytes: std::fs::metadata(&model_abs).map(|m| m.len()).unwrap_or(0),
-        sha256: model_entry
-            .as_ref()
-            .and_then(|m| m.verified_sha256.clone()),
+        sha256: model_entry.as_ref().and_then(|m| m.verified_sha256.clone()),
     };
     let mut record = mb::SweepRecord {
         id: sweep_id.clone(),
@@ -1987,16 +1998,10 @@ pub async fn op_bench_run_start(
                 json!({ "sweep_id": sweep_id, "cancelled": true }),
             )
             .await;
-        return Err(ApiError::InvalidInput(
-            "bench sweep cancelled".to_string(),
-        ));
+        return Err(ApiError::InvalidInput("bench sweep cancelled".to_string()));
     }
     state
-        .finish_task(
-            &task_id,
-            TaskStatus::Done,
-            json!({ "sweep_id": sweep_id }),
-        )
+        .finish_task(&task_id, TaskStatus::Done, json!({ "sweep_id": sweep_id }))
         .await;
     let results = load_results(state);
     Ok(results_payload(state, &results))
@@ -2154,11 +2159,7 @@ mod tests {
         // Undetermined and the interlock flagged it against every
         // sweep.
         let target = placed_backend("planner", vec![1.0], Some("--parallel 1"));
-        let coder = placed_backend(
-            "coder",
-            Vec::new(),
-            Some("--tensor-split 0,1 -ot exps=CPU"),
-        );
+        let coder = placed_backend("coder", Vec::new(), Some("--tensor-split 0,1 -ot exps=CPU"));
         let cfg = cfg_with(vec![target.clone(), coder]);
         let conflicts = interlock_conflicts(&cfg, &running(&["coder"]), &target);
         assert!(conflicts.is_empty(), "conflicts: {conflicts:?}");
@@ -2182,16 +2183,11 @@ mod tests {
         // running CPU-offload backend shares the CPU expert
         // resource and conflicts (§3.4/§6.2) — while a running
         // dense backend on the other GPU does not.
-        let target = placed_backend(
-            "coder-target",
-            vec![1.0, 0.0],
-            Some("-ot exps=CPU"),
-        );
+        let target = placed_backend("coder-target", vec![1.0, 0.0], Some("-ot exps=CPU"));
         let moe = placed_backend("planner-moe", vec![0.0, 1.0], Some("--n-cpu-moe 24"));
         let dense = placed_backend("planner", vec![0.0, 1.0], Some("--parallel 1"));
         let cfg = cfg_with(vec![target.clone(), moe, dense]);
-        let conflicts =
-            interlock_conflicts(&cfg, &running(&["planner-moe", "planner"]), &target);
+        let conflicts = interlock_conflicts(&cfg, &running(&["planner-moe", "planner"]), &target);
         assert_eq!(conflicts, vec!["planner-moe".to_string()]);
     }
 

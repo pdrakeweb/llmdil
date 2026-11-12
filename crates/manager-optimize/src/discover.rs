@@ -126,18 +126,8 @@ pub const EARLY_EXIT_MIN_REPOS: usize = 10;
 /// record whose `gguf.architecture` starts with none of the
 /// named tokens is dropped.
 pub const FAMILY_TOKENS: &[&str] = &[
-    "qwen",
-    "llama",
-    "mistral",
-    "mixtral",
-    "gemma",
-    "phi",
-    "deepseek",
-    "nemotron",
-    "falcon",
-    "yi",
-    "glm",
-    "internlm",
+    "qwen", "llama", "mistral", "mixtral", "gemma", "phi", "deepseek", "nemotron", "falcon", "yi",
+    "glm", "internlm",
 ];
 
 /// Repo cap for the Add Model form's shallow lookup
@@ -545,11 +535,7 @@ pub fn quant_files(siblings: &[HfSibling]) -> Vec<QuantFile> {
         // The hash survives only while the group is a single
         // file; the moment a second sibling joins, the entry
         // names a series and no one hash describes it.
-        entry.2 = if entry.1 == 1 {
-            s.sha256.clone()
-        } else {
-            None
-        };
+        entry.2 = if entry.1 == 1 { s.sha256.clone() } else { None };
     }
     groups
         .into_iter()
@@ -600,7 +586,14 @@ pub fn fit_verdict(
     // No offload is proposed for a candidate, and with no KV or
     // recurrent-state geometry the requirement is weights-only
     // at any context and any slot count.
-    let req = layout_requirement(&facts, ExpertOffload::None, manager_models::CacheSelection::default(), 0, 1, 0);
+    let req = layout_requirement(
+        &facts,
+        ExpertOffload::None,
+        manager_models::CacheSelection::default(),
+        0,
+        1,
+        0,
+    );
     let zeros = vec![0u64; free_vram_mib_per_gpu.len()];
     let outcome = evaluate_fit(&req, &[], free_vram_mib_per_gpu, &zeros, &zeros);
     if !outcome.placeable {
@@ -1483,10 +1476,7 @@ impl HfClient {
     }
 
     async fn get_text(&self, url: &str) -> Result<String, DiscoverError> {
-        Ok(self
-            .get_checked(url, Duration::from_secs(30))
-            .await?
-            .1)
+        Ok(self.get_checked(url, Duration::from_secs(30)).await?.1)
     }
 
     /// GET with a per-request timeout, returning the
@@ -1549,15 +1539,11 @@ impl HfClient {
     /// the previous page's `Link` cursor), with the deep
     /// per-request timeout.
     async fn search_page(&self, url: &str) -> Result<SearchPage, DiscoverError> {
-        let (headers, body) = self
-            .get_checked(url, DISCOVERY_REQUEST_TIMEOUT)
-            .await?;
+        let (headers, body) = self.get_checked(url, DISCOVERY_REQUEST_TIMEOUT).await?;
         let link = headers
             .get(reqwest::header::LINK)
             .and_then(|v| v.to_str().ok());
-        let rate_limit = headers
-            .get("ratelimit")
-            .and_then(|v| v.to_str().ok());
+        let rate_limit = headers.get("ratelimit").and_then(|v| v.to_str().ok());
         Ok(SearchPage {
             hits: parse_search_results_capped(&body, SEARCH_PAGE_LIMIT)?,
             next_url: parse_link_next(link),
@@ -1594,7 +1580,10 @@ impl HfClient {
         &self,
         repos: &[PoolRepo],
         deadline: tokio::time::Instant,
-    ) -> (Vec<(String, Result<HfModelFacts, DiscoverError>, Option<u64>)>, bool) {
+    ) -> (
+        Vec<(String, Result<HfModelFacts, DiscoverError>, Option<u64>)>,
+        bool,
+    ) {
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(DISCOVERY_CONCURRENCY));
         let mut set = tokio::task::JoinSet::new();
         for repo in repos {
@@ -1723,7 +1712,10 @@ impl HfClient {
                         continue;
                     }
                     if let Some(repo) = pool.iter().find(|p| p.repo_id == hit.id) {
-                        if !page_repos.iter().any(|p: &PoolRepo| p.repo_id == repo.repo_id) {
+                        if !page_repos
+                            .iter()
+                            .any(|p: &PoolRepo| p.repo_id == repo.repo_id)
+                        {
                             page_repos.push(repo.clone());
                         }
                     }
@@ -1741,11 +1733,9 @@ impl HfClient {
                 // The depth cap trims the batch; repos past
                 // it are simply never fetched.
                 let remaining = MAX_RECORD_FETCHES.saturating_sub(attempts);
-                let batch: Vec<PoolRepo> =
-                    survivors.into_iter().take(remaining).collect();
+                let batch: Vec<PoolRepo> = survivors.into_iter().take(remaining).collect();
                 if !batch.is_empty() {
-                    let (results, deadline_hit) =
-                        self.fetch_records_batch(&batch, deadline).await;
+                    let (results, deadline_hit) = self.fetch_records_batch(&batch, deadline).await;
                     attempts += results.len();
                     let mut rate_limited = false;
                     // Process in batch (pool) order, not
@@ -2332,10 +2322,20 @@ mod tests {
         // The cap is exactly 1 joined + 4 singles + 1 family.
         assert_eq!(
             query_variants_for_directive("qwen llama gemma phi for the coder"),
-            vec!["qwen llama gemma phi", "qwen", "llama", "gemma", "phi", "coder"]
+            vec![
+                "qwen llama gemma phi",
+                "qwen",
+                "llama",
+                "gemma",
+                "phi",
+                "coder"
+            ]
         );
         // No salient terms and no seat: one unseeded variant.
-        assert_eq!(query_variants_for_directive("make it better please"), vec![""]);
+        assert_eq!(
+            query_variants_for_directive("make it better please"),
+            vec![""]
+        );
         // search_terms excludes the family term by contract.
         assert_eq!(
             search_terms_for_directive("qwen3 for the coder"),
@@ -2501,9 +2501,27 @@ mod tests {
         }
         candidates.push(cand("bartowski/big", "big-Q4.gguf", 4_000, FIT_FITS, 7_777));
         candidates.push(cand("bartowski/big", "big-Q8.gguf", 9_000, FIT_FITS, 7_777));
-        candidates.push(cand("bartowski/big", "big-S1.gguf", 8_000, FIT_FITS_WITH_SPLIT, 7_777));
-        candidates.push(cand("bartowski/big", "big-S2.gguf", 12_000, FIT_FITS_WITH_SPLIT, 7_777));
-        candidates.push(cand("bartowski/big", "big-tiny.gguf", 50, FIT_UNCHECKED, 7_777));
+        candidates.push(cand(
+            "bartowski/big",
+            "big-S1.gguf",
+            8_000,
+            FIT_FITS_WITH_SPLIT,
+            7_777,
+        ));
+        candidates.push(cand(
+            "bartowski/big",
+            "big-S2.gguf",
+            12_000,
+            FIT_FITS_WITH_SPLIT,
+            7_777,
+        ));
+        candidates.push(cand(
+            "bartowski/big",
+            "big-tiny.gguf",
+            50,
+            FIT_UNCHECKED,
+            7_777,
+        ));
         assert_eq!(candidates.len(), 29);
         let (collapsed, removed) = collapse_candidates(&candidates);
         assert_eq!(collapsed.len(), 3);
@@ -2543,7 +2561,13 @@ mod tests {
         // downloads, then recency.
         assert_eq!(
             order,
-            vec!["org/rich", "org/new", "org/old", "org/split", "org/unchecked"]
+            vec![
+                "org/rich",
+                "org/new",
+                "org/old",
+                "org/split",
+                "org/unchecked"
+            ]
         );
         // The shortlist cap binds.
         let many: Vec<CandidateFact> = (0..40)
@@ -2616,7 +2640,10 @@ mod tests {
             parse_rate_limit_remaining(Some("\"api\";r=499;t=299")),
             Some(499)
         );
-        assert_eq!(parse_rate_limit_remaining(Some("\"api\";r=0;t=12")), Some(0));
+        assert_eq!(
+            parse_rate_limit_remaining(Some("\"api\";r=0;t=12")),
+            Some(0)
+        );
         assert_eq!(parse_rate_limit_remaining(Some("garbage")), None);
         assert_eq!(parse_rate_limit_remaining(None), None);
     }
@@ -2659,7 +2686,11 @@ mod tests {
         b.extend_from_slice(&(tensors as u64).to_le_bytes());
         b.extend_from_slice(&4u64.to_le_bytes());
         w_kv_str(&mut b, "general.architecture", "testarch");
-        w_kv_u32(&mut b, "testarch.block_count", moe_blocks + u32::from(nextn));
+        w_kv_u32(
+            &mut b,
+            "testarch.block_count",
+            moe_blocks + u32::from(nextn),
+        );
         w_kv_u32(&mut b, "testarch.nextn_predict_layers", u32::from(nextn));
         // The template value pads the header: its length
         // prefix plus content is what the parser must walk.
@@ -2667,10 +2698,20 @@ mod tests {
         let pad = pad_to.saturating_sub(fixed + tensors as usize * 64);
         w_kv_str(&mut b, "general.chat_template", &"x".repeat(pad));
         for blk in 0..moe_blocks {
-            w_tensor(&mut b, &format!("blk.{blk}.ffn_gate_exps.weight"), &[256], 12);
+            w_tensor(
+                &mut b,
+                &format!("blk.{blk}.ffn_gate_exps.weight"),
+                &[256],
+                12,
+            );
         }
         if nextn {
-            w_tensor(&mut b, &format!("blk.{moe_blocks}.nextn.eh_proj.weight"), &[16], 1);
+            w_tensor(
+                &mut b,
+                &format!("blk.{moe_blocks}.nextn.eh_proj.weight"),
+                &[16],
+                1,
+            );
         }
         b
     }
@@ -2858,12 +2899,7 @@ mod tests {
 
     // -- deep pass against a local mock server (Part 1, §P1.14) ---------------
 
-    fn deep_record(
-        id: &str,
-        downloads: u64,
-        last_modified: &str,
-        files: &[(&str, u64)],
-    ) -> String {
+    fn deep_record(id: &str, downloads: u64, last_modified: &str, files: &[(&str, u64)]) -> String {
         serde_json::json!({
             "id": id,
             "downloads": downloads,
@@ -2917,53 +2953,54 @@ mod tests {
                         })
                     };
                     let mib = MIB64;
-                    let (status, extra_headers, body): (&str, String, String) =
-                        if path.contains("blobs=true") {
-                            let id = path
-                                .trim_start_matches("/api/models/")
-                                .split('?')
-                                .next()
-                                .unwrap_or("")
-                                .to_string();
-                            let record = match id.as_str() {
-                                "org/a1" => Some(deep_record(
-                                    "org/a1",
-                                    60_000,
-                                    "2026-10-01T00:00:00.000Z",
-                                    &[
-                                        ("a1-Q4.gguf", 4_000 * mib),
-                                        ("a1-Q8.gguf", 20_000 * mib),
-                                        ("a1-IQ.gguf", 1_000 * mib),
-                                    ],
-                                )),
-                                "org/oldbig" => Some(deep_record(
-                                    "org/oldbig",
-                                    20_000,
-                                    "2020-01-01T00:00:00.000Z",
-                                    &[("old-Q4.gguf", 2_000 * mib)],
-                                )),
-                                "org/a2" => Some(deep_record(
-                                    "org/a2",
-                                    30_000,
-                                    "2026-08-01T00:00:00.000Z",
-                                    &[("a2-Q4.gguf", 5_000 * mib)],
-                                )),
-                                "org/a3" => Some(deep_record(
-                                    "org/a3",
-                                    15_000,
-                                    "2026-07-01T00:00:00.000Z",
-                                    &[("a3-Q8.gguf", 6_000 * mib), ("a3-Q4.gguf", 500 * mib)],
-                                )),
-                                _ => None,
-                            };
-                            match record {
-                                Some(body) => ("200 OK", String::new(), body),
-                                None => ("404 Not Found", String::new(), String::new()),
-                            }
-                        } else if path.starts_with("/api/models") {
-                            let search = param("search").unwrap_or_default();
-                            let cursor = param("cursor");
-                            match (search.as_str(), cursor.as_deref()) {
+                    let (status, extra_headers, body): (&str, String, String) = if path
+                        .contains("blobs=true")
+                    {
+                        let id = path
+                            .trim_start_matches("/api/models/")
+                            .split('?')
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        let record = match id.as_str() {
+                            "org/a1" => Some(deep_record(
+                                "org/a1",
+                                60_000,
+                                "2026-10-01T00:00:00.000Z",
+                                &[
+                                    ("a1-Q4.gguf", 4_000 * mib),
+                                    ("a1-Q8.gguf", 20_000 * mib),
+                                    ("a1-IQ.gguf", 1_000 * mib),
+                                ],
+                            )),
+                            "org/oldbig" => Some(deep_record(
+                                "org/oldbig",
+                                20_000,
+                                "2020-01-01T00:00:00.000Z",
+                                &[("old-Q4.gguf", 2_000 * mib)],
+                            )),
+                            "org/a2" => Some(deep_record(
+                                "org/a2",
+                                30_000,
+                                "2026-08-01T00:00:00.000Z",
+                                &[("a2-Q4.gguf", 5_000 * mib)],
+                            )),
+                            "org/a3" => Some(deep_record(
+                                "org/a3",
+                                15_000,
+                                "2026-07-01T00:00:00.000Z",
+                                &[("a3-Q8.gguf", 6_000 * mib), ("a3-Q4.gguf", 500 * mib)],
+                            )),
+                            _ => None,
+                        };
+                        match record {
+                            Some(body) => ("200 OK", String::new(), body),
+                            None => ("404 Not Found", String::new(), String::new()),
+                        }
+                    } else if path.starts_with("/api/models") {
+                        let search = param("search").unwrap_or_default();
+                        let cursor = param("cursor");
+                        match (search.as_str(), cursor.as_deref()) {
                                 ("alpha beta", None) => {
                                     let next = format!(
                                         "{base_for_link}/api/models?search=alpha+beta&filter=gguf&sort=downloads&direction=-1&limit=100&full=true&cursor=p2"
@@ -3002,9 +3039,9 @@ mod tests {
                                 }
                                 _ => ("200 OK", String::new(), "[]".to_string()),
                             }
-                        } else {
-                            ("404 Not Found", String::new(), String::new())
-                        };
+                    } else {
+                        ("404 Not Found", String::new(), String::new())
+                    };
                     let resp = format!(
                         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -3093,10 +3130,7 @@ mod tests {
             .await
             .unwrap();
         assert!(out.funnel.partial);
-        assert_eq!(
-            out.funnel.partial_reason.as_deref(),
-            Some("rate_limited")
-        );
+        assert_eq!(out.funnel.partial_reason.as_deref(), Some("rate_limited"));
         assert_eq!(out.funnel.queries_run, 1);
         assert!(out.candidates.is_empty());
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);

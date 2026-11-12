@@ -32,8 +32,8 @@ use manager_config::{
 use manager_models::{self, DownloadHandle};
 use manager_mxc::{self, Policy};
 use manager_supervisor::{
-    test_request, test_tool_call, BackoffPolicy, HealthProbe, HttpHealthProbe, LogLevelFilter, LogRecord,
-    LogStream, ProcessSpec, ProcessState, Supervisor,
+    test_request, test_tool_call, BackoffPolicy, HealthProbe, HttpHealthProbe, LogLevelFilter,
+    LogRecord, LogStream, ProcessSpec, ProcessState, Supervisor,
 };
 use manager_telemetry::{
     DriverModel, GpuInfo, GpuSample, NvidiaSmiSource, PollCadence, Poller, TelemetryStore,
@@ -51,10 +51,10 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 pub mod activation;
 pub mod activation_history;
 pub mod app_update;
+pub mod bench;
 pub mod gateway_stats;
 pub mod gpu_history;
 pub mod hf_forms;
-pub mod bench;
 pub mod log_receiver;
 pub mod logship;
 pub mod notify;
@@ -63,6 +63,21 @@ pub mod optimize_eval;
 pub mod optimize_experiments;
 pub mod optimize_tuning;
 
+pub use app_update::{
+    op_app_update_check, op_app_update_download, op_app_update_restart, op_app_update_set_auto,
+    op_app_update_set_checking, op_app_update_status,
+};
+pub use bench::{
+    op_bench_prompt_delete, op_bench_prompt_generate, op_bench_prompt_generate_cancel,
+    op_bench_prompt_save, op_bench_prompts_list, op_bench_result_delete, op_bench_results_list,
+    op_bench_run_cancel, op_bench_run_start,
+};
+pub use gpu_history::op_get_gpu_history;
+pub use hf_forms::{op_model_hf_header, op_model_hf_lookup};
+pub use log_receiver::{
+    op_log_receiver_deploy, op_log_receiver_flip_endpoint, op_log_receiver_remove,
+    op_log_receiver_status,
+};
 pub use optimize::{
     op_measurement_delete, op_measurement_lookup, op_optimize_cancel_consult,
     op_optimize_cancel_job, op_optimize_consult, op_optimize_discard_plan, op_optimize_discover,
@@ -70,26 +85,13 @@ pub use optimize::{
     op_optimize_save_purpose, op_optimize_set_item_outcome, op_optimize_set_item_state,
     op_optimize_validate_plan,
 };
-pub use gpu_history::op_get_gpu_history;
-pub use hf_forms::{op_model_hf_header, op_model_hf_lookup};
-pub use app_update::{
-    op_app_update_check, op_app_update_download, op_app_update_restart, op_app_update_set_auto,
-    op_app_update_set_checking, op_app_update_status,
-};
 pub use optimize_eval::op_optimize_run_baseline;
 pub use optimize_experiments::{
     op_optimize_estimate_experiments, op_optimize_run_experiments, op_optimize_set_experiment_state,
 };
-pub use log_receiver::{
-    op_log_receiver_deploy, op_log_receiver_flip_endpoint, op_log_receiver_remove,
-    op_log_receiver_status,
+pub use optimize_tuning::{
+    op_optimize_tuning_adopt, op_optimize_tuning_preview, op_optimize_tuning_run,
 };
-pub use bench::{
-    op_bench_prompt_delete, op_bench_prompt_generate, op_bench_prompt_generate_cancel,
-    op_bench_prompt_save, op_bench_prompts_list, op_bench_result_delete, op_bench_results_list,
-    op_bench_run_cancel, op_bench_run_start,
-};
-pub use optimize_tuning::{op_optimize_tuning_adopt, op_optimize_tuning_preview, op_optimize_tuning_run};
 pub mod registry;
 
 // ---------------------------------------------------------------------------
@@ -627,9 +629,7 @@ struct PersistedWizard {
 /// comparing a pre/post pair pass both configurations, so a
 /// server removed by the change still resolves its arming state
 /// for the pre-change side.
-async fn mcp_credential_presence(
-    cfgs: &[&AppConfig],
-) -> std::collections::HashSet<String> {
+async fn mcp_credential_presence(cfgs: &[&AppConfig]) -> std::collections::HashSet<String> {
     let ops = RealSystemOps::default();
     let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut targets: Vec<&str> = Vec::new();
@@ -1018,9 +1018,7 @@ impl AppState {
         // unreadable). Presence results are gathered async here and
         // handed to the sync helpers as a lookup set.
         let mcp_present = mcp_credential_presence(&[cfg]).await;
-        let mcp_armed = manager_wizard::armed_gateway_mcp_servers(cfg, |t| {
-            mcp_present.contains(t)
-        });
+        let mcp_armed = manager_wizard::armed_gateway_mcp_servers(cfg, |t| mcp_present.contains(t));
         let fingerprint = manager_wizard::gateway_spawn_fingerprint(
             cfg,
             postgres,
@@ -1173,7 +1171,6 @@ impl AppState {
     async fn mcp_registry(&self) -> Vec<manager_config::McpServerConfig> {
         self.config.read().await.mcp.servers.clone()
     }
-
 
     /// Seed the install wizard's checklist from the machine's actual
     /// state: run the audit wizard's checks once and adopt the passing
@@ -1672,8 +1669,7 @@ pub async fn op_update_config(
     manager_config::reset_stale_tool_call_probes(&cfg, &mut new_cfg);
     // `save` validates before writing, so a failed save never clobbers
     // the last-known-good file.
-    manager_config::save(&new_cfg, &state.config_path)
-        .map_err(ApiError::from)?;
+    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
     *cfg = new_cfg;
     drop(cfg);
     // Saved log-streaming settings apply now, not at the next start
@@ -1681,7 +1677,6 @@ pub async fn op_update_config(
     logship::apply_log_streaming(state).await;
     Ok(json!({ "ok": true, "persisted": true }))
 }
-
 
 // ---------------------------------------------------------------------------
 // Backends
@@ -2106,7 +2101,6 @@ fn backend_spec(
     }
 }
 
-
 /// (Re)register supervisor specs from the current config so start/stop/
 /// restart/status always act on what is configured now. Registration only
 /// touches the spec table, never live processes: re-registering a running
@@ -2408,8 +2402,7 @@ struct VramGateFailure {
 fn failures_are_wddm_overcommit(failures: &[VramGateFailure]) -> bool {
     !failures.is_empty()
         && failures.iter().all(|f| {
-            f.class == VramGateClass::ExceedsTotal
-                && f.driver_model == Some(DriverModel::Wddm)
+            f.class == VramGateClass::ExceedsTotal && f.driver_model == Some(DriverModel::Wddm)
         })
 }
 
@@ -2587,10 +2580,7 @@ async fn vram_start_gate(
         .collect();
     let statuses: Vec<(String, ProcessState)> = {
         let sup = state.supervisor().await.lock().await;
-        sup.status()
-            .into_iter()
-            .map(|s| (s.id, s.state))
-            .collect()
+        sup.status().into_iter().map(|s| (s.id, s.state)).collect()
     };
     let running: std::collections::HashSet<&str> = statuses
         .iter()
@@ -2680,8 +2670,7 @@ async fn vram_start_gate(
                 if consumers.len() == 1 {
                     part += &format!("; backend '{}' is running on this GPU", consumers[0]);
                 } else if !consumers.is_empty() {
-                    let named: Vec<String> =
-                        consumers.iter().map(|c| format!("'{c}'")).collect();
+                    let named: Vec<String> = consumers.iter().map(|c| format!("'{c}'")).collect();
                     part += &format!("; backends {} are running on this GPU", named.join(", "));
                 }
                 parts.push(part);
@@ -2704,7 +2693,6 @@ async fn vram_start_gate(
     )))
 }
 
-
 /// All backends with their launch ports, models, and live supervisor
 /// runtime state (process state, pid, restarts, uptime). Configured
 /// backends carry `configured: true`; the list also appends
@@ -2712,10 +2700,7 @@ async fn vram_start_gate(
 /// backend processes still live under ids that left the config, so they
 /// stay visible and stoppable instead of silently holding their port.
 /// MCP server processes share the Supervisor but are never listed here.
-pub async fn op_list_backends(
-    state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
-) -> ApiResult {
+pub async fn op_list_backends(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
     adopt_orphan_backends(state).await;
     // Clone and drop the config guard here: the offload guardrail
     // block below needs the telemetry inventory and the activation
@@ -2829,14 +2814,11 @@ pub async fn op_list_backends(
                 let Some(req) = backend_memory_requirement(&cfg, b) else {
                     continue;
                 };
-                let per_gpu =
-                    manager_optimize::residency_per_gpu(&req, &b.flags.tensor_split, n);
+                let per_gpu = manager_optimize::residency_per_gpu(&req, &b.flags.tensor_split, n);
                 let mut states: Vec<manager_models::FitState> = Vec::new();
                 let mut per: Vec<Value> = Vec::new();
                 for &index in &placed {
-                    let Some(pos) =
-                        inventory.iter().position(|g| g.index == index)
-                    else {
+                    let Some(pos) = inventory.iter().position(|g| g.index == index) else {
                         continue;
                     };
                     let gpu = &inventory[pos];
@@ -3061,7 +3043,10 @@ pub async fn op_list_backends(
                 GpuVisibility::CpuOnly => Some("CPU".to_string()),
                 GpuVisibility::Gpus(idxs) => Some(format!(
                     "GPU {}",
-                    idxs.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("+")
+                    idxs.iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join("+")
                 )),
                 GpuVisibility::Undetermined => None,
             };
@@ -3248,7 +3233,6 @@ pub async fn op_list_backends(
     Ok(json!({ "backends": backends }))
 }
 
-
 /// Start a backend (supervisor spawn, or SCM start in service mode
 /// when the backend is registered as a service). Returns a task id.
 /// `allow_wddm_overcommit` is the operator's two-click confirmation
@@ -3309,7 +3293,6 @@ pub async fn op_start_backend(
     }
 }
 
-
 /// Stop a backend, gracefully (drain) or immediately.
 pub async fn op_stop_backend(
     state: &Arc<AppState>,
@@ -3365,7 +3348,6 @@ pub async fn op_stop_backend(
         }
     }
 }
-
 
 /// Restart a backend (stop + start under the supervisor).
 pub async fn op_restart_backend(
@@ -3452,7 +3434,6 @@ pub async fn op_restart_backend(
     }
 }
 
-
 /// One raw prompt against a backend; raw JSON result, no history (spec §1.3).
 /// Minimal inference test request against a backend's
 /// `/v1/chat/completions` (spec §14 `backend_test_request`).
@@ -3493,10 +3474,7 @@ pub async fn op_test_backend(
 /// poll error's message while polls are failing and `null` when the last
 /// poll succeeded — a failing source must not look like a GPU-less
 /// machine returning an empty snapshot.
-pub async fn op_get_gpu_telemetry(
-    state: &Arc<AppState>,
-    sink: &Arc<dyn EventSink>,
-) -> ApiResult {
+pub async fn op_get_gpu_telemetry(state: &Arc<AppState>, sink: &Arc<dyn EventSink>) -> ApiResult {
     // Adoption first: the pid -> backend map below is how telemetry
     // processes get attributed, and an unadopted orphan attributes
     // to nothing.
@@ -3553,12 +3531,12 @@ pub async fn op_get_gpu_telemetry(
                 v["temp_peak_c"] = json!(peak);
                 let history = guard.history(s.index);
                 if history.len() >= 2 {
-                    v["util_spark"] =
-                        json!(history.iter().map(|h| h.utilization_pct).collect::<Vec<_>>());
-                    v["temp_spark"] =
-                        json!(history.iter().map(|h| h.temp_c).collect::<Vec<_>>());
-                    let power: Vec<f32> =
-                        history.iter().filter_map(|h| h.power_w).collect();
+                    v["util_spark"] = json!(history
+                        .iter()
+                        .map(|h| h.utilization_pct)
+                        .collect::<Vec<_>>());
+                    v["temp_spark"] = json!(history.iter().map(|h| h.temp_c).collect::<Vec<_>>());
+                    let power: Vec<f32> = history.iter().filter_map(|h| h.power_w).collect();
                     if power.len() >= 2 {
                         v["power_spark"] = json!(power);
                     }
@@ -3582,7 +3560,6 @@ pub async fn op_get_gpu_telemetry(
         "source_error": source_error,
     }))
 }
-
 
 // ---------------------------------------------------------------------------
 // Wizard / audit
@@ -3768,7 +3745,6 @@ pub async fn op_run_wizard_step(
     }
     Ok(json!({ "task_id": task_id, "outcome": outcome }))
 }
-
 
 /// Re-run audit: re-executes check-type steps without reinstalling (spec §4.1).
 pub async fn op_run_audit(state: &Arc<AppState>, sink: &Arc<dyn EventSink>) -> ApiResult {
@@ -4321,7 +4297,6 @@ pub async fn op_download_model(
     Ok(json!({ "model_id": id, "dest": dest }))
 }
 
-
 /// Cancel an in-flight download (partial file removed by the worker).
 pub async fn op_cancel_download(
     state: &Arc<AppState>,
@@ -4606,12 +4581,12 @@ pub async fn op_get_logs(
     // Unfiltered fetch: filtering, merging with the file-backed
     // gateway records, ordering, and pagination happen here so every
     // source is treated identically.
-    let mut records: Vec<LogRecord> = if scope == "gateway" || scope == "wizard" || scope == "optimize"
-    {
-        Vec::new()
-    } else {
-        sup.logs_query(&scope, None, None, usize::MAX).records
-    };
+    let mut records: Vec<LogRecord> =
+        if scope == "gateway" || scope == "wizard" || scope == "optimize" {
+            Vec::new()
+        } else {
+            sup.logs_query(&scope, None, None, usize::MAX).records
+        };
     let mut scopes: Vec<Value> = sup
         .log_scopes()
         .into_iter()
@@ -5033,7 +5008,6 @@ pub async fn op_setup_skip_step(
     Ok(json!({ "ok": true, "step_id": step_id }))
 }
 
-
 /// Exact commands a step will run ("Show commands" UI). Must equal the argv
 /// actually spawned by the step.
 pub async fn op_setup_get_commands(
@@ -5083,10 +5057,7 @@ fn wizard_steps_payload(guard: &Wizard) -> Value {
 /// run), the last known snapshot is served with `busy: true` instead
 /// of blocking — blocking left the checklist blank for the duration
 /// of long steps.
-pub async fn op_setup_get_steps(
-    state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
-) -> ApiResult {
+pub async fn op_setup_get_steps(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
     let wizard = state.wizard(RunMode::Install).await;
     match wizard.try_lock() {
         Ok(guard) => {
@@ -5114,7 +5085,6 @@ pub async fn op_setup_get_steps(
         }
     }
 }
-
 
 /// Whether the user has finished the setup wizard. The UI opens the wizard
 /// on launch until this is true.
@@ -5264,7 +5234,6 @@ pub async fn op_setup_mark_manual(
     Ok(json!({ "ok": true, "step_id": step_id }))
 }
 
-
 // ---------------------------------------------------------------------------
 // Backends: additional §14 commands
 // ---------------------------------------------------------------------------
@@ -5346,8 +5315,8 @@ pub async fn op_backend_apply_config(
                 ensure_backend_not_advanced(b)?;
             }
         }
-        let diff = manager_config::apply_config_diff(&mut new_cfg, &id, &patch)
-            .map_err(ApiError::from)?;
+        let diff =
+            manager_config::apply_config_diff(&mut new_cfg, &id, &patch).map_err(ApiError::from)?;
         record_gateway_change(
             state,
             &pre_cfg,
@@ -5356,8 +5325,7 @@ pub async fn op_backend_apply_config(
             format!("Backend `{id}` settings changed"),
             false,
         )
-        .await
-        ?;
+        .await?;
         // The same save is also a backend activation: whatever the
         // gateway does with it, the backend process itself only
         // picks its settings up at its next (re)start.
@@ -5370,11 +5338,9 @@ pub async fn op_backend_apply_config(
                 format!("Backend `{id}` settings changed"),
                 &id,
             )
-            .await
-            ?;
+            .await?;
         }
-        manager_config::save(&new_cfg, &state.config_path)
-            .map_err(ApiError::from)?;
+        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
         *cfg = new_cfg;
         diff
     };
@@ -5396,8 +5362,6 @@ pub async fn op_backend_apply_config(
         "persisted": true,
     }))
 }
-
-
 
 /// The tensor split a newly created backend for `model_id` is
 /// assigned from live telemetry: existing enabled backends are
@@ -5707,9 +5671,7 @@ pub async fn op_backend_add(
         ));
     }
     if port == 0 {
-        return Err(ApiError::InvalidInput(
-            "port must be non-zero".to_string(),
-        ));
+        return Err(ApiError::InvalidInput("port must be non-zero".to_string()));
     }
     // Context/batch: the add form's values when chosen, the seeded
     // defaults otherwise; validated by the same rules
@@ -5875,8 +5837,7 @@ pub async fn op_backend_add(
             m.assigned_backends.push(id.clone());
         }
     }
-    manager_config::validate(&new_cfg)
-        .map_err(ApiError::from)?;
+    manager_config::validate(&new_cfg).map_err(ApiError::from)?;
     record_gateway_change(
         state,
         &pre_cfg,
@@ -5885,10 +5846,8 @@ pub async fn op_backend_add(
         format!("Backend `{id}` added to group `{group}`"),
         false,
     )
-    .await
-    ?;
-    manager_config::save(&new_cfg, &state.config_path)
-        .map_err(ApiError::from)?;
+    .await?;
+    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
     *cfg = new_cfg;
     drop(cfg);
     if let Some((layers, placed_ccs)) = offload_override_to_record {
@@ -5898,7 +5857,6 @@ pub async fn op_backend_add(
     state.sync_backend_service_definition(&id).await;
     Ok(json!({ "backend_id": id, "group": group, "persisted": true }))
 }
-
 
 /// Preview what creating a backend for `model_id` would carry
 /// (tracker #49): the expert-offload slider state for the model —
@@ -5987,9 +5945,7 @@ pub async fn op_backend_add_preview(
             n_ctx.unwrap_or(backend.flags.n_ctx),
             parallel
                 .map(|p| p.max(1))
-                .unwrap_or_else(|| {
-                    manager_models::effective_slots(backend.raw_flags.as_deref())
-                }),
+                .unwrap_or_else(|| manager_models::effective_slots(backend.raw_flags.as_deref())),
             manager_models::moe_cache_mib(backend.raw_flags.as_deref()).unwrap_or(0),
             targets.as_ref(),
         )
@@ -6031,8 +5987,7 @@ pub async fn op_backend_update_flags(
     let changed = b.flags.n_ctx != n_ctx || b.flags.n_batch != n_batch;
     b.flags.n_ctx = n_ctx;
     b.flags.n_batch = n_batch;
-    manager_config::validate(&new_cfg)
-        .map_err(ApiError::from)?;
+    manager_config::validate(&new_cfg).map_err(ApiError::from)?;
     if changed {
         record_backend_change(
             state,
@@ -6042,18 +5997,15 @@ pub async fn op_backend_update_flags(
             format!("Backend `{id}` context/batch changed"),
             &id,
         )
-        .await
-        ?;
+        .await?;
     }
-    manager_config::save(&new_cfg, &state.config_path)
-        .map_err(ApiError::from)?;
+    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
     *cfg = new_cfg;
     drop(cfg);
     ensure_backend_specs(state).await;
     state.sync_backend_service_definition(&id).await;
     Ok(json!({ "backend_id": id, "persisted": true, "applies": "next start" }))
 }
-
 
 /// The raw flags a backend serving `model_id` starts with: the
 /// model's catalog default expert offload (its green limit — see
@@ -6230,8 +6182,7 @@ pub async fn op_backend_set_offload(
         b.tool_call_probe = None;
     }
     if changed {
-        manager_config::validate(&new_cfg)
-            .map_err(ApiError::from)?;
+        manager_config::validate(&new_cfg).map_err(ApiError::from)?;
         let summary = match target {
             manager_models::ExpertOffload::None => {
                 format!("Backend `{id}` expert offload turned off")
@@ -6251,10 +6202,8 @@ pub async fn op_backend_set_offload(
             summary,
             &id,
         )
-        .await
-        ?;
-        manager_config::save(&new_cfg, &state.config_path)
-            .map_err(ApiError::from)?;
+        .await?;
+        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
         *cfg = new_cfg;
     }
     drop(cfg);
@@ -6424,13 +6373,8 @@ pub async fn op_backend_set_offload_override(
             eval.layers, eval.moe_layers
         )));
     }
-    activation::record_offload_override(
-        &state.data_dir,
-        &id,
-        layers,
-        eval.placed_ccs.clone(),
-    )
-    .map_err(ApiError::Io)?;
+    activation::record_offload_override(&state.data_dir, &id, layers, eval.placed_ccs.clone())
+        .map_err(ApiError::Io)?;
     let journal = activation::load_journal(&state.data_dir);
     if !activation::offload_override_covers(&journal, &id, layers, &eval.placed_ccs) {
         return Err(ApiError::Io(format!(
@@ -6576,24 +6520,13 @@ pub async fn op_backend_set_mtp(
         b.tool_call_probe = None;
     }
     if changed {
-        manager_config::validate(&new_cfg)
-            .map_err(ApiError::from)?;
+        manager_config::validate(&new_cfg).map_err(ApiError::from)?;
         let summary = match n_max {
             Some(n) => format!("Backend `{id}` MTP draft set to {n} tokens"),
             None => format!("Backend `{id}` MTP draft turned off"),
         };
-        record_backend_change(
-            state,
-            &pre_cfg,
-            &new_cfg,
-            "backend_set_mtp",
-            summary,
-            &id,
-        )
-        .await
-        ?;
-        manager_config::save(&new_cfg, &state.config_path)
-            .map_err(ApiError::from)?;
+        record_backend_change(state, &pre_cfg, &new_cfg, "backend_set_mtp", summary, &id).await?;
+        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
         *cfg = new_cfg;
     }
     drop(cfg);
@@ -6636,9 +6569,9 @@ async fn resolve_auto_moe_cache_mib(
         GpuVisibility::Gpus(indices) => indices,
         _ => {
             return Err(ApiError::InvalidInput(format!(
-                "Auto cannot price an expert cache for backend {}: it is not placed on specific GPUs",
-                b.id
-            )))
+            "Auto cannot price an expert cache for backend {}: it is not placed on specific GPUs",
+            b.id
+        )))
         }
     };
     let Some(mut req) = backend_memory_requirement(cfg, b) else {
@@ -6691,16 +6624,19 @@ async fn resolve_auto_moe_cache_mib(
             continue;
         }
         let free = sample.free_vram_mib();
-        let available = free
-            .saturating_sub(others[pos])
-            .saturating_sub(own[pos]);
+        let available = free.saturating_sub(others[pos]).saturating_sub(own[pos]);
         bearing.push((available, probe[pos] as f64 / PROBE_MIB as f64));
         let tighter = match tightest {
             None => true,
             Some((_, a, _, _)) => available < a,
         };
         if tighter {
-            tightest = Some((sample.index, available, free, others[pos].saturating_add(own[pos])));
+            tightest = Some((
+                sample.index,
+                available,
+                free,
+                others[pos].saturating_add(own[pos]),
+            ));
         }
     }
     match manager_models::auto_moe_cache_budget(
@@ -6922,8 +6858,7 @@ pub async fn op_backend_set_parallel(
         .iter_mut()
         .find(|b| b.id == id)
         .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
-    let new_raw =
-        manager_models::set_parallel_slots(b.raw_flags.as_deref(), slots.map(i64::from));
+    let new_raw = manager_models::set_parallel_slots(b.raw_flags.as_deref(), slots.map(i64::from));
     let changed = new_raw != b.raw_flags;
     b.raw_flags = new_raw.clone();
     if changed {
@@ -6932,8 +6867,7 @@ pub async fn op_backend_set_parallel(
         b.tool_call_probe = None;
     }
     if changed {
-        manager_config::validate(&new_cfg)
-            .map_err(ApiError::from)?;
+        manager_config::validate(&new_cfg).map_err(ApiError::from)?;
         let summary = match slots {
             Some(n) => format!("Backend `{id}` parallel slots set to {n}"),
             None => {
@@ -6948,10 +6882,8 @@ pub async fn op_backend_set_parallel(
             summary,
             &id,
         )
-        .await
-        ?;
-        manager_config::save(&new_cfg, &state.config_path)
-            .map_err(ApiError::from)?;
+        .await?;
+        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
         *cfg = new_cfg;
     }
     drop(cfg);
@@ -6971,7 +6903,6 @@ pub async fn op_backend_set_parallel(
         "applies": "next start",
     }))
 }
-
 
 /// Parse one cache-control value from the wire: a cache type
 /// spelling the pinned build accepts among the types v1 offers.
@@ -7396,19 +7327,9 @@ pub async fn op_backend_set_cache(
                 sel.v.as_str(),
                 sel.flash_attn.as_str()
             ),
-            None => format!(
-                "Backend `{id}` KV cache controls cleared (llama.cpp defaults)"
-            ),
+            None => format!("Backend `{id}` KV cache controls cleared (llama.cpp defaults)"),
         };
-        record_backend_change(
-            state,
-            &pre_cfg,
-            &new_cfg,
-            "backend_set_cache",
-            summary,
-            &id,
-        )
-        .await?;
+        record_backend_change(state, &pre_cfg, &new_cfg, "backend_set_cache", summary, &id).await?;
         manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
         *cfg = new_cfg;
     }
@@ -7470,10 +7391,8 @@ pub async fn op_backend_set_flags_mode(
     b.flags_advanced = advanced;
     let raw_flags = b.raw_flags.clone();
     if changed {
-        manager_config::validate(&new_cfg)
-            .map_err(ApiError::from)?;
-        manager_config::save(&new_cfg, &state.config_path)
-            .map_err(ApiError::from)?;
+        manager_config::validate(&new_cfg).map_err(ApiError::from)?;
+        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
         *cfg = new_cfg;
     }
     Ok(json!({
@@ -7539,8 +7458,7 @@ pub async fn op_backend_set_raw_flags(
         // A raw-flags change invalidates the recorded tool-call
         // probe (MCP design §7.2).
         b.tool_call_probe = None;
-        manager_config::validate(&new_cfg)
-            .map_err(ApiError::from)?;
+        manager_config::validate(&new_cfg).map_err(ApiError::from)?;
         record_backend_change(
             state,
             &pre_cfg,
@@ -7549,10 +7467,8 @@ pub async fn op_backend_set_raw_flags(
             format!("Backend `{id}` raw flags changed"),
             &id,
         )
-        .await
-        ?;
-        manager_config::save(&new_cfg, &state.config_path)
-            .map_err(ApiError::from)?;
+        .await?;
+        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
         *cfg = new_cfg;
     }
     drop(cfg);
@@ -7614,8 +7530,7 @@ pub async fn op_backend_delete(
     for m in new_cfg.models.iter_mut() {
         m.assigned_backends.retain(|b| b != &id);
     }
-    manager_config::validate(&new_cfg)
-        .map_err(ApiError::from)?;
+    manager_config::validate(&new_cfg).map_err(ApiError::from)?;
     record_gateway_change(
         state,
         &pre_cfg,
@@ -7624,10 +7539,8 @@ pub async fn op_backend_delete(
         format!("Backend `{id}` removed"),
         false,
     )
-    .await
-    ?;
-    manager_config::save(&new_cfg, &state.config_path)
-        .map_err(ApiError::from)?;
+    .await?;
+    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
     *cfg = new_cfg;
     drop(cfg);
     ensure_backend_specs(state).await;
@@ -7649,7 +7562,6 @@ pub async fn op_backend_delete(
     }
     Ok(json!({ "backend_id": id, "deleted": true, "persisted": true }))
 }
-
 
 /// Move a backend to a group, or out of all groups
 /// (predicted-throughput design §8.5 — the Groups page's drop and
@@ -7677,8 +7589,7 @@ pub async fn op_gateway_set_backend_group(
             let name = name.trim().to_string();
             if name.is_empty() {
                 return Err(ApiError::InvalidInput(
-                    "group name must not be empty; pass null to ungroup the backend"
-                        .to_string(),
+                    "group name must not be empty; pass null to ungroup the backend".to_string(),
                 ));
             }
             Some(name)
@@ -7719,8 +7630,7 @@ pub async fn op_gateway_set_backend_group(
     }
     let changed = added || !removed_from.is_empty();
     if changed {
-        manager_config::validate(&new_cfg)
-            .map_err(ApiError::from)?;
+        manager_config::validate(&new_cfg).map_err(ApiError::from)?;
         let summary = match &target {
             Some(name) => format!("Backend `{id}` moved to group `{name}`"),
             None => format!("Backend `{id}` removed from all groups (ungrouped)"),
@@ -7733,10 +7643,8 @@ pub async fn op_gateway_set_backend_group(
             summary,
             false,
         )
-        .await
-        ?;
-        manager_config::save(&new_cfg, &state.config_path)
-            .map_err(ApiError::from)?;
+        .await?;
+        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
         *cfg = new_cfg;
     }
     Ok(json!({
@@ -7796,8 +7704,7 @@ pub async fn op_gateway_create_group(
         fallbacks: Vec::new(),
         purpose: String::new(),
     });
-    manager_config::validate(&new_cfg)
-        .map_err(ApiError::from)?;
+    manager_config::validate(&new_cfg).map_err(ApiError::from)?;
     record_gateway_change(
         state,
         &pre_cfg,
@@ -7806,10 +7713,8 @@ pub async fn op_gateway_create_group(
         format!("Group `{name}` created"),
         false,
     )
-    .await
-    ?;
-    manager_config::save(&new_cfg, &state.config_path)
-        .map_err(ApiError::from)?;
+    .await?;
+    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
     *cfg = new_cfg;
     Ok(json!({ "name": name, "persisted": true }))
 }
@@ -7845,8 +7750,7 @@ pub async fn op_gateway_delete_group(
         )));
     }
     new_cfg.gateway.groups.remove(pos);
-    manager_config::validate(&new_cfg)
-        .map_err(ApiError::from)?;
+    manager_config::validate(&new_cfg).map_err(ApiError::from)?;
     record_gateway_change(
         state,
         &pre_cfg,
@@ -7855,10 +7759,8 @@ pub async fn op_gateway_delete_group(
         format!("Group `{name}` deleted"),
         false,
     )
-    .await
-    ?;
-    manager_config::save(&new_cfg, &state.config_path)
-        .map_err(ApiError::from)?;
+    .await?;
+    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
     *cfg = new_cfg;
     Ok(json!({ "name": name, "deleted": true, "persisted": true }))
 }
@@ -7900,10 +7802,7 @@ pub async fn op_backend_get_launch_command(
 /// whether the cloud tier's configured credential reference exists in
 /// Windows Credential Manager (presence only — the value is never
 /// read); it is null when no reference is configured.
-pub async fn op_gateway_status(
-    state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
-) -> ApiResult {
+pub async fn op_gateway_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
     let (port, bind_host, probe_host, groups, routing_rules, cred_ref) = {
         let cfg = state.config.read().await;
         (
@@ -7989,7 +7888,6 @@ pub async fn op_gateway_status(
         "litellm_version": manager_wizard::recorded_litellm_version(&state.data_dir),
     }))
 }
-
 
 /// The activation plan: every saved change that is not live yet,
 /// across scopes — gateway changes waiting on a gateway restart and
@@ -8127,7 +8025,6 @@ pub async fn op_gateway_activation_plan(
     }))
 }
 
-
 /// Cancel the pending activation plan's changes: restore the
 /// configuration snapshot taken before the first pending change.
 /// Refused when the configuration has changed through another path
@@ -8165,10 +8062,8 @@ pub async fn op_gateway_activation_cancel(
         Ok(None) => return Ok(json!({ "cancelled": false, "reason": "no pending changes" })),
         Err(msg) => return Err(ApiError::InvalidInput(msg)),
     };
-    manager_config::validate(&restored)
-        .map_err(ApiError::from)?;
-    manager_config::save(&restored, &state.config_path)
-        .map_err(ApiError::from)?;
+    manager_config::validate(&restored).map_err(ApiError::from)?;
+    manager_config::save(&restored, &state.config_path).map_err(ApiError::from)?;
     *cfg = restored.clone();
     drop(cfg);
     // Regenerate the gateway YAML from the restored config and
@@ -8184,11 +8079,12 @@ pub async fn op_gateway_activation_cancel(
     let yaml_path = state.data_dir.join("gateway").join("config.yaml");
     let yaml_error: Option<String> = match manager_gateway::generate_config_yaml(&restored) {
         Ok(yaml) => {
-            let write = std::fs::create_dir_all(
-                yaml_path.parent().expect("the YAML path has a parent"),
-            )
-            .and_then(|_| std::fs::write(&yaml_path, yaml));
-            write.err().map(|e| format!("could not write {}: {e}", yaml_path.display()))
+            let write =
+                std::fs::create_dir_all(yaml_path.parent().expect("the YAML path has a parent"))
+                    .and_then(|_| std::fs::write(&yaml_path, yaml));
+            write
+                .err()
+                .map(|e| format!("could not write {}: {e}", yaml_path.display()))
         }
         Err(e) => Some(format!("could not regenerate the gateway config: {e}")),
     };
@@ -8207,8 +8103,6 @@ pub async fn op_gateway_activation_cancel(
     }))
 }
 
-
-
 /// Mark the gateway side of the activation plan complete after a
 /// successful gateway (re)start. The start-gateway step regenerates
 /// everything from the live configuration, so gateway-scope
@@ -8223,8 +8117,7 @@ pub async fn op_gateway_activation_complete(
 ) -> ApiResult {
     let (before, _) = activation_unresolved(state).await;
     let gateway_entries = before.iter().filter(|e| e.scope == "gateway").count();
-    activation::clear_gateway_scope(&state.data_dir)
-        .map_err(ApiError::InvalidInput)?;
+    activation::clear_gateway_scope(&state.data_dir).map_err(ApiError::InvalidInput)?;
     if gateway_entries > 0 {
         // The gateway side of a plan just went live. When nothing
         // remains pending, the plan is applied: fire the toast here
@@ -8234,10 +8127,7 @@ pub async fn op_gateway_activation_complete(
         let (after, drift) = activation_unresolved(state).await;
         if after.is_empty() && !drift {
             {
-                let mut watch = state
-                    .notify_watch
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut watch = state.notify_watch.lock().unwrap_or_else(|e| e.into_inner());
                 watch.activation_applied_notified = true;
             }
             notify::notify(
@@ -8252,7 +8142,6 @@ pub async fn op_gateway_activation_complete(
     }
     Ok(json!({ "cleared": true }))
 }
-
 
 /// Record one finished activation plan execution in the durable
 /// history ([`activation_history`]). The apply itself is
@@ -8381,10 +8270,7 @@ pub async fn op_gateway_quiesce_wait(
 /// `<data_dir>/gateway.pid` by the start-gateway step (see
 /// [`manager_wizard::stop_gateway`]). Restarting is stop + re-running
 /// the start-gateway step, which is what the wizard does itself.
-pub async fn op_gateway_stop(
-    state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
-) -> ApiResult {
+pub async fn op_gateway_stop(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
     let data_dir = state.data_dir.clone();
     // Service mode: the SCM owns the gateway process; the pid-file
     // stop would kill the service host's child out from under it.
@@ -8444,7 +8330,6 @@ pub async fn op_gateway_stop(
     }
     Ok(json!({ "ok": true, "stopped": stopped, "postgres_stopped": postgres_stopped }))
 }
-
 
 /// One-shot gateway liveness probe: connect to <host>:<port> with a
 /// 500 ms timeout, `GET /health/liveliness` with a 1 s read timeout,
@@ -8585,7 +8470,6 @@ fn fetch_gateway_metrics(host: &str, port: u16, master_key: &str) -> Option<Stri
     None
 }
 
-
 /// One gateway-metrics poll cycle: resolve the probe host and port,
 /// read the stored master key (never generate one here — polling
 /// must not create credentials), fetch and record a snapshot. Any
@@ -8706,12 +8590,10 @@ pub async fn op_gateway_preview_yaml(
     _sink: &Arc<dyn EventSink>,
 ) -> ApiResult {
     let cfg = state.config.read().await;
-    let yaml = manager_gateway::generate_config_yaml(&cfg)
-        .map_err(ApiError::from)?;
+    let yaml = manager_gateway::generate_config_yaml(&cfg).map_err(ApiError::from)?;
     let routing_py = manager_gateway::generate_routing_callback(&cfg);
     Ok(json!({ "yaml": yaml, "routing_py": routing_py }))
 }
-
 
 /// Trace routing for a tagged request: `request` carries the model group
 /// name (`{"group": "planner"}`). Runs `pick_backend` as an explainer
@@ -9114,7 +8996,6 @@ pub async fn op_model_add(
     Ok(json!({ "model_id": id }))
 }
 
-
 /// Assign a model to a backend with a tensor split (spec §14
 /// `model_assign`). Sets the backend's model file, applies the split, and
 /// records a restart task for the guided rolling restart.
@@ -9196,8 +9077,7 @@ pub async fn op_model_assign(
             }
         }
         if !untouched {
-            manager_models::apply_placement(backend, &split)
-                .map_err(ApiError::from)?;
+            manager_models::apply_placement(backend, &split).map_err(ApiError::from)?;
         }
         // A model-file or raw-flags change invalidates the recorded
         // tool-call probe (MCP design §7.2).
@@ -9211,8 +9091,7 @@ pub async fn op_model_assign(
             model.assigned_backends.push(backend_id.clone());
         }
     }
-    manager_config::validate(&cfg)
-        .map_err(ApiError::from)?;
+    manager_config::validate(&cfg).map_err(ApiError::from)?;
     // The assignment activates twice over: the gateway's routes
     // change with the backend's model (gateway scope, recorded only
     // when the generated YAML actually differs), and the backend
@@ -9226,8 +9105,7 @@ pub async fn op_model_assign(
         format!("Backend `{backend_id}` now serves model `{id}`"),
         false,
     )
-    .await
-    ?;
+    .await?;
     record_backend_change(
         state,
         &pre_cfg,
@@ -9267,7 +9145,6 @@ pub async fn op_model_assign(
         "flags_untouched": flags_untouched,
     }))
 }
-
 
 // ---------------------------------------------------------------------------
 // Telemetry: additional §14 commands
@@ -9388,8 +9265,8 @@ fn gguf_layout_cached(path: &PathBuf) -> Option<manager_models::GgufLayout> {
     for prefix in [8 * 1024 * 1024usize, 64 * 1024 * 1024, 256 * 1024 * 1024] {
         let want = (meta.len() as usize).min(prefix);
         let mut buf = vec![0u8; want];
-        if let Err(e) = std::fs::File::open(path)
-            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+        if let Err(e) =
+            std::fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
         {
             // Transient by definition: nothing about the file's
             // contents was learned. Log and leave the cache alone
@@ -9604,10 +9481,7 @@ fn backend_memory_requirement(
 /// f16 default and prices exactly as before this feature. When
 /// the layout carries no geometry, the f16 figure (if any) is
 /// all that exists and is used unchanged.
-fn kv_bytes_per_token_for(
-    layout: &WeightLayout,
-    raw_flags: Option<&str>,
-) -> Option<u64> {
+fn kv_bytes_per_token_for(layout: &WeightLayout, raw_flags: Option<&str>) -> Option<u64> {
     match layout.kv_geometry {
         Some(geo) => {
             let sel = manager_models::cache_selection(raw_flags);
@@ -9694,7 +9568,6 @@ struct OffloadInfo {
     /// backend's model (empty outside the curated catalog).
     restrictions: Vec<manager_models::OffloadRestriction>,
 }
-
 
 fn backend_offload_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> Option<OffloadInfo> {
     let layout = resolve_weight_layout(cfg, b)?;
@@ -9929,7 +9802,6 @@ fn backend_moe_cache_info(
     })
 }
 
-
 /// Project a tensor split onto discovered VRAM (spec §14
 /// `placement_propose`). The model resolves from the curated catalog
 /// first, else from the config (size = the on-disk file when downloaded,
@@ -10132,9 +10004,7 @@ pub async fn op_placement_propose(
             let n = samples.len();
             let required = manager_optimize::residency_per_gpu(req, &split, n);
             let current: Vec<u64> = match (&current_split, credit_active) {
-                (Some(cur), true) => {
-                    manager_optimize::residency_per_gpu(req, cur, n)
-                }
+                (Some(cur), true) => manager_optimize::residency_per_gpu(req, cur, n),
                 _ => vec![0; n],
             };
             let totals: Vec<u64> = samples.iter().map(|s| s.vram_total_mib).collect();
@@ -10324,8 +10194,7 @@ pub async fn op_placement_apply(
                 .iter_mut()
                 .find(|b| &b.id == bid)
                 .expect("existence checked above");
-            manager_models::apply_placement(backend, &split)
-                .map_err(ApiError::from)?;
+            manager_models::apply_placement(backend, &split).map_err(ApiError::from)?;
         }
         // Record the (possibly derived) assignment on the model.
         if let Some(m) = new_cfg.models.iter_mut().find(|m| m.id == model_id) {
@@ -10335,8 +10204,7 @@ pub async fn op_placement_apply(
                 }
             }
         }
-        manager_config::validate(&new_cfg)
-            .map_err(ApiError::from)?;
+        manager_config::validate(&new_cfg).map_err(ApiError::from)?;
         // Journal before the save (ordering rule): each target
         // backend activates the split at its next (re)start — a
         // backend-scope plan entry per target (the gateway YAML
@@ -10387,7 +10255,6 @@ pub async fn op_placement_apply(
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Tasks / diagnostics
@@ -10545,20 +10412,15 @@ pub async fn op_diagnostics_export_bundle(
 /// from the persisted registry. Includes credential presence per
 /// env key (Windows Credential Manager lookup; values never read)
 /// with dual-target acceptance for the legacy servers (§10.1).
-pub async fn op_mcp_list(
-    state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
-) -> ApiResult {
+pub async fn op_mcp_list(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
     let registry = state.mcp_registry().await;
     let servers = state.mcp_servers().await;
     let statuses = {
         let sup = state.supervisor().await.lock().await;
         manager_mcp::list_status(&sup, &servers)
     };
-    let running: HashMap<String, bool> = statuses
-        .iter()
-        .map(|s| (s.id.clone(), s.running))
-        .collect();
+    let running: HashMap<String, bool> =
+        statuses.iter().map(|s| (s.id.clone(), s.running)).collect();
     // Presence checks are blocking cmdkey calls; run off the async worker.
     let servers_for_presence = servers.clone();
     let found_targets: Vec<Option<String>> = tokio::task::spawn_blocking(move || {
@@ -10600,17 +10462,12 @@ pub async fn op_mcp_list(
                     "missing".to_string()
                 },
                 credential_target_found: found.clone(),
-                credential_presence: cfg
-                    .env_keys
-                    .iter()
-                    .map(|k| (k.clone(), present))
-                    .collect(),
+                credential_presence: cfg.env_keys.iter().map(|k| (k.clone(), present)).collect(),
             }
         })
         .collect();
     Ok(serde_json::to_value(&entries)?)
 }
-
 
 /// The registration / API-key page for a server's credential:
 /// its own stored `signup_url` when set, else the curated seed
@@ -10673,9 +10530,7 @@ pub async fn op_mcp_start_preflight(
         .mcp
         .servers
         .iter()
-        .filter(|s| {
-            s.exposure == manager_config::McpExposure::Gateway && !s.env_keys.is_empty()
-        })
+        .filter(|s| s.exposure == manager_config::McpExposure::Gateway && !s.env_keys.is_empty())
         .filter_map(|s| {
             let cred_ref = s.cred_ref.as_deref().filter(|r| !r.is_empty())?;
             if presence.contains(cred_ref) {
@@ -10761,9 +10616,7 @@ pub async fn op_mcp_test_connection(
         }
         manager_mcp::McpMode::Remote => {
             let url = server.url.clone().ok_or_else(|| {
-                ApiError::Mcp(format!(
-                    "remote server {id} has no url configured"
-                ))
+                ApiError::Mcp(format!("remote server {id} has no url configured"))
             })?;
             let probe = HttpHealthProbe::new(url, Duration::from_secs(5));
             match probe.probe().await {
@@ -10776,7 +10629,6 @@ pub async fn op_mcp_test_connection(
         }
     }
 }
-
 
 /// Install Continue.dev + Cline via the wizard's `vscode-extensions` step
 /// (spec §9, §14 `vscode_install_extensions`). Runs `code
@@ -11416,9 +11268,7 @@ mod tests {
             residency: None,
             peak_temp_c: None,
         });
-        store
-            .save(&optimize::measurements_path(&state))
-            .unwrap();
+        store.save(&optimize::measurements_path(&state)).unwrap();
         let r = op_list_backends(&state, &sink).await.unwrap();
         let rows = r["backends"].as_array().unwrap();
         let prow = rows
@@ -11537,8 +11387,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r["changed"], json!(true));
-        let mut removed: Vec<String> =
-            serde_json::from_value(r["removed_from"].clone()).unwrap();
+        let mut removed: Vec<String> = serde_json::from_value(r["removed_from"].clone()).unwrap();
         removed.sort();
         assert_eq!(removed, vec!["coder".to_string(), "planner".to_string()]);
         let cfg = state.config.read().await;
@@ -11683,9 +11532,13 @@ mod tests {
         cfg.backends.push(extra);
         let (state, dir) = advanced_test_state(cfg);
         let sink = test_sink();
-        let r = op_update_config(&state, &sink, json!({ "supervision": { "mode": "process" } }))
-            .await
-            .unwrap();
+        let r = op_update_config(
+            &state,
+            &sink,
+            json!({ "supervision": { "mode": "process" } }),
+        )
+        .await
+        .unwrap();
         assert_eq!(r["ok"], true);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11708,19 +11561,25 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        op_notifications_set_config(&state, &sink, notif).await.unwrap();
+        op_notifications_set_config(&state, &sink, notif)
+            .await
+            .unwrap();
         let loaded = manager_config::load(&state.config_path).unwrap();
         assert!(!loaded.notifications.enabled);
         let notif = manager_config::NotificationConfig {
             enabled: true,
             ..Default::default()
         };
-        op_notifications_set_config(&state, &sink, notif).await.unwrap();
+        op_notifications_set_config(&state, &sink, notif)
+            .await
+            .unwrap();
         let loaded = manager_config::load(&state.config_path).unwrap();
         assert!(loaded.notifications.enabled);
 
         // Telemetry poll interval.
-        op_telemetry_set_interval(&state, &sink, 2500).await.unwrap();
+        op_telemetry_set_interval(&state, &sink, 2500)
+            .await
+            .unwrap();
         let loaded = manager_config::load(&state.config_path).unwrap();
         assert_eq!(loaded.telemetry.poll_interval_ms, 2500);
 
@@ -11739,9 +11598,13 @@ mod tests {
         )
         .await
         .unwrap();
-        op_update_config(&state, &sink, json!({ "mxc": { "path": "/tmp/custom-policy.json" } }))
-            .await
-            .unwrap();
+        op_update_config(
+            &state,
+            &sink,
+            json!({ "mxc": { "path": "/tmp/custom-policy.json" } }),
+        )
+        .await
+        .unwrap();
         let loaded = manager_config::load(&state.config_path).unwrap();
         assert_eq!(loaded.postgres.port, 54330);
         assert_eq!(loaded.admin_api.port, 47822);
@@ -11751,9 +11614,14 @@ mod tests {
         assert_eq!(loaded.mxc.path, PathBuf::from("/tmp/custom-policy.json"));
 
         // Component pin + auto-update, then unpin + re-enable.
-        op_updates_pin(&state, &sink, "litellm".to_string(), Some("1.105.1".to_string()))
-            .await
-            .unwrap();
+        op_updates_pin(
+            &state,
+            &sink,
+            "litellm".to_string(),
+            Some("1.105.1".to_string()),
+        )
+        .await
+        .unwrap();
         op_updates_set_auto(&state, &sink, "litellm".to_string(), false)
             .await
             .unwrap();
@@ -11815,10 +11683,19 @@ mod tests {
             .unwrap();
         let loaded = manager_config::load(&state.config_path).unwrap();
         assert_eq!(loaded.gateway.port, 4001);
-        assert_eq!(loaded.gateway.openrouter.cred_ref.as_deref(), Some("openrouter-key"));
+        assert_eq!(
+            loaded.gateway.openrouter.cred_ref.as_deref(),
+            Some("openrouter-key")
+        );
         assert_eq!(loaded.gateway.openrouter.daily_cap_usd, 12.5);
-        assert_eq!(loaded.gateway.openrouter.model_allowlist, vec!["openai/gpt-5".to_string()]);
-        assert_eq!(loaded.gateway.groups[0].fallbacks, vec!["openrouter".to_string()]);
+        assert_eq!(
+            loaded.gateway.openrouter.model_allowlist,
+            vec!["openai/gpt-5".to_string()]
+        );
+        assert_eq!(
+            loaded.gateway.groups[0].fallbacks,
+            vec!["openrouter".to_string()]
+        );
         // The groups patch must not reset the stored purpose.
         assert_eq!(
             loaded.gateway.groups[0].purpose,
@@ -11866,7 +11743,10 @@ mod tests {
         let saved = manager_config::load(&state.config_path).unwrap();
         let coder = saved.backends.iter().find(|b| b.id == "coder").unwrap();
         assert!(!coder.flags_advanced);
-        assert_eq!(coder.raw_flags.as_deref(), Some("--n-cpu-moe=46  --threads 8"));
+        assert_eq!(
+            coder.raw_flags.as_deref(),
+            Some("--n-cpu-moe=46  --threads 8")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11901,9 +11781,10 @@ mod tests {
             .await
             .unwrap();
         const RAW: &str = "--parallel 1 --spec-type draft-mtp --spec-draft-n-max 2 --threads 8";
-        let r = op_backend_set_raw_flags(&state, &sink, "planner".to_string(), Some(RAW.to_string()))
-            .await
-            .unwrap();
+        let r =
+            op_backend_set_raw_flags(&state, &sink, "planner".to_string(), Some(RAW.to_string()))
+                .await
+                .unwrap();
         assert_eq!(r["changed"], true);
         assert_eq!(r["raw_flags"], RAW);
         assert!(r["warnings"].as_array().unwrap().is_empty());
@@ -11923,9 +11804,10 @@ mod tests {
         assert_eq!(planner.raw_flags.as_deref(), Some(RAW));
         assert_eq!(planner.tool_call_probe, None);
         // A no-change save journals nothing new.
-        let r = op_backend_set_raw_flags(&state, &sink, "planner".to_string(), Some(RAW.to_string()))
-            .await
-            .unwrap();
+        let r =
+            op_backend_set_raw_flags(&state, &sink, "planner".to_string(), Some(RAW.to_string()))
+                .await
+                .unwrap();
         assert_eq!(r["changed"], false);
         assert_eq!(
             activation::load_journal(&dir)
@@ -11951,14 +11833,24 @@ mod tests {
         assert!(warnings.iter().any(|w| w["token"] == "--parallel"));
         assert!(warnings.iter().any(|w| w["token"] == "--bogus-flag"));
         // An all-whitespace save clears the flags entirely.
-        let r = op_backend_set_raw_flags(&state, &sink, "planner".to_string(), Some("   ".to_string()))
-            .await
-            .unwrap();
+        let r = op_backend_set_raw_flags(
+            &state,
+            &sink,
+            "planner".to_string(),
+            Some("   ".to_string()),
+        )
+        .await
+        .unwrap();
         assert_eq!(r["changed"], true);
         assert_eq!(r["raw_flags"], Value::Null);
         let saved = manager_config::load(&state.config_path).unwrap();
         assert_eq!(
-            saved.backends.iter().find(|b| b.id == "planner").unwrap().raw_flags,
+            saved
+                .backends
+                .iter()
+                .find(|b| b.id == "planner")
+                .unwrap()
+                .raw_flags,
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -12041,9 +11933,13 @@ mod tests {
         assert!(refused(op_update_config(&state, &sink, patch).await));
         // A benign whole-config patch (the supervision toggle the
         // Settings view sends) still succeeds.
-        let r = op_update_config(&state, &sink, json!({ "supervision": { "mode": "process" } }))
-            .await
-            .unwrap();
+        let r = op_update_config(
+            &state,
+            &sink,
+            json!({ "supervision": { "mode": "process" } }),
+        )
+        .await
+        .unwrap();
         assert_eq!(r["ok"], true);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -12084,9 +11980,9 @@ mod tests {
         // documented no-telemetry path). Against live host telemetry
         // the fixed [1.0] split is rejected on multi-GPU machines,
         // which is unrelated to the flags behavior under test.
-        let _ = state.telemetry.set(Arc::new(std::sync::Mutex::new(
-            TelemetryStore::new(),
-        )));
+        let _ = state
+            .telemetry
+            .set(Arc::new(std::sync::Mutex::new(TelemetryStore::new())));
         let sink = test_sink();
         let r = op_model_assign(
             &state,
@@ -12118,9 +12014,9 @@ mod tests {
         }
         let (state, dir) = advanced_test_state(cfg);
         // Same empty-telemetry pin as the advanced case above.
-        let _ = state.telemetry.set(Arc::new(std::sync::Mutex::new(
-            TelemetryStore::new(),
-        )));
+        let _ = state
+            .telemetry
+            .set(Arc::new(std::sync::Mutex::new(TelemetryStore::new())));
         let r = op_model_assign(
             &state,
             &sink,
@@ -12233,9 +12129,9 @@ mod tests {
         // model_assign tests do: with no GPU count polled, the
         // split check is skipped and the refusal under test is
         // the unregistered-model lookup itself.
-        let _ = state.telemetry.set(Arc::new(std::sync::Mutex::new(
-            TelemetryStore::new(),
-        )));
+        let _ = state
+            .telemetry
+            .set(Arc::new(std::sync::Mutex::new(TelemetryStore::new())));
         let sink = test_sink();
         let before = serde_json::to_value(state.config.read().await.clone()).unwrap();
         let prior_model_file = state
@@ -12305,9 +12201,10 @@ mod tests {
         // foreign flag no control models (--threads).
         const RAW: &str =
             "--parallel 1 --spec-type draft-mtp --spec-draft-n-max 2 --threads 8 -ot exps=CPU";
-        let r = op_backend_set_raw_flags(&state, &sink, "planner".to_string(), Some(RAW.to_string()))
-            .await
-            .unwrap();
+        let r =
+            op_backend_set_raw_flags(&state, &sink, "planner".to_string(), Some(RAW.to_string()))
+                .await
+                .unwrap();
         assert_eq!(r["changed"], true);
         assert!(r["warnings"].as_array().unwrap().is_empty());
         // Leaving the mode writes nothing: the string survives
@@ -12330,7 +12227,10 @@ mod tests {
             manager_models::mtp_draft(b.raw_flags.as_deref()),
             manager_models::MtpDraft::On(Some(2))
         );
-        assert_eq!(manager_models::parallel_slots(b.raw_flags.as_deref()), Some(1));
+        assert_eq!(
+            manager_models::parallel_slots(b.raw_flags.as_deref()),
+            Some(1)
+        );
         let info = backend_mtp_info(&saved, b).expect("planner-mtp is MTP-capable");
         assert!(info.enabled);
         assert_eq!(info.n_max, Some(2));
@@ -12489,8 +12389,8 @@ mod tests {
         let mut gpus = test_gpus();
         gpus[0].compute_capability = (6, 0);
         let journal = activation::ActivationJournal::default();
-        let eval = evaluate_backend_offload(&cfg, &b, &gpus, &journal)
-            .expect("coder backend evaluates");
+        let eval =
+            evaluate_backend_offload(&cfg, &b, &gpus, &journal).expect("coder backend evaluates");
         assert_eq!(eval.layers, 46);
         assert_eq!(eval.moe_layers, 48);
         assert_eq!(eval.status, manager_models::OffloadStatus::Blocked);
@@ -12510,16 +12410,16 @@ mod tests {
             }],
             ..Default::default()
         };
-        let eval = evaluate_backend_offload(&cfg, &b, &gpus, &journal)
-            .expect("coder backend evaluates");
+        let eval =
+            evaluate_backend_offload(&cfg, &b, &gpus, &journal).expect("coder backend evaluates");
         assert!(eval.has_override);
         assert!(eval.overridden);
 
         // Same position on an unrestricted GPU: no restriction
         // matches, nothing is blocked.
         let gpus = test_gpus();
-        let eval = evaluate_backend_offload(&cfg, &b, &gpus, &journal)
-            .expect("coder backend evaluates");
+        let eval =
+            evaluate_backend_offload(&cfg, &b, &gpus, &journal).expect("coder backend evaluates");
         assert_eq!(eval.restricting_cc, None);
         assert_ne!(eval.status, manager_models::OffloadStatus::Blocked);
     }
@@ -12528,9 +12428,7 @@ mod tests {
     /// backend serves Coder-Next at a raw-flags position, with the
     /// telemetry inventory pinned so GPU 0 is a Pascal (6,0) card —
     /// the #37 field configuration.
-    fn guardrail_override_test_state(
-        raw_flags: &str,
-    ) -> (Arc<AppState>, PathBuf) {
+    fn guardrail_override_test_state(raw_flags: &str) -> (Arc<AppState>, PathBuf) {
         let mut cfg = test_cfg();
         serve_model(
             &mut cfg,
@@ -12552,9 +12450,7 @@ mod tests {
         let mut gpus = test_gpus();
         gpus[0].compute_capability = (6, 0);
         store.set_inventory(gpus);
-        let _ = state
-            .telemetry
-            .set(Arc::new(std::sync::Mutex::new(store)));
+        let _ = state.telemetry.set(Arc::new(std::sync::Mutex::new(store)));
         (state, dir)
     }
 
@@ -12705,7 +12601,10 @@ mod tests {
                 vec![bad.to_string()],
             )
             .await;
-            assert!(matches!(r, Err(ApiError::InvalidInput(_))), "{bad:?}: {r:?}");
+            assert!(
+                matches!(r, Err(ApiError::InvalidInput(_))),
+                "{bad:?}: {r:?}"
+            );
         }
         let journal = activation::load_journal(&dir);
         assert!(
@@ -12724,13 +12623,22 @@ mod tests {
         .unwrap();
         let journal = activation::load_journal(&dir);
         assert!(activation::offload_override_covers(
-            &journal, "coder", 46, &[(6, 0)]
+            &journal,
+            "coder",
+            46,
+            &[(6, 0)]
         ));
         assert!(!activation::offload_override_covers(
-            &journal, "coder", 45, &[(6, 0)]
+            &journal,
+            "coder",
+            45,
+            &[(6, 0)]
         ));
         assert!(!activation::offload_override_covers(
-            &journal, "coder", 46, &[(8, 6)]
+            &journal,
+            "coder",
+            46,
+            &[(8, 6)]
         ));
         assert!(!activation::offload_override_covers(
             &journal,
@@ -12739,7 +12647,10 @@ mod tests {
             &[(6, 0), (8, 6)]
         ));
         assert!(!activation::offload_override_covers(
-            &journal, "planner", 46, &[(6, 0)]
+            &journal,
+            "planner",
+            46,
+            &[(6, 0)]
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -12815,8 +12726,8 @@ mod tests {
         let mut gpus = test_gpus();
         gpus[0].compute_capability = (6, 0);
         let journal = activation::ActivationJournal::default();
-        let eval = evaluate_backend_offload(&cfg, &b, &gpus, &journal)
-            .expect("coder backend evaluates");
+        let eval =
+            evaluate_backend_offload(&cfg, &b, &gpus, &journal).expect("coder backend evaluates");
         let info = backend_offload_info(&cfg, &b).expect("coder info");
         let row = offload_row_json(&info, Some(&eval));
         let guardrail = &row["guardrail"];
@@ -12850,7 +12761,8 @@ mod tests {
         assert!(validate_parallel_slots(0).is_err());
         let err = validate_parallel_slots(1025).expect_err("past the ceiling refuses");
         assert!(
-            err.to_string().contains("parallel slots must be between 1 and 1024"),
+            err.to_string()
+                .contains("parallel slots must be between 1 and 1024"),
             "unexpected wording: {err}"
         );
     }
@@ -13106,10 +13018,7 @@ mod tests {
             Some("/")
         );
         // Relative reference resolves against the current directory.
-        assert_eq!(
-            metrics_redirect_path("/a/b", "c").as_deref(),
-            Some("/a/c")
-        );
+        assert_eq!(metrics_redirect_path("/a/b", "c").as_deref(), Some("/a/c"));
         assert_eq!(metrics_redirect_path("/metrics", "  "), None);
     }
 
@@ -13209,7 +13118,8 @@ mod tests {
 
     #[test]
     fn metrics_response_redirect_keeps_location() {
-        let raw = b"HTTP/1.1 307 Temporary Redirect\r\nlocation: /metrics/\r\ncontent-length: 0\r\n\r\n";
+        let raw =
+            b"HTTP/1.1 307 Temporary Redirect\r\nlocation: /metrics/\r\ncontent-length: 0\r\n\r\n";
         let resp = decode_metrics_response(raw).expect("redirect decodes");
         assert_eq!(resp.status, 307);
         assert_eq!(resp.location.as_deref(), Some("/metrics/"));
@@ -13360,12 +13270,7 @@ mod tests {
             .filter(|(_, mib)| **mib > 0)
             .map(|(i, mib)| (i as u32, *mib))
             .collect();
-        let failures = vram_gate_failures(
-            &[1],
-            &required,
-            &[vram_reading(1, 16_384, 16_384)],
-            &[],
-        );
+        let failures = vram_gate_failures(&[1], &required, &[vram_reading(1, 16_384, 16_384)], &[]);
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].class, VramGateClass::ExceedsTotal);
         assert_eq!(failures[0].required_mib, 16_461);
@@ -13467,12 +13372,7 @@ mod tests {
     fn vram_gate_zero_total_is_unavailable() {
         // A reading whose total memory is zero is a device not
         // responding with real figures, not a very full card.
-        let failures = vram_gate_failures(
-            &[0],
-            &[(0, 1024)],
-            &[vram_reading(0, 0, 0)],
-            &[],
-        );
+        let failures = vram_gate_failures(&[0], &[(0, 1024)], &[vram_reading(0, 0, 0)], &[]);
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].class, VramGateClass::GpuUnavailable);
     }
@@ -14294,7 +14194,12 @@ mod tests {
         assert_eq!(info_off.mib, None);
         assert!(!info_off.custom);
         // A dense backend (the default config's planner) has none.
-        let dense = cfg.backends.iter().find(|x| x.id == "planner").unwrap().clone();
+        let dense = cfg
+            .backends
+            .iter()
+            .find(|x| x.id == "planner")
+            .unwrap()
+            .clone();
         assert!(backend_moe_cache_info(&cfg, &dense).is_none());
 
         // Pricing: the requirement carries the cache, residency
@@ -14377,15 +14282,10 @@ mod tests {
         .unwrap();
         // The declared default offload (16) is in place; the cache
         // op rewrites only its own token.
-        let r = op_backend_set_moe_cache(
-            &state,
-            &sink,
-            "moe-backend".to_string(),
-            Some(4096),
-            None,
-        )
-        .await
-        .unwrap();
+        let r =
+            op_backend_set_moe_cache(&state, &sink, "moe-backend".to_string(), Some(4096), None)
+                .await
+                .unwrap();
         assert_eq!(r["mib"], 4096);
         assert_eq!(r["changed"], true);
         let saved = manager_config::load(&state.config_path).unwrap();
@@ -14414,14 +14314,9 @@ mod tests {
         op_backend_set_offload(&state, &sink, "moe-backend".to_string(), 0, None)
             .await
             .unwrap();
-        let r = op_backend_set_moe_cache(
-            &state,
-            &sink,
-            "moe-backend".to_string(),
-            Some(8192),
-            None,
-        )
-        .await;
+        let r =
+            op_backend_set_moe_cache(&state, &sink, "moe-backend".to_string(), Some(8192), None)
+                .await;
         match r {
             Err(ApiError::InvalidInput(msg)) => {
                 assert!(msg.contains("offloads 0 MoE layers"), "{msg}")
@@ -14448,14 +14343,9 @@ mod tests {
         op_backend_set_offload(&state, &sink, "moe-backend".to_string(), 16, None)
             .await
             .unwrap();
-        let r = op_backend_set_moe_cache(
-            &state,
-            &sink,
-            "moe-backend".to_string(),
-            None,
-            Some(true),
-        )
-        .await;
+        let r =
+            op_backend_set_moe_cache(&state, &sink, "moe-backend".to_string(), None, Some(true))
+                .await;
         assert!(matches!(r, Err(ApiError::InvalidInput(_))), "{r:?}");
         // A row (tensor) split refuses a nonzero cache: the
         // pinned llama.cpp rejects the cache under tensor
@@ -14469,14 +14359,9 @@ mod tests {
                 .unwrap();
             b.flags.split_mode = manager_config::SplitMode::Row;
         }
-        let r = op_backend_set_moe_cache(
-            &state,
-            &sink,
-            "moe-backend".to_string(),
-            Some(4096),
-            None,
-        )
-        .await;
+        let r =
+            op_backend_set_moe_cache(&state, &sink, "moe-backend".to_string(), Some(4096), None)
+                .await;
         match r {
             Err(ApiError::InvalidInput(msg)) => {
                 assert!(msg.contains("row (tensor) split"), "{msg}")
@@ -14484,14 +14369,8 @@ mod tests {
             other => panic!("expected the row-split refusal, got {other:?}"),
         }
         // A dense backend has no expert cache to set.
-        let r = op_backend_set_moe_cache(
-            &state,
-            &sink,
-            "planner".to_string(),
-            Some(4096),
-            None,
-        )
-        .await;
+        let r =
+            op_backend_set_moe_cache(&state, &sink, "planner".to_string(), Some(4096), None).await;
         match r {
             Err(ApiError::InvalidInput(msg)) => {
                 assert!(msg.contains("does not support an expert cache"), "{msg}")
@@ -14625,7 +14504,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let off = preview["offload"].as_object().expect("preview carries offload");
+        let off = preview["offload"]
+            .as_object()
+            .expect("preview carries offload");
         assert_eq!(off["moe_layers"], 48);
         assert_eq!(off["green_limit_layers"], 16);
         assert_eq!(off["layers"], 16);
@@ -15016,9 +14897,10 @@ mod tests {
             .clone();
         assert_eq!(b.raw_flags, None);
         assert!(backend_offload_info(&saved, &b).is_none());
-        let preview = op_backend_add_preview(&state, &sink, "dense-7b".to_string(), None, None, None)
-            .await
-            .unwrap();
+        let preview =
+            op_backend_add_preview(&state, &sink, "dense-7b".to_string(), None, None, None)
+                .await
+                .unwrap();
         assert!(preview["offload"].is_null());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15089,9 +14971,7 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<usize>>,
     ) {
         use std::io::{Read, Write};
-        fn next_status(
-            script: &std::sync::Mutex<Vec<u16>>,
-        ) -> u16 {
+        fn next_status(script: &std::sync::Mutex<Vec<u16>>) -> u16 {
             let mut script = script.lock().unwrap();
             if script.len() > 1 {
                 script.remove(0)
@@ -15134,10 +15014,7 @@ mod tests {
                     let mut head_end: Option<usize> = None;
                     loop {
                         if head_end.is_none() {
-                            head_end = buf
-                                .windows(4)
-                                .position(|w| w == b"\r\n\r\n")
-                                .map(|p| p + 4);
+                            head_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
                             if let Some(he) = head_end {
                                 let head = String::from_utf8_lossy(&buf[..he]).into_owned();
                                 for line in head.lines() {
@@ -15160,11 +15037,7 @@ mod tests {
                         }
                     }
                     let req = String::from_utf8_lossy(&buf).into_owned();
-                    let path = req
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("")
-                        .to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
                     let status = if path == "/health" {
                         *health_count.lock().unwrap() += 1;
                         next_status(&health_script)
@@ -15187,11 +15060,7 @@ mod tests {
                 }
             });
         }
-        (
-            format!("http://127.0.0.1:{port}"),
-            health_count,
-            chat_count,
-        )
+        (format!("http://127.0.0.1:{port}"), health_count, chat_count)
     }
 
     fn offload_probe_test_timing() -> OffloadProbeTiming {
@@ -15210,14 +15079,13 @@ mod tests {
         // chat request until readiness, and must then pass — the
         // old status-blind "ping" gate fired the probe request
         // into the loading 503 and reported a failure.
-        let (base, health_count, chat_count) =
-            offload_probe_stub(vec![503, 503, 200], vec![200]);
+        let (base, health_count, chat_count) = offload_probe_stub(vec![503, 503, 200], vec![200]);
         let mut alive = || {
             Box::pin(async { true })
                 as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         };
-        let outcome = offload_probe_http_sequence(&base, offload_probe_test_timing(), &mut alive)
-            .await;
+        let outcome =
+            offload_probe_http_sequence(&base, offload_probe_test_timing(), &mut alive).await;
         assert_eq!(outcome, OffloadProbeHttpOutcome::Passed);
         assert!(*health_count.lock().unwrap() >= 3);
         assert_eq!(*chat_count.lock().unwrap(), 1);
@@ -15247,14 +15115,13 @@ mod tests {
         // Ready, but the first probe attempts still draw 503s
         // (startup work racing the probe): retried within the
         // window, then the probe passes.
-        let (base, _health_count, chat_count) =
-            offload_probe_stub(vec![200], vec![503, 503, 200]);
+        let (base, _health_count, chat_count) = offload_probe_stub(vec![200], vec![503, 503, 200]);
         let mut alive = || {
             Box::pin(async { true })
                 as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         };
-        let outcome = offload_probe_http_sequence(&base, offload_probe_test_timing(), &mut alive)
-            .await;
+        let outcome =
+            offload_probe_http_sequence(&base, offload_probe_test_timing(), &mut alive).await;
         assert_eq!(outcome, OffloadProbeHttpOutcome::Passed);
         assert_eq!(*chat_count.lock().unwrap(), 3);
     }
@@ -15268,8 +15135,8 @@ mod tests {
             Box::pin(async { true })
                 as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         };
-        let outcome = offload_probe_http_sequence(&base, offload_probe_test_timing(), &mut alive)
-            .await;
+        let outcome =
+            offload_probe_http_sequence(&base, offload_probe_test_timing(), &mut alive).await;
         assert_eq!(
             outcome,
             OffloadProbeHttpOutcome::FailedAfterReady("HTTP 500".to_string())
@@ -15312,39 +15179,39 @@ mod tests {
         }
     }
 
-        /// Loopback HTTP server for the metrics-fetcher tests: answers
-        /// each accepted connection with the canned response mapped to
-        /// the request's path (404 when unmapped), then closes.
-        /// Returns the bound port.
-        fn metrics_test_server(
-            responses: std::collections::HashMap<String, String>,
-            connections: usize,
-        ) -> u16 {
-            use std::io::{Read, Write};
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            std::thread::spawn(move || {
-                for _ in 0..connections {
-                    let Ok((mut stream, _)) = listener.accept() else {
-                        return;
-                    };
-                    let mut buf = [0u8; 4096];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
-                    let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
-                    let resp = responses.get(&path).cloned().unwrap_or_else(|| {
-                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()
-                    });
-                    let _ = stream.write_all(resp.as_bytes());
-                }
-            });
-            port
-        }
+    /// Loopback HTTP server for the metrics-fetcher tests: answers
+    /// each accepted connection with the canned response mapped to
+    /// the request's path (404 when unmapped), then closes.
+    /// Returns the bound port.
+    fn metrics_test_server(
+        responses: std::collections::HashMap<String, String>,
+        connections: usize,
+    ) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                let resp = responses.get(&path).cloned().unwrap_or_else(|| {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()
+                });
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
 
-        #[test]
-        fn metrics_fetch_follows_trailing_slash_redirect() {
-            let body = "litellm_deployment_success_responses_total 3.0\n";
-            let responses = std::collections::HashMap::from([
+    #[test]
+    fn metrics_fetch_follows_trailing_slash_redirect() {
+        let body = "litellm_deployment_success_responses_total 3.0\n";
+        let responses = std::collections::HashMap::from([
                 (
                     "/metrics".to_string(),
                     "HTTP/1.1 307 Temporary Redirect\r\nLocation: /metrics/\r\nContent-Length: 0\r\n\r\n"
@@ -15359,490 +15226,524 @@ mod tests {
                     ),
                 ),
             ]);
-            let port = metrics_test_server(responses, 2);
-            let got =
-                fetch_gateway_metrics("127.0.0.1", port, "test-key").expect("body after redirect");
-            assert_eq!(got, body);
-        }
+        let port = metrics_test_server(responses, 2);
+        let got =
+            fetch_gateway_metrics("127.0.0.1", port, "test-key").expect("body after redirect");
+        assert_eq!(got, body);
+    }
 
-        #[test]
-        fn metrics_fetch_direct_200_and_error_status() {
-            let responses = std::collections::HashMap::from([(
-                "/metrics".to_string(),
-                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody".to_string(),
-            )]);
-            let port = metrics_test_server(responses, 1);
-            assert_eq!(
-                fetch_gateway_metrics("127.0.0.1", port, "k").as_deref(),
-                Some("body")
-            );
-            // No path mapped -> the server's 404 -> None, no panic.
-            let port = metrics_test_server(std::collections::HashMap::new(), 1);
-            assert_eq!(fetch_gateway_metrics("127.0.0.1", port, "k"), None);
-        }
+    #[test]
+    fn metrics_fetch_direct_200_and_error_status() {
+        let responses = std::collections::HashMap::from([(
+            "/metrics".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody".to_string(),
+        )]);
+        let port = metrics_test_server(responses, 1);
+        assert_eq!(
+            fetch_gateway_metrics("127.0.0.1", port, "k").as_deref(),
+            Some("body")
+        );
+        // No path mapped -> the server's 404 -> None, no panic.
+        let port = metrics_test_server(std::collections::HashMap::new(), 1);
+        assert_eq!(fetch_gateway_metrics("127.0.0.1", port, "k"), None);
+    }
 
-        #[test]
-        fn backend_spec_filters_no_jinja_from_raw_flags() {
-            // --jinja is app-owned (MCP design §7.1): every raw form
-            // that would disable it is stripped, in both spellings,
-            // while unrelated raw flags pass through.
-            let cfg = test_cfg();
-            let mut b = backend(&cfg, "planner");
-            for raw in [
-                "--no-jinja --threads 4",
-                "--no_jinja --threads 4",
-                "--jinja=false --threads 4",
-            ] {
-                b.raw_flags = Some(raw.into());
-                let spec = backend_spec(&cfg, &b, &[]);
-                assert!(
-                    !spec.args.iter().any(|a| a.starts_with("--no-jinja")
-                        || a.starts_with("--no_jinja")
-                        || a == "--jinja=false"),
-                    "raw form {raw:?} must be filtered"
-                );
-                assert!(spec.args.iter().any(|a| a == "--threads"));
-                // The structured --jinja survives exactly once.
-                assert_eq!(
-                    spec.args.iter().filter(|a| *a == "--jinja").count(),
-                    1
-                );
-            }
-        }
-
-        #[test]
-        fn offload_block_reason_partial_on_p100_is_blocked() {
-            // Tracker #37: the field failure — Coder-Next at the
-            // position `--n-cpu-moe 46` spells, on a Pascal (6,0) GPU.
-            let restrictions = catalog_restrictions("qwen3-coder-30b");
-            let position = manager_models::expert_offload(Some("--n-cpu-moe 46"));
-            let reason = offload_block_reason(
-                &restrictions,
-                position.layers(48),
-                48,
-                &[(6, 0)],
-                false,
-                false,
-            )
-            .expect("46 of 48 on compute capability 6.0 is blocked");
-            assert!(reason.contains("offload of 46 of 48 layers"), "{reason}");
-            assert!(reason.contains("compute capability 6.0"), "{reason}");
+    #[test]
+    fn backend_spec_filters_no_jinja_from_raw_flags() {
+        // --jinja is app-owned (MCP design §7.1): every raw form
+        // that would disable it is stripped, in both spellings,
+        // while unrelated raw flags pass through.
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        for raw in [
+            "--no-jinja --threads 4",
+            "--no_jinja --threads 4",
+            "--jinja=false --threads 4",
+        ] {
+            b.raw_flags = Some(raw.into());
+            let spec = backend_spec(&cfg, &b, &[]);
             assert!(
-                reason.contains("set the offload to 48 of 48 layers"),
-                "{reason}"
+                !spec.args.iter().any(|a| a.starts_with("--no-jinja")
+                    || a.starts_with("--no_jinja")
+                    || a == "--jinja=false"),
+                "raw form {raw:?} must be filtered"
             );
+            assert!(spec.args.iter().any(|a| a == "--threads"));
+            // The structured --jinja survives exactly once.
+            assert_eq!(spec.args.iter().filter(|a| *a == "--jinja").count(), 1);
         }
+    }
 
-        #[test]
-        fn offload_block_reason_overridden_position_is_allowed() {
-            let restrictions = catalog_restrictions("qwen3-coder-30b");
+    #[test]
+    fn offload_block_reason_partial_on_p100_is_blocked() {
+        // Tracker #37: the field failure — Coder-Next at the
+        // position `--n-cpu-moe 46` spells, on a Pascal (6,0) GPU.
+        let restrictions = catalog_restrictions("qwen3-coder-30b");
+        let position = manager_models::expert_offload(Some("--n-cpu-moe 46"));
+        let reason = offload_block_reason(
+            &restrictions,
+            position.layers(48),
+            48,
+            &[(6, 0)],
+            false,
+            false,
+        )
+        .expect("46 of 48 on compute capability 6.0 is blocked");
+        assert!(reason.contains("offload of 46 of 48 layers"), "{reason}");
+        assert!(reason.contains("compute capability 6.0"), "{reason}");
+        assert!(
+            reason.contains("set the offload to 48 of 48 layers"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn offload_block_reason_overridden_position_is_allowed() {
+        let restrictions = catalog_restrictions("qwen3-coder-30b");
+        assert_eq!(
+            offload_block_reason(&restrictions, 46, 48, &[(6, 0)], false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn offload_block_reason_endpoints_are_allowed() {
+        let restrictions = catalog_restrictions("qwen3-coder-30b");
+        for layers in [0, 48] {
             assert_eq!(
-                offload_block_reason(&restrictions, 46, 48, &[(6, 0)], false, true),
-                None
+                offload_block_reason(&restrictions, layers, 48, &[(6, 0)], false, false),
+                None,
+                "endpoint {layers} is verified on 6.0"
             );
         }
+    }
 
-        #[test]
-        fn offload_block_reason_endpoints_are_allowed() {
-            let restrictions = catalog_restrictions("qwen3-coder-30b");
-            for layers in [0, 48] {
-                assert_eq!(
-                    offload_block_reason(&restrictions, layers, 48, &[(6, 0)], false, false),
-                    None,
-                    "endpoint {layers} is verified on 6.0"
-                );
+    #[test]
+    fn offload_block_reason_other_gpu_is_allowed() {
+        // Placement re-evaluation: the same saved position on a
+        // newer GPU carries no pinned restriction.
+        let restrictions = catalog_restrictions("qwen3-coder-30b");
+        assert_eq!(
+            offload_block_reason(&restrictions, 46, 48, &[(8, 6)], false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn offload_block_reason_unrestricted_model_is_allowed() {
+        let restrictions = catalog_restrictions("nemotron-3.5-lightning-30b");
+        assert!(restrictions.is_empty());
+        assert_eq!(
+            offload_block_reason(&restrictions, 16, 24, &[(6, 0)], false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn offload_block_reason_cpu_only_is_allowed() {
+        let restrictions = catalog_restrictions("qwen3-coder-30b");
+        assert_eq!(
+            offload_block_reason(&restrictions, 46, 48, &[], true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn offload_info_payload_fields_for_coder_and_nemotron() {
+        // sys_bytes_by_position is exact for Coder-Next (uniform
+        // expert blocks): index 0 is empty, index 48 is the full
+        // expert bytes.
+        let mut cfg = test_cfg();
+        let b = serve_model(
+            &mut cfg,
+            "coder",
+            "qwen3-coder-30b",
+            "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
+            Some("--n-cpu-moe 46"),
+        );
+        let info = backend_offload_info(&cfg, &b).expect("coder info");
+        assert_eq!(info.sys_bytes_by_position.len(), 49);
+        assert_eq!(info.sys_bytes_by_position[0], 0);
+        assert_eq!(info.sys_bytes_by_position[48], info.expert_bytes);
+        assert!(!info.custom, "canonical spelling is not custom");
+        assert_eq!(info.restrictions.len(), 1);
+
+        // A padded-but-equivalent spelling is not custom either;
+        // a spelling the canonical form would not produce is.
+        let b = serve_model(
+            &mut cfg,
+            "coder",
+            "qwen3-coder-30b",
+            "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
+            Some("  --n-cpu-moe   46  "),
+        );
+        let info = backend_offload_info(&cfg, &b).expect("coder info");
+        assert!(!info.custom, "whitespace-only difference is not custom");
+
+        let b = serve_model(
+            &mut cfg,
+            "coder-fast",
+            "nemotron-3.5-lightning-30b",
+            "models/Nemotron.gguf",
+            Some("--n-cpu-moe=16"),
+        );
+        let info = backend_offload_info(&cfg, &b).expect("nemotron info");
+        assert!(
+            info.custom,
+            "the `=` spelling is not the canonical form for the position"
+        );
+        assert_eq!(info.sys_bytes_by_position.len(), 25);
+        assert!(info.restrictions.is_empty());
+    }
+
+    #[test]
+    fn model_add_entry_unknown_size_is_a_clean_error() {
+        // Tracker #32: an unknown-size model used to be stored with
+        // params_b 0.0, which fails config validation. The add must
+        // now refuse up front, naming what is missing.
+        let r = model_add_entry(
+            "obscure-1b",
+            "https://example.com/obscure.gguf",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        match r {
+            Err(ApiError::InvalidInput(msg)) => {
+                assert!(msg.contains("params_b"), "error names the gap: {msg}");
+                assert!(msg.contains("obscure-1b"), "error names the model: {msg}");
             }
+            other => panic!("expected InvalidInput, got {other:?}"),
         }
+        // A non-positive explicit value counts as "not supplied".
+        let r = model_add_entry(
+            "obscure-1b",
+            "https://example.com/obscure.gguf",
+            None,
+            None,
+            Some(0.0),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(r, Err(ApiError::InvalidInput(_))), "{r:?}");
+    }
 
-        #[test]
-        fn offload_block_reason_other_gpu_is_allowed() {
-            // Placement re-evaluation: the same saved position on a
-            // newer GPU carries no pinned restriction.
-            let restrictions = catalog_restrictions("qwen3-coder-30b");
-            assert_eq!(
-                offload_block_reason(&restrictions, 46, 48, &[(8, 6)], false, false),
-                None
-            );
-        }
+    #[test]
+    fn model_add_entry_uses_explicit_params() {
+        // Known-size add: behavior unchanged from before the fix —
+        // enabled, unpinned hash, file name from the URL, quant
+        // defaulting to "unknown".
+        let e = model_add_entry(
+            "my-7b",
+            "https://example.com/my-7b-q4.gguf",
+            None,
+            None,
+            Some(7.5),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("explicit params resolve");
+        assert_eq!(e.id, "my-7b");
+        assert_eq!(e.params_b, 7.5);
+        assert_eq!(e.gguf_path, PathBuf::from("models").join("my-7b-q4.gguf"));
+        assert_eq!(e.quant, "unknown");
+        assert!(e.enabled);
+        assert!(e.sha256.is_empty());
+        // The built entry passes config validation (the defect was
+        // an entry that could not).
+        let mut cfg = test_cfg();
+        cfg.models.push(e);
+        manager_config::validate(&cfg).expect("added entry validates");
+        // An explicit value wins over the catalog.
+        let e = model_add_entry(
+            "qwen3-8b",
+            "https://example.com/x.gguf",
+            None,
+            None,
+            Some(9.0),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("explicit params resolve");
+        assert_eq!(e.params_b, 9.0);
+    }
 
-        #[test]
-        fn offload_block_reason_unrestricted_model_is_allowed() {
-            let restrictions = catalog_restrictions("nemotron-3.5-lightning-30b");
-            assert!(restrictions.is_empty());
-            assert_eq!(
-                offload_block_reason(&restrictions, 16, 24, &[(6, 0)], false, false),
-                None
-            );
-        }
+    #[test]
+    fn model_add_entry_resolves_params_from_catalog() {
+        // By id.
+        let e = model_add_entry(
+            "qwen3-8b",
+            "https://example.com/x.gguf",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("catalog id resolves");
+        assert_eq!(e.params_b, 8.0);
+        // By exact source URL under an operator-chosen id.
+        let e = model_add_entry(
+            "my-qwen3-8b",
+            "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("catalog URL resolves");
+        assert_eq!(e.params_b, 8.0);
+    }
 
-        #[test]
-        fn offload_block_reason_cpu_only_is_allowed() {
-            let restrictions = catalog_restrictions("qwen3-coder-30b");
-            assert_eq!(
-                offload_block_reason(&restrictions, 46, 48, &[], true, false),
-                None
-            );
-        }
-
-        #[test]
-        fn offload_info_payload_fields_for_coder_and_nemotron() {
-            // sys_bytes_by_position is exact for Coder-Next (uniform
-            // expert blocks): index 0 is empty, index 48 is the full
-            // expert bytes.
-            let mut cfg = test_cfg();
-            let b = serve_model(
-                &mut cfg,
-                "coder",
-                "qwen3-coder-30b",
-                "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
-                Some("--n-cpu-moe 46"),
-            );
-            let info = backend_offload_info(&cfg, &b).expect("coder info");
-            assert_eq!(info.sys_bytes_by_position.len(), 49);
-            assert_eq!(info.sys_bytes_by_position[0], 0);
-            assert_eq!(info.sys_bytes_by_position[48], info.expert_bytes);
-            assert!(!info.custom, "canonical spelling is not custom");
-            assert_eq!(info.restrictions.len(), 1);
-
-            // A padded-but-equivalent spelling is not custom either;
-            // a spelling the canonical form would not produce is.
-            let b = serve_model(
-                &mut cfg,
-                "coder",
-                "qwen3-coder-30b",
-                "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
-                Some("  --n-cpu-moe   46  "),
-            );
-            let info = backend_offload_info(&cfg, &b).expect("coder info");
-            assert!(!info.custom, "whitespace-only difference is not custom");
-
-            let b = serve_model(
-                &mut cfg,
-                "coder-fast",
-                "nemotron-3.5-lightning-30b",
-                "models/Nemotron.gguf",
-                Some("--n-cpu-moe=16"),
-            );
-            let info = backend_offload_info(&cfg, &b).expect("nemotron info");
+    #[test]
+    fn model_add_entry_stores_and_validates_the_moe_declaration() {
+        let e = model_add_entry(
+            "moe-27b",
+            "https://example.com/moe.gguf",
+            None,
+            None,
+            Some(27.0),
+            Some(48),
+            Some(16),
+            None,
+            None,
+        )
+        .expect("declared pair resolves");
+        assert_eq!(e.moe_layers, Some(48));
+        assert_eq!(e.default_offload_layers, Some(16));
+        let mut cfg = test_cfg();
+        cfg.models.push(e);
+        manager_config::validate(&cfg).expect("declared entry validates");
+        // The pair is atomic at the write path: half a
+        // declaration, an over-range default, and a zero count
+        // all refuse.
+        for (layers, default) in [
+            (Some(48), None),
+            (None, Some(16)),
+            (Some(48), Some(49)),
+            (Some(0), Some(0)),
+        ] {
             assert!(
-                info.custom,
-                "the `=` spelling is not the canonical form for the position"
-            );
-            assert_eq!(info.sys_bytes_by_position.len(), 25);
-            assert!(info.restrictions.is_empty());
-        }
-
-        #[test]
-        fn model_add_entry_unknown_size_is_a_clean_error() {
-            // Tracker #32: an unknown-size model used to be stored with
-            // params_b 0.0, which fails config validation. The add must
-            // now refuse up front, naming what is missing.
-            let r = model_add_entry(
-                "obscure-1b",
-                "https://example.com/obscure.gguf",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            );
-            match r {
-                Err(ApiError::InvalidInput(msg)) => {
-                    assert!(msg.contains("params_b"), "error names the gap: {msg}");
-                    assert!(msg.contains("obscure-1b"), "error names the model: {msg}");
-                }
-                other => panic!("expected InvalidInput, got {other:?}"),
-            }
-            // A non-positive explicit value counts as "not supplied".
-            let r = model_add_entry(
-                "obscure-1b",
-                "https://example.com/obscure.gguf",
-                None,
-                None,
-                Some(0.0),
-                None,
-                None,
-                None,
-                None,
-            );
-            assert!(matches!(r, Err(ApiError::InvalidInput(_))), "{r:?}");
-        }
-
-        #[test]
-        fn model_add_entry_uses_explicit_params() {
-            // Known-size add: behavior unchanged from before the fix —
-            // enabled, unpinned hash, file name from the URL, quant
-            // defaulting to "unknown".
-            let e = model_add_entry(
-                "my-7b",
-                "https://example.com/my-7b-q4.gguf",
-                None,
-                None,
-                Some(7.5),
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("explicit params resolve");
-            assert_eq!(e.id, "my-7b");
-            assert_eq!(e.params_b, 7.5);
-            assert_eq!(e.gguf_path, PathBuf::from("models").join("my-7b-q4.gguf"));
-            assert_eq!(e.quant, "unknown");
-            assert!(e.enabled);
-            assert!(e.sha256.is_empty());
-            // The built entry passes config validation (the defect was
-            // an entry that could not).
-            let mut cfg = test_cfg();
-            cfg.models.push(e);
-            manager_config::validate(&cfg).expect("added entry validates");
-            // An explicit value wins over the catalog.
-            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, Some(9.0), None, None, None, None)
-                .expect("explicit params resolve");
-            assert_eq!(e.params_b, 9.0);
-        }
-
-        #[test]
-        fn model_add_entry_resolves_params_from_catalog() {
-            // By id.
-            let e = model_add_entry("qwen3-8b", "https://example.com/x.gguf", None, None, None, None, None, None, None)
-                .expect("catalog id resolves");
-            assert_eq!(e.params_b, 8.0);
-            // By exact source URL under an operator-chosen id.
-            let e = model_add_entry(
-                "my-qwen3-8b",
-                "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("catalog URL resolves");
-            assert_eq!(e.params_b, 8.0);
-        }
-
-        #[test]
-        fn model_add_entry_stores_and_validates_the_moe_declaration() {
-            let e = model_add_entry(
-                "moe-27b",
-                "https://example.com/moe.gguf",
-                None,
-                None,
-                Some(27.0),
-                Some(48),
-                Some(16),
-                None,
-                None,
-            )
-            .expect("declared pair resolves");
-            assert_eq!(e.moe_layers, Some(48));
-            assert_eq!(e.default_offload_layers, Some(16));
-            let mut cfg = test_cfg();
-            cfg.models.push(e);
-            manager_config::validate(&cfg).expect("declared entry validates");
-            // The pair is atomic at the write path: half a
-            // declaration, an over-range default, and a zero count
-            // all refuse.
-            for (layers, default) in [
-                (Some(48), None),
-                (None, Some(16)),
-                (Some(48), Some(49)),
-                (Some(0), Some(0)),
-            ] {
-                assert!(
-                    matches!(
-                        model_add_entry(
-                            "moe-27b",
-                            "https://example.com/moe.gguf",
-                            None,
-                            None,
-                            Some(27.0),
-                            layers,
-                            default,
-                            None,
-                            None,
-                        ),
-                        Err(ApiError::InvalidInput(_))
+                matches!(
+                    model_add_entry(
+                        "moe-27b",
+                        "https://example.com/moe.gguf",
+                        None,
+                        None,
+                        Some(27.0),
+                        layers,
+                        default,
+                        None,
+                        None,
                     ),
-                    "{layers:?} / {default:?} must refuse"
-                );
-            }
-        }
-
-        #[test]
-        fn model_add_entry_stores_the_mtp_declaration() {
-            let e = model_add_entry(
-                "mtp-27b",
-                "https://example.com/mtp.gguf",
-                None,
-                None,
-                Some(27.0),
-                None,
-                None,
-                Some(true),
-                None,
-            )
-            .expect("declared entry resolves");
-            assert_eq!(e.mtp, Some(true));
-            let mut cfg = test_cfg();
-            cfg.models.push(e);
-            manager_config::validate(&cfg).expect("declared entry validates");
-            // Undeclared stays undeclared (the field is omitted
-            // from the stored config, not written as false).
-            let e = model_add_entry(
-                "dense-7b",
-                "https://example.com/dense.gguf",
-                None,
-                None,
-                Some(7.0),
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("undeclared entry resolves");
-            assert_eq!(e.mtp, None);
-        }
-
-        #[test]
-        fn model_add_entry_stores_a_valid_sha256_pin() {
-            // P2-D6: an HF-picked add passes the sibling's
-            // lfs.sha256 and the record starts pinned, so the
-            // download path verifies against it (download_spec_for
-            // treats a real pin as authoritative).
-            let pin = "b".repeat(64);
-            let e = model_add_entry(
-                "picked-7b",
-                "https://huggingface.co/org/picked/resolve/main/picked-7b.gguf",
-                None,
-                None,
-                Some(7.0),
-                None,
-                None,
-                None,
-                Some(pin.clone()),
-            )
-            .expect("pinned entry resolves");
-            assert_eq!(e.sha256, pin);
-            let mut cfg = test_cfg();
-            cfg.models.push(e);
-            manager_config::validate(&cfg).expect("pinned entry validates");
-            // No pin supplied: the record starts unpinned,
-            // exactly as before Part 2.
-            let e = model_add_entry(
-                "plain-7b",
-                "https://example.com/plain.gguf",
-                None,
-                None,
-                Some(7.0),
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("unpinned entry resolves");
-            assert!(e.sha256.is_empty());
-        }
-
-        #[test]
-        fn model_add_entry_refuses_a_malformed_sha256() {
-            // §P2.12: a malformed hash is refused at the add —
-            // a short or non-hex "pin" would verify nothing.
-            for bad in ["abc", "z".repeat(64).as_str(), "a".repeat(63).as_str()] {
-                assert!(
-                    matches!(
-                        model_add_entry(
-                            "picked-7b",
-                            "https://example.com/picked.gguf",
-                            None,
-                            None,
-                            Some(7.0),
-                            None,
-                            None,
-                            None,
-                            Some(bad.to_string()),
-                        ),
-                        Err(ApiError::InvalidInput(_))
-                    ),
-                    "malformed pin {bad:?} must refuse"
-                );
-            }
-        }
-
-        #[test]
-        fn model_add_entry_keeps_the_existing_input_rules() {
-            assert!(matches!(
-                model_add_entry("  ", "https://example.com/x.gguf", None, None, Some(1.0), None, None, None, None),
-                Err(ApiError::InvalidInput(_))
-            ));
-            assert!(matches!(
-                model_add_entry("m", "http://example.com/x.gguf", None, None, Some(1.0), None, None, None, None),
-                Err(ApiError::InvalidInput(_))
-            ));
-            assert!(matches!(
-                model_add_entry(
-                    "m",
-                    "https://example.com/x.gguf",
-                    Some("sub/dir.gguf".to_string()),
-                    None,
-                    Some(1.0),
-                    None,
-                    None,
-                    None,
-                    None,
+                    Err(ApiError::InvalidInput(_))
                 ),
-                Err(ApiError::InvalidInput(_))
-            ));
-        }
-
-        #[test]
-        fn model_add_save_step_never_persists_an_invalid_config() {
-            // The command's persistence shape: push onto a CLONE, save
-            // (which validates first), swap into state only on success.
-            // With a hand-built invalid entry (params_b 0.0 — what the
-            // old code produced), the save must fail and both the file
-            // on disk and the live config must stay exactly as they were.
-            let dir = std::env::temp_dir().join(format!(
-                "model-add-save-step-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("config.json");
-            let cfg = test_cfg();
-            manager_config::save(&cfg, &path).expect("baseline config saves");
-            let before = std::fs::read(&path).unwrap();
-
-            let mut new_cfg = cfg.clone();
-            new_cfg.models.push(manager_config::ModelConfig {
-                id: "bad-0b".to_string(),
-                gguf_path: PathBuf::from("models").join("bad.gguf"),
-                quant: "unknown".to_string(),
-                params_b: 0.0,
-                sha256: String::new(),
-                verified_at: None,
-                verified_sha256: None,
-                source_url: "https://example.com/bad.gguf".to_string(),
-                assigned_backends: Vec::new(),
-                enabled: true,
-                display_name: None,
-                moe_layers: None,
-                default_offload_layers: None,
-                mtp: None,
-            });
-            assert!(manager_config::save(&new_cfg, &path).is_err());
-            assert_eq!(std::fs::read(&path).unwrap(), before, "file untouched");
-            assert!(
-                !cfg.models.iter().any(|m| m.id == "bad-0b"),
-                "live config untouched (the entry only ever existed on the clone)"
+                "{layers:?} / {default:?} must refuse"
             );
-            let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn model_add_entry_stores_the_mtp_declaration() {
+        let e = model_add_entry(
+            "mtp-27b",
+            "https://example.com/mtp.gguf",
+            None,
+            None,
+            Some(27.0),
+            None,
+            None,
+            Some(true),
+            None,
+        )
+        .expect("declared entry resolves");
+        assert_eq!(e.mtp, Some(true));
+        let mut cfg = test_cfg();
+        cfg.models.push(e);
+        manager_config::validate(&cfg).expect("declared entry validates");
+        // Undeclared stays undeclared (the field is omitted
+        // from the stored config, not written as false).
+        let e = model_add_entry(
+            "dense-7b",
+            "https://example.com/dense.gguf",
+            None,
+            None,
+            Some(7.0),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("undeclared entry resolves");
+        assert_eq!(e.mtp, None);
+    }
+
+    #[test]
+    fn model_add_entry_stores_a_valid_sha256_pin() {
+        // P2-D6: an HF-picked add passes the sibling's
+        // lfs.sha256 and the record starts pinned, so the
+        // download path verifies against it (download_spec_for
+        // treats a real pin as authoritative).
+        let pin = "b".repeat(64);
+        let e = model_add_entry(
+            "picked-7b",
+            "https://huggingface.co/org/picked/resolve/main/picked-7b.gguf",
+            None,
+            None,
+            Some(7.0),
+            None,
+            None,
+            None,
+            Some(pin.clone()),
+        )
+        .expect("pinned entry resolves");
+        assert_eq!(e.sha256, pin);
+        let mut cfg = test_cfg();
+        cfg.models.push(e);
+        manager_config::validate(&cfg).expect("pinned entry validates");
+        // No pin supplied: the record starts unpinned,
+        // exactly as before Part 2.
+        let e = model_add_entry(
+            "plain-7b",
+            "https://example.com/plain.gguf",
+            None,
+            None,
+            Some(7.0),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("unpinned entry resolves");
+        assert!(e.sha256.is_empty());
+    }
+
+    #[test]
+    fn model_add_entry_refuses_a_malformed_sha256() {
+        // §P2.12: a malformed hash is refused at the add —
+        // a short or non-hex "pin" would verify nothing.
+        for bad in ["abc", "z".repeat(64).as_str(), "a".repeat(63).as_str()] {
+            assert!(
+                matches!(
+                    model_add_entry(
+                        "picked-7b",
+                        "https://example.com/picked.gguf",
+                        None,
+                        None,
+                        Some(7.0),
+                        None,
+                        None,
+                        None,
+                        Some(bad.to_string()),
+                    ),
+                    Err(ApiError::InvalidInput(_))
+                ),
+                "malformed pin {bad:?} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn model_add_entry_keeps_the_existing_input_rules() {
+        assert!(matches!(
+            model_add_entry(
+                "  ",
+                "https://example.com/x.gguf",
+                None,
+                None,
+                Some(1.0),
+                None,
+                None,
+                None,
+                None
+            ),
+            Err(ApiError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            model_add_entry(
+                "m",
+                "http://example.com/x.gguf",
+                None,
+                None,
+                Some(1.0),
+                None,
+                None,
+                None,
+                None
+            ),
+            Err(ApiError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            model_add_entry(
+                "m",
+                "https://example.com/x.gguf",
+                Some("sub/dir.gguf".to_string()),
+                None,
+                Some(1.0),
+                None,
+                None,
+                None,
+                None,
+            ),
+            Err(ApiError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn model_add_save_step_never_persists_an_invalid_config() {
+        // The command's persistence shape: push onto a CLONE, save
+        // (which validates first), swap into state only on success.
+        // With a hand-built invalid entry (params_b 0.0 — what the
+        // old code produced), the save must fail and both the file
+        // on disk and the live config must stay exactly as they were.
+        let dir = std::env::temp_dir().join(format!("model-add-save-step-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let cfg = test_cfg();
+        manager_config::save(&cfg, &path).expect("baseline config saves");
+        let before = std::fs::read(&path).unwrap();
+
+        let mut new_cfg = cfg.clone();
+        new_cfg.models.push(manager_config::ModelConfig {
+            id: "bad-0b".to_string(),
+            gguf_path: PathBuf::from("models").join("bad.gguf"),
+            quant: "unknown".to_string(),
+            params_b: 0.0,
+            sha256: String::new(),
+            verified_at: None,
+            verified_sha256: None,
+            source_url: "https://example.com/bad.gguf".to_string(),
+            assigned_backends: Vec::new(),
+            enabled: true,
+            display_name: None,
+            moe_layers: None,
+            default_offload_layers: None,
+            mtp: None,
+        });
+        assert!(manager_config::save(&new_cfg, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before, "file untouched");
+        assert!(
+            !cfg.models.iter().any(|m| m.id == "bad-0b"),
+            "live config untouched (the entry only ever existed on the clone)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // --- KV cache / flash attention integration (feature/backend-kv-fa) ---
 
@@ -15995,7 +15896,12 @@ mod tests {
         // Split across two targets: shares follow the split and
         // each target's verdict is its own — the small card
         // refuses its half while the large one takes it.
-        let split_targets = (vec![0.5, 0.5], vec![16_384u64, 4_096], vec![0u32, 3], vec![None, None]);
+        let split_targets = (
+            vec![0.5, 0.5],
+            vec![16_384u64, 4_096],
+            vec![0u32, 3],
+            vec![None, None],
+        );
         let p = cache_preview_json(
             &layout,
             manager_models::ExpertOffload::None,
@@ -16010,7 +15916,10 @@ mod tests {
         assert_eq!(p["targets"][0]["required_mib"], half);
         assert_eq!(p["targets"][0]["fits"], true);
         assert_eq!(p["targets"][1]["gpu"], 3);
-        assert_eq!(p["targets"][1]["required_mib"], (11_559 + 2_048 + 150) - half);
+        assert_eq!(
+            p["targets"][1]["required_mib"],
+            (11_559 + 2_048 + 150) - half
+        );
         assert_eq!(p["targets"][1]["fits"], false);
         // Over total with no WDDM driver model reported: the
         // three-state verdict is a hard does_not_fit, no paging.
@@ -16044,9 +15953,7 @@ mod tests {
         assert_eq!(info.selection, manager_models::CacheSelection::default());
         b.raw_flags = Some("--parallel 1".to_string());
         assert!(!backend_cache_info(&b).present);
-        b.raw_flags = Some(
-            "--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on".to_string(),
-        );
+        b.raw_flags = Some("--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on".to_string());
         let info = backend_cache_info(&b);
         assert!(info.present);
         assert!(!info.custom);
@@ -16150,8 +16057,7 @@ pub async fn op_notifications_set_config(
     let mut cfg = state.config.write().await;
     let mut new_cfg = cfg.clone();
     new_cfg.notifications = config;
-    manager_config::save(&new_cfg, &state.config_path)
-        .map_err(ApiError::from)?;
+    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
     *cfg = new_cfg;
     Ok(json!({ "ok": true, "persisted": true }))
 }
@@ -16195,9 +16101,7 @@ pub async fn op_backend_test_tool_call(
             .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
         format!("http://127.0.0.1:{}", backend.port)
     };
-    let result = test_tool_call(&base_url)
-        .await
-        .map_err(ApiError::from)?;
+    let result = test_tool_call(&base_url).await.map_err(ApiError::from)?;
     // The supervisor and config crates spell the same three outcomes
     // with separate enums (neither depends on the other); the
     // mapping between them lives here, at the layer that holds both.
@@ -16219,8 +16123,7 @@ pub async fn op_backend_test_tool_call(
             at_ms: now_ms(),
         });
     }
-    manager_config::save(&cfg, &state.config_path)
-        .map_err(ApiError::from)?;
+    manager_config::save(&cfg, &state.config_path).map_err(ApiError::from)?;
     drop(cfg);
     Ok(serde_json::to_value(&result)?)
 }
@@ -16228,10 +16131,7 @@ pub async fn op_backend_test_tool_call(
 /// Supervision state for Settings: the mode, the resolved service
 /// account, shim presence, and every managed service's registration
 /// + SCM state.
-pub async fn op_services_list(
-    state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
-) -> ApiResult {
+pub async fn op_services_list(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
     let cfg = state.config.read().await.clone();
     let host = service_host_path();
     let mut targets: Vec<(String, String)> = cfg
@@ -16259,9 +16159,9 @@ pub async fn op_services_list(
     let services: Vec<Value> = queried
         .into_iter()
         .map(|(target, name, status)| {
-            let live = status.as_ref().filter(|s| {
-                !matches!(s.state, manager_services::ServiceState::NotInstalled)
-            });
+            let live = status
+                .as_ref()
+                .filter(|s| !matches!(s.state, manager_services::ServiceState::NotInstalled));
             json!({
                 "target": target,
                 "service_name": name,
@@ -16311,13 +16211,10 @@ pub async fn op_services_register(
             .write_backend_service_definition(&target)
             .await
             .map_err(ApiError::Services)?;
-        manager_services::read_definition(&path)
-            .map_err(|e| ApiError::Services(e.to_string()))?
+        manager_services::read_definition(&path).map_err(|e| ApiError::Services(e.to_string()))?
     };
     let account = manager_services::scm::current_user_account().ok_or_else(|| {
-        ApiError::Services(
-            "could not resolve the current user account for the service".to_string(),
-        )
+        ApiError::Services("could not resolve the current user account for the service".to_string())
     })?;
     def.account = Some(account.clone());
     let service_name = def.name.clone();
@@ -16366,13 +16263,14 @@ pub async fn op_services_unregister(
         "--name".to_string(),
         service_name.clone(),
     ]);
-    let out = <RealSystemOps as manager_wizard::SystemOps>::run_elevated(&RealSystemOps::default(), &cmd)
-        .await
-        .map_err(|e| {
-            ApiError::Services(format!(
-                "elevated unregister could not run (was the prompt declined?): {e}"
-            ))
-        })?;
+    let out =
+        <RealSystemOps as manager_wizard::SystemOps>::run_elevated(&RealSystemOps::default(), &cmd)
+            .await
+            .map_err(|e| {
+                ApiError::Services(format!(
+                    "elevated unregister could not run (was the prompt declined?): {e}"
+                ))
+            })?;
     if out.exit_code != 0 {
         return Err(ApiError::Services(format!(
             "unregister of {service_name} failed (helper exit {})",
@@ -16417,8 +16315,7 @@ pub async fn op_mcp_set_exposure(
             .ok_or_else(|| ApiError::NotFound(format!("mcp server {id}")))?;
         let previous = server.exposure;
         server.exposure = exposure;
-        manager_config::save(&new_cfg, &state.config_path)
-            .map_err(ApiError::from)?;
+        manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
         *cfg = new_cfg;
         previous
     };
@@ -16477,8 +16374,7 @@ pub async fn op_mcp_save_server(
         Some(existing) => *existing = server,
         None => new_cfg.mcp.servers.push(server),
     }
-    manager_config::save(&new_cfg, &state.config_path)
-        .map_err(ApiError::from)?;
+    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
     *cfg = new_cfg;
     Ok(json!({ "id": id, "persisted": true }))
 }
@@ -16505,8 +16401,7 @@ pub async fn op_mcp_delete_server(
     let mut cfg = state.config.write().await;
     let mut new_cfg = cfg.clone();
     new_cfg.mcp.servers.retain(|s| s.id != id);
-    manager_config::save(&new_cfg, &state.config_path)
-        .map_err(ApiError::from)?;
+    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
     *cfg = new_cfg;
     Ok(json!({ "id": id, "deleted": true, "persisted": true }))
 }
@@ -16541,9 +16436,7 @@ pub async fn op_mcp_store_credential(
             .clone()
             .filter(|r| !r.trim().is_empty())
             .ok_or_else(|| {
-                ApiError::InvalidInput(format!(
-                    "mcp server {id} declares no credential target"
-                ))
+                ApiError::InvalidInput(format!("mcp server {id} declares no credential target"))
             })?
     };
     RealSystemOps::default()
@@ -16588,18 +16481,12 @@ fn evaluate_offload_position(
     cpu_only: bool,
     journal: &activation::ActivationJournal,
 ) -> OffloadEvaluation {
-    let status = manager_models::offload_status(
-        restrictions,
-        layers,
-        moe_layers,
-        &placed_ccs,
-        cpu_only,
-    );
-    let restricting_cc = placed_ccs.iter().copied().find(|cc| {
-        restrictions
-            .iter()
-            .any(|r| r.compute_capability == *cc)
-    });
+    let status =
+        manager_models::offload_status(restrictions, layers, moe_layers, &placed_ccs, cpu_only);
+    let restricting_cc = placed_ccs
+        .iter()
+        .copied()
+        .find(|cc| restrictions.iter().any(|r| r.compute_capability == *cc));
     // The nearest allowed position is computed against the
     // restricting architecture; with no placed architecture it is
     // computed against the first restriction's, so an unknown
@@ -16654,11 +16541,10 @@ fn offload_block_reason(
     // Blocked implies a placed CC matches a restriction; the first
     // such CC names the architecture in the message and drives the
     // nearest-allowed snap.
-    let cc = placed_ccs.iter().copied().find(|cc| {
-        restrictions
-            .iter()
-            .any(|r| r.compute_capability == *cc)
-    })?;
+    let cc = placed_ccs
+        .iter()
+        .copied()
+        .find(|cc| restrictions.iter().any(|r| r.compute_capability == *cc))?;
     let nearest = manager_models::nearest_allowed(restrictions, cc, layers, moe_layers);
     Some(format!(
         "offload of {layers} of {moe_layers} layers is outside the verified range for this GPU (compute capability {}.{}) — set the offload to {nearest} of {moe_layers} layers in Edit Flags, or save the position with an explicit override",
@@ -16727,10 +16613,7 @@ async fn offload_change_pending(state: &AppState, cfg: &AppConfig, id: &str) -> 
 /// of the SAVED position. Captured before the spawn, after the
 /// preflight passes — a start that the preflight refuses never
 /// probes, and the position probed is the one being activated.
-async fn offload_probe_context(
-    state: &AppState,
-    id: &str,
-) -> Option<(u32, u32, u16)> {
+async fn offload_probe_context(state: &AppState, id: &str) -> Option<(u32, u32, u16)> {
     let cfg = state.config.read().await.clone();
     if !offload_change_pending(state, &cfg, id).await {
         return None;
@@ -17035,9 +16918,7 @@ fn model_add_entry(
 ) -> Result<manager_config::ModelConfig, ApiError> {
     let id = id.trim().to_string();
     if id.is_empty() {
-        return Err(ApiError::InvalidInput(
-            "model id is required".to_string(),
-        ));
+        return Err(ApiError::InvalidInput("model id is required".to_string()));
     }
     if !source_url.starts_with("https://") {
         return Err(ApiError::InvalidInput(
@@ -17480,9 +17361,8 @@ enum OffloadProbeHttpOutcome {
 
 /// Liveness check consulted between readiness polls and probe
 /// attempts: true while the backend's process is alive.
-type OffloadProbeAlive<'a> = dyn FnMut() -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = bool> + Send + 'a>,
-    > + Send
+type OffloadProbeAlive<'a> = dyn FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+    + Send
     + 'a;
 
 /// The offload probe's HTTP sequence, split from

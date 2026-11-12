@@ -62,9 +62,7 @@ enum Command {
     /// List backends
     Backends,
     /// Get one backend
-    Backend {
-        id: String,
-    },
+    Backend { id: String },
     /// Start a backend (202 operation, polled to completion)
     BackendStart {
         id: String,
@@ -105,15 +103,11 @@ enum Command {
     /// GPU telemetry
     Gpus,
     /// GPU telemetry history for a range (e.g. 1h, 24h)
-    TelemetryHistory {
-        range: String,
-    },
+    TelemetryHistory { range: String },
     /// List models
     Models,
     /// Get one model
-    Model {
-        id: String,
-    },
+    Model { id: String },
     /// Query logs
     Logs {
         /// Log scope (see logs-scopes)
@@ -134,17 +128,11 @@ enum Command {
     /// List operations
     Ops,
     /// Get one operation
-    Op {
-        id: String,
-    },
+    Op { id: String },
     /// Poll one operation to a terminal state
-    OpPoll {
-        id: String,
-    },
+    OpPoll { id: String },
     /// Abort one operation
-    OpAbort {
-        id: String,
-    },
+    OpAbort { id: String },
     /// Activation plan
     Activation,
     /// Apply the activation plan (202 operation, polled)
@@ -219,9 +207,7 @@ enum AuthCommand {
     /// List own sessions
     Sessions,
     /// Revoke one own session
-    SessionRevoke {
-        id: String,
-    },
+    SessionRevoke { id: String },
     /// Rotate a refresh token (prints the new pair as JSON)
     Refresh {
         /// Read the refresh token from stdin instead of
@@ -247,11 +233,7 @@ fn read_stdin_secret(what: &str) -> Result<String, ApiError> {
 
 /// Resolve a secret from exactly one source: a `--*-stdin` flag
 /// (stdin wins when set) or its environment variable.
-fn secret_from(
-    stdin_flag: bool,
-    env_name: &str,
-    what: &str,
-) -> Result<String, ApiError> {
+fn secret_from(stdin_flag: bool, env_name: &str, what: &str) -> Result<String, ApiError> {
     if stdin_flag {
         return read_stdin_secret(what);
     }
@@ -328,11 +310,7 @@ fn print_operation(op: &Operation) {
 /// Run a 202 operation command: print the accepted record, poll on
 /// the API cadence, print the terminal record. A failed operation
 /// exits non-zero.
-async fn run_operation(
-    client: &mut ApiClient,
-    path: &str,
-    body: Value,
-) -> Result<(), ApiError> {
+async fn run_operation(client: &mut ApiClient, path: &str, body: Value) -> Result<(), ApiError> {
     let op = client.post_operation(path, body).await?;
     eprintln!("operation {} ({}) running…", op.id, op.kind);
     let final_op = client
@@ -379,12 +357,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             if *allow_wddm_overcommit {
                 body["allow_wddm_overcommit"] = serde_json::json!(true);
             }
-            run_operation(
-                &mut client,
-                &format!("/api/v1/backends/{id}/start"),
-                body,
-            )
-            .await?;
+            run_operation(&mut client, &format!("/api/v1/backends/{id}/start"), body).await?;
         }
         Command::BackendStop { id, graceful, yes } => {
             confirm(&format!("stop backend {id}"), *yes)?;
@@ -396,11 +369,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             )
             .await?;
         }
-        Command::BackendRestart {
-            id,
-            graceful,
-            yes,
-        } => {
+        Command::BackendRestart { id, graceful, yes } => {
             confirm(&format!("restart backend {id}"), *yes)?;
             let mut client = authed_client(&cli)?;
             run_operation(
@@ -416,22 +385,12 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         }
         Command::GatewayStart => {
             let mut client = authed_client(&cli)?;
-            run_operation(
-                &mut client,
-                "/api/v1/gateway/start",
-                serde_json::json!({}),
-            )
-            .await?;
+            run_operation(&mut client, "/api/v1/gateway/start", serde_json::json!({})).await?;
         }
         Command::GatewayStop { yes } => {
             confirm("stop gateway", *yes)?;
             let mut client = authed_client(&cli)?;
-            run_operation(
-                &mut client,
-                "/api/v1/gateway/stop",
-                serde_json::json!({}),
-            )
-            .await?;
+            run_operation(&mut client, "/api/v1/gateway/stop", serde_json::json!({})).await?;
         }
         Command::GatewayConfig => {
             let mut client = authed_client(&cli)?;
@@ -511,7 +470,10 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             let mut client = authed_client(&cli)?;
             print_json(
                 &client
-                    .post(&format!("/api/v1/operations/{id}/abort"), serde_json::json!({}))
+                    .post(
+                        &format!("/api/v1/operations/{id}/abort"),
+                        serde_json::json!({}),
+                    )
                     .await?,
             );
         }
@@ -671,11 +633,7 @@ fn totp_code(totp_stdin: bool) -> Result<String, ApiError> {
 /// Scripted verification (Stage 2 test client): enroll, then a full
 /// read sweep. Each step prints PASS/FAIL; the exit code is 0 only
 /// when every step passes. No TUI, no interaction.
-async fn run_verify(
-    cli: &Cli,
-    device_name: &str,
-    code_stdin: bool,
-) -> Result<(), ApiError> {
+async fn run_verify(cli: &Cli, device_name: &str, code_stdin: bool) -> Result<(), ApiError> {
     let code = secret_from(code_stdin, ENROLL_ENV, "enrollment code")?;
     let mut client = public_client(cli)?;
     let mut failures = 0usize;
@@ -716,10 +674,7 @@ async fn run_verify(
     let mut anon = public_client(cli)?;
     match anon.server().await {
         Ok(doc) => {
-            let api_version = doc
-                .get("api_version")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let api_version = doc.get("api_version").and_then(Value::as_str).unwrap_or("");
             if api_version == "1" {
                 println!("PASS server identity (api_version 1)");
             } else {

@@ -260,9 +260,7 @@ mod tests {
     fn rule_identity() {
         assert_eq!(rule_name(47821), "LLMdil Admin API (47821)");
         assert!(REMOTE_SCOPES.contains("100.64.0.0/10"));
-        assert!(netsh_show_argv(47821)
-            .iter()
-            .any(|a| a.contains("47821")));
+        assert!(netsh_show_argv(47821).iter().any(|a| a.contains("47821")));
     }
 
     #[tokio::test]

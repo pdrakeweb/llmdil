@@ -182,10 +182,7 @@ impl TelemetryStore {
             // every poll, so the state is visible in the log as well
             // as recorded on the sample.
             if sample.power_absence == Some(PowerAbsence::FieldMissing)
-                && self
-                    .latest
-                    .get(&idx)
-                    .map(|prev| prev.sample.power_absence)
+                && self.latest.get(&idx).map(|prev| prev.sample.power_absence)
                     != Some(Some(PowerAbsence::FieldMissing))
             {
                 tracing::warn!(

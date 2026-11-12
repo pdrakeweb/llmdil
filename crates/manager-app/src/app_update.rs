@@ -162,7 +162,8 @@ impl Version {
 
     pub fn cmp_semver(&self, other: &Version) -> std::cmp::Ordering {
         use std::cmp::Ordering;
-        let core = (self.major, self.minor, self.patch).cmp(&(other.major, other.minor, other.patch));
+        let core =
+            (self.major, self.minor, self.patch).cmp(&(other.major, other.minor, other.patch));
         if core != Ordering::Equal {
             return core;
         }
@@ -508,7 +509,11 @@ fn load_reconciled(state: &Arc<AppState>) -> AppUpdateState {
 async fn current_status(state: &Arc<AppState>) -> Value {
     let cfg = state.config.read().await;
     let st = load_reconciled(state);
-    status_payload(&st, cfg.app_update.check_enabled, cfg.app_update.auto_update)
+    status_payload(
+        &st,
+        cfg.app_update.check_enabled,
+        cfg.app_update.auto_update,
+    )
 }
 
 fn emit_changed(sink: &Arc<dyn EventSink>, payload: &Value) {
@@ -532,7 +537,11 @@ fn http_client() -> Result<reqwest::Client, ApiError> {
 /// status, malformed payload): the outcome lands in the state file
 /// and the returned payload, per the silent-failure rule. When
 /// auto-update is on and an update was found, staging runs inline.
-pub async fn perform_check(state: &Arc<AppState>, sink: &Arc<dyn EventSink>, trigger: &str) -> Value {
+pub async fn perform_check(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    trigger: &str,
+) -> Value {
     let now_ms = Utc::now().timestamp_millis();
     let (check_enabled, auto_update) = {
         let cfg = state.config.read().await;
@@ -615,7 +624,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// file: the file counts as staged only when its digest equals
 /// the expected one. A mismatch deletes the file — unverified
 /// bytes are never left where the helper could run them.
-pub fn finalize_download(part_path: &Path, final_path: &Path, expected_sha256: &str) -> Result<(), String> {
+pub fn finalize_download(
+    part_path: &Path,
+    final_path: &Path,
+    expected_sha256: &str,
+) -> Result<(), String> {
     let bytes = std::fs::read(part_path).map_err(|e| format!("reading the download: {e}"))?;
     let actual = sha256_hex(&bytes);
     if actual != expected_sha256 {
@@ -663,7 +676,8 @@ pub async fn stage_available(state: &Arc<AppState>, st: &mut AppUpdateState) -> 
     // Idempotent re-stage: a verified installer already on disk
     // (e.g. a retry after the state save failed) needs no download.
     if final_path.exists() {
-        let bytes = std::fs::read(&final_path).map_err(|e| format!("reading the staged installer: {e}"))?;
+        let bytes =
+            std::fs::read(&final_path).map_err(|e| format!("reading the staged installer: {e}"))?;
         if sha256_hex(&bytes) == expected {
             st.staged = Some(StagedUpdate {
                 version: avail.version.clone(),
@@ -686,7 +700,10 @@ pub async fn stage_available(state: &Arc<AppState>, st: &mut AppUpdateState) -> 
         .await
         .map_err(|e| format!("installer download failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("installer download returned HTTP {}", resp.status()));
+        return Err(format!(
+            "installer download returned HTTP {}",
+            resp.status()
+        ));
     }
     let bytes = resp
         .bytes()
@@ -755,7 +772,8 @@ pub async fn begin_apply(state: &Arc<AppState>) -> Result<Value, ApiError> {
         relaunch_exe: exe.to_string_lossy().into_owned(),
         requested_at_unix_ms: Utc::now().timestamp_millis(),
     });
-    save_state(&state.data_dir, &st).map_err(|e| ApiError::Io(format!("saving update state: {e}")))?;
+    save_state(&state.data_dir, &st)
+        .map_err(|e| ApiError::Io(format!("saving update state: {e}")))?;
 
     let (helper, args) = build_apply_plan(&exe, std::process::id(), &state_path(&state.data_dir));
     let mut cmd = std::process::Command::new(&helper);
@@ -797,10 +815,16 @@ pub fn run_apply_helper(args: &[String]) -> i32 {
         return 2;
     };
     let state_file = PathBuf::from(state_file);
-    let Some(data_dir) = state_file.parent().and_then(|d| d.parent()).map(Path::to_path_buf) else {
+    let Some(data_dir) = state_file
+        .parent()
+        .and_then(|d| d.parent())
+        .map(Path::to_path_buf)
+    else {
         return 2;
     };
-    let wait_pid: u32 = helper_arg(args, "--wait-pid").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let wait_pid: u32 = helper_arg(args, "--wait-pid")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let mut st = load_state(&data_dir);
     let Some(pending) = st.pending_apply.take() else {
@@ -821,7 +845,8 @@ pub fn run_apply_helper(args: &[String]) -> i32 {
                 st.last_apply = Some(ApplyRecord {
                     version: pending.version.clone(),
                     ok: false,
-                    message: "the app did not exit within two minutes; the update was not applied".to_string(),
+                    message: "the app did not exit within two minutes; the update was not applied"
+                        .to_string(),
                     at_unix_ms: Utc::now().timestamp_millis(),
                 });
                 let _ = save_state(&data_dir, &st);
@@ -845,7 +870,12 @@ pub fn run_apply_helper(args: &[String]) -> i32 {
 
     let (ok, message) = match outcome {
         Ok(0) => (true, format!("LLMdil {} installed", pending.version)),
-        Ok(code) => (false, format!("the installer exited with code {code}; the previous version is still installed")),
+        Ok(code) => (
+            false,
+            format!(
+                "the installer exited with code {code}; the previous version is still installed"
+            ),
+        ),
         Err(msg) => (false, msg),
     };
     st.last_apply = Some(ApplyRecord {
@@ -856,7 +886,12 @@ pub fn run_apply_helper(args: &[String]) -> i32 {
     });
     if ok {
         st.staged = None;
-        if st.available.as_ref().map(|a| a.version == pending.version).unwrap_or(false) {
+        if st
+            .available
+            .as_ref()
+            .map(|a| a.version == pending.version)
+            .unwrap_or(false)
+        {
             st.available = None;
         }
         let _ = std::fs::remove_file(&installer);
@@ -874,11 +909,17 @@ pub fn run_apply_helper(args: &[String]) -> i32 {
 // Operations (registry handlers)
 // ---------------------------------------------------------------------------
 
-pub async fn op_app_update_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> crate::ApiResult {
+pub async fn op_app_update_status(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+) -> crate::ApiResult {
     Ok(current_status(state).await)
 }
 
-pub async fn op_app_update_check(state: &Arc<AppState>, sink: &Arc<dyn EventSink>) -> crate::ApiResult {
+pub async fn op_app_update_check(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+) -> crate::ApiResult {
     let _guard = state.app_update_guard.lock().await;
     Ok(perform_check(state, sink, "manual").await)
 }
@@ -916,7 +957,10 @@ async fn set_app_update_flag(
     Ok(())
 }
 
-pub async fn op_app_update_download(state: &Arc<AppState>, sink: &Arc<dyn EventSink>) -> crate::ApiResult {
+pub async fn op_app_update_download(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+) -> crate::ApiResult {
     let _guard = state.app_update_guard.lock().await;
     let mut st = load_reconciled(state);
     if st.available.is_none() {
@@ -936,7 +980,10 @@ pub async fn op_app_update_download(state: &Arc<AppState>, sink: &Arc<dyn EventS
     Ok(payload)
 }
 
-pub async fn op_app_update_restart(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> crate::ApiResult {
+pub async fn op_app_update_restart(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+) -> crate::ApiResult {
     let _guard = state.app_update_guard.lock().await;
     begin_apply(state).await
 }
@@ -1020,7 +1067,10 @@ mod tests {
         assert_eq!(up.version, "0.1.45");
         assert_eq!(up.tag, "v0.1.45");
         assert_eq!(up.asset_name, "LLMdil_0.1.45_x64-setup.exe");
-        assert_eq!(up.sha256.as_deref(), Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"));
+        assert_eq!(
+            up.sha256.as_deref(),
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        );
         // From 0.1.45 itself: nothing newer that qualifies.
         assert!(pick_update(&rels, &v("0.1.45")).is_none());
         // From ahead of everything: no downgrade is ever offered.
@@ -1028,10 +1078,18 @@ mod tests {
         // Digest parsing: only a well-formed sha256 digest counts.
         assert_eq!(parse_asset_digest(Some("sha256:AB12")), None);
         assert_eq!(
-            parse_asset_digest(Some("sha256:7d7450e6b4f3b399c736a1af01f2d2b66686160b852a98a3b18d39547d2645b2")).as_deref(),
+            parse_asset_digest(Some(
+                "sha256:7d7450e6b4f3b399c736a1af01f2d2b66686160b852a98a3b18d39547d2645b2"
+            ))
+            .as_deref(),
             Some("7d7450e6b4f3b399c736a1af01f2d2b66686160b852a98a3b18d39547d2645b2")
         );
-        assert_eq!(parse_asset_digest(Some("md5:7d7450e6b4f3b399c736a1af01f2d2b66686160b852a98a3b18d39547d2645b2")), None);
+        assert_eq!(
+            parse_asset_digest(Some(
+                "md5:7d7450e6b4f3b399c736a1af01f2d2b66686160b852a98a3b18d39547d2645b2"
+            )),
+            None
+        );
         assert_eq!(parse_asset_digest(None), None);
     }
 
@@ -1070,7 +1128,10 @@ mod tests {
     fn banner_derives_from_staged_state() {
         let current = v("0.1.42");
         let st = AppUpdateState::default();
-        assert!(derive_banner(&st, &current).is_none(), "nothing staged, no banner");
+        assert!(
+            derive_banner(&st, &current).is_none(),
+            "nothing staged, no banner"
+        );
         let st = AppUpdateState {
             staged: Some(StagedUpdate {
                 version: "0.1.43".to_string(),
@@ -1094,7 +1155,10 @@ mod tests {
             ..st
         };
         let banner = derive_banner(&st, &current).unwrap();
-        assert_eq!(banner["last_apply_error"], "the installer exited with code 1");
+        assert_eq!(
+            banner["last_apply_error"],
+            "the installer exited with code 1"
+        );
         // Running version caught up: a staged record at the running
         // version is stale and reconciles away (with its file).
         let dropped = reconcile_with_running(&mut st, &v("0.1.43"));
@@ -1152,8 +1216,12 @@ mod tests {
             a
         }));
         assert!(!is_helper_invocation(&["exe".to_string()]));
-        let (iex, iargs) = installer_command(Path::new("C:/data/app-update/LLMdil_0.1.43_x64-setup.exe"));
-        assert_eq!(iex, PathBuf::from("C:/data/app-update/LLMdil_0.1.43_x64-setup.exe"));
+        let (iex, iargs) =
+            installer_command(Path::new("C:/data/app-update/LLMdil_0.1.43_x64-setup.exe"));
+        assert_eq!(
+            iex,
+            PathBuf::from("C:/data/app-update/LLMdil_0.1.43_x64-setup.exe")
+        );
         assert_eq!(iargs, vec!["/S".to_string()]);
     }
 }

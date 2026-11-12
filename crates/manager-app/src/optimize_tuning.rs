@@ -74,7 +74,9 @@ fn save_tuning_store(state: &AppState, store: &TuningStore) {
 /// recent finished sweep, whichever backends they tuned.
 pub(crate) fn tuning_payload(state: &AppState) -> Value {
     let store = load_tuning_store(state);
-    let running = store.running().map(|s| serde_json::to_value(s).unwrap_or(Value::Null));
+    let running = store
+        .running()
+        .map(|s| serde_json::to_value(s).unwrap_or(Value::Null));
     let latest = store
         .sweeps
         .iter()
@@ -91,11 +93,7 @@ pub(crate) fn tuning_payload(state: &AppState) -> Value {
 /// GPU indices a backend is placed on, resolved the way the
 /// fingerprint resolution resolves them: an undetermined
 /// placement counts as every installed GPU.
-fn placed_indices(
-    cfg: &AppConfig,
-    b: &manager_config::BackendConfig,
-    all: &[u32],
-) -> Vec<u32> {
+fn placed_indices(cfg: &AppConfig, b: &manager_config::BackendConfig, all: &[u32]) -> Vec<u32> {
     let _ = cfg;
     match crate::backend_gpu_visibility(b) {
         crate::GpuVisibility::CpuOnly => Vec::new(),
@@ -121,7 +119,9 @@ pub(crate) async fn build_tuning_inputs(
         .ok_or_else(|| ApiError::NotFound(format!("backend {backend_id}")))?
         .clone();
     let model = crate::model_for_backend(cfg, &backend)
-        .ok_or_else(|| ApiError::InvalidInput(format!("backend {backend_id} serves no registered model")))?
+        .ok_or_else(|| {
+            ApiError::InvalidInput(format!("backend {backend_id} serves no registered model"))
+        })?
         .clone();
 
     let inventory = {
@@ -214,8 +214,8 @@ pub(crate) async fn build_tuning_inputs(
             kv: geo,
             gpu_weights_mib: req.gpu_weights_mib,
             rs_mib: req.rs_mib,
-            moe_cache_mib: manager_models::moe_cache_mib(backend.raw_flags.as_deref())
-                .unwrap_or(0) as u64,
+            moe_cache_mib: manager_models::moe_cache_mib(backend.raw_flags.as_deref()).unwrap_or(0)
+                as u64,
             n_ctx: backend.flags.n_ctx,
             split: incumbent.tensor_split.clone(),
             gpu_total_mib: placed_totals,
@@ -259,7 +259,9 @@ fn price_coords(
     let req = crate::backend_memory_requirement(&temp_cfg, &temp)?;
     let n = coords.gpu_indices.len();
     if n == 0 {
-        return Some(ArmPricing { per_gpu_mib: Vec::new() });
+        return Some(ArmPricing {
+            per_gpu_mib: Vec::new(),
+        });
     }
     let split: Vec<f32> = if coords.tensor_split.len() == n {
         coords.tensor_split.clone()
@@ -343,8 +345,13 @@ fn exclusion_reason(
     coords: &TuningCoords,
 ) -> Option<String> {
     let pricing = price_coords(cfg, backend, inputs, coords);
-    plan_filter(coords, inputs, pricing.as_ref(), guardrail_reason(cfg, backend, inputs, coords))
-        .err()
+    plan_filter(
+        coords,
+        inputs,
+        pricing.as_ref(),
+        guardrail_reason(cfg, backend, inputs, coords),
+    )
+    .err()
 }
 
 /// The stop list (§B.4.1): every running backend placed on
@@ -352,7 +359,11 @@ fn exclusion_reason(
 /// all), the tuned backend included. CPU-only backends are
 /// never parked — a sweep does not contend with them for
 /// VRAM, and parking governs GPU residency.
-async fn compute_stop_list(state: &AppState, cfg: &AppConfig, inputs: &TuningInputs) -> Vec<String> {
+async fn compute_stop_list(
+    state: &AppState,
+    cfg: &AppConfig,
+    inputs: &TuningInputs,
+) -> Vec<String> {
     let gathered = crate::optimize::gather(state, cfg).await;
     let all: Vec<u32> = inputs.gpus.iter().map(|g| g.index).collect();
     let mut out: Vec<String> = Vec::new();
@@ -379,7 +390,10 @@ fn axis_display(inputs: &TuningInputs) -> Vec<(String, Vec<String>)> {
                 .map(|(g, _)| {
                     format!(
                         "GPU {}",
-                        g.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("+")
+                        g.iter()
+                            .map(|i| i.to_string())
+                            .collect::<Vec<_>>()
+                            .join("+")
                     )
                 })
                 .collect(),
@@ -637,7 +651,11 @@ async fn run_arm(
             arm.detail = Some(format!("temp backend {temp_id} failed to start: {e:?}"));
             return fail(&arm);
         }
-        let pid = sup.status().into_iter().find(|s| s.id == temp_id).and_then(|s| s.pid);
+        let pid = sup
+            .status()
+            .into_iter()
+            .find(|s| s.id == temp_id)
+            .and_then(|s| s.pid);
         drop(sup);
         if let Some(pid) = pid {
             let mut journal =
@@ -667,7 +685,11 @@ async fn run_arm(
                 continue;
             }
             if let Some(other) = cfg.backends.iter().find(|b| b.id == s.id) {
-                let placed = placed_indices(cfg, other, &inputs.gpus.iter().map(|g| g.index).collect::<Vec<_>>());
+                let placed = placed_indices(
+                    cfg,
+                    other,
+                    &inputs.gpus.iter().map(|g| g.index).collect::<Vec<_>>(),
+                );
                 if placed.iter().any(|i| coords.gpu_indices.contains(i)) {
                     others.push(s.id.clone());
                 }
@@ -694,7 +716,10 @@ async fn run_arm(
         });
         arm.residency = Some(if !others.is_empty() {
             ResidencyVerdict::Unverified {
-                reason: format!("backends still resident on the arm's GPUs: {}", others.join(", ")),
+                reason: format!(
+                    "backends still resident on the arm's GPUs: {}",
+                    others.join(", ")
+                ),
             }
         } else if missing {
             ResidencyVerdict::Unverified {
@@ -783,8 +808,12 @@ async fn run_arm(
     }
     arm.temp_peak_c = peak;
     let mut iter = results.into_iter();
-    let short = iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
-    let long = iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
+    let short = iter
+        .next()
+        .unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
+    let long = iter
+        .next()
+        .unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
     arm.measured = Some(ExperimentMeasured {
         short: short.clone(),
         long: long.clone(),
@@ -831,18 +860,13 @@ async fn run_arm(
                 .map(|n| n.to_string_lossy().into_owned()),
             model_sha256: fp_sha256,
             model_size_bytes: fp_size_bytes,
-            inputs: Some(manager_optimize::MeasurementInputs::from_fingerprint_inputs(
-                &fp_inputs,
-            )),
+            inputs: Some(manager_optimize::MeasurementInputs::from_fingerprint_inputs(&fp_inputs)),
             driver_version: crate::optimize::driver_versions_for(
                 &fp_inputs,
                 &gathered.gpu_driver_versions,
             ),
             llama_build,
-            residency: arm
-                .residency
-                .as_ref()
-                .map(|r| r.as_str().to_string()),
+            residency: arm.residency.as_ref().map(|r| r.as_str().to_string()),
             peak_temp_c: arm.temp_peak_c,
         };
         let mut store = MeasurementStore::load(&crate::optimize::measurements_path(state));
@@ -1144,10 +1168,7 @@ async fn run_sweep(
                         } else {
                             None
                         };
-                        (
-                            delta.map(|d| d.abs() <= 10.0).unwrap_or(false),
-                            delta,
-                        )
+                        (delta.map(|d| d.abs() <= 10.0).unwrap_or(false), delta)
                     }
                     _ => (false, None),
                 };
@@ -1322,10 +1343,7 @@ pub async fn op_optimize_tuning_run(
         "tuning",
     )?;
     let task_id = state
-        .record_task(
-            "optimize-tuning",
-            json!({ "backend": backend_id }),
-        )
+        .record_task("optimize-tuning", json!({ "backend": backend_id }))
         .await;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     {
@@ -1461,8 +1479,13 @@ pub async fn op_optimize_tuning_adopt(
         crate::op_backend_set_mtp(state, sink, backend_id.clone(), coords.mtp_n_max).await?;
     }
     if coords.parallel_slots != inputs.incumbent.parallel_slots {
-        crate::op_backend_set_parallel(state, sink, backend_id.clone(), Some(coords.parallel_slots))
-            .await?;
+        crate::op_backend_set_parallel(
+            state,
+            sink,
+            backend_id.clone(),
+            Some(coords.parallel_slots),
+        )
+        .await?;
     }
     if coords.offload_layers.unwrap_or(0) > 0
         && coords.moe_cache_mib != inputs.incumbent.moe_cache_mib

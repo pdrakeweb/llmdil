@@ -23,11 +23,9 @@ use std::sync::Arc;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{
-    CertificateError, DigitallySignedStruct, Error as TlsError, SignatureScheme,
-};
-use webpki::EndEntityCert;
+use rustls::{CertificateError, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use sha2::{Digest, Sha256};
+use webpki::EndEntityCert;
 
 /// Parse a fingerprint as shown by the LLMdil UI: exactly 64 hex
 /// characters (case-insensitive, surrounding whitespace ignored).
@@ -112,12 +110,9 @@ impl FingerprintVerifier {
             .iter()
             .find(|(scheme, _)| *scheme == dss.scheme)
             .map(|(_, algs)| *algs)
-            .ok_or(TlsError::InvalidCertificate(
-                CertificateError::BadSignature,
-            ))?;
-        let end_entity = EndEntityCert::try_from(cert).map_err(|_| {
-            TlsError::InvalidCertificate(CertificateError::BadEncoding)
-        })?;
+            .ok_or(TlsError::InvalidCertificate(CertificateError::BadSignature))?;
+        let end_entity = EndEntityCert::try_from(cert)
+            .map_err(|_| TlsError::InvalidCertificate(CertificateError::BadEncoding))?;
         for alg in algs {
             if end_entity
                 .verify_signature(*alg, message, dss.signature())
@@ -126,9 +121,7 @@ impl FingerprintVerifier {
                 return Ok(HandshakeSignatureValid::assertion());
             }
         }
-        Err(TlsError::InvalidCertificate(
-            CertificateError::BadSignature,
-        ))
+        Err(TlsError::InvalidCertificate(CertificateError::BadSignature))
     }
 }
 
@@ -197,8 +190,8 @@ mod tests {
     use rustls::client::danger::ServerCertVerifier;
 
     fn test_cert_der() -> Vec<u8> {
-        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .expect("params");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
         params.is_ca = rcgen::IsCa::NoCa;
         let key = rcgen::KeyPair::generate().expect("keypair");
         let cert = params.self_signed(&key).expect("self-signed cert");
@@ -209,10 +202,7 @@ mod tests {
     fn fingerprint_parses_and_rejects() {
         let good = "ab".repeat(32);
         assert_eq!(parse_fingerprint(&good).unwrap(), [0xab; 32]);
-        assert_eq!(
-            parse_fingerprint(&"AB".repeat(32)).unwrap(),
-            [0xab; 32]
-        );
+        assert_eq!(parse_fingerprint(&"AB".repeat(32)).unwrap(), [0xab; 32]);
         assert!(parse_fingerprint("  ab  ").is_err());
         assert!(parse_fingerprint(&"ab".repeat(31)).is_err());
         assert!(parse_fingerprint(&"zz".repeat(32)).is_err());
@@ -255,14 +245,12 @@ mod tests {
         use std::sync::Arc;
 
         let server_cert = CertificateDer::from(cert_der.to_vec());
-        let server_key = PrivateKeyDer::try_from(key_der.to_vec())
-            .expect("private key der");
+        let server_key = PrivateKeyDer::try_from(key_der.to_vec()).expect("private key der");
         let server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![server_cert], server_key)
             .expect("server config");
-        let acceptor =
-            tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
@@ -273,11 +261,8 @@ mod tests {
             }
         });
         let client_config = pinned_client_config(fp);
-        let connector =
-            tokio_rustls::TlsConnector::from(Arc::new(client_config));
-        let stream = tokio::net::TcpStream::connect(addr)
-            .await
-            .expect("connect");
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let name = ServerName::try_from("localhost").expect("server name");
         let ok = connector.connect(name, stream).await.is_ok();
         let _ = accept_task.await;
@@ -286,8 +271,8 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_handshake_accepts_match_and_rejects_mismatch() {
-        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .expect("params");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
         params.is_ca = rcgen::IsCa::NoCa;
         let key = rcgen::KeyPair::generate().expect("keypair");
         let cert = params.self_signed(&key).expect("self-signed cert");

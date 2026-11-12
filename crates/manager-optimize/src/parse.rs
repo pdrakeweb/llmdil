@@ -458,9 +458,7 @@ fn assign_create_port(cfg: &AppConfig, assigned: &HashSet<u16>) -> u16 {
     used.insert(cfg.gateway.port);
     used.insert(cfg.postgres.port);
     used.extend(assigned.iter().copied());
-    (8081..=8999)
-        .find(|p| !used.contains(p))
-        .unwrap_or(8999)
+    (8081..=8999).find(|p| !used.contains(p)).unwrap_or(8999)
 }
 
 /// One discovered candidate from the consultation's context
@@ -628,10 +626,9 @@ fn ground_backend_model_refs(
         }
         // An authored add for this model sits later in the plan:
         // move it ahead of the item.
-        if let Some(pos) = pending
-            .iter()
-            .position(|p| p.kind == PlanKind::ModelAdd && p.target.as_deref() == Some(model_id.as_str()))
-        {
+        if let Some(pos) = pending.iter().position(|p| {
+            p.kind == PlanKind::ModelAdd && p.target.as_deref() == Some(model_id.as_str())
+        }) {
             let add = pending.remove(pos);
             adds_available.insert(model_id.clone());
             out.push(add);
@@ -713,12 +710,7 @@ fn ground_backend_model_refs(
             // the already-registered model with that id): rewrite
             // and re-fingerprint, as port assignment rewrites a
             // create's port at parse.
-            if item
-                .change
-                .get("model_id")
-                .and_then(|v| v.as_str())
-                != Some(derived.as_str())
-            {
+            if item.change.get("model_id").and_then(|v| v.as_str()) != Some(derived.as_str()) {
                 item.change["model_id"] = json!(derived);
                 item.fingerprint = fingerprint(item.kind, item.target.as_deref(), &item.change);
                 item.previously_denied = denied_fingerprints.contains(&item.fingerprint);
@@ -802,16 +794,12 @@ fn ground_model_add_params(
             let file_name = url.rsplit('/').next().unwrap_or("");
             let candidate = candidates.iter().find(|c| {
                 c.params_b > 0.0
-                    && (c.file == file_name
-                        || url.contains(&format!("{}/{}", c.repo_id, c.file)))
+                    && (c.file == file_name || url.contains(&format!("{}/{}", c.repo_id, c.file)))
             });
             if let Some(c) = candidate {
                 item.change["params_b"] = json!(c.params_b);
-                item.fingerprint = fingerprint(
-                    PlanKind::ModelAdd,
-                    item.target.as_deref(),
-                    &item.change,
-                );
+                item.fingerprint =
+                    fingerprint(PlanKind::ModelAdd, item.target.as_deref(), &item.change);
                 item.previously_denied = denied_fingerprints.contains(&item.fingerprint);
                 if item.previously_denied {
                     item.decision = Decision::Denied;
@@ -919,10 +907,9 @@ fn ground_experiment_provisioning(
         // registers the id.
         let mut resolved: Option<(String, Option<Value>)> = None;
         let mut already_registered_as: Option<String> = None;
-        if items
-            .iter()
-            .any(|i| i.kind == PlanKind::ModelAdd && i.target.as_deref() == Some(candidate.as_str()))
-        {
+        if items.iter().any(|i| {
+            i.kind == PlanKind::ModelAdd && i.target.as_deref() == Some(candidate.as_str())
+        }) {
             resolved = Some((candidate.clone(), None));
         } else if let Some(c) = candidates.iter().find(|c| {
             candidate == c.repo_id
@@ -932,10 +919,9 @@ fn ground_experiment_provisioning(
             let derived = candidate_model_id(&c.file);
             if registered.contains(derived.as_str()) {
                 already_registered_as = Some(derived);
-            } else if items
-                .iter()
-                .any(|i| i.kind == PlanKind::ModelAdd && i.target.as_deref() == Some(derived.as_str()))
-            {
+            } else if items.iter().any(|i| {
+                i.kind == PlanKind::ModelAdd && i.target.as_deref() == Some(derived.as_str())
+            }) {
                 resolved = Some((derived, None));
             } else {
                 let mut change = json!({
@@ -965,10 +951,9 @@ fn ground_experiment_provisioning(
             let derived = candidate_model_id(file);
             if registered.contains(derived.as_str()) {
                 already_registered_as = Some(derived);
-            } else if items
-                .iter()
-                .any(|i| i.kind == PlanKind::ModelAdd && i.target.as_deref() == Some(derived.as_str()))
-            {
+            } else if items.iter().any(|i| {
+                i.kind == PlanKind::ModelAdd && i.target.as_deref() == Some(derived.as_str())
+            }) {
                 resolved = Some((derived, None));
             } else {
                 let change = json!({
@@ -1340,7 +1325,8 @@ fn item_entities(item: &PlanItem) -> (Vec<String>, Vec<String>, Vec<String>) {
 fn order_items_by_dependency(items: Vec<PlanItem>) -> Vec<PlanItem> {
     let n = items.len();
     let mut creators: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut removers: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    let mut removers: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
     let mut requires: Vec<Vec<String>> = Vec::with_capacity(n);
     for (i, item) in items.iter().enumerate() {
         let (creates, reqs, removes) = item_entities(item);
@@ -1376,12 +1362,7 @@ fn order_items_by_dependency(items: Vec<PlanItem>) -> Vec<PlanItem> {
     for preds in predecessors.iter_mut() {
         preds.sort_unstable();
     }
-    fn visit(
-        i: usize,
-        predecessors: &[Vec<usize>],
-        state: &mut [u8],
-        out: &mut Vec<usize>,
-    ) {
+    fn visit(i: usize, predecessors: &[Vec<usize>], state: &mut [u8], out: &mut Vec<usize>) {
         // state: 0 = unvisited, 1 = on the current path (cycle
         // guard), 2 = emitted.
         if state[i] != 0 {
@@ -1478,7 +1459,9 @@ fn parse_experiments(
                 match req_f32_vec(fo, "tensor_split") {
                     Some(v) => {
                         flags.tensor_split = Some(
-                            v.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect(),
+                            v.iter()
+                                .filter_map(|x| x.as_f64().map(|f| f as f32))
+                                .collect(),
                         );
                     }
                     None => flags_ok = false,
@@ -2221,11 +2204,7 @@ mod tests {
         cfg
     }
 
-    fn parse_with(
-        response: &str,
-        cfg: &AppConfig,
-        context: Value,
-    ) -> Result<Plan, ParseError> {
+    fn parse_with(response: &str, cfg: &AppConfig, context: Value) -> Result<Plan, ParseError> {
         parse_plan(
             response,
             cfg,
@@ -2265,7 +2244,10 @@ mod tests {
             r.items[0].change["source_url"].as_str(),
             Some(spec.url.as_str())
         );
-        assert_eq!(r.items[0].change["quant"].as_str(), Some(spec.quant.as_str()));
+        assert_eq!(
+            r.items[0].change["quant"].as_str(),
+            Some(spec.quant.as_str())
+        );
         if !spec.sha256.is_empty() {
             assert_eq!(
                 r.items[0].change["sha256"].as_str(),
@@ -2417,10 +2399,7 @@ mod tests {
         .unwrap();
         assert_eq!(r.items.len(), 2);
         assert_eq!(r.items[0].kind, PlanKind::ModelAdd);
-        assert_eq!(
-            r.items[0].target.as_deref(),
-            Some("qwen3.8-27b-moe-q4_k_m")
-        );
+        assert_eq!(r.items[0].target.as_deref(), Some("qwen3.8-27b-moe-q4_k_m"));
         assert_eq!(
             r.items[0].change["source_url"].as_str(),
             Some("https://huggingface.co/someorg/Qwen3.8-27B-MoE-GGUF/resolve/main/Qwen3.8-27B-MoE-Q4_K_M.gguf")
@@ -2508,7 +2487,10 @@ mod tests {
             r.items[0].change["source_url"].as_str(),
             Some(spec.url.as_str())
         );
-        assert_eq!(r.items[0].change["quant"].as_str(), Some(spec.quant.as_str()));
+        assert_eq!(
+            r.items[0].change["quant"].as_str(),
+            Some(spec.quant.as_str())
+        );
         if !spec.sha256.is_empty() {
             assert_eq!(
                 r.items[0].change["sha256"].as_str(),
@@ -2558,10 +2540,7 @@ mod tests {
         .unwrap();
         assert_eq!(r.items.len(), 2);
         assert_eq!(r.items[0].kind, PlanKind::ModelAdd);
-        assert_eq!(
-            r.items[0].target.as_deref(),
-            Some("qwen3.8-27b-moe-q4_k_m")
-        );
+        assert_eq!(r.items[0].target.as_deref(), Some("qwen3.8-27b-moe-q4_k_m"));
         assert_eq!(
             r.items[0].change["source_url"].as_str(),
             Some("https://huggingface.co/someorg/Qwen3.8-27B-MoE-GGUF/resolve/main/Qwen3.8-27B-MoE-Q4_K_M.gguf")
@@ -2839,7 +2818,11 @@ mod tests {
                 (PlanKind::ModelDownload, "qwen3.8-27b-moe"),
             ]
         );
-        assert!(plan.items.iter().enumerate().all(|(i, item)| item.id == i + 1));
+        assert!(plan
+            .items
+            .iter()
+            .enumerate()
+            .all(|(i, item)| item.id == i + 1));
 
         // (b) No Invalid flags on items 1, 2, 4 (the create,
         // the members change, the planner delete) once the
@@ -2869,7 +2852,11 @@ mod tests {
         };
         let verdicts = crate::validate::validate_plan(&plan, &cfg, &live);
         use crate::validate::ValidationStatus;
-        for (idx, label) in [(1, "backend.create"), (2, "group.set_members"), (4, "backend.delete planner")] {
+        for (idx, label) in [
+            (1, "backend.create"),
+            (2, "group.set_members"),
+            (4, "backend.delete planner"),
+        ] {
             assert_ne!(
                 verdicts[idx].status,
                 ValidationStatus::Invalid,
@@ -2894,22 +2881,38 @@ mod tests {
         // (c) E1 gains provisioning steps and is runnable once
         // they are accepted.
         let exp = &plan.experiments[0];
-        assert_eq!(exp.decision, Decision::Denied, "requires_stopping starts denied");
+        assert_eq!(
+            exp.decision,
+            Decision::Denied,
+            "requires_stopping starts denied"
+        );
         let prov = exp
             .provisioning
             .as_ref()
             .expect("the experiment must carry provisioning");
         assert_eq!(prov.model_id, "qwen3.8-27b-moe");
-        assert_eq!(prov.item_ids, vec![1, 7], "the authored add and the chained download");
+        assert_eq!(
+            prov.item_ids,
+            vec![1, 7],
+            "the authored add and the chained download"
+        );
         let download = &plan.items[6];
         assert_eq!(download.provision_for_experiment, Some(1));
-        assert_eq!(download.decision, Decision::Denied, "provisioning starts with the experiment's decision");
+        assert_eq!(
+            download.decision,
+            Decision::Denied,
+            "provisioning starts with the experiment's decision"
+        );
         // Plan-aware validation: not a dead-end Invalid.
-        let extra = vec![
-            "Qwen/Qwen3.8-27B-MoE-GGUF/Qwen3.8-27B-MoE-Q4_K_M.gguf".to_string(),
-        ];
-        let ev = crate::experiment::validate_experiment_for_plan(exp, &cfg, &extra, &plan.items, None);
-        assert_eq!(ev.status, ValidationStatus::Valid, "E1 verdict: {:?}", ev.reason);
+        let extra = vec!["Qwen/Qwen3.8-27B-MoE-GGUF/Qwen3.8-27B-MoE-Q4_K_M.gguf".to_string()];
+        let ev =
+            crate::experiment::validate_experiment_for_plan(exp, &cfg, &extra, &plan.items, None);
+        assert_eq!(
+            ev.status,
+            ValidationStatus::Valid,
+            "E1 verdict: {:?}",
+            ev.reason
+        );
 
         // Accepting the experiment accepts its provisioning
         // items; after they apply (model registered, file on
@@ -2921,8 +2924,16 @@ mod tests {
                 .expect("experiment exists");
         assert!(newly_denied.is_empty());
         assert_eq!(accepted_plan.experiments[0].decision, Decision::Accepted);
-        assert_eq!(accepted_plan.items[0].decision, Decision::Accepted, "linked authored add accepted");
-        assert_eq!(accepted_plan.items[6].decision, Decision::Accepted, "chained download accepted");
+        assert_eq!(
+            accepted_plan.items[0].decision,
+            Decision::Accepted,
+            "linked authored add accepted"
+        );
+        assert_eq!(
+            accepted_plan.items[6].decision,
+            Decision::Accepted,
+            "chained download accepted"
+        );
         let mut cfg_after = cfg.clone();
         cfg_after.models.push(manager_config::ModelConfig {
             id: "qwen3.8-27b-moe".to_string(),
@@ -2952,7 +2963,10 @@ mod tests {
             |_| true,
         );
         assert!(
-            matches!(resolution, crate::experiment::CandidateResolution::OnDisk { .. }),
+            matches!(
+                resolution,
+                crate::experiment::CandidateResolution::OnDisk { .. }
+            ),
             "post-provisioning resolution: {resolution:?}"
         );
 
@@ -2962,7 +2976,11 @@ mod tests {
         let mut denied_plan = plan.clone();
         crate::experiment::apply_experiment_decision(&mut denied_plan, 1, Decision::Denied)
             .expect("experiment exists");
-        assert_eq!(denied_plan.items[6].decision, Decision::Denied, "chained download denied");
+        assert_eq!(
+            denied_plan.items[6].decision,
+            Decision::Denied,
+            "chained download denied"
+        );
         assert_eq!(
             denied_plan.items[0].decision,
             Decision::Undecided,
@@ -3074,7 +3092,10 @@ mod tests {
         let reason = ev.reason.unwrap();
         assert!(reason.contains("not a registered model"), "{reason}");
         assert!(reason.contains("not in the curated catalog"), "{reason}");
-        assert!(reason.contains("not among the candidates discovered"), "{reason}");
+        assert!(
+            reason.contains("not among the candidates discovered"),
+            "{reason}"
+        );
         assert!(reason.contains("not an HF repo/file"), "{reason}");
     }
 

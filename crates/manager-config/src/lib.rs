@@ -864,9 +864,9 @@ pub fn validate_moe_declaration(
             "a MoE declaration needs both the layer count and the default offload layers"
                 .to_string(),
         ),
-        (None, Some(_)) => Err(
-            "a default offload requires the MoE layer count it counts against".to_string(),
-        ),
+        (None, Some(_)) => {
+            Err("a default offload requires the MoE layer count it counts against".to_string())
+        }
     }
 }
 
@@ -973,8 +973,7 @@ impl Default for AdminApiConfig {
 /// (log-streaming design D6). Per-machine, write-only, revocable;
 /// entered by the operator, read by the shipper at start, never
 /// written into `config.json` and never readable back through any op.
-pub const LOG_STREAMING_TOKEN_CRED_TARGET: &str =
-    "local-llm-service-manager/log-streaming-token";
+pub const LOG_STREAMING_TOKEN_CRED_TARGET: &str = "local-llm-service-manager/log-streaming-token";
 
 /// Destination kind for log streaming (design D1/D10: exactly one
 /// destination; the wire format and redactor are identical for both).
@@ -2095,9 +2094,7 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
         }
     }
     if enabled_overflow_rules > 1 {
-        errors.push(
-            "at most one enabled context-overflow routing rule is supported".to_string(),
-        );
+        errors.push("at most one enabled context-overflow routing rule is supported".to_string());
     }
 
     // --- mcp servers (design §3.2) ---
@@ -2504,7 +2501,12 @@ fn validate_mcp_servers(mcp: &McpConfig, errors: &mut Vec<String>) {
                 s.id
             ));
         }
-        if let Some(url) = s.signup_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        if let Some(url) = s
+            .signup_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
             if let Err(e) = parse_mcp_http_url(url) {
                 errors.push(format!("mcp server {:?}: signup_url: {e}", s.id));
             }
@@ -2526,9 +2528,7 @@ fn validate_searxng(searxng: &SearxngSettings, errors: &mut Vec<String>) {
     }
     let api_base = searxng.api_base.trim();
     if api_base.is_empty() {
-        errors.push(
-            "mcp.searxng: api_base must not be empty while searxng is enabled".to_string(),
-        );
+        errors.push("mcp.searxng: api_base must not be empty while searxng is enabled".to_string());
         return;
     }
     if let Err(e) = parse_mcp_http_url(api_base) {
@@ -3198,10 +3198,7 @@ mod tests {
         // 0 is not a usable threshold.
         let mut cfg = working_config();
         let mut rule = overflow_rule("context-overflow", "tool-runner");
-        if let Some(RoutingRuleKind::ContextOverflow {
-            optimal_tokens, ..
-        }) = &mut rule.kind
-        {
+        if let Some(RoutingRuleKind::ContextOverflow { optimal_tokens, .. }) = &mut rule.kind {
             *optimal_tokens = Some(0);
         }
         cfg.gateway.routing_rules.push(rule);
@@ -3212,10 +3209,7 @@ mod tests {
         // (tool-runner: 32768) the threshold can never fire.
         let mut cfg = working_config();
         let mut rule = overflow_rule("context-overflow", "tool-runner");
-        if let Some(RoutingRuleKind::ContextOverflow {
-            optimal_tokens, ..
-        }) = &mut rule.kind
-        {
+        if let Some(RoutingRuleKind::ContextOverflow { optimal_tokens, .. }) = &mut rule.kind {
             *optimal_tokens = Some(32768);
         }
         cfg.gateway.routing_rules.push(rule);
@@ -3225,10 +3219,7 @@ mod tests {
         // Below it validates.
         let mut cfg = working_config();
         let mut rule = overflow_rule("context-overflow", "tool-runner");
-        if let Some(RoutingRuleKind::ContextOverflow {
-            optimal_tokens, ..
-        }) = &mut rule.kind
-        {
+        if let Some(RoutingRuleKind::ContextOverflow { optimal_tokens, .. }) = &mut rule.kind {
             *optimal_tokens = Some(16384);
         }
         cfg.gateway.routing_rules.push(rule);
@@ -3766,10 +3757,18 @@ mod tests {
         );
         assert_eq!(brave.env_keys, vec!["BRAVE_API_KEY"]);
         assert_eq!(brave.cred_ref.as_deref(), Some(BRAVE_SEARCH_MCP_CRED_REF));
-        assert_eq!(BRAVE_SEARCH_MCP_CRED_REF, "local-llm-service-manager/brave-search-mcp");
+        assert_eq!(
+            BRAVE_SEARCH_MCP_CRED_REF,
+            "local-llm-service-manager/brave-search-mcp"
+        );
         assert_eq!(
             brave.allowed_tools.as_deref(),
-            Some(&["brave_web_search".to_string(), "brave_llm_context".to_string()][..])
+            Some(
+                &[
+                    "brave_web_search".to_string(),
+                    "brave_llm_context".to_string()
+                ][..]
+            )
         );
         assert!(brave.metered);
         assert_eq!(brave.rpm_limit, Some(20));
@@ -3791,7 +3790,10 @@ mod tests {
         assert_eq!(fetch.args, vec!["mcp-server-fetch@2026.10.10"]);
         assert!(fetch.env_keys.is_empty());
         assert_eq!(fetch.cred_ref, None);
-        assert_eq!(fetch.allowed_tools.as_deref(), Some(&["fetch".to_string()][..]));
+        assert_eq!(
+            fetch.allowed_tools.as_deref(),
+            Some(&["fetch".to_string()][..])
+        );
         assert!(!fetch.metered);
         assert_eq!(fetch.rpm_limit, None);
         assert_eq!(fetch.signup_url, None);
@@ -3845,7 +3847,8 @@ mod tests {
         // A Phase 3 file whose operator deleted both curated entries:
         // the marker is present and set, so nothing is resurrected.
         let mut cfg = working_config();
-        cfg.mcp.servers
+        cfg.mcp
+            .servers
             .retain(|s| s.id == "github" || s.id == "gdrive");
         assert_eq!(cfg.mcp.servers.len(), 2);
         assert!(cfg.mcp_curated_seeded);

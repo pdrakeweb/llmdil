@@ -253,12 +253,9 @@ pub fn condition_winners(sweep: &SweepRecord) -> Vec<ConditionWinner> {
             .as_ref()
             .and_then(|s| s.median_gen_tps)
             .expect("winner was filtered to measured arms");
-        let baseline = arms
-            .iter()
-            .find(|a| a.index == sweep.baseline_arm_index);
-        let baseline_gen_tps = baseline.and_then(|a| {
-            a.summary.as_ref().and_then(|s| s.median_gen_tps)
-        });
+        let baseline = arms.iter().find(|a| a.index == sweep.baseline_arm_index);
+        let baseline_gen_tps =
+            baseline.and_then(|a| a.summary.as_ref().and_then(|s| s.median_gen_tps));
         let delta_pct = baseline_gen_tps.and_then(|base| {
             if base != 0.0 {
                 Some((winner_tps - base) / base * 100.0)
@@ -509,10 +506,8 @@ mod tests {
 
     #[test]
     fn results_roundtrip_and_missing_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "manager-bench-results-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("manager-bench-results-test-{}", std::process::id()));
         let path = dir.join("bench-results.json");
         let store = BenchResults::load(&path).expect("missing loads empty");
         assert!(store.sweeps.is_empty());

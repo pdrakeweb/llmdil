@@ -146,13 +146,16 @@ async fn async_op_lifecycle_202_poll_terminal() {
     assert!(done["finished_ms"].is_number());
 
     // The record appears in the merged operations list.
-    let (status, list) = call(&ctx, Method::GET, "/api/v1/operations", Some(&operator), None).await;
+    let (status, list) = call(
+        &ctx,
+        Method::GET,
+        "/api/v1/operations",
+        Some(&operator),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(list
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|t| t["id"] == id));
+    assert!(list.as_array().unwrap().iter().any(|t| t["id"] == id));
 
     // A viewer's start attempt is refused by the guard, not queued.
     let viewer = seed_token(&ctx, "look", RoleName::Viewer).await;
@@ -365,8 +368,10 @@ async fn sse_stream_carries_operation_events() {
     // flowing).
     let chunk = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            ctx.sink
-                .emit("backend-status", json!({ "id": "planner", "running": true }));
+            ctx.sink.emit(
+                "backend-status",
+                json!({ "id": "planner", "running": true }),
+            );
             match tokio::time::timeout(Duration::from_millis(400), resp.chunk()).await {
                 Ok(Ok(Some(bytes))) => break bytes,
                 Ok(Ok(None)) => panic!("stream ended"),
@@ -389,4 +394,3 @@ async fn sse_stream_carries_operation_events() {
     let _ = tokio::time::timeout(Duration::from_secs(5), server.shutdown()).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
-

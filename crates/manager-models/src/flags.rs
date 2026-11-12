@@ -68,54 +68,320 @@ fn flag_spec(name: &str) -> Option<&'static FlagSpec> {
     use ValueKind::*;
     static SPECS: &[(&str, &FlagSpec)] = &[
         // Owned by this crate's decoders (memory.rs / mtp.rs).
-        ("--n-cpu-moe", &FlagSpec { canonical: "--n-cpu-moe", reserved: false, arity: Value(Int) }),
-        ("-ncmoe", &FlagSpec { canonical: "--n-cpu-moe", reserved: false, arity: Value(Int) }),
-        ("--cpu-moe", &FlagSpec { canonical: "--cpu-moe", reserved: false, arity: None }),
-        ("-cmoe", &FlagSpec { canonical: "--cpu-moe", reserved: false, arity: None }),
-        ("--override-tensor", &FlagSpec { canonical: "--override-tensor", reserved: false, arity: MultiValue(Any) }),
-        ("-ot", &FlagSpec { canonical: "--override-tensor", reserved: false, arity: MultiValue(Any) }),
-        ("--cache-type-k", &FlagSpec { canonical: "--cache-type-k", reserved: false, arity: Value(Any) }),
-        ("-ctk", &FlagSpec { canonical: "--cache-type-k", reserved: false, arity: Value(Any) }),
-        ("--cache-type-v", &FlagSpec { canonical: "--cache-type-v", reserved: false, arity: Value(Any) }),
-        ("-ctv", &FlagSpec { canonical: "--cache-type-v", reserved: false, arity: Value(Any) }),
-        ("--flash-attn", &FlagSpec { canonical: "--flash-attn", reserved: false, arity: Value(Any) }),
-        ("-fa", &FlagSpec { canonical: "--flash-attn", reserved: false, arity: Value(Any) }),
-        ("--spec-type", &FlagSpec { canonical: "--spec-type", reserved: false, arity: Value(Any) }),
-        ("--spec-draft-n-max", &FlagSpec { canonical: "--spec-draft-n-max", reserved: false, arity: Value(Int) }),
-        ("--parallel", &FlagSpec { canonical: "--parallel", reserved: false, arity: Value(Int) }),
-        ("-np", &FlagSpec { canonical: "--parallel", reserved: false, arity: Value(Int) }),
+        (
+            "--n-cpu-moe",
+            &FlagSpec {
+                canonical: "--n-cpu-moe",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "-ncmoe",
+            &FlagSpec {
+                canonical: "--n-cpu-moe",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--cpu-moe",
+            &FlagSpec {
+                canonical: "--cpu-moe",
+                reserved: false,
+                arity: None,
+            },
+        ),
+        (
+            "-cmoe",
+            &FlagSpec {
+                canonical: "--cpu-moe",
+                reserved: false,
+                arity: None,
+            },
+        ),
+        (
+            "--override-tensor",
+            &FlagSpec {
+                canonical: "--override-tensor",
+                reserved: false,
+                arity: MultiValue(Any),
+            },
+        ),
+        (
+            "-ot",
+            &FlagSpec {
+                canonical: "--override-tensor",
+                reserved: false,
+                arity: MultiValue(Any),
+            },
+        ),
+        (
+            "--cache-type-k",
+            &FlagSpec {
+                canonical: "--cache-type-k",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "-ctk",
+            &FlagSpec {
+                canonical: "--cache-type-k",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--cache-type-v",
+            &FlagSpec {
+                canonical: "--cache-type-v",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "-ctv",
+            &FlagSpec {
+                canonical: "--cache-type-v",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--flash-attn",
+            &FlagSpec {
+                canonical: "--flash-attn",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "-fa",
+            &FlagSpec {
+                canonical: "--flash-attn",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--spec-type",
+            &FlagSpec {
+                canonical: "--spec-type",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--spec-draft-n-max",
+            &FlagSpec {
+                canonical: "--spec-draft-n-max",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--parallel",
+            &FlagSpec {
+                canonical: "--parallel",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "-np",
+            &FlagSpec {
+                canonical: "--parallel",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
         // Emitted from the structured flags by the launch builder
         // (backend_spec): repeating one in raw flags overrides the
         // structured value at llama.cpp's sequential parse.
-        ("--model", &FlagSpec { canonical: "--model", reserved: false, arity: Value(Any) }),
-        ("-m", &FlagSpec { canonical: "--model", reserved: false, arity: Value(Any) }),
-        ("--port", &FlagSpec { canonical: "--port", reserved: false, arity: Value(Int) }),
-        ("--ctx-size", &FlagSpec { canonical: "--ctx-size", reserved: false, arity: Value(Int) }),
-        ("-c", &FlagSpec { canonical: "--ctx-size", reserved: false, arity: Value(Int) }),
-        ("--batch-size", &FlagSpec { canonical: "--batch-size", reserved: false, arity: Value(Int) }),
-        ("-b", &FlagSpec { canonical: "--batch-size", reserved: false, arity: Value(Int) }),
-        ("--tensor-split", &FlagSpec { canonical: "--tensor-split", reserved: false, arity: Value(Any) }),
-        ("-ts", &FlagSpec { canonical: "--tensor-split", reserved: false, arity: Value(Any) }),
-        ("--split-mode", &FlagSpec { canonical: "--split-mode", reserved: false, arity: Value(Any) }),
+        (
+            "--model",
+            &FlagSpec {
+                canonical: "--model",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "-m",
+            &FlagSpec {
+                canonical: "--model",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--port",
+            &FlagSpec {
+                canonical: "--port",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--ctx-size",
+            &FlagSpec {
+                canonical: "--ctx-size",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "-c",
+            &FlagSpec {
+                canonical: "--ctx-size",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--batch-size",
+            &FlagSpec {
+                canonical: "--batch-size",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "-b",
+            &FlagSpec {
+                canonical: "--batch-size",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--tensor-split",
+            &FlagSpec {
+                canonical: "--tensor-split",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "-ts",
+            &FlagSpec {
+                canonical: "--tensor-split",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--split-mode",
+            &FlagSpec {
+                canonical: "--split-mode",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
         // Interpreted or remapped by the launch builder's
         // placement code (device selection follows placement).
-        ("--device", &FlagSpec { canonical: "--device", reserved: false, arity: Value(Any) }),
-        ("-dev", &FlagSpec { canonical: "--device", reserved: false, arity: Value(Any) }),
-        ("--main-gpu", &FlagSpec { canonical: "--main-gpu", reserved: false, arity: Value(Int) }),
-        ("--gpu-layers", &FlagSpec { canonical: "--gpu-layers", reserved: false, arity: Value(Int) }),
-        ("--n-gpu-layers", &FlagSpec { canonical: "--gpu-layers", reserved: false, arity: Value(Int) }),
-        ("-ngl", &FlagSpec { canonical: "--gpu-layers", reserved: false, arity: Value(Int) }),
-        ("--threads", &FlagSpec { canonical: "--threads", reserved: false, arity: Value(Int) }),
-        ("-t", &FlagSpec { canonical: "--threads", reserved: false, arity: Value(Int) }),
+        (
+            "--device",
+            &FlagSpec {
+                canonical: "--device",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "-dev",
+            &FlagSpec {
+                canonical: "--device",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--main-gpu",
+            &FlagSpec {
+                canonical: "--main-gpu",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--gpu-layers",
+            &FlagSpec {
+                canonical: "--gpu-layers",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--n-gpu-layers",
+            &FlagSpec {
+                canonical: "--gpu-layers",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "-ngl",
+            &FlagSpec {
+                canonical: "--gpu-layers",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--threads",
+            &FlagSpec {
+                canonical: "--threads",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "-t",
+            &FlagSpec {
+                canonical: "--threads",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
         // App-owned launch flags: --jinja is emitted by the app
         // itself; its negation and --host are filtered out of raw
         // flags at launch (backends bind loopback behind the
         // gateway, and tool calling depends on --jinja), so
         // writing them is a no-op the operator should hear about.
-        ("--jinja", &FlagSpec { canonical: "--jinja", reserved: false, arity: None }),
-        ("--no-jinja", &FlagSpec { canonical: "--no-jinja", reserved: true, arity: None }),
-        ("--no_jinja", &FlagSpec { canonical: "--no-jinja", reserved: true, arity: None }),
-        ("--host", &FlagSpec { canonical: "--host", reserved: true, arity: Value(Any) }),
+        (
+            "--jinja",
+            &FlagSpec {
+                canonical: "--jinja",
+                reserved: false,
+                arity: None,
+            },
+        ),
+        (
+            "--no-jinja",
+            &FlagSpec {
+                canonical: "--no-jinja",
+                reserved: true,
+                arity: None,
+            },
+        ),
+        (
+            "--no_jinja",
+            &FlagSpec {
+                canonical: "--no-jinja",
+                reserved: true,
+                arity: None,
+            },
+        ),
+        (
+            "--host",
+            &FlagSpec {
+                canonical: "--host",
+                reserved: true,
+                arity: Value(Any),
+            },
+        ),
     ];
     SPECS.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
 }
@@ -237,9 +503,7 @@ pub fn raw_flag_warnings(raw_flags: Option<&str>) -> Vec<FlagWarning> {
                         if kind == ValueKind::Int && v.parse::<i64>().is_err() {
                             warnings.push(FlagWarning {
                                 token: t.to_string(),
-                                message: format!(
-                                    "`{name}` expects a number; `{v}` is not one"
-                                ),
+                                message: format!("`{name}` expects a number; `{v}` is not one"),
                             });
                         }
                     }

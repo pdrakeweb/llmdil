@@ -235,8 +235,8 @@ impl UserStore {
         if self.path.parent().is_none() || self.path.starts_with("/nonexistent") {
             return Ok(());
         }
-        let text = serde_json::to_string_pretty(file)
-            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        let text =
+            serde_json::to_string_pretty(file).map_err(|e| StoreError::Corrupt(e.to_string()))?;
         let tmp = self.path.with_extension("json.tmp");
         tokio::fs::write(&tmp, text).await?;
         tokio::fs::rename(&tmp, &self.path).await?;
@@ -244,10 +244,7 @@ impl UserStore {
     }
 
     /// Run a mutation against the store and persist the result.
-    pub async fn mutate<T, E>(
-        &self,
-        f: impl FnOnce(&mut UsersFile) -> Result<T, E>,
-    ) -> Result<T, E>
+    pub async fn mutate<T, E>(&self, f: impl FnOnce(&mut UsersFile) -> Result<T, E>) -> Result<T, E>
     where
         E: From<StoreError>,
     {
@@ -361,16 +358,56 @@ impl argon2::password_hash::rand_core::CryptoRng for SaltRng {}
 /// the standard public lists — enough to stop the trivially guessed
 /// passwords the plan's policy targets).
 const COMMON_PASSWORDS: &[&str] = &[
-    "password", "password1", "password123", "123456789012", "1234567890",
-    "qwertyuiop", "qwerty123456", "letmein12345", "admin1234567", "administrator",
-    "welcome12345", "changeme1234", "iloveyou1234", "football1234", "baseball1234",
-    "sunshine1234", "princess1234", "dragon123456", "monkey123456", "shadow123456",
-    "master123456", "superman1234", "batman123456", "trustno12345", "starwars1234",
-    "pokemon12345", "naruto123456", "computer1234", "internet1234", "michael12345",
-    "jordan123456", "hunter123456", "soccer123456", "hockey123456", "killer123456",
-    "george123456", "charlie12345", "thomas123456", "jessica12345", "pepper123456",
-    "ginger123456", "maggie123456", "summer123456", "winter123456", "spring123456",
-    "autumn123456", "secret123456", "passw0rd1234", "p@ssw0rd123", "default12345",
+    "password",
+    "password1",
+    "password123",
+    "123456789012",
+    "1234567890",
+    "qwertyuiop",
+    "qwerty123456",
+    "letmein12345",
+    "admin1234567",
+    "administrator",
+    "welcome12345",
+    "changeme1234",
+    "iloveyou1234",
+    "football1234",
+    "baseball1234",
+    "sunshine1234",
+    "princess1234",
+    "dragon123456",
+    "monkey123456",
+    "shadow123456",
+    "master123456",
+    "superman1234",
+    "batman123456",
+    "trustno12345",
+    "starwars1234",
+    "pokemon12345",
+    "naruto123456",
+    "computer1234",
+    "internet1234",
+    "michael12345",
+    "jordan123456",
+    "hunter123456",
+    "soccer123456",
+    "hockey123456",
+    "killer123456",
+    "george123456",
+    "charlie12345",
+    "thomas123456",
+    "jessica12345",
+    "pepper123456",
+    "ginger123456",
+    "maggie123456",
+    "summer123456",
+    "winter123456",
+    "spring123456",
+    "autumn123456",
+    "secret123456",
+    "passw0rd1234",
+    "p@ssw0rd123",
+    "default12345",
 ];
 
 /// Password policy (auth plan): minimum 12 characters, no
@@ -416,7 +453,11 @@ fn base64url(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(ALPHABET[(n >> 18) as usize & 63] as char);
         out.push(ALPHABET[(n >> 12) as usize & 63] as char);
@@ -437,7 +478,10 @@ mod tests {
     #[test]
     fn argon2id_round_trip_with_plan_params() {
         let hash = hash_password("correct horse battery staple").unwrap();
-        assert!(hash.starts_with("$argon2id$v=19$m=65536,t=3,p=1$"), "{hash}");
+        assert!(
+            hash.starts_with("$argon2id$v=19$m=65536,t=3,p=1$"),
+            "{hash}"
+        );
         assert!(verify_password("correct horse battery staple", &hash));
         assert!(!verify_password("wrong password entirely", &hash));
         assert!(!verify_password("anything", "not-a-phc-string"));
@@ -464,10 +508,8 @@ mod tests {
 
     #[tokio::test]
     async fn store_mutate_and_reload() {
-        let dir = std::env::temp_dir().join(format!(
-            "manager-api-users-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("manager-api-users-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = UserStore::load(&dir).await.unwrap();

@@ -379,10 +379,8 @@ mod tests {
 
     #[test]
     fn load_missing_file_is_empty_and_roundtrip_saves() {
-        let dir = std::env::temp_dir().join(format!(
-            "manager-bench-prompts-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("manager-bench-prompts-test-{}", std::process::id()));
         let path = dir.join("bench-prompts.json");
         let lib = PromptLibrary::load(&path).expect("missing file loads empty");
         assert!(lib.entries.is_empty());

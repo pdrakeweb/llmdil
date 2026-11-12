@@ -94,10 +94,8 @@ mod tests {
 
     #[test]
     fn append_and_read_recent() {
-        let dir = std::env::temp_dir().join(format!(
-            "manager-api-audit-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("manager-api-audit-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let log = AuditLog::new(&dir);
         for i in 0..3 {

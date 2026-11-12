@@ -103,19 +103,19 @@ mod windows_impl {
         SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{
-        GetTokenInformation, LookupAccountSidW, TokenUser, DACL_SECURITY_INFORMATION,
-        TOKEN_QUERY, TOKEN_USER,
+        GetTokenInformation, LookupAccountSidW, TokenUser, DACL_SECURITY_INFORMATION, TOKEN_QUERY,
+        TOKEN_USER,
     };
     use windows_sys::Win32::System::Services::{
-        ChangeServiceConfig2W, CloseServiceHandle, ControlService, CreateServiceW,
-        DeleteService, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SetServiceObjectSecurity,
+        ChangeServiceConfig2W, CloseServiceHandle, ControlService, CreateServiceW, DeleteService,
+        OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SetServiceObjectSecurity,
         StartServiceW, SC_ACTION, SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_CREATE_SERVICE,
-        SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_CONFIG_DESCRIPTION,
-        SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START,
-        SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_PAUSED,
-        SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING,
-        SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_STOPPED,
-        SERVICE_STOP_PENDING, SERVICE_WIN32_OWN_PROCESS, SC_STATUS_PROCESS_INFO,
+        SC_STATUS_PROCESS_INFO, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG,
+        SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONTROL_STOP,
+        SERVICE_DEMAND_START, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW,
+        SERVICE_PAUSED, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START,
+        SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP,
+        SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_WIN32_OWN_PROCESS,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -147,9 +147,7 @@ mod windows_impl {
     }
 
     fn open_manager(access: u32) -> Result<ScHandle, ServiceError> {
-        let handle = unsafe {
-            OpenSCManagerW(std::ptr::null(), std::ptr::null(), access)
-        };
+        let handle = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), access) };
         if handle.is_null() {
             return Err(scm_error("OpenSCManagerW"));
         }
@@ -272,7 +270,10 @@ mod windows_impl {
             let take = |buf: &[u16], len: u32| {
                 String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())])
             };
-            Some((sid_string, format!("{}\\{}", take(&domain, domain_len), take(&name, name_len))))
+            Some((
+                sid_string,
+                format!("{}\\{}", take(&domain, domain_len), take(&name, name_len)),
+            ))
         }
     }
 
@@ -404,9 +405,18 @@ mod windows_impl {
             // Failure actions: restart with the definition's delays.
             let fa = def.failure_actions;
             let mut actions = [
-                SC_ACTION { Type: SC_ACTION_RESTART, Delay: fa.first_delay_secs * 1000 },
-                SC_ACTION { Type: SC_ACTION_RESTART, Delay: fa.second_delay_secs * 1000 },
-                SC_ACTION { Type: SC_ACTION_RESTART, Delay: fa.subsequent_delay_secs * 1000 },
+                SC_ACTION {
+                    Type: SC_ACTION_RESTART,
+                    Delay: fa.first_delay_secs * 1000,
+                },
+                SC_ACTION {
+                    Type: SC_ACTION_RESTART,
+                    Delay: fa.second_delay_secs * 1000,
+                },
+                SC_ACTION {
+                    Type: SC_ACTION_RESTART,
+                    Delay: fa.subsequent_delay_secs * 1000,
+                },
             ];
             let mut failure = SERVICE_FAILURE_ACTIONSW {
                 dwResetPeriod: fa.reset_period_secs,
@@ -446,7 +456,9 @@ mod windows_impl {
                     )
                 };
                 if ok == 0 {
-                    return Err(scm_error("ConvertStringSecurityDescriptorToSecurityDescriptorW"));
+                    return Err(scm_error(
+                        "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+                    ));
                 }
                 let ok = unsafe {
                     SetServiceObjectSecurity(handle.0, DACL_SECURITY_INFORMATION, descriptor)

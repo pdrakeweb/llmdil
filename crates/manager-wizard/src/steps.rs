@@ -10,7 +10,9 @@ use crate::{
     StepOutcome, SystemOps, WizardContext, WizardError, WizardStep,
 };
 use async_trait::async_trait;
-use manager_config::{AppConfig, BackendConfig, McpExposure, ModelConfig, SplitMode, SupervisionMode};
+use manager_config::{
+    AppConfig, BackendConfig, McpExposure, ModelConfig, SplitMode, SupervisionMode,
+};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -2307,16 +2309,12 @@ fn postgres_zip_path(data_dir: &Path, pin: &PostgresPin) -> PathBuf {
 /// resolved that server's credential into it, and the service host
 /// resolves any `CredentialRef` entry generically by target
 /// (`manager_services::resolve_env` is not name-locked).
-fn gateway_launch_spec(
-    cmd: &PlannedCommand,
-    config: &AppConfig,
-) -> manager_services::LaunchSpec {
+fn gateway_launch_spec(cmd: &PlannedCommand, config: &AppConfig) -> manager_services::LaunchSpec {
     // Env-key name -> Credential Manager target, for every
     // gateway-exposed MCP server that names a credential. The first
     // server wins on a shared env-key name (the spawn env itself
     // holds only one value per name, from the same iteration).
-    let mut mcp_cred_refs: std::collections::HashMap<&str, &str> =
-        std::collections::HashMap::new();
+    let mut mcp_cred_refs: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for server in &config.mcp.servers {
         if server.exposure != manager_config::McpExposure::Gateway {
             continue;
@@ -2653,14 +2651,18 @@ async fn wait_for_postgres_ready_ticked(
     let mut polls: u32 = 0;
     loop {
         if postgres_ready(ops, config, data_dir).await {
-            streamer.stream_new(ctx, ops, &log_path, "postgres: ", log).await;
+            streamer
+                .stream_new(ctx, ops, &log_path, "postgres: ", log)
+                .await;
             return PostgresWait::Ready;
         }
         if require_postmaster {
             match read_postmaster_pid(ops, data_dir).await {
                 Some(pid) if ops.process_alive(pid) => {}
                 _ => {
-                    streamer.stream_new(ctx, ops, &log_path, "postgres: ", log).await;
+                    streamer
+                        .stream_new(ctx, ops, &log_path, "postgres: ", log)
+                        .await;
                     return PostgresWait::PostmasterGone;
                 }
             }
@@ -2671,7 +2673,9 @@ async fn wait_for_postgres_ready_ticked(
         tokio::time::sleep(POSTGRES_READY_POLL_INTERVAL).await;
         polls += 1;
         if tick_polls > 0 && polls.is_multiple_of(tick_polls) {
-            streamer.stream_new(ctx, ops, &log_path, "postgres: ", log).await;
+            streamer
+                .stream_new(ctx, ops, &log_path, "postgres: ", log)
+                .await;
             ctx.emit_log(&format!(
                 "waiting for PostgreSQL on 127.0.0.1:{} — {:.0}s elapsed",
                 config.postgres.port,
@@ -3310,7 +3314,11 @@ impl WizardStep for InstallPostgres {
         createdb.env.insert("PGPASSWORD".to_string(), password);
         match run_command_logged(ctx, &mut log, &createdb, None).await {
             Ok(out) if out.exit_code == 0 => {
-                push_log(ctx, &mut log, format!("database {POSTGRES_DATABASE} created"));
+                push_log(
+                    ctx,
+                    &mut log,
+                    format!("database {POSTGRES_DATABASE} created"),
+                );
             }
             Ok(out) if out.stderr.contains("already exists") => {
                 push_log(
@@ -3667,7 +3675,10 @@ impl StartGateway {
             "uv bootstrap downloaded in {}",
             fmt_elapsed(dl_started)
         ));
-        ctx.emit_log(&format!("extracting the uv bootstrap archive to {}", dir.display()));
+        ctx.emit_log(&format!(
+            "extracting the uv bootstrap archive to {}",
+            dir.display()
+        ));
         let extract_started = std::time::Instant::now();
         ctx.ops.extract_zip(&archive, &dir).await.map_err(|e| {
             StepOutcome::failed(
@@ -4126,10 +4137,8 @@ impl StartGateway {
         // os.environ/<NAME>). The values were read once by the
         // arming pass in run(); they are never logged.
         if mcp_stdio_enabled {
-            cmd.env.insert(
-                "LITELLM_ENABLE_MCP_STDIO".to_string(),
-                "true".to_string(),
-            );
+            cmd.env
+                .insert("LITELLM_ENABLE_MCP_STDIO".to_string(), "true".to_string());
         }
         for (key, value) in mcp_env {
             cmd.env.insert(key.clone(), value.clone());
@@ -4313,15 +4322,9 @@ impl StartGateway {
                 ))
             }
         }
-        ctx.ops
-            .service_start_gateway(&def)
-            .await
-            .map_err(|e| {
-                StepOutcome::failed(
-                    format!("gateway service start failed: {e}"),
-                    log.clone(),
-                )
-            })
+        ctx.ops.service_start_gateway(&def).await.map_err(|e| {
+            StepOutcome::failed(format!("gateway service start failed: {e}"), log.clone())
+        })
     }
 
     /// Files the gateway child's stdout/stderr are captured to.
@@ -4768,7 +4771,10 @@ impl StartGateway {
                 push_log(
                     ctx,
                     log,
-                    format!("prisma-client-py {} installed", crate::PRISMA_PINNED_VERSION),
+                    format!(
+                        "prisma-client-py {} installed",
+                        crate::PRISMA_PINNED_VERSION
+                    ),
                 );
                 Ok(())
             }
@@ -4894,8 +4900,7 @@ impl StartGateway {
             );
         }
         // --- Verification (no mutation) ---
-        let (installed, version_probe_detail) =
-            self.installed_prisma_version_probe(ctx).await;
+        let (installed, version_probe_detail) = self.installed_prisma_version_probe(ctx).await;
         let version_ok = installed.as_deref() == Some(crate::PRISMA_PINNED_VERSION);
         let client_present = ctx.ops.file_exists(&self.generated_client_path(ctx)).await;
         if version_ok && client_present {
@@ -5306,18 +5311,16 @@ impl WizardStep for StartGateway {
                     .iter()
                     .any(|s| s.transport == manager_config::McpTransport::Stdio)
                 {
-                    spawn.env.insert(
-                        "LITELLM_ENABLE_MCP_STDIO".to_string(),
-                        "true".to_string(),
-                    );
+                    spawn
+                        .env
+                        .insert("LITELLM_ENABLE_MCP_STDIO".to_string(), "true".to_string());
                 }
                 for server in &gateway_mcp {
                     if server.cred_ref.as_deref().is_some_and(|r| !r.is_empty()) {
                         for key in &server.env_keys {
-                            spawn.env.insert(
-                                key.clone(),
-                                "<set from credential manager>".to_string(),
-                            );
+                            spawn
+                                .env
+                                .insert(key.clone(), "<set from credential manager>".to_string());
                         }
                     }
                 }
@@ -5454,8 +5457,7 @@ impl WizardStep for StartGateway {
                 const SETUP_COMMAND_TIMEOUT: std::time::Duration =
                     std::time::Duration::from_secs(900);
                 for cmd in &setup_cmds {
-                    match run_command_logged(ctx, &mut log, cmd, Some(SETUP_COMMAND_TIMEOUT))
-                        .await
+                    match run_command_logged(ctx, &mut log, cmd, Some(SETUP_COMMAND_TIMEOUT)).await
                     {
                         Ok(out) if out.success() => {
                             if !out.stdout.trim().is_empty() {
@@ -5474,10 +5476,8 @@ impl WizardStep for StartGateway {
                             .with_manual_command(manual))
                         }
                         Err(e) => {
-                            return Ok(
-                                StepOutcome::failed(format!("{e}"), log)
-                                    .with_manual_command(manual),
-                            )
+                            return Ok(StepOutcome::failed(format!("{e}"), log)
+                                .with_manual_command(manual))
                         }
                     }
                 }
@@ -5577,10 +5577,10 @@ impl WizardStep for StartGateway {
                 // unarmed Gateway servers are omitted from this
                 // start's YAML (the generator itself stays a pure
                 // function of the config it is handed).
-                let generation_config = crate::config_with_armed_gateway_mcp_servers(
-                    &ctx.config,
-                    |t| mcp_cred_values.contains_key(t),
-                );
+                let generation_config =
+                    crate::config_with_armed_gateway_mcp_servers(&ctx.config, |t| {
+                        mcp_cred_values.contains_key(t)
+                    });
                 let yaml = match manager_gateway::generate_config_yaml(&generation_config) {
                     Ok(y) => y,
                     Err(e) => {
@@ -5613,8 +5613,10 @@ impl WizardStep for StartGateway {
                 let routing_path = ctx.data_dir.join("gateway").join("llmdil_routing.py");
                 match manager_gateway::generate_routing_callback(&generation_config) {
                     Some(callback_py) => {
-                        if let Err(e) =
-                            ctx.ops.write_file(&routing_path, callback_py.as_bytes()).await
+                        if let Err(e) = ctx
+                            .ops
+                            .write_file(&routing_path, callback_py.as_bytes())
+                            .await
                         {
                             return Ok(StepOutcome::failed(
                                 format!(
@@ -5695,9 +5697,9 @@ impl WizardStep for StartGateway {
                             .as_deref()
                             .and_then(|r| mcp_cred_values.get(r))
                             .cloned();
-                        s.env_keys.iter().filter_map(move |k| {
-                            value.clone().map(|v| (k.clone(), v))
-                        })
+                        s.env_keys
+                            .iter()
+                            .filter_map(move |k| value.clone().map(|v| (k.clone(), v)))
                     })
                     .collect();
                 let (mut spawn, openrouter_warning) = match self
@@ -5738,24 +5740,16 @@ impl WizardStep for StartGateway {
                     // definition file) and start the service. The
                     // health checks below run unchanged against the
                     // child pid the service host recorded.
-                    match self
-                        .spawn_gateway_as_service(ctx, &spawn, &mut log)
-                        .await
-                    {
+                    match self.spawn_gateway_as_service(ctx, &spawn, &mut log).await {
                         Ok(pid) => pid,
-                        Err(outcome) => {
-                            return Ok(outcome.with_manual_command(manual))
-                        }
+                        Err(outcome) => return Ok(outcome.with_manual_command(manual)),
                     }
                 } else {
                     match ctx.ops.spawn_detached(&spawn).await {
                         Ok(pid) => pid,
                         Err(e) => {
-                            return Ok(StepOutcome::failed(
-                                format!("{e}"),
-                                vec![format!("{e:?}")],
-                            )
-                            .with_manual_command(manual))
+                            return Ok(StepOutcome::failed(format!("{e}"), vec![format!("{e:?}")])
+                                .with_manual_command(manual))
                         }
                     }
                 };
@@ -5827,8 +5821,7 @@ impl WizardStep for StartGateway {
                 let mcp_load_failed: Vec<String> = if mcp_armed.is_empty() {
                     Vec::new()
                 } else {
-                    let armed_ids: Vec<String> =
-                        mcp_armed.iter().map(|s| s.id.clone()).collect();
+                    let armed_ids: Vec<String> = mcp_armed.iter().map(|s| s.id.clone()).collect();
                     self.mcp_load_check(ctx, &armed_ids, &mut log).await
                 };
                 // Record what this gateway was actually spawned
@@ -5903,16 +5896,15 @@ impl WizardStep for StartGateway {
                 // endpoint must answer 200. A failure here fails
                 // the step with the gateway's output attached, like
                 // any other health failure.
-                let final_check_failure =
-                    if ctx.config.supervision.mode != SupervisionMode::Service
-                        && !ctx.ops.process_alive(pid)
-                    {
-                        Some(format!(
-                            "the gateway process (pid {pid}) exited after its health checks passed"
-                        ))
-                    } else {
-                        let headers = self.gateway_auth_headers(ctx).await;
-                        match ctx
+                let final_check_failure = if ctx.config.supervision.mode != SupervisionMode::Service
+                    && !ctx.ops.process_alive(pid)
+                {
+                    Some(format!(
+                        "the gateway process (pid {pid}) exited after its health checks passed"
+                    ))
+                } else {
+                    let headers = self.gateway_auth_headers(ctx).await;
+                    match ctx
                             .ops
                             .http_get_with_headers(&self.gateway_url(ctx), &headers)
                             .await
@@ -5926,7 +5918,7 @@ impl WizardStep for StartGateway {
                                 "the gateway is unreachable on the final health re-check ({e}) after passing its health checks"
                             )),
                         }
-                    };
+                };
                 if let Some(reason) = final_check_failure {
                     self.append_gateway_log_tail(ctx, &mut log).await;
                     return Ok(StepOutcome::failed(
@@ -7668,8 +7660,10 @@ mod tests {
             ..Default::default()
         });
         let mut cmd = PlannedCommand::new(vec!["pythonw.exe".to_string()]);
-        cmd.env
-            .insert("BRAVE_API_KEY".to_string(), "sentinel-mcp-value".to_string());
+        cmd.env.insert(
+            "BRAVE_API_KEY".to_string(),
+            "sentinel-mcp-value".to_string(),
+        );
         cmd.env
             .insert("LOCAL_ONLY_KEY".to_string(), "local-value".to_string());
         cmd.env
@@ -7682,7 +7676,9 @@ mod tests {
             .expect("brave env entry present");
         assert_eq!(
             brave.value,
-            manager_services::EnvValue::CredentialRef { target: brave_target }
+            manager_services::EnvValue::CredentialRef {
+                target: brave_target
+            }
         );
         let local = spec
             .env
@@ -9234,16 +9230,8 @@ mod tests {
         let ctx = ctx_with(ops.clone(), RunMode::Install);
         let out = step.run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Failed, "{out:?}");
-        assert!(
-            out.message.contains("did not stay up"),
-            "{}",
-            out.message
-        );
-        assert!(
-            out.message.contains("HTTP 500"),
-            "{}",
-            out.message
-        );
+        assert!(out.message.contains("did not stay up"), "{}", out.message);
+        assert!(out.message.contains("HTTP 500"), "{}", out.message);
         assert!(
             out.log_tail
                 .iter()
@@ -10339,7 +10327,10 @@ mod tests {
         let text = String::from_utf8(cfg).unwrap();
         assert!(text.contains("mcp_servers:"), "{text}");
         assert!(text.contains("brave_search"), "{text}");
-        assert!(text.contains("require_key_mcp_access_defined: true"), "{text}");
+        assert!(
+            text.contains("require_key_mcp_access_defined: true"),
+            "{text}"
+        );
         assert!(!text.contains("brave-secret"), "{text}");
         // Load check passed and is logged.
         assert!(
@@ -10467,7 +10458,8 @@ mod tests {
         let out = step.run(&ctx).await.unwrap();
         assert_eq!(out.state, StepState::Done, "{out:?}");
         assert!(
-            out.message.contains("MCP load check failed for: brave_search"),
+            out.message
+                .contains("MCP load check failed for: brave_search"),
             "{out:?}"
         );
         assert!(
@@ -10489,9 +10481,7 @@ mod tests {
         );
         ops.with_http_get(
             "http://127.0.0.1:4000/v1/mcp/server",
-            FakeSystemOps::http_ok(
-                r#"[{"server_id":"brave_search"},{"server_id":"db_extra"}]"#,
-            ),
+            FakeSystemOps::http_ok(r#"[{"server_id":"brave_search"},{"server_id":"db_extra"}]"#),
         );
         ops.with_http_get(
             "http://127.0.0.1:4000/mcp-rest/tools/list?server_id=brave_search",
@@ -10505,7 +10495,8 @@ mod tests {
         assert!(
             out.log_tail
                 .iter()
-                .any(|l| l.contains("'db_extra'") && l.contains("not in the generated configuration")),
+                .any(|l| l.contains("'db_extra'")
+                    && l.contains("not in the generated configuration")),
             "{out:?}"
         );
         assert!(!out.message.contains("MCP load check failed"), "{out:?}");
@@ -10522,7 +10513,10 @@ mod tests {
             .find(|c| c.argv.iter().any(|a| a == "--config"))
             .expect("gateway spawn planned");
         assert_eq!(
-            plan_spawn.env.get("LITELLM_ENABLE_MCP_STDIO").map(String::as_str),
+            plan_spawn
+                .env
+                .get("LITELLM_ENABLE_MCP_STDIO")
+                .map(String::as_str),
             Some("true")
         );
         assert_eq!(
@@ -10531,10 +10525,7 @@ mod tests {
         );
     }
 
-    fn gateway_ctx_with_searxng(
-        ops: Arc<FakeSystemOps>,
-        api_base: &str,
-    ) -> WizardContext {
+    fn gateway_ctx_with_searxng(ops: Arc<FakeSystemOps>, api_base: &str) -> WizardContext {
         let mut cfg = test_config_with_models();
         cfg.mcp.servers = vec![];
         cfg.mcp.searxng = manager_config::SearxngSettings {
@@ -12230,12 +12221,7 @@ mod tests {
     /// below: they take the context for its config, data dir, ops
     /// and live sink.
     fn pg_ctx(ops: &Arc<FakeSystemOps>, cfg: AppConfig, data_dir: &Path) -> WizardContext {
-        WizardContext::new(
-            cfg,
-            data_dir.to_path_buf(),
-            RunMode::Install,
-            ops.clone(),
-        )
+        WizardContext::new(cfg, data_dir.to_path_buf(), RunMode::Install, ops.clone())
     }
 
     #[tokio::test]
@@ -12259,10 +12245,7 @@ mod tests {
             .await
             .expect("adopts the running postmaster");
         assert!(url.contains("127.0.0.1:54329"), "{url}");
-        assert!(
-            log.iter().any(|l| l.contains("waiting for it")),
-            "{log:?}"
-        );
+        assert!(log.iter().any(|l| l.contains("waiting for it")), "{log:?}");
         assert!(
             !ops.executed_commands()
                 .iter()
@@ -12302,7 +12285,11 @@ mod tests {
         );
         // The start command launches without waiting: readiness is
         // polled by the caller, not by pg_ctl's own wait.
-        assert!(start.argv.iter().any(|a| a == "--no-wait"), "{:?}", start.argv);
+        assert!(
+            start.argv.iter().any(|a| a == "--no-wait"),
+            "{:?}",
+            start.argv
+        );
         assert!(!start.argv.iter().any(|a| a == "-t"), "{:?}", start.argv);
     }
 
@@ -12508,14 +12495,8 @@ mod tests {
         // TimedOut: no postmaster requirement, never ready, and a
         // zero window — returns without sleeping.
         assert_eq!(
-            wait_for_postgres_ready(
-                &ctx,
-                &data_dir,
-                std::time::Duration::ZERO,
-                false,
-                &mut log
-            )
-            .await,
+            wait_for_postgres_ready(&ctx, &data_dir, std::time::Duration::ZERO, false, &mut log)
+                .await,
             PostgresWait::TimedOut
         );
         // Ready: the probe answers on the second call.
@@ -12526,8 +12507,7 @@ mod tests {
         );
         let ctx2 = pg_ctx(&ops2, cfg, &data_dir);
         assert_eq!(
-            wait_for_postgres_ready(&ctx2, &data_dir, POSTGRES_SETTLE_WAIT, false, &mut log)
-                .await,
+            wait_for_postgres_ready(&ctx2, &data_dir, POSTGRES_SETTLE_WAIT, false, &mut log).await,
             PostgresWait::Ready
         );
     }
@@ -12589,8 +12569,7 @@ mod tests {
                 pg_ready_output(),
             ],
         );
-        let lines: Arc<std::sync::Mutex<Vec<String>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = lines.clone();
         let ctx = pg_ctx(&ops, cfg, &data_dir).with_log_sink(Arc::new(move |line: String| {
             captured.lock().unwrap().push(line)

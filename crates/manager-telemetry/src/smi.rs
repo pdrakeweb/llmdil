@@ -583,10 +583,7 @@ fn finalize_gpu(
         .iter()
         .map(|el| get(&format!("gpu_power_readings/{el}")))
         .collect();
-    let power_w = draw_raws
-        .iter()
-        .flatten()
-        .find_map(|s| parse_watts(s));
+    let power_w = draw_raws.iter().flatten().find_map(|s| parse_watts(s));
     let power_absence = if power_w.is_some() {
         None
     } else if draw_raws.iter().flatten().any(|s| is_na(s)) {
@@ -594,9 +591,14 @@ fn finalize_gpu(
     } else {
         Some(PowerAbsence::FieldMissing)
     };
-    let power_limit_w = ["power_limit", "current_power_limit", "requested_power_limit", "enforced_power_limit"]
-        .iter()
-        .find_map(|el| get(&format!("gpu_power_readings/{el}")).and_then(|s| parse_watts(&s)));
+    let power_limit_w = [
+        "power_limit",
+        "current_power_limit",
+        "requested_power_limit",
+        "enforced_power_limit",
+    ]
+    .iter()
+    .find_map(|el| get(&format!("gpu_power_readings/{el}")).and_then(|s| parse_watts(&s)));
 
     let pci_bus_id = get("pci/pci_bus").unwrap_or_else(|| id_attr.to_string());
 
@@ -651,7 +653,10 @@ mod tests {
         assert_eq!(a4000.vram_total_mib, 16384);
         assert!((a4000.temp_c - 67.0).abs() < f32::EPSILON);
         assert!((a4000.power_w.expect("power reported") - 95.30).abs() < 0.01);
-        assert_eq!(a4000.power_absence, None, "measured power records no absence");
+        assert_eq!(
+            a4000.power_absence, None,
+            "measured power records no absence"
+        );
         assert_eq!(a4000.fan_pct, Some(32.0));
         assert_eq!(a4000.power_limit_w, Some(140.0));
         assert_eq!(a4000.clocks_graphics_mhz, Some(1560));

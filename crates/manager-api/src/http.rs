@@ -99,8 +99,7 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
         )
         .route(
             "/api/v1/gateway/groups/{name}",
-            axum::routing::patch(handle_group_patch)
-                .delete(handle_group_delete),
+            axum::routing::patch(handle_group_patch).delete(handle_group_delete),
         )
         .route(
             "/api/v1/gateway/start",
@@ -120,21 +119,51 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
         records.push(RouteRecord { method, path });
     }
     router = router
-        .route("/api/v1/auth/login", axum::routing::post(crate::auth_routes::handle_login))
-        .route("/api/v1/auth/totp", axum::routing::post(crate::auth_routes::handle_totp))
-        .route("/api/v1/auth/refresh", axum::routing::post(crate::auth_routes::handle_refresh))
-        .route("/api/v1/enroll", axum::routing::post(crate::auth_routes::handle_enroll))
+        .route(
+            "/api/v1/auth/login",
+            axum::routing::post(crate::auth_routes::handle_login),
+        )
+        .route(
+            "/api/v1/auth/totp",
+            axum::routing::post(crate::auth_routes::handle_totp),
+        )
+        .route(
+            "/api/v1/auth/refresh",
+            axum::routing::post(crate::auth_routes::handle_refresh),
+        )
+        .route(
+            "/api/v1/enroll",
+            axum::routing::post(crate::auth_routes::handle_enroll),
+        )
         .route("/api/v1/auth/me", get(crate::auth_routes::handle_me))
-        .route("/api/v1/auth/logout", axum::routing::post(crate::auth_routes::handle_logout))
-        .route("/api/v1/auth/password", axum::routing::post(crate::auth_routes::handle_change_password))
-        .route("/api/v1/auth/sessions", get(crate::auth_routes::handle_list_sessions))
+        .route(
+            "/api/v1/auth/logout",
+            axum::routing::post(crate::auth_routes::handle_logout),
+        )
+        .route(
+            "/api/v1/auth/password",
+            axum::routing::post(crate::auth_routes::handle_change_password),
+        )
+        .route(
+            "/api/v1/auth/sessions",
+            get(crate::auth_routes::handle_list_sessions),
+        )
         .route(
             "/api/v1/auth/sessions/{id}",
             axum::routing::delete(crate::auth_routes::handle_revoke_session),
         )
-        .route("/api/v1/auth/totp/enroll", axum::routing::post(crate::auth_routes::handle_totp_enroll))
-        .route("/api/v1/auth/totp/verify", axum::routing::post(crate::auth_routes::handle_totp_verify))
-        .route("/api/v1/auth/totp/disable", axum::routing::post(crate::auth_routes::handle_totp_disable))
+        .route(
+            "/api/v1/auth/totp/enroll",
+            axum::routing::post(crate::auth_routes::handle_totp_enroll),
+        )
+        .route(
+            "/api/v1/auth/totp/verify",
+            axum::routing::post(crate::auth_routes::handle_totp_verify),
+        )
+        .route(
+            "/api/v1/auth/totp/disable",
+            axum::routing::post(crate::auth_routes::handle_totp_disable),
+        )
         .route(
             "/api/v1/admin/users",
             get(crate::auth_routes::handle_admin_list_users)
@@ -178,11 +207,7 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
     // envelope, not the framework's bare 404.
     let router = router.fallback(|state: State<Arc<ApiCtx>>| async move {
         let State(ctx) = state;
-        error_response(
-            &ctx,
-            &ApiError::NotFound("no such route".to_string()),
-            None,
-        )
+        error_response(&ctx, &ApiError::NotFound("no such route".to_string()), None)
     });
     let mw_state = crate::auth_routes::AuthMwState {
         ctx: ctx.clone(),
@@ -235,25 +260,19 @@ async fn handle_op(
                 .await
             {
                 Ok(value) => {
-                    if spec.op == Op::RunWizardStep
-                        && value.get("busy") == Some(&json!(true))
-                    {
+                    if spec.op == Op::RunWizardStep && value.get("busy") == Some(&json!(true)) {
                         spawn_ctx.operations.fail_with_detail(
                             &id,
                             "a wizard step is already running",
                             value,
                         );
                     } else {
-                        spawn_ctx
-                            .operations
-                            .complete(&id, spec.name, Ok(value));
+                        spawn_ctx.operations.complete(&id, spec.name, Ok(value));
                     }
                 }
                 Err(e) => {
                     let message = sanitize(&e.to_string(), &spawn_ctx.data_dir);
-                    spawn_ctx
-                        .operations
-                        .complete(&id, spec.name, Err(message));
+                    spawn_ctx.operations.complete(&id, spec.name, Err(message));
                 }
             }
         });
@@ -286,8 +305,7 @@ async fn handle_op(
         if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
             if ctx.operations.get(task_id).is_some() {
                 ctx.operations.abort(task_id);
-                return axum::Json(json!({ "ok": true, "task_id": task_id }))
-                    .into_response();
+                return axum::Json(json!({ "ok": true, "task_id": task_id })).into_response();
             }
         }
     }
@@ -635,10 +653,7 @@ async fn handle_model_patch(
     }
 }
 
-async fn handle_group_create(
-    State(ctx): State<Arc<ApiCtx>>,
-    body: axum::body::Bytes,
-) -> Response {
+async fn handle_group_create(State(ctx): State<Arc<ApiCtx>>, body: axum::body::Bytes) -> Response {
     let parsed = match parse_body(&ctx, &body) {
         Ok(v) => v,
         Err(r) => return *r,
@@ -664,10 +679,7 @@ async fn handle_group_patch(
     }
 }
 
-async fn handle_group_delete(
-    State(ctx): State<Arc<ApiCtx>>,
-    Path(name): Path<String>,
-) -> Response {
+async fn handle_group_delete(State(ctx): State<Arc<ApiCtx>>, Path(name): Path<String>) -> Response {
     match composites::delete_group(&ctx, &name).await {
         Ok(v) => axum::Json(v).into_response(),
         Err(e) => error_response(&ctx, &e, None),
@@ -753,7 +765,10 @@ async fn handle_bundle_content(
             (
                 axum::http::StatusCode::OK,
                 [
-                    (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        "application/zip".to_string(),
+                    ),
                     (
                         axum::http::header::CONTENT_DISPOSITION,
                         format!("attachment; filename=\"{name}\""),
@@ -777,9 +792,7 @@ async fn handle_bundle_content(
 static EVENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 struct MpscEventStream {
-    rx: tokio::sync::mpsc::Receiver<
-        Result<axum::response::sse::Event, std::convert::Infallible>,
-    >,
+    rx: tokio::sync::mpsc::Receiver<Result<axum::response::sse::Event, std::convert::Infallible>>,
 }
 
 impl futures_core::Stream for MpscEventStream {

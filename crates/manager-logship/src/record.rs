@@ -50,7 +50,10 @@ impl ShipLevel {
 /// presents them.
 pub fn classify_level(line: &str) -> ShipLevel {
     let lc = line.to_lowercase();
-    if ["error", "fail", "panic", "fatal"].iter().any(|t| lc.contains(t)) {
+    if ["error", "fail", "panic", "fatal"]
+        .iter()
+        .any(|t| lc.contains(t))
+    {
         return ShipLevel::Error;
     }
     if lc.contains("warn") {
