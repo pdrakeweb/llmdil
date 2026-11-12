@@ -1650,12 +1650,20 @@ impl ConfigureTensorSplit {
         // file after each wizard step). Base: the persisted config
         // when it loads, else the context snapshot.
         let config_path = ctx.data_dir.join("config.json");
-        let mut config = match manager_config::load(&config_path) {
-            Ok(cfg) => cfg,
-            Err(_) if ctx.data_dir.is_dir() => ctx.config.clone(),
+        let mut config = match persisted_config_base(ctx) {
+            Ok(PersistedBase::Loaded(cfg)) | Ok(PersistedBase::FirstRun(cfg)) => cfg,
+            Ok(PersistedBase::NoDataDir) => {
+                return Ok(StepOutcome::failed(
+                    format!(
+                        "could not load the persisted config to write splits: data directory {} does not exist",
+                        ctx.data_dir.display()
+                    ),
+                    log,
+                ))
+            }
             Err(e) => {
                 return Ok(StepOutcome::failed(
-                    format!("could not load the persisted config to write splits: {e}"),
+                    format!("could not write splits: {e}"),
                     log,
                 ))
             }
@@ -2007,7 +2015,11 @@ impl WizardStep for DownloadModels {
                         }
                     }
                     if pinned {
-                        Self::stamp_verified_at(ctx, &model.id, &model.sha256, &mut log);
+                        if let Err(e) =
+                            Self::stamp_verified_at(ctx, &model.id, &model.sha256, &mut log)
+                        {
+                            return Ok(StepOutcome::failed(e, log));
+                        }
                         verified += 1;
                     } else {
                         unverified += 1;
@@ -2074,7 +2086,11 @@ impl WizardStep for DownloadModels {
                     match ctx.ops.sha256_file(&dest).await {
                         Ok(h) if verify(&h) => {
                             log.push(format!("{}: checksum verified", model.id));
-                            Self::stamp_verified_at(ctx, &model.id, &model.sha256, &mut log);
+                            if let Err(e) =
+                                Self::stamp_verified_at(ctx, &model.id, &model.sha256, &mut log)
+                            {
+                                return Ok(StepOutcome::failed(e, log));
+                            }
                             verified += 1;
                         }
                         Ok(h) => {
@@ -2106,6 +2122,56 @@ impl WizardStep for DownloadModels {
     }
 }
 
+/// The base for a step's load-modify-save of `<data_dir>/config.json`
+/// (see [`persisted_config_base`]).
+enum PersistedBase {
+    /// The persisted primary file loaded cleanly.
+    Loaded(AppConfig),
+    /// Fresh install: the data dir exists but neither `config.json`
+    /// nor `config.json.bak` does, so the context snapshot (the
+    /// caller's current config) is the base.
+    FirstRun(AppConfig),
+    /// No data dir on disk (unit tests drive steps with a fictional
+    /// data dir): there is no persisted config to write.
+    NoDataDir,
+}
+
+/// Choose the base a step edits before saving `<data_dir>/config.json`.
+///
+/// Code-review PS-4: the context snapshot may be minutes old, so it
+/// is a valid base ONLY when no persisted config exists at all (a
+/// fresh install). A file that exists but does not load — a parse
+/// error, a validation failure, any I/O error other than "not found",
+/// or a primary that only loaded through its `.bak` fallback (a save
+/// would rotate the unreadable primary over the good `.bak`) — is an
+/// error: the step must fail and save nothing over it.
+fn persisted_config_base(ctx: &WizardContext) -> Result<PersistedBase, String> {
+    let config_path = ctx.data_dir.join("config.json");
+    let mut bak = config_path.as_os_str().to_owned();
+    bak.push(".bak");
+    let bak = PathBuf::from(bak);
+    match manager_config::load_detailed(&config_path) {
+        Ok(report) if !report.used_backup => Ok(PersistedBase::Loaded(report.config)),
+        Ok(_) => Err(format!(
+            "{} could not be loaded (only its .bak copy loads); refusing to save over it",
+            config_path.display()
+        )),
+        Err(manager_config::ConfigError::Io(e))
+            if e.kind() == std::io::ErrorKind::NotFound && !bak.exists() =>
+        {
+            if ctx.data_dir.is_dir() {
+                Ok(PersistedBase::FirstRun(ctx.config.clone()))
+            } else {
+                Ok(PersistedBase::NoDataDir)
+            }
+        }
+        Err(e) => Err(format!(
+            "{} could not be loaded ({e}); refusing to save over it",
+            config_path.display()
+        )),
+    }
+}
+
 impl DownloadModels {
     /// Stamp `verified_at` for one model this run just verified into
     /// the persisted config.
@@ -2128,20 +2194,29 @@ impl DownloadModels {
     /// outcome. The verification itself already succeeded; an
     /// unstamped model simply stays gated until something else
     /// verifies it.
+    ///
+    /// The one exception (code-review PS-4): a `config.json` that
+    /// exists but does not load is an error returned to the caller,
+    /// which fails the step — the snapshot fallback applies only to a
+    /// fresh install, never over a file that failed to load.
     fn stamp_verified_at(
         ctx: &WizardContext,
         model_id: &str,
         verified_sha256: &str,
         log: &mut Vec<String>,
-    ) {
+    ) -> Result<(), String> {
         let config_path = ctx.data_dir.join("config.json");
-        let mut config = match manager_config::load(&config_path) {
-            Ok(cfg) => cfg,
-            Err(_) if ctx.data_dir.is_dir() => ctx.config.clone(),
-            Err(_) => return,
+        let mut config = match persisted_config_base(ctx) {
+            Ok(PersistedBase::Loaded(cfg)) | Ok(PersistedBase::FirstRun(cfg)) => cfg,
+            Ok(PersistedBase::NoDataDir) => return Ok(()),
+            Err(e) => {
+                return Err(format!(
+                    "model '{model_id}' verified, but verified_at could not be stamped: {e}"
+                ))
+            }
         };
         let Some(model) = config.models.iter_mut().find(|m| m.id == model_id) else {
-            return;
+            return Ok(());
         };
         model.verified_at = Some(chrono::Utc::now());
         // The stamp records WHICH pinned hash the file was verified
@@ -2158,6 +2233,7 @@ impl DownloadModels {
                 config_path.display()
             )),
         }
+        Ok(())
     }
 
     /// Fail when the models still needing download exceed the free space on
@@ -8739,6 +8815,98 @@ mod tests {
             bad.verified_at.is_none(),
             "mismatching model must not be stamped"
         );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // --- PS-4: never save a snapshot over an unloadable config.json ---
+
+    const GARBAGE_CONFIG: &[u8] = b"{ this is not json";
+
+    /// Fixture for the placement step: enabled backends whose model
+    /// needs a split on the three test GPUs (see
+    /// `tensor_split_install_persists_splits_and_audit_validates`).
+    fn split_test_config() -> AppConfig {
+        let mut config = test_config_with_models();
+        for b in config.backends.iter_mut() {
+            b.model_file = if b.id == "coder-fast" {
+                PathBuf::from("models/qwen2.5-coder-7b.gguf")
+            } else {
+                PathBuf::from("models/qwen3-8b.gguf")
+            };
+            b.raw_flags = None;
+        }
+        for m in config.models.iter_mut() {
+            if m.gguf_path.ends_with("qwen3-8b.gguf") {
+                m.id = "qwen3-coder-30b".to_string();
+            }
+        }
+        config
+    }
+
+    #[tokio::test]
+    async fn download_models_unloadable_config_fails_and_is_not_overwritten() {
+        let data_dir = stamp_test_dir("ps4-garbage");
+        let config_path = data_dir.join("config.json");
+        std::fs::write(&config_path, GARBAGE_CONFIG).unwrap();
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_download(
+            "https://example.com/qwen3-8b.gguf",
+            b"gguf-8b-bytes".to_vec(),
+        );
+        ops.with_download(
+            "https://example.com/qwen2.5-coder-7b.gguf",
+            b"gguf-7b-bytes".to_vec(),
+        );
+        let ctx = WizardContext::new(stamp_test_config(), data_dir.clone(), RunMode::Install, ops);
+        let out = DownloadModels.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(
+            out.message.contains("could not be loaded"),
+            "{}",
+            out.message
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            GARBAGE_CONFIG,
+            "the unloadable file must not be overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn tensor_split_unloadable_config_fails_and_is_not_overwritten() {
+        let data_dir = stamp_test_dir("ps4-split-garbage");
+        let config_path = data_dir.join("config.json");
+        std::fs::write(&config_path, GARBAGE_CONFIG).unwrap();
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_gpus(test_gpus());
+        let ctx = WizardContext::new(split_test_config(), data_dir.clone(), RunMode::Install, ops);
+        let out = ConfigureTensorSplit.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(
+            out.message.contains("could not be loaded"),
+            "{}",
+            out.message
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), GARBAGE_CONFIG);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn tensor_split_absent_config_seeds_from_snapshot() {
+        let data_dir = stamp_test_dir("ps4-split-fresh");
+        let config_path = data_dir.join("config.json");
+        let ops = Arc::new(FakeSystemOps::new());
+        ops.with_gpus(test_gpus());
+        let ctx = WizardContext::new(split_test_config(), data_dir.clone(), RunMode::Install, ops);
+        let out = ConfigureTensorSplit.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let saved = manager_config::load(&config_path).unwrap();
+        assert!(saved
+            .backends
+            .iter()
+            .filter(|b| b.enabled)
+            .all(|b| !b.flags.tensor_split.is_empty()));
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
