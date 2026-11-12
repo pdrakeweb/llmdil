@@ -373,7 +373,12 @@ fn required<T>(
 
 fn parse_document(xml: &str) -> Result<ParsedDoc, TelemetryError> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // Not trimmed per event: quick-xml 0.38 splits a leaf's text at
+    // every entity reference (`R&amp;D` arrives as Text "R",
+    // GeneralRef "amp", Text "D"), and per-event trimming would eat
+    // whitespace beside a reference. A leaf's pieces are accumulated
+    // in `leaf_text` and trimmed once, at its end tag (P-9).
+    reader.config_mut().trim_text(false);
 
     let mut stack: Vec<String> = Vec::new();
     let mut driver_version = String::from("unknown");
@@ -385,11 +390,17 @@ fn parse_document(xml: &str) -> Result<ParsedDoc, TelemetryError> {
     let mut proc_fields: Option<HashMap<String, String>> = None;
     let mut proc_list: Vec<ProcessSample> = Vec::new();
     let mut order: u32 = 0;
+    // Text of the innermost open element, valid while that element
+    // has had no child (`in_leaf`): text + resolved entity pieces.
+    let mut leaf_text = String::new();
+    let mut in_leaf = false;
 
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
+                leaf_text.clear();
+                in_leaf = true;
                 let name = name_of(e.name())?;
                 if name == "gpu" {
                     gpu_id_attr = attr_of(&e, "id").unwrap_or_default();
@@ -402,28 +413,52 @@ fn parse_document(xml: &str) -> Result<ParsedDoc, TelemetryError> {
             }
             Ok(Event::Empty(e)) => {
                 // Self-closing element: no text; nothing to record.
+                // It is a child, so the enclosing element is no leaf.
+                in_leaf = false;
                 let _ = name_of(e.name())?;
             }
             Ok(Event::Text(e)) => {
-                let text = e.xml_content().map(|c| c.into_owned()).unwrap_or_default();
-                if stack.len() >= 2 && stack[0] == "nvidia_smi_log" && stack[1] == "driver_version"
-                {
-                    driver_version = text.trim().to_string();
-                } else if stack.len() >= 2 && stack[0] == "nvidia_smi_log" && stack[1] == "gpu" {
-                    if stack.iter().any(|s| s == "process_info") {
-                        if let Some(pf) = proc_fields.as_mut() {
-                            if let Some(leaf) = stack.last() {
-                                pf.insert(leaf.clone(), text);
+                if in_leaf {
+                    if let Ok(c) = e.xml_content() {
+                        leaf_text.push_str(&c);
+                    }
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if in_leaf {
+                    if let Ok(Some(ch)) = e.resolve_char_ref() {
+                        leaf_text.push(ch);
+                    } else if let Ok(name) = e.decode() {
+                        match quick_xml::escape::resolve_predefined_entity(&name) {
+                            Some(resolved) => leaf_text.push_str(resolved),
+                            // Unknown entity: keep it verbatim rather
+                            // than dropping the text around it.
+                            None => {
+                                leaf_text.push('&');
+                                leaf_text.push_str(&name);
+                                leaf_text.push(';');
                             }
                         }
-                    } else if let Some(gf) = gpu_fields.as_mut() {
-                        // Key is the path relative to <gpu>, e.g. "pci/pci_bus".
-                        let rel = stack[2..].join("/");
-                        gf.insert(rel, text);
                     }
                 }
             }
             Ok(Event::End(e)) => {
+                if in_leaf {
+                    in_leaf = false;
+                    let text = leaf_text.trim().to_string();
+                    leaf_text.clear();
+                    // Whitespace-only text recorded nothing before
+                    // (trimmed events were dropped); keep that.
+                    if !text.is_empty() {
+                        record_leaf_text(
+                            &stack,
+                            text,
+                            &mut driver_version,
+                            proc_fields.as_mut(),
+                            gpu_fields.as_mut(),
+                        );
+                    }
+                }
                 let name = name_of(e.name())?;
                 if name == "process_info" {
                     if let Some(pf) = proc_fields.take() {
@@ -484,6 +519,29 @@ fn parse_document(xml: &str) -> Result<ParsedDoc, TelemetryError> {
         driver_version,
         gpus,
     })
+}
+
+/// File a finished leaf's text under its element path: the driver
+/// version, a process field (keyed by leaf name), or a GPU field
+/// (keyed by the path relative to `<gpu>`, e.g. "pci/pci_bus").
+fn record_leaf_text(
+    stack: &[String],
+    text: String,
+    driver_version: &mut String,
+    proc_fields: Option<&mut HashMap<String, String>>,
+    gpu_fields: Option<&mut HashMap<String, String>>,
+) {
+    if stack.len() >= 2 && stack[0] == "nvidia_smi_log" && stack[1] == "driver_version" {
+        *driver_version = text;
+    } else if stack.len() >= 2 && stack[0] == "nvidia_smi_log" && stack[1] == "gpu" {
+        if stack.iter().any(|s| s == "process_info") {
+            if let (Some(pf), Some(leaf)) = (proc_fields, stack.last()) {
+                pf.insert(leaf.clone(), text);
+            }
+        } else if let Some(gf) = gpu_fields {
+            gf.insert(stack[2..].join("/"), text);
+        }
+    }
 }
 
 fn name_of(name: quick_xml::name::QName<'_>) -> Result<String, TelemetryError> {
@@ -1054,6 +1112,27 @@ mod tests {
         let (samples, procs) = NvidiaSmiSource::parse_xml_with_processes(xml).expect("must parse");
         assert_eq!(samples[0].driver_model, Some(DriverModel::Tcc));
         assert_eq!(procs[0].vram_mib, Some(11264));
+    }
+
+    /// P-9 (docs/code-review-v0.1.60.md): text around entity references
+    /// (quick-xml 0.38 GeneralRef events) is kept, not overwritten by
+    /// the last piece, and whitespace beside a reference survives.
+    #[test]
+    fn entity_references_keep_surrounding_text() {
+        let xml = r#"<?xml version="1.0" ?><nvidia_smi_log>
+<driver_version>581.57</driver_version>
+<gpu id="00000000:01:00.0">
+<product_name>Card &amp; Co &#65;4000</product_name><uuid>GPU-a</uuid>
+<fb_memory_usage><total>8192 MiB</total><used>0 MiB</used></fb_memory_usage>
+<utilization><gpu_util>0 %</gpu_util></utilization>
+<temperature><gpu_temp>30 C</gpu_temp></temperature>
+<gpu_power_readings><power_draw>20.00 W</power_draw></gpu_power_readings>
+<processes><process_info><pid>4321</pid><process_name>C:\R&amp;D\llama-server.exe</process_name><used_memory>1024 MiB</used_memory></process_info></processes>
+</gpu></nvidia_smi_log>"#;
+        let (samples, procs) = NvidiaSmiSource::parse_xml_with_processes(xml).expect("must parse");
+        assert_eq!(samples[0].name, "Card & Co A4000");
+        assert_eq!(procs[0].name, r"C:\R&D\llama-server.exe");
+        assert_eq!(procs[0].pid, 4321);
     }
 
     /// P-3: a hung nvidia-smi is killed at the bound and reported as a
