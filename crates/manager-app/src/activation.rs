@@ -42,7 +42,11 @@
 //! pre-change configuration. Cancelling restores that snapshot —
 //! refused when the current configuration no longer matches the
 //! last entry's post-change state, because another path changed it
-//! since and a blind restore would discard that change too.
+//! since and a blind restore would discard that change too. The
+//! comparison ignores background bookkeeping stamps, the restore
+//! keeps the current stamps, and a restore that would roll back a
+//! security-relevant section is refused — see [`cancel_plan`] and
+//! [`crate::activation_cancel`] (PS-10).
 
 use std::path::{Path, PathBuf};
 
@@ -56,6 +60,17 @@ fn default_scope() -> String {
 /// One saved change waiting on activation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivationEntry {
+    /// Unique id of this entry (PS-6): what a command rolls back by
+    /// when its configuration save fails after the entry was
+    /// recorded. `ts` is not unique — two records in the same
+    /// instant share it — and removing by position (pop-last) would
+    /// drop a concurrent writer's entry instead. Serde-defaulted:
+    /// journals written before ids existed load with an empty id,
+    /// which no rollback ever targets (rollback only removes entries
+    /// the same command just recorded, and those always carry one),
+    /// so legacy entries need no backfill.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     /// RFC 3339 UTC timestamp of the save.
     pub ts: String,
     /// Machine kind of the mutation (`backend_add`, `backend_delete`,
@@ -509,6 +524,12 @@ fn normalize_yaml(text: &str) -> String {
 /// and propagate the `Err`: a journal write failure then aborts
 /// the change with the configuration untouched, instead of
 /// stranding a saved change no plan will ever show (4.3).
+///
+/// Returns the new entry's id. When the configuration save that
+/// follows fails, the caller removes exactly that entry with
+/// [`remove_entries`] (via [`JournalRecords::roll_back`]) — see
+/// there for why that is safe against this function's prune and
+/// snapshot reset (PS-6).
 #[allow(clippy::too_many_arguments)]
 pub fn record_change(
     data_dir: &Path,
@@ -521,7 +542,7 @@ pub fn record_change(
     started_at: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
     configured: &std::collections::HashSet<String>,
     running: &std::collections::HashSet<String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let _guard = journal_lock();
     let mut journal = load_journal(data_dir);
     let mut unresolved = unresolved_entries_scoped(data_dir, &journal, started_at, configured);
@@ -537,7 +558,9 @@ pub fn record_change(
             journal.snapshot = serde_json::to_value(pre).ok();
         }
     }
+    let id = new_entry_id();
     journal.entries.push(ActivationEntry {
+        id: id.clone(),
         ts: chrono::Utc::now().to_rfc3339(),
         kind: kind.to_string(),
         summary,
@@ -546,7 +569,112 @@ pub fn record_change(
         targets,
         pre_change_yaml_hash: yaml_hash_before_change(data_dir, pre),
     });
+    save_journal(data_dir, &journal)?;
+    Ok(id)
+}
+
+/// A fresh journal-entry id: wall-clock nanoseconds, the process
+/// id, and a process-wide counter. The counter makes ids unique
+/// within a process even when the clock does not advance between
+/// two records; the pid and clock separate processes (the app and
+/// a CLI run against the same data dir). Opaque to every reader —
+/// only equality matters.
+fn new_entry_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}-{:x}-{n:x}", std::process::id())
+}
+
+/// Remove the entries with these ids — the rollback for a command
+/// whose configuration save failed after it journaled (PS-6).
+///
+/// The record-before-save contract (code-review 4.3) stays: the
+/// entry is still written first, so a crash between the journal
+/// write and the config save leaves a phantom entry (the safe
+/// direction — a plan that asks for a restart nobody needed) and
+/// never a saved change no plan shows. This only covers the case
+/// the command itself observes: the save returned an error, the
+/// configuration on disk and in memory is unchanged, and the entry
+/// describes a change that never happened.
+///
+/// Removal is by id, under the journal lock, on a freshly loaded
+/// journal — never pop-last and never a restore of the whole
+/// pre-record journal: either would clobber whatever another
+/// writer journaled in between (a concurrent
+/// [`record_offload_override`], another command's entry).
+///
+/// [`record_change`] may also have pruned resolved entries and reset
+/// the snapshot to the command's `pre` configuration. Neither needs
+/// undoing when the save fails:
+///
+/// - the pruned entries were already resolved or already effective
+///   — no plan shows them, cancel ignores them, and the next record
+///   prunes them anyway;
+/// - the snapshot is reset only when no unresolved entry remained,
+///   so after removing this entry the journal is empty again; the
+///   snapshot is then dropped here (it is the cancel target for
+///   pending entries only), and even if it were kept it equals the
+///   unchanged on-disk configuration, which the next record would
+///   overwrite from its own `pre` regardless.
+///
+/// Empty ids are ignored (legacy entries carry none). Entries that
+/// are already gone (cleared by a concurrent activation) are not an
+/// error.
+pub fn remove_entries(data_dir: &Path, ids: &[String]) -> Result<(), String> {
+    let ids: Vec<&String> = ids.iter().filter(|id| !id.is_empty()).collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let _guard = journal_lock();
+    let mut journal = load_journal(data_dir);
+    let before = journal.entries.len();
+    journal.entries.retain(|e| !ids.contains(&&e.id));
+    if journal.entries.len() == before {
+        return Ok(());
+    }
+    if journal.entries.is_empty() {
+        journal.snapshot = None;
+    }
     save_journal(data_dir, &journal)
+}
+
+/// The journal entries one command recorded ahead of its
+/// configuration save (PS-6): the ids its rollback removes when the
+/// save — or a later record in the same command — fails.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct JournalRecords {
+    ids: Vec<String>,
+}
+
+impl JournalRecords {
+    /// No entries recorded (a change the gateway rule did not
+    /// journal).
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// The records of one [`record_change`] call.
+    pub fn one(id: String) -> Self {
+        Self { ids: vec![id] }
+    }
+
+    /// Fold another record's ids into this command's set.
+    pub fn extend(&mut self, other: JournalRecords) {
+        self.ids.extend(other.ids);
+    }
+
+    pub fn ids(&self) -> &[String] {
+        &self.ids
+    }
+
+    /// Remove every entry this command recorded ([`remove_entries`]).
+    pub fn roll_back(&self, data_dir: &Path) -> Result<(), String> {
+        remove_entries(data_dir, &self.ids)
+    }
 }
 
 /// The hash of the gateway YAML in effect before a change: the
@@ -665,6 +793,9 @@ pub fn clear_gateway_scope(data_dir: &Path) -> Result<(), String> {
 /// the same way, so it is not the plan's to cancel either. When
 /// nothing is pending the answer is `None`, however many
 /// already-effective entries the journal still carries.
+///
+/// This is [`cancel_plan`] with the stale-journal outcome folded into
+/// `None` (nothing to restore).
 pub fn cancel_target(
     data_dir: &Path,
     current: &AppConfig,
@@ -673,14 +804,78 @@ pub fn cancel_target(
     running: &std::collections::HashSet<String>,
     gateway_up: bool,
 ) -> Result<Option<AppConfig>, String> {
+    match cancel_plan(
+        data_dir, current, started_at, configured, running, gateway_up,
+    )? {
+        CancelPlan::Restore(cfg) => Ok(Some(*cfg)),
+        CancelPlan::Nothing | CancelPlan::StaleJournal => Ok(None),
+    }
+}
+
+/// What a cancel request should do (see [`cancel_plan`]).
+#[derive(Debug)]
+pub enum CancelPlan {
+    /// Nothing is pending: no restore.
+    Nothing,
+    /// The configuration already equals the snapshot (apart from
+    /// bookkeeping) while the journal still carries entries: a
+    /// previous cancel saved the restored configuration and stopped
+    /// (crash) before clearing the journal. The caller clears the
+    /// journal; there is nothing to restore.
+    StaleJournal,
+    /// Install this configuration: the snapshot, with bookkeeping
+    /// carried over from the current configuration.
+    Restore(Box<AppConfig>),
+}
+
+/// The cancel decision (PS-10). Field treatment follows
+/// [`crate::activation_cancel`]:
+///
+/// - The guard compares the current configuration with the newest
+///   pending entry's `config_after` with bookkeeping stripped from
+///   both sides, so background stamps (`verified_at`,
+///   `setup_completed`, …) no longer make cancel permanently
+///   refused, while any other field — including one added to
+///   `AppConfig` later — still refuses on a difference.
+/// - Cancel is refused when a security section differs between the
+///   snapshot and the current configuration: restoring would roll it
+///   back to an older value.
+/// - The restore is the snapshot with bookkeeping copied over from
+///   the current configuration.
+/// - Self-heal: when the journal still has entries but the current
+///   configuration equals the snapshot (and differs from the newest
+///   entry's post-change state), the journal is stale — see
+///   [`CancelPlan::StaleJournal`].
+///
+/// Callers hold the configuration write lock across this call and
+/// the restore's save, so the guard sees exactly the configuration
+/// the restore replaces.
+pub fn cancel_plan(
+    data_dir: &Path,
+    current: &AppConfig,
+    started_at: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    configured: &std::collections::HashSet<String>,
+    running: &std::collections::HashSet<String>,
+    gateway_up: bool,
+) -> Result<CancelPlan, String> {
+    use crate::activation_cancel as fields;
     let _guard = journal_lock();
     let journal = load_journal(data_dir);
+    let current_value = serde_json::to_value(current)
+        .map_err(|e| format!("current configuration is not serializable: {e}"))?;
+    if let (Some(snapshot), Some(newest)) = (&journal.snapshot, journal.entries.last()) {
+        if fields::same_configuration(snapshot, &current_value)
+            && !fields::same_configuration(&newest.config_after, &current_value)
+        {
+            return Ok(CancelPlan::StaleJournal);
+        }
+    }
     let unresolved = unresolved_entries_scoped(data_dir, &journal, started_at, configured);
     let pending = pending_entries(
         data_dir, &journal, started_at, configured, running, gateway_up,
     );
     let Some(last) = pending.last() else {
-        return Ok(None);
+        return Ok(CancelPlan::Nothing);
     };
     // Restoring the snapshot reverts EVERY journaled change back to
     // it, including strict-unresolved entries that live state has
@@ -696,9 +891,7 @@ pub fn cancel_target(
                 .to_string(),
         );
     }
-    let current_value = serde_json::to_value(current)
-        .map_err(|e| format!("current configuration is not serializable: {e}"))?;
-    if current_value != last.config_after {
+    if !fields::same_configuration(&current_value, &last.config_after) {
         return Err(
             "the configuration changed through another path after these changes were saved; \
              cancelling would discard that change too, so the saved changes stand"
@@ -706,11 +899,18 @@ pub fn cancel_target(
         );
     }
     let Some(snapshot) = journal.snapshot else {
-        return Ok(None);
+        return Ok(CancelPlan::Nothing);
     };
-    let cfg: AppConfig = serde_json::from_value(snapshot)
-        .map_err(|e| format!("the saved snapshot cannot be restored: {e}"))?;
-    Ok(Some(cfg))
+    let security = fields::changed_security_sections(&snapshot, &current_value);
+    if !security.is_empty() {
+        return Err(format!(
+            "security-relevant settings ({}) changed since these changes were first saved; \
+             cancelling would roll them back to their earlier values, so the saved changes \
+             stand — revert the pending changes individually instead",
+            security.join(", ")
+        ));
+    }
+    fields::restored_config(&snapshot, current).map(|cfg| CancelPlan::Restore(Box::new(cfg)))
 }
 
 /// Sum the `litellm_in_flight_requests` gauge from a Prometheus
@@ -767,6 +967,7 @@ litellm_deployment_success_responses_total 9.0
 
     fn entry(scope: &str, targets: &[&str]) -> ActivationEntry {
         ActivationEntry {
+            id: String::new(),
             ts: "2026-10-16T12:00:00+00:00".to_string(),
             kind: "backend_flags".to_string(),
             summary: "change".to_string(),
@@ -1728,6 +1929,197 @@ litellm_deployment_success_responses_total 9.0
         // The same state with the gateway DOWN composes no item:
         // the stale file is information, not pending work (#45).
         assert!(!drift_is_pending(detail.any(), false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn ps_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "activation-ps-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn record_gateway(dir: &Path, pre: &AppConfig, post: &AppConfig, summary: &str) -> String {
+        record_change(
+            dir,
+            pre,
+            post,
+            "gateway_config",
+            summary.to_string(),
+            "gateway",
+            Vec::new(),
+            &starts(&[]),
+            &ids(&[]),
+            &ids(&[]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rollback_removes_only_its_entry_and_keeps_a_concurrent_override() {
+        // PS-6: a command records, a concurrent command records an
+        // offload override, then the first command's save fails.
+        // The rollback must remove exactly the first command's entry
+        // — not pop-last, not a restore of the pre-record journal —
+        // so the override and an earlier entry survive.
+        let dir = ps_test_dir("rollback");
+        let cfg0 = AppConfig::default_config();
+        let mut cfg1 = cfg0.clone();
+        cfg1.gateway.port += 1;
+        let mut cfg2 = cfg1.clone();
+        cfg2.gateway.port += 1;
+        let earlier = record_gateway(&dir, &cfg0, &cfg1, "earlier");
+        let failed = record_gateway(&dir, &cfg1, &cfg2, "failed save");
+        assert_ne!(earlier, failed, "entry ids are unique");
+        record_offload_override(&dir, "coder", 24, vec![(8, 9)]).unwrap();
+        JournalRecords::one(failed.clone()).roll_back(&dir).unwrap();
+        let journal = load_journal(&dir);
+        assert_eq!(journal.entries.len(), 1);
+        assert_eq!(journal.entries[0].id, earlier);
+        assert_eq!(journal.entries[0].summary, "earlier");
+        assert!(
+            journal.snapshot.is_some(),
+            "the earlier entry keeps its cancel target"
+        );
+        assert!(offload_override_covers(&journal, "coder", 24, &[(8, 9)]));
+        // Rolling back the last entry empties the journal and drops
+        // the snapshot; the override still stands.
+        JournalRecords::one(earlier).roll_back(&dir).unwrap();
+        let journal = load_journal(&dir);
+        assert!(journal.entries.is_empty());
+        assert!(journal.snapshot.is_none());
+        assert_eq!(journal.offload_overrides.len(), 1);
+        // An unknown id (already cleared) and an empty id are no-ops.
+        remove_entries(&dir, &["gone".to_string(), String::new()]).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_entries_without_ids_load_and_are_never_rolled_back() {
+        let dir = ps_test_dir("legacy-id");
+        let cfg = AppConfig::default_config();
+        let legacy = serde_json::json!({
+            "snapshot": serde_json::to_value(&cfg).unwrap(),
+            "entries": [{
+                "ts": "2026-10-16T12:00:00+00:00",
+                "kind": "gateway_config",
+                "summary": "legacy",
+                "config_after": serde_json::to_value(&cfg).unwrap(),
+            }],
+        });
+        std::fs::write(journal_path(&dir), legacy.to_string()).unwrap();
+        let journal = load_journal(&dir);
+        assert_eq!(journal.entries.len(), 1);
+        assert!(journal.entries[0].id.is_empty());
+        remove_entries(&dir, &[String::new()]).unwrap();
+        assert_eq!(load_journal(&dir).entries.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A journal with one pending backend-scope entry (`coder`
+    /// running, started before the entry) from `snapshot` to `after`.
+    fn pending_journal(dir: &Path, snapshot: &AppConfig, after: &AppConfig) {
+        let mut e = entry("backend", &["coder"]);
+        e.config_after = serde_json::to_value(after).unwrap();
+        save_journal(
+            dir,
+            &ActivationJournal {
+                snapshot: Some(serde_json::to_value(snapshot).unwrap()),
+                entries: vec![e],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    fn plan(dir: &Path, current: &AppConfig) -> Result<CancelPlan, String> {
+        cancel_plan(
+            dir,
+            current,
+            &starts(&[("coder", "2026-10-16T11:00:00+00:00")]),
+            &ids(&["coder"]),
+            &ids(&["coder"]),
+            false,
+        )
+    }
+
+    #[test]
+    fn cancel_ignores_background_stamps_and_keeps_them_on_restore() {
+        // PS-10: a download verification stamp and the wizard's
+        // setup_completed landed after the change was journaled. The
+        // guard used to refuse forever; now they are bookkeeping —
+        // ignored by the comparison and carried into the restore.
+        let dir = ps_test_dir("cancel-stamps");
+        let cfg0 = crate::activation_cancel::test_config_with_model();
+        let mut cfg1 = cfg0.clone();
+        cfg1.gateway.port += 1;
+        pending_journal(&dir, &cfg0, &cfg1);
+        let mut current = cfg1.clone();
+        let stamp = chrono::Utc::now();
+        current.models[0].verified_at = Some(stamp);
+        current.models[0].verified_sha256 = Some(current.models[0].sha256.clone());
+        current.setup_completed = !cfg0.setup_completed;
+        let CancelPlan::Restore(restored) = plan(&dir, &current).unwrap() else {
+            panic!("a bookkeeping-only difference must not refuse cancel");
+        };
+        assert_eq!(restored.gateway.port, cfg0.gateway.port);
+        assert_eq!(restored.models[0].verified_at, Some(stamp));
+        assert_eq!(restored.setup_completed, current.setup_completed);
+        // A real configuration difference still refuses.
+        current.telemetry = {
+            let mut t = current.telemetry.clone();
+            t.poll_interval_ms += 1;
+            t
+        };
+        let err = plan(&dir, &current).expect_err("an operator change refuses");
+        assert!(err.contains("another path"), "unexpected refusal: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_refuses_to_roll_back_a_security_section() {
+        // The snapshot predates an admin API change that reached the
+        // current configuration (e.g. a non-journaled save between
+        // two journaled ones): restoring would roll it back.
+        let dir = ps_test_dir("cancel-security");
+        let cfg0 = AppConfig::default_config();
+        let mut cfg1 = cfg0.clone();
+        cfg1.gateway.port += 1;
+        cfg1.admin_api.port = cfg1.admin_api.port.wrapping_add(1);
+        pending_journal(&dir, &cfg0, &cfg1);
+        let err = plan(&dir, &cfg1).expect_err("security rollback refuses");
+        assert!(err.contains("admin_api"), "names the section: {err}");
+        assert!(err.contains("security"), "says why: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_self_heals_a_journal_left_after_a_restore() {
+        // Crash between a cancel's config save and its journal
+        // clear: the configuration equals the snapshot while the
+        // entry still says otherwise. Cancel reports the stale
+        // journal (the op clears it) instead of refusing forever.
+        let dir = ps_test_dir("cancel-heal");
+        let cfg0 = crate::activation_cancel::test_config_with_model();
+        let mut cfg1 = cfg0.clone();
+        cfg1.gateway.port += 1;
+        pending_journal(&dir, &cfg0, &cfg1);
+        let mut current = cfg0.clone();
+        current.models[0].verified_at = Some(chrono::Utc::now());
+        assert!(matches!(
+            plan(&dir, &current).unwrap(),
+            CancelPlan::StaleJournal
+        ));
+        // A no-op change (after == snapshot) is not mistaken for a
+        // stale journal.
+        pending_journal(&dir, &cfg0, &cfg0);
+        assert!(matches!(plan(&dir, &cfg0).unwrap(), CancelPlan::Restore(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
