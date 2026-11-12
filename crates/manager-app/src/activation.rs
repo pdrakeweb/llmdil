@@ -150,10 +150,50 @@ fn journal_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 pub fn load_journal(data_dir: &Path) -> ActivationJournal {
-    match std::fs::read_to_string(journal_path(data_dir)) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+    let path = journal_path(data_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(journal) => journal,
+            Err(e) => {
+                // PS-9: an unparseable journal used to load as Default
+                // and the next write silently erased it — standing
+                // offload overrides included. Move it aside first
+                // (same `.corrupt-<unix-ms>` naming as the config
+                // file's F2 preservation) so the evidence survives and
+                // a repair is possible, and say so in the log.
+                let preserved = preserve_corrupt_journal(&path);
+                match preserved {
+                    Ok(dest) => eprintln!(
+                        "activation journal: {} is unreadable ({e}); preserved as {} and starting empty",
+                        path.display(),
+                        dest.display()
+                    ),
+                    Err(err) => eprintln!(
+                        "activation journal: {} is unreadable ({e}) and could not be preserved: {err}",
+                        path.display()
+                    ),
+                }
+                ActivationJournal::default()
+            }
+        },
         Err(_) => ActivationJournal::default(),
     }
+}
+
+/// Move an unparseable journal to `<file>.corrupt-<unix-ms>` beside it
+/// (PS-9). A move, not a copy: the file is reloaded on every journal
+/// access, and a copy would mint a fresh `.corrupt-*` file each time
+/// until the next save replaced the original.
+fn preserve_corrupt_journal(path: &Path) -> Result<PathBuf, String> {
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut dest = path.as_os_str().to_owned();
+    dest.push(format!(".corrupt-{unix_ms}"));
+    let dest = PathBuf::from(dest);
+    std::fs::rename(path, &dest).map_err(|e| format!("{e}"))?;
+    Ok(dest)
 }
 
 /// Persist the journal, surfacing failure: a swallowed write here
@@ -1325,6 +1365,34 @@ litellm_deployment_success_responses_total 9.0
         .unwrap();
         let journal = load_journal(&dir);
         assert!(journal.offload_overrides.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PS-9 (docs/code-review-v0.1.60.md): a corrupt journal is moved
+    /// aside to `.corrupt-<unix-ms>` before the next write replaces
+    /// it, so its standing overrides are not silently erased.
+    #[test]
+    fn corrupt_journal_is_preserved_before_next_write() {
+        let dir = override_test_dir("corrupt-preserved");
+        let garbage = r#"{"snapshot":null,"entries":[ this is not json"#;
+        std::fs::write(dir.join("activation-journal.json"), garbage).unwrap();
+        let journal = load_journal(&dir);
+        assert!(journal.entries.is_empty());
+        assert!(journal.offload_overrides.is_empty());
+        record_offload_override(&dir, "coder", 46, vec![(6, 0)]).unwrap();
+        let preserved: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("activation-journal.json.corrupt-"))
+            })
+            .collect();
+        assert_eq!(preserved.len(), 1, "{preserved:?}");
+        assert_eq!(std::fs::read_to_string(&preserved[0]).unwrap(), garbage);
+        let journal = load_journal(&dir);
+        assert!(offload_override_covers(&journal, "coder", 46, &[(6, 0)]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
