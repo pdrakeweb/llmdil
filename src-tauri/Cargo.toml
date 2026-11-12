@@ -6,6 +6,11 @@ edition = "2021"
 # NOTE: excluded from the Cargo workspace (see root Cargo.toml `exclude`).
 # Builds on Windows via the release workflow (tauri-action). Not expected to
 # compile on this Linux VM (no GTK/WebKit); kept syntactically valid.
+#
+# The empty `[workspace]` table makes this package its own workspace root, so
+# Cargo never walks further up and adopts an unrelated parent manifest (e.g.
+# when this repo is checked out as a git worktree nested inside another clone).
+[workspace]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
