@@ -270,6 +270,29 @@ pub async fn auth_middleware(
             match token {
                 Some(token) => match mw.ctx.auth.validate_bearer(&token).await {
                     Some(p) => {
+                        // SEC-03: an account flagged must-change (admin
+                        // reset) reaches only the change-password path.
+                        // The flag is read from the user store by
+                        // validate_bearer, for sessions and API tokens.
+                        if p.must_change_password && !password_change_exempt(&class_method, &path) {
+                            mw.ctx.audit.append(&AuditEntry {
+                                ts_ms: now_ms(),
+                                actor: p.username.clone(),
+                                auth_type: p.auth_type.as_str().to_string(),
+                                source_ip: source_ip.clone(),
+                                action: format!(
+                                    "{method} {}",
+                                    template_for_audit(&mw.table, &method, &path)
+                                ),
+                                target: audit_target(&path),
+                                result: "password_change_required".to_string(),
+                                request_id: request_id.clone(),
+                            });
+                            return finish(
+                                auth_error_response(&AuthError::PasswordChangeRequired),
+                                &request_id,
+                            );
+                        }
                         if let AuthClass::Class(c) = class {
                             if !role_allows(p.role, c) {
                                 return finish(
@@ -337,6 +360,22 @@ pub async fn auth_middleware(
         }
     }
     finish(resp, &request_id)
+}
+
+/// Routes open to a principal whose account must change its password
+/// (SEC-03, auth plan §3.6): the change itself, logging out, and
+/// reading `/auth/me` (which reports the flag). `method` is the
+/// class-resolution method, so HEAD counts as GET.
+pub const PASSWORD_CHANGE_EXEMPT: &[(&str, &str)] = &[
+    ("POST", "/api/v1/auth/password"),
+    ("POST", "/api/v1/auth/logout"),
+    ("GET", "/api/v1/auth/me"),
+];
+
+fn password_change_exempt(method: &Method, path: &str) -> bool {
+    PASSWORD_CHANGE_EXEMPT
+        .iter()
+        .any(|(m, p)| *m == method.as_str() && *p == path)
 }
 
 fn finish(mut resp: Response, request_id: &str) -> Response {
@@ -433,6 +472,13 @@ fn auth_error_response(e: &AuthError) -> Response {
             &format!("not found: {m}"),
             None,
         ),
+        AuthError::PasswordChangeRequired => error_response_raw(
+            StatusCode::FORBIDDEN,
+            "PASSWORD_CHANGE_REQUIRED",
+            "PasswordChangeRequired",
+            "this account must change its password first (POST /api/v1/auth/password)",
+            None,
+        ),
         AuthError::Internal => error_response_raw(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL",
@@ -452,6 +498,9 @@ fn tokens_body(pair: &crate::auth::TokenPair, user: &UserView) -> Value {
         "access_expires_ms": pair.access_expires_ms,
         "refresh_expires_ms": pair.refresh_expires_ms,
         "user": user,
+        // SEC-03: additive top-level copy of the account flag, so a
+        // client routes to change-password without digging into `user`.
+        "must_change_password": user.must_change_password,
     })
 }
 
@@ -627,6 +676,21 @@ pub async fn handle_refresh(
             );
             auth_error_response(&AuthError::SessionRevoked)
         }
+        Err(AuthError::PasswordChangeRequired) => {
+            // SEC-03: refresh is public, so the middleware gate never
+            // saw this; audit the refusal here like the gate does.
+            let owner = ctx.auth.refresh_token_owner(&body.refresh_token).await;
+            audit_auth(
+                &ctx,
+                owner.as_deref().unwrap_or("unknown"),
+                "session",
+                &ip,
+                "POST /api/v1/auth/refresh",
+                "password_change_required",
+                &rid,
+            );
+            auth_error_response(&AuthError::PasswordChangeRequired)
+        }
         Err(e) => auth_error_response(&e),
     }
 }
@@ -694,6 +758,7 @@ pub async fn handle_me(
         .await;
     match view {
         Some(user) => axum::Json(json!({
+            "must_change_password": user.must_change_password,
             "user": user,
             "auth_type": p.auth_type.as_str(),
             "session_id": p.session_id,

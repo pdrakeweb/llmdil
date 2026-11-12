@@ -53,6 +53,10 @@ pub struct Principal {
     pub auth_type: AuthType,
     /// Session id, or the API token id for token principals.
     pub session_id: String,
+    /// The account's must-change-password flag, read from the user
+    /// store at validation time (SEC-03). While set, the middleware
+    /// admits only change-password, logout and `/auth/me`.
+    pub must_change_password: bool,
 }
 
 /// Failures from [`AuthService`], mapped one-to-one onto HTTP error envelopes by the auth
@@ -72,6 +76,11 @@ pub enum AuthError {
     Forbidden(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// The account carries the must-change-password flag (set by an
+    /// admin reset); only change-password, logout and `/auth/me` are
+    /// open to it (SEC-03, auth plan §3.6).
+    #[error("password change required")]
+    PasswordChangeRequired,
     #[error("internal error")]
     Internal,
 }
@@ -214,6 +223,10 @@ const LOCK_MAX_MS: i64 = 60 * 60 * 1000;
 const IP_FAILURE_LIMIT: usize = 30;
 const CHALLENGE_TTL_MS: i64 = 5 * 60 * 1000;
 const ENROLLMENT_TTL_MS: i64 = 10 * 60 * 1000;
+/// Lifetime of both tokens of a session minted for an account that
+/// must change its password (SEC-03): long enough to change it, never
+/// the 30-day refresh lifetime of a normal session.
+pub const MUST_CHANGE_SESSION_TTL_MS: i64 = 15 * 60 * 1000;
 /// Minimum interval between persisted last-used updates for one
 /// session or API token (SEC-14: no store rewrite per request).
 const LAST_USED_WRITE_INTERVAL_MS: i64 = 60_000;
@@ -612,7 +625,8 @@ impl AuthService {
 
     /// Mint a new per-device session. Performs no credential check of its own: callers must
     /// already have authenticated the user (password, TOTP or enrollment code). Only the
-    /// token hashes are persisted.
+    /// token hashes are persisted. An account flagged must-change-password gets a short
+    /// session ([`MUST_CHANGE_SESSION_TTL_MS`] for both tokens) instead of 30 days (SEC-03).
     pub async fn create_session(
         &self,
         user_id: &str,
@@ -621,38 +635,56 @@ impl AuthService {
         let access = generate_token();
         let refresh = generate_token();
         let now = now_ms();
-        let session = Session {
-            id: uuid::Uuid::new_v4().to_string(),
-            user_id: user_id.to_string(),
-            device_name: device_name.to_string(),
-            access_hash: hash_token(&access),
-            refresh_hash: hash_token(&refresh),
-            retired_refresh_hashes: Vec::new(),
-            retired_refresh_ms: Vec::new(),
-            created_ms: now,
-            access_expires_ms: now + ACCESS_TTL_MS,
-            refresh_expires_ms: now + REFRESH_TTL_MS,
-            last_used_ms: now,
-            revoked: false,
-        };
-        let pair = TokenPair {
-            access_token: access,
-            refresh_token: refresh,
-            session_id: session.id.clone(),
-            access_expires_ms: session.access_expires_ms,
-            refresh_expires_ms: session.refresh_expires_ms,
-        };
+        let uid = user_id.to_string();
+        let device = device_name.to_string();
         self.store
             .mutate::<_, AuthError>(|f| {
+                let must_change = f
+                    .users
+                    .iter()
+                    .find(|u| u.id == uid)
+                    .map(|u| u.must_change_password)
+                    .unwrap_or(false);
+                let (access_ttl, refresh_ttl) = if must_change {
+                    (
+                        ACCESS_TTL_MS.min(MUST_CHANGE_SESSION_TTL_MS),
+                        MUST_CHANGE_SESSION_TTL_MS,
+                    )
+                } else {
+                    (ACCESS_TTL_MS, REFRESH_TTL_MS)
+                };
+                let session = Session {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    user_id: uid,
+                    device_name: device,
+                    access_hash: hash_token(&access),
+                    refresh_hash: hash_token(&refresh),
+                    retired_refresh_hashes: Vec::new(),
+                    retired_refresh_ms: Vec::new(),
+                    created_ms: now,
+                    access_expires_ms: now + access_ttl,
+                    refresh_expires_ms: now + refresh_ttl,
+                    last_used_ms: now,
+                    revoked: false,
+                };
+                let pair = TokenPair {
+                    access_token: access.clone(),
+                    refresh_token: refresh.clone(),
+                    session_id: session.id.clone(),
+                    access_expires_ms: session.access_expires_ms,
+                    refresh_expires_ms: session.refresh_expires_ms,
+                };
                 f.sessions.push(session);
-                Ok(())
+                Ok(pair)
             })
-            .await?;
-        Ok(pair)
+            .await
     }
 
     /// Rotate a refresh token. Presenting a retired token revokes
-    /// the whole session family (theft detection).
+    /// the whole session family (theft detection). A disabled account
+    /// is refused, and an account flagged must-change-password gets
+    /// `PasswordChangeRequired` without rotating (SEC-03): refresh is a
+    /// public route, so the middleware gate never sees it.
     pub async fn refresh(&self, refresh_token: &str) -> Result<(TokenPair, UserView), AuthError> {
         let hash = hash_token(refresh_token);
         let now = now_ms();
@@ -708,6 +740,15 @@ impl AuthService {
                     s.revoked = true;
                     return Ok(Err(AuthError::SessionRevoked));
                 }
+                // The owner's live record decides, under the same lock.
+                match f.users.iter().find(|u| u.id == s.user_id) {
+                    Some(u) if u.disabled => return Ok(Err(AuthError::InvalidCredentials)),
+                    Some(u) if u.must_change_password => {
+                        return Ok(Err(AuthError::PasswordChangeRequired))
+                    }
+                    Some(_) => {}
+                    None => return Ok(Err(AuthError::InvalidCredentials)),
+                }
                 s.retire_refresh_hash(now);
                 s.access_hash = hash_token(&access);
                 s.refresh_hash = hash_token(&refresh);
@@ -738,6 +779,24 @@ impl AuthService {
         Ok((pair, UserView::from(&user)))
     }
 
+    /// The username owning the session a (current or retired) refresh
+    /// token belongs to, for auditing refused refreshes. `None` when
+    /// the token matches no session.
+    pub async fn refresh_token_owner(&self, refresh_token: &str) -> Option<String> {
+        let hash = hash_token(refresh_token);
+        self.store
+            .read(|f| {
+                let s = f.sessions.iter().find(|s| {
+                    s.refresh_hash == hash || s.retired_refresh_hashes.iter().any(|h| h == &hash)
+                })?;
+                f.users
+                    .iter()
+                    .find(|u| u.id == s.user_id)
+                    .map(|u| u.username.clone())
+            })
+            .await
+    }
+
     /// Validate a bearer credential (session access token or API
     /// token) into a principal. Records last use.
     pub async fn validate_bearer(&self, token: &str) -> Option<Principal> {
@@ -762,6 +821,7 @@ impl AuthService {
                 role: user.role.to_role(),
                 auth_type: AuthType::Session,
                 session_id,
+                must_change_password: user.must_change_password,
             });
         }
         // API token?
@@ -783,6 +843,7 @@ impl AuthService {
                 role: role.to_role(),
                 auth_type: AuthType::ApiToken,
                 session_id: token_id,
+                must_change_password: user.must_change_password,
             });
         }
         None
@@ -863,12 +924,17 @@ impl AuthService {
     }
 
     /// Revoke every session of `user_id` except `except` (the caller's own, on password
-    /// change). Best-effort: a store write failure is swallowed. API tokens are untouched.
-    pub async fn revoke_user_sessions(&self, user_id: &str, except: Option<&str>) {
+    /// change). API tokens are untouched. A store write failure is returned rather than
+    /// swallowed: the in-memory revocation has taken effect, but the caller must not report
+    /// success for a revocation that may not survive a restart.
+    pub async fn revoke_user_sessions(
+        &self,
+        user_id: &str,
+        except: Option<&str>,
+    ) -> Result<(), AuthError> {
         let uid = user_id.to_string();
         let except = except.map(str::to_string);
-        let _ = self
-            .store
+        self.store
             .mutate::<_, AuthError>(|f| {
                 for s in f.sessions.iter_mut() {
                     if s.user_id == uid && except.as_deref() != Some(&s.id) {
@@ -877,7 +943,7 @@ impl AuthService {
                 }
                 Ok(())
             })
-            .await;
+            .await
     }
 
     // -- passwords ------------------------------------------------------
@@ -918,13 +984,14 @@ impl AuthService {
                 Ok(())
             })
             .await?;
-        self.revoke_user_sessions(user_id, keep_session).await;
-        Ok(())
+        self.revoke_user_sessions(user_id, keep_session).await
     }
 
     /// Admin reset: a generated temporary password, must-change set,
-    /// all sessions revoked. Returns the temporary password (shown
-    /// once to the admin).
+    /// and every session AND API token of the user revoked (SEC-03) —
+    /// in one store write, so a failed write reaches the admin instead
+    /// of a reported reset whose revocations were lost. Returns the
+    /// temporary password (shown once to the admin).
     pub async fn admin_reset_password(&self, user_id: &str) -> Result<String, AuthError> {
         let temp = generate_token()[..16].to_string();
         let hash = hash_password(&temp).map_err(|_| AuthError::Internal)?;
@@ -932,20 +999,24 @@ impl AuthService {
         let found = self
             .store
             .mutate::<bool, AuthError>(|f| {
-                if let Some(u) = f.users.iter_mut().find(|u| u.id == uid) {
-                    u.password_hash = hash;
-                    u.must_change_password = true;
-                    u.updated_ms = now_ms();
-                    Ok(true)
-                } else {
-                    Ok(false)
+                let Some(u) = f.users.iter_mut().find(|u| u.id == uid) else {
+                    return Ok(false);
+                };
+                u.password_hash = hash;
+                u.must_change_password = true;
+                u.updated_ms = now_ms();
+                for s in f.sessions.iter_mut().filter(|s| s.user_id == uid) {
+                    s.revoked = true;
                 }
+                for t in f.api_tokens.iter_mut().filter(|t| t.user_id == uid) {
+                    t.revoked = true;
+                }
+                Ok(true)
             })
             .await?;
         if !found {
             return Err(AuthError::NotFound("user".into()));
         }
-        self.revoke_user_sessions(user_id, None).await;
         Ok(temp)
     }
 
@@ -1055,7 +1126,7 @@ impl AuthService {
             .ok_or(AuthError::NotFound("user".into()))?;
         // Role change or disable revokes sessions immediately.
         if role.is_some() || disabled == Some(true) {
-            self.revoke_user_sessions(user_id, None).await;
+            self.revoke_user_sessions(user_id, None).await?;
         }
         Ok(view)
     }
@@ -1906,6 +1977,7 @@ mod tests {
             role: Role::Admin,
             auth_type: AuthType::Session,
             session_id: "s".into(),
+            must_change_password: false,
         };
         let (meta, value) = svc
             .create_api_token(&issuer, &viewer.id, "pixel", RoleName::Viewer, None)
@@ -2026,6 +2098,7 @@ mod tests {
             role: Role::Admin,
             auth_type: AuthType::Session,
             session_id: "s".into(),
+            must_change_password: false,
         };
         let (meta, value) = svc
             .create_api_token(&issuer, &admin.id, "ci", RoleName::Viewer, None)

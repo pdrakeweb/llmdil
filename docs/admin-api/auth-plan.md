@@ -300,7 +300,15 @@ any user exists. Rules:
 - **Reset by admin**: an admin sets a temporary password for a
   user; the account is flagged must-change, all sessions revoked,
   and the temporary password works only to reach the change-
-  password endpoint. Audited.
+  password endpoint. Audited. As built (SEC-03): the reset also
+  revokes the user's API tokens, in the same store write; a
+  flagged login (TOTP step included) gets a 15-minute session;
+  every route except `POST /auth/password`, `POST /auth/logout`
+  and `GET /auth/me` answers 403 `PASSWORD_CHANGE_REQUIRED` for
+  the flagged user's sessions and API tokens, refresh is refused,
+  and each refusal is audited. The desktop's local admin commands
+  (Tauri IPC, not HTTP) are not gated — the desktop is the local
+  admin, and it has no self-service password or TOTP commands.
 - **Local reset**: if every admin is locked out, the desktop app
   (local access = physical access = already root on this machine)
   offers password reset for any account. This is the recovery path

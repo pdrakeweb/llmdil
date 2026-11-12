@@ -109,8 +109,9 @@ Every error response uses one envelope:
 - `code` is the stable machine-readable form (SCREAMING_SNAKE of `kind`),
   plus REST-layer codes that have no app counterpart: `BUSY` (a singleton
   resource is already running something), `OPERATION_FAILED` (an operation's
-  terminal error, §3), and the auth codes the auth plan will define
-  (`UNAUTHENTICATED`, `FORBIDDEN`).
+  terminal error, §3), and the auth codes (`UNAUTHENTICATED`,
+  `FORBIDDEN`, `INVALID_CREDENTIALS`, `SESSION_REVOKED`,
+  `PASSWORD_CHANGE_REQUIRED`; see §6.17).
 - `message` is the app's error string, unparsed. Clients display it; they
   never branch on it.
 - HTTP status mapping:
@@ -119,6 +120,9 @@ Every error response uses one envelope:
   |---|---|---|
   | Invalid argument / body fails validation | 400 | `INVALID_INPUT` |
   | Referenced backend/model/group/step/operation absent | 404 | `NOT_FOUND` |
+  | Missing, invalid, expired or revoked bearer | 401 | `UNAUTHENTICATED` |
+  | Role may not use the endpoint; API token on account self-service | 403 | `FORBIDDEN` |
+  | Account flagged must-change-password (after an admin reset) on any route but `POST /auth/password`, `POST /auth/logout`, `GET /auth/me`; also `POST /auth/refresh` | 403 | `PASSWORD_CHANGE_REQUIRED` |
   | Singleton busy (wizard step already running, download already in flight, plan apply already running) | 409 | `BUSY` |
   | Config patch fails validation | 422 | `CONFIG` |
   | Capability deferred in the app itself | 501 | `UNSUPPORTED` |
@@ -1321,6 +1325,27 @@ The remaining 24 API-layer routes are the auth/admin surface
 `GET|POST /admin/api-tokens`, `DELETE /admin/api-tokens/{id}`,
 `POST /admin/enrollment-codes`, `GET /admin/audit` — all under
 `/api/v1`.
+
+**Must-change-password (SEC-03).** `POST /admin/users/{id}/reset-password`
+sets a temporary password, flags the account must-change, and revokes
+every session **and API token** of the user in one store write. Until
+the user changes the password:
+
+- `POST /auth/login` (and `POST /auth/totp` for a TOTP account, which
+  still completes) returns tokens for a short session (15 minutes for
+  both tokens, not 30 days). Token responses from login, TOTP, enroll
+  and refresh carry an additive top-level `"must_change_password":
+  <bool>` alongside `user.must_change_password`; `GET /auth/me` carries
+  the same top-level field.
+- Every authenticated route except `POST /auth/password`,
+  `POST /auth/logout` and `GET /auth/me` answers **403
+  `PASSWORD_CHANGE_REQUIRED`** — for session tokens and API tokens
+  alike (the flag is read from the user record on every request).
+  `POST /auth/refresh` is refused the same way, without rotating.
+  Each refusal is audited (`result: "password_change_required"`).
+- `POST /auth/password` (`{ "current_password", "new_password" }`)
+  clears the flag; the calling session stays valid (and becomes
+  refreshable) and the account's other sessions are revoked.
 
 ### 6.18 Measurements
 
