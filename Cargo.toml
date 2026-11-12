@@ -30,6 +30,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # codes). Already in the lock transitively (via zip), so declaring it
 # adds no new code to the build.
 getrandom = "0.3"
+# Linear-time regex (finite automata, no backtracking) for pricing
+# operator-supplied `--override-tensor` patterns against GGUF tensor
+# names (manager-models).
+regex = "1"
 tracing = "0.1"
 async-trait = "0.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
