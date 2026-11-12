@@ -29,6 +29,11 @@ pub struct ShipperState {
     /// Per-source tail offsets (byte offsets into the current file).
     #[serde(default)]
     pub offsets: BTreeMap<String, u64>,
+    /// Per-tail fingerprint of the consumed region ending at the
+    /// saved offset (same keys as `offsets`): lets a restart tell a
+    /// replaced file from the one the offset belongs to.
+    #[serde(default)]
+    pub fingerprints: BTreeMap<String, u64>,
     /// Spool-cap drops not yet reported to the destination.
     #[serde(default)]
     pub unreported_spool_drops: u64,

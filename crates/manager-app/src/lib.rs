@@ -380,6 +380,11 @@ pub struct AppState {
     /// once after config load when the feature is enabled; see
     /// [`logship`].
     logship: OnceCell<Arc<manager_logship::ShipperHandle>>,
+    /// The shipper's in-process record feed (app events, process-mode
+    /// backend output). Exists from startup so sinks can be wrapped
+    /// before the shipper starts; sending is a no-op until a shipper
+    /// subscribes.
+    logship_tap: manager_logship::RecordTap,
     wizard_install: OnceCell<Mutex<Wizard>>,
     wizard_audit: OnceCell<Mutex<Wizard>>,
     /// Last setup_get_steps payload, refreshed whenever the install
@@ -665,6 +670,7 @@ impl AppState {
             telemetry_poller: OnceCell::new(),
             gpu_history: OnceCell::new(),
             logship: OnceCell::new(),
+            logship_tap: manager_logship::RecordTap::new(),
             wizard_install: OnceCell::new(),
             wizard_audit: OnceCell::new(),
             wizard_steps_cache: RwLock::new(None),

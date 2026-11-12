@@ -1015,10 +1015,9 @@ impl LogStreamingLevel {
     }
 }
 
-/// Per-source streaming toggles (design §2.3 defaults). The MVP
-/// shipper tails `wizard` and `optimize`; the remaining toggles are
-/// stored configuration for the Phase 2 sources and are honored as
-/// those taps land.
+/// Per-source streaming toggles (design §2.3 defaults). Every
+/// toggle controls a real tap in the shipper (docs/log-streaming.md,
+/// "Phase 2"); the shipper reads them when the app starts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogStreamingSources {
     /// S3 wizard file tail.
@@ -1027,19 +1026,20 @@ pub struct LogStreamingSources {
     /// S4 optimize file tail.
     #[serde(default = "default_true")]
     pub optimize: bool,
-    /// S2 gateway file tails (Phase 2).
+    /// S2 gateway file tails.
     #[serde(default = "default_true")]
     pub gateway: bool,
-    /// S5 app / supervisor events (Phase 2).
+    /// S5 app / supervisor events.
     #[serde(default = "default_true")]
     pub app: bool,
-    /// S6 service-manage file tail (Phase 2).
+    /// S6 service-manage file tail.
     #[serde(default = "default_true")]
     pub service_manage: bool,
-    /// S7 Admin API audit log tail (Phase 2).
+    /// S7 Admin API audit log tail.
     #[serde(default = "default_true")]
     pub audit: bool,
-    /// S1 per-backend rings, per-backend opt-in (D3, Phase 2).
+    /// S1 per-backend logs, opt-in (D3). One switch for every
+    /// configured backend: there is no per-backend setting.
     #[serde(default)]
     pub backends: bool,
 }

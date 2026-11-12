@@ -1,7 +1,9 @@
 //! manager-logship — the LLMdil log-streaming shipper
 //! (log-streaming design, D9).
 //!
-//! Tails the app's own log files (MVP: wizard + optimize, §8),
+//! Tails the app's own log files (wizard, optimize, gateway,
+//! service-manage, audit, opt-in per-backend) and takes in-process
+//! records from the app (events, process-mode backend output),
 //! redacts every line in-process before anything is serialized to
 //! the wire (§5), batches records (§6.4), and delivers them to the
 //! single configured destination — the self-hosted receiver (D1) —
@@ -18,11 +20,13 @@ pub mod secrets;
 pub mod shipper;
 pub mod spool;
 pub mod tail;
+pub mod tap;
 
-pub use record::{classify_level, ShipLevel, WireRecord};
+pub use record::{audit_level, classify_level, ShipLevel, WireRecord};
 pub use redact::Redactor;
-pub use shipper::{spawn, ShipperConfig, ShipperHandle, ShipperStatus};
+pub use shipper::{spawn, ShipperConfig, ShipperHandle, ShipperStatus, SourceState, SourceStatus};
 pub use spool::DEFAULT_SPOOL_CAP_BYTES;
+pub use tap::{RecordTap, TapRecord};
 
 /// The deployment's machine identity when none is configured: the
 /// OS hostname (`COMPUTERNAME` on Windows, `HOSTNAME` elsewhere),

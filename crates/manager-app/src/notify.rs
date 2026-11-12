@@ -75,6 +75,12 @@ pub async fn notify(
     title: &str,
     body: &str,
 ) {
+    // The transition is an app event whether or not the operator
+    // wants a toast for it: offer it to the log shipper first.
+    let level = matches!(category, Category::Failures).then_some(manager_logship::ShipLevel::Warn);
+    crate::logship::offer_app_line(state, level, || {
+        format!("notify ({category:?}): {title} — {body}")
+    });
     let allowed = {
         let cfg = state.config.read().await;
         match category {

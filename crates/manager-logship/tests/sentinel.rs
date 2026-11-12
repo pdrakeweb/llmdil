@@ -179,6 +179,7 @@ async fn sentinel_redaction_end_to_end() {
             TOKEN.to_string(),
         ],
         spool_cap_bytes: manager_logship::DEFAULT_SPOOL_CAP_BYTES,
+        ..ShipperConfig::default()
     });
 
     // Wait for the batch to land (batch window is 2 s).

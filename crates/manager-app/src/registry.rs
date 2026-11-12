@@ -465,6 +465,10 @@ macro_rules! gen_dispatch {
             op: Op,
             args: Value,
         ) -> Result<Value, ApiError> {
+            // Every operation's events also reach the log shipper's
+            // in-process feed (source `app`); a no-op while log
+            // streaming is off.
+            let sink = &crate::logship::tap_sink(state, Arc::clone(sink));
             match op {
                 $(
                     Op::$variant => {

@@ -538,6 +538,50 @@ mod tests {
         );
     }
 
+    /// Representative gateway (LiteLLM proxy) log lines, Phase 2
+    /// source S2: the master key in its startup shapes, the
+    /// `DATABASE_URL` DSN password, and a proxied `Authorization`
+    /// header — by pattern alone, with no literal list to lean on.
+    #[test]
+    fn gateway_lines_redact() {
+        let out = r("LiteLLM Proxy: master_key='sk-1234abcd5678efgh' loaded");
+        assert!(!out.contains("1234abcd5678efgh"), "{out}");
+        assert!(out.contains("master_key="), "{out}");
+
+        let out = r("LITELLM_MASTER_KEY=sk-1234abcd5678efgh");
+        assert!(!out.contains("1234abcd5678efgh"), "{out}");
+
+        let out = r("DATABASE_URL=postgresql://llmdil:s3cretPgPass99@127.0.0.1:54329/litellm");
+        assert!(!out.contains("s3cretPgPass99"), "{out}");
+        assert!(out.contains("127.0.0.1:54329/litellm"), "{out}");
+
+        let out = r(
+            "INFO: 127.0.0.1:53211 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK Authorization: Bearer abcDEF123456ghiJKL",
+        );
+        assert!(!out.contains("abcDEF123456ghiJKL"), "{out}");
+        assert!(out.contains("POST /v1/chat/completions"), "{out}");
+
+        let out = r("request headers: {'authorization': 'Bearer abcDEF123456ghiJKL', 'x-id': '7'}");
+        assert!(!out.contains("abcDEF123456ghiJKL"), "{out}");
+    }
+
+    /// An Admin API audit line (Phase 2 source S7) carries
+    /// identities and outcomes only, so it ships verbatim — and
+    /// stays one parseable JSON object even when an attacker-chosen
+    /// field (the actor of a failed login) is itself secret-shaped.
+    #[test]
+    fn audit_lines_ship_verbatim_and_stay_json() {
+        let plain = r#"{"ts_ms":1762900000000,"actor":"alice","auth_type":"session","source_ip":"127.0.0.1","action":"POST /api/v1/backends/{id}/start","target":"planner","result":"202","request_id":"req-1"}"#;
+        assert_eq!(r(plain), plain);
+
+        let hostile = r#"{"ts_ms":1762900000001,"actor":"sk-1234abcd5678efgh","auth_type":"session","source_ip":"10.0.0.9","action":"POST /api/v1/auth/login","target":null,"result":"invalid_credentials","request_id":"req-2"}"#;
+        let out = r(hostile);
+        assert!(!out.contains("1234abcd5678efgh"), "{out}");
+        let doc: serde_json::Value = serde_json::from_str(&out).expect("still JSON");
+        assert_eq!(doc["result"], "invalid_credentials");
+        assert_eq!(doc["request_id"], "req-2");
+    }
+
     #[test]
     fn innocent_lines_untouched() {
         assert_eq!(r("the author wrote a token bucket note"), "the author wrote a token bucket note");

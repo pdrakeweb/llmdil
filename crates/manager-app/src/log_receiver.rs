@@ -102,6 +102,12 @@ pub async fn op_log_receiver_status(
         "endpoint": cfg.log_streaming.endpoint,
         "endpoint_is_local": cfg.log_streaming.endpoint.trim() == LOCAL_RECEIVER_ENDPOINT,
         "streaming_enabled": cfg.log_streaming.enabled,
+        // What the shipper is doing, per source (active / disabled /
+        // file_missing / …): see `logship::shipper_surface`.
+        "shipper": crate::logship::shipper_surface(
+            &cfg.log_streaming,
+            crate::logship::log_streaming_status(state).as_ref(),
+        ),
     }))
 }
 

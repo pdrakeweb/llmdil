@@ -18,12 +18,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use tokio::sync::watch;
 
-use crate::record::{classify_level, ShipLevel, WireRecord, WIRE_VERSION};
+use crate::record::{audit_level, classify_level, ShipLevel, WireRecord, WIRE_VERSION};
 use crate::redact::Redactor;
 use crate::spool::{Spool, DEFAULT_SPOOL_CAP_BYTES};
 use crate::tail::FileTail;
+use crate::tap::RecordTap;
 
 /// Bounded queue capacity in records (design D9).
 pub const QUEUE_CAPACITY: usize = 1024;
@@ -46,6 +48,28 @@ pub struct ShipperConfig {
     pub level_floor: ShipLevel,
     pub tail_wizard: bool,
     pub tail_optimize: bool,
+    /// S2: `gateway.stdout.log` / `gateway.stderr.log`, shipped as
+    /// source `gateway` with the file's stream.
+    pub tail_gateway: bool,
+    /// S6: `service-manage.log`, the elevated service helper's own
+    /// outcome log (`llm-service-host`, under `<data_dir>/logs`).
+    pub tail_service_manage: bool,
+    /// S7: `admin-api-audit.jsonl`. Lines are JSON records and ship
+    /// verbatim (through redaction); the level comes from the
+    /// record's `result`.
+    pub tail_audit: bool,
+    /// S5: app / supervisor events, offered on [`Self::tap`] as
+    /// source `app`.
+    pub app_events: bool,
+    /// The in-process record feed. The shipper subscribes only when
+    /// a tap-fed source is enabled, and accepts only records whose
+    /// source is enabled.
+    pub tap: Option<RecordTap>,
+    /// S1 (opt-in, D3): per-backend output as source `backend:<id>`.
+    /// `None` is off. `Some(ids)` tails each listed backend's
+    /// service-mode files (`backend-<id>.stdout.log` / `.stderr.log`)
+    /// and accepts `backend:*` records on the tap (process mode).
+    pub backends: Option<Vec<String>>,
     /// Literal secret values for redaction layer 1.
     pub literal_secrets: Vec<String>,
     pub spool_cap_bytes: u64,
@@ -62,15 +86,231 @@ impl Default for ShipperConfig {
             level_floor: ShipLevel::Info,
             tail_wizard: true,
             tail_optimize: true,
+            tail_gateway: true,
+            tail_service_manage: true,
+            tail_audit: true,
+            app_events: true,
+            tap: None,
+            backends: None,
             literal_secrets: Vec::new(),
             spool_cap_bytes: DEFAULT_SPOOL_CAP_BYTES,
         }
     }
 }
 
-/// Label: Value status snapshot (design §6.5), read by the app for
-/// the `log_streaming_status` surface in Phase 2; maintained from
-/// the first build so the counters exist when the surface lands.
+/// What one source is doing right now (the per-source rows of the
+/// status surface).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceState {
+    /// Tailed or subscribed, and its input exists.
+    Active,
+    /// Toggled off: not tailed, not subscribed.
+    Disabled,
+    /// Enabled, but none of its log files exist (yet).
+    FileMissing,
+    /// Enabled and subscribed, with nothing captured yet: a backend
+    /// that has no service log file and has not produced output in
+    /// this process since the shipper started.
+    Waiting,
+    /// Enabled, but this process gave the shipper no in-process
+    /// feed to subscribe to.
+    Unavailable,
+}
+
+/// One source's row in [`ShipperStatus::sources`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceStatus {
+    pub source: String,
+    pub state: SourceState,
+    /// Records this source has put on the queue since the shipper
+    /// started (after the level floor, before delivery).
+    pub records: u64,
+}
+
+/// One file a source tails.
+struct TailFile {
+    /// Spool-state key for the offset and fingerprint.
+    key: String,
+    stream: &'static str,
+    path: PathBuf,
+}
+
+/// One source the shipper knows about, enabled or not — the plan
+/// the taps are built from and the status rows are reported from,
+/// so a toggle that does nothing cannot exist.
+struct PlannedSource {
+    source: String,
+    enabled: bool,
+    files: Vec<TailFile>,
+    /// Fed by the in-process tap (instead of, or as well as, files).
+    tapped: bool,
+}
+
+/// Source name of app / supervisor events on the tap (S5).
+pub const APP_SOURCE: &str = "app";
+
+/// Prefix of a per-backend source name (S1): `backend:<id>`.
+pub const BACKEND_SOURCE_PREFIX: &str = "backend:";
+
+/// The source name of one backend's output.
+pub fn backend_source(id: &str) -> String {
+    format!("{BACKEND_SOURCE_PREFIX}{id}")
+}
+
+/// Whether a tap record from `source` is one this config ships.
+fn tap_accepts(config: &ShipperConfig, source: &str) -> bool {
+    (source == APP_SOURCE && config.app_events)
+        || (source.starts_with(BACKEND_SOURCE_PREFIX) && config.backends.is_some())
+}
+
+/// Every source for `config`, in report order.
+fn source_plan(config: &ShipperConfig) -> Vec<PlannedSource> {
+    let logs = config.data_dir.join("logs");
+    let single = |source: &str, enabled: bool, file: &str| PlannedSource {
+        source: source.to_string(),
+        enabled,
+        files: vec![TailFile {
+            key: source.to_string(),
+            stream: "stdout",
+            path: logs.join(file),
+        }],
+        tapped: false,
+    };
+    let pair = |source: &str, enabled: bool, stem: &str| PlannedSource {
+        source: source.to_string(),
+        enabled,
+        files: ["stdout", "stderr"]
+            .into_iter()
+            .map(|stream| TailFile {
+                key: format!("{source}.{stream}"),
+                stream,
+                path: logs.join(format!("{stem}.{stream}.log")),
+            })
+            .collect(),
+        tapped: false,
+    };
+    let mut plan = vec![
+        single("wizard", config.tail_wizard, "wizard.log"),
+        single("optimize", config.tail_optimize, "optimize.log"),
+        pair("gateway", config.tail_gateway, "gateway"),
+        single(
+            "service-manage",
+            config.tail_service_manage,
+            "service-manage.log",
+        ),
+        single(AUDIT_SOURCE, config.tail_audit, "admin-api-audit.jsonl"),
+        PlannedSource {
+            source: APP_SOURCE.to_string(),
+            enabled: config.app_events,
+            files: Vec::new(),
+            tapped: true,
+        },
+    ];
+    // S1: one source per backend, fed both ways — the service host's
+    // files (service mode) and the tap (process mode). Whichever
+    // mode a backend runs in, only one of the two produces lines.
+    match &config.backends {
+        Some(ids) if !ids.is_empty() => {
+            for id in ids {
+                let mut src = pair(&backend_source(id), true, &format!("backend-{id}"));
+                src.tapped = true;
+                plan.push(src);
+            }
+        }
+        other => plan.push(PlannedSource {
+            source: "backends".to_string(),
+            enabled: other.is_some(),
+            files: Vec::new(),
+            tapped: true,
+        }),
+    }
+    plan
+}
+
+/// The rotation sibling the app's writers use: `<file>.prev`.
+fn prev_sibling(path: &std::path::Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".prev");
+    PathBuf::from(s)
+}
+
+/// Source name of the Admin API audit log tail (S7).
+const AUDIT_SOURCE: &str = "audit";
+
+/// The level of one line from `source`: audit records carry their
+/// outcome, everything else is classified by the line heuristic.
+fn source_level(source: &str, line: &str) -> ShipLevel {
+    if source == AUDIT_SOURCE {
+        audit_level(line)
+    } else {
+        classify_level(line)
+    }
+}
+
+/// Redacts, sequences and enqueues records — the one path every
+/// source's lines take into the queue, so redaction, the level
+/// floor and the queue bound apply to all of them identically.
+struct Intake {
+    machine: String,
+    app_version: String,
+    level_floor: ShipLevel,
+    redactor: Redactor,
+    started: Instant,
+    /// Records enqueued per source since start.
+    counts: std::collections::BTreeMap<String, u64>,
+}
+
+impl Intake {
+    #[allow(clippy::too_many_arguments)] // one record's fields
+    fn admit(
+        &mut self,
+        spool: &mut Spool,
+        status: &Arc<Mutex<ShipperStatus>>,
+        queue: &mut VecDeque<WireRecord>,
+        source: &str,
+        stream: &str,
+        level: ShipLevel,
+        line: &str,
+        // The shipper's own loss reports ship at every floor.
+        bypass_floor: bool,
+    ) {
+        if !bypass_floor && level.rank() < self.level_floor.rank() {
+            return;
+        }
+        let (line, counts) = self.redactor.redact(line);
+        if counts.literal_lines > 0 || counts.pattern_hits > 0 {
+            set_status(status, |s| {
+                s.literal_redacted_lines += counts.literal_lines;
+                s.pattern_redactions += counts.pattern_hits;
+            });
+        }
+        let seq = spool.state.next_seq;
+        spool.state.next_seq += 1;
+        let record = WireRecord {
+            v: WIRE_VERSION,
+            machine: self.machine.clone(),
+            app_version: self.app_version.clone(),
+            seq,
+            ts_wall: chrono::Local::now().to_rfc3339(),
+            ts_mono_ms: self.started.elapsed().as_millis() as u64,
+            source: source.to_string(),
+            stream: stream.to_string(),
+            level,
+            line,
+        };
+        if queue.len() >= QUEUE_CAPACITY {
+            // Full queue: drop the newest, count it (§6.4).
+            set_status(status, |s| s.dropped_queue += 1);
+        } else {
+            queue.push_back(record);
+            *self.counts.entry(source.to_string()).or_insert(0) += 1;
+        }
+    }
+}
+
+/// Label: Value status snapshot (design §6.5), surfaced by the app
+/// on the Log receiver card's status payload.
 #[derive(Debug, Clone, Default)]
 pub struct ShipperStatus {
     /// "starting" | "connected" | "spooling"
@@ -80,9 +320,14 @@ pub struct ShipperStatus {
     pub delivered: u64,
     pub dropped_queue: u64,
     pub dropped_spool: u64,
+    /// In-process records lost because the shipper fell behind the
+    /// feed (each episode is also shipped as a warning record).
+    pub dropped_events: u64,
     pub literal_redacted_lines: u64,
     pub pattern_redactions: u64,
     pub last_delivered: Option<String>,
+    /// One row per known source, enabled or not.
+    pub sources: Vec<SourceStatus>,
 }
 
 pub struct ShipperHandle {
@@ -97,6 +342,12 @@ impl ShipperHandle {
 
     pub fn shutdown(&self) {
         let _ = self.shutdown.send(true);
+    }
+
+    /// Whether [`Self::shutdown`] has been requested (tasks feeding
+    /// the shipper stop with it).
+    pub fn is_shut_down(&self) -> bool {
+        *self.shutdown.borrow()
     }
 }
 
@@ -188,7 +439,14 @@ async fn run_loop(
             return;
         }
     };
-    let redactor = Redactor::new(config.literal_secrets.iter().map(|s| s.as_str()));
+    let mut intake = Intake {
+        machine: config.machine.clone(),
+        app_version: config.app_version.clone(),
+        level_floor: config.level_floor,
+        redactor: Redactor::new(config.literal_secrets.iter().map(|s| s.as_str())),
+        started: Instant::now(),
+        counts: Default::default(),
+    };
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
@@ -202,25 +460,33 @@ async fn run_loop(
     };
     let endpoint = format!("{}/v1/batches", config.endpoint.trim_end_matches('/'));
 
+    // A disabled source gets no tail at all — it is only reported.
+    let plan = source_plan(&config);
     let mut tails: Vec<FileTail> = Vec::new();
-    if config.tail_wizard {
-        tails.push(FileTail::new(
-            "wizard",
-            logs_dir.join("wizard.log"),
-            logs_dir.join("wizard.log.prev"),
-            spool.state.offsets.get("wizard").copied(),
-        ));
-    }
-    if config.tail_optimize {
-        tails.push(FileTail::new(
-            "optimize",
-            logs_dir.join("optimize.log"),
-            logs_dir.join("optimize.log.prev"),
-            spool.state.offsets.get("optimize").copied(),
-        ));
+    for src in plan.iter().filter(|s| s.enabled) {
+        for file in &src.files {
+            tails.push(
+                FileTail::new(
+                    &src.source,
+                    file.path.clone(),
+                    prev_sibling(&file.path),
+                    spool.state.offsets.get(&file.key).copied(),
+                )
+                .with_stream(&file.key, file.stream)
+                .with_fingerprint(spool.state.fingerprints.get(&file.key).copied()),
+            );
+        }
     }
 
-    let started = Instant::now();
+    // Subscribe to the in-process feed only when a tap-fed source
+    // is enabled: a disabled source is not subscribed.
+    let mut tap_rx = config
+        .tap
+        .as_ref()
+        .filter(|_| plan.iter().any(|s| s.tapped && s.enabled))
+        .map(|tap| tap.subscribe());
+
+    let started = intake.started;
     let mut queue: VecDeque<WireRecord> = VecDeque::new();
     let mut batch: Vec<WireRecord> = Vec::new();
     let mut batch_since: Option<Instant> = None;
@@ -236,47 +502,126 @@ async fn run_loop(
         // --- Taps: poll tails, redact, sequence, enqueue. --------
         let mut dirty_offsets = false;
         for tail in &mut tails {
-            for line in tail.poll() {
-                if let Some(o) = tail.offset {
-                    spool.state.offsets.insert(tail.source.clone(), o);
+            let lines = tail.poll();
+            if let Some(o) = tail.offset {
+                if spool.state.offsets.get(&tail.key) != Some(&o) {
+                    spool.state.offsets.insert(tail.key.clone(), o);
                     dirty_offsets = true;
                 }
-                let level = classify_level(&line);
-                if level.rank() < config.level_floor.rank() {
-                    continue;
-                }
-                let (line, counts) = redactor.redact(&line);
-                if counts.literal_lines > 0 || counts.pattern_hits > 0 {
-                    set_status(&status, |s| {
-                        s.literal_redacted_lines += counts.literal_lines;
-                        s.pattern_redactions += counts.pattern_hits;
-                    });
-                }
-                let seq = spool.state.next_seq;
-                spool.state.next_seq += 1;
-                let record = WireRecord {
-                    v: WIRE_VERSION,
-                    machine: config.machine.clone(),
-                    app_version: config.app_version.clone(),
-                    seq,
-                    ts_wall: chrono::Local::now().to_rfc3339(),
-                    ts_mono_ms: started.elapsed().as_millis() as u64,
-                    source: tail.source.clone(),
-                    stream: "stdout".to_string(),
-                    level,
-                    line,
+                match tail.fingerprint() {
+                    Some(fp) => spool.state.fingerprints.insert(tail.key.clone(), fp),
+                    None => spool.state.fingerprints.remove(&tail.key),
                 };
-                if queue.len() >= QUEUE_CAPACITY {
-                    // Full queue: drop the newest, count it (§6.4).
-                    set_status(&status, |s| s.dropped_queue += 1);
-                } else {
-                    queue.push_back(record);
-                }
+            }
+            for line in lines {
+                let level = source_level(&tail.source, &line);
+                intake.admit(
+                    &mut spool,
+                    &status,
+                    &mut queue,
+                    &tail.source,
+                    &tail.stream,
+                    level,
+                    &line,
+                    false,
+                );
             }
         }
         if dirty_offsets {
             let _ = spool.save_state();
         }
+
+        // --- In-process feed: drain what is buffered, at most one
+        // queue's worth per pass. `try_recv` never waits, and the
+        // senders never wait on us: falling behind surfaces here
+        // as `Lagged(n)`, shipped as one warning record.
+        if let Some(rx) = tap_rx.as_mut() {
+            use tokio::sync::broadcast::error::TryRecvError;
+            for _ in 0..QUEUE_CAPACITY {
+                match rx.try_recv() {
+                    Ok(rec) => {
+                        if !tap_accepts(&config, &rec.source) {
+                            continue;
+                        }
+                        let level = rec
+                            .level
+                            .unwrap_or_else(|| source_level(&rec.source, &rec.line));
+                        intake.admit(
+                            &mut spool,
+                            &status,
+                            &mut queue,
+                            &rec.source,
+                            &rec.stream,
+                            level,
+                            &rec.line,
+                            false,
+                        );
+                    }
+                    Err(TryRecvError::Lagged(n)) => {
+                        set_status(&status, |s| s.dropped_events += n);
+                        intake.admit(
+                            &mut spool,
+                            &status,
+                            &mut queue,
+                            "shipper",
+                            "stdout",
+                            ShipLevel::Warn,
+                            &format!(
+                                "shipper: {n} in-process record(s) were dropped because the shipper fell behind the event feed"
+                            ),
+                            true,
+                        );
+                    }
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                }
+            }
+        }
+
+        // --- Per-source status rows. -----------------------------
+        let mut rows: Vec<SourceStatus> = plan
+            .iter()
+            .map(|src| {
+                let records = intake.counts.get(&src.source).copied().unwrap_or(0);
+                let subscribed = src.tapped && tap_rx.is_some();
+                let state = if !src.enabled {
+                    SourceState::Disabled
+                } else if tails.iter().any(|t| t.source == src.source && t.present) {
+                    SourceState::Active
+                } else if src.files.is_empty() {
+                    // Fed by the tap alone.
+                    if subscribed {
+                        SourceState::Active
+                    } else {
+                        SourceState::Unavailable
+                    }
+                } else if !subscribed {
+                    SourceState::FileMissing
+                } else if records > 0 {
+                    SourceState::Active
+                } else {
+                    SourceState::Waiting
+                };
+                SourceStatus {
+                    source: src.source.clone(),
+                    state,
+                    records,
+                }
+            })
+            .collect();
+        // Backends that appeared after the plan was built (added to
+        // the config since the shipper started) and are shipping.
+        for (source, records) in &intake.counts {
+            if source.starts_with(BACKEND_SOURCE_PREFIX)
+                && !rows.iter().any(|r| &r.source == source)
+            {
+                rows.push(SourceStatus {
+                    source: source.clone(),
+                    state: SourceState::Active,
+                    records: *records,
+                });
+            }
+        }
+        set_status(&status, |s| s.sources = rows);
 
         // --- Batching: spool drains first, then the live queue. --
         let now = Instant::now();
