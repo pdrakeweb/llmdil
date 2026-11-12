@@ -643,3 +643,115 @@ async fn backends_on_ships_service_files_and_process_feed() {
     assert_eq!(row(&rows, "app").state, SourceState::Disabled);
     rig.finish(&handle).await;
 }
+
+/// SEC-16: the shipper never posts to a non-loopback `http://`
+/// endpoint — no tap is built and no status row claims a source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_loopback_http_endpoint_is_refused() {
+    let rig = Rig::new("sec16");
+    write_lines(&rig.logs().join("wizard.log"), &["=== step one ==="]);
+    let handle = manager_logship::spawn(ShipperConfig {
+        tail_wizard: true,
+        // TEST-NET-1: never routed; the shipper must not even try.
+        endpoint: "http://192.0.2.10:8473".to_string(),
+        ..rig.config()
+    });
+    let shipper_log = rig.logs().join("shipper.log");
+    wait_until("the refusal to be logged", || shipper_log.exists()).await;
+    assert!(handle.shutdown_and_wait(Duration::from_secs(10)).await);
+    assert!(handle.status().sources.is_empty());
+    assert!(rig.capture.records().is_empty());
+    let log = std::fs::read_to_string(rig.logs().join("shipper.log")).unwrap();
+    assert!(log.contains("loopback"), "{log}");
+    // Nothing was consumed: the tail never started.
+    assert!(!rig.logs().join("shipper-spool").join("state.json").exists());
+    rig.finish(&handle).await;
+}
+
+/// Audit ships only to a loopback destination. With an https
+/// endpoint on another host the source is held — `local_only`, not
+/// tailed — while the other sources carry on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_is_held_for_a_non_loopback_endpoint() {
+    let rig = Rig::new("auditheld");
+    write_lines(
+        &rig.logs().join("admin-api-audit.jsonl"),
+        &[r#"{"ts_ms":1,"actor":"alice","result":"202","request_id":"r1"}"#],
+    );
+    let handle = manager_logship::spawn(ShipperConfig {
+        tail_audit: true,
+        tail_gateway: true,
+        // Accepted by the endpoint policy, unreachable in the test.
+        endpoint: "https://192.0.2.10:8473".to_string(),
+        ..rig.config()
+    });
+    wait_until("status rows", || !handle.status().sources.is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let rows = handle.status().sources;
+    assert_eq!(row(&rows, "audit").state, SourceState::LocalOnly);
+    assert_eq!(row(&rows, "audit").records, 0);
+    assert_eq!(row(&rows, "gateway").state, SourceState::FileMissing);
+    assert!(handle.shutdown_and_wait(Duration::from_secs(30)).await);
+    // The audit file was never read: no offset was recorded for it.
+    let state = std::fs::read_to_string(rig.logs().join("shipper-spool").join("state.json"))
+        .unwrap_or_default();
+    assert!(!state.contains("audit"), "{state}");
+    rig.finish(&handle).await;
+}
+
+/// Restarting the shipper (how saved settings apply) loses nothing:
+/// records the first shipper had read but not delivered are parked
+/// in the spool at shutdown and delivered by the next one, and no
+/// line ships twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_parks_undelivered_records_and_the_next_shipper_delivers_them() {
+    let rig = Rig::new("restart");
+    let wizard = rig.logs().join("wizard.log");
+    write_lines(&wizard, &["first run line 1", "first run line 2"]);
+    // First shipper: a level floor that lets the lines in, and a
+    // shutdown before the 2 s batch window can send them.
+    let first = manager_logship::spawn(ShipperConfig {
+        tail_wizard: true,
+        ..rig.config()
+    });
+    wait_until("the wizard lines to be queued", || {
+        first
+            .status()
+            .sources
+            .iter()
+            .any(|r| r.source == "wizard" && r.records == 2)
+    })
+    .await;
+    assert!(first.shutdown_and_wait(Duration::from_secs(30)).await);
+    let delivered_by_first = rig.capture.records().len();
+
+    // Second shipper on the same data dir, with a source added.
+    write_lines(
+        &rig.logs().join("service-manage.log"),
+        &["[1] register llm-gateway: ok"],
+    );
+    let second = manager_logship::spawn(ShipperConfig {
+        tail_wizard: true,
+        tail_service_manage: true,
+        ..rig.config()
+    });
+    let records = rig.wait_for(3).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let records = if rig.capture.records().len() > records.len() {
+        rig.capture.records()
+    } else {
+        records
+    };
+    assert_eq!(
+        records.len(),
+        3,
+        "each line exactly once ({delivered_by_first} sent before the restart): {records:?}"
+    );
+    assert_eq!(by_source(&records, "wizard").len(), 2);
+    assert_eq!(by_source(&records, "service-manage").len(), 1);
+    let mut seqs: Vec<u64> = records.iter().map(|r| r["seq"].as_u64().unwrap()).collect();
+    seqs.sort_unstable();
+    seqs.dedup();
+    assert_eq!(seqs.len(), 3, "sequence numbers are never reused");
+    rig.finish(&second).await;
+}

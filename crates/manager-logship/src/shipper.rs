@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tokio::sync::watch;
 
+use crate::endpoint::{check_endpoint, is_loopback_endpoint};
 use crate::record::{audit_level, classify_level, ShipLevel, WireRecord, WIRE_VERSION};
 use crate::redact::Redactor;
 use crate::spool::{Spool, DEFAULT_SPOOL_CAP_BYTES};
@@ -116,6 +117,9 @@ pub enum SourceState {
     /// Enabled, but this process gave the shipper no in-process
     /// feed to subscribe to.
     Unavailable,
+    /// Toggled on, but held back: this source ships only to a
+    /// loopback destination and the endpoint is not one (audit).
+    LocalOnly,
 }
 
 /// One source's row in [`ShipperStatus::sources`].
@@ -143,6 +147,9 @@ struct PlannedSource {
     source: String,
     enabled: bool,
     files: Vec<TailFile>,
+    /// Toggled on, but policy keeps it on the machine (see
+    /// [`SourceState::LocalOnly`]): no tap is built for it.
+    held: bool,
     /// Fed by the in-process tap (instead of, or as well as, files).
     tapped: bool,
 }
@@ -176,6 +183,7 @@ fn source_plan(config: &ShipperConfig) -> Vec<PlannedSource> {
             path: logs.join(file),
         }],
         tapped: false,
+        held: false,
     };
     let pair = |source: &str, enabled: bool, stem: &str| PlannedSource {
         source: source.to_string(),
@@ -189,6 +197,7 @@ fn source_plan(config: &ShipperConfig) -> Vec<PlannedSource> {
             })
             .collect(),
         tapped: false,
+        held: false,
     };
     let mut plan = vec![
         single("wizard", config.tail_wizard, "wizard.log"),
@@ -205,6 +214,7 @@ fn source_plan(config: &ShipperConfig) -> Vec<PlannedSource> {
             enabled: config.app_events,
             files: Vec::new(),
             tapped: true,
+            held: false,
         },
     ];
     // S1: one source per backend, fed both ways — the service host's
@@ -223,7 +233,16 @@ fn source_plan(config: &ShipperConfig) -> Vec<PlannedSource> {
             enabled: other.is_some(),
             files: Vec::new(),
             tapped: true,
+            held: false,
         }),
+    }
+    // Audit records carry usernames and source addresses: they ship
+    // only to a destination on this machine. With any other endpoint
+    // the source is held — reported, never tailed.
+    if !is_loopback_endpoint(&config.endpoint) {
+        for src in plan.iter_mut().filter(|s| s.source == AUDIT_SOURCE) {
+            src.held = true;
+        }
     }
     plan
 }
@@ -333,6 +352,8 @@ pub struct ShipperStatus {
 pub struct ShipperHandle {
     status: Arc<Mutex<ShipperStatus>>,
     shutdown: watch::Sender<bool>,
+    /// The supervised task, taken by [`Self::shutdown_and_wait`].
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ShipperHandle {
@@ -349,6 +370,22 @@ impl ShipperHandle {
     pub fn is_shut_down(&self) -> bool {
         *self.shutdown.borrow()
     }
+
+    /// Request shutdown and wait until the shipper task has ended —
+    /// it has released the spool and parked what it held (see
+    /// `run_loop`), so a replacement shipper on the same data dir can
+    /// start. Returns `false` if the task had not ended within
+    /// `limit` (an in-flight POST can hold it for its HTTP timeout);
+    /// a second shipper must not be started in that case.
+    pub async fn shutdown_and_wait(&self, limit: Duration) -> bool {
+        self.shutdown();
+        let task = self.task.lock().ok().and_then(|mut t| t.take());
+        match task {
+            Some(task) => tokio::time::timeout(limit, task).await.is_ok(),
+            // Already waited for by an earlier call.
+            None => true,
+        }
+    }
 }
 
 /// Spawn the supervised shipper task. Requires a tokio runtime
@@ -360,10 +397,11 @@ pub fn spawn(config: ShipperConfig) -> ShipperHandle {
     }));
     let (tx, rx) = watch::channel(false);
     let st = status.clone();
-    tokio::spawn(supervise(config, st, rx));
+    let task = tokio::spawn(supervise(config, st, rx));
     ShipperHandle {
         status,
         shutdown: tx,
+        task: Mutex::new(Some(task)),
     }
 }
 
@@ -458,12 +496,25 @@ async fn run_loop(
             return;
         }
     };
-    let endpoint = format!("{}/v1/batches", config.endpoint.trim_end_matches('/'));
+    // SEC-16: never send the token or a batch to a destination the
+    // endpoint policy refuses. The app checks before spawning; this
+    // is the same check where the POST is made.
+    if let Err(reason) = check_endpoint(&config.endpoint) {
+        append_shipper_log(
+            &config.data_dir,
+            &format!("shipper not started: {reason}"),
+        );
+        return;
+    }
+    let endpoint = format!(
+        "{}/v1/batches",
+        config.endpoint.trim().trim_end_matches('/')
+    );
 
     // A disabled source gets no tail at all — it is only reported.
     let plan = source_plan(&config);
     let mut tails: Vec<FileTail> = Vec::new();
-    for src in plan.iter().filter(|s| s.enabled) {
+    for src in plan.iter().filter(|s| s.enabled && !s.held) {
         for file in &src.files {
             tails.push(
                 FileTail::new(
@@ -496,7 +547,7 @@ async fn run_loop(
 
     loop {
         if *shutdown.borrow() {
-            return;
+            break;
         }
 
         // --- Taps: poll tails, redact, sequence, enqueue. --------
@@ -585,6 +636,8 @@ async fn run_loop(
                 let subscribed = src.tapped && tap_rx.is_some();
                 let state = if !src.enabled {
                     SourceState::Disabled
+                } else if src.held {
+                    SourceState::LocalOnly
                 } else if tails.iter().any(|t| t.source == src.source && t.present) {
                     SourceState::Active
                 } else if src.files.is_empty() {
@@ -756,9 +809,42 @@ async fn run_loop(
 
         tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => {},
-            _ = shutdown.changed() => return,
+            _ = shutdown.changed() => break,
         }
     }
+
+    // --- Shutdown: park what is held in memory. ------------------
+    // The tails' offsets are already past these records, so dropping
+    // them would lose them for good. They go to the spool and are
+    // delivered, in order, by the next shipper on this data dir — a
+    // restart to apply new settings, or the next app start. A batch
+    // that came from the spool is still on disk and is not re-added.
+    let batch_on_disk = !batch.is_empty()
+        && spool
+            .oldest_segment()
+            .ok()
+            .flatten()
+            .map(|(_, recs)| recs.first().map(|r| r.seq) == Some(batch[0].seq))
+            .unwrap_or(false);
+    let queued: Vec<WireRecord> = queue.into_iter().collect();
+    for held in [
+        if batch_on_disk { &[][..] } else { &batch[..] },
+        &queued[..],
+    ] {
+        if held.is_empty() {
+            continue;
+        }
+        if let Err(e) = spool.append_batch(held) {
+            append_shipper_log(
+                &config.data_dir,
+                &format!(
+                    "shipper could not park {} record(s) at shutdown: {e}",
+                    held.len()
+                ),
+            );
+        }
+    }
+    let _ = spool.save_state();
 }
 
 /// Exponential backoff 5 s → 5 min cap (design §6.4) with a small
