@@ -501,7 +501,17 @@ fn candidates_from_context(context: &Value) -> Vec<CandidateGrounding> {
 /// '-'). Deterministic, so the same candidate always derives
 /// the same id — in the context, in a proposal, and here.
 fn candidate_model_id(file: &str) -> String {
-    let stem = file.strip_suffix(".gguf").unwrap_or(file);
+    // Case-insensitive, like the `.gguf` acceptance check in
+    // experiment.rs (P-11c): `X.GGUF` derives the same id as `X.gguf`.
+    let stem = file
+        .len()
+        .checked_sub(".gguf".len())
+        .and_then(|cut| {
+            file.get(cut..)
+                .filter(|ext| ext.eq_ignore_ascii_case(".gguf"))
+                .map(|_| &file[..cut])
+        })
+        .unwrap_or(file);
     stem.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
@@ -1871,6 +1881,29 @@ pub fn parse_plan(
 mod tests {
     use super::*;
     use manager_config::AppConfig;
+
+    /// P-11c (docs/code-review-v0.1.60.md): `.gguf` is accepted case-
+    /// insensitively, so the id derivation strips it the same way.
+    #[test]
+    fn candidate_model_id_strips_extension_case_insensitively() {
+        assert_eq!(
+            candidate_model_id("Qwen3-8B-Q4_K_M.gguf"),
+            "qwen3-8b-q4_k_m"
+        );
+        assert_eq!(
+            candidate_model_id("Qwen3-8B-Q4_K_M.GGUF"),
+            "qwen3-8b-q4_k_m"
+        );
+        assert_eq!(
+            candidate_model_id("Qwen3-8B-Q4_K_M.Gguf"),
+            "qwen3-8b-q4_k_m"
+        );
+        // No extension, or a name shorter than one: unchanged rule.
+        assert_eq!(candidate_model_id("model"), "model");
+        assert_eq!(candidate_model_id("gguf"), "gguf");
+        // A multi-byte character before the cut does not panic.
+        assert_eq!(candidate_model_id("é.gguf"), "-");
+    }
 
     fn parse(response: &str) -> Result<Plan, ParseError> {
         parse_plan(
