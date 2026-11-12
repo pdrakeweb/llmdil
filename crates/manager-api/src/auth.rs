@@ -1267,9 +1267,13 @@ pub fn totp_verify(secret: &[u8], code: &str, unix_secs: i64) -> bool {
 }
 
 fn recovery_code() -> String {
-    // XXXX-XXXX from a Crockford-style alphabet.
+    // XXXX-XXXX from a Crockford-style alphabet. Every character is
+    // drawn from the OS CSPRNG (SEC-N2): the earlier UUID-v4 source
+    // pinned character 7 to the version nibble (16 of 32 values).
+    // 32 divides 256, so `% 32` is unbiased: 40 bits per code.
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    let bytes = uuid::Uuid::new_v4().into_bytes();
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable");
     let pick = |i: usize| ALPHABET[(bytes[i] % 32) as usize] as char;
     format!(
         "{}{}{}{}-{}{}{}{}",
@@ -1800,5 +1804,33 @@ mod tests {
         assert_eq!(view.username, "dave");
         assert!(svc.validate_bearer(&pair.access_token).await.is_some());
         assert!(svc.redeem_enrollment_code(&code, "pixel").await.is_err());
+    }
+
+    /// SEC-N2: recovery/enrollment codes keep the XXXX-XXXX format and
+    /// every character position spans the full 32-symbol alphabet (the
+    /// UUID-v4 source pinned position 7 to 16 values).
+    #[test]
+    fn recovery_code_uses_full_alphabet_in_every_position() {
+        const ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        let mut seen: Vec<std::collections::HashSet<char>> = vec![Default::default(); 9];
+        for _ in 0..4000 {
+            let code = recovery_code();
+            assert_eq!(code.len(), 9, "{code}");
+            for (i, c) in code.chars().enumerate() {
+                if i == 4 {
+                    assert_eq!(c, '-', "{code}");
+                } else {
+                    assert!(ALPHABET.contains(c), "{code}");
+                    seen[i].insert(c);
+                }
+            }
+        }
+        for (i, s) in seen.iter().enumerate() {
+            if i != 4 {
+                // 4000 uniform draws miss a symbol with negligible odds;
+                // a 16-value position can never exceed 16.
+                assert!(s.len() > 16, "position {i} saw only {} values", s.len());
+            }
+        }
     }
 }
