@@ -1,11 +1,14 @@
-//! Log-streaming startup and status (log-streaming design §6.1,
-//! §6.5, §8 MVP).
+//! Log-streaming startup, in-process sources and status
+//! (log-streaming design §6.1, §6.5; docs/log-streaming.md).
 //!
 //! The shipper (crate `manager-logship`) starts once, after config
 //! load, when `log_streaming.enabled` is set and a destination
-//! endpoint is configured. Enablement in the MVP is the config-file
-//! section plus the Credential Manager token (D6) — the Settings
-//! card and registry ops are Phase 2. Every failure to start is
+//! endpoint is configured. Enablement is the config-file section
+//! plus the Credential Manager token (D6); the source toggles are
+//! read here, at start. This module also feeds the shipper the
+//! sources that have no file to tail — app events and process-mode
+//! backend output — and builds the per-source status the Log
+//! receiver card shows. Every failure to start is
 //! written to the local `shipper.log` and never fails the app: a
 //! deployment that never opts in behaves exactly as before.
 
