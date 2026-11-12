@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use tokio::sync::watch;
 
 use crate::record::{classify_level, ShipLevel, WireRecord, WIRE_VERSION};
@@ -46,6 +47,9 @@ pub struct ShipperConfig {
     pub level_floor: ShipLevel,
     pub tail_wizard: bool,
     pub tail_optimize: bool,
+    /// S2: `gateway.stdout.log` / `gateway.stderr.log`, shipped as
+    /// source `gateway` with the file's stream.
+    pub tail_gateway: bool,
     /// Literal secret values for redaction layer 1.
     pub literal_secrets: Vec<String>,
     pub spool_cap_bytes: u64,
@@ -62,15 +66,157 @@ impl Default for ShipperConfig {
             level_floor: ShipLevel::Info,
             tail_wizard: true,
             tail_optimize: true,
+            tail_gateway: true,
             literal_secrets: Vec::new(),
             spool_cap_bytes: DEFAULT_SPOOL_CAP_BYTES,
         }
     }
 }
 
-/// Label: Value status snapshot (design §6.5), read by the app for
-/// the `log_streaming_status` surface in Phase 2; maintained from
-/// the first build so the counters exist when the surface lands.
+/// What one source is doing right now (the per-source rows of the
+/// status surface).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceState {
+    /// Tailed or subscribed, and its input exists.
+    Active,
+    /// Toggled off: not tailed, not subscribed.
+    Disabled,
+    /// Enabled, but none of its log files exist (yet).
+    FileMissing,
+}
+
+/// One source's row in [`ShipperStatus::sources`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceStatus {
+    pub source: String,
+    pub state: SourceState,
+    /// Records this source has put on the queue since the shipper
+    /// started (after the level floor, before delivery).
+    pub records: u64,
+}
+
+/// One file a source tails.
+struct TailFile {
+    /// Spool-state key for the offset and fingerprint.
+    key: String,
+    stream: &'static str,
+    path: PathBuf,
+}
+
+/// One source the shipper knows about, enabled or not — the plan
+/// the taps are built from and the status rows are reported from,
+/// so a toggle that does nothing cannot exist.
+struct PlannedSource {
+    source: String,
+    enabled: bool,
+    files: Vec<TailFile>,
+}
+
+/// Every source for `config`, in report order.
+fn source_plan(config: &ShipperConfig) -> Vec<PlannedSource> {
+    let logs = config.data_dir.join("logs");
+    let single = |source: &str, enabled: bool, file: &str| PlannedSource {
+        source: source.to_string(),
+        enabled,
+        files: vec![TailFile {
+            key: source.to_string(),
+            stream: "stdout",
+            path: logs.join(file),
+        }],
+    };
+    let pair = |source: &str, enabled: bool, stem: &str| PlannedSource {
+        source: source.to_string(),
+        enabled,
+        files: ["stdout", "stderr"]
+            .into_iter()
+            .map(|stream| TailFile {
+                key: format!("{source}.{stream}"),
+                stream,
+                path: logs.join(format!("{stem}.{stream}.log")),
+            })
+            .collect(),
+    };
+    vec![
+        single("wizard", config.tail_wizard, "wizard.log"),
+        single("optimize", config.tail_optimize, "optimize.log"),
+        pair("gateway", config.tail_gateway, "gateway"),
+    ]
+}
+
+/// The rotation sibling the app's writers use: `<file>.prev`.
+fn prev_sibling(path: &std::path::Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".prev");
+    PathBuf::from(s)
+}
+
+/// The level of one line from `source`.
+fn source_level(_source: &str, line: &str) -> ShipLevel {
+    classify_level(line)
+}
+
+/// Redacts, sequences and enqueues records — the one path every
+/// source's lines take into the queue, so redaction, the level
+/// floor and the queue bound apply to all of them identically.
+struct Intake {
+    machine: String,
+    app_version: String,
+    level_floor: ShipLevel,
+    redactor: Redactor,
+    started: Instant,
+    /// Records enqueued per source since start.
+    counts: std::collections::BTreeMap<String, u64>,
+}
+
+impl Intake {
+    #[allow(clippy::too_many_arguments)] // one record's fields
+    fn admit(
+        &mut self,
+        spool: &mut Spool,
+        status: &Arc<Mutex<ShipperStatus>>,
+        queue: &mut VecDeque<WireRecord>,
+        source: &str,
+        stream: &str,
+        level: ShipLevel,
+        line: &str,
+    ) {
+        if level.rank() < self.level_floor.rank() {
+            return;
+        }
+        let (line, counts) = self.redactor.redact(line);
+        if counts.literal_lines > 0 || counts.pattern_hits > 0 {
+            set_status(status, |s| {
+                s.literal_redacted_lines += counts.literal_lines;
+                s.pattern_redactions += counts.pattern_hits;
+            });
+        }
+        let seq = spool.state.next_seq;
+        spool.state.next_seq += 1;
+        let record = WireRecord {
+            v: WIRE_VERSION,
+            machine: self.machine.clone(),
+            app_version: self.app_version.clone(),
+            seq,
+            ts_wall: chrono::Local::now().to_rfc3339(),
+            ts_mono_ms: self.started.elapsed().as_millis() as u64,
+            source: source.to_string(),
+            stream: stream.to_string(),
+            level,
+            line,
+        };
+        if queue.len() >= QUEUE_CAPACITY {
+            // Full queue: drop the newest, count it (§6.4).
+            set_status(status, |s| s.dropped_queue += 1);
+        } else {
+            queue.push_back(record);
+            *self.counts.entry(source.to_string()).or_insert(0) += 1;
+        }
+    }
+}
+
+/// Label: Value status snapshot (design §6.5), surfaced by the app
+/// on the Log receiver card's status payload.
 #[derive(Debug, Clone, Default)]
 pub struct ShipperStatus {
     /// "starting" | "connected" | "spooling"
@@ -83,6 +229,8 @@ pub struct ShipperStatus {
     pub literal_redacted_lines: u64,
     pub pattern_redactions: u64,
     pub last_delivered: Option<String>,
+    /// One row per known source, enabled or not.
+    pub sources: Vec<SourceStatus>,
 }
 
 pub struct ShipperHandle {
@@ -188,7 +336,14 @@ async fn run_loop(
             return;
         }
     };
-    let redactor = Redactor::new(config.literal_secrets.iter().map(|s| s.as_str()));
+    let mut intake = Intake {
+        machine: config.machine.clone(),
+        app_version: config.app_version.clone(),
+        level_floor: config.level_floor,
+        redactor: Redactor::new(config.literal_secrets.iter().map(|s| s.as_str())),
+        started: Instant::now(),
+        counts: Default::default(),
+    };
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
@@ -202,25 +357,25 @@ async fn run_loop(
     };
     let endpoint = format!("{}/v1/batches", config.endpoint.trim_end_matches('/'));
 
+    // A disabled source gets no tail at all — it is only reported.
+    let plan = source_plan(&config);
     let mut tails: Vec<FileTail> = Vec::new();
-    if config.tail_wizard {
-        tails.push(FileTail::new(
-            "wizard",
-            logs_dir.join("wizard.log"),
-            logs_dir.join("wizard.log.prev"),
-            spool.state.offsets.get("wizard").copied(),
-        ));
-    }
-    if config.tail_optimize {
-        tails.push(FileTail::new(
-            "optimize",
-            logs_dir.join("optimize.log"),
-            logs_dir.join("optimize.log.prev"),
-            spool.state.offsets.get("optimize").copied(),
-        ));
+    for src in plan.iter().filter(|s| s.enabled) {
+        for file in &src.files {
+            tails.push(
+                FileTail::new(
+                    &src.source,
+                    file.path.clone(),
+                    prev_sibling(&file.path),
+                    spool.state.offsets.get(&file.key).copied(),
+                )
+                .with_stream(&file.key, file.stream)
+                .with_fingerprint(spool.state.fingerprints.get(&file.key).copied()),
+            );
+        }
     }
 
-    let started = Instant::now();
+    let started = intake.started;
     let mut queue: VecDeque<WireRecord> = VecDeque::new();
     let mut batch: Vec<WireRecord> = Vec::new();
     let mut batch_since: Option<Instant> = None;
@@ -236,47 +391,50 @@ async fn run_loop(
         // --- Taps: poll tails, redact, sequence, enqueue. --------
         let mut dirty_offsets = false;
         for tail in &mut tails {
-            for line in tail.poll() {
-                if let Some(o) = tail.offset {
-                    spool.state.offsets.insert(tail.source.clone(), o);
+            let lines = tail.poll();
+            if let Some(o) = tail.offset {
+                if spool.state.offsets.get(&tail.key) != Some(&o) {
+                    spool.state.offsets.insert(tail.key.clone(), o);
                     dirty_offsets = true;
                 }
-                let level = classify_level(&line);
-                if level.rank() < config.level_floor.rank() {
-                    continue;
-                }
-                let (line, counts) = redactor.redact(&line);
-                if counts.literal_lines > 0 || counts.pattern_hits > 0 {
-                    set_status(&status, |s| {
-                        s.literal_redacted_lines += counts.literal_lines;
-                        s.pattern_redactions += counts.pattern_hits;
-                    });
-                }
-                let seq = spool.state.next_seq;
-                spool.state.next_seq += 1;
-                let record = WireRecord {
-                    v: WIRE_VERSION,
-                    machine: config.machine.clone(),
-                    app_version: config.app_version.clone(),
-                    seq,
-                    ts_wall: chrono::Local::now().to_rfc3339(),
-                    ts_mono_ms: started.elapsed().as_millis() as u64,
-                    source: tail.source.clone(),
-                    stream: "stdout".to_string(),
-                    level,
-                    line,
+                match tail.fingerprint() {
+                    Some(fp) => spool.state.fingerprints.insert(tail.key.clone(), fp),
+                    None => spool.state.fingerprints.remove(&tail.key),
                 };
-                if queue.len() >= QUEUE_CAPACITY {
-                    // Full queue: drop the newest, count it (§6.4).
-                    set_status(&status, |s| s.dropped_queue += 1);
-                } else {
-                    queue.push_back(record);
-                }
+            }
+            for line in lines {
+                let level = source_level(&tail.source, &line);
+                intake.admit(
+                    &mut spool,
+                    &status,
+                    &mut queue,
+                    &tail.source,
+                    &tail.stream,
+                    level,
+                    &line,
+                );
             }
         }
         if dirty_offsets {
             let _ = spool.save_state();
         }
+
+        // --- Per-source status rows. -----------------------------
+        let rows: Vec<SourceStatus> = plan
+            .iter()
+            .map(|src| SourceStatus {
+                source: src.source.clone(),
+                state: if !src.enabled {
+                    SourceState::Disabled
+                } else if tails.iter().any(|t| t.source == src.source && t.present) {
+                    SourceState::Active
+                } else {
+                    SourceState::FileMissing
+                },
+                records: intake.counts.get(&src.source).copied().unwrap_or(0),
+            })
+            .collect();
+        set_status(&status, |s| s.sources = rows);
 
         // --- Batching: spool drains first, then the live queue. --
         let now = Instant::now();

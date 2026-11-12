@@ -21,7 +21,9 @@ pub mod tail;
 
 pub use record::{classify_level, ShipLevel, WireRecord};
 pub use redact::Redactor;
-pub use shipper::{spawn, ShipperConfig, ShipperHandle, ShipperStatus};
+pub use shipper::{
+    spawn, ShipperConfig, ShipperHandle, ShipperStatus, SourceState, SourceStatus,
+};
 pub use spool::DEFAULT_SPOOL_CAP_BYTES;
 
 /// The deployment's machine identity when none is configured: the

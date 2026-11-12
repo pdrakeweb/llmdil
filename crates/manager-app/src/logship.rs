@@ -89,6 +89,7 @@ pub async fn start_log_streaming(state: &AppState) {
         },
         tail_wizard: ls.sources.wizard,
         tail_optimize: ls.sources.optimize,
+        tail_gateway: ls.sources.gateway,
         literal_secrets: literals,
         spool_cap_bytes: manager_logship::DEFAULT_SPOOL_CAP_BYTES,
     });
