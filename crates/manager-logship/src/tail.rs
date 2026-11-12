@@ -51,7 +51,16 @@ fn file_identity(meta: &fs::Metadata) -> Option<u64> {
 }
 
 pub struct FileTail {
+    /// Key this tail's offset and fingerprint persist under in the
+    /// spool state. Equal to `source` for single-file sources;
+    /// distinct per file where one source has several (`gateway`
+    /// stdout/stderr share a source and differ by stream).
+    pub key: String,
     pub source: String,
+    /// The wire record's `stream` for lines from this file.
+    pub stream: String,
+    /// Whether the file existed at the last poll (per-source status).
+    pub present: bool,
     path: PathBuf,
     prev_path: PathBuf,
     /// Byte offset into the current file; `None` until first poll.
@@ -66,8 +75,10 @@ pub struct FileTail {
     /// the offset, so a mismatch means the file was replaced —
     /// the rotation signal that works everywhere, including
     /// Windows, where creation timestamps of the old and new file
-    /// can fall in the same tick and compare equal. In-memory
-    /// only, re-baselined on the first poll after a restart.
+    /// can fall in the same tick and compare equal. Persisted by
+    /// the caller beside the offset (see [`Self::fingerprint`]) so
+    /// a file replaced while the shipper was down — by one at least
+    /// as long as the saved offset — is still recognised.
     consumed_fingerprint: Option<u64>,
 }
 
@@ -95,7 +106,10 @@ fn window_fingerprint(path: &PathBuf, offset: u64) -> Option<u64> {
 impl FileTail {
     pub fn new(source: &str, path: PathBuf, prev_path: PathBuf, offset: Option<u64>) -> Self {
         Self {
+            key: source.to_string(),
             source: source.to_string(),
+            stream: "stdout".to_string(),
+            present: false,
             path,
             prev_path,
             offset,
@@ -104,14 +118,37 @@ impl FileTail {
         }
     }
 
+    /// Set the state key and wire stream for a source that tails
+    /// more than one file.
+    pub fn with_stream(mut self, key: &str, stream: &str) -> Self {
+        self.key = key.to_string();
+        self.stream = stream.to_string();
+        self
+    }
+
+    /// Restore the persisted fingerprint of the consumed region
+    /// (the value [`Self::fingerprint`] returned before a restart).
+    pub fn with_fingerprint(mut self, fingerprint: Option<u64>) -> Self {
+        self.consumed_fingerprint = fingerprint;
+        self
+    }
+
+    /// Fingerprint of the region ending at `offset`, for the caller
+    /// to persist with the offset.
+    pub fn fingerprint(&self) -> Option<u64> {
+        self.consumed_fingerprint
+    }
+
     /// Read every complete line appended since the last poll.
     /// Incomplete trailing lines (no newline yet) wait for their
     /// remainder.
     pub fn poll(&mut self) -> Vec<String> {
         let mut out = Vec::new();
         let Ok(meta) = fs::metadata(&self.path) else {
+            self.present = false;
             return out;
         };
+        self.present = true;
         let len = meta.len();
         let id = file_identity(&meta);
         let mut offset = match self.offset {
@@ -275,5 +312,110 @@ mod tests {
         );
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&prev);
+    }
+
+    /// Sources without a `.prev` convention (service-manage, audit,
+    /// service-mode backend logs: append-only, never rotated by
+    /// their writers) must still survive an operator truncating or
+    /// replacing the file: nothing re-shipped, nothing lost.
+    #[test]
+    fn tail_survives_truncation_without_prev() {
+        let path = temp_file("trunc.log");
+        let prev = temp_file("trunc.log.prev");
+        fs::write(&path, "a\nb\nc\n").unwrap();
+        let mut tail = FileTail::new("audit", path.clone(), prev.clone(), None);
+        assert_eq!(tail.poll().len(), 3);
+        // Truncated in place, then appended to.
+        fs::write(&path, "x\n").unwrap();
+        assert_eq!(tail.poll(), vec!["x".to_string()]);
+        assert!(tail.poll().is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tail_survives_larger_replacement_without_prev() {
+        let path = temp_file("repl.log");
+        let prev = temp_file("repl.log.prev");
+        fs::write(&path, "one\ntwo\n").unwrap();
+        let mut tail = FileTail::new("service-manage", path.clone(), prev.clone(), None);
+        assert_eq!(tail.poll().len(), 2);
+        // Replaced by a longer file whose prefix differs: size alone
+        // cannot see it; the consumed-region fingerprint does.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "uno\ndos\ntres\n").unwrap();
+        assert_eq!(
+            tail.poll(),
+            vec!["uno".to_string(), "dos".to_string(), "tres".to_string()]
+        );
+        assert!(tail.poll().is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A restart resumes from the persisted offset: no history is
+    /// re-shipped, and lines appended while down are picked up.
+    #[test]
+    fn tail_resumes_from_persisted_offset_and_fingerprint() {
+        let path = temp_file("resume.log");
+        let prev = temp_file("resume.log.prev");
+        fs::write(&path, "a\nb\n").unwrap();
+        let mut tail = FileTail::new("gateway", path.clone(), prev.clone(), None);
+        assert_eq!(tail.poll().len(), 2);
+        let (offset, fp) = (tail.offset, tail.fingerprint());
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"c\n").unwrap();
+        drop(f);
+        let mut resumed =
+            FileTail::new("gateway", path.clone(), prev.clone(), offset).with_fingerprint(fp);
+        assert_eq!(resumed.poll(), vec!["c".to_string()]);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The gateway logs rotate to `.prev` on every gateway spawn. A
+    /// rotation while the shipper was down, to a new file already
+    /// longer than the saved offset, is caught by the persisted
+    /// fingerprint: the old run's unread tail drains from `.prev`
+    /// and the new run ships from its first line.
+    #[test]
+    fn tail_detects_rotation_during_downtime_via_persisted_fingerprint() {
+        let path = temp_file("down.log");
+        let prev = temp_file("down.log.prev");
+        fs::write(&path, "old1\nold2\n").unwrap();
+        let mut tail = FileTail::new("gateway", path.clone(), prev.clone(), None);
+        assert_eq!(tail.poll().len(), 2);
+        let (offset, fp) = (tail.offset, tail.fingerprint());
+        drop(tail);
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"old3\n").unwrap();
+        drop(f);
+        fs::rename(&path, &prev).unwrap();
+        fs::write(&path, "new1\nnew2\nnew3\nnew4\n").unwrap();
+        let mut resumed =
+            FileTail::new("gateway", path.clone(), prev.clone(), offset).with_fingerprint(fp);
+        assert_eq!(
+            resumed.poll(),
+            vec![
+                "old3".to_string(),
+                "new1".to_string(),
+                "new2".to_string(),
+                "new3".to_string(),
+                "new4".to_string()
+            ]
+        );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&prev);
+    }
+
+    #[test]
+    fn tail_reports_presence() {
+        let path = temp_file("presence.log");
+        let prev = temp_file("presence.log.prev");
+        let mut tail = FileTail::new("audit", path.clone(), prev, None);
+        assert!(tail.poll().is_empty());
+        assert!(!tail.present);
+        assert_eq!(tail.offset, None);
+        fs::write(&path, "x\n").unwrap();
+        assert_eq!(tail.poll().len(), 1);
+        assert!(tail.present);
+        let _ = fs::remove_file(&path);
     }
 }
