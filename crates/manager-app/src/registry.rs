@@ -22,6 +22,11 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+mod op_types;
+pub use op_types::{
+    camel_case, render_schema_json, render_ts, request_params, request_schema, ParamInfo, ParamType,
+};
+
 pub use crate::event_bus::EventOrigin;
 use crate::{ApiError, AppState, EventSink};
 
@@ -460,6 +465,78 @@ macro_rules! gen_op_specs {
 }
 for_each_operation!(gen_op_specs);
 
+macro_rules! gen_requests {
+    ($(($variant:ident, $name:ident, $class:ident, $op:ident, [$($pname:ident : $pty:ty),*], $route:expr)),*) => {
+        /// Typed request envelopes: one struct per registered
+        /// operation, named after its [`Op`] variant, with one field
+        /// per declared parameter under the declared (snake_case)
+        /// name. Generated from the same declaration as [`Op`]; do
+        /// not edit.
+        ///
+        /// `from_args` (and the `Deserialize` impl, which delegates
+        /// to it) reads each field with the registry's per-argument
+        /// rule — a missing key reads as `null`, so `Option`
+        /// arguments are `None` and a missing required argument is
+        /// `InvalidInput("argument `name`: …")`; unknown keys are
+        /// ignored — so the accepted wire format is unchanged.
+        pub mod requests {
+            use super::{arg, ApiError, Value};
+
+            $(
+                #[doc = concat!("Arguments of `", stringify!($name), "`.")]
+                #[derive(Debug, Clone, serde::Serialize)]
+                pub struct $variant {
+                    $(pub $pname: $pty),*
+                }
+
+                impl $variant {
+                    /// Read the declared arguments out of an argument
+                    /// object, in declaration order.
+                    #[allow(unused_variables)] // no-argument operations
+                    pub fn from_args(args: &Value) -> Result<Self, ApiError> {
+                        Ok(Self {
+                            $($pname: arg::<$pty>(args, stringify!($pname))?),*
+                        })
+                    }
+                }
+
+                impl<'de> serde::Deserialize<'de> for $variant {
+                    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                        let args = <Value as serde::Deserialize>::deserialize(d)?;
+                        Self::from_args(&args).map_err(serde::de::Error::custom)
+                    }
+                }
+            )*
+        }
+
+        /// The declared parameters of `op` (see [`request_params`]).
+        fn gen_request_params(op: Op) -> Vec<op_types::ParamInfo> {
+            match op {
+                $(Op::$variant => vec![$(op_types::ParamInfo::of::<$pty>(stringify!($pname))),*],)*
+            }
+        }
+
+        /// The [`Op`] variant's identifier (names the generated
+        /// request struct and TS interface).
+        fn variant_name(op: Op) -> &'static str {
+            match op {
+                $(Op::$variant => stringify!($variant),)*
+            }
+        }
+
+        /// Parse `args` into `op`'s request struct and serialize it
+        /// back (contract tests).
+        #[cfg(test)]
+        fn parse_request(op: Op, args: &Value) -> Result<Value, ApiError> {
+            match op {
+                $(Op::$variant => Ok(serde_json::to_value(requests::$variant::from_args(args)?)
+                    .expect("request serializes")),)*
+            }
+        }
+    };
+}
+for_each_operation!(gen_requests);
+
 macro_rules! gen_dispatch {
     ($(($variant:ident, $name:ident, $class:ident, $op:ident, [$($pname:ident : $pty:ty),*], $route:expr)),*) => {
         /// Run one operation by its registry handle. The match is
@@ -481,7 +558,13 @@ macro_rules! gen_dispatch {
                     match op {
                         $(
                             Op::$variant => {
-                                crate::$op(state, sink, $(arg::<$pty>(&args, stringify!($pname))?),*).await
+                                // The typed request envelope reads the
+                                // declared arguments exactly as the
+                                // per-argument reads always did (see
+                                // `requests`), then hands its fields on.
+                                let requests::$variant { $($pname),* } =
+                                    requests::$variant::from_args(&args)?;
+                                crate::$op(state, sink, $($pname),*).await
                             }
                         )*
                     }
