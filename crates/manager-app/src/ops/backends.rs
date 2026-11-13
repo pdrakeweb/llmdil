@@ -530,13 +530,13 @@ pub async fn op_list_backends(state: &Arc<AppState>, sink: &Arc<dyn EventSink>) 
         // is locked, so this block never holds both locks in
         // the opposite order anywhere else.
         let direct_rates: std::collections::HashMap<String, Option<f64>> = {
-            let direct = state.direct_slots.lock().await;
+            let direct = state.gateway.direct_slots.lock().await;
             pairs
                 .iter()
                 .map(|(id, _)| (id.clone(), direct.live_rate(id)))
                 .collect()
         };
-        let mut stats = state.gateway_stats.lock().await;
+        let mut stats = state.gateway.stats.lock().await;
         let windows = stats.window_stats(&pairs);
         let series = stats.series_stats(&pairs);
         let live = stats.live_throughput(&pairs);

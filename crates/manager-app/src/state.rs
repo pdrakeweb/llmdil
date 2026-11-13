@@ -52,12 +52,14 @@ use crate::*;
 
 mod bench_slots;
 mod downloads;
+mod gateway;
 mod optimize_slots;
 mod task_registry;
 mod wizard;
 
 pub(crate) use bench_slots::BenchState;
 pub(crate) use downloads::{DownloadOutcome, DownloadsState};
+pub(crate) use gateway::GatewayState;
 pub(crate) use optimize_slots::OptimizeState;
 pub(crate) use task_registry::TaskRegistry;
 pub(crate) use wizard::WizardState;
@@ -119,21 +121,8 @@ pub struct AppState {
     /// Local processes are spawned from it by `mcp_local` (review
     /// v0.1.60 PS-5).
     pub(crate) mcp_modes: Mutex<HashMap<String, manager_mcp::McpMode>>,
-    /// Recent gateway routing decisions (spec §14 `gateway_recent_requests`).
-    /// Every `gateway_test_routing` trace records here.
-    pub(crate) routing_log: Mutex<manager_gateway::RoutingLog>,
-    /// Gateway request-statistic snapshots scraped from LiteLLM's
-    /// Prometheus endpoint by the background poller (see
-    /// [`gateway_stats`]); `list_backends` turns them into the
-    /// Dashboard's request/error figures (trailing hour) and live
-    /// throughput rate (recent window).
-    pub(crate) gateway_stats: Mutex<gateway_stats::GatewayStatsStore>,
-    /// Per-backend llama-server `/slots` snapshots polled directly
-    /// from each backend's own port by the background poller (see
-    /// [`gateway_stats::DirectSlotsStore`]); `list_backends`
-    /// prefers this live rate over the gateway rate, and falls
-    /// back when a backend's `/slots` is unavailable.
-    pub(crate) direct_slots: Mutex<gateway_stats::DirectSlotsStore>,
+    /// The gateway observation stores (see [`gateway::GatewayState`]).
+    pub(crate) gateway: GatewayState,
     /// WinML secondary-backend registry (stateful single-model rule).
     pub(crate) winml: OnceCell<Mutex<manager_winml::WinMlRegistry>>,
     /// The Optimize job slots (see [`optimize_slots::OptimizeState`]).
@@ -320,9 +309,7 @@ impl AppState {
             downloads: DownloadsState::default(),
             backend_spec_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
             mcp_modes: Mutex::new(HashMap::new()),
-            routing_log: Mutex::new(manager_gateway::RoutingLog::default()),
-            gateway_stats: Mutex::new(gateway_stats::GatewayStatsStore::default()),
-            direct_slots: Mutex::new(gateway_stats::DirectSlotsStore::default()),
+            gateway: GatewayState::default(),
             winml: OnceCell::new(),
             bench: BenchState::default(),
             optimize: OptimizeState::default(),

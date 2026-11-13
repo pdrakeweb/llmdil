@@ -551,7 +551,7 @@ pub async fn op_gateway_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>
         ),
         None => None,
     };
-    let routing_log_len = state.routing_log.lock().await.len();
+    let routing_log_len = state.gateway.routing_log.lock().await.len();
     // Activation-plan state for the status surfaces: saved changes
     // that are genuinely pending — a running process still holds
     // the pre-change state (pending_entries applies the live-state
@@ -725,7 +725,12 @@ pub async fn op_gateway_test_routing(
         .map(|m| manager_gateway::BackendStats::healthy(m.clone()))
         .collect();
     let decision = manager_gateway::trace_routing(group, &stats, false, now_ms());
-    state.routing_log.lock().await.record(decision.clone());
+    state
+        .gateway
+        .routing_log
+        .lock()
+        .await
+        .record(decision.clone());
     Ok(serde_json::to_value(&decision)?)
 }
 
@@ -735,7 +740,7 @@ pub async fn op_gateway_recent_requests(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
 ) -> ApiResult {
-    let recent = state.routing_log.lock().await.recent();
+    let recent = state.gateway.routing_log.lock().await.recent();
     Ok(json!({ "requests": recent }))
 }
 

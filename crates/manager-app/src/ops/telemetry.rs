@@ -171,7 +171,7 @@ pub async fn poll_gateway_metrics_once(state: &AppState) {
         .flatten();
     if let Some(body) = body {
         let snap = gateway_stats::parse_metrics(&body, std::time::Instant::now());
-        state.gateway_stats.lock().await.record(snap);
+        state.gateway.stats.lock().await.record(snap);
         // OpenRouter daily spend ledger (spec §7) from the same scrape.
         openrouter_spend::record_scrape(&state.data_dir, &body);
     }
@@ -210,7 +210,7 @@ pub async fn poll_direct_slots_once(state: &AppState) {
     .await
     .unwrap_or_default();
     let now = std::time::Instant::now();
-    let mut store = state.direct_slots.lock().await;
+    let mut store = state.gateway.direct_slots.lock().await;
     for (id, body) in bodies {
         if let Some(body) = body {
             if let Some(snap) = gateway_stats::parse_slots(&body, now) {
