@@ -358,3 +358,8 @@ key / Test (the cards' and prompt's workflow actions, words + icon),
 Save server (form commit), Remove (destructive, words + icon), Edit
 (icon-only), Continue start (words + icon). Handlers and hooks are
 unchanged; smoke pins the four changes.
+
+Also closed (2026-11-12): the plan summary's non-dismissed Review link
+(`<a href="#/activation-plan">`, "Observed, not changed" above) now
+carries the `eye` icon beside its word and a "Review activation plan"
+title, so all three Review renderings match (C1).

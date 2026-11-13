@@ -965,7 +965,7 @@ function activationPlanHtml(plan: ActivationPlanData | null, ui: PlanUiState, va
       <span class="spacer" style="flex:1"></span>
       ${ui.dismissed
         ? `<button class="btn" data-plan-act="review" title="Review activation plan"${dis}>${icon("eye")} Review</button>`
-        : `<a class="btn" href="#/activation-plan">Review</a>`}
+        : `<a class="btn" href="#/activation-plan" title="Review activation plan">${icon("eye")} Review</a>`}
       ${planApplyButtons(plan, ui)}
     </div>
     ${plan.actionable ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">${esc(planApplyLine(plan))}</div>` : ""}
