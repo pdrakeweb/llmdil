@@ -119,7 +119,8 @@ fn prompts_payload(lib: &mb::PromptLibrary) -> Value {
 
 fn results_payload(state: &AppState, results: &mb::BenchResults) -> Value {
     let job = state
-        .bench_job
+        .bench
+        .job
         .try_lock()
         .ok()
         .and_then(|guard| (*guard).clone());
@@ -413,7 +414,7 @@ pub async fn op_bench_run_start(
     // One sweep at a time (§6.4), and never alongside a
     // measurement/experiment job (they contend for the same
     // GPUs the interlock reasons about).
-    if state.bench_job.lock().await.is_some() {
+    if state.bench.job.lock().await.is_some() {
         return Err(ApiError::InvalidInput(
             "a bench sweep is already running".to_string(),
         ));
@@ -710,7 +711,7 @@ pub async fn op_bench_run_start(
         .await;
     let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
     {
-        let mut slot = state.bench_abort.lock().await;
+        let mut slot = state.bench.abort.lock().await;
         *slot = Some(tx);
     }
     state.tasks.controls.set_canceller(
@@ -720,7 +721,7 @@ pub async fn op_bench_run_start(
         },
     );
     {
-        let mut slot = state.bench_job.lock().await;
+        let mut slot = state.bench.job.lock().await;
         *slot = Some(BenchJob {
             sweep_id: sweep_id.clone(),
             progress: BenchProgress {
@@ -776,7 +777,7 @@ pub async fn op_bench_run_start(
             arm.raw_flags = String::new();
         }
         save_sweep(state, &confirm_record);
-        if let Ok(mut slot) = state.bench_job.try_lock() {
+        if let Ok(mut slot) = state.bench.job.try_lock() {
             if let Some(job) = slot.as_mut() {
                 job.sweep_id = confirm_record.id.clone();
             }
@@ -803,11 +804,11 @@ pub async fn op_bench_run_start(
     }
 
     {
-        let mut slot = state.bench_abort.lock().await;
+        let mut slot = state.bench.abort.lock().await;
         *slot = None;
     }
     {
-        let mut slot = state.bench_job.lock().await;
+        let mut slot = state.bench.job.lock().await;
         *slot = None;
     }
     if cancelled {
@@ -833,7 +834,7 @@ pub async fn op_bench_run_cancel(
     sweep_id: String,
 ) -> crate::ApiResult {
     let matches = {
-        let slot = state.bench_job.lock().await;
+        let slot = state.bench.job.lock().await;
         slot.as_ref().map(|j| j.sweep_id.clone())
     };
     let current = match matches {
@@ -846,7 +847,7 @@ pub async fn op_bench_run_cancel(
         return Ok(json!({ "cancelled": false }));
     }
     let sender = {
-        let mut slot = state.bench_abort.lock().await;
+        let mut slot = state.bench.abort.lock().await;
         slot.take()
     };
     match sender {
@@ -871,7 +872,7 @@ pub async fn op_bench_result_delete(
     _sink: &Arc<dyn crate::EventSink>,
     sweep_id: String,
 ) -> crate::ApiResult {
-    if let Some(job) = state.bench_job.lock().await.as_ref() {
+    if let Some(job) = state.bench.job.lock().await.as_ref() {
         if job.sweep_id == sweep_id {
             return Err(ApiError::InvalidInput(
                 "that sweep is running; cancel it before deleting".to_string(),

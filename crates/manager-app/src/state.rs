@@ -50,11 +50,13 @@
 
 use crate::*;
 
+mod bench_slots;
 mod downloads;
 mod optimize_slots;
 mod task_registry;
 mod wizard;
 
+pub(crate) use bench_slots::BenchState;
 pub(crate) use downloads::{DownloadOutcome, DownloadsState};
 pub(crate) use optimize_slots::OptimizeState;
 pub(crate) use task_registry::TaskRegistry;
@@ -136,21 +138,8 @@ pub struct AppState {
     pub(crate) winml: OnceCell<Mutex<manager_winml::WinMlRegistry>>,
     /// The Optimize job slots (see [`optimize_slots::OptimizeState`]).
     pub(crate) optimize: OptimizeState,
-    /// Bench sweep cancellation slot (Bench design §6.4): the
-    /// running sweep's scoped cancel handle, owned by the sweep
-    /// rather than the task bookkeeping (D13) — the same shape
-    /// as the Optimize job slot, a separate slot because a sweep
-    /// and an Optimize job are different jobs with different
-    /// lifetimes.
-    pub(crate) bench_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    /// Prompt-generation cancellation slot (Bench design §4.3):
-    /// the stored abort handle for the in-flight draft
-    /// generation, mirroring the consultation's slot.
-    pub(crate) bench_generate_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    /// The running Bench sweep's descriptor (id + progress),
-    /// read by `bench_results_list` so any page instance can
-    /// render the sweep's progress.
-    pub(crate) bench_job: Mutex<Option<bench::BenchJob>>,
+    /// The Bench job slots (see [`bench_slots::BenchState`]).
+    pub(crate) bench: BenchState,
     /// Transition-watch state for the toast notification monitor
     /// (see [`notify`]): backend states, gateway liveness
     /// expectation, and activation-plan pending state, so
@@ -335,9 +324,7 @@ impl AppState {
             gateway_stats: Mutex::new(gateway_stats::GatewayStatsStore::default()),
             direct_slots: Mutex::new(gateway_stats::DirectSlotsStore::default()),
             winml: OnceCell::new(),
-            bench_abort: Mutex::new(None),
-            bench_generate_abort: Mutex::new(None),
-            bench_job: Mutex::new(None),
+            bench: BenchState::default(),
             optimize: OptimizeState::default(),
             notify_watch: std::sync::Mutex::new(notify::NotifyWatch::default()),
             app_update_guard: Mutex::new(()),

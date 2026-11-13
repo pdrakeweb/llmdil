@@ -83,7 +83,7 @@ pub async fn op_bench_prompt_generate(
         .await;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     {
-        let mut slot = state.bench_generate_abort.lock().await;
+        let mut slot = state.bench.generate_abort.lock().await;
         if slot.is_some() {
             state
                 .finish_task(
@@ -143,7 +143,7 @@ pub async fn op_bench_prompt_generate(
         _ = rx => None,
     };
     {
-        let mut slot = state.bench_generate_abort.lock().await;
+        let mut slot = state.bench.generate_abort.lock().await;
         *slot = None;
     }
     match outcome {
@@ -206,7 +206,7 @@ pub async fn op_bench_prompt_generate_cancel(
     _sink: &Arc<dyn crate::EventSink>,
 ) -> crate::ApiResult {
     let sender = {
-        let mut slot = state.bench_generate_abort.lock().await;
+        let mut slot = state.bench.generate_abort.lock().await;
         slot.take()
     };
     match sender {
