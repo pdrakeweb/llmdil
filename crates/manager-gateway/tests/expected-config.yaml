@@ -39,6 +39,10 @@ model_list:
       # intended routing strategy for group 'tool-runner': least-busy
 router_settings:
   routing_strategy: latency-based-routing
+  provider_budget_config:
+    openrouter:
+      budget_limit: 5.0
+      time_period: 1d
 litellm_settings:
   success_callback: ["prometheus"]
   fallbacks:

@@ -470,6 +470,7 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
     gatewayUp: !gw.error && gw.data.up,
     gatewayStrategy: gwCfg.data ? effectiveGatewayStrategy(gwCfg.data) : null,
     gatewayError: gw.error,
+    openrouterSpend: gw.error ? null : gw.data.openrouter_spend ?? null,
     stale: g.data.stale, updatedAt: Date.now(),
   };
   return errors.length ? { data, live: true, error: errors.join("; ") } : { data, live: true };
@@ -2183,6 +2184,60 @@ export interface GatewayStatusData {
    *  design §4.3); null when no spawn has recorded one — rendered
    *  as "not measured", never as a guess. */
   litellm_version: string | null;
+  /** OpenRouter daily spend vs cap (spec §7), from the app's spend
+   *  ledger; absent/null when the backend did not report it. */
+  openrouter_spend?: OpenRouterSpend | null;
+}
+
+/** gateway_status.openrouter_spend. The cap itself is enforced inside
+ *  the gateway (LiteLLM provider budget, 1-day window); this is the
+ *  app's measurement for the banner. */
+export interface OpenRouterSpend {
+  enabled: boolean;
+  /** The generated gateway config carries OpenRouter deployments. */
+  tier_active: boolean;
+  spent_today_usd: number;
+  cap_usd: number;
+  /** spent / cap; null when the cap is zero. */
+  fraction: number | null;
+  /** No OpenRouter traffic will be sent (cap reached, or a zero cap). */
+  capped: boolean;
+  /** Spend is at or above 80% of the cap. */
+  warn: boolean;
+}
+
+function parseOpenRouterSpend(raw: unknown): OpenRouterSpend | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  return {
+    enabled: Boolean(r.enabled),
+    tier_active: Boolean(r.tier_active),
+    spent_today_usd: num(r.spent_today_usd),
+    cap_usd: num(r.cap_usd),
+    fraction: typeof r.fraction === "number" && Number.isFinite(r.fraction) ? r.fraction : null,
+    capped: Boolean(r.capped),
+    warn: Boolean(r.warn),
+  };
+}
+
+/** Banner HTML for the OpenRouter spend cap — shown on the Dashboard
+ *  and Gateway views when the cap is reached or spend is at ≥80% of
+ *  it; empty otherwise. Uses the shared `.banner` pattern. */
+export function openRouterSpendBannerHtml(spend: OpenRouterSpend | null | undefined, warnIcon: string): string {
+  if (!spend || !spend.enabled) return "";
+  const usd = (v: number) => `$${v.toFixed(2)}`;
+  const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c] as string);
+  if (spend.capped) {
+    const why = spend.cap_usd > 0
+      ? `today's OpenRouter spend ${usd(spend.spent_today_usd)} reached the ${usd(spend.cap_usd)} daily cap`
+      : "the OpenRouter daily cap is $0.00";
+    return `<div class="banner" id="openrouterSpendBanner" role="status" title="${esc("Cloud fallbacks are disabled: the gateway's provider budget filters OpenRouter out, so requests stay local (fail closed). The cap resets after a day; raise it on the Gateway view's OpenRouter tier.")}">${warnIcon} OpenRouter fallbacks disabled — ${why}. Requests stay local.</div>`;
+  }
+  if (spend.warn) {
+    return `<div class="banner" id="openrouterSpendBanner" role="status">${warnIcon} OpenRouter spend ${usd(spend.spent_today_usd)} of the ${usd(spend.cap_usd)} daily cap (${Math.round((spend.fraction ?? 0) * 100)}%). Cloud fallbacks stop at the cap.</div>`;
+  }
+  return "";
 }
 
 /** gateway_status — probe state (up) + port + group/rule counts + the
@@ -2219,6 +2274,7 @@ export async function getGatewayStatus(): Promise<CallResult<GatewayStatusData>>
         activation_pending: Boolean(raw.activation_pending),
         activation_changes: typeof raw.activation_changes === "number" ? raw.activation_changes : 0,
         litellm_version: typeof raw.litellm_version === "string" ? raw.litellm_version : null,
+        openrouter_spend: parseOpenRouterSpend(raw.openrouter_spend),
       },
       live: true,
     };

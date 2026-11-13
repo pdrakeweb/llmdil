@@ -237,8 +237,62 @@ pub struct CloudTierConfig {
     pub enabled: bool,
     /// Credential Manager target name — never the key itself.
     pub cred_ref: Option<String>,
+    /// Per-day OpenRouter spend cap in USD. Enforced in the gateway by
+    /// LiteLLM's provider budget (`router_settings.provider_budget_config`,
+    /// a one-day window); `0` means never spend — the OpenRouter
+    /// deployments are then not generated at all (LiteLLM reads a zero
+    /// budget as "no limit", so it cannot express zero itself).
     pub daily_cap_usd: f64,
     pub model_allowlist: Vec<String>,
+    /// Overflow escalation (spec §7 trigger 2): route a group's new
+    /// requests to the cloud tier while its local queue depth or p99
+    /// latency has been over threshold for `sustained_secs`. Opt-in:
+    /// absent in configurations written before the field existed,
+    /// which therefore keep the failover-only behavior.
+    #[serde(default)]
+    pub overflow: OverflowEscalationConfig,
+}
+
+/// Thresholds for the OpenRouter overflow trigger (spec §7 trigger 2).
+/// Baked into the generated gateway routing callback, which owns the
+/// per-group queue-depth / latency clock at request time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OverflowEscalationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// In-flight requests on a group at or above which it is breached.
+    #[serde(default = "default_overflow_queue_depth")]
+    pub queue_depth: u32,
+    /// p99 completed-request latency (ms) at or above which a group is
+    /// breached.
+    #[serde(default = "default_overflow_p99_ms")]
+    pub p99_latency_ms: u32,
+    /// The breach must hold this long before requests escalate.
+    #[serde(default = "default_overflow_sustained_secs")]
+    pub sustained_secs: u32,
+}
+
+impl Default for OverflowEscalationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            queue_depth: default_overflow_queue_depth(),
+            p99_latency_ms: default_overflow_p99_ms(),
+            sustained_secs: default_overflow_sustained_secs(),
+        }
+    }
+}
+
+fn default_overflow_queue_depth() -> u32 {
+    8
+}
+
+fn default_overflow_p99_ms() -> u32 {
+    30_000
+}
+
+fn default_overflow_sustained_secs() -> u32 {
+    30
 }
 
 /// Serde default for [`ModelConfig::enabled`]: configurations written

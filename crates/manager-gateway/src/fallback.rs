@@ -1,7 +1,7 @@
 //! OpenRouter fallback evaluation (spec §7).
 
 use crate::*;
-use manager_config::ModelGroup;
+use manager_config::{AppConfig, ModelGroup};
 
 // ---------------------------------------------------------------------------
 // OpenRouter fallback evaluation (spec §7, three triggers in order)
@@ -24,6 +24,70 @@ impl Default for OverflowThresholds {
             sustained_secs: 30,
         }
     }
+}
+
+impl OverflowThresholds {
+    /// The thresholds configured on the cloud tier.
+    pub fn from_config(c: &manager_config::OverflowEscalationConfig) -> Self {
+        Self {
+            queue_depth: c.queue_depth,
+            p99_latency_ms: f64::from(c.p99_latency_ms),
+            sustained_secs: u64::from(c.sustained_secs),
+        }
+    }
+
+    /// Whether a group's instantaneous readings breach the overflow
+    /// thresholds: in-flight at or above the queue depth, or p99 at
+    /// or above the latency bound. The generated routing callback
+    /// applies this exact rule at request time
+    /// (`_overflow_breached`); the parity test pins the two.
+    pub fn breached(&self, in_flight: u32, p99_latency_ms: Option<f64>) -> bool {
+        in_flight >= self.queue_depth || p99_latency_ms.is_some_and(|p| p >= self.p99_latency_ms)
+    }
+}
+
+/// The overflow-escalation table baked into the generated routing
+/// callback (spec §7 trigger 2): the thresholds and the groups whose
+/// new requests may escalate to the cloud tier.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverflowEscalationTable {
+    pub thresholds: OverflowThresholds,
+    /// Groups in the generated config that list `openrouter` in their
+    /// fallback chain and serve local deployments, in config order.
+    pub groups: Vec<String>,
+}
+
+/// The overflow-escalation table for a config, or `None` when the
+/// trigger is off: escalation disabled, or no OpenRouter deployments
+/// to escalate to (tier disabled, zero cap, empty allowlist), or no
+/// group lists `openrouter` as a fallback. Only groups that opt into
+/// the cloud tier through their own fallback chain escalate — the
+/// trigger never routes a group to OpenRouter that failover would not.
+pub fn overflow_escalation_table(config: &AppConfig) -> Option<OverflowEscalationTable> {
+    let cloud = &config.gateway.openrouter;
+    if !cloud.overflow.enabled || !openrouter_tier_active(config) {
+        return None;
+    }
+    let groups: Vec<String> = config
+        .gateway
+        .groups
+        .iter()
+        .filter(|g| g.name != OPENROUTER_MODEL_NAME)
+        .filter(|g| g.fallbacks.iter().any(|f| f == OPENROUTER_MODEL_NAME))
+        .filter(|g| {
+            model_entries_for_group(g, config)
+                .map(|es| es.iter().any(|e| e.model_name == g.name))
+                .unwrap_or(false)
+        })
+        .map(|g| g.name.clone())
+        .collect();
+    if groups.is_empty() {
+        return None;
+    }
+    Some(OverflowEscalationTable {
+        thresholds: OverflowThresholds::from_config(&cloud.overflow),
+        groups,
+    })
 }
 
 /// Overflow signal as tracked by the app (which owns the duration clock).

@@ -166,6 +166,16 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
     if !oc.daily_cap_usd.is_finite() || oc.daily_cap_usd < 0.0 {
         errors.push("gateway.openrouter.daily_cap_usd must be a finite value >= 0".to_string());
     }
+    let ov = &oc.overflow;
+    if ov.queue_depth == 0 {
+        errors.push("gateway.openrouter.overflow.queue_depth must be >= 1".to_string());
+    }
+    if ov.p99_latency_ms == 0 {
+        errors.push("gateway.openrouter.overflow.p99_latency_ms must be >= 1".to_string());
+    }
+    if ov.sustained_secs > 3600 {
+        errors.push("gateway.openrouter.overflow.sustained_secs must be <= 3600".to_string());
+    }
     let mut group_names: HashSet<String> = HashSet::new();
     for g in &config.gateway.groups {
         if g.name.trim().is_empty() {

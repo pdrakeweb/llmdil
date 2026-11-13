@@ -108,10 +108,14 @@ pub fn model_entries_for_group(
         });
     }
 
-    // OpenRouter fallback deployments, one per allowlisted model.
+    // OpenRouter fallback deployments, one per allowlisted model. A
+    // zero daily cap means "never spend" (spec §7: fail closed to
+    // local): no deployments are generated, so no fallback row can
+    // reference the cloud tier. LiteLLM's provider budget cannot
+    // express this itself — it treats a zero budget as unlimited.
     if group.fallbacks.iter().any(|f| f == OPENROUTER_MODEL_NAME) {
         let cloud = &config.gateway.openrouter;
-        if cloud.enabled {
+        if cloud.enabled && openrouter_cap_allows_spend(cloud.daily_cap_usd) {
             if cloud.model_allowlist.is_empty() {
                 return Err(GatewayError::ConfigInvalid(
                     "openrouter fallback enabled but model_allowlist is empty".to_string(),
@@ -262,6 +266,29 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
         "  routing_strategy: {}\n",
         strategy_to_litellm(global_strategy)
     ));
+    // OpenRouter daily spend cap (spec §7 cost guardrail), enforced
+    // natively by LiteLLM's provider budget limiter (verified against
+    // 1.105.1: router_strategy/budget_limiter.py). It is a deployment
+    // filter keyed by provider, so it caps the AGGREGATE spend of
+    // every `openrouter/...` deployment; once the window's spend
+    // reaches the limit the deployments are filtered out and a
+    // fallback to the cloud tier fails, leaving the request on the
+    // local error path (fail closed — never silently spend). Emitted
+    // only when OpenRouter deployments exist, so a config without
+    // the cloud tier stays byte-identical to the pre-cap generator.
+    let has_openrouter = group_entries
+        .iter()
+        .flat_map(|(_, es)| es.iter())
+        .any(|e| e.model_name == OPENROUTER_MODEL_NAME);
+    if has_openrouter {
+        out.push_str("  provider_budget_config:\n");
+        out.push_str("    openrouter:\n");
+        out.push_str(&format!(
+            "      budget_limit: {}\n",
+            yaml_number(config.gateway.openrouter.daily_cap_usd)
+        ));
+        out.push_str(&format!("      time_period: {OPENROUTER_BUDGET_PERIOD}\n"));
+    }
 
     // --- litellm_settings ---
     out.push_str("litellm_settings:\n");
@@ -281,8 +308,11 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
     // typed rule, neither key is emitted — the output is
     // byte-identical to the pre-feature generator (the kill switch
     // is structural, design §6.1).
+    // The same module also carries the OpenRouter overflow
+    // escalation (spec §7 trigger 2) when that is enabled, so the
+    // callback is registered when either feature needs it.
     let routing_table = context_overflow_table(config);
-    if routing_table.is_some() {
+    if routing_table.is_some() || overflow_escalation_table(config).is_some() {
         out.push_str("  callbacks: llmdil_routing.proxy_handler_instance\n");
     }
     out.push_str("  fallbacks:\n");
@@ -531,6 +561,39 @@ fn yaml_comment_text(s: &str) -> String {
         .collect()
 }
 
+/// LiteLLM's provider budget window for the OpenRouter cap. LiteLLM
+/// opens the window at the first metered spend and resets it one day
+/// later (not at local midnight); the app's own ledger, which drives
+/// the Dashboard banner, resets at local midnight.
+pub const OPENROUTER_BUDGET_PERIOD: &str = "1d";
+
+/// Whether a daily cap permits any OpenRouter spend: a positive,
+/// finite cap. Zero (or anything validation would refuse) disables
+/// the cloud tier's deployments entirely.
+pub fn openrouter_cap_allows_spend(daily_cap_usd: f64) -> bool {
+    daily_cap_usd.is_finite() && daily_cap_usd > 0.0
+}
+
+/// Whether the generated config carries OpenRouter deployments at
+/// all: tier enabled, a spend-permitting cap, and a model allowlist.
+pub fn openrouter_tier_active(config: &AppConfig) -> bool {
+    let cloud = &config.gateway.openrouter;
+    cloud.enabled
+        && openrouter_cap_allows_spend(cloud.daily_cap_usd)
+        && !cloud.model_allowlist.is_empty()
+}
+
+/// Render a finite f64 as a YAML number (always with a decimal point
+/// so it parses as a float).
+fn yaml_number(v: f64) -> String {
+    let s = format!("{v}");
+    if s.contains('.') || s.contains('e') {
+        s
+    } else {
+        format!("{s}.0")
+    }
+}
+
 /// Minimal YAML scalar quoting: bare when safe, double-quoted otherwise.
 fn yaml_scalar(s: &str) -> String {
     let safe = !s.is_empty()
@@ -561,6 +624,70 @@ mod tests {
             .expect("read snapshot")
             .replace("\r\n", "\n");
         assert_eq!(yaml, expected, "generated YAML drifted from snapshot");
+    }
+
+    // --- OpenRouter daily spend cap (spec §7 cost guardrail) ---
+
+    #[test]
+    fn spend_cap_emits_litellm_provider_budget() {
+        let cfg = four_backend_config();
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(
+            yaml.contains(
+                "router_settings:\n  routing_strategy: latency-based-routing\n  provider_budget_config:\n    openrouter:\n      budget_limit: 5.0\n      time_period: 1d\n"
+            ),
+            "{yaml}"
+        );
+        let mut cfg = four_backend_config();
+        cfg.gateway.openrouter.daily_cap_usd = 0.25;
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(yaml.contains("      budget_limit: 0.25\n"), "{yaml}");
+        // The budget is valid YAML LiteLLM reads as a float.
+        let v: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml");
+        assert_eq!(
+            v["router_settings"]["provider_budget_config"]["openrouter"]["budget_limit"].as_f64(),
+            Some(0.25)
+        );
+        assert_eq!(
+            v["router_settings"]["provider_budget_config"]["openrouter"]["time_period"].as_str(),
+            Some("1d")
+        );
+    }
+
+    #[test]
+    fn spend_cap_zero_disables_openrouter_entirely() {
+        let mut cfg = four_backend_config();
+        cfg.gateway.openrouter.daily_cap_usd = 0.0;
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(
+            !yaml.contains("openrouter/"),
+            "no cloud deployments:\n{yaml}"
+        );
+        assert!(!yaml.contains("provider_budget_config"), "{yaml}");
+        // No fallback row may reference the missing cloud tier.
+        assert!(!yaml.contains(", openrouter]"), "{yaml}");
+        assert!(!yaml.contains("[openrouter]"), "{yaml}");
+        assert!(!openrouter_tier_active(&cfg));
+    }
+
+    #[test]
+    fn spend_cap_absent_when_tier_disabled() {
+        let mut cfg = four_backend_config();
+        cfg.gateway.openrouter.enabled = false;
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(!yaml.contains("provider_budget_config"), "{yaml}");
+        assert!(!yaml.contains("openrouter"), "{yaml}");
+    }
+
+    #[test]
+    fn spend_cap_predicates() {
+        assert!(openrouter_cap_allows_spend(0.01));
+        assert!(!openrouter_cap_allows_spend(0.0));
+        assert!(!openrouter_cap_allows_spend(-1.0));
+        assert!(!openrouter_cap_allows_spend(f64::NAN));
+        assert!(!openrouter_cap_allows_spend(f64::INFINITY));
+        assert_eq!(yaml_number(5.0), "5.0");
+        assert_eq!(yaml_number(12.5), "12.5");
     }
 
     fn mcp_stdio_server() -> manager_config::McpServerConfig {
