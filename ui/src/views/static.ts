@@ -4166,27 +4166,8 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       <button class="btn icon-only" id="addBackCancel" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
     <div id="addBackMsg" style="font-size:12px;margin-top:6px"></div>
   </div>`;
-    // Model summary strip: the model's size — the one creation
-    // consequence not carried by a form field (the context lives
-    // in the Launch parameters fields now, tracker #49, and a
-    // value lives in one place). GPU/System RAM requirement tiles
-    // need a propose-assignment payload for a not-yet-created
-    // backend, which does not exist (see IMPLEMENTATION.md gaps) —
-    // those tiles are omitted, never zero-filled.
     const stripEl = addHost.querySelector("#addBackStrip") as HTMLElement | null;
     const modelSelEl = addHost.querySelector("#addBackModel") as HTMLSelectElement | null;
-    const paintStrip = (): void => {
-      if (!stripEl || !modelSelEl) return;
-      const m = lastModels.find((x) => x.id === modelSelEl.value);
-      if (!m) { stripEl.innerHTML = ""; return; }
-      const size = m.size_bytes ? fmtBytes(m.size_bytes)
-        : m.catalog_size_bytes !== null ? `~${fmtBytes(m.catalog_size_bytes)} (estimate)` : null;
-      stripEl.innerHTML = `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:10px">
-        ${size !== null ? `<div class="kv"><span class="k">Size</span><span class="v" style="font-size:12px">${esc(size)}</span></div>` : ""}
-      </div>`;
-    };
-    modelSelEl?.addEventListener("change", paintStrip);
-    paintStrip();
 
     /* Launch parameters (tracker #49): the same fields the Edit
      * Flags and Placement forms expose for an existing backend,
@@ -4253,7 +4234,64 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     const paramsEl = addHost.querySelector("#addBackParams") as HTMLElement | null;
     const selectedGpus = (): number[] =>
       lastGpuList.map((g) => Number(g.id)).filter((ix) => !gpuExcluded.has(ix));
+    /* Model summary strip (add-backend audit Q3/Q8): Size, then the
+     * creation requirement as the backend card's GPU RAM / System
+     * RAM tiles (backend_add_preview's `memory` — the same
+     * requirement model, at the form's context/slot draft), then
+     * the split preview: one segmented bar, one segment per GPU the
+     * placement uses, width = its share of the split, keyed
+     * "GPU n — %", the required GiB in each segment's tooltip. For
+     * an offload-capable model the two weight tiles follow the
+     * offload draft through the same per-position pricing the
+     * slider readout uses. A figure the payload does not carry is
+     * omitted, never zero-filled; no placement = no bar. */
+    const splitColors = ["#4a9eff", "#a371f7", "#39c5cf", "#d29922", "#3fb950", "#f85149"];
+    const paintStrip = (): void => {
+      if (!stripEl || !modelSelEl) return;
+      const m = lastModels.find((x) => x.id === modelSelEl.value);
+      if (!m) { stripEl.innerHTML = ""; return; }
+      const size = m.size_bytes ? fmtBytes(m.size_bytes)
+        : m.catalog_size_bytes !== null ? `~${fmtBytes(m.catalog_size_bytes)} (estimate)` : null;
+      const mem = preview && preview.model_id === m.id ? preview.memory ?? null : null;
+      const tiles: [string, string, string][] = [];
+      if (size !== null) tiles.push(["Size", size, ""]);
+      if (mem) {
+        let gpuMib = mem.gpu_ram_mib;
+        let sysMib = mem.sys_ram_mib;
+        if (preview?.offload) {
+          const figs = offloadFigures(preview.offload, offLayers ?? preview.offload.layers);
+          gpuMib = figs.gpuMib;
+          sysMib = figs.sysMib;
+        }
+        tiles.push(["GPU RAM", `${fmtGb(gpuMib / 1024)} GiB`, "GPU-resident weights of the backend this form would create"]);
+        tiles.push(["System RAM", `${fmtGb(sysMib / 1024)} GiB`, "Weights held in system RAM (routed experts under expert offload)"]);
+      }
+      let barHtml = "";
+      const split = preview && preview.model_id === m.id ? preview.tensor_split : [];
+      const entries: { gpu: number; share: number; required: number | null; total: number | null }[] = mem && mem.per_gpu.length
+        ? mem.per_gpu.map((p) => ({ gpu: p.gpu, share: p.share, required: p.required_mib, total: p.total_mib }))
+        : lastGpuList
+          .map((g, p) => ({ gpu: Number(g.id), share: split[p] ?? 0, required: null, total: null }))
+          .filter((e) => e.share > 0);
+      if (entries.length) {
+        const nameOf = (ix: number): string => lastGpuList.find((g) => Number(g.id) === ix)?.name ?? "";
+        const segs = entries.map((e) => {
+          const nm = nameOf(e.gpu);
+          const req = e.required !== null && e.total !== null ? ` · Required: ${fmtGb(e.required / 1024)} of ${fmtGb(e.total / 1024)} GiB` : "";
+          return { pct: e.share * 100, color: splitColors[e.gpu % splitColors.length], label: `GPU ${e.gpu}${nm ? ` · ${nm}` : ""} — ${trim1(e.share * 100)}%${req}` };
+        });
+        const keys = entries.map((e, i) => `<span title="${esc(segs[i].label)}"><span class="sw" style="background:${segs[i].color}"></span>GPU ${e.gpu} — ${trim1(e.share * 100)}%</span>`).join("");
+        barHtml = `<div data-add-split-bar style="margin-top:10px">
+        <span style="font-size:12px;color:var(--text2)">Split</span><span class="info-tip" title="The tensor split creation would assign: each segment is one GPU's share of the model's weights. The selection comes from live telemetry unless GPUs are picked under Placement.">${icon("info")}</span>
+        <div style="margin-top:4px">${stackedBar(segs, 600, 10)}</div>
+        <div class="legend" style="margin-top:4px">${keys}</div></div>`;
+      }
+      stripEl.innerHTML = `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:10px">
+        ${tiles.map(([k, v, tip]) => `<div class="kv"${tip ? ` title="${esc(tip)}"` : ""}><span class="k">${k}</span><span class="v" style="font-size:12px">${esc(v)}</span></div>`).join("")}
+      </div>${barHtml}`;
+    };
     const paintParams = (): void => {
+      paintStrip();
       if (!paramsEl) return;
       const m = lastModels.find((x) => x.id === modelSelEl?.value);
       const ctxMax = m?.ctx_max ? m.ctx_max : null;
@@ -4286,13 +4324,9 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       // chips over the telemetry GPUs, defaulting to the split
       // creation would assign.
       let placeHtml = "";
+      // The resulting split renders once, as the strip's split bar
+      // directly below (its keys carry the percentages).
       if (lastGpuList.length) {
-        const split = preview?.tensor_split ?? [];
-        const summary = lastGpuList
-          .map((g, p) => ({ ix: Number(g.id), frac: split[p] ?? 0 }))
-          .filter((e) => e.frac > 0)
-          .map((e) => `GPU ${e.ix} \u2014 ${Math.round(e.frac * 100)}%`)
-          .join(" \u00b7 ");
         placeHtml = `<div style="margin-top:12px">
         <span style="font-size:12px;color:var(--text2)">Placement (tensor split)</span><span class="info-tip" title="The split divides the model's weights across the selected GPUs, in nvidia-smi index order. The selection starts at the split a creation would assign from live telemetry; changing it makes the split an even division across the selected GPUs instead.">${icon("info")}</span>
         <div class="gpu-chip-row">${lastGpuList.map((g) => {
@@ -4300,7 +4334,6 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
           const on = !gpuExcluded.has(ix);
           return `<label class="gpu-chip${on ? " on" : ""}" title="${esc(g.name)}"><span class="gpu-chip-top"><input type="checkbox" data-add-place-gpu="${ix}"${on ? " checked" : ""}> GPU ${ix}</span><span class="gpu-chip-name">${esc(gpuShortName(g.name))}</span></label>`;
         }).join("")}</div>
-        ${summary ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Split: ${esc(summary)}</div>` : ""}
       </div>`;
       } else {
         placeHtml = `<div style="font-size:12px;color:var(--text2);margin-top:12px">Placement: auto<span class="info-tip" title="No GPU telemetry yet \u2014 a tensor split cannot be previewed or selected; creation leaves the split unset, as it does today.">${icon("info")}</span></div>`;
@@ -4360,7 +4393,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       paintParams();
       scheduleAddLookup();
     };
-    modelSelEl?.addEventListener("change", () => { void loadPreview(true); });
+    modelSelEl?.addEventListener("change", () => { paintStrip(); void loadPreview(true); });
     paramsEl?.addEventListener("input", (ev) => {
       const t = ev.target as HTMLElement;
       if (t.hasAttribute("data-offload-slider")) {
@@ -4370,6 +4403,8 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         scheduleAddLookup();
         const card = t.closest(".card");
         if (card) paintOffloadReadout(card, preview.offload, n);
+        // The strip's GPU RAM / System RAM tiles follow the draft.
+        paintStrip();
         // Keep a pending decision in step with the draft (the
         // edit form's rule): its text follows a still-blocked
         // position, and the row hides while the draft sits on a

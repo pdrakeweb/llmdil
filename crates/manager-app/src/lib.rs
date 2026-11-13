@@ -6222,13 +6222,86 @@ pub async fn op_backend_add_preview(
             targets.as_ref(),
         )
     });
+    let memory = add_preview_memory_json(&cfg, &backend, n_ctx, parallel, &gpu_inventory);
     Ok(json!({
         "model_id": model_id,
         "offload": offload,
         "cache": cache,
         "tensor_split": tensor_split,
         "split_mode": split_mode_str(split_mode),
+        "memory": memory,
     }))
+}
+
+/// The add form's requirement summary (add-backend audit Q8): the
+/// transient backend creation would build, sized at the form's
+/// context/slot draft, priced by `backend_memory_requirement` —
+/// the figures list_backends rows carry as `gpu_ram_mib` /
+/// `sys_ram_mib` / `kv_ram_mib` / `rs_ram_mib` / `moe_cache_mib` /
+/// `memory_basis`, so the add form's GPU RAM / System RAM tiles
+/// mean what the backend card's tiles mean — plus `per_gpu`: the
+/// split share and the residency the start gate would judge
+/// (`residency_per_gpu` over the telemetry inventory) for every
+/// GPU the previewed placement uses. An unsplit placement loads on
+/// the first GPU (share 1). `per_gpu` is empty without telemetry.
+/// Null when the model's layout cannot be resolved — never a
+/// zero-filled requirement.
+fn add_preview_memory_json(
+    cfg: &AppConfig,
+    backend: &manager_config::BackendConfig,
+    n_ctx: Option<u32>,
+    parallel: Option<u32>,
+    gpu_inventory: &[GpuInfo],
+) -> Value {
+    let mut sized = backend.clone();
+    if let Some(c) = n_ctx {
+        sized.flags.n_ctx = c;
+    }
+    if let Some(p) = parallel {
+        sized.raw_flags = manager_models::set_parallel_slots(
+            sized.raw_flags.as_deref(),
+            Some(i64::from(p.max(1))),
+        );
+    }
+    let Some(req) = backend_memory_requirement(cfg, &sized) else {
+        return Value::Null;
+    };
+    let split = &sized.flags.tensor_split;
+    let n = gpu_inventory.len();
+    let residency = manager_optimize::residency_per_gpu(&req, split, n);
+    let per_gpu: Vec<Value> = gpu_inventory
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, g)| {
+            let share = if split.is_empty() {
+                if pos == 0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                split.get(pos).copied().unwrap_or(0.0)
+            };
+            if share <= 0.0 {
+                return None;
+            }
+            Some(json!({
+                "gpu": g.index,
+                "share": share,
+                "required_mib": residency[pos],
+                "total_mib": g.total_vram_mib,
+            }))
+        })
+        .collect();
+    json!({
+        "gpu_ram_mib": req.gpu_weights_mib,
+        "sys_ram_mib": req.sys_weights_mib,
+        "kv_ram_mib": req.kv_mib,
+        "rs_ram_mib": req.rs_mib,
+        "moe_cache_mib": req.moe_cache_mib,
+        "basis": serde_json::to_value(req.basis).unwrap_or(Value::Null),
+        "per_gpu": per_gpu,
+    })
 }
 
 /// Update a backend's llama-server sizing flags: context length
@@ -15785,6 +15858,64 @@ mod tests {
         let info = backend_offload_info(&cfg_now, &b).expect("offload info for the new backend");
         assert_eq!(info.moe_layers, 48);
         assert_eq!(info.green_limit_layers, 16);
+        // The preview's requirement summary prices exactly what the
+        // created backend's card prices (same configuration: the
+        // catalog default offload at the 32K creation context).
+        let req =
+            backend_memory_requirement(&cfg_now, &b).expect("requirement for the new backend");
+        let mem = preview["memory"]
+            .as_object()
+            .expect("preview carries memory");
+        assert_eq!(mem["gpu_ram_mib"], json!(req.gpu_weights_mib));
+        assert_eq!(mem["sys_ram_mib"], json!(req.sys_weights_mib));
+        assert!(
+            req.sys_weights_mib > 0,
+            "partial offload holds experts in system RAM"
+        );
+        assert_eq!(mem["kv_ram_mib"], json!(req.kv_mib));
+        assert!(mem["per_gpu"].is_array());
+        // A larger context draft re-prices the KV term, never the
+        // weights.
+        let wide = op_backend_add_preview(
+            &state,
+            &sink,
+            "qwen3.8-27b-moe".to_string(),
+            None,
+            Some(65536),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wide["memory"]["gpu_ram_mib"], mem["gpu_ram_mib"]);
+        assert_eq!(wide["memory"]["sys_ram_mib"], mem["sys_ram_mib"]);
+        if let (Some(a), Some(b2)) = (
+            mem["kv_ram_mib"].as_u64(),
+            wide["memory"]["kv_ram_mib"].as_u64(),
+        ) {
+            assert!(b2 > a, "KV at 64K exceeds KV at 32K");
+        }
+        // per_gpu: one entry per GPU the split uses, carrying its
+        // share and the start gate's residency for it; an unsplit
+        // placement loads on the first GPU.
+        let gpus = test_gpus();
+        let mut split_b = b.clone();
+        split_b.flags.tensor_split = vec![0.75, 0.0, 0.25];
+        let m = add_preview_memory_json(&cfg_now, &split_b, None, None, &gpus);
+        let per = m["per_gpu"].as_array().unwrap();
+        assert_eq!(per.len(), 2);
+        assert_eq!(per[0]["gpu"], 0);
+        assert_eq!(per[1]["gpu"], 2);
+        assert_eq!(per[1]["total_mib"], 16384);
+        let res = manager_optimize::residency_per_gpu(&req, &split_b.flags.tensor_split, 3);
+        assert_eq!(per[0]["required_mib"], json!(res[0]));
+        assert_eq!(per[1]["required_mib"], json!(res[2]));
+        let mut unsplit = b.clone();
+        unsplit.flags.tensor_split = Vec::new();
+        let m = add_preview_memory_json(&cfg_now, &unsplit, None, None, &gpus);
+        let per = m["per_gpu"].as_array().unwrap();
+        assert_eq!(per.len(), 1);
+        assert_eq!(per[0]["gpu"], 0);
+        assert_eq!(per[0]["share"], 1.0);
         // The slider op rewrites only the offload tokens: partial,
         // full, and off — a sibling -ot assignment and an unrelated
         // flag survive every rewrite.

@@ -987,5 +987,14 @@ check(staticSrcNar.includes("status.bind_fallback"), "Remote Access card shows t
 check(staticSrcNar.includes("pairingQrHtml(enroll.qr_svg)"), "pairing block renders the shell's QR");
 check(/function pairingQrHtml[\s\S]{0,600}<script/.test(staticSrcNar), "pairing QR guard rejects scriptable SVG");
 
+// Add-a-backend card (design audit Q3/Q8 remainder): the summary
+// strip carries GPU RAM / System RAM tiles from backend_add_preview's
+// memory object and the split preview is a segmented bar, not the
+// old "Split:" text line.
+check(apiSrcGw.includes("memory?: BackendAddMemory | null"), "BackendAddPreview carries the memory requirement object");
+check(staticSrcNar.includes("data-add-split-bar") && /data-add-split-bar[\s\S]{0,400}stackedBar\(segs/.test(staticSrcNar), "add-backend form renders the split preview as a segmented bar");
+check(/preview\.memory \?\? null[\s\S]{0,900}"GPU RAM"[\s\S]{0,300}"System RAM"/.test(staticSrcNar), "add-backend strip renders GPU RAM / System RAM tiles from the preview memory");
+check(!staticSrcNar.includes("Split: ${esc(summary)}"), "add-backend placement no longer repeats the split as a text line");
+
 if (failures > 0) { console.error(`\n${failures} smoke check(s) failed`); process.exit(1); }
 console.log("\nsmoke: all checks passed");
