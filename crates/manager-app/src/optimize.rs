@@ -960,7 +960,7 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
     }
 }
 
-fn current_config_hash(cfg: &AppConfig) -> String {
+pub(crate) fn current_config_hash(cfg: &AppConfig) -> String {
     let bytes = serde_json::to_vec(cfg).unwrap_or_default();
     config_fingerprint(&bytes)
 }
@@ -969,7 +969,7 @@ fn current_config_hash(cfg: &AppConfig) -> String {
 // State payload
 // ---------------------------------------------------------------------------
 
-fn validation_json(v: &ItemValidation) -> Value {
+pub(crate) fn validation_json(v: &ItemValidation) -> Value {
     json!({
         "status": match v.status {
             ValidationStatus::Valid => "valid",
@@ -1288,6 +1288,12 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
         "eval_baseline": crate::optimize_eval::eval_baseline_json(state, &gathered.fingerprints),
         "consulting": state.optimize_abort.lock().await.is_some(),
         "consult_started_unix_ms": *state.optimize_consult_started_unix_ms.lock().await,
+        // Streaming progress of the running consultation (Phase
+        // 3): chunk (≈ token) count, partial answer size, time to
+        // first token; null when none is streaming.
+        "consult_progress": state.optimize_live.progress_json(),
+        // The Rust apply executor is running (Phase 3).
+        "applying": state.optimize_live.applying(),
         "consult_error": state.optimize_consult_error.lock().await.as_ref().map(|(m, _)| m.clone()),
         "consult_error_unix_ms": state.optimize_consult_error.lock().await.as_ref().map(|(_, t)| *t),
         "measuring": state.optimize_job_abort.lock().await.is_some(),
@@ -1684,6 +1690,13 @@ pub async fn op_optimize_consult(
             ));
         }
     }
+    // A consultation replaces the plan; the Rust apply executor
+    // (Phase 3) records outcomes on the stored plan as it runs.
+    if state.optimize_live.applying() {
+        return Err(ApiError::InvalidInput(
+            "a plan apply is running; consult after it finishes".to_string(),
+        ));
+    }
     {
         // Cross-family serialization (Addendum B §B.4.3,
         // extension E2): a consultation refuses while the
@@ -1854,17 +1867,36 @@ pub async fn op_optimize_consult(
         // literal loopback host with the backend's own port —
         // never the gateway, never the LAN address.
         let base_url = format!("http://127.0.0.1:{}", backend.port);
-        let completion = manager_supervisor::chat_completion(
+        // Phase 3: streamed generation with live progress
+        // (`consult_progress` in the state payload) and the plan
+        // contract's JSON schema as `response_format`; the client
+        // falls back to weaker request shapes when this build
+        // rejects them, and the salvage parser below reads the
+        // answer either way.
+        let response_format = manager_optimize::plan_response_format();
+        let live = &state.optimize_live;
+        live.begin_consult(&target);
+        let _progress_guard = crate::optimize_stream::ConsultProgressGuard(live);
+        let on_progress = |p: &manager_supervisor::StreamProgress| live.record(p);
+        let completion = manager_supervisor::consult_completion(
             &base_url,
             &model_name,
             &messages,
             CONSULT_TEMPERATURE,
             CONSULT_MAX_TOKENS,
+            Some(&response_format),
             CONSULT_TIMEOUT,
+            &on_progress,
         );
+        // Either cancel route stops the generation: the scoped
+        // abort handle (`optimize_cancel_consult`) or the task
+        // system's token (`task_abort` routes to the same op, and
+        // the token covers any future direct cancel).
+        let token = state.task_controls.token(&task_id);
         let outcome = tokio::select! {
             res = completion => Some(res),
             _ = rx => None,
+            _ = token.cancelled() => None,
         };
         {
             let mut slot = state.optimize_abort.lock().await;
@@ -1898,7 +1930,26 @@ pub async fn op_optimize_consult(
                     .await;
                 return Err(ApiError::InvalidInput(format!("consultation failed: {e}")));
             }
-            Some(Ok(result)) => {
+            Some(Ok(consult)) => {
+                // The fallback trail (Phase 3): which request
+                // shapes this build rejected before one was
+                // accepted, and how the answer finally came back.
+                let mut lines: Vec<String> = consult
+                    .fallbacks
+                    .iter()
+                    .map(|f| opt_log_line(&format!("consultation fallback: {f}")))
+                    .collect();
+                lines.push(opt_log_line(&format!(
+                    "consultation transport: streamed {}, response_format {}",
+                    consult.streamed,
+                    if consult.structured {
+                        "json_schema"
+                    } else {
+                        "none"
+                    }
+                )));
+                opt_log(state, &lines);
+                let result = consult.result;
                 // Response diagnostics (Oct 19, 2026): the raw
                 // response log below records the extracted answer
                 // text only, which made a "0 bytes" response

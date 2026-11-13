@@ -353,6 +353,11 @@ macro_rules! for_each_operation {
             (OptimizeSetItemState, optimize_set_item_state, C, op_optimize_set_item_state, [item_id: usize, decision: String], None),
             (OptimizeSetItemOutcome, optimize_set_item_outcome, C, op_optimize_set_item_outcome, [item_id: usize, outcome: String, error: Option<String>], None),
             (OptimizeDiscardPlan, optimize_discard_plan, C, op_optimize_discard_plan, [], None),
+            // Rust apply executor (optimize design §5.2, Phase 3):
+            // executes accepted items through the existing ops.
+            // Class D because the destructive phase deletes
+            // backends and groups (backend_delete is D).
+            (OptimizeApplyPlan, optimize_apply_plan, D, op_optimize_apply_plan, [destructive: Option<bool>, dry_run: Option<bool>], None),
             (OptimizeSetExperimentState, optimize_set_experiment_state, C, op_optimize_set_experiment_state, [experiment_id: usize, decision: String], None),
             (OptimizeConsult, optimize_consult, L, op_optimize_consult, [backend_id: Option<String>, sample: Option<bool>, directive: Option<String>, candidate_repos: Option<Vec<String>>], None),
             (OptimizeDiscover, optimize_discover, L, op_optimize_discover, [directive: String], None),
@@ -511,7 +516,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 152);
+        assert_eq!(OP_SPECS.len(), 153);
     }
 
     #[test]
