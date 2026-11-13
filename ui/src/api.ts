@@ -4705,6 +4705,11 @@ export interface AdminApiPairing {
   base_url: string;
   cert_sha256: string | null;
   enrollment_code?: string;
+  /** The pairing QR (PLAN.md §3.8) as an inline <svg>, rendered by the
+   *  shell (manager-api pairing module) from exactly the values above
+   *  ({ base_url, cert_sha256, enrollment_code } JSON). Null without a
+   *  certificate fingerprint; absent from older shells. */
+  qr_svg?: string | null;
 }
 
 export async function adminApiCreateEnrollment(userId: string): Promise<CallResult<AdminApiPairing | null>> {

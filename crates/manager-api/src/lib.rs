@@ -26,6 +26,7 @@ pub mod composites;
 pub mod firewall;
 pub mod http;
 pub mod operations;
+pub mod pairing;
 pub mod tls;
 pub mod users;
 

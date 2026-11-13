@@ -8700,6 +8700,20 @@ function certNotes(status: AdminApiStatus): string {
   return notes.join("");
 }
 
+/** The pairing QR (PLAN.md §3.8): the shell renders it as an inline
+ *  <svg> of black/white modules from exactly the values listed below
+ *  it (the CSP admits no data: images, so it is inlined). Accepted
+ *  only as a bare <svg> element with nothing scriptable in it;
+ *  anything else renders nothing and the text values still pair. */
+function pairingQrHtml(svg: string | null | undefined): string {
+  if (!svg) return "";
+  const s = svg.trim();
+  const lower = s.toLowerCase();
+  if (!lower.startsWith("<svg") || !lower.endsWith("</svg>")) return "";
+  if (lower.includes("<script") || lower.includes("<foreignobject") || /\son[a-z]+\s*=/.test(lower) || lower.includes("javascript:")) return "";
+  return `<div class="ra-qr" role="img" aria-label="Pairing QR code" style="display:inline-block;margin:8px 0;background:#fff;line-height:0">${s}</div>`;
+}
+
 /** Remote Access tab: the admin API's state, its users, and
  *  device pairing. Values are Label: Value rows with copy buttons
  *  (the global [data-copy-value] handler serves them); state the
@@ -8792,7 +8806,7 @@ function remoteAccessHtml(
     ${audit.length ? `<div style="font-size:12px;color:var(--text2);margin-top:16px">Audit log<span class="info-tip" title="Every API mutation and sign-in event, newest first. Full log: logs/admin-api-audit.jsonl in the data directory.">${icon("info")}</span></div>
     <div style="font-size:12px">${audit.map((e) => `<div style="display:flex;justify-content:space-between;gap:16px;padding:2px 0"><span>${esc(new Date(e.ts_ms).toLocaleString())} \u00b7 ${esc(e.actor)} \u00b7 ${esc(e.action)}${e.target ? ` \u00b7 ${esc(e.target)}` : ""}</span><span style="color:${e.result.startsWith("2") ? "var(--ok)" : "var(--err)"}">${esc(e.result)}</span></div>`).join("")}</div>` : ""}
     ${temp ? `<div style="margin-top:12px">${settingsRows([{ key: `Temporary password \u00b7 ${temp.user}`, value: temp.password, copy: temp.password, tip: "Shown once. The user must change it at first sign-in." }])}</div>` : ""}
-    ${enroll ? `<div style="margin-top:12px"><div style="font-size:12px;color:var(--text2)">Pairing \u00b7 ${esc(enroll.user)}<span class="info-tip" title="Enter these values in the LLMdil app to pair this device. The code is single-use and expires in 10 minutes.">${icon("info")}</span></div>${settingsRows([
+    ${enroll ? `<div style="margin-top:12px"><div style="font-size:12px;color:var(--text2)">Pairing \u00b7 ${esc(enroll.user)}<span class="info-tip" title="Scan the code with the LLMdil app, or enter these values in it, to pair this device. The code is single-use and expires in 10 minutes.">${icon("info")}</span></div>${pairingQrHtml(enroll.qr_svg)}${settingsRows([
       { key: "Base URL", value: enroll.base_url, copy: enroll.base_url },
       { key: "Certificate SHA-256", value: enroll.cert_sha256 ?? "", copy: enroll.cert_sha256 ?? undefined },
       { key: "Enrollment code", value: enroll.enrollment_code ?? "", copy: enroll.enrollment_code ?? undefined },

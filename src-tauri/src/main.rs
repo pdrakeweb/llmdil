@@ -759,9 +759,16 @@ async fn admin_api_get_pairing(
 ) -> Result<Value, String> {
     let api = admin_api_config(state.inner(), &app).await?;
     let data_dir = state.inner().data_dir().to_path_buf();
+    let base_url = api_base_url(slot.inner(), &api);
+    let cert = manager_api::tls::stored_fingerprint(&data_dir);
+    // The QR encodes exactly the two values returned beside it.
+    let qr_svg = manager_api::pairing::pairing_qr_svg(&base_url, cert.as_deref(), None)
+        .ok()
+        .flatten();
     Ok(json!({
-        "base_url": api_base_url(slot.inner(), &api),
-        "cert_sha256": manager_api::tls::stored_fingerprint(&data_dir),
+        "base_url": base_url,
+        "cert_sha256": cert,
+        "qr_svg": qr_svg,
     }))
 }
 
@@ -783,10 +790,19 @@ async fn admin_api_create_enrollment(
         .create_enrollment_code(&user_id)
         .await
         .map_err(|e| e.to_string())?;
+    let base_url = api_base_url(slot.inner(), &api);
+    let cert = manager_api::tls::stored_fingerprint(&data_dir);
+    // The QR (PLAN.md §3.8) encodes exactly the three values returned
+    // beside it — the ones the card already shows as text. A render
+    // failure leaves the text values, which pair just the same.
+    let qr_svg = manager_api::pairing::pairing_qr_svg(&base_url, cert.as_deref(), Some(&code))
+        .ok()
+        .flatten();
     Ok(json!({
-        "base_url": api_base_url(slot.inner(), &api),
-        "cert_sha256": manager_api::tls::stored_fingerprint(&data_dir),
+        "base_url": base_url,
+        "cert_sha256": cert,
         "enrollment_code": code,
+        "qr_svg": qr_svg,
     }))
 }
 

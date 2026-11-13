@@ -982,5 +982,10 @@ check(staticSrcNar.includes("data-ra-bind-save") && staticSrcNar.includes('id="r
 check(staticSrcNar.includes('bind_mode: "interface", bind_ip:'), "bind selector saves an interface choice with its address");
 check(staticSrcNar.includes("status.bind_fallback"), "Remote Access card shows the bind fallback reason");
 
+// Pairing QR (PLAN.md §3.8): rendered by the shell, inlined on the
+// pairing block through the guard that accepts only a bare <svg>.
+check(staticSrcNar.includes("pairingQrHtml(enroll.qr_svg)"), "pairing block renders the shell's QR");
+check(/function pairingQrHtml[\s\S]{0,600}<script/.test(staticSrcNar), "pairing QR guard rejects scriptable SVG");
+
 if (failures > 0) { console.error(`\n${failures} smoke check(s) failed`); process.exit(1); }
 console.log("\nsmoke: all checks passed");
