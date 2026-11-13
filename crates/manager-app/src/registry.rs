@@ -720,8 +720,23 @@ mod tests {
     #[test]
     fn frontend_invocations_are_all_registered() {
         let api_ts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/api.ts");
-        let src = std::fs::read_to_string(&api_ts)
+        let mut src = std::fs::read_to_string(&api_ts)
             .unwrap_or_else(|e| panic!("read {}: {e}", api_ts.display()));
+        // api.ts is a barrel over its per-domain modules in ui/src/api/
+        // (T-02h); the invoke call sites live there, so scan them all.
+        let api_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/api");
+        let mut parts: Vec<std::path::PathBuf> = std::fs::read_dir(&api_dir)
+            .unwrap_or_else(|e| panic!("read dir {}: {e}", api_dir.display()))
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "ts"))
+            .collect();
+        parts.sort();
+        for p in &parts {
+            src.push('\n');
+            src.push_str(
+                &std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())),
+            );
+        }
         // Scan for invoke<T>("name", ...) / invoke("name", ...) call
         // sites: after `invoke`, allow a generic argument list, then
         // `(`, then the quoted command name as the first argument.
