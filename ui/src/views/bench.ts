@@ -17,6 +17,7 @@ import type {
 } from "../api";
 import { fmtCount, stackedBar, trim1 } from "../charts";
 import { esc } from "../html";
+import { fromWire } from "../lifecycle";
 import { icon } from "../icons";
 
 export function renderBench(): string {
@@ -793,7 +794,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
         </select>
         <select id="benchGenBackend" style="${SELECT_STYLE}" aria-label="Generate backend">
           <option value=""${genBackendId === "" ? " selected" : ""}>Best running</option>
-          ${backends.filter((b) => b.state === "running").map((b) => `<option value="${esc(b.id)}"${genBackendId === b.id ? " selected" : ""}>${esc(b.id)}</option>`).join("")}
+          ${backends.filter((b) => fromWire(b.lifecycle ?? b.state) === "running").map((b) => `<option value="${esc(b.id)}"${genBackendId === b.id ? " selected" : ""}>${esc(b.id)}</option>`).join("")}
         </select>
         ${generating
           ? `<span class="opt-consulting">${icon("clock")} Generating <span id="benchGenElapsed">${genElapsed}</span></span>

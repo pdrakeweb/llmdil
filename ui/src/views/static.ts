@@ -7,13 +7,13 @@
 
 import { fmtCount, fmtGb, gaugeRing, historyChart, historyChartX, historyChartY, meter, sparkline, stackedBar, trim1, type HistoryChartGeom, type HistoryChartSeries } from "../charts";
 import { icon, type IconName } from "../icons";
-import { esc } from "../html";
+import { esc, setHtml } from "../html";
 import { enableSwitch } from "../switch";
 import {
   runWizardStep, wizardBusyMessage, isTauri, openUrl, markSetupComplete, getWizardSteps, runAudit,
   getWizardCommands,
   getGpuTelemetry, getGpuHistory, setTelemetryInterval, resetTelemetryPeaks, saveTelemetrySnapshot,
-  getBackends, startBackend, stopBackend, restartBackend, updateBackendFlags, setBackendOffload, setBackendOffloadOverride, clearBackendOffloadOverride, setBackendMtp, setBackendMoeCache, setBackendParallel, setBackendCache, backendCachePreview, setBackendRawFlags, setBackendFlagsMode, getBackendLaunchCommand,
+  getBackends, updateBackendFlags, setBackendOffload, setBackendOffloadOverride, clearBackendOffloadOverride, setBackendMtp, setBackendMoeCache, setBackendParallel, setBackendCache, backendCachePreview, setBackendRawFlags, setBackendFlagsMode, getBackendLaunchCommand,
   measurementLookup,
   optimizeMeasureBackend,
   getBackendConfig, applyBackendConfig, testBackend, testBackendToolCall, placementPropose, placementApply,
@@ -23,9 +23,9 @@ import {
   modelHfLookup, modelHfSuggest, modelHfHeader,
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
   getGatewayMasterKey, setGatewayBindHost,
-  updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
-  getActivationPlan, activationCancelChanges, activationComplete, quiesceWait,
-  recordActivationExecution, getActivationHistory, getActivationExecution,
+  updateGatewayConfig, effectiveGatewayStrategy,
+  getActivationPlan, activationCancelChanges, activationApply,
+  getActivationHistory, getActivationExecution,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
   setNotificationConfig, sendTestNotification, updateAppConfig, updatesPin, updatesSetAuto,
   getAppUpdateStatus, appUpdateCheck, appUpdateSetChecking, appUpdateSetAuto, appUpdateDownload,
@@ -35,8 +35,13 @@ import {
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
   adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, BackendCache, BackendMoeCache, BackendMtp, BackendOffload, BackendParallel, BackendRow, CachePreview, CacheSelectionLike, CacheTypeName, FlashAttnName, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, HfHeaderResult, HfLookupQuant, HfLookupRepo, LogReceiverInfo, LogRow, LogShipperInfo, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
-import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
+import type { ActivationChange, ActivationExecution, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, BackendCache, BackendMoeCache, BackendMtp, BackendOffload, BackendParallel, BackendRow, CachePreview, CacheSelectionLike, CacheTypeName, FlashAttnName, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, HfHeaderResult, HfLookupQuant, HfLookupRepo, LogReceiverInfo, LogRow, LogShipperInfo, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
+import {
+  LIFECYCLE_STATES, META, applyBlockedReason, fromWire, lifecycleActions, lifecycleChip, lifecycleDot, lifecycleLabel,
+  logReceiverState, renderLifecycleActions, runLifecycle, serviceRowState, serviceStore, targetKey,
+  wireLifecycleActions,
+} from "../lifecycle";
+import type { LifecycleResult, LifecycleState, LifecycleTarget, ServiceSnapshot } from "../lifecycle";
 import type { GpuInfo, WizardStepState } from "../types";
 
 const C = { blue: "#4a9eff", purple: "#a371f7", teal: "#39c5cf", green: "#3fb950", amber: "#d29922", red: "#f85149", grey: "#6d7686" };
@@ -52,12 +57,6 @@ function dot(s: string): string {
   return `<span class="dot ${s === "ok" ? "ok" : s === "warn" || s === "starting" || s === "degraded" ? "warn" : s === "err" ? "err" : "idle"}"></span>`;
 }
 
-/** Map a supervisor process state onto the dot() vocabulary. */
-function stateDot(state: string): string {
-  return dot(state === "running" ? "ok"
-    : state === "starting" || state === "stopping" ? "starting"
-    : state === "failed" ? "err" : "idle");
-}
 
 /** Status/health button for an overview-list row: a colored dot and
  *  icon; clicking it scrolls to the item's card (data-ov-goto holds
@@ -605,7 +604,7 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     const pos = lastGpus.findIndex((x) => x.id === g.id);
     const rows: GpuModelRow[] = [];
     for (const b of gpuBackends) {
-      if (!b.configured || (b.state !== "running" && b.state !== "starting")) continue;
+      if (!b.configured || !META[fromWire(b.lifecycle ?? b.state)].isLive) continue;
       const mdl = gpuModels.find((m) => sameModelFile(b.model_file, m.gguf_path));
       // Sum of the measured rows for this backend on this GPU; null
       // when no row was measured (WDDM, counters unavailable) — an
@@ -932,16 +931,36 @@ function planScopeBarHtml(plan: ActivationPlanData): string {
  * and the shell banner). */
 function planApplyButtons(plan: ActivationPlanData, ui: PlanUiState): string {
   if (!plan.actionable) return "";
-  const dis = ui.acting ? " disabled" : "";
+  // Disabled on every surface while ANY apply runs (this card's, the
+  // banner's, another window's or a REST/CLI one): the server's
+  // activation_applying is the shared signal (ACT-9).
+  const dis = ui.acting || activationApplying() ? " disabled" : "";
   const tip = esc(planApplyLine(plan));
-  return plan.gateway_pending && plan.gateway_up
+  // Drain-or-restart keys on the gateway's lifecycle state from the
+  // shared store (the same rule as the shell banner); the plan's own
+  // probe is the fallback before the store's first snapshot.
+  const gs = serviceStore.gatewayState();
+  const gwLive = gs !== null ? META[gs].isLive : plan.gateway_up;
+  return plan.gateway_pending && gwLive
     ? `<button class="btn" data-plan-act="quiesce" title="${tip}"${dis}>${icon("pause")} Drain Requests and Apply</button>
        <button class="btn" data-plan-act="restart" title="${tip}"${dis}>${icon("restart")} Apply now</button>`
     : `<button class="btn" data-plan-act="start" title="${tip}"${dis}>${icon("play")} Apply plan</button>`;
 }
 
+/** The server-side activation apply in flight (any surface), from the
+ *  shared service store; null when idle or not yet measured. */
+export function activationApplying(): { message: string } | null {
+  return serviceStore.get().gateway?.activation_applying ?? null;
+}
+
 function planStatusHtml(ui: PlanUiState): string {
-  return `${ui.status ? `<div style="font-size:12px;margin-top:6px;color:${ui.statusErr ? "var(--err)" : "var(--text2)"}">${esc(ui.status)}</div>` : ""}
+  // While an apply started elsewhere runs, its progress line shows
+  // here too (this surface's own status, when set, wins).
+  const applying = activationApplying();
+  if (applying && !ui.status) {
+    return `<div style="font-size:12px;margin-top:6px;color:var(--text2)">${icon("clock")} Applying… ${esc(applying.message)}</div>`;
+  }
+  return `${ui.status ?`<div style="font-size:12px;margin-top:6px;color:${ui.statusErr ? "var(--err)" : "var(--text2)"}">${esc(ui.status)}</div>` : ""}
     ${ui.manualCommand ? manualCommandHtml(ui.manualCommand) : ""}`;
 }
 
@@ -998,180 +1017,57 @@ function activationPlanHtml(plan: ActivationPlanData | null, ui: PlanUiState, va
   </div>`;
 }
 
-/** Execute the restart side of an activation plan with the
- *  existing primitives: the quiesce wait (optional), gateway stop,
- *  the start-gateway wizard step, then mark the plan complete.
- *  `setManual` receives the failed start-gateway outcome's
- *  manual-command block (or null to clear a previous one), rendered
- *  as a code block under the failure message. */
-async function executeActivationRestart(
+/** Apply the pending activation plan through the ONE server-side
+ *  apply (activation_apply): the server re-reads the plan, restarts
+ *  each stale backend (waiting for /health), restarts the gateway
+ *  when a gateway change is pending (never PostgreSQL), and records
+ *  one execution in the history with source "desktop". Nothing is
+ *  orchestrated client-side any more — no client gateway stop, no
+ *  activationComplete, no client history record (ACT-3).
+ *
+ *  While the call runs, the server's progress line
+ *  (gateway_status.activation_applying.message, polled by the shared
+ *  service store) is piped into `setStatus`, and every status surface
+ *  shows the services it restarts as "restarting…". The result's
+ *  message (and manual commands from a failed gateway restart) are
+ *  rendered at the end. The plan argument is kept for the callers'
+ *  signature (banner, plan card): the server reads its own copy.
+ *  Exported for the app shell's global activation banner. */
+export async function applyActivationPlan(
+  _plan: ActivationPlanData,
   mode: "quiesce" | "restart" | "start",
   setStatus: (text: string, err?: boolean) => void,
   setManual?: (cmd: string | null) => void,
 ): Promise<boolean> {
   setManual?.(null);
-  if (mode === "quiesce") {
-    setStatus("Waiting for in-flight gateway requests to finish (up to 120 seconds)…");
-    const q = await quiesceWait(120);
-    if (q.error) { setStatus(`Drain check failed: ${q.error}`, true); return false; }
-    if (!q.data.drained) {
-      setStatus(`${q.data.in_flight} request(s) still in flight after the wait — restarting now.`);
+  setStatus(mode === "quiesce"
+    ? "Applying the activation plan — draining in-flight gateway requests first…"
+    : "Applying the activation plan…");
+  let lastProgress = "";
+  const unsubscribe = serviceStore.subscribe((snap) => {
+    const msg = snap.gateway?.activation_applying?.message ?? "";
+    if (msg && msg !== lastProgress) {
+      lastProgress = msg;
+      setStatus(msg);
     }
-  }
-  if (mode !== "start") {
-    const st = await getGatewayStatus();
-    if (st.data.up) {
-      setStatus("Stopping the running gateway…");
-      const sr = await gatewayStop();
-      if (sr.error) { setStatus(`Gateway stop failed: ${sr.error}`, true); return false; }
-    }
-  }
-  setStatus("Running the start-gateway step…");
-  const r = await runWizardStep("start-gateway");
-  if (r.error) { setStatus(`Gateway start failed: ${r.error}`, true); return false; }
-  if (r.data.busy || !r.data.outcome) {
-    setStatus(wizardBusyMessage(r.data, "A setup step is already running — wait for it to finish, then execute the plan again."), true);
-    return false;
-  }
-  if (r.data.outcome.state === "failed") {
-    setStatus(`Start-gateway step failed — ${r.data.outcome.message}`, true);
-    if (r.data.outcome.manual_command) setManual?.(r.data.outcome.manual_command);
-    return false;
-  }
-  await activationComplete();
-  setStatus("Gateway restarted — the saved changes are live.");
-  return true;
-}
-
-/** Apply a whole activation plan across scopes: restart each
- *  running backend the plan names (its saved flags, split, or
- *  model take effect), then the gateway side when a gateway change
- *  is pending (quiesce wait, stop, start-gateway step, mark the
- *  gateway scope complete). Backend entries for stopped backends
- *  are left alone — they apply at that backend's next start and
- *  resolve in the plan on their own. Exported for the app shell's
- *  global activation banner, whose Apply button runs the same
- *  execution as the plan card and the Activation Plan view.
- *
- *  Every apply — completed, partially failed, or aborted — is
- *  recorded whole in the durable execution history (the Activation
- *  Plan view's Recent executions) through
- *  gateway_activation_record_execution: the plan as computed here,
- *  one item per change with its outcome. Items start as unattempted
- *  skips and each step overwrites the items it acts on, so an
- *  abort leaves an accurate trail with no cleanup pass. The record
- *  call's result is ignored: recording is best-effort and must
- *  never change what an apply does or reports. */
-export async function applyActivationPlan(
-  plan: ActivationPlanData,
-  mode: "quiesce" | "restart" | "start",
-  setStatus: (text: string, err?: boolean) => void,
-  setManual?: (cmd: string | null) => void,
-): Promise<boolean> {
-  const startedAt = new Date().toISOString();
-  const items: ActivationExecutionItem[] = plan.changes.map((c) => ({
-    ts: c.ts,
-    kind: c.kind,
-    summary: c.summary,
-    scope: c.scope ?? "",
-    targets: c.targets ?? [],
-    activation: c.activation ?? "",
-    outcome: "skipped",
-    detail: "Not attempted — the apply did not reach this item",
-  }));
-  let lastError = "";
-  const trackedStatus = (text: string, err = false): void => {
-    if (err) lastError = text;
-    setStatus(text, err);
-  };
-  const finish = (status: string, ok: boolean): boolean => {
-    void recordActivationExecution({
-      started_at: startedAt,
-      finished_at: new Date().toISOString(),
-      status,
-      source: "desktop",
-      mode,
-      drift: plan.drift,
-      gateway_up: plan.gateway_up,
-      gateway_pending: Boolean(plan.gateway_pending),
-      items,
-    });
-    return ok;
-  };
-  const restartIds = plan.backend_restart_ids ?? [];
-  const restarted = new Set<string>();
+  });
+  let r: Awaited<ReturnType<typeof activationApply>>;
   try {
-    for (const id of restartIds) {
-      trackedStatus(`Restarting backend ${id}…`);
-      const r = await restartBackend(id);
-      if (r.error) {
-        trackedStatus(`Backend ${id} restart failed: ${r.error}`, true);
-        for (const item of items) {
-          if (item.scope !== "backend") {
-            if (plan.gateway_pending) {
-              item.detail = "Not attempted — the apply stopped before the gateway restart";
-            }
-            continue;
-          }
-          if (item.targets.includes(id)) {
-            item.outcome = "failed";
-            item.detail = r.error;
-          } else if (item.targets.length && item.targets.every((t) => restarted.has(t))) {
-            item.outcome = "applied";
-            item.detail = undefined;
-          } else if (item.targets.some((t) => restartIds.includes(t))) {
-            item.detail = "Not attempted — the apply stopped after a failed backend restart";
-          } else {
-            item.detail = "Already effective — takes effect at the backend's next start";
-          }
-        }
-        return finish("failed", false);
-      }
-      restarted.add(id);
-    }
-    // Every named backend restarted: restart-class items are
-    // applied; the rest were already effective (their backends are
-    // stopped — the saved change is what the next start launches
-    // with).
-    for (const item of items) {
-      if (item.scope !== "backend") continue;
-      if (item.targets.some((t) => restarted.has(t))) {
-        item.outcome = "applied";
-        item.detail = undefined;
-      } else {
-        item.detail = "Already effective — takes effect at the backend's next start";
-      }
-    }
-    if (plan.gateway_pending) {
-      const ok = await executeActivationRestart(mode, trackedStatus, setManual);
-      for (const item of items) {
-        if (item.scope === "backend") continue;
-        if (ok) {
-          item.outcome = "applied";
-          item.detail = undefined;
-        } else {
-          item.outcome = "failed";
-          item.detail = lastError || "The gateway restart did not complete";
-        }
-      }
-      // The gateway step is the last step: reaching it means every
-      // step was attempted, so a failure here completes the
-      // execution with failures rather than aborting it.
-      const anyFailed = items.some((i) => i.outcome === "failed");
-      return finish(anyFailed ? "completed_with_failures" : "completed", ok);
-    }
-    trackedStatus("Backends restarted — the saved changes are live.");
-    return finish("completed", true);
-  } catch {
-    // An unexpected failure still leaves its record; the apply's
-    // contract to its callers (a boolean) is unchanged.
-    for (const item of items) {
-      if (item.outcome === "skipped" && item.detail?.startsWith("Not attempted")) {
-        item.detail = "Not attempted — the apply errored out";
-      }
-    }
-    return finish("failed", false);
+    r = await activationApply(mode, "desktop");
+  } finally {
+    unsubscribe();
   }
+  void serviceStore.refresh();
+  if (r.data.busy) {
+    setStatus(r.error ?? "Another activation apply is already running — wait for it to finish.", true);
+    return false;
+  }
+  const ok = r.data.ok;
+  const message = r.data.message
+    || (ok ? "Activation plan applied — the saved changes are live." : `Activation apply failed${r.error ? `: ${r.error}` : "."}`);
+  setStatus(message, !ok);
+  if (r.data.manual_command) setManual?.(r.data.manual_command);
+  return ok;
 }
 
 /** Shared click handling for the plan card's buttons, used by the
@@ -1350,10 +1246,10 @@ export async function wireActivationPlan(root: HTMLElement): Promise<() => void>
     if (!detail) {
       return `<div style="font-size:12px;color:var(--err);margin-top:6px">${esc(execDetailErrors.get(id) ?? "Execution detail unavailable")}</div>`;
     }
-    const modeLabel = detail.mode === "quiesce" ? "Drain and apply"
-      : detail.mode === "restart" ? "Apply now"
+    const modeLabel = detail.mode === "quiesce" || detail.mode === "drain" ? "Drain and apply"
+      : detail.mode === "restart" || detail.mode === "now" ? "Apply now"
       : detail.mode === "start" ? "Apply plan" : (detail.mode ?? "");
-    const meta = `<div style="font-size:12px;color:var(--text2);margin-top:6px">Mode: <b style="color:var(--text)">${esc(modeLabel)}</b> · Source: <b style="color:var(--text)">${esc(detail.source)}</b> · Gateway: <b style="color:var(--text)">${detail.gateway_up ? "running" : "stopped"}</b>${detail.drift ? ` · Gateway config: <b style="color:var(--text)">drifted</b>` : ""}</div>`;
+    const meta = `<div style="font-size:12px;color:var(--text2);margin-top:6px">Mode: <b style="color:var(--text)">${esc(modeLabel)}</b> · Source: <b style="color:var(--text)">${esc(detail.source)}</b> · Gateway: ${lifecycleChip(detail.gateway_up ? "running" : "stopped", "The gateway's state when this apply started")}${detail.drift ? ` · Gateway config: <b style="color:var(--text)">drifted</b>` : ""}</div>`;
     if (!detail.items.length) {
       return `${meta}<div style="font-size:12px;color:var(--text2);margin-top:6px">No plan changes — the apply addressed gateway drift only.</div>`;
     }
@@ -1424,7 +1320,11 @@ export async function wireActivationPlan(root: HTMLElement): Promise<() => void>
     // Drift arrives as a synthesized gateway_drift change item
     // (tracker #57), so a drift-only plan lists it in the table
     // like any journal change.
-    const gwChip = `<span class="chip status-tag ${p.gateway_up ? "status-on" : "status-bad"}">Gateway: ${p.gateway_up ? "running" : "stopped"}</span>`;
+    // The gateway's live lifecycle state from the shared store (a
+    // restart reads "restarting…", never "stopped"); the plan's own
+    // probe is the fallback before the store's first snapshot.
+    const gwState: LifecycleState = serviceStore.gatewayState() ?? (p.gateway_up ? "running" : "stopped");
+    const gwChip = `<span style="font-size:12px;color:var(--text2);font-weight:400">Gateway:</span> ${lifecycleChip(gwState, { transition: serviceStore.transitionOf("gateway", serviceStore.get().gateway?.transition ?? null) })}`;
     const driftChip = p.drift
       ? ` <span class="chip status-tag status-transition" title="The saved gateway configuration differs from the running one (drift).">Drift</span>`
       : "";
@@ -1503,9 +1403,24 @@ export async function wireActivationPlan(root: HTMLElement): Promise<() => void>
   root.addEventListener("click", onClick);
   timer = window.setInterval(() => { void load(); }, 10000);
   await load();
+  // Gateway lifecycle and apply progress come from the shared store:
+  // repaint when the gateway state or the server-side apply changes
+  // (an apply started on another surface disables Apply here too),
+  // and reload the plan when an apply finishes.
+  let lcSig = "";
+  let wasApplying = false;
+  const unsubscribe = serviceStore.subscribe((snap) => {
+    if (disposed) return;
+    const applying = Boolean(snap.gateway?.activation_applying);
+    const sig = `${serviceStore.gatewayState() ?? ""}|${snap.gateway?.activation_applying?.message ?? ""}`;
+    if (wasApplying && !applying) void load();
+    wasApplying = applying;
+    if (sig !== lcSig) { lcSig = sig; paint(); }
+  });
 
   return () => {
     disposed = true;
+    unsubscribe();
     if (timer !== null) window.clearInterval(timer);
     root.removeEventListener("click", onClick);
   };
@@ -2259,16 +2174,6 @@ export interface PlaceCardState {
   busy: boolean;
 }
 
-/** Color class for a backend state tag: green while running, red
- *  when stopped or failed, amber while changing state, grey for
- *  any other state. */
-function stateTagClass(state: string): string {
-  if (state === "running") return "status-on";
-  if (state === "stopped" || state === "failed") return "status-bad";
-  if (state === "starting" || state === "stopping") return "status-transition";
-  return "status-off";
-}
-
 function backendCard(
   b: BackendRow,
   openArgv: Set<string>,
@@ -2290,21 +2195,37 @@ function backendCard(
   confirmOverride: Set<string>,
   armedWddmStart: Set<string>,
 ): string {
-  const active = b.state === "running" || b.state === "starting";
-  // Buttons render disabled while this card's action is in flight.
-  // The set lives outside the repainted DOM, so the disabled state
-  // survives the repaints a poll or a log-tail fetch triggers.
+  // The row's state is the EFFECTIVE lifecycle state (wire state
+  // with the shared store's pending overlay, normalized by the
+  // view's load): a restart from any surface reads "restarting…".
+  const st: LifecycleState = fromWire(b.lifecycle ?? b.state);
+  const active = META[st].isLive || META[st].isTransition;
+  // Buttons render disabled while this card's (non-lifecycle) action
+  // is in flight. The set lives outside the repainted DOM, so the
+  // disabled state survives the repaints a poll or a log-tail fetch
+  // triggers. Lifecycle buttons follow the shared rule instead
+  // (lifecycleActions: disabled with the reason mid-transition).
   const dis = inFlight.has(b.id) ? " disabled" : "";
-  const stopBtn = `<button class="btn" data-back-act="stop" data-back-id="${esc(b.id)}"${dis}>${icon("pause")} Stop</button>`;
-  const restartBtn = `<button class="btn${b.fit?.state === "wddm_paged" && armedWddmStart.has(b.id) ? " armed" : ""}" data-back-act="restart" data-back-id="${esc(b.id)}"${dis}>${icon("restart")} Restart</button>`;
+  const applyBlocked = applyBlockedReason({ kind: "backend", id: b.id });
+  const lcSpecs = lifecycleActions(st, {
+    kind: "backend", enabled: b.enabled, configured: b.configured,
+    ...(applyBlocked ? { blockedReason: applyBlocked } : {}),
+  });
+  const lcSpec = (a: "start" | "stop" | "restart") => lcSpecs.find((x) => x.action === a);
+  const lcAttrs = (a: "start" | "stop" | "restart"): string => {
+    const sp = lcSpec(a);
+    return `${inFlight.has(b.id) || sp?.disabled ? " disabled" : ""}${sp?.reason ? ` title="${esc(sp.reason)}"` : ""}`;
+  };
+  const stopBtn = `<button class="btn" data-back-act="stop" data-back-id="${esc(b.id)}"${lcAttrs("stop")}>${icon("pause")} Stop</button>`;
+  const restartBtn = `<button class="btn${b.fit?.state === "wddm_paged" && armedWddmStart.has(b.id) ? " armed" : ""}" data-back-act="restart" data-back-id="${esc(b.id)}"${lcAttrs("restart")}>${icon("restart")} Restart</button>`;
   // A WDDM paged fit starts only through the two-click confirm
   // (the delete-confirm idiom): the first click arms the button,
   // the second starts with the overcommit flag. The armed label
   // states the paged amount and nothing else.
   const wddmPaged = b.fit?.state === "wddm_paged";
   const startBtn = wddmPaged
-    ? `<button class="btn${armedWddmStart.has(b.id) ? " armed" : ""}" data-back-act="start" data-back-id="${esc(b.id)}" title="${armedWddmStart.has(b.id) ? "Confirm start with paging" : "Start (pages to system RAM)"}"${dis}>${icon("play")} ${armedWddmStart.has(b.id) ? `Start — ${fmtGb((b.fit?.paged_mib ?? 0) / 1024)} GiB paged` : "Start"}</button>`
-    : `<button class="btn" data-back-act="start" data-back-id="${esc(b.id)}"${dis}>${icon("play")} Start</button>`;
+    ? `<button class="btn${armedWddmStart.has(b.id) ? " armed" : ""}" data-back-act="start" data-back-id="${esc(b.id)}" title="${armedWddmStart.has(b.id) ? "Confirm start with paging" : "Start (pages to system RAM)"}"${inFlight.has(b.id) || lcSpec("start")?.disabled ? " disabled" : ""}>${icon("play")} ${armedWddmStart.has(b.id) ? `Start — ${fmtGb((b.fit?.paged_mib ?? 0) / 1024)} GiB paged` : "Start"}</button>`
+    : `<button class="btn" data-back-act="start" data-back-id="${esc(b.id)}"${lcAttrs("start")}>${icon("play")} Start</button>`;
   const testBtn = `<button class="btn icon-only" data-back-act="test" data-back-id="${esc(b.id)}" title="Test backend" aria-label="Test ${esc(b.id)}"${dis}>${icon("bolt")}</button>`;
   // The tool-call probe (MCP design §7.2) and the go-to-logs link
   // (tracker #47) are NOT card-face buttons: the wrench read as an
@@ -2320,7 +2241,7 @@ function backendCard(
   // is stopped, not disabled). The data-back-act flips with the
   // state, so the delegated handler fires the same
   // applyBackendConfig call the two buttons fired.
-  const toggleable = !b.enabled || b.state === "stopped" || b.state === "failed";
+  const toggleable = !b.enabled || st === "stopped" || st === "failed";
   const enableSw = enableSwitch({
     on: b.enabled,
     name: `Backend ${b.id}`,
@@ -2329,24 +2250,28 @@ function backendCard(
     disabled: inFlight.has(b.id) || !toggleable,
   });
   const removeBtn = `<button class="btn icon-only danger${confirmRemove.has(b.id) ? " armed" : ""}" data-back-act="remove" data-back-id="${esc(b.id)}" title="${confirmRemove.has(b.id) ? "Confirm remove" : "Remove backend"}" aria-label="${confirmRemove.has(b.id) ? "Confirm remove" : "Remove"} ${esc(b.id)}"${dis}>${icon("trash")}</button>`;
-  // Offer only what the command layer will accept:
-  // - Stop whenever a live process exists (pid present, running or
-  //   starting), whether the backend is configured, enabled, or an
-  //   orphan — stopping is always allowed.
-  // - Start/Restart only for configured, enabled backends; no Start
-  //   while a stop is still draining ("stopping").
+  // The shared lifecycle rule (lifecycleActions) decides Start /
+  // Stop / Restart and their disabled reasons — the same rule as the
+  // Dashboard cards and Settings > Supervision:
+  // - Stop while live or in transition, whether the backend is
+  //   configured, enabled, or an orphan — stopping is always allowed
+  //   (disabled mid-restart/stop with the reason).
+  // - Restart for configured live backends (disabled with the reason
+  //   when the backend is disabled — the shared rule).
+  // - Start for stopped/failed configured backends (disabled with the
+  //   reason when the backend is disabled).
   // - The enable/disable switch shows on every configured backend;
   //   it is toggleable only in the states listed for it above.
   // - Test only while running.
   const parts: string[] = [];
-  if (b.pid !== null && active) parts.push(stopBtn);
-  if (b.configured && b.enabled && active) parts.push(restartBtn);
-  if (b.configured && b.enabled && !active && b.state !== "stopping") parts.push(startBtn);
+  if (lcSpec("stop")) parts.push(stopBtn);
+  if (b.configured && lcSpec("restart") && !lcSpec("start")) parts.push(restartBtn);
+  if (b.configured && lcSpec("start")) parts.push(startBtn);
   if (b.configured) parts.push(enableSw);
-  if (b.state === "running") parts.push(testBtn);
+  if (st === "running") parts.push(testBtn);
   // Removal is refused by the command layer while running; offer it
   // only for configured backends with no live process.
-  if (b.configured && !active && b.state !== "stopping") parts.push(removeBtn);
+  if (b.configured && !active) parts.push(removeBtn);
   const actions = parts.join("\n        ");
   // Advanced, infrequently used options live behind one hamburger
   // menu so the card's primary action row stays within the card.
@@ -2983,18 +2908,19 @@ function backendCard(
   // state only: it names the cause (e.g. the device-unavailable
   // fail-fast verdict) the state chip cannot. Principle 9 form —
   // a noun label and the value, no sentence.
-  const failureHtml = b.state === "failed" && b.failure_reason
+  const failureHtml = st === "failed" && b.failure_reason
     ? `<div style="font-size:12px;color:var(--err);margin-top:6px">Failure: ${esc(b.failure_reason)}</div>`
     : "";
   const detailsBtn = `<button class="btn icon-only" data-back-act="details" data-back-id="${esc(b.id)}" aria-expanded="${detailsOpen}" title="Details" aria-label="Details">${icon(detailsOpen ? "chevD" : "chevR")}</button>`;
   return `<div class="card backend-card" id="card-backend-${esc(b.id)}">
-      <h3 class="backend-card-head">${stateDot(b.state)} ${esc(b.id)} <span class="port">:${b.port}</span>
+      <h3 class="backend-card-head">${lifecycleDot(st)} ${esc(b.id)} <span class="port">:${b.port}</span>
         <span class="spacer" style="flex:1"></span>
         ${b.configured ? "" : `<span class="chip status-tag status-off" title="${esc(orphanText)}">not in config</span>`}
         ${b.configured ? `<span class="chip status-tag ${b.enabled ? "status-on" : "status-off"}">${b.enabled ? "enabled" : "disabled"}</span>` : ""}
         ${b.adopted ? `<span class="chip status-tag status-on" title="${esc(adoptedText)}">adopted</span>` : ""}
         ${b.flags_advanced ? `<span class="chip status-tag" title="Advanced flags mode: this backend's launch flags are edited as raw text in the Flags panel, and the structured flags form is disabled for it.">advanced flags</span>` : ""}
-        <span class="chip status-tag ${stateTagClass(b.state)}">${esc(b.state)}</span></h3>
+        ${b.service_managed ? `<span class="chip status-tag status-off" title="Runs as a Windows service (SCM)">service</span>` : ""}
+        ${lifecycleChip(st, { transition: b.transition ?? null, failure: b.failure_reason ?? null, detail: b.pid !== null ? `pid ${b.pid}` : undefined })}</h3>
       ${failureHtml}
       ${stripHtml}
       ${fitHtml}
@@ -3030,10 +2956,7 @@ export function renderBackends(): string {
     <label style="font-size:12px;color:var(--text2)">State
       <select id="backStateSel" style="${SELECT_STYLE}">
         <option value="all">All</option>
-        <option value="running">Running</option>
-        <option value="stopped">Stopped</option>
-        <option value="failed">Failed</option>
-        <option value="starting">Starting</option>
+        ${LIFECYCLE_STATES.filter((s) => s !== "not_installed").map((s) => `<option value="${s}">${esc(META[s].label.charAt(0).toUpperCase() + META[s].label.slice(1))}</option>`).join("")}
       </select></label>
     <input id="backFilter" type="text" placeholder="Filter by name, group, or model file" style="background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:5px 8px;font-size:12px;min-width:200px">
   </div>
@@ -3117,10 +3040,21 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     const host = root.querySelector("#backPlan");
     if (host) host.innerHTML = activationPlanHtml(lastPlan, planUi, "summary");
   };
-  let actionInFlight = false;
   let disposed = false;
   /** Load sequence: only the most recently started load may paint. */
   let loadSeq = 0;
+  /** The rows as the server last reported them (list_backends, or a
+   *  fresher shared-store snapshot). `lastRows` is these rows with
+   *  the effective lifecycle state applied (the store's pending
+   *  overlay), so every card, chip, filter and button rule reads one
+   *  state — a restart started on any surface shows "restarting…". */
+  let wireRows: BackendRow[] = [];
+  const effRow = (row: BackendRow): BackendRow => {
+    const st = serviceStore.backendState(row);
+    return { ...row, state: st, lifecycle: st, transition: serviceStore.transitionOf(`backend:${row.id}`, row.transition ?? null) };
+  };
+  const lcSignature = (rows: BackendRow[]): string =>
+    rows.map((r) => `${r.id}:${r.state}:${r.transition?.kind ?? ""}:${r.transition?.origin ?? ""}`).join("|");
 
   const paint = (): void => {
     const b = root.querySelector("#backBody");
@@ -3151,11 +3085,11 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
           const gpuTxt = resident.length ? resident.map((r) => `GPU ${r.gpu}`).join(", ")
             : res.some((r) => r.mib !== null) ? "context only"
             : res.length ? "not measured" : "\u2014";
-          const btn = row.state === "running" ? ovStatusBtn("ok", "check", `card-backend-${row.id}`, `${row.id}: running — go to card`)
-            : row.state === "failed" ? ovStatusBtn("err", "err", `card-backend-${row.id}`, `${row.id}: failed — go to card`)
-            : row.state === "starting" || row.state === "stopping" ? ovStatusBtn("warn", "clock", `card-backend-${row.id}`, `${row.id}: ${row.state} — go to card`)
-            : ovStatusBtn("idle", "pause", `card-backend-${row.id}`, `${row.id}: ${row.state} — go to card`);
-          return `<div class="ov-row">${btn}<span class="ov-name">${esc(row.id)}</span><span class="ov-dim">${esc(row.state)}</span><span class="ov-dim">${esc(row.group ?? "ungrouped")}</span><span class="ov-dim">${row.port}</span><span class="ov-dim">${esc(gpuTxt)}</span><span class="ov-dim">${row.requests_1h !== undefined ? fmtCount(row.requests_1h) : "\u2014"}</span><span class="ov-dim">${row.errors_1h !== undefined ? fmtCount(row.errors_1h) : "\u2014"}</span></div>`;
+          const rst = fromWire(row.lifecycle ?? row.state);
+          const rlabel = lifecycleLabel(rst, row.transition ?? null);
+          const rdot = META[rst].dot;
+          const btn = ovStatusBtn(rdot, rdot === "ok" ? "check" : rdot === "err" ? "err" : META[rst].isTransition || rst === "degraded" ? "clock" : "pause", `card-backend-${row.id}`, `${row.id}: ${rlabel} — go to card`);
+          return `<div class="ov-row">${btn}<span class="ov-name">${esc(row.id)}</span><span class="ov-dim">${esc(rlabel)}</span><span class="ov-dim">${esc(row.group ?? "ungrouped")}</span><span class="ov-dim">${row.port}</span><span class="ov-dim">${esc(gpuTxt)}</span><span class="ov-dim">${row.requests_1h !== undefined ? fmtCount(row.requests_1h) : "\u2014"}</span><span class="ov-dim">${row.errors_1h !== undefined ? fmtCount(row.errors_1h) : "\u2014"}</span></div>`;
         }).join("")}</div>` : "";
     }
     const f = backFilter.trim().toLowerCase();
@@ -3286,8 +3220,12 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         : "No backend data in sample mode.");
       return;
     }
-    const prevStates = new Map(lastRows.map((row) => [row.id, row.state]));
-    lastRows = r.data;
+    // Note/arming lifetimes key to the SERVER state (not the local
+    // pending overlay), so a lifecycle action's own overlay does not
+    // clear the note it produces.
+    const prevStates = new Map(wireRows.map((row) => [row.id, fromWire(row.lifecycle ?? row.state)]));
+    wireRows = r.data;
+    lastRows = wireRows.map(effRow);
     // Bench adoption path (Bench design §5.2): an arm detail's
     // "Open in backend editor" sets this key before navigating
     // here; open that backend's flags form once, prefilled from
@@ -3304,7 +3242,8 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       // A note belongs to the state it was produced in; when the
       // backend's state changes, the stale note goes away.
       const prev = prevStates.get(row.id);
-      if (prev !== undefined && prev !== row.state) { msgs.delete(row.id); confirmRemove.delete(row.id); confirmOverride.delete(row.id); armedWddmStart.delete(row.id); }
+      const wireNow = fromWire(wireRows.find((w) => w.id === row.id)?.lifecycle ?? row.state);
+      if (prev !== undefined && prev !== wireNow) { msgs.delete(row.id); confirmRemove.delete(row.id); confirmOverride.delete(row.id); armedWddmStart.delete(row.id); }
       // A config change that ends the paged fit disarms the
       // confirmation with it.
       if (row.fit?.state !== "wddm_paged") armedWddmStart.delete(row.id);
@@ -5005,7 +4944,6 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       if (!argvCache.has(id)) {
         // Only successful fetches are cached (per mount); a failure is
         // shown in the message area and the next toggle retries.
-        actionInFlight = true;
         inFlight.add(id);
         paint();
         try {
@@ -5014,7 +4952,6 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
           if (r.error) msgs.set(id, { text: `Launch command failed: ${r.error}`, err: true });
           else argvCache.set(id, r.data.argv);
         } finally {
-          actionInFlight = false;
           inFlight.delete(id);
         }
         if (!argvCache.has(id)) { paint(); return; } // fetch failed: show the note, stay closed
@@ -5024,8 +4961,34 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       return;
     }
 
+    if (act === "start" || act === "restart" || act === "stop") {
+      // Lifecycle actions run through the shared runner: the store's
+      // pending overlay shows the transition on this card and on every
+      // other surface at once, polling continues meanwhile (the server
+      // reports the transition with its origin), and the result lands
+      // in the card note.
+      const row = lastRows.find((r) => r.id === id);
+      if (act !== "stop" && row?.fit?.state === "wddm_paged" && !armedWddmStart.has(id)) {
+        // WDDM paged fits start only through the two-click confirm:
+        // the first click arms and states the paged amount; the
+        // second click carries the confirmation to the gate.
+        armedWddmStart.add(id);
+        msgs.set(id, { text: `${fmtGb(row.fit.paged_mib / 1024)} GiB will page to system RAM. Click ${act === "start" ? "Start" : "Restart"} again to confirm.`, err: false });
+        paint();
+        return;
+      }
+      const allow = (act !== "stop" && armedWddmStart.has(id)) || undefined;
+      armedWddmStart.delete(id);
+      msgs.delete(id);
+      const r = await runLifecycle({ kind: "backend", id }, act, { origin: "ui", allowWddmOvercommit: allow });
+      if (disposed) return;
+      if (!r.ok) msgs.set(id, { text: r.message, err: true });
+      else msgs.delete(id);
+      await load();
+      return;
+    }
+
     inFlight.add(id);
-    actionInFlight = true;
     paint();
     try {
       if (act === "enable" || act === "disable") {
@@ -5077,34 +5040,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
         paint();
         return;
       }
-      if (act === "start" || act === "restart") {
-        // WDDM paged fits start only through the two-click
-        // confirm: the first click arms and states the paged
-        // amount; the second click carries the confirmation to
-        // the gate. Any other fit starts directly.
-        const row = lastRows.find((r) => r.id === id);
-        if (row?.fit?.state === "wddm_paged" && !armedWddmStart.has(id)) {
-          armedWddmStart.add(id);
-          msgs.set(id, { text: `${fmtGb(row.fit.paged_mib / 1024)} GiB will page to system RAM. Click ${act === "start" ? "Start" : "Restart"} again to confirm.`, err: false });
-          paint();
-          return;
-        }
-        const allow = armedWddmStart.has(id) || undefined;
-        armedWddmStart.delete(id);
-        const r = act === "start" ? await startBackend(id, allow) : await restartBackend(id, allow);
-        if (r.error) msgs.set(id, { text: `${act} failed: ${r.error}`, err: true });
-        else msgs.delete(id);
-        await load();
-        return;
-      }
-      const fn = act === "stop" ? stopBackend : null;
-      if (!fn) return;
-      const r = await fn(id);
-      if (r.error) msgs.set(id, { text: `${act} failed: ${r.error}`, err: true });
-      else msgs.delete(id);
-      await load();
     } finally {
-      actionInFlight = false;
       inFlight.delete(id);
       if (!disposed) paint();
     }
@@ -5121,14 +5057,35 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
 
   await load();
 
-  // Keep process state fresh (a backend can die outside this view); skip
-  // a tick while an action request is in flight.
+  // Keep the view's data fresh (a backend can die outside this view).
+  // Polling continues during lifecycle actions: the shared store's
+  // pending overlay and the server's own transition keep the cards
+  // truthful meanwhile (UI-5).
   const timer = window.setInterval(() => {
-    if (!actionInFlight && !disposed) void load();
+    if (!disposed) void load();
   }, 5000);
+  // Lifecycle state between loads comes from the shared store (fast
+  // while anything is in transition, immediate on the backend's
+  // lifecycle events): fold its rows' state into the wire rows and
+  // repaint only when an effective state actually changed.
+  const unsubscribeStore = serviceStore.subscribe((snap: ServiceSnapshot) => {
+    if (disposed || !wireRows.length) return;
+    const fresh = new Map(snap.backends.map((r) => [r.id, r]));
+    wireRows = wireRows.map((r) => {
+      const f = fresh.get(r.id);
+      return f ? { ...r, state: f.state, lifecycle: f.lifecycle, transition: f.transition ?? null, pid: f.pid, failure_reason: f.failure_reason } : r;
+    });
+    const next = wireRows.map(effRow);
+    if (lcSignature(next) === lcSignature(lastRows)) return;
+    lastRows = next;
+    const sliderFocused = (document.activeElement as HTMLElement | null)?.hasAttribute?.("data-offload-slider");
+    const rawFocused = (document.activeElement as HTMLElement | null)?.hasAttribute?.("data-flags-raw");
+    if (!sliderFocused && !rawFocused) paint();
+  });
 
   return () => {
     disposed = true;
+    unsubscribeStore();
     window.clearInterval(timer);
     stopPredictTicker();
     root.removeEventListener("click", onClick);
@@ -6406,7 +6363,11 @@ function fmtDateTime(ts: string): string {
 function logRow(r: LogRow, showSource: boolean): string {
   const src = showSource && r.source ? ` <span class="chip">${esc(r.source)}</span>` : "";
   const arch = r.archived ? ` <span class="chip badge-warn">previous run</span>` : "";
-  return `<div class="ln"><span class="t" title="${esc(fmtDateTime(r.ts))}">${esc(fmtTime(r.ts))}</span>${src} <span class="chip">${esc(r.stream)}</span>${arch} ${esc(r.line)}</div>`;
+  // Lifecycle markers ("[lifecycle] … restarting (origin: …)") are
+  // what every service's own log scope records for start / stop /
+  // restart / exit — styled so they stand out in a busy stream.
+  const lc = r.line.includes("[lifecycle]") ? " log-lifecycle" : "";
+  return `<div class="ln${lc}"><span class="t" title="${esc(fmtDateTime(r.ts))}">${esc(fmtTime(r.ts))}</span>${src} <span class="chip">${esc(r.stream)}</span>${arch} ${esc(r.line)}</div>`;
 }
 
 export function renderLogs(): string {
@@ -7007,6 +6968,72 @@ interface RuleFormState {
   advisory: boolean;
 }
 
+/** The freshest gateway status: the shared store's snapshot when it
+ *  has one (it polls fast during transitions and refreshes on the
+ *  backend's lifecycle events), else the view's own load. */
+function freshGatewayStatus(status: GatewayStatusData): GatewayStatusData {
+  return serviceStore.get().gateway ?? status;
+}
+
+/** The gateway's effective lifecycle state and transition (the store's
+ *  pending overlay applied: a Restart click reads "restarting…" at
+ *  once, and a restart from any other surface reads the same). */
+function gatewayLc(status: GatewayStatusData): { state: LifecycleState; transition: GatewayStatusData["transition"] } {
+  const g = freshGatewayStatus(status);
+  return {
+    state: serviceStore.effective("gateway", g.state),
+    transition: serviceStore.transitionOf("gateway", g.transition),
+  };
+}
+
+/** The Gateway view's summary title: lifecycle dot + label (with the
+ *  transition's origin and age), plus a "service" chip when the
+ *  gateway runs as a Windows service. */
+function gatewayLcTitleHtml(status: GatewayStatusData): string {
+  const g = freshGatewayStatus(status);
+  const { state, transition } = gatewayLc(status);
+  const fail = state === "failed" && g.failure ? ` title="${esc(g.failure.reason)}"` : "";
+  return `${lifecycleDot(state)} <span${fail}>Gateway \u2014 LiteLLM \u00b7 ${esc(lifecycleLabel(state, transition))}</span>`
+    + (g.service_managed ? ` <span class="chip status-tag status-off" title="The gateway runs as a Windows service (SCM)">service</span>` : "")
+    + (g.pid !== null && META[state].isLive ? ` <span style="font-size:11px;color:var(--text3);font-weight:400">pid ${g.pid}</span>` : "");
+}
+
+/** Start / Stop / Restart for the gateway, from the shared rule. */
+function gatewayLcActionsHtml(status: GatewayStatusData): string {
+  const { state } = gatewayLc(status);
+  return renderLifecycleActions({ kind: "gateway" }, state, {}, {
+    labels: { start: "Start gateway", stop: "Stop gateway", restart: "Restart gateway" },
+  });
+}
+
+/** The app-managed PostgreSQL sub-row under the gateway title: its
+ *  lifecycle chip, pid and port, a port-mismatch warning (the next
+ *  gateway start restarts it on the configured port), and "Stop
+ *  database" — enabled only while the gateway is stopped, since the
+ *  gateway uses the database. PostgreSQL starts with the gateway. */
+function gatewayPgRowHtml(status: GatewayStatusData): string {
+  const pg = freshGatewayStatus(status).postgres;
+  if (!pg) return "";
+  if (!pg.installed && pg.state === "not_installed") {
+    return `<div style="font-size:12px;color:var(--text2);margin:-4px 0 10px">PostgreSQL: not installed<span class="info-tip" title="The LiteLLM admin UI needs a database — run the setup wizard's Install PostgreSQL step.">${icon("info")}</span></div>`;
+  }
+  const ps = serviceStore.effective("postgres", pg.state);
+  const pt = serviceStore.transitionOf("postgres", pg.transition);
+  const gs = gatewayLc(status).state;
+  const gatewayDown = gs === "stopped" || gs === "failed" || gs === "unknown" || gs === "not_installed";
+  const parts = [
+    pg.pid !== null && META[ps].isLive ? `pid ${pg.pid}` : "",
+    pg.port !== null ? `port ${pg.port}` : "",
+  ].filter(Boolean).join(" \u00b7 ");
+  const mismatch = pg.port_mismatch
+    ? ` <span style="color:var(--warn)" title="The running server listens on a different port than configured. The next gateway start restarts PostgreSQL on the configured port.">${icon("warn")} port differs from the configuration</span>`
+    : "";
+  const stopBtn = renderLifecycleActions({ kind: "postgres" }, ps, {
+    blockedReason: gatewayDown ? undefined : "Stop the gateway first — it uses the database",
+  }, { className: "btn", labels: { stop: "Stop database" } });
+  return `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--text2);margin:-4px 0 10px">PostgreSQL ${lifecycleChip(ps, { transition: pt })}${parts ? ` <span>${esc(parts)}</span>` : ""}${mismatch}<span class="spacer" style="flex:1"></span>${stopBtn}</div>`;
+}
+
 function gatewayPaint(
   status: GatewayStatusData,
   cfg: GatewayConfigData,
@@ -7015,8 +7042,6 @@ function gatewayPaint(
   yamlOpen: boolean,
   yamlText: string | null,
   yamlErr: string,
-  starting: boolean,
-  stopping: boolean,
   backendsError: string | null,
   masterKey: string | null,
   keyRevealed: boolean,
@@ -7116,7 +7141,8 @@ function gatewayPaint(
       </div>`;
       })()
     : "";
-  const summary = `<div class="card" style="margin-bottom:12px"><div class="sec-title">${dot(status.up ? "ok" : "err")} Gateway \u2014 LiteLLM \u00b7 ${status.up ? "up" : "down"}</div>
+  const summary = `<div class="card" style="margin-bottom:12px"><div class="sec-title" id="gwLcTitle">${gatewayLcTitleHtml(status)}</div>
+    <div id="gwPgRow">${gatewayPgRowHtml(status)}</div>
     <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px">
       ${([["Port", String(port)], ["Groups", fmtCount(status.groups), "Enabled groups — a group counts when at least one of its member backends is enabled; the gateway serves enabled groups only."], ["Routing rules", fmtCount(status.routing_rules)], ["Routing test traces", fmtCount(status.routing_log_len), "Routing test traces are dry-run decisions recorded from routing tests this session — live requests are not logged."], ["LiteLLM", status.litellm_version ?? "not measured", "The LiteLLM version the start-gateway step probed in the gateway venv at the last spawn (MCP design §4.3). Not measured until a spawn records one."]] as [string, string, string?][])
 
@@ -7137,8 +7163,7 @@ function gatewayPaint(
   // connect to") — the row renders directly under the summary card
   // instead (client-endpoint audit Q7). Ids and handlers unchanged.
   const gwActions = `<div class="card-actions" style="margin:0 0 12px">
-      <button class="btn" id="gwStartBtn"${starting || stopping ? " disabled" : ""}>${icon("restart")} ${status.up ? "Restart gateway" : "Start gateway"}</button><span class="info-tip" title="Runs the Setup Wizard's start-gateway step: LiteLLM binds the configured address, and the step reconciles the Windows firewall rule with it (one elevation prompt when the rule state changes). When the OpenRouter tier is enabled, the fallback is armed from Windows Credential Manager.">${icon("info")}</span>
-      <button class="btn" id="gwStopBtn"${status.up && !starting && !stopping ? "" : " disabled"}>${icon("pause")} Stop gateway</button>
+      <span id="gwLcActions" style="display:contents">${gatewayLcActionsHtml(status)}</span><span class="info-tip" title="Start runs the Setup Wizard's start-gateway step: LiteLLM binds the configured address, and the step reconciles the Windows firewall rule with it (one elevation prompt when the rule state changes). When the OpenRouter tier is enabled, the fallback is armed from Windows Credential Manager. Restart replaces the running gateway in one server-side operation (PostgreSQL keeps running unless its port changed); Stop stops the gateway only.">${icon("info")}</span>
       <a class="btn" href="#/wizard">${icon("wrench")} Setup Wizard</a>
       <button class="btn icon-only" id="gwAdminUiBtn" title="LiteLLM admin UI" aria-label="LiteLLM admin UI">${icon("gateway")}</button><span class="info-tip" title="Sign in as admin with the master key as the password. The admin UI requires a database — run the setup wizard's Install PostgreSQL step if sign-in reports &quot;Not connected to DB&quot;.">${icon("info")}</span>
       <a class="btn icon-only" href="#/logs?scope=gateway&follow=1" title="Logs" aria-label="Gateway logs">${icon("logs")}</a>
@@ -7502,11 +7527,11 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
   let yamlText: string | null = null;
   let yamlErr = "";
   let disposed = false;
-  let starting = false;
-  let stopping = false;
-  /** The probe's up state from the latest load (false when the probe
-   *  errored — the restart path keys its stop-first step to it). */
-  let lastUp = false;
+  /** The gateway status from the latest load: the lifecycle title,
+   *  actions and PostgreSQL row repaint in place from it (merged
+   *  with the shared store's fresher snapshot) without a full body
+   *  repaint. */
+  let lastStatus: GatewayStatusData | null = null;
   /** Last loaded config (the toggle handler patches against it). */
   let lastCfg: GatewayConfigData | null = null;
   /** Gateway port from the latest load (the admin UI link target). */
@@ -7586,10 +7611,10 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
       return;
     }
     lastCfg = cfg.data;
-    lastUp = st.data.up;
+    lastStatus = st.data;
     lastPort = st.data.port || cfg.data.port;
     lastLanIp = st.data.lan_ip ?? null;
-    b.innerHTML = gatewayPaint(st.data, cfg.data, backs.data, lastModels, yamlOpen, yamlText, yamlErr, starting, stopping, backs.error ?? null, masterKey, keyRevealed, lastPlan, planUi, routingTab, orModelsOpen, openFragments, ruleForm, confirmRuleDelete, ruleRawFlags, genTab, routingPyText);
+    b.innerHTML = gatewayPaint(st.data, cfg.data, backs.data, lastModels, yamlOpen, yamlText, yamlErr, backs.error ?? null, masterKey, keyRevealed, lastPlan, planUi, routingTab, orModelsOpen, openFragments, ruleForm, confirmRuleDelete, ruleRawFlags, genTab, routingPyText);
   };
 
   /** Fetch the generated config when a Copy/Download click needs
@@ -7901,79 +7926,6 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
       return;
     }
 
-    if (t.closest("#gwStopBtn")) {
-      if (stopping || starting) return;
-      stopping = true;
-      await load(); // repaint with both actions disabled
-      const r = await gatewayStop();
-      stopping = false;
-      if (disposed) return;
-      if (r.error) {
-        gwMsg(`Gateway stop failed: ${r.error}`, true);
-      } else {
-        gwMsg(r.data.stopped ? "Gateway stopped." : "Gateway was not running.");
-      }
-      await load();
-      return;
-    }
-
-    if (t.closest("#gwStartBtn")) {
-      if (starting || stopping) return;
-      starting = true;
-      // MCP credential prompt (Pete, 2026-10-18): Gateway MCP
-      // servers the start would omit for want of a credential are
-      // offered registration/storage first — before the stop, so
-      // cancelling leaves a running gateway untouched, and before
-      // the step, so a stored credential lands in this start's
-      // config.
-      const proceed = await promptForUnarmedMcpCredentials();
-      if (disposed) { starting = false; return; }
-      if (!proceed) {
-        starting = false;
-        gwMsg("Gateway start cancelled at the MCP credential prompt.");
-        await load();
-        return;
-      }
-      try {
-        // Restart is stop-then-start: the wizard step spawns a fresh
-        // LiteLLM, which cannot take the port while the old process
-        // holds it. If the stop fails, surface it and do not start.
-        if (lastUp) {
-          gwMsg("Stopping the running gateway, then running the start-gateway step\u2026");
-          await load();
-          const sr = await gatewayStop();
-          if (disposed) return;
-          if (sr.error) {
-            gwMsg(`Gateway restart failed \u2014 the running gateway could not be stopped: ${sr.error}`, true);
-            return;
-          }
-        } else {
-          gwMsg("Running the start-gateway step\u2026");
-          await load();
-        }
-        const r = await runWizardStep("start-gateway");
-        if (disposed) return;
-        if (r.error) {
-          gwMsg(`Gateway start failed: ${r.error}`, true);
-        } else if (r.data.busy || !r.data.outcome) {
-          gwMsg(wizardBusyMessage(r.data, "A setup step is already running \u2014 wait for it to finish, then start the gateway again."), true);
-        } else {
-          const o = r.data.outcome;
-          const tail = o.log_tail.length ? ` ${o.log_tail[o.log_tail.length - 1]}` : "";
-          // A successful (re)start makes any pending activation
-          // plan live; clear it promptly instead of waiting for the
-          // journal's mtime resolution.
-          if (o.state !== "failed") await activationComplete();
-          gwMsg(`Start-gateway step ${o.state} \u2014 ${o.message}${tail}`, o.state === "failed");
-          if (o.state === "failed" && o.manual_command) gwShowManual(o.manual_command);
-        }
-      } finally {
-        starting = false;
-        if (!disposed) await load();
-      }
-      return;
-    }
-
     if (t.closest("#gwOrToggle")) {
       const or = lastCfg?.openrouter;
       if (!or) return;
@@ -8092,6 +8044,32 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
 
   await load();
 
+  // Lifecycle buttons (gateway Start/Stop/Restart, PostgreSQL Stop)
+  // run through the shared runner: Restart is ONE server-side
+  // operation (no client-side stop, no client activationComplete —
+  // the server clears the plan), Stop stops the gateway only, and
+  // Start/Restart offer the MCP credential prompt first.
+  const unwireLc = wireLifecycleActions(root, (r: LifecycleResult) => {
+    if (disposed) return;
+    gwMsg(r.message, !r.ok && !r.cancelled);
+    if (r.manualCommand) gwShowManual(r.manualCommand);
+    void load();
+  }, { origin: "ui" });
+  // The lifecycle title, actions and PostgreSQL row repaint in place
+  // from the shared store (every restart, from any surface, reads
+  // "restarting…" here), without the full body repaint the hover
+  // rule below guards.
+  const paintLc = (): void => {
+    if (!lastStatus) return;
+    const t = root.querySelector("#gwLcTitle");
+    if (t) setHtml(t, gatewayLcTitleHtml(lastStatus));
+    const a = root.querySelector("#gwLcActions");
+    if (a) setHtml(a, gatewayLcActionsHtml(lastStatus));
+    const p = root.querySelector("#gwPgRow");
+    if (p) setHtml(p, gatewayPgRowHtml(lastStatus));
+  };
+  const unsubscribeStore = serviceStore.subscribe(() => { if (!disposed) paintLc(); });
+
   // Status poll: a gateway that dies while the view is open must show
   // as down without a manual refresh. The repaint replaces #gwBody's
   // innerHTML wholesale, which destroys the node under the pointer —
@@ -8102,11 +8080,13 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
   // user is reading it, so the periodic repaint waits for the next
   // cycle; click-driven loads are unaffected.
   const timer = window.setInterval(() => {
-    if (!disposed && !starting && !stopping && !root.querySelector("#gwBody:hover")) void load();
+    if (!disposed && !root.querySelector("#gwBody:hover")) void load();
   }, 5000);
 
   return () => {
     disposed = true;
+    unwireLc();
+    unsubscribeStore();
     window.clearInterval(timer);
     root.removeEventListener("click", onClick);
     root.removeEventListener("change", onBindChange);
@@ -8339,15 +8319,45 @@ function supervisionInner(svcR: { data: ServicesInfo; error?: string; live: bool
     { key: "Service host (llm-service-host.exe)", value: info.host_present ? info.host_path : `missing — expected at ${info.host_path}` },
   ];
   const svcRows = info.services.map((s) => {
-    const state = s.registered
-      ? (typeof s.state === "string" ? s.state : "unknown")
-      : "not registered";
+    // The shared lifecycle vocabulary (SCM state + exit code mapped
+    // server-side to `lifecycle`; fromScm otherwise), with the store's
+    // pending overlay, so a Start/Stop/Restart here — or anywhere —
+    // reads as the transition at once (UI-7, SCM-15, OS-13).
+    const target = serviceRowTarget(s);
+    const key = targetKey(target);
+    // The server routes a registered gateway/backend through the SCM
+    // only in service mode (the log receiver is always an SCM
+    // service). In process mode the registration's SCM state is not
+    // the target's state, and its Start/Stop would act on the process
+    // instead: show it labelled as the service's state, with no buttons.
+    const scmRouted = s.registered && (mode === "service" || target.kind === "log-receiver");
+    const pid = s.child_pid ?? s.pid;
+    let chip: string;
+    let lc = "";
+    if (scmRouted || !s.registered) {
+      const st = serviceStore.effective(key, serviceRowState(s));
+      const tr = serviceStore.transitionOf(key, s.transition ?? null);
+      chip = lifecycleChip(st, {
+        transition: tr,
+        failure: s.failure_reason ?? null,
+        detail: pid !== null && pid !== undefined && META[st].isLive ? `pid ${pid}` : undefined,
+      });
+      if (scmRouted) {
+        const row = target.kind === "backend" ? serviceStore.get().backends.find((b) => b.id === target.id) : undefined;
+        lc = renderLifecycleActions(target, st, row ? { enabled: row.enabled, configured: row.configured } : {});
+      }
+    } else {
+      const scmSt = serviceRowState(s);
+      chip = `<span style="color:var(--text3)" title="Process mode: the app runs this as a process; this is the registered Windows service's own state">service: ${esc(lifecycleLabel(scmSt))}</span>`;
+    }
+    const exit = s.exit_code ? ` <span style="color:var(--text3)" title="${esc(s.failure_reason ?? "The service-specific exit code of the last stop")}">exit ${s.exit_code}</span>` : "";
     const btn = s.registered
       ? `<button class="btn" data-svc-unregister="${esc(s.target)}">Unregister</button>`
       : `<button class="btn" data-svc-register="${esc(s.target)}" ${info.host_present ? "" : "disabled"}>Register</button>`;
+    const name = s.target === "gateway" ? "Gateway" : s.target === "log-receiver" ? "Log receiver" : s.target;
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px">
-      <span>${esc(s.target === "gateway" ? "Gateway" : s.target)} <span style="color:var(--text3)">${esc(s.service_name)}</span></span>
-      <span style="display:flex;align-items:center;gap:10px"><span>${esc(state)}</span>${btn}</span></div>`;
+      <span>${esc(name)} <span style="color:var(--text3)">${esc(s.service_name)}</span></span>
+      <span style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end">${chip}${exit}${lc}${btn}</span></div>`;
   }).join("");
   const anyUnregistered = info.services.some((s) => !s.registered);
   const regNote = anyUnregistered
@@ -8358,6 +8368,25 @@ function supervisionInner(svcR: { data: ServicesInfo; error?: string; live: bool
       `<button class="btn${mode === m ? " primary" : ""}" data-sup-mode="${m}">${m === "process" ? "Process" : "Service"}</button>`).join("")}</div>
     <div style="margin-top:10px">${svcRows}</div>
     ${regNote}`;
+}
+
+/** The lifecycle target a services_list row controls. */
+function serviceRowTarget(s: { target: string; kind?: string }): LifecycleTarget {
+  if (s.kind === "gateway" || s.target === "gateway") return { kind: "gateway" };
+  if (s.kind === "log-receiver" || s.target === "log-receiver") return { kind: "log-receiver" };
+  return { kind: "backend", id: s.target };
+}
+
+/** A signature of the Supervision tab's lifecycle-relevant state, so
+ *  a store refresh repaints it only when something changed. */
+function supervisionSignature(snap: ServiceSnapshot): string {
+  const rows = (snap.services?.services ?? []).map((s) => {
+    const key = targetKey(serviceRowTarget(s));
+    return `${key}:${s.registered}:${serviceStore.effective(key, serviceRowState(s))}:${s.transition?.kind ?? ""}:${s.exit_code ?? ""}:${s.pid ?? ""}`;
+  });
+  const lr = snap.logReceiver;
+  const lrSig = lr ? `${lr.registered}:${serviceStore.effective("log-receiver", logReceiverState(lr))}:${lr.exit_code ?? ""}:${lr.ingest_ok ?? ""}` : "";
+  return `${rows.join("|")}#${lrSig}`;
 }
 
 /** What one log-streaming source state means, in the card's words.
@@ -8456,11 +8485,19 @@ function logReceiverInner(
     <div style="font-size:12px;color:var(--text2)">Log receiver deployment is available in the installed app.</div>`;
   }
   const info = lrR.data;
-  const state = info.registered
-    ? (typeof info.state === "string" ? info.state : "registered")
-    : "not deployed";
+  // The receiver's lifecycle state (SCM state + exit code, downgraded
+  // to "not responding" when the ingest port refuses connections),
+  // with the shared chip and Start/Stop/Restart (OS-12).
+  const lst = serviceStore.effective("log-receiver", logReceiverState(info));
+  const ltr = serviceStore.transitionOf("log-receiver", info.transition ?? null);
+  const ingestNote = info.ingest_port !== undefined
+    ? `Ingest port ${info.ingest_port}${info.ingest_ok === false ? " refuses connections" : info.ingest_ok ? " accepting" : ""}`
+    : undefined;
+  const lrState = info.registered
+    ? `<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px;margin:6px 0">${esc(info.service_name)} ${lifecycleChip(lst, { transition: ltr, failure: info.failure_reason ?? null, detail: ingestNote })}${info.exit_code ? ` <span style="color:var(--text3)">exit ${info.exit_code}</span>` : ""}${info.failure_reason && lst === "failed" ? ` <span style="color:var(--err)">${esc(info.failure_reason)}</span>` : ""}<span class="spacer" style="flex:1"></span>${renderLifecycleActions({ kind: "log-receiver" }, lst)}</div>`
+    : "";
   const rows: SettingsRow[] = [
-    { key: "Service", value: `${info.service_name} · ${state}` },
+    { key: "Service", value: info.registered ? info.service_name : `${info.service_name} · not deployed` },
     { key: "Receiver binary", value: info.receiver_present ? info.receiver_exe : `missing — expected at ${info.receiver_exe}` },
     { key: "Tokens", value: `ingest ${info.ingest_token_seeded ? "seeded" : "not seeded"} · read ${info.read_token_seeded ? "seeded" : "not seeded"}` },
     { key: "Shipper endpoint", value: info.endpoint === "" ? "not configured" : info.endpoint },
@@ -8472,6 +8509,7 @@ function logReceiverInner(
     : `<button class="btn" data-lr-flip ${info.registered ? "" : "disabled"}>Flip endpoint to local receiver</button>`;
   const shipperHtml = info.shipper ? logShipperInner(info.shipper) : "";
   return `<div style="font-size:12px;color:var(--text2);margin-top:16px">Log receiver<span class="info-tip" title="The log-streaming receiver runs on this machine as its own auto-start Windows service (LocalService). Ingest is on 127.0.0.1:8473; reads are served only on the machine's Tailscale address (port 8474, read-token gated). Deploy seeds its token files from the same Credential Manager ingest token the shipper uses, registers the service, and adds the firewall rule — one UAC prompt. Flipping the endpoint is separate; the shipper restarts onto it at once.">${icon("info")}</span></div>
+    ${lrState}
     ${settingsRows(rows)}
     <div class="card-actions" style="margin-top:8px">${deployBtn}${removeBtn}${flipBtn}</div>
     ${shipperHtml}
@@ -8659,7 +8697,7 @@ function settingsPaint(
     </div>` : "";
   const mxcPanel = `${modeBlock}${policyFileEditor}${mxcPolicyInner(policyR, ui.rulesFilter, ui.rulesOpen, null)}${mxcActivityInner(activityR)}${selfTest}`;
 
-  const supervisionPanel = supervisionInner(svcR) + logReceiverHtml;
+  const supervisionPanel = `<div id="supSvc">${supervisionInner(svcR)}</div><div id="supLr">${logReceiverHtml}</div>`;
   const panel = tab === "general" ? generalPanel
     : tab === "remote" ? remoteHtml
     : tab === "updates" ? updatesPanel
@@ -9379,11 +9417,36 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     await load();
   };
   root.addEventListener("click", onClick);
+  // Start/Stop/Restart on the Supervision rows and the Log receiver
+  // card run through the shared lifecycle runner.
+  const unwireLc = wireLifecycleActions(root, (r: LifecycleResult) => {
+    if (disposed) return;
+    setMsg(r.message, !r.ok && !r.cancelled);
+  }, { origin: "ui" });
 
   await load();
 
+  // While Settings is open, the shared store also polls services_list
+  // and log_receiver_status (fast during transitions, immediately on
+  // lifecycle events) — the Supervision tab repaints in place when a
+  // service's lifecycle state changes, instead of showing the state
+  // from when the view was opened (UI-7, OS-12).
+  let supSig = "";
+  const unsubscribeStore = serviceStore.subscribe((snap) => {
+    if (disposed || setUi.tab !== "supervision" || !snap.services) return;
+    const sig = supervisionSignature(snap);
+    if (sig === supSig) return;
+    supSig = sig;
+    const svc = root.querySelector("#supSvc");
+    if (svc) svc.innerHTML = supervisionInner({ data: snap.services, live: snap.live });
+    const lr = root.querySelector("#supLr");
+    if (lr && snap.logReceiver) lr.innerHTML = logReceiverInner({ data: snap.logReceiver, live: snap.live }, lrNewToken);
+  }, { services: true });
+
   return () => {
     disposed = true;
+    unwireLc();
+    unsubscribeStore();
     root.removeEventListener("click", onClick);
   };
 }
@@ -9675,10 +9738,13 @@ export function wireWizard(root: HTMLElement): () => void {
     if (r.error || !r.data) { logLine(`could not list backends before the smoke test: ${r.error ?? "no data"}`, "lvl-warn"); return; }
     for (const b of r.data) {
       if (!b.configured || !b.enabled) continue;
-      if (b.state === "running" || b.state === "starting") continue;
+      // Live (running, starting, restarting, not responding) or mid
+      // stop: nothing to start.
+      const st = fromWire(b.lifecycle ?? b.state);
+      if (META[st].isLive || META[st].isTransition) continue;
       logLine(`starting backend: ${b.id}\u2026`);
-      const sr = await startBackend(b.id);
-      if (sr.error) logLine(`backend ${b.id} did not start: ${sr.error}`, "lvl-err");
+      const sr = await runLifecycle({ kind: "backend", id: b.id }, "start", { origin: "wizard" });
+      if (!sr.ok) logLine(`backend ${b.id} did not start: ${sr.message}`, "lvl-err");
       else logLine(`backend ${b.id} starting`);
     }
   };

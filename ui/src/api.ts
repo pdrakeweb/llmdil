@@ -9,15 +9,25 @@
 */
 
 import { trim1 } from "./charts";
-import { mockBackends, mockDashboard, mockGpuHistory, mockGpus, mockOptimizeState, mockWizardSteps } from "./mock";
-import type { BackendInfo, DashboardModel, GpuInfo, Status, StatusResponse, WizardStepState } from "./types";
+import { mockBackends, mockDashboard, mockGatewayStatus, mockGpuHistory, mockGpus, mockOptimizeState, mockWizardSteps } from "./mock";
+import type { BackendInfo, DashboardModel, GpuInfo, StatusResponse, WizardStepState } from "./types";
+import { fromWire, isBusyError, toStatus } from "./lifecycle-state";
+import type { FailureWire, LifecycleState, TransitionWire } from "./lifecycle-state";
 
 export {}; // module marker
+
+// The system verdict rule moved to the shared lifecycle module; it is
+// re-exported here so existing imports keep compiling.
+export { systemVerdict } from "./lifecycle-state";
+export type { SystemVerdict } from "./lifecycle-state";
 
 declare global {
   interface Window {
     __TAURI__?: {
       core: { invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> };
+      /** Tauri's global event API (withGlobalTauri). Optional: absent
+       *  outside Tauri and on shells built without it. */
+      event?: { listen(name: string, cb: (e: { payload: unknown }) => void): Promise<() => void> };
     };
   }
 }
@@ -56,14 +66,32 @@ export async function getStatus(): Promise<CallResult<StatusResponse>> {
   return { data: { status: "ok", version: "0.1.0-sample" }, live: false };
 }
 
-/** Supervisor process state -> dashboard Status vocabulary. */
-const BACKEND_STATUS: Record<string, Status> = {
-  running: "ok",
-  starting: "starting",
-  stopping: "degraded",
-  failed: "down",
-  stopped: "idle",
-};
+/** A list_backends row -> the UI-side BackendInfo. The lifecycle state
+ *  is the row's unified `lifecycle` (falling back to `state` on older
+ *  payloads); `status` is derived from it with toStatus(). Exported so
+ *  views holding raw rows (the service store) map them the same way. */
+export function backendInfoFromRow(b: BackendRow): BackendInfo {
+  const lifecycle = fromWire(b.lifecycle ?? b.state);
+  return {
+    id: b.id,
+    name: b.id,
+    port: b.port,
+    model: b.model_file,
+    status: toStatus(lifecycle),
+    lifecycle,
+    transition: b.transition ?? null,
+    adopted: b.adopted,
+    enabled: b.enabled,
+    configured: b.configured,
+    service_managed: b.service_managed,
+    requests_1h: typeof b.requests_1h === "number" ? b.requests_1h : undefined,
+    errors_1h: typeof b.errors_1h === "number" ? b.errors_1h : undefined,
+    throughput_toks: typeof b.throughput_toks === "number" ? b.throughput_toks : undefined,
+    health: typeof b.health === "number" ? b.health : undefined,
+    spark: Array.isArray(b.spark) ? b.spark : undefined,
+    reqSpark: Array.isArray(b.req_spark) ? b.req_spark : undefined,
+  };
+}
 
 /** list_backends — returns { backends: BackendRow[] } (configured backends
  *  merged with live supervisor state). Each row is mapped to the UI-side
@@ -81,23 +109,7 @@ export async function listBackends(): Promise<CallResult<BackendInfo[]>> {
     try {
       const r = await invoke<{ backends: BackendRow[] }>("list_backends");
       const rows = Array.isArray(r.backends) ? r.backends : [];
-      const data: BackendInfo[] = rows.map((b) => ({
-        id: b.id,
-        name: b.id,
-        port: b.port,
-        model: b.model_file,
-        status: BACKEND_STATUS[b.state] ?? "idle",
-        adopted: b.adopted,
-        enabled: b.enabled,
-        configured: b.configured,
-        service_managed: b.service_managed,
-        requests_1h: typeof b.requests_1h === "number" ? b.requests_1h : undefined,
-        errors_1h: typeof b.errors_1h === "number" ? b.errors_1h : undefined,
-        throughput_toks: typeof b.throughput_toks === "number" ? b.throughput_toks : undefined,
-        health: typeof b.health === "number" ? b.health : undefined,
-        spark: Array.isArray(b.spark) ? b.spark : undefined,
-        reqSpark: Array.isArray(b.req_spark) ? b.req_spark : undefined,
-      }));
+      const data: BackendInfo[] = rows.map(backendInfoFromRow);
       return { data, live: true };
     } catch (e) {
       return { data: [], live: true, error: errOf(e) };
@@ -353,51 +365,25 @@ function placementFromConfig(
   return rows;
 }
 
-export interface SystemVerdict {
-  /** Dot class vocabulary shared by the dashboard pill and the map pill. */
-  dot: "ok" | "warn" | "err" | "idle";
-  text: string;
-  ok: boolean;
-}
-
-/** The one system-verdict rule, shared by the Dashboard header pill and
- *  the Service Map pill: "All systems normal" iff at least one backend
- *  is configured, every backend is running, telemetry is not stale, no
- *  load error occurred, and the gateway probe reports up. Every other
- *  state gets its own wording — all-stopped is idle, not "normal" and
- *  not an error; a partial count reads "N / M backends running". */
-export function systemVerdict(input: {
-  total: number;
-  running: number;
-  stale: boolean;
-  error: string | null;
-  gatewayUp: boolean;
-}): SystemVerdict {
-  const { total, running, stale, error, gatewayUp } = input;
-  if (error) return { dot: "err", text: "Backend error", ok: false };
-  if (total === 0) return { dot: "idle", text: "No backends configured", ok: false };
-  if (running === total) {
-    if (stale) return { dot: "warn", text: "Telemetry stale", ok: false };
-    if (!gatewayUp) return { dot: "err", text: "Gateway down", ok: false };
-    return { dot: "ok", text: "All systems normal", ok: true };
-  }
-  // A down gateway is part of the picture in the partial and
-  // all-stopped states too — the pill must not read as if backends
-  // were the only problem. (The all-running + gateway-down state has
-  // its own "Gateway down" verdict above.)
-  const gwSuffix = gatewayUp ? "" : " \u00b7 gateway down";
-  if (running === 0) return { dot: "idle", text: `All backends stopped${gwSuffix}`, ok: false };
-  return { dot: "warn", text: `${running} / ${total} backends running${gwSuffix}`, ok: false };
-}
-
 /** Assemble the dashboard model from the backend commands. Live
  *  placement is derived from the configured backends' tensor splits
  *  (see placementFromConfig) — empty when no split is configured, and
  *  the view renders an explicit empty state for that card. The gateway
  *  card comes from the gateway_status probe (up state + port), never
- *  from a list_backends row: no backend row represents the gateway. */
-export async function getDashboard(): Promise<CallResult<DashboardModel>> {
-  const [s, b, g, gw] = await Promise.all([getStatus(), listBackends(), getGpuTelemetry(), getGatewayStatus()]);
+ *  from a list_backends row: no backend row represents the gateway.
+ *  The gateway card's status is its lifecycle state (gateway_status
+ *  .state), so a restart reads "restarting", never "down".
+ *  `prefetched` lets a caller holding fresh list_backends /
+ *  gateway_status results (the service store) skip those two calls. */
+export async function getDashboard(prefetched?: {
+  backends?: CallResult<BackendRow[]>;
+  gateway?: CallResult<GatewayStatusData>;
+}): Promise<CallResult<DashboardModel>> {
+  const backendsCall: Promise<CallResult<BackendInfo[]>> = prefetched?.backends
+    ? Promise.resolve({ ...prefetched.backends, data: prefetched.backends.data.map(backendInfoFromRow) })
+    : listBackends();
+  const gatewayCall = prefetched?.gateway ? Promise.resolve(prefetched.gateway) : getGatewayStatus();
+  const [s, b, g, gw] = await Promise.all([getStatus(), backendsCall, getGpuTelemetry(), gatewayCall]);
   const live = s.live && b.live && g.live;
   if (!live) {
     return { data: { ...mockDashboard(), stale: false, updatedAt: Date.now() }, live: false };
@@ -439,7 +425,9 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
         id: "gateway",
         name: "LiteLLM gateway",
         port: gw.data.port,
-        status: gw.data.up ? "ok" : "down",
+        status: toStatus(gw.data.state),
+        lifecycle: gw.data.state,
+        transition: gw.data.transition,
         model: "",
         requests_1h: sumStat((x) => x.requests_1h),
         errors_1h: sumStat((x) => x.errors_1h),
@@ -468,6 +456,7 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
   const data: DashboardModel = {
     gateway, backends, gpus: g.data.gpus, placement: placementFromConfig(cfg.data, g.data.gpus, backends),
     gatewayUp: !gw.error && gw.data.up,
+    gatewayState: gw.error ? null : gw.data.state,
     gatewayStrategy: gwCfg.data ? effectiveGatewayStrategy(gwCfg.data) : null,
     gatewayError: gw.error,
     stale: g.data.stale, updatedAt: Date.now(),
@@ -493,6 +482,10 @@ export interface WizardStepOutcome {
  * long. */
 export interface WizardStepRun {
   task_id: string;
+  /** The step succeeded (done or skipped). False for a failed or
+   *  manual outcome and for a busy refusal. Derived from the outcome
+   *  on payloads from before the server sent `ok`. */
+  ok: boolean;
   busy: boolean;
   running_step?: string;
   elapsed_secs?: number;
@@ -523,16 +516,23 @@ export function wizardBusyMessage(data: { running_step?: string; elapsed_secs?: 
  * result. `busy` is true when another step already holds the wizard
  * lock: that is a running state to report, not a failure, and
  * `outcome` is null. */
-export async function runWizardStep(stepId: string): Promise<CallResult<WizardStepRun>> {
+export async function runWizardStep(stepId: string, opts?: { origin?: string }): Promise<CallResult<WizardStepRun>> {
   if (isTauri()) {
     try {
-      const data = await invoke<{ task_id: string; busy?: boolean; running_step?: string; elapsed_secs?: number; outcome: WizardStepOutcome | null }>("run_wizard_step", { stepId });
-      return { data: { task_id: data.task_id, busy: Boolean(data.busy), running_step: data.running_step, elapsed_secs: data.elapsed_secs, outcome: data.outcome ?? null }, live: true };
+      const args: Record<string, unknown> = { stepId };
+      if (opts?.origin) args.origin = opts.origin;
+      const data = await invoke<{ task_id: string; ok?: boolean; busy?: boolean; running_step?: string; elapsed_secs?: number; outcome: WizardStepOutcome | null }>("run_wizard_step", args);
+      const busy = Boolean(data.busy);
+      const outcome = data.outcome ?? null;
+      const ok = typeof data.ok === "boolean"
+        ? data.ok
+        : !busy && outcome !== null && (outcome.state === "done" || outcome.state === "skipped");
+      return { data: { task_id: data.task_id, ok, busy, running_step: data.running_step, elapsed_secs: data.elapsed_secs, outcome }, live: true };
     } catch (e) {
-      return { data: { task_id: "", busy: false, outcome: { state: "failed", message: String(e), log_tail: [], duration_ms: 0 } }, live: true, error: errOf(e) };
+      return { data: { task_id: "", ok: false, busy: false, outcome: { state: "failed", message: String(e), log_tail: [], duration_ms: 0 } }, live: true, error: errOf(e) };
     }
   }
-  return { data: { task_id: "sample-task", busy: false, outcome: { state: "done", message: "sample mode", log_tail: [], duration_ms: 0 } }, live: false };
+  return { data: { task_id: "sample-task", ok: true, busy: false, outcome: { state: "done", message: "sample mode", log_tail: [], duration_ms: 0 } }, live: false };
 }
 
 /** run_audit — re-run all check-type steps in audit mode. The response
@@ -699,11 +699,22 @@ export interface BackendRow {
   configured: boolean;
   port: number;
   model_file: string;
-  /** Supervisor process state: stopped | starting | running | stopping | failed. */
+  /** The unified lifecycle state (wire string of LifecycleState):
+   *  running | starting | restarting | stopping | stopped | failed |
+   *  degraded | unknown | not_installed — the same shared view in
+   *  process and service mode. Normalize with fromWire(). */
   state: string;
-  /** True when the row's state was merged from the SCM (service mode). */
+  /** Same value as `state` (the field every lifecycle payload names
+   *  `lifecycle`); absent on older payloads. */
+  lifecycle?: string;
+  /** The lifecycle operation in flight ({kind, origin, since}), or null. */
+  transition?: TransitionWire | null;
+  /** True when the row's state comes from the SCM (service mode). */
   service_managed?: boolean;
   pid: number | null;
+  /** The llama-server child pid of a service-managed row (the shim
+   *  is `pid`); null otherwise. */
+  child_pid?: number | null;
   /** True when this session adopted the process (started by a previous
    *  launch; the app tracks it by pid rather than as its own child). */
   adopted: boolean;
@@ -1042,28 +1053,51 @@ export async function getBackends(): Promise<CallResult<BackendRow[]>> {
   }
 }
 
+/** Options for the backend lifecycle wrappers. A bare boolean (the
+ *  older signature) is `allowWddmOvercommit`. */
+export interface BackendActionOpts {
+  /** The WDDM-overcommit confirmation (the card's armed second click). */
+  allowWddmOvercommit?: boolean;
+  /** Who asked (ui, dashboard, activation, bench, optimize, …): named in
+   *  the backend's lifecycle log markers. The server defaults to ui. */
+  origin?: string;
+  /** Stop/restart: drain in-flight requests first (default true). */
+  graceful?: boolean;
+  /** Restart only: wait up to this many seconds for /health before
+   *  the call returns. */
+  waitReadySecs?: number;
+}
+
+/** The start/stop/restart result. `busy` is set when the server refused
+ *  because another lifecycle operation holds the backend (the error
+ *  then names it). */
+export type BackendActionResult = CallResult<{ task_id: string; backend_id: string }> & { busy?: boolean };
+
 async function backendAction(
   cmd: "start_backend" | "stop_backend" | "restart_backend",
   id: string,
-  allowWddmOvercommit?: boolean,
-): Promise<CallResult<{ task_id: string; backend_id: string }>> {
+  optsOrAllow?: boolean | BackendActionOpts,
+): Promise<BackendActionResult> {
+  const opts: BackendActionOpts = typeof optsOrAllow === "boolean" ? { allowWddmOvercommit: optsOrAllow } : (optsOrAllow ?? {});
   if (!isTauri()) return { data: { task_id: "sample-task", backend_id: id }, live: false };
   try {
-    const args: Record<string, unknown> = cmd === "start_backend" ? { id } : { id, graceful: true };
-    // The WDDM-overcommit confirmation (the card's armed second
-    // click) rides only when set, preserving the previous invoke
-    // shape for unconfirmed starts.
-    if (allowWddmOvercommit) args.allowWddmOvercommit = true;
+    const args: Record<string, unknown> = cmd === "start_backend" ? { id } : { id, graceful: opts.graceful ?? true };
+    // Optional arguments ride only when set, preserving the previous
+    // invoke shape for plain calls.
+    if (opts.allowWddmOvercommit && cmd !== "stop_backend") args.allowWddmOvercommit = true;
+    if (opts.origin) args.origin = opts.origin;
+    if (cmd === "restart_backend" && typeof opts.waitReadySecs === "number") args.waitReadySecs = opts.waitReadySecs;
     const data = await invoke<{ task_id: string; backend_id: string }>(cmd, args);
     return { data, live: true };
   } catch (e) {
-    return { data: { task_id: "", backend_id: id }, live: true, error: errOf(e) };
+    const error = errOf(e);
+    return { data: { task_id: "", backend_id: id }, live: true, error, busy: isBusyError(error) };
   }
 }
 
-export function startBackend(id: string, allowWddmOvercommit?: boolean) { return backendAction("start_backend", id, allowWddmOvercommit); }
-export function stopBackend(id: string) { return backendAction("stop_backend", id); }
-export function restartBackend(id: string, allowWddmOvercommit?: boolean) { return backendAction("restart_backend", id, allowWddmOvercommit); }
+export function startBackend(id: string, opts?: boolean | BackendActionOpts) { return backendAction("start_backend", id, opts); }
+export function stopBackend(id: string, opts?: BackendActionOpts) { return backendAction("stop_backend", id, opts); }
+export function restartBackend(id: string, opts?: boolean | BackendActionOpts) { return backendAction("restart_backend", id, opts); }
 
 /** backend_update_flags — change a backend's context length and
  *  batch size. Persisted immediately; applies on the next start. */
@@ -2151,8 +2185,30 @@ export interface GatewayStatusData {
    *  serves, not the configured total (tracker #11). */
   groups: number;
   routing_rules: number;
-  /** Live probe result: true when the gateway answered on its port. */
+  /** Live probe result: true when the gateway answered on its port.
+   *  Kept for older consumers; render `state`, never this. */
   up: boolean;
+  /** The gateway lifecycle state (the shared gateway view): a restart
+   *  reads "restarting", an operator stop "stopped", a crash "failed",
+   *  alive-but-not-answering "degraded". Derived from `up` on payloads
+   *  from before the field existed. */
+  state: LifecycleState;
+  /** The gateway operation in flight ({kind, origin, since}), or null. */
+  transition: TransitionWire | null;
+  /** What the operator last asked for, or null when never recorded. */
+  intent: "running" | "stopped" | null;
+  /** The live gateway pid (pid file, else the port owner), or null. */
+  pid: number | null;
+  /** True when the gateway runs as a Windows service. */
+  service_managed: boolean;
+  /** The last unexpected failure (crash, failed start), or null. */
+  failure: FailureWire | null;
+  /** The app-managed PostgreSQL server, or null on payloads from
+   *  before the field existed. */
+  postgres: PostgresStatusData | null;
+  /** The server-side activation apply in flight, or null when idle.
+   *  Status surfaces keep the plan visible ("Applying…") while set. */
+  activation_applying: ActivationProgress | null;
   /** Routing-test traces recorded this session (dry-run decisions from
    *  gateway_test_routing). Live requests are not logged. */
   routing_log_len: number;
@@ -2179,8 +2235,6 @@ export interface GatewayStatusData {
   litellm_version: string | null;
 }
 
-/** gateway_status — probe state (up) + port + group/rule counts + the
- *  recorded routing-test trace count. */
 /** gateway_master_key — the LiteLLM master key: the API key local
  *  clients present and the admin UI password (username admin). The
  *  backend reads it from Windows Credential Manager (generating and
@@ -2195,17 +2249,121 @@ export async function getGatewayMasterKey(): Promise<CallResult<{ master_key: st
   }
 }
 
+/** The app-managed PostgreSQL server as gateway_status reports it. */
+export interface PostgresStatusData {
+  installed: boolean;
+  /** Lifecycle state: running, starting, stopping, stopped, failed,
+   *  not_installed. */
+  state: LifecycleState;
+  pid: number | null;
+  /** The configured port. */
+  port: number | null;
+  /** The running server listens on a different port than configured
+   *  (postmaster.pid); the next gateway start restarts it. */
+  port_mismatch: boolean;
+  transition: TransitionWire | null;
+}
+
+/** The server-side activation apply in flight (gateway_status /
+ *  activation plan `activation_applying`). */
+export interface ActivationProgress {
+  /** The surface that started it: desktop, api, cli. */
+  source: string;
+  mode: string;
+  started_at: string;
+  /** plan | backend | gateway */
+  step: string;
+  /** The backend id or "gateway" being restarted; null while reading the plan. */
+  target: string | null;
+  /** Operator-facing progress line ("Restarting backend planner…"). */
+  message: string;
+}
+
+function numOrNull(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function strOr(v: unknown, d: string): string {
+  return typeof v === "string" ? v : d;
+}
+
+/** Defensive parse of a `transition` object ({kind, origin, since}). */
+export function parseTransition(v: unknown): TransitionWire | null {
+  if (!v || typeof v !== "object") return null;
+  const r = v as Record<string, unknown>;
+  if (r.kind !== "starting" && r.kind !== "stopping" && r.kind !== "restarting") return null;
+  return { kind: r.kind, origin: strOr(r.origin, ""), since: strOr(r.since, "") };
+}
+
+function parseFailure(v: unknown): FailureWire | null {
+  if (!v || typeof v !== "object") return null;
+  const r = v as Record<string, unknown>;
+  if (typeof r.reason !== "string") return null;
+  return { at: strOr(r.at, ""), reason: r.reason, exit_code: numOrNull(r.exit_code) };
+}
+
+function parsePostgres(v: unknown): PostgresStatusData | null {
+  if (!v || typeof v !== "object") return null;
+  const r = v as Record<string, unknown>;
+  const installed = r.installed !== false;
+  return {
+    installed,
+    state: r.state === undefined || r.state === null ? (installed ? "unknown" : "not_installed") : fromWire(r.state),
+    pid: numOrNull(r.pid),
+    port: numOrNull(r.port),
+    port_mismatch: r.port_mismatch === true,
+    transition: parseTransition(r.transition),
+  };
+}
+
+/** Defensive parse of an `activation_applying` object; null when idle. */
+export function parseActivationProgress(v: unknown): ActivationProgress | null {
+  if (!v || typeof v !== "object") return null;
+  const r = v as Record<string, unknown>;
+  return {
+    source: strOr(r.source, ""),
+    mode: strOr(r.mode, ""),
+    started_at: strOr(r.started_at, ""),
+    step: strOr(r.step, ""),
+    target: typeof r.target === "string" ? r.target : null,
+    message: strOr(r.message, "Applying the activation plan…"),
+  };
+}
+
+/** gateway_status — the gateway's lifecycle state (`state`, with the
+ *  transition, intent, pid and failure behind it), the PostgreSQL
+ *  sub-state, the activation apply in flight, the probe (`up`), port,
+ *  group/rule counts and the recorded routing-test trace count. Every
+ *  field is parsed defensively; a payload without `state` derives it
+ *  from `up`. In sample mode: the mock status (gateway running). */
 export async function getGatewayStatus(): Promise<CallResult<GatewayStatusData>> {
-  const fallback: GatewayStatusData = { port: 4000, groups: 0, routing_rules: 0, up: false, routing_log_len: 0, openrouter_cred_present: null, bind_host: "0.0.0.0", lan_ip: null, activation_pending: false, activation_changes: 0, litellm_version: null };
-  if (!isTauri()) return { data: fallback, live: false };
+  const fallback: GatewayStatusData = {
+    port: 4000, groups: 0, routing_rules: 0, up: false, state: "unknown", transition: null, intent: null, pid: null,
+    service_managed: false, failure: null, postgres: null, activation_applying: null, routing_log_len: 0,
+    openrouter_cred_present: null, bind_host: "0.0.0.0", lan_ip: null, activation_pending: false, activation_changes: 0,
+    litellm_version: null,
+  };
+  if (!isTauri()) return { data: mockGatewayStatus(), live: false };
   try {
-    const raw = await invoke<Partial<GatewayStatusData>>("gateway_status");
+    const raw = await invoke<Record<string, unknown>>("gateway_status");
+    const up = Boolean(raw.up);
+    const state: LifecycleState = raw.state === undefined || raw.state === null
+      ? (up ? "running" : "stopped")
+      : fromWire(raw.state);
     return {
       data: {
         port: typeof raw.port === "number" ? raw.port : 0,
         groups: typeof raw.groups === "number" ? raw.groups : 0,
         routing_rules: typeof raw.routing_rules === "number" ? raw.routing_rules : 0,
-        up: Boolean(raw.up),
+        up,
+        state,
+        transition: parseTransition(raw.transition),
+        intent: raw.intent === "running" || raw.intent === "stopped" ? raw.intent : null,
+        pid: numOrNull(raw.pid),
+        service_managed: raw.service_managed === true,
+        failure: parseFailure(raw.failure),
+        postgres: parsePostgres(raw.postgres),
+        activation_applying: parseActivationProgress(raw.activation_applying),
         routing_log_len: typeof raw.routing_log_len === "number" ? raw.routing_log_len : 0,
         openrouter_cred_present: typeof raw.openrouter_cred_present === "boolean" ? raw.openrouter_cred_present : null,
         bind_host: typeof raw.bind_host === "string" ? raw.bind_host : "0.0.0.0",
@@ -2234,17 +2392,100 @@ export async function setGatewayBindHost(host: string): Promise<CallResult<{ bin
   }
 }
 
-/** gateway_stop — stop the running gateway process (the counterpart
- *  of the wizard's start-gateway step). `stopped` reports whether a
- *  gateway process was actually terminated; false with ok=true means
- *  it was not running. */
-export async function gatewayStop(): Promise<CallResult<{ ok: boolean; stopped: boolean }>> {
+/** The gateway_stop result. `stopped` reports whether a gateway process
+ *  was actually terminated (false with ok=true: it was not running);
+ *  `postgres_stopped` whether PostgreSQL was stopped too (only when
+ *  asked). */
+export interface GatewayStopResult {
+  ok: boolean;
+  stopped: boolean;
+  pid?: number | null;
+  found_by?: string | null;
+  postgres_stopped?: boolean;
+}
+
+/** gateway_stop — stop the running gateway (the counterpart of the
+ *  wizard's start-gateway step). Stops the gateway ONLY: PostgreSQL
+ *  keeps running unless `stopPostgres` is set (an explicit "stop the
+ *  gateway and its database"). `origin` names who asked in the
+ *  gateway's lifecycle log; the server defaults to ui. `busy` is set
+ *  when another gateway operation is in flight. */
+export async function gatewayStop(opts?: { stopPostgres?: boolean; origin?: string }): Promise<CallResult<GatewayStopResult> & { busy?: boolean }> {
   if (!isTauri()) return { data: { ok: false, stopped: false }, live: false, error: "gateway_stop is not available in sample mode" };
   try {
-    const data = await invoke<{ ok: boolean; stopped: boolean }>("gateway_stop");
+    const args: Record<string, unknown> = {};
+    if (opts?.stopPostgres) args.stopPostgres = true;
+    if (opts?.origin) args.origin = opts.origin;
+    const data = await invoke<GatewayStopResult>("gateway_stop", args);
     return { data, live: true };
   } catch (e) {
-    return { data: { ok: false, stopped: false }, live: true, error: errOf(e) };
+    const error = errOf(e);
+    return { data: { ok: false, stopped: false }, live: true, error, busy: isBusyError(error) };
+  }
+}
+
+/** The gateway_restart result: the start-gateway step's outcome run
+ *  under one "restarting" transition (the step stops the old gateway
+ *  itself; PostgreSQL is never stopped). `ok` false with `busy` when
+ *  another gateway operation (or a setup step) holds it. */
+export interface GatewayRestartResult {
+  ok: boolean;
+  busy?: boolean;
+  running_step?: string;
+  elapsed_secs?: number;
+  task_id?: string;
+  outcome: WizardStepOutcome | null;
+  message: string | null;
+  manual_command: string | null;
+  /** The drain result when `drain` was asked. */
+  quiesce?: { drained: boolean; in_flight: number; timed_out: boolean };
+}
+
+/** gateway_restart — restart the gateway server-side (optionally
+ *  draining in-flight requests first). Status surfaces read
+ *  "restarting" for the whole operation. */
+export async function gatewayRestart(opts?: { origin?: string; drain?: boolean }): Promise<CallResult<GatewayRestartResult>> {
+  const empty: GatewayRestartResult = { ok: false, outcome: null, message: null, manual_command: null };
+  if (!isTauri()) return { data: empty, live: false, error: "gateway_restart is not available in sample mode" };
+  try {
+    const args: Record<string, unknown> = {};
+    if (opts?.origin) args.origin = opts.origin;
+    if (opts?.drain !== undefined) args.drain = opts.drain;
+    const raw = await invoke<Partial<GatewayRestartResult>>("gateway_restart", args);
+    const outcome = raw.outcome ?? null;
+    return {
+      data: {
+        ok: raw.ok === true,
+        busy: raw.busy === true ? true : undefined,
+        running_step: raw.running_step,
+        elapsed_secs: raw.elapsed_secs,
+        task_id: raw.task_id,
+        outcome,
+        message: typeof raw.message === "string" ? raw.message : outcome?.message ?? null,
+        manual_command: typeof raw.manual_command === "string" ? raw.manual_command : outcome?.manual_command ?? null,
+        quiesce: raw.quiesce,
+      },
+      live: true,
+    };
+  } catch (e) {
+    const error = errOf(e);
+    return { data: { ...empty, busy: isBusyError(error) || undefined, message: error }, live: true, error };
+  }
+}
+
+/** postgres_stop — stop the app-managed PostgreSQL server. Refused
+ *  while the gateway is running or in transition ("stop the gateway
+ *  first"). */
+export async function postgresStop(opts?: { origin?: string }): Promise<CallResult<{ ok: boolean; stopped: boolean }> & { busy?: boolean }> {
+  if (!isTauri()) return { data: { ok: false, stopped: false }, live: false, error: "postgres_stop is not available in sample mode" };
+  try {
+    const args: Record<string, unknown> = {};
+    if (opts?.origin) args.origin = opts.origin;
+    const data = await invoke<{ ok: boolean; stopped: boolean }>("postgres_stop", args);
+    return { data, live: true };
+  } catch (e) {
+    const error = errOf(e);
+    return { data: { ok: false, stopped: false }, live: true, error, busy: isBusyError(error) };
   }
 }
 
@@ -2616,6 +2857,58 @@ export async function activationComplete(): Promise<CallResult<{ cleared: boolea
   }
 }
 
+/** The activation_apply result (the one server-side apply: backend
+ *  restarts, then the gateway restart, each under its lifecycle
+ *  transition; history recorded once). */
+export interface ActivationApplyResult {
+  ok: boolean;
+  /** nothing_pending | completed | completed_with_failures | failed */
+  status: string;
+  message: string;
+  mode?: string;
+  source?: string;
+  /** Present when a failed gateway restart produced manual commands. */
+  manual_command?: string | null;
+  restarted_backends: string[];
+  gateway_restarted: boolean;
+  quiesce?: { drained: boolean; in_flight: number; timed_out: boolean } | null;
+  execution_id?: string | null;
+  items: ActivationExecutionItem[];
+  /** The server refused: another apply is running (`error` names it). */
+  busy?: boolean;
+}
+
+/** activation_apply — apply the pending activation plan server-side.
+ *  `mode` "drain" drains in-flight gateway requests before the gateway
+ *  restart; "now" restarts at once. The plan card's spellings are
+ *  accepted too ("quiesce" = drain, "restart"/"start" = now) and
+ *  recorded as given, so the history keeps its mode labels. `source`
+ *  is the surface recorded in the history ("desktop" for the app).
+ *  Progress is visible meanwhile as gateway_status.activation_applying. */
+export async function activationApply(mode: "drain" | "now" | "quiesce" | "restart" | "start", source = "desktop"):Promise<CallResult<ActivationApplyResult>> {
+  const empty: ActivationApplyResult = { ok: false, status: "failed", message: "", restarted_backends: [], gateway_restarted: false, items: [] };
+  if (!isTauri()) return { data: { ...empty, message: "activation_apply is not available in sample mode" }, live: false, error: "activation_apply is not available in sample mode" };
+  try {
+    const raw = await invoke<Partial<ActivationApplyResult>>("activation_apply", { mode, source });
+    return {
+      data: {
+        ...empty,
+        ...raw,
+        ok: raw.ok === true,
+        status: typeof raw.status === "string" ? raw.status : raw.ok ? "completed" : "failed",
+        message: typeof raw.message === "string" ? raw.message : "",
+        restarted_backends: Array.isArray(raw.restarted_backends) ? raw.restarted_backends : [],
+        gateway_restarted: raw.gateway_restarted === true,
+        items: Array.isArray(raw.items) ? raw.items : [],
+      },
+      live: true,
+    };
+  } catch (e) {
+    const error = errOf(e);
+    return { data: { ...empty, message: error, busy: isBusyError(error) || undefined }, live: true, error };
+  }
+}
+
 /** One plan change inside a recorded activation execution, with
  *  the outcome the apply recorded for it. */
 export interface ActivationExecutionItem {
@@ -2802,13 +3095,29 @@ export async function getGatewayYaml(): Promise<CallResult<{ yaml: string; routi
 
 /** One managed service's row in the services_list payload. */
 export interface ServiceRow {
-  /** A backend id, or "gateway". */
+  /** A backend id, "gateway", or "log-receiver". */
   target: string;
+  /** backend | gateway | log-receiver (absent on older payloads). */
+  kind?: string;
   service_name: string;
   registered: boolean;
-  /** SCM state (snake_case), null when not registered. */
-  state: string | null;
+  /** Raw SCM state (snake_case, or `{unknown: n}` for an unmodeled
+   *  state), null when not registered. Render `lifecycle`, not this. */
+  state: string | { unknown: number } | null;
+  /** The shared lifecycle state (SCM state with exit codes: a stop
+   *  with a non-zero code reads failed). Absent on older payloads —
+   *  normalize with fromScm(state) then. */
+  lifecycle?: string;
+  /** The lifecycle operation in flight, or null. */
+  transition?: TransitionWire | null;
   pid: number | null;
+  /** The supervised child's pid (the shim is `pid`). */
+  child_pid?: number | null;
+  /** The service-specific exit code of the last stop, when non-zero. */
+  exit_code?: number | null;
+  /** Why the last exit was a failure (1 = credential/env resolution,
+   *  2 = spawn failed, otherwise the child's exit code), or null. */
+  failure_reason?: string | null;
 }
 
 /** services_list payload: mode, resolved account, shim presence, rows. */
@@ -2889,8 +3198,21 @@ export async function servicesUnregister(target: string): Promise<CallResult<{ o
 export interface LogReceiverInfo {
   service_name: string;
   registered: boolean;
-  /** SCM state, null when not registered. */
-  state: string | null;
+  /** Raw SCM state, null when not registered. Render `lifecycle`. */
+  state: string | { unknown: number } | null;
+  /** The shared lifecycle state: SCM state with exit codes, and
+   *  running downgraded to degraded when the ingest port refuses
+   *  connections. Absent on older payloads (fromScm(state) then). */
+  lifecycle?: string;
+  /** The receiver operation in flight, or null. */
+  transition?: TransitionWire | null;
+  /** The service-specific exit code of the last stop, when non-zero. */
+  exit_code?: number | null;
+  /** Why the last exit was a failure, or null. */
+  failure_reason?: string | null;
+  /** The ingest port and whether it accepted a TCP connect. */
+  ingest_port?: number;
+  ingest_ok?: boolean;
   pid: number | null;
   receiver_exe: string;
   receiver_present: boolean;
@@ -2998,6 +3320,44 @@ export async function logReceiverFlipEndpoint(): Promise<CallResult<{ ok: boolea
     return { data: { ok: false, endpoint: "", already: false, backup: null }, live: true, error: errOf(e) };
   }
 }
+
+/** The log_receiver_start/stop/restart result. */
+export interface LogReceiverOpResult {
+  ok: boolean;
+  service_name: string;
+  /** start | stop | restart */
+  action: string;
+  detail?: string | null;
+  /** The ingest port accepted a connection after the operation. */
+  ingest_ok?: boolean;
+  /** The receiver's lifecycle state after the operation. */
+  lifecycle?: string;
+  pid?: number | null;
+}
+
+async function logReceiverOp(
+  cmd: "log_receiver_start" | "log_receiver_stop" | "log_receiver_restart",
+  opts?: { origin?: string },
+): Promise<CallResult<LogReceiverOpResult> & { busy?: boolean }> {
+  const empty: LogReceiverOpResult = { ok: false, service_name: "", action: cmd.replace("log_receiver_", "") };
+  if (!isTauri()) return { data: empty, live: false, error: `${cmd} is not available in sample mode` };
+  try {
+    const args: Record<string, unknown> = {};
+    if (opts?.origin) args.origin = opts.origin;
+    const data = await invoke<LogReceiverOpResult>(cmd, args);
+    return { data, live: true };
+  } catch (e) {
+    const error = errOf(e);
+    return { data: empty, live: true, error, busy: isBusyError(error) };
+  }
+}
+
+/** Start / stop / restart the log receiver service (unelevated; the
+ *  service DACL grants start/stop). Markers go to the receiver's own
+ *  lifecycle log. */
+export function logReceiverStart(opts?: { origin?: string }) { return logReceiverOp("log_receiver_start", opts); }
+export function logReceiverStop(opts?: { origin?: string }) { return logReceiverOp("log_receiver_stop", opts); }
+export function logReceiverRestart(opts?: { origin?: string }) { return logReceiverOp("log_receiver_restart", opts); }
 
 export async function getAppConfig(): Promise<CallResult<Record<string, unknown> | null>> {
   if (!isTauri()) return { data: null, live: false };

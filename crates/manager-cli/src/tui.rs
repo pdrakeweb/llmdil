@@ -124,7 +124,10 @@ fn render_json_lines(value: &Option<Value>, max_lines: usize) -> Vec<String> {
             let mut lines: Vec<String> = pretty.lines().map(str::to_string).collect();
             if lines.len() > max_lines {
                 lines.truncate(max_lines);
-                lines.push(format!("… ({} more lines)", pretty.lines().count() - max_lines));
+                lines.push(format!(
+                    "… ({} more lines)",
+                    pretty.lines().count() - max_lines
+                ));
             }
             lines
         }
@@ -141,19 +144,14 @@ fn draw(frame: &mut Frame, app: &App, base_url: &str) {
     ])
     .split(area);
 
-    let title = format!(
-        "llmdil-cli — {}  (refresh #{})",
-        base_url, app.refreshes
-    );
+    let title = format!("llmdil-cli — {}  (refresh #{})", base_url, app.refreshes);
     frame.render_widget(Paragraph::new(title), chunks[0]);
 
-    let tabs = Tabs::new(TABS)
-        .select(app.tab)
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
+    let tabs = Tabs::new(TABS).select(app.tab).highlight_style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
     frame.render_widget(tabs, chunks[1]);
 
     match app.tab {
@@ -250,10 +248,7 @@ fn draw(frame: &mut Frame, app: &App, base_url: &str) {
                                 .get("line")
                                 .and_then(Value::as_str)
                                 .map(str::to_string)
-                                .unwrap_or_else(|| {
-                                    serde_json::to_string(item)
-                                        .unwrap_or_default()
-                                });
+                                .unwrap_or_else(|| serde_json::to_string(item).unwrap_or_default());
                             out.push(text);
                         }
                     } else {

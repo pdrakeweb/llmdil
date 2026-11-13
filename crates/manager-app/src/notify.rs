@@ -16,15 +16,12 @@
 //!
 //! Duplicate suppression is structural, not timed: state-driven
 //! events (backend failure, gateway down, activation resolution) are
-//! detected by the monitor in the shell as *transitions* — a toast
+//! detected by the lifecycle monitor as *transitions* — a toast
 //! fires once when the state is entered, never on each poll that
 //! observes it. Discrete events (a step finishing, a download
 //! completing) occur exactly once at their call site by construction.
 
-use std::collections::HashMap;
-
-use manager_supervisor::ProcessState;
-
+use crate::lifecycle_monitor::{self, MonitorEvent};
 use crate::{AppState, EventSink};
 
 /// Toast event categories; each maps to one switch in
@@ -97,26 +94,13 @@ pub async fn notify(
     }
 }
 
-/// Transition-watch state for the notification monitor (see
-/// `notify_monitor_tick`). Held in `AppState` behind a std Mutex:
+/// Transition-watch state for the activation-plan resolution toast
+/// (see [`monitor_tick`]). Service up/down detection lives in
+/// [`crate::lifecycle_monitor`], driven by the lifecycle registry's
+/// intent and transitions. Held in `AppState` behind a std Mutex:
 /// every access is a synchronous read/update of small fields.
 #[derive(Debug, Default)]
 pub struct NotifyWatch {
-    /// Last observed supervisor state per backend-owned process id.
-    /// A move into `Failed` from `Running`/`Starting` is the
-    /// unexpected-exit event; the baseline (first observation) never
-    /// fires, so a backend already dead at launch raises nothing.
-    pub backend_states: HashMap<String, ProcessState>,
-    /// Last gateway probe result (`None` until the first probe).
-    pub gateway_up: Option<bool>,
-    /// The gateway has been observed up since launch and the app has
-    /// not stopped it since. Only an expected gateway going down is
-    /// a failure event; one that was never up is just off.
-    pub gateway_expected: bool,
-    /// Consecutive down probes while expected. The down toast fires
-    /// at 2: a single 500 ms probe miss (a gateway mid-restart, a
-    /// loaded machine) must not cry wolf.
-    pub gateway_down_strikes: u8,
     /// Last computed activation-plan pending state (`None` until the
     /// monitor's first computation, which only sets the baseline).
     pub activation_pending: Option<bool>,
@@ -131,15 +115,14 @@ pub struct NotifyWatch {
 }
 
 /// Compose the backend-failure toast body. `exit_status` is the
-/// reaped process's exit string when this monitor pass's own reap
-/// saw the exit (absent when another reader reaped first);
-/// `reason` is the supervisor's recorded failure reason for the
-/// backend (e.g. the device-unavailable fail-fast verdict). When
-/// a reason is recorded it is named as its own sentence: it
-/// states the cause, which the exit string cannot. The recorded
-/// string carries no trailing period, so the sentence is
-/// terminated here when it does not already end with one. With
-/// no reason the body is byte-identical to the pre-reason copy.
+/// exit the lifecycle monitor recorded for the crash (the reaped exit
+/// string, or the Windows service's exit code); `reason` is the
+/// classified cause (e.g. the device-unavailable fail-fast verdict,
+/// or the service host's credential/spawn failure). When a reason is
+/// known it is named as its own sentence: it states the cause, which
+/// the exit string cannot. The recorded string carries no trailing
+/// period, so the sentence is terminated here when it does not
+/// already end with one.
 fn backend_failure_body(id: &str, exit_status: Option<&str>, reason: Option<&str>) -> String {
     let mut body = match exit_status {
         Some(status) => format!("Backend {id} exited unexpectedly ({status})."),
@@ -152,117 +135,75 @@ fn backend_failure_body(id: &str, exit_status: Option<&str>, reason: Option<&str
             body.push('.');
         }
     }
-    body.push_str(" It stays down until restarted from the Backends view.");
+    body.push_str(" Restart it from the Backends view.");
     body
 }
 
-/// One pass of the notification monitor (the shell runs it on a
-/// 5-second loop): detect the state-driven transitions — a backend
-/// dying unexpectedly, the gateway going down after being up, an
-/// activation plan resolving — and fire each toast exactly once, on
-/// entry into the state. Detection state lives in
-/// `AppState.notify_watch`; baselines are set on first observation
-/// and never fire.
-pub async fn monitor_tick(state: &AppState, sink: &dyn EventSink) {
-    let mut toasts: Vec<(Category, String, String)> = Vec::new();
-
-    // -- Backends: a move into Failed from Running/Starting is an
-    // unexpected exit. The reap runs here as elsewhere so a corpse is
-    // marked Failed even between UI polls; which caller reaps first
-    // does not matter, the Failed state persists in `status()`.
-    let (statuses, dead) = {
-        let mut sup = state.supervisor().await.lock().await;
-        let dead: HashMap<String, String> = sup
-            .reap_exited()
-            .into_iter()
-            .map(|(id, status)| (id, status.to_string()))
-            .collect();
-        (sup.status(), dead)
-    };
-    let backend_owned: std::collections::HashSet<String> = state
-        .backend_spec_ids
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    {
-        let mut watch = state.notify_watch.lock().unwrap_or_else(|e| e.into_inner());
-        for st in &statuses {
-            if !backend_owned.contains(&st.id) {
-                continue;
-            }
-            let prev = watch.backend_states.insert(st.id.clone(), st.state);
-            let was_active = matches!(
-                prev,
-                Some(ProcessState::Running) | Some(ProcessState::Starting)
-            );
-            if was_active && st.state == ProcessState::Failed {
-                let body = backend_failure_body(
-                    &st.id,
-                    dead.get(&st.id).map(String::as_str),
-                    st.failure_reason.as_deref(),
-                );
-                toasts.push((
-                    Category::Failures,
-                    "Backend stopped unexpectedly".to_string(),
-                    body,
-                ));
-            }
-        }
-    }
-
-    // -- Gateway: probe liveness unless a wizard step is in flight
-    // (a step may be mid-restart of the gateway itself; the step's
-    // own outcome hook reports that case). Down fires only for a
-    // gateway the app has seen up and did not stop itself, and only
-    // after two consecutive missed probes.
-    let step_running = state
-        .wizard_step_running
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_some();
-    if !step_running {
-        let (probe_host, port) = {
-            let cfg = state.config.read().await;
+/// The toast (category, title, body) of one lifecycle monitor event.
+fn monitor_toast(event: &MonitorEvent) -> (Category, String, String) {
+    match event {
+        MonitorEvent::Crashed {
+            id,
+            exit_status,
+            reason,
+        } => (
+            Category::Failures,
+            "Backend stopped unexpectedly".to_string(),
+            backend_failure_body(id, exit_status.as_deref(), reason.as_deref()),
+        ),
+        MonitorEvent::GatewayDown { reason } => (
+            Category::Failures,
+            "Gateway is down".to_string(),
+            format!("The LiteLLM gateway stopped ({reason}). Restart it from the Gateway view."),
+        ),
+        MonitorEvent::PostgresDown { reason } => (
+            Category::Failures,
+            "Database is down".to_string(),
+            format!(
+                "The gateway's PostgreSQL database stopped ({reason}). Restart the gateway from the Gateway view to bring it back."
+            ),
+        ),
+        MonitorEvent::LogReceiverDown { exit_code, reason } => {
+            let cause = match (reason, exit_code) {
+                (Some(r), _) => format!(" ({r})"),
+                (None, Some(c)) => format!(" (exit code {c})"),
+                (None, None) => String::new(),
+            };
             (
-                manager_wizard::steps::gateway_probe_host(&cfg),
-                cfg.gateway.port,
+                Category::Failures,
+                "Log receiver stopped".to_string(),
+                format!(
+                    "The log receiver service stopped unexpectedly{cause}. Restart it from Settings > Log receiver."
+                ),
             )
-        };
-        let up = tokio::task::spawn_blocking(move || crate::probe_gateway(&probe_host, port))
-            .await
-            .unwrap_or(false);
-        let mut watch = state.notify_watch.lock().unwrap_or_else(|e| e.into_inner());
-        if up {
-            watch.gateway_up = Some(true);
-            watch.gateway_expected = true;
-            watch.gateway_down_strikes = 0;
-        } else {
-            if watch.gateway_expected {
-                watch.gateway_down_strikes = watch.gateway_down_strikes.saturating_add(1);
-                if watch.gateway_down_strikes >= 2 && watch.gateway_up == Some(true) {
-                    toasts.push((
-                        Category::Failures,
-                        "Gateway is down".to_string(),
-                        format!(
-                            "The LiteLLM gateway on port {port} stopped responding. Start it again from the Gateway view or the Setup Wizard."
-                        ),
-                    ));
-                    watch.gateway_up = Some(false);
-                    watch.gateway_down_strikes = 0;
-                }
-            } else {
-                watch.gateway_up = Some(false);
-                watch.gateway_down_strikes = 0;
-            }
         }
     }
+}
+
+/// One pass of the notification monitor (the shell runs it on a
+/// 3-second loop): run the lifecycle monitor ([`lifecycle_monitor::tick`],
+/// which detects crashes of every managed service against operator
+/// intent and writes the markers and events), turn its events into
+/// toasts, and fire the activation plan's applied toast when the plan
+/// resolves. Each toast fires once, on entry into the state.
+pub async fn monitor_tick(state: &AppState, sink: &dyn EventSink) {
+    let mut toasts: Vec<(Category, String, String)> = lifecycle_monitor::tick(state, sink)
+        .await
+        .iter()
+        .map(monitor_toast)
+        .collect();
 
     // -- Activation plan: pending → resolved fires the applied
     // toast unless the resolution was a cancellation (flagged by the
     // cancel command) or the completion command already fired it.
-    let (unresolved, drift) = crate::activation_unresolved(state).await;
-    let pending = !unresolved.is_empty() || drift;
-    {
+    // While an activation apply or a gateway operation is in flight the
+    // plan resolves piecemeal (the start-gateway step rewrites the
+    // config before the new gateway is healthy): the watch is left
+    // untouched, and the apply / the gateway completion fires the one
+    // toast itself when it ends (CR-1a / ACT-6).
+    if !activation_resolution_suppressed(state) {
+        let (unresolved, drift) = crate::activation_unresolved(state).await;
+        let pending = !unresolved.is_empty() || drift;
         let mut watch = state.notify_watch.lock().unwrap_or_else(|e| e.into_inner());
         match watch.activation_pending {
             None => watch.activation_pending = Some(pending),
@@ -290,9 +231,43 @@ pub async fn monitor_tick(state: &AppState, sink: &dyn EventSink) {
     }
 }
 
+/// Whether the monitor must not judge the activation plan's resolution
+/// now: an activation apply is running, or a gateway lifecycle
+/// operation is in flight.
+pub(crate) fn activation_resolution_suppressed(state: &AppState) -> bool {
+    crate::activation_apply::current_progress(state).is_some()
+        || state
+            .lifecycle
+            .transition(crate::lifecycle::GATEWAY)
+            .is_some()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::backend_failure_body;
+    use super::{backend_failure_body, monitor_toast, Category, MonitorEvent};
+
+    #[test]
+    fn monitor_events_map_to_failure_toasts() {
+        let (cat, title, body) = monitor_toast(&MonitorEvent::GatewayDown {
+            reason: "process exited".into(),
+        });
+        assert_eq!(cat, Category::Failures);
+        assert_eq!(title, "Gateway is down");
+        assert_eq!(
+            body,
+            "The LiteLLM gateway stopped (process exited). Restart it from the Gateway view."
+        );
+        let (_, title, body) = monitor_toast(&MonitorEvent::LogReceiverDown {
+            exit_code: Some(1066),
+            reason: None,
+        });
+        assert_eq!(title, "Log receiver stopped");
+        assert!(body.contains("(exit code 1066)"), "{body}");
+        let (_, title, _) = monitor_toast(&MonitorEvent::PostgresDown {
+            reason: "the server is not running".into(),
+        });
+        assert_eq!(title, "Database is down");
+    }
 
     const GPU_REASON: &str =
         "GPU unavailable: the device was busy or unavailable while the backend loaded";
@@ -301,11 +276,11 @@ mod tests {
     fn failure_body_without_reason_is_the_original_copy() {
         assert_eq!(
             backend_failure_body("planner", Some("exit code: 1"), None),
-            "Backend planner exited unexpectedly (exit code: 1). It stays down until restarted from the Backends view."
+            "Backend planner exited unexpectedly (exit code: 1). Restart it from the Backends view."
         );
         assert_eq!(
             backend_failure_body("planner", None, None),
-            "Backend planner is no longer running. It stays down until restarted from the Backends view."
+            "Backend planner is no longer running. Restart it from the Backends view."
         );
     }
 
@@ -317,11 +292,11 @@ mod tests {
         // no trailing period; the helper terminates the sentence.
         assert_eq!(
             backend_failure_body("planner-moe", Some("exit code: 1"), Some(GPU_REASON)),
-            "Backend planner-moe exited unexpectedly (exit code: 1). GPU unavailable: the device was busy or unavailable while the backend loaded. It stays down until restarted from the Backends view."
+            "Backend planner-moe exited unexpectedly (exit code: 1). GPU unavailable: the device was busy or unavailable while the backend loaded. Restart it from the Backends view."
         );
         assert_eq!(
             backend_failure_body("planner-moe", None, Some(GPU_REASON)),
-            "Backend planner-moe is no longer running. GPU unavailable: the device was busy or unavailable while the backend loaded. It stays down until restarted from the Backends view."
+            "Backend planner-moe is no longer running. GPU unavailable: the device was busy or unavailable while the backend loaded. Restart it from the Backends view."
         );
     }
 }

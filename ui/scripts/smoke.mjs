@@ -32,7 +32,7 @@ const html = existsSync(indexHtml) ? readFileSync(indexHtml, "utf8") : "";
 check(/assets\/.*\.js/.test(html), "index.html references the JS bundle");
 
 const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
-for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_offload_override", "backend_clear_offload_override", "backend_set_mtp", "backend_set_moe_cache", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_set_mtp", "model_delete", "model_assign", "model_hf_lookup", "model_hf_header", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "optimize_tuning_preview", "optimize_tuning_run", "optimize_tuning_adopt", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
+for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_offload_override", "backend_clear_offload_override", "backend_set_mtp", "backend_set_moe_cache", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_set_mtp", "model_delete", "model_assign", "model_hf_lookup", "model_hf_header", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_restart", "postgres_stop", "activation_apply", "services_list", "log_receiver_status", "log_receiver_start", "log_receiver_stop", "log_receiver_restart", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "optimize_tuning_preview", "optimize_tuning_run", "optimize_tuning_adopt", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
 
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
@@ -257,7 +257,7 @@ check(readFileSync(join(root, "src", "views", "optimize.ts"), "utf8").includes('
 // while the gateway is up and the metrics poller has not yet landed
 // two scrapes. It must stay gated on the gateway being up — shown
 // while the gateway is down, it blames a wait that cannot end.
-check(readFileSync(join(root, "src", "views", "dashboard.ts"), "utf8").includes("m.gateway !== null && m.gatewayUp &&"),
+check(readFileSync(join(root, "src", "views", "dashboard.ts"), "utf8").includes("m.gateway !== null && m.gatewayState === \"running\" &&"),
   "dashboard gateway-stats banner requires the gateway to be up");
 
 // Optimize Estimate (tracker #56): the Estimate control sits
@@ -760,7 +760,7 @@ check(apiSrc.includes("rs_ram_mib?: number | null"), "BackendRow declares the re
 check(apiSrc.includes("failure_reason?: string | null"), "BackendRow declares the recorded failure reason");
 check(staticSrc.includes('["State cache"'), "Backends card renders the State cache tile");
 check(staticSrc.includes("b.rs_ram_mib != null"), "State cache tile renders only when the requirement carries the term");
-check(staticSrc.includes('b.state === "failed" && b.failure_reason'), "Failure line is gated on the failed state and a recorded reason");
+check(staticSrc.includes('st === "failed" && b.failure_reason'), "Failure line is gated on the failed state and a recorded reason");
 check(staticSrc.includes("Failure: ${esc(b.failure_reason)}"), "Backends card renders the recorded failure reason");
 check(bundle.includes("State cache"), "bundle contains the State cache tile label");
 
@@ -866,7 +866,7 @@ check(staticSrcFit.includes('"wddm_paged"'), "fit surfaces render the WDDM paged
 check(staticSrcFit.includes("GiB paged"), "fit surfaces state the paged amount");
 check(staticSrcFit.includes("moeCacheMib: moeDraft"), "cache preview sends the Expert cache control's draft");
 check(staticSrcFit.includes("armedWddmStart"), "backend card arms the WDDM paged Start for the two-click confirm");
-check(staticSrcFit.includes("startBackend(id, allow)"), "the confirmed start carries the overcommit flag");
+check(staticSrcFit.includes("allowWddmOvercommit: allow"), "the confirmed start carries the overcommit flag");
 check(apiSrc.includes("moe_cache_mib"), "api types carry the expert-cache figure");
 
 // The UI detects Tauri via window.__TAURI__, which Tauri only injects when

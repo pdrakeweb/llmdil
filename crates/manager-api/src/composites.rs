@@ -269,12 +269,14 @@ async fn delete_group_inner(ctx: &ApiCtx, name: &str) -> Result<Value, ApiError>
 }
 
 /// POST /api/v1/gateway/start: the start-gateway wizard step under
-/// a domain name (rest-api §6.5). Same operation, same semantics.
+/// a domain name (rest-api §6.5). Same operation, same semantics: the
+/// HTTP layer fails the operation on a busy, failed or manual-action
+/// run by the shared outcome rule (CR-2).
 pub async fn gateway_start(ctx: &ApiCtx) -> Result<Value, ApiError> {
     call(
         ctx,
         Op::RunWizardStep,
-        json!({ "step_id": "start-gateway" }),
+        json!({ "step_id": "start-gateway", "origin": "api" }),
     )
     .await
 }
@@ -296,78 +298,24 @@ pub fn validate_apply_body(body: &Value) -> Result<String, ApiError> {
     Ok(mode.to_string())
 }
 
-/// POST /api/v1/activation-plan/apply: the one server-side
-/// composition (PLAN.md §3.6). Restarts the plan's stale backends,
-/// then — when the gateway has pending changes — optionally drains,
-/// stops the gateway, runs the start-gateway step, and performs
-/// the completion bookkeeping server-side. Steps run in order and
-/// stop at the first failure; completed restarts are not rolled back.
+/// POST /api/v1/activation-plan/apply: delegates to the one
+/// server-side activation apply (`activation_apply` op, service-lifecycle
+/// WP7) with source `api`. The op re-reads the plan, restarts the stale
+/// backends through the shared backend restart, restarts the gateway
+/// through the shared gateway restart (PostgreSQL stays up), records one
+/// activation-history execution, and reports `ok: false` when any item
+/// failed. The HTTP layer turns that payload into a failed operation
+/// whose detail is the whole payload (the shared outcome rule,
+/// [`manager_app::lifecycle::payload_failure`]; ACT-1/GW-7), so a
+/// failed or manual gateway start is never reported as applied.
 pub async fn activation_apply(ctx: &ApiCtx, body: Value) -> Result<Value, ApiError> {
     let mode = validate_apply_body(&body)?;
-    let mode = mode.as_str();
-    let plan = call(ctx, Op::GatewayActivationPlan, json!({})).await?;
-    let restart_ids: Vec<String> = plan
-        .get("backend_restart_ids")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let gateway_pending = plan
-        .get("gateway_pending")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    let mut restarted: Vec<String> = Vec::new();
-    for id in &restart_ids {
-        call(
-            ctx,
-            Op::RestartBackend,
-            json!({ "id": id, "graceful": true }),
-        )
-        .await
-        .map_err(|e| {
-            ApiError::Gateway(format!(
-                "activation apply: restarting backend `{id}` failed: {e}"
-            ))
-        })?;
-        restarted.push(id.clone());
-    }
-
-    let mut quiesce: Option<Value> = None;
-    let mut gateway_restarted = false;
-    if gateway_pending {
-        if mode == "drain" {
-            // On timeout the apply proceeds (the doc's contract);
-            // the outcome is reported, not treated as failure.
-            quiesce = call(
-                ctx,
-                Op::GatewayQuiesceWait,
-                json!({ "timeout_secs": 120 }),
-            )
-            .await
-            .ok();
-        }
-        call(ctx, Op::GatewayStop, json!({})).await?;
-        gateway_start(ctx).await.map_err(|e| {
-            ApiError::Gateway(format!("activation apply: gateway start failed: {e}"))
-        })?;
-        gateway_restarted = true;
-    }
-
-    call(ctx, Op::GatewayActivationComplete, json!({})).await?;
-    let mut result = json!({
-        "applied": true,
-        "mode": mode,
-        "restarted_backends": restarted,
-        "gateway_restarted": gateway_restarted,
-    });
-    if let Some(q) = quiesce {
-        result["quiesce"] = q;
-    }
-    Ok(result)
+    call(
+        ctx,
+        Op::ActivationApply,
+        json!({ "mode": mode, "source": "api" }),
+    )
+    .await
 }
 
 /// PATCH /api/v1/gateway/config composition: a `bind_host` field in

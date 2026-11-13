@@ -881,6 +881,7 @@ async fn run_arm(
 /// experiment batch's does.
 async fn run_sweep(
     state: Arc<AppState>,
+    sink: Arc<dyn crate::EventSink>,
     backend_id: String,
     mut rx: tokio::sync::oneshot::Receiver<()>,
 ) {
@@ -991,12 +992,13 @@ async fn run_sweep(
     let mut stopped: Vec<String> = Vec::new();
     let mut park_failed: Option<String> = None;
     for id in &plan.stop_list {
-        let outcome = state.supervisor().await.lock().await.stop(id, false).await;
+        let opts = crate::backend_lifecycle::BackendOpOpts::new(crate::lifecycle::Origin::Optimize);
+        let outcome = crate::backend_lifecycle::stop_backend(&state, &sink, id, opts).await;
         match outcome {
-            Ok(()) => stopped.push(id.clone()),
+            Ok(_) => stopped.push(id.clone()),
             Err(e) => {
                 park_failed = Some(format!(
-                    "preflight parking needed backend '{id}' stopped, but stopping it failed: {e:?}"
+                    "preflight parking needed backend '{id}' stopped, but stopping it failed: {e}"
                 ));
                 break;
             }
@@ -1225,7 +1227,7 @@ async fn run_sweep(
     }
 
     // Restart what the sweep parked, whatever its outcome.
-    let note = crate::optimize_experiments::restart_stopped(&state, &stopped).await;
+    let note = crate::optimize_experiments::restart_stopped(&state, &sink, &stopped).await;
     if !note.is_empty() {
         crate::optimize::opt_log1(&state, &format!("tuning {sweep_id}: {note}"));
     }
@@ -1284,7 +1286,7 @@ async fn run_sweep(
 /// under the shared job slot — Cancel is `optimize_cancel_job`.
 pub async fn op_optimize_tuning_run(
     state: &Arc<AppState>,
-    _sink: &Arc<dyn crate::EventSink>,
+    sink: &Arc<dyn crate::EventSink>,
     backend_id: String,
 ) -> crate::ApiResult {
     {
@@ -1345,12 +1347,13 @@ pub async fn op_optimize_tuning_run(
         *slot = Some(tx);
     }
     let task_state = state.clone();
+    let task_sink = Arc::clone(sink);
     let task_backend = backend_id.clone();
     tokio::spawn(async move {
         // The guard lives for the sweep's whole run: its
         // claim is the per-backend record the refusals name.
         let _guard = guard;
-        run_sweep(task_state.clone(), task_backend, rx).await;
+        run_sweep(task_state.clone(), task_sink, task_backend, rx).await;
         {
             let mut slot = task_state.optimize_job_abort.lock().await;
             *slot = None;

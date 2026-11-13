@@ -3,52 +3,42 @@
    -> GPUs, dashed MXC boundary around the backends, cluster summary
    inspector, GPU load rings.
    Live wiring: renderServiceMap() returns the shell; wireServiceMap(root)
-   loads backends (getBackends), GPU telemetry (getGpuTelemetry), and the
-   gateway summary (getGatewayStatus) and paints real nodes — gateway port
+   takes backends and the gateway summary from the shared service store
+   (lifecycle.ts: fast during transitions, with the local pending
+   overlay), loads GPU telemetry and the config itself, and paints real
+   nodes — gateway port
    and group count, backend id/port/process state, GPU name and VRAM
    used/total. Node dots and edges are colored by backend state. Nothing is
    fabricated: with no backends configured the canvas shows an empty state,
    and in the browser (live=false) a sample-mode banner says so. */
 
-import { getAppConfig, getBackends, getGatewayStatus, getGpuTelemetry, systemVerdict } from "../api";
+import { getAppConfig, getGpuTelemetry, systemVerdict } from "../api";
 import type { BackendRow, GatewayStatusData } from "../api";
 import { fmtGb, gaugeRing, trim1 } from "../charts";
 import { icon } from "../icons";
 import { esc } from "../html";
+import { LIFECYCLE_COLORS, META, lifecycleColor, lifecycleEdge, lifecycleLabel, serviceStore } from "../lifecycle";
+import type { LifecycleState, ServiceSnapshot } from "../lifecycle";
 import type { GpuInfo } from "../types";
 
-const C = { green: "#3fb950", amber: "#d29922", red: "#f85149", blue: "#4a9eff", grey: "#6d7686" };
+const C = { green: LIFECYCLE_COLORS.green, amber: LIFECYCLE_COLORS.amber, red: LIFECYCLE_COLORS.red, blue: "#4a9eff", grey: LIFECYCLE_COLORS.grey };
 
-/** Dot color for a supervisor process state. */
-function stateColor(state: string): string {
-  switch (state) {
-    case "running": return C.green;
-    case "starting": case "stopping": return C.amber;
-    case "failed": return C.red;
-    default: return C.grey; // stopped and anything unknown
-  }
-}
+/** Node rect stroke for a lifecycle state: only failure/transition
+ *  override the default border, so running/stopped keep the approved
+ *  quiet look. */
+/** Placeholder payload when gateway_status failed: the node renders
+ *  "status unknown" from gatewayError, never these zeros. */
+const GATEWAY_UNKNOWN: GatewayStatusData = {
+  port: 0, groups: 0, routing_rules: 0, up: false, state: "unknown", transition: null, intent: null,
+  pid: null, service_managed: false, failure: null, postgres: null, activation_applying: null,
+  routing_log_len: 0, openrouter_cred_present: null, bind_host: "", lan_ip: null,
+  activation_pending: false, activation_changes: 0, litellm_version: null,
+};
 
-/** Edge styling for a backend state: running = hot (blue), transitioning =
- *  warn (amber dashed), failed = red (no CSS class exists, inline stroke),
- *  stopped = plain grey. */
-function stateEdge(state: string): { cls: string; stroke: string } {
-  switch (state) {
-    case "running": return { cls: "hot", stroke: "" };
-    case "starting": case "stopping": return { cls: "warn", stroke: "" };
-    case "failed": return { cls: "", stroke: C.red };
-    default: return { cls: "", stroke: "" };
-  }
-}
-
-/** Node rect stroke for a backend state: only failure/transition override
- *  the default border, so running/stopped keep the approved quiet look. */
-function stateStroke(state: string): string {
-  switch (state) {
-    case "failed": return C.red;
-    case "starting": case "stopping": return C.amber;
-    default: return "";
-  }
+function lifecycleStroke(s: LifecycleState): string {
+  if (s === "failed") return C.red;
+  if (META[s].isTransition || s === "degraded") return C.amber;
+  return "";
 }
 
 function gpuDot(g: GpuInfo): string {
@@ -70,6 +60,11 @@ function fmtUptime(secs: number): string {
 
 interface MapData {
   backends: BackendRow[];
+  /** Effective lifecycle state per backend id (the store's overlay). */
+  states: Map<string, LifecycleState>;
+  /** Effective gateway/PostgreSQL lifecycle state (null: unmeasured). */
+  gatewayState: LifecycleState | null;
+  postgresState: LifecycleState | null;
   gpus: GpuInfo[];
   stale: boolean;
   gateway: GatewayStatusData;
@@ -167,8 +162,9 @@ function topologySvg(d: MapData): string {
   //    placement signal for a display GPU under WDDM, where
   //    nvidia-smi cannot measure per-process memory at all.
   // A stopped or failed backend resides nowhere: no GPU edges.
+  const stOf = (b: BackendRow): LifecycleState => d.states.get(b.id) ?? "unknown";
   backends.forEach((b, i) => {
-    const e = stateEdge(b.state);
+    const e = lifecycleEdge(stOf(b));
     edge(COL.gateway + NW, H / 2, COL.backends, ys[i], e.cls, e.stroke);
     const measured = d.residency.get(b.id);
     const resident = measured
@@ -178,7 +174,7 @@ function topologySvg(d: MapData): string {
       for (const [j] of resident) {
         if (gpus[j]) edge(COL.backends + NW, ys[i], COL.gpus, spreadY(j, gpus.length), e.cls, e.stroke);
       }
-    } else if (b.state === "running" || b.state === "starting") {
+    } else if (META[stOf(b)].isLive) {
       const split = d.splits.get(b.id);
       const targets = split
         ? split.map((frac, j) => (frac > 0 ? j : -1)).filter((j) => j >= 0)
@@ -199,13 +195,21 @@ function topologySvg(d: MapData): string {
   if (d.gatewayError) {
     node(COL.gateway, H / 2, "LiteLLM", "status unknown", C.grey, "", undefined, "#/gateway");
   } else {
+    // The gateway node names its lifecycle state when it is not simply
+    // running ("restarting… (activation, 12 s)", "stopped", …) and the
+    // PostgreSQL state when the database is not running.
+    const gs = d.live ? d.gatewayState : null;
+    const gwTxt = gs && gs !== "running" ? ` \u00b7 ${lifecycleLabel(gs, serviceStore.transitionOf("gateway", gateway.transition))}` : "";
+    const pg = d.live ? d.postgresState : null;
+    const pgTxt = pg && pg !== "running" && pg !== "not_installed" ? ` \u00b7 db ${lifecycleLabel(pg)}` : "";
     node(COL.gateway, H / 2, "LiteLLM",
-      `:${gateway.port} \u00b7 ${gateway.groups} enabled groups \u00b7 ${gateway.routing_rules} rules${d.live && !gateway.up ? " \u00b7 down" : ""}`,
-      d.live ? (gateway.up ? C.green : C.red) : C.grey, C.blue, undefined, "#/gateway");
+      `:${gateway.port} \u00b7 ${gateway.groups} enabled groups \u00b7 ${gateway.routing_rules} rules${gwTxt}${pgTxt}`,
+      gs ? lifecycleColor(gs) : C.grey, gs ? lifecycleStroke(gs) || C.blue : C.blue, undefined, "#/gateway");
   }
 
   backends.forEach((b, i) => {
-    const up = b.state === "running" && b.uptime_secs != null ? ` \u00b7 up ${fmtUptime(b.uptime_secs)}` : "";
+    const st = stOf(b);
+    const up = st === "running" && b.uptime_secs != null ? ` \u00b7 up ${fmtUptime(b.uptime_secs)}` : "";
     const model = b.model_file ? ` \u00b7 ${b.model_file.split(/[\\/]/).pop()}` : "";
     const res = d.residency.get(b.id);
     const resident = res ? [...res.entries()].filter((e): e is [number, number] => e[1] !== null && e[1] >= RESIDENCY_MIN_MIB) : [];
@@ -215,7 +219,7 @@ function topologySvg(d: MapData): string {
       : res && res.size
         ? anyMeasured ? " \u00b7 context only" : " \u00b7 residency not measured"
         : "";
-    node(COL.backends, ys[i], b.id, `:${b.port} \u00b7 ${b.state}${up}${model}${resTxt}`, stateColor(b.state), stateStroke(b.state), undefined, "#/backends");
+    node(COL.backends, ys[i], b.id, `:${b.port} \u00b7 ${lifecycleLabel(st, serviceStore.transitionOf(`backend:${b.id}`, b.transition ?? null))}${up}${model}${resTxt}`, lifecycleColor(st), lifecycleStroke(st), undefined, "#/backends");
   });
 
   gpus.forEach((g, j) => {
@@ -247,18 +251,18 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
     }
   }
 
-  const running = d.backends.filter((b) => b.state === "running").length;
+  // The shared count rule (enabled + configured backends), used by the
+  // pill and the summary row alike.
+  const counts = d.live ? serviceStore.summary() : { ...serviceStore.summary(), gateway: null };
   const pill = root.querySelector("#mapPill");
   if (pill) {
     // The shared verdict rule (api.ts systemVerdict) — the same one
     // the Dashboard header pill uses. In sample mode the gateway state
     // is unmeasured, so it does not degrade the verdict.
     const verdict = systemVerdict({
-      total: d.backends.length,
-      running,
+      summary: counts,
       stale: d.stale,
       error: d.errors.length ? d.errors.join("; ") : null,
-      gatewayUp: d.live ? d.gateway.up : true,
     });
     pill.innerHTML = `<span class="dot ${verdict.dot}"></span> ${esc(verdict.text)}`;
   }
@@ -283,10 +287,7 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
     } else {
       canvas.innerHTML = `${topologySvg(d)}
         <div class="legend" style="margin-top:8px">
-          <span><span class="sw" style="background:${C.green}"></span>running</span>
-          <span><span class="sw" style="background:${C.amber}"></span>starting / stopping</span>
-          <span><span class="sw" style="background:${C.red}"></span>failed</span>
-          <span><span class="sw" style="background:${C.grey}"></span>stopped</span>
+          ${mapLegend()}
           <span><span class="dot ok"></span>GPU ok</span>
           <span><span class="dot warn"></span>GPU degraded</span>
           <span><span class="dot err"></span>GPU down</span>
@@ -300,8 +301,9 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
   const vramUsed = d.gpus.reduce((a, g) => a + g.vram_used_gb, 0);
   const vramTotal = d.gpus.reduce((a, g) => a + g.vram_total_gb, 0);
   const summary: [string, string][] = [
-    ["Backends", `${running} / ${d.backends.length} running`],
-    ["Gateway", d.gatewayError ? "status unknown" : `:${d.gateway.port} \u00b7 ${d.gateway.groups} enabled groups${d.live && !d.gateway.up ? " \u00b7 down" : ""}`],
+    ["Backends", `${counts.backendsRunning} / ${counts.backendsTotal} running`],
+    ["Gateway", d.gatewayError ? "status unknown" : `:${d.gateway.port} \u00b7 ${d.gateway.groups} enabled groups${d.live && d.gatewayState && d.gatewayState !== "running" ? ` \u00b7 ${lifecycleLabel(d.gatewayState)}` : ""}`],
+    ...(d.live && d.postgresState ? [["PostgreSQL", lifecycleLabel(d.postgresState)] as [string, string]] : []),
     ["Routing rules", String(d.gateway.routing_rules)],
     ["GPUs", `${d.gpus.length} detected`],
     ["VRAM used (all processes)", d.gpus.length ? `${fmtGb(vramUsed)} / ${fmtGb(vramTotal)} GB` : "—"],
@@ -335,6 +337,17 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
       ? d.gpus.map((g) => `<div style="display:flex;align-items:center;gap:10px;margin:8px 0"><span style="font-size:12px;width:70px">${esc(g.name.replace("Tesla ", ""))}</span>${gaugeRing(g.util_pct, 44, g.util_pct > 60 ? C.amber : C.green, trim1(g.util_pct), "%")}</div>`).join("")
       : `<div class="empty">no GPUs reported</div>`;
   }
+}
+
+/** The lifecycle legend, generated from the shared META: one swatch
+ *  per color, labeled with the states it covers. */
+function mapLegend(): string {
+  const groups: { color: string; states: LifecycleState[] }[] = [];
+  for (const s of ["running", "starting", "restarting", "stopping", "degraded", "failed", "stopped"] as LifecycleState[]) {
+    const g = groups.find((x) => x.color === META[s].color);
+    if (g) g.states.push(s); else groups.push({ color: META[s].color, states: [s] });
+  }
+  return groups.map((g) => `<span><span class="sw" style="background:${g.color}"></span>${esc(g.states.map((s) => META[s].label).join(" / "))}</span>`).join("");
 }
 
 export function renderServiceMap(): string {
@@ -384,51 +397,76 @@ function splitsFromConfig(cfg: Record<string, unknown> | null): Map<string, numb
 export async function wireServiceMap(root: HTMLElement): Promise<() => void> {
   let disposed = false;
   let loading = false;
+  /** Telemetry + config from the latest load; the lifecycle part of
+   *  each paint comes from the shared store's latest snapshot. */
+  let lastTele: Awaited<ReturnType<typeof getGpuTelemetry>> | null = null;
+  let lastCfg: Awaited<ReturnType<typeof getAppConfig>> | null = null;
+  let lastLoadAt = 0;
 
+  const paint = (snap: ServiceSnapshot): void => {
+    // No store snapshot yet: keep the Loading state rather than
+    // painting an empty topology.
+    if (disposed || !lastTele || !lastCfg || snap.updatedAt === 0) return;
+    const g = lastTele;
+    const cfg = lastCfg;
+    const gwErr = snap.live ? snap.gatewayError : null;
+    // A config failure belongs in the banner too: without it the MXC
+    // labels fall back and the tensor-split edges vanish silently.
+    const errors = [snap.backendsError, g.error, gwErr, cfg.error].filter((e): e is string => Boolean(e));
+    const mxc = cfg.data?.mxc as { mode?: unknown } | undefined;
+    const residency = new Map<string, Map<number, number | null>>();
+    for (const gpu of g.data.gpus) {
+      for (const p of gpu.processes ?? []) {
+        if (p.backend === "\u2014") continue;
+        const gm = residency.get(p.backend) ?? new Map<number, number | null>();
+        // A backend can hold several processes on one GPU: its
+        // residency there is their SUM (code-review 5.10 — the
+        // plain set() kept only the last process's figure). A
+        // null (not measured) contributes nothing; the entry is
+        // null only when every process on that GPU is unmeasured.
+        const key = Number(gpu.id);
+        const prev = gm.get(key);
+        if (p.vram_mib === null) {
+          if (!gm.has(key)) gm.set(key, null);
+        } else {
+          gm.set(key, (prev ?? 0) + p.vram_mib);
+        }
+        residency.set(p.backend, gm);
+      }
+    }
+    const live = snap.live && g.live;
+    const gateway = snap.gateway ?? GATEWAY_UNKNOWN;
+    paintServiceMap(root, {
+      backends: snap.backends,
+      states: new Map(snap.backends.map((r) => [r.id, serviceStore.backendState(r)])),
+      gatewayState: serviceStore.gatewayState(),
+      postgresState: serviceStore.postgresState(),
+      gpus: g.data.gpus,
+      stale: g.data.stale,
+      gateway,
+      gatewayError: snap.live && !snap.gateway,
+      backendsError: snap.backendsError,
+      mxcMode: typeof mxc?.mode === "string" ? mxc.mode : null,
+      splits: splitsFromConfig(cfg.data),
+      residency,
+      live,
+      errors,
+      updatedAt: snap.updatedAt || Date.now(),
+    });
+  };
+
+  /** Telemetry and config: refreshed on the store's cadence, at most
+   *  every ~5 s (lifecycle repaints in between need neither). */
   const load = async (): Promise<void> => {
     if (loading) return;
     loading = true;
+    lastLoadAt = Date.now();
     try {
-      const [b, g, gw, cfg] = await Promise.all([getBackends(), getGpuTelemetry(), getGatewayStatus(), getAppConfig()]);
+      const [g, cfg] = await Promise.all([getGpuTelemetry(), getAppConfig()]);
       if (disposed) return;
-      // A config failure belongs in the banner too: without it the MXC
-      // labels fall back and the tensor-split edges vanish silently.
-      const errors = [b.error, g.error, gw.error, cfg.error].filter((e): e is string => Boolean(e));
-      const mxc = cfg.data?.mxc as { mode?: unknown } | undefined;
-      const residency = new Map<string, Map<number, number | null>>();
-      for (const gpu of g.data.gpus) {
-        for (const p of gpu.processes ?? []) {
-          if (p.backend === "\u2014") continue;
-          const gm = residency.get(p.backend) ?? new Map<number, number | null>();
-          // A backend can hold several processes on one GPU: its
-          // residency there is their SUM (code-review 5.10 — the
-          // plain set() kept only the last process's figure). A
-          // null (not measured) contributes nothing; the entry is
-          // null only when every process on that GPU is unmeasured.
-          const key = Number(gpu.id);
-          const prev = gm.get(key);
-          if (p.vram_mib === null) {
-            if (!gm.has(key)) gm.set(key, null);
-          } else {
-            gm.set(key, (prev ?? 0) + p.vram_mib);
-          }
-          residency.set(p.backend, gm);
-        }
-      }
-      paintServiceMap(root, {
-        backends: b.data,
-        gpus: g.data.gpus,
-        stale: g.data.stale,
-        gateway: gw.data,
-        gatewayError: Boolean(gw.error),
-        backendsError: b.error ?? null,
-        mxcMode: typeof mxc?.mode === "string" ? mxc.mode : null,
-        splits: splitsFromConfig(cfg.data),
-        residency,
-        live: b.live && g.live && gw.live,
-        errors,
-        updatedAt: Date.now(),
-      });
+      lastTele = g;
+      lastCfg = cfg;
+      paint(serviceStore.get());
     } finally {
       loading = false;
     }
@@ -436,12 +474,17 @@ export async function wireServiceMap(root: HTMLElement): Promise<() => void> {
 
   await load();
 
-  // Poll on the dashboard pattern: the map asserts live state, so it
-  // refreshes while open and stops on teardown.
-  const timer = window.setInterval(() => { if (!disposed) void load(); }, 5000);
+  // The map asserts live state: every store refresh repaints it (the
+  // shared poller — fast while anything is in transition, immediate on
+  // lifecycle events), and telemetry reloads at most every ~5 s.
+  const unsubscribe = serviceStore.subscribe((snap) => {
+    if (disposed) return;
+    if (Date.now() - lastLoadAt >= 4500) void load();
+    else paint(snap);
+  });
 
   return () => {
     disposed = true;
-    window.clearInterval(timer);
+    unsubscribe();
   };
 }

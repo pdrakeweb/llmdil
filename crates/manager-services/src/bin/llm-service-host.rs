@@ -391,9 +391,11 @@ fn prompt_service_account_password(
 mod windows_host {
     use super::cred_read;
     use manager_services::{resolve_env, ServiceDefinition};
+    use manager_supervisor::lifecycle;
     use std::ffi::c_void;
     use std::path::Path;
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0,
     };
@@ -415,7 +417,7 @@ mod windows_host {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, GetExitCodeProcess, WaitForSingleObject, PROCESS_INFORMATION,
+        CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject, PROCESS_INFORMATION,
         STARTF_USESTDHANDLES, STARTUPINFOW,
     };
 
@@ -431,6 +433,46 @@ mod windows_host {
         child: HANDLE,
         job: HANDLE,
         state: SERVICE_STATUS_CURRENT_STATE,
+        /// Set by the control handler on STOP/SHUTDOWN: the child's exit
+        /// that follows is an operator stop (reported as a clean
+        /// SERVICE_STOPPED), not a crash.
+        stop_requested: bool,
+        /// When the child was spawned (uptime in the exit marker).
+        child_started: Option<Instant>,
+        child_pid: u32,
+    }
+
+    /// Append one lifecycle marker for this service to its lifecycle log
+    /// (`ServiceDefinition::lifecycle_log`, or the stdout log's
+    /// `<stem>.lifecycle.log` sibling for an older definition), in the
+    /// shared `[ts] [lifecycle] <key>: <event>: <detail> — by scm` format.
+    fn marker(def: &ServiceDefinition, event: &str, detail: Option<&str>) {
+        let Some(path) = manager_services::lifecycle_log_path(def) else {
+            return;
+        };
+        let line = lifecycle::marker_line(
+            chrono::Utc::now(),
+            &manager_services::lifecycle_key(&def.name),
+            event,
+            detail,
+            Some(lifecycle::Origin::Scm),
+        );
+        lifecycle::append_marker(&path, &line);
+    }
+
+    fn def_snapshot() -> Option<ServiceDefinition> {
+        HOST.lock().ok()?.as_ref().map(|s| s.def.clone())
+    }
+
+    fn uptime_text(d: Duration) -> String {
+        let secs = d.as_secs();
+        if secs >= 3600 {
+            format!("{}h{:02}m{:02}s", secs / 3600, (secs / 60) % 60, secs % 60)
+        } else if secs >= 60 {
+            format!("{}m{:02}s", secs / 60, secs % 60)
+        } else {
+            format!("{:.1}s", d.as_secs_f64())
+        }
     }
 
     // The handles are only ever touched under the HOST mutex (or by
@@ -455,6 +497,9 @@ mod windows_host {
                 child: std::ptr::null_mut(),
                 job: std::ptr::null_mut(),
                 state: SERVICE_STOPPED,
+                stop_requested: false,
+                child_started: None,
+                child_pid: 0,
             });
         }
         let mut table = [
@@ -500,16 +545,51 @@ mod windows_host {
                 state.status_handle = handle;
             }
         }
-        report(SERVICE_START_PENDING, 0, 30_000);
+        report(SERVICE_START_PENDING, 0, 0, 30_000);
+        if let Some(def) = def_snapshot() {
+            marker(
+                &def,
+                "service start",
+                Some(&format!(
+                    "llm-service-host v{}, definition {} (format v{}), host pid {}",
+                    env!("CARGO_PKG_VERSION"),
+                    def.name,
+                    def.version,
+                    std::process::id()
+                )),
+            );
+        }
         if let Err(code) = start_child() {
+            if let Some(def) = def_snapshot() {
+                marker(
+                    &def,
+                    "service stopped",
+                    Some(&format!("start failed (service-specific code {code})")),
+                );
+            }
             report_specific_failure(code);
             return;
         }
-        report(
-            windows_sys::Win32::System::Services::SERVICE_RUNNING,
-            0,
-            0,
-        );
+        // RUNNING, unless a stop arrived while the child was being
+        // spawned (STOP is accepted during START_PENDING): then the job
+        // could not be terminated yet — do it now, under the same lock
+        // the control handler takes, so the two cannot interleave.
+        {
+            let mut guard = HOST.lock().expect("host state");
+            if let Some(host) = guard.as_mut() {
+                if host.stop_requested {
+                    terminate_child(host);
+                } else {
+                    report_locked(
+                        host,
+                        windows_sys::Win32::System::Services::SERVICE_RUNNING,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+            }
+        }
         // Wait for the child; a stop control terminates the job,
         // which ends this wait.
         let child = {
@@ -517,14 +597,65 @@ mod windows_host {
             guard.as_ref().map(|s| s.child).unwrap_or(std::ptr::null_mut())
         };
         let mut exit_code: u32 = 0;
+        let mut exit_known = false;
         if !child.is_null() {
             let wait = unsafe { WaitForSingleObject(child, INFINITE) };
             if wait == WAIT_OBJECT_0 {
-                unsafe { GetExitCodeProcess(child, &mut exit_code) };
+                exit_known = unsafe { GetExitCodeProcess(child, &mut exit_code) } != 0;
             }
         }
+        let (requested, started, pid, def) = {
+            let guard = HOST.lock().expect("host state");
+            match guard.as_ref() {
+                Some(h) => (h.stop_requested, h.child_started, h.child_pid, Some(h.def.clone())),
+                None => (false, None, 0, None),
+            }
+        };
+        if let Some(def) = &def {
+            let uptime = started
+                .map(|t| uptime_text(t.elapsed()))
+                .unwrap_or_else(|| "unknown".to_string());
+            let code = if exit_known {
+                exit_code.to_string()
+            } else {
+                "unknown".to_string()
+            };
+            let why = if requested {
+                "stop requested"
+            } else {
+                "unexpected exit"
+            };
+            marker(
+                def,
+                "child exited",
+                Some(&format!("pid {pid}, code {code}, uptime {uptime}, {why}")),
+            );
+        }
         cleanup();
-        report(SERVICE_STOPPED, exit_code, 0);
+        if requested {
+            // An operator stop: a clean stop, whatever code
+            // TerminateJobObject left on the child. Never triggers SCM
+            // recovery.
+            if let Some(def) = &def {
+                marker(def, "service stopped", Some("clean stop (exit 0)"));
+            }
+            report(SERVICE_STOPPED, NO_ERROR, 0, 0);
+        } else {
+            // The child went away on its own: a failure the SCM (and the
+            // app) can tell apart from a stop. With
+            // fFailureActionsOnNonCrashFailures set (the log receiver)
+            // the SCM runs its restart actions.
+            if let Some(def) = &def {
+                marker(
+                    def,
+                    "service stopped",
+                    Some(&format!(
+                        "child failed (reported service-specific code {exit_code})"
+                    )),
+                );
+            }
+            report(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, exit_code, 0);
+        }
     }
 
     extern "system" fn control_handler(
@@ -535,13 +666,27 @@ mod windows_host {
     ) -> u32 {
         match control {
             SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
-                report(SERVICE_STOP_PENDING, 0, 15_000);
-                let job = {
-                    let guard = HOST.lock().expect("host state");
-                    guard.as_ref().map(|s| s.job).unwrap_or(std::ptr::null_mut())
-                };
-                if !job.is_null() {
-                    unsafe { TerminateJobObject(job, 1) };
+                // Marker first, so it precedes the "child exited" line
+                // service_main writes once the kill lands.
+                if let Some(def) = def_snapshot() {
+                    let detail = if control == SERVICE_CONTROL_SHUTDOWN {
+                        "system shutdown"
+                    } else {
+                        "service control STOP"
+                    };
+                    marker(&def, "stop requested", Some(detail));
+                }
+                let mut guard = HOST.lock().expect("host state");
+                if let Some(host) = guard.as_mut() {
+                    // Before the kill: the exit that follows is a
+                    // requested stop, not a crash.
+                    host.stop_requested = true;
+                    report_locked(host, SERVICE_STOP_PENDING, 0, 0, 15_000);
+                    // Under the lock, so cleanup() cannot close the
+                    // handles in between. With no child yet (a stop
+                    // during START_PENDING) service_main terminates it
+                    // once start_child returns.
+                    terminate_child(host);
                 }
                 NO_ERROR
             }
@@ -550,53 +695,63 @@ mod windows_host {
         }
     }
 
-    fn report(state: SERVICE_STATUS_CURRENT_STATE, win32_exit: u32, wait_hint: u32) {
-        let (handle, accepted) = {
-            let mut guard = HOST.lock().expect("host state");
-            let Some(host) = guard.as_mut() else { return };
-            host.state = state;
-            let accepted = if state
-                == windows_sys::Win32::System::Services::SERVICE_RUNNING
-            {
-                SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
-            } else {
-                0
-            };
-            (host.status_handle, accepted)
-        };
-        if handle.is_null() {
+    /// Kill the child tree: the job object when there is one, else (job
+    /// creation failed) the child process itself. Caller holds HOST.
+    fn terminate_child(host: &HostState) {
+        if !host.job.is_null() {
+            unsafe { TerminateJobObject(host.job, 1) };
+        } else if !host.child.is_null() {
+            unsafe { TerminateProcess(host.child, 1) };
+        }
+    }
+
+    /// Report a status to the SCM. `specific` is the service-specific
+    /// exit code (meaningful with `ERROR_SERVICE_SPECIFIC_ERROR`).
+    fn report(state: SERVICE_STATUS_CURRENT_STATE, win32_exit: u32, specific: u32, wait_hint: u32) {
+        let mut guard = HOST.lock().expect("host state");
+        if let Some(host) = guard.as_mut() {
+            report_locked(host, state, win32_exit, specific, wait_hint);
+        }
+    }
+
+    /// [`report`] with the HOST lock already held. STOP and SHUTDOWN are
+    /// accepted while RUNNING and while START_PENDING, so a stop during
+    /// a start is honored instead of failing with
+    /// ERROR_SERVICE_CANNOT_ACCEPT_CTRL.
+    fn report_locked(
+        host: &mut HostState,
+        state: SERVICE_STATUS_CURRENT_STATE,
+        win32_exit: u32,
+        specific: u32,
+        wait_hint: u32,
+    ) {
+        host.state = state;
+        if host.status_handle.is_null() {
             return;
         }
+        let accepted = if state == windows_sys::Win32::System::Services::SERVICE_RUNNING
+            || state == SERVICE_START_PENDING
+        {
+            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
+        } else {
+            0
+        };
         let status = SERVICE_STATUS {
             dwServiceType: SERVICE_WIN32_OWN_PROCESS,
             dwCurrentState: state,
             dwControlsAccepted: accepted,
             dwWin32ExitCode: win32_exit,
-            dwServiceSpecificExitCode: 0,
+            dwServiceSpecificExitCode: specific,
             dwCheckPoint: 0,
             dwWaitHint: wait_hint,
         };
-        unsafe { SetServiceStatus(handle, &status) };
+        unsafe { SetServiceStatus(host.status_handle, &status) };
     }
 
+    /// A failed start: SERVICE_STOPPED with `ERROR_SERVICE_SPECIFIC_ERROR`
+    /// and `specific` (1 = env/credential resolution, 2 = spawn).
     fn report_specific_failure(specific: u32) {
-        let handle = {
-            let guard = HOST.lock().expect("host state");
-            guard.as_ref().map(|s| s.status_handle).unwrap_or(std::ptr::null_mut())
-        };
-        if handle.is_null() {
-            return;
-        }
-        let status = SERVICE_STATUS {
-            dwServiceType: SERVICE_WIN32_OWN_PROCESS,
-            dwCurrentState: SERVICE_STOPPED,
-            dwControlsAccepted: 0,
-            dwWin32ExitCode: ERROR_SERVICE_SPECIFIC_ERROR,
-            dwServiceSpecificExitCode: specific,
-            dwCheckPoint: 0,
-            dwWaitHint: 0,
-        };
-        unsafe { SetServiceStatus(handle, &status) };
+        report(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, specific, 0);
     }
 
     /// Security attributes marking a handle inheritable. The child's
@@ -662,7 +817,23 @@ mod windows_host {
             let guard = HOST.lock().expect("host state");
             guard.as_ref().expect("host state").def.clone()
         };
+        // One previous run per log, as process mode keeps
+        // (`lifecycle::open_rotated_log`): rotate to `.prev` before the
+        // handles are opened (OPEN_ALWAYS + append, below). Best-effort:
+        // a file someone holds open without delete sharing stays put and
+        // this run appends to it.
+        let mut rotated: Vec<&Path> = Vec::new();
+        for log in [def.stdout_log.as_deref(), def.stderr_log.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if !rotated.contains(&log) {
+                let _ = lifecycle::rotate_log(log);
+                rotated.push(log);
+            }
+        }
         let resolved = resolve_env(&def, cred_read).map_err(|e| {
+            marker(&def, "start failed", Some(&format!("environment resolution: {e}")));
             if let Some(stderr_log) = &def.stderr_log {
                 let _ = std::fs::create_dir_all(
                     stderr_log.parent().unwrap_or(Path::new(".")),
@@ -676,7 +847,7 @@ mod windows_host {
                         let _ = writeln!(f, "llm-service-host: {e}");
                     });
             }
-            1u32
+            manager_services::HOST_EXIT_ENV_FAILURE
         })?;
 
         // Environment: the service's own environment overlaid with
@@ -744,6 +915,8 @@ mod windows_host {
                 &mut process,
             )
         };
+        // Read before CloseHandle below can overwrite it.
+        let spawn_error = if ok == 0 { unsafe { GetLastError() } } else { 0 };
         // The child holds its own copies of the stdio handles now.
         for h in [stdout, stderr].into_iter().flatten() {
             unsafe { CloseHandle(h) };
@@ -754,7 +927,23 @@ mod windows_host {
             unsafe { CloseHandle(stdin) };
         }
         if ok == 0 {
-            return Err(2);
+            let text = std::io::Error::from_raw_os_error(spawn_error as i32);
+            let detail = format!(
+                "CreateProcessW({}) failed with Windows error {spawn_error}: {text}",
+                def.program.display()
+            );
+            marker(&def, "start failed", Some(&detail));
+            if let Some(stderr_log) = &def.stderr_log {
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(stderr_log)
+                    .map(|mut f| {
+                        use std::io::Write;
+                        let _ = writeln!(f, "llm-service-host: {detail}");
+                    });
+            }
+            return Err(manager_services::HOST_EXIT_SPAWN_FAILURE);
         }
         unsafe { CloseHandle(process.hThread) };
 
@@ -783,10 +972,22 @@ mod windows_host {
             let _ = std::fs::write(pid_file, process.dwProcessId.to_string());
         }
 
+        marker(
+            &def,
+            "child spawned",
+            Some(&format!(
+                "pid {}, program {}",
+                process.dwProcessId,
+                def.program.display()
+            )),
+        );
+
         let mut guard = HOST.lock().expect("host state");
         if let Some(state) = guard.as_mut() {
             state.child = process.hProcess;
             state.job = job;
+            state.child_started = Some(Instant::now());
+            state.child_pid = process.dwProcessId;
         }
         Ok(())
     }

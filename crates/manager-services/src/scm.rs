@@ -111,7 +111,8 @@ mod windows_impl {
         DeleteService, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SetServiceObjectSecurity,
         StartServiceW, SC_ACTION, SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_CREATE_SERVICE,
         SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_CONFIG_DESCRIPTION,
-        SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START,
+        SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+        SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_FAILURE_ACTIONS_FLAG,
         SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_PAUSED,
         SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING,
         SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_STOPPED,
@@ -205,6 +206,7 @@ mod windows_impl {
             },
             child_pid: None,
             win32_exit_code: status.dwWin32ExitCode,
+            service_specific_exit_code: status.dwServiceSpecificExitCode,
         })
     }
 
@@ -294,6 +296,7 @@ mod windows_impl {
                     pid: None,
                     child_pid: None,
                     win32_exit_code: 0,
+                    service_specific_exit_code: 0,
                 });
             };
             query_status(&handle, name)
@@ -324,6 +327,10 @@ mod windows_impl {
             let ok = unsafe { ControlService(handle.0, SERVICE_CONTROL_STOP, &mut status) };
             if ok == 0 {
                 let code = unsafe { GetLastError() };
+                // Not running: nothing to stop. Every other code —
+                // notably ERROR_SERVICE_CANNOT_ACCEPT_CTRL (1061) while
+                // start/stop-pending — surfaces as a typed
+                // ServiceError::Scm so `stop_and_wait` can keep waiting.
                 if code != ERROR_SERVICE_NOT_ACTIVE {
                     return Err(ServiceError::Scm {
                         operation: "ControlService",
@@ -426,6 +433,26 @@ mod windows_impl {
                 return Err(scm_error("ChangeServiceConfig2W(failure actions)"));
             }
 
+            // Whether those actions also fire on a "non-crash" failure:
+            // the shim staying alive but reporting SERVICE_STOPPED with
+            // a non-zero exit code after its child exited unexpectedly.
+            // Operator stops are reported with exit 0 and never count.
+            // Set explicitly either way so a re-registration always
+            // matches the definition.
+            let mut flag = SERVICE_FAILURE_ACTIONS_FLAG {
+                fFailureActionsOnNonCrashFailures: i32::from(fa.restart_on_child_exit),
+            };
+            let ok = unsafe {
+                ChangeServiceConfig2W(
+                    handle.0,
+                    SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+                    &mut flag as *mut SERVICE_FAILURE_ACTIONS_FLAG as *mut c_void,
+                )
+            };
+            if ok == 0 {
+                return Err(scm_error("ChangeServiceConfig2W(failure actions flag)"));
+            }
+
             // DACL: SYSTEM full, Administrators full, the operator's
             // own SID query/start/stop — day-to-day control without
             // elevation; create/delete/change stay admin-only.
@@ -467,9 +494,12 @@ mod windows_impl {
                 SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG | 0x0001_0000,
             )?
             .ok_or_else(|| ServiceError::NotRegistered(name.to_string()))?;
-            // Best-effort stop first: a running service is only marked
-            // for deletion and lingers until it stops.
-            let _ = self.stop(name);
+            // Stop and wait first: a running service is only marked for
+            // deletion and lingers (blocking a re-register with
+            // ERROR_SERVICE_MARKED_FOR_DELETE) until it stops. A stop
+            // that does not finish in time still deletes — the service
+            // then disappears when its process exits.
+            let _ = crate::stop_and_wait(self, name, crate::ServiceTimeouts::unregister(name));
             let ok = unsafe { DeleteService(handle.0) };
             if ok == 0 {
                 return Err(scm_error("DeleteService"));

@@ -172,12 +172,21 @@ fn save_journal(data_dir: &Path, journal: &ActivationJournal) -> Result<(), Stri
     Ok(())
 }
 
-/// When the running gateway's configuration was generated: the
-/// mtime of the YAML the start-gateway step last wrote. Entries at
-/// or before this instant were resolved by that start.
+/// When the configuration the running gateway serves was generated:
+/// the `at` of the applied stamp the start-gateway step writes only
+/// after a fully successful start (`manager_wizard::gateway_applied_at`).
+/// Entries at or before this instant were resolved by that start. The
+/// step writes the YAML early — before the stop, the PostgreSQL start,
+/// the spawn and the health waits — so a failed restart leaves a newer
+/// YAML behind; its mtime is used only when no stamp exists at all
+/// (installs from before the stamp), never to override one (CR-1).
 pub(crate) fn gateway_config_written_at(
     data_dir: &Path,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Some(at) = manager_wizard::gateway_applied_at(data_dir) {
+        return Some(at);
+    }
+    // No stamp (or an unparseable one): the pre-stamp rule.
     let meta = std::fs::metadata(gateway_yaml_path(data_dir)).ok()?;
     let modified = meta.modified().ok()?;
     Some(chrono::DateTime::<chrono::Utc>::from(modified))
@@ -1657,6 +1666,41 @@ litellm_deployment_success_responses_total 9.0
         // The same state with the gateway DOWN composes no item:
         // the stale file is information, not pending work (#45).
         assert!(!drift_is_pending(detail.any(), false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gateway_entries_resolve_from_the_applied_stamp_not_the_yaml() {
+        // CR-1: a failed restart rewrites the YAML but writes no
+        // stamp, so an entry newer than the last successful start
+        // stays unresolved even though the YAML is newer still.
+        let dir = drift_test_dir("applied-stamp");
+        let _ = std::fs::remove_file(manager_wizard::gateway_applied_stamp_path(&dir));
+        std::fs::write(gateway_yaml_path(&dir), "model_list: []\n").unwrap();
+        let journal = ActivationJournal {
+            snapshot: None,
+            entries: vec![entry("gateway", &[])],
+            ..Default::default()
+        };
+        let none = std::collections::HashMap::new();
+        let configured = std::collections::HashSet::new();
+        // No stamp: the YAML mtime (now) resolves the 2026-10-16 entry.
+        assert!(unresolved_entries_scoped(&dir, &journal, &none, &configured).is_empty());
+        // A stamp from before the entry keeps it pending.
+        manager_wizard::write_gateway_applied_stamp(&dir, at("2026-10-16T11:00:00+00:00"), 4)
+            .unwrap();
+        assert_eq!(
+            gateway_config_written_at(&dir),
+            Some(at("2026-10-16T11:00:00+00:00"))
+        );
+        assert_eq!(
+            unresolved_entries_scoped(&dir, &journal, &none, &configured).len(),
+            1
+        );
+        // A successful start after the entry resolves it.
+        manager_wizard::write_gateway_applied_stamp(&dir, at("2026-10-16T12:00:01+00:00"), 5)
+            .unwrap();
+        assert!(unresolved_entries_scoped(&dir, &journal, &none, &configured).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

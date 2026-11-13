@@ -5,7 +5,12 @@
    in api.ts; fields the backend does not supply are optional and are left
    undefined by the mapping rather than fabricated. */
 
-export type Status = "ok" | "degraded" | "starting" | "down" | "idle";
+import type { LifecycleState, TransitionWire } from "./lifecycle-state";
+
+/** Card/telemetry status. "stopping" and "restarting" are lifecycle
+ *  transitions (toStatus in lifecycle.ts); "degraded" on a GPU is
+ *  telemetry health, not lifecycle. */
+export type Status = "ok" | "degraded" | "starting" | "stopping" | "restarting" | "down" | "idle";
 
 export interface StatusResponse {
   status: string;
@@ -27,6 +32,11 @@ export interface BackendInfo {
   name: string;
   port: number;
   status: Status;
+  /** The unified lifecycle state (lifecycle.ts vocabulary); `status`
+   *  is derived from it with toStatus(). */
+  lifecycle: LifecycleState;
+  /** The lifecycle operation in flight, when the payload reports one. */
+  transition?: TransitionWire | null;
   model: string;
   /** True when the running process was adopted by this session (it was
    *  started by a previous launch and survived the app closing). */
@@ -146,6 +156,11 @@ export interface DashboardModel {
   /** Gateway probe result (gateway_status.up); feeds the shared
    *  system verdict. False when the probe failed or reported down. */
   gatewayUp: boolean;
+  /** The gateway lifecycle state (gateway_status.state): running,
+   *  starting, restarting, stopping, stopped, failed, degraded. Null
+   *  when the gateway_status call failed (state unknown). Every
+   *  surface renders this, never the bare probe. */
+  gatewayState: LifecycleState | null;
   /** The one global LiteLLM routing strategy resolved from the
    *  gateway config, or null when no config/groups are available. */
   gatewayStrategy: string | null;

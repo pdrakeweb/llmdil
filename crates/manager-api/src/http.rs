@@ -231,31 +231,10 @@ async fn handle_op(
         let (id, record) = ctx.operations.begin(spec.name);
         let spawn_ctx = ctx.clone();
         tokio::spawn(async move {
-            match manager_app::registry::dispatch(&spawn_ctx.app, &spawn_ctx.sink, spec.op, args)
-                .await
-            {
-                Ok(value) => {
-                    if spec.op == Op::RunWizardStep
-                        && value.get("busy") == Some(&json!(true))
-                    {
-                        spawn_ctx.operations.fail_with_detail(
-                            &id,
-                            "a wizard step is already running",
-                            value,
-                        );
-                    } else {
-                        spawn_ctx
-                            .operations
-                            .complete(&id, spec.name, Ok(value));
-                    }
-                }
-                Err(e) => {
-                    let message = sanitize(&e.to_string(), &spawn_ctx.data_dir);
-                    spawn_ctx
-                        .operations
-                        .complete(&id, spec.name, Err(message));
-                }
-            }
+            let result =
+                manager_app::registry::dispatch(&spawn_ctx.app, &spawn_ctx.sink, spec.op, args)
+                    .await;
+            finish_operation(&spawn_ctx, &id, spec.name, result);
         });
         return (axum::http::StatusCode::ACCEPTED, axum::Json(record)).into_response();
     }
@@ -303,6 +282,41 @@ async fn handle_op(
     match manager_app::registry::dispatch(&ctx.app, &ctx.sink, spec.op, args).await {
         Ok(value) => shape_success(&ctx, spec, value),
         Err(e) => error_response(&ctx, &e, None),
+    }
+}
+
+/// The terminal outcome of an asynchronous operation, by the one
+/// shared lifecycle rule ([`manager_app::lifecycle::payload_failure`]):
+/// a payload with `busy: true` or `ok: false` is a failed operation
+/// whose error is the payload's message and whose detail is the whole
+/// payload (CR-2: a failed or manual start-gateway step, a refused
+/// run, or an activation apply with a failed item). `Ok` is a done
+/// operation; `Err` keeps the op error's text.
+pub fn operation_outcome(
+    result: Result<Value, ApiError>,
+) -> Result<Value, (String, Option<Value>)> {
+    match result {
+        Ok(value) => match manager_app::lifecycle::payload_failure(&value) {
+            Some(message) => Err((message, Some(value))),
+            None => Ok(value),
+        },
+        Err(e) => Err((e.to_string(), None)),
+    }
+}
+
+/// Record an asynchronous operation's terminal state (see
+/// [`operation_outcome`]). Every 202 route ends here: the registry's
+/// AsyncOp routes and the gateway-start / activation-apply composites.
+fn finish_operation(ctx: &ApiCtx, id: &str, kind: &str, result: Result<Value, ApiError>) {
+    match operation_outcome(result) {
+        Ok(value) => ctx.operations.complete(id, kind, Ok(value)),
+        Err((message, detail)) => {
+            let message = sanitize(&message, &ctx.data_dir);
+            match detail {
+                Some(detail) => ctx.operations.fail_with_detail(id, &message, detail),
+                None => ctx.operations.complete(id, kind, Err(message)),
+            }
+        }
     }
 }
 
@@ -362,6 +376,12 @@ fn assemble_args(
                 }
             }
         }
+    }
+    // Lifecycle operations record who asked (markers, events,
+    // history): a REST caller that names no origin is `api` (the CLI
+    // sends `cli`).
+    if spec.params.contains(&"origin") && !obj.contains_key("origin") {
+        obj.insert("origin".to_string(), json!("api"));
     }
     Ok(Value::Object(obj))
 }
@@ -439,6 +459,7 @@ pub fn error_mapping(e: &ApiError) -> (axum::http::StatusCode, &'static str, &'s
         ApiError::Services(_) => (S::INTERNAL_SERVER_ERROR, "SERVICES", "Services"),
         ApiError::Io(_) => (S::INTERNAL_SERVER_ERROR, "IO", "Io"),
         ApiError::Json(_) => (S::INTERNAL_SERVER_ERROR, "JSON", "Json"),
+        ApiError::Busy(_) => (S::CONFLICT, "BUSY", "Busy"),
     }
 }
 
@@ -680,27 +701,8 @@ async fn handle_gateway_start(State(ctx): State<Arc<ApiCtx>>) -> Response {
     let (id, record) = ctx.operations.begin("gateway_start");
     let spawn_ctx = ctx.clone();
     tokio::spawn(async move {
-        match composites::gateway_start(&spawn_ctx).await {
-            Ok(value) => {
-                if value.get("busy") == Some(&json!(true)) {
-                    spawn_ctx.operations.fail_with_detail(
-                        &id,
-                        "a wizard step is already running",
-                        value,
-                    );
-                } else {
-                    spawn_ctx
-                        .operations
-                        .complete(&id, "gateway_start", Ok(value));
-                }
-            }
-            Err(e) => {
-                let message = sanitize(&e.to_string(), &spawn_ctx.data_dir);
-                spawn_ctx
-                    .operations
-                    .complete(&id, "gateway_start", Err(message));
-            }
-        }
+        let result = composites::gateway_start(&spawn_ctx).await;
+        finish_operation(&spawn_ctx, &id, "gateway_start", result);
     });
     (axum::http::StatusCode::ACCEPTED, axum::Json(record)).into_response()
 }
@@ -722,17 +724,8 @@ async fn handle_activation_apply(
     let (id, record) = ctx.operations.begin("activation_apply");
     let spawn_ctx = ctx.clone();
     tokio::spawn(async move {
-        match composites::activation_apply(&spawn_ctx, parsed).await {
-            Ok(value) => spawn_ctx
-                .operations
-                .complete(&id, "activation_apply", Ok(value)),
-            Err(e) => {
-                let message = sanitize(&e.to_string(), &spawn_ctx.data_dir);
-                spawn_ctx
-                    .operations
-                    .complete(&id, "activation_apply", Err(message));
-            }
-        }
+        let result = composites::activation_apply(&spawn_ctx, parsed).await;
+        finish_operation(&spawn_ctx, &id, "activation_apply", result);
     });
     (axum::http::StatusCode::ACCEPTED, axum::Json(record)).into_response()
 }
@@ -848,6 +841,51 @@ mod tests {
     }
 
     #[test]
+    fn async_outcome_follows_the_shared_rule() {
+        // A start-gateway step that ended Failed (or Manual) is a failed
+        // operation, with the payload kept as the detail (CR-2).
+        let failed = json!({
+            "task_id": "t1",
+            "ok": false,
+            "outcome": { "state": "failed", "message": "gateway did not answer" },
+        });
+        let (message, detail) = operation_outcome(Ok(failed.clone())).unwrap_err();
+        assert_eq!(message, "the operation failed");
+        assert_eq!(detail, Some(failed));
+
+        // A refused run (busy) fails too, naming what is running.
+        let busy = json!({
+            "task_id": "t2", "busy": true, "ok": false, "outcome": null,
+            "running_step": "gateway restarting (activation)",
+        });
+        let (message, _) = operation_outcome(Ok(busy)).unwrap_err();
+        assert_eq!(message, "busy: gateway restarting (activation) is running");
+
+        // An activation apply with a failed item fails with its message
+        // (ACT-1/GW-7), keeping the items and execution id as detail.
+        let apply = json!({
+            "ok": false, "applied": false, "status": "completed_with_failures",
+            "message": "gateway restart failed: port in use",
+            "execution_id": "e1", "items": [],
+        });
+        let (message, detail) = operation_outcome(Ok(apply)).unwrap_err();
+        assert_eq!(message, "gateway restart failed: port in use");
+        assert_eq!(detail.unwrap()["execution_id"], "e1");
+
+        // Success: ok true, or a payload with no ok/busy at all.
+        let done = json!({ "task_id": "t3", "ok": true, "outcome": { "state": "done" } });
+        assert_eq!(operation_outcome(Ok(done.clone())).unwrap(), done);
+        assert!(operation_outcome(Ok(json!({ "task_id": "t4" }))).is_ok());
+
+        // An op error keeps its text and has no detail.
+        let (message, detail) =
+            operation_outcome(Err(ApiError::Busy("gateway restart already in progress".into())))
+                .unwrap_err();
+        assert!(message.contains("gateway restart already in progress"), "{message}");
+        assert!(detail.is_none());
+    }
+
+    #[test]
     fn every_error_variant_maps() {
         // Kind strings are the wire contract; pinning them here keeps
         // a variant rename from silently changing the API.
@@ -857,9 +895,14 @@ mod tests {
             (ApiError::Config("x".into()), 422),
             (ApiError::Unsupported("x".into()), 501),
             (ApiError::Gateway("x".into()), 500),
+            (ApiError::Busy("x".into()), 409),
         ];
         for (e, status) in cases {
             assert_eq!(error_mapping(&e).0.as_u16(), status);
         }
+        assert_eq!(
+            error_mapping(&ApiError::Busy("x".into())),
+            (axum::http::StatusCode::CONFLICT, "BUSY", "Busy")
+        );
     }
 }

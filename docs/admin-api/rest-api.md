@@ -3,11 +3,11 @@
 Status: implemented. The API shipped with the admin-API build
 (PLAN.md §9) and this contract describes the shipped surface as of
 v0.1.50. The source of truth for routes is the operation registry —
-`crates/manager-app/src/registry.rs` (`for_each_operation!`): 139
-operations, of which 84 carry a REST route and 55 are explicit
+`crates/manager-app/src/registry.rs` (`for_each_operation!`): 158
+operations, of which 89 carry a REST route and 69 are explicit
 `None` exclusions (§6.16). Derived/composite and auth/admin routes
 are API-layer routes in `crates/manager-api` (§6.17); the full live
-surface is 123 route records (84 registry + 15 derived + 24
+surface is 128 route records (89 registry + 15 derived + 24
 auth/admin).
 Scope: an HTTP API served by the Service Manager on a dedicated **admin port**
 on the managed machine (separate from the LiteLLM gateway port), exposing the
@@ -105,7 +105,7 @@ Every error response uses one envelope:
 - `kind` is the app's `ApiError` variant name (`manager-app`):
   `Config`, `Supervisor`, `Wizard`, `Telemetry`, `Gateway`, `Models`,
   `Mxc`, `Mcp`, `WinMl`, `Services`, `NotFound`, `InvalidInput`,
-  `ContractGap`, `Unsupported`, `Io`, `Json`.
+  `ContractGap`, `Unsupported`, `Io`, `Json`, `Busy`.
 - `code` is the stable machine-readable form (SCREAMING_SNAKE of `kind`),
   plus REST-layer codes that have no app counterpart: `BUSY` (a singleton
   resource is already running something), `OPERATION_FAILED` (an operation's
@@ -119,7 +119,7 @@ Every error response uses one envelope:
   |---|---|---|
   | Invalid argument / body fails validation | 400 | `INVALID_INPUT` |
   | Referenced backend/model/group/step/operation absent | 404 | `NOT_FOUND` |
-  | Singleton busy (wizard step already running, download already in flight, plan apply already running) | 409 | `BUSY` |
+  | Singleton busy (wizard step already running, download already in flight, plan apply already running), or a lifecycle operation already in flight on the same service (app kind `Busy`, e.g. "gateway restart already in progress (started by activation 12 s ago)") | 409 | `BUSY` |
   | Config patch fails validation | 422 | `CONFIG` |
   | Capability deferred in the app itself | 501 | `UNSUPPORTED` |
   | App contract gap (a crate API cannot express the operation) | 501 | `CONTRACT_GAP` |
@@ -216,6 +216,22 @@ Why this model, over retained synchronous endpoints:
 - Poll cadence guidance for clients: 1 s for the first 10 s, then 5 s;
   operations are retained in the list for the life of the process
   (mirroring `tasks_list`).
+- **Terminal outcome rule (every `202` route).** An operation ends
+  `failed` when its op returns an error, and also when its payload
+  reports `busy: true` or `ok: false` — the one shared lifecycle rule
+  (`manager_app::lifecycle::payload_failure`). A start-gateway step
+  whose outcome is `failed` or `manual`, a refused (busy) run, a
+  gateway restart that did not come back healthy, and an activation
+  apply with a failed item are therefore all `failed` operations,
+  never `done`. The `error` is the payload's `message`, and the
+  `detail` keeps the whole payload (outcome, `manual_command`, items,
+  `execution_id`). A lifecycle operation refused because another one
+  is in flight on the same service fails with the `Busy` message
+  (the same condition is `409 BUSY` on a synchronous route).
+- **Origin.** Lifecycle operations take an optional `origin` body
+  field (`api`, `cli`, …) that lands in the service's lifecycle log
+  markers and `service-lifecycle` events. The REST layer fills in
+  `api` when the caller names none; the CLI sends `cli`.
 - Cancellation: `POST /operations/{id}/abort` (§6.10). Not every kind is
   abortable — a wizard step mid-subprocess may only be abandonable; the
   operation's terminal state says what happened.
@@ -375,10 +391,40 @@ in the API as in the app.
 {
   "port": 4000, "bind_host": "0.0.0.0", "lan_ip": "192.168.5.23",
   "groups": 5, "routing_rules": 0, "up": true,
+  "state": "restarting",
+  "transition": { "kind": "restarting", "origin": "api", "since": "…" },
+  "intent": "running", "pid": 12345, "found_by": "pid_file",
+  "service_managed": false, "failure": null,
+  "postgres": { "installed": true, "state": "running", "pid": 6789,
+                "port": 5432, "port_mismatch": false, "transition": null },
+  "activation_applying": null,
   "routing_log_len": 0, "openrouter_cred_present": null,
-  "activation_pending": true, "activation_changes": 3
+  "activation_pending": true, "activation_changes": 3,
+  "litellm_version": "1.x"
 }
 ```
+
+- `state` is the shared lifecycle state every surface renders:
+  `running`, `starting`, `restarting`, `stopping`, `stopped`,
+  `failed`, `degraded` (process alive but not answering), `unknown`.
+  During a restart it reads `restarting` (never `stopped`). `up` is
+  the bare liveness probe, kept for older clients.
+- `transition` is the lifecycle operation in flight (`kind`,
+  `origin`, `since`), null when settled. `intent` is what the
+  operator last asked for (`running` | `stopped`); `failure`
+  (`at`, `reason`, `exit_code`) is the last unexpected failure,
+  cleared at the next start.
+- `pid` / `found_by` (`pid_file` | `port_owner`) identify the
+  gateway process; `service_managed` is true when the Windows
+  service owns it.
+- `postgres` is the app-managed database's own view (`state`:
+  `not_installed` | `running` | `starting` | `stopped` | `failed`,
+  plus `stopping` during its own stop); `port_mismatch` flags a
+  running server on a port other than the configured one (the one
+  case a gateway start restarts PostgreSQL).
+- `activation_applying` is the server-side activation apply in
+  flight (`source`, `mode`, `started_at`, `step`, `target`,
+  `message`), null when idle.
 
 `groups` counts enabled groups only (derived as in §4.4: at least one
 member backend enabled) — the groups the gateway actually serves, not
@@ -458,10 +504,11 @@ not reported) — never an interpolated value.
 
 ## 5. Endpoint index
 
-88 implemented client-facing endpoints: 73 registry operation
+93 implemented client-facing endpoints: 78 registry operation
 routes + 15 derived/API-layer routes (§6.17). A further 24
-auth/admin routes (§6.17) bring the live surface to 112 route
-records. ("Op" = returns `202` + operation, §3.) Specified but not
+auth/admin routes (§6.17) bring the live surface to 117 route
+records (see the header for the registry's own count, which also
+includes the measurement and update routes). ("Op" = returns `202` + operation, §3.) Specified but not
 implemented in v1: the gateway master key (decision 4), raw
 `PATCH /config` (decision 11), and the peripheral domains
 (decision 10) — §6.16 accounts for every registry operation with
@@ -473,7 +520,8 @@ no route.
 | Backends | 21 | list, create, get, delete, config get/patch, diff preview, start/stop/restart (Op), test, flags, offload, offload override set/clear, mtp, parallel, raw flags, flags mode, group membership, launch command |
 | Models | 11 | list, create, get, delete, patch, download (Op) + pause/resume/cancel, verify (Op), assign |
 | Placement | 2 | propose, apply |
-| Gateway | 12 | status, config get/patch, generated config, start (Op), stop, groups list + CRUD (4), routing test, routing recent — plus master key specified, NOT IMPLEMENTED (§6.5) |
+| Gateway | 14 | status, config get/patch, generated config, start (Op), restart (Op), stop (Op), database stop (Op), groups list + CRUD (4), routing test, routing recent — plus master key specified, NOT IMPLEMENTED (§6.5) |
+| Log receiver | 3 | start, stop, restart (Op) (§6.5a) |
 | Activation plan | 5 | get, apply (Op), quiesce-wait, cancel, execution history |
 | Wizard / setup | 11 | steps, status, prerequisites, run (Op), retry, skip, mark-manual, commands, help URL, complete, audit (Op) |
 | Logs | 2 | query, scopes |
@@ -551,7 +599,8 @@ its creation default.
 #### `POST /api/v1/backends/{id}/stop` — `control` — **Op**
 #### `POST /api/v1/backends/{id}/restart` — `control` — **Op**
 `start_backend` / `stop_backend` / `restart_backend`. Body (stop,
-restart): `{ "graceful": true }`. The app commands already return
+restart): `{ "graceful": true }`; every one also takes an optional
+`origin` (§3.1). The app commands already return
 `{ task_id, backend_id }`; the REST layer returns `202` with the
 operation for that task. Start runs the app's preflight (port, model
 file, placement) and fails the operation with the preflight message.
@@ -899,11 +948,53 @@ operation). It enforces the prisma pin, runs `prisma generate`,
 probes the database, spawns with the health-watchdog flag, and
 confirms sustained health — minutes-scale, hence an operation. The
 operation detail carries the step outcome, including
-`manual_command` on failure.
+`manual_command` on failure. A step that ends `failed` or `manual`,
+or a run refused because another gateway operation is in flight,
+is a `failed` operation (§3.1). The step stops the running gateway
+itself just before it spawns the new one, and adopts a running
+PostgreSQL server rather than restarting it.
 
-#### `POST /api/v1/gateway/stop` — `control`
-`gateway_stop` → `{ "ok": true, "stopped": true|false }`
-(`stopped: false` with `ok: true` means it was not running).
+#### `POST /api/v1/gateway/restart` — `control` — **Op**
+`gateway_restart`. Body (all optional): `{ "drain": true,
+"origin": "api" }`. One server-side restart, shared with the desktop
+Gateway view and the activation apply: it takes the gateway's
+`restarting` transition (another gateway operation in flight fails
+the operation with `Busy`), optionally drains in-flight requests
+(up to 120 s; a timeout restarts anyway and is reported in
+`quiesce`), and runs the start-gateway step under that transition.
+**PostgreSQL is not stopped or restarted** (only a PostgreSQL port
+change restarts it, inside the step). While it runs,
+`GET /gateway/status` reads `state: "restarting"`. The gateway's own
+log (`gateway` scope) carries `[lifecycle]` markers: restart
+requested (by whom), PostgreSQL kept running, drain, stopped, and
+restarted or restart failed. Completion detail: `{ ok, task_id,
+outcome, message, manual_command, activation_pending_before,
+quiesce? }`; `ok: false` fails the operation (§3.1).
+
+#### `POST /api/v1/gateway/stop` — `control` — **Op**
+`gateway_stop`. Body (all optional): `{ "stop_postgres": false,
+"origin": "api" }`. Stops **the gateway only** by default — PostgreSQL
+keeps running. With `stop_postgres: true` the app-managed PostgreSQL
+server is stopped afterwards, under its own lifecycle transition and
+markers. The operator's intent (stopped) is recorded before the kill,
+so the stop is never reported as a crash. Process mode finds the
+gateway by its pid file, else by the port owner, stops it gracefully
+and confirms the exit and the port release; service mode stops the
+Windows service and waits for it to reach Stopped. Completion detail:
+`{ "ok": true, "stopped": true|false, "pid": 123|null, "found_by":
+"pid_file"|"port_owner"|"service"|null, "postgres_stopped": bool }`
+(`stopped: false` means it was not running). An operation since the
+service-lifecycle work (it was synchronous before, which the CLI
+could not parse).
+
+#### `POST /api/v1/gateway/database/stop` — `control` — **Op**
+`postgres_stop`. Body (optional): `{ "origin": "api" }`. Stops the
+app-managed PostgreSQL server (`pg_ctl stop -m fast`) under its own
+`stopping` transition, with markers in the `postgres` lifecycle log.
+Refused (`INVALID_INPUT`, the operation fails) while the gateway is
+running or has an operation in flight: stop the gateway first, or use
+`POST /gateway/stop` with `stop_postgres: true`. Completion detail:
+`{ "ok": true, "stopped": true|false }`.
 
 #### `POST /api/v1/gateway/routing/test` — `read`
 `gateway_test_routing`. Body: `{ "group": "planner" }` (the app's
@@ -920,6 +1011,26 @@ Routing rules have no dedicated app commands: they are part of the
 gateway config (§4.4) and change only through `PATCH /gateway/config`.
 `GET /gateway/config` is their read path. (See §7.)
 
+### 6.5a Log receiver
+
+#### `POST /api/v1/log-receiver/start` — `control` — **Op**
+#### `POST /api/v1/log-receiver/stop` — `control` — **Op**
+#### `POST /api/v1/log-receiver/restart` — `control` — **Op**
+`log_receiver_start` / `log_receiver_stop` / `log_receiver_restart`.
+Body (optional): `{ "origin": "api" }`. Unelevated SCM control of the
+deployed receiver service (its registration grants the operator
+start/stop): stop waits for Stopped, start waits for Running and then
+up to 10 s for the ingest port (127.0.0.1:8473) to accept connections,
+and restart does both inside one `restarting` transition, so no
+re-deploy (and no UAC prompt) is needed. Markers go to the receiver's
+`receiver.lifecycle.log`. Refused (`INVALID_INPUT`) when the receiver
+is not deployed; a second operation while one is in flight fails with
+`Busy`; a start that falls back to Stopped fails with the service
+host's exit-code reason. Completion detail: `{ ok, service_name,
+action, detail, ingest_ok (null for stop), lifecycle, pid }`, where
+`lifecycle` is `running`, `degraded` (running but the ingest port
+refuses connections), `stopped` or `failed`.
+
 ### 6.6 Activation plan
 
 #### `GET /api/v1/activation-plan` — `read`
@@ -928,25 +1039,43 @@ gateway config (§4.4) and change only through `PATCH /gateway/config`.
 #### `POST /api/v1/activation-plan/apply` — `control` — **Op**
 Body: `{ "mode": "drain" | "now" }`.
 
-- `now`: restart each running backend in `backend_restart_ids`, then
-  (when `gateway_pending`) stop and restart the gateway via the
-  start-gateway step.
+- `now`: restart each backend in `backend_restart_ids` (each through
+  the shared backend restart, waiting for readiness), then (when
+  `gateway_pending`) restart the gateway through the shared gateway
+  restart (`POST /gateway/restart` semantics — PostgreSQL stays up).
 - `drain`: the same, preceded by the quiesce wait (in-flight gateway
   requests drain to zero, bounded at 120 s; on timeout the apply
   proceeds and the operation detail reports the in-flight count it
   proceeded with).
 
-→ `202` operation; completion clears the plan
-(`gateway_activation_complete`, server-side, as the desktop flow
-does after success).
+→ `202` operation. The route delegates to the app's single
+server-side apply (`activation_apply`, the same op the desktop
+calls) with `source: "api"`:
 
-**This is the one endpoint that is not a thin command wrapper:**
-today the orchestration (restart backends → quiesce → stop → start
-step → complete) is composed in the desktop UI (`applyActivationPlan`
-in `ui/src/api.ts` / `main.ts`) from the primitives below. The API
-server must own that composition. The primitives remain individually
-exposed where they have standalone meaning (quiesce-wait, gateway
-stop/start, backend restart).
+- The plan is re-read when the apply starts; steps run in order and
+  stop at the first backend failure (completed restarts are not
+  rolled back).
+- **Failure semantics:** the operation is `failed` when any item
+  failed — a backend restart, or a gateway restart that was refused,
+  failed or needs a manual step (§3.1). The gateway side of the plan
+  is completed only after a successful gateway start, so a failed
+  apply never reports pending changes as live. The `error` is the
+  apply's `message`; the `detail` keeps the full payload, including
+  `manual_command` when the gateway step attached one.
+- Every apply that ran something is recorded once in the activation
+  history with `source: "api"` (`execution_id` in the detail), with
+  status `completed`, `completed_with_failures` (a gateway failure)
+  or `failed` (a backend abort).
+- A second apply while one is running fails with `Busy`, naming the
+  running apply's source, step and elapsed time.
+- Nothing pending: `{ ok: true, applied: true, status:
+  "nothing_pending" }`; nothing runs and nothing is recorded.
+
+Completion detail: `{ ok, applied (alias of ok, for older
+clients), status, message, mode, source, restarted_backends,
+gateway_restarted, execution_id, items, manual_command?, quiesce? }`.
+While the apply runs, `GET /activation-plan` and `GET /gateway/status`
+carry `activation_applying`.
 
 #### `POST /api/v1/activation-plan/quiesce-wait` — `control` — synchronous
 `gateway_quiesce_wait`. Body: `{ "timeout_secs": 120 }` →
@@ -984,7 +1113,8 @@ history file reads as an empty history, never an error.
 `gateway_activation_record_execution` is **not** a client endpoint:
 it is the bookkeeping write the desktop apply funnel reports when an
 apply ends, like `gateway_activation_complete`. Listed here so the
-mapping is complete.
+mapping is complete. `activation_apply` itself has no route of its
+own: `POST /activation-plan/apply` is its REST form.
 
 ### 6.7 Wizard / setup
 
@@ -1267,8 +1397,8 @@ operations the draft knew (`mcp_save_server`,
 
 ### 6.16 Registry exclusions — every operation with no route
 
-The registry holds 134 operations: 82 routed (§6.1–§6.14,
-§6.18) and 52 with route `None`. A `None` route is an explicit
+The registry holds 158 operations: 89 routed (§6.1–§6.14,
+§6.18) and 69 with route `None`. A `None` route is an explicit
 exclusion, never an oversight (registry module docs); the
 complete list, grouped by reason:
 
@@ -1277,15 +1407,17 @@ complete list, grouped by reason:
 | Raw config patch excluded (decision 11) | `update_config` (C) |
 | Master-key value never mirrored (decision 4) | `gateway_master_key` (SDisclosure) |
 | Desktop-only actions (§7.1–7.2) | `open_url` (L), `open_folder` (L) |
-| No 1:1 route — served inside a composition | `gateway_set_bind_host` (C, inside `PATCH /gateway/config`); `model_set_short_name` (C), `model_set_enabled` (C), `model_set_offload_spec` (C) and `model_set_mtp` (C), inside `PATCH /models/{id}`; `gateway_activation_complete` (L, server bookkeeping after apply/(re)start, §6.6); `gateway_activation_record_execution` (C, execution bookkeeping recorded by the desktop apply funnel, §6.6); `gateway_create_group` (C) and `gateway_delete_group` (D), served by the derived group routes (§6.5/§6.17) |
-| Desktop-only preview | `backend_add_preview` (R) — the add-backend form's placement preview; creation itself is `POST /backends` |
+| No 1:1 route — served inside a composition | `gateway_set_bind_host` (C, inside `PATCH /gateway/config`); `model_set_short_name` (C), `model_set_enabled` (C), `model_set_offload_spec` (C) and `model_set_mtp` (C), inside `PATCH /models/{id}`; `gateway_activation_complete` (L, server bookkeeping after apply/(re)start, §6.6); `gateway_activation_record_execution` (C, execution bookkeeping recorded by the desktop apply funnel, §6.6); `gateway_create_group` (C) and `gateway_delete_group` (D), served by the derived group routes (§6.5/§6.17); `activation_apply` (L), served by `POST /activation-plan/apply` (§6.6) |
+| Desktop-only preview | `backend_cache_preview` (R) — the MoE cache form's preview; `backend_add_preview` (R) — the add-backend form's placement preview; creation itself is `POST /backends` |
 | Model form helpers — desktop-only in v1 | `model_hf_lookup` (R), `model_hf_header` (R) — the Add Model form's Hugging Face lookup/pick and pick-time GGUF header read (deep-discovery design Part 2); creation itself is `POST /models` |
 | MCP — peripheral (decision 10) | `mcp_list` (R), `mcp_start_preflight` (R), `mcp_test_connection` (X), `mcp_set_exposure` (X), `mcp_save_server` (X), `mcp_delete_server` (X), `mcp_store_credential` (X), `backend_test_tool_call` (L, gateway MCP tool-call test) |
 | VS Code — peripheral (decision 10) | `vscode_install_extensions` (X), `vscode_write_config` (X) |
 | WinML — peripheral (decision 10) | `winml_probe` (R), `winml_status` (R), `winml_register` (D), `winml_unregister` (D) |
 | Notifications — desktop-only (toast delivery is a shell concern) | `notifications_set_config` (C), `notifications_send_test` (L) |
 | Windows services — desktop-only in v1 (SCM elevation is a shell concern) | `services_list` (R), `services_register` (D), `services_unregister` (D) |
-| Optimize — desktop-only in v1 | `optimize_get_state` (R), `optimize_validate_plan` (R), `optimize_save_purpose` (C), `optimize_set_item_state` (C), `optimize_set_item_outcome` (C), `optimize_discard_plan` (C), `optimize_set_experiment_state` (C), `optimize_consult` (L), `optimize_discover` (L), `optimize_cancel_consult` (L), `optimize_measure_backend` (L), `optimize_cancel_job` (L), `optimize_run_baseline` (L), `optimize_run_experiments` (L), `optimize_estimate_backend` (L), `optimize_estimate_experiments` (L) |
+| Log receiver deployment — desktop-only (elevated deploy/remove through the shell's runas pattern; the status names local paths) | `log_receiver_status` (R), `log_receiver_deploy` (D), `log_receiver_remove` (D), `log_receiver_flip_endpoint` (C) — its unelevated start/stop/restart are routed (§6.5a) |
+| Bench — desktop-only in v1 | `bench_prompts_list` (R), `bench_prompt_save` (C), `bench_prompt_delete` (D), `bench_prompt_generate` (L), `bench_prompt_generate_cancel` (L), `bench_run_start` (L), `bench_run_cancel` (L), `bench_results_list` (R), `bench_result_delete` (D) |
+| Optimize — desktop-only in v1 | `optimize_get_state` (R), `optimize_validate_plan` (R), `optimize_save_purpose` (C), `optimize_set_item_state` (C), `optimize_set_item_outcome` (C), `optimize_discard_plan` (C), `optimize_set_experiment_state` (C), `optimize_consult` (L), `optimize_discover` (L), `optimize_cancel_consult` (L), `optimize_measure_backend` (L), `optimize_cancel_job` (L), `optimize_run_baseline` (L), `optimize_run_experiments` (L), `optimize_estimate_backend` (L), `optimize_estimate_experiments` (L), `optimize_tuning_preview` (R), `optimize_tuning_run` (L), `optimize_tuning_adopt` (C) |
 
 ### 6.17 API-layer routes (no backing registry operation)
 

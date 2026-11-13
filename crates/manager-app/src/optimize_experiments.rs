@@ -50,7 +50,7 @@ use manager_optimize::{
     MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, RegisteredModelFile,
     BATCH_TIMEOUT_SECS, BENCHMARK_TEMPERATURE, ESTIMATE_RUNS, EXPERIMENT_TIMEOUT_SECS, MEASURED_RUNS,
 };
-use manager_supervisor::{HealthProbe, HttpHealthProbe, ProcessState};
+use manager_supervisor::ProcessState;
 
 use crate::{ApiError, AppState, TaskStatus};
 
@@ -61,6 +61,9 @@ const EXP_RUN_TIMEOUT: Duration = Duration::from_secs(600);
 /// `/health` probe after spawn. Model loads are minutes-scale;
 /// the per-experiment budget caps the total anyway.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a backend the batch stopped and restarts afterwards may
+/// take to answer `/health` again (model load).
+const RESTART_READY_TIMEOUT: Duration = Duration::from_secs(600);
 
 // ---------------------------------------------------------------------------
 // Journal (<data_dir>/optimize-experiments.json)
@@ -320,42 +323,30 @@ pub(crate) async fn cleanup_temp(state: &AppState, temp_id: &str) {
 /// the supervisor reports the process gone/failed, or until
 /// the bounded wait expires.
 pub(crate) async fn wait_healthy(state: &AppState, temp_id: &str, port: u16) -> Result<(), String> {
-    let probe = HttpHealthProbe::new(
-        format!("http://127.0.0.1:{port}/health"),
-        Duration::from_secs(5),
-    );
-    let deadline = Instant::now() + HEALTH_TIMEOUT;
-    loop {
-        if let Ok(manager_supervisor::HealthStatus::Healthy) = probe.probe().await {
-            return Ok(());
+    // The shared readiness poll (backend_lifecycle); a temp backend is
+    // not a managed service, so "gone" is read from its supervisor row.
+    crate::backend_lifecycle::poll_health_until(port, HEALTH_TIMEOUT, Duration::from_secs(1), || async {
+        let mut sup = state.supervisor().await.lock().await;
+        sup.reap_exited();
+        match sup.status().into_iter().find(|s| s.id == temp_id) {
+            Some(s) if s.state == ProcessState::Failed => Some(format!(
+                "temp backend {temp_id} exited before becoming healthy"
+            )),
+            Some(s) if s.pid.is_none() => Some(format!(
+                "temp backend {temp_id} is not running (state {:?})",
+                s.state
+            )),
+            _ => None,
         }
-        {
-            let mut sup = state.supervisor().await.lock().await;
-            sup.reap_exited();
-            let status = sup.status().into_iter().find(|s| s.id == temp_id);
-            match status {
-                Some(s) if s.state == ProcessState::Failed => {
-                    return Err(format!(
-                        "temp backend {temp_id} exited before becoming healthy"
-                    ));
-                }
-                Some(s) if s.pid.is_none() => {
-                    return Err(format!(
-                        "temp backend {temp_id} is not running (state {:?})",
-                        s.state
-                    ));
-                }
-                _ => {}
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "temp backend {temp_id} did not become healthy within {} s",
-                HEALTH_TIMEOUT.as_secs()
-            ));
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+    })
+    .await
+    .map_err(|e| match e {
+        crate::backend_lifecycle::ReadyError::Gone(reason) => reason,
+        crate::backend_lifecycle::ReadyError::Timeout(t) => format!(
+            "temp backend {temp_id} did not become healthy within {} s",
+            t.as_secs()
+        ),
+    })
 }
 
 /// The measurement fingerprint inputs for a temp backend,
@@ -405,7 +396,8 @@ fn temp_fingerprint_inputs(
 /// so a dropped (cancelled / timed-out) inner future cannot
 /// skip it.
 async fn run_experiment_inner(
-    state: &AppState,
+    state: &std::sync::Arc<AppState>,
+    sink: &std::sync::Arc<dyn crate::EventSink>,
     cfg: &AppConfig,
     proposal: &ExperimentProposal,
     ctx: &mut BatchCtx,
@@ -674,10 +666,11 @@ async fn run_experiment_inner(
     // -- Stop exactly the accepted requires_stopping ids the
     // fit verdict needs stopped.
     for id in &to_stop {
-        let outcome = state.supervisor().await.lock().await.stop(id, false).await;
+        let opts = crate::backend_lifecycle::BackendOpOpts::new(crate::lifecycle::Origin::Optimize);
+        let outcome = crate::backend_lifecycle::stop_backend(state, sink, id, opts).await;
         if let Err(e) = outcome {
             return InnerOutcome::failed(
-                format!("preflight fit needed backend '{id}' stopped, but stopping it failed: {e:?}"),
+                format!("preflight fit needed backend '{id}' stopped, but stopping it failed: {e}"),
                 preflight,
             );
         }
@@ -1038,10 +1031,15 @@ fn record_estimate(
 }
 
 /// Restart the requires_stopping backends the batch stopped
-/// (those running at batch start, still stopped now), via the
-/// ordinary spec registration + supervisor spawn. Returns the
-/// note stated in each of the batch's result details.
-pub(crate) async fn restart_stopped(state: &AppState, ids: &[String]) -> String {
+/// (those running at batch start, still stopped now), through the
+/// shared backend lifecycle start (either run mode; markers, events,
+/// intent), waiting for each to answer `/health`. Returns the note
+/// stated in each of the batch's result details.
+pub(crate) async fn restart_stopped(
+    state: &std::sync::Arc<AppState>,
+    sink: &std::sync::Arc<dyn crate::EventSink>,
+    ids: &[String],
+) -> String {
     if ids.is_empty() {
         return String::new();
     }
@@ -1049,17 +1047,14 @@ pub(crate) async fn restart_stopped(state: &AppState, ids: &[String]) -> String 
     let mut restarted: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     for id in ids {
-        let mut sup = state.supervisor().await.lock().await;
-        sup.reap_exited();
-        let running = sup
-            .status()
-            .iter()
-            .any(|s| &s.id == id && s.pid.is_some());
+        let running = crate::lifecycle::backend_liveness(state)
+            .await
+            .get(id)
+            .is_some_and(|l| l.state.is_live());
         if running {
             restarted.push(id.clone());
             continue;
         }
-        drop(sup);
         // Start preflight (code-review B-2): the restart goes
         // through the same gate as any app-mediated start, so a
         // backend whose saved position the guardrails now block
@@ -1069,10 +1064,14 @@ pub(crate) async fn restart_stopped(state: &AppState, ids: &[String]) -> String 
             failed.push(format!("{id} (start preflight refused the restart: {e})"));
             continue;
         }
-        let mut sup = state.supervisor().await.lock().await;
-        match sup.spawn_backend(id).await {
-            Ok(()) => restarted.push(id.clone()),
-            Err(e) => failed.push(format!("{id} ({e:?})")),
+        let opts = crate::backend_lifecycle::BackendOpOpts {
+            wait_ready: Some(RESTART_READY_TIMEOUT),
+            preflight: false,
+            ..crate::backend_lifecycle::BackendOpOpts::new(crate::lifecycle::Origin::Optimize)
+        };
+        match crate::backend_lifecycle::start_backend(state, sink, id, opts).await {
+            Ok(_) => restarted.push(id.clone()),
+            Err(e) => failed.push(format!("{id} ({e})")),
         }
     }
     let mut note = format!(
@@ -1101,7 +1100,7 @@ pub(crate) async fn restart_stopped(state: &AppState, ids: &[String]) -> String 
 /// lifecycle, preflight, stopping, cleanup, and budgets; an
 /// estimate pass runs only the abbreviated benchmark and
 /// records its figures on the proposal as an estimate.
-async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>, mode: RunMode) -> crate::ApiResult {
+async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, sink: &std::sync::Arc<dyn crate::EventSink>, mode: RunMode) -> crate::ApiResult {
     {
         let slot = state.optimize_job_abort.lock().await;
         if slot.is_some() {
@@ -1268,7 +1267,7 @@ async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, _sink: &s
         let remaining_batch = Duration::from_secs(BATCH_TIMEOUT_SECS)
             .saturating_sub(batch_start.elapsed());
         let budget = Duration::from_secs(EXPERIMENT_TIMEOUT_SECS).min(remaining_batch);
-        let inner = run_experiment_inner(state, &cfg, proposal, &mut ctx, mode);
+        let inner = run_experiment_inner(state, sink, &cfg, proposal, &mut ctx, mode);
         // Cancellation and timeout drop the inner future; the
         // cleanup below is outside it and always runs.
         let outcome = tokio::select! {
@@ -1352,7 +1351,7 @@ async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, _sink: &s
     // Restart what the batch stopped (any outcome, including
     // cancellation and deadline), and state it in every result
     // this batch recorded — journal history and plan alike.
-    let note = restart_stopped(state, &ctx.stopped_to_restart.clone()).await;
+    let note = restart_stopped(state, sink, &ctx.stopped_to_restart.clone()).await;
     if !note.is_empty() {
         let mut journal = load_journal(state);
         journal.append_batch_detail(&batch_id, &note);
@@ -1547,7 +1546,7 @@ mod tests {
             stopped_to_restart: Vec::new(),
             used_ports: HashSet::new(),
         };
-        let outcome = run_experiment_inner(&state, &cfg, &proposal, &mut ctx, RunMode::Full).await;
+        let outcome = run_experiment_inner(&state, &(std::sync::Arc::new(crate::NoopSink) as std::sync::Arc<dyn crate::EventSink>), &cfg, &proposal, &mut ctx, RunMode::Full).await;
         assert_eq!(outcome.status, ExperimentStatus::Failed);
         assert!(
             outcome.detail.contains("outside the verified range"),
@@ -1585,7 +1584,7 @@ mod tests {
         coder.raw_flags = Some("--n-cpu-moe 40".to_string());
         // restart_stopped's preflight reads the saved config.
         *state.config.write().await = cfg;
-        let note = restart_stopped(&state, &["coder".to_string()]).await;
+        let note = restart_stopped(&state, &(std::sync::Arc::new(crate::NoopSink) as std::sync::Arc<dyn crate::EventSink>), &["coder".to_string()]).await;
         assert!(
             note.contains("Restart failed for: coder"),
             "the refusal must be stated as a restart failure, got: {note}"

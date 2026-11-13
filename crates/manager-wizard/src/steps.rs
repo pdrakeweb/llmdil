@@ -35,6 +35,36 @@ fn push_log(ctx: &WizardContext, log: &mut Vec<String>, line: String) {
     log.push(line);
 }
 
+/// Write a gateway lifecycle marker (`logs/gateway.lifecycle.log`,
+/// the gateway's own log scope).
+fn gateway_mark(ctx: &WizardContext, event: &str, detail: Option<&str>) {
+    crate::mark(
+        ctx.ops.as_ref(),
+        &crate::gateway_lifecycle_log(&ctx.data_dir),
+        "gateway",
+        event,
+        detail,
+    );
+}
+
+/// Write a PostgreSQL lifecycle marker (`logs/postgres.lifecycle.log`).
+fn postgres_mark(ops: &dyn SystemOps, data_dir: &Path, event: &str, detail: Option<&str>) {
+    crate::mark(
+        ops,
+        &crate::postgres_lifecycle_log(data_dir),
+        "postgres",
+        event,
+        detail,
+    );
+}
+
+/// The first non-empty line of a (possibly multi-line) message — a
+/// failure reason for a one-line marker, without the log tail that
+/// follows it.
+fn first_line(s: &str) -> &str {
+    s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
+}
+
 /// Compact elapsed label for start/finish pairs ("83.2s", "2m 05s").
 fn fmt_elapsed(start: std::time::Instant) -> String {
     let secs = start.elapsed().as_secs_f64();
@@ -2495,7 +2525,10 @@ pub async fn postgres_installed(ops: &dyn SystemOps, data_dir: &Path) -> bool {
             .await
 }
 
-async fn postgres_ready(ops: &dyn SystemOps, config: &AppConfig, data_dir: &Path) -> bool {
+/// Whether the app-managed server accepts connections on the
+/// configured port (`pg_isready`). The start path's readiness probe;
+/// status polling uses the cheaper TCP connect in [`postgres_status`].
+pub async fn postgres_ready(ops: &dyn SystemOps, config: &AppConfig, data_dir: &Path) -> bool {
     let cmd = PlannedCommand::new(vec![
         postgres_bin_dir(data_dir)
             .join("pg_isready.exe")
@@ -2582,9 +2615,121 @@ fn postmaster_pid_path(data_dir: &Path) -> PathBuf {
 /// its first line parses. Absent or unparseable both read as "no
 /// recorded postmaster".
 async fn read_postmaster_pid(ops: &dyn SystemOps, data_dir: &Path) -> Option<u32> {
+    read_postmaster_info(ops, data_dir).await.map(|i| i.pid)
+}
+
+/// What `postmaster.pid` records: line 1 the postmaster's pid, line 4
+/// the port it listens on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PostmasterInfo {
+    pid: u32,
+    /// `None` when line 4 is missing or unparseable (a pid file
+    /// still being written, or a truncated one).
+    port: Option<u16>,
+}
+
+/// Parse `postmaster.pid` text (see [`PostmasterInfo`]).
+fn parse_postmaster_pid(text: &str) -> Option<PostmasterInfo> {
+    let mut lines = text.lines();
+    let pid = lines.next()?.trim().parse().ok()?;
+    let port = lines.nth(2).and_then(|l| l.trim().parse().ok());
+    Some(PostmasterInfo { pid, port })
+}
+
+async fn read_postmaster_info(ops: &dyn SystemOps, data_dir: &Path) -> Option<PostmasterInfo> {
     let bytes = ops.read_file(&postmaster_pid_path(data_dir)).await.ok()?;
-    let text = String::from_utf8_lossy(&bytes);
-    text.lines().next()?.trim().parse().ok()
+    parse_postmaster_pid(&String::from_utf8_lossy(&bytes))
+}
+
+/// A point-in-time view of the app-managed PostgreSQL server, cheap
+/// enough for status polling: a pid-file read, a liveness check and
+/// a 300 ms TCP connect — never `pg_isready`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PostgresStatus {
+    /// The binaries and cluster are in place ([`postgres_installed`]).
+    pub installed: bool,
+    /// The postmaster pid `postmaster.pid` records.
+    pub pid: Option<u32>,
+    /// That pid is alive and not a recycled pid of another program.
+    pub pid_alive: bool,
+    /// The port `postmaster.pid` records (line 4).
+    pub pid_port: Option<u16>,
+    /// The configured port (`config.postgres.port`).
+    pub configured_port: u16,
+    /// 127.0.0.1:<configured port> accepted a TCP connection.
+    pub accepting: bool,
+}
+
+impl PostgresStatus {
+    /// A live postmaster listens on a port other than the configured
+    /// one: the next gateway start restarts it on the new port.
+    pub fn port_mismatch(&self) -> bool {
+        self.pid_alive && self.pid_port.is_some_and(|p| p != self.configured_port)
+    }
+}
+
+/// Status of the app-managed PostgreSQL server (see [`PostgresStatus`]).
+pub async fn postgres_status(
+    ops: &dyn SystemOps,
+    config: &AppConfig,
+    data_dir: &Path,
+) -> PostgresStatus {
+    let configured_port = config.postgres.port;
+    if !postgres_installed(ops, data_dir).await {
+        return PostgresStatus {
+            installed: false,
+            pid: None,
+            pid_alive: false,
+            pid_port: None,
+            configured_port,
+            accepting: false,
+        };
+    }
+    let info = read_postmaster_info(ops, data_dir).await;
+    let pid_alive = info.is_some_and(|i| {
+        ops.process_alive(i.pid) && ops.process_image_is(i.pid, "postgres.exe") != Some(false)
+    });
+    let accepting = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        tokio::net::TcpStream::connect(("127.0.0.1", configured_port)),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+    PostgresStatus {
+        installed: true,
+        pid: info.map(|i| i.pid),
+        pid_alive,
+        pid_port: info.and_then(|i| i.port),
+        configured_port,
+        accepting,
+    }
+}
+
+/// How [`ensure_postgres_running_detailed`] got a ready server.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PostgresReady {
+    /// A server was already accepting connections and was adopted.
+    Adopted { pid: Option<u32> },
+    /// A postmaster that was still starting (e.g. crash recovery) was
+    /// adopted and awaited.
+    AdoptedStarting { pid: u32 },
+    /// This call started the server.
+    Started { pid: Option<u32>, secs: f64 },
+}
+
+impl PostgresReady {
+    /// Marker/log phrasing ("adopted pid 812", "started pid 812 in 3.1 s").
+    pub fn describe(&self) -> String {
+        let pid = |p: &Option<u32>| p.map(|p| format!(" pid {p}")).unwrap_or_default();
+        match self {
+            PostgresReady::Adopted { pid: p } => format!("adopted{}", pid(p)),
+            PostgresReady::AdoptedStarting { pid } => {
+                format!("adopted pid {pid} (was still starting)")
+            }
+            PostgresReady::Started { pid: p, secs } => format!("started{} in {secs:.1} s", pid(p)),
+        }
+    }
 }
 
 /// Outcome of [`wait_for_postgres_ready`].
@@ -2704,6 +2849,35 @@ pub async fn ensure_postgres_running(
     ctx: &WizardContext,
     log: &mut Vec<String>,
 ) -> Result<String, String> {
+    ensure_postgres_running_detailed(ctx, log)
+        .await
+        .map(|(url, _)| url)
+}
+
+/// [`ensure_postgres_running`], also saying how the server became
+/// ready (adopted vs started), with lifecycle markers in
+/// `logs/postgres.lifecycle.log` for every adopt, start, ready, port
+/// change and failure.
+pub async fn ensure_postgres_running_detailed(
+    ctx: &WizardContext,
+    log: &mut Vec<String>,
+) -> Result<(String, PostgresReady), String> {
+    let result = ensure_postgres_running_inner(ctx, log).await;
+    if let Err(e) = &result {
+        postgres_mark(
+            ctx.ops.as_ref(),
+            &ctx.data_dir,
+            "start failed",
+            Some(first_line(e)),
+        );
+    }
+    result
+}
+
+async fn ensure_postgres_running_inner(
+    ctx: &WizardContext,
+    log: &mut Vec<String>,
+) -> Result<(String, PostgresReady), String> {
     let ops = ctx.ops.as_ref();
     let config = &ctx.config;
     let data_dir = ctx.data_dir.as_path();
@@ -2711,6 +2885,53 @@ pub async fn ensure_postgres_running(
         .await
         .map_err(|e| format!("could not obtain the PostgreSQL password: {e}"))?;
     let url = postgres_database_url(config, &password);
+    // Port change (OS-5): a live postmaster of this cluster listening
+    // on a port other than the configured one cannot be adopted (the
+    // gateway would connect to the new port and wait for nothing),
+    // and starting a second server against the same data directory
+    // is refused. Stop it, then start on the configured port below.
+    // This is the only case in which a gateway (re)start restarts
+    // PostgreSQL.
+    if let Some(info) = read_postmaster_info(ops, data_dir).await {
+        let ours = ops.process_alive(info.pid)
+            && ops.process_image_is(info.pid, "postgres.exe") != Some(false);
+        if let Some(old_port) = info.port.filter(|p| ours && *p != config.postgres.port) {
+            let pid = info.pid;
+            push_log(
+                ctx,
+                log,
+                format!(
+                    "PostgreSQL (pid {pid}) is running on port {old_port} but the configured port is {} — restarting it on the new port",
+                    config.postgres.port
+                ),
+            );
+            postgres_mark(
+                ops,
+                data_dir,
+                "port changed",
+                Some(&format!(
+                    "pid {pid} listens on {old_port}, configured {} — restarting",
+                    config.postgres.port
+                )),
+            );
+            if let Err(e) = stop_postgres_server(ops, data_dir).await {
+                return Err(format!(
+                    "could not stop PostgreSQL (pid {pid}) on its old port {old_port}: {e}"
+                ));
+            }
+            if ops.process_alive(pid) {
+                return Err(format!(
+                    "PostgreSQL (pid {pid}) is still running on its old port {old_port} after pg_ctl stop; it must stop before it can start on port {}",
+                    config.postgres.port
+                ));
+            }
+            push_log(
+                ctx,
+                log,
+                format!("stopped PostgreSQL (pid {pid}) on its old port {old_port}"),
+            );
+        }
+    }
     if postgres_ready(ops, config, data_dir).await {
         push_log(
             ctx,
@@ -2720,7 +2941,18 @@ pub async fn ensure_postgres_running(
                 config.postgres.port
             ),
         );
-        return Ok(url);
+        let pid = read_postmaster_pid(ops, data_dir).await;
+        postgres_mark(
+            ops,
+            data_dir,
+            "adopted running server",
+            Some(&format!(
+                "{}port {}",
+                pid.map(|p| format!("pid {p}, ")).unwrap_or_default(),
+                config.postgres.port
+            )),
+        );
+        return Ok((url, PostgresReady::Adopted { pid }));
     }
     // A postmaster the readiness probe cannot see yet: one left
     // running by an earlier session (PostgreSQL stops with the
@@ -2770,7 +3002,16 @@ pub async fn ensure_postgres_running(
                             config.postgres.port
                         ),
                     );
-                    return Ok(url);
+                    postgres_mark(
+                        ops,
+                        data_dir,
+                        "adopted starting server",
+                        Some(&format!(
+                            "pid {pid}, ready on port {}",
+                            config.postgres.port
+                        )),
+                    );
+                    return Ok((url, PostgresReady::AdoptedStarting { pid }));
                 }
                 PostgresWait::PostmasterGone => {
                     push_log(
@@ -2806,6 +3047,12 @@ pub async fn ensure_postgres_running(
     // fast via the postmaster requirement below.
     let launched = std::time::Instant::now();
     let start = postgres_start_command(data_dir, config.postgres.port);
+    postgres_mark(
+        ops,
+        data_dir,
+        "starting",
+        Some(&format!("pg_ctl start on port {}", config.postgres.port)),
+    );
     let start_failure = match run_command_logged(ctx, log, &start, Some(POSTGRES_LAUNCH_BUDGET))
         .await
     {
@@ -2866,6 +3113,18 @@ pub async fn ensure_postgres_running(
     let wait = wait_for_postgres_ready(ctx, data_dir, POSTGRES_SETTLE_WAIT, true, log).await;
     match wait {
         PostgresWait::Ready => {
+            let secs = launched.elapsed().as_secs_f64();
+            let pid = read_postmaster_pid(ops, data_dir).await;
+            postgres_mark(
+                ops,
+                data_dir,
+                "ready",
+                Some(&format!(
+                    "{}port {} after {secs:.1} s",
+                    pid.map(|p| format!("pid {p}, ")).unwrap_or_default(),
+                    config.postgres.port
+                )),
+            );
             if start_failure.is_some() {
                 push_log(
                     ctx,
@@ -2884,7 +3143,7 @@ pub async fn ensure_postgres_running(
                     ),
                 );
             }
-            Ok(url)
+            Ok((url, PostgresReady::Started { pid, secs }))
         }
         _ => {
             let tail = postgres_log_tail(ops, data_dir).await;
@@ -2914,12 +3173,18 @@ pub async fn stop_postgres_server(
         return Ok(false);
     }
     let stop = pg_ctl_command(data_dir, &["stop", "-m", "fast"]);
-    match ops.run_command(&stop).await {
+    let result = match ops.run_command(&stop).await {
         Ok(out) if out.exit_code == 0 => Ok(true),
         // "no server running" exits non-zero: the desired end state.
         Ok(_) => Ok(false),
         Err(e) => Err(e),
+    };
+    match &result {
+        Ok(true) => postgres_mark(ops, data_dir, "stopped (pg_ctl stop -m fast)", None),
+        Ok(false) => postgres_mark(ops, data_dir, "stop: no server was running", None),
+        Err(e) => postgres_mark(ops, data_dir, "stop failed", Some(&e.to_string())),
     }
+    result
 }
 
 /// Step 5: install the pinned PostgreSQL binaries under the app
@@ -4192,94 +4457,178 @@ impl StartGateway {
         }
     }
 
-    /// Stop the gateway recorded in `<data_dir>/gateway.pid`, if any.
+    /// Stop the previous gateway, whatever runs it.
     ///
     /// Restart semantics: the previously spawned LiteLLM still holds
     /// the port and serves the old generated config, so spawning a
     /// second one would fail to bind (silently — its stdio is nulled)
     /// while the health check passes against the old process. Stopping
-    /// the recorded pid first is what makes re-running this step a
-    /// real restart. A live recorded process that cannot be stopped
-    /// fails the step: failing loudly beats a duplicate spawn.
+    /// it first is what makes re-running this step a real restart. A
+    /// live previous gateway that cannot be stopped fails the step:
+    /// failing loudly beats a duplicate spawn.
+    ///
+    /// Both kinds of previous gateway are handled on every run, so a
+    /// supervision-mode flip or a (de)registration never leaves a
+    /// duplicate behind (SCM-7, CR-4):
+    /// 1. The gateway SERVICE, when it is registered (always on the
+    ///    service route; on the process route only when it is
+    ///    actually running), via the shared SCM stop-and-wait. The
+    ///    typed outcome is logged as it happened (CR-7): a service
+    ///    that was not running is not reported as stopped, and the
+    ///    pid file is only cleared when the service owned it.
+    /// 2. A live gateway PROCESS — the pid file's pid, else the
+    ///    gateway interpreter owning the gateway port — killed and
+    ///    awaited until it is gone and has released the port.
     async fn stop_previous_gateway(
         &self,
         ctx: &WizardContext,
+        service_route: bool,
         log: &mut Vec<String>,
     ) -> Result<(), StepOutcome> {
+        use manager_services::{ServiceState, StopOutcome};
         let pid_path = crate::gateway_pid_path(&ctx.data_dir);
-        if ctx.config.supervision.mode == SupervisionMode::Service {
-            // The SCM owns the previous gateway process; killing the
-            // recorded pid would kill the service host's child out
-            // from under it and leave the service state lying. Stop
-            // the service instead — its host removes the pid file.
-            match ctx
-                .ops
-                .service_stop(manager_services::GATEWAY_SERVICE_NAME)
-                .await
-            {
-                Ok(()) => {
-                    log.push("stopped previous gateway service".to_string());
-                    let _ = ctx.ops.remove_file(&pid_path).await;
-                    return Ok(());
+        let port = ctx.config.gateway.port;
+        let service_name = manager_services::GATEWAY_SERVICE_NAME;
+        // 1. The service. On the process route a registered service
+        // is only stopped when it is actually up (a mode flip from
+        // service to process while it runs); its child would
+        // otherwise keep the port, and killing that child by pid
+        // would leave the SCM state lying.
+        let stop_service = if service_route {
+            true
+        } else if ctx.ops.service_registered(service_name).await {
+            !matches!(
+                ctx.ops.service_state(service_name).await,
+                None | Some(ServiceState::Stopped) | Some(ServiceState::NotInstalled)
+            )
+        } else {
+            false
+        };
+        if stop_service {
+            let running_before = !matches!(
+                ctx.ops.service_state(service_name).await,
+                Some(ServiceState::Stopped) | Some(ServiceState::NotInstalled)
+            );
+            if running_before {
+                gateway_mark(ctx, "stopping previous gateway", Some("service"));
+            }
+            match ctx.ops.service_stop(service_name).await {
+                Ok(StopOutcome::NotRegistered) => {
+                    push_log(
+                        ctx,
+                        log,
+                        format!(
+                            "gateway service '{service_name}' is not registered — no service to stop"
+                        ),
+                    );
+                }
+                Ok(StopOutcome::AlreadyStopped) => {
+                    push_log(ctx, log, "gateway service was not running".to_string());
+                }
+                Ok(StopOutcome::Stopped { waited_ms }) => {
+                    push_log(
+                        ctx,
+                        log,
+                        format!("stopped previous gateway service in {waited_ms} ms"),
+                    );
+                    gateway_mark(
+                        ctx,
+                        "previous gateway stopped",
+                        Some(&format!("service, in {waited_ms} ms")),
+                    );
                 }
                 Err(e) => {
                     return Err(StepOutcome::failed(
                         format!(
                             "could not stop the previous gateway service: {e}; \
-                             refusing to start a duplicate on :{}",
-                            ctx.config.gateway.port
+                             refusing to start a duplicate on :{port}"
                         ),
                         log.clone(),
                     ));
                 }
             }
         }
+        // 2. A gateway process: recorded in the pid file, else found
+        // by the port it listens on. The pid file is NOT cleared by
+        // the service branch above: after a real service stop its
+        // pid (the service host's child) is dead and is skipped
+        // here, while after a mode flip it may name a live
+        // process-mode gateway that must still be stopped (SCM-7).
+        // It is removed below, once nothing it names is running.
         let recorded = match ctx.ops.read_file(&pid_path).await {
             Ok(bytes) => String::from_utf8_lossy(&bytes).trim().parse::<u32>().ok(),
             Err(_) => None,
         };
-        let Some(old_pid) = recorded else {
-            return Ok(());
-        };
-        if ctx.ops.process_alive(old_pid) && ctx.ops.process_is_gateway(old_pid) == Some(false) {
-            // The recorded pid now names another program (the old
-            // gateway died, e.g. across a reboot, and Windows reused
-            // the pid). `kill_process` is `taskkill /T /F`: killing it
-            // would take down that program's whole tree (PL-M4).
-            log.push(format!(
-                "recorded gateway pid {old_pid} now belongs to another program; \
-                 treating the pid file as stale"
-            ));
-        } else if ctx.ops.process_alive(old_pid) {
+        if let Some(old_pid) = recorded {
+            if ctx.ops.process_alive(old_pid) && ctx.ops.process_is_gateway(old_pid) == Some(false)
+            {
+                // The recorded pid now names another program (the old
+                // gateway died, e.g. across a reboot, and Windows reused
+                // the pid). `kill_process` is `taskkill /T /F`: killing it
+                // would take down that program's whole tree (PL-M4).
+                log.push(format!(
+                    "recorded gateway pid {old_pid} now belongs to another program; \
+                     treating the pid file as stale"
+                ));
+            }
+        }
+        let port_owner = ctx.ops.port_owner_pid(port);
+        let found = crate::ops::pick_gateway_pid(
+            recorded,
+            port_owner,
+            |p| ctx.ops.process_alive(p),
+            |p| ctx.ops.process_is_gateway(p),
+        );
+        if let Some((old_pid, found_by)) = found {
+            if found_by == crate::FoundBy::PortOwner {
+                push_log(
+                    ctx,
+                    log,
+                    format!(
+                        "found a running gateway (pid {old_pid}) on :{port} that no pid file records"
+                    ),
+                );
+            }
+            gateway_mark(
+                ctx,
+                "stopping previous gateway",
+                Some(&format!("pid {old_pid} (found by {})", found_by.label())),
+            );
             if let Err(e) = ctx.ops.kill_process(old_pid) {
                 return Err(StepOutcome::failed(
                     format!(
                         "could not stop the previous gateway (pid {old_pid}): {e}; \
-                         refusing to spawn a duplicate on :{}",
-                        ctx.config.gateway.port
+                         refusing to spawn a duplicate on :{port}"
                     ),
                     log.clone(),
                 ));
             }
             log.push(format!("stopped previous gateway (pid {old_pid})"));
-            // Wait briefly for the process to actually exit so the
-            // port is free before the replacement spawns.
-            for _ in 0..30 {
-                if !ctx.ops.process_alive(old_pid) {
+            // Wait for the process to actually exit and release the
+            // port before the replacement spawns.
+            let gone = |ops: &dyn SystemOps| {
+                !ops.process_alive(old_pid) && ops.port_owner_pid(port) != Some(old_pid)
+            };
+            for _ in 0..100 {
+                if gone(ctx.ops.as_ref()) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            if ctx.ops.process_alive(old_pid) {
+            if !gone(ctx.ops.as_ref()) {
                 return Err(StepOutcome::failed(
                     format!(
                         "previous gateway (pid {old_pid}) is still running after a stop \
-                         request; refusing to spawn a duplicate on :{}",
-                        ctx.config.gateway.port
+                         request; refusing to spawn a duplicate on :{port}"
                     ),
                     log.clone(),
                 ));
             }
+            gateway_mark(
+                ctx,
+                "previous gateway stopped",
+                Some(&format!("pid {old_pid}")),
+            );
         }
         let _ = ctx.ops.remove_file(&pid_path).await;
         Ok(())
@@ -4301,7 +4650,7 @@ impl StartGateway {
             self.gateway_stderr_log(ctx),
             crate::gateway_pid_path(&ctx.data_dir),
         );
-        match manager_services::write_definition(&ctx.data_dir, &def) {
+        match ctx.ops.write_service_definition(&ctx.data_dir, &def).await {
             Ok(path) => log.push(format!(
                 "wrote gateway service definition {}",
                 path.display()
@@ -5352,599 +5701,8 @@ impl WizardStep for StartGateway {
         Some("re-run start-gateway to regenerate config and restart the gateway")
     }
     async fn run(&self, ctx: &WizardContext) -> Result<StepOutcome, WizardError> {
-        let mut log = Vec::new();
         match ctx.mode {
-            RunMode::Install => {
-                // Built once, up front: every failure path below
-                // attaches it, so a failed start always shows how
-                // to start the gateway by hand.
-                let manual = self.manual_start_block(ctx).await;
-                let uv = match self.ensure_uv(ctx).await {
-                    Ok(p) => {
-                        push_log(ctx, &mut log, format!("using uv at {}", p.display()));
-                        p
-                    }
-                    Err(outcome) => return Ok(outcome.with_manual_command(manual)),
-                };
-                // Reuse a healthy existing venv: one already on the
-                // pinned Python with litellm importable needs no venv
-                // creation and no package install. A venv on the
-                // pinned Python whose packages are missing or broken
-                // needs only the package install — recreating the
-                // venv (`uv venv --clear`) for a package-level
-                // problem threw away a sound interpreter and redid
-                // minutes of work on every retry. Only a venv on the
-                // WRONG Python (or no venv at all) is (re)created;
-                // --clear replaces a venv left behind by a failed
-                // install or built with an unpinned (too new)
-                // Python, which previously made every retry fail
-                // with "already exists" before the real error.
-                // The probes carry their failure evidence into the
-                // log (see venv_python_version_probe): which repair
-                // runs — and why — is always stated before it runs.
-                let (existing_version, version_probe_detail) =
-                    self.venv_python_version_probe(ctx).await;
-                let venv_current =
-                    existing_version.as_deref() == Some(crate::GATEWAY_PYTHON_VERSION);
-                let (litellm_ok, import_probe_detail) = if venv_current {
-                    self.litellm_import_probe(ctx).await
-                } else {
-                    (false, None)
-                };
-                let setup_cmds: Vec<PlannedCommand> = if litellm_ok {
-                    push_log(
-                        ctx,
-                        &mut log,
-                        format!(
-                            "existing install verified — skipping install (venv on Python {}; litellm, prisma and prometheus_client import cleanly)",
-                            crate::GATEWAY_PYTHON_VERSION
-                        ),
-                    );
-                    Vec::new()
-                } else if venv_current {
-                    push_log(
-                        ctx,
-                        &mut log,
-                        format!(
-                            "venv is on Python {} but the litellm import probe failed ({}) — installing packages only (the venv itself is kept)",
-                            crate::GATEWAY_PYTHON_VERSION,
-                            import_probe_detail.as_deref().unwrap_or("no detail")
-                        ),
-                    );
-                    vec![self.pip_command(ctx, &uv)]
-                } else {
-                    match &existing_version {
-                        Some(v) => push_log(
-                            ctx,
-                            &mut log,
-                            format!(
-                                "existing venv uses Python {v}; recreating it with Python {}",
-                                crate::GATEWAY_PYTHON_VERSION
-                            ),
-                        ),
-                        None => {
-                            if ctx.ops.file_exists(&self.venv_python(ctx)).await {
-                                push_log(
-                                    ctx,
-                                    &mut log,
-                                    format!(
-                                        "the venv interpreter probe failed ({}) — recreating the venv with Python {}",
-                                        version_probe_detail.as_deref().unwrap_or("no detail"),
-                                        crate::GATEWAY_PYTHON_VERSION
-                                    ),
-                                );
-                            } else {
-                                push_log(
-                                    ctx,
-                                    &mut log,
-                                    format!(
-                                        "creating venv with Python {}",
-                                        crate::GATEWAY_PYTHON_VERSION
-                                    ),
-                                );
-                            }
-                        }
-                    }
-                    vec![self.venv_command(ctx, &uv), self.pip_command(ctx, &uv)]
-                };
-                // Package installs get a longer command budget than
-                // the ops default: a cold `uv pip install` of
-                // litellm[proxy] + prisma on a slow link is the one
-                // legitimate multi-minute command in the wizard.
-                const SETUP_COMMAND_TIMEOUT: std::time::Duration =
-                    std::time::Duration::from_secs(900);
-                for cmd in &setup_cmds {
-                    match run_command_logged(ctx, &mut log, cmd, Some(SETUP_COMMAND_TIMEOUT))
-                        .await
-                    {
-                        Ok(out) if out.success() => {
-                            if !out.stdout.trim().is_empty() {
-                                log.push(out.stdout.trim().to_string());
-                            }
-                        }
-                        Ok(out) => {
-                            return Ok(StepOutcome::failed(
-                                format!(
-                                    "command failed (exit {}): {}",
-                                    out.exit_code,
-                                    cmd.argv.join(" ")
-                                ),
-                                log,
-                            )
-                            .with_manual_command(manual))
-                        }
-                        Err(e) => {
-                            return Ok(
-                                StepOutcome::failed(format!("{e}"), log)
-                                    .with_manual_command(manual),
-                            )
-                        }
-                    }
-                }
-                // Probe the installed LiteLLM version before the
-                // spawn (MCP design §4.3): the result is recorded in
-                // the spawn state below and drives the MCP floor
-                // check in the arming pass that follows.
-                let litellm_version = self.installed_litellm_version(ctx).await;
-                match &litellm_version {
-                    Some(v) => push_log(ctx, &mut log, format!("detected LiteLLM version: {v}")),
-                    None => push_log(
-                        ctx,
-                        &mut log,
-                        "LiteLLM version could not be determined (the version probe returned nothing usable)"
-                            .to_string(),
-                    ),
-                }
-                // MCP gateway arming (design §4.2), resolved BEFORE
-                // the YAML is generated: the generated config, the
-                // spawn environment and the spawn fingerprint all key
-                // off this one armed set (the single rule lives in
-                // crate::armed_gateway_mcp_servers). Each Gateway
-                // server's credential is read once here; a server
-                // whose credential cannot be read is NOT armed — it
-                // is omitted from this start with a warning and the
-                // gateway start proceeds: a missing MCP credential
-                // never fails the gateway.
-                let mut mcp_cred_values: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
-                for server in ctx.config.mcp.servers.iter().filter(|s| {
-                    s.exposure == manager_config::McpExposure::Gateway && !s.env_keys.is_empty()
-                }) {
-                    let Some(cred_ref) = server.cred_ref.as_deref().filter(|r| !r.is_empty())
-                    else {
-                        log.push(format!(
-                            "warning: MCP server '{}' is not armed: it declares env keys but no credential reference — the server is omitted from this gateway start",
-                            server.id
-                        ));
-                        continue;
-                    };
-                    if mcp_cred_values.contains_key(cred_ref) {
-                        continue;
-                    }
-                    match ctx
-                        .ops
-                        .credential_read(cred_ref)
-                        .await
-                        .filter(|v| !v.is_empty())
-                    {
-                        Some(value) => {
-                            mcp_cred_values.insert(cred_ref.to_string(), value);
-                        }
-                        None => log.push(format!(
-                            "warning: MCP server '{}' is not armed: credential '{cred_ref}' could not be read from Windows Credential Manager — the server is omitted from this gateway start",
-                            server.id
-                        )),
-                    }
-                }
-                let mcp_armed: Vec<&manager_config::McpServerConfig> =
-                    crate::armed_gateway_mcp_servers(&ctx.config, |t| {
-                        mcp_cred_values.contains_key(t)
-                    });
-                let mcp_stdio_armed = crate::mcp_armed_set_has_stdio(&mcp_armed);
-                // Floor enforcement (design §4.3), fail-closed BEFORE
-                // any spawn: with an armed stdio Gateway server, the
-                // installed LiteLLM must be at or above
-                // LITELLM_MCP_FLOOR_VERSION (the release carrying the
-                // stdio command/args allowlist fix). An UNDETERMINED
-                // version also fails: the allowlist state would be
-                // unverifiable, and the CVE surface is exactly that
-                // allowlist — a deliberate conservative reading.
-                if mcp_stdio_armed {
-                    let meets_floor = litellm_version
-                        .as_deref()
-                        .and_then(crate::litellm_version_meets_mcp_floor);
-                    if meets_floor != Some(true) {
-                        return Ok(StepOutcome::failed(
-                            format!(
-                                "MCP stdio gateway servers require LiteLLM >= {} (the stdio allowlist fix), but the installed version is {}. Remediation: set updates.components[\"litellm\"].pinned_version to a version at or above {} (or clear a stale pin) and re-run this step",
-                                crate::LITELLM_MCP_FLOOR_VERSION,
-                                litellm_version
-                                    .as_deref()
-                                    .unwrap_or("unknown — the version probe could not determine it"),
-                                crate::LITELLM_MCP_FLOOR_VERSION
-                            ),
-                            log,
-                        )
-                        .with_manual_command(manual));
-                    }
-                }
-                // config.yaml is generated from app state, never hand-edited.
-                // Both failure paths carry the manual block and the
-                // accumulated step log, like every other failure in
-                // this step — they previously returned a one-line
-                // debug outcome with neither (code-review 2.8).
-                // Generate from the armed-only view of the config:
-                // unarmed Gateway servers are omitted from this
-                // start's YAML (the generator itself stays a pure
-                // function of the config it is handed).
-                let generation_config = crate::config_with_armed_gateway_mcp_servers(
-                    &ctx.config,
-                    |t| mcp_cred_values.contains_key(t),
-                );
-                let yaml = match manager_gateway::generate_config_yaml(&generation_config) {
-                    Ok(y) => y,
-                    Err(e) => {
-                        return Ok(StepOutcome::failed(
-                            format!("gateway config generation failed: {e}"),
-                            log,
-                        )
-                        .with_manual_command(manual))
-                    }
-                };
-                let cfg_path = ctx.data_dir.join("gateway").join("config.yaml");
-                if let Err(e) = ctx.ops.write_file(&cfg_path, yaml.as_bytes()).await {
-                    return Ok(StepOutcome::failed(
-                        format!(
-                            "could not write the gateway configuration {}: {e}",
-                            cfg_path.display()
-                        ),
-                        log,
-                    )
-                    .with_manual_command(manual));
-                }
-                log.push(format!("wrote {}", cfg_path.display()));
-                // The context-overflow routing callback
-                // (routing-rules design §6.3) ships as a generated
-                // sibling the config's `callbacks:` entry resolves
-                // config-directory-relative. Written when a typed
-                // rule is enabled; a stale copy is removed when not,
-                // so disabling the rule restores exactly the
-                // pre-feature gateway directory.
-                let routing_path = ctx.data_dir.join("gateway").join("llmdil_routing.py");
-                match manager_gateway::generate_routing_callback(&generation_config) {
-                    Some(callback_py) => {
-                        if let Err(e) =
-                            ctx.ops.write_file(&routing_path, callback_py.as_bytes()).await
-                        {
-                            return Ok(StepOutcome::failed(
-                                format!(
-                                    "could not write the gateway routing callback {}: {e}",
-                                    routing_path.display()
-                                ),
-                                log,
-                            )
-                            .with_manual_command(manual));
-                        }
-                        log.push(format!("wrote {}", routing_path.display()));
-                    }
-                    None => {
-                        if let Err(e) = ctx.ops.remove_file(&routing_path).await {
-                            return Ok(StepOutcome::failed(
-                                format!(
-                                    "could not remove the stale gateway routing callback {}: {e}",
-                                    routing_path.display()
-                                ),
-                                log,
-                            )
-                            .with_manual_command(manual));
-                        }
-                    }
-                }
-                // Restart = stop the recorded gateway first; without
-                // this the spawn below is a duplicate that fails to
-                // bind while the old process keeps serving.
-                if let Err(outcome) = self.stop_previous_gateway(ctx, &mut log).await {
-                    return Ok(outcome.with_manual_command(manual));
-                }
-                // App-managed PostgreSQL: when install-postgres has
-                // run, the server must be up before the gateway
-                // spawns — the gateway receives DATABASE_URL and
-                // migrates against it at startup. Not installed →
-                // no DATABASE_URL, the pre-PostgreSQL behavior.
-                let database_url = if postgres_installed(ctx.ops.as_ref(), &ctx.data_dir).await {
-                    match ensure_postgres_running(ctx, &mut log).await {
-                        Ok(url) => {
-                            // Verify (and only if needed, repair)
-                            // the Prisma install before the spawn:
-                            // the gateway imports the Prisma client
-                            // at startup and dies if the install is
-                            // broken, so that work happens here,
-                            // where its failure is reported as this
-                            // step's failure — not as a dead gateway.
-                            // On a healthy install this is three
-                            // checks and no mutation (see
-                            // ensure_prisma_client_generated); the
-                            // old `--version` pre-warm is gone — it
-                            // generated nothing, proved nothing the
-                            // connect probe does not prove better,
-                            // and cost a process spawn on every
-                            // start.
-                            if let Err(outcome) = self
-                                .ensure_prisma_client_generated(ctx, &uv, &url, &mut log)
-                                .await
-                            {
-                                return Ok(outcome.with_manual_command(manual));
-                            }
-                            Some(url)
-                        }
-                        Err(e) => {
-                            return Ok(StepOutcome::failed(e, log).with_manual_command(manual))
-                        }
-                    }
-                } else {
-                    None
-                };
-                // The spawn env's MCP entries: each armed server's
-                // credential value (read once in the arming pass)
-                // under each of its env-key names.
-                let mcp_env: Vec<(String, String)> = mcp_armed
-                    .iter()
-                    .flat_map(|s| {
-                        let value = s
-                            .cred_ref
-                            .as_deref()
-                            .and_then(|r| mcp_cred_values.get(r))
-                            .cloned();
-                        s.env_keys.iter().filter_map(move |k| {
-                            value.clone().map(|v| (k.clone(), v))
-                        })
-                    })
-                    .collect();
-                let (mut spawn, openrouter_warning) = match self
-                    .spawn_command_with_env(ctx, database_url.as_deref(), &mcp_env, mcp_stdio_armed)
-                    .await
-                {
-                    Ok(pair) => pair,
-                    Err(outcome) => return Ok(outcome.with_manual_command(manual)),
-                };
-                if let Some(w) = &openrouter_warning {
-                    log.push(format!("warning: {w}"));
-                }
-                // Capture the gateway's own output: without it a
-                // startup failure is undiagnosable from inside the app.
-                spawn.stdout_log = Some(self.gateway_stdout_log(ctx));
-                spawn.stderr_log = Some(self.gateway_stderr_log(ctx));
-                push_log(
-                    ctx,
-                    &mut log,
-                    format!(
-                        "gateway output is captured to {} and {}",
-                        self.gateway_stdout_log(ctx).display(),
-                        self.gateway_stderr_log(ctx).display()
-                    ),
-                );
-                push_log(
-                    ctx,
-                    &mut log,
-                    format!(
-                        "spawning the gateway process ({})",
-                        spawn.argv.first().cloned().unwrap_or_default()
-                    ),
-                );
-                let pid = if ctx.config.supervision.mode == SupervisionMode::Service {
-                    // Service mode: regenerate the gateway's service
-                    // definition from this spawn (secret values become
-                    // credential references — never written to the
-                    // definition file) and start the service. The
-                    // health checks below run unchanged against the
-                    // child pid the service host recorded.
-                    match self
-                        .spawn_gateway_as_service(ctx, &spawn, &mut log)
-                        .await
-                    {
-                        Ok(pid) => pid,
-                        Err(outcome) => {
-                            return Ok(outcome.with_manual_command(manual))
-                        }
-                    }
-                } else {
-                    match ctx.ops.spawn_detached(&spawn).await {
-                        Ok(pid) => pid,
-                        Err(e) => {
-                            return Ok(StepOutcome::failed(
-                                format!("{e}"),
-                                vec![format!("{e:?}")],
-                            )
-                            .with_manual_command(manual))
-                        }
-                    }
-                };
-                push_log(ctx, &mut log, format!("LiteLLM spawned (pid {pid})"));
-                // Record the pid so a later stop (the gateway_stop
-                // command) or restart (this step re-run) terminates
-                // exactly this process instead of guessing by port.
-                let pid_path = crate::gateway_pid_path(&ctx.data_dir);
-                match ctx
-                    .ops
-                    .write_file(&pid_path, pid.to_string().as_bytes())
-                    .await
-                {
-                    Ok(()) => push_log(
-                        ctx,
-                        &mut log,
-                        format!("recorded gateway pid in {}", pid_path.display()),
-                    ),
-                    Err(e) => log.push(format!(
-                        "warning: could not record the gateway pid in {}: {e}; \
-                         stopping this gateway later will not be possible",
-                        pid_path.display()
-                    )),
-                }
-                // First-healthy is not enough on the database path:
-                // the known database defects kill the gateway about
-                // a second after it first answers, so that path also
-                // has to survive the confirmation window.
-                let health_failure = if !self.wait_healthy(ctx, pid, &mut log).await {
-                    Some("did not become healthy")
-                } else if let Some(url) = &database_url {
-                    if self.confirm_sustained_health(ctx, pid, url, &mut log).await {
-                        None
-                    } else {
-                        Some("became healthy but did not stay up")
-                    }
-                } else {
-                    None
-                };
-                if let Some(health_failure) = health_failure {
-                    // The gateway's own output is the diagnosis —
-                    // appended to the step log above its tail,
-                    // LABELED as gateway output. The failure MESSAGE
-                    // is the step's own verdict only: embedding the
-                    // raw stderr tail in the message presented it as
-                    // the step's error, and unrelated gateway log
-                    // noise (auth rejections from the app's own
-                    // status polling) reached the operator labeled
-                    // as the cause of the failure (2026-10-16).
-                    self.append_gateway_log_tail(ctx, &mut log).await;
-                    return Ok(StepOutcome::failed(
-                        format!(
-                            "gateway {health_failure} on :{} — the gateway's output is in the step log and in {}",
-                            ctx.config.gateway.port,
-                            ctx.data_dir.join("logs").display()
-                        ),
-                        log,
-                    )
-                    .with_manual_command(manual));
-                }
-                // Post-start MCP load check (design §8, §11, §14.6):
-                // every armed server must appear in the gateway's
-                // registered list and answer its tools list. A
-                // failure is logged with the gateway's own error
-                // text and noted in the outcome message, but never
-                // fails the step — the gateway itself is healthy.
-                // Nothing is persisted: the MCP view re-queries the
-                // gateway live (Phase 4).
-                let mcp_load_failed: Vec<String> = if mcp_armed.is_empty() {
-                    Vec::new()
-                } else {
-                    let armed_ids: Vec<String> =
-                        mcp_armed.iter().map(|s| s.id.clone()).collect();
-                    self.mcp_load_check(ctx, &armed_ids, &mut log).await
-                };
-                // Record what this gateway was actually spawned
-                // with (config fingerprint + the YAML): the drift
-                // check at the next launch compares the record
-                // against the then-current configuration, YAML and
-                // spawn-only inputs alike (code-review 2.3).
-                {
-                    let fingerprint = crate::gateway_spawn_fingerprint(
-                        &ctx.config,
-                        database_url.is_some(),
-                        spawn.env.get("LITELLM_MASTER_KEY").map(String::as_str),
-                        spawn.env.get("OPENROUTER_API_KEY").map(String::as_str),
-                        &mcp_armed,
-                    );
-                    let state_json = crate::gateway_spawn_state_json(
-                        &fingerprint,
-                        &yaml,
-                        litellm_version.as_deref(),
-                    );
-                    match ctx
-                        .ops
-                        .write_file(
-                            &crate::gateway_spawn_state_path(&ctx.data_dir),
-                            state_json.as_bytes(),
-                        )
-                        .await
-                    {
-                        Ok(()) => log.push(
-                            "recorded the gateway spawn state for the next launch's drift check"
-                                .to_string(),
-                        ),
-                        Err(e) => log.push(format!(
-                            "warning: could not record the gateway spawn state: {e}; \
-                             the next launch will treat this start as drifted and re-run this step"
-                        )),
-                    }
-                }
-                let mut message = match &openrouter_warning {
-                    Some(w) => format!(
-                        "LiteLLM gateway running on :{} — warning: {w}",
-                        ctx.config.gateway.port
-                    ),
-                    None => format!("LiteLLM gateway running on :{}", ctx.config.gateway.port),
-                };
-                // The gateway is healthy; reconcile the Windows
-                // firewall rule with the bind address so LAN clients
-                // can actually reach a LAN-bound gateway.
-                if let Some(fw) = self.ensure_gateway_firewall(ctx, &mut log).await {
-                    log.push(format!("warning: {fw}"));
-                    message = format!("{message} — warning: {fw}");
-                }
-                if !mcp_load_failed.is_empty() {
-                    message = format!(
-                        "{message} — warning: MCP load check failed for: {}",
-                        mcp_load_failed.join(", ")
-                    );
-                }
-                // Final re-check, immediately before reporting
-                // done: between the health confirmation above and
-                // here, the step runs the MCP load check and the
-                // firewall reconcile — the reconcile can wait on a
-                // UAC prompt for minutes — and a gateway that died
-                // in that window was still reported as a successful
-                // start (field report 2026-10-19: the step said
-                // "done" while the Gateway page showed the gateway
-                // down). One last probe at the health check's own
-                // standard: in process mode the spawned pid must
-                // still be alive (a service host may legitimately
-                // restart its child, so service mode relies on the
-                // probe alone) and the authenticated models
-                // endpoint must answer 200. A failure here fails
-                // the step with the gateway's output attached, like
-                // any other health failure.
-                let final_check_failure =
-                    if ctx.config.supervision.mode != SupervisionMode::Service
-                        && !ctx.ops.process_alive(pid)
-                    {
-                        Some(format!(
-                            "the gateway process (pid {pid}) exited after its health checks passed"
-                        ))
-                    } else {
-                        let headers = self.gateway_auth_headers(ctx).await;
-                        match ctx
-                            .ops
-                            .http_get_with_headers(&self.gateway_url(ctx), &headers)
-                            .await
-                        {
-                            Ok(resp) if resp.status == 200 => None,
-                            Ok(resp) => Some(format!(
-                                "the gateway answered HTTP {} on the final health re-check after passing its health checks",
-                                resp.status
-                            )),
-                            Err(e) => Some(format!(
-                                "the gateway is unreachable on the final health re-check ({e}) after passing its health checks"
-                            )),
-                        }
-                    };
-                if let Some(reason) = final_check_failure {
-                    self.append_gateway_log_tail(ctx, &mut log).await;
-                    return Ok(StepOutcome::failed(
-                        format!(
-                            "gateway started but did not stay up: {reason} — the gateway's output is in the step log and in {}",
-                            ctx.data_dir.join("logs").display()
-                        ),
-                        log,
-                    )
-                    .with_manual_command(manual));
-                }
-                push_log(
-                    ctx,
-                    &mut log,
-                    "final health re-check passed — the gateway is still serving".to_string(),
-                );
-                Ok(StepOutcome::done(message, log))
-            }
+            RunMode::Install => self.run_install_marked(ctx).await,
             RunMode::Audit => {
                 // Re-probe backend health without reinstalling.
                 let headers = self.gateway_auth_headers(ctx).await;
@@ -5968,6 +5726,748 @@ impl WizardStep for StartGateway {
                 }
             }
         }
+    }
+}
+
+impl StartGateway {
+    /// The install-mode body of [`WizardStep::run`] (see
+    /// [`Self::run_install_marked`] for the lifecycle markers around it).
+    async fn run_install(&self, ctx: &WizardContext) -> Result<StepOutcome, WizardError> {
+        let mut log = Vec::new();
+        // Built once, up front: every failure path below
+        // attaches it, so a failed start always shows how
+        // to start the gateway by hand.
+        let manual = self.manual_start_block(ctx).await;
+        let uv = match self.ensure_uv(ctx).await {
+            Ok(p) => {
+                push_log(ctx, &mut log, format!("using uv at {}", p.display()));
+                p
+            }
+            Err(outcome) => return Ok(outcome.with_manual_command(manual)),
+        };
+        // Reuse a healthy existing venv: one already on the
+        // pinned Python with litellm importable needs no venv
+        // creation and no package install. A venv on the
+        // pinned Python whose packages are missing or broken
+        // needs only the package install — recreating the
+        // venv (`uv venv --clear`) for a package-level
+        // problem threw away a sound interpreter and redid
+        // minutes of work on every retry. Only a venv on the
+        // WRONG Python (or no venv at all) is (re)created;
+        // --clear replaces a venv left behind by a failed
+        // install or built with an unpinned (too new)
+        // Python, which previously made every retry fail
+        // with "already exists" before the real error.
+        // The probes carry their failure evidence into the
+        // log (see venv_python_version_probe): which repair
+        // runs — and why — is always stated before it runs.
+        let (existing_version, version_probe_detail) =
+            self.venv_python_version_probe(ctx).await;
+        let venv_current =
+            existing_version.as_deref() == Some(crate::GATEWAY_PYTHON_VERSION);
+        let (litellm_ok, import_probe_detail) = if venv_current {
+            self.litellm_import_probe(ctx).await
+        } else {
+            (false, None)
+        };
+        let setup_cmds: Vec<PlannedCommand> = if litellm_ok {
+            push_log(
+                ctx,
+                &mut log,
+                format!(
+                    "existing install verified — skipping install (venv on Python {}; litellm, prisma and prometheus_client import cleanly)",
+                    crate::GATEWAY_PYTHON_VERSION
+                ),
+            );
+            Vec::new()
+        } else if venv_current {
+            push_log(
+                ctx,
+                &mut log,
+                format!(
+                    "venv is on Python {} but the litellm import probe failed ({}) — installing packages only (the venv itself is kept)",
+                    crate::GATEWAY_PYTHON_VERSION,
+                    import_probe_detail.as_deref().unwrap_or("no detail")
+                ),
+            );
+            vec![self.pip_command(ctx, &uv)]
+        } else {
+            match &existing_version {
+                Some(v) => push_log(
+                    ctx,
+                    &mut log,
+                    format!(
+                        "existing venv uses Python {v}; recreating it with Python {}",
+                        crate::GATEWAY_PYTHON_VERSION
+                    ),
+                ),
+                None => {
+                    if ctx.ops.file_exists(&self.venv_python(ctx)).await {
+                        push_log(
+                            ctx,
+                            &mut log,
+                            format!(
+                                "the venv interpreter probe failed ({}) — recreating the venv with Python {}",
+                                version_probe_detail.as_deref().unwrap_or("no detail"),
+                                crate::GATEWAY_PYTHON_VERSION
+                            ),
+                        );
+                    } else {
+                        push_log(
+                            ctx,
+                            &mut log,
+                            format!(
+                                "creating venv with Python {}",
+                                crate::GATEWAY_PYTHON_VERSION
+                            ),
+                        );
+                    }
+                }
+            }
+            vec![self.venv_command(ctx, &uv), self.pip_command(ctx, &uv)]
+        };
+        // Package installs get a longer command budget than
+        // the ops default: a cold `uv pip install` of
+        // litellm[proxy] + prisma on a slow link is the one
+        // legitimate multi-minute command in the wizard.
+        const SETUP_COMMAND_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(900);
+        // Route: service mode applies only when the gateway service is
+        // actually registered — the same "mode AND registered" rule
+        // the backends use (SCM-7). Otherwise the gateway runs as a
+        // process, and the previous one is stopped by pid either way.
+        let service_route = self.service_route(ctx, &mut log).await;
+        // Restart semantics: the old gateway keeps serving through the
+        // slow preparation (probes, MCP arming, YAML, PostgreSQL) and
+        // is stopped just before the spawn — EXCEPT when the venv is
+        // about to be repaired: recreating the venv or reinstalling
+        // packages under a running interpreter fails on Windows (files
+        // in use) and pulls the code out from under it, so the old
+        // gateway is stopped first in that case.
+        let mut previous_stopped = false;
+        if !setup_cmds.is_empty() {
+            push_log(
+                ctx,
+                &mut log,
+                "stopping any running gateway before repairing its venv".to_string(),
+            );
+            if let Err(outcome) = self.stop_previous_gateway(ctx, service_route, &mut log).await {
+                return Ok(outcome.with_manual_command(manual));
+            }
+            previous_stopped = true;
+        }
+        for cmd in &setup_cmds {
+            match run_command_logged(ctx, &mut log, cmd, Some(SETUP_COMMAND_TIMEOUT))
+                .await
+            {
+                Ok(out) if out.success() => {
+                    if !out.stdout.trim().is_empty() {
+                        log.push(out.stdout.trim().to_string());
+                    }
+                }
+                Ok(out) => {
+                    return Ok(StepOutcome::failed(
+                        format!(
+                            "command failed (exit {}): {}",
+                            out.exit_code,
+                            cmd.argv.join(" ")
+                        ),
+                        log,
+                    )
+                    .with_manual_command(manual))
+                }
+                Err(e) => {
+                    return Ok(
+                        StepOutcome::failed(format!("{e}"), log)
+                            .with_manual_command(manual),
+                    )
+                }
+            }
+        }
+        // Probe the installed LiteLLM version before the
+        // spawn (MCP design §4.3): the result is recorded in
+        // the spawn state below and drives the MCP floor
+        // check in the arming pass that follows.
+        let litellm_version = self.installed_litellm_version(ctx).await;
+        match &litellm_version {
+            Some(v) => push_log(ctx, &mut log, format!("detected LiteLLM version: {v}")),
+            None => push_log(
+                ctx,
+                &mut log,
+                "LiteLLM version could not be determined (the version probe returned nothing usable)"
+                    .to_string(),
+            ),
+        }
+        // MCP gateway arming (design §4.2), resolved BEFORE
+        // the YAML is generated: the generated config, the
+        // spawn environment and the spawn fingerprint all key
+        // off this one armed set (the single rule lives in
+        // crate::armed_gateway_mcp_servers). Each Gateway
+        // server's credential is read once here; a server
+        // whose credential cannot be read is NOT armed — it
+        // is omitted from this start with a warning and the
+        // gateway start proceeds: a missing MCP credential
+        // never fails the gateway.
+        let mut mcp_cred_values: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for server in ctx.config.mcp.servers.iter().filter(|s| {
+            s.exposure == manager_config::McpExposure::Gateway && !s.env_keys.is_empty()
+        }) {
+            let Some(cred_ref) = server.cred_ref.as_deref().filter(|r| !r.is_empty())
+            else {
+                log.push(format!(
+                    "warning: MCP server '{}' is not armed: it declares env keys but no credential reference — the server is omitted from this gateway start",
+                    server.id
+                ));
+                continue;
+            };
+            if mcp_cred_values.contains_key(cred_ref) {
+                continue;
+            }
+            match ctx
+                .ops
+                .credential_read(cred_ref)
+                .await
+                .filter(|v| !v.is_empty())
+            {
+                Some(value) => {
+                    mcp_cred_values.insert(cred_ref.to_string(), value);
+                }
+                None => log.push(format!(
+                    "warning: MCP server '{}' is not armed: credential '{cred_ref}' could not be read from Windows Credential Manager — the server is omitted from this gateway start",
+                    server.id
+                )),
+            }
+        }
+        let mcp_armed: Vec<&manager_config::McpServerConfig> =
+            crate::armed_gateway_mcp_servers(&ctx.config, |t| {
+                mcp_cred_values.contains_key(t)
+            });
+        let mcp_stdio_armed = crate::mcp_armed_set_has_stdio(&mcp_armed);
+        // Floor enforcement (design §4.3), fail-closed BEFORE
+        // any spawn: with an armed stdio Gateway server, the
+        // installed LiteLLM must be at or above
+        // LITELLM_MCP_FLOOR_VERSION (the release carrying the
+        // stdio command/args allowlist fix). An UNDETERMINED
+        // version also fails: the allowlist state would be
+        // unverifiable, and the CVE surface is exactly that
+        // allowlist — a deliberate conservative reading.
+        if mcp_stdio_armed {
+            let meets_floor = litellm_version
+                .as_deref()
+                .and_then(crate::litellm_version_meets_mcp_floor);
+            if meets_floor != Some(true) {
+                return Ok(StepOutcome::failed(
+                    format!(
+                        "MCP stdio gateway servers require LiteLLM >= {} (the stdio allowlist fix), but the installed version is {}. Remediation: set updates.components[\"litellm\"].pinned_version to a version at or above {} (or clear a stale pin) and re-run this step",
+                        crate::LITELLM_MCP_FLOOR_VERSION,
+                        litellm_version
+                            .as_deref()
+                            .unwrap_or("unknown — the version probe could not determine it"),
+                        crate::LITELLM_MCP_FLOOR_VERSION
+                    ),
+                    log,
+                )
+                .with_manual_command(manual));
+            }
+        }
+        // config.yaml is generated from app state, never hand-edited.
+        // Both failure paths carry the manual block and the
+        // accumulated step log, like every other failure in
+        // this step — they previously returned a one-line
+        // debug outcome with neither (code-review 2.8).
+        // Generate from the armed-only view of the config:
+        // unarmed Gateway servers are omitted from this
+        // start's YAML (the generator itself stays a pure
+        // function of the config it is handed).
+        let generation_config = crate::config_with_armed_gateway_mcp_servers(
+            &ctx.config,
+            |t| mcp_cred_values.contains_key(t),
+        );
+        let yaml = match manager_gateway::generate_config_yaml(&generation_config) {
+            Ok(y) => y,
+            Err(e) => {
+                return Ok(StepOutcome::failed(
+                    format!("gateway config generation failed: {e}"),
+                    log,
+                )
+                .with_manual_command(manual))
+            }
+        };
+        let cfg_path = ctx.data_dir.join("gateway").join("config.yaml");
+        // The applied stamp written on success carries this instant:
+        // activation-journal entries recorded after it (during this
+        // very run) stay pending (CR-1).
+        let yaml_written_at = chrono::Utc::now();
+        if let Err(e) = ctx.ops.write_file(&cfg_path, yaml.as_bytes()).await {
+            return Ok(StepOutcome::failed(
+                format!(
+                    "could not write the gateway configuration {}: {e}",
+                    cfg_path.display()
+                ),
+                log,
+            )
+            .with_manual_command(manual));
+        }
+        log.push(format!("wrote {}", cfg_path.display()));
+        // The context-overflow routing callback
+        // (routing-rules design §6.3) ships as a generated
+        // sibling the config's `callbacks:` entry resolves
+        // config-directory-relative. Written when a typed
+        // rule is enabled; a stale copy is removed when not,
+        // so disabling the rule restores exactly the
+        // pre-feature gateway directory.
+        let routing_path = ctx.data_dir.join("gateway").join("llmdil_routing.py");
+        match manager_gateway::generate_routing_callback(&generation_config) {
+            Some(callback_py) => {
+                if let Err(e) =
+                    ctx.ops.write_file(&routing_path, callback_py.as_bytes()).await
+                {
+                    return Ok(StepOutcome::failed(
+                        format!(
+                            "could not write the gateway routing callback {}: {e}",
+                            routing_path.display()
+                        ),
+                        log,
+                    )
+                    .with_manual_command(manual));
+                }
+                log.push(format!("wrote {}", routing_path.display()));
+            }
+            None => {
+                if let Err(e) = ctx.ops.remove_file(&routing_path).await {
+                    return Ok(StepOutcome::failed(
+                        format!(
+                            "could not remove the stale gateway routing callback {}: {e}",
+                            routing_path.display()
+                        ),
+                        log,
+                    )
+                    .with_manual_command(manual));
+                }
+            }
+        }
+        // App-managed PostgreSQL: when install-postgres has
+        // run, the server must be up before the gateway
+        // spawns — the gateway receives DATABASE_URL and
+        // migrates against it at startup. Not installed →
+        // no DATABASE_URL, the pre-PostgreSQL behavior.
+        // Ensured BEFORE the previous gateway is stopped: a
+        // running server is simply adopted (a gateway restart
+        // never restarts PostgreSQL unless its port changed),
+        // and a PostgreSQL failure leaves the old gateway
+        // serving instead of taking it down for nothing.
+        let postgres_url = if postgres_installed(ctx.ops.as_ref(), &ctx.data_dir).await {
+            match ensure_postgres_running_detailed(ctx, &mut log).await {
+                Ok((url, how)) => {
+                    gateway_mark(ctx, "PostgreSQL ready", Some(&how.describe()));
+                    Some(url)
+                }
+                Err(e) => {
+                    return Ok(StepOutcome::failed(e, log).with_manual_command(manual))
+                }
+            }
+        } else {
+            None
+        };
+        // Restart = stop the previous gateway now, just before the
+        // spawn (unless the venv repair above already did); without
+        // this the spawn below is a duplicate that fails to bind
+        // while the old process keeps serving.
+        if !previous_stopped {
+            if let Err(outcome) = self.stop_previous_gateway(ctx, service_route, &mut log).await {
+                return Ok(outcome.with_manual_command(manual));
+            }
+        }
+        let database_url = match postgres_url {
+            Some(url) => {
+                // Verify (and only if needed, repair)
+                // the Prisma install before the spawn:
+                // the gateway imports the Prisma client
+                // at startup and dies if the install is
+                // broken, so that work happens here,
+                // where its failure is reported as this
+                // step's failure — not as a dead gateway.
+                // On a healthy install this is three
+                // checks and no mutation (see
+                // ensure_prisma_client_generated); the
+                // old `--version` pre-warm is gone — it
+                // generated nothing, proved nothing the
+                // connect probe does not prove better,
+                // and cost a process spawn on every
+                // start.
+                if let Err(outcome) = self
+                    .ensure_prisma_client_generated(ctx, &uv, &url, &mut log)
+                    .await
+                {
+                    return Ok(outcome.with_manual_command(manual));
+                }
+                Some(url)
+            }
+            None => None,
+        };
+        // The spawn env's MCP entries: each armed server's
+        // credential value (read once in the arming pass)
+        // under each of its env-key names.
+        let mcp_env: Vec<(String, String)> = mcp_armed
+            .iter()
+            .flat_map(|s| {
+                let value = s
+                    .cred_ref
+                    .as_deref()
+                    .and_then(|r| mcp_cred_values.get(r))
+                    .cloned();
+                s.env_keys.iter().filter_map(move |k| {
+                    value.clone().map(|v| (k.clone(), v))
+                })
+            })
+            .collect();
+        let (mut spawn, openrouter_warning) = match self
+            .spawn_command_with_env(ctx, database_url.as_deref(), &mcp_env, mcp_stdio_armed)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(outcome) => return Ok(outcome.with_manual_command(manual)),
+        };
+        if let Some(w) = &openrouter_warning {
+            log.push(format!("warning: {w}"));
+        }
+        // Capture the gateway's own output: without it a
+        // startup failure is undiagnosable from inside the app.
+        spawn.stdout_log = Some(self.gateway_stdout_log(ctx));
+        spawn.stderr_log = Some(self.gateway_stderr_log(ctx));
+        push_log(
+            ctx,
+            &mut log,
+            format!(
+                "gateway output is captured to {} and {}",
+                self.gateway_stdout_log(ctx).display(),
+                self.gateway_stderr_log(ctx).display()
+            ),
+        );
+        push_log(
+            ctx,
+            &mut log,
+            format!(
+                "spawning the gateway process ({})",
+                spawn.argv.first().cloned().unwrap_or_default()
+            ),
+        );
+        let spawned_at = std::time::Instant::now();
+        let pid = if service_route {
+            // Service mode: regenerate the gateway's service
+            // definition from this spawn (secret values become
+            // credential references — never written to the
+            // definition file) and start the service. The
+            // health checks below run unchanged against the
+            // child pid the service host recorded.
+            match self
+                .spawn_gateway_as_service(ctx, &spawn, &mut log)
+                .await
+            {
+                Ok(pid) => pid,
+                Err(outcome) => {
+                    return Ok(outcome.with_manual_command(manual))
+                }
+            }
+        } else {
+            match ctx.ops.spawn_detached(&spawn).await {
+                Ok(pid) => pid,
+                Err(e) => {
+                    return Ok(StepOutcome::failed(
+                        format!("{e}"),
+                        vec![format!("{e:?}")],
+                    )
+                    .with_manual_command(manual))
+                }
+            }
+        };
+        push_log(ctx, &mut log, format!("LiteLLM spawned (pid {pid})"));
+        gateway_mark(
+            ctx,
+            "spawned",
+            Some(&format!(
+                "pid {pid} ({})",
+                if service_route { "service" } else { "process" }
+            )),
+        );
+        // Record the pid so a later stop (the gateway_stop
+        // command) or restart (this step re-run) terminates
+        // exactly this process instead of guessing by port.
+        let pid_path = crate::gateway_pid_path(&ctx.data_dir);
+        match ctx
+            .ops
+            .write_file(&pid_path, pid.to_string().as_bytes())
+            .await
+        {
+            Ok(()) => push_log(
+                ctx,
+                &mut log,
+                format!("recorded gateway pid in {}", pid_path.display()),
+            ),
+            Err(e) => log.push(format!(
+                "warning: could not record the gateway pid in {}: {e}; \
+                 stopping this gateway later will not be possible",
+                pid_path.display()
+            )),
+        }
+        // First-healthy is not enough on the database path:
+        // the known database defects kill the gateway about
+        // a second after it first answers, so that path also
+        // has to survive the confirmation window.
+        let health_failure = if !self.wait_healthy(ctx, pid, &mut log).await {
+            Some("did not become healthy")
+        } else if let Some(url) = &database_url {
+            if self.confirm_sustained_health(ctx, pid, url, &mut log).await {
+                None
+            } else {
+                Some("became healthy but did not stay up")
+            }
+        } else {
+            None
+        };
+        if health_failure.is_none() {
+            gateway_mark(
+                ctx,
+                "healthy",
+                Some(&format!(
+                    "pid {pid} after {:.1} s",
+                    spawned_at.elapsed().as_secs_f64()
+                )),
+            );
+        }
+        if let Some(health_failure) = health_failure {
+            // The gateway's own output is the diagnosis —
+            // appended to the step log above its tail,
+            // LABELED as gateway output. The failure MESSAGE
+            // is the step's own verdict only: embedding the
+            // raw stderr tail in the message presented it as
+            // the step's error, and unrelated gateway log
+            // noise (auth rejections from the app's own
+            // status polling) reached the operator labeled
+            // as the cause of the failure (2026-10-16).
+            self.append_gateway_log_tail(ctx, &mut log).await;
+            return Ok(StepOutcome::failed(
+                format!(
+                    "gateway {health_failure} on :{} — the gateway's output is in the step log and in {}",
+                    ctx.config.gateway.port,
+                    ctx.data_dir.join("logs").display()
+                ),
+                log,
+            )
+            .with_manual_command(manual));
+        }
+        // Post-start MCP load check (design §8, §11, §14.6):
+        // every armed server must appear in the gateway's
+        // registered list and answer its tools list. A
+        // failure is logged with the gateway's own error
+        // text and noted in the outcome message, but never
+        // fails the step — the gateway itself is healthy.
+        // Nothing is persisted: the MCP view re-queries the
+        // gateway live (Phase 4).
+        let mcp_load_failed: Vec<String> = if mcp_armed.is_empty() {
+            Vec::new()
+        } else {
+            let armed_ids: Vec<String> =
+                mcp_armed.iter().map(|s| s.id.clone()).collect();
+            self.mcp_load_check(ctx, &armed_ids, &mut log).await
+        };
+        // Record what this gateway was actually spawned
+        // with (config fingerprint + the YAML): the drift
+        // check at the next launch compares the record
+        // against the then-current configuration, YAML and
+        // spawn-only inputs alike (code-review 2.3).
+        {
+            let fingerprint = crate::gateway_spawn_fingerprint(
+                &ctx.config,
+                database_url.is_some(),
+                spawn.env.get("LITELLM_MASTER_KEY").map(String::as_str),
+                spawn.env.get("OPENROUTER_API_KEY").map(String::as_str),
+                &mcp_armed,
+            );
+            let state_json = crate::gateway_spawn_state_json(
+                &fingerprint,
+                &yaml,
+                litellm_version.as_deref(),
+            );
+            match ctx
+                .ops
+                .write_file(
+                    &crate::gateway_spawn_state_path(&ctx.data_dir),
+                    state_json.as_bytes(),
+                )
+                .await
+            {
+                Ok(()) => log.push(
+                    "recorded the gateway spawn state for the next launch's drift check"
+                        .to_string(),
+                ),
+                Err(e) => log.push(format!(
+                    "warning: could not record the gateway spawn state: {e}; \
+                     the next launch will treat this start as drifted and re-run this step"
+                )),
+            }
+        }
+        let mut message = match &openrouter_warning {
+            Some(w) => format!(
+                "LiteLLM gateway running on :{} — warning: {w}",
+                ctx.config.gateway.port
+            ),
+            None => format!("LiteLLM gateway running on :{}", ctx.config.gateway.port),
+        };
+        // The gateway is healthy; reconcile the Windows
+        // firewall rule with the bind address so LAN clients
+        // can actually reach a LAN-bound gateway.
+        if let Some(fw) = self.ensure_gateway_firewall(ctx, &mut log).await {
+            log.push(format!("warning: {fw}"));
+            message = format!("{message} — warning: {fw}");
+        }
+        if !mcp_load_failed.is_empty() {
+            message = format!(
+                "{message} — warning: MCP load check failed for: {}",
+                mcp_load_failed.join(", ")
+            );
+        }
+        // Final re-check, immediately before reporting
+        // done: between the health confirmation above and
+        // here, the step runs the MCP load check and the
+        // firewall reconcile — the reconcile can wait on a
+        // UAC prompt for minutes — and a gateway that died
+        // in that window was still reported as a successful
+        // start (field report 2026-10-19: the step said
+        // "done" while the Gateway page showed the gateway
+        // down). One last probe at the health check's own
+        // standard: the spawned pid must still be alive — in
+        // service mode too: the service host does not restart
+        // the gateway child, so a dead pid is a dead gateway, and
+        // a probe answering from some OTHER process on the port
+        // (an old gateway left over by a mode flip) must not pass
+        // for this start (SCM-7) — in service mode the SCM must
+        // also still report the service Running; and the
+        // authenticated models endpoint must answer 200. A
+        // failure here fails the step with the gateway's output
+        // attached, like any other health failure.
+        let scm_state = if service_route {
+            ctx.ops
+                .service_state(manager_services::GATEWAY_SERVICE_NAME)
+                .await
+        } else {
+            None
+        };
+        let final_check_failure = if !ctx.ops.process_alive(pid) {
+            Some(format!(
+                "the gateway process (pid {pid}) exited after its health checks passed"
+            ))
+        } else if let Some(state) =
+            scm_state.filter(|s| *s != manager_services::ServiceState::Running)
+        {
+            Some(format!(
+                "the gateway service is {} (not running) after its health checks passed",
+                state.as_str()
+            ))
+        } else {
+                let headers = self.gateway_auth_headers(ctx).await;
+                match ctx
+                    .ops
+                    .http_get_with_headers(&self.gateway_url(ctx), &headers)
+                    .await
+                {
+                    Ok(resp) if resp.status == 200 => None,
+                    Ok(resp) => Some(format!(
+                        "the gateway answered HTTP {} on the final health re-check after passing its health checks",
+                        resp.status
+                    )),
+                    Err(e) => Some(format!(
+                        "the gateway is unreachable on the final health re-check ({e}) after passing its health checks"
+                    )),
+                }
+            };
+        if let Some(reason) = final_check_failure {
+            self.append_gateway_log_tail(ctx, &mut log).await;
+            return Ok(StepOutcome::failed(
+                format!(
+                    "gateway started but did not stay up: {reason} — the gateway's output is in the step log and in {}",
+                    ctx.data_dir.join("logs").display()
+                ),
+                log,
+            )
+            .with_manual_command(manual));
+        }
+        push_log(
+            ctx,
+            &mut log,
+            "final health re-check passed — the gateway is still serving".to_string(),
+        );
+        // Only now is the new configuration live: stamp it, so the
+        // activation plan resolves gateway-scope entries from a
+        // successful start and never from the YAML write alone
+        // (CR-1). Written through the ops layer (hermetic tests).
+        let stamp_path = crate::gateway_applied_stamp_path(&ctx.data_dir);
+        match ctx
+            .ops
+            .write_file(
+                &stamp_path,
+                crate::gateway_applied_stamp_json(yaml_written_at, pid).as_bytes(),
+            )
+            .await
+        {
+            Ok(()) => log.push(format!("recorded the applied stamp in {}", stamp_path.display())),
+            Err(e) => log.push(format!(
+                "warning: could not record the applied stamp in {}: {e};                  the activation plan may keep showing these changes as pending",
+                stamp_path.display()
+            )),
+        }
+        gateway_mark(
+            ctx,
+            "started",
+            Some(&format!("pid {pid} serving on :{}", ctx.config.gateway.port)),
+        );
+        Ok(StepOutcome::done(message, log))
+    }
+
+    /// [`Self::run_install`] wrapped in the gateway's lifecycle
+    /// markers (`logs/gateway.lifecycle.log`): one when the step
+    /// starts and, on any failure return, one carrying the reason —
+    /// so the gateway's own log scope shows every start/restart
+    /// attempt and how it ended, not only `wizard.log` (GW-4).
+    async fn run_install_marked(&self, ctx: &WizardContext) -> Result<StepOutcome, WizardError> {
+        gateway_mark(ctx, "start-gateway step started", None);
+        let result = self.run_install(ctx).await;
+        match &result {
+            Ok(out) if out.state == crate::StepState::Failed => {
+                gateway_mark(ctx, "start failed", Some(first_line(&out.message)))
+            }
+            Err(e) => gateway_mark(ctx, "start failed", Some(first_line(&e.to_string()))),
+            Ok(_) => {}
+        }
+        result
+    }
+
+    /// The gateway's route for this run: the SCM service when
+    /// service supervision is on AND the gateway service is
+    /// registered; the process path otherwise (a service-mode
+    /// install whose gateway service is not registered falls back
+    /// to process supervision, as backends do — SCM-7).
+    async fn service_route(&self, ctx: &WizardContext, log: &mut Vec<String>) -> bool {
+        if ctx.config.supervision.mode != SupervisionMode::Service {
+            return false;
+        }
+        if ctx
+            .ops
+            .service_registered(manager_services::GATEWAY_SERVICE_NAME)
+            .await
+        {
+            return true;
+        }
+        push_log(
+            ctx,
+            log,
+            format!(
+                "service supervision is on but the gateway service '{}' is not registered — running the gateway as a process",
+                manager_services::GATEWAY_SERVICE_NAME
+            ),
+        );
+        false
     }
 }
 
@@ -12918,5 +13418,585 @@ mod tests {
         assert_eq!(hw_cmds[0].argv[0], smi);
         assert!(hw_cmds[0].argv.iter().any(|a| a.contains("--query-gpu")));
         assert_eq!(hw_cmds[1].argv, vec![smi]);
+    }
+
+    // --- Lifecycle (WP3): restart semantics, PostgreSQL adopt/port
+    // change, honest stop, markers, applied stamp ---
+
+    /// A gateway step with fast health polling and no DB sustain wait.
+    fn fast_gateway_step() -> StartGateway {
+        StartGateway {
+            health_retries: 3,
+            health_interval_ms: 1,
+            db_sustain_ms: 0,
+        }
+    }
+
+    /// Script an existing venv on the pinned Python with litellm
+    /// importable: no setup commands run (the fast restart path).
+    fn with_healthy_venv(ops: &FakeSystemOps, step: &StartGateway, ctx: &WizardContext) {
+        ops.with_file(step.venv_python(ctx), Vec::new());
+        let probe = step.version_probe_command(ctx);
+        let probe_argv: Vec<&str> = probe.argv.iter().map(String::as_str).collect();
+        ops.with_command(
+            &probe_argv,
+            FakeSystemOps::ok_output(&format!("{}\n", crate::GATEWAY_PYTHON_VERSION)),
+        );
+    }
+
+    fn with_healthy_gateway_http(ops: &FakeSystemOps) {
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+    }
+
+    fn gateway_markers(ops: &FakeSystemOps) -> Vec<String> {
+        ops.markers_in(&crate::gateway_lifecycle_log(Path::new("/data")))
+    }
+
+    fn postgres_markers(ops: &FakeSystemOps) -> Vec<String> {
+        ops.markers_in(&crate::postgres_lifecycle_log(Path::new("/data")))
+    }
+
+    fn has_marker(markers: &[String], needle: &str) -> bool {
+        markers
+            .iter()
+            .any(|m| manager_supervisor::lifecycle::is_marker_line(m) && m.contains(needle))
+    }
+
+    fn pg_ctl_argv(data_dir: &Path, args: &[&str]) -> Vec<String> {
+        pg_ctl_command(data_dir, args).argv
+    }
+
+    /// GW-1 / ACT-2 / OS-4: a gateway restart with a healthy venv and
+    /// a PostgreSQL that already accepts connections adopts the
+    /// server — no `pg_ctl stop`, no `pg_ctl start` — and still stops
+    /// the previous gateway exactly once.
+    #[tokio::test]
+    async fn start_gateway_restart_adopts_ready_postgres_without_restarting_it() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        with_healthy_gateway_http(&ops);
+        let step = fast_gateway_step();
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        with_healthy_venv(&ops, &step, &ctx);
+        with_postgres_installed(&ops, &ctx);
+        // The previous gateway is running.
+        ops.with_file(PathBuf::from("/data/gateway.pid"), b"7777".to_vec());
+        ops.with_live_pid(7777);
+        // pg_isready answers (unscripted commands succeed); a live
+        // postmaster on the configured port.
+        ops.with_file(
+            postmaster_pid_path(&ctx.data_dir),
+            b"5151\n/data/postgres/data\n1700000000\n54329\n".to_vec(),
+        );
+        ops.with_process_image(5151, "postgres.exe");
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let executed = ops.executed_commands();
+        let pg_ctl = |verb: &str| {
+            executed.iter().any(|a| {
+                a.first().is_some_and(|p| p.contains("pg_ctl")) && a.iter().any(|x| x == verb)
+            })
+        };
+        assert!(!pg_ctl("stop"), "PostgreSQL must not be stopped: {executed:?}");
+        assert!(!pg_ctl("start"), "PostgreSQL must not be started: {executed:?}");
+        assert!(ops.process_alive(5151), "the postmaster keeps running");
+        assert_eq!(ops.killed_pids(), vec![7777]);
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("PostgreSQL already running")),
+            "{out:?}"
+        );
+        assert!(
+            has_marker(&postgres_markers(&ops), "adopted running server: pid 5151, port 54329"),
+            "{:?}",
+            ops.markers()
+        );
+        assert!(
+            has_marker(&gateway_markers(&ops), "PostgreSQL ready: adopted pid 5151"),
+            "{:?}",
+            ops.markers()
+        );
+    }
+
+    /// GW-2(d): PostgreSQL is ensured BEFORE the previous gateway is
+    /// stopped, so a database that cannot start leaves the old
+    /// gateway serving (and the failure lands in the gateway's own
+    /// lifecycle log and in PostgreSQL's).
+    #[tokio::test]
+    async fn start_gateway_postgres_failure_leaves_previous_gateway_serving() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        with_healthy_gateway_http(&ops);
+        let step = fast_gateway_step();
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        with_healthy_venv(&ops, &step, &ctx);
+        with_postgres_installed(&ops, &ctx);
+        ops.with_file(PathBuf::from("/data/gateway.pid"), b"7777".to_vec());
+        ops.with_live_pid(7777);
+        let isready = pg_isready_argv(&ctx.data_dir);
+        ops.with_command(&argv_refs(&isready), pg_not_ready_output());
+        let start = postgres_start_command(&ctx.data_dir, 54329).argv;
+        ops.with_command_failure(&argv_refs(&start), 1, "could not start server");
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(ops.killed_pids().is_empty(), "{:?}", ops.killed_pids());
+        assert!(ops.process_alive(7777), "the old gateway keeps serving");
+        assert!(ops.spawns().is_empty());
+        assert!(
+            has_marker(&gateway_markers(&ops), "gateway: start failed: PostgreSQL failed to start"),
+            "{:?}",
+            ops.markers()
+        );
+        assert!(
+            has_marker(&postgres_markers(&ops), "postgres: start failed"),
+            "{:?}",
+            ops.markers()
+        );
+        assert!(
+            ops.file_bytes(&crate::gateway_applied_stamp_path(Path::new("/data")))
+                .is_none(),
+            "no applied stamp on failure"
+        );
+    }
+
+    /// OS-5 / GW-1: a live postmaster listening on a port other than
+    /// the configured one is stopped (`pg_ctl stop -m fast`) and the
+    /// server is started on the configured port.
+    #[tokio::test]
+    async fn postgres_port_change_restarts_the_server_on_the_new_port() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let data_dir = PathBuf::from("/data");
+        let ctx = pg_ctx(&ops, test_config_with_models(), &data_dir);
+        with_postgres_installed(&ops, &ctx);
+        ops.with_file(
+            postmaster_pid_path(&data_dir),
+            b"5151\n/data/postgres/data\n1700000000\n5432\n".to_vec(),
+        );
+        ops.with_process_image(5151, "postgres.exe");
+        let stop = pg_ctl_argv(&data_dir, &["stop", "-m", "fast"]);
+        ops.with_command_kills_pid(&argv_refs(&stop), 5151);
+        let isready = pg_isready_argv(&data_dir);
+        ops.with_command_sequence(
+            &argv_refs(&isready),
+            vec![pg_not_ready_output(), pg_ready_output()],
+        );
+        let mut log = Vec::new();
+        let (url, how) = ensure_postgres_running_detailed(&ctx, &mut log)
+            .await
+            .expect("restarted on the configured port");
+        assert!(url.contains("127.0.0.1:54329"), "{url}");
+        assert!(matches!(how, PostgresReady::Started { .. }), "{how:?}");
+        let executed = ops.executed_commands();
+        let stop_at = executed.iter().position(|a| *a == stop).expect("pg_ctl stop ran");
+        let start = postgres_start_command(&data_dir, 54329).argv;
+        let start_at = executed
+            .iter()
+            .position(|a| *a == start)
+            .expect("pg_ctl start ran on the new port");
+        assert!(stop_at < start_at, "{executed:?}");
+        assert!(
+            log.iter().any(|l| l.contains("running on port 5432 but the configured port is 54329")),
+            "{log:?}"
+        );
+        let markers = postgres_markers(&ops);
+        assert!(has_marker(&markers, "port changed"), "{markers:?}");
+        assert!(has_marker(&markers, "stopped (pg_ctl stop -m fast)"), "{markers:?}");
+        assert!(has_marker(&markers, "starting: pg_ctl start on port 54329"), "{markers:?}");
+        assert!(has_marker(&markers, "ready:"), "{markers:?}");
+    }
+
+    /// A postmaster on the configured port is adopted as before (no
+    /// port-change restart).
+    #[tokio::test]
+    async fn postgres_matching_port_is_not_restarted() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let data_dir = PathBuf::from("/data");
+        let ctx = pg_ctx(&ops, test_config_with_models(), &data_dir);
+        with_postgres_installed(&ops, &ctx);
+        ops.with_file(
+            postmaster_pid_path(&data_dir),
+            b"5151\n/data/postgres/data\n1700000000\n54329\n".to_vec(),
+        );
+        ops.with_process_image(5151, "postgres.exe");
+        let mut log = Vec::new();
+        let (_, how) = ensure_postgres_running_detailed(&ctx, &mut log)
+            .await
+            .unwrap();
+        assert_eq!(how, PostgresReady::Adopted { pid: Some(5151) });
+        assert!(
+            !ops.executed_commands()
+                .iter()
+                .any(|a| a.iter().any(|x| x == "stop" || x == "start")),
+            "{:?}",
+            ops.executed_commands()
+        );
+    }
+
+    /// GW-2(a), critic correction: when the venv must be repaired, the
+    /// previous gateway is stopped BEFORE the setup commands run (and
+    /// not a second time before the spawn).
+    #[tokio::test]
+    async fn start_gateway_venv_repair_stops_previous_gateway_first() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        with_healthy_gateway_http(&ops);
+        let step = fast_gateway_step();
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        // No venv: venv creation + package install run.
+        ops.with_file(PathBuf::from("/data/gateway.pid"), b"7777".to_vec());
+        ops.with_live_pid(7777);
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert_eq!(ops.killed_pids(), vec![7777]);
+        let stopped_at = out
+            .log_tail
+            .iter()
+            .position(|l| l == "stopped previous gateway (pid 7777)")
+            .expect("previous gateway stopped");
+        let first_setup = out
+            .log_tail
+            .iter()
+            .position(|l| l.starts_with("running: ") && l.contains(" venv "))
+            .expect("venv command ran");
+        assert!(stopped_at < first_setup, "{:?}", out.log_tail);
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("before repairing its venv")),
+            "{out:?}"
+        );
+        assert_eq!(
+            gateway_markers(&ops)
+                .iter()
+                .filter(|m| m.contains("stopping previous gateway"))
+                .count(),
+            1,
+            "{:?}",
+            ops.markers()
+        );
+    }
+
+    fn service_mode_ctx(ops: &Arc<FakeSystemOps>) -> WizardContext {
+        let mut cfg = test_config_with_models();
+        cfg.supervision.mode = SupervisionMode::Service;
+        WizardContext::new(cfg, PathBuf::from("/data"), RunMode::Install, ops.clone())
+    }
+
+    /// SCM-7 / CR-7: service mode with the gateway service NOT
+    /// registered falls back to the process route — the recorded
+    /// process-mode gateway is stopped by pid (not orphaned by a
+    /// pid-file delete) and no service stop is claimed.
+    #[tokio::test]
+    async fn start_gateway_service_mode_unregistered_falls_back_to_process() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        with_healthy_gateway_http(&ops);
+        let step = fast_gateway_step();
+        let ctx = service_mode_ctx(&ops);
+        with_healthy_venv(&ops, &step, &ctx);
+        ops.with_file(PathBuf::from("/data/gateway.pid"), b"7777".to_vec());
+        ops.with_live_pid(7777);
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert_eq!(ops.killed_pids(), vec![7777]);
+        assert!(ops.service_stops().is_empty(), "{:?}", ops.service_stops());
+        assert!(ops.service_starts().is_empty());
+        assert_eq!(ops.spawns().len(), 1, "spawned as a process");
+        assert!(
+            out.log_tail.iter().any(|l| l.contains("is not registered")),
+            "{out:?}"
+        );
+        assert!(
+            !out.log_tail
+                .iter()
+                .any(|l| l.contains("stopped previous gateway service")),
+            "{out:?}"
+        );
+        assert!(
+            has_marker(&gateway_markers(&ops), "spawned: pid 4242 (process)"),
+            "{:?}",
+            ops.markers()
+        );
+    }
+
+    /// CR-7 / SCM-7: on the service route an already-stopped service
+    /// is logged as "not running" (never as stopped), and a live
+    /// process-mode gateway left over from before the mode flip is
+    /// still stopped — the pid file is not deleted out from under it.
+    #[tokio::test]
+    async fn start_gateway_service_route_logs_stop_outcome_and_stops_leftover_process() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        with_healthy_gateway_http(&ops);
+        let step = fast_gateway_step();
+        let ctx = service_mode_ctx(&ops);
+        with_healthy_venv(&ops, &step, &ctx);
+        let svc = manager_services::GATEWAY_SERVICE_NAME;
+        ops.with_registered_service(svc);
+        ops.with_service_state(svc, manager_services::ServiceState::Stopped);
+        ops.with_service_stop_outcome(svc, manager_services::StopOutcome::AlreadyStopped);
+        ops.with_file(PathBuf::from("/data/gateway.pid"), b"7777".to_vec());
+        ops.with_live_pid(7777);
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert_eq!(ops.service_stops(), vec![svc.to_string()]);
+        assert_eq!(ops.service_starts(), vec![svc.to_string()]);
+        assert!(ops.spawns().is_empty(), "started as a service");
+        assert_eq!(ops.killed_pids(), vec![7777]);
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l == "gateway service was not running"),
+            "{out:?}"
+        );
+        assert!(
+            !out.log_tail
+                .iter()
+                .any(|l| l.contains("stopped previous gateway service")),
+            "{out:?}"
+        );
+        assert!(
+            has_marker(&gateway_markers(&ops), "spawned: pid 4242 (service)"),
+            "{:?}",
+            ops.markers()
+        );
+    }
+
+    /// A running gateway service is stopped and reported with its
+    /// measured wait.
+    #[tokio::test]
+    async fn start_gateway_service_route_reports_real_service_stop() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        with_healthy_gateway_http(&ops);
+        let step = fast_gateway_step();
+        let ctx = service_mode_ctx(&ops);
+        with_healthy_venv(&ops, &step, &ctx);
+        let svc = manager_services::GATEWAY_SERVICE_NAME;
+        ops.with_registered_service(svc);
+        ops.with_service_stop_outcome(
+            svc,
+            manager_services::StopOutcome::Stopped { waited_ms: 420 },
+        );
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l == "stopped previous gateway service in 420 ms"),
+            "{out:?}"
+        );
+        let markers = gateway_markers(&ops);
+        assert!(has_marker(&markers, "stopping previous gateway: service"), "{markers:?}");
+        assert!(has_marker(&markers, "previous gateway stopped: service, in 420 ms"), "{markers:?}");
+    }
+
+    /// Service route, final re-check: the SCM no longer reporting the
+    /// service Running fails the step even though the probe answers
+    /// (it may be answering from another process on the port).
+    #[tokio::test]
+    async fn start_gateway_service_route_final_check_requires_running_service() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        with_healthy_gateway_http(&ops);
+        let step = fast_gateway_step();
+        let ctx = service_mode_ctx(&ops);
+        with_healthy_venv(&ops, &step, &ctx);
+        let svc = manager_services::GATEWAY_SERVICE_NAME;
+        ops.with_registered_service(svc);
+        // The service reaches Running, then falls back to Stopped
+        // while the probe still answers (from another process).
+        ops.with_service_state_after_start(svc, manager_services::ServiceState::Stopped);
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(
+            out.message.contains("the gateway service is stopped"),
+            "{out:?}"
+        );
+        assert!(ops
+            .file_bytes(&crate::gateway_applied_stamp_path(Path::new("/data")))
+            .is_none());
+    }
+
+    /// CR-4: a gateway still serving on the port with no pid file
+    /// recording it is found by its port and stopped before the spawn.
+    #[tokio::test]
+    async fn start_gateway_stops_unrecorded_gateway_found_by_port() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        with_healthy_gateway_http(&ops);
+        let step = fast_gateway_step();
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        with_healthy_venv(&ops, &step, &ctx);
+        ops.with_port_owner(4000, 8888);
+        ops.with_process_image(8888, "python.exe");
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert_eq!(ops.killed_pids(), vec![8888]);
+        assert!(
+            out.log_tail
+                .iter()
+                .any(|l| l.contains("no pid file records")),
+            "{out:?}"
+        );
+        assert!(
+            has_marker(
+                &gateway_markers(&ops),
+                "stopping previous gateway: pid 8888 (found by port owner)"
+            ),
+            "{:?}",
+            ops.markers()
+        );
+    }
+
+    /// An unrelated program on the gateway port (unknown or other
+    /// image) is never killed by port.
+    #[tokio::test]
+    async fn start_gateway_never_kills_a_non_gateway_port_owner() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        with_healthy_gateway_http(&ops);
+        let step = fast_gateway_step();
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        with_healthy_venv(&ops, &step, &ctx);
+        ops.with_port_owner(4000, 8888);
+        ops.with_process_image(8888, "nginx.exe");
+        let _ = step.run(&ctx).await.unwrap();
+        assert!(ops.killed_pids().is_empty(), "{:?}", ops.killed_pids());
+    }
+
+    /// CR-1: the applied stamp is written on success, carrying the
+    /// YAML write instant and the new pid ...
+    #[tokio::test]
+    async fn start_gateway_writes_applied_stamp_on_success() {
+        let before = chrono::Utc::now();
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        with_healthy_gateway_http(&ops);
+        let step = fast_gateway_step();
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        with_healthy_venv(&ops, &step, &ctx);
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let stamp = ops
+            .file_bytes(&crate::gateway_applied_stamp_path(Path::new("/data")))
+            .expect("applied stamp written");
+        let text = String::from_utf8(stamp).unwrap();
+        let at = crate::parse_gateway_applied_at(&text).expect("stamp parses");
+        assert!(at >= before && at <= chrono::Utc::now(), "{text}");
+        assert!(text.contains("4242"), "{text}");
+        let markers = gateway_markers(&ops);
+        assert!(has_marker(&markers, "start-gateway step started"), "{markers:?}");
+        assert!(has_marker(&markers, "spawned: pid 4242 (process)"), "{markers:?}");
+        assert!(has_marker(&markers, "healthy: pid 4242 after"), "{markers:?}");
+        assert!(has_marker(&markers, "started: pid 4242 serving on :4000"), "{markers:?}");
+        assert!(!has_marker(&markers, "start failed"), "{markers:?}");
+    }
+
+    /// ... and NOT when the gateway never becomes healthy (the YAML
+    /// was already rewritten by then), where a failure marker is
+    /// written instead.
+    #[tokio::test]
+    async fn start_gateway_skips_applied_stamp_when_unhealthy() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        // No healthy answer scripted: the health wait fails.
+        let step = fast_gateway_step();
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        with_healthy_venv(&ops, &step, &ctx);
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Failed, "{out:?}");
+        assert!(ops
+            .file_bytes(&PathBuf::from("/data/gateway/config.yaml"))
+            .is_some());
+        assert!(ops
+            .file_bytes(&crate::gateway_applied_stamp_path(Path::new("/data")))
+            .is_none());
+        let markers = gateway_markers(&ops);
+        assert!(has_marker(&markers, "spawned: pid 4242"), "{markers:?}");
+        assert!(has_marker(&markers, "start failed: gateway did not become healthy"), "{markers:?}");
+    }
+
+    #[test]
+    fn postmaster_pid_parses_pid_and_port() {
+        assert_eq!(
+            parse_postmaster_pid("5151\n/data\n1700000000\n5432\n/tmp\nlocalhost\n"),
+            Some(PostmasterInfo {
+                pid: 5151,
+                port: Some(5432)
+            })
+        );
+        assert_eq!(
+            parse_postmaster_pid("5151\n/data\n"),
+            Some(PostmasterInfo {
+                pid: 5151,
+                port: None
+            })
+        );
+        assert_eq!(
+            parse_postmaster_pid("5151\r\n/data\r\n1\r\n 6543 \r\n"),
+            Some(PostmasterInfo {
+                pid: 5151,
+                port: Some(6543)
+            })
+        );
+        assert_eq!(parse_postmaster_pid("garbage\n"), None);
+        assert_eq!(parse_postmaster_pid(""), None);
+    }
+
+    #[test]
+    fn postgres_status_port_mismatch_needs_a_live_postmaster() {
+        let mut st = PostgresStatus {
+            installed: true,
+            pid: Some(1),
+            pid_alive: true,
+            pid_port: Some(5432),
+            configured_port: 54329,
+            accepting: false,
+        };
+        assert!(st.port_mismatch());
+        st.pid_port = Some(54329);
+        assert!(!st.port_mismatch());
+        st.pid_port = Some(5432);
+        st.pid_alive = false;
+        assert!(!st.port_mismatch());
+        st.pid_alive = true;
+        st.pid_port = None;
+        assert!(!st.port_mismatch());
+    }
+
+    #[tokio::test]
+    async fn postgres_status_reports_not_installed() {
+        let ops = FakeSystemOps::new();
+        let st = postgres_status(&ops, &test_config_with_models(), Path::new("/data")).await;
+        assert!(!st.installed);
+        assert_eq!(st.pid, None);
+        assert!(!st.accepting);
+    }
+
+    #[tokio::test]
+    async fn stop_postgres_server_writes_markers() {
+        let ops = Arc::new(FakeSystemOps::new());
+        let data_dir = PathBuf::from("/data");
+        let ctx = pg_ctx(&ops, test_config_with_models(), &data_dir);
+        with_postgres_installed(&ops, &ctx);
+        assert!(stop_postgres_server(ops.as_ref(), &data_dir).await.unwrap());
+        let stop = pg_ctl_argv(&data_dir, &["stop", "-m", "fast"]);
+        ops.with_command(
+            &argv_refs(&stop),
+            CommandOutput {
+                exit_code: 3,
+                stdout: String::new(),
+                stderr: "pg_ctl: no server running".to_string(),
+            },
+        );
+        assert!(!stop_postgres_server(ops.as_ref(), &data_dir).await.unwrap());
+        let markers = postgres_markers(&ops);
+        assert!(has_marker(&markers, "postgres: stopped (pg_ctl stop -m fast)"), "{markers:?}");
+        assert!(has_marker(&markers, "postgres: stop: no server was running"), "{markers:?}");
     }
 }

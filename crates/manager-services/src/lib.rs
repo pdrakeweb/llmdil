@@ -22,9 +22,11 @@
 
 pub mod scm;
 
+use manager_supervisor::lifecycle::LifecycleState;
 use manager_supervisor::{ProcessSpec, ProcessState};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Definition format version written by [`write_definition`].
 pub const DEFINITION_VERSION: u32 = 1;
@@ -114,12 +116,27 @@ pub enum ServiceStartMode {
 
 /// SCM recovery actions for a managed service (restart with growing
 /// delays; the failure counter resets after `reset_period_secs`).
+///
+/// The SCM runs these actions only when the service *process* (the
+/// shim) dies, unless the registration also sets
+/// `SERVICE_CONFIG_FAILURE_ACTIONS_FLAG`. [`Self::restart_on_child_exit`]
+/// controls that flag: with it, an unexpected child exit (which the
+/// shim reports as `ERROR_SERVICE_SPECIFIC_ERROR` + the child's exit
+/// code) also triggers the restart actions. An operator stop is always
+/// reported as a clean `SERVICE_STOPPED` (exit 0), so it never does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureActions {
     pub first_delay_secs: u32,
     pub second_delay_secs: u32,
     pub subsequent_delay_secs: u32,
     pub reset_period_secs: u32,
+    /// Run the restart actions when the shim's child exits
+    /// unexpectedly (`fFailureActionsOnNonCrashFailures`). True only
+    /// for the log receiver: the app owns the gateway and backends,
+    /// and neither mode auto-restarts them (one crash policy for
+    /// process mode and service mode).
+    #[serde(default)]
+    pub restart_on_child_exit: bool,
 }
 
 impl Default for FailureActions {
@@ -129,6 +146,7 @@ impl Default for FailureActions {
             second_delay_secs: 30,
             subsequent_delay_secs: 60,
             reset_period_secs: 3600,
+            restart_on_child_exit: false,
         }
     }
 }
@@ -167,6 +185,14 @@ pub struct ServiceDefinition {
     pub account: Option<String>,
     pub start_mode: ServiceStartMode,
     pub failure_actions: FailureActions,
+    /// The service's lifecycle marker log (`<scope>.lifecycle.log`),
+    /// where the shim records service start, child spawn, stop
+    /// requests and child exits in the shared
+    /// `manager_supervisor::lifecycle::marker_line` format. Definitions
+    /// written before this field existed derive it from `stdout_log`
+    /// (see [`lifecycle_log_path`]).
+    #[serde(default)]
+    pub lifecycle_log: Option<PathBuf>,
 }
 
 impl ServiceDefinition {
@@ -222,10 +248,14 @@ pub fn backend_definition(spec: &ProcessSpec, log_dir: &Path) -> ServiceDefiniti
         workdir: spec.workdir.clone(),
         stdout_log: Some(log_dir.join(format!("backend-{}.stdout.log", spec.id))),
         stderr_log: Some(log_dir.join(format!("backend-{}.stderr.log", spec.id))),
-        pid_file: None,
+        // The child (llama-server) pid, so service-mode backends report
+        // the real model process (VRAM attribution, uptime) instead of
+        // the shim.
+        pid_file: Some(log_dir.join(format!("backend-{}.pid", spec.id))),
         account: None,
         start_mode: ServiceStartMode::Manual,
         failure_actions: FailureActions::default(),
+        lifecycle_log: Some(log_dir.join(format!("backend-{}.lifecycle.log", spec.id))),
     }
 }
 
@@ -239,6 +269,7 @@ pub fn gateway_definition(
     gateway_stderr_log: PathBuf,
     gateway_pid_file: PathBuf,
 ) -> ServiceDefinition {
+    let lifecycle_log = sibling_lifecycle_log(&gateway_stdout_log, "gateway");
     ServiceDefinition {
         version: DEFINITION_VERSION,
         name: GATEWAY_SERVICE_NAME.to_string(),
@@ -254,6 +285,50 @@ pub fn gateway_definition(
         account: None,
         start_mode: ServiceStartMode::Manual,
         failure_actions: FailureActions::default(),
+        lifecycle_log: Some(lifecycle_log),
+    }
+}
+
+/// `<dir of log>/<stem>.lifecycle.log`.
+fn sibling_lifecycle_log(log: &Path, stem: &str) -> PathBuf {
+    log.parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("{stem}.lifecycle.log"))
+}
+
+/// The lifecycle marker log of a definition: its `lifecycle_log`, or,
+/// for a definition written before that field existed, the
+/// `<stem>.lifecycle.log` sibling of its stdout log (`backend-x.stdout.log`
+/// → `backend-x.lifecycle.log`). `None` when the definition has no
+/// log files at all.
+pub fn lifecycle_log_path(def: &ServiceDefinition) -> Option<PathBuf> {
+    if let Some(p) = &def.lifecycle_log {
+        return Some(p.clone());
+    }
+    let log = def.stdout_log.as_ref().or(def.stderr_log.as_ref())?;
+    let file = log.file_name()?.to_string_lossy().into_owned();
+    let stem = file
+        .strip_suffix(".stdout.log")
+        .or_else(|| file.strip_suffix(".stderr.log"))
+        .or_else(|| file.strip_suffix(".log"))
+        .unwrap_or(&file)
+        .to_string();
+    Some(sibling_lifecycle_log(log, &stem))
+}
+
+/// The app-side lifecycle key for an SCM service name, as used in
+/// lifecycle markers and events: `llm-gateway` → `gateway`,
+/// `llm-log-receiver` → `log-receiver`, `llm-backend-<id>` →
+/// `backend:<id>`; any other name is returned unchanged.
+pub fn lifecycle_key(service_name: &str) -> String {
+    if service_name == GATEWAY_SERVICE_NAME {
+        "gateway".to_string()
+    } else if service_name == LOG_RECEIVER_SERVICE_NAME {
+        "log-receiver".to_string()
+    } else if let Some(id) = service_name.strip_prefix("llm-backend-") {
+        format!("backend:{id}")
+    } else {
+        service_name.to_string()
     }
 }
 
@@ -283,9 +358,13 @@ pub fn log_receiver_dir(data_dir: &Path) -> PathBuf {
 /// copies are ACL'd files, seeded once by the deploy script).
 /// Failure actions are the design's: restart 5 s / 30 s / 5 min,
 /// counter reset after 24 h — SCM recovery replaces the retired
-/// VM-side watchdog's repair role.
+/// VM-side watchdog's repair role. `restart_on_child_exit` makes those
+/// actions fire when the receiver process exits unexpectedly (the shim
+/// stays alive and reports a service-specific failure), not only when
+/// the shim itself dies.
 pub fn log_receiver_definition(data_dir: &Path, receiver_exe: &Path) -> ServiceDefinition {
     let dir = log_receiver_dir(data_dir);
+    let log_dir = dir.join("logs");
     ServiceDefinition {
         version: DEFINITION_VERSION,
         name: LOG_RECEIVER_SERVICE_NAME.to_string(),
@@ -314,8 +393,8 @@ pub fn log_receiver_definition(data_dir: &Path, receiver_exe: &Path) -> ServiceD
             EnvEntry::literal("LLMDIL_LOG_RETENTION_CAP_MIB", "512".to_string()),
         ],
         workdir: Some(dir.clone()),
-        stdout_log: Some(dir.join("logs").join("receiver.stdout.log")),
-        stderr_log: Some(dir.join("logs").join("receiver.stderr.log")),
+        stdout_log: Some(log_dir.join("receiver.stdout.log")),
+        stderr_log: Some(log_dir.join("receiver.stderr.log")),
         pid_file: None,
         account: Some("NT AUTHORITY\\LocalService".to_string()),
         start_mode: ServiceStartMode::Automatic,
@@ -324,7 +403,9 @@ pub fn log_receiver_definition(data_dir: &Path, receiver_exe: &Path) -> ServiceD
             second_delay_secs: 30,
             subsequent_delay_secs: 300,
             reset_period_secs: 86_400,
+            restart_on_child_exit: true,
         },
+        lifecycle_log: Some(log_dir.join("receiver.lifecycle.log")),
     }
 }
 
@@ -462,18 +543,116 @@ pub struct ServiceStatus {
     /// only reports the service's own pid.
     pub child_pid: Option<u32>,
     pub win32_exit_code: u32,
+    /// `dwServiceSpecificExitCode`, meaningful when `win32_exit_code`
+    /// is [`ERROR_SERVICE_SPECIFIC_ERROR`]. The shim reports 1 for an
+    /// env/credential resolution failure, 2 for a spawn failure, and
+    /// the child's own exit code for an unexpected child exit.
+    #[serde(default)]
+    pub service_specific_exit_code: u32,
+}
+
+impl ServiceState {
+    /// Wire/display spelling (matches the serde form; `Unknown(_)` is
+    /// `"unknown"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServiceState::NotInstalled => "not_installed",
+            ServiceState::Stopped => "stopped",
+            ServiceState::StartPending => "start_pending",
+            ServiceState::StopPending => "stop_pending",
+            ServiceState::Running => "running",
+            ServiceState::Paused => "paused",
+            ServiceState::Unknown(_) => "unknown",
+        }
+    }
+}
+
+/// `ERROR_SERVICE_SPECIFIC_ERROR`: the shim's "see the service-specific
+/// exit code" status after a failed start or an unexpected child exit.
+pub const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
+/// `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`: a control sent while the service
+/// is start- or stop-pending (or, for older shims, start-pending only).
+pub const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: u32 = 1061;
+/// `ERROR_SERVICE_MARKED_FOR_DELETE`: a create/open against a service
+/// whose deletion is pending until its process exits.
+pub const ERROR_SERVICE_MARKED_FOR_DELETE: u32 = 1072;
+
+/// The shim's service-specific exit code for an env/credential
+/// resolution failure.
+pub const HOST_EXIT_ENV_FAILURE: u32 = 1;
+/// The shim's service-specific exit code for a child spawn failure.
+pub const HOST_EXIT_SPAWN_FAILURE: u32 = 2;
+
+/// A child exit code as text: decimal, plus hex for NTSTATUS-style
+/// values (`3221225477 (0xC0000005)`).
+fn exit_code_text(code: u32) -> String {
+    if code > 0xFFFF {
+        format!("{code} (0x{code:08X})")
+    } else {
+        code.to_string()
+    }
 }
 
 impl ServiceStatus {
+    /// True when the service is stopped with a non-zero exit status (a
+    /// failed start or an unexpected child exit), as opposed to a clean
+    /// operator stop.
+    pub fn stopped_with_error(&self) -> bool {
+        matches!(self.state, ServiceState::Stopped)
+            && (self.win32_exit_code != 0 || self.service_specific_exit_code != 0)
+    }
+
+    /// The shared lifecycle state for this SCM status (design state
+    /// model §1): Stopped with any non-zero exit code is `failed`,
+    /// Paused (the process is there but not serving) is `degraded`.
+    pub fn lifecycle_state(&self) -> LifecycleState {
+        match self.state {
+            ServiceState::Running => LifecycleState::Running,
+            ServiceState::StartPending => LifecycleState::Starting,
+            ServiceState::StopPending => LifecycleState::Stopping,
+            ServiceState::Stopped if self.stopped_with_error() => LifecycleState::Failed,
+            ServiceState::Stopped => LifecycleState::Stopped,
+            ServiceState::Paused => LifecycleState::Degraded,
+            ServiceState::Unknown(_) => LifecycleState::Unknown,
+            ServiceState::NotInstalled => LifecycleState::NotInstalled,
+        }
+    }
+
+    /// Why the service is in `failed`, from its exit codes; `None` for
+    /// any other state.
+    pub fn failure_reason(&self) -> Option<String> {
+        if !self.stopped_with_error() {
+            return None;
+        }
+        if self.win32_exit_code == ERROR_SERVICE_SPECIFIC_ERROR {
+            return Some(match self.service_specific_exit_code {
+                HOST_EXIT_ENV_FAILURE => {
+                    "service host could not resolve the environment/credentials".to_string()
+                }
+                HOST_EXIT_SPAWN_FAILURE => {
+                    "service host could not spawn the program".to_string()
+                }
+                code => format!("child exited with code {}", exit_code_text(code)),
+            });
+        }
+        // Older shims reported the child's exit code as the Win32 code.
+        Some(format!(
+            "child exited with code {}",
+            exit_code_text(self.win32_exit_code)
+        ))
+    }
+
     /// Map onto the supervisor's backend state model. `NotInstalled`
     /// maps to `Stopped` — callers distinguish it via
-    /// [`ServiceState`] before mapping.
+    /// [`ServiceState`] before mapping. Stopped with a non-zero exit
+    /// code (a crash or a failed start) maps to `Failed`.
     pub fn process_state(&self) -> ProcessState {
         match self.state {
             ServiceState::Running => ProcessState::Running,
             ServiceState::StartPending => ProcessState::Starting,
             ServiceState::StopPending => ProcessState::Stopping,
             ServiceState::Paused => ProcessState::Failed,
+            ServiceState::Stopped if self.stopped_with_error() => ProcessState::Failed,
             ServiceState::Stopped
             | ServiceState::NotInstalled
             | ServiceState::Unknown(_) => ProcessState::Stopped,
@@ -529,6 +708,319 @@ pub enum ServiceError {
     Unsupported(String),
     #[error("credential '{target}' for environment variable {name} was not found")]
     CredentialMissing { name: String, target: String },
+    /// A wait helper ran out of time.
+    #[error("service '{name}' did not reach {waiting_for} within {} s (last state: {last_state})", waited_ms.div_ceil(1000))]
+    Timeout {
+        name: String,
+        waiting_for: String,
+        last_state: &'static str,
+        waited_ms: u64,
+    },
+    /// [`start_and_wait`]: the service fell back to Stopped instead of
+    /// reaching Running.
+    #[error("service '{name}' failed to start: {reason}")]
+    StartFailed {
+        name: String,
+        reason: String,
+        status: Box<ServiceStatus>,
+    },
+}
+
+impl ServiceError {
+    /// The Win32 error code of an SCM call failure.
+    pub fn win32_code(&self) -> Option<u32> {
+        match self {
+            ServiceError::Scm { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// True for `ERROR_SERVICE_CANNOT_ACCEPT_CTRL` (the service is
+    /// start- or stop-pending and cannot take the control now).
+    pub fn is_cannot_accept_control(&self) -> bool {
+        self.win32_code() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)
+    }
+}
+
+/// Result of [`stop_and_wait`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum StopOutcome {
+    /// No such service: nothing to stop.
+    NotRegistered,
+    /// The service was already stopped when asked.
+    AlreadyStopped,
+    /// The service was running (or pending) and is now stopped (or,
+    /// when its deletion was pending, gone).
+    Stopped { waited_ms: u64 },
+}
+
+/// The one table of SCM wait budgets (replaces the per-call-site
+/// 15 s / 30 s loops).
+pub struct ServiceTimeouts;
+
+impl ServiceTimeouts {
+    /// Poll interval of every wait helper.
+    pub const POLL: Duration = Duration::from_millis(100);
+
+    /// Budget for a stop to reach Stopped. The shim terminates its job
+    /// object on the stop control, so this is generous for every
+    /// service; the same for all (the gateway used to get 15 s and
+    /// backends 30 s for the same operation).
+    pub fn stop(_name: &str) -> Duration {
+        Duration::from_secs(30)
+    }
+
+    /// Budget for a start to reach Running. The shim reports Running
+    /// once the child is spawned (the gateway's pid file is written
+    /// before that), so 30 s covers credential resolution and process
+    /// creation on a loaded machine.
+    pub fn start(_name: &str) -> Duration {
+        Duration::from_secs(30)
+    }
+
+    /// Budget for a deleted registration to disappear (it lingers while
+    /// the old service process is still exiting).
+    pub fn unregister(_name: &str) -> Duration {
+        Duration::from_secs(15)
+    }
+}
+
+fn timeout_error(name: &str, waiting_for: &str, last: ServiceState, started: Instant) -> ServiceError {
+    ServiceError::Timeout {
+        name: name.to_string(),
+        waiting_for: waiting_for.to_string(),
+        last_state: last.as_str(),
+        waited_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
+/// Calls `on_change` the first time and whenever the state changes.
+struct ChangeTracker<'a> {
+    last: Option<ServiceState>,
+    on_change: &'a mut dyn FnMut(&ServiceStatus),
+}
+
+impl ChangeTracker<'_> {
+    fn see(&mut self, status: &ServiceStatus) {
+        if self.last != Some(status.state) {
+            self.last = Some(status.state);
+            (self.on_change)(status);
+        }
+    }
+}
+
+/// Poll `name` every [`ServiceTimeouts::POLL`] until its state is one of
+/// `accept`; returns that status. `on_change` sees the first status and
+/// every state change (progress for markers/UI). Query errors end the
+/// wait; running out of time is [`ServiceError::Timeout`].
+pub fn wait_for_state(
+    control: &dyn ServiceControl,
+    name: &str,
+    accept: &[ServiceState],
+    timeout: Duration,
+    on_change: &mut dyn FnMut(&ServiceStatus),
+) -> Result<ServiceStatus, ServiceError> {
+    wait_for_state_polling(control, name, accept, timeout, ServiceTimeouts::POLL, on_change)
+}
+
+fn state_matches(state: ServiceState, accept: &[ServiceState]) -> bool {
+    accept.iter().any(|a| match (a, state) {
+        // Any raw state matches an `Unknown` entry.
+        (ServiceState::Unknown(_), ServiceState::Unknown(_)) => true,
+        (a, s) => *a == s,
+    })
+}
+
+fn wait_for_state_polling(
+    control: &dyn ServiceControl,
+    name: &str,
+    accept: &[ServiceState],
+    timeout: Duration,
+    poll: Duration,
+    on_change: &mut dyn FnMut(&ServiceStatus),
+) -> Result<ServiceStatus, ServiceError> {
+    let started = Instant::now();
+    let mut tracker = ChangeTracker { last: None, on_change };
+    loop {
+        let status = control.query(name)?;
+        tracker.see(&status);
+        if state_matches(status.state, accept) {
+            return Ok(status);
+        }
+        if started.elapsed() >= timeout {
+            let wanted = accept
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("/");
+            return Err(timeout_error(name, &wanted, status.state, started));
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Stop `name` and wait until it is Stopped (or gone). Blocking; run it
+/// on a blocking thread from async code.
+///
+/// - Not registered → [`StopOutcome::NotRegistered`]; already Stopped →
+///   [`StopOutcome::AlreadyStopped`].
+/// - StopPending: someone else's stop is in flight; just wait.
+/// - StartPending: the stop control is sent (current shims accept it
+///   while starting); a shim that refuses it with
+///   `ERROR_SERVICE_CANNOT_ACCEPT_CTRL` (1061) is waited on until it is
+///   Running and then stopped.
+/// - A 1061 from a race (the service turned pending between the query
+///   and the control) is "keep waiting", never an error.
+pub fn stop_and_wait(
+    control: &dyn ServiceControl,
+    name: &str,
+    timeout: Duration,
+) -> Result<StopOutcome, ServiceError> {
+    stop_and_wait_with(control, name, timeout, &mut |_| {})
+}
+
+/// [`stop_and_wait`] with a progress callback (first status and every
+/// state change).
+pub fn stop_and_wait_with(
+    control: &dyn ServiceControl,
+    name: &str,
+    timeout: Duration,
+    on_change: &mut dyn FnMut(&ServiceStatus),
+) -> Result<StopOutcome, ServiceError> {
+    stop_and_wait_polling(control, name, timeout, ServiceTimeouts::POLL, on_change)
+}
+
+fn stop_and_wait_polling(
+    control: &dyn ServiceControl,
+    name: &str,
+    timeout: Duration,
+    poll: Duration,
+    on_change: &mut dyn FnMut(&ServiceStatus),
+) -> Result<StopOutcome, ServiceError> {
+    let started = Instant::now();
+    let mut tracker = ChangeTracker { last: None, on_change };
+    let mut first = true;
+    let mut stop_sent = false;
+    loop {
+        let status = control.query(name)?;
+        tracker.see(&status);
+        let waited_ms = started.elapsed().as_millis() as u64;
+        match status.state {
+            ServiceState::NotInstalled if first => return Ok(StopOutcome::NotRegistered),
+            // Deleted while we waited (a pending deletion completes
+            // when the process exits): stopped for every purpose.
+            ServiceState::NotInstalled => return Ok(StopOutcome::Stopped { waited_ms }),
+            ServiceState::Stopped if first => return Ok(StopOutcome::AlreadyStopped),
+            ServiceState::Stopped => return Ok(StopOutcome::Stopped { waited_ms }),
+            ServiceState::StopPending => {}
+            ServiceState::StartPending
+            | ServiceState::Running
+            | ServiceState::Paused
+            | ServiceState::Unknown(_) => {
+                if !stop_sent {
+                    match control.stop(name) {
+                        Ok(()) => stop_sent = true,
+                        // Pending: retry on the next poll.
+                        Err(e) if e.is_cannot_accept_control() => {}
+                        Err(ServiceError::NotRegistered(_)) => {
+                            return Ok(if first {
+                                StopOutcome::NotRegistered
+                            } else {
+                                StopOutcome::Stopped { waited_ms }
+                            });
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+        first = false;
+        if started.elapsed() >= timeout {
+            return Err(timeout_error(name, "stopped", status.state, started));
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Start `name` and wait until it is Running. Blocking.
+///
+/// - Not registered → [`ServiceError::NotRegistered`].
+/// - Already Running → Ok at once; StartPending → wait without a second
+///   start; StopPending → wait for the stop to finish, then start.
+/// - Falling back to Stopped after the start →
+///   [`ServiceError::StartFailed`] carrying
+///   [`ServiceStatus::failure_reason`] (env/credential failure, spawn
+///   failure, or the child's exit code).
+pub fn start_and_wait(
+    control: &dyn ServiceControl,
+    name: &str,
+    timeout: Duration,
+) -> Result<ServiceStatus, ServiceError> {
+    start_and_wait_with(control, name, timeout, &mut |_| {})
+}
+
+/// [`start_and_wait`] with a progress callback.
+pub fn start_and_wait_with(
+    control: &dyn ServiceControl,
+    name: &str,
+    timeout: Duration,
+    on_change: &mut dyn FnMut(&ServiceStatus),
+) -> Result<ServiceStatus, ServiceError> {
+    start_and_wait_polling(control, name, timeout, ServiceTimeouts::POLL, on_change)
+}
+
+fn start_and_wait_polling(
+    control: &dyn ServiceControl,
+    name: &str,
+    timeout: Duration,
+    poll: Duration,
+    on_change: &mut dyn FnMut(&ServiceStatus),
+) -> Result<ServiceStatus, ServiceError> {
+    let started = Instant::now();
+    let mut tracker = ChangeTracker { last: None, on_change };
+    let mut start_sent = false;
+    loop {
+        let status = control.query(name)?;
+        tracker.see(&status);
+        match status.state {
+            ServiceState::NotInstalled => {
+                return Err(ServiceError::NotRegistered(name.to_string()))
+            }
+            ServiceState::Running => return Ok(status),
+            ServiceState::Stopped if start_sent => {
+                return Err(ServiceError::StartFailed {
+                    name: name.to_string(),
+                    reason: status
+                        .failure_reason()
+                        .unwrap_or_else(|| "the service stopped during start".to_string()),
+                    status: Box::new(status),
+                });
+            }
+            ServiceState::Stopped => {
+                control.start(name)?;
+                start_sent = true;
+            }
+            // Someone else's start (wait for it) or stop (wait for it to
+            // finish, then start).
+            ServiceState::StartPending => start_sent = true,
+            ServiceState::StopPending | ServiceState::Paused | ServiceState::Unknown(_) => {}
+        }
+        if started.elapsed() >= timeout {
+            return Err(timeout_error(name, "running", status.state, started));
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Wait until `name` is no longer registered (a deleted service whose
+/// process is still exiting lingers as "marked for delete"). Blocking.
+pub fn wait_until_absent(
+    control: &dyn ServiceControl,
+    name: &str,
+    timeout: Duration,
+) -> Result<(), ServiceError> {
+    wait_for_state(control, name, &[ServiceState::NotInstalled], timeout, &mut |_| {}).map(|_| ())
 }
 
 #[cfg(test)]
@@ -777,11 +1269,356 @@ mod tests {
             pid: None,
             child_pid: None,
             win32_exit_code: 0,
+            service_specific_exit_code: 0,
         };
         assert_eq!(status(ServiceState::Running).process_state(), ProcessState::Running);
         assert_eq!(status(ServiceState::StartPending).process_state(), ProcessState::Starting);
         assert_eq!(status(ServiceState::StopPending).process_state(), ProcessState::Stopping);
         assert_eq!(status(ServiceState::Stopped).process_state(), ProcessState::Stopped);
         assert_eq!(status(ServiceState::NotInstalled).process_state(), ProcessState::Stopped);
+        // A crash (or a failed start) is Failed, not a clean stop.
+        let mut crashed = status(ServiceState::Stopped);
+        crashed.win32_exit_code = ERROR_SERVICE_SPECIFIC_ERROR;
+        crashed.service_specific_exit_code = 3;
+        assert_eq!(crashed.process_state(), ProcessState::Failed);
+    }
+
+    fn st(state: ServiceState, win32: u32, specific: u32) -> ServiceStatus {
+        ServiceStatus {
+            name: "svc".to_string(),
+            state,
+            pid: None,
+            child_pid: None,
+            win32_exit_code: win32,
+            service_specific_exit_code: specific,
+        }
+    }
+
+    #[test]
+    fn lifecycle_state_mapping_includes_exit_codes() {
+        use LifecycleState as L;
+        assert_eq!(st(ServiceState::Running, 0, 0).lifecycle_state(), L::Running);
+        assert_eq!(st(ServiceState::StartPending, 0, 0).lifecycle_state(), L::Starting);
+        assert_eq!(st(ServiceState::StopPending, 0, 0).lifecycle_state(), L::Stopping);
+        assert_eq!(st(ServiceState::Stopped, 0, 0).lifecycle_state(), L::Stopped);
+        assert_eq!(st(ServiceState::Stopped, 0, 0).failure_reason(), None);
+        assert_eq!(st(ServiceState::Paused, 0, 0).lifecycle_state(), L::Degraded);
+        assert_eq!(st(ServiceState::Unknown(42), 0, 0).lifecycle_state(), L::Unknown);
+        assert_eq!(st(ServiceState::NotInstalled, 0, 0).lifecycle_state(), L::NotInstalled);
+
+        let env = st(ServiceState::Stopped, ERROR_SERVICE_SPECIFIC_ERROR, 1);
+        assert_eq!(env.lifecycle_state(), L::Failed);
+        assert_eq!(
+            env.failure_reason().as_deref(),
+            Some("service host could not resolve the environment/credentials")
+        );
+        let spawn = st(ServiceState::Stopped, ERROR_SERVICE_SPECIFIC_ERROR, 2);
+        assert_eq!(
+            spawn.failure_reason().as_deref(),
+            Some("service host could not spawn the program")
+        );
+        let child = st(ServiceState::Stopped, ERROR_SERVICE_SPECIFIC_ERROR, 7);
+        assert_eq!(child.failure_reason().as_deref(), Some("child exited with code 7"));
+        let av = st(ServiceState::Stopped, ERROR_SERVICE_SPECIFIC_ERROR, 0xC000_0005);
+        assert_eq!(
+            av.failure_reason().as_deref(),
+            Some("child exited with code 3221225477 (0xC0000005)")
+        );
+        // An older shim reported the child's code as the Win32 code.
+        let legacy = st(ServiceState::Stopped, 1, 0);
+        assert_eq!(legacy.lifecycle_state(), L::Failed);
+        assert_eq!(legacy.failure_reason().as_deref(), Some("child exited with code 1"));
+        // A running service never has a failure reason.
+        assert_eq!(
+            st(ServiceState::Running, ERROR_SERVICE_SPECIFIC_ERROR, 2).failure_reason(),
+            None
+        );
+    }
+
+    /// A scripted [`ServiceControl`]: `query` replays `states` (the last
+    /// one repeats); `stop`/`start` return the next scripted result and
+    /// are recorded.
+    struct FakeControl {
+        states: std::sync::Mutex<std::collections::VecDeque<ServiceStatus>>,
+        stop_results: std::sync::Mutex<std::collections::VecDeque<Result<(), ServiceError>>>,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl FakeControl {
+        fn new(states: Vec<ServiceStatus>) -> Self {
+            Self {
+                states: std::sync::Mutex::new(states.into()),
+                stop_results: std::sync::Mutex::new(Default::default()),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn with_stop_results(self, results: Vec<Result<(), ServiceError>>) -> Self {
+            *self.stop_results.lock().unwrap() = results.into();
+            self
+        }
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ServiceControl for FakeControl {
+        fn query(&self, _name: &str) -> Result<ServiceStatus, ServiceError> {
+            let mut states = self.states.lock().unwrap();
+            let s = if states.len() > 1 {
+                states.pop_front().unwrap()
+            } else {
+                states.front().cloned().expect("scripted state")
+            };
+            Ok(s)
+        }
+        fn start(&self, _name: &str) -> Result<(), ServiceError> {
+            self.calls.lock().unwrap().push("start");
+            Ok(())
+        }
+        fn stop(&self, _name: &str) -> Result<(), ServiceError> {
+            self.calls.lock().unwrap().push("stop");
+            self.stop_results.lock().unwrap().pop_front().unwrap_or(Ok(()))
+        }
+        fn register(&self, _: &ServiceDefinition, _: &str, _: Option<&str>) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        fn unregister(&self, _name: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    const FAST: Duration = Duration::from_millis(1);
+    const LONG: Duration = Duration::from_secs(10);
+
+    fn cannot_accept() -> ServiceError {
+        ServiceError::Scm {
+            operation: "ControlService",
+            code: ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
+        }
+    }
+
+    #[test]
+    fn stop_and_wait_outcomes() {
+        let fake = FakeControl::new(vec![st(ServiceState::NotInstalled, 0, 0)]);
+        assert_eq!(
+            stop_and_wait_polling(&fake, "svc", LONG, FAST, &mut |_| {}).unwrap(),
+            StopOutcome::NotRegistered
+        );
+        assert!(fake.calls().is_empty());
+
+        let fake = FakeControl::new(vec![st(ServiceState::Stopped, 0, 0)]);
+        assert_eq!(
+            stop_and_wait_polling(&fake, "svc", LONG, FAST, &mut |_| {}).unwrap(),
+            StopOutcome::AlreadyStopped
+        );
+        assert!(fake.calls().is_empty());
+
+        let fake = FakeControl::new(vec![
+            st(ServiceState::Running, 0, 0),
+            st(ServiceState::StopPending, 0, 0),
+            st(ServiceState::Stopped, 0, 0),
+        ]);
+        let mut seen = Vec::new();
+        let out =
+            stop_and_wait_polling(&fake, "svc", LONG, FAST, &mut |s| seen.push(s.state)).unwrap();
+        assert!(matches!(out, StopOutcome::Stopped { .. }));
+        assert_eq!(fake.calls(), vec!["stop"]);
+        assert_eq!(
+            seen,
+            vec![ServiceState::Running, ServiceState::StopPending, ServiceState::Stopped]
+        );
+    }
+
+    #[test]
+    fn stop_and_wait_keeps_waiting_through_pending_and_1061() {
+        // Already stop-pending (someone else's stop): no control sent,
+        // just wait.
+        let fake = FakeControl::new(vec![
+            st(ServiceState::StopPending, 0, 0),
+            st(ServiceState::StopPending, 0, 0),
+            st(ServiceState::Stopped, 0, 0),
+        ]);
+        let out = stop_and_wait_polling(&fake, "svc", LONG, FAST, &mut |_| {}).unwrap();
+        assert!(matches!(out, StopOutcome::Stopped { .. }));
+        assert!(fake.calls().is_empty());
+
+        // Start-pending on an older shim: the stop is refused with 1061,
+        // retried once the service is Running, then waited out.
+        let fake = FakeControl::new(vec![
+            st(ServiceState::StartPending, 0, 0),
+            st(ServiceState::StartPending, 0, 0),
+            st(ServiceState::Running, 0, 0),
+            st(ServiceState::StopPending, 0, 0),
+            st(ServiceState::Stopped, 0, 0),
+        ])
+        .with_stop_results(vec![Err(cannot_accept()), Err(cannot_accept()), Ok(())]);
+        let out = stop_and_wait_polling(&fake, "svc", LONG, FAST, &mut |_| {}).unwrap();
+        assert!(matches!(out, StopOutcome::Stopped { .. }));
+        assert_eq!(fake.calls(), vec!["stop", "stop", "stop"]);
+
+        // Any other control error is an error.
+        let fake = FakeControl::new(vec![st(ServiceState::Running, 0, 0)]).with_stop_results(vec![
+            Err(ServiceError::Scm {
+                operation: "ControlService",
+                code: 5,
+            }),
+        ]);
+        let err = stop_and_wait_polling(&fake, "svc", LONG, FAST, &mut |_| {}).unwrap_err();
+        assert_eq!(err.win32_code(), Some(5));
+
+        // A stop that never completes times out.
+        let fake = FakeControl::new(vec![st(ServiceState::StopPending, 0, 0)]);
+        let err = stop_and_wait_polling(&fake, "svc", Duration::from_millis(20), FAST, &mut |_| {})
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Timeout { last_state: "stop_pending", .. }), "{err}");
+    }
+
+    #[test]
+    fn start_and_wait_reports_the_shim_failure_reason() {
+        let fake = FakeControl::new(vec![
+            st(ServiceState::Stopped, 0, 0),
+            st(ServiceState::StartPending, 0, 0),
+            st(ServiceState::Stopped, ERROR_SERVICE_SPECIFIC_ERROR, HOST_EXIT_SPAWN_FAILURE),
+        ]);
+        let err = start_and_wait_polling(&fake, "svc", LONG, FAST, &mut |_| {}).unwrap_err();
+        match &err {
+            ServiceError::StartFailed { reason, status, .. } => {
+                assert_eq!(reason, "service host could not spawn the program");
+                assert_eq!(status.lifecycle_state(), LifecycleState::Failed);
+            }
+            other => panic!("expected StartFailed, got {other:?}"),
+        }
+        assert_eq!(fake.calls(), vec!["start"]);
+
+        // Happy path.
+        let fake = FakeControl::new(vec![
+            st(ServiceState::Stopped, 0, 0),
+            st(ServiceState::StartPending, 0, 0),
+            st(ServiceState::Running, 0, 0),
+        ]);
+        let ok = start_and_wait_polling(&fake, "svc", LONG, FAST, &mut |_| {}).unwrap();
+        assert_eq!(ok.state, ServiceState::Running);
+
+        // Stop-pending first: wait for the stop, then start.
+        let fake = FakeControl::new(vec![
+            st(ServiceState::StopPending, 0, 0),
+            st(ServiceState::Stopped, 0, 0),
+            st(ServiceState::Running, 0, 0),
+        ]);
+        start_and_wait_polling(&fake, "svc", LONG, FAST, &mut |_| {}).unwrap();
+        assert_eq!(fake.calls(), vec!["start"]);
+
+        // Already running: no start call.
+        let fake = FakeControl::new(vec![st(ServiceState::Running, 0, 0)]);
+        start_and_wait_polling(&fake, "svc", LONG, FAST, &mut |_| {}).unwrap();
+        assert!(fake.calls().is_empty());
+
+        // Not registered.
+        let fake = FakeControl::new(vec![st(ServiceState::NotInstalled, 0, 0)]);
+        assert!(matches!(
+            start_and_wait_polling(&fake, "svc", LONG, FAST, &mut |_| {}),
+            Err(ServiceError::NotRegistered(_))
+        ));
+    }
+
+    #[test]
+    fn wait_for_state_accepts_and_times_out() {
+        let fake = FakeControl::new(vec![
+            st(ServiceState::StopPending, 0, 0),
+            st(ServiceState::NotInstalled, 0, 0),
+        ]);
+        let s = wait_for_state_polling(&fake, "svc", &[ServiceState::NotInstalled], LONG, FAST, &mut |_| {})
+            .unwrap();
+        assert_eq!(s.state, ServiceState::NotInstalled);
+        let fake = FakeControl::new(vec![st(ServiceState::Running, 0, 0)]);
+        let err = wait_for_state_polling(
+            &fake,
+            "svc",
+            &[ServiceState::NotInstalled],
+            Duration::from_millis(10),
+            FAST,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not_installed"), "{err}");
+    }
+
+    #[test]
+    fn old_definition_json_without_new_fields_deserializes() {
+        let json = r#"{
+            "version": 1,
+            "name": "llm-backend-planner",
+            "display_name": "LLM Backend planner",
+            "description": "d",
+            "program": "C:\\llama-server.exe",
+            "args": [],
+            "env": [],
+            "workdir": null,
+            "stdout_log": "C:\\data\\logs\\backend-planner.stdout.log",
+            "stderr_log": "C:\\data\\logs\\backend-planner.stderr.log",
+            "pid_file": null,
+            "account": null,
+            "start_mode": "manual",
+            "failure_actions": {
+                "first_delay_secs": 10,
+                "second_delay_secs": 30,
+                "subsequent_delay_secs": 60,
+                "reset_period_secs": 3600
+            }
+        }"#;
+        let def: ServiceDefinition = serde_json::from_str(json).expect("old definition");
+        assert_eq!(def.lifecycle_log, None);
+        assert!(!def.failure_actions.restart_on_child_exit);
+        // The marker log is derived from the stdout log for it.
+        assert_eq!(
+            lifecycle_log_path(&def),
+            Some(PathBuf::from("C:\\data\\logs\\backend-planner.stdout.log").with_file_name("backend-planner.lifecycle.log"))
+        );
+        // An old status payload without the specific code, too.
+        let s: ServiceStatus = serde_json::from_str(
+            r#"{"name":"x","state":"stopped","pid":null,"child_pid":null,"win32_exit_code":0}"#,
+        )
+        .expect("old status");
+        assert_eq!(s.service_specific_exit_code, 0);
+    }
+
+    #[test]
+    fn definitions_carry_lifecycle_logs_and_child_exit_policy() {
+        let logs = Path::new(r"C:\data\logs");
+        let def = backend_definition(&sample_spec(), logs);
+        assert_eq!(def.pid_file, Some(logs.join("backend-planner.pid")));
+        assert_eq!(def.lifecycle_log, Some(logs.join("backend-planner.lifecycle.log")));
+        assert!(!def.failure_actions.restart_on_child_exit);
+
+        let gw = gateway_definition(
+            LaunchSpec {
+                program: PathBuf::from("python.exe"),
+                args: Vec::new(),
+                env: Vec::new(),
+                workdir: None,
+            },
+            logs.join("gateway.stdout.log"),
+            logs.join("gateway.stderr.log"),
+            PathBuf::from(r"C:\data\gateway.pid"),
+        );
+        assert_eq!(gw.lifecycle_log, Some(logs.join("gateway.lifecycle.log")));
+        assert!(!gw.failure_actions.restart_on_child_exit);
+
+        let data_dir = Path::new(r"C:\data");
+        let lr = log_receiver_definition(data_dir, Path::new("recv.exe"));
+        assert_eq!(
+            lr.lifecycle_log,
+            Some(log_receiver_dir(data_dir).join("logs").join("receiver.lifecycle.log"))
+        );
+        assert!(lr.failure_actions.restart_on_child_exit);
+        assert_eq!(lifecycle_log_path(&lr), lr.lifecycle_log);
+    }
+
+    #[test]
+    fn lifecycle_keys_match_the_app_vocabulary() {
+        assert_eq!(lifecycle_key(GATEWAY_SERVICE_NAME), "gateway");
+        assert_eq!(lifecycle_key(LOG_RECEIVER_SERVICE_NAME), "log-receiver");
+        assert_eq!(lifecycle_key(&backend_service_name("coder")), "backend:coder");
+        assert_eq!(lifecycle_key("other"), "other");
     }
 }

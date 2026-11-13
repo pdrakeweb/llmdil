@@ -19,7 +19,10 @@
 //!   control delivery wired yet, so `drain()` waits the timeout for natural
 //!   exit and then kills (future work: GenerateConsoleCtrlEvent).
 //! - Children are spawned with `kill_on_drop(true)`: dropping a
-//!   `SupervisedProcess` without an explicit stop still reaps the child.
+//!   `SupervisedProcess` without an explicit stop kills the child. App exit
+//!   does NOT drop it (the process exits without running destructors, and
+//!   `on_app_exit` forgets backend processes deliberately): backends are
+//!   left running for the next session to adopt.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -32,6 +35,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
+
+pub mod lifecycle;
 
 /// Graceful-drain timeout used by `Supervisor::stop(id, graceful = true)`
 /// (spec §2.2: 30 s, then kill).
@@ -725,7 +730,10 @@ impl SupervisedProcess {
     /// closing (nothing kills it), and the new session must still
     /// see it: status, pid-keyed VRAM attribution, and stop all key
     /// off the tracked pid. There is no captured output (the log
-    /// ring starts empty) and no known start time (uptime None).
+    /// ring starts empty). The start time is the OS process creation
+    /// time where the platform reports it
+    /// ([`lifecycle::process_start_time`]), so an adopted process
+    /// still reports an uptime; elsewhere uptime is `None`.
     pub fn adopt(id: &str, pid: u32, log_ring: Arc<Mutex<RingBuffer<LogRecord>>>) -> Self {
         Self {
             id: id.to_string(),
@@ -736,7 +744,7 @@ impl SupervisedProcess {
             fatal: Arc::new(std::sync::Mutex::new(None)),
             state: ProcessState::Running,
             restart_attempts: 0,
-            started_at: None,
+            started_at: lifecycle::process_start_time(pid).and_then(instant_from_system_time),
             last_exit: None,
         }
     }
@@ -946,8 +954,9 @@ impl SupervisedProcess {
         self.child.is_some() || self.adopted_pid.is_some()
     }
 
-    /// Time since this supervisor spawned the process. `None` for an adopted process (start
-    /// time unknown) and once a stop or kill has recorded the exit.
+    /// Time since the process started: since this supervisor spawned it, or since the OS
+    /// created an adopted process (where the platform reports that). `None` for an adopted
+    /// process whose start time is unknown, and once a stop or kill has recorded the exit.
     pub fn uptime(&self) -> Option<Duration> {
         self.started_at.map(|t| t.elapsed())
     }
@@ -998,6 +1007,75 @@ impl SupervisedProcess {
             r.push(LogRecord::new(stream, line));
         }
     }
+}
+
+/// The `Instant` corresponding to a wall-clock `SystemTime` in the past:
+/// `now - (SystemTime::now - t)`. `None` when `t` is in the future or the
+/// subtraction would precede the monotonic clock's origin.
+fn instant_from_system_time(t: std::time::SystemTime) -> Option<Instant> {
+    let age = std::time::SystemTime::now().duration_since(t).ok()?;
+    Instant::now().checked_sub(age)
+}
+
+/// The drain window `stop_process(.., graceful = true)` allows. On
+/// Windows the graceful signal is a no-op (see `send_graceful_signal`),
+/// so a long drain window is pure latency: the child either exits on its
+/// own almost immediately or never will. Use a short window there.
+fn graceful_drain_timeout() -> Duration {
+    #[cfg(windows)]
+    {
+        Duration::from_secs(3)
+    }
+    #[cfg(not(windows))]
+    {
+        DEFAULT_DRAIN_TIMEOUT
+    }
+}
+
+/// Stop a detached process — drain (graceful) or kill — without any
+/// supervisor borrow, so the supervisor lock is not held for the drain
+/// window and the kill reap. Pair with [`Supervisor::detach`] before and
+/// [`Supervisor::finish_stop`] after.
+pub async fn stop_process(
+    proc: &mut SupervisedProcess,
+    graceful: bool,
+) -> Result<(), SupervisorError> {
+    if graceful {
+        proc.drain(graceful_drain_timeout()).await
+    } else {
+        proc.kill().await
+    }
+}
+
+/// Spawn `id` from `spec` without any supervisor borrow: the bounded
+/// port-free wait (10 s) and the spawn itself. Pair with
+/// [`Supervisor::prepare_spawn`] before and [`Supervisor::commit_spawn`]
+/// (or [`Supervisor::record_spawn_failure`]) after.
+pub async fn spawn_process(
+    id: &str,
+    spec: &ProcessSpec,
+) -> Result<SupervisedProcess, SupervisorError> {
+    if let Some(port) = spec.port {
+        // Bounded wait, not a single probe: a just-stopped
+        // process (above all an adopted one) may still be
+        // releasing this port. A port held by something that is
+        // not going away fails after the wait, with the same
+        // PortInUse error as before.
+        if !wait_port_free(port, Duration::from_secs(10)).await {
+            return Err(SupervisorError::PortInUse(port));
+        }
+    }
+    let ring = Arc::new(Mutex::new(RingBuffer::new(DEFAULT_LOG_RING_CAPACITY)));
+    SupervisedProcess::spawn_with_workdir(
+        id,
+        &spec.program,
+        &spec.args,
+        &spec.env,
+        spec.workdir.as_deref(),
+        ring,
+        spec.low_priority,
+    )
+    .await
 }
 
 fn port_free(port: u16) -> bool {
@@ -1258,6 +1336,11 @@ pub struct Supervisor {
     /// spawn and by `unregister_spec`, like the other per-id
     /// runtime history.
     failure_reasons: HashMap<String, String>,
+    /// The exit status `reap_exited` saw for each id's last unexpected
+    /// exit, kept so a reader that did not reap it (the lifecycle
+    /// monitor, when a status poll reaped first) can still report the
+    /// exit code. Cleared by the next spawn or adoption.
+    exit_statuses: HashMap<String, std::process::ExitStatus>,
     crash_counts: HashMap<String, u32>,
     backoff: BackoffPolicy,
 }
@@ -1274,6 +1357,7 @@ impl Supervisor {
             trackers: HashMap::new(),
             failed_ids: HashSet::new(),
             failure_reasons: HashMap::new(),
+            exit_statuses: HashMap::new(),
             crash_counts: HashMap::new(),
             backoff,
         }
@@ -1309,6 +1393,7 @@ impl Supervisor {
             // stale "failed" state and restart count.
             self.failed_ids.remove(id);
             self.failure_reasons.remove(id);
+            self.exit_statuses.remove(id);
             self.crash_counts.remove(id);
             self.trackers.remove(id);
             self.dead_rings.remove(id);
@@ -1331,36 +1416,58 @@ impl Supervisor {
 
     /// Spawn the registered backend `id` (spec §6.2: port-conflict check
     /// before spawn). A manual spawn resets the crash budget for `id`.
+    ///
+    /// Holds `&mut self` across the port wait and the spawn; callers that
+    /// must not block supervisor readers for that window use the split
+    /// form: [`Self::prepare_spawn`], [`spawn_process`] with no lock held,
+    /// then [`Self::commit_spawn`] / [`Self::record_spawn_failure`].
+    /// A failed spawn (port still held, program missing) leaves the id
+    /// `Failed` with a "spawn failed: …" reason.
     pub async fn spawn_backend(&mut self, id: &str) -> Result<(), SupervisorError> {
+        let spec = self.prepare_spawn(id)?;
+        match spawn_process(id, &spec).await {
+            Ok(proc) => self.commit_spawn(id, proc),
+            Err(e) => {
+                self.record_spawn_failure(id, format!("spawn failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// First half of a lock-split spawn: refuses an id that is already
+    /// live (`AlreadyRunning`) or has no spec (`NotFound`), and returns a
+    /// clone of the spec to spawn from with no supervisor lock held.
+    pub fn prepare_spawn(&self, id: &str) -> Result<ProcessSpec, SupervisorError> {
         if self.live.contains_key(id) {
             return Err(SupervisorError::AlreadyRunning(id.to_string()));
         }
-        let spec = self
-            .specs
+        self.specs
             .get(id)
-            .ok_or_else(|| SupervisorError::NotFound(id.to_string()))?
-            .clone();
-        if let Some(port) = spec.port {
-            // Bounded wait, not a single probe: a just-stopped
-            // process (above all an adopted one) may still be
-            // releasing this port. A port held by something that is
-            // not going away fails after the wait, with the same
-            // PortInUse error as before.
-            if !wait_port_free(port, Duration::from_secs(10)).await {
-                return Err(SupervisorError::PortInUse(port));
-            }
+            .cloned()
+            .ok_or_else(|| SupervisorError::NotFound(id.to_string()))
+    }
+
+    /// Record a spawn that failed (e.g. after [`spawn_process`] returned an
+    /// error): `status()` then reads `Failed` with `reason`, instead of an
+    /// idle `Stopped`. A later successful spawn clears both.
+    pub fn record_spawn_failure(&mut self, id: &str, reason: String) {
+        tracing::warn!(process = id, %reason, "spawn failed");
+        self.failed_ids.insert(id.to_string());
+        self.failure_reasons.insert(id.to_string(), reason);
+    }
+
+    /// Last half of a lock-split spawn: insert the freshly spawned `proc`
+    /// as `id`'s live process. Refused with `AlreadyRunning` when another
+    /// spawn or adoption won the race while no lock was held (the extra
+    /// process is then dropped, and `kill_on_drop` reaps it).
+    pub fn commit_spawn(
+        &mut self,
+        id: &str,
+        proc: SupervisedProcess,
+    ) -> Result<(), SupervisorError> {
+        if self.live.contains_key(id) {
+            return Err(SupervisorError::AlreadyRunning(id.to_string()));
         }
-        let ring = Arc::new(Mutex::new(RingBuffer::new(DEFAULT_LOG_RING_CAPACITY)));
-        let proc = SupervisedProcess::spawn_with_workdir(
-            id,
-            &spec.program,
-            &spec.args,
-            &spec.env,
-            spec.workdir.as_deref(),
-            ring,
-            spec.low_priority,
-        )
-        .await?;
         self.live.insert(id.to_string(), proc);
         // Archive the previous run's retained ring before the fresh ring
         // takes over the id: restarting a failed backend is the standard
@@ -1374,6 +1481,7 @@ impl Supervisor {
         // failure (and its no-retry mark) from the previous run
         // no longer applies.
         self.failure_reasons.remove(id);
+        self.exit_statuses.remove(id);
         self.crash_counts.insert(id.to_string(), 0);
         self.trackers.entry(id.to_string()).or_default();
         Ok(())
@@ -1398,6 +1506,7 @@ impl Supervisor {
         }
         self.failed_ids.remove(id);
         self.failure_reasons.remove(id);
+        self.exit_statuses.remove(id);
         self.trackers.entry(id.to_string()).or_default();
         Ok(())
     }
@@ -1406,33 +1515,43 @@ impl Supervisor {
     /// The process's log ring is retained so `logs_query` still serves its
     /// history; when the id is spawned again the ring becomes the archived
     /// previous run instead of being dropped.
+    ///
+    /// Holds `&mut self` across the drain; the lock-split form is
+    /// [`Self::detach`], [`stop_process`] with no lock held, then
+    /// [`Self::finish_stop`].
     pub async fn stop(&mut self, id: &str, graceful: bool) -> Result<(), SupervisorError> {
-        let mut proc = self
-            .live
+        let mut proc = self.detach(id)?;
+        let stop_result = stop_process(&mut proc, graceful).await;
+        self.finish_stop(id, proc, &stop_result);
+        stop_result
+    }
+
+    /// First half of a lock-split stop: take `id`'s live process out of
+    /// the supervisor (`NotFound` when nothing is live). Until
+    /// [`Self::finish_stop`] runs, `status()` reports the id as not live;
+    /// the app's lifecycle registry overlays the in-flight transition.
+    pub fn detach(&mut self, id: &str) -> Result<SupervisedProcess, SupervisorError> {
+        self.live
             .remove(id)
-            .ok_or_else(|| SupervisorError::NotFound(id.to_string()))?;
-        let stop_result = if graceful {
-            // On Windows the graceful signal is a no-op (see
-            // send_graceful_signal), so a long drain window is pure
-            // latency: the child either exits on its own almost
-            // immediately or never will. Use a short window there.
-            #[cfg(windows)]
-            let drain_timeout = Duration::from_secs(3);
-            #[cfg(not(windows))]
-            let drain_timeout = DEFAULT_DRAIN_TIMEOUT;
-            proc.drain(drain_timeout).await
-        } else {
-            proc.kill().await
-        };
+            .ok_or_else(|| SupervisorError::NotFound(id.to_string()))
+    }
+
+    /// Last half of a lock-split stop: retain the stopped process's log
+    /// ring (it becomes the archived previous run on the next spawn) and,
+    /// when `result` is an error, mark the id failed.
+    pub fn finish_stop(
+        &mut self,
+        id: &str,
+        proc: SupervisedProcess,
+        result: &Result<(), SupervisorError>,
+    ) {
         self.dead_rings.insert(id.to_string(), proc.log_ring());
-        if let Err(e) = stop_result {
+        if result.is_err() {
             // The child could not be confirmed dead (e.g. DrainTimeout):
             // it may still be alive and holding its port. Report the id
             // as failed rather than stopped so the state stays honest.
             self.failed_ids.insert(id.to_string());
-            return Err(e);
         }
-        Ok(())
     }
 
     /// Graceful stop then spawn again. Unknown ids are a fresh start.
@@ -1490,6 +1609,7 @@ impl Supervisor {
                     ?status,
                     "supervised process exited unexpectedly"
                 );
+                self.exit_statuses.insert(id.clone(), status);
                 dead.push((id, status));
             }
         }
@@ -1525,6 +1645,13 @@ impl Supervisor {
     /// (see [`DEVICE_UNAVAILABLE_REASON`]).
     pub fn failure_reason(&self, id: &str) -> Option<&str> {
         self.failure_reasons.get(id).map(|s| s.as_str())
+    }
+
+    /// The exit status of `id`'s last unexpected exit (as reaped by
+    /// [`Self::reap_exited`], whoever called it), until the id is
+    /// spawned or adopted again.
+    pub fn last_exit_status(&self, id: &str) -> Option<std::process::ExitStatus> {
+        self.exit_statuses.get(id).copied()
     }
 
     /// Reset the crash budget for `id` after a healthy observation.
@@ -2979,6 +3106,229 @@ mod tests {
         assert_eq!(z.len(), 1);
     }
 
+    /// A long-lived external sleeper, on either platform.
+    fn ext_sleeper() -> std::process::Child {
+        #[cfg(unix)]
+        {
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap()
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("ping")
+                .args(["-n", "60", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn detach_stop_process_finish_stop_leaves_stopped_and_keeps_ring() {
+        let mut sup = Supervisor::new(test_policy());
+        sup.register_spec(ext_spec("split"));
+        sup.spawn_backend("split").await.unwrap();
+        let ring = sup.current_ring("split").unwrap();
+        ring.lock()
+            .unwrap()
+            .push(LogRecord::new(LogStream::Stdout, "before stop"));
+
+        let mut proc = sup.detach("split").unwrap();
+        // Detached: no longer live, and a second detach is NotFound.
+        assert!(matches!(
+            sup.detach("split"),
+            Err(SupervisorError::NotFound(_))
+        ));
+        let pid = proc.pid().unwrap();
+        let result = stop_process(&mut proc, false).await;
+        assert!(result.is_ok());
+        sup.finish_stop("split", proc, &result);
+
+        let st = sup.status().into_iter().find(|s| s.id == "split").unwrap();
+        assert_eq!(st.state, ProcessState::Stopped);
+        assert!(st.pid.is_none());
+        assert!(!pid_alive(pid));
+        // The run's ring is retained and still served.
+        assert!(Arc::ptr_eq(&ring, &sup.current_ring("split").unwrap()));
+        assert!(sup
+            .logs_query("split", None, None, 10)
+            .records
+            .iter()
+            .any(|r| r.line == "before stop"));
+    }
+
+    #[tokio::test]
+    async fn finish_stop_with_error_marks_failed() {
+        let mut sup = Supervisor::new(test_policy());
+        sup.register_spec(ext_spec("stuck"));
+        sup.spawn_backend("stuck").await.unwrap();
+        let mut proc = sup.detach("stuck").unwrap();
+        stop_process(&mut proc, false).await.unwrap();
+        // Simulate a stop whose kill could not be confirmed.
+        sup.finish_stop(
+            "stuck",
+            proc,
+            &Err(SupervisorError::DrainTimeout("stuck".into())),
+        );
+        let st = sup.status().into_iter().find(|s| s.id == "stuck").unwrap();
+        assert_eq!(st.state, ProcessState::Failed);
+    }
+
+    #[tokio::test]
+    async fn status_readable_while_detached_process_stops() {
+        let sup = Arc::new(tokio::sync::Mutex::new(Supervisor::new(test_policy())));
+        {
+            let mut s = sup.lock().await;
+            s.register_spec(ext_spec("slow"));
+            s.spawn_backend("slow").await.unwrap();
+        }
+        // Short lock: take the process out.
+        let mut proc = sup.lock().await.detach("slow").unwrap();
+        let stop_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = Arc::clone(&stop_done);
+        let stopper = async move {
+            // Graceful: on Windows this waits the full drain window
+            // (the sleeper ignores it) before the kill.
+            let r = stop_process(&mut proc, true).await;
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            (r, proc)
+        };
+        let sup_r = Arc::clone(&sup);
+        let flag = Arc::clone(&stop_done);
+        let reader = async move {
+            tokio::time::sleep(ms(50)).await;
+            // The supervisor lock is free while the drain runs.
+            let guard = sup_r
+                .try_lock()
+                .expect("supervisor lock must not be held during stop_process");
+            let st = guard.status();
+            let stopping = !flag.load(std::sync::atomic::Ordering::SeqCst);
+            (st, stopping)
+        };
+        let ((result, proc), (st, read_mid_stop)) = tokio::join!(stopper, reader);
+        assert!(result.is_ok());
+        assert_eq!(st.len(), 1);
+        assert!(
+            st[0].pid.is_none(),
+            "a detached process is not reported live"
+        );
+        // On Windows the drain window is 3 s, so the read certainly
+        // happened mid-stop; on Unix the sleeper exits on SIGTERM at once.
+        #[cfg(windows)]
+        assert!(read_mid_stop);
+        #[cfg(not(windows))]
+        let _ = read_mid_stop;
+        sup.lock().await.finish_stop("slow", proc, &result);
+        let st = sup.lock().await.status();
+        assert_eq!(st[0].state, ProcessState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_reads_failed_with_reason_until_next_spawn() {
+        let mut sup = Supervisor::new(test_policy());
+        #[cfg(windows)]
+        let missing = PathBuf::from(r"C:\nonexistent-dir-xyz\binary-xyz.exe");
+        #[cfg(not(windows))]
+        let missing = PathBuf::from("/nonexistent/binary-xyz");
+        let mut spec = ext_spec("broken");
+        spec.program = missing;
+        sup.register_spec(spec);
+        let err = sup.spawn_backend("broken").await.unwrap_err();
+        assert!(matches!(err, SupervisorError::SpawnFailed(..)));
+        let st = sup.status().into_iter().find(|s| s.id == "broken").unwrap();
+        assert_eq!(st.state, ProcessState::Failed);
+        assert!(
+            st.failure_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("spawn failed")),
+            "reason: {:?}",
+            st.failure_reason
+        );
+        // restart() of a never-started id takes the same path.
+        assert!(sup.restart("broken", false).await.is_err());
+        assert_eq!(
+            sup.status()[0].state,
+            ProcessState::Failed,
+            "restart spawn failure reads failed"
+        );
+        // A good spec and a successful spawn clear the failure.
+        sup.register_spec(ext_spec("broken"));
+        sup.spawn_backend("broken").await.unwrap();
+        let st = sup.status().into_iter().find(|s| s.id == "broken").unwrap();
+        assert_eq!(st.state, ProcessState::Running);
+        assert_eq!(st.failure_reason, None);
+        sup.stop("broken", false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn split_spawn_prepare_and_commit() {
+        let mut sup = Supervisor::new(test_policy());
+        assert!(matches!(
+            sup.prepare_spawn("ghost"),
+            Err(SupervisorError::NotFound(_))
+        ));
+        sup.register_spec(ext_spec("split-spawn"));
+        let spec = sup.prepare_spawn("split-spawn").unwrap();
+        let proc = spawn_process("split-spawn", &spec).await.unwrap();
+        // A racing second spawn of the same id.
+        let racer = spawn_process("split-spawn", &spec).await.unwrap();
+        let racer_pid = racer.pid().unwrap();
+        sup.commit_spawn("split-spawn", proc).unwrap();
+        assert!(matches!(
+            sup.prepare_spawn("split-spawn"),
+            Err(SupervisorError::AlreadyRunning(_))
+        ));
+        assert!(matches!(
+            sup.commit_spawn("split-spawn", racer),
+            Err(SupervisorError::AlreadyRunning(_))
+        ));
+        // The refused racer was dropped and kill_on_drop kills it. (On
+        // Unix the killed child may linger as a zombie until tokio's
+        // orphan reaper runs, so liveness is only checked on Windows.)
+        #[cfg(windows)]
+        {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while pid_alive(racer_pid) && Instant::now() < deadline {
+                tokio::time::sleep(ms(50)).await;
+            }
+            assert!(!pid_alive(racer_pid));
+        }
+        #[cfg(not(windows))]
+        let _ = racer_pid;
+        let st = sup
+            .status()
+            .into_iter()
+            .find(|s| s.id == "split-spawn")
+            .unwrap();
+        assert_eq!(st.state, ProcessState::Running);
+        sup.stop("split-spawn", false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn adopted_process_reports_os_start_time_where_available() {
+        let mut ext = ext_sleeper();
+        let pid = ext.id();
+        let mut sup = Supervisor::new(test_policy());
+        sup.register_spec(ext_spec("adopted"));
+        sup.adopt("adopted", pid).unwrap();
+        let st = sup
+            .status()
+            .into_iter()
+            .find(|s| s.id == "adopted")
+            .unwrap();
+        #[cfg(windows)]
+        {
+            let up = st.uptime.expect("adopted uptime from GetProcessTimes");
+            assert!(up < Duration::from_secs(600));
+        }
+        #[cfg(not(windows))]
+        assert_eq!(st.uptime, None);
+        sup.stop("adopted", false).await.unwrap();
+        let _ = ext.wait();
+    }
+
     #[test]
     fn log_record_carries_stream_and_timestamp() {
         let r = LogRecord::new(LogStream::Stderr, "boom");
@@ -3416,8 +3766,15 @@ mod tests {
 
         let err = sup.spawn_backend("web").await.unwrap_err();
         assert!(matches!(err, SupervisorError::PortInUse(p) if p == port));
-        // Nothing was spawned.
-        assert_eq!(sup.status()[0].state, ProcessState::Stopped);
+        // Nothing was spawned, and the failed start reads as failed
+        // with its reason rather than an idle "stopped".
+        let st = &sup.status()[0];
+        assert_eq!(st.state, ProcessState::Failed);
+        assert!(st.pid.is_none());
+        assert_eq!(
+            st.failure_reason.as_deref(),
+            Some(format!("spawn failed: port {port} is already in use").as_str())
+        );
         drop(listener);
     }
 

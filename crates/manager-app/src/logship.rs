@@ -367,6 +367,15 @@ fn event_record(event: &str, payload: &Value) -> Option<TapRecord> {
     }
     let level = if event == events::DOWNLOAD_PROGRESS {
         ShipLevel::Debug
+    } else if event == events::SERVICE_LIFECYCLE
+        && matches!(
+            payload.get("event").and_then(Value::as_str),
+            Some("crashed" | "failed")
+        )
+    {
+        // A lifecycle failure is an error whatever state it settled
+        // in (a crash can settle as `stopped` with intent Running).
+        ShipLevel::Error
     } else {
         let outcome: Vec<&str> = [
             "state", "status", "event", "outcome", "result", "level", "error",
@@ -559,6 +568,29 @@ mod tests {
         assert!(rec.line.starts_with("backend-status {"), "{}", rec.line);
         assert!(rec.line.contains(r#""event":"started""#));
         assert!(rec.line.contains(r#""id":"planner""#));
+
+        // Lifecycle events of every service ship as app records; a
+        // crash is an error even when it settled as `stopped`.
+        let restarting = event_record(
+            crate::events::SERVICE_LIFECYCLE,
+            &crate::lifecycle::event_payload(
+                "gateway",
+                "restarting",
+                crate::lifecycle::LifecycleState::Restarting,
+                Some(crate::lifecycle::Origin::Activation),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(restarting.source, "app");
+        assert_eq!(restarting.level, Some(ShipLevel::Info));
+        assert!(restarting.line.starts_with("service-lifecycle {"), "{}", restarting.line);
+        let crashed = event_record(
+            crate::events::SERVICE_LIFECYCLE,
+            &json!({ "key": "backend:a", "event": "crashed", "state": "stopped" }),
+        )
+        .unwrap();
+        assert_eq!(crashed.level, Some(ShipLevel::Error));
 
         // A failed step is an error; a null `error` key is not.
         let failed = event_record(

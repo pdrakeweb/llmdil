@@ -297,7 +297,201 @@ pub fn process_is_gateway(pid: u32) -> Option<bool> {
     }
 }
 
+/// How a gateway process was found (see [`resolve_gateway_pid`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FoundBy {
+    /// Recorded in `gateway.pid`.
+    PidFile,
+    /// No usable pid file; the gateway interpreter owning the
+    /// gateway port's LISTEN socket.
+    PortOwner,
+    /// Nothing found.
+    None,
+}
+
+impl FoundBy {
+    /// Marker/log spelling ("pid file", "port owner", "none").
+    pub fn label(self) -> &'static str {
+        match self {
+            FoundBy::PidFile => "pid file",
+            FoundBy::PortOwner => "port owner",
+            FoundBy::None => "none",
+        }
+    }
+}
+
+/// Result of [`stop_gateway_and_wait`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GatewayStopOutcome {
+    /// A live gateway process was terminated and confirmed gone.
+    pub stopped: bool,
+    /// The pid that was stopped, when one was found.
+    pub pid: Option<u32>,
+    /// How the pid was found.
+    pub found_by: FoundBy,
+    /// The graceful phase alone ended the process (no forced kill).
+    pub graceful: bool,
+    /// The gateway port had no listener when the stop returned
+    /// (`true` when no port was given).
+    pub port_released: bool,
+}
+
+/// The live gateway process, if any: the pid recorded in
+/// `<data_dir>/gateway.pid` when it is alive and not a recycled pid
+/// of another program (`process_is_gateway != Some(false)`); else the
+/// owner of the gateway port's LISTEN socket when it is positively a
+/// gateway interpreter (`process_is_gateway == Some(true)` — an
+/// unknown image is never adopted by port, the same rule backend
+/// adoption uses). `port == 0` skips the port lookup.
+pub fn resolve_gateway_pid(data_dir: &Path, port: u16) -> Option<(u32, FoundBy)> {
+    let recorded = std::fs::read_to_string(gateway_pid_path(data_dir))
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok());
+    let port_owner = if port == 0 {
+        None
+    } else {
+        manager_supervisor::port_owner_pid(port)
+    };
+    pick_gateway_pid(recorded, port_owner, process_alive, process_is_gateway)
+}
+
+/// The decision behind [`resolve_gateway_pid`] (and the start-gateway
+/// step's ops-based twin), over injected probes so it is unit-testable.
+pub fn pick_gateway_pid(
+    recorded: Option<u32>,
+    port_owner: Option<u32>,
+    alive: impl Fn(u32) -> bool,
+    is_gateway: impl Fn(u32) -> Option<bool>,
+) -> Option<(u32, FoundBy)> {
+    if let Some(pid) = recorded {
+        if alive(pid) && is_gateway(pid) != Some(false) {
+            return Some((pid, FoundBy::PidFile));
+        }
+    }
+    let pid = port_owner?;
+    (alive(pid) && is_gateway(pid) == Some(true)).then_some((pid, FoundBy::PortOwner))
+}
+
+/// Ask `pid` (and its tree) to exit without forcing it. Windows:
+/// `taskkill /PID <pid> /T` without `/F` (posts WM_CLOSE; a windowless
+/// console interpreter may refuse, which the caller treats as "no
+/// graceful phase"). Unix: SIGTERM. Returns whether the request was
+/// delivered.
+fn request_graceful_exit(pid: u32) -> bool {
+    if !pid_is_signalable(pid) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T"]);
+        // CREATE_NO_WINDOW: this runs from a GUI process.
+        cmd.creation_flags(0x08000000);
+        cmd.output().map(|o| o.status.success()).unwrap_or(false)
+    }
+    #[cfg(unix)]
+    {
+        std::process::Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Poll `done` every 100 ms for up to `budget`; true once it holds.
+fn wait_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if done() {
+            return true;
+        }
+        if started.elapsed() >= budget {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Graceful-phase budget of [`stop_gateway_and_wait`].
+pub const GATEWAY_GRACEFUL_STOP: Duration = Duration::from_secs(3);
+/// Exit-confirmation budget of [`stop_gateway_and_wait`] after the
+/// forced kill (and for the port to be released).
+pub const GATEWAY_STOP_CONFIRM: Duration = Duration::from_secs(10);
+
+/// Stop the process-mode gateway and wait until it is really gone.
+///
+/// 1. Find it with [`resolve_gateway_pid`] (pid file, else the port
+///    owner): a lost or stale pid file no longer reads as "not
+///    running" while a gateway still serves (CR-4).
+/// 2. `graceful`: ask it to exit ([`request_graceful_exit`]) and wait
+///    up to [`GATEWAY_GRACEFUL_STOP`] (GW-9).
+/// 3. Otherwise / then: [`kill_process`] (`taskkill /T /F`).
+/// 4. Wait up to [`GATEWAY_STOP_CONFIRM`] for the pid to exit, then
+///    for the port to have no listener.
+///
+/// The pid file is removed once nothing gateway is running; it is
+/// kept when the kill fails or the process outlives the wait, so a
+/// retry knows the pid. Blocking: run it off the async runtime.
+/// `port == 0` skips the port lookup and the port wait.
+pub fn stop_gateway_and_wait(
+    data_dir: &Path,
+    port: u16,
+    graceful: bool,
+) -> Result<GatewayStopOutcome, String> {
+    let pid_path = gateway_pid_path(data_dir);
+    let port_free = || port == 0 || manager_supervisor::port_owner_pid(port).is_none();
+    let Some((pid, found_by)) = resolve_gateway_pid(data_dir, port) else {
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(GatewayStopOutcome {
+            stopped: false,
+            pid: None,
+            found_by: FoundBy::None,
+            graceful: false,
+            port_released: port_free(),
+        });
+    };
+    let mut ended_gracefully = false;
+    if graceful && request_graceful_exit(pid) {
+        ended_gracefully = wait_until(GATEWAY_GRACEFUL_STOP, || !process_alive(pid));
+    }
+    if !ended_gracefully {
+        if let Err(e) = kill_process(pid) {
+            // taskkill also fails on a process that exited meanwhile.
+            if process_alive(pid) {
+                return Err(format!("could not stop gateway (pid {pid}): {e}"));
+            }
+        }
+        if !wait_until(GATEWAY_STOP_CONFIRM, || !process_alive(pid)) {
+            return Err(format!(
+                "gateway (pid {pid}) is still running {} s after it was killed",
+                GATEWAY_STOP_CONFIRM.as_secs()
+            ));
+        }
+    }
+    let port_released = wait_until(GATEWAY_STOP_CONFIRM, port_free);
+    let _ = std::fs::remove_file(&pid_path);
+    Ok(GatewayStopOutcome {
+        stopped: true,
+        pid: Some(pid),
+        found_by,
+        graceful: ended_gracefully,
+        port_released,
+    })
+}
+
 /// Stop the gateway process recorded in `<data_dir>/gateway.pid`.
+///
+/// Compatibility wrapper for existing callers: pid file only, no exit
+/// wait. New code uses [`stop_gateway_and_wait`], which also finds an
+/// unrecorded gateway by its port and confirms the exit.
 ///
 /// Returns `Ok(true)` when a live recorded process was terminated,
 /// `Ok(false)` when there was nothing to stop (no pid file, an
@@ -565,31 +759,12 @@ async fn http_post_impl(
     })
 }
 
-/// The rotation sibling of a log file: `gateway.stdout.log` rotates
-/// to `gateway.stdout.log.prev` (one previous run kept, matching the
-/// log retention the Logs view documents).
-pub fn prev_log_path(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(".prev");
-    PathBuf::from(s)
-}
-
-/// Open `path` for appending, first rotating any existing file to its
-/// `.prev` sibling. Creates parent directories as needed.
-fn open_rotated_log(path: &Path) -> std::io::Result<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if path.exists() {
-        let prev = prev_log_path(path);
-        let _ = std::fs::remove_file(&prev);
-        std::fs::rename(path, &prev)?;
-    }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-}
+// The rotation sibling of a log file (`gateway.stdout.log` →
+// `gateway.stdout.log.prev`) and the rotating opener. Both live in
+// `manager_supervisor::lifecycle` so the service shim and the app share
+// the one rotation rule; re-exported here so existing callers compile.
+use manager_supervisor::lifecycle::open_rotated_log;
+pub use manager_supervisor::lifecycle::prev_log_path;
 
 impl RealSystemOps {
     /// Spawn `cmd` and wait for it under `budget`, capturing output.
@@ -817,7 +992,16 @@ impl SystemOps for RealSystemOps {
                         "the gateway service '{name}' is not registered — register it in Settings → Supervision before starting it in service mode"
                     ));
                 }
-                control.start(&name).map_err(|e| e.to_string())?;
+                // The shared start-and-wait: a start that falls back
+                // to Stopped reports the shim's own reason (credential
+                // resolution, spawn failure, the child's exit code)
+                // instead of a pid-file timeout.
+                manager_services::start_and_wait(
+                    &control,
+                    &name,
+                    manager_services::ServiceTimeouts::start(&name),
+                )
+                .map_err(|e| e.to_string())?;
                 if let Some(pid_file) = &pid_file {
                     // The service host writes the child's pid once it
                     // is spawned; wait for a live pid to appear.
@@ -827,6 +1011,19 @@ impl SystemOps for RealSystemOps {
                                 if process_alive(pid) {
                                     return Ok(pid);
                                 }
+                            }
+                        }
+                        // A child that died right after the service
+                        // reached Running takes the service down with
+                        // it: report the shim's reason, not a timeout.
+                        if let Ok(status) = control.query(&name) {
+                            if status.state == manager_services::ServiceState::Stopped {
+                                return Err(format!(
+                                    "gateway service '{name}' stopped right after starting: {}",
+                                    status
+                                        .failure_reason()
+                                        .unwrap_or_else(|| "no exit code recorded".to_string())
+                                ));
                             }
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -867,27 +1064,21 @@ impl SystemOps for RealSystemOps {
         }
     }
 
-    async fn service_stop(&self, name: &str) -> Result<(), WizardError> {
+    async fn service_stop(
+        &self,
+        name: &str,
+    ) -> Result<manager_services::StopOutcome, WizardError> {
         #[cfg(windows)]
         {
-            use manager_services::ServiceControl;
             let control = manager_services::scm::platform_control();
             let name = name.to_string();
             tokio::task::spawn_blocking(move || {
-                if !control.is_registered(&name).map_err(|e| e.to_string())? {
-                    return Ok(());
-                }
-                control.stop(&name).map_err(|e| e.to_string())?;
-                for _ in 0..150 {
-                    match control.query(&name).map_err(|e| e.to_string())?.state {
-                        manager_services::ServiceState::Stopped
-                        | manager_services::ServiceState::NotInstalled => return Ok(()),
-                        _ => std::thread::sleep(std::time::Duration::from_millis(100)),
-                    }
-                }
-                Err(format!(
-                    "service '{name}' did not reach the stopped state within 15 s"
-                ))
+                manager_services::stop_and_wait(
+                    &control,
+                    &name,
+                    manager_services::ServiceTimeouts::stop(&name),
+                )
+                .map_err(|e| e.to_string())
             })
             .await
             .map_err(|e| WizardError::IoError {
@@ -908,6 +1099,52 @@ impl SystemOps for RealSystemOps {
                 ),
             })
         }
+    }
+
+    async fn service_registered(&self, name: &str) -> bool {
+        #[cfg(windows)]
+        {
+            use manager_services::ServiceControl;
+            let name = name.to_string();
+            tokio::task::spawn_blocking(move || {
+                manager_services::scm::platform_control()
+                    .is_registered(&name)
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = name;
+            false
+        }
+    }
+
+    async fn service_state(&self, name: &str) -> Option<manager_services::ServiceState> {
+        #[cfg(windows)]
+        {
+            use manager_services::ServiceControl;
+            let name = name.to_string();
+            tokio::task::spawn_blocking(move || {
+                manager_services::scm::platform_control()
+                    .query(&name)
+                    .ok()
+                    .map(|s| s.state)
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = name;
+            None
+        }
+    }
+
+    fn port_owner_pid(&self, port: u16) -> Option<u32> {
+        manager_supervisor::port_owner_pid(port)
     }
 
     async fn spawn_detached(&self, cmd: &PlannedCommand) -> Result<u32, WizardError> {
@@ -2112,6 +2349,55 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(!alive, "spawned process was not terminated");
+    }
+
+    #[test]
+    fn pick_gateway_pid_prefers_live_pid_file_then_gateway_port_owner() {
+        let alive = |p: u32| p == 10 || p == 20 || p == 30;
+        let is_gw = |p: u32| match p {
+            10 => None,        // cannot tell: still trusted from the pid file
+            20 => Some(true),  // a gateway interpreter
+            30 => Some(false), // another program
+            _ => Some(false),
+        };
+        // Live recorded pid wins.
+        assert_eq!(
+            pick_gateway_pid(Some(10), Some(20), alive, is_gw),
+            Some((10, FoundBy::PidFile))
+        );
+        // Dead recorded pid: the gateway port owner.
+        assert_eq!(
+            pick_gateway_pid(Some(99), Some(20), alive, is_gw),
+            Some((20, FoundBy::PortOwner))
+        );
+        // Recycled recorded pid (another program): port owner.
+        assert_eq!(
+            pick_gateway_pid(Some(30), Some(20), alive, is_gw),
+            Some((20, FoundBy::PortOwner))
+        );
+        // A port owner is only taken when positively a gateway.
+        assert_eq!(pick_gateway_pid(None, Some(10), alive, is_gw), None);
+        assert_eq!(pick_gateway_pid(None, Some(30), alive, is_gw), None);
+        assert_eq!(pick_gateway_pid(None, None, alive, is_gw), None);
+    }
+
+    #[test]
+    fn stop_gateway_and_wait_with_nothing_running_reports_not_stopped() {
+        let dir =
+            std::env::temp_dir().join(format!("wizard-stop-gw-wait-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = stop_gateway_and_wait(&dir, 0, true).unwrap();
+        assert_eq!(
+            out,
+            GatewayStopOutcome {
+                stopped: false,
+                pid: None,
+                found_by: FoundBy::None,
+                graceful: false,
+                port_released: true,
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

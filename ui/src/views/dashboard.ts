@@ -2,18 +2,27 @@
    - Appliance: service cards, GPU strip, model placement, throughput chart.
    - Console: dense tables with sparklines/bars.
    - Topology: mini cluster node map (SVG).
-   Polls getDashboard() every 5s; Pause live stops polling; data older than
-   10s without a successful poll is labeled STALE (spec §4 global UI rules).
+   Lifecycle state comes from the shared service store (lifecycle.ts):
+   every store refresh repaints the cards with the effective state (a
+   restart from any surface reads "restarting…"), and getDashboard() —
+   fed the store's backend/gateway rows — refreshes the telemetry and
+   metrics at most every ~5 s. Pause live stops repainting; data older
+   than 10s without a successful poll is labeled STALE (spec §4 global
+   UI rules).
    Backend failures keep the last good model and show an error banner —
    never fabricated data presented as live. */
 
-import { getDashboard, isTauri, restartBackend, runWizardStep, startBackend, systemVerdict } from "../api";
-import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
+import { getDashboard, systemVerdict } from "../api";
 import type { SystemVerdict } from "../api";
+import {
+  LIFECYCLE_COLORS, META, lifecycleChip, lifecycleColor, lifecycleDot, lifecycleEdge, lifecycleLabel,
+  renderLifecycleActions, runLifecycle, serviceStore, summarize, toStatus, wireLifecycleActions,
+} from "../lifecycle";
+import type { LifecycleState, ServiceSnapshot } from "../lifecycle";
 import { esc } from "../html";
 import { fmtCount, fmtGb, fmtPct, gaugeRing, meter, sparkline, stackedBar, trim1 } from "../charts";
 import { icon } from "../icons";
-import type { BackendInfo, DashboardModel, GpuInfo, PlacementSegment } from "../types";
+import type { BackendInfo, DashboardModel, GpuInfo, PlacementSegment, Status } from "../types";
 
 type ViewMode = "appliance" | "console" | "topology";
 
@@ -21,15 +30,24 @@ const VIEW_KEY = "llm.view.dashboard";
 let mode: ViewMode = (localStorage.getItem(VIEW_KEY) as ViewMode) || "appliance";
 if (mode !== "appliance" && mode !== "console" && mode !== "topology") mode = "appliance";
 
-let timer: number | null = null;
 let paused = false;
 let lastOk = 0;
 let lastModel: DashboardModel | null = null;
 let lastLive = false;
 let lastError: string | null = null;
-/** Set when a restart_backend call fails; shown in the header notice area
- *  and cleared by the next successful poll. */
+/** Set when a card's lifecycle action fails; shown in the header
+ *  notice area and cleared by the next successful poll. */
 let restartError: string | null = null;
+/** Store subscription and the delegated lifecycle-button handler of
+ *  the current mount. */
+let unsubscribeStore: (() => void) | null = null;
+let unwireActions: (() => void) | null = null;
+/** Date.now() when the last full getDashboard() fetch started, and
+ *  whether one is in flight (store refreshes in between only repaint
+ *  the lifecycle overlay). */
+let lastFetchAt = 0;
+let fetching = false;
+const FULL_FETCH_MS = 4500;
 /** Start All in flight: the bar stays rendered with a busy button so
  *  the action's state is visible while starts complete one by one. */
 let startAllBusy = false;
@@ -55,16 +73,54 @@ function setMode(m: ViewMode): void {
   try { localStorage.setItem(VIEW_KEY, m); } catch { /* storage unavailable */ }
 }
 
-function statusDot(s: string): string {
-  const cls = s === "ok" ? "ok" : s === "degraded" || s === "starting" ? "warn" : s === "down" ? "err" : "idle";
+/** GPU health dot (telemetry health, NOT lifecycle: a GPU is ok,
+ *  degraded, or down). Services render through lifecycleDot. */
+function gpuDot(s: Status): string {
+  const cls = s === "ok" ? "ok" : s === "down" ? "err" : s === "idle" ? "idle" : "warn";
   return `<span class="dot ${cls}"></span>`;
 }
 
-/** The one status->color map for the whole dashboard (dots, rings,
- *  topology nodes): ok green, degraded/starting amber, down red,
- *  anything else gray. */
-function statusColor(s: string): string {
-  return s === "ok" ? C.green : s === "degraded" || s === "starting" ? C.amber : s === "down" ? C.red : "#6d7686";
+/** GPU health color for the topology nodes (same palette). */
+function gpuColor2(s: Status): string {
+  return s === "ok" ? LIFECYCLE_COLORS.green : s === "down" ? LIFECYCLE_COLORS.red : s === "idle" ? LIFECYCLE_COLORS.grey : LIFECYCLE_COLORS.amber;
+}
+
+/** A Status that means a live (or coming-up) process: placements and
+ *  topology edges are drawn only for these. */
+function statusLive(s: Status | undefined): boolean {
+  return s === "ok" || s === "starting" || s === "restarting" || s === "degraded";
+}
+
+/** The model with the shared store's effective lifecycle state applied
+ *  to every service card, placement row and the gateway: the store
+ *  refreshes faster than the full dashboard fetch and carries the
+ *  local pending overlay, so a click (or a restart elsewhere) shows
+ *  the transition at once. */
+function overlayModel(m: DashboardModel, snap: ServiceSnapshot): DashboardModel {
+  if (!snap.live || snap.updatedAt === 0) return m;
+  const rows = new Map(snap.backends.map((r) => [r.id, r]));
+  const backends = m.backends.map((b) => {
+    const r = rows.get(b.id);
+    const key = `backend:${b.id}`;
+    const st = r ? serviceStore.backendState(r) : serviceStore.effective(key, b.lifecycle);
+    return {
+      ...b,
+      lifecycle: st,
+      status: toStatus(st),
+      transition: serviceStore.transitionOf(key, r ? r.transition ?? null : b.transition ?? null),
+      enabled: r ? r.enabled : b.enabled,
+      configured: r ? r.configured : b.configured,
+    };
+  });
+  const gs = serviceStore.gatewayState();
+  const gateway = m.gateway && gs
+    ? { ...m.gateway, lifecycle: gs, status: toStatus(gs), transition: serviceStore.transitionOf("gateway", snap.gateway?.transition ?? null) }
+    : m.gateway;
+  const placement = m.placement.map((p) => {
+    const b = p.backendId ? backends.find((x) => x.id === p.backendId) : undefined;
+    return b ? { ...p, backendStatus: b.status } : p;
+  });
+  return { ...m, backends, gateway, placement, gatewayState: gs ?? m.gatewayState, gatewayUp: gs ? META[gs].isLive : m.gatewayUp };
 }
 
 /** GPU strip cards whose Trends expandable is open, by GPU id —
@@ -87,7 +143,7 @@ function backendSparkColor(id: string): string {
 }
 
 function serviceCard(b: BackendInfo, isGateway: boolean): string {
-  const ringColor = statusColor(b.status);
+  const ringColor = lifecycleColor(b.lifecycle);
   // requests_1h / errors_1h come from LiteLLM's Prometheus
   // counters via the app's metrics poller (live since v0.1.18);
   // throughput_toks is the poller's LIVE rate over the recent
@@ -133,18 +189,22 @@ function serviceCard(b: BackendInfo, isGateway: boolean): string {
       ${sparkline(b.spark, 220, 34, isGateway ? C.blue : backendSparkColor(b.id))}
     </div>`
     : "";
-  // The gateway card is the probe summary, not a supervised backend:
-  // Restart would target a backend id that does not exist. Its action
-  // is the Gateway view, where the start/restart control lives.
+  // Start / Stop / Restart come from the shared lifecycle rule, for
+  // the gateway card too (GW-11): a stopped backend offers Start (not
+  // an unconditional Restart, UI-6), a transitioning one has its
+  // buttons disabled with the reason. The gateway card keeps its link
+  // to the Gateway view for everything else.
+  const lc = isGateway
+    ? renderLifecycleActions({ kind: "gateway" }, b.lifecycle)
+    : renderLifecycleActions({ kind: "backend", id: b.id }, b.lifecycle, { enabled: b.enabled, configured: b.configured });
   const actions = isGateway
-    ? `<div class="card-actions"><a class="btn" href="#/gateway">${icon("gateway")} Open Gateway view</a>
+    ? `<div class="card-actions">${lc}<a class="btn icon-only" href="#/gateway" title="Open Gateway view" aria-label="Open Gateway view">${icon("gateway")}</a>
       <a class="btn icon-only" href="#/logs?scope=gateway&follow=1" title="Logs" aria-label="Gateway logs">${icon("logs")}</a></div>`
-    : `<div class="card-actions">
-      <button class="btn" data-act="restart" data-id="${esc(b.id)}">${icon("restart")} Restart</button>
+    : `<div class="card-actions">${lc}
       <button class="btn icon-only" data-act="logs" data-id="${esc(b.id)}" title="Logs" aria-label="Logs for ${esc(b.id)}">${icon("logs")}</button>
     </div>`;
   return `<div class="card">
-    <h3>${statusDot(b.status)} ${esc(b.name)} <span class="port">:${b.port}</span></h3>
+    <h3>${lifecycleDot(b.lifecycle)} ${esc(b.name)} <span class="port">:${b.port}</span> ${lifecycleChip(b.lifecycle, { transition: b.transition ?? null })}</h3>
     <div class="svc-top">
       ${ring}
       <div class="kv">
@@ -224,7 +284,7 @@ function gpuStripCard(g: GpuInfo): string {
       ${trendsOpen ? `<div class="gpu-metrics" style="margin-top:6px">${trendRows.join("")}</div>` : ""}</div>`
     : "";
   return `<div class="card">
-    <div class="gpu-head">${statusDot(g.status)} ${icon("gpu")} ${esc(g.name)}</div>
+    <div class="gpu-head">${gpuDot(g.status)} ${icon("gpu")} ${esc(g.name)}</div>
     <div class="gpu-metrics">
       ${vramHtml}
       <div class="mrow"><span class="mlabel">Utilization</span><span class="mval">${trim1(g.util_pct)}%</span></div>
@@ -272,7 +332,7 @@ function applianceView(m: DashboardModel, live: boolean): string {
   const EVENTUAL_TIP = "Placement takes effect when the backend is enabled and started.";
   const placeHtml = m.placement.map((p) => {
     const disabled = p.backendEnabled === false;
-    const stopped = !disabled && p.backendStatus !== undefined && p.backendStatus !== "ok" && p.backendStatus !== "starting";
+    const stopped = !disabled && p.backendStatus !== undefined && !statusLive(p.backendStatus);
     const eventual = disabled || stopped;
     const label = p.backendId ?? p.model;
     const tag = disabled
@@ -296,7 +356,7 @@ function applianceView(m: DashboardModel, live: boolean): string {
   const legendByLabel = new Map<string, string>();
   for (const p of m.placement) {
     if (p.backendEnabled === false || p.defaulted) continue;
-    if (p.backendStatus !== undefined && p.backendStatus !== "ok" && p.backendStatus !== "starting") continue;
+    if (p.backendStatus !== undefined && !statusLive(p.backendStatus)) continue;
     p.segments.forEach((s, k) => {
       if (!legendByLabel.has(s.gpu)) legendByLabel.set(s.gpu, gpuColor(segmentGpuPos(s, k, m.gpus)));
     });
@@ -317,7 +377,7 @@ function applianceView(m: DashboardModel, live: boolean): string {
   // whenever the status probe answered (m.gateway non-null covers
   // down too), and a down gateway has no statistics to wait for —
   // its card already says so.
-  const noWindow = live && m.gateway !== null && m.gatewayUp && svcs.every((b) => b.requests_1h === undefined)
+  const noWindow = live && m.gateway !== null && m.gatewayState === "running" && svcs.every((b) => b.requests_1h === undefined)
     ? `<div class="card" style="margin-bottom:12px;font-size:12px;color:var(--text2)">${icon("warn")} Gateway statistics are not available yet. They appear after the gateway has been running about 30 s with the app polling it (the generated config enables its metrics at gateway start).</div>`
     : "";
   return `${empty}
@@ -339,13 +399,13 @@ function consoleView(m: DashboardModel): string {
       ? `${trim1(b.throughput_toks)} tok/s`
       : b.requests_1h !== undefined ? `${fmtCount(b.requests_1h)} req/h` : "—";
     return `<tr>
-    <td>${statusDot(b.status)} ${esc(b.name)}</td><td>:${b.port}</td><td>${b.model ? esc(b.model) : "—"}</td>
+    <td>${lifecycleDot(b.lifecycle)} ${esc(b.name)} ${lifecycleChip(b.lifecycle, { transition: b.transition ?? null })}</td><td>:${b.port}</td><td>${b.model ? esc(b.model) : "—"}</td>
     <td>${b.health == null ? "—" : trim1(b.health)}</td><td>${rate}</td>
     <td>${b.spark && b.spark.length ? sparkline(b.spark, 120, 20, C.blue) : "—"}</td></tr>`;
   }).join("");
   const gpuRows = m.gpus.map((g) => {
     const vramPct = Math.round((g.vram_used_gb / g.vram_total_gb) * 100);
-    return `<tr><td>${statusDot(g.status)} ${esc(g.name)}</td><td>${trim1(g.util_pct)}%</td>
+    return `<tr><td>${gpuDot(g.status)} ${esc(g.name)}</td><td>${trim1(g.util_pct)}%</td>
       <td>${meter(g.util_pct, 120, 8, C.blue)}</td>
       <td>${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GB</td>
       <td>${meter(vramPct, 120, 8, C.purple)}</td>
@@ -374,14 +434,14 @@ function topologyView(m: DashboardModel): string {
   const gpus = m.gpus;
   const models = m.placement;
 
-  /** Edge class follows the backend's state: hot only while running. */
-  const edgeCls = (s: string): string => (s === "ok" ? "hot" : s === "starting" || s === "degraded" ? "warn" : "");
-  /** A backend is linked in the topology only while it is actually
-   *  running (code-review 5.3): an edge asserts a live connection,
-   *  and a stopped or disabled backend has none. Its NODE still
-   *  draws — the map shows what is configured — but unconnected. */
-  const running = (s: string | undefined): boolean =>
-    s === "ok" || s === "starting" || s === "degraded";
+  /** Edge class follows the backend's lifecycle state (the shared
+   *  lifecycleEdge rule, as on the Service Map). */
+  const edgeCls = (s: LifecycleState): string => lifecycleEdge(s).cls;
+  /** A backend is linked in the topology only while it is live
+   *  (code-review 5.3): an edge asserts a live connection, and a
+   *  stopped or disabled backend has none. Its NODE still draws —
+   *  the map shows what is configured — but unconnected. */
+  const running = (s: Status | undefined): boolean => statusLive(s);
 
   const cy = (i: number, n: number) => 60 + (i * (H - 120)) / Math.max(1, n - 1 || 1);
   let svg = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="display:block;width:100%" role="img" aria-label="Cluster topology mini map">`;
@@ -398,17 +458,22 @@ function topologyView(m: DashboardModel): string {
   };
 
   node(colX[0], H / 2, "LiteLLM",
-    m.gateway ? `:${m.gateway.port}${m.gatewayStrategy ? ` \u00b7 ${m.gatewayStrategy}` : ""}` : "not reported",
-    m.gateway ? statusColor(m.gateway.status) : "#6d7686");
+    m.gateway
+      ? `:${m.gateway.port}${m.gateway.lifecycle !== "running" ? ` \u00b7 ${lifecycleLabel(m.gateway.lifecycle)}` : m.gatewayStrategy ? ` \u00b7 ${m.gatewayStrategy}` : ""}`
+      : "not reported",
+    m.gateway ? lifecycleColor(m.gateway.lifecycle) : LIFECYCLE_COLORS.grey);
   backs.forEach((b, i) => {
     const y = cy(i, backs.length);
-    node(colX[1], y, b.name, `:${b.port}${b.throughput_toks !== undefined ? ` \u00b7 ${trim1(b.throughput_toks)} tok/s` : ""}`, statusColor(b.status));
+    const sub = b.lifecycle !== "running"
+      ? ` \u00b7 ${lifecycleLabel(b.lifecycle)}`
+      : b.throughput_toks !== undefined ? ` \u00b7 ${trim1(b.throughput_toks)} tok/s` : "";
+    node(colX[1], y, b.name, `:${b.port}${sub}`, lifecycleColor(b.lifecycle));
     if (running(b.status)) {
-      edge(colX[0] + nodeW, H / 2, colX[1], y, "", edgeCls(b.status));
+      edge(colX[0] + nodeW, H / 2, colX[1], y, "", edgeCls(b.lifecycle));
     }
   });
   gpus.forEach((g, i) => {
-    node(colX[2], cy(i, gpus.length), g.name, `${trim1(g.util_pct)}% util`, statusColor(g.status));
+    node(colX[2], cy(i, gpus.length), g.name, `${trim1(g.util_pct)}% util`, gpuColor2(g.status));
   });
   // Backend -> GPU connectivity comes from the configured tensor
   // splits (the placement rows' segments), exactly like the full
@@ -416,7 +481,7 @@ function topologyView(m: DashboardModel): string {
   // configuration does not have. A segment that cannot be matched to
   // a drawn GPU node draws no edge.
   const backendIdxById = new Map(backs.map((b, i) => [b.id, i] as const));
-  const rowStatus = (p: (typeof models)[number]): string | undefined =>
+  const rowStatus = (p: (typeof models)[number]): Status | undefined =>
     p.backendStatus ?? (p.backendId ? backs.find((b) => b.id === p.backendId)?.status : undefined);
   const segGpuIdx = (seg: PlacementSegment): number => {
     if (seg.gpuIndex !== undefined && gpus[seg.gpuIndex]) return seg.gpuIndex;
@@ -439,7 +504,7 @@ function topologyView(m: DashboardModel): string {
     p.segments.forEach((seg) => {
       const gj = segGpuIdx(seg);
       if (gj < 0) return;
-      edge(colX[1] + nodeW, cy(bi, backs.length), colX[2], cy(gj, gpus.length), "", edgeCls(backs[bi].status));
+      edge(colX[1] + nodeW, cy(bi, backs.length), colX[2], cy(gj, gpus.length), "", edgeCls(backs[bi].lifecycle));
     });
   }
   // Model nodes key to their owning backend's measured state: the dot
@@ -448,9 +513,9 @@ function topologyView(m: DashboardModel): string {
   const linkedModels = models.filter(linked);
   linkedModels.slice(0, 4).forEach((p, i) => {
     const y = cy(i, Math.min(4, linkedModels.length));
-    const st = rowStatus(p);
+    const owner = p.backendId ? backs.find((b) => b.id === p.backendId) : undefined;
     const sub = p.segments.length ? p.segments.map((s) => `${s.pct}%`).join(" \u00b7 ") : "\u2014";
-    node(colX[3], y, p.model, sub, st ? statusColor(st) : "#6d7686");
+    node(colX[3], y, p.model, sub, owner ? lifecycleColor(owner.lifecycle) : LIFECYCLE_COLORS.grey);
     p.segments.forEach((seg) => {
       const gj = segGpuIdx(seg);
       if (gj < 0) return;
@@ -463,22 +528,32 @@ function topologyView(m: DashboardModel): string {
     <text class="map-col-label" x="${colX[3]}" y="24">MODELS</text></svg>`;
   return `<div class="card"><div class="sec-title">${icon("map")} Topology — same data, node view</div>
     <div class="map-canvas" style="border:0;padding:0">${svg}</div>
-    <div class="legend"><span><span class="sw" style="background:${C.green}"></span>healthy</span>
-    <span><span class="sw" style="background:${C.amber}"></span>degraded / starting</span>
-    <span><span class="sw" style="background:${C.red}"></span>down / failed</span>
+    <div class="legend">${lifecycleLegend()}
     <a href="#/map" style="color:var(--accent)">Open full service map \u2192</a></div></div>`;
 }
 
-/** What Start All would start right now: enabled backends that are
- *  stopped or failed (never disabled ones, never ones already
- *  starting), and the gateway when its probe reported it down. A
- *  gateway probe failure yields no card — the state is unknown, so
- *  the gateway is not a target. */
+/** The service-state legend, generated from the shared META (one
+ *  swatch per color class, labeled with the states it covers). */
+function lifecycleLegend(): string {
+  const groups: { color: string; states: LifecycleState[] }[] = [];
+  for (const s of ["running", "starting", "restarting", "stopping", "degraded", "failed", "stopped"] as LifecycleState[]) {
+    const color = META[s].color;
+    const g = groups.find((x) => x.color === color);
+    if (g) g.states.push(s); else groups.push({ color, states: [s] });
+  }
+  return groups.map((g) => `<span><span class="sw" style="background:${g.color}"></span>${esc(g.states.map((s) => META[s].label).join(" / "))}</span>`).join("");
+}
+
+/** What Start All would start right now: enabled, configured backends
+ *  that are stopped or failed (never disabled ones, never ones in
+ *  transition), and the gateway when it is stopped or failed — never
+ *  while it is restarting/starting (UI-2). An unmeasured gateway
+ *  (status call failed) is not a target: its state is unknown. */
 function startAllTargets(m: DashboardModel): { backends: BackendInfo[]; gatewayDown: boolean } {
   const backends = m.backends.filter(
-    (b) => b.enabled === true && (b.status === "down" || b.status === "idle"),
+    (b) => b.enabled === true && b.configured !== false && (b.lifecycle === "stopped" || b.lifecycle === "failed"),
   );
-  const gatewayDown = m.gateway !== null && m.gatewayUp === false;
+  const gatewayDown = m.gateway !== null && (m.gatewayState === "stopped" || m.gatewayState === "failed");
   return { backends, gatewayDown };
 }
 
@@ -489,17 +564,17 @@ function startAllBar(m: DashboardModel): string {
   if (!lastLive) return "";
   const { backends, gatewayDown } = startAllTargets(m);
   if (!startAllBusy && backends.length === 0 && !gatewayDown) return "";
-  const enabled = m.backends.filter((b) => b.enabled === true);
-  const running = enabled.filter((b) => b.status === "ok").length + (m.gatewayUp ? 1 : 0);
-  const total = enabled.length + (m.gateway ? 1 : 0);
+  // The shared count rule (enabled + configured backends) plus the gateway.
+  const sum = summarize({ backends: m.backends, gateway: m.gatewayState });
+  const running = sum.backendsRunning + (m.gatewayState === "running" ? 1 : 0);
+  const total = sum.backendsTotal + (m.gateway ? 1 : 0);
   return `<div style="padding:12px 20px 0"><div class="banner" style="display:flex;align-items:center;gap:10px"><span>Services running: ${running} of ${total}</span><span class="spacer"></span><button class="btn primary" id="startAllBtn" ${startAllBusy ? "disabled" : ""}>${icon("play")} ${startAllBusy ? "Starting…" : "Start All Services"}</button></div></div>`;
 }
 
 function headerHtml(live: boolean, stale: boolean, updatedAgo: string, verdict: SystemVerdict, startAll = ""): string {
-  const dotStatus = verdict.dot === "warn" ? "degraded" : verdict.dot === "err" ? "down" : verdict.dot;
   return `<div class="topbar">
     <h1>Dashboard</h1>
-    <span class="status-pill">${statusDot(dotStatus)} ${esc(verdict.text)}</span>
+    <span class="status-pill"><span class="dot ${verdict.dot}"></span> ${esc(verdict.text)}</span>
     <span class="viewsel-label">View:</span>
     <span class="viewsel" role="tablist">
       <button data-view="appliance" class="${mode === "appliance" ? "active" : ""}">Appliance</button>
@@ -535,22 +610,22 @@ function render(): void {
   if (!lastModel) {
     // No data yet — either still loading or the first poll failed.
     el.innerHTML = lastError
-      ? headerHtml(lastLive, true, "never", systemVerdict({ total: 0, running: 0, stale: true, error: lastError, gatewayUp: false })) + `<div class="view"><div class="card"><div class="empty">Backend error: ${esc(lastError)} — retrying…</div></div></div>`
+      ? headerHtml(lastLive, true, "never", systemVerdict({ summary: summarize({ backends: [], gateway: null }), stale: true, error: lastError })) + `<div class="view"><div class="card"><div class="empty">Backend error: ${esc(lastError)} — retrying…</div></div></div>`
       : "";
     return;
   }
-  const m = lastModel;
+  const m = overlayModel(lastModel, serviceStore.get());
   // Staleness is a function of the last successful poll's age, so it
   // applies while polling is paused too — not only on a failed poll.
   const staleNow = m.stale || (lastOk > 0 && Date.now() - lastOk > 10_000);
   staleShown = staleNow;
-  const running = m.backends.filter((b) => b.status === "ok").length;
+  // The shared count rule (enabled + configured backends) and the
+  // gateway lifecycle state: a restart reads as a transition, never
+  // as "Gateway down".
   const verdict = systemVerdict({
-    total: m.backends.length,
-    running,
+    summary: summarize({ backends: m.backends, gateway: m.gatewayState }),
     stale: staleNow,
     error: lastError,
-    gatewayUp: m.gatewayUp,
   });
   const body = mode === "appliance" ? applianceView(m, lastLive) : mode === "console" ? consoleView(m) : topologyView(m);
   el.innerHTML = headerHtml(lastLive, staleNow, ago(m.updatedAt), verdict, startAllBar(m)) + `<div class="view">${body}</div>`;
@@ -571,67 +646,65 @@ function render(): void {
       const act = (b as HTMLElement).dataset.act;
       const id = (b as HTMLElement).dataset.id;
       if (act === "logs" && id) location.hash = `#/logs?scope=${encodeURIComponent(id)}&follow=1`;
-      else if (act === "restart" && id) {
-        (b as HTMLButtonElement).disabled = true; // guard against double-submit; render() rebuilds the DOM
-        void (async () => {
-          const r = await restartBackend(id);
-          if (r.error) {
-            restartError = `Restart of ${id} failed: ${r.error}`;
-            render();
-          } else {
-            await doPoll(); // immediate refresh so the new state shows
-          }
-        })();
-      }
     }));
 }
 
 /** Start everything that should be running and is not, through the
- *  same entry points the rest of the app uses: start_backend per
- *  backend (which routes to the SCM in service mode) and the
- *  start-gateway wizard step for the gateway. Sequential, so one
- *  failure does not block the rest; failures are collected and
- *  reported together at the end. */
+ *  shared lifecycle runner (the same entry points every surface uses:
+ *  start_backend per backend — routed to the SCM in service mode —
+ *  and the start-gateway step for the gateway, after the MCP
+ *  credential prompt). Each start shows as "starting…" on every
+ *  surface at once. Sequential, so one failure does not block the
+ *  rest; failures are collected and reported together at the end.
+ *  The server clears the activation plan itself after a gateway
+ *  start — no client-side activationComplete. */
 async function startAllServices(): Promise<void> {
   if (startAllBusy || !lastModel) return;
   startAllBusy = true;
   render();
   const errors: string[] = [];
-  const { backends, gatewayDown } = startAllTargets(lastModel);
+  const { backends, gatewayDown } = startAllTargets(overlayModel(lastModel, serviceStore.get()));
   for (const b of backends) {
     if (disposed) break;
-    const r = await startBackend(b.id);
-    if (r.error) errors.push(`${b.id}: ${r.error}`);
+    const r = await runLifecycle({ kind: "backend", id: b.id }, "start", { origin: "dashboard" });
+    if (!r.ok) errors.push(r.message);
   }
   if (gatewayDown && !disposed) {
-    // MCP credential prompt (Pete, 2026-10-18): same pre-start
-    // step as the Gateway view's Start button. Cancelling skips
-    // only the gateway leg; the backends above already started.
-    const proceed = await promptForUnarmedMcpCredentials();
-    if (!proceed) {
-      errors.push("gateway: start cancelled at the MCP credential prompt");
-    } else if (!disposed) {
-      const r = await runWizardStep("start-gateway");
-      if (r.error) {
-        errors.push(`gateway: ${r.error}`);
-      } else if (r.data.busy) {
-        errors.push("gateway: a setup step is already running");
-      } else if (r.data.outcome && r.data.outcome.state !== "done") {
-        errors.push(`gateway: ${r.data.outcome.message}`);
-      }
-    }
+    // MCP credential prompt (Pete, 2026-10-18): same pre-start step
+    // as the Gateway view's Start button. Cancelling skips only the
+    // gateway leg; the backends above already started.
+    const r = await runLifecycle({ kind: "gateway" }, "start", { origin: "dashboard", promptMcp: true });
+    if (r.cancelled) errors.push("gateway: start cancelled at the MCP credential prompt");
+    else if (!r.ok) errors.push(r.message);
   }
   startAllBusy = false;
   if (disposed) return;
-  await doPoll(); // refresh first; a successful poll clears prior notices
+  await doPoll(serviceStore.get()); // refresh first; a successful poll clears prior notices
   if (errors.length) {
     startAllError = `Start All failed — ${errors.join("; ")}`;
     render();
   }
 }
 
-async function doPoll(): Promise<void> {
-  const r = await getDashboard(); // never rejects; failures arrive as r.error
+/** The full dashboard fetch (telemetry, metrics, config), fed the
+ *  shared store's backend and gateway rows so list_backends and
+ *  gateway_status are not polled twice. */
+async function doPoll(snap?: ServiceSnapshot): Promise<void> {
+  if (fetching) return;
+  fetching = true;
+  lastFetchAt = Date.now();
+  const prefetched = snap && snap.live && snap.updatedAt > 0
+    ? {
+      backends: { data: snap.backends, live: true, ...(snap.backendsError ? { error: snap.backendsError } : {}) },
+      ...(snap.gateway ? { gateway: { data: snap.gateway, live: true } } : {}),
+    }
+    : undefined;
+  let r: Awaited<ReturnType<typeof getDashboard>>;
+  try {
+    r = await getDashboard(prefetched); // never rejects; failures arrive as r.error
+  } finally {
+    fetching = false;
+  }
   if (disposed) return; // navigated away while the poll was in flight
   if (r.error) {
     lastError = r.error;
@@ -652,20 +725,58 @@ async function doPoll(): Promise<void> {
   render();
 }
 
-async function poll(): Promise<void> {
-  if (paused) return;
-  await doPoll();
+/** The lifecycle signature of a store snapshot: everything the overlay
+ *  paints (each backend's effective state, transition, enabled and
+ *  configured; the gateway's; the activation apply message). */
+let lastLcSig = "";
+function lcSignature(snap: ServiceSnapshot): string {
+  const backends = snap.backends.map((r) => {
+    const tr = serviceStore.transitionOf(`backend:${r.id}`, r.transition ?? null);
+    return `${r.id}:${serviceStore.backendState(r)}:${tr?.kind ?? ""}:${tr?.origin ?? ""}:${r.enabled}:${r.configured}`;
+  }).join("|");
+  const gtr = serviceStore.transitionOf("gateway", snap.gateway?.transition ?? null);
+  return `${backends}#${serviceStore.gatewayState() ?? ""}:${gtr?.kind ?? ""}:${gtr?.origin ?? ""}#${snap.gateway?.activation_applying?.message ?? ""}`;
+}
+
+/** One store refresh: repaint the lifecycle overlay when something it
+ *  shows changed (an identical repaint would replace the buttons under
+ *  the pointer and lose the click), and run the full dashboard fetch
+ *  when the last one is older than FULL_FETCH_MS. Paused: nothing
+ *  repaints. */
+function onStoreSnapshot(snap: ServiceSnapshot): void {
+  if (disposed || paused) return;
+  const sig = lcSignature(snap);
+  if (!lastModel || Date.now() - lastFetchAt >= FULL_FETCH_MS) {
+    lastLcSig = sig;
+    void doPoll(snap);
+    return;
+  }
+  if (sig === lastLcSig) return;
+  lastLcSig = sig;
+  render();
 }
 
 export async function mountDashboard(): Promise<() => void> {
   disposed = false;
   staleShown = false;
   // A pause from a previous mount must not leak into this one: the
-  // view would sit blank (poll() no-ops while paused) with no Pause
+  // view would sit blank (repaints no-op while paused) with no Pause
   // button painted to unstick it.
   paused = false;
-  await poll();
-  timer = window.setInterval(poll, 5000);
+  lastFetchAt = 0;
+  lastLcSig = "";
+  await doPoll(serviceStore.get().updatedAt > 0 ? serviceStore.get() : undefined);
+  const view = document.getElementById("view");
+  // The card Start/Stop/Restart buttons (gateway and backends) run
+  // through the shared lifecycle runner; failures land in the notice
+  // area, and the store refresh repaints the cards.
+  unwireActions = view
+    ? wireLifecycleActions(view, (r) => {
+      if (disposed) return;
+      if (!r.ok && !r.cancelled) { restartError = r.message; render(); }
+    }, { origin: "dashboard" })
+    : null;
+  unsubscribeStore = serviceStore.subscribe(onStoreSnapshot);
   // "Xs ago" ticker: update the timestamp node in place instead of a full re-render.
   tickTimer = window.setInterval(() => {
     if (disposed) return;
@@ -681,8 +792,10 @@ export async function mountDashboard(): Promise<() => void> {
   }, 1000);
   return () => {
     disposed = true;
-    if (timer) clearInterval(timer);
+    unsubscribeStore?.();
+    unwireActions?.();
+    unsubscribeStore = unwireActions = null;
     if (tickTimer) clearInterval(tickTimer);
-    timer = tickTimer = null;
+    tickTimer = null;
   };
 }

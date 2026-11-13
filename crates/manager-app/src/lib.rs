@@ -49,12 +49,18 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
 pub mod activation;
+pub mod activation_apply;
+pub mod backend_lifecycle;
 pub mod activation_history;
 pub mod app_update;
 pub mod gateway_stats;
+#[cfg(test)]
+mod gateway_ops_tests;
 pub mod gpu_history;
 pub mod hf_forms;
 pub mod bench;
+pub mod lifecycle;
+pub mod lifecycle_monitor;
 pub mod log_receiver;
 pub mod logship;
 pub mod notify;
@@ -70,6 +76,7 @@ pub use optimize::{
     op_optimize_save_purpose, op_optimize_set_item_outcome, op_optimize_set_item_state,
     op_optimize_validate_plan,
 };
+pub use activation_apply::op_activation_apply;
 pub use gpu_history::op_get_gpu_history;
 pub use hf_forms::{op_model_hf_header, op_model_hf_lookup};
 pub use app_update::{
@@ -82,7 +89,7 @@ pub use optimize_experiments::{
 };
 pub use log_receiver::{
     op_log_receiver_deploy, op_log_receiver_flip_endpoint, op_log_receiver_remove,
-    op_log_receiver_status,
+    op_log_receiver_restart, op_log_receiver_start, op_log_receiver_status, op_log_receiver_stop,
 };
 pub use bench::{
     op_bench_prompt_delete, op_bench_prompt_generate, op_bench_prompt_generate_cancel,
@@ -97,14 +104,25 @@ pub mod registry;
 // ---------------------------------------------------------------------------
 
 /// Frontend event names. The primary streams are emitted below;
-/// BACKEND_STATUS is emitted by the backend start/stop/restart commands;
-/// the rest are reserved per spec §14 and go live with their producers.
+/// SERVICE_LIFECYCLE (and, for backends, BACKEND_STATUS) is emitted by
+/// the shared lifecycle helpers ([`lifecycle::emit`]); the rest are
+/// reserved per spec §14 and go live with their producers.
 pub mod events {
     pub const TELEMETRY_UPDATE: &str = "telemetry-update";
     pub const WIZARD_PROGRESS: &str = "wizard-progress";
     pub const DOWNLOAD_PROGRESS: &str = "download-progress";
-    // Emitted by the backend start/stop/restart commands.
+    // Backend start/stop/restart: `{id, event, state, origin, error?}`.
+    // Emitted beside SERVICE_LIFECYCLE for backend keys (compatibility
+    // and log shipping).
     pub const BACKEND_STATUS: &str = "backend-status";
+    /// Every lifecycle transition of every managed service (gateway,
+    /// postgres, log-receiver, backend:<id>): emitted when an operation
+    /// begins and ends and on every monitor-observed change. Payload
+    /// `{key, kind, id?, event, state, origin, detail?, at}`, where
+    /// `event` is requested | starting | stopping | restarting | ready |
+    /// started | stopped | restarted | failed | crashed | adopted and
+    /// `state` is the shared `LifecycleState` wire string.
+    pub const SERVICE_LIFECYCLE: &str = "service-lifecycle";
     // Reserved (spec §14): emitted by future producers. LOG_LINE is
     // declared (with its LogLinePayload shape) but nothing emits it yet;
     // log records reach the UI through the get_logs command instead.
@@ -210,6 +228,10 @@ pub enum ApiError {
     Unsupported(String),
     Io(String),
     Json(String),
+    /// Another lifecycle operation holds the service (e.g. "gateway
+    /// restart already in progress (started by activation 12 s ago)").
+    /// REST maps it to 409 / `BUSY`.
+    Busy(String),
 }
 
 impl fmt::Display for ApiError {
@@ -231,6 +253,7 @@ impl fmt::Display for ApiError {
             ApiError::Unsupported(e) => write!(f, "unsupported in this version: {e}"),
             ApiError::Io(e) => write!(f, "io error: {e}"),
             ApiError::Json(e) => write!(f, "json error: {e}"),
+            ApiError::Busy(e) => write!(f, "{e}"),
         }
     }
 }
@@ -544,6 +567,31 @@ pub struct AppState {
     /// after a start that activates a saved offload change). std
     /// Mutex: synchronous insert/read only.
     offload_probes: std::sync::Mutex<std::collections::HashMap<String, OffloadProbe>>,
+    /// Per-service lifecycle registry (see [`lifecycle`]): in-flight
+    /// transitions, operator intent, failures and readiness for the
+    /// gateway, PostgreSQL, the log receiver and every backend.
+    lifecycle: Arc<lifecycle::LifecycleRegistry>,
+    /// The cached SCM snapshot ([`lifecycle::scm_snapshot`]): when it
+    /// was taken and the status of every managed service. std Mutex:
+    /// synchronous read/replace only.
+    #[allow(clippy::type_complexity)]
+    scm_cache: std::sync::Mutex<
+        Option<(
+            std::time::Instant,
+            Arc<HashMap<String, manager_services::ServiceStatus>>,
+        )>,
+    >,
+    /// Serializes activation plan applies ([`activation_apply`]): taken
+    /// with `try_lock`, so a second apply from any surface is refused
+    /// instead of interleaving restarts (ACT-9).
+    activation_apply_lock: Mutex<()>,
+    /// What the running apply is doing (`activation_applying` on the
+    /// gateway status and plan payloads); `None` when idle. std Mutex:
+    /// synchronous read/replace only.
+    activation_progress: std::sync::Mutex<Option<activation_apply::ApplyProgress>>,
+    /// The lifecycle monitor's counters between ticks (see
+    /// [`lifecycle_monitor`]). std Mutex: synchronous updates only.
+    lifecycle_monitor: std::sync::Mutex<lifecycle_monitor::MonitorState>,
 }
 
 /// One running Estimate/Measure job's descriptor (tracker #69),
@@ -706,7 +754,17 @@ impl AppState {
             notify_watch: std::sync::Mutex::new(notify::NotifyWatch::default()),
             app_update_guard: Mutex::new(()),
             offload_probes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            lifecycle: Arc::new(lifecycle::LifecycleRegistry::new()),
+            scm_cache: std::sync::Mutex::new(None),
+            lifecycle_monitor: std::sync::Mutex::new(lifecycle_monitor::MonitorState::default()),
+            activation_apply_lock: Mutex::new(()),
+            activation_progress: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The per-service lifecycle registry.
+    pub fn lifecycle(&self) -> &Arc<lifecycle::LifecycleRegistry> {
+        &self.lifecycle
     }
 
     /// Record the startup config-load outcome (finding F2) for
@@ -1042,11 +1100,16 @@ impl AppState {
     /// the global mode is Service AND the service is registered.
     /// Registration is the per-service opt-in, so an unregistered
     /// backend in service mode keeps process supervision (mixed mode;
-    /// see docs/windows-services-design.md). SCM queries are
-    /// blocking; they run on the blocking pool.
+    /// see docs/windows-services-design.md). Reads the shared SCM
+    /// snapshot (at most 1 s old); a name outside it (an unconfigured
+    /// backend) is queried directly on the blocking pool.
     async fn service_route_active(&self, service_name: &str) -> bool {
         if self.supervision_mode().await != manager_config::SupervisionMode::Service {
             return false;
+        }
+        let snap = lifecycle::scm_snapshot(self, Duration::from_secs(1)).await;
+        if let Some(status) = snap.get(service_name) {
+            return !matches!(status.state, manager_services::ServiceState::NotInstalled);
         }
         let name = service_name.to_string();
         tokio::task::spawn_blocking(move || {
@@ -2166,43 +2229,108 @@ async fn ensure_backend_specs(state: &AppState) {
 /// process health) reads empty. Adoption is conservative: the port
 /// owner must be a live `llama-server` image, and a backend that is
 /// already supervised is never touched.
-async fn adopt_orphan_backends(state: &AppState) {
+///
+/// Never adopted (SCM-3): a backend whose Windows service owns it (the
+/// service is registered and live, or registered in service mode — its
+/// llama-server is the service host's child, and adopting it would turn
+/// an SCM stop into a phantom crash), and a backend with a lifecycle
+/// operation in flight (its old process may still be draining on the
+/// port). Each adoption writes the backend's "adopted" marker and
+/// records intent Running and readiness (an adopted process is already
+/// serving). Returns the adoptions as `(id, pid, port)` so callers that
+/// hold an event sink can emit them ([`emit_adopted`]). Reaping exits
+/// is the monitor's job, not this function's.
+async fn adopt_orphan_backends(state: &AppState) -> Vec<(String, u32, u16)> {
     ensure_backend_specs(state).await;
-    let ports: Vec<(String, u16)> = {
+    let (ports, service_mode): (Vec<(String, u16)>, bool) = {
         let cfg = state.config.read().await;
-        cfg.backends
-            .iter()
-            .map(|b| (b.id.clone(), b.port))
+        (
+            cfg.backends
+                .iter()
+                .map(|b| (b.id.clone(), b.port))
+                .collect(),
+            cfg.supervision.mode == manager_config::SupervisionMode::Service,
+        )
+    };
+    let live: std::collections::HashSet<String> = {
+        let sup = state.supervisor().await.lock().await;
+        sup.status()
+            .into_iter()
+            .filter(|s| s.pid.is_some())
+            .map(|s| s.id)
             .collect()
     };
-    let mut sup = state.supervisor().await.lock().await;
-    sup.reap_exited();
-    let live: std::collections::HashSet<String> = sup
-        .status()
-        .into_iter()
-        .filter(|s| s.pid.is_some())
-        .map(|s| s.id)
-        .collect();
+    let scm = lifecycle::scm_snapshot(state, Duration::from_secs(5)).await;
+    let mut candidates: Vec<(String, u32, u16)> = Vec::new();
     for (id, port) in ports {
         if live.contains(&id) {
             continue;
         }
+        let key = lifecycle::backend_key(&id);
+        if state.lifecycle.transition(&key).is_some() {
+            continue;
+        }
+        if let Some(s) = scm.get(&manager_services::backend_service_name(&id)) {
+            if lifecycle::registered(s) && (service_mode || lifecycle::scm_live(s)) {
+                continue;
+            }
+        }
         if let Some(pid) = manager_supervisor::port_owner_pid(port) {
             if manager_supervisor::process_image_is(pid, "llama-server.exe") {
-                let _ = sup.adopt(&id, pid);
+                candidates.push((id, pid, port));
             }
         }
     }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let mut adopted = Vec::new();
+    {
+        let mut sup = state.supervisor().await.lock().await;
+        for (id, pid, port) in candidates {
+            if sup.adopt(&id, pid).is_ok() {
+                adopted.push((id, pid, port));
+            }
+        }
+    }
+    for (id, pid, port) in &adopted {
+        let key = lifecycle::backend_key(id);
+        state.lifecycle.set_intent(&key, lifecycle::Intent::Running);
+        state.lifecycle.set_ready(&key, *pid);
+        lifecycle::mark(
+            &state.data_dir,
+            &key,
+            "adopted",
+            Some(&format!(
+                "pid {pid} on port {port} (started by a previous session)"
+            )),
+            Some(lifecycle::Origin::Startup),
+        );
+    }
+    adopted
 }
 
-fn process_state_str(s: ProcessState) -> &'static str {
-    match s {
-        ProcessState::Stopped => "stopped",
-        ProcessState::Starting => "starting",
-        ProcessState::Running => "running",
-        ProcessState::Stopping => "stopping",
-        ProcessState::Failed => "failed",
+/// Emit the `adopted` lifecycle event for each adoption
+/// [`adopt_orphan_backends`] made.
+fn emit_adopted(sink: &dyn EventSink, adopted: &[(String, u32, u16)]) {
+    for (id, pid, port) in adopted {
+        lifecycle::emit(
+            sink,
+            &lifecycle::backend_key(id),
+            "adopted",
+            lifecycle::LifecycleState::Running,
+            Some(lifecycle::Origin::Startup),
+            Some(&format!("pid {pid} on port {port}")),
+        );
     }
+}
+
+/// Wire string of a supervisor state: the shared lifecycle vocabulary's
+/// spelling (`LifecycleState::as_str`). Rows read their state from the
+/// liveness view now; kept for the vocabulary test.
+#[cfg(test)]
+fn process_state_str(s: ProcessState) -> &'static str {
+    lifecycle::LifecycleState::from(s).as_str()
 }
 
 /// Gates a start/restart: the backend must be configured and enabled,
@@ -2714,30 +2842,49 @@ async fn vram_start_gate(
 /// MCP server processes share the Supervisor but are never listed here.
 pub async fn op_list_backends(
     state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
+    sink: &Arc<dyn EventSink>,
 ) -> ApiResult {
-    adopt_orphan_backends(state).await;
+    let adopted = adopt_orphan_backends(state).await;
+    emit_adopted(sink.as_ref(), &adopted);
     // Clone and drop the config guard here: the offload guardrail
     // block below needs the telemetry inventory and the activation
     // journal, and the telemetry accessor reads the config while
     // initializing — it must never be called while this command
     // holds the config guard (the rule ensure_backend_specs follows).
     let cfg = state.config.read().await.clone();
-    let mut sup = state.supervisor().await.lock().await;
-    // Reap children that exited since the last read so a crashed backend
-    // reports "failed" instead of "running" forever.
-    sup.reap_exited();
-    let statuses: HashMap<String, manager_supervisor::ProcessStatus> = sup
-        .status()
-        .into_iter()
-        .map(|s| (s.id.clone(), s))
-        .collect();
+    // Every row's lifecycle fields come from the one shared liveness
+    // view (supervisor + SCM + in-flight transitions + readiness), so
+    // this list, the dashboard, the activation plan and bench/optimize
+    // agree in both run modes. Reaping exits is the monitor's job.
+    let liveness = lifecycle::backend_liveness(state).await;
+    // Orphan (removed-but-live) rows need their spawn spec's port and
+    // model: one short supervisor block, released before any other
+    // await below (the telemetry, direct-slots and gateway-stats locks
+    // are never taken under the supervisor lock here).
+    let configured_ids: std::collections::HashSet<&str> =
+        cfg.backends.iter().map(|b| b.id.as_str()).collect();
+    let orphan_specs: HashMap<String, (u16, String)> = {
+        let sup = state.supervisor().await.lock().await;
+        liveness
+            .keys()
+            .filter(|id| !configured_ids.contains(id.as_str()))
+            .filter_map(|id| {
+                let spec = sup.spec(id)?;
+                let model_file = spec
+                    .args
+                    .iter()
+                    .position(|a| a == "-m")
+                    .and_then(|i| spec.args.get(i + 1).cloned())
+                    .unwrap_or_default();
+                Some((id.clone(), (spec.port.unwrap_or(0), model_file)))
+            })
+            .collect()
+    };
     let mut backends: Vec<Value> = cfg
         .backends
         .iter()
         .map(|b| {
-            let st = statuses.get(&b.id);
-            json!({
+            let mut row = json!({
                 "id": b.id,
                 "enabled": b.enabled,
                 "port": b.port,
@@ -2755,23 +2902,14 @@ pub async fn op_list_backends(
                 "group": cfg.gateway.groups.iter()
                     .find(|g| g.members.iter().any(|m| m == &b.id))
                     .map(|g| g.name.clone()),
-                "state": st.map(|s| process_state_str(s.state)).unwrap_or("stopped"),
-                "pid": st.and_then(|s| s.pid),
-                "adopted": st.map(|s| s.adopted).unwrap_or(false),
-                "restarts": st.map(|s| s.restarts).unwrap_or(0),
-                "uptime_secs": st.and_then(|s| s.uptime).map(|u| u.as_secs()),
-                // The supervisor's recorded reason for the last
-                // spawn/load failure (e.g. the device-unavailable
-                // fail-fast verdict), or null when the last start
-                // did not fail with a recorded reason. The card's
-                // failed state surfaces it verbatim.
-                "failure_reason": st.and_then(|s| s.failure_reason.clone()),
                 // The persisted tool-call probe (MCP design §7.2):
                 // {outcome: verified|unparsed|failed, at_ms} or null
                 // when the backend has never been probed — the UI
                 // renders null as "not measured", never as a state.
                 "tool_call_probe": serde_json::to_value(b.tool_call_probe).unwrap_or(Value::Null),
-            })
+            });
+            apply_liveness(&mut row, liveness.get(&b.id));
+            row
         })
         .collect();
     // Memory requirements per configured backend (GPU-resident
@@ -3164,288 +3302,252 @@ pub async fn op_list_backends(
             }
         }
     }
-    // Processes still live under ids that left the config (their specs
-    // survive pruning while live): surface them so they stay visible and
-    // stoppable instead of silently holding their port.
-    let configured: std::collections::HashSet<&str> =
-        cfg.backends.iter().map(|b| b.id.as_str()).collect();
-    let backend_owned: std::collections::HashSet<String> = state
-        .backend_spec_ids
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    for (id, st) in &statuses {
-        if configured.contains(id.as_str()) || !backend_owned.contains(id) || st.pid.is_none() {
+    // Processes still live (or mid-operation) under ids that left the
+    // config — their specs survive pruning while live: surface them so
+    // they stay visible and stoppable instead of silently holding their
+    // port.
+    let mut orphan_ids: Vec<&String> = liveness
+        .keys()
+        .filter(|id| !configured_ids.contains(id.as_str()))
+        .collect();
+    orphan_ids.sort();
+    for id in orphan_ids {
+        let Some((port, model_file)) = orphan_specs.get(id) else {
             continue;
-        }
-        let spec = sup.spec(id);
-        let model_file = spec
-            .and_then(|sp| {
-                sp.args
-                    .iter()
-                    .position(|a| a == "-m")
-                    .map(|i| sp.args[i + 1].clone())
-            })
-            .unwrap_or_default();
+        };
         // The spec argv carries the data-dir-resolved absolute path;
         // configured rows show the config-relative path. Strip the
         // data-dir prefix so orphan rows display the same form.
-        let model_file = match std::path::Path::new(&model_file).strip_prefix(&cfg.data_dir) {
+        let model_file = match std::path::Path::new(model_file).strip_prefix(&cfg.data_dir) {
             Ok(rel) => rel.to_string_lossy().into_owned(),
-            Err(_) => model_file,
+            Err(_) => model_file.clone(),
         };
+        let mut row = json!({
+            "id": id,
+            "enabled": false,
+            "port": port,
+            "model_file": model_file,
+            "configured": false,
+        });
+        apply_liveness(&mut row, liveness.get(id));
+        backends.push(row);
+    }
+    // Leftover backend services (SCM-18): a registered, live
+    // `llm-backend-<id>` service whose id left the config keeps running
+    // invisibly unless listed. Rows come from the definitions the app
+    // wrote under <data_dir>/services/; they are stoppable (the stop
+    // route reaches a live registered service in either mode).
+    let listed: std::collections::HashSet<String> = backends
+        .iter()
+        .filter_map(|r| r["id"].as_str().map(str::to_string))
+        .collect();
+    for (id, port, model_file) in orphan_service_definitions(&state.data_dir, &listed) {
+        let name = manager_services::backend_service_name(&id);
+        let Some(status) = lifecycle::scm_status(state, &name, Duration::from_secs(1)).await else {
+            continue;
+        };
+        if !lifecycle::registered(&status) || !lifecycle::scm_live(&status) {
+            continue;
+        }
+        let key = lifecycle::backend_key(&id);
+        let record = state.lifecycle.record(&key);
+        let lifecycle_state = record
+            .transition
+            .as_ref()
+            .map(|t| lifecycle::LifecycleState::from(t.kind))
+            .unwrap_or_else(|| status.lifecycle_state());
         backends.push(json!({
             "id": id,
             "enabled": false,
-            "port": spec.and_then(|sp| sp.port).unwrap_or(0),
+            "port": port,
             "model_file": model_file,
             "configured": false,
-            "state": process_state_str(st.state),
-            "pid": st.pid,
-            "adopted": st.adopted,
-            "restarts": st.restarts,
-            "uptime_secs": st.uptime.map(|u| u.as_secs()),
-            "failure_reason": st.failure_reason,
+            "service_managed": true,
+            "state": lifecycle_state.as_str(),
+            "lifecycle": lifecycle_state.as_str(),
+            "pid": status.pid,
+            "child_pid": status.child_pid,
+            "adopted": false,
+            "restarts": 0,
+            "uptime_secs": Value::Null,
+            "failure_reason": status.failure_reason(),
+            "transition": transition_json(record.transition.as_ref()),
         }));
-    }
-    // Service supervision: in service mode, a registered service's
-    // SCM state is the truth for its row — the supervisor never
-    // spawned it, so its view is stale by construction. `pid` is the
-    // service host's pid (the llama-server child is the host's to
-    // manage); rows gain `service_managed: true`.
-    if cfg.supervision.mode == manager_config::SupervisionMode::Service {
-        let names: Vec<(String, String)> = backends
-            .iter()
-            .filter_map(|row| {
-                row["id"]
-                    .as_str()
-                    .map(|id| (id.to_string(), manager_services::backend_service_name(id)))
-            })
-            .collect();
-        let queried = tokio::task::spawn_blocking(move || {
-            use manager_services::ServiceControl;
-            let control = manager_services::scm::platform_control();
-            names
-                .into_iter()
-                .map(|(id, name)| (id, control.query(&name).ok()))
-                .collect::<Vec<_>>()
-        })
-        .await
-        .unwrap_or_default();
-        for (id, status) in queried {
-            let Some(status) = status else { continue };
-            if matches!(status.state, manager_services::ServiceState::NotInstalled) {
-                continue;
-            }
-            if let Some(row) = backends.iter_mut().find(|r| r["id"] == json!(id)) {
-                row["state"] = json!(process_state_str(status.process_state()));
-                row["pid"] = json!(status.pid);
-                row["adopted"] = json!(false);
-                row["service_managed"] = json!(true);
-            }
-        }
     }
     Ok(json!({ "backends": backends }))
 }
 
+/// The `transition` field of a backend row: `{kind, origin, since}` of
+/// the operation in flight, or null.
+fn transition_json(t: Option<&lifecycle::Transition>) -> Value {
+    match t {
+        Some(t) => json!({
+            "kind": t.kind,
+            "origin": t.origin,
+            "since": t.since.to_rfc3339(),
+        }),
+        None => Value::Null,
+    }
+}
+
+/// Write a backend row's lifecycle fields from the shared liveness view
+/// (`state` and `lifecycle` carry the same wire string). A backend the
+/// view does not know reads stopped.
+fn apply_liveness(row: &mut Value, live: Option<&lifecycle::BackendLive>) {
+    let state = live
+        .map(|l| l.state)
+        .unwrap_or(lifecycle::LifecycleState::Stopped);
+    row["state"] = json!(state.as_str());
+    row["lifecycle"] = json!(state.as_str());
+    row["pid"] = json!(live.and_then(|l| l.pid));
+    row["child_pid"] = json!(live.and_then(|l| l.child_pid));
+    row["adopted"] = json!(live.is_some_and(|l| l.adopted));
+    row["restarts"] = json!(live.map(|l| l.restarts).unwrap_or(0));
+    row["uptime_secs"] = json!(live.and_then(|l| l.uptime_secs));
+    // The recorded reason for the last spawn/load failure (e.g. the
+    // device-unavailable fail-fast verdict, or the service's exit-code
+    // reason), or null. The card's failed state surfaces it verbatim.
+    row["failure_reason"] = json!(live.and_then(|l| l.failure_reason.clone()));
+    row["service_managed"] = json!(live.is_some_and(|l| l.service_managed));
+    row["transition"] = transition_json(live.and_then(|l| l.transition.as_ref()));
+}
+
+/// Backend service definitions under `<data_dir>/services/` whose id is
+/// not in `listed`: `(id, port, model_file)` from each definition's
+/// argv (`--port`, `-m`).
+fn orphan_service_definitions(
+    data_dir: &std::path::Path,
+    listed: &std::collections::HashSet<String>,
+) -> Vec<(String, u16, String)> {
+    let prefix = manager_services::backend_service_name("");
+    let Ok(entries) = std::fs::read_dir(manager_services::services_dir(data_dir)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(id) = stem.strip_prefix(&prefix) else {
+            continue;
+        };
+        if id.is_empty() || listed.contains(id) {
+            continue;
+        }
+        let Ok(def) = manager_services::read_definition(&path) else {
+            continue;
+        };
+        let arg_after = |flag: &str| {
+            def.args
+                .iter()
+                .position(|a| a == flag)
+                .and_then(|i| def.args.get(i + 1).cloned())
+        };
+        let port = arg_after("--port")
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(0);
+        let model_file = arg_after("-m").unwrap_or_default();
+        out.push((id.to_string(), port, model_file));
+    }
+    out.sort();
+    out
+}
+
+
+/// The origin of an op invocation: the `origin` argument when given
+/// (`activation`, `dashboard`, ...), else `ui` (desktop calls; the REST
+/// layer passes its own).
+fn op_origin(origin: Option<&str>) -> lifecycle::Origin {
+    origin
+        .map(lifecycle::Origin::parse)
+        .unwrap_or(lifecycle::Origin::Ui)
+}
 
 /// Start a backend (supervisor spawn, or SCM start in service mode
 /// when the backend is registered as a service). Returns a task id.
 /// `allow_wddm_overcommit` is the operator's two-click confirmation
 /// for a start whose requirement exceeds a WDDM GPU's total VRAM
 /// (the excess pages to system RAM); it never overrides a TCC
-/// refusal — see [`vram_start_gate`].
+/// refusal — see [`vram_start_gate`]. A thin wrapper over
+/// [`backend_lifecycle::start_backend`].
 pub async fn op_start_backend(
     state: &Arc<AppState>,
     sink: &Arc<dyn EventSink>,
     id: String,
     allow_wddm_overcommit: Option<bool>,
+    origin: Option<String>,
 ) -> ApiResult {
-    ensure_backend_specs(state).await;
-    backend_start_preflight(state, &id, allow_wddm_overcommit == Some(true)).await?;
-    // Offload-probe capture: pending change + saved position,
-    // before the spawn (a refused start never reaches here).
-    let probe_ctx = offload_probe_context(state, &id).await;
-    let task_id = state
-        .record_task("backend_start", json!({ "backend_id": id }))
-        .await;
-    let outcome: Result<(), ApiError> = if state
-        .service_route_active(&manager_services::backend_service_name(&id))
-        .await
-    {
-        scm_start_backend(state, &id).await
-    } else {
-        let mut sup = state.supervisor().await.lock().await;
-        // Reap first: without this, a backend that crashed since the
-        // last list_backends poll would read as AlreadyRunning for a
-        // corpse.
-        sup.reap_exited();
-        sup.spawn_backend(&id).await.map_err(ApiError::from)
+    let opts = backend_lifecycle::BackendOpOpts {
+        allow_wddm_overcommit: allow_wddm_overcommit == Some(true),
+        ..backend_lifecycle::BackendOpOpts::new(op_origin(origin.as_deref()))
     };
-    match outcome {
-        Ok(()) => {
-            state
-                .finish_task(&task_id, TaskStatus::Done, json!({ "backend_id": id }))
-                .await;
-            if let Some((layers, moe_layers, port)) = probe_ctx {
-                spawn_offload_probe(sink, state, &id, layers, moe_layers, port);
-            }
-            sink.emit(
-                events::BACKEND_STATUS,
-                json!({ "id": id, "event": "started" }),
-            );
-            Ok(json!({ "task_id": task_id, "backend_id": id }))
-        }
-        Err(e) => {
-            state
-                .finish_task(
-                    &task_id,
-                    TaskStatus::Failed,
-                    json!({ "backend_id": id, "error": e.to_string() }),
-                )
-                .await;
-            Err(e)
-        }
-    }
+    backend_lifecycle::start_backend(state, sink, &id, opts).await
 }
 
 
-/// Stop a backend, gracefully (drain) or immediately.
+/// Stop a backend, gracefully (drain) or immediately. A thin wrapper
+/// over [`backend_lifecycle::stop_backend`].
 pub async fn op_stop_backend(
     state: &Arc<AppState>,
     sink: &Arc<dyn EventSink>,
     id: String,
     graceful: bool,
+    origin: Option<String>,
 ) -> ApiResult {
-    ensure_backend_specs(state).await;
-    let task_id = state
-        .record_task(
-            "backend_stop",
-            json!({ "backend_id": id, "graceful": graceful }),
-        )
-        .await;
-    let outcome: Result<(), ApiError> = if state
-        .service_route_active(&manager_services::backend_service_name(&id))
-        .await
-    {
-        // The graceful flag has no service-mode equivalent in
-        // increment 1 (see scm_stop_backend).
-        let _ = graceful;
-        scm_stop_backend(&id).await
-    } else {
-        state
-            .supervisor()
-            .await
-            .lock()
-            .await
-            .stop(&id, graceful)
-            .await
-            .map_err(ApiError::from)
+    let opts = backend_lifecycle::BackendOpOpts {
+        graceful,
+        ..backend_lifecycle::BackendOpOpts::new(op_origin(origin.as_deref()))
     };
-    match outcome {
-        Ok(()) => {
-            state
-                .finish_task(&task_id, TaskStatus::Done, json!({ "backend_id": id }))
-                .await;
-            sink.emit(
-                events::BACKEND_STATUS,
-                json!({ "id": id, "event": "stopped" }),
-            );
-            Ok(json!({ "task_id": task_id, "backend_id": id }))
-        }
-        Err(e) => {
-            state
-                .finish_task(
-                    &task_id,
-                    TaskStatus::Failed,
-                    json!({ "error": e.to_string() }),
-                )
-                .await;
-            Err(e)
-        }
-    }
+    backend_lifecycle::stop_backend(state, sink, &id, opts).await
 }
 
 
-/// Restart a backend (stop + start under the supervisor).
+/// Restart a backend: stop + start inside one `restarting` transition
+/// ([`backend_lifecycle::restart_backend`]). `wait_ready_secs` makes the
+/// call return only once the backend answers `/health` (the activation
+/// plan uses it so "applied" means live).
 pub async fn op_restart_backend(
     state: &Arc<AppState>,
     sink: &Arc<dyn EventSink>,
     id: String,
     graceful: bool,
     allow_wddm_overcommit: Option<bool>,
+    origin: Option<String>,
+    wait_ready_secs: Option<u64>,
 ) -> ApiResult {
-    ensure_backend_specs(state).await;
-    backend_start_preflight(state, &id, allow_wddm_overcommit == Some(true)).await?;
-    // Offload-probe capture: pending change + saved position,
-    // before the restart's spawn.
-    let probe_ctx = offload_probe_context(state, &id).await;
-    let task_id = state
-        .record_task(
-            "backend_restart",
-            json!({ "backend_id": id, "graceful": graceful }),
-        )
-        .await;
-    let outcome: Result<(), ApiError> = if state
-        .service_route_active(&manager_services::backend_service_name(&id))
-        .await
-    {
-        // SCM stop (waits for the stopped state) + SCM start on a
-        // freshly regenerated definition.
-        let _ = graceful;
-        match scm_stop_backend(&id).await {
-            Ok(()) => scm_start_backend(state, &id).await,
-            Err(e) => Err(e),
-        }
-    } else {
-        state
-            .supervisor()
-            .await
-            .lock()
-            .await
-            .restart(&id, graceful)
-            .await
-            .map_err(ApiError::from)
+    let opts = backend_lifecycle::BackendOpOpts {
+        graceful,
+        allow_wddm_overcommit: allow_wddm_overcommit == Some(true),
+        wait_ready: wait_ready_secs.filter(|s| *s > 0).map(Duration::from_secs),
+        ..backend_lifecycle::BackendOpOpts::new(op_origin(origin.as_deref()))
     };
-    match outcome {
-        Ok(()) => {
-            state
-                .finish_task(&task_id, TaskStatus::Done, json!({ "backend_id": id }))
-                .await;
-            if let Some((layers, moe_layers, port)) = probe_ctx {
-                spawn_offload_probe(sink, state, &id, layers, moe_layers, port);
-            }
-            sink.emit(
-                events::BACKEND_STATUS,
-                json!({ "id": id, "event": "restarted" }),
-            );
-            Ok(json!({ "task_id": task_id, "backend_id": id }))
-        }
+    match backend_lifecycle::restart_backend(state, sink, &id, opts).await {
+        Ok(v) => Ok(v),
         Err(e) => {
-            state
-                .finish_task(
-                    &task_id,
-                    TaskStatus::Failed,
-                    json!({ "error": e.to_string() }),
-                )
-                .await;
             // A restart the pending activation plan depends on just
             // failed: that is the plan failing to apply. A restart
             // failure with no plan entry for this backend is a plain
-            // command error the UI already shows — no toast.
-            let (unresolved, _) = activation_unresolved(state).await;
-            if unresolved
-                .iter()
-                .any(|en| en.scope == "backend" && en.targets.iter().any(|t| t == &id))
-            {
-                notify::notify(
-                    sink.as_ref(),
-                    state,
-                    notify::Category::Activation,
-                    "Activation plan failed",
-                    &format!("Backend {id} could not be restarted: {e}"),
-                )
-                .await;
+            // command error the UI already shows — no toast. A busy
+            // refusal is not a failure of the restart in flight.
+            if !matches!(e, ApiError::Busy(_)) {
+                let (unresolved, _) = activation_unresolved(state).await;
+                if unresolved
+                    .iter()
+                    .any(|en| en.scope == "backend" && en.targets.iter().any(|t| t == &id))
+                {
+                    notify::notify(
+                        sink.as_ref(),
+                        state,
+                        notify::Category::Activation,
+                        "Activation plan failed",
+                        &format!("Backend {id} could not be restarted: {e}"),
+                    )
+                    .await;
+                }
             }
             Err(e)
         }
@@ -3500,7 +3602,8 @@ pub async fn op_get_gpu_telemetry(
     // Adoption first: the pid -> backend map below is how telemetry
     // processes get attributed, and an unadopted orphan attributes
     // to nothing.
-    adopt_orphan_backends(state).await;
+    let adopted = adopt_orphan_backends(state).await;
+    emit_adopted(sink.as_ref(), &adopted);
     let store = state.telemetry().await;
     let (samples, raw_processes, source_error, last_poll_at) = {
         let guard = lock_telemetry(&store);
@@ -3588,15 +3691,191 @@ pub async fn op_get_gpu_telemetry(
 // Wizard / audit
 // ---------------------------------------------------------------------------
 
-/// Run one wizard step; streams `wizard-progress`. Returns a task id.
+/// What one wizard step run produced ([`run_wizard_step_inner`]).
+pub(crate) struct WizardRun {
+    pub task_id: String,
+    /// The refusal payload when the run did not happen: another setup
+    /// step holds the wizard, or another gateway operation is in
+    /// flight (`busy: true`, `ok: false`, `running_step`,
+    /// `elapsed_secs`).
+    pub busy: Option<Value>,
+    pub outcome: Option<StepOutcome>,
+    /// Whether an activation plan was pending before the step ran
+    /// (start-gateway only; CR-1b).
+    pub pending_before: bool,
+}
+
+impl WizardRun {
+    /// The step ran and ended Done (or Skipped).
+    pub fn ok(&self) -> bool {
+        self.busy.is_none()
+            && self
+                .outcome
+                .as_ref()
+                .is_some_and(|o| matches!(o.state, StepState::Done | StepState::Skipped))
+    }
+
+    /// The op payload: the busy payload as is, else
+    /// `{task_id, ok, outcome}`.
+    fn payload(&self) -> Value {
+        if let Some(busy) = &self.busy {
+            return busy.clone();
+        }
+        json!({ "task_id": self.task_id, "ok": self.ok(), "outcome": self.outcome })
+    }
+}
+
+/// The activation plan as a gateway start found it, for the
+/// completion bookkeeping after the start ([`complete_gateway_activation`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GatewayPlanBefore {
+    /// Any unresolved entry, or drift.
+    pub pending: bool,
+    pub drift: bool,
+    /// The unresolved gateway-scope entries.
+    pub gateway_entries: Vec<activation::ActivationEntry>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl GatewayPlanBefore {
+    async fn capture(state: &AppState) -> Self {
+        let (unresolved, drift) = activation_unresolved(state).await;
+        Self {
+            pending: !unresolved.is_empty() || drift,
+            drift,
+            gateway_entries: unresolved
+                .into_iter()
+                .filter(|e| e.scope != "backend")
+                .collect(),
+            started_at: Some(chrono::Utc::now()),
+        }
+    }
+}
+
+/// Run one wizard step; streams `wizard-progress`. The payload is
+/// `{task_id, ok, outcome}` (`ok`: the step ended Done or Skipped), or
+/// the busy payload. `origin` names the surface that asked (default
+/// `wizard`); for start-gateway it lands in the gateway's lifecycle
+/// markers and the activation history.
 pub async fn op_run_wizard_step(
     state: &Arc<AppState>,
     sink: &Arc<dyn EventSink>,
     step_id: String,
+    origin: Option<String>,
 ) -> ApiResult {
+    let origin = origin
+        .as_deref()
+        .map(lifecycle::Origin::parse)
+        .unwrap_or(lifecycle::Origin::Wizard);
+    let run = run_wizard_step_inner(state, sink, &step_id, origin, None).await?;
+    Ok(run.payload())
+}
+
+/// The CR-5 guard of the install-llamacpp step: the step extracts the
+/// llama.cpp build over `<data_dir>/llamacpp` in place, which fails on
+/// (or partially overwrites) binaries a running llama-server has
+/// mapped. Refused while any backend is live or mid-transition.
+async fn refuse_llamacpp_update_while_running(state: &AppState) -> Result<(), ApiError> {
+    let live = lifecycle::backend_liveness(state).await;
+    let mut busy: Vec<String> = live
+        .values()
+        .filter(|b| b.state.is_live() || b.transition.is_some())
+        .map(|b| b.id.clone())
+        .collect();
+    if busy.is_empty() {
+        return Ok(());
+    }
+    busy.sort();
+    Err(ApiError::InvalidInput(format!(
+        "stop backends {} before updating llama.cpp",
+        busy.join(", ")
+    )))
+}
+
+/// The busy payload of a refused step run.
+fn wizard_busy_payload(task_id: &str, running: Option<(String, u64)>) -> Value {
+    let mut payload = json!({ "task_id": task_id, "busy": true, "ok": false, "outcome": null });
+    if let Some((id, secs)) = running {
+        payload["running_step"] = json!(id);
+        payload["elapsed_secs"] = json!(secs);
+    }
+    payload
+}
+
+/// One wizard step run, shared by `run_wizard_step` and
+/// `gateway_restart`.
+///
+/// start-gateway runs under the gateway's lifecycle transition: the
+/// caller's `gateway_guard` (gateway_restart), else one taken here —
+/// `restarting` when a gateway is running or its process is alive,
+/// else `starting`. Another gateway operation in flight refuses the
+/// run with the busy payload (`running_step: "gateway <kind>
+/// (<origin>)"`), before anything is touched. A Done outcome sets
+/// intent Running, completes the gateway side of the activation plan
+/// ([`complete_gateway_activation`]) and finishes the transition
+/// `started`/`restarted`; any other outcome finishes it failed with
+/// the step's message.
+pub(crate) async fn run_wizard_step_inner(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    step_id: &str,
+    origin: lifecycle::Origin,
+    gateway_guard: Option<lifecycle::TransitionGuard>,
+) -> Result<WizardRun, ApiError> {
+    let is_gateway = step_id == "start-gateway";
+    if step_id == "install-llamacpp" {
+        refuse_llamacpp_update_while_running(state).await?;
+    }
     let task_id = state
-        .record_task("wizard_step", json!({ "step_id": step_id }))
+        .record_task(
+            "wizard_step",
+            json!({ "step_id": step_id, "origin": origin }),
+        )
         .await;
+    let mut gateway_guard = gateway_guard;
+    if is_gateway && gateway_guard.is_none() {
+        let view = lifecycle::gateway_view(state).await;
+        let kind = if matches!(
+            view.state,
+            lifecycle::LifecycleState::Running | lifecycle::LifecycleState::Degraded
+        ) || view.pid.is_some()
+        {
+            lifecycle::TransitionKind::Restarting
+        } else {
+            lifecycle::TransitionKind::Starting
+        };
+        match lifecycle::begin(state, sink, lifecycle::GATEWAY, kind, origin, None).await {
+            Ok(g) => gateway_guard = Some(g),
+            Err(ApiError::Busy(msg)) => {
+                let running = state.lifecycle.transition(lifecycle::GATEWAY).map(|t| {
+                    (
+                        format!("gateway {} ({})", t.kind, t.origin),
+                        (chrono::Utc::now() - t.since).num_seconds().max(0) as u64,
+                    )
+                });
+                append_wizard_log(
+                    &state.data_dir,
+                    &[format!(
+                        "[{}] === step {step_id} (install): rejected — {msg} ===",
+                        chrono::Utc::now().to_rfc3339(),
+                    )],
+                );
+                let payload = wizard_busy_payload(&task_id, running);
+                let mut detail = payload.clone();
+                detail["message"] = json!(msg);
+                state.finish_task(&task_id, TaskStatus::Done, detail).await;
+                let mut payload = payload;
+                payload["message"] = json!(msg);
+                return Ok(WizardRun {
+                    task_id,
+                    busy: Some(payload),
+                    outcome: None,
+                    pending_before: false,
+                });
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let ctx = state.wizard_ctx(RunMode::Install).await;
     let wizard = state.wizard(RunMode::Install).await;
     // try_lock, not lock: a second invocation (e.g. a stray double
@@ -3616,29 +3895,68 @@ pub async fn op_run_wizard_step(
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
                 .map(|(id, since)| (id.clone(), since.elapsed().as_secs()));
+            let reason = match &running {
+                Some((id, secs)) => format!("step {id} is already running (started {secs}s ago)"),
+                None => "another setup step is already running".to_string(),
+            };
             append_wizard_log(
                 &state.data_dir,
                 &[format!(
-                    "[{}] === step {step_id} (install): rejected — {} ===",
+                    "[{}] === step {step_id} (install): rejected — {reason} ===",
                     chrono::Utc::now().to_rfc3339(),
-                    match &running {
-                        Some((id, secs)) =>
-                            format!("step {id} is already running (started {secs}s ago)"),
-                        None => "another setup step is already running".to_string(),
-                    }
                 )],
             );
+            // The gateway transition taken for this run ends without
+            // touching the gateway: nothing failed, so no failure is
+            // recorded — only the refusal is marked.
+            if let Some(g) = gateway_guard.take() {
+                lifecycle::mark(
+                    &state.data_dir,
+                    lifecycle::GATEWAY,
+                    &format!("{} refused", g.kind().verb()),
+                    Some(&reason),
+                    Some(origin),
+                );
+                drop(g);
+                // The begin announced a transition: settle every
+                // event-driven surface back on the measured state.
+                let settled = lifecycle::gateway_view(state).await.state;
+                state.lifecycle.observe(lifecycle::GATEWAY, settled);
+                lifecycle::emit(
+                    sink.as_ref(),
+                    lifecycle::GATEWAY,
+                    "refused",
+                    settled,
+                    Some(origin),
+                    Some(&reason),
+                );
+            }
+            let payload = wizard_busy_payload(&task_id, running);
             let mut detail = json!({ "busy": true });
-            let mut payload = json!({ "task_id": task_id, "busy": true, "outcome": null });
-            if let Some((id, secs)) = &running {
-                detail["running_step"] = json!(id);
-                detail["elapsed_secs"] = json!(secs);
-                payload["running_step"] = json!(id);
-                payload["elapsed_secs"] = json!(secs);
+            if let Some(step) = payload.get("running_step") {
+                detail["running_step"] = step.clone();
+                detail["elapsed_secs"] = payload["elapsed_secs"].clone();
             }
             state.finish_task(&task_id, TaskStatus::Done, detail).await;
-            return Ok(payload);
+            return Ok(WizardRun {
+                task_id,
+                busy: Some(payload),
+                outcome: None,
+                pending_before: false,
+            });
         }
+    };
+    // Captured BEFORE the step runs: start-gateway rewrites the
+    // gateway configuration (and, on success, the applied stamp), so
+    // the plan read afterwards no longer says whether this run was
+    // applying it (CR-1b).
+    let plan_before = if is_gateway {
+        state
+            .lifecycle
+            .set_intent(lifecycle::GATEWAY, lifecycle::Intent::Running);
+        GatewayPlanBefore::capture(state).await
+    } else {
+        GatewayPlanBefore::default()
     };
     let (_done_before, total) = guard.progress();
     // A start marker lands in the wizard log before the step runs:
@@ -3656,18 +3974,26 @@ pub async fn op_run_wizard_step(
     *state
         .wizard_step_running
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some((step_id.clone(), std::time::Instant::now()));
-    let outcome_result = guard.run_step(&ctx, &step_id).await;
+        .unwrap_or_else(|e| e.into_inner()) = Some((step_id.to_string(), std::time::Instant::now()));
+    let outcome_result = guard.run_step(&ctx, step_id).await;
     *state
         .wizard_step_running
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
-    let outcome: StepOutcome = outcome_result.map_err(ApiError::from)?;
+    let outcome: StepOutcome = match outcome_result {
+        Ok(o) => o,
+        Err(e) => {
+            if let Some(g) = gateway_guard.take() {
+                lifecycle::finish(state, sink.as_ref(), g, Err(e.to_string()));
+            }
+            return Err(ApiError::from(e));
+        }
+    };
     append_wizard_log(
         &state.data_dir,
         &wizard_log_block(
             "install",
-            &step_id,
+            step_id,
             &format!("{:?}", outcome.state).to_lowercase(),
             &outcome.message,
             outcome.duration_ms,
@@ -3684,16 +4010,41 @@ pub async fn op_run_wizard_step(
         .iter()
         .find(|s| s.id == step_id)
         .map(|s| s.name.clone())
-        .unwrap_or_else(|| step_id.clone());
+        .unwrap_or_else(|| step_id.to_string());
     drop(guard);
     state.persist_wizard().await;
     state.reload_config_from_disk().await;
     // A step run can complete the checklist (this is also the path
     // the wizard's "Run setup" full run takes, once per step).
     state.reconcile_setup_completed().await;
+    // The gateway's own lifecycle record: intent, failure, the
+    // activation completion and the started/restarted marker.
+    if let Some(g) = gateway_guard.take() {
+        if outcome.state == StepState::Done {
+            state.lifecycle.clear_failure(lifecycle::GATEWAY);
+            rearm_postgres_after_gateway_start(state);
+            complete_gateway_activation(state, sink, origin, &plan_before).await;
+            let pid = gateway_pid_now(state).await;
+            lifecycle::finish(
+                state,
+                sink.as_ref(),
+                g,
+                Ok(pid.map(|p| format!("pid {p}")).unwrap_or_default()),
+            );
+        } else {
+            let reason = outcome
+                .message
+                .lines()
+                .next()
+                .filter(|l| !l.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("start-gateway ended {:?}", outcome.state).to_lowercase());
+            lifecycle::finish(state, sink.as_ref(), g, Err(reason));
+        }
+    }
     let payload = WizardProgressPayload {
         task_id: task_id.clone(),
-        step_id: Some(step_id.clone()),
+        step_id: Some(step_id.to_string()),
         state: outcome.state,
         done,
         total,
@@ -3712,7 +4063,7 @@ pub async fn op_run_wizard_step(
         .await;
     // Toasts: a step run is a discrete, operator-visible event (one
     // toast per run, at its terminal state). A failed start-gateway
-    // while an activation plan is pending is the plan failing — one
+    // while an activation plan was pending is the plan failing — one
     // toast, the Activation one, not both categories.
     let step_body = if outcome.message.trim().is_empty() {
         step_name.clone()
@@ -3731,7 +4082,7 @@ pub async fn op_run_wizard_step(
             .await;
         }
         StepState::Failed => {
-            if step_id == "start-gateway" && activation_plan_pending(state).await {
+            if is_gateway && plan_before.pending {
                 notify::notify(
                     sink.as_ref(),
                     state,
@@ -3766,7 +4117,23 @@ pub async fn op_run_wizard_step(
         }
         _ => {}
     }
-    Ok(json!({ "task_id": task_id, "outcome": outcome }))
+    Ok(WizardRun {
+        task_id,
+        busy: None,
+        outcome: Some(outcome),
+        pending_before: plan_before.pending,
+    })
+}
+
+/// The live gateway pid (pid file, else the gateway port's owner).
+async fn gateway_pid_now(state: &AppState) -> Option<u32> {
+    let port = state.config.read().await.gateway.port;
+    let data_dir = state.data_dir.clone();
+    tokio::task::spawn_blocking(move || manager_wizard::resolve_gateway_pid(&data_dir, port))
+        .await
+        .ok()
+        .flatten()
+        .map(|(pid, _)| pid)
 }
 
 
@@ -4346,47 +4713,190 @@ pub async fn op_cancel_download(
 // Logs
 // ---------------------------------------------------------------------------
 
-/// The file-backed gateway log records: the current run's
-/// `gateway.stdout.log` / `gateway.stderr.log` under `<data_dir>/logs`
-/// plus their rotated `.prev` runs (marked archived). The capture
-/// writes no per-line timestamps, so every line is stamped with its
-/// file's modification time; lines are emitted newest-first within
-/// each file so the merged ordering stays correct under the caller's
-/// stable sort. At most the last 2,000 lines of each file are read.
-fn gateway_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord>, bool) {
-    let logs = data_dir.join("logs");
+/// Lines read from the tail of each file-backed log file.
+const FILE_SCOPE_TAIL_LINES: usize = 2000;
+
+/// Records of a file-backed log scope: each file in `files` (and, with
+/// `with_prev`, its rotated `.prev` run, marked archived), stamped as
+/// `source`. A line that starts with an `[<rfc3339>]` stamp (lifecycle
+/// markers, wizard/optimize lines) carries its own timestamp; any other
+/// line (raw LiteLLM / llama-server / PostgreSQL output) is stamped
+/// with its file's modification time. Lines are emitted newest-first
+/// within each file so same-timestamp groups keep their order under
+/// the caller's stable sort. At most the last 2,000 lines of each file
+/// are read. Returns the records and whether any `.prev` run exists.
+fn file_scope_records(
+    source: &str,
+    files: &[(PathBuf, LogStream)],
+    with_prev: bool,
+) -> (Vec<LogRecord>, bool) {
     let mut records = Vec::new();
     let mut has_previous = false;
-    for (name, stream) in [
-        ("gateway.stdout.log", LogStream::Stdout),
-        ("gateway.stderr.log", LogStream::Stderr),
-    ] {
-        for archived in [false, true] {
-            let base = logs.join(name);
-            let path = if archived { prev_log_path(&base) } else { base };
+    for (base, stream) in files {
+        let variants: &[bool] = if with_prev { &[false, true] } else { &[false] };
+        for &archived in variants {
+            let path = if archived {
+                prev_log_path(base)
+            } else {
+                base.clone()
+            };
             let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
             if archived {
                 has_previous = true;
             }
-            let ts = std::fs::metadata(&path)
+            let mtime = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .map(chrono::DateTime::<chrono::Utc>::from)
                 .unwrap_or_else(|_| chrono::Utc::now());
             let text = String::from_utf8_lossy(&bytes);
-            for line in text.lines().rev().take(2000) {
+            for line in text.lines().rev().take(FILE_SCOPE_TAIL_LINES) {
                 records.push(LogRecord {
-                    ts,
-                    stream,
+                    ts: manager_supervisor::lifecycle::parse_line_ts(line).unwrap_or(mtime),
+                    stream: *stream,
                     line: line.to_string(),
-                    source: "gateway".to_string(),
+                    source: source.to_string(),
                     archived,
                 });
             }
         }
     }
     (records, has_previous)
+}
+
+/// Whether a file-backed scope has anything to show (a non-empty file
+/// or `.prev` run) and whether a `.prev` run exists — metadata only,
+/// for listing scopes without reading them.
+fn file_scope_presence(files: &[(PathBuf, LogStream)]) -> (bool, bool) {
+    let nonempty = |p: &std::path::Path| std::fs::metadata(p).is_ok_and(|m| m.len() > 0);
+    let mut any = false;
+    let mut prev = false;
+    for (base, _) in files {
+        let p = prev_log_path(base);
+        if nonempty(&p) {
+            any = true;
+            prev = true;
+        }
+        if nonempty(base) {
+            any = true;
+        }
+    }
+    (any, prev)
+}
+
+/// Every file-backed log scope and its files (design H):
+/// - `gateway`: LiteLLM stdout/stderr plus `gateway.lifecycle.log`;
+/// - `wizard`, `optimize`: the step and pipeline logs;
+/// - `postgres`: `postgres.log` plus `postgres.lifecycle.log`;
+/// - `log-receiver`: the receiver's stdout/stderr/lifecycle logs and
+///   its `deploy.log`;
+/// - `services`: `service-manage.log` (the elevated service helper);
+/// - `<id>` for each backend id: `backend-<id>.lifecycle.log` and, in
+///   service mode, the shim's `backend-<id>.stdout/stderr.log` — merged
+///   with the supervisor ring of the same id by `get_logs`.
+fn file_log_scopes(
+    data_dir: &std::path::Path,
+    backend_ids: &[String],
+) -> Vec<(String, Vec<(PathBuf, LogStream)>)> {
+    let logs = data_dir.join("logs");
+    let receiver = manager_services::log_receiver_definition(
+        data_dir,
+        std::path::Path::new("llmdil-log-receiver.exe"),
+    );
+    let receiver_dir = manager_services::log_receiver_dir(data_dir);
+    let mut receiver_files: Vec<(PathBuf, LogStream)> = Vec::new();
+    if let Some(p) = receiver.stdout_log.clone() {
+        receiver_files.push((p, LogStream::Stdout));
+    }
+    if let Some(p) = receiver.stderr_log.clone() {
+        receiver_files.push((p, LogStream::Stderr));
+    }
+    receiver_files.push((
+        lifecycle::log_path(data_dir, lifecycle::LOG_RECEIVER),
+        LogStream::Stdout,
+    ));
+    receiver_files.push((receiver_dir.join("deploy.log"), LogStream::Stdout));
+    let mut scopes = vec![
+        (
+            "gateway".to_string(),
+            vec![
+                (logs.join("gateway.stdout.log"), LogStream::Stdout),
+                (logs.join("gateway.stderr.log"), LogStream::Stderr),
+                (
+                    lifecycle::log_path(data_dir, lifecycle::GATEWAY),
+                    LogStream::Stdout,
+                ),
+            ],
+        ),
+        (
+            "wizard".to_string(),
+            vec![(logs.join("wizard.log"), LogStream::Stdout)],
+        ),
+        (
+            "optimize".to_string(),
+            vec![(logs.join("optimize.log"), LogStream::Stdout)],
+        ),
+        (
+            "postgres".to_string(),
+            vec![
+                (
+                    manager_wizard::steps::postgres_log_path(data_dir),
+                    LogStream::Stdout,
+                ),
+                (
+                    lifecycle::log_path(data_dir, lifecycle::POSTGRES),
+                    LogStream::Stdout,
+                ),
+            ],
+        ),
+        ("log-receiver".to_string(), receiver_files),
+        (
+            "services".to_string(),
+            vec![(logs.join("service-manage.log"), LogStream::Stdout)],
+        ),
+    ];
+    for id in backend_ids {
+        scopes.push((
+            id.clone(),
+            vec![
+                (
+                    lifecycle::log_path(data_dir, &lifecycle::backend_key(id)),
+                    LogStream::Stdout,
+                ),
+                (
+                    logs.join(format!("backend-{id}.stdout.log")),
+                    LogStream::Stdout,
+                ),
+                (
+                    logs.join(format!("backend-{id}.stderr.log")),
+                    LogStream::Stderr,
+                ),
+            ],
+        ));
+    }
+    scopes
+}
+
+/// The scope ids [`file_log_scopes`] serves from files alone (no
+/// supervisor ring): `get_logs` skips the supervisor lock for these.
+const FILE_ONLY_SCOPES: [&str; 6] = [
+    "gateway",
+    "wizard",
+    "optimize",
+    "postgres",
+    "log-receiver",
+    "services",
+];
+
+/// The records of one named file-only scope (tests).
+#[cfg(test)]
+fn named_file_scope_records(data_dir: &std::path::Path, scope: &str) -> (Vec<LogRecord>, bool) {
+    file_log_scopes(data_dir, &[])
+        .into_iter()
+        .find(|(id, _)| id == scope)
+        .map(|(id, files)| file_scope_records(&id, &files, true))
+        .unwrap_or_default()
 }
 
 /// Wizard step output, persisted to `<data_dir>/logs/wizard.log` and
@@ -4447,39 +4957,6 @@ fn wizard_log_block(
     out
 }
 
-/// File-backed wizard records for `get_logs` (mirrors
-/// `gateway_log_records`): newest last-2000 lines per file.
-fn wizard_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord>, bool) {
-    let logs = data_dir.join("logs");
-    let mut records = Vec::new();
-    let mut has_previous = false;
-    for archived in [true, false] {
-        let base = logs.join("wizard.log");
-        let path = if archived { prev_log_path(&base) } else { base };
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        if archived {
-            has_previous = true;
-        }
-        let ts = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .map(chrono::DateTime::<chrono::Utc>::from)
-            .unwrap_or_else(|_| chrono::Utc::now());
-        let text = String::from_utf8_lossy(&bytes);
-        for line in text.lines().rev().take(2000) {
-            records.push(LogRecord {
-                ts,
-                stream: LogStream::Stdout,
-                line: line.to_string(),
-                source: "wizard".to_string(),
-                archived,
-            });
-        }
-    }
-    (records, has_previous)
-}
-
 /// Optimize pipeline output, persisted to
 /// `<data_dir>/logs/optimize.log` and served by `get_logs` as the
 /// `optimize` scope (tracker #52). The Optimize pipeline's
@@ -4528,37 +5005,10 @@ pub(crate) fn append_optimize_log(data_dir: &std::path::Path, lines: &[String]) 
     }
 }
 
-/// File-backed optimize records for `get_logs` (mirrors
-/// `wizard_log_records`): newest last-2000 lines per file.
+/// The file-backed optimize scope (see [`file_log_scopes`]).
+#[cfg(test)]
 fn optimize_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord>, bool) {
-    let logs = data_dir.join("logs");
-    let mut records = Vec::new();
-    let mut has_previous = false;
-    for archived in [true, false] {
-        let base = logs.join("optimize.log");
-        let path = if archived { prev_log_path(&base) } else { base };
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        if archived {
-            has_previous = true;
-        }
-        let ts = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .map(chrono::DateTime::<chrono::Utc>::from)
-            .unwrap_or_else(|_| chrono::Utc::now());
-        let text = String::from_utf8_lossy(&bytes);
-        for line in text.lines().rev().take(2000) {
-            records.push(LogRecord {
-                ts,
-                stream: LogStream::Stdout,
-                line: line.to_string(),
-                source: "optimize".to_string(),
-                archived,
-            });
-        }
-    }
-    (records, has_previous)
+    named_file_scope_records(data_dir, "optimize")
 }
 
 /// Query captured logs. `scope` is a process id — live, stopped, or an
@@ -4602,40 +5052,59 @@ pub async fn op_get_logs(
     limit: Option<u64>,
 ) -> ApiResult {
     let limit = limit.unwrap_or(200) as usize;
-    let sup = state.supervisor().await.lock().await;
+    let backend_ids: Vec<String> = state
+        .config
+        .read()
+        .await
+        .backends
+        .iter()
+        .map(|b| b.id.clone())
+        .collect();
     // Unfiltered fetch: filtering, merging with the file-backed
-    // gateway records, ordering, and pagination happen here so every
-    // source is treated identically.
-    let mut records: Vec<LogRecord> = if scope == "gateway" || scope == "wizard" || scope == "optimize"
-    {
-        Vec::new()
-    } else {
-        sup.logs_query(&scope, None, None, usize::MAX).records
-    };
-    let mut scopes: Vec<Value> = sup
-        .log_scopes()
+    // records, ordering, and pagination happen here so every source
+    // is treated identically. The supervisor lock is held only to
+    // copy the ring records and the scope list (never across a file
+    // read), and a file-only scope never waits for it (BE-11): it
+    // lists the supervisor scopes only when the lock is free.
+    let file_only = FILE_ONLY_SCOPES.contains(&scope.as_str());
+    let (mut records, sup_scopes): (Vec<LogRecord>, Vec<manager_supervisor::LogScope>) =
+        if file_only {
+            match state.supervisor().await.try_lock() {
+                Ok(sup) => (Vec::new(), sup.log_scopes()),
+                Err(_) => (Vec::new(), Vec::new()),
+            }
+        } else {
+            let sup = state.supervisor().await.lock().await;
+            (
+                sup.logs_query(&scope, None, None, usize::MAX).records,
+                sup.log_scopes(),
+            )
+        };
+    let mut scopes: Vec<Value> = sup_scopes
         .into_iter()
         .map(|s| json!({ "id": s.id, "previous": s.previous }))
         .collect();
-    let (gateway_records, gateway_previous) = gateway_log_records(&state.data_dir);
-    if !gateway_records.is_empty() {
-        scopes.push(json!({ "id": "gateway", "previous": gateway_previous }));
-        if scope == "all" || scope == "gateway" {
-            records.extend(gateway_records);
+    for (id, files) in file_log_scopes(&state.data_dir, &backend_ids) {
+        let wanted = scope == "all" || scope == id;
+        let (present, previous) = if wanted {
+            let (file_records, previous) = file_scope_records(&id, &files, true);
+            let present = !file_records.is_empty();
+            records.extend(file_records);
+            (present, previous)
+        } else {
+            file_scope_presence(&files)
+        };
+        if !present {
+            continue;
         }
-    }
-    let (wizard_records, wizard_previous) = wizard_log_records(&state.data_dir);
-    if !wizard_records.is_empty() {
-        scopes.push(json!({ "id": "wizard", "previous": wizard_previous }));
-        if scope == "all" || scope == "wizard" {
-            records.extend(wizard_records);
-        }
-    }
-    let (optimize_records, optimize_previous) = optimize_log_records(&state.data_dir);
-    if !optimize_records.is_empty() {
-        scopes.push(json!({ "id": "optimize", "previous": optimize_previous }));
-        if scope == "all" || scope == "optimize" {
-            records.extend(optimize_records);
+        // A backend id may already be listed from its supervisor ring.
+        match scopes.iter_mut().find(|s| s["id"] == json!(id)) {
+            Some(existing) => {
+                if previous {
+                    existing["previous"] = json!(true);
+                }
+            }
+            None => scopes.push(json!({ "id": id, "previous": previous })),
         }
     }
     if let Some(filter) = level.as_deref().and_then(LogLevelFilter::parse) {
@@ -4812,8 +5281,8 @@ async fn record_gateway_change(
             }
         }
     }
-    let started_at = backend_start_times(state).await;
-    let running = backend_running_ids(state).await;
+    let started_at = backend_start_times(state, pre).await;
+    let running = backend_running_ids(state, pre).await;
     let configured: std::collections::HashSet<String> =
         post.backends.iter().map(|b| b.id.clone()).collect();
     activation::record_change(
@@ -4846,8 +5315,8 @@ async fn record_backend_change(
     summary: String,
     backend_id: &str,
 ) -> Result<(), ApiError> {
-    let started_at = backend_start_times(state).await;
-    let running = backend_running_ids(state).await;
+    let started_at = backend_start_times(state, pre).await;
+    let running = backend_running_ids(state, pre).await;
     let configured: std::collections::HashSet<String> =
         post.backends.iter().map(|b| b.id.clone()).collect();
     activation::record_change(
@@ -4890,36 +5359,41 @@ fn ensure_backend_not_advanced(b: &manager_config::BackendConfig) -> Result<(), 
     }
 }
 
-/// Running backends' start instants (now minus supervisor uptime),
-/// for activation-plan resolution: a backend-scope entry resolves
-/// once every target has (re)started at or after it. Adopted
-/// processes report no uptime and are absent here — their entries
-/// stay unresolved and the plan classifies them from live state.
+/// Live backends' start instants, both run modes, from the shared
+/// liveness view ([`lifecycle::backend_liveness`]): supervisor uptime
+/// for spawned processes, the OS process creation time for adopted
+/// ones and for service-managed llama-servers. For activation-plan
+/// resolution: a backend-scope entry resolves once every target has
+/// (re)started at or after it.
 async fn backend_start_times(
     state: &AppState,
+    cfg: &AppConfig,
 ) -> std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> {
-    let sup = state.supervisor().await.lock().await;
-    let now = chrono::Utc::now();
-    sup.status()
-        .iter()
-        .filter_map(|s| {
-            s.uptime.map(|u| {
-                (
-                    s.id.clone(),
-                    now - chrono::Duration::from_std(u).unwrap_or_default(),
-                )
-            })
-        })
+    lifecycle::backend_liveness_for(state, cfg)
+        .await
+        .into_values()
+        .filter(|l| l.state.is_live())
+        .filter_map(|l| l.started_at.map(|at| (l.id, at)))
         .collect()
 }
 
-/// Ids of backends whose supervisor process is running or starting.
-async fn backend_running_ids(state: &AppState) -> std::collections::HashSet<String> {
-    let sup = state.supervisor().await.lock().await;
-    sup.status()
-        .iter()
-        .filter(|s| matches!(s.state, ProcessState::Running | ProcessState::Starting))
-        .map(|s| s.id.clone())
+/// Ids of live backends (running, starting, restarting or not
+/// responding), both run modes — a running service-managed backend
+/// counts exactly like a supervised one (ACT-4 / SCM-4).
+async fn backend_running_ids(
+    state: &AppState,
+    cfg: &AppConfig,
+) -> std::collections::HashSet<String> {
+    running_ids_of(&lifecycle::backend_liveness_for(state, cfg).await)
+}
+
+/// The live ids of a liveness snapshot (pure).
+fn running_ids_of(
+    live: &HashMap<String, lifecycle::BackendLive>,
+) -> std::collections::HashSet<String> {
+    live.values()
+        .filter(|l| l.state.is_live())
+        .map(|l| l.id.clone())
         .collect()
 }
 
@@ -7583,7 +8057,7 @@ pub async fn op_backend_set_raw_flags(
 /// deployments and can gain members again later.
 pub async fn op_backend_delete(
     state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
+    sink: &Arc<dyn EventSink>,
     id: String,
 ) -> ApiResult {
     {
@@ -7598,6 +8072,27 @@ pub async fn op_backend_delete(
             }
         }
     }
+    if !state.config.read().await.backends.iter().any(|b| b.id == id) {
+        return Err(ApiError::NotFound(format!("backend {id}")));
+    }
+    // A running Windows service of this backend would otherwise keep
+    // serving, invisible once the id leaves the config (SCM-18): stop
+    // it through the shared lifecycle path first (markers, events,
+    // intent). The registration itself stays the operator's to remove.
+    let service_name = manager_services::backend_service_name(&id);
+    let service_stopped = match lifecycle::scm_status(state, &service_name, Duration::from_secs(1)).await {
+        Some(s) if lifecycle::registered(&s) && lifecycle::scm_live(&s) => {
+            backend_lifecycle::stop_backend(
+                state,
+                sink,
+                &id,
+                backend_lifecycle::BackendOpOpts::new(lifecycle::Origin::Ui),
+            )
+            .await?;
+            true
+        }
+        _ => false,
+    };
     let mut cfg = state.config.write().await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
@@ -7631,12 +8126,21 @@ pub async fn op_backend_delete(
     *cfg = new_cfg;
     drop(cfg);
     ensure_backend_specs(state).await;
+    if service_stopped {
+        lifecycle::mark(
+            &state.data_dir,
+            &lifecycle::backend_key(&id),
+            "deleted from the configuration",
+            Some("its running service was stopped first; the registration remains"),
+            Some(lifecycle::Origin::Ui),
+        );
+    }
     // A deleted backend's service registration is the operator's to
     // remove (Settings → Supervision) — a config delete must not fire
     // a UAC prompt from a list action. Record the leftover so it is
     // discoverable rather than silent.
     if state
-        .service_route_active(&manager_services::backend_service_name(&id))
+        .service_route_active(&service_name)
         .await
     {
         append_wizard_log(
@@ -7904,20 +8408,28 @@ pub async fn op_gateway_status(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
 ) -> ApiResult {
-    let (port, bind_host, probe_host, groups, routing_rules, cred_ref) = {
+    let (port, bind_host, groups, routing_rules, cred_ref) = {
         let cfg = state.config.read().await;
         (
             cfg.gateway.port,
             cfg.gateway.bind_host.clone(),
-            manager_wizard::steps::gateway_probe_host(&cfg),
             manager_gateway::enabled_group_count(&cfg),
             cfg.gateway.routing_rules.len(),
             cfg.gateway.openrouter.cred_ref.clone(),
         )
     };
-    let up = tokio::task::spawn_blocking(move || probe_gateway(&probe_host, port))
-        .await
-        .unwrap_or(false);
+    // The derived lifecycle views (transition, SCM state, probe, live
+    // pid, intent, failure): read with no config guard held, they take
+    // it themselves.
+    let view = lifecycle::gateway_view(state).await;
+    let pg = lifecycle::postgres_view(state).await;
+    let up = view.up;
+    // While a gateway operation or an activation apply is in flight
+    // the plan is computed as if the gateway were up: a restart's down
+    // window must not make pending changes read as already effective
+    // (GW-10 / ACT-5).
+    let applying = activation_apply::current_progress(state);
+    let up_for_pending = up || view.transition.is_some() || applying.is_some();
     // The workstation's primary LAN address, for the client endpoint
     // shown when the gateway binds beyond loopback. A UDP connect
     // sends nothing; it selects the egress interface.
@@ -7949,8 +8461,8 @@ pub async fn op_gateway_status(
     let (activation_pending, activation_changes) = {
         let cfg = state.config.read().await;
         let journal = activation::load_journal(&state.data_dir);
-        let started_at = backend_start_times(state).await;
-        let running = backend_running_ids(state).await;
+        let started_at = backend_start_times(state, &cfg).await;
+        let running = backend_running_ids(state, &cfg).await;
         let configured: std::collections::HashSet<String> =
             cfg.backends.iter().map(|b| b.id.clone()).collect();
         let pending = activation::pending_entries(
@@ -7959,17 +8471,17 @@ pub async fn op_gateway_status(
             &started_at,
             &configured,
             &running,
-            up,
+            up_for_pending,
         );
         let presence = mcp_credential_presence(&[&cfg]).await;
         let drift = activation::config_drift(&cfg, &state.data_dir, |t| presence.contains(t));
         (
-            !pending.is_empty() || (drift && up),
+            !pending.is_empty() || (drift && up_for_pending),
             // The count the activation plan itself reports:
             // journal entries plus the plan's synthesized drift
             // item when drift is pending work (tracker #57) —
             // never "pending" beside a zero count.
-            pending.len() + usize::from(drift && up),
+            pending.len() + usize::from(drift && up_for_pending),
         )
     };
     Ok(json!({
@@ -7978,7 +8490,31 @@ pub async fn op_gateway_status(
         "lan_ip": lan_ip,
         "groups": groups,
         "routing_rules": routing_rules,
+        // The liveness probe alone (kept for older clients); `state`
+        // is the lifecycle state every surface renders.
         "up": up,
+        "state": view.state,
+        "transition": view.transition,
+        "intent": view.intent,
+        "pid": view.pid,
+        "found_by": view.found_by,
+        "service_managed": view.service_managed,
+        "failure": view.failure.as_ref().map(|f| json!({
+            "at": f.at,
+            "reason": f.reason,
+            "exit_code": f.exit_code,
+        })),
+        "postgres": {
+            "installed": pg.installed,
+            "state": pg.state,
+            "pid": pg.pid,
+            "port": pg.port,
+            "port_mismatch": pg.port_mismatch,
+            "transition": pg.transition,
+        },
+        // The server-side activation apply in flight (step, target,
+        // message, source), null when idle.
+        "activation_applying": applying,
         "routing_log_len": routing_log_len,
         "openrouter_cred_present": openrouter_cred_present,
         "activation_pending": activation_pending,
@@ -8019,15 +8555,17 @@ pub async fn op_gateway_activation_plan(
 ) -> ApiResult {
     let cfg = state.config.read().await.clone();
     let journal = activation::load_journal(&state.data_dir);
-    let started_at = backend_start_times(state).await;
-    let running = backend_running_ids(state).await;
+    let started_at = backend_start_times(state, &cfg).await;
+    let running = backend_running_ids(state, &cfg).await;
     let configured: std::collections::HashSet<String> =
         cfg.backends.iter().map(|b| b.id.clone()).collect();
-    let probe_host = manager_wizard::steps::gateway_probe_host(&cfg);
-    let port = cfg.gateway.port;
-    let up = tokio::task::spawn_blocking(move || probe_gateway(&probe_host, port))
-        .await
-        .unwrap_or(false);
+    let view = lifecycle::gateway_view(state).await;
+    // `gateway_up` stays the probe; the plan's pending rule treats a
+    // gateway with an operation in flight as up, so a restart's down
+    // window never makes the plan vanish (GW-10 / ACT-5).
+    let applying = activation_apply::current_progress(state);
+    let probe_up = view.up;
+    let up = probe_up || view.transition.is_some() || applying.is_some();
     let pending_entries = activation::pending_entries(
         &state.data_dir,
         &journal,
@@ -8115,7 +8653,8 @@ pub async fn op_gateway_activation_plan(
     let actionable = gateway_pending || changes.iter().any(|c| c["activation"] == "restart");
     Ok(json!({
         "pending": pending,
-        "gateway_up": up,
+        "gateway_up": probe_up,
+        "gateway_state": view.state,
         "gateway_pending": gateway_pending,
         "drift": drift,
         "files_differ": drift_detail.any(),
@@ -8124,6 +8663,9 @@ pub async fn op_gateway_activation_plan(
         "backend_restart_ids": backend_restart_ids,
         "changes": changes,
         "snapshot_available": journal.snapshot.is_some() && !pending_entries.is_empty(),
+        // The server-side activation apply in flight, null when idle:
+        // every surface disables Apply and shows its progress line.
+        "activation_applying": applying,
     }))
 }
 
@@ -8144,8 +8686,8 @@ pub async fn op_gateway_activation_cancel(
     // and must not be "cancelled" (code-review 4.1; Pete's report,
     // 2026-10-17 — cancel was the only resolution offered for an
     // already-effective change, and it reverted the edit).
-    let started_at = backend_start_times(state).await;
-    let running = backend_running_ids(state).await;
+    let started_at = backend_start_times(state, &cfg).await;
+    let running = backend_running_ids(state, &cfg).await;
     let configured: std::collections::HashSet<String> =
         cfg.backends.iter().map(|b| b.id.clone()).collect();
     let probe_host = manager_wizard::steps::gateway_probe_host(&cfg);
@@ -8213,44 +8755,150 @@ pub async fn op_gateway_activation_cancel(
 /// successful gateway (re)start. The start-gateway step regenerates
 /// everything from the live configuration, so gateway-scope
 /// journaled changes are live by definition at that point (the
-/// plan also self-resolves through the journal's mtime rule; this
+/// plan also self-resolves through the applied-stamp rule; this
 /// just clears promptly). Backend-scope entries are NOT cleared
 /// here: they resolve through their backends' (re)starts, which
 /// the scoped resolution rule observes directly.
+///
+/// Refused (`cleared: false`) while the gateway is not running: a
+/// down or failed gateway serves none of those changes (ACT-1).
+/// The start-gateway step does this bookkeeping itself on success
+/// ([`complete_gateway_activation`]); this op remains for clients
+/// that still call it after their own start.
 pub async fn op_gateway_activation_complete(
     state: &Arc<AppState>,
     sink: &Arc<dyn EventSink>,
 ) -> ApiResult {
-    let (before, _) = activation_unresolved(state).await;
-    let gateway_entries = before.iter().filter(|e| e.scope == "gateway").count();
-    activation::clear_gateway_scope(&state.data_dir)
-        .map_err(ApiError::InvalidInput)?;
-    if gateway_entries > 0 {
-        // The gateway side of a plan just went live. When nothing
-        // remains pending, the plan is applied: fire the toast here
-        // and mark it so the monitor does not repeat it when it
-        // observes the same resolution. When backend entries are
-        // still outstanding, the monitor fires it as they resolve.
-        let (after, drift) = activation_unresolved(state).await;
-        if after.is_empty() && !drift {
-            {
-                let mut watch = state
-                    .notify_watch
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                watch.activation_applied_notified = true;
-            }
-            notify::notify(
-                sink.as_ref(),
-                state,
-                notify::Category::Activation,
-                "Activation plan applied",
-                "All saved changes are now live.",
-            )
-            .await;
-        }
+    let view = lifecycle::gateway_view(state).await;
+    if view.state != lifecycle::LifecycleState::Running {
+        return Ok(json!({
+            "cleared": false,
+            "reason": "gateway is not running",
+            "gateway_state": view.state,
+        }));
     }
+    let before = GatewayPlanBefore::capture(state).await;
+    complete_gateway_activation(state, sink, lifecycle::Origin::Ui, &before).await;
     Ok(json!({ "cleared": true }))
+}
+
+/// The gateway side of the activation plan after a successful
+/// gateway (re)start: clear the gateway journal scope; when the
+/// start resolved the last pending change, fire the one "Activation
+/// plan applied" toast (and mark it so the monitor does not repeat
+/// it); and when a plan was pending before the start and the start
+/// did not come from the activation apply itself (which records its
+/// own execution), record the execution in the activation history
+/// with the starting surface as its source (CR-6).
+pub(crate) async fn complete_gateway_activation(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    origin: lifecycle::Origin,
+    before: &GatewayPlanBefore,
+) {
+    if let Err(e) = activation::clear_gateway_scope(&state.data_dir) {
+        lifecycle::mark(
+            &state.data_dir,
+            lifecycle::GATEWAY,
+            "activation bookkeeping failed",
+            Some(&e),
+            Some(origin),
+        );
+    }
+    if !before.pending {
+        return;
+    }
+    let (after, drift_after) = activation_unresolved(state).await;
+    if !before.gateway_entries.is_empty() && after.is_empty() && !drift_after {
+        // The gateway side of a plan just went live and nothing
+        // remains pending: the plan is applied. When backend entries
+        // are still outstanding, the monitor fires it as they resolve.
+        {
+            let mut watch = state
+                .notify_watch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            watch.activation_applied_notified = true;
+        }
+        notify::notify(
+            sink.as_ref(),
+            state,
+            notify::Category::Activation,
+            "Activation plan applied",
+            "All saved changes are now live.",
+        )
+        .await;
+    }
+    if origin == lifecycle::Origin::Activation
+        || (before.gateway_entries.is_empty() && !before.drift)
+    {
+        return;
+    }
+    let mut execution = gateway_restart_execution(origin, before, chrono::Utc::now());
+    if let Some(id) = activation_history::record_execution(&state.data_dir, &mut execution) {
+        lifecycle::mark(
+            &state.data_dir,
+            lifecycle::GATEWAY,
+            "activation plan applied",
+            Some(&format!(
+                "{} gateway change(s), execution {id}",
+                execution.items.len()
+            )),
+            Some(origin),
+        );
+    }
+}
+
+/// The activation-history record of a gateway (re)start that applied
+/// the plan's gateway side: one applied item per gateway-scope entry
+/// (plus a drift item when only drift was pending), sourced from the
+/// starting surface. Pure.
+pub(crate) fn gateway_restart_execution(
+    origin: lifecycle::Origin,
+    before: &GatewayPlanBefore,
+    finished_at: chrono::DateTime<chrono::Utc>,
+) -> activation_history::ActivationExecution {
+    let mut items: Vec<activation_history::ActivationExecutionItem> = before
+        .gateway_entries
+        .iter()
+        .map(|e| activation_history::ActivationExecutionItem {
+            ts: e.ts.clone(),
+            kind: e.kind.clone(),
+            summary: e.summary.clone(),
+            scope: e.scope.clone(),
+            targets: e.targets.clone(),
+            activation: "gateway_restart".to_string(),
+            outcome: "applied".to_string(),
+            detail: None,
+        })
+        .collect();
+    if items.is_empty() && before.drift {
+        items.push(activation_history::ActivationExecutionItem {
+            ts: before
+                .started_at
+                .unwrap_or(finished_at)
+                .to_rfc3339(),
+            kind: "gateway_drift".to_string(),
+            summary: "Generated gateway configuration regenerated".to_string(),
+            scope: "gateway".to_string(),
+            targets: Vec::new(),
+            activation: "gateway_restart".to_string(),
+            outcome: "applied".to_string(),
+            detail: None,
+        });
+    }
+    activation_history::ActivationExecution {
+        id: String::new(),
+        started_at: before.started_at.unwrap_or(finished_at).to_rfc3339(),
+        finished_at: finished_at.to_rfc3339(),
+        status: "completed".to_string(),
+        source: origin.as_str().to_string(),
+        mode: "restart".to_string(),
+        drift: before.drift,
+        gateway_up: true,
+        gateway_pending: true,
+        items,
+    }
 }
 
 
@@ -8333,6 +8981,12 @@ pub async fn op_gateway_quiesce_wait(
     _sink: &Arc<dyn EventSink>,
     timeout_secs: u64,
 ) -> ApiResult {
+    Ok(gateway_quiesce(state, timeout_secs).await)
+}
+
+/// The quiesce wait behind [`op_gateway_quiesce_wait`] and the drain
+/// phase of [`op_gateway_restart`]: `{drained, in_flight, timed_out}`.
+async fn gateway_quiesce(state: &AppState, timeout_secs: u64) -> Value {
     let timeout = timeout_secs.clamp(5, 600);
     let (host, port) = {
         let cfg = state.config.read().await;
@@ -8360,89 +9014,323 @@ pub async fn op_gateway_quiesce_wait(
         match body {
             Some(text) => match activation::parse_in_flight(&text) {
                 Some(0.0) | None => {
-                    return Ok(json!({ "drained": true, "in_flight": 0, "timed_out": false }))
+                    return json!({ "drained": true, "in_flight": 0, "timed_out": false })
                 }
                 Some(n) => last_in_flight = Some(n),
             },
-            None => return Ok(json!({ "drained": true, "in_flight": 0, "timed_out": false })),
+            None => return json!({ "drained": true, "in_flight": 0, "timed_out": false }),
         }
         if std::time::Instant::now() >= deadline {
-            return Ok(json!({
+            return json!({
                 "drained": false,
                 "in_flight": last_in_flight.unwrap_or(0.0),
                 "timed_out": true,
-            }));
+            });
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
 
-/// Stop the running gateway: terminate the process recorded in
-/// `<data_dir>/gateway.pid` by the start-gateway step (see
-/// [`manager_wizard::stop_gateway`]). Restarting is stop + re-running
-/// the start-gateway step, which is what the wizard does itself.
+/// Restart the gateway server-side, in one operation every surface
+/// shares (the Gateway view, the activation apply, the REST/CLI
+/// route).
+///
+/// - Takes the gateway's lifecycle transition (`restarting`) first:
+///   another gateway operation in flight refuses it with
+///   [`ApiError::Busy`] before anything is touched (GW-8).
+/// - `drain`: waits for in-flight gateway requests first (the
+///   quiesce wait, up to 120 s; a timeout proceeds and is reported).
+/// - Runs the start-gateway step under that transition. The step
+///   prepares while the old gateway keeps serving, stops it just
+///   before the spawn, and adopts the running PostgreSQL server: a
+///   restart never calls [`op_gateway_stop`] and never stops
+///   PostgreSQL (GW-1/GW-2; only a PostgreSQL port change restarts
+///   it, inside the step).
+///
+/// Payload: `{ok, busy?, running_step?, outcome, message,
+/// manual_command, task_id, quiesce?}` — `ok: false` for a refused,
+/// failed or manual-action run (the shared outcome rule,
+/// [`lifecycle::payload_failure`]).
+pub async fn op_gateway_restart(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    origin: Option<String>,
+    drain: Option<bool>,
+) -> ApiResult {
+    let origin = op_origin(origin.as_deref());
+    let drain = drain == Some(true);
+    let guard = lifecycle::begin(
+        state,
+        sink,
+        lifecycle::GATEWAY,
+        lifecycle::TransitionKind::Restarting,
+        origin,
+        drain.then_some("drain in-flight requests first"),
+    )
+    .await?;
+    // The database stays up across a gateway restart; say so in the
+    // gateway's own log, so a reader never wonders whether it moved.
+    let pg = lifecycle::postgres_view(state).await;
+    if pg.state == lifecycle::LifecycleState::Running {
+        lifecycle::mark(
+            &state.data_dir,
+            lifecycle::GATEWAY,
+            "PostgreSQL kept running",
+            pg.pid.map(|p| format!("pid {p}")).as_deref(),
+            Some(origin),
+        );
+    }
+    let quiesce = if drain {
+        lifecycle::mark(
+            &state.data_dir,
+            lifecycle::GATEWAY,
+            "draining in-flight requests",
+            None,
+            Some(origin),
+        );
+        let q = gateway_quiesce(state, 120).await;
+        let detail = if q["timed_out"] == json!(true) {
+            format!(
+                "drain timed out with {} request(s) in flight; restarting anyway",
+                q["in_flight"]
+            )
+        } else {
+            "drained".to_string()
+        };
+        lifecycle::mark(
+            &state.data_dir,
+            lifecycle::GATEWAY,
+            "drain finished",
+            Some(&detail),
+            Some(origin),
+        );
+        Some(q)
+    } else {
+        None
+    };
+    let run = run_wizard_step_inner(state, sink, "start-gateway", origin, Some(guard)).await?;
+    let mut payload = gateway_restart_payload(&run);
+    if let Some(q) = quiesce {
+        payload["quiesce"] = q;
+    }
+    Ok(payload)
+}
+
+/// The [`op_gateway_restart`] payload of one start-gateway run.
+fn gateway_restart_payload(run: &WizardRun) -> Value {
+    if let Some(busy) = &run.busy {
+        let mut p = busy.clone();
+        p["ok"] = json!(false);
+        if p.get("message").is_none() {
+            p["message"] = json!(match busy.get("running_step").and_then(Value::as_str) {
+                Some(step) => format!("busy: {step} is running"),
+                None => "busy: another setup step is running".to_string(),
+            });
+        }
+        return p;
+    }
+    let outcome = run.outcome.as_ref();
+    json!({
+        "ok": run.ok(),
+        "task_id": run.task_id,
+        "outcome": outcome,
+        "message": outcome.map(|o| o.message.clone()),
+        "manual_command": outcome.and_then(|o| o.manual_command.clone()),
+        // An activation plan was pending when the restart began (the
+        // completion bookkeeping ran on success).
+        "activation_pending_before": run.pending_before,
+    })
+}
+
+/// Stop the gateway — the gateway only, by default.
+///
+/// - Takes the gateway's lifecycle transition (`stopping`); another
+///   gateway operation in flight refuses it with [`ApiError::Busy`].
+/// - Records intent Stopped (bumping the lifecycle generation) BEFORE
+///   the kill, so no monitor tick reads the exit as a crash (GW-6).
+/// - Service route: the SCM stop through the shared
+///   [`manager_services::stop_and_wait`]. Process route:
+///   [`manager_wizard::stop_gateway_and_wait`] — finds the gateway by
+///   its pid file, else its port, stops it gracefully, and confirms
+///   the exit and the port release (CR-4).
+/// - Markers in the gateway's own log: "stop requested by …", then
+///   "stopped: pid N, found by pid file|port owner" or "stopped: was
+///   not running".
+/// - PostgreSQL is stopped ONLY when `stop_postgres == Some(true)`
+///   (an explicit "stop gateway and database"), under its own
+///   lifecycle transition and markers (GW-1).
+///
+/// Payload: `{ok, stopped, pid, found_by, postgres_stopped}`.
 pub async fn op_gateway_stop(
     state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
+    sink: &Arc<dyn EventSink>,
+    stop_postgres: Option<bool>,
+    origin: Option<String>,
 ) -> ApiResult {
+    let origin = op_origin(origin.as_deref());
+    let guard = lifecycle::begin(
+        state,
+        sink,
+        lifecycle::GATEWAY,
+        lifecycle::TransitionKind::Stopping,
+        origin,
+        None,
+    )
+    .await?;
+    state
+        .lifecycle
+        .set_intent(lifecycle::GATEWAY, lifecycle::Intent::Stopped);
+    let port = state.config.read().await.gateway.port;
     let data_dir = state.data_dir.clone();
-    // Service mode: the SCM owns the gateway process; the pid-file
-    // stop would kill the service host's child out from under it.
-    let stopped = if state
+    let result: Result<(bool, Option<u32>, Option<&'static str>), String> = if state
         .service_route_active(manager_services::GATEWAY_SERVICE_NAME)
         .await
     {
-        tokio::task::spawn_blocking(|| {
-            use manager_services::ServiceControl;
+        // Service mode: the SCM owns the gateway process; a pid kill
+        // would take the service host's child out from under it.
+        let pid = lifecycle::scm_status(
+            state,
+            manager_services::GATEWAY_SERVICE_NAME,
+            Duration::from_secs(1),
+        )
+        .await
+        .filter(lifecycle::scm_live)
+        .and_then(|s| s.child_pid.or(s.pid));
+        tokio::task::spawn_blocking(move || {
+            let name = manager_services::GATEWAY_SERVICE_NAME;
             let control = manager_services::scm::platform_control();
-            control
-                .stop(manager_services::GATEWAY_SERVICE_NAME)
-                .map_err(|e| e.to_string())?;
-            for _ in 0..150 {
-                match control
-                    .query(manager_services::GATEWAY_SERVICE_NAME)
-                    .map_err(|e| e.to_string())?
-                    .state
-                {
-                    manager_services::ServiceState::Stopped
-                    | manager_services::ServiceState::NotInstalled => return Ok(true),
-                    _ => std::thread::sleep(std::time::Duration::from_millis(100)),
-                }
-            }
-            Err("gateway service did not stop within 15 s".to_string())
+            manager_services::stop_and_wait(
+                &control,
+                name,
+                manager_services::ServiceTimeouts::stop(name),
+            )
+            .map_err(|e| e.to_string())
         })
         .await
-        .map_err(|e| ApiError::Gateway(format!("gateway stop task failed: {e}")))?
-        .map_err(ApiError::Gateway)?
+        .map_err(|e| format!("gateway stop task failed: {e}"))
+        .and_then(|r| r)
+        .map(|outcome| match outcome {
+            manager_services::StopOutcome::Stopped { .. } => (true, pid, Some("service")),
+            manager_services::StopOutcome::AlreadyStopped
+            | manager_services::StopOutcome::NotRegistered => (false, None, None),
+        })
     } else {
-        tokio::task::spawn_blocking({
-            let data_dir = data_dir.clone();
-            move || manager_wizard::stop_gateway(&data_dir)
+        tokio::task::spawn_blocking(move || {
+            manager_wizard::stop_gateway_and_wait(&data_dir, port, true)
         })
         .await
-        .map_err(|e| ApiError::Gateway(format!("gateway stop task failed: {e}")))?
-        .map_err(ApiError::Gateway)?
+        .map_err(|e| format!("gateway stop task failed: {e}"))
+        .and_then(|r| r)
+        .map(|o| {
+            let by = match o.found_by {
+                manager_wizard::FoundBy::PidFile => Some("pid_file"),
+                manager_wizard::FoundBy::PortOwner => Some("port_owner"),
+                manager_wizard::FoundBy::None => None,
+            };
+            (o.stopped, o.pid, by)
+        })
     };
-    // The app-managed PostgreSQL server exists to serve the
-    // gateway's database; stop it after the gateway so nothing is
-    // left holding pooled connections to a stopping server.
-    // Best-effort: the gateway stop already succeeded, so a
-    // PostgreSQL stop problem is reported in the payload, not as a
-    // command failure.
-    let postgres_stopped =
-        manager_wizard::steps::stop_postgres_server(&RealSystemOps::default(), &data_dir)
-            .await
-            .unwrap_or(false);
-    // The operator stopped the gateway deliberately: the
-    // notification monitor must not report it as down. Clear the
-    // expectation until a probe sees it up again.
+    let (stopped, pid, found_by) = match result {
+        Ok(r) => r,
+        Err(e) => {
+            lifecycle::finish(state, sink.as_ref(), guard, Err(e.clone()));
+            return Err(ApiError::Gateway(e));
+        }
+    };
+    let detail = match (stopped, pid, found_by) {
+        (true, Some(pid), Some("service")) => format!("pid {pid}, service stop"),
+        (true, Some(pid), Some(by)) => format!("pid {pid}, found by {}", by.replace('_', " ")),
+        (true, _, _) => "service stopped".to_string(),
+        (false, _, _) => "was not running".to_string(),
+    };
+    lifecycle::finish(state, sink.as_ref(), guard, Ok(detail));
+    let postgres_stopped = if stop_postgres == Some(true) {
+        postgres_stop_inner(state, sink, origin).await?
+    } else {
+        false
+    };
+    Ok(json!({
+        "ok": true,
+        "stopped": stopped,
+        "pid": pid,
+        "found_by": found_by,
+        "postgres_stopped": postgres_stopped,
+    }))
+}
+
+/// A start-gateway that finished Done has the app-managed PostgreSQL
+/// server up again (adopted or started by `ensure_postgres_running`):
+/// an earlier "Stop database" no longer stands, so PostgreSQL is
+/// expected up again (intent Running, the stale failure cleared) and a
+/// later postmaster death reads `failed` and is reported by the monitor.
+/// Harmless without an app-managed server (its view reads
+/// `not_installed` before intent is consulted).
+pub(crate) fn rearm_postgres_after_gateway_start(state: &AppState) {
+    state
+        .lifecycle
+        .set_intent(lifecycle::POSTGRES, lifecycle::Intent::Running);
+    state.lifecycle.clear_failure(lifecycle::POSTGRES);
+}
+
+/// Stop the app-managed PostgreSQL server under its own lifecycle
+/// transition (`pg_ctl stop -m fast`; the wizard writes the pg_ctl
+/// markers into `postgres.lifecycle.log`). Intent Stopped is recorded
+/// before the stop. Returns whether a running server was stopped.
+async fn postgres_stop_inner(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    origin: lifecycle::Origin,
+) -> Result<bool, ApiError> {
+    let guard = lifecycle::begin(
+        state,
+        sink,
+        lifecycle::POSTGRES,
+        lifecycle::TransitionKind::Stopping,
+        origin,
+        None,
+    )
+    .await?;
+    state
+        .lifecycle
+        .set_intent(lifecycle::POSTGRES, lifecycle::Intent::Stopped);
+    match manager_wizard::steps::stop_postgres_server(&RealSystemOps::default(), &state.data_dir)
+        .await
     {
-        let mut watch = state.notify_watch.lock().unwrap_or_else(|e| e.into_inner());
-        watch.gateway_expected = false;
-        watch.gateway_up = Some(false);
-        watch.gateway_down_strikes = 0;
+        Ok(stopped) => {
+            lifecycle::finish(
+                state,
+                sink.as_ref(),
+                guard,
+                Ok(if stopped { String::new() } else { "was not running".to_string() }),
+            );
+            Ok(stopped)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            lifecycle::finish(state, sink.as_ref(), guard, Err(msg.clone()));
+            Err(ApiError::Gateway(format!("PostgreSQL stop failed: {msg}")))
+        }
     }
-    Ok(json!({ "ok": true, "stopped": stopped, "postgres_stopped": postgres_stopped }))
+}
+
+/// Stop the app-managed PostgreSQL server on its own. Refused while
+/// the gateway is live or has an operation in flight (the gateway
+/// would lose its database mid-request): stop the gateway first, or
+/// use `gateway_stop` with `stop_postgres`. Payload: `{ok, stopped}`.
+pub async fn op_postgres_stop(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    origin: Option<String>,
+) -> ApiResult {
+    let view = lifecycle::gateway_view(state).await;
+    if view.state.is_live() || view.transition.is_some() {
+        return Err(ApiError::InvalidInput(format!(
+            "stop the gateway first (it is {})",
+            view.state
+        )));
+    }
+    let stopped = postgres_stop_inner(state, sink, op_origin(origin.as_deref())).await?;
+    Ok(json!({ "ok": true, "stopped": stopped }))
 }
 
 
@@ -10439,27 +11327,46 @@ pub async fn op_diagnostics_export_bundle(
         samples = lock_telemetry(&store).snapshot();
     }
     let telemetry_json = serde_json::to_string_pretty(&samples)?;
-    let scopes: Vec<String> = {
+    // Every retained supervisor log scope (log_scopes() also covers
+    // scopes whose process was pruned but whose ring, incl. an archived
+    // previous run, is retained), copied under one short lock.
+    let mut scope_records: Vec<(String, Vec<LogRecord>)> = {
         let sup = state.supervisor().await.lock().await;
-        // Every retained log scope, not just registered specs:
-        // log_scopes() also covers scopes whose process was pruned but
-        // whose ring (incl. an archived previous run) is retained.
         let mut ids: Vec<String> = sup.log_scopes().into_iter().map(|s| s.id).collect();
         ids.sort();
-        ids
+        ids.into_iter()
+            .map(|id| {
+                let records = sup.logs_query(&id, None, None, 5000).records;
+                (id, records)
+            })
+            .collect()
     };
+    // The file-backed scopes join the bundle (no lock held): the
+    // gateway's LiteLLM output and lifecycle markers (the record of
+    // the most recent gateway failures), the wizard log (step
+    // outcomes, unfinished steps, busy rejections), the optimize log,
+    // PostgreSQL's server log and markers, the log receiver's logs,
+    // the service helper's log, and each backend's lifecycle markers
+    // and service-mode output (merged into that backend's scope).
+    let backend_ids: Vec<String> = cfg.backends.iter().map(|b| b.id.clone()).collect();
+    for (id, files) in file_log_scopes(&state.data_dir, &backend_ids) {
+        let (records, _) = file_scope_records(&id, &files, true);
+        if records.is_empty() {
+            continue;
+        }
+        match scope_records.iter_mut().find(|(s, _)| *s == id) {
+            Some((_, existing)) => existing.extend(records),
+            None => scope_records.push((id, records)),
+        }
+    }
     let mut log_scopes: Vec<(String, Vec<String>)> = Vec::new();
-    for scope in scopes {
-        let records = state
-            .supervisor()
-            .await
-            .lock()
-            .await
-            .logs_query(&scope, None, None, 5000)
-            .records;
+    for (scope, mut records) in scope_records {
+        // Oldest first; reversing the newest-first sources first keeps
+        // same-timestamp groups in file order under the stable sort.
+        records.reverse();
+        records.sort_by_key(|r| r.ts);
         let lines: Vec<String> = records
             .iter()
-            .rev()
             .map(|r| {
                 // Archived (previous-run) records keep their marker in
                 // the bundle so the distinction survives export.
@@ -10474,49 +11381,6 @@ pub async fn op_diagnostics_export_bundle(
             })
             .collect();
         log_scopes.push((scope, lines));
-    }
-    // The file-backed gateway log joins the bundle as the "gateway"
-    // scope: it is the record of the most recent gateway failures
-    // (startup errors included) and the supervisor hub never sees it.
-    let (gateway_records, _) = gateway_log_records(&state.data_dir);
-    if !gateway_records.is_empty() {
-        let lines: Vec<String> = gateway_records
-            .iter()
-            .rev()
-            .map(|r| {
-                let archived = if r.archived { " [archived]" } else { "" };
-                format!(
-                    "[{}] [{:?}]{} {}",
-                    r.ts.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
-                    r.stream,
-                    archived,
-                    r.line
-                )
-            })
-            .collect();
-        log_scopes.push(("gateway".to_string(), lines));
-    }
-    // The wizard log joins as the "wizard" scope: step outcomes,
-    // start markers for steps that never finished, and busy
-    // rejections live only in that file — a bundle without it
-    // cannot show why a setup step blocked or stalled.
-    let (wizard_records, _) = wizard_log_records(&state.data_dir);
-    if !wizard_records.is_empty() {
-        let lines: Vec<String> = wizard_records
-            .iter()
-            .rev()
-            .map(|r| {
-                let archived = if r.archived { " [archived]" } else { "" };
-                format!(
-                    "[{}] [{:?}]{} {}",
-                    r.ts.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
-                    r.stream,
-                    archived,
-                    r.line
-                )
-            })
-            .collect();
-        log_scopes.push(("wizard".to_string(), lines));
     }
     let versions = vec![
         ("app".to_string(), env!("CARGO_PKG_VERSION").to_string()),
@@ -11169,8 +12033,14 @@ mod tests {
     /// tests (tracker #60): config file and data dir in scratch
     /// space, so saves and the activation journal land there.
     fn advanced_test_state(cfg: AppConfig) -> (Arc<AppState>, PathBuf) {
+        // pid + a process-wide counter beside the timestamp: Windows
+        // clock resolution let two parallel tests draw the same name,
+        // and the first to finish deleted the other's data dir.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "llm-mgr-advanced-flags-{}",
+            "llm-mgr-advanced-flags-{}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -11378,6 +12248,11 @@ mod tests {
     #[tokio::test]
     async fn list_backends_resolves_predicted_from_a_stored_measurement() {
         let (state, dir) = advanced_test_state(test_cfg());
+        // Hermetic telemetry: the fingerprint below is computed with
+        // no GPUs, so list_backends must not see live host GPUs.
+        let _ = state.telemetry.set(Arc::new(std::sync::Mutex::new(
+            TelemetryStore::new(),
+        )));
         let sink = test_sink();
         let cfg = state.config.read().await.clone();
         let planner = cfg
@@ -12176,6 +13051,12 @@ mod tests {
             coder.flags.split_mode = manager_config::SplitMode::Layer;
         }
         let (state, dir) = advanced_test_state(cfg);
+        // Hermetic telemetry (no GPUs): against live host telemetry
+        // the [1.0] split is refused on multi-GPU machines, which
+        // made this test flaky depending on poll timing.
+        let _ = state.telemetry.set(Arc::new(std::sync::Mutex::new(
+            TelemetryStore::new(),
+        )));
         let sink = test_sink();
         let before = serde_json::to_value(state.config.read().await.clone()).unwrap();
         let r = op_model_assign(
@@ -12372,6 +13253,142 @@ mod tests {
         let current: Vec<&LogRecord> = records.iter().filter(|r| !r.archived).collect();
         assert_eq!(current.len(), 1);
         assert!(current[0].line.contains("consultation start"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_scope_records_order_markers_by_their_own_timestamps() {
+        let dir = std::env::temp_dir().join(format!(
+            "llm-mgr-file-scope-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        // Raw LiteLLM output: no per-line stamps (file mtime = now).
+        std::fs::write(logs.join("gateway.stdout.log"), "INFO: boot\nINFO: serving\n").unwrap();
+        std::fs::write(logs.join("gateway.stderr.log.prev"), "old crash trace\n").unwrap();
+        let lifecycle_log = lifecycle::log_path(&dir, lifecycle::GATEWAY);
+        for (secs, event) in [(0, "restart requested"), (5, "stopped"), (9, "started")] {
+            let at = chrono::DateTime::parse_from_rfc3339("2026-11-12T10:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+                + chrono::Duration::seconds(secs);
+            manager_supervisor::lifecycle::append_marker(
+                &lifecycle_log,
+                &manager_supervisor::lifecycle::marker_line(at, "gateway", event, None, None),
+            );
+        }
+        let files = file_log_scopes(&dir, &[])
+            .into_iter()
+            .find(|(id, _)| id == "gateway")
+            .unwrap()
+            .1;
+        let (mut records, previous) = file_scope_records("gateway", &files, true);
+        assert!(previous, "the stderr .prev run is reported");
+        assert!(records.iter().all(|r| r.source == "gateway"));
+        assert_eq!(records.iter().filter(|r| r.archived).count(), 1);
+        records.sort_by_key(|r| std::cmp::Reverse(r.ts));
+        let markers: Vec<&str> = records
+            .iter()
+            .filter(|r| r.line.contains("[lifecycle]"))
+            .map(|r| r.line.rsplit(": ").next().unwrap())
+            .collect();
+        // Newest first by the markers' own stamps, not the file mtime.
+        assert_eq!(markers, ["started", "stopped", "restart requested"]);
+        let started = records.iter().find(|r| r.line.ends_with("started")).unwrap();
+        assert_eq!(started.ts.to_rfc3339(), "2026-11-12T10:00:09+00:00");
+        // Unstamped lines keep their file order (newest-first emission).
+        let raw: Vec<&str> = records
+            .iter()
+            .filter(|r| r.line.starts_with("INFO"))
+            .map(|r| r.line.as_str())
+            .collect();
+        assert_eq!(raw, ["INFO: serving", "INFO: boot"]);
+        // Presence without reading.
+        assert_eq!(file_scope_presence(&files), (true, true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn get_logs_serves_file_backed_lifecycle_scopes() {
+        let mut cfg = test_cfg();
+        cfg.backends.truncate(1);
+        let backend = cfg.backends[0].id.clone();
+        let (state, dir) = advanced_test_state(cfg);
+        let sink = test_sink();
+        lifecycle::mark(&dir, lifecycle::POSTGRES, "ready", Some("pid 7"), None);
+        lifecycle::mark(
+            &dir,
+            &lifecycle::backend_key(&backend),
+            "restart requested",
+            None,
+            Some(lifecycle::Origin::Activation),
+        );
+        std::fs::write(dir.join("logs").join("service-manage.log"), "registered\n").unwrap();
+        let page = |v: &Value| -> Vec<String> {
+            v["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l["line"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let pg = op_get_logs(
+            &state,
+            &sink,
+            "postgres".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let lines = page(&pg);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with("postgres: ready: pid 7"));
+        let ids: Vec<&str> = pg["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"postgres"));
+        assert!(ids.contains(&"services"));
+        assert!(ids.contains(&backend.as_str()), "{ids:?}");
+        assert!(!ids.contains(&"gateway"), "empty scopes are not listed");
+        let be = op_get_logs(
+            &state, &sink, backend.clone(), None, None, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        let lines = page(&be);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("restart requested — by activation"));
+        assert_eq!(be["lines"][0]["source"], json!(backend));
+        let all = op_get_logs(
+            &state,
+            &sink,
+            "all".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(page(&all).len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16234,40 +17251,60 @@ pub async fn op_services_list(
 ) -> ApiResult {
     let cfg = state.config.read().await.clone();
     let host = service_host_path();
-    let mut targets: Vec<(String, String)> = cfg
+    // (target, kind, service name, lifecycle key)
+    let mut targets: Vec<(String, &'static str, String, String)> = cfg
         .backends
         .iter()
-        .map(|b| (b.id.clone(), manager_services::backend_service_name(&b.id)))
+        .map(|b| {
+            (
+                b.id.clone(),
+                "backend",
+                manager_services::backend_service_name(&b.id),
+                lifecycle::backend_key(&b.id),
+            )
+        })
         .collect();
     targets.push((
         "gateway".to_string(),
+        "gateway",
         manager_services::GATEWAY_SERVICE_NAME.to_string(),
+        lifecycle::GATEWAY.to_string(),
     ));
-    let queried = tokio::task::spawn_blocking(move || {
-        use manager_services::ServiceControl;
-        let control = manager_services::scm::platform_control();
-        targets
-            .into_iter()
-            .map(|(target, name)| {
-                let status = control.query(&name).ok();
-                (target, name, status)
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_default();
-    let services: Vec<Value> = queried
+    targets.push((
+        lifecycle::LOG_RECEIVER.to_string(),
+        "log-receiver",
+        manager_services::LOG_RECEIVER_SERVICE_NAME.to_string(),
+        lifecycle::LOG_RECEIVER.to_string(),
+    ));
+    // One batched SCM query (the shared snapshot, at most 1 s old).
+    let ids: Vec<String> = cfg.backends.iter().map(|b| b.id.clone()).collect();
+    let snap = lifecycle::scm_snapshot_ids(state, Duration::from_secs(1), ids).await;
+    let services: Vec<Value> = targets
         .into_iter()
-        .map(|(target, name, status)| {
-            let live = status.as_ref().filter(|s| {
-                !matches!(s.state, manager_services::ServiceState::NotInstalled)
-            });
+        .map(|(target, kind, name, key)| {
+            let live = snap
+                .get(&name)
+                .filter(|s| lifecycle::registered(s));
+            // An operation in flight on the service wins (the same
+            // precedence every lifecycle view applies).
+            let transition = state.lifecycle.transition(&key);
+            let lifecycle_state = match (&transition, live) {
+                (Some(t), _) => t.kind.into(),
+                (None, Some(s)) => s.lifecycle_state(),
+                (None, None) => lifecycle::LifecycleState::NotInstalled,
+            };
             json!({
                 "target": target,
+                "kind": kind,
                 "service_name": name,
                 "registered": live.is_some(),
                 "state": live.map(|s| serde_json::to_value(s.state).unwrap_or(Value::Null)),
+                "lifecycle": lifecycle_state.as_str(),
+                "transition": transition,
                 "pid": live.and_then(|s| s.pid),
+                "child_pid": live.and_then(|s| s.child_pid),
+                "exit_code": live.and_then(lifecycle::scm_exit_code),
+                "failure_reason": live.and_then(|s| s.failure_reason()),
             })
         })
         .collect();
@@ -16290,9 +17327,29 @@ pub async fn op_services_list(
 /// written to config or logs.
 pub async fn op_services_register(
     state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
+    sink: &Arc<dyn EventSink>,
     target: String,
 ) -> ApiResult {
+    refuse_log_receiver_target(&target)?;
+    // A live process-route instance would keep holding the port while
+    // the next start routes to the SCM: refuse until it is stopped
+    // (SCM-18). An operation in flight on it is refused the same way.
+    if target == "gateway" {
+        let view = lifecycle::gateway_view(state).await;
+        if view.transition.is_some()
+            || (!view.service_managed && (view.pid.is_some() || view.state.is_live()))
+        {
+            return Err(ApiError::InvalidInput(
+                "stop the gateway first (it is running under process supervision)".to_string(),
+            ));
+        }
+    } else if let Some(b) = lifecycle::backend_liveness(state).await.get(&target) {
+        if b.transition.is_some() || (b.state.is_live() && !b.service_managed) {
+            return Err(ApiError::InvalidInput(format!(
+                "stop backend {target} first (it is running under process supervision)"
+            )));
+        }
+    }
     let host = require_service_host()?;
     let cfg = state.config.read().await.clone();
     let mut def = if target == "gateway" {
@@ -16343,23 +17400,95 @@ pub async fn op_services_register(
             out.exit_code
         )));
     }
+    service_registration_changed(state, sink, &target, "registered as a Windows service", &service_name);
     Ok(json!({ "ok": true, "service_name": service_name, "account": account }))
+}
+
+/// The log receiver is deployed and removed from its own card
+/// (`log_receiver_deploy` / `log_receiver_remove`), never through the
+/// generic services register/unregister.
+fn refuse_log_receiver_target(target: &str) -> Result<(), ApiError> {
+    if target == lifecycle::LOG_RECEIVER {
+        return Err(ApiError::InvalidInput(
+            "the log receiver is deployed and removed from Settings > Log receiver".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The lifecycle key of a services register/unregister `target`.
+fn service_target_key(target: &str) -> String {
+    if target == "gateway" {
+        lifecycle::GATEWAY.to_string()
+    } else {
+        lifecycle::backend_key(target)
+    }
+}
+
+/// After a (un)registration: a marker in the target's own lifecycle
+/// log, a SERVICE_LIFECYCLE event (so every surface repaints its
+/// route and state) and a fresh SCM snapshot on the next read.
+fn service_registration_changed(
+    state: &AppState,
+    sink: &Arc<dyn EventSink>,
+    target: &str,
+    event: &str,
+    service_name: &str,
+) {
+    let key = service_target_key(target);
+    lifecycle::mark(
+        &state.data_dir,
+        &key,
+        event,
+        Some(service_name),
+        Some(lifecycle::Origin::Ui),
+    );
+    lifecycle::invalidate_scm(state);
+    lifecycle::emit(
+        sink.as_ref(),
+        &key,
+        if event.starts_with("registered") {
+            "registered"
+        } else {
+            "unregistered"
+        },
+        lifecycle::LifecycleState::Stopped,
+        Some(lifecycle::Origin::Ui),
+        Some(service_name),
+    );
 }
 
 /// Unregister one service (`target`: a backend id, or "gateway")
 /// through the elevated helper. The service returns to process
-/// supervision; its definition file is left in place.
+/// supervision; its definition file is left in place. Refused while
+/// the service is running or pending (unregistering would stop it
+/// silently inside the SCM delete): stop it first (SCM-18).
 pub async fn op_services_unregister(
-    _state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
     target: String,
 ) -> ApiResult {
-    let host = require_service_host()?;
+    refuse_log_receiver_target(&target)?;
     let service_name = if target == "gateway" {
         manager_services::GATEWAY_SERVICE_NAME.to_string()
     } else {
         manager_services::backend_service_name(&target)
     };
+    if let Some(status) = lifecycle::scm_status(state, &service_name, Duration::from_secs(1)).await
+    {
+        if lifecycle::scm_live(&status) {
+            return Err(ApiError::InvalidInput(format!(
+                "stop {} first (its service is {})",
+                if target == "gateway" {
+                    "the gateway".to_string()
+                } else {
+                    format!("backend {target}")
+                },
+                status.state.as_str()
+            )));
+        }
+    }
+    let host = require_service_host()?;
     let cmd = manager_wizard::PlannedCommand::new(vec![
         host.display().to_string(),
         "unregister".to_string(),
@@ -16379,6 +17508,7 @@ pub async fn op_services_unregister(
             out.exit_code
         )));
     }
+    service_registration_changed(state, sink, &target, "unregistered (back to process supervision)", &service_name);
     Ok(json!({ "ok": true, "service_name": service_name }))
 }
 
@@ -16710,7 +17840,7 @@ fn token_normalized_flags(raw: Option<&str>) -> Option<String> {
 /// `backend_set_offload` entry targeting it.
 async fn offload_change_pending(state: &AppState, cfg: &AppConfig, id: &str) -> bool {
     let journal = activation::load_journal(&state.data_dir);
-    let started_at = backend_start_times(state).await;
+    let started_at = backend_start_times(state, cfg).await;
     let configured: std::collections::HashSet<String> =
         cfg.backends.iter().map(|b| b.id.clone()).collect();
     activation::unresolved_entries_scoped(&state.data_dir, &journal, &started_at, &configured)
@@ -16752,51 +17882,6 @@ async fn offload_probe_backend_alive(state: &AppState, id: &str) -> bool {
         .find(|s| s.id == id)
         .map(|s| matches!(s.state, ProcessState::Running | ProcessState::Starting))
         .unwrap_or(false)
-}
-
-/// Service-mode backend start: regenerate the definition from the
-/// current spec, then start the service through the SCM. The
-/// service reports Running once the host has spawned llama-server;
-/// model-load progress is observed through `list_backends`, as in
-/// process mode.
-async fn scm_start_backend(state: &AppState, id: &str) -> Result<(), ApiError> {
-    state
-        .write_backend_service_definition(id)
-        .await
-        .map_err(ApiError::Services)?;
-    let name = manager_services::backend_service_name(id);
-    tokio::task::spawn_blocking(move || {
-        use manager_services::ServiceControl;
-        manager_services::scm::platform_control().start(&name)
-    })
-    .await
-    .map_err(|e| ApiError::Services(format!("service start task failed: {e}")))?
-    .map_err(|e| ApiError::Services(e.to_string()))
-}
-
-/// Service-mode backend stop: SCM stop, then wait for the stopped
-/// state — the supervisor's stop returns once the process is down,
-/// so the service path does too. (A service-mode stop terminates the
-/// host's job object: the whole tree goes down at once. The graceful
-/// drain window is process-mode behavior in increment 1.)
-async fn scm_stop_backend(id: &str) -> Result<(), ApiError> {
-    let name = manager_services::backend_service_name(id);
-    tokio::task::spawn_blocking(move || {
-        use manager_services::ServiceControl;
-        let control = manager_services::scm::platform_control();
-        control.stop(&name).map_err(|e| e.to_string())?;
-        for _ in 0..300 {
-            match control.query(&name).map_err(|e| e.to_string())?.state {
-                manager_services::ServiceState::Stopped
-                | manager_services::ServiceState::NotInstalled => return Ok(()),
-                _ => std::thread::sleep(std::time::Duration::from_millis(100)),
-            }
-        }
-        Err(format!("service '{name}' did not stop within 30 s"))
-    })
-    .await
-    .map_err(|e| ApiError::Services(format!("service stop task failed: {e}")))?
-    .map_err(ApiError::Services)
 }
 
 fn require_service_host() -> Result<std::path::PathBuf, ApiError> {
@@ -16991,7 +18076,7 @@ async fn mcp_test_gateway_connection(
 async fn activation_unresolved(state: &AppState) -> (Vec<activation::ActivationEntry>, bool) {
     let cfg = state.config.read().await;
     let journal = activation::load_journal(&state.data_dir);
-    let started_at = backend_start_times(state).await;
+    let started_at = backend_start_times(state, &cfg).await;
     let configured: std::collections::HashSet<String> =
         cfg.backends.iter().map(|b| b.id.clone()).collect();
     let unresolved =
@@ -16999,13 +18084,6 @@ async fn activation_unresolved(state: &AppState) -> (Vec<activation::ActivationE
     let presence = mcp_credential_presence(&[&cfg]).await;
     let drift = activation::config_drift(&cfg, &state.data_dir, |t| presence.contains(t));
     (unresolved, drift)
-}
-
-/// Whether an activation plan is pending right now (any unresolved
-/// entry, or live config drift).
-async fn activation_plan_pending(state: &AppState) -> bool {
-    let (unresolved, drift) = activation_unresolved(state).await;
-    !unresolved.is_empty() || drift
 }
 
 /// Build the registry entry for [`model_add`]: every input rule and
