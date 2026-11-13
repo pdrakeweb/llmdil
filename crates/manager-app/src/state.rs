@@ -55,6 +55,7 @@ mod downloads;
 mod gateway;
 mod optimize_slots;
 mod task_registry;
+mod telemetry;
 mod wizard;
 
 pub(crate) use bench_slots::BenchState;
@@ -62,6 +63,7 @@ pub(crate) use downloads::{DownloadOutcome, DownloadsState};
 pub(crate) use gateway::GatewayState;
 pub(crate) use optimize_slots::OptimizeState;
 pub(crate) use task_registry::TaskRegistry;
+pub(crate) use telemetry::TelemetryState;
 pub(crate) use wizard::WizardState;
 
 /// Shared backend state. Subsystems are lazily initialized (`OnceCell`) so
@@ -78,16 +80,8 @@ pub struct AppState {
     /// (tests, tools).
     pub(crate) config_load: std::sync::Mutex<Option<Value>>,
     pub(crate) supervisor: OnceCell<Mutex<Supervisor>>,
-    /// The telemetry store is owned by the poll loop (single writer); the
-    /// Arc is shared with the Poller built in `telemetry()`. The std Mutex
-    /// is the store's own lock type from manager-telemetry.
-    pub(crate) telemetry: OnceCell<Arc<std::sync::Mutex<TelemetryStore>>>,
-    /// Keeps the telemetry poll loop alive for the app's lifetime.
-    pub(crate) telemetry_poller: OnceCell<std::sync::Mutex<manager_telemetry::store::PollHandle>>,
-    /// Persistent per-GPU telemetry history (see [`gpu_history`]):
-    /// loaded from the data dir on first use, appended by the
-    /// recorder loop, read by the history query op.
-    pub(crate) gpu_history: OnceCell<std::sync::Mutex<gpu_history::GpuHistoryCell>>,
+    /// GPU telemetry and history (see [`telemetry::TelemetryState`]).
+    pub(crate) telemetry: TelemetryState,
     /// The log-streaming shipper (log-streaming design) and what it
     /// was started with; started after config load when the feature
     /// is enabled and restarted when its settings are saved. See
@@ -297,9 +291,7 @@ impl AppState {
             data_dir,
             config_load: std::sync::Mutex::new(None),
             supervisor: OnceCell::new(),
-            telemetry: OnceCell::new(),
-            telemetry_poller: OnceCell::new(),
-            gpu_history: OnceCell::new(),
+            telemetry: TelemetryState::default(),
             logship: std::sync::Mutex::new(logship::LogshipSlot::default()),
             logship_apply: Mutex::new(()),
             logship_tap: manager_logship::RecordTap::new(),
@@ -428,6 +420,7 @@ impl AppState {
     /// always empty.
     pub(crate) async fn telemetry(&self) -> Arc<std::sync::Mutex<TelemetryStore>> {
         self.telemetry
+            .store
             .get_or_init(|| async {
                 let interval_ms = self.config.read().await.telemetry.poll_interval_ms;
                 let cadence = if interval_ms == 0 {
@@ -440,7 +433,7 @@ impl AppState {
                 let source = manager_telemetry::default_telemetry_stack();
                 let (poller, store) = Poller::new(source, cadence);
                 let handle = poller.start();
-                let _ = self.telemetry_poller.set(std::sync::Mutex::new(handle));
+                let _ = self.telemetry.poller.set(std::sync::Mutex::new(handle));
                 // Static GPU inventory (index, UUID, driver model)
                 // for launch construction: CUDA_VISIBLE_DEVICES is
                 // expressed in GPU UUIDs (see backend_spec). The
@@ -528,7 +521,8 @@ impl AppState {
     /// the recorder appends and the history op reads through the
     /// same cell, so the file's in-memory image is single-owned.
     pub(crate) async fn gpu_history(&self) -> &std::sync::Mutex<gpu_history::GpuHistoryCell> {
-        self.gpu_history
+        self.telemetry
+            .gpu_history
             .get_or_init(|| async {
                 std::sync::Mutex::new(gpu_history::GpuHistoryCell {
                     store: gpu_history::load_history(&self.data_dir),
