@@ -21,7 +21,11 @@ use tower::ServiceExt;
 const PW: &str = "a-unique-passphrase";
 
 async fn ctx_with_users() -> (Arc<ApiCtx>, std::path::PathBuf, [String; 4]) {
-    let dir = std::env::temp_dir().join(format!("manager-api-matrix-{}", std::process::id()));
+    // pid + a per-call counter: a pid-only name was shared by every
+    // test in this binary, each removing the dir the others ran in.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("manager-api-matrix-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut cfg = manager_config::AppConfig::default_config();
