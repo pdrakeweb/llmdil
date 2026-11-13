@@ -161,7 +161,7 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
     } else if (s.url) {
       // URLs carry a copy button (principle 10), following the
       // settings rows' data-copy-value pattern.
-      lines.push(line("URL", `<span style="font-family:var(--mono)">${esc(s.url)}</span> <button class="btn" data-mcp-copy="${esc(s.url)}" style="padding:1px 7px;font-size:11px">Copy</button>`));
+      lines.push(line("URL", `<span style="font-family:var(--mono)">${esc(s.url)}</span> <button class="btn" data-mcp-copy="${esc(s.url)}" title="Copy URL" aria-label="Copy URL" style="padding:1px 7px;font-size:11px">${icon("copy")}</button>`));
     }
     if (s.cred_ref) {
       lines.push(line("Credential", s.credential_present ? "present" : "missing"));
@@ -290,7 +290,7 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
       <input data-mcp-field="metered" type="checkbox"${draft.metered ? " checked" : ""}> Metered (paid upstream)</label>
     ${formError ? `<div style="font-size:12px;color:var(--err);margin-top:8px">${esc(formError)}</div>` : ""}
     <div class="card-actions"><button class="btn" data-mcp-act="form-save"${idErr ? " disabled" : ""}>${icon("check")} Save server</button>
-      <button class="btn" data-mcp-act="form-cancel">Cancel</button></div>
+      <button class="btn icon-only" data-mcp-act="form-cancel" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
   </div>`;
   };
 

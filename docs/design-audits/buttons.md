@@ -338,3 +338,23 @@ sites. The #48 addendum's 8 swapped controls stand as recorded.
   are predominantly words + icon workflow actions (consult, measure,
   run, discover, store credential); a rule-15 sweep of those three
   files is the open follow-up, not a finding recorded here.
+
+## Addendum — rule-15 sweep of the MCP surfaces (2026-11-12)
+
+Closes the recount's open follow-up for `views/mcp.ts` and
+`mcp-prompt.ts`. `views/optimize.ts` is **not** swept here — it was
+under concurrent edit by another workstream; its sweep stays open.
+
+| Button | Before | After | Call |
+|---|---|---|---|
+| MCP card URL Copy (`data-mcp-copy`) | word "Copy" | icon-only `copy`, title/aria-label "Copy URL" (compact in-row padding) | secondary safe action, like every other copy button |
+| MCP form Cancel (`data-mcp-act="form-cancel"`) | word "Cancel" | `.btn.icon-only` `x`, title/aria-label "Cancel" | dismiss family, matching the add-backend/add-model form Cancel |
+| Credential prompt Skip (`data-prompt-act="skip"`) | word "Skip" | `.btn.icon-only` `x`, title/aria-label "Skip <server>" | judgement call: Skip only dismisses the row — the gateway starts without the server either way — so it is a secondary safe action |
+| Credential prompt Cancel start (`data-prompt-act="cancel"`) | word only | `x` icon + "Cancel start" | operation-critical (aborts the gateway start): words kept, icon added |
+
+Unchanged (already compliant): Add server (topbar workflow opener,
+words + icon, as addendum C5), Store / Store credential / Get an API
+key / Test (the cards' and prompt's workflow actions, words + icon),
+Save server (form commit), Remove (destructive, words + icon), Edit
+(icon-only), Continue start (words + icon). Handlers and hooks are
+unchanged; smoke pins the four changes.
