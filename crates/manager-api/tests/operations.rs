@@ -16,14 +16,19 @@ use manager_api::users::RoleName;
 use manager_api::{build_router, ApiCtx, UserStore};
 use manager_app::AppState;
 
+/// A scratch data dir unique within this run: pid + a process-wide
+/// counter. A clock-only name collided between tests started in
+/// parallel, so two tests shared one data dir and the first to finish
+/// removed it under the other (activation_apply_runs_as_operation then
+/// failed writing activation-journal.json.tmp: path not found).
+fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()))
+}
+
 async fn test_ctx() -> (Arc<ApiCtx>, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!(
-        "llm-api-ops-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = unique_test_dir("llm-api-ops");
     std::fs::create_dir_all(&dir).unwrap();
     let config_path = dir.join("config.json");
     let app = Arc::new(AppState::new(

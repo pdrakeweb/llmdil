@@ -11554,6 +11554,16 @@ mod tests {
         let mut cfg = cfg;
         cfg.data_dir = dir.clone();
         let state = Arc::new(AppState::new(cfg, dir.join("config.json"), dir.clone()));
+        // Pin an empty telemetry store. Left unset, the first
+        // `state.telemetry()` call starts the real host poller and
+        // an nvidia-smi inventory query, and whichever finishes
+        // first decides what the op sees: on a GPU host the GPU
+        // count/names arrived mid-test only under load, flipping
+        // split checks and measurement fingerprints. A test that
+        // needs GPUs writes a fixture inventory into this store.
+        let _ = state
+            .telemetry
+            .set(Arc::new(std::sync::Mutex::new(TelemetryStore::new())));
         (state, dir)
     }
 
@@ -13340,11 +13350,13 @@ mod tests {
             .unwrap()
             .enabled = true;
         let (state, dir) = advanced_test_state(cfg);
-        let mut store = TelemetryStore::new();
         let mut gpus = test_gpus();
         gpus[0].compute_capability = (6, 0);
-        store.set_inventory(gpus);
-        let _ = state.telemetry.set(Arc::new(std::sync::Mutex::new(store)));
+        let store = state
+            .telemetry
+            .get()
+            .expect("advanced_test_state pins telemetry");
+        lock_telemetry(store).set_inventory(gpus);
         (state, dir)
     }
 
@@ -18500,7 +18512,8 @@ struct OffloadProbeTiming {
     ready_poll: Duration,
     /// After readiness, how long transient probe-request failures
     /// (HTTP 503, transport errors) are retried before the failure
-    /// is reported as terminal.
+    /// is reported as terminal, measured from the first transient
+    /// failure.
     retry_window: Duration,
     /// Delay between probe-request retries.
     retry_poll: Duration,
@@ -18594,7 +18607,12 @@ async fn offload_probe_http_sequence(
     // other failure — or a transient one that outlasts the window —
     // is terminal.
     let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(450);
-    let retry_deadline = std::time::Instant::now() + timing.retry_window;
+    // The window opens at the first transient failure, not before
+    // the first request: a slow first attempt must not consume the
+    // whole window, so a transient failure is always retried at
+    // least once (and the outcome no longer depends on how long
+    // that first request happened to take).
+    let mut retry_deadline: Option<std::time::Instant> = None;
     loop {
         let result = test_request(base_url, &prompt).await;
         // Process death outranks a request error: a dead backend's
@@ -18608,7 +18626,9 @@ async fn offload_probe_http_sequence(
             Ok(r) => (format!("HTTP {}", r.status), r.status == 503),
             Err(e) => (e.to_string(), true),
         };
-        if !transient || std::time::Instant::now() >= retry_deadline {
+        let now = std::time::Instant::now();
+        let deadline = *retry_deadline.get_or_insert(now + timing.retry_window);
+        if !transient || now >= deadline {
             return OffloadProbeHttpOutcome::FailedAfterReady(failure);
         }
         tokio::time::sleep(timing.retry_poll).await;
