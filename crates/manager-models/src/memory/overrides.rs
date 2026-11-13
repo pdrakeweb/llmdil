@@ -40,9 +40,12 @@
 //! # Where this model departs from llama.cpp, deliberately
 //!
 //! - Surrounding shell quotes (`'…'` / `"…"`) are stripped from
-//!   values: operators paste recipes written for a shell. (The app
-//!   launches llama-server with whitespace-split argv and no shell,
-//!   so llama.cpp itself would see the quotes.)
+//!   values: operators paste recipes written for a shell. (The
+//!   launcher tokenizes raw flags with
+//!   [`crate::flags::split_raw_flags`], which removes the quotes
+//!   too, so llama.cpp sees the same unquoted value; this crate's
+//!   decoders still split on whitespace and strip quotes per token,
+//!   which agrees except for quoted whitespace.)
 //! - Overrides are split on `,` only at the top level of the
 //!   pattern — never inside `{m,n}` quantifiers, character classes
 //!   or groups — pricing what the operator meant. llama.cpp's

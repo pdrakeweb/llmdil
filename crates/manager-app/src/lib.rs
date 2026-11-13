@@ -1799,7 +1799,8 @@ fn raw_device_selection(raw: Option<&str>) -> RawDeviceSelection {
     let Some(raw) = raw else {
         return RawDeviceSelection::None;
     };
-    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let owned = manager_models::split_raw_flags(raw);
+    let tokens: Vec<&str> = owned.iter().map(String::as_str).collect();
     let mut set = std::collections::BTreeSet::new();
     let mut any = false;
     let mut i = 0;
@@ -1918,7 +1919,8 @@ fn backend_gpu_visibility(b: &manager_config::BackendConfig) -> GpuVisibility {
 /// it with an empty CUDA_VISIBLE_DEVICES (code-review 4.7).
 fn raw_flags_pin_cpu_only(raw: Option<&str>) -> bool {
     let Some(raw) = raw else { return false };
-    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let owned = manager_models::split_raw_flags(raw);
+    let tokens: Vec<&str> = owned.iter().map(String::as_str).collect();
     let mut last: Option<&str> = None;
     let mut i = 0;
     while i < tokens.len() {
@@ -2096,7 +2098,14 @@ fn backend_spec(
         // - When the launch is GPU-restricted, device-selection flags
         //   are remapped onto the visible subset (placement is the
         //   source of truth — see the fn docs).
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        // Tokenized like a shell would for the operator's quotes —
+        // `'…'`/`"…"` group and are removed — but with every
+        // backslash literal (regexes in `-ot` need them); there is
+        // no shell, so whitespace-splitting alone handed
+        // llama-server literal quote characters
+        // (see manager_models::split_raw_flags for the full rule).
+        let owned = manager_models::split_raw_flags(raw);
+        let tokens: Vec<&str> = owned.iter().map(String::as_str).collect();
         let mut i = 0;
         while i < tokens.len() {
             let t = tokens[i];
@@ -7594,7 +7603,9 @@ pub async fn op_backend_set_flags_mode(
 ///
 /// Validation is warn, never block: the string is checked with
 /// [`manager_models::raw_flag_warnings`] and the warnings ride
-/// the response, but any string saves — an unrecognized flag may
+/// the response, but any string saves (except one llama-server is
+/// certain to refuse at startup, [`manager_models::raw_flag_errors`])
+/// — an unrecognized flag may
 /// be exactly what the operator needs, and llama-server's own
 /// start is the real check. The input is normalized the way the
 /// launch tokenizer sees it: leading/trailing whitespace is not
@@ -7617,6 +7628,17 @@ pub async fn op_backend_set_raw_flags(
     let new_raw: Option<String> = raw_flags
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // The one exception to warn-never-block: a string llama-server
+    // is certain to refuse at startup (an `-ot` pattern with a
+    // comma inside `{m,n}`, a class or a group — llama-server
+    // splits -ot on every comma) is refused here, with a message
+    // that suggests an alternation instead.
+    if let Some(err) = manager_models::raw_flag_errors(new_raw.as_deref())
+        .into_iter()
+        .next()
+    {
+        return Err(ApiError::InvalidInput(err.message));
+    }
     let warnings = manager_models::raw_flag_warnings(new_raw.as_deref());
     let mut cfg = state.config.write().await;
     let pre_cfg = cfg.clone();
@@ -12374,6 +12396,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_flags_save_refuses_an_override_comma_llama_server_would_split() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        op_backend_set_flags_mode(&state, &sink, "planner".to_string(), true)
+            .await
+            .unwrap();
+        let err = op_backend_set_raw_flags(
+            &state,
+            &sink,
+            "planner".to_string(),
+            Some(r#"-ot "blk\.[0-9]{1,2}\.ffn_.*_exps=CPU""#.to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, ApiError::InvalidInput(m) if m.contains("alternation")),
+            "{err}"
+        );
+        // Nothing was saved.
+        let cfg = state.config.read().await.clone();
+        let b = cfg.backends.iter().find(|b| b.id == "planner").unwrap();
+        assert!(b.raw_flags.as_deref().is_none_or(|r| !r.contains("{1,2}")));
+        // The alternation spelling saves.
+        let r = op_backend_set_raw_flags(
+            &state,
+            &sink,
+            "planner".to_string(),
+            Some(r#"-ot "blk\.([0-9]|[1-9][0-9])\.ffn_.*_exps=CPU""#.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["changed"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn raw_flags_save_requires_mode_journals_and_warns_without_blocking() {
         let mut cfg = test_cfg();
         cfg.backends
@@ -14392,6 +14450,30 @@ mod tests {
         let spec = backend_spec(&cfg, &b, &[]);
         assert!(!spec.args.iter().any(|a| a.starts_with("--host")));
         assert!(spec.args.iter().any(|a| a == "--threads"));
+    }
+
+    #[test]
+    fn backend_spec_strips_raw_flag_quotes_and_keeps_backslashes() {
+        // No shell runs llama-server: a quoted `-ot` value must
+        // reach it unquoted (it refused buffer `CPU"` before), with
+        // the regex's backslashes intact, exactly like the unquoted
+        // spelling.
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        let tail = |spec: &ProcessSpec| {
+            let pos = spec.args.iter().position(|a| a == "-ot").unwrap();
+            spec.args[pos..].to_vec()
+        };
+        b.raw_flags = Some(r"-ot blk\..=CPU --alias x".into());
+        let plain = tail(&backend_spec(&cfg, &b, &[]));
+        assert_eq!(plain, vec!["-ot", r"blk\..=CPU", "--alias", "x"]);
+        b.raw_flags = Some(r#"-ot "blk\..=CPU" --alias 'x'"#.into());
+        assert_eq!(tail(&backend_spec(&cfg, &b, &[])), plain);
+        b.raw_flags = Some(r#"-ot "blk\..=CPU" --alias """#.into());
+        assert_eq!(
+            tail(&backend_spec(&cfg, &b, &[])),
+            vec!["-ot", r"blk\..=CPU", "--alias", ""]
+        );
     }
 
     /// Register a catalog model in a test config and point a
