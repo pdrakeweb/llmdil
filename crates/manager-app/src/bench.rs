@@ -1734,6 +1734,12 @@ pub async fn op_bench_run_start(
             allowed_layers,
             compute_capability,
             inherited_layers: Some(info.layers),
+            // Arm `--n-cpu-moe` values are block-index bounds;
+            // positions are MoE layers (review item 11). Sent only
+            // when it differs from the identity.
+            n_cpu_moe_by_position: Some(info.n_cpu_moe_by_position())
+                .filter(|b| b.iter().enumerate().any(|(k, &v)| v != k as u32))
+                .unwrap_or_default(),
         })
     });
     let prune_ctx = mb::PruneContext {

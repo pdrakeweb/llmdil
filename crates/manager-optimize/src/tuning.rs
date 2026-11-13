@@ -254,6 +254,13 @@ pub struct TuningInputs {
     /// cache/FA parameters stay at the incumbent's values and
     /// only context size varies.
     pub predicted_cache: Option<CacheSelection>,
+    /// The model's MoE block map when its GGUF was parsed (code
+    /// review v0.1.60 item 11): offload coordinates count MoE
+    /// layers and are written at their `--n-cpu-moe` block-index
+    /// bound through it. Absent (older records, catalog-only
+    /// models) is the identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe_block_map: Option<manager_models::MoeBlockMap>,
 }
 
 /// The fixed axis order of the descent (§B.5).
@@ -995,6 +1002,21 @@ pub fn tuning_temp_backend(
     port: u16,
     moe_layers: Option<u32>,
 ) -> BackendConfig {
+    tuning_temp_backend_mapped(incumbent, coords, temp_id, port, moe_layers, None)
+}
+
+/// [`tuning_temp_backend`] with the model's MoE block map: the
+/// coordinate's `offload_layers` counts MoE layers and is written
+/// at its `--n-cpu-moe` block-index bound (code review v0.1.60
+/// item 11). `None` is the identity.
+pub fn tuning_temp_backend_mapped(
+    incumbent: &BackendConfig,
+    coords: &TuningCoords,
+    temp_id: &str,
+    port: u16,
+    moe_layers: Option<u32>,
+    moe_block_map: Option<&manager_models::MoeBlockMap>,
+) -> BackendConfig {
     let mut temp = incumbent.clone();
     temp.id = temp_id.to_string();
     temp.port = port;
@@ -1008,7 +1030,7 @@ pub fn tuning_temp_backend(
     let mut raw = incumbent.raw_flags.clone();
     if let Some(layers) = coords.offload_layers {
         let offload = match moe_layers {
-            Some(moe) => manager_models::offload_for_layers(layers, moe),
+            Some(moe) => manager_models::offload_for_moe_layers(layers, moe, moe_block_map),
             None => manager_models::ExpertOffload::CpuMoeLayers(layers),
         };
         raw = manager_models::set_expert_offload(raw.as_deref(), offload);
@@ -1065,6 +1087,7 @@ mod tests {
                 v: CacheType::Q4_0,
                 flash_attn: FlashAttn::On,
             }),
+            moe_block_map: None,
         }
     }
 
@@ -1226,5 +1249,26 @@ mod tests {
         assert!(raw.contains("--parallel 1"), "{raw}");
         assert_eq!(temp.id, "opt-exp-tuning-1");
         assert_eq!(temp.port, 19000);
+        // Review item 11: an offload coordinate counts MoE layers
+        // and is written at its block-index bound through the map
+        // (2 leading dense blocks: 16 layers is `--n-cpu-moe 18`).
+        coords.offload_layers = Some(16);
+        let map = manager_models::MoeBlockMap::from_block_indices(2..50);
+        let temp = tuning_temp_backend_mapped(&incumbent, &coords, "t", 1, Some(48), map.as_ref());
+        assert!(temp.raw_flags.unwrap().contains("--n-cpu-moe 18"));
+        let temp = tuning_temp_backend(&incumbent, &coords, "t", 1, Some(48));
+        assert!(temp.raw_flags.unwrap().contains("--n-cpu-moe 16"));
+        // The map is additive on the persisted inputs: older
+        // records without it deserialize.
+        let mut v = serde_json::to_value(inputs()).unwrap();
+        assert!(v.get("moe_block_map").is_none());
+        v.as_object_mut().unwrap().remove("moe_block_map");
+        let back: TuningInputs = serde_json::from_value(v).unwrap();
+        assert_eq!(back.moe_block_map, None);
+        let mut with = inputs();
+        with.moe_block_map = map;
+        let back: TuningInputs =
+            serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+        assert_eq!(back, with);
     }
 }

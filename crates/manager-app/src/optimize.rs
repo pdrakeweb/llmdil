@@ -704,9 +704,6 @@ pub(crate) fn driver_versions_for(
 pub(crate) struct Gathered {
     pub(crate) measure: MeasureInputs,
     pub(crate) live: LiveSnapshot,
-    /// MoE block maps by model id for the parsed layouts in
-    /// `live.layouts` (see `manager_optimize::fit::others_residency_mapped`).
-    pub(crate) moe_block_maps: HashMap<String, manager_models::MoeBlockMap>,
     candidates: Vec<ConsultCandidate>,
     pub(crate) running: HashMap<String, bool>,
     /// Each configured backend's current measurement
@@ -871,18 +868,11 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
     // Layout facts per model: from serving backends' resolved
     // layouts; catalog-only facts for models no backend serves.
     let mut layouts: HashMap<String, LayoutFacts> = HashMap::new();
-    // MoE block maps for the same parsed layouts: the fit model
-    // prices `--n-cpu-moe` by block index through them (code
-    // review v0.1.60 item 11). Catalog-only facts have none.
-    let mut moe_block_maps: HashMap<String, manager_models::MoeBlockMap> = HashMap::new();
     for b in &cfg.backends {
         if let (Some(model), Some(l)) = (
             crate::model_for_backend(cfg, b),
             crate::resolve_weight_layout(cfg, b),
         ) {
-            if let Some(map) = l.moe_block_map() {
-                moe_block_maps.insert(model.id.clone(), map);
-            }
             layouts.insert(
                 model.id.clone(),
                 LayoutFacts {
@@ -896,10 +886,20 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
                     basis: l.basis,
                     ctx_max: l.catalog.as_ref().map(|c| c.ctx_max).unwrap_or(0),
                     params_b: model.params_b,
+                    // The parsed layout's MoE block map: the plan
+                    // model converts MoE layers to `--n-cpu-moe`
+                    // bounds through it (review item 11).
+                    moe_block_map: l.moe_block_map(),
                 },
             );
         }
     }
+    // The consult context reports offload in MoE layers through the
+    // same block maps (review item 11).
+    measure.moe_block_maps = layouts
+        .iter()
+        .filter_map(|(id, f)| f.moe_block_map.clone().map(|m| (id.clone(), m)))
+        .collect();
     for spec in manager_models::curated_models() {
         layouts
             .entry(spec.id.clone())
@@ -914,6 +914,7 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
                 basis: manager_models::MemoryBasis::Catalog,
                 ctx_max: spec.ctx_max,
                 params_b: spec.params_b,
+                moe_block_map: None,
             });
     }
     let mut free: Vec<(u32, u64)> = samples
@@ -951,7 +952,6 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
     Gathered {
         measure,
         live,
-        moe_block_maps,
         candidates,
         running,
         fingerprints,

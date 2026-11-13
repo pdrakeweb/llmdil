@@ -10021,6 +10021,17 @@ impl OffloadInfo {
     fn offload_for(&self, layers: u32) -> manager_models::ExpertOffload {
         manager_models::offload_for_moe_layers(layers, self.moe_layers, self.block_map.as_ref())
     }
+
+    /// The `--n-cpu-moe` value each position `0..=moe_layers`
+    /// writes (the identity without a block map).
+    fn n_cpu_moe_by_position(&self) -> Vec<u32> {
+        (0..=self.moe_layers)
+            .map(|k| match &self.block_map {
+                Some(map) => map.bound_for_layers(k),
+                None => k,
+            })
+            .collect()
+    }
 }
 
 fn backend_offload_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> Option<OffloadInfo> {
@@ -10155,12 +10166,7 @@ fn offload_row_json(o: &OffloadInfo, eval: Option<&OffloadEvaluation>) -> Value 
         // that moves exactly that many MoE layers (review item 11).
         // Endpoints are written as no tokens / `-ot exps=CPU`; their
         // entries are the bounds for reference only. Additive.
-        "n_cpu_moe_by_position": (0..=o.moe_layers)
-            .map(|k| match &o.block_map {
-                Some(map) => map.bound_for_layers(k),
-                None => k,
-            })
-            .collect::<Vec<u32>>(),
+        "n_cpu_moe_by_position": o.n_cpu_moe_by_position(),
         "custom": o.custom,
         "guardrail": guardrail,
     })

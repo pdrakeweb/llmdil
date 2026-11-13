@@ -788,10 +788,24 @@ pub fn temp_backend_config(
     port: u16,
     moe_layers: Option<u32>,
 ) -> BackendConfig {
+    temp_backend_config_mapped(proposal, model_file, port, moe_layers, None)
+}
+
+/// [`temp_backend_config`] with the model's MoE block map: the
+/// proposal's `offload_layers` counts MoE layers and is written at
+/// its `--n-cpu-moe` block-index bound (code review v0.1.60 item
+/// 11). `None` is the identity.
+pub fn temp_backend_config_mapped(
+    proposal: &ExperimentProposal,
+    model_file: PathBuf,
+    port: u16,
+    moe_layers: Option<u32>,
+    moe_block_map: Option<&manager_models::MoeBlockMap>,
+) -> BackendConfig {
     let split = proposal.flags.tensor_split.clone().unwrap_or_default();
     let mut raw_flags = proposal.flags.offload_layers.and_then(|n| {
         let offload = match moe_layers {
-            Some(moe) => manager_models::offload_for_layers(n, moe),
+            Some(moe) => manager_models::offload_for_moe_layers(n, moe, moe_block_map),
             None => manager_models::ExpertOffload::CpuMoeLayers(n),
         };
         manager_models::set_expert_offload(None, offload)
@@ -1140,6 +1154,31 @@ mod tests {
             validate_experiment(&p, &c, &[], None).status,
             ValidationStatus::Valid
         );
+    }
+
+    #[test]
+    fn temp_backend_writes_moe_layers_at_their_block_bound() {
+        // Review item 11: 2 leading dense blocks, 48 MoE blocks
+        // (2..=49). 24 MoE layers is `--n-cpu-moe 26`.
+        let map = manager_models::MoeBlockMap::from_block_indices(2..50);
+        let mut p = proposal("qwen3-coder-30b");
+        p.flags.offload_layers = Some(24);
+        let temp = temp_backend_config_mapped(
+            &p,
+            PathBuf::from("models/coder.gguf"),
+            18099,
+            Some(48),
+            map.as_ref(),
+        );
+        assert_eq!(temp.raw_flags.as_deref(), Some("--n-cpu-moe 26"));
+        // Endpoints are unaffected; no map is the identity.
+        p.flags.offload_layers = Some(48);
+        let temp =
+            temp_backend_config_mapped(&p, PathBuf::from("m.gguf"), 1, Some(48), map.as_ref());
+        assert_eq!(temp.raw_flags.as_deref(), Some("-ot exps=CPU"));
+        p.flags.offload_layers = Some(24);
+        let temp = temp_backend_config_mapped(&p, PathBuf::from("m.gguf"), 1, Some(48), None);
+        assert_eq!(temp.raw_flags.as_deref(), Some("--n-cpu-moe 24"));
     }
 
     #[test]

@@ -148,6 +148,11 @@ pub struct MeasureInputs {
     /// the caller. Empty — and the `experiment_results` block
     /// absent — until an experiment batch has run.
     pub experiment_results: Vec<ExperimentResultFact>,
+    /// MoE block maps by model id, for models whose GGUF was
+    /// parsed with an expert tensor index (code review v0.1.60
+    /// item 11): a backend's `--n-cpu-moe` bound is reported as
+    /// the MoE layers it really moves. Absent = identity.
+    pub moe_block_maps: HashMap<String, manager_models::MoeBlockMap>,
 }
 
 /// Counts and provenance for the page's context summary line and
@@ -206,7 +211,16 @@ pub fn model_short_name(cfg: &AppConfig, model: &ModelConfig) -> String {
         .unwrap_or_else(|| model.id.clone())
 }
 
-fn offload_json(backend: &BackendConfig, moe_layers: Option<u32>) -> Value {
+/// The decoded offload block for one backend. `layers` under
+/// `cpu_moe_layers` is the raw `--n-cpu-moe` value (a block-index
+/// bound); `offloaded_layers` is the MoE layers it really moves,
+/// through the model's block map when one is known (item 11) —
+/// the unit `offload_layers` in plan items uses.
+fn offload_json(
+    backend: &BackendConfig,
+    moe_layers: Option<u32>,
+    block_map: Option<&manager_models::MoeBlockMap>,
+) -> Value {
     let offload = manager_models::expert_offload(backend.raw_flags.as_deref());
     let mut v = match offload {
         manager_models::ExpertOffload::None => json!({ "setting": "none" }),
@@ -217,7 +231,7 @@ fn offload_json(backend: &BackendConfig, moe_layers: Option<u32>) -> Value {
         manager_models::ExpertOffload::TensorOverrides => json!({ "setting": "tensor_overrides" }),
     };
     if let Some(moe) = moe_layers {
-        v["offloaded_layers"] = json!(offload.layers(moe));
+        v["offloaded_layers"] = json!(offload.moe_layers_offloaded(moe, block_map));
         v["moe_layers"] = json!(moe);
     }
     v
@@ -300,7 +314,8 @@ pub fn build_context(
                     .find(|s| s.id == m.id)
                     .and_then(|s| s.moe_layers)
             });
-            v["offload"] = offload_json(b, moe_layers);
+            let block_map = model.and_then(|m| measure.moe_block_maps.get(&m.id));
+            v["offload"] = offload_json(b, moe_layers, block_map);
             if let Some(req) = measure.requirements.get(&b.id) {
                 let mut r = json!({
                     "gpu_ram_mib": req.gpu_weights_mib,
@@ -920,6 +935,25 @@ mod tests {
             .unwrap()
             .iter()
             .any(|c| c["id"] == "qwen3-coder-30b"));
+    }
+
+    #[test]
+    fn offload_fact_reports_moe_layers_through_the_block_map() {
+        // Review item 11: `layers` is the raw flag value,
+        // `offloaded_layers` the MoE layers it moves (2 leading
+        // dense blocks: `--n-cpu-moe 18` moves 16 of 48).
+        let mut b = AppConfig::default_config().backends[0].clone();
+        b.raw_flags = Some("--n-cpu-moe 18".to_string());
+        let map = manager_models::MoeBlockMap::from_block_indices(2..50).unwrap();
+        let v = offload_json(&b, Some(48), Some(&map));
+        assert_eq!(v["layers"], json!(18));
+        assert_eq!(v["offloaded_layers"], json!(16));
+        assert_eq!(v["moe_layers"], json!(48));
+        // No map: the identity, as before.
+        assert_eq!(
+            offload_json(&b, Some(48), None)["offloaded_layers"],
+            json!(18)
+        );
     }
 
     #[test]

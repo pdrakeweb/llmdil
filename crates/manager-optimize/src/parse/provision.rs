@@ -589,6 +589,7 @@ mod tests {
                 basis: manager_models::MemoryBasis::Estimate,
                 ctx_max: 131072,
                 params_b: 27.0,
+                moe_block_map: None,
             },
         );
         let mut backend_running = std::collections::HashMap::new();

@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 use manager_config::AppConfig;
 use manager_optimize::{
     benchmark_prompts, compare, lowest_free_port, plan_filter, planned_arm_count, rank_arms,
-    residency_per_gpu, thermal_tripped, tuning_temp_backend, winner_index, ActiveExperiment,
+    residency_per_gpu, thermal_tripped, tuning_temp_backend_mapped, winner_index, ActiveExperiment,
     ArmPricing, ArmStatus, BenchResult, BenchRun, Descent, ExperimentJournal, ExperimentMeasured,
     MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, ResidencyVerdict, SweepPlan,
     SweepState, TuningArm, TuningConfirmation, TuningCoords, TuningExclusion, TuningGpu,
@@ -233,6 +233,10 @@ pub(crate) async fn build_tuning_inputs(
         ctx_max: layout.map(|l| l.ctx_max).unwrap_or(0),
         gpus,
         predicted_cache,
+        moe_block_map: offload_info
+            .as_ref()
+            .and_then(|i| i.block_map.clone())
+            .or_else(|| layout.and_then(|l| l.moe_block_map.clone())),
     })
 }
 
@@ -247,12 +251,13 @@ fn price_coords(
     inputs: &TuningInputs,
     coords: &TuningCoords,
 ) -> Option<ArmPricing> {
-    let temp = tuning_temp_backend(
+    let temp = tuning_temp_backend_mapped(
         backend,
         coords,
         "opt-exp-tuning-price",
         backend.port,
         inputs.moe_layers,
+        inputs.moe_block_map.as_ref(),
     );
     let mut temp_cfg = cfg.clone();
     temp_cfg.backends.push(temp.clone());
@@ -612,7 +617,14 @@ async fn run_arm(
     let mut used_ports: HashSet<u16> = cfg.backends.iter().map(|b| b.port).collect();
     let port = lowest_free_port(&used_ports, cfg.gateway.port, cfg.postgres.port);
     used_ports.insert(port);
-    let temp = tuning_temp_backend(backend, coords, &temp_id, port, inputs.moe_layers);
+    let temp = tuning_temp_backend_mapped(
+        backend,
+        coords,
+        &temp_id,
+        port,
+        inputs.moe_layers,
+        inputs.moe_block_map.as_ref(),
+    );
     let mut temp_cfg = cfg.clone();
     temp_cfg.backends.push(temp.clone());
 
