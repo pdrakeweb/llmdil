@@ -50,6 +50,7 @@
 
 use crate::*;
 
+mod activation_slots;
 mod bench_slots;
 mod downloads;
 mod gateway;
@@ -58,6 +59,7 @@ mod task_registry;
 mod telemetry;
 mod wizard;
 
+pub(crate) use activation_slots::ActivationState;
 pub(crate) use bench_slots::BenchState;
 pub(crate) use downloads::{DownloadOutcome, DownloadsState};
 pub(crate) use gateway::GatewayState;
@@ -154,14 +156,9 @@ pub struct AppState {
             Arc<HashMap<String, manager_services::ServiceStatus>>,
         )>,
     >,
-    /// Serializes activation plan applies ([`activation_apply`]): taken
-    /// with `try_lock`, so a second apply from any surface is refused
-    /// instead of interleaving restarts (ACT-9).
-    pub(crate) activation_apply_lock: Mutex<()>,
-    /// What the running apply is doing (`activation_applying` on the
-    /// gateway status and plan payloads); `None` when idle. std Mutex:
-    /// synchronous read/replace only.
-    pub(crate) activation_progress: std::sync::Mutex<Option<activation_apply::ApplyProgress>>,
+    /// Activation plan apply serialization and progress (see
+    /// [`activation_slots::ActivationState`]).
+    pub(crate) activation: ActivationState,
     /// The lifecycle monitor's counters between ticks (see
     /// [`lifecycle_monitor`]). std Mutex: synchronous updates only.
     pub(crate) lifecycle_monitor: std::sync::Mutex<lifecycle_monitor::MonitorState>,
@@ -311,8 +308,7 @@ impl AppState {
             lifecycle: Arc::new(lifecycle::LifecycleRegistry::new()),
             scm_cache: std::sync::Mutex::new(None),
             lifecycle_monitor: std::sync::Mutex::new(lifecycle_monitor::MonitorState::default()),
-            activation_apply_lock: Mutex::new(()),
-            activation_progress: std::sync::Mutex::new(None),
+            activation: ActivationState::default(),
         }
     }
 

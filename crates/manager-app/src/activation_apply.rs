@@ -255,7 +255,8 @@ impl ProgressGuard<'_> {
     fn set(&self, progress: ApplyProgress) {
         *self
             .state
-            .activation_progress
+            .activation
+            .progress
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(progress);
     }
@@ -265,7 +266,8 @@ impl Drop for ProgressGuard<'_> {
     fn drop(&mut self) {
         *self
             .state
-            .activation_progress
+            .activation
+            .progress
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -274,7 +276,8 @@ impl Drop for ProgressGuard<'_> {
 /// The running apply's progress, `None` when no apply is in flight.
 pub fn current_progress(state: &AppState) -> Option<ApplyProgress> {
     state
-        .activation_progress
+        .activation
+        .progress
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
@@ -329,7 +332,7 @@ pub async fn op_activation_apply(
 ) -> ApiResult {
     let (apply_mode, mode_label) = parse_mode(mode.as_deref())?;
     let source = parse_source(source.as_deref())?;
-    let _lock = match state.activation_apply_lock.try_lock() {
+    let _lock = match state.activation.apply_lock.try_lock() {
         Ok(g) => g,
         Err(_) => {
             return Err(ApiError::Busy(busy_message(
