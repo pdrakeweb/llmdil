@@ -1,27 +1,58 @@
 //! `AppState`: the shared service state, its constructor, lazily
 //! initialized subsystems, and the config save/install helpers.
+//!
+//! `AppState` is a container: cohesive groups of state live in
+//! per-subsystem objects (the `state/` submodules), each owning its
+//! own locks. Re-homing a lock into a subsystem never merged it with
+//! another lock or changed its kind (std vs tokio, `Mutex` vs
+//! `RwLock`) or its critical sections; the rules below are the ones
+//! the code already followed and still does.
+//!
+//! # Lock order
+//!
+//! Where two locks are ever held together they are acquired in this
+//! order — never the reverse:
+//!
+//! 1. **wizard → config.** A wizard (`wizard(mode)`) guard is held
+//!    while the config write lock is taken to apply a step's returned
+//!    config edits (`apply_wizard_config_edits`, PS-4) and across
+//!    hydration/restore; the step-payload cache
+//!    (`wizard.steps_cache`) is written under the wizard guard too
+//!    (wizard → steps cache).
+//! 2. **config → downloads (PS-1).** `op_list_models` and the start
+//!    preflight read the config and then lock the download handles;
+//!    `op_download_model` therefore drops the `downloads.handles`
+//!    guard before it waits on `config.write()` (a parked writer on
+//!    tokio's `RwLock` queues every later reader, so the inversion
+//!    deadlocked the whole app). Within downloads: handles →
+//!    outcomes → verifying.
+//! 3. **config → supervisor (PS-11, deferred).** The activation
+//!    journal's `record_*_change` helpers run under `config.write()`
+//!    and read backend start times from the supervisor. No
+//!    supervisor → config path exists; keep it that way.
+//! 4. **Never initialize telemetry under the config write lock.** The
+//!    first `telemetry()` call reads the config while building the
+//!    poll loop; callers fetch telemetry/inventory before (or without)
+//!    taking the config write lock.
+//! 5. **Telemetry, gateway stats and direct slots are never taken
+//!    under the supervisor lock**, and the preflight reads the
+//!    telemetry snapshot and the supervisor status without holding
+//!    either across the other.
+//! 6. **tasks → event bus.** `record_task` publishes the task event
+//!    while holding the task-records lock so no settle event can
+//!    overtake it (the bus publish is synchronous and takes no
+//!    `AppState` lock).
+//!
+//! Lifecycle (`lifecycle`, `scm_cache`, `lifecycle_monitor`,
+//! `backend_spec_ids`) and log-shipping (`logship*`) state keep
+//! their own rules, documented in [`crate::lifecycle`] and
+//! [`crate::logship`].
 
 use crate::*;
 
-/// Terminal outcome of a model download, recorded by the completion
-/// watcher spawned in `download_model`.
-#[derive(Debug, Clone)]
-pub(crate) struct DownloadOutcome {
-    /// Token of the `download_model` attempt that produced this
-    /// outcome (0 for outcomes recorded outside a download, i.e. a
-    /// manual `model_verify_checksum` mismatch). The watcher writes
-    /// only when its token is still the model's latest attempt, so a
-    /// superseded download cannot overwrite a newer attempt's outcome.
-    pub(crate) attempt: u64,
-    /// The failure message when the download — or the hash verification
-    /// that follows it — failed; `None` when it completed.
-    pub(crate) failed: Option<String>,
-    /// True when the failure is a SHA-256 verification failure
-    /// (post-download watcher or manual verify). Only verification
-    /// failures gate backend start in the preflight; transfer failures
-    /// set this false and do not gate.
-    pub(crate) verification_failure: bool,
-}
+mod downloads;
+
+pub(crate) use downloads::{DownloadOutcome, DownloadsState};
 
 /// Shared backend state. Subsystems are lazily initialized (`OnceCell`) so
 /// a failure surfaces on first use of that subsystem, never at startup.
@@ -81,27 +112,8 @@ pub struct AppState {
     /// Per-task cancellation tokens and abort routing (see [`tasks`]).
     pub(crate) task_controls: tasks::TaskControls,
     pub(crate) task_counter: AtomicU64,
-    /// Live model-download handles by model id (spec §14 download commands).
-    pub(crate) downloads: Mutex<HashMap<String, DownloadHandle>>,
-    /// Terminal download outcomes by model id, recorded by the
-    /// completion watcher spawned in `download_model`: `failed` is the
-    /// failure message, or `None` when the download completed (verified
-    /// against the pinned hash when one exists). Read by `list_models`
-    /// to surface `download_error` and by the backend start preflight
-    /// to gate on verification failures.
-    pub(crate) download_outcomes: Mutex<HashMap<String, DownloadOutcome>>,
-    /// Monotonic download-attempt counter; each `download_model` call
-    /// takes the next token (see [`DownloadOutcome::attempt`]).
-    pub(crate) download_attempt_counter: AtomicU64,
-    /// Latest download-attempt token per model id. The completion
-    /// watcher writes its outcome only when its token still matches.
-    pub(crate) download_latest_attempt: Mutex<HashMap<String, u64>>,
-    /// Model ids whose post-download SHA-256 verification is currently
-    /// running in the completion watcher. Backend start is refused for
-    /// these: the file may be seconds from being deleted as corrupt.
-    /// std Mutex like `backend_spec_ids` — only synchronous membership
-    /// checks and inserts are needed.
-    pub(crate) verifying_downloads: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The model-download subsystem (see [`downloads::DownloadsState`]).
+    pub(crate) downloads: DownloadsState,
     /// Ids of the supervisor specs this layer registered as backends.
     /// The Supervisor is shared with the MCP subsystem (process ids
     /// `mcp-<id>`); pruning and orphan-surfacing in the backend commands
@@ -385,11 +397,7 @@ impl AppState {
             tasks: Mutex::new(HashMap::new()),
             task_controls: tasks::TaskControls::default(),
             task_counter: AtomicU64::new(1),
-            downloads: Mutex::new(HashMap::new()),
-            download_outcomes: Mutex::new(HashMap::new()),
-            download_attempt_counter: AtomicU64::new(1),
-            download_latest_attempt: Mutex::new(HashMap::new()),
-            verifying_downloads: std::sync::Mutex::new(std::collections::HashSet::new()),
+            downloads: DownloadsState::default(),
             backend_spec_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
             mcp_modes: Mutex::new(HashMap::new()),
             routing_log: Mutex::new(manager_gateway::RoutingLog::default()),
@@ -447,50 +455,6 @@ impl AppState {
     pub(crate) fn next_task_id(&self) -> String {
         let n = self.task_counter.fetch_add(1, Ordering::Relaxed);
         format!("task-{n:06}")
-    }
-
-    /// Take the next download-attempt token and record it as the
-    /// model's latest attempt.
-    pub(crate) async fn begin_download_attempt(&self, model_id: &str) -> u64 {
-        let attempt = self
-            .download_attempt_counter
-            .fetch_add(1, Ordering::Relaxed);
-        self.download_latest_attempt
-            .lock()
-            .await
-            .insert(model_id.to_string(), attempt);
-        attempt
-    }
-
-    /// Record a download outcome only if its attempt token is still
-    /// the model's latest; a superseded watcher's outcome is dropped.
-    pub(crate) async fn record_download_outcome(&self, model_id: &str, outcome: DownloadOutcome) {
-        let latest = self
-            .download_latest_attempt
-            .lock()
-            .await
-            .get(model_id)
-            .copied();
-        if latest == Some(outcome.attempt) {
-            self.download_outcomes
-                .lock()
-                .await
-                .insert(model_id.to_string(), outcome);
-        }
-    }
-
-    /// Clear a download outcome (e.g. cancellation) under the same
-    /// latest-attempt gate as [`Self::record_download_outcome`].
-    pub(crate) async fn clear_download_outcome(&self, model_id: &str, attempt: u64) {
-        let latest = self
-            .download_latest_attempt
-            .lock()
-            .await
-            .get(model_id)
-            .copied();
-        if latest == Some(attempt) {
-            self.download_outcomes.lock().await.remove(model_id);
-        }
     }
 
     pub(crate) async fn record_task(&self, kind: &str, detail: Value) -> String {
@@ -1120,7 +1084,7 @@ pub(crate) fn resolve_under_data_dir(
 /// start preflight rejects the backend as "still downloading" until the
 /// app restarts. Called on the paths that consult the map.
 pub(crate) async fn reap_downloads(state: &AppState) {
-    state.downloads.lock().await.retain(|_, h| !h.is_terminal());
+    state.downloads.reap().await;
 }
 
 /// True when `sha` is a real pinned SHA-256 — 64 hex chars — as opposed

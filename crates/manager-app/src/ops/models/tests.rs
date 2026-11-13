@@ -272,7 +272,7 @@ async fn download_model_releases_downloads_lock_before_config_write() {
     // supervisor lock we hold).
     let mut parked = false;
     for _ in 0..200 {
-        if state.downloads.try_lock().is_err() {
+        if state.downloads.handles.try_lock().is_err() {
             parked = true;
             break;
         }
@@ -281,7 +281,11 @@ async fn download_model_releases_downloads_lock_before_config_write() {
     assert!(parked, "download op never took the downloads lock");
     let read_guard = state.config.read().await;
     drop(sup_guard);
-    let got = tokio::time::timeout(std::time::Duration::from_secs(5), state.downloads.lock()).await;
+    let got = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.downloads.handles.lock(),
+    )
+    .await;
     let released = got.is_ok();
     drop(got);
     drop(read_guard);

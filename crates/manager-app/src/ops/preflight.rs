@@ -50,14 +50,15 @@ pub(crate) async fn backend_start_preflight_for(
         .iter()
         .find(|m| resolve_under_data_dir(&cfg.data_dir, &m.gguf_path) == resolved_model)
     {
-        if state.downloads.lock().await.contains_key(&m.id) {
+        if state.downloads.handles.lock().await.contains_key(&m.id) {
             return Err(ApiError::InvalidInput(format!(
                 "model {} is still downloading; a backend started now would load a truncated file",
                 m.id
             )));
         }
         if state
-            .verifying_downloads
+            .downloads
+            .verifying
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains(&m.id)
@@ -70,7 +71,7 @@ pub(crate) async fn backend_start_preflight_for(
         // A recorded verification failure gates start until the model
         // is re-downloaded or passes a manual verify: the file that
         // came down did not match its pinned hash.
-        if let Some(outcome) = state.download_outcomes.lock().await.get(&m.id) {
+        if let Some(outcome) = state.downloads.outcomes.lock().await.get(&m.id) {
             if outcome.verification_failure {
                 return Err(ApiError::InvalidInput(outcome.failed.clone().unwrap_or_else(
                     || {
