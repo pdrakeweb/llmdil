@@ -1390,6 +1390,8 @@ export async function addBackend(input: {
  *  row carries (null when the model is not offload-capable), and
  *  the placement creation would use. */
 export interface BackendAddPreview {
+  /** The previewed model (echoed by the op; absent in the browser mock). */
+  model_id?: string;
   offload: BackendOffload | null;
   /** The cache preview for the backend creation would build
    *  (predicted footprint + predicted-best ladder), or null when
@@ -1397,6 +1399,24 @@ export interface BackendAddPreview {
   cache: CachePreview | null;
   tensor_split: number[];
   split_mode: string;
+  /** The creation requirement (the backend card's gpu_ram_mib /
+   *  sys_ram_mib figures for the backend creation would build, at
+   *  the form's context/slot draft) plus the per-GPU split shares
+   *  and residency; null when the model's layout cannot be
+   *  resolved. Absent from older payloads. */
+  memory?: BackendAddMemory | null;
+}
+
+/** backend_add_preview's `memory` object. per_gpu lists only the
+ *  GPUs the previewed placement uses (empty without telemetry). */
+export interface BackendAddMemory {
+  gpu_ram_mib: number;
+  sys_ram_mib: number;
+  kv_ram_mib: number | null;
+  rs_ram_mib: number | null;
+  moe_cache_mib: number;
+  basis: string | null;
+  per_gpu: { gpu: number; share: number; required_mib: number; total_mib: number }[];
 }
 
 /** backend_add_preview — the add form's model-dependent parameter

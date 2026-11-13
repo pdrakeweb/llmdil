@@ -987,5 +987,26 @@ check(staticSrcNar.includes("status.bind_fallback"), "Remote Access card shows t
 check(staticSrcNar.includes("pairingQrHtml(enroll.qr_svg)"), "pairing block renders the shell's QR");
 check(/function pairingQrHtml[\s\S]{0,600}<script/.test(staticSrcNar), "pairing QR guard rejects scriptable SVG");
 
+// Add-a-backend card (design audit Q3/Q8 remainder): the summary
+// strip carries GPU RAM / System RAM tiles from backend_add_preview's
+// memory object and the split preview is a segmented bar, not the
+// old "Split:" text line.
+check(apiSrcGw.includes("memory?: BackendAddMemory | null"), "BackendAddPreview carries the memory requirement object");
+check(staticSrcNar.includes("data-add-split-bar") && /data-add-split-bar[\s\S]{0,400}stackedBar\(segs/.test(staticSrcNar), "add-backend form renders the split preview as a segmented bar");
+check(/preview\.memory \?\? null[\s\S]{0,900}"GPU RAM"[\s\S]{0,300}"System RAM"/.test(staticSrcNar), "add-backend strip renders GPU RAM / System RAM tiles from the preview memory");
+check(!staticSrcNar.includes("Split: ${esc(summary)}"), "add-backend placement no longer repeats the split as a text line");
+// Rule 15 sweep of the MCP surfaces (buttons audit follow-up): the
+// URL copy, form Cancel, and prompt Skip are icon-only with a name;
+// Cancel start (aborts the operation) carries its word and an icon.
+const mcpSrcR15 = readFileSync(join(root, "src", "views", "mcp.ts"), "utf8");
+const mcpPromptR15 = readFileSync(join(root, "src", "mcp-prompt.ts"), "utf8");
+check(mcpSrcR15.includes('title="Copy URL" aria-label="Copy URL"') && !mcpSrcR15.includes('font-size:11px">Copy</button>'), "MCP URL copy button is icon-only with an accessible name");
+check(mcpSrcR15.includes('class="btn icon-only" data-mcp-act="form-cancel" title="Cancel" aria-label="Cancel"'), "MCP form Cancel is icon-only with an accessible name");
+check(/data-prompt-act="skip"[^>]*aria-label="Skip /.test(mcpPromptR15) && !mcpPromptR15.includes('">Skip</button>'), "MCP credential prompt Skip is icon-only with an accessible name");
+check(mcpPromptR15.includes('data-prompt-act="cancel">${icon("x")} Cancel start'), "MCP credential prompt Cancel start keeps its word and carries an icon");
+// OpenRouter tier card: spent-vs-cap meter in the audit's designated
+// slot, fed by gateway_status.openrouter_spend.
+check(/const spendRow = spend && spend\.fraction !== null[\s\S]{0,1600}meter\(Math\.min\(100, spend\.fraction \* 100\)/.test(staticSrcNar) && staticSrcNar.includes("${spendRow}"), "OpenRouter tier card renders the spent-vs-cap meter from openrouter_spend");
+
 if (failures > 0) { console.error(`\n${failures} smoke check(s) failed`); process.exit(1); }
 console.log("\nsmoke: all checks passed");
