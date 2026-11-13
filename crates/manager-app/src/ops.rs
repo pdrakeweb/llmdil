@@ -3,8 +3,12 @@
 //! handlers and downstream crates keep their `crate::op_*` paths.
 
 pub(crate) mod config;
+pub(crate) mod gateway;
+pub(crate) mod gateway_activation;
 pub(crate) mod logs;
 pub(crate) mod mcp;
+pub(crate) mod models;
 pub(crate) mod platform;
 pub(crate) mod services;
+pub(crate) mod telemetry;
 pub(crate) mod wizard;

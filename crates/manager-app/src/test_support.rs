@@ -49,3 +49,22 @@ pub(crate) fn advanced_test_state(cfg: AppConfig) -> (Arc<AppState>, PathBuf) {
 pub(crate) fn test_sink() -> Arc<dyn EventSink> {
     Arc::new(NoopSink)
 }
+
+pub(crate) fn register_test_model(cfg: &mut AppConfig, model_id: &str, file: &str) {
+    cfg.models.push(manager_config::ModelConfig {
+        id: model_id.to_string(),
+        gguf_path: PathBuf::from(file),
+        quant: "Q4_K_M".to_string(),
+        params_b: 30.0,
+        sha256: "a".repeat(64),
+        verified_at: None,
+        verified_sha256: None,
+        source_url: String::new(),
+        assigned_backends: Vec::new(),
+        enabled: true,
+        display_name: None,
+        moe_layers: None,
+        default_offload_layers: None,
+        mtp: None,
+    });
+}
