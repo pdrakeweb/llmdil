@@ -54,6 +54,8 @@ pub mod activation_history;
 pub mod app_update;
 pub mod bench;
 pub mod gateway_stats;
+#[cfg(test)]
+mod golden_tests;
 pub mod gpu_history;
 pub mod hf_forms;
 pub mod log_receiver;

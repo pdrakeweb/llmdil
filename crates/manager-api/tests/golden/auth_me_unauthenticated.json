@@ -1,0 +1,11 @@
+{
+  "body": {
+    "error": {
+      "code": "UNAUTHENTICATED",
+      "details": null,
+      "kind": "Unauthenticated",
+      "message": "a valid access token is required"
+    }
+  },
+  "status": 401
+}

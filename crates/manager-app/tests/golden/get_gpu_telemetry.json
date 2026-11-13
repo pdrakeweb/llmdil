@@ -1,0 +1,85 @@
+{
+  "at_ms": "<number>",
+  "has_polled": true,
+  "processes": [
+    {
+      "backend_id": null,
+      "gpu_index": 0,
+      "name": "llama-server.exe",
+      "pid": 4242,
+      "vram_mib": null
+    },
+    {
+      "backend_id": null,
+      "gpu_index": 1,
+      "name": "python.exe",
+      "pid": 4343,
+      "vram_mib": 2048
+    }
+  ],
+  "samples": [
+    {
+      "clocks_graphics_mhz": null,
+      "clocks_mem_mhz": null,
+      "down": false,
+      "driver_model": "wddm",
+      "fan_pct": 40.0,
+      "index": 0,
+      "mem_util_pct": 12.0,
+      "name": "NVIDIA GeForce RTX 4090",
+      "power_absence": null,
+      "power_limit_w": 450.0,
+      "power_spark": [
+        180.5,
+        180.5
+      ],
+      "power_w": 180.5,
+      "source": "nvidiasmi",
+      "stale": false,
+      "temp_c": 61.0,
+      "temp_peak_c": 61.0,
+      "temp_spark": [
+        55.0,
+        61.0
+      ],
+      "ts": "2026-01-01T12:00:02Z",
+      "util_spark": [
+        30.0,
+        75.0
+      ],
+      "utilization_pct": 75.0,
+      "vram_total_mib": 24564,
+      "vram_used_mib": 8192
+    },
+    {
+      "clocks_graphics_mhz": null,
+      "clocks_mem_mhz": null,
+      "down": false,
+      "driver_model": "tcc",
+      "fan_pct": null,
+      "index": 1,
+      "mem_util_pct": null,
+      "name": "Tesla P100-PCIE-16GB",
+      "power_absence": "driver_not_available",
+      "power_limit_w": null,
+      "power_w": null,
+      "source": "nvidiasmi",
+      "stale": false,
+      "temp_c": 35.0,
+      "temp_peak_c": 35.0,
+      "temp_spark": [
+        35.0,
+        35.0
+      ],
+      "ts": "2026-01-01T12:00:02Z",
+      "util_spark": [
+        0.0,
+        0.0
+      ],
+      "utilization_pct": 0.0,
+      "vram_total_mib": 16384,
+      "vram_used_mib": 512
+    }
+  ],
+  "source_error": null
+}
