@@ -6,10 +6,12 @@
 //! the process lifetime (decision 14) and merge into
 //! `GET /operations` alongside the app's own task records.
 //!
-//! Abort is bookkeeping, exactly as in the app: the record flips
-//! to `aborted` and the underlying work — which the app cannot
-//! cancel either — is left to finish detached; its completion does
-//! not overwrite the aborted state.
+//! Abort of an API-side record is bookkeeping: the record flips to
+//! `aborted` and the dispatched work is left to finish detached; its
+//! completion does not overwrite the aborted state. (The app's own
+//! task records, which these dispatches create for long work, abort
+//! with real cooperative cancellation — `manager-app`'s `tasks`
+//! module.)
 //!
 //! The store also retains diagnostics bundle locations: when an
 //! export operation completes, its file is registered under a
@@ -137,9 +139,8 @@ impl OperationStore {
         all
     }
 
-    /// Flip a record to aborted (bookkeeping parity with the app's
-    /// task_abort, which sets the status unconditionally). Returns
-    /// the record when it exists.
+    /// Flip a record to aborted (bookkeeping only; see the module
+    /// docs). Returns the record when it exists.
     pub fn abort(&self, id: &str) -> Option<Value> {
         let mut ops = self.ops.lock().unwrap();
         let record = ops.get_mut(id)?;
