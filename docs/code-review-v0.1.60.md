@@ -245,12 +245,15 @@ All other invoke argument keys (backend action family, `backend_add`/preview, mo
 
 ## Deferred (summary)
 
-- **F1 follow-up — hash-locked requirements** for the gateway venv (`uv pip install --require-hashes` from a generated lock): needs a lock-generation step and a refresh workflow; the version pin closes the immediate exposure.
-- SEC-13 remainder (desktop `admin_api_*` auditing), SEC-N3, SEC-N4. (SEC-05 rotation, SEC-13 TOTP/lockout, SEC-14, SEC-15, SEC-N1, SEC-N2 fixed after this review.)
-- PS-8, PS-9, PS-11, PS-12.
-- PL-m1, PL-m2, PL-m4, PL-m6, PL-n1.
-- P-4, P-9, P-10, P-11a..c.
-- D-2 (whole-tree rustfmt).
+Reconciled 2026-11-12. Implemented since this review (see the inline notes on each finding): PS-4, PS-5, PS-6, PS-8, PS-9, PS-10, PS-12, P-4, P-5, P-9, P-10, P-11a..c, D-2 (whole-tree rustfmt, `7bb9439`), SEC-03, SEC-04, SEC-05 rotation, SEC-08, SEC-13 (TOTP/lockout), SEC-14, SEC-15, SEC-16, SEC-N1, SEC-N2. Still open:
+
+- **F1 follow-up: hash-locked requirements** for the gateway venv (`uv pip install --require-hashes` from a generated lock): needs a lock-generation step and a refresh workflow; the version pin closes the immediate exposure.
+- **SEC-13 remainder:** desktop `admin_api_*` auditing (the desktop actor/auth_type values are an owner choice).
+- **SEC-N3:** TLS key (`server.key`) in Credential Manager rather than plaintext PEM.
+- **SEC-N4:** `sk-` redaction without a word boundary (log streaming area).
+- **PL-\*** (service lifecycle owner): PL-M2, PL-m1, PL-m2, PL-m4, PL-m5, PL-m6, PL-m7, PL-n1.
+- **PS-11:** config write lock held while waiting on the supervisor.
+- **Rubric escalation:** the escalation behaviour is undefined in the spec.
 
 ## Needs Pete's decision
 
@@ -258,8 +261,8 @@ All other invoke argument keys (backend action family, `backend_add`/preview, mo
 2. ~~**SEC-04 (remainder)** — password step-up for first TOTP enrollment.~~ Decided and fixed (see SEC-04 above).
 3. ~~**SEC-08** — stop regenerating the TLS certificate on SAN drift at startup.~~ Decided and fixed (see SEC-08 above).
 4. ~~**SEC-16** — refuse non-loopback `http://` log-streaming endpoints.~~ Decided and fixed (see SEC-16 above).
-5. **PS-4** — how wizard steps should persist config edits (return edits to the app vs. a locked save callback; fail the step instead of saving a snapshot over an unloadable file).
-6. **PS-5 (remainder)** — derive MCP local-process specs from `AppConfig.mcp` (exposure → mode mapping).
+5. ~~**PS-4** — how wizard steps should persist config edits (return edits to the app vs. a locked save callback; fail the step instead of saving a snapshot over an unloadable file).~~ Implemented (`a8faf5e`: steps return typed config edits that the app applies under its lock).
+6. ~~**PS-5 (remainder)** — derive MCP local-process specs from `AppConfig.mcp` (exposure → mode mapping).~~ Decided and implemented (see PS-5 above).
 7. ~~**PS-6 (remainder) / PS-10** — journal rollback on a failed save, and which fields activation cancel compares/restores.~~ Decided and implemented (see PS-6 / PS-10 above).
 8. **PL-M2 / PL-m5** — crash-restart policy: SCM recovery for services (stop-reason plumbing + failure-actions flag) and whether process mode should get the unused backoff/restart loop or lose the dead code.
 9. **PL-m7** — DACL grantee under over-the-shoulder elevation.

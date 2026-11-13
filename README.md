@@ -46,6 +46,12 @@ Current release: **v0.1.61** (November 12, 2026).
   single-GPU models
 - Manages MXC (Microsoft Execution Containers) sandbox policies for agent tool
   execution
+- Updates components (llama.cpp, LiteLLM, models, extensions) from the
+  in-app Updates surface
+- Optional OpenRouter cloud tier with a configurable daily spend cap
+- Admin API bind choice and a device-pairing QR code; a `GET /api/v1/events`
+  event stream (SSE) that mirrors the desktop UI's events; running tasks
+  can be cancelled cooperatively
 - Exposes an Admin API whose settings and admin users are managed from the
   desktop UI (Settings → Remote Access), and reports activity through
   Windows toast notifications (Operations / Failures / Activation

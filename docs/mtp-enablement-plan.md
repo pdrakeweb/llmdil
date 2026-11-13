@@ -37,10 +37,12 @@ model entry and planner backend are not modified at any point.
   does not touch it. When MTP is on and the saved flags set
   `--parallel` / `-np` to a value other than 1, the UI shows a
   warning that drafting will not occur until the saved flags set it
-  to 1. As of v0.1.40 there is still no in-app raw-flags editor, so
-  setting `--parallel 1` remains a hand edit of `config.json` (the
-  raw-flags instructions in step 3 are superseded for the
-  speculative flags by the slider, but not for `--parallel`).
+  to 1. The app now has an in-app raw-flags editor (operation
+  `backend_set_raw_flags`, `PUT /api/v1/backends/{id}/raw-flags`), so
+  setting `--parallel 1` no longer needs a hand edit of `config.json`
+  (as of v0.1.40 there was no editor; the raw-flags instructions in
+  step 3 are superseded for the speculative flags by the slider, and
+  `--parallel` is set through the raw-flags editor).
   Before v0.1.40 there was no UI surface for the speculative flags
   at all; the manual raw-flags route in step 3 was the only one.
 - **Measured outcome (Pete's machine, v0.1.40).** With the spec
