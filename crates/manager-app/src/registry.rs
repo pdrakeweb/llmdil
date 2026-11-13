@@ -469,13 +469,24 @@ macro_rules! gen_dispatch {
             // in-process feed (source `app`); a no-op while log
             // streaming is off.
             let sink = &crate::logship::tap_sink(state, Arc::clone(sink));
-            match op {
-                $(
-                    Op::$variant => {
-                        crate::$op(state, sink, $(arg::<$pty>(&args, stringify!($pname))?),*).await
+            // Every operation runs inside an `op` span; a task the
+            // operation records stamps its task_id and kind onto it
+            // (see `tasks::op_span`), so the operation's log events
+            // carry the task they belong to.
+            let span = crate::tasks::op_span(spec(op).name);
+            tracing::Instrument::instrument(
+                async move {
+                    match op {
+                        $(
+                            Op::$variant => {
+                                crate::$op(state, sink, $(arg::<$pty>(&args, stringify!($pname))?),*).await
+                            }
+                        )*
                     }
-                )*
-            }
+                },
+                span,
+            )
+            .await
         }
     };
 }

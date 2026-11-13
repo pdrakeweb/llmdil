@@ -64,7 +64,7 @@ fn load_tuning_store(state: &AppState) -> TuningStore {
 
 fn save_tuning_store(state: &AppState, store: &TuningStore) {
     if let Err(e) = store.save(&tuning_path(state)) {
-        eprintln!("optimize-tuning: store save failed: {e}");
+        tracing::warn!("optimize-tuning: store save failed: {e}");
     }
 }
 
@@ -1367,7 +1367,7 @@ pub async fn op_optimize_tuning_run(
         .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeJob);
     let task_state = state.clone();
     let task_backend = backend_id.clone();
-    tokio::spawn(async move {
+    let sweep = async move {
         // The guard lives for the sweep's whole run: its
         // claim is the per-backend record the refusals name.
         let _guard = guard;
@@ -1386,7 +1386,9 @@ pub async fn op_optimize_tuning_run(
         task_state
             .finish_task(&task_id, status, json!({ "backend": backend_id }))
             .await;
-    });
+    };
+    // The sweep logs inside the task's operation span.
+    tokio::spawn(tracing::Instrument::in_current_span(sweep));
     crate::optimize::state_payload(state).await
 }
 
