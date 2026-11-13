@@ -945,7 +945,7 @@ pub async fn op_model_assign(
     // the save itself — and a failure that left them in the live
     // config would persist on the next unrelated save with no
     // journal entry.
-    let mut guard = state.config.write().await;
+    let (mut guard, live) = config_write_for_journal(state).await;
     let pre_cfg = guard.clone();
     let mut cfg = pre_cfg.clone();
     let model = cfg
@@ -1017,6 +1017,7 @@ pub async fn op_model_assign(
     // Recorded before the save, per the journal ordering rule.
     let mut journaled = record_gateway_change(
         state,
+        &live,
         &pre_cfg,
         &cfg,
         "model_assign",
@@ -1026,6 +1027,7 @@ pub async fn op_model_assign(
     .await?;
     let backend_record = record_backend_change(
         state,
+        &live,
         &pre_cfg,
         &cfg,
         "model_assign",

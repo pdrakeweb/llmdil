@@ -299,3 +299,106 @@ async fn failed_save_rolls_back_only_its_journal_entry() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The bind host a test switches to: whichever loopback/any value
+/// the configuration does not already carry.
+async fn other_bind_host(state: &AppState) -> &'static str {
+    if state.config.read().await.gateway.bind_host == "127.0.0.1" {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    }
+}
+
+/// PS-11 (docs/code-review-v0.1.60.md): a journaled edit must not
+/// wait on the supervisor lock while it holds `config.write()` —
+/// a backend start holds the supervisor for up to ~10 s, and a
+/// parked config writer queues every status/list poll behind it.
+/// The test holds the supervisor (as a start would), runs a
+/// journaling op, and asserts the config stays readable the whole
+/// time the op is parked; then it releases the supervisor and
+/// checks the op journaled and saved as before (record-before-save).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journaled_edit_does_not_hold_config_write_while_waiting_on_supervisor() {
+    let (state, dir) = advanced_test_state(test_cfg());
+    let new_host = other_bind_host(&state).await;
+    let sup_guard = state.supervisor().await.lock().await;
+    let op_state = state.clone();
+    let op = tokio::spawn(async move {
+        op_gateway_set_bind_host(&op_state, &test_sink(), new_host.to_string()).await
+    });
+    // For 500 ms the op is parked on the supervisor we hold; the
+    // config must never be write-locked meanwhile.
+    for _ in 0..50 {
+        assert!(
+            state.config.try_read().is_ok(),
+            "the journaling op holds config.write() while waiting on the supervisor"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!op.is_finished(), "the op must be parked on the supervisor");
+    // A config read (what every status/list poll takes) completes
+    // promptly while the supervisor is still held.
+    let read = tokio::time::timeout(std::time::Duration::from_secs(1), state.config.read()).await;
+    assert!(
+        read.is_ok(),
+        "config.read() queued behind the journaling op"
+    );
+    drop(read);
+    drop(sup_guard);
+    let r = tokio::time::timeout(std::time::Duration::from_secs(10), op)
+        .await
+        .expect("op finished")
+        .unwrap();
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(state.config.read().await.gateway.bind_host, new_host);
+    let journal = activation::load_journal(&dir);
+    assert_eq!(journal.entries.len(), 1, "the change is journaled");
+    assert_eq!(journal.entries[0].kind, "gateway_bind");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PS-11 race: a config change to the liveness inputs (here a
+/// backend's port) that lands between the journal op's liveness
+/// snapshot and its write lock makes the op re-gather against the
+/// configuration it actually writes. The op completes, and the
+/// concurrent change survives (the op's `pre` is the locked config).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journaled_edit_regathers_liveness_when_backends_change_meanwhile() {
+    let (state, dir) = advanced_test_state(test_cfg());
+    let new_host = other_bind_host(&state).await;
+    let sup_guard = state.supervisor().await.lock().await;
+    let op_state = state.clone();
+    let op = tokio::spawn(async move {
+        op_gateway_set_bind_host(&op_state, &test_sink(), new_host.to_string()).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!op.is_finished(), "the op must be parked on the supervisor");
+    // Not blocked: the op holds no config guard while parked.
+    let new_port = {
+        let mut cfg = tokio::time::timeout(std::time::Duration::from_secs(1), state.config.write())
+            .await
+            .expect("config writable while the op is parked");
+        let b = cfg
+            .backends
+            .first_mut()
+            .expect("default config has backends");
+        b.port += 1000;
+        b.port
+    };
+    drop(sup_guard);
+    let r = tokio::time::timeout(std::time::Duration::from_secs(10), op)
+        .await
+        .expect("op finished")
+        .unwrap();
+    assert!(r.is_ok(), "{r:?}");
+    let cfg = state.config.read().await;
+    assert_eq!(cfg.gateway.bind_host, new_host);
+    assert_eq!(
+        cfg.backends.first().unwrap().port,
+        new_port,
+        "the concurrent change survives"
+    );
+    drop(cfg);
+    let _ = std::fs::remove_dir_all(&dir);
+}

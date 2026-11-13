@@ -378,7 +378,7 @@ pub async fn op_placement_apply(
             json!({ "model_id": model_id, "backends": backend_ids, "split": split }),
         )
         .await;
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let outcome: Result<(), ApiError> = (async {
         let mut new_cfg = cfg.clone();
         // Existence first: a missing backend must not leave earlier
@@ -414,6 +414,7 @@ pub async fn op_placement_apply(
         for bid in &backend_ids {
             let record = record_backend_change(
                 state,
+                &live,
                 &pre_cfg,
                 &new_cfg,
                 "backend_placement",

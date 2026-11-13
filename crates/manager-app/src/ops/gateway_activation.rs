@@ -900,7 +900,10 @@ pub(crate) fn probe_gateway(host: &str, port: u16) -> bool {
 pub(crate) async fn activation_unresolved(
     state: &AppState,
 ) -> (Vec<activation::ActivationEntry>, bool) {
-    let cfg = state.config.read().await;
+    // A clone, not a held read guard (PS-11): the start times below
+    // wait on the supervisor, and a read guard held across that wait
+    // queues every config writer (and, behind it, every later reader).
+    let cfg = state.config.read().await.clone();
     let journal = activation::load_journal(&state.data_dir);
     let started_at = backend_start_times(state, &cfg).await;
     let configured: std::collections::HashSet<String> =

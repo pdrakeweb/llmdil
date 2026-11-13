@@ -52,7 +52,7 @@ pub async fn op_backend_set_mtp(
             )));
         }
     }
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     {
@@ -95,9 +95,16 @@ pub async fn op_backend_set_mtp(
             Some(n) => format!("Backend `{id}` MTP draft set to {n} tokens"),
             None => format!("Backend `{id}` MTP draft turned off"),
         };
-        let journaled =
-            record_backend_change(state, &pre_cfg, &new_cfg, "backend_set_mtp", summary, &id)
-                .await?;
+        let journaled = record_backend_change(
+            state,
+            &live,
+            &pre_cfg,
+            &new_cfg,
+            "backend_set_mtp",
+            summary,
+            &id,
+        )
+        .await?;
         save_journaled(state, &new_cfg, &journaled)?;
         *cfg = new_cfg;
     }
@@ -302,7 +309,7 @@ pub async fn op_backend_set_moe_cache(
         None
     };
     let target: Option<u32> = if want_auto { resolved } else { mib };
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     {
@@ -344,6 +351,7 @@ pub async fn op_backend_set_moe_cache(
         };
         let journaled = record_backend_change(
             state,
+            &live,
             &pre_cfg,
             &new_cfg,
             "backend_set_moe_cache",
@@ -422,7 +430,7 @@ pub async fn op_backend_set_parallel(
     if let Some(n) = slots {
         validate_parallel_slots(n)?;
     }
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     let b = new_cfg
@@ -448,6 +456,7 @@ pub async fn op_backend_set_parallel(
         };
         let journaled = record_backend_change(
             state,
+            &live,
             &pre_cfg,
             &new_cfg,
             "backend_set_parallel",
@@ -876,7 +885,7 @@ pub async fn op_backend_set_cache(
     flash_attn: Option<String>,
 ) -> ApiResult {
     let target = resolve_cache_selection(cache_k, cache_v, flash_attn)?;
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     let b = new_cfg
@@ -906,9 +915,16 @@ pub async fn op_backend_set_cache(
             ),
             None => format!("Backend `{id}` KV cache controls cleared (llama.cpp defaults)"),
         };
-        let journaled =
-            record_backend_change(state, &pre_cfg, &new_cfg, "backend_set_cache", summary, &id)
-                .await?;
+        let journaled = record_backend_change(
+            state,
+            &live,
+            &pre_cfg,
+            &new_cfg,
+            "backend_set_cache",
+            summary,
+            &id,
+        )
+        .await?;
         save_journaled(state, &new_cfg, &journaled)?;
         *cfg = new_cfg;
     }

@@ -72,7 +72,7 @@ pub async fn op_backend_apply_config(
         || patch.split_mode.is_some()
         || patch.raw_flags.is_some();
     let diff: ConfigDiff = {
-        let mut cfg = state.config.write().await;
+        let (mut cfg, live) = config_write_for_journal(state).await;
         let pre_cfg = cfg.clone();
         let mut new_cfg = cfg.clone();
         if touches_flags {
@@ -84,6 +84,7 @@ pub async fn op_backend_apply_config(
             manager_config::apply_config_diff(&mut new_cfg, &id, &patch).map_err(ApiError::from)?;
         let mut journaled = record_gateway_change(
             state,
+            &live,
             &pre_cfg,
             &new_cfg,
             "backend_apply_config",
@@ -97,6 +98,7 @@ pub async fn op_backend_apply_config(
         if !diff.changes.is_empty() {
             let backend_record = record_backend_change(
                 state,
+                &live,
                 &pre_cfg,
                 &new_cfg,
                 "backend_apply_config",
@@ -485,7 +487,7 @@ pub async fn op_backend_add(
             None => (Vec::new(), manager_config::SplitMode::None),
         },
     };
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     if new_cfg.backends.iter().any(|b| b.id == id) {
@@ -606,6 +608,7 @@ pub async fn op_backend_add(
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
     let journaled = record_gateway_change(
         state,
+        &live,
         &pre_cfg,
         &new_cfg,
         "backend_add",
@@ -812,7 +815,7 @@ pub async fn op_backend_update_flags(
     n_batch: u32,
 ) -> ApiResult {
     validate_ctx_batch(n_ctx, n_batch)?;
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     let b = new_cfg
@@ -830,6 +833,7 @@ pub async fn op_backend_update_flags(
     let journaled = if changed {
         record_backend_change(
             state,
+            &live,
             &pre_cfg,
             &new_cfg,
             "backend_flags",
@@ -1034,7 +1038,7 @@ pub async fn op_backend_set_raw_flags(
         return Err(ApiError::InvalidInput(err.message));
     }
     let warnings = manager_models::raw_flag_warnings(new_raw.as_deref());
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     let b = new_cfg
@@ -1059,6 +1063,7 @@ pub async fn op_backend_set_raw_flags(
         manager_config::validate(&new_cfg).map_err(ApiError::from)?;
         let journaled = record_backend_change(
             state,
+            &live,
             &pre_cfg,
             &new_cfg,
             "backend_set_raw_flags",
@@ -1141,7 +1146,7 @@ pub async fn op_backend_delete(
             }
             _ => false,
         };
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     let pos = new_cfg
@@ -1160,6 +1165,7 @@ pub async fn op_backend_delete(
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
     let journaled = record_gateway_change(
         state,
+        &live,
         &pre_cfg,
         &new_cfg,
         "backend_delete",
