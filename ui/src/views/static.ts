@@ -27,7 +27,7 @@ import {
   getActivationPlan, activationCancelChanges, activationComplete, quiesceWait,
   recordActivationExecution, getActivationHistory, getActivationExecution,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
-  setNotificationConfig, sendTestNotification, updateAppConfig, updatesPin, updatesSetAuto,
+  setNotificationConfig, sendTestNotification, updateAppConfig, winmlRecheckCapabilities, updatesPin, updatesSetAuto,
   getAppUpdateStatus, appUpdateCheck, appUpdateSetChecking, appUpdateSetAuto, appUpdateDownload,
   servicesList, servicesRegister, servicesUnregister, setSupervisionMode,
   logReceiverStatus, logReceiverDeploy, logReceiverRemove, logReceiverFlipEndpoint,
@@ -8557,6 +8557,8 @@ function settingsPaint(
         <label style="font-size:12px;color:var(--text2)">Port <input id="setWinmlPort" type="number" min="1" max="65535" value="${typeof winml.port === "number" ? winml.port : 8090}" style="width:90px;font-size:12px"></label>
         <label style="font-size:12px;color:var(--text2)">Model <input id="setWinmlModel" type="text" value="${esc(primStr(winml.model_id) ?? "")}" placeholder="model id" style="width:180px;font-size:12px"></label>
         <button class="btn" id="setWinmlApply" style="padding:1px 7px;font-size:11px">Apply</button>
+        <button class="btn" id="setWinmlRecheck" style="padding:1px 7px;font-size:11px">Re-check capabilities</button>
+        <span class="info-tip" title="Probes the Windows ML server now and reports what it serves and its limits. With a model registered, the registration's recorded limits are refreshed from the probe.">${icon("info")}</span>
       </div></div>` : "";
   const postgresEditor = pgPort !== null ? `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border)">
       <span class="k">PostgreSQL port<span class="info-tip" title="Loopback port of the app-managed PostgreSQL server the gateway migrates against at launch. Saved immediately and validated against every other claimed port; it applies the next time PostgreSQL starts — a running gateway keeps the server it started with.">${icon("info")}</span></span>
@@ -9112,6 +9114,24 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       }
       setMsg("Windows ML port and model saved.");
       await load();
+      return;
+    }
+
+    const winmlRecheck = t.closest("#setWinmlRecheck") as HTMLButtonElement | null;
+    if (winmlRecheck) {
+      winmlRecheck.disabled = true;
+      setMsg("Probing Windows ML…");
+      const r = await winmlRecheckCapabilities();
+      if (disposed) return;
+      winmlRecheck.disabled = false;
+      if (r.error || !r.data) {
+        setMsg(`Windows ML re-check failed: ${r.error ?? "no report"}`, true);
+        return;
+      }
+      const rep = r.data;
+      const serves = rep.models.length ? rep.models.join(", ") : "no models listed";
+      const split = rep.limits.supports_tensor_split === true ? "supported" : "not supported";
+      setMsg(`Windows ML at ${rep.base_url}: serves ${serves} · adapter ${rep.adapter_hint ?? "not reported"} · tensor split ${split}`);
       return;
     }
 

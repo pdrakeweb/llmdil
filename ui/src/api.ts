@@ -2854,6 +2854,28 @@ export async function updateAppConfig(patch: Record<string, unknown>): Promise<C
   }
 }
 
+/** winml_probe result (manager-winml WinMlProbeReport). */
+export interface WinMlProbeReport {
+  base_url: string;
+  models: string[];
+  adapter_hint: string | null;
+  limits: { supports_tensor_split?: boolean } & Record<string, unknown>;
+}
+
+/** "Re-check capabilities" on the WinML card: winml_probe re-probes
+ *  WinMLServer. With a model registered it goes through the registry
+ *  and refreshes the registration's limits (tech spec §6.5);
+ *  otherwise it probes the configured port. */
+export async function winmlRecheckCapabilities(): Promise<CallResult<WinMlProbeReport | null>> {
+  if (!isTauri()) return { data: null, live: false, error: "winml_probe is not available in sample mode" };
+  try {
+    const data = await invoke<WinMlProbeReport>("winml_probe");
+    return { data, live: true };
+  } catch (e) {
+    return { data: null, live: true, error: errOf(e) };
+  }
+}
+
 /** Register one service (backend id or "gateway") via the elevated
  *  helper. The helper prompts for the account password with the
  *  Windows system credential dialog; the app never sees it. */

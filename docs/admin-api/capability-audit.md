@@ -556,9 +556,9 @@ target names only.
 
 ### `winml_probe` — read (active probe)
 - What: Probe the WinMLServer secondary backend and record its limits.
-- Entry: `winml_probe`, main.rs:5683. UI: **no**.
+- Entry: `winml_probe`, main.rs:5683. UI: yes — the WinML card's **Re-check capabilities** button (Settings → General; tech spec §6.5 / P7).
 - In: none. Out: the probe report (`WinMlRegistration`-adjacent: availability + `WinMlLimits` — no tensor split, max 1 registered model, coarse GPU selection, experimental).
-- Side effects: HTTP probe of `http://127.0.0.1:<winml port>` (default 8090), 10 s transport timeout.
+- Side effects: HTTP probe of `http://127.0.0.1:<winml port>` (default 8090), 10 s transport timeout. With a model registered the probe goes through `WinMlRegistry::recheck_capabilities` on the registered port and refreshes the in-memory registration's limits (and a missing adapter hint); no persisted state changes.
 
 ### `winml_register` — mutate
 - What: Register a model with the Windows ML backend (tool-runner-class models only; the registry refuses ineligible classes).
