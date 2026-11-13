@@ -1710,6 +1710,34 @@
       "title": "open_url",
       "type": "object"
     },
+    "optimize_apply_plan": {
+      "additionalProperties": false,
+      "properties": {
+        "destructive": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dry_run": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "optimize_apply_plan",
+      "type": "object"
+    },
     "optimize_cancel_consult": {
       "additionalProperties": false,
       "properties": {},
@@ -2396,6 +2424,16 @@
       "properties": {
         "component_id": {
           "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [

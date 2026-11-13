@@ -114,6 +114,7 @@ export type OpName =
   | "optimize_set_item_state"
   | "optimize_set_item_outcome"
   | "optimize_discard_plan"
+  | "optimize_apply_plan"
   | "optimize_set_experiment_state"
   | "optimize_consult"
   | "optimize_discover"
@@ -710,6 +711,12 @@ export interface OptimizeSetItemOutcomeArgs {
 /** Arguments of `optimize_discard_plan`. */
 export interface OptimizeDiscardPlanArgs {}
 
+/** Arguments of `optimize_apply_plan`. */
+export interface OptimizeApplyPlanArgs {
+  readonly destructive?: boolean | null;
+  readonly dryRun?: boolean | null;
+}
+
 /** Arguments of `optimize_set_experiment_state`. */
 export interface OptimizeSetExperimentStateArgs {
   readonly experimentId: number;
@@ -879,6 +886,7 @@ export interface UpdatesCheckAllArgs {}
 /** Arguments of `updates_apply`. */
 export interface UpdatesApplyArgs {
   readonly componentId: string;
+  readonly version?: string | null;
 }
 
 /** Arguments of `updates_pin`. */
@@ -1023,6 +1031,7 @@ export interface OpArgs {
   optimize_set_item_state: OptimizeSetItemStateArgs;
   optimize_set_item_outcome: OptimizeSetItemOutcomeArgs;
   optimize_discard_plan: OptimizeDiscardPlanArgs;
+  optimize_apply_plan: OptimizeApplyPlanArgs;
   optimize_set_experiment_state: OptimizeSetExperimentStateArgs;
   optimize_consult: OptimizeConsultArgs;
   optimize_discover: OptimizeDiscoverArgs;
