@@ -30,7 +30,7 @@ async fn optimize_measure_backend_refuses_while_a_gpu_job_runs() {
     let (state, dir) = advanced_test_state(test_cfg());
     let sink = test_sink();
     let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
-    *state.optimize_job_abort.lock().await = Some(tx);
+    *state.optimize.job_abort.lock().await = Some(tx);
     let r = op_optimize_measure_backend(&state, &sink, "planner".to_string()).await;
     match r {
         Err(ApiError::InvalidInput(msg)) => {

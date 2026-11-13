@@ -125,7 +125,7 @@ pub(super) async fn set_progress(
     phase: &str,
     run: usize,
 ) {
-    if let Ok(mut slot) = state.bench_job.try_lock() {
+    if let Ok(mut slot) = state.bench.job.try_lock() {
         if let Some(job) = slot.as_mut() {
             job.progress.arm_index = arm_index;
             job.progress.arm_count = arm_count;

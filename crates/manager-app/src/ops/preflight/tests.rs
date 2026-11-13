@@ -31,17 +31,18 @@ async fn start_preflight_tolerates_poisoned_verifying_lock() {
         .id
         .clone();
     state
-        .verifying_downloads
+        .downloads
+        .verifying
         .lock()
         .unwrap()
         .insert(model_id.clone());
     let poisoner = Arc::clone(&state);
     let _ = std::thread::spawn(move || {
-        let _guard = poisoner.verifying_downloads.lock().unwrap();
+        let _guard = poisoner.downloads.verifying.lock().unwrap();
         panic!("poison the verifying_downloads lock");
     })
     .join();
-    assert!(state.verifying_downloads.is_poisoned());
+    assert!(state.downloads.verifying.is_poisoned());
     let err = backend_start_preflight_for(&state, &cfg, &b, false)
         .await
         .expect_err("a model under verification refuses the start");

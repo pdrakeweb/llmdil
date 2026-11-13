@@ -87,7 +87,7 @@ pub async fn op_optimize_consult(
         .map(|d| d.trim().to_string())
         .unwrap_or_default();
     {
-        let slot = state.optimize_abort.lock().await;
+        let slot = state.optimize.consult_abort.lock().await;
         if slot.is_some() {
             return Err(ApiError::InvalidInput(
                 "a consultation is already running".to_string(),
@@ -96,7 +96,7 @@ pub async fn op_optimize_consult(
     }
     // A consultation replaces the plan; the Rust apply executor
     // (Phase 3) records outcomes on the stored plan as it runs.
-    if state.optimize_live.applying() {
+    if state.optimize.live.applying() {
         return Err(ApiError::InvalidInput(
             "a plan apply is running; consult after it finishes".to_string(),
         ));
@@ -110,7 +110,7 @@ pub async fn op_optimize_consult(
         // consultation is generation traffic; run during a
         // sweep it would contend for the CPU and system RAM
         // the sweep's arms are measuring.
-        let slot = state.optimize_job_abort.lock().await;
+        let slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             return Err(ApiError::InvalidInput(
                 "a measurement, experiment, or tuning job is already running".to_string(),
@@ -235,7 +235,7 @@ pub async fn op_optimize_consult(
     } else {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         {
-            let mut slot = state.optimize_abort.lock().await;
+            let mut slot = state.optimize.consult_abort.lock().await;
             if slot.is_some() {
                 state
                     .finish_task(
@@ -251,7 +251,8 @@ pub async fn op_optimize_consult(
             *slot = Some(tx);
         }
         state
-            .task_controls
+            .tasks
+            .controls
             .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeConsult);
         record_consult_start(state).await;
         let model_name = crate::model_for_backend(&cfg, &backend)
@@ -278,7 +279,7 @@ pub async fn op_optimize_consult(
         // rejects them, and the salvage parser below reads the
         // answer either way.
         let response_format = manager_optimize::plan_response_format();
-        let live = &state.optimize_live;
+        let live = &state.optimize.live;
         live.begin_consult(&target);
         let _progress_guard = crate::optimize_stream::ConsultProgressGuard(live);
         let on_progress = |p: &manager_supervisor::StreamProgress| live.record(p);
@@ -296,14 +297,14 @@ pub async fn op_optimize_consult(
         // abort handle (`optimize_cancel_consult`) or the task
         // system's token (`task_abort` routes to the same op, and
         // the token covers any future direct cancel).
-        let token = state.task_controls.token(&task_id);
+        let token = state.tasks.controls.token(&task_id);
         let outcome = tokio::select! {
             res = completion => Some(res),
             _ = rx => None,
             _ = token.cancelled() => None,
         };
         {
-            let mut slot = state.optimize_abort.lock().await;
+            let mut slot = state.optimize.consult_abort.lock().await;
             *slot = None;
         }
         match outcome {
@@ -578,7 +579,7 @@ pub async fn op_optimize_cancel_consult(
     _sink: &std::sync::Arc<dyn crate::EventSink>,
 ) -> crate::ApiResult {
     let sender = {
-        let mut slot = state.optimize_abort.lock().await;
+        let mut slot = state.optimize.consult_abort.lock().await;
         slot.take()
     };
     match sender {

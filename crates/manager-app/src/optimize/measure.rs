@@ -137,7 +137,7 @@ pub async fn op_optimize_measure_backend(
     backend_id: String,
 ) -> crate::ApiResult {
     {
-        let slot = state.optimize_job_abort.lock().await;
+        let slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             return Err(ApiError::InvalidInput(
                 "a measurement or experiment job is already running".to_string(),
@@ -170,7 +170,7 @@ pub async fn op_optimize_measure_backend(
         .await;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             state
                 .finish_task(
@@ -186,7 +186,8 @@ pub async fn op_optimize_measure_backend(
         *slot = Some(tx);
     }
     state
-        .task_controls
+        .tasks
+        .controls
         .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeJob);
     let job_started_ms = record_job_start(state, "measure", &backend_id).await;
     // Loopback by construction, as with consultations (§3).
@@ -286,7 +287,7 @@ pub async fn op_optimize_measure_backend(
         _ = rx => None,
     };
     {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         *slot = None;
     }
     let entry = match outcome {
@@ -369,7 +370,7 @@ pub async fn op_optimize_estimate_backend(
     backend_id: String,
 ) -> crate::ApiResult {
     {
-        let slot = state.optimize_job_abort.lock().await;
+        let slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             return Err(ApiError::InvalidInput(
                 "a measurement or experiment job is already running".to_string(),
@@ -402,7 +403,7 @@ pub async fn op_optimize_estimate_backend(
         .await;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             state
                 .finish_task(
@@ -418,7 +419,8 @@ pub async fn op_optimize_estimate_backend(
         *slot = Some(tx);
     }
     state
-        .task_controls
+        .tasks
+        .controls
         .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeJob);
     let job_started_ms = record_job_start(state, "estimate", &backend_id).await;
     // Loopback by construction, as with measurements (§3).
@@ -489,7 +491,7 @@ pub async fn op_optimize_estimate_backend(
         _ = rx => None,
     };
     {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         *slot = None;
     }
     let entry = match outcome {
@@ -565,7 +567,7 @@ pub async fn op_optimize_cancel_job(
     _sink: &std::sync::Arc<dyn crate::EventSink>,
 ) -> crate::ApiResult {
     let sender = {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         slot.take()
     };
     match sender {

@@ -1,27 +1,72 @@
 //! `AppState`: the shared service state, its constructor, lazily
 //! initialized subsystems, and the config save/install helpers.
+//!
+//! `AppState` is a container: cohesive groups of state live in
+//! per-subsystem objects (the `state/` submodules), each owning its
+//! own locks. Re-homing a lock into a subsystem never merged it with
+//! another lock or changed its kind (std vs tokio, `Mutex` vs
+//! `RwLock`) or its critical sections; the rules below are the ones
+//! the code already followed and still does.
+//!
+//! # Lock order
+//!
+//! Where two locks are ever held together they are acquired in this
+//! order — never the reverse:
+//!
+//! 1. **wizard → config.** A wizard (`wizard(mode)`) guard is held
+//!    while the config write lock is taken to apply a step's returned
+//!    config edits (`apply_wizard_config_edits`, PS-4) and across
+//!    hydration/restore; the step-payload cache
+//!    (`wizard.steps_cache`) is written under the wizard guard too
+//!    (wizard → steps cache).
+//! 2. **config → downloads (PS-1).** `op_list_models` and the start
+//!    preflight read the config and then lock the download handles;
+//!    `op_download_model` therefore drops the `downloads.handles`
+//!    guard before it waits on `config.write()` (a parked writer on
+//!    tokio's `RwLock` queues every later reader, so the inversion
+//!    deadlocked the whole app). Within downloads: handles →
+//!    outcomes → verifying.
+//! 3. **config → supervisor (PS-11, deferred).** The activation
+//!    journal's `record_*_change` helpers run under `config.write()`
+//!    and read backend start times from the supervisor. No
+//!    supervisor → config path exists; keep it that way.
+//! 4. **Never initialize telemetry under the config write lock.** The
+//!    first `telemetry()` call reads the config while building the
+//!    poll loop; callers fetch telemetry/inventory before (or without)
+//!    taking the config write lock.
+//! 5. **Telemetry, gateway stats and direct slots are never taken
+//!    under the supervisor lock**, and the preflight reads the
+//!    telemetry snapshot and the supervisor status without holding
+//!    either across the other.
+//! 6. **tasks → event bus.** `record_task` publishes the task event
+//!    while holding the task-records lock so no settle event can
+//!    overtake it (the bus publish is synchronous and takes no
+//!    `AppState` lock).
+//!
+//! Lifecycle (`lifecycle`, `scm_cache`, `lifecycle_monitor`,
+//! `backend_spec_ids`) and log-shipping (`logship*`) state keep
+//! their own rules, documented in [`crate::lifecycle`] and
+//! [`crate::logship`].
 
 use crate::*;
 
-/// Terminal outcome of a model download, recorded by the completion
-/// watcher spawned in `download_model`.
-#[derive(Debug, Clone)]
-pub(crate) struct DownloadOutcome {
-    /// Token of the `download_model` attempt that produced this
-    /// outcome (0 for outcomes recorded outside a download, i.e. a
-    /// manual `model_verify_checksum` mismatch). The watcher writes
-    /// only when its token is still the model's latest attempt, so a
-    /// superseded download cannot overwrite a newer attempt's outcome.
-    pub(crate) attempt: u64,
-    /// The failure message when the download — or the hash verification
-    /// that follows it — failed; `None` when it completed.
-    pub(crate) failed: Option<String>,
-    /// True when the failure is a SHA-256 verification failure
-    /// (post-download watcher or manual verify). Only verification
-    /// failures gate backend start in the preflight; transfer failures
-    /// set this false and do not gate.
-    pub(crate) verification_failure: bool,
-}
+mod activation_slots;
+mod bench_slots;
+mod downloads;
+mod gateway;
+mod optimize_slots;
+mod task_registry;
+mod telemetry;
+mod wizard;
+
+pub(crate) use activation_slots::ActivationState;
+pub(crate) use bench_slots::BenchState;
+pub(crate) use downloads::{DownloadOutcome, DownloadsState};
+pub(crate) use gateway::GatewayState;
+pub(crate) use optimize_slots::OptimizeState;
+pub(crate) use task_registry::TaskRegistry;
+pub(crate) use telemetry::TelemetryState;
+pub(crate) use wizard::WizardState;
 
 /// Shared backend state. Subsystems are lazily initialized (`OnceCell`) so
 /// a failure surfaces on first use of that subsystem, never at startup.
@@ -37,16 +82,8 @@ pub struct AppState {
     /// (tests, tools).
     pub(crate) config_load: std::sync::Mutex<Option<Value>>,
     pub(crate) supervisor: OnceCell<Mutex<Supervisor>>,
-    /// The telemetry store is owned by the poll loop (single writer); the
-    /// Arc is shared with the Poller built in `telemetry()`. The std Mutex
-    /// is the store's own lock type from manager-telemetry.
-    pub(crate) telemetry: OnceCell<Arc<std::sync::Mutex<TelemetryStore>>>,
-    /// Keeps the telemetry poll loop alive for the app's lifetime.
-    pub(crate) telemetry_poller: OnceCell<std::sync::Mutex<manager_telemetry::store::PollHandle>>,
-    /// Persistent per-GPU telemetry history (see [`gpu_history`]):
-    /// loaded from the data dir on first use, appended by the
-    /// recorder loop, read by the history query op.
-    pub(crate) gpu_history: OnceCell<std::sync::Mutex<gpu_history::GpuHistoryCell>>,
+    /// GPU telemetry and history (see [`telemetry::TelemetryState`]).
+    pub(crate) telemetry: TelemetryState,
     /// The log-streaming shipper (log-streaming design) and what it
     /// was started with; started after config load when the feature
     /// is enabled and restarted when its settings are saved. See
@@ -62,46 +99,12 @@ pub struct AppState {
     pub(crate) logship_tap: manager_logship::RecordTap,
     /// The app-level event bus (see [`event_bus`]).
     pub(crate) event_bus: event_bus::AppEventBus,
-    pub(crate) wizard_install: OnceCell<Mutex<Wizard>>,
-    pub(crate) wizard_audit: OnceCell<Mutex<Wizard>>,
-    /// Last setup_get_steps payload, refreshed whenever the install
-    /// wizard's state is read or mutated under its lock. Served when
-    /// the wizard lock is held by a running step, so the checklist
-    /// never sits blank for the duration of a step.
-    pub(crate) wizard_steps_cache: RwLock<Option<Value>>,
-    /// The install-wizard step currently executing (id + start
-    /// instant), set by `run_wizard_step` just before the step runs
-    /// and cleared when it returns. A caller that finds the wizard
-    /// lock held reads this to report *what* is running and for how
-    /// long instead of a bare "busy" — and the rejection is written
-    /// to the wizard log, so the state is diagnosable afterwards.
-    /// std Mutex: only synchronous set/clear/read.
-    pub(crate) wizard_step_running: std::sync::Mutex<Option<(String, std::time::Instant)>>,
-    pub(crate) tasks: Mutex<HashMap<String, TaskRecord>>,
-    /// Per-task cancellation tokens and abort routing (see [`tasks`]).
-    pub(crate) task_controls: tasks::TaskControls,
-    pub(crate) task_counter: AtomicU64,
-    /// Live model-download handles by model id (spec §14 download commands).
-    pub(crate) downloads: Mutex<HashMap<String, DownloadHandle>>,
-    /// Terminal download outcomes by model id, recorded by the
-    /// completion watcher spawned in `download_model`: `failed` is the
-    /// failure message, or `None` when the download completed (verified
-    /// against the pinned hash when one exists). Read by `list_models`
-    /// to surface `download_error` and by the backend start preflight
-    /// to gate on verification failures.
-    pub(crate) download_outcomes: Mutex<HashMap<String, DownloadOutcome>>,
-    /// Monotonic download-attempt counter; each `download_model` call
-    /// takes the next token (see [`DownloadOutcome::attempt`]).
-    pub(crate) download_attempt_counter: AtomicU64,
-    /// Latest download-attempt token per model id. The completion
-    /// watcher writes its outcome only when its token still matches.
-    pub(crate) download_latest_attempt: Mutex<HashMap<String, u64>>,
-    /// Model ids whose post-download SHA-256 verification is currently
-    /// running in the completion watcher. Backend start is refused for
-    /// these: the file may be seconds from being deleted as corrupt.
-    /// std Mutex like `backend_spec_ids` — only synchronous membership
-    /// checks and inserts are needed.
-    pub(crate) verifying_downloads: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The setup wizard (see [`wizard::WizardState`]).
+    pub(crate) wizard: WizardState,
+    /// The tracked-task registry (see [`task_registry::TaskRegistry`]).
+    pub(crate) tasks: TaskRegistry,
+    /// The model-download subsystem (see [`downloads::DownloadsState`]).
+    pub(crate) downloads: DownloadsState,
     /// Ids of the supervisor specs this layer registered as backends.
     /// The Supervisor is shared with the MCP subsystem (process ids
     /// `mcp-<id>`); pruning and orphan-surfacing in the backend commands
@@ -114,95 +117,14 @@ pub struct AppState {
     /// Local processes are spawned from it by `mcp_local` (review
     /// v0.1.60 PS-5).
     pub(crate) mcp_modes: Mutex<HashMap<String, manager_mcp::McpMode>>,
-    /// Recent gateway routing decisions (spec §14 `gateway_recent_requests`).
-    /// Every `gateway_test_routing` trace records here.
-    pub(crate) routing_log: Mutex<manager_gateway::RoutingLog>,
-    /// Gateway request-statistic snapshots scraped from LiteLLM's
-    /// Prometheus endpoint by the background poller (see
-    /// [`gateway_stats`]); `list_backends` turns them into the
-    /// Dashboard's request/error figures (trailing hour) and live
-    /// throughput rate (recent window).
-    pub(crate) gateway_stats: Mutex<gateway_stats::GatewayStatsStore>,
-    /// Per-backend llama-server `/slots` snapshots polled directly
-    /// from each backend's own port by the background poller (see
-    /// [`gateway_stats::DirectSlotsStore`]); `list_backends`
-    /// prefers this live rate over the gateway rate, and falls
-    /// back when a backend's `/slots` is unavailable.
-    pub(crate) direct_slots: Mutex<gateway_stats::DirectSlotsStore>,
+    /// The gateway observation stores (see [`gateway::GatewayState`]).
+    pub(crate) gateway: GatewayState,
     /// WinML secondary-backend registry (stateful single-model rule).
     pub(crate) winml: OnceCell<Mutex<manager_winml::WinMlRegistry>>,
-    /// Shared cancellation slot for the Optimize consultation (the
-    /// design's one-consult-at-a-time rule): starting a consult
-    /// stores its sender; firing it aborts the in-flight LLM call.
-    pub(crate) optimize_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    /// When the running consultation started (Unix ms), recorded
-    /// beside the abort slot so the state payload can report a
-    /// true elapsed time to any page instance — the page's own
-    /// clock only knows about consultations it started itself.
-    pub(crate) optimize_consult_started_unix_ms: Mutex<Option<i64>>,
-    /// The last consultation's failure (message + Unix ms),
-    /// recorded when a run ends in failure and cleared when a
-    /// new run starts or one succeeds: a consultation that ran
-    /// while the operator was on another view must still surface
-    /// its failure on the Optimize page, not silently leave the
-    /// previous plan looking current.
-    pub(crate) optimize_consult_error: Mutex<Option<(String, i64)>>,
-    /// Optimize Phase 3 live state: streaming-consultation progress
-    /// and the Rust apply executor's one-at-a-time claim.
-    pub(crate) optimize_live: optimize_stream::OptimizeLive,
-    /// Shared cancellation slot for GPU-bound Optimize jobs
-    /// (Phase 5: measurements and experiment batches): one such job
-    /// at a time, separate from the consult slot because a
-    /// consultation and a measurement are different jobs with
-    /// different lifetimes.
-    pub(crate) optimize_job_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    /// Bench sweep cancellation slot (Bench design §6.4): the
-    /// running sweep's scoped cancel handle, owned by the sweep
-    /// rather than the task bookkeeping (D13) — the same shape
-    /// as the Optimize job slot, a separate slot because a sweep
-    /// and an Optimize job are different jobs with different
-    /// lifetimes.
-    pub(crate) bench_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    /// Prompt-generation cancellation slot (Bench design §4.3):
-    /// the stored abort handle for the in-flight draft
-    /// generation, mirroring the consultation's slot.
-    pub(crate) bench_generate_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    /// The running Bench sweep's descriptor (id + progress),
-    /// read by `bench_results_list` so any page instance can
-    /// render the sweep's progress.
-    pub(crate) bench_job: Mutex<Option<bench::BenchJob>>,
-    /// The running Estimate/Measure job's descriptor (tracker
-    /// #69): kind, backend, and start time, recorded beside the
-    /// job slot so the state payload can tell ANY page instance
-    /// what is actually running — the payload's shared
-    /// `measuring` boolean alone cannot distinguish an Estimate
-    /// from a Measure, which is how an Estimate run rendered
-    /// with the Measure profile's copy (Oct 20, 2026).
-    pub(crate) optimize_job: Mutex<Option<OptimizeJobInfo>>,
-    /// The last Estimate/Measure job's failure (message + Unix
-    /// ms), following the consultation's `consult_error`
-    /// pattern: recorded when a job ends in failure, cleared
-    /// when a new job starts or one succeeds, so a failure that
-    /// lands while the operator is on another view (or in
-    /// another window) still surfaces instead of leaving stale
-    /// in-progress copy forever.
-    pub(crate) optimize_job_error: Mutex<Option<(String, i64)>>,
-    /// Per-backend record of the currently running Optimize
-    /// operation (tracker #70): backend id -> the operation
-    /// holding that backend, in one of the two families
-    /// (consultation vs benchmark). Consulted at job start on
-    /// both paths so a consultation and a benchmark (Measure /
-    /// Estimate / eval baseline / an experiment batch's run
-    /// against its consulted backend) never run concurrently
-    /// against the same backend and store figures depressed by
-    /// contention as if they were uncontended. Entries are
-    /// claimed at job start and released on every terminal path
-    /// (completion, failure, timeout, operator cancel) through
-    /// the RAII guard in `optimize.rs`; the cancel commands also
-    /// clear the family they cancel. std Mutex: claims, releases,
-    /// and the guard's Drop are all synchronous.
-    pub(crate) optimize_running_ops:
-        std::sync::Mutex<std::collections::HashMap<String, OptimizeRunningOp>>,
+    /// The Optimize job slots (see [`optimize_slots::OptimizeState`]).
+    pub(crate) optimize: OptimizeState,
+    /// The Bench job slots (see [`bench_slots::BenchState`]).
+    pub(crate) bench: BenchState,
     /// Transition-watch state for the toast notification monitor
     /// (see [`notify`]): backend states, gateway liveness
     /// expectation, and activation-plan pending state, so
@@ -234,14 +156,9 @@ pub struct AppState {
             Arc<HashMap<String, manager_services::ServiceStatus>>,
         )>,
     >,
-    /// Serializes activation plan applies ([`activation_apply`]): taken
-    /// with `try_lock`, so a second apply from any surface is refused
-    /// instead of interleaving restarts (ACT-9).
-    pub(crate) activation_apply_lock: Mutex<()>,
-    /// What the running apply is doing (`activation_applying` on the
-    /// gateway status and plan payloads); `None` when idle. std Mutex:
-    /// synchronous read/replace only.
-    pub(crate) activation_progress: std::sync::Mutex<Option<activation_apply::ApplyProgress>>,
+    /// Activation plan apply serialization and progress (see
+    /// [`activation_slots::ActivationState`]).
+    pub(crate) activation: ActivationState,
     /// The lifecycle monitor's counters between ticks (see
     /// [`lifecycle_monitor`]). std Mutex: synchronous updates only.
     pub(crate) lifecycle_monitor: std::sync::Mutex<lifecycle_monitor::MonitorState>,
@@ -371,50 +288,27 @@ impl AppState {
             data_dir,
             config_load: std::sync::Mutex::new(None),
             supervisor: OnceCell::new(),
-            telemetry: OnceCell::new(),
-            telemetry_poller: OnceCell::new(),
-            gpu_history: OnceCell::new(),
+            telemetry: TelemetryState::default(),
             logship: std::sync::Mutex::new(logship::LogshipSlot::default()),
             logship_apply: Mutex::new(()),
             logship_tap: manager_logship::RecordTap::new(),
             event_bus: event_bus::AppEventBus::default(),
-            wizard_install: OnceCell::new(),
-            wizard_audit: OnceCell::new(),
-            wizard_steps_cache: RwLock::new(None),
-            wizard_step_running: std::sync::Mutex::new(None),
-            tasks: Mutex::new(HashMap::new()),
-            task_controls: tasks::TaskControls::default(),
-            task_counter: AtomicU64::new(1),
-            downloads: Mutex::new(HashMap::new()),
-            download_outcomes: Mutex::new(HashMap::new()),
-            download_attempt_counter: AtomicU64::new(1),
-            download_latest_attempt: Mutex::new(HashMap::new()),
-            verifying_downloads: std::sync::Mutex::new(std::collections::HashSet::new()),
+            wizard: WizardState::default(),
+            tasks: TaskRegistry::default(),
+            downloads: DownloadsState::default(),
             backend_spec_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
             mcp_modes: Mutex::new(HashMap::new()),
-            routing_log: Mutex::new(manager_gateway::RoutingLog::default()),
-            gateway_stats: Mutex::new(gateway_stats::GatewayStatsStore::default()),
-            direct_slots: Mutex::new(gateway_stats::DirectSlotsStore::default()),
+            gateway: GatewayState::default(),
             winml: OnceCell::new(),
-            optimize_abort: Mutex::new(None),
-            optimize_consult_started_unix_ms: Mutex::new(None),
-            optimize_consult_error: Mutex::new(None),
-            optimize_live: Default::default(),
-            optimize_job_abort: Mutex::new(None),
-            bench_abort: Mutex::new(None),
-            bench_generate_abort: Mutex::new(None),
-            bench_job: Mutex::new(None),
-            optimize_job: Mutex::new(None),
-            optimize_job_error: Mutex::new(None),
-            optimize_running_ops: std::sync::Mutex::new(std::collections::HashMap::new()),
+            bench: BenchState::default(),
+            optimize: OptimizeState::default(),
             notify_watch: std::sync::Mutex::new(notify::NotifyWatch::default()),
             app_update_guard: Mutex::new(()),
             offload_probes: std::sync::Mutex::new(std::collections::HashMap::new()),
             lifecycle: Arc::new(lifecycle::LifecycleRegistry::new()),
             scm_cache: std::sync::Mutex::new(None),
             lifecycle_monitor: std::sync::Mutex::new(lifecycle_monitor::MonitorState::default()),
-            activation_apply_lock: Mutex::new(()),
-            activation_progress: std::sync::Mutex::new(None),
+            activation: ActivationState::default(),
         }
     }
 
@@ -444,57 +338,8 @@ impl AppState {
         *self.config_load.lock().unwrap_or_else(|p| p.into_inner()) = Some(v);
     }
 
-    pub(crate) fn next_task_id(&self) -> String {
-        let n = self.task_counter.fetch_add(1, Ordering::Relaxed);
-        format!("task-{n:06}")
-    }
-
-    /// Take the next download-attempt token and record it as the
-    /// model's latest attempt.
-    pub(crate) async fn begin_download_attempt(&self, model_id: &str) -> u64 {
-        let attempt = self
-            .download_attempt_counter
-            .fetch_add(1, Ordering::Relaxed);
-        self.download_latest_attempt
-            .lock()
-            .await
-            .insert(model_id.to_string(), attempt);
-        attempt
-    }
-
-    /// Record a download outcome only if its attempt token is still
-    /// the model's latest; a superseded watcher's outcome is dropped.
-    pub(crate) async fn record_download_outcome(&self, model_id: &str, outcome: DownloadOutcome) {
-        let latest = self
-            .download_latest_attempt
-            .lock()
-            .await
-            .get(model_id)
-            .copied();
-        if latest == Some(outcome.attempt) {
-            self.download_outcomes
-                .lock()
-                .await
-                .insert(model_id.to_string(), outcome);
-        }
-    }
-
-    /// Clear a download outcome (e.g. cancellation) under the same
-    /// latest-attempt gate as [`Self::record_download_outcome`].
-    pub(crate) async fn clear_download_outcome(&self, model_id: &str, attempt: u64) {
-        let latest = self
-            .download_latest_attempt
-            .lock()
-            .await
-            .get(model_id)
-            .copied();
-        if latest == Some(attempt) {
-            self.download_outcomes.lock().await.remove(model_id);
-        }
-    }
-
     pub(crate) async fn record_task(&self, kind: &str, detail: Value) -> String {
-        let id = self.next_task_id();
+        let id = self.tasks.next_id();
         let record = TaskRecord {
             id: id.clone(),
             kind: kind.to_string(),
@@ -504,8 +349,8 @@ impl AppState {
         };
         // The control exists before the record, so an abort that
         // finds the record running always finds its token.
-        self.task_controls.register(&id);
-        let mut tasks = self.tasks.lock().await;
+        self.tasks.controls.register(&id);
+        let mut tasks = self.tasks.records.lock().await;
         // Published under the lock: a subscriber that GETs the task
         // on this event finds it, and no settle event can overtake it.
         event_bus::publish_task(self, &record);
@@ -571,6 +416,7 @@ impl AppState {
     /// always empty.
     pub(crate) async fn telemetry(&self) -> Arc<std::sync::Mutex<TelemetryStore>> {
         self.telemetry
+            .store
             .get_or_init(|| async {
                 let interval_ms = self.config.read().await.telemetry.poll_interval_ms;
                 let cadence = if interval_ms == 0 {
@@ -583,7 +429,7 @@ impl AppState {
                 let source = manager_telemetry::default_telemetry_stack();
                 let (poller, store) = Poller::new(source, cadence);
                 let handle = poller.start();
-                let _ = self.telemetry_poller.set(std::sync::Mutex::new(handle));
+                let _ = self.telemetry.poller.set(std::sync::Mutex::new(handle));
                 // Static GPU inventory (index, UUID, driver model)
                 // for launch construction: CUDA_VISIBLE_DEVICES is
                 // expressed in GPU UUIDs (see backend_spec). The
@@ -671,7 +517,8 @@ impl AppState {
     /// the recorder appends and the history op reads through the
     /// same cell, so the file's in-memory image is single-owned.
     pub(crate) async fn gpu_history(&self) -> &std::sync::Mutex<gpu_history::GpuHistoryCell> {
-        self.gpu_history
+        self.telemetry
+            .gpu_history
             .get_or_init(|| async {
                 std::sync::Mutex::new(gpu_history::GpuHistoryCell {
                     store: gpu_history::load_history(&self.data_dir),
@@ -696,17 +543,7 @@ impl AppState {
     }
 
     pub(crate) async fn wizard(&self, mode: RunMode) -> &Mutex<Wizard> {
-        let cell = match mode {
-            RunMode::Install => &self.wizard_install,
-            RunMode::Audit => &self.wizard_audit,
-        };
-        cell.get_or_init(|| async {
-            Mutex::new(
-                Wizard::new(default_steps(), mode)
-                    .expect("default_steps() has unique step ids by construction"),
-            )
-        })
-        .await
+        self.wizard.get(mode).await
     }
 
     /// The full gateway drift check for hydration/restore: the
@@ -937,7 +774,7 @@ impl AppState {
         // current configuration (see Wizard::hydrate).
         let gateway_current = self.gateway_config_current(&ctx.config).await;
         guard.hydrate(&report, gateway_current);
-        *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
+        *self.wizard.steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
 
     /// Persist the install wizard's current report to
@@ -1069,7 +906,7 @@ impl AppState {
         let cfg = self.config.read().await.clone();
         let gateway_current = self.gateway_config_current(&cfg).await;
         guard.restore(&persisted.report, gateway_current);
-        *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
+        *self.wizard.steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
 
     /// Runtime views of the persisted MCP registry, in registry order
@@ -1120,7 +957,7 @@ pub(crate) fn resolve_under_data_dir(
 /// start preflight rejects the backend as "still downloading" until the
 /// app restarts. Called on the paths that consult the map.
 pub(crate) async fn reap_downloads(state: &AppState) {
-    state.downloads.lock().await.retain(|_, h| !h.is_terminal());
+    state.downloads.reap().await;
 }
 
 /// True when `sha` is a real pinned SHA-256 — 64 hex chars — as opposed

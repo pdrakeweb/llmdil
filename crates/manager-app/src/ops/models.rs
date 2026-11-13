@@ -18,10 +18,11 @@ pub async fn op_list_models(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -
     ensure_catalog_models(state).await;
     reap_downloads(state).await;
     let cfg = state.config.read().await;
-    let downloads = state.downloads.lock().await;
-    let outcomes = state.download_outcomes.lock().await;
+    let downloads = state.downloads.handles.lock().await;
+    let outcomes = state.downloads.outcomes.lock().await;
     let verifying = state
-        .verifying_downloads
+        .downloads
+        .verifying
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
@@ -217,7 +218,7 @@ pub async fn op_download_model(
     // both spawn workers onto one destination file (Range-append vs
     // truncate corrupts it, and the second insert would orphan the
     // first handle).
-    let mut downloads = state.downloads.lock().await;
+    let mut downloads = state.downloads.handles.lock().await;
     downloads.retain(|_, h| !h.is_terminal());
     if downloads.contains_key(&id) {
         return Err(ApiError::Models(format!(
@@ -279,7 +280,7 @@ pub async fn op_download_model(
     let task_id = state
         .record_task("model_download", json!({ "model_id": id, "dest": dest }))
         .await;
-    state.task_controls.set_canceller(
+    state.tasks.controls.set_canceller(
         &task_id,
         tasks::TaskCanceller::Download {
             model_id: id.clone(),
@@ -289,8 +290,8 @@ pub async fn op_download_model(
     // any earlier verification stamp: until this attempt's file passes
     // verification the model counts as unverified (the start
     // preflight's durable gate reads `verified_at`).
-    state.download_outcomes.lock().await.remove(&id);
-    let attempt = state.begin_download_attempt(&id).await;
+    state.downloads.outcomes.lock().await.remove(&id);
+    let attempt = state.downloads.begin_attempt(&id).await;
     {
         let mut cfg = state.config.write().await;
         if let Some(m) = cfg.models.iter_mut().find(|m| m.id == id) {
@@ -303,7 +304,8 @@ pub async fn op_download_model(
     // reports the model as verifying and the start preflight refuses
     // to launch a backend on a file that may be deleted as corrupt.
     state
-        .verifying_downloads
+        .downloads
+        .verifying
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(id.clone());
@@ -344,7 +346,8 @@ pub async fn op_download_model(
         };
         // Every path below leaves verification; clear the mark first
         // so no outcome branch can skip it.
-        st.verifying_downloads
+        st.downloads
+            .verifying
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&watcher_id);
@@ -463,15 +466,16 @@ pub async fn op_download_model(
                     json!({ "model_id": watcher_id, "error": failed, "verified": verified }),
                 )
                 .await;
-                st.record_download_outcome(
-                    &watcher_id,
-                    DownloadOutcome {
-                        attempt,
-                        failed,
-                        verification_failure,
-                    },
-                )
-                .await;
+                st.downloads
+                    .record_outcome(
+                        &watcher_id,
+                        DownloadOutcome {
+                            attempt,
+                            failed,
+                            verification_failure,
+                        },
+                    )
+                    .await;
                 if let Some((category, title, body)) = toast {
                     notify::notify(watcher_sink.as_ref(), &st, category, title, &body).await;
                 }
@@ -479,7 +483,7 @@ pub async fn op_download_model(
             Err(manager_models::ModelError::Cancelled(_)) => {
                 // Operator-initiated: neither a completion nor a
                 // failure — clear the outcome instead of recording one.
-                st.clear_download_outcome(&watcher_id, attempt).await;
+                st.downloads.clear_outcome(&watcher_id, attempt).await;
                 st.finish_task(
                     &watcher_task,
                     TaskStatus::Aborted,
@@ -496,15 +500,16 @@ pub async fn op_download_model(
                 .await;
                 // Transfer failures are not verification failures and
                 // do not gate backend start.
-                st.record_download_outcome(
-                    &watcher_id,
-                    DownloadOutcome {
-                        attempt,
-                        failed: Some(format!("download failed: {e}")),
-                        verification_failure: false,
-                    },
-                )
-                .await;
+                st.downloads
+                    .record_outcome(
+                        &watcher_id,
+                        DownloadOutcome {
+                            attempt,
+                            failed: Some(format!("download failed: {e}")),
+                            verification_failure: false,
+                        },
+                    )
+                    .await;
                 notify::notify(
                     watcher_sink.as_ref(),
                     &st,
@@ -533,6 +538,7 @@ pub async fn op_cancel_download(
     reap_downloads(state).await;
     let handle = state
         .downloads
+        .handles
         .lock()
         .await
         .remove(&id)
@@ -547,7 +553,7 @@ pub async fn op_model_pause_download(
     _sink: &Arc<dyn EventSink>,
     id: String,
 ) -> ApiResult {
-    let downloads = state.downloads.lock().await;
+    let downloads = state.downloads.handles.lock().await;
     let handle = downloads
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("no download in flight for {id}")))?;
@@ -561,7 +567,7 @@ pub async fn op_model_resume_download(
     _sink: &Arc<dyn EventSink>,
     id: String,
 ) -> ApiResult {
-    let downloads = state.downloads.lock().await;
+    let downloads = state.downloads.handles.lock().await;
     let handle = downloads
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("no download in flight for {id}")))?;
@@ -605,7 +611,8 @@ pub async fn op_model_verify_checksum(
     // The mark is removed on every exit path below.
     {
         let mut verifying = state
-            .verifying_downloads
+            .downloads
+            .verifying
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if !verifying.insert(id.clone()) {
@@ -616,7 +623,8 @@ pub async fn op_model_verify_checksum(
     }
     let verify_result = manager_models::verify_sha256(&path, &sha).await;
     state
-        .verifying_downloads
+        .downloads
+        .verifying
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
@@ -647,9 +655,9 @@ pub async fn op_model_verify_checksum(
         }
         // A passing manual verify clears the start gate recorded by an
         // earlier failed verification.
-        state.download_outcomes.lock().await.remove(&id);
+        state.downloads.outcomes.lock().await.remove(&id);
     } else {
-        state.download_outcomes.lock().await.insert(
+        state.downloads.outcomes.lock().await.insert(
             id.clone(),
             DownloadOutcome {
                 // Not produced by a download attempt; direct insert
@@ -716,7 +724,7 @@ pub async fn op_model_delete(
     id: String,
 ) -> ApiResult {
     reap_downloads(state).await;
-    if state.downloads.lock().await.contains_key(&id) {
+    if state.downloads.handles.lock().await.contains_key(&id) {
         return Err(ApiError::Models(format!(
             "download in flight for model {id}; cancel it before deleting"
         )));

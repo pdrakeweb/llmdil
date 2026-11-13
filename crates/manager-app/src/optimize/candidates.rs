@@ -300,7 +300,7 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
         .iter()
         .map(|b| (b.id.clone(), b.port))
         .collect();
-    let windows = state.gateway_stats.lock().await.window_stats(&pairs);
+    let windows = state.gateway.stats.lock().await.window_stats(&pairs);
     let mut errors_1h: HashMap<String, u64> = HashMap::new();
     if let Some(windows) = &windows {
         let rows: Vec<(String, u64, u64, u64)> = cfg

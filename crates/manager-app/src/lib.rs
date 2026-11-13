@@ -23,13 +23,16 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+// Glob-imported by the test modules (`use super::*`); the lib itself
+// keeps its atomics inside the `state` subsystems.
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use manager_config::{
     self, AppConfig, BackendPatch, ComponentUpdate, ConfigDiff, GatewayConfig, MxcMode,
 };
-use manager_models::{self, DownloadHandle};
+use manager_models::{self};
 use manager_mxc::{self, Policy};
 use manager_supervisor::{
     test_request, test_tool_call, BackoffPolicy, HealthProbe, HttpHealthProbe, LogLevelFilter,
@@ -40,7 +43,7 @@ use manager_telemetry::{
 };
 use manager_wizard::{
     ops::{prev_log_path, RealSystemOps},
-    steps::{continue_config_yaml, default_steps, merge_env_contents, VscodeExtensions},
+    steps::{continue_config_yaml, merge_env_contents, VscodeExtensions},
     RunMode, StepOutcome, StepState, SystemOps, Wizard, WizardContext, WizardReport,
 };
 use serde::{Deserialize, Serialize};

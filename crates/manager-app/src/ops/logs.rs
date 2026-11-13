@@ -471,7 +471,7 @@ pub async fn op_task_abort(
 
 /// All tracked tasks.
 pub async fn op_tasks_list(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
-    let tasks = state.tasks.lock().await;
+    let tasks = state.tasks.records.lock().await;
     let list: Vec<&TaskRecord> = tasks.values().collect();
     Ok(serde_json::to_value(list)?)
 }

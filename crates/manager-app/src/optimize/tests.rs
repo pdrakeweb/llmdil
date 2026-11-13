@@ -161,7 +161,7 @@ fn mutex_sink() -> std::sync::Arc<dyn crate::EventSink> {
 }
 
 fn running_ops_empty(state: &AppState) -> bool {
-    state.optimize_running_ops.lock().unwrap().is_empty()
+    state.optimize.running_ops.lock().unwrap().is_empty()
 }
 
 /// Tracker #70, scope test 1: a benchmark (Measure and
@@ -221,7 +221,7 @@ async fn benchmark_refused_during_consultation() {
     }
     // The refused starts claimed nothing of their own.
     assert_eq!(
-        state.optimize_running_ops.lock().unwrap().len(),
+        state.optimize.running_ops.lock().unwrap().len(),
         1,
         "only the consultation's record remains"
     );
@@ -255,7 +255,7 @@ async fn consultation_refused_during_benchmark() {
         other => panic!("expected the mutual-exclusion refusal, got {other:?}"),
     }
     // The refused consultation claimed nothing of its own.
-    assert_eq!(state.optimize_running_ops.lock().unwrap().len(), 1);
+    assert_eq!(state.optimize.running_ops.lock().unwrap().len(), 1);
 }
 
 /// Tracker #70, scope test 3: once the running operation
@@ -320,11 +320,11 @@ async fn start_allowed_after_cancel() {
     )
     .unwrap();
     let consult_claim = {
-        let ops = state.optimize_running_ops.lock().unwrap();
+        let ops = state.optimize.running_ops.lock().unwrap();
         ops.get("coder").unwrap().claim_id
     };
     let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
-    *state.optimize_abort.lock().await = Some(tx);
+    *state.optimize.consult_abort.lock().await = Some(tx);
     let r = op_optimize_cancel_consult(&state, &sink).await.unwrap();
     assert_eq!(r["cancelled"], json!(true));
     assert!(
@@ -339,7 +339,7 @@ async fn start_allowed_after_cancel() {
     // newer benchmark claim.
     drop(consult);
     release_optimize_op(&state, "coder", consult_claim);
-    assert_eq!(state.optimize_running_ops.lock().unwrap().len(), 1);
+    assert_eq!(state.optimize.running_ops.lock().unwrap().len(), 1);
     drop(bench);
     assert!(running_ops_empty(&state));
 
@@ -348,7 +348,7 @@ async fn start_allowed_after_cancel() {
     let _bench =
         OptimizeOpGuard::claim(&state, "coder", OptimizeOpFamily::Benchmark, "measure").unwrap();
     let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
-    *state.optimize_job_abort.lock().await = Some(tx);
+    *state.optimize.job_abort.lock().await = Some(tx);
     let r = op_optimize_cancel_job(&state, &sink).await.unwrap();
     assert_eq!(r["cancelled"], json!(true));
     assert!(running_ops_empty(&state));
@@ -368,7 +368,7 @@ async fn start_allowed_after_cancel() {
 fn contention_refusal_names_kind_and_elapsed() {
     let state = mutex_test_state();
     let started = chrono::Utc::now().timestamp_millis() - 125_000;
-    state.optimize_running_ops.lock().unwrap().insert(
+    state.optimize.running_ops.lock().unwrap().insert(
         "coder".to_string(),
         OptimizeRunningOp {
             family: OptimizeOpFamily::Consultation,
@@ -428,18 +428,19 @@ async fn job_record_lifecycle() {
     let state = job_test_state();
     let started = record_job_start(&state, "estimate", "coder").await;
     {
-        let job = state.optimize_job.lock().await.clone();
+        let job = state.optimize.job.lock().await.clone();
         let job = job.expect("a started job has a descriptor");
         assert_eq!(job.kind, "estimate");
         assert_eq!(job.backend_id, "coder");
         assert!(job.started_unix_ms > 0);
-        assert!(state.optimize_job_error.lock().await.is_none());
+        assert!(state.optimize.job_error.lock().await.is_none());
     }
     record_job_failure(&state, started, "estimate failed: boom".to_string()).await;
-    assert!(state.optimize_job.lock().await.is_none());
+    assert!(state.optimize.job.lock().await.is_none());
     {
         let (msg, at) = state
-            .optimize_job_error
+            .optimize
+            .job_error
             .lock()
             .await
             .clone()
@@ -449,10 +450,11 @@ async fn job_record_lifecycle() {
     }
     // A new start supersedes the recorded failure.
     let started2 = record_job_start(&state, "measure", "planner").await;
-    assert!(state.optimize_job_error.lock().await.is_none());
+    assert!(state.optimize.job_error.lock().await.is_none());
     assert_eq!(
         state
-            .optimize_job
+            .optimize
+            .job
             .lock()
             .await
             .as_ref()
@@ -460,13 +462,13 @@ async fn job_record_lifecycle() {
         Some("measure")
     );
     record_job_success(&state, started2).await;
-    assert!(state.optimize_job.lock().await.is_none());
-    assert!(state.optimize_job_error.lock().await.is_none());
+    assert!(state.optimize.job.lock().await.is_none());
+    assert!(state.optimize.job_error.lock().await.is_none());
     // Cancellation clears the descriptor, records no error.
     let started3 = record_job_start(&state, "measure", "planner").await;
     record_job_end(&state, started3).await;
-    assert!(state.optimize_job.lock().await.is_none());
-    assert!(state.optimize_job_error.lock().await.is_none());
+    assert!(state.optimize.job.lock().await.is_none());
+    assert!(state.optimize.job_error.lock().await.is_none());
     // A stale job's terminal records (a cancelled job's late
     // unwind, tracker #70's cancel-then-restart case) must
     // not clear a newer job's descriptor or record a failure
@@ -478,12 +480,12 @@ async fn job_record_lifecycle() {
     record_job_failure(&state, stale, "stale failure".to_string()).await;
     record_job_success(&state, stale).await;
     {
-        let job = state.optimize_job.lock().await.clone();
+        let job = state.optimize.job.lock().await.clone();
         let job = job.expect("the newer job's descriptor survives stale terminal records");
         assert_eq!(job.kind, "estimate");
         assert_eq!(job.started_unix_ms, current);
-        assert!(state.optimize_job_error.lock().await.is_none());
+        assert!(state.optimize.job_error.lock().await.is_none());
     }
     record_job_success(&state, current).await;
-    assert!(state.optimize_job.lock().await.is_none());
+    assert!(state.optimize.job.lock().await.is_none());
 }

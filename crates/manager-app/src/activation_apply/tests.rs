@@ -192,14 +192,14 @@ fn sample_progress() -> ApplyProgress {
 }
 
 fn set_progress(state: &AppState, p: Option<ApplyProgress>) {
-    *state.activation_progress.lock().unwrap() = p;
+    *state.activation.progress.lock().unwrap() = p;
 }
 
 #[tokio::test]
 async fn a_second_apply_while_one_runs_is_busy() {
     let (state, dir) = apply_state("busy");
     let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
-    let held = state.activation_apply_lock.lock().await;
+    let held = state.activation.apply_lock.lock().await;
     set_progress(&state, Some(sample_progress()));
     let err = op_activation_apply(&state, &sink, None, Some("desktop".to_string()))
         .await
@@ -235,7 +235,7 @@ async fn an_apply_with_nothing_pending_runs_nothing_and_records_nothing() {
     assert!(activation_history::load_history(&dir).executions.is_empty());
     // Progress cleared, lock released.
     assert!(current_progress(&state).is_none());
-    assert!(state.activation_apply_lock.try_lock().is_ok());
+    assert!(state.activation.apply_lock.try_lock().is_ok());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -451,7 +451,7 @@ pub async fn record_gpu_history_once(state: &AppState) {
         .map(|b| (b.id.clone(), b.port))
         .collect();
     let series = {
-        let stats = state.gateway_stats.lock().await;
+        let stats = state.gateway.stats.lock().await;
         stats.series_stats(&pairs)
     };
     let mut rates: Vec<(f32, GpuPlacement)> = Vec::new();

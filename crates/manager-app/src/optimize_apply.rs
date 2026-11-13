@@ -714,7 +714,7 @@ pub async fn op_optimize_apply_plan(
 ) -> ApiResult {
     let destructive = destructive.unwrap_or(false);
     let dry_run = dry_run.unwrap_or(false);
-    let live = &state.optimize_live;
+    let live = &state.optimize.live;
     if !live.try_begin_apply() {
         return Err(ApiError::InvalidInput(
             "a plan apply is already running".to_string(),
@@ -724,7 +724,7 @@ pub async fn op_optimize_apply_plan(
     // A consultation replaces the plan when it finishes; applying a
     // plan that is about to be replaced would record outcomes on
     // the wrong plan.
-    if state.optimize_abort.lock().await.is_some() {
+    if state.optimize.consult_abort.lock().await.is_some() {
         return Err(ApiError::InvalidInput(
             "a consultation is running; apply after it finishes".to_string(),
         ));
@@ -1078,7 +1078,7 @@ mod tests {
         );
         assert_eq!(outcome_of(&state, PlanKind::BackendSetContext), None);
         assert!(crate::activation::load_journal(&dir).entries.is_empty());
-        assert!(!state.optimize_live.applying(), "claim released");
+        assert!(!state.optimize.live.applying(), "claim released");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1216,20 +1216,20 @@ mod tests {
     async fn apply_is_exclusive_and_refused_during_consultation() {
         let (state, dir) = test_state(test_cfg());
         store_plan(&state, two_item_plan()).await;
-        assert!(state.optimize_live.try_begin_apply());
+        assert!(state.optimize.live.try_begin_apply());
         let err = op_optimize_apply_plan(&state, &sink(), None, Some(true))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already running"), "{err}");
-        state.optimize_live.end_apply();
+        state.optimize.live.end_apply();
         let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
-        *state.optimize_abort.lock().await = Some(tx);
+        *state.optimize.consult_abort.lock().await = Some(tx);
         let err = op_optimize_apply_plan(&state, &sink(), None, Some(true))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("consultation is running"), "{err}");
         assert!(
-            !state.optimize_live.applying(),
+            !state.optimize.live.applying(),
             "a refused apply releases its claim"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -1240,13 +1240,13 @@ mod tests {
     #[tokio::test]
     async fn consultation_refused_during_apply() {
         let (state, dir) = test_state(test_cfg());
-        assert!(state.optimize_live.try_begin_apply());
+        assert!(state.optimize.live.try_begin_apply());
         let err =
             crate::optimize::op_optimize_consult(&state, &sink(), None, Some(true), None, None)
                 .await
                 .unwrap_err();
         assert!(err.to_string().contains("plan apply is running"), "{err}");
-        state.optimize_live.end_apply();
+        state.optimize.live.end_apply();
         std::fs::remove_dir_all(&dir).ok();
     }
 
