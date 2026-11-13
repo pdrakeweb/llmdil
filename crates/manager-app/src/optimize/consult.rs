@@ -251,7 +251,8 @@ pub async fn op_optimize_consult(
             *slot = Some(tx);
         }
         state
-            .task_controls
+            .tasks
+            .controls
             .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeConsult);
         record_consult_start(state).await;
         let model_name = crate::model_for_backend(&cfg, &backend)
@@ -296,7 +297,7 @@ pub async fn op_optimize_consult(
         // abort handle (`optimize_cancel_consult`) or the task
         // system's token (`task_abort` routes to the same op, and
         // the token covers any future direct cancel).
-        let token = state.task_controls.token(&task_id);
+        let token = state.tasks.controls.token(&task_id);
         let outcome = tokio::select! {
             res = completion => Some(res),
             _ = rx => None,

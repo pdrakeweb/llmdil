@@ -1377,7 +1377,8 @@ pub async fn op_optimize_tuning_run(
         *slot = Some(tx);
     }
     state
-        .task_controls
+        .tasks
+        .controls
         .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeJob);
     let task_state = state.clone();
     let task_sink = Arc::clone(sink);
@@ -1393,7 +1394,7 @@ pub async fn op_optimize_tuning_run(
         }
         // A sweep stopped by optimize_cancel_job (or task_abort,
         // which routes there) ends early; record it as aborted.
-        let status = if task_state.task_controls.abort_requested(&task_id) {
+        let status = if task_state.tasks.controls.abort_requested(&task_id) {
             TaskStatus::Aborted
         } else {
             TaskStatus::Done

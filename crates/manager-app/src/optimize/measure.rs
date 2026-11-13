@@ -186,7 +186,8 @@ pub async fn op_optimize_measure_backend(
         *slot = Some(tx);
     }
     state
-        .task_controls
+        .tasks
+        .controls
         .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeJob);
     let job_started_ms = record_job_start(state, "measure", &backend_id).await;
     // Loopback by construction, as with consultations (§3).
@@ -418,7 +419,8 @@ pub async fn op_optimize_estimate_backend(
         *slot = Some(tx);
     }
     state
-        .task_controls
+        .tasks
+        .controls
         .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeJob);
     let job_started_ms = record_job_start(state, "estimate", &backend_id).await;
     // Loopback by construction, as with measurements (§3).

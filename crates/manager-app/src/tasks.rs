@@ -274,8 +274,8 @@ fn settle(rec: &mut TaskRecord, status: TaskStatus, detail: Value, abort_request
 /// Body of `AppState::finish_task`.
 pub(crate) async fn finish(state: &AppState, id: &str, status: TaskStatus, detail: Value) {
     let settled = {
-        let mut tasks = state.tasks.lock().await;
-        let abort_requested = state.task_controls.abort_requested(id);
+        let mut tasks = state.tasks.records.lock().await;
+        let abort_requested = state.tasks.controls.abort_requested(id);
         tasks.get_mut(id).map(|rec| {
             settle(rec, status, detail, abort_requested);
             crate::event_bus::publish_task(state, rec);
@@ -287,7 +287,7 @@ pub(crate) async fn finish(state: &AppState, id: &str, status: TaskStatus, detai
     }
     // After the record is settled, so a waiting abort reads the final
     // status.
-    state.task_controls.finished(id);
+    state.tasks.controls.finished(id);
 }
 
 /// `task_abort`: cancel the task's work and wait (bounded) for it to
@@ -308,7 +308,7 @@ pub(crate) async fn abort(
             "already_finished": true,
         }));
     }
-    let Some((token, canceller, mut finished_rx)) = state.task_controls.request_abort(&task_id)
+    let Some((token, canceller, mut finished_rx)) = state.tasks.controls.request_abort(&task_id)
     else {
         // Finished between the status read and here.
         let status = current_status(state, &task_id).await;
@@ -336,7 +336,7 @@ pub(crate) async fn abort(
     // The wait and the forced mark run detached: a caller that drops
     // the request (an HTTP client disconnecting) must not leave the
     // task running forever with its abort half-applied.
-    let grace = state.task_controls.grace();
+    let grace = state.tasks.controls.grace();
     let enforcer_state = Arc::clone(state);
     let enforcer_id = task_id.clone();
     let enforcer = tokio::spawn(async move {
@@ -347,7 +347,7 @@ pub(crate) async fn abort(
         .await
         .is_ok();
         if !stopped {
-            let mut tasks = enforcer_state.tasks.lock().await;
+            let mut tasks = enforcer_state.tasks.records.lock().await;
             if let Some(rec) = tasks.get_mut(&enforcer_id) {
                 if rec.status == TaskStatus::Running {
                     rec.status = TaskStatus::Aborted;
@@ -383,7 +383,7 @@ pub(crate) async fn abort(
 }
 
 async fn current_status(state: &AppState, id: &str) -> Option<TaskStatus> {
-    state.tasks.lock().await.get(id).map(|r| r.status)
+    state.tasks.records.lock().await.get(id).map(|r| r.status)
 }
 
 #[cfg(test)]
@@ -466,7 +466,7 @@ mod tests {
     }
 
     async fn status_of(state: &AppState, id: &str) -> (TaskStatus, Value) {
-        let tasks = state.tasks.lock().await;
+        let tasks = state.tasks.records.lock().await;
         let r = tasks.get(id).expect("task recorded");
         (r.status, r.detail.clone())
     }
@@ -553,7 +553,8 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         *state.optimize_job_abort.lock().await = Some(tx);
         state
-            .task_controls
+            .tasks
+            .controls
             .set_canceller(&task_id, TaskCanceller::OptimizeJob);
         // The job observes only its slot's abort handle, not the token.
         let worker_state = Arc::clone(&state);
@@ -585,7 +586,7 @@ mod tests {
     async fn abort_cancels_the_token_and_waits_for_the_work() {
         let (state, dir) = test_state("token");
         let task_id = state.record_task("wizard_step", json!({})).await;
-        let token = state.task_controls.token(&task_id);
+        let token = state.tasks.controls.token(&task_id);
         let worker_state = Arc::clone(&state);
         let worker_id = task_id.clone();
         tokio::spawn(async move {
@@ -641,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn task_ignoring_cancel_is_aborted_after_grace() {
         let (state, dir) = test_state("grace");
-        state.task_controls.set_grace(Duration::from_millis(100));
+        state.tasks.controls.set_grace(Duration::from_millis(100));
         let task_id = state
             .record_task("backend_start", json!({ "backend_id": "b" }))
             .await;

@@ -51,8 +51,10 @@
 use crate::*;
 
 mod downloads;
+mod task_registry;
 
 pub(crate) use downloads::{DownloadOutcome, DownloadsState};
+pub(crate) use task_registry::TaskRegistry;
 
 /// Shared backend state. Subsystems are lazily initialized (`OnceCell`) so
 /// a failure surfaces on first use of that subsystem, never at startup.
@@ -108,10 +110,8 @@ pub struct AppState {
     /// to the wizard log, so the state is diagnosable afterwards.
     /// std Mutex: only synchronous set/clear/read.
     pub(crate) wizard_step_running: std::sync::Mutex<Option<(String, std::time::Instant)>>,
-    pub(crate) tasks: Mutex<HashMap<String, TaskRecord>>,
-    /// Per-task cancellation tokens and abort routing (see [`tasks`]).
-    pub(crate) task_controls: tasks::TaskControls,
-    pub(crate) task_counter: AtomicU64,
+    /// The tracked-task registry (see [`task_registry::TaskRegistry`]).
+    pub(crate) tasks: TaskRegistry,
     /// The model-download subsystem (see [`downloads::DownloadsState`]).
     pub(crate) downloads: DownloadsState,
     /// Ids of the supervisor specs this layer registered as backends.
@@ -394,9 +394,7 @@ impl AppState {
             wizard_audit: OnceCell::new(),
             wizard_steps_cache: RwLock::new(None),
             wizard_step_running: std::sync::Mutex::new(None),
-            tasks: Mutex::new(HashMap::new()),
-            task_controls: tasks::TaskControls::default(),
-            task_counter: AtomicU64::new(1),
+            tasks: TaskRegistry::default(),
             downloads: DownloadsState::default(),
             backend_spec_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
             mcp_modes: Mutex::new(HashMap::new()),
@@ -452,13 +450,8 @@ impl AppState {
         *self.config_load.lock().unwrap_or_else(|p| p.into_inner()) = Some(v);
     }
 
-    pub(crate) fn next_task_id(&self) -> String {
-        let n = self.task_counter.fetch_add(1, Ordering::Relaxed);
-        format!("task-{n:06}")
-    }
-
     pub(crate) async fn record_task(&self, kind: &str, detail: Value) -> String {
-        let id = self.next_task_id();
+        let id = self.tasks.next_id();
         let record = TaskRecord {
             id: id.clone(),
             kind: kind.to_string(),
@@ -468,8 +461,8 @@ impl AppState {
         };
         // The control exists before the record, so an abort that
         // finds the record running always finds its token.
-        self.task_controls.register(&id);
-        let mut tasks = self.tasks.lock().await;
+        self.tasks.controls.register(&id);
+        let mut tasks = self.tasks.records.lock().await;
         // Published under the lock: a subscriber that GETs the task
         // on this event finds it, and no settle event can overtake it.
         event_bus::publish_task(self, &record);

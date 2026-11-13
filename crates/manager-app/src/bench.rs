@@ -713,7 +713,7 @@ pub async fn op_bench_run_start(
         let mut slot = state.bench_abort.lock().await;
         *slot = Some(tx);
     }
-    state.task_controls.set_canceller(
+    state.tasks.controls.set_canceller(
         &task_id,
         crate::tasks::TaskCanceller::BenchRun {
             sweep_id: sweep_id.clone(),

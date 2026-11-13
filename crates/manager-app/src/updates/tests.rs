@@ -789,14 +789,14 @@ async fn apply_op_runs_as_a_task_and_records_history() {
     let task_id = payload["task_id"].as_str().unwrap().to_string();
     let mut status = TaskStatus::Running;
     for _ in 0..400 {
-        status = state.tasks.lock().await[&task_id].status;
+        status = state.tasks.records.lock().await[&task_id].status;
         if status != TaskStatus::Running {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(status, TaskStatus::Done);
-    let detail = state.tasks.lock().await[&task_id].detail.clone();
+    let detail = state.tasks.records.lock().await[&task_id].detail.clone();
     assert_eq!(detail["results"][0]["outcome"], "updated");
     let history: Vec<Value> = serde_json::from_str(
         &std::fs::read_to_string(dir.join("updates").join("history.json")).unwrap(),

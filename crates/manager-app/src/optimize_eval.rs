@@ -273,7 +273,8 @@ pub async fn op_optimize_run_baseline(
         *slot = Some(tx);
     }
     state
-        .task_controls
+        .tasks
+        .controls
         .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeJob);
     // Loopback by construction, as with consultations (§3).
     let base_url = format!("http://127.0.0.1:{}", backend.port);

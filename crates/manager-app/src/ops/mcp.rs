@@ -277,7 +277,7 @@ pub async fn op_vscode_install_extensions(
         }
     };
     // task_abort stops the install (the `code` child is killed).
-    let cancel_token = state.task_controls.token(&task_id);
+    let cancel_token = state.tasks.controls.token(&task_id);
     let report = wizard
         .run_all_until(&ctx, std::pin::pin!(cancel_token.cancelled()))
         .await;

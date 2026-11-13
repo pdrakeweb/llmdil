@@ -280,7 +280,7 @@ pub async fn op_download_model(
     let task_id = state
         .record_task("model_download", json!({ "model_id": id, "dest": dest }))
         .await;
-    state.task_controls.set_canceller(
+    state.tasks.controls.set_canceller(
         &task_id,
         tasks::TaskCanceller::Download {
             model_id: id.clone(),

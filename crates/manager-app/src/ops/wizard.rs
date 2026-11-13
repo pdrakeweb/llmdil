@@ -314,7 +314,7 @@ pub(crate) async fn run_wizard_step_inner(
         Some((step_id.to_string(), std::time::Instant::now()));
     // task_abort cancels the token: the runner stops the step (its
     // command's process tree is killed) and records it failed.
-    let cancel_token = state.task_controls.token(&task_id);
+    let cancel_token = state.tasks.controls.token(&task_id);
     let parent = parent.unwrap_or_default();
     let cancelled = async {
         tokio::select! {
@@ -541,7 +541,7 @@ pub async fn op_run_audit(state: &Arc<AppState>, sink: &Arc<dyn EventSink>) -> A
         }
     };
     // task_abort stops the running check and starts no further one.
-    let cancel_token = state.task_controls.token(&task_id);
+    let cancel_token = state.tasks.controls.token(&task_id);
     let _ = guard
         .run_all_until(&ctx, std::pin::pin!(cancel_token.cancelled()))
         .await;

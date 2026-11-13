@@ -99,7 +99,8 @@ pub async fn op_bench_prompt_generate(
         *slot = Some(tx);
     }
     state
-        .task_controls
+        .tasks
+        .controls
         .set_canceller(&task_id, crate::tasks::TaskCanceller::BenchPromptGenerate);
     let model_name = crate::model_for_backend(&cfg, &backend)
         .map(|m| m.id.clone())

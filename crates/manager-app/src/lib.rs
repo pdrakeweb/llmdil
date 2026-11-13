@@ -23,6 +23,9 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+// Glob-imported by the test modules (`use super::*`); the lib itself
+// keeps its atomics inside the `state` subsystems.
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

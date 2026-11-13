@@ -1205,7 +1205,8 @@ async fn run_experiment_batch(
         *slot = Some(tx);
     }
     state
-        .task_controls
+        .tasks
+        .controls
         .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeJob);
     let mut ctx = BatchCtx {
         consulted_backend: plan.consulted_backend.clone(),

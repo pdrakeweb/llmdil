@@ -1591,7 +1591,7 @@ pub(crate) async fn apply_with(
             json!({ "component_id": component_id, "version": version, "plan": plan }),
         )
         .await;
-    let token = state.task_controls.token(&task_id);
+    let token = state.tasks.controls.token(&task_id);
     let env = make_env(task_id.clone());
     let state2 = state.clone();
     let sink2 = sink.clone();
