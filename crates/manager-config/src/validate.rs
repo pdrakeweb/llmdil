@@ -70,6 +70,25 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
         ));
     }
 
+    // --- admin API bind choice (auth-plan §5) ---
+    // A specific-interface bind names one concrete address. A
+    // wildcard there would silently mean "all interfaces", so it is
+    // refused rather than accepted as a narrower-looking setting.
+    if let Some(ip) = &config.admin_api.bind_ip {
+        match ip.parse::<std::net::IpAddr>() {
+            Err(_) => errors.push(format!("admin_api bind_ip {ip:?} is not an IP address")),
+            Ok(addr) if addr.is_unspecified() || addr.is_multicast() => errors.push(format!(
+                "admin_api bind_ip {ip:?} is not a single interface address"
+            )),
+            Ok(_) => {}
+        }
+    }
+    if config.admin_api.bind_mode == crate::AdminApiBindMode::Interface
+        && config.admin_api.bind_ip.is_none()
+    {
+        errors.push("admin_api bind_mode \"interface\" requires bind_ip".to_string());
+    }
+
     // --- ports: gateway, backends, WinML (when enabled) ---
     let mut ports: HashMap<u16, String> = HashMap::new();
     let mut claim_port = |port: u16, owner: String| {
@@ -561,6 +580,48 @@ mod tests {
         assert!(err.contains("bind_host"), "unexpected: {err}");
         cfg.gateway.bind_host = "127.0.0.1".to_string();
         validate(&cfg).expect("loopback bind validates");
+    }
+
+    /// Admin API bind choice (auth-plan §5): a config written before
+    /// the setting existed keeps binding all interfaces, exactly as
+    /// before — the field is additive and defaulted.
+    #[test]
+    fn admin_api_bind_defaults_preserve_existing_configs() {
+        let legacy: AppConfig = serde_json::from_value({
+            let mut v = serde_json::to_value(AppConfig::default_config()).unwrap();
+            v["admin_api"] = serde_json::json!({ "enabled": true, "port": 47821 });
+            v
+        })
+        .unwrap();
+        assert_eq!(legacy.admin_api.bind_mode, crate::AdminApiBindMode::All);
+        assert_eq!(legacy.admin_api.bind_ip, None);
+        validate(&legacy).expect("legacy admin_api validates");
+        assert_eq!(
+            AppConfig::default_config().admin_api.bind_mode,
+            crate::AdminApiBindMode::All
+        );
+        // Wire spelling.
+        let v = serde_json::to_value(crate::AdminApiBindMode::Interface).unwrap();
+        assert_eq!(v, "interface");
+    }
+
+    #[test]
+    fn admin_api_bind_ip_must_be_one_concrete_address() {
+        let mut cfg = working_config();
+        cfg.admin_api.bind_mode = crate::AdminApiBindMode::Interface;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("requires bind_ip"), "unexpected: {err}");
+        for bad in ["localhost", "0.0.0.0", "::", "224.0.0.1"] {
+            cfg.admin_api.bind_ip = Some(bad.to_string());
+            let err = validate(&cfg).unwrap_err().to_string();
+            assert!(err.contains("bind_ip"), "{bad}: unexpected: {err}");
+        }
+        cfg.admin_api.bind_ip = Some("192.168.1.20".to_string());
+        validate(&cfg).expect("a concrete address validates");
+        // A remembered address is kept (and still checked) in the
+        // other modes.
+        cfg.admin_api.bind_mode = crate::AdminApiBindMode::Loopback;
+        validate(&cfg).expect("loopback with a remembered bind_ip validates");
     }
 
     #[test]

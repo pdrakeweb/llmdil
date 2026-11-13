@@ -87,6 +87,28 @@ pub struct SupervisionConfig {
     pub mode: SupervisionMode,
 }
 
+/// Which local addresses the Admin API listener binds (auth-plan §5,
+/// "Bind choices"). Applied when the listener starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminApiBindMode {
+    /// 127.0.0.1 only: reachable from this machine (or through a
+    /// tunnel) and nothing else. No firewall rule is needed.
+    Loopback,
+    /// Every interface (0.0.0.0), with the inbound firewall rule
+    /// scoped to the local subnet and the Tailscale range. The
+    /// default, because it is what every configuration written before
+    /// the setting existed did — an existing install keeps exactly
+    /// its listening surface.
+    #[default]
+    All,
+    /// One specific local address ([`AdminApiConfig::bind_ip`]),
+    /// under the same scoped firewall rule. If the address is not
+    /// assigned to this machine when the listener starts, the
+    /// listener falls back to loopback and says why — it never widens.
+    Interface,
+}
+
 /// Admin REST API settings (see [`AppConfig::admin_api`](crate::AppConfig::admin_api)).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminApiConfig {
@@ -96,6 +118,15 @@ pub struct AdminApiConfig {
     /// TCP port for the API listener (47821 per the plan; chosen to
     /// sit clear of the gateway and backend port ranges).
     pub port: u16,
+    /// Listening surface. Absent in configs written before the
+    /// setting existed, which therefore keep binding all interfaces.
+    #[serde(default)]
+    pub bind_mode: AdminApiBindMode,
+    /// The address bound when `bind_mode` is `interface` (an IP
+    /// literal, chosen from the machine's addresses in the UI).
+    /// Ignored, but kept, in the other modes.
+    #[serde(default)]
+    pub bind_ip: Option<String>,
 }
 
 impl Default for AdminApiConfig {
@@ -103,6 +134,8 @@ impl Default for AdminApiConfig {
         Self {
             enabled: false,
             port: 47821,
+            bind_mode: AdminApiBindMode::All,
+            bind_ip: None,
         }
     }
 }

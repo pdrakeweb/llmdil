@@ -4576,7 +4576,21 @@ export interface AdminApiStatus {
   enabled: boolean;
   running: boolean;
   port: number;
+  /** The address the listener has bound (or would bind if started
+   *  now): 127.0.0.1, 0.0.0.0 (all interfaces) or one interface. */
   bind: string;
+  /** Configured bind choice (auth-plan §5): loopback | all |
+   *  interface. Optional: older shells do not send it. */
+  bind_mode?: string;
+  /** The configured interface address (kept across mode changes). */
+  bind_ip?: string | null;
+  /** Why the listener fell back to loopback from the configured
+   *  interface address (never widened); null when it did not. */
+  bind_fallback?: string | null;
+  /** This machine's current interface addresses, for the selector. */
+  bind_candidates?: string[];
+  /** False when the bind is loopback-only: no inbound rule needed. */
+  firewall_needed?: boolean;
   base_url: string | null;
   cert_sha256: string | null;
   /** Why the listener's certificate is the one in use (SEC-08):
@@ -4611,6 +4625,7 @@ export interface AdminApiUser {
 
 const emptyStatus: AdminApiStatus = {
   enabled: false, running: false, port: 47821, bind: "0.0.0.0",
+  bind_mode: "all", bind_ip: null, bind_fallback: null, bind_candidates: [], firewall_needed: true,
   base_url: null, cert_sha256: null, cert_source: null, cert_detail: null,
   cert_not_after_ms: null, san_drift: false, san_drift_ips: [], firewall: "unsupported",
   note: null, user_count: 0, admin_count: 0,

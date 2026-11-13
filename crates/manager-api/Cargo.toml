@@ -32,5 +32,15 @@ manager-app = { path = "../manager-app" }
 manager-config = { path = "../manager-config" }
 manager-wizard = { path = "../manager-wizard" }
 
+# Interface enumeration for the bind choice (src/bind.rs): the same
+# version and API family the log receiver already uses.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
 [dev-dependencies]
 reqwest = { workspace = true }

@@ -457,6 +457,19 @@ by name, payloads by target id only.
   scoped firewall rule for the gateway, so this follows existing
   precedent; or a single specified interface address for stricter
   setups.
+  As built (Nov 2026): `admin_api.bind_mode` = `loopback` | `all` |
+  `interface` (+ `admin_api.bind_ip`), chosen on the Remote Access
+  card from this machine's current addresses. The field is additive
+  and defaults to `all`, so every configuration written before it
+  keeps exactly its listening surface. A configured interface address
+  that is not assigned to the machine when the listener starts falls
+  back to **loopback**, never wider, and the reason shows in the
+  status (`bind_fallback`); a wildcard is refused as an interface
+  address. The firewall rule (same remote scope) is reconciled for
+  `all` and `interface`; a loopback listener needs none, so none is
+  created and the status reports it as not needed. The bind is
+  desktop-only configuration: the raw config patch has no REST route
+  (rest-api decision 11), so a remote client cannot widen it.
 - **TLS — decision with a recommendation.** Options:
   1. **Self-signed certificate + client pinning (recommended).**
      At enable time the server generates a self-signed cert

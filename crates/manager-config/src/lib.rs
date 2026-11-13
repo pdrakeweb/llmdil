@@ -94,10 +94,12 @@ pub struct AppConfig {
     #[serde(default)]
     pub supervision: SupervisionConfig,
     /// Admin REST API (admin-api plan): opt-in remote administration.
-    /// Disabled by default; when enabled the API binds all interfaces
-    /// on `port` with a firewall rule scoped to the local subnet and
-    /// the Tailscale range. Only enablement and the port are
-    /// configuration — users, sessions, and tokens live in the
+    /// Disabled by default; when enabled the API binds `bind_mode`
+    /// (all interfaces by default — loopback only, or one interface
+    /// address, are the alternatives) on `port`, with a firewall rule
+    /// scoped to the local subnet and the Tailscale range whenever the
+    /// bind is not loopback. Only enablement, the port and the bind
+    /// choice are configuration — users, sessions, and tokens live in the
     /// dedicated `admin-users.json` store, never here, so a config
     /// write can never mint or elevate an API user.
     #[serde(default)]

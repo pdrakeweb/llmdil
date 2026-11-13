@@ -8719,11 +8719,35 @@ function remoteAccessHtml(
     : status.enabled
       ? `<span style="color:var(--err)">Enabled \u2014 not running</span>`
       : `<span style="color:var(--text2)">Disabled</span>`;
-  const fwText = status.firewall === "ok" ? "Allowed: local subnet + Tailscale"
+  const fwText = status.firewall_needed === false ? "Not needed (loopback only)"
+    : status.firewall === "ok" ? "Allowed: local subnet + Tailscale"
     : status.firewall === "missing" ? "Rule missing"
     : status.firewall === "drifted" ? "Rule differs from expected"
     : status.firewall === "unsupported" ? "Not reported on this platform"
     : "Unknown";
+  // Bind choice (auth-plan §5). Options: loopback, all interfaces,
+  // or one of this machine's current addresses; a configured address
+  // that is no longer present stays listed (marked) so the saved
+  // choice is visible rather than silently replaced.
+  const bindMode = status.bind_mode ?? "all";
+  const bindIp = status.bind_ip ?? null;
+  const candidates = [...(status.bind_candidates ?? [])];
+  if (bindIp && !candidates.includes(bindIp)) candidates.push(bindIp);
+  const bindSel = bindMode === "interface" && bindIp ? `ip:${bindIp}` : bindMode;
+  const bindOptions = [
+    { value: "loopback", label: "This computer only (127.0.0.1)" },
+    { value: "all", label: "All interfaces (LAN + Tailscale)" },
+    ...candidates.map((ip) => ({
+      value: `ip:${ip}`,
+      label: `Interface ${ip}${(status.bind_candidates ?? []).includes(ip) ? "" : " (not present)"}`,
+    })),
+  ];
+  const bindEditor = `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border)">
+      <span class="k">Listen on<span class="info-tip" title="Which addresses the Admin API listens on. This computer only: reachable from this machine alone, no firewall rule. All interfaces: the LAN and Tailscale, limited by the firewall rule to the local subnet and the Tailscale range. Interface: one address of this machine, under the same rule. If that address is missing when the API starts, it listens on this computer only and says why. Saved through the generic config patch; applies when the API is switched off and on, or the app restarts.">${icon("info")}</span></span>
+      <span style="display:flex;gap:6px;align-items:center">
+        <select id="raBind" style="font-size:12px">${bindOptions.map((o) => `<option value="${esc(o.value)}"${o.value === bindSel ? " selected" : ""}>${esc(o.label)}</option>`).join("")}</select>
+        <button class="btn" data-ra-bind-save style="padding:1px 7px;font-size:11px">Apply</button>
+      </span></div>`;
   const rows: SettingsRow[] = [
     { key: "Bind", value: status.bind },
     { key: "Firewall rule", value: fwText },
@@ -8750,7 +8774,9 @@ function remoteAccessHtml(
         <input id="raPort" type="number" min="1" max="65535" value="${status.port}" style="width:100px;font-size:12px">
         <button class="btn" data-ra-port-save style="padding:1px 7px;font-size:11px">Apply</button>
       </span></div>
+    ${bindEditor}
     ${settingsRows(rows)}
+    ${status.bind_fallback ? `<div style="font-size:12px;color:var(--warn);margin-top:6px">${esc(status.bind_fallback)}</div>` : ""}
     ${status.note ? `<div style="font-size:12px;color:var(--err);margin-top:6px">${esc(status.note)}</div>` : ""}
     <div class="card-actions" style="margin-top:10px">${enableSwitch({ on: status.enabled, name: "Admin API", attrs: "data-ra-toggle" })}
     <button class="btn" data-ra-regen>Regenerate certificate</button></div>
@@ -9171,6 +9197,31 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
         return;
       }
       setMsg("Admin API port saved — switch the API off and on, or restart the app, to apply it.");
+      await load();
+      return;
+    }
+
+    const raBindSave = t.closest("[data-ra-bind-save]") as HTMLButtonElement | null;
+    if (raBindSave) {
+      const sel = (root.querySelector("#raBind") as HTMLSelectElement | null)?.value ?? "";
+      // Loopback / all keep any remembered interface address; an
+      // interface choice sends the address with it.
+      const patch: Record<string, unknown> = sel.startsWith("ip:")
+        ? { bind_mode: "interface", bind_ip: sel.slice(3) }
+        : { bind_mode: sel };
+      if (!["loopback", "all", "interface"].includes(String(patch.bind_mode))) {
+        setMsg("Choose where the Admin API listens.", true);
+        return;
+      }
+      raBindSave.disabled = true;
+      const r = await updateAppConfig({ admin_api: patch });
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`Admin API bind not saved: ${r.error}`, true);
+        raBindSave.disabled = false;
+        return;
+      }
+      setMsg("Admin API bind saved — switch the API off and on, or restart the app, to apply it.");
       await load();
       return;
     }

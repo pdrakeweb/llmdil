@@ -975,5 +975,12 @@ const apiSrcGw = readFileSync(join(root, "src", "api.ts"), "utf8");
 check(!allSrc.includes("effectiveGatewayStrategy"), "no TypeScript re-implementation of the gateway strategy rule (effectiveGatewayStrategy) remains in ui/src");
 check(apiSrcGw.includes("raw.effective_strategy"), "getGatewayConfig reads the backend-computed effective_strategy");
 
+// Admin API bind choice (auth-plan §5): the Remote Access card carries
+// the selector, saved as admin_api.bind_mode (+ bind_ip), and shows
+// the loopback-fallback reason the shell reports.
+check(staticSrcNar.includes("data-ra-bind-save") && staticSrcNar.includes('id="raBind"'), "Remote Access card has the Admin API bind selector");
+check(staticSrcNar.includes('bind_mode: "interface", bind_ip:'), "bind selector saves an interface choice with its address");
+check(staticSrcNar.includes("status.bind_fallback"), "Remote Access card shows the bind fallback reason");
+
 if (failures > 0) { console.error(`\n${failures} smoke check(s) failed`); process.exit(1); }
 console.log("\nsmoke: all checks passed");
