@@ -3826,16 +3826,21 @@ impl StartGateway {
     /// covers a context built from a config that never went through it,
     /// so no code path installs whatever PyPI serves that day.
     fn litellm_spec(&self, ctx: &WizardContext) -> String {
-        let pin = ctx
-            .config
+        format!("litellm[proxy]=={}", self.litellm_pinned_version(ctx))
+    }
+
+    /// The LiteLLM version the venv must carry: the operator pin, else
+    /// [`manager_config::DEFAULT_LITELLM_PIN`] (see [`Self::litellm_spec`]).
+    fn litellm_pinned_version(&self, ctx: &WizardContext) -> String {
+        ctx.config
             .updates
             .components
             .get(manager_config::LITELLM_COMPONENT)
             .and_then(|c| c.pinned_version.as_deref())
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .unwrap_or(manager_config::DEFAULT_LITELLM_PIN);
-        format!("litellm[proxy]=={pin}")
+            .unwrap_or(manager_config::DEFAULT_LITELLM_PIN)
+            .to_string()
     }
 
     fn venv_command(&self, ctx: &WizardContext, uv: &std::path::Path) -> PlannedCommand {
@@ -5502,7 +5507,36 @@ impl WizardStep for StartGateway {
                 } else {
                     (false, None)
                 };
-                let setup_cmds: Vec<PlannedCommand> = if litellm_ok {
+                // A healthy venv on a different LiteLLM version than
+                // the pin (the operator moved the pin forward, or an
+                // update rolled it back) gets a package-only install
+                // of the pinned version: the pin is the version that
+                // runs, never just the one installed first. An
+                // undeterminable version is not treated as drift.
+                let pinned_litellm = self.litellm_pinned_version(ctx);
+                let probed_before_install = if litellm_ok {
+                    Some(self.installed_litellm_version(ctx).await)
+                } else {
+                    None
+                };
+                let pin_drift = matches!(
+                    &probed_before_install,
+                    Some(Some(v)) if *v != pinned_litellm
+                );
+                let setup_cmds: Vec<PlannedCommand> = if pin_drift {
+                    push_log(
+                        ctx,
+                        &mut log,
+                        format!(
+                            "venv has LiteLLM {} but the pin is {pinned_litellm} — installing the pinned version (the venv itself is kept)",
+                            probed_before_install
+                                .clone()
+                                .flatten()
+                                .unwrap_or_default()
+                        ),
+                    );
+                    vec![self.pip_command(ctx, &uv)]
+                } else if litellm_ok {
                     push_log(
                         ctx,
                         &mut log,
@@ -5592,8 +5626,12 @@ impl WizardStep for StartGateway {
                 // Probe the installed LiteLLM version before the
                 // spawn (MCP design §4.3): the result is recorded in
                 // the spawn state below and drives the MCP floor
-                // check in the arming pass that follows.
-                let litellm_version = self.installed_litellm_version(ctx).await;
+                // check in the arming pass that follows. When nothing
+                // was installed, the pre-install probe is the answer.
+                let litellm_version = match probed_before_install {
+                    Some(v) if setup_cmds.is_empty() => v,
+                    _ => self.installed_litellm_version(ctx).await,
+                };
                 match &litellm_version {
                     Some(v) => push_log(ctx, &mut log, format!("detected LiteLLM version: {v}")),
                     None => push_log(
@@ -9262,6 +9300,94 @@ mod tests {
             "no venv/pip commands may run: {executed:?}"
         );
         assert_eq!(ops.spawns().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_gateway_reinstalls_when_venv_litellm_differs_from_pin() {
+        // Component updates move LiteLLM by moving the pin: a healthy
+        // venv on another version must get a package-only install of
+        // the pinned version (the venv itself kept), not the skip.
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = fast_step();
+        let mut cfg = test_config_with_models();
+        cfg.updates.components.insert(
+            manager_config::LITELLM_COMPONENT.to_string(),
+            manager_config::ComponentUpdate {
+                pinned_version: Some("1.106.0".to_string()),
+                auto_update: false,
+                last_checked: None,
+            },
+        );
+        let ctx = WizardContext::new(cfg, PathBuf::from("/data"), RunMode::Install, ops.clone());
+        ops.with_file(step.venv_python(&ctx), Vec::new());
+        let probe = step.version_probe_command(&ctx);
+        let probe_argv: Vec<&str> = probe.argv.iter().map(String::as_str).collect();
+        ops.with_command(
+            &probe_argv,
+            FakeSystemOps::ok_output(&format!("{}\n", crate::GATEWAY_PYTHON_VERSION)),
+        );
+        let argv = litellm_version_argv(&step, &ctx);
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        ops.with_command_sequence(
+            &refs,
+            vec![
+                FakeSystemOps::ok_output("1.105.1\n"),
+                FakeSystemOps::ok_output("1.106.0\n"),
+            ],
+        );
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let executed = ops.executed_commands();
+        assert!(
+            !executed.iter().any(|a| a.iter().any(|x| x == "venv")),
+            "the venv is kept: {executed:?}"
+        );
+        let pip = executed
+            .iter()
+            .find(|a| a.iter().any(|x| x == "install"))
+            .expect("pip install ran");
+        assert!(
+            pip.contains(&"litellm[proxy]==1.106.0".to_string()),
+            "{pip:?}"
+        );
+        assert_eq!(ops.spawns().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_gateway_skips_install_when_venv_litellm_matches_pin() {
+        let ops = Arc::new(FakeSystemOps::new());
+        with_bundled_uv(&ops);
+        ops.with_http_get(
+            "http://127.0.0.1:4000/v1/models",
+            FakeSystemOps::http_ok(r#"{"data":[]}"#),
+        );
+        let step = fast_step();
+        let ctx = ctx_with(ops.clone(), RunMode::Install);
+        ops.with_file(step.venv_python(&ctx), Vec::new());
+        let probe = step.version_probe_command(&ctx);
+        let probe_argv: Vec<&str> = probe.argv.iter().map(String::as_str).collect();
+        ops.with_command(
+            &probe_argv,
+            FakeSystemOps::ok_output(&format!("{}\n", crate::GATEWAY_PYTHON_VERSION)),
+        );
+        script_litellm_version(&ops, &step, &ctx, manager_config::DEFAULT_LITELLM_PIN);
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        let executed = ops.executed_commands();
+        assert!(
+            executed.iter().all(|a| !a.iter().any(|x| x == "install")),
+            "no pip install: {executed:?}"
+        );
+        let version_probes = executed
+            .iter()
+            .filter(|a| **a == litellm_version_argv(&step, &ctx))
+            .count();
+        assert_eq!(version_probes, 1, "the version is probed once");
     }
 
     /// A recording live sink for the logging tests: every line a

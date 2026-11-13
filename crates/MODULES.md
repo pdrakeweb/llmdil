@@ -372,7 +372,13 @@ activation journal (`activation`), and the gateway stats sampler
 (`gateway_stats`). App self-update lives in `app_update`: the
 GitHub-Releases check, installer staging with SHA-256
 verification, the state file under `<data_dir>/app-update/`, and
-the apply-helper entry the shell runs before the UI starts. `registry` holds the single operation
+the apply-helper entry the shell runs before the UI starts. Component
+updates (spec §12) live in `updates`: `updates_check_all` (installed vs
+upstream vs pin per wizard-managed component, per-component feed
+errors) and `updates_apply` (a cancellable task that stops dependents
+through the existing ops, re-runs the wizard install step, verifies,
+restarts/smokes, and rolls back on failure; LiteLLM moves only by an
+explicit newer pin). `registry` holds the single operation
 declaration (`for_each_operation!`) from which the `Op` enum,
 `OP_SPECS`, `dispatch()`, the Tauri command adapters, and the REST
 router are all generated — see `docs/admin-api/PLAN.md` §3.1.

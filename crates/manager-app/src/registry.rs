@@ -407,7 +407,7 @@ macro_rules! for_each_operation {
             (WinmlStatus, winml_status, R, op_winml_status, [], None),
             // Updates
             (UpdatesCheckAll, updates_check_all, R, op_updates_check_all, [], Some(route(HttpMethod::Post, "/api/v1/updates/check"))),
-            (UpdatesApply, updates_apply, D, op_updates_apply, [component_id: String], Some(route(HttpMethod::Post, "/api/v1/updates/components/{component_id}/apply"))),
+            (UpdatesApply, updates_apply, D, op_updates_apply, [component_id: String, version: Option<String>], Some(route(HttpMethod::Post, "/api/v1/updates/components/{component_id}/apply"))),
             (UpdatesPin, updates_pin, C, op_updates_pin, [component_id: String, version: Option<String>], Some(route(HttpMethod::Put, "/api/v1/updates/components/{component_id}/pin"))),
             (UpdatesSetAuto, updates_set_auto, C, op_updates_set_auto, [component_id: String, enabled: bool], Some(route(HttpMethod::Put, "/api/v1/updates/components/{component_id}/auto"))),
             // App self-update (Settings → Updates & diagnostics):
@@ -727,17 +727,23 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_reaches_the_operation() {
-        // updates_check_all is a stub that always errors Unsupported;
-        // reaching it through dispatch proves the arm is wired.
+        // updates_apply on a report-only component errors Unsupported
+        // before any I/O; reaching it through dispatch proves the arm
+        // is wired (and that the optional `version` may be omitted).
         let state = Arc::new(AppState::new(
             manager_config::AppConfig::default_config(),
             std::path::PathBuf::from("/nonexistent/config.json"),
             std::path::PathBuf::from("/nonexistent"),
         ));
         let sink: Arc<dyn EventSink> = Arc::new(crate::NoopSink);
-        let err = dispatch(&state, &sink, Op::UpdatesCheckAll, serde_json::json!({}))
-            .await
-            .unwrap_err();
+        let err = dispatch(
+            &state,
+            &sink,
+            Op::UpdatesApply,
+            serde_json::json!({ "component_id": "postgres" }),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ApiError::Unsupported(_)), "{err}");
     }
 }

@@ -28,6 +28,7 @@ import {
   recordActivationExecution, getActivationHistory, getActivationExecution,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
   setNotificationConfig, sendTestNotification, updateAppConfig, winmlRecheckCapabilities, updatesPin, updatesSetAuto,
+  updatesCheckAll, updatesApply, tasksList, taskAbort,
   getAppUpdateStatus, appUpdateCheck, appUpdateSetChecking, appUpdateSetAuto, appUpdateDownload,
   servicesList, servicesRegister, servicesUnregister, setSupervisionMode,
   logReceiverStatus, logReceiverDeploy, logReceiverRemove, logReceiverFlipEndpoint,
@@ -35,7 +36,7 @@ import {
   adminApiUpdateUser, adminApiDeleteUser, adminApiResetPassword, adminApiCreateEnrollment,
   adminApiRegenerateCert, adminApiGetAudit,
 } from "../api";
-import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, BackendCache, BackendMoeCache, BackendMtp, BackendOffload, BackendParallel, BackendRow, CachePreview, CacheSelectionLike, CacheTypeName, FlashAttnName, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, HfHeaderResult, HfLookupQuant, HfLookupRepo, LogReceiverInfo, LogRow, LogShipperInfo, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
+import type { ActivationChange, ActivationExecution, ActivationExecutionItem, ActivationExecutionSummary, ActivationPlanData, AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, BackendAddPreview, ComponentUpdateCheck, TaskRecordWire, BackendCache, BackendMoeCache, BackendMtp, BackendOffload, BackendParallel, BackendRow, CachePreview, CacheSelectionLike, CacheTypeName, FlashAttnName, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, GpuHistoryData, GpuHistoryPoint, HfHeaderResult, HfLookupQuant, HfLookupRepo, LogReceiverInfo, LogRow, LogShipperInfo, MeasurementLookupRequest, ModelRow, MxcActivityData, MxcPolicyData, PlacementProjectionData, PlannedCommandWire, PredictedThroughput, ServicesInfo } from "../api";
 import { promptForUnarmedMcpCredentials } from "../mcp-prompt";
 import type { GpuInfo, WizardStepState } from "../types";
 
@@ -8486,6 +8487,54 @@ function logReceiverInner(
     ${newToken ? `<div style="margin-top:10px">${settingsRows([{ key: "Read token (new)", value: newToken, copy: newToken, tip: "Shown once. File Muse's copy through the Secure Vault; the receiver's copy is in its data directory." }])}</div>` : ""}`;
 }
 
+/** The component-updates block of the Updates tab (updates_check_all
+ *  / updates_apply): one row per wizard-managed component with the
+ *  installed, latest-known and target versions, its pin, and an
+ *  Apply button where the app can perform the update. Nothing here
+ *  claims to be live without a check: before the first "Check now"
+ *  the block says so. LiteLLM's Apply sets a newer explicit pin. */
+function componentUpdatesInner(check: ComponentUpdateCheck | null, live: boolean, task: TaskRecordWire | null): string {
+  const head = `<div style="font-size:12px;color:var(--text2);margin-top:14px">Component updates<span class="info-tip" title="The components the setup wizard installs. llama.cpp updates to the build this app carries a verified checksum for (backends are stopped, the build is swapped, backends restart and must answer a smoke request — otherwise the old build is restored). LiteLLM moves only by setting a newer explicit pin. PostgreSQL and MXC are report-only.">${icon("info")}</span></div>`;
+  if (!live) {
+    return `${head}<div style="font-size:12px;color:var(--text2);margin-top:6px">Component update checks are available in the installed app.</div>`;
+  }
+  const running = task !== null && task.status === "running";
+  const canApplyAll = !!check && check.components.some((c) => c.applyable && !c.pinned);
+  const actions = `<div class="card-actions" style="margin-top:6px">
+    <button class="btn" data-compupd-check${running ? " disabled" : ""}>${icon("search")} Check now</button>
+    ${canApplyAll && !running ? `<button class="btn" data-compupd-apply-all title="Apply every available update of an unpinned component">${icon("download")} Apply all unpinned</button>` : ""}
+    ${running && task ? `<button class="btn" data-compupd-abort="${esc(task.id)}">Cancel update</button>` : ""}</div>`;
+  let taskLine = "";
+  if (task) {
+    const detail = asRecord(task.detail);
+    const results = detail && Array.isArray(detail.results) ? detail.results.map(asRecord).filter((r): r is Record<string, unknown> => r !== null) : [];
+    const lines = results.map((r) => `${esc(String(r.component ?? ""))} → ${esc(String(r.to ?? ""))}: ${esc(String(r.outcome ?? ""))} — ${esc(String(r.message ?? ""))}${r.rolled_back === true ? " (previous version restored)" : r.rolled_back === false ? " (ROLLBACK FAILED — see the task log)" : ""}`);
+    const color = task.status === "failed" ? "var(--err)" : "var(--text2)";
+    taskLine = task.status === "running"
+      ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Updating… (task ${esc(task.id)}). Dependent services are stopped and restarted by the update.</div>`
+      : `<div style="font-size:12px;color:${color};margin-top:6px">Last update ${esc(task.status)}${lines.length ? `:<br>${lines.join("<br>")}` : "."}</div>`;
+  }
+  if (!check) {
+    return `${head}<div style="font-size:12px;color:var(--text2);margin-top:6px">Not checked yet in this session.</div>${actions}${taskLine}`;
+  }
+  const v = (s: string | null): string => (s === null ? "—" : esc(s));
+  const rows = check.components.map((c) => {
+    const status = c.check_error ? `<span style="color:var(--err)">check failed: ${esc(c.check_error)}</span>`
+      : c.update_available ? "update available" : c.installed_version === null ? "not installed / not measured" : "up to date";
+    const isLitellm = c.id === "litellm";
+    const applyBtn = c.applyable && !running && c.target_version
+      ? `<button class="btn" data-compupd-apply="${esc(c.id)}" data-compupd-version="${isLitellm ? esc(c.target_version) : ""}" style="padding:1px 7px;font-size:11px">${isLitellm ? `Pin ${esc(c.target_version)} &amp; apply` : `Apply ${esc(c.target_version)}`}</button>`
+      : "";
+    return `<div style="padding:4px 0;border-bottom:1px solid var(--border)">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:16px">
+        <span class="k">${esc(c.name)}${c.pinned ? ` <span style="font-size:11px;color:var(--text2)">(pinned${c.pinned_version ? ` ${esc(c.pinned_version)}` : ""})</span>` : ""}</span>
+        <span style="display:flex;gap:6px;align-items:center;font-size:12px">${status}${applyBtn}</span></div>
+      <div style="font-size:12px;color:var(--text2);margin-top:2px">Installed: ${v(c.installed_version)} · Latest upstream: ${v(c.latest_available)} · Apply installs: ${v(c.target_version)}</div>
+      ${c.note ? `<div style="font-size:11px;color:var(--text2);margin-top:2px">${esc(c.note)}</div>` : ""}</div>`;
+  }).join("");
+  return `${head}<div style="font-size:12px;color:var(--text2);margin-top:4px">Checked ${esc(fmtDateTime(check.checked_at))}</div>${rows}${actions}${taskLine}`;
+}
+
 function settingsPaint(
   cfg: Record<string, unknown>,
   policyR: { data: MxcPolicyData | null; error?: string; live: boolean },
@@ -8496,6 +8545,7 @@ function settingsPaint(
   remoteHtml = "",
   appUpdateHtml = "",
   logReceiverHtml = "",
+  componentUpdatesHtml = "",
 ): string {
   const notif = asRecord(cfg.notifications);
   const tabs: { id: SettingsTab; label: string }[] = [
@@ -8616,7 +8666,8 @@ function settingsPaint(
       ${compHtml}`;
   }
   const updatesPanel = `${appUpdateHtml}
-    ${policyBlock ? `<div style="font-size:12px;color:var(--text2);margin-top:14px">Components<span class="info-tip" title="Per-component version pins the setup wizard manages (LiteLLM, llama.cpp). Separate from LLMdil's own updates above.">${icon("info")}</span></div>${policyBlock}` : ""}
+    ${componentUpdatesHtml}
+    ${policyBlock ? `<div style="font-size:12px;color:var(--text2);margin-top:14px">Component pins<span class="info-tip" title="Per-component version pins the setup wizard manages (LiteLLM, llama.cpp). Separate from LLMdil's own updates above.">${icon("info")}</span></div>${policyBlock}` : ""}
     <div style="font-size:12px;color:var(--text2);margin-top:14px">Diagnostics</div>
     <div class="card-actions"><a class="btn" href="#/wizard">${icon("search")} Open Setup Wizard</a>
     <button class="btn icon-only" id="setExportBtn" title="Export diagnostics bundle" aria-label="Export diagnostics bundle">${icon("download")}</button><span class="info-tip" title="The bundle contains raw, unredacted process logs. Review it before sharing.">${icon("info")}</span>
@@ -8861,6 +8912,34 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
    *  rendered state). */
   let lastAppUpd: AppUpdateInfo | null = null;
   let appUpdLive = false;
+  /** Last component-update check and the update task this view
+   *  started (polled until it settles). */
+  let compCheck: ComponentUpdateCheck | null = null;
+  let compTask: TaskRecordWire | null = null;
+  let compPoll: number | null = null;
+  const stopCompPoll = (): void => {
+    if (compPoll !== null) { window.clearInterval(compPoll); compPoll = null; }
+  };
+  const pollCompTask = (taskId: string): void => {
+    stopCompPoll();
+    compPoll = window.setInterval(() => {
+      void (async () => {
+        const r = await tasksList();
+        if (disposed) { stopCompPoll(); return; }
+        const rec = r.data.find((x) => x.id === taskId) ?? null;
+        if (!rec) return;
+        compTask = rec;
+        if (rec.status !== "running") {
+          stopCompPoll();
+          const chk = await updatesCheckAll();
+          if (disposed) return;
+          if (chk.data) compCheck = chk.data;
+          setMsg(rec.status === "done" ? "Component update finished." : `Component update ${rec.status}.`, rec.status === "failed");
+        }
+        if (setUi.tab === "updates") await load();
+      })();
+    }, 3000);
+  };
   /** Read token produced by the deploy that just ran in this
    *  session; shown once on the Supervision tab until the next
    *  action replaces it. */
@@ -8888,7 +8967,8 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     b.innerHTML = settingsPaint(cfgR.data, polR, actR, selfTestHtml, setUi, svcR,
       remoteAccessHtml(raStatus, raUsers, raTemp, raEnroll, raAudit),
       appUpdateInner(lastAppUpd, appUpdLive),
-      logReceiverInner(lrR, lrNewToken));
+      logReceiverInner(lrR, lrNewToken),
+      componentUpdatesInner(compCheck, appUpdLive, compTask));
   };
 
   const onClick = async (ev: Event): Promise<void> => {
@@ -9139,6 +9219,55 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       else if (r.data.available) setMsg(`LLMdil ${r.data.available.version} is available.`);
       else setMsg("LLMdil is up to date.");
       await load();
+      return;
+    }
+    if (t.closest("[data-compupd-check]")) {
+      const btn = t.closest("[data-compupd-check]") as HTMLButtonElement;
+      btn.disabled = true;
+      setMsg("Checking component release sources…");
+      const r = await updatesCheckAll();
+      if (disposed) return;
+      if (r.error || !r.data) {
+        setMsg(`Component check failed: ${r.error ?? "no result"}`, true);
+      } else {
+        compCheck = r.data;
+        const failed = r.data.components.filter((c) => c.check_error).map((c) => c.name);
+        const avail = r.data.components.filter((c) => c.update_available).map((c) => c.name);
+        setMsg(`${avail.length ? `Updates available: ${avail.join(", ")}.` : "No component updates available."}${failed.length ? ` Could not reach the release source for: ${failed.join(", ")}.` : ""}`, failed.length > 0);
+      }
+      await load();
+      return;
+    }
+    const compApply = t.closest("[data-compupd-apply]") as HTMLButtonElement | null;
+    const compApplyAll = t.closest("[data-compupd-apply-all]") as HTMLButtonElement | null;
+    if (compApply || compApplyAll) {
+      const id = compApply ? (compApply.getAttribute("data-compupd-apply") ?? "") : "all";
+      const version = compApply ? (compApply.getAttribute("data-compupd-version") ?? "") : "";
+      const what = id === "all" ? "every available update of an unpinned component" : `${id}${version ? ` ${version}` : ""}`;
+      if (!window.confirm(`Apply ${what}? Dependent services (backends or the gateway) are stopped and restarted; a failed update is rolled back.`)) return;
+      (compApply ?? compApplyAll)!.disabled = true;
+      const r = await updatesApply(id, version || null);
+      if (disposed) return;
+      if (r.error || !r.data) {
+        setMsg(`Update not started: ${r.error ?? "no result"}`, true);
+      } else if (!r.data.task_id) {
+        setMsg(r.data.message ?? "Nothing to update.");
+      } else {
+        compTask = { id: r.data.task_id, kind: "updates_apply", status: "running", detail: null, created_ms: Date.now() };
+        setMsg(`Update started (task ${r.data.task_id}).`);
+        pollCompTask(r.data.task_id);
+      }
+      await load();
+      return;
+    }
+    const compAbort = t.closest("[data-compupd-abort]") as HTMLButtonElement | null;
+    if (compAbort) {
+      const taskId = compAbort.getAttribute("data-compupd-abort") ?? "";
+      compAbort.disabled = true;
+      setMsg("Cancelling the update — the component in flight is rolled back…");
+      const r = await taskAbort(taskId);
+      if (disposed) return;
+      if (r.error) setMsg(`Cancel failed: ${r.error}`, true);
       return;
     }
 
@@ -9502,6 +9631,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
 
   return () => {
     disposed = true;
+    stopCompPoll();
     root.removeEventListener("click", onClick);
   };
 }

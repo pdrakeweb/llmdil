@@ -35,10 +35,11 @@ manager-optimize = { path = "../manager-optimize" }
 manager-services = { path = "../manager-services" }
 manager-mxc = { path = "../manager-mxc" }
 manager-winml = { path = "../manager-winml" }
+# Component updates: the release-feed and update-environment seams
+# (also the test-only WizardStep impls; the trait is #[async_trait]).
+async-trait = { workspace = true }
 
 [dev-dependencies]
-# Test-only WizardStep impls (the trait is #[async_trait]).
-async-trait = { workspace = true }
 # Reading diagnostics bundles back in tests (already a manager-config
 # dependency).
 zip = { workspace = true }
