@@ -2,6 +2,34 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "GENERATED from the manager-app operation registry; do not edit. Regenerate: UPDATE_GENERATED=1 cargo test -p manager-app --lib generated_. One schema per operation for its snake_case argument object (dispatch / admin API).",
   "ops": {
+    "activation_apply": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "activation_apply",
+      "type": "object"
+    },
     "app_update_check": {
       "additionalProperties": false,
       "properties": {},
@@ -939,6 +967,34 @@
       "title": "gateway_recent_requests",
       "type": "object"
     },
+    "gateway_restart": {
+      "additionalProperties": false,
+      "properties": {
+        "drain": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "gateway_restart",
+      "type": "object"
+    },
     "gateway_set_backend_group": {
       "additionalProperties": false,
       "properties": {
@@ -984,7 +1040,28 @@
     },
     "gateway_stop": {
       "additionalProperties": false,
-      "properties": {},
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stop_postgres": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
       "required": [],
       "title": "gateway_stop",
       "type": "object"
@@ -1180,11 +1257,65 @@
       "title": "log_receiver_remove",
       "type": "object"
     },
+    "log_receiver_restart": {
+      "additionalProperties": false,
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "log_receiver_restart",
+      "type": "object"
+    },
+    "log_receiver_start": {
+      "additionalProperties": false,
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "log_receiver_start",
+      "type": "object"
+    },
     "log_receiver_status": {
       "additionalProperties": false,
       "properties": {},
       "required": [],
       "title": "log_receiver_status",
+      "type": "object"
+    },
+    "log_receiver_stop": {
+      "additionalProperties": false,
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "log_receiver_stop",
       "type": "object"
     },
     "mcp_delete_server": {
@@ -2090,6 +2221,24 @@
       "title": "placement_propose",
       "type": "object"
     },
+    "postgres_stop": {
+      "additionalProperties": false,
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "postgres_stop",
+      "type": "object"
+    },
     "restart_backend": {
       "additionalProperties": false,
       "properties": {
@@ -2108,6 +2257,27 @@
         },
         "id": {
           "type": "string"
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "wait_ready_secs": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -2127,6 +2297,16 @@
     "run_wizard_step": {
       "additionalProperties": false,
       "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "step_id": {
           "type": "string"
         }
@@ -2290,6 +2470,16 @@
         },
         "id": {
           "type": "string"
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -2306,6 +2496,16 @@
         },
         "id": {
           "type": "string"
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [

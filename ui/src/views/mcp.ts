@@ -17,6 +17,7 @@ import type {
   BackendRow, McpExposureKind, McpServerInput, McpServerRow, McpTestResult, McpTransportKind,
 } from "../api";
 import { esc } from "../html";
+import { lifecycleChip } from "../lifecycle";
 import { icon } from "../icons";
 import { enableSwitch } from "../switch";
 
@@ -135,15 +136,19 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
 
   const chipFor = (s: McpServerRow): string => {
     if (s.exposure === "disabled") return ` <span class="chip status-tag status-off">disabled</span>`;
+    // A locally run server is a process: its running flag renders in
+    // the shared lifecycle vocabulary (UI-12). Gateway-exposed servers
+    // are run by LiteLLM, not by this app.
+    const proc = s.exposure === "local" ? ` ${lifecycleChip(s.running ? "running" : "stopped", "Local MCP server process")}` : "";
     const t = testState.get(s.id);
-    if (!t) return "";
-    if (t.status === "testing") return ` <span class="chip status-tag status-transition">testing</span>`;
-    if (!t.result.ok) return ` <span class="chip status-tag status-bad">failed</span>`;
+    if (!t) return proc;
+    if (t.status === "testing") return `${proc} <span class="chip status-tag status-transition">testing</span>`;
+    if (!t.result.ok) return `${proc} <span class="chip status-tag status-bad">test failed</span>`;
     // A passing Gateway test means the server is registered with
     // the gateway; a passing Local test is a liveness pass only.
     return s.exposure === "gateway"
       ? ` <span class="chip status-tag status-on">registered</span>`
-      : ` <span class="chip status-tag status-on">passed</span>`;
+      : `${proc} <span class="chip status-tag status-on">passed</span>`;
   };
 
   const line = (label: string, valueHtml: string): string =>

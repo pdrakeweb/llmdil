@@ -528,7 +528,7 @@ async fn run_op(
             if backend_state(state, sink, id).await?.as_deref() != Some("running") {
                 return Ok(());
             }
-            crate::op_stop_backend(state, sink, id.clone(), true)
+            crate::op_stop_backend(state, sink, id.clone(), true, Some("optimize".to_string()))
                 .await
                 .map_err(e)?;
             let deadline = tokio::time::Instant::now() + STOP_DEADLINE;

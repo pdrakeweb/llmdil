@@ -1273,7 +1273,8 @@ fn api_err(e: ApiError) -> String {
 #[async_trait]
 impl UpdateEnv for AppUpdateEnv {
     async fn running_backends(&self) -> Vec<String> {
-        let mut ids: Vec<String> = crate::backend_running_ids(&self.state)
+        let cfg = self.state.config.read().await.clone();
+        let mut ids: Vec<String> = crate::backend_running_ids(&self.state, &cfg)
             .await
             .into_iter()
             .collect();
@@ -1281,16 +1282,28 @@ impl UpdateEnv for AppUpdateEnv {
         ids
     }
     async fn stop_backend(&self, id: &str) -> Result<(), String> {
-        crate::op_stop_backend(&self.state, &self.sink, id.to_string(), true)
-            .await
-            .map(|_| ())
-            .map_err(api_err)
+        crate::op_stop_backend(
+            &self.state,
+            &self.sink,
+            id.to_string(),
+            true,
+            Some("wizard".to_string()),
+        )
+        .await
+        .map(|_| ())
+        .map_err(api_err)
     }
     async fn start_backend(&self, id: &str) -> Result<(), String> {
-        crate::op_start_backend(&self.state, &self.sink, id.to_string(), None)
-            .await
-            .map(|_| ())
-            .map_err(api_err)
+        crate::op_start_backend(
+            &self.state,
+            &self.sink,
+            id.to_string(),
+            None,
+            Some("wizard".to_string()),
+        )
+        .await
+        .map(|_| ())
+        .map_err(api_err)
     }
     async fn smoke_backend(&self, id: &str, cancel: &CancellationToken) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + SMOKE_TIMEOUT;
@@ -1362,7 +1375,7 @@ impl UpdateEnv for AppUpdateEnv {
             .unwrap_or(false)
     }
     async fn stop_gateway(&self) -> Result<(), String> {
-        crate::op_gateway_stop(&self.state, &self.sink)
+        crate::op_gateway_stop(&self.state, &self.sink, None, Some("wizard".to_string()))
             .await
             .map(|_| ())
             .map_err(api_err)

@@ -1,10 +1,11 @@
 [package]
 name = "manager-wizard"
-version = "0.1.60"
+version = "0.1.61"
 edition = "2021"
 
 [dependencies]
 manager-services = { path = "../manager-services" }
+manager-supervisor = { path = "../manager-supervisor" }
 manager-config = { path = "../manager-config" }
 manager-models = { path = "../manager-models" }
 manager-present = { path = "../manager-present" }

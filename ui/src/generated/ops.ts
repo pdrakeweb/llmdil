@@ -68,9 +68,12 @@ export type OpName =
   | "get_gateway_config"
   | "update_gateway_config"
   | "gateway_status"
+  | "gateway_restart"
   | "gateway_stop"
+  | "postgres_stop"
   | "gateway_activation_plan"
   | "gateway_activation_cancel"
+  | "activation_apply"
   | "gateway_activation_complete"
   | "gateway_activation_record_execution"
   | "gateway_activation_history"
@@ -108,6 +111,9 @@ export type OpName =
   | "log_receiver_deploy"
   | "log_receiver_remove"
   | "log_receiver_flip_endpoint"
+  | "log_receiver_start"
+  | "log_receiver_stop"
+  | "log_receiver_restart"
   | "optimize_get_state"
   | "optimize_validate_plan"
   | "optimize_save_purpose"
@@ -181,12 +187,14 @@ export interface ListBackendsArgs {}
 export interface StartBackendArgs {
   readonly id: string;
   readonly allowWddmOvercommit?: boolean | null;
+  readonly origin?: string | null;
 }
 
 /** Arguments of `stop_backend`. */
 export interface StopBackendArgs {
   readonly id: string;
   readonly graceful: boolean;
+  readonly origin?: string | null;
 }
 
 /** Arguments of `restart_backend`. */
@@ -194,6 +202,8 @@ export interface RestartBackendArgs {
   readonly id: string;
   readonly graceful: boolean;
   readonly allowWddmOvercommit?: boolean | null;
+  readonly origin?: string | null;
+  readonly waitReadySecs?: number | null;
 }
 
 /** Arguments of `test_backend`. */
@@ -336,6 +346,7 @@ export interface BackendGetLaunchCommandArgs {
 /** Arguments of `run_wizard_step`. */
 export interface RunWizardStepArgs {
   readonly stepId: string;
+  readonly origin?: string | null;
 }
 
 /** Arguments of `run_audit`. */
@@ -513,14 +524,34 @@ export interface UpdateGatewayConfigArgs {
 /** Arguments of `gateway_status`. */
 export interface GatewayStatusArgs {}
 
+/** Arguments of `gateway_restart`. */
+export interface GatewayRestartArgs {
+  readonly origin?: string | null;
+  readonly drain?: boolean | null;
+}
+
 /** Arguments of `gateway_stop`. */
-export interface GatewayStopArgs {}
+export interface GatewayStopArgs {
+  readonly stopPostgres?: boolean | null;
+  readonly origin?: string | null;
+}
+
+/** Arguments of `postgres_stop`. */
+export interface PostgresStopArgs {
+  readonly origin?: string | null;
+}
 
 /** Arguments of `gateway_activation_plan`. */
 export interface GatewayActivationPlanArgs {}
 
 /** Arguments of `gateway_activation_cancel`. */
 export interface GatewayActivationCancelArgs {}
+
+/** Arguments of `activation_apply`. */
+export interface ActivationApplyArgs {
+  readonly mode?: string | null;
+  readonly source?: string | null;
+}
 
 /** Arguments of `gateway_activation_complete`. */
 export interface GatewayActivationCompleteArgs {}
@@ -681,6 +712,21 @@ export interface LogReceiverRemoveArgs {}
 
 /** Arguments of `log_receiver_flip_endpoint`. */
 export interface LogReceiverFlipEndpointArgs {}
+
+/** Arguments of `log_receiver_start`. */
+export interface LogReceiverStartArgs {
+  readonly origin?: string | null;
+}
+
+/** Arguments of `log_receiver_stop`. */
+export interface LogReceiverStopArgs {
+  readonly origin?: string | null;
+}
+
+/** Arguments of `log_receiver_restart`. */
+export interface LogReceiverRestartArgs {
+  readonly origin?: string | null;
+}
 
 /** Arguments of `optimize_get_state`. */
 export interface OptimizeGetStateArgs {}
@@ -985,9 +1031,12 @@ export interface OpArgs {
   get_gateway_config: GetGatewayConfigArgs;
   update_gateway_config: UpdateGatewayConfigArgs;
   gateway_status: GatewayStatusArgs;
+  gateway_restart: GatewayRestartArgs;
   gateway_stop: GatewayStopArgs;
+  postgres_stop: PostgresStopArgs;
   gateway_activation_plan: GatewayActivationPlanArgs;
   gateway_activation_cancel: GatewayActivationCancelArgs;
+  activation_apply: ActivationApplyArgs;
   gateway_activation_complete: GatewayActivationCompleteArgs;
   gateway_activation_record_execution: GatewayActivationRecordExecutionArgs;
   gateway_activation_history: GatewayActivationHistoryArgs;
@@ -1025,6 +1074,9 @@ export interface OpArgs {
   log_receiver_deploy: LogReceiverDeployArgs;
   log_receiver_remove: LogReceiverRemoveArgs;
   log_receiver_flip_endpoint: LogReceiverFlipEndpointArgs;
+  log_receiver_start: LogReceiverStartArgs;
+  log_receiver_stop: LogReceiverStopArgs;
+  log_receiver_restart: LogReceiverRestartArgs;
   optimize_get_state: OptimizeGetStateArgs;
   optimize_validate_plan: OptimizeValidatePlanArgs;
   optimize_save_purpose: OptimizeSavePurposeArgs;

@@ -1,12 +1,13 @@
 [package]
 name = "manager-services"
-version = "0.1.60"
+version = "0.1.61"
 edition = "2021"
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+chrono = { workspace = true }
 manager-supervisor = { path = "../manager-supervisor" }
 
 [target.'cfg(windows)'.dependencies]

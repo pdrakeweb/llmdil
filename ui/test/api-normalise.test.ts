@@ -78,7 +78,8 @@ describe("list_backends normalisation", () => {
     });
     const r = await listBackends();
     expect(r.live).toBe(true);
-    expect(r.data.map((b) => b.status)).toEqual(["ok", "degraded", "idle"]);
+    // Shared lifecycle vocabulary: a stopping backend reads "stopping".
+    expect(r.data.map((b) => b.status)).toEqual(["ok", "stopping", "idle"]);
     expect(r.data[0]).toMatchObject({ id: "a", name: "a", model: "a.gguf", requests_1h: 12, spark: [1, 2] });
     expect(r.data[0].errors_1h).toBeUndefined();
     expect(r.data[0].reqSpark).toBeUndefined();
@@ -164,8 +165,23 @@ describe("gateway_status normalisation", () => {
 });
 
 describe("systemVerdict", () => {
-  const v = (o: Partial<Parameters<typeof systemVerdict>[0]>) =>
-    systemVerdict({ total: 2, running: 2, stale: false, error: null, gatewayUp: true, ...o });
+  // The verdict takes the shared lifecycle summary (service-lifecycle
+  // merge); a down gateway is a `failed` gateway lifecycle state.
+  type Old = { total: number; running: number; stale: boolean; error: string | null; gatewayUp: boolean };
+  const v = (o: Partial<Old>) => {
+    const i: Old = { total: 2, running: 2, stale: false, error: null, gatewayUp: true, ...o };
+    return systemVerdict({
+      summary: {
+        backendsTotal: i.total,
+        backendsRunning: i.running,
+        backendsTransitioning: 0,
+        backendsFailed: 0,
+        gateway: i.gatewayUp ? "running" : "failed",
+      },
+      stale: i.stale,
+      error: i.error,
+    });
+  };
   it("is normal only when everything is up", () => {
     expect(v({})).toEqual({ dot: "ok", text: "All systems normal", ok: true });
   });

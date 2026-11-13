@@ -140,10 +140,89 @@ first failure, restart after 30 s on second, restart after 60 s on
 subsequent failures, failure counter resets after 1 hour. This is
 deliberately weaker than the process supervisor's crash-loop backoff
 (the supervisor tracks attempts and gives up); SCM has no give-up
-state, so SCM restart is unconditional in increment 1. A flapping
-service is visible as Running→Stopped churn in the Backends view
-through the SCM status merge; backoff tuning is a field-test
-question.
+state. A flapping service is visible as Running→Stopped churn in the
+Backends view through the SCM status merge; backoff tuning is a
+field-test question.
+
+**When the actions run (service-lifecycle work, Nov 2026).** The SCM
+runs recovery actions only when the service *process* (the shim)
+dies, unless the registration also sets
+`SERVICE_CONFIG_FAILURE_ACTIONS_FLAG` (`fFailureActionsOnNonCrashFailures`).
+`FailureActions::restart_on_child_exit` controls that flag:
+
+- **Log receiver: `true`.** Nothing else watches it, so an
+  unexpected receiver exit is restarted by the SCM.
+- **Gateway and backends: `false`.** The app owns them, and neither
+  run mode auto-restarts them: one crash policy for process mode and
+  service mode. An unexpected child exit leaves the service Stopped
+  with a non-zero exit code, which the app reports as `failed` (and
+  the lifecycle monitor raises once).
+
+An operator stop is always reported as a clean stop (exit 0), so it
+never triggers recovery, whatever the flag.
+
+### Lifecycle markers, exit codes and log rotation
+
+The shim and the app share one lifecycle vocabulary and one marker
+format (`manager_supervisor::lifecycle`), so a service's own log reads
+the same in both run modes:
+
+- **`lifecycle_log`.** Every `ServiceDefinition` carries
+  `lifecycle_log` (`#[serde(default)]`), set by the builders to
+  `<dir of stdout_log>/<stem>.lifecycle.log`:
+  `logs/gateway.lifecycle.log`, `logs/backend-<id>.lifecycle.log`,
+  and the receiver's `receiver.lifecycle.log`. An older definition
+  without the field falls back to the same sibling of its stdout log
+  (`lifecycle_log_path`). These are the same files the app's own
+  lifecycle operations write, and `get_logs` merges each into its
+  service's scope.
+- **Shim markers.** One line per event, in the shared
+  `[<rfc3339>] [lifecycle] <service>: <event> — <detail>` format:
+  `service start` (shim version, definition, host pid), `start
+  failed` (environment/credential resolution or spawn, with the
+  reason), `child spawned` (pid, program), `stop requested` (service control STOP
+  or system shutdown; written before the kill), `child exited` (pid,
+  exit code, uptime, and whether a stop was requested or the exit
+  was unexpected), and `service stopped` (clean stop, start failure,
+  or child failure with the reported code).
+- **Exit-code semantics.** The shim reports `SERVICE_STOPPED` with:
+  - a requested stop (STOP or shutdown): `NO_ERROR`, service-specific
+    code 0. The SCM state reads as a clean `stopped`.
+  - an unexpected child exit: `ERROR_SERVICE_SPECIFIC_ERROR` (1066)
+    with the child's exit code as the service-specific code.
+  - an environment/credential resolution failure:
+    service-specific code 1 (`HOST_EXIT_ENV_FAILURE`).
+  - a spawn failure: service-specific code 2
+    (`HOST_EXIT_SPAWN_FAILURE`).
+
+  `ServiceStatus::lifecycle_state()` maps Stopped with any non-zero
+  code to `failed`, and `failure_reason()` turns the code into the
+  text the UI and the operation errors show ("service host could not
+  spawn the program", "child exited with code N"). This is what lets
+  the app tell a crash from an operator stop in service mode.
+- **STOP during START_PENDING.** The shim accepts STOP while it is
+  still starting; when the child is not spawned yet, it is terminated
+  as soon as the spawn returns, and the service never reports
+  RUNNING.
+- **Log rotation per start.** Before opening the child's stdout and
+  stderr logs, the shim rotates each to `<log>.prev` (one previous
+  run per log, as process mode keeps through
+  `lifecycle::open_rotated_log`). Best-effort: a file another process
+  holds open without delete sharing stays put, and the run appends to
+  it. The lifecycle log itself is append-only and rotates to `.prev`
+  past 1 MiB.
+- **App-side waits.** Every SCM stop/start in the app goes through
+  the shared `stop_and_wait` / `start_and_wait` helpers
+  (`ServiceTimeouts`: 30 s each). A start that falls back to Stopped
+  fails with the exit-code reason instead of timing out.
+- **Log receiver controls.** Start, stop and restart run unelevated
+  through those helpers (the registration's DACL grants the operator
+  start/stop): `log_receiver_start/stop/restart`, REST
+  `POST /api/v1/log-receiver/{start|stop|restart}`. Restarting no
+  longer needs a re-deploy (and its UAC prompt). The receiver's status
+  reports `degraded` when the service is Running but its ingest port
+  (127.0.0.1:8473) refuses connections, since the shim reports
+  RUNNING at spawn, before the receiver has bound the port.
 
 ### Start mode: Manual
 

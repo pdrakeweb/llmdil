@@ -91,10 +91,11 @@ pub struct ActivationExecution {
     /// `completed`, `completed_with_failures`, or `failed`.
     #[serde(default)]
     pub status: String,
-    /// The surface that initiated the apply (`desktop` — the
-    /// desktop UI funnel is the one apply path that exists; the
-    /// REST apply composition in rest-api.md §6.6 is not yet
-    /// server-owned). Recorded as reported, never invented.
+    /// The surface that initiated the apply: `desktop`, `api` or
+    /// `cli` for the server-side apply (`activation_apply`), or the
+    /// starting surface (`ui`, `wizard`, `dashboard`, …) for a gateway
+    /// (re)start that applied the plan's gateway side. Recorded as
+    /// reported, never invented.
     #[serde(default)]
     pub source: String,
     /// The apply mode the operator chose: `quiesce`, `restart`, or

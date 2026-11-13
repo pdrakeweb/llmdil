@@ -9,6 +9,7 @@
         "present": false,
         "v": "f16"
       },
+      "child_pid": null,
       "configured": true,
       "enabled": true,
       "failure_reason": null,
@@ -31,6 +32,7 @@
       "group": "planner",
       "id": "planner",
       "kv_ram_mib": 2048,
+      "lifecycle": "stopped",
       "memory_basis": "catalog",
       "model_file": "models/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf",
       "moe_cache_mib": 0,
@@ -47,10 +49,12 @@
       "raw_flags": null,
       "restarts": 0,
       "rs_ram_mib": null,
+      "service_managed": false,
       "state": "stopped",
       "sys_ram_mib": 0,
       "tensor_split": [],
       "tool_call_probe": null,
+      "transition": null,
       "uptime_secs": null
     },
     {
@@ -62,6 +66,7 @@
         "present": false,
         "v": "f16"
       },
+      "child_pid": null,
       "configured": true,
       "enabled": true,
       "failure_reason": null,
@@ -84,6 +89,7 @@
       "group": "coder",
       "id": "coder",
       "kv_ram_mib": 768,
+      "lifecycle": "stopped",
       "memory_basis": "catalog",
       "model_file": "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
       "moe_cache": {
@@ -219,10 +225,12 @@
       "raw_flags": "-ot exps=CPU",
       "restarts": 0,
       "rs_ram_mib": null,
+      "service_managed": false,
       "state": "stopped",
       "sys_ram_mib": 44544,
       "tensor_split": [],
       "tool_call_probe": null,
+      "transition": null,
       "uptime_secs": null
     },
     {
@@ -234,6 +242,7 @@
         "present": false,
         "v": "f16"
       },
+      "child_pid": null,
       "configured": true,
       "enabled": true,
       "failure_reason": null,
@@ -256,6 +265,7 @@
       "group": "coder-fast",
       "id": "coder-fast",
       "kv_ram_mib": 1792,
+      "lifecycle": "stopped",
       "memory_basis": "catalog",
       "model_file": "models/qwen2.5-coder-7b-instruct-q4_k_m.gguf",
       "moe_cache_mib": 0,
@@ -272,10 +282,12 @@
       "raw_flags": null,
       "restarts": 0,
       "rs_ram_mib": null,
+      "service_managed": false,
       "state": "stopped",
       "sys_ram_mib": 0,
       "tensor_split": [],
       "tool_call_probe": null,
+      "transition": null,
       "uptime_secs": null
     },
     {
@@ -287,6 +299,7 @@
         "present": false,
         "v": "f16"
       },
+      "child_pid": null,
       "configured": true,
       "enabled": true,
       "failure_reason": null,
@@ -309,6 +322,7 @@
       "group": "tool-runner",
       "id": "tool-runner",
       "kv_ram_mib": 4608,
+      "lifecycle": "stopped",
       "memory_basis": "catalog",
       "model_file": "models/Qwen3-8B-Q4_K_M.gguf",
       "moe_cache_mib": 0,
@@ -325,10 +339,12 @@
       "raw_flags": null,
       "restarts": 0,
       "rs_ram_mib": null,
+      "service_managed": false,
       "state": "stopped",
       "sys_ram_mib": 0,
       "tensor_split": [],
       "tool_call_probe": null,
+      "transition": null,
       "uptime_secs": null
     }
   ]
