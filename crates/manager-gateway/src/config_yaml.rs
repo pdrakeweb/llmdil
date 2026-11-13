@@ -189,13 +189,7 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
     // make the deployment unreachable (a v0.1.32 regression — the
     // pre-derivation generator emitted any group whose entries
     // were non-empty).
-    let mut group_entries: Vec<(&ModelGroup, Vec<LiteLlmModelEntry>)> = Vec::new();
-    for group in &config.gateway.groups {
-        let entries = model_entries_for_group(group, config)?;
-        if group_enabled(group, config) || !entries.is_empty() {
-            group_entries.push((group, entries));
-        }
-    }
+    let group_entries = included_group_entries(config)?;
     if group_entries.is_empty() {
         return Err(GatewayError::ConfigInvalid(
             "no enabled model groups (every group's member backends are disabled)".to_string(),
@@ -496,6 +490,39 @@ fn curated_env_literals(server: &manager_config::McpServerConfig) -> Vec<(String
         "web_fetch" => vec![("PYTHONIOENCODING".to_string(), "utf-8".to_string())],
         _ => Vec::new(),
     }
+}
+
+/// The groups the generated config includes, each with its
+/// deployments, in configuration order: groups that produce
+/// deployments (see [`generate_config_yaml`]). Member references are
+/// validated for every group, enabled or not.
+fn included_group_entries(
+    config: &AppConfig,
+) -> Result<Vec<(&ModelGroup, Vec<LiteLlmModelEntry>)>, GatewayError> {
+    let mut group_entries = Vec::new();
+    for group in &config.gateway.groups {
+        let entries = model_entries_for_group(group, config)?;
+        if group_enabled(group, config) || !entries.is_empty() {
+            group_entries.push((group, entries));
+        }
+    }
+    Ok(group_entries)
+}
+
+/// The one global routing strategy the generated config applies
+/// (`router_settings.routing_strategy`), resolved by the same rule
+/// and over the same included groups as [`generate_config_yaml`].
+/// `None` when the generator would emit no config: no included
+/// group, or a member reference it rejects. This is the single
+/// implementation the UI reads (via `get_gateway_config`'s
+/// `effective_strategy`); clients must not re-derive it.
+pub fn effective_global_strategy(config: &AppConfig) -> Option<RoutingStrategy> {
+    let group_entries = included_group_entries(config).ok()?;
+    if group_entries.is_empty() {
+        return None;
+    }
+    let groups: Vec<&ModelGroup> = group_entries.iter().map(|(g, _)| *g).collect();
+    Some(resolve_global_strategy(&groups, config))
 }
 
 /// Resolve the single global `routing_strategy` for `router_settings`
@@ -1101,6 +1128,72 @@ mod tests {
             yaml.contains("routing_strategy: latency-based-routing"),
             "{yaml}"
         );
+        // The exported resolver agrees with the emitted value. (The
+        // UI's former TypeScript copy counted configured members and
+        // would have answered least-busy here.)
+        assert_eq!(
+            effective_global_strategy(&cfg),
+            Some(RoutingStrategy::LatencyBased)
+        );
+    }
+
+    /// `effective_global_strategy` is the generator's own rule: it
+    /// names exactly the strategy written to `router_settings`.
+    #[test]
+    fn effective_global_strategy_matches_generated_router_settings() {
+        let cfg = four_backend_config();
+        let strategy = effective_global_strategy(&cfg).expect("groups included");
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(
+            yaml.contains(&format!(
+                "routing_strategy: {}",
+                strategy_to_litellm(strategy)
+            )),
+            "{yaml}"
+        );
+    }
+
+    /// A group whose only deployments are OpenRouter fallbacks is
+    /// included by the generator (its members are all disabled), so it
+    /// takes part in the resolution.
+    #[test]
+    fn effective_global_strategy_counts_fallback_only_groups() {
+        let mut cfg = four_backend_config();
+        cfg.gateway.openrouter.enabled = true;
+        cfg.gateway.groups = vec![ModelGroup {
+            name: "solo".to_string(),
+            members: vec!["coder-fast".to_string()],
+            strategy: RoutingStrategy::LeastBusy,
+            fallbacks: vec!["openrouter".to_string()],
+            purpose: String::new(),
+        }];
+        for b in cfg.backends.iter_mut() {
+            b.enabled = false;
+        }
+        assert!(generate_config_yaml(&cfg).is_ok());
+        assert_eq!(
+            effective_global_strategy(&cfg),
+            Some(RoutingStrategy::LeastBusy)
+        );
+    }
+
+    /// No config would be generated: no strategy is reported.
+    #[test]
+    fn effective_global_strategy_none_when_nothing_generates() {
+        let mut cfg = four_backend_config();
+        cfg.gateway.groups.clear();
+        assert_eq!(effective_global_strategy(&cfg), None);
+
+        let mut cfg = four_backend_config();
+        cfg.gateway.groups = vec![ModelGroup {
+            name: "ghost".to_string(),
+            members: vec!["no-such-backend".to_string()],
+            strategy: RoutingStrategy::LeastBusy,
+            fallbacks: vec![],
+            purpose: String::new(),
+        }];
+        assert!(generate_config_yaml(&cfg).is_err());
+        assert_eq!(effective_global_strategy(&cfg), None);
     }
 
     #[test]

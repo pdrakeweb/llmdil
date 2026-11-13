@@ -365,13 +365,18 @@ post-download proposal (deep-discovery design Part 2, P2-D7).
                        "litellm_fragment": "…" } ],
   "request_log_len": 0,
   "openrouter": { "enabled": false, "cred_ref": null,
-                  "daily_cap_usd": 0, "model_allowlist": [] }
+                  "daily_cap_usd": 0, "model_allowlist": [] },
+  "effective_strategy": "latency-based"
 }
 ```
 
 Group `enabled`/`enabled_members` are derived by the app (a group is
 enabled iff at least one member backend is enabled); they are read-only
-in the API as in the app.
+in the API as in the app. `effective_strategy` is the one global
+routing strategy the generated gateway config applies, computed by the
+generator's own rule (`manager_gateway::effective_global_strategy`);
+`null` when no config would be generated. Clients display it and never
+re-derive it.
 
 ### 4.5 Gateway status (`gateway_status`)
 

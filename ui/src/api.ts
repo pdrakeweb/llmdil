@@ -468,7 +468,7 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
   const data: DashboardModel = {
     gateway, backends, gpus: g.data.gpus, placement: placementFromConfig(cfg.data, g.data.gpus, backends),
     gatewayUp: !gw.error && gw.data.up,
-    gatewayStrategy: gwCfg.data ? effectiveGatewayStrategy(gwCfg.data) : null,
+    gatewayStrategy: gwCfg.data ? gwCfg.data.effective_strategy : null,
     gatewayError: gw.error,
     stale: g.data.stale, updatedAt: Date.now(),
   };
@@ -2064,6 +2064,12 @@ export interface GatewayConfigData {
   routing_rules: GatewayRule[];
   request_log_len: number;
   openrouter: GatewayOpenRouter | null;
+  /** The one global routing strategy LiteLLM will apply, computed by
+   *  the backend with the config generator's own rule
+   *  (manager-gateway effective_global_strategy) — never re-derived
+   *  here. Null when no gateway config would be generated (or an
+   *  older backend did not send it). */
+  effective_strategy: string | null;
 }
 
 /** get_gateway_config — LiteLLM gateway configuration from AppConfig.
@@ -2113,6 +2119,7 @@ export async function getGatewayConfig(): Promise<CallResult<GatewayConfigData |
         fragment_raw: r.litellm_fragment === undefined ? undefined : r.litellm_fragment,
       })) : [],
       request_log_len: typeof raw.request_log_len === "number" ? raw.request_log_len : 0,
+      effective_strategy: typeof raw.effective_strategy === "string" ? raw.effective_strategy : null,
       openrouter: or && typeof or === "object"
         ? {
             enabled: Boolean(or.enabled),
@@ -2126,22 +2133,6 @@ export async function getGatewayConfig(): Promise<CallResult<GatewayConfigData |
   } catch (e) {
     return { data: null, live: true, error: errOf(e) };
   }
-}
-
-/** The one global routing strategy LiteLLM will apply, resolved with
- *  the same rule the config generator uses (manager-gateway's
- *  resolve_global_strategy) over the groups the generator includes
- *  — enabled groups only: the first multi-member group's strategy,
- *  else the planner group's, else the first group's. Null when no
- *  enabled group exists. */
-export function effectiveGatewayStrategy(cfg: GatewayConfigData): string | null {
-  const included = cfg.groups.filter((g) => g.enabled);
-  if (!included.length) return null;
-  const multi = included.find((g) => g.members.length > 1);
-  if (multi) return multi.strategy;
-  const planner = included.find((g) => g.name === "planner");
-  if (planner) return planner.strategy;
-  return included[0].strategy;
 }
 
 export interface GatewayStatusData {

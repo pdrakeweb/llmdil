@@ -4882,6 +4882,12 @@ pub async fn op_get_gateway_config(state: &Arc<AppState>, _sink: &Arc<dyn EventS
             group_json["enabled_members"] = json!(enabled_members);
         }
     }
+    // The one global routing strategy the generated gateway config
+    // applies, computed by the generator's own rule (additive field;
+    // null when no config would be generated). Clients display it
+    // and never re-derive it (capability audit §13.2).
+    v["effective_strategy"] =
+        serde_json::to_value(manager_gateway::effective_global_strategy(&cfg))?;
     Ok(v)
 }
 
@@ -11411,6 +11417,40 @@ mod tests {
 
     fn test_sink() -> Arc<dyn EventSink> {
         Arc::new(NoopSink)
+    }
+
+    /// Capability audit §13.2: the effective global routing strategy
+    /// is computed server-side by the generator's rule and returned on
+    /// `get_gateway_config` (additive field), so the UI never
+    /// re-implements it.
+    #[tokio::test]
+    async fn get_gateway_config_reports_effective_strategy() {
+        let cfg = AppConfig::default_config();
+        let expected = manager_gateway::effective_global_strategy(&cfg);
+        let (state, _dir) = advanced_test_state(cfg);
+        let v = op_get_gateway_config(&state, &test_sink()).await.unwrap();
+        assert_eq!(
+            v["effective_strategy"],
+            serde_json::to_value(expected).unwrap()
+        );
+        if let Some(s) = expected {
+            // Same kebab-case spelling as each group's `strategy`.
+            let groups = v["groups"].as_array().unwrap();
+            assert!(groups
+                .iter()
+                .any(|g| g["strategy"] == serde_json::to_value(s).unwrap()));
+        }
+
+        // No group would be generated: null, not a guess.
+        let mut empty = AppConfig::default_config();
+        empty.gateway.groups.clear();
+        let (state, _dir) = advanced_test_state(empty);
+        let v = op_get_gateway_config(&state, &test_sink()).await.unwrap();
+        assert!(v["effective_strategy"].is_null());
+        assert!(
+            v.get("effective_strategy").is_some(),
+            "field is always present"
+        );
     }
 
     /// P-4 (docs/code-review-v0.1.60.md): a header still `Incomplete`

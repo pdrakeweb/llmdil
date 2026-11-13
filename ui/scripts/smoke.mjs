@@ -968,5 +968,12 @@ const staticSrcNar = readFileSync(join(root, "src", "views", "static.ts"), "utf8
 check(staticSrcNar.includes('"banner mode-live"'), "wizard live mode renders as a neutral status banner, not warning styling");
 check(!staticSrcNar.includes("wiz-side"), "wizard sidebar narrative block is removed from static.ts");
 
+// Capability audit §13.2: the effective global routing strategy is
+// computed server-side (get_gateway_config.effective_strategy); the
+// UI must not carry a second implementation of the rule.
+const apiSrcGw = readFileSync(join(root, "src", "api.ts"), "utf8");
+check(!allSrc.includes("effectiveGatewayStrategy"), "no TypeScript re-implementation of the gateway strategy rule (effectiveGatewayStrategy) remains in ui/src");
+check(apiSrcGw.includes("raw.effective_strategy"), "getGatewayConfig reads the backend-computed effective_strategy");
+
 if (failures > 0) { console.error(`\n${failures} smoke check(s) failed`); process.exit(1); }
 console.log("\nsmoke: all checks passed");

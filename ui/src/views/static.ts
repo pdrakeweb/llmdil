@@ -23,7 +23,7 @@ import {
   modelHfLookup, modelHfSuggest, modelHfHeader,
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
   getGatewayMasterKey, setGatewayBindHost,
-  updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
+  updateGatewayConfig, gatewayStop,
   getActivationPlan, activationCancelChanges, activationComplete, quiesceWait,
   recordActivationExecution, getActivationHistory, getActivationExecution,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
@@ -7205,7 +7205,9 @@ function gatewayPaint(
   </div>`;
   })();
 
-  const effStrategy = effectiveGatewayStrategy(cfg);
+  // Computed by the backend (get_gateway_config.effective_strategy)
+  // with the config generator's own rule; never re-derived here.
+  const effStrategy = cfg.effective_strategy;
 
   /* ---- Routing section: one section, two views (Flow | Groups).
    * The section top carries the one answer-level fact — the
