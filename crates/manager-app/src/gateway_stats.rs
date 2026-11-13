@@ -287,7 +287,7 @@ impl GatewayStatsStore {
             let attribution_missed = tokens_delta == 0 && successes_delta > 0 && !token_series_seen;
             if attribution_missed {
                 if self.miss_reported.insert(id.clone()) {
-                    eprintln!(
+                    tracing::warn!(
                         "gateway stats: requests completed for backend '{id}' but its token \
                          series (model=\"{model}\") is absent from the gateway metrics — \
                          throughput for '{id}' is not measured (check the token-metric \

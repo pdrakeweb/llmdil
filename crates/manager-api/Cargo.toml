@@ -28,6 +28,7 @@ sha2 = { workspace = true }
 uuid = { workspace = true }
 getrandom = { workspace = true }
 futures-core = { workspace = true }
+tracing = { workspace = true }
 manager-app = { path = "../manager-app" }
 manager-config = { path = "../manager-config" }
 manager-wizard = { path = "../manager-wizard" }
