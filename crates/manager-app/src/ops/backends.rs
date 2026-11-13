@@ -518,7 +518,8 @@ pub async fn op_list_backends(state: &Arc<AppState>, sink: &Arc<dyn EventSink>) 
         // it polls the backend itself, so it sees direct-drive
         // generation exactly as it sees gateway traffic.
         let direct_ops: std::collections::HashSet<String> = state
-            .optimize_running_ops
+            .optimize
+            .running_ops
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .keys()

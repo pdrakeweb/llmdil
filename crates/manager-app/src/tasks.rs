@@ -551,7 +551,7 @@ mod tests {
         let (state, dir) = test_state("route");
         let task_id = state.record_task("optimize-measure", json!({})).await;
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        *state.optimize_job_abort.lock().await = Some(tx);
+        *state.optimize.job_abort.lock().await = Some(tx);
         state
             .tasks
             .controls
@@ -576,7 +576,7 @@ mod tests {
         assert_eq!(out["routed_to"]["result"]["cancelled"], true, "{out}");
         assert_eq!(out["stopped"], true, "{out}");
         assert_eq!(out["status"], "aborted", "{out}");
-        assert!(state.optimize_job_abort.lock().await.is_none());
+        assert!(state.optimize.job_abort.lock().await.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

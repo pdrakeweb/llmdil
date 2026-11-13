@@ -1114,7 +1114,7 @@ async fn run_experiment_batch(
     mode: RunMode,
 ) -> crate::ApiResult {
     {
-        let slot = state.optimize_job_abort.lock().await;
+        let slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             return Err(ApiError::InvalidInput(
                 "a measurement or experiment job is already running".to_string(),
@@ -1189,7 +1189,7 @@ async fn run_experiment_batch(
     let batch_id = task_id.clone();
     let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
     {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             state
                 .finish_task(
@@ -1397,7 +1397,7 @@ async fn run_experiment_batch(
         }
     }
     {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         *slot = None;
     }
     let (status, detail) = if cancelled {

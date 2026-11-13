@@ -196,7 +196,7 @@ pub async fn op_optimize_run_baseline(
     backend_id: String,
 ) -> crate::ApiResult {
     {
-        let slot = state.optimize_job_abort.lock().await;
+        let slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             return Err(ApiError::InvalidInput(
                 "a measurement or experiment job is already running".to_string(),
@@ -257,7 +257,7 @@ pub async fn op_optimize_run_baseline(
         .await;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             state
                 .finish_task(
@@ -284,7 +284,7 @@ pub async fn op_optimize_run_baseline(
         _ = rx => None,
     };
     {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         *slot = None;
     }
     let record = match outcome {

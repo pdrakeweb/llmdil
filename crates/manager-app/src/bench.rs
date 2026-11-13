@@ -418,7 +418,7 @@ pub async fn op_bench_run_start(
             "a bench sweep is already running".to_string(),
         ));
     }
-    if state.optimize_job_abort.lock().await.is_some() {
+    if state.optimize.job_abort.lock().await.is_some() {
         return Err(ApiError::InvalidInput(
             "a measurement or experiment job is already running".to_string(),
         ));

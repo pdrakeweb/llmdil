@@ -11,11 +11,11 @@
 //! adoption through the existing structured save ops.
 //!
 //! Serialization (§B.4.3, extension E2): a sweep holds the
-//! shared Optimize job slot (`optimize_job_abort`) for its
+//! shared Optimize job slot (`optimize.job_abort`) for its
 //! whole run, so Measure / Estimate / experiment batches
 //! refuse while it runs and it refuses while they run; it
 //! additionally refuses while a consultation occupies
-//! `optimize_abort`, and `op_optimize_consult` refuses while
+//! `optimize.consult_abort`, and `op_optimize_consult` refuses while
 //! the job slot is occupied (the reciprocal check lives
 //! there). On top of the slots, the sweep claims the tuned
 //! backend in the per-backend mutual-exclusion record
@@ -1323,7 +1323,7 @@ pub async fn op_optimize_tuning_run(
     backend_id: String,
 ) -> crate::ApiResult {
     {
-        let slot = state.optimize_job_abort.lock().await;
+        let slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             return Err(ApiError::InvalidInput(
                 "a measurement or experiment job is already running".to_string(),
@@ -1335,7 +1335,7 @@ pub async fn op_optimize_tuning_run(
         // while a consultation occupies its slot — a
         // consultation is generation traffic that contends
         // for the CPU and system RAM offload arms measure.
-        let slot = state.optimize_abort.lock().await;
+        let slot = state.optimize.consult_abort.lock().await;
         if slot.is_some() {
             return Err(ApiError::InvalidInput(
                 "a consultation is running; a tuning sweep refuses to start until it finishes (§B.4.3)".to_string(),
@@ -1361,7 +1361,7 @@ pub async fn op_optimize_tuning_run(
         .await;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             state
                 .finish_task(
@@ -1389,7 +1389,7 @@ pub async fn op_optimize_tuning_run(
         let _guard = guard;
         run_sweep(task_state.clone(), task_sink, task_backend, rx).await;
         {
-            let mut slot = task_state.optimize_job_abort.lock().await;
+            let mut slot = task_state.optimize.job_abort.lock().await;
             *slot = None;
         }
         // A sweep stopped by optimize_cancel_job (or task_abort,

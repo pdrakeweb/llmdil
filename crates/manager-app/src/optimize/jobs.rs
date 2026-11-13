@@ -69,20 +69,20 @@ pub(crate) async fn load_plan_file_current(state: &AppState) -> PlanFile {
 // ---------------------------------------------------------------------------
 
 pub(super) async fn record_consult_start(state: &AppState) {
-    *state.optimize_consult_started_unix_ms.lock().await =
+    *state.optimize.consult_started_unix_ms.lock().await =
         Some(chrono::Utc::now().timestamp_millis());
-    *state.optimize_consult_error.lock().await = None;
+    *state.optimize.consult_error.lock().await = None;
 }
 
 pub(super) async fn record_consult_failure(state: &AppState, message: String) {
-    *state.optimize_consult_started_unix_ms.lock().await = None;
-    *state.optimize_consult_error.lock().await =
+    *state.optimize.consult_started_unix_ms.lock().await = None;
+    *state.optimize.consult_error.lock().await =
         Some((message, chrono::Utc::now().timestamp_millis()));
 }
 
 pub(super) async fn record_consult_success(state: &AppState) {
-    *state.optimize_consult_started_unix_ms.lock().await = None;
-    *state.optimize_consult_error.lock().await = None;
+    *state.optimize.consult_started_unix_ms.lock().await = None;
+    *state.optimize.consult_error.lock().await = None;
 }
 
 // ---------------------------------------------------------------------------
@@ -126,12 +126,12 @@ pub(crate) async fn record_job_start(state: &AppState, kind: &str, backend_id: &
             break next;
         }
     };
-    *state.optimize_job.lock().await = Some(crate::OptimizeJobInfo {
+    *state.optimize.job.lock().await = Some(crate::OptimizeJobInfo {
         kind: kind.to_string(),
         backend_id: backend_id.to_string(),
         started_unix_ms,
     });
-    *state.optimize_job_error.lock().await = None;
+    *state.optimize.job_error.lock().await = None;
     started_unix_ms
 }
 
@@ -145,7 +145,8 @@ pub(crate) async fn record_job_start(state: &AppState, kind: &str, backend_id: &
 /// running-operation record's claim ids provide there.
 pub(super) async fn job_is_current(state: &AppState, started_unix_ms: i64) -> bool {
     state
-        .optimize_job
+        .optimize
+        .job
         .lock()
         .await
         .as_ref()
@@ -161,8 +162,8 @@ pub(crate) async fn record_job_failure(state: &AppState, started_unix_ms: i64, m
     if !job_is_current(state, started_unix_ms).await {
         return;
     }
-    *state.optimize_job.lock().await = None;
-    *state.optimize_job_error.lock().await = Some((message, chrono::Utc::now().timestamp_millis()));
+    *state.optimize.job.lock().await = None;
+    *state.optimize.job_error.lock().await = Some((message, chrono::Utc::now().timestamp_millis()));
 }
 
 /// Record a benchmark job's success: descriptor and recorded
@@ -171,8 +172,8 @@ pub(crate) async fn record_job_success(state: &AppState, started_unix_ms: i64) {
     if !job_is_current(state, started_unix_ms).await {
         return;
     }
-    *state.optimize_job.lock().await = None;
-    *state.optimize_job_error.lock().await = None;
+    *state.optimize.job.lock().await = None;
+    *state.optimize.job_error.lock().await = None;
 }
 
 /// Record a benchmark job's end without a verdict (operator
@@ -183,7 +184,7 @@ pub(crate) async fn record_job_end(state: &AppState, started_unix_ms: i64) {
     if !job_is_current(state, started_unix_ms).await {
         return;
     }
-    *state.optimize_job.lock().await = None;
+    *state.optimize.job.lock().await = None;
 }
 
 /// The `job` payload value for a descriptor: the descriptor
@@ -274,7 +275,8 @@ pub(crate) fn try_claim_optimize_op(
     kind: &str,
 ) -> Result<OptimizeRunningOp, ApiError> {
     let mut ops = state
-        .optimize_running_ops
+        .optimize
+        .running_ops
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = ops.get(backend_id) {
@@ -302,7 +304,8 @@ pub(crate) fn try_claim_optimize_op(
 /// the backend) must not clear the newer record.
 pub(crate) fn release_optimize_op(state: &AppState, backend_id: &str, claim_id: u64) {
     let mut ops = state
-        .optimize_running_ops
+        .optimize
+        .running_ops
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if ops
@@ -319,7 +322,8 @@ pub(crate) fn release_optimize_op(state: &AppState, backend_id: &str, claim_id: 
 /// then finds nothing — or a newer claim — and leaves it alone).
 pub(crate) fn clear_running_ops(state: &AppState, family: OptimizeOpFamily) {
     let mut ops = state
-        .optimize_running_ops
+        .optimize
+        .running_ops
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     ops.retain(|_, op| op.family != family);
@@ -363,7 +367,8 @@ impl Drop for OptimizeOpGuard {
 /// any page instance.
 pub(super) fn running_ops_json(state: &AppState) -> Value {
     let ops = state
-        .optimize_running_ops
+        .optimize
+        .running_ops
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut map = serde_json::Map::new();

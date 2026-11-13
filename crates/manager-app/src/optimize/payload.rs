@@ -324,25 +324,25 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
         "measurements": measurements_json,
         "candidates": candidates_json(&load_candidates_file(state)),
         "eval_baseline": crate::optimize_eval::eval_baseline_json(state, &gathered.fingerprints),
-        "consulting": state.optimize_abort.lock().await.is_some(),
-        "consult_started_unix_ms": *state.optimize_consult_started_unix_ms.lock().await,
+        "consulting": state.optimize.consult_abort.lock().await.is_some(),
+        "consult_started_unix_ms": *state.optimize.consult_started_unix_ms.lock().await,
         // Streaming progress of the running consultation (Phase
         // 3): chunk (≈ token) count, partial answer size, time to
         // first token; null when none is streaming.
-        "consult_progress": state.optimize_live.progress_json(),
+        "consult_progress": state.optimize.live.progress_json(),
         // The Rust apply executor is running (Phase 3).
-        "applying": state.optimize_live.applying(),
-        "consult_error": state.optimize_consult_error.lock().await.as_ref().map(|(m, _)| m.clone()),
-        "consult_error_unix_ms": state.optimize_consult_error.lock().await.as_ref().map(|(_, t)| *t),
-        "measuring": state.optimize_job_abort.lock().await.is_some(),
+        "applying": state.optimize.live.applying(),
+        "consult_error": state.optimize.consult_error.lock().await.as_ref().map(|(m, _)| m.clone()),
+        "consult_error_unix_ms": state.optimize.consult_error.lock().await.as_ref().map(|(_, t)| *t),
+        "measuring": state.optimize.job_abort.lock().await.is_some(),
         // The running Estimate/Measure job's descriptor and the
         // last such job's failure (tracker #69), following the
         // consult_* pattern above: any page instance renders the
         // true job kind/backend/elapsed and surfaces failures
         // without having started (or awaited) the job itself.
-        "job": job_json(&state.optimize_job.lock().await.clone()),
-        "job_error": state.optimize_job_error.lock().await.as_ref().map(|(m, _)| m.clone()),
-        "job_error_unix_ms": state.optimize_job_error.lock().await.as_ref().map(|(_, t)| *t),
+        "job": job_json(&state.optimize.job.lock().await.clone()),
+        "job_error": state.optimize.job_error.lock().await.as_ref().map(|(m, _)| m.clone()),
+        "job_error_unix_ms": state.optimize.job_error.lock().await.as_ref().map(|(_, t)| *t),
         // Per-backend running Optimize operations (tracker #70):
         // the mutual-exclusion record the start refusals name,
         // exposed so any page instance can see which operation
