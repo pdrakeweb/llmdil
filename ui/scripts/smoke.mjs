@@ -32,7 +32,7 @@ const html = existsSync(indexHtml) ? readFileSync(indexHtml, "utf8") : "";
 check(/assets\/.*\.js/.test(html), "index.html references the JS bundle");
 
 const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
-for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_offload_override", "backend_clear_offload_override", "backend_set_mtp", "backend_set_moe_cache", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_set_mtp", "model_delete", "model_assign", "model_hf_lookup", "model_hf_header", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "optimize_tuning_preview", "optimize_tuning_run", "optimize_tuning_adopt", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
+for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_offload_override", "backend_clear_offload_override", "backend_set_mtp", "backend_set_moe_cache", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_set_mtp", "model_delete", "model_assign", "model_hf_lookup", "model_hf_header", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "optimize_tuning_preview", "optimize_tuning_run", "optimize_tuning_adopt", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart", "winml_probe"]) {
 
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
@@ -967,6 +967,25 @@ check(!optSrcNar.includes('<p class="opt-note">Every stored measurement'), "Opti
 const staticSrcNar = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
 check(staticSrcNar.includes('"banner mode-live"'), "wizard live mode renders as a neutral status banner, not warning styling");
 check(!staticSrcNar.includes("wiz-side"), "wizard sidebar narrative block is removed from static.ts");
+
+// Capability audit §13.2: the effective global routing strategy is
+// computed server-side (get_gateway_config.effective_strategy); the
+// UI must not carry a second implementation of the rule.
+const apiSrcGw = readFileSync(join(root, "src", "api.ts"), "utf8");
+check(!allSrc.includes("effectiveGatewayStrategy"), "no TypeScript re-implementation of the gateway strategy rule (effectiveGatewayStrategy) remains in ui/src");
+check(apiSrcGw.includes("raw.effective_strategy"), "getGatewayConfig reads the backend-computed effective_strategy");
+
+// Admin API bind choice (auth-plan §5): the Remote Access card carries
+// the selector, saved as admin_api.bind_mode (+ bind_ip), and shows
+// the loopback-fallback reason the shell reports.
+check(staticSrcNar.includes("data-ra-bind-save") && staticSrcNar.includes('id="raBind"'), "Remote Access card has the Admin API bind selector");
+check(staticSrcNar.includes('bind_mode: "interface", bind_ip:'), "bind selector saves an interface choice with its address");
+check(staticSrcNar.includes("status.bind_fallback"), "Remote Access card shows the bind fallback reason");
+
+// Pairing QR (PLAN.md §3.8): rendered by the shell, inlined on the
+// pairing block through the guard that accepts only a bare <svg>.
+check(staticSrcNar.includes("pairingQrHtml(enroll.qr_svg)"), "pairing block renders the shell's QR");
+check(/function pairingQrHtml[\s\S]{0,600}<script/.test(staticSrcNar), "pairing QR guard rejects scriptable SVG");
 
 if (failures > 0) { console.error(`\n${failures} smoke check(s) failed`); process.exit(1); }
 console.log("\nsmoke: all checks passed");

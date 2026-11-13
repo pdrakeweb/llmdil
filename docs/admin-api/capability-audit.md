@@ -328,7 +328,7 @@ a pre-change config snapshot supports cancel.
 ### `get_gateway_config` — read
 - What: The gateway section of the config, with derived per-group enablement.
 - Entry: `get_gateway_config`, main.rs:2676. UI: yes.
-- In: none. Out: `GatewayConfig {port, bind_host, groups: [{name, members, strategy, fallbacks, enabled, enabled_members}], routing_rules: [{id, description, source, litellm_fragment}], request_log_len, openrouter: {enabled, cred_ref, daily_cap_usd, model_allowlist} | null}`. `enabled`/`enabled_members` are derived by `manager-gateway` (a group is enabled iff ≥1 member backend is enabled); never stored.
+- In: none. Out: `GatewayConfig {port, bind_host, groups: [{name, members, strategy, fallbacks, enabled, enabled_members}], routing_rules: [{id, description, source, litellm_fragment}], request_log_len, openrouter: {enabled, cred_ref, daily_cap_usd, model_allowlist} | null, effective_strategy: string | null}`. `enabled`/`enabled_members` are derived by `manager-gateway` (a group is enabled iff ≥1 member backend is enabled); never stored. `effective_strategy` is the global routing strategy the generated config applies (`manager_gateway::effective_global_strategy`; null when nothing would be generated).
 - Side effects: none.
 
 ### `update_gateway_config` — mutate
@@ -556,9 +556,9 @@ target names only.
 
 ### `winml_probe` — read (active probe)
 - What: Probe the WinMLServer secondary backend and record its limits.
-- Entry: `winml_probe`, main.rs:5683. UI: **no**.
+- Entry: `winml_probe`, main.rs:5683. UI: yes — the WinML card's **Re-check capabilities** button (Settings → General; tech spec §6.5 / P7).
 - In: none. Out: the probe report (`WinMlRegistration`-adjacent: availability + `WinMlLimits` — no tensor split, max 1 registered model, coarse GPU selection, experimental).
-- Side effects: HTTP probe of `http://127.0.0.1:<winml port>` (default 8090), 10 s transport timeout.
+- Side effects: HTTP probe of `http://127.0.0.1:<winml port>` (default 8090), 10 s transport timeout. With a model registered the probe goes through `WinMlRegistry::recheck_capabilities` on the registered port and refreshes the in-memory registration's limits (and a missing adapter hint); no persisted state changes.
 
 ### `winml_register` — mutate
 - What: Register a model with the Windows ML backend (tool-runner-class models only; the registry refuses ineligible classes).
@@ -625,7 +625,7 @@ several whole feature areas (MCP, WinML, updates policy) exist *only* here:
 - **Editor MCP config generation** — `manager_mcp::editor_mcp_config` generates the `mcpServers` JSON for Continue/Cline; used only in crate tests. Nothing writes it anywhere.
 - **Config backup-fallback signal** — `manager_config::load_detailed` reports `used_backup` (the config was recovered from the `.bak` last-known-good copy); the app loads with plain `load` at startup and the fact never surfaces.
 - **Supervisor graceful drain** — `SupervisedProcess::drain` (30 s default) exists only as part of stop/restart; there is no standalone drain-a-process capability.
-- **Global routing-strategy resolution** — `manager_gateway::resolve_global_strategy` has no command; the UI reimplements it in TypeScript (`effectiveGatewayStrategy` in `ui/src/api.ts`). Two implementations of one rule — the API should have exactly one, server-side.
+- ~~**Global routing-strategy resolution**~~ — resolved (Nov 2026): `manager_gateway::effective_global_strategy` (the generator's own rule over the groups it includes) is returned as `effective_strategy` on `get_gateway_config`; the UI's TypeScript copy (`effectiveGatewayStrategy`) is removed and the smoke harness keeps it out. The TS copy had also drifted: it counted configured rather than enabled members and ignored fallback-only groups.
 - **Catalog management** — the curated model catalog (`manager_models::curated_models`, `CATALOG_REVISION`) is compiled in; `ensure_catalog_models` (main.rs) seeds/repairs stored model metadata against it implicitly on config writes. There is no catalog read endpoint, no refresh trigger, and no way to see the catalog except through `list_models`.
 - **Orphan backend adoption** — at launch the app adopts llama-server processes started by a previous session (tracked by pid). Adoption is automatic and invisible as a capability; adopted backends show an `adopted` flag in `list_backends` and are stoppable, but there is no adopt/release operation.
 - **Gateway metrics polling** — a background loop scrapes LiteLLM's Prometheus endpoint every 15 s into `GatewayStatsStore` (`src-tauri/src/gateway_stats.rs`), producing the trailing-hour `requests_1h` / `errors_1h` / `throughput_toks` on `list_backends` and the in-flight gauge `gateway_quiesce_wait` reads. No command exposes the store, the raw metrics, or the poller's health.

@@ -31,6 +31,15 @@ pipelines stage them under `binaries/` with the target-triple
 suffix before any src-tauri build step — see
 [`binaries/README.md`](binaries/README.md).
 
+## Bundled operator scripts
+
+`bundle.resources` in `tauri.conf.json` installs the Prometheus
+operator scripts under `tools\prometheus\` in the install dir:
+`Invoke-ModelBaseline.ps1`, `Get-SystemSnapshot.ps1`, the fixed
+benchmark prompt set (`prompts\*.txt`) and their README. They are
+measurement tools Pete runs by hand, not part of the app; the source
+of truth stays in the repo's [`tools/prometheus/`](../tools/prometheus/README.md).
+
 ## Uninstall: user data is kept by default
 
 The uninstaller always removes app binaries. User data in

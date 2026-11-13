@@ -12,8 +12,10 @@
 //! - `main()` owns startup: config load, state management, and the
 //!   two background loops (wizard hydration, gateway metrics).
 //! - The admin API lifecycle (phase 2): when `admin_api.enabled` is
-//!   set, the API is hosted in-process on all interfaces with the
-//!   scoped firewall rule reconciled on enable/disable. The
+//!   set, the API is hosted in-process on the configured bind choice
+//!   (`admin_api.bind_mode`: loopback, all interfaces — the default —
+//!   or one interface address) with the scoped firewall rule
+//!   reconciled on enable/disable when the bind needs one. The
 //!   hand-written `admin_api_*` commands at the bottom are the
 //!   Remote Access settings page's controls — desktop-local server
 //!   management, not app capabilities, so they live here rather
@@ -48,6 +50,9 @@ pub struct ApiServerSlot {
     /// Why the listener's certificate is the one it is (SEC-08):
     /// `CertSource::as_str()` plus the regeneration detail, if any.
     pub cert: std::sync::Mutex<Option<(&'static str, Option<String>)>>,
+    /// What the running listener bound, and why when it fell back to
+    /// loopback from the configured choice (auth-plan §5).
+    pub bind: std::sync::Mutex<Option<manager_api::bind::BindPlan>>,
 }
 
 /// The auth service shared by the API server and the desktop's
@@ -201,6 +206,7 @@ fn main() {
                 server: std::sync::Mutex::new(None),
                 note: std::sync::Mutex::new(None),
                 cert: std::sync::Mutex::new(None),
+                bind: std::sync::Mutex::new(None),
             });
             // The API user store + auth service, shared between the
             // HTTP server and this shell's admin commands.
@@ -326,7 +332,7 @@ fn main() {
                         app_state,
                         api_data_dir,
                         auth.inner().0.clone(),
-                        admin_api.port,
+                        &admin_api,
                         slot.inner(),
                     )
                     .await;
@@ -377,37 +383,49 @@ fn main() {
         .expect("failed to run Local LLM Service Manager");
 }
 
-/// Start the API on all interfaces with TLS and reconcile the
-/// scoped firewall rule. Shared by app startup and the settings
-/// page's enable action. The stored certificate is reused (SEC-08);
-/// why it is the one in use is recorded in `slot.cert` for status.
+/// Start the API with TLS on the configured bind choice (auth-plan
+/// §5: loopback, all interfaces, or one interface address — a
+/// missing interface address falls back to loopback, never wider)
+/// and reconcile the scoped firewall rule when the bind needs one.
+/// Shared by app startup and the settings page's enable action. The
+/// stored certificate is reused (SEC-08); why it is the one in use is
+/// recorded in `slot.cert`, and the effective bind in `slot.bind`.
 async fn start_admin_api(
     app_state: Arc<AppState>,
     data_dir: std::path::PathBuf,
     auth: Arc<AuthService>,
-    port: u16,
+    api: &manager_config::AdminApiConfig,
     slot: &ApiServerSlot,
 ) -> Result<manager_api::ApiServer, String> {
+    let port = api.port;
     let load = manager_api::tls::ensure_cert(&data_dir, &cert_sans())
         .map_err(|e| format!("TLS setup failed: {e}"))?;
     *slot.cert.lock().unwrap() = Some((load.source.as_str(), load.detail.clone()));
     let tls = load.material;
+    let plan = manager_api::bind::resolve_now(api);
+    if let Some(why) = &plan.fallback {
+        eprintln!("admin api: {why}");
+    }
     let ctx = manager_api::ApiCtx::with_auth(app_state, data_dir, auth);
     let server = manager_api::ApiServer::start_ctx(
         ctx,
         manager_api::ApiOptions {
-            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            bind: plan.addr,
             port,
             tls: Some(tls),
         },
     )
     .await
     .map_err(|e| e.to_string())?;
-    if let Err(e) = manager_api::firewall::ensure(port).await {
-        // The API still serves on the LAN interfaces the host
-        // firewall already permits; the settings page shows the
-        // note and offers the repair by toggling.
-        tracing::warn!("admin api: firewall rule not applied: {e}");
+    let rule_needed = manager_api::firewall::rule_needed(plan.addr);
+    *slot.bind.lock().unwrap() = Some(plan);
+    if rule_needed {
+        if let Err(e) = manager_api::firewall::ensure(port).await {
+            // The API still serves on the LAN interfaces the host
+            // firewall already permits; the settings page shows the
+            // note and offers the repair by toggling.
+            tracing::warn!("admin api: firewall rule not applied: {e}");
+        }
     }
     Ok(server)
 }
@@ -464,28 +482,46 @@ fn tailscale_ip() -> Option<std::net::IpAddr> {
 }
 
 /// The current `admin_api` settings, read through the app's own
-/// config operation.
-async fn admin_api_settings(st: &Arc<AppState>, app: &AppHandle) -> Result<(bool, u16), String> {
+/// config operation (bind choice included); a missing or unreadable
+/// section is the defaults.
+async fn admin_api_config(
+    st: &Arc<AppState>,
+    app: &AppHandle,
+) -> Result<manager_config::AdminApiConfig, String> {
     let sink: Arc<dyn EventSink> = Arc::new(TauriSink(app.clone()));
     let cfg = manager_app::registry::dispatch(st, &sink, Op::GetConfig, json!({}))
         .await
         .map_err(|e| e.to_string())?;
-    let enabled = cfg
-        .pointer("/admin_api/enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let port = cfg
-        .pointer("/admin_api/port")
-        .and_then(Value::as_u64)
-        .unwrap_or(47821) as u16;
-    Ok((enabled, port))
+    Ok(cfg
+        .get("admin_api")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default())
 }
 
-fn lan_base_url(port: u16) -> String {
-    match primary_lan_ip() {
-        Some(ip) => format!("https://{ip}:{port}"),
-        None => format!("https://127.0.0.1:{port}"),
+/// The bind the listener has (while running) or would get if started
+/// now from `api` (auth-plan §5 resolution, loopback fallback).
+fn effective_bind(
+    slot: &ApiServerSlot,
+    api: &manager_config::AdminApiConfig,
+) -> manager_api::bind::BindPlan {
+    let running = slot.server.lock().unwrap().is_some();
+    let current = slot.bind.lock().unwrap().clone();
+    match current {
+        Some(plan) if running => plan,
+        _ => manager_api::bind::resolve_now(api),
     }
+}
+
+/// The base URL clients pair against for the effective bind.
+fn api_base_url(slot: &ApiServerSlot, api: &manager_config::AdminApiConfig) -> String {
+    let bind = effective_bind(slot, api).addr;
+    let lan = if bind.is_unspecified() {
+        primary_lan_ip()
+    } else {
+        None
+    };
+    manager_api::bind::base_url(bind, api.port, lan)
 }
 
 /// Status for the Remote Access settings card.
@@ -496,10 +532,24 @@ async fn admin_api_get_status(
     slot: State<'_, ApiServerSlot>,
     auth: State<'_, AdminAuth>,
 ) -> Result<Value, String> {
-    let (enabled, port) = admin_api_settings(state.inner(), &app).await?;
+    let api = admin_api_config(state.inner(), &app).await?;
+    let (enabled, port) = (api.enabled, api.port);
     let data_dir = state.inner().data_dir().to_path_buf();
     let running = slot.inner().server.lock().unwrap().is_some();
     let note = slot.inner().note.lock().unwrap().clone();
+    // Bind choice (auth-plan §5): what is bound (or would be, if
+    // started now), the loopback-fallback reason when the configured
+    // interface address is absent, and the addresses the operator can
+    // pick from.
+    let bind = effective_bind(slot.inner(), &api);
+    let bind_candidates: Vec<String> =
+        tauri::async_runtime::spawn_blocking(manager_api::bind::interface_addresses)
+            .await
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|ip| ip.to_string())
+            .collect();
+    let firewall_needed = manager_api::firewall::rule_needed(bind.addr);
     let (users, admins) = auth
         .inner()
         .0
@@ -548,8 +598,13 @@ async fn admin_api_get_status(
         "enabled": enabled,
         "running": running,
         "port": port,
-        "bind": "0.0.0.0",
-        "base_url": if running { Value::String(lan_base_url(port)) } else { Value::Null },
+        "bind": bind.addr.to_string(),
+        "bind_mode": api.bind_mode,
+        "bind_ip": api.bind_ip,
+        "bind_fallback": bind.fallback,
+        "bind_candidates": bind_candidates,
+        "firewall_needed": firewall_needed,
+        "base_url": if running { Value::String(api_base_url(slot.inner(), &api)) } else { Value::Null },
         "cert_sha256": manager_api::tls::stored_fingerprint(&data_dir),
         "cert_source": cert_source,
         "cert_detail": cert_detail,
@@ -575,7 +630,8 @@ async fn admin_api_set_enabled(
     enabled: bool,
 ) -> Result<Value, String> {
     let st = state.inner().clone();
-    let (_, port) = admin_api_settings(&st, &app).await?;
+    let mut api = admin_api_config(&st, &app).await?;
+    let port = api.port;
     let sink: Arc<dyn EventSink> = Arc::new(TauriSink(app.clone()));
     manager_app::registry::dispatch(
         &st,
@@ -585,13 +641,14 @@ async fn admin_api_set_enabled(
     )
     .await
     .map_err(|e| e.to_string())?;
+    api.enabled = enabled;
     if enabled {
         let data_dir = st.data_dir().to_path_buf();
         match start_admin_api(
             st.clone(),
             data_dir,
             auth.inner().0.clone(),
-            port,
+            &api,
             slot.inner(),
         )
         .await
@@ -703,12 +760,20 @@ async fn admin_api_reset_password(auth: State<'_, AdminAuth>, id: String) -> Res
 async fn admin_api_get_pairing(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
+    slot: State<'_, ApiServerSlot>,
 ) -> Result<Value, String> {
-    let (_, port) = admin_api_settings(state.inner(), &app).await?;
+    let api = admin_api_config(state.inner(), &app).await?;
     let data_dir = state.inner().data_dir().to_path_buf();
+    let base_url = api_base_url(slot.inner(), &api);
+    let cert = manager_api::tls::stored_fingerprint(&data_dir);
+    // The QR encodes exactly the two values returned beside it.
+    let qr_svg = manager_api::pairing::pairing_qr_svg(&base_url, cert.as_deref(), None)
+        .ok()
+        .flatten();
     Ok(json!({
-        "base_url": lan_base_url(port),
-        "cert_sha256": manager_api::tls::stored_fingerprint(&data_dir),
+        "base_url": base_url,
+        "cert_sha256": cert,
+        "qr_svg": qr_svg,
     }))
 }
 
@@ -718,10 +783,11 @@ async fn admin_api_get_pairing(
 async fn admin_api_create_enrollment(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
+    slot: State<'_, ApiServerSlot>,
     auth: State<'_, AdminAuth>,
     user_id: String,
 ) -> Result<Value, String> {
-    let (_, port) = admin_api_settings(state.inner(), &app).await?;
+    let api = admin_api_config(state.inner(), &app).await?;
     let data_dir = state.inner().data_dir().to_path_buf();
     let code = auth
         .inner()
@@ -729,10 +795,19 @@ async fn admin_api_create_enrollment(
         .create_enrollment_code(&user_id)
         .await
         .map_err(|e| e.to_string())?;
+    let base_url = api_base_url(slot.inner(), &api);
+    let cert = manager_api::tls::stored_fingerprint(&data_dir);
+    // The QR (PLAN.md §3.8) encodes exactly the three values returned
+    // beside it — the ones the card already shows as text. A render
+    // failure leaves the text values, which pair just the same.
+    let qr_svg = manager_api::pairing::pairing_qr_svg(&base_url, cert.as_deref(), Some(&code))
+        .ok()
+        .flatten();
     Ok(json!({
-        "base_url": lan_base_url(port),
-        "cert_sha256": manager_api::tls::stored_fingerprint(&data_dir),
+        "base_url": base_url,
+        "cert_sha256": cert,
         "enrollment_code": code,
+        "qr_svg": qr_svg,
     }))
 }
 
@@ -748,7 +823,7 @@ async fn admin_api_regenerate_cert(
     auth: State<'_, AdminAuth>,
 ) -> Result<Value, String> {
     let st = state.inner().clone();
-    let (_, port) = admin_api_settings(&st, &app).await?;
+    let api = admin_api_config(&st, &app).await?;
     let data_dir = st.data_dir().to_path_buf();
     // The only path that changes the key or the SANs (SEC-08): the
     // current addresses are taken here, at the operator's request.
@@ -764,7 +839,7 @@ async fn admin_api_regenerate_cert(
         if let Some(old) = old {
             old.shutdown().await;
         }
-        match start_admin_api(st, data_dir, auth.inner().0.clone(), port, slot.inner()).await {
+        match start_admin_api(st, data_dir, auth.inner().0.clone(), &api, slot.inner()).await {
             Ok(server) => {
                 *slot.inner().server.lock().unwrap() = Some(server);
                 // The restart loaded the material regenerated above;
@@ -796,7 +871,15 @@ async fn admin_api_apply_firewall_rule(
     slot: State<'_, ApiServerSlot>,
     auth: State<'_, AdminAuth>,
 ) -> Result<Value, String> {
-    let (_, port) = admin_api_settings(state.inner(), &app).await?;
+    let api = admin_api_config(state.inner(), &app).await?;
+    // Consistent with the bind choice: a loopback-only listener needs
+    // no inbound rule, so none is created for it.
+    if !manager_api::firewall::rule_needed(effective_bind(slot.inner(), &api).addr) {
+        return Err(
+            "no firewall rule is needed: the Admin API listens on loopback only".to_string(),
+        );
+    }
+    let port = api.port;
     manager_api::firewall::ensure(port)
         .await
         .map_err(|e| format!("firewall rule failed: {e}"))?;

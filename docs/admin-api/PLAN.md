@@ -920,11 +920,16 @@ replayed on reconnect; ids let a client detect gaps.
   Manager. The in-process server reads it at startup before any
   UI exists; the directory is per-user app data alongside
   `admin-users.json`. Moving custody is future hardening.
-- QR rendering: the desktop pairing surface shows the payload
-  (`base_url`, `cert_sha256`, enrollment code) as copyable values;
-  no QR library was installable in the build environment. The
-  payload format is the QR content, so rendering is additive
-  later.
+- QR rendering (resolved Nov 2026): the desktop pairing surface
+  shows the payload (`base_url`, `cert_sha256`, enrollment code) as
+  copyable values **and** as a QR code encoding the same three values
+  as compact JSON (`{"base_url":…,"cert_sha256":…,"enrollment_code":…}`).
+  The shell renders it with the `qrcode` crate (0.14, SVG renderer
+  only, error-correction level M; `manager_api::pairing`) and returns
+  it as `qr_svg` beside the values on `admin_api_create_enrollment`
+  / `admin_api_get_pairing`; the card inlines the `<svg>` (the CSP
+  admits no `data:` images). No value beyond those already shown as
+  text is encoded.
 - Certificate SAN set: hostname + primary LAN IP + Tailscale IP
   (when the CLI reports one) + loopback, regenerated when the set
   changes at enable time; rotation is a desktop action that

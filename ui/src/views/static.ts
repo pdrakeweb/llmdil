@@ -23,11 +23,11 @@ import {
   modelHfLookup, modelHfSuggest, modelHfHeader,
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
   getGatewayMasterKey, setGatewayBindHost, openRouterSpendBannerHtml,
-  updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
+  updateGatewayConfig, gatewayStop,
   getActivationPlan, activationCancelChanges, activationComplete, quiesceWait,
   recordActivationExecution, getActivationHistory, getActivationExecution,
   getAppConfig, getMxcPolicy, getMxcActivity, setMxcMode, mxcRunSelfTest,
-  setNotificationConfig, sendTestNotification, updateAppConfig, updatesPin, updatesSetAuto,
+  setNotificationConfig, sendTestNotification, updateAppConfig, winmlRecheckCapabilities, updatesPin, updatesSetAuto,
   getAppUpdateStatus, appUpdateCheck, appUpdateSetChecking, appUpdateSetAuto, appUpdateDownload,
   servicesList, servicesRegister, servicesUnregister, setSupervisionMode,
   logReceiverStatus, logReceiverDeploy, logReceiverRemove, logReceiverFlipEndpoint,
@@ -7207,7 +7207,9 @@ function gatewayPaint(
   </div>`;
   })();
 
-  const effStrategy = effectiveGatewayStrategy(cfg);
+  // Computed by the backend (get_gateway_config.effective_strategy)
+  // with the config generator's own rule; never re-derived here.
+  const effStrategy = cfg.effective_strategy;
 
   /* ---- Routing section: one section, two views (Flow | Groups).
    * The section top carries the one answer-level fact — the
@@ -8561,6 +8563,8 @@ function settingsPaint(
         <label style="font-size:12px;color:var(--text2)">Port <input id="setWinmlPort" type="number" min="1" max="65535" value="${typeof winml.port === "number" ? winml.port : 8090}" style="width:90px;font-size:12px"></label>
         <label style="font-size:12px;color:var(--text2)">Model <input id="setWinmlModel" type="text" value="${esc(primStr(winml.model_id) ?? "")}" placeholder="model id" style="width:180px;font-size:12px"></label>
         <button class="btn" id="setWinmlApply" style="padding:1px 7px;font-size:11px">Apply</button>
+        <button class="btn" id="setWinmlRecheck" style="padding:1px 7px;font-size:11px">Re-check capabilities</button>
+        <span class="info-tip" title="Probes the Windows ML server now and reports what it serves and its limits. With a model registered, the registration's recorded limits are refreshed from the probe.">${icon("info")}</span>
       </div></div>` : "";
   const postgresEditor = pgPort !== null ? `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border)">
       <span class="k">PostgreSQL port<span class="info-tip" title="Loopback port of the app-managed PostgreSQL server the gateway migrates against at launch. Saved immediately and validated against every other claimed port; it applies the next time PostgreSQL starts — a running gateway keeps the server it started with.">${icon("info")}</span></span>
@@ -8702,6 +8706,20 @@ function certNotes(status: AdminApiStatus): string {
   return notes.join("");
 }
 
+/** The pairing QR (PLAN.md §3.8): the shell renders it as an inline
+ *  <svg> of black/white modules from exactly the values listed below
+ *  it (the CSP admits no data: images, so it is inlined). Accepted
+ *  only as a bare <svg> element with nothing scriptable in it;
+ *  anything else renders nothing and the text values still pair. */
+function pairingQrHtml(svg: string | null | undefined): string {
+  if (!svg) return "";
+  const s = svg.trim();
+  const lower = s.toLowerCase();
+  if (!lower.startsWith("<svg") || !lower.endsWith("</svg>")) return "";
+  if (lower.includes("<script") || lower.includes("<foreignobject") || /\son[a-z]+\s*=/.test(lower) || lower.includes("javascript:")) return "";
+  return `<div class="ra-qr" role="img" aria-label="Pairing QR code" style="display:inline-block;margin:8px 0;background:#fff;line-height:0">${s}</div>`;
+}
+
 /** Remote Access tab: the admin API's state, its users, and
  *  device pairing. Values are Label: Value rows with copy buttons
  *  (the global [data-copy-value] handler serves them); state the
@@ -8721,11 +8739,35 @@ function remoteAccessHtml(
     : status.enabled
       ? `<span style="color:var(--err)">Enabled \u2014 not running</span>`
       : `<span style="color:var(--text2)">Disabled</span>`;
-  const fwText = status.firewall === "ok" ? "Allowed: local subnet + Tailscale"
+  const fwText = status.firewall_needed === false ? "Not needed (loopback only)"
+    : status.firewall === "ok" ? "Allowed: local subnet + Tailscale"
     : status.firewall === "missing" ? "Rule missing"
     : status.firewall === "drifted" ? "Rule differs from expected"
     : status.firewall === "unsupported" ? "Not reported on this platform"
     : "Unknown";
+  // Bind choice (auth-plan §5). Options: loopback, all interfaces,
+  // or one of this machine's current addresses; a configured address
+  // that is no longer present stays listed (marked) so the saved
+  // choice is visible rather than silently replaced.
+  const bindMode = status.bind_mode ?? "all";
+  const bindIp = status.bind_ip ?? null;
+  const candidates = [...(status.bind_candidates ?? [])];
+  if (bindIp && !candidates.includes(bindIp)) candidates.push(bindIp);
+  const bindSel = bindMode === "interface" && bindIp ? `ip:${bindIp}` : bindMode;
+  const bindOptions = [
+    { value: "loopback", label: "This computer only (127.0.0.1)" },
+    { value: "all", label: "All interfaces (LAN + Tailscale)" },
+    ...candidates.map((ip) => ({
+      value: `ip:${ip}`,
+      label: `Interface ${ip}${(status.bind_candidates ?? []).includes(ip) ? "" : " (not present)"}`,
+    })),
+  ];
+  const bindEditor = `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border)">
+      <span class="k">Listen on<span class="info-tip" title="Which addresses the Admin API listens on. This computer only: reachable from this machine alone, no firewall rule. All interfaces: the LAN and Tailscale, limited by the firewall rule to the local subnet and the Tailscale range. Interface: one address of this machine, under the same rule. If that address is missing when the API starts, it listens on this computer only and says why. Saved through the generic config patch; applies when the API is switched off and on, or the app restarts.">${icon("info")}</span></span>
+      <span style="display:flex;gap:6px;align-items:center">
+        <select id="raBind" style="font-size:12px">${bindOptions.map((o) => `<option value="${esc(o.value)}"${o.value === bindSel ? " selected" : ""}>${esc(o.label)}</option>`).join("")}</select>
+        <button class="btn" data-ra-bind-save style="padding:1px 7px;font-size:11px">Apply</button>
+      </span></div>`;
   const rows: SettingsRow[] = [
     { key: "Bind", value: status.bind },
     { key: "Firewall rule", value: fwText },
@@ -8752,7 +8794,9 @@ function remoteAccessHtml(
         <input id="raPort" type="number" min="1" max="65535" value="${status.port}" style="width:100px;font-size:12px">
         <button class="btn" data-ra-port-save style="padding:1px 7px;font-size:11px">Apply</button>
       </span></div>
+    ${bindEditor}
     ${settingsRows(rows)}
+    ${status.bind_fallback ? `<div style="font-size:12px;color:var(--warn);margin-top:6px">${esc(status.bind_fallback)}</div>` : ""}
     ${status.note ? `<div style="font-size:12px;color:var(--err);margin-top:6px">${esc(status.note)}</div>` : ""}
     <div class="card-actions" style="margin-top:10px">${enableSwitch({ on: status.enabled, name: "Admin API", attrs: "data-ra-toggle" })}
     <button class="btn" data-ra-regen>Regenerate certificate</button></div>
@@ -8768,7 +8812,7 @@ function remoteAccessHtml(
     ${audit.length ? `<div style="font-size:12px;color:var(--text2);margin-top:16px">Audit log<span class="info-tip" title="Every API mutation and sign-in event, newest first. Full log: logs/admin-api-audit.jsonl in the data directory.">${icon("info")}</span></div>
     <div style="font-size:12px">${audit.map((e) => `<div style="display:flex;justify-content:space-between;gap:16px;padding:2px 0"><span>${esc(new Date(e.ts_ms).toLocaleString())} \u00b7 ${esc(e.actor)} \u00b7 ${esc(e.action)}${e.target ? ` \u00b7 ${esc(e.target)}` : ""}</span><span style="color:${e.result.startsWith("2") ? "var(--ok)" : "var(--err)"}">${esc(e.result)}</span></div>`).join("")}</div>` : ""}
     ${temp ? `<div style="margin-top:12px">${settingsRows([{ key: `Temporary password \u00b7 ${temp.user}`, value: temp.password, copy: temp.password, tip: "Shown once. The user must change it at first sign-in." }])}</div>` : ""}
-    ${enroll ? `<div style="margin-top:12px"><div style="font-size:12px;color:var(--text2)">Pairing \u00b7 ${esc(enroll.user)}<span class="info-tip" title="Enter these values in the LLMdil app to pair this device. The code is single-use and expires in 10 minutes.">${icon("info")}</span></div>${settingsRows([
+    ${enroll ? `<div style="margin-top:12px"><div style="font-size:12px;color:var(--text2)">Pairing \u00b7 ${esc(enroll.user)}<span class="info-tip" title="Scan the code with the LLMdil app, or enter these values in it, to pair this device. The code is single-use and expires in 10 minutes.">${icon("info")}</span></div>${pairingQrHtml(enroll.qr_svg)}${settingsRows([
       { key: "Base URL", value: enroll.base_url, copy: enroll.base_url },
       { key: "Certificate SHA-256", value: enroll.cert_sha256 ?? "", copy: enroll.cert_sha256 ?? undefined },
       { key: "Enrollment code", value: enroll.enrollment_code ?? "", copy: enroll.enrollment_code ?? undefined },
@@ -9119,6 +9163,24 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       return;
     }
 
+    const winmlRecheck = t.closest("#setWinmlRecheck") as HTMLButtonElement | null;
+    if (winmlRecheck) {
+      winmlRecheck.disabled = true;
+      setMsg("Probing Windows ML…");
+      const r = await winmlRecheckCapabilities();
+      if (disposed) return;
+      winmlRecheck.disabled = false;
+      if (r.error || !r.data) {
+        setMsg(`Windows ML re-check failed: ${r.error ?? "no report"}`, true);
+        return;
+      }
+      const rep = r.data;
+      const serves = rep.models.length ? rep.models.join(", ") : "no models listed";
+      const split = rep.limits.supports_tensor_split === true ? "supported" : "not supported";
+      setMsg(`Windows ML at ${rep.base_url}: serves ${serves} · adapter ${rep.adapter_hint ?? "not reported"} · tensor split ${split}`);
+      return;
+    }
+
     const pgApply = t.closest("#setPgApply") as HTMLButtonElement | null;
     if (pgApply) {
       const port = Math.round(Number((root.querySelector("#setPgPort") as HTMLInputElement | null)?.value));
@@ -9155,6 +9217,31 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
         return;
       }
       setMsg("Admin API port saved — switch the API off and on, or restart the app, to apply it.");
+      await load();
+      return;
+    }
+
+    const raBindSave = t.closest("[data-ra-bind-save]") as HTMLButtonElement | null;
+    if (raBindSave) {
+      const sel = (root.querySelector("#raBind") as HTMLSelectElement | null)?.value ?? "";
+      // Loopback / all keep any remembered interface address; an
+      // interface choice sends the address with it.
+      const patch: Record<string, unknown> = sel.startsWith("ip:")
+        ? { bind_mode: "interface", bind_ip: sel.slice(3) }
+        : { bind_mode: sel };
+      if (!["loopback", "all", "interface"].includes(String(patch.bind_mode))) {
+        setMsg("Choose where the Admin API listens.", true);
+        return;
+      }
+      raBindSave.disabled = true;
+      const r = await updateAppConfig({ admin_api: patch });
+      if (disposed) return;
+      if (r.error) {
+        setMsg(`Admin API bind not saved: ${r.error}`, true);
+        raBindSave.disabled = false;
+        return;
+      }
+      setMsg("Admin API bind saved — switch the API off and on, or restart the app, to apply it.");
       await load();
       return;
     }

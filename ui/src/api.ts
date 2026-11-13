@@ -468,7 +468,7 @@ export async function getDashboard(): Promise<CallResult<DashboardModel>> {
   const data: DashboardModel = {
     gateway, backends, gpus: g.data.gpus, placement: placementFromConfig(cfg.data, g.data.gpus, backends),
     gatewayUp: !gw.error && gw.data.up,
-    gatewayStrategy: gwCfg.data ? effectiveGatewayStrategy(gwCfg.data) : null,
+    gatewayStrategy: gwCfg.data ? gwCfg.data.effective_strategy : null,
     gatewayError: gw.error,
     openrouterSpend: gw.error ? null : gw.data.openrouter_spend ?? null,
     stale: g.data.stale, updatedAt: Date.now(),
@@ -2071,6 +2071,12 @@ export interface GatewayConfigData {
   routing_rules: GatewayRule[];
   request_log_len: number;
   openrouter: GatewayOpenRouter | null;
+  /** The one global routing strategy LiteLLM will apply, computed by
+   *  the backend with the config generator's own rule
+   *  (manager-gateway effective_global_strategy) — never re-derived
+   *  here. Null when no gateway config would be generated (or an
+   *  older backend did not send it). */
+  effective_strategy: string | null;
 }
 
 /** get_gateway_config — LiteLLM gateway configuration from AppConfig.
@@ -2120,6 +2126,7 @@ export async function getGatewayConfig(): Promise<CallResult<GatewayConfigData |
         fragment_raw: r.litellm_fragment === undefined ? undefined : r.litellm_fragment,
       })) : [],
       request_log_len: typeof raw.request_log_len === "number" ? raw.request_log_len : 0,
+      effective_strategy: typeof raw.effective_strategy === "string" ? raw.effective_strategy : null,
       openrouter: or && typeof or === "object"
         ? {
             enabled: Boolean(or.enabled),
@@ -2133,22 +2140,6 @@ export async function getGatewayConfig(): Promise<CallResult<GatewayConfigData |
   } catch (e) {
     return { data: null, live: true, error: errOf(e) };
   }
-}
-
-/** The one global routing strategy LiteLLM will apply, resolved with
- *  the same rule the config generator uses (manager-gateway's
- *  resolve_global_strategy) over the groups the generator includes
- *  — enabled groups only: the first multi-member group's strategy,
- *  else the planner group's, else the first group's. Null when no
- *  enabled group exists. */
-export function effectiveGatewayStrategy(cfg: GatewayConfigData): string | null {
-  const included = cfg.groups.filter((g) => g.enabled);
-  if (!included.length) return null;
-  const multi = included.find((g) => g.members.length > 1);
-  if (multi) return multi.strategy;
-  const planner = included.find((g) => g.name === "planner");
-  if (planner) return planner.strategy;
-  return included[0].strategy;
 }
 
 export interface GatewayStatusData {
@@ -2922,6 +2913,28 @@ export async function updateAppConfig(patch: Record<string, unknown>): Promise<C
     return { data, live: true };
   } catch (e) {
     return { data: { ok: false }, live: true, error: errOf(e) };
+  }
+}
+
+/** winml_probe result (manager-winml WinMlProbeReport). */
+export interface WinMlProbeReport {
+  base_url: string;
+  models: string[];
+  adapter_hint: string | null;
+  limits: { supports_tensor_split?: boolean } & Record<string, unknown>;
+}
+
+/** "Re-check capabilities" on the WinML card: winml_probe re-probes
+ *  WinMLServer. With a model registered it goes through the registry
+ *  and refreshes the registration's limits (tech spec §6.5);
+ *  otherwise it probes the configured port. */
+export async function winmlRecheckCapabilities(): Promise<CallResult<WinMlProbeReport | null>> {
+  if (!isTauri()) return { data: null, live: false, error: "winml_probe is not available in sample mode" };
+  try {
+    const data = await invoke<WinMlProbeReport>("winml_probe");
+    return { data, live: true };
+  } catch (e) {
+    return { data: null, live: true, error: errOf(e) };
   }
 }
 
@@ -4625,7 +4638,21 @@ export interface AdminApiStatus {
   enabled: boolean;
   running: boolean;
   port: number;
+  /** The address the listener has bound (or would bind if started
+   *  now): 127.0.0.1, 0.0.0.0 (all interfaces) or one interface. */
   bind: string;
+  /** Configured bind choice (auth-plan §5): loopback | all |
+   *  interface. Optional: older shells do not send it. */
+  bind_mode?: string;
+  /** The configured interface address (kept across mode changes). */
+  bind_ip?: string | null;
+  /** Why the listener fell back to loopback from the configured
+   *  interface address (never widened); null when it did not. */
+  bind_fallback?: string | null;
+  /** This machine's current interface addresses, for the selector. */
+  bind_candidates?: string[];
+  /** False when the bind is loopback-only: no inbound rule needed. */
+  firewall_needed?: boolean;
   base_url: string | null;
   cert_sha256: string | null;
   /** Why the listener's certificate is the one in use (SEC-08):
@@ -4660,6 +4687,7 @@ export interface AdminApiUser {
 
 const emptyStatus: AdminApiStatus = {
   enabled: false, running: false, port: 47821, bind: "0.0.0.0",
+  bind_mode: "all", bind_ip: null, bind_fallback: null, bind_candidates: [], firewall_needed: true,
   base_url: null, cert_sha256: null, cert_source: null, cert_detail: null,
   cert_not_after_ms: null, san_drift: false, san_drift_ips: [], firewall: "unsupported",
   note: null, user_count: 0, admin_count: 0,
@@ -4739,6 +4767,11 @@ export interface AdminApiPairing {
   base_url: string;
   cert_sha256: string | null;
   enrollment_code?: string;
+  /** The pairing QR (PLAN.md §3.8) as an inline <svg>, rendered by the
+   *  shell (manager-api pairing module) from exactly the values above
+   *  ({ base_url, cert_sha256, enrollment_code } JSON). Null without a
+   *  certificate fingerprint; absent from older shells. */
+  qr_svg?: string | null;
 }
 
 export async function adminApiCreateEnrollment(userId: string): Promise<CallResult<AdminApiPairing | null>> {

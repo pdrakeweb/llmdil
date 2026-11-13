@@ -21,10 +21,12 @@ use crate::operations::OperationStore;
 pub mod audit;
 pub mod auth;
 pub mod auth_routes;
+pub mod bind;
 pub mod composites;
 pub mod firewall;
 pub mod http;
 pub mod operations;
+pub mod pairing;
 pub mod tls;
 pub mod users;
 

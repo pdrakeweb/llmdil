@@ -55,6 +55,11 @@ jobs:
             if (-not (Test-Path "$dir\$sidecar")) { throw "bundled sidecar missing from install: $sidecar" }
             Write-Host "Bundled sidecar present: $sidecar"
           }
+          # Operator scripts bundled as resources (tools/prometheus/README.md).
+          foreach ($res in @("tools\prometheus\Invoke-ModelBaseline.ps1", "tools\prometheus\Get-SystemSnapshot.ps1", "tools\prometheus\prompts\planner-1-planning.txt")) {
+            if (-not (Test-Path "$dir\$res")) { throw "bundled resource missing from install: $res" }
+            Write-Host "Bundled resource present: $res"
+          }
           echo "APP_EXE=$($appExe.FullName)" >> $env:GITHUB_ENV
 
       - name: Launch smoke test
