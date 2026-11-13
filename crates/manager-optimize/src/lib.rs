@@ -73,8 +73,8 @@ pub use eval::{
 pub use experiment::{
     apply_experiment_decision, experiment_fingerprint, experiment_result_fact, fit_verdict_text,
     is_hf_form, is_temp_backend_id, lowest_free_port, resolve_candidate, temp_backend_config,
-    temp_backend_id, validate_experiment, validate_experiment_for_plan, ActiveExperiment,
-    CandidateResolution, ExperimentEstimate, ExperimentFlags, ExperimentJournal,
+    temp_backend_config_mapped, temp_backend_id, validate_experiment, validate_experiment_for_plan,
+    ActiveExperiment, CandidateResolution, ExperimentEstimate, ExperimentFlags, ExperimentJournal,
     ExperimentMeasured, ExperimentPredicted, ExperimentProposal, ExperimentProvisioning,
     ExperimentResult, ExperimentStatus, ExperimentValidation, RegisteredModelFile,
     BATCH_TIMEOUT_SECS, EXPERIMENT_TIMEOUT_SECS, MAX_EXPERIMENTS, TEMP_BACKEND_ID_PREFIX,
@@ -99,10 +99,10 @@ pub use probe::{probe_hardware, HardwareProbe};
 pub use tuning::{
     adopt_is_default, cache_fa_offered, cache_ladder, context_cache_values, context_values,
     moe_cache_values, offload_values, placement_values, plan_filter, planned_arm_count, rank_arms,
-    slot_values, spec_values, thermal_tripped, tuning_temp_backend, winner_index, ArmPricing,
-    ArmStatus, Descent, ResidencyVerdict, SweepPlan, SweepState, TuningArm, TuningConfirmation,
-    TuningCoords, TuningExclusion, TuningGpu, TuningInputs, TuningStore, TuningSweep, AXIS_ORDER,
-    THERMAL_ABORT_C, THERMAL_ABORT_STREAK, TUNING_ARM_TIMEOUT_SECS, TUNING_MAX_ARMS,
-    TUNING_SWEEP_TIMEOUT_SECS,
+    slot_values, spec_values, thermal_tripped, tuning_temp_backend, tuning_temp_backend_mapped,
+    winner_index, ArmPricing, ArmStatus, Descent, ResidencyVerdict, SweepPlan, SweepState,
+    TuningArm, TuningConfirmation, TuningCoords, TuningExclusion, TuningGpu, TuningInputs,
+    TuningStore, TuningSweep, AXIS_ORDER, THERMAL_ABORT_C, THERMAL_ABORT_STREAK,
+    TUNING_ARM_TIMEOUT_SECS, TUNING_MAX_ARMS, TUNING_SWEEP_TIMEOUT_SECS,
 };
 pub use validate::{validate_plan, ItemValidation, LiveSnapshot, ValidationStatus};

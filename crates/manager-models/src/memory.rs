@@ -116,7 +116,8 @@ pub fn offload_for_layers(layers: u32, moe_layers: u32) -> ExpertOffload {
 /// conversions are the identity — the pre-map behaviour, which is
 /// exact for models whose MoE blocks are blocks `0..N` and
 /// otherwise remains an Estimate.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "Vec<u32>", into = "Vec<u32>")]
 pub struct MoeBlockMap {
     blocks: Vec<u32>,
 }
@@ -153,8 +154,10 @@ impl MoeBlockMap {
     /// block plus one (0 for 0; past the last MoE block, the bound
     /// of the last one).
     pub fn bound_for_layers(&self, layers: u32) -> u32 {
-        if layers == 0 {
-            return 0;
+        if layers == 0 || self.blocks.is_empty() {
+            // (An empty map only arises from deserializing `[]`:
+            // the identity, as with no map at all.)
+            return layers;
         }
         let k = (layers as usize).min(self.blocks.len());
         self.blocks[k - 1].saturating_add(1)
@@ -163,7 +166,24 @@ impl MoeBlockMap {
     /// The number of MoE blocks `--n-cpu-moe bound` moves: those
     /// with block index `< bound`.
     pub fn layers_for_bound(&self, bound: u32) -> u32 {
+        if self.blocks.is_empty() {
+            return bound;
+        }
         self.blocks.partition_point(|&b| b < bound) as u32
+    }
+}
+
+/// Serialized as the plain block-index list; deserializing
+/// normalizes it (sorted, distinct), since the input is untrusted.
+impl From<Vec<u32>> for MoeBlockMap {
+    fn from(blocks: Vec<u32>) -> Self {
+        MoeBlockMap::from_block_indices(blocks).unwrap_or_default()
+    }
+}
+
+impl From<MoeBlockMap> for Vec<u32> {
+    fn from(map: MoeBlockMap) -> Self {
+        map.blocks
     }
 }
 
@@ -1745,6 +1765,19 @@ mod tests {
         assert_eq!(MoeBlockMap::from_tensors(&t), Some(map.clone()));
         let table = sys_bytes_by_position_with_tensors(4 * GIB, None, 4, Some(&t));
         assert_eq!(table, vec![0, GIB, 2 * GIB, 3 * GIB, 4 * GIB]);
+    }
+
+    #[test]
+    fn moe_block_map_serializes_as_a_normalized_index_list() {
+        let map = MoeBlockMap::from_block_indices([5, 3, 4, 2]).unwrap();
+        assert_eq!(serde_json::to_string(&map).unwrap(), "[2,3,4,5]");
+        // Untrusted input is normalized; an empty list is the
+        // identity rather than a panic.
+        let back: MoeBlockMap = serde_json::from_str("[5,2,2,4,3]").unwrap();
+        assert_eq!(back, map);
+        let empty: MoeBlockMap = serde_json::from_str("[]").unwrap();
+        assert_eq!(empty.bound_for_layers(3), 3);
+        assert_eq!(empty.layers_for_bound(3), 3);
     }
 
     #[test]

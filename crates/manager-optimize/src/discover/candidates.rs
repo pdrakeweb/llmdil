@@ -39,6 +39,7 @@ pub fn fit_verdict(
         basis: MemoryBasis::Estimate,
         ctx_max,
         params_b,
+        moe_block_map: None,
     };
     // No offload is proposed for a candidate, and with no KV or
     // recurrent-state geometry the requirement is weights-only

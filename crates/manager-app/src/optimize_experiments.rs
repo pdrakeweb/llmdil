@@ -44,12 +44,12 @@ use serde_json::json;
 use manager_config::AppConfig;
 use manager_optimize::{
     benchmark_prompts, compare, estimate_prompts, evaluate_fit, fit_verdict_text,
-    is_temp_backend_id, lowest_free_port, resolve_candidate, temp_backend_config, temp_backend_id,
-    ActiveExperiment, BenchResult, BenchRun, CandidateResolution, Decision, ExperimentEstimate,
-    ExperimentJournal, ExperimentMeasured, ExperimentProposal, ExperimentResult, ExperimentStatus,
-    MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, RegisteredModelFile,
-    BATCH_TIMEOUT_SECS, BENCHMARK_TEMPERATURE, ESTIMATE_RUNS, EXPERIMENT_TIMEOUT_SECS,
-    MEASURED_RUNS,
+    is_temp_backend_id, lowest_free_port, resolve_candidate, temp_backend_config_mapped,
+    temp_backend_id, ActiveExperiment, BenchResult, BenchRun, CandidateResolution, Decision,
+    ExperimentEstimate, ExperimentJournal, ExperimentMeasured, ExperimentProposal,
+    ExperimentResult, ExperimentStatus, MeasurementEntry, MeasurementFingerprintInputs,
+    MeasurementStore, RegisteredModelFile, BATCH_TIMEOUT_SECS, BENCHMARK_TEMPERATURE,
+    ESTIMATE_RUNS, EXPERIMENT_TIMEOUT_SECS, MEASURED_RUNS,
 };
 use manager_supervisor::{HealthProbe, HttpHealthProbe, ProcessState};
 
@@ -504,12 +504,18 @@ async fn run_experiment_inner(
     // facts (GGUF layout or catalog pin, as resolved by
     // `crate::optimize::gather`) — the same source the fit
     // preflight below prices from. `None` when unknown.
-    let moe_layers = gathered
-        .live
-        .layouts
-        .get(&model_id)
-        .and_then(|f| f.moe_layers);
-    let temp = temp_backend_config(proposal, model_file.clone(), port, moe_layers);
+    // The block map rides the same facts: the proposal's
+    // offload_layers (MoE layers) is written at its --n-cpu-moe
+    // block-index bound (review item 11).
+    let facts = gathered.live.layouts.get(&model_id);
+    let moe_layers = facts.and_then(|f| f.moe_layers);
+    let temp = temp_backend_config_mapped(
+        proposal,
+        model_file.clone(),
+        port,
+        moe_layers,
+        facts.and_then(|f| f.moe_block_map.as_ref()),
+    );
     // A cloned config carrying the temp backend (and, for an
     // unregistered HF candidate, a synthetic model entry so
     // the existing resolution machinery can price it). Never
@@ -550,10 +556,9 @@ async fn run_experiment_inner(
                 )
             } else {
                 let free = gathered.live.free_vram_mib_per_gpu.clone();
-                let (run_res, acct_res) = manager_optimize::fit::others_residency_mapped(
+                let (run_res, acct_res) = manager_optimize::fit::others_residency(
                     &temp_cfg,
                     &gathered.live.layouts,
-                    &gathered.moe_block_maps,
                     &gathered.live.backend_running,
                     &temp_id,
                     n_gpus,
@@ -574,10 +579,9 @@ async fn run_experiment_inner(
                     for id in &proposal.requires_stopping {
                         running2.insert(id.clone(), false);
                     }
-                    let (run2, acct2) = manager_optimize::fit::others_residency_mapped(
+                    let (run2, acct2) = manager_optimize::fit::others_residency(
                         &temp_cfg,
                         &gathered.live.layouts,
-                        &gathered.moe_block_maps,
                         &running2,
                         &temp_id,
                         n_gpus,

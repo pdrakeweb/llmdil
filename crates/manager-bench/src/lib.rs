@@ -24,7 +24,8 @@ pub mod prompts;
 pub mod results;
 
 pub use arm::{
-    expand, offload_expr_for_layers, offload_layers_of, preset_combined, preset_kv, preset_spec,
+    expand, layers_for_n_cpu_moe, offload_expr_for_layers, offload_expr_for_layers_mapped,
+    offload_layers_of, offload_layers_of_mapped, preset_combined, preset_kv, preset_spec,
     project_minutes, prune_arms, ArmOutcome, ArmSpec, ArmVariant, CacheType, DraftDevice,
     FlashAttn, OffloadGuardrail, PresetSweep, PruneContext, SpecKind,
 };

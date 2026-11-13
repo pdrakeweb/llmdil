@@ -87,20 +87,31 @@ function armLabel(v: BenchArmVariant): string {
  *  manager-bench's offload_expr_for_layers): 0 layers → no offload
  *  (the empty string, deliberately not null — the arm sets the
  *  position), all layers → full expert offload, otherwise the
- *  partial --n-cpu-moe spelling. */
-function offloadExprFor(layers: number, moeLayers: number): string {
+ *  partial --n-cpu-moe spelling at the position's block-index bound
+ *  (`bounds`, the backend's n_cpu_moe_by_position; absent = the
+ *  position itself). */
+function offloadExprFor(layers: number, moeLayers: number, bounds?: number[]): string {
   if (layers <= 0) return "";
   if (layers >= moeLayers) return "-ot exps=CPU";
-  return `--n-cpu-moe ${layers}`;
+  return `--n-cpu-moe ${bounds?.[layers] ?? layers}`;
+}
+
+/** The MoE-layer position a --n-cpu-moe bound selects: the largest
+ *  position whose bound is <= it (identity without a table). */
+function layersForBound(bound: number, bounds?: number[]): number {
+  if (!bounds || bounds.length < 2) return bound;
+  let k = 0;
+  for (let i = 1; i < bounds.length && bounds[i] <= bound; i++) k = i;
+  return k;
 }
 
 /** The position an offload expression names, in layers (null when
  *  the expression is a custom form the preview cannot judge). */
-function offloadLayersOf(expr: string, moeLayers: number): number | null {
+function offloadLayersOf(expr: string, moeLayers: number, bounds?: number[]): number | null {
   const t = expr.trim();
   if (t === "") return 0;
   const ncmoe = /^(?:--n-cpu-moe|-ncmoe)[=\s](\d+)$/.exec(t);
-  if (ncmoe) return Math.min(Number(ncmoe[1]), moeLayers);
+  if (ncmoe) return Math.min(layersForBound(Number(ncmoe[1]), bounds), moeLayers);
   if (/^(?:--cpu-moe|-cmoe)$/.test(t)) return moeLayers;
   if (/^-ot\s+(.+)$/.test(t)) {
     const parts = t.replace(/^-ot\s+/, "").split(",").map((p) => p.trim());
@@ -121,7 +132,7 @@ function offloadChoices(off: BackendOffload): number[] {
 function offloadPosLabel(n: number, off: BackendOffload): string {
   if (n === 0) return "No offload";
   if (n === off.moe_layers) return "All experts";
-  return `-ncmoe ${n}`;
+  return `-ncmoe ${off.n_cpu_moe_by_position?.[n] ?? n}`;
 }
 
 /** The client-knowable pruning rules (§3.2); the server's
@@ -143,7 +154,7 @@ function pruneReason(v: BenchArmVariant, requestDraftModelId: string | null, off
   // no journaled override). The server's prune is authoritative.
   if (off?.guardrail && off.guardrail.allowed === "endpoints_only"
     && off.guardrail.placed_ccs.includes(off.guardrail.compute_capability)) {
-    const position = v.offload_expr != null ? offloadLayersOf(v.offload_expr, off.moe_layers) : off.layers;
+    const position = v.offload_expr != null ? offloadLayersOf(v.offload_expr, off.moe_layers, off.n_cpu_moe_by_position) : off.layers;
     if (position != null && position > 0 && position < off.moe_layers) {
       return `Partial expert offload is forbidden on compute capability ${off.guardrail.compute_capability} — only no offload or full expert offload is permitted; nearest permitted position: ${off.layers >= off.moe_layers / 2 ? off.moe_layers : 0} of ${off.moe_layers} layers`;
     }
@@ -378,7 +389,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     const off = selOffload();
     if (off && dims.offloadOn && dims.offloadPositions.size) {
       out.push([...dims.offloadPositions].sort((a, b) => a - b)
-        .map((n) => ({ offload_expr: offloadExprFor(n, off.moe_layers) })));
+        .map((n) => ({ offload_expr: offloadExprFor(n, off.moe_layers, off.n_cpu_moe_by_position) })));
     }
     return out;
   }

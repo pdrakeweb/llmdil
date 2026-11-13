@@ -428,12 +428,16 @@ fn validate_one(
             }
             let mut raw_flags: Option<String> = None;
             if let Some(layers) = get_u32(&item.change, "offload_layers") {
-                match live.layouts.get(&model.id).and_then(|f| f.moe_layers) {
-                    Some(moe) => {
-                        raw_flags = manager_models::set_expert_offload(
-                            None,
-                            manager_models::offload_for_layers(layers, moe),
-                        );
+                // `offload_layers` counts MoE layers; the facts'
+                // block map turns it into the `--n-cpu-moe` bound
+                // (code review v0.1.60 item 11).
+                match live
+                    .layouts
+                    .get(&model.id)
+                    .and_then(|f| f.offload_for(layers))
+                {
+                    Some(offload) => {
+                        raw_flags = manager_models::set_expert_offload(None, offload);
                     }
                     None => warnings.push(
                         "offload_layers cannot be encoded: the model's MoE layer count is unknown"
@@ -600,7 +604,12 @@ fn validate_one(
             let Some(model) = resolve_model(&candidate, &b).cloned() else {
                 fail!(format!("backend '{target}' has no resolvable model"));
             };
-            let Some(moe) = live.layouts.get(&model.id).and_then(|f| f.moe_layers) else {
+            let Some(facts) = live
+                .layouts
+                .get(&model.id)
+                .filter(|f| f.moe_layers.is_some())
+                .cloned()
+            else {
                 fail!(format!(
                     "offload cannot be resolved for model '{}': its MoE layer count is unknown",
                     model.id
@@ -622,7 +631,11 @@ fn validate_one(
                     );
                 }
             }
-            let current = manager_models::expert_offload(b.raw_flags.as_deref()).layers(moe);
+            // Positions are MoE layers on both sides: the saved
+            // `--n-cpu-moe` bound reads back through the block map,
+            // and the target is written at its bound (item 11).
+            let current =
+                facts.offloaded_layers(manager_models::expert_offload(b.raw_flags.as_deref()));
             let current_cache = manager_models::moe_cache_mib(b.raw_flags.as_deref()).unwrap_or(0);
             if current == layers && cache.is_none_or(|c| c == current_cache) {
                 fail!("already satisfied".to_string());
@@ -630,7 +643,11 @@ fn validate_one(
             let bm = backend_mut(&mut candidate, &target).unwrap();
             bm.raw_flags = manager_models::set_expert_offload(
                 bm.raw_flags.as_deref(),
-                manager_models::offload_for_layers(layers, moe),
+                manager_models::offload_for_moe_layers(
+                    layers,
+                    facts.moe_layers.unwrap_or(0),
+                    facts.moe_block_map.as_ref(),
+                ),
             );
             if let Some(c) = cache {
                 // The writer's disabled form: a 0 value removes
@@ -1021,6 +1038,7 @@ mod tests {
                 basis: manager_models::MemoryBasis::Estimate,
                 ctx_max: 131072,
                 params_b: 8.0,
+                moe_block_map: None,
             },
         );
         let _ = cfg;
@@ -1523,6 +1541,40 @@ mod tests {
         let out = validate_plan(&p, &cfg, &live);
         assert_eq!(out[0].status, ValidationStatus::Invalid);
         assert_eq!(out[0].reason.as_deref(), Some("already satisfied"));
+    }
+
+    #[test]
+    fn set_offload_reads_saved_bounds_through_the_block_map() {
+        // Review item 11: the model has 2 leading dense blocks, so
+        // its 48 MoE blocks are blocks 2..=49. The saved
+        // `--n-cpu-moe 18` moves 16 MoE layers: restating 16 is
+        // "already satisfied"; without the map (identity) it would
+        // read as 18.
+        let (mut cfg, mut live) = moe_fixture();
+        cfg.backends[0].raw_flags = Some("--n-cpu-moe 18".to_string());
+        live.layouts.get_mut("qwen3-8b").unwrap().moe_block_map =
+            manager_models::MoeBlockMap::from_block_indices(2..50);
+        let item16 = |c: u32| {
+            plan(vec![item(
+                1,
+                PlanKind::BackendSetOffload,
+                "tool-runner",
+                json!({"offload_layers": 16, "moe_cache_mib": c}),
+                Decision::Undecided,
+            )])
+        };
+        let out = validate_plan(&item16(0), &cfg, &live);
+        assert_eq!(out[0].status, ValidationStatus::Invalid);
+        assert_eq!(out[0].reason.as_deref(), Some("already satisfied"));
+        // The same saved flag without a map is position 18.
+        live.layouts.get_mut("qwen3-8b").unwrap().moe_block_map = None;
+        let out = validate_plan(&item16(0), &cfg, &live);
+        assert_eq!(
+            out[0].status,
+            ValidationStatus::Valid,
+            "{:?}",
+            out[0].reason
+        );
     }
 
     #[test]
