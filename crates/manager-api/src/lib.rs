@@ -35,8 +35,16 @@ pub use http::{build_router, RouteRecord, DERIVED_ROUTES};
 pub use tls::TlsMaterial;
 pub use users::UserStore;
 
-/// One event emitted by an operation, as published to API
-/// subscribers (the phase-4 SSE stream consumes this channel).
+/// The origin every API-dispatched operation is tagged with on the
+/// app event bus (`manager_app::event_bus`).
+pub const API_ORIGIN: manager_app::event_bus::EventOrigin =
+    manager_app::event_bus::EventOrigin::Api;
+
+/// One event emitted by an API-dispatched operation. The SSE stream
+/// no longer reads this channel: it subscribes to the app-level bus
+/// (`manager_app::event_bus`), which carries the same events plus
+/// desktop-originated and background ones. Kept for in-process
+/// consumers of [`ApiCtx::events`].
 #[derive(Debug, Clone)]
 pub struct EventEnvelope {
     pub event: String,
@@ -84,7 +92,8 @@ pub struct ApiCtx {
     pub app: Arc<AppState>,
     /// The sink handed to operations (trait-object view of `events`).
     pub sink: Arc<dyn EventSink>,
-    /// The broadcast channel behind `sink` (SSE subscribes here).
+    /// The broadcast channel behind `sink` (API-dispatched events
+    /// only; `GET /events` streams the app event bus instead).
     pub events: Arc<BroadcastSink>,
     pub deployment_id: String,
     pub data_dir: PathBuf,

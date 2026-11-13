@@ -81,6 +81,16 @@ pub async fn notify(
     crate::logship::offer_app_line(state, level, || {
         format!("notify ({category:?}): {title} — {body}")
     });
+    // Failures and activation outcomes are alerts on the app event
+    // bus, independent of the toast switches (completions are not).
+    let alert_category = match category {
+        Category::Failures => Some("failures"),
+        Category::Activation => Some("activation"),
+        Category::Operations => None,
+    };
+    if let Some(c) = alert_category {
+        crate::event_bus::publish_alert(state, c, title, body);
+    }
     let allowed = {
         let cfg = state.config.read().await;
         match category {

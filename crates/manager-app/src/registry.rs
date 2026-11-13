@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+pub use crate::event_bus::EventOrigin;
 use crate::{ApiError, AppState, EventSink};
 
 /// Capability classes (auth plan §1; PLAN.md §2.6 — the auth taxonomy
@@ -459,16 +460,12 @@ macro_rules! gen_dispatch {
         /// Run one operation by its registry handle. The match is
         /// exhaustive with no wildcard arm — a registered operation
         /// without a dispatch arm does not compile.
-        pub async fn dispatch(
+        async fn run_op(
             state: &Arc<AppState>,
             sink: &Arc<dyn EventSink>,
             op: Op,
             args: Value,
         ) -> Result<Value, ApiError> {
-            // Every operation's events also reach the log shipper's
-            // in-process feed (source `app`); a no-op while log
-            // streaming is off.
-            let sink = &crate::logship::tap_sink(state, Arc::clone(sink));
             match op {
                 $(
                     Op::$variant => {
@@ -480,6 +477,45 @@ macro_rules! gen_dispatch {
     };
 }
 for_each_operation!(gen_dispatch);
+
+/// Run one operation invoked from the desktop UI (Tauri IPC) — the
+/// shell's entry point. Same as [`dispatch_from`] with
+/// [`EventOrigin::Desktop`].
+pub async fn dispatch(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    op: Op,
+    args: Value,
+) -> Result<Value, ApiError> {
+    dispatch_from(state, sink, op, args, EventOrigin::Desktop).await
+}
+
+/// Run one operation on behalf of `origin`. This is the single choke
+/// point every surface shares: the operation's events go to the
+/// caller's sink, to the log shipper's in-process feed (source `app`;
+/// a no-op while log streaming is off), and to the app event bus
+/// tagged with `origin` — so an action taken in the desktop UI
+/// reaches Admin API event subscribers exactly as the same action
+/// through the API does. After a successful run the dispatch-level
+/// events (`config-changed`, `gateway-request`) are emitted the same
+/// way (see [`crate::event_bus::after_dispatch`]).
+pub async fn dispatch_from(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    op: Op,
+    args: Value,
+    origin: EventOrigin,
+) -> Result<Value, ApiError> {
+    let sink = crate::event_bus::bus_sink(state, Arc::clone(sink), origin);
+    let sink = &crate::logship::tap_sink(state, sink);
+    crate::event_bus::with_origin(origin, async {
+        let watch = crate::event_bus::before_dispatch(state, op).await;
+        let result = run_op(state, sink, op, args).await;
+        crate::event_bus::after_dispatch(state, sink, op, &result, watch).await;
+        result
+    })
+    .await
+}
 
 /// The spec for one operation.
 pub fn spec(op: Op) -> &'static OpSpec {

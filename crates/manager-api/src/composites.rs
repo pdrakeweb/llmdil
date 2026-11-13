@@ -9,14 +9,14 @@
 //! runs the admin-class start-gateway step, exactly as the desktop
 //! flow composes the same primitives for the signed-in user.
 
-use manager_app::registry::{dispatch, Op};
+use manager_app::registry::{dispatch_from, Op};
 use manager_app::ApiError;
 use serde_json::{json, Value};
 
-use crate::ApiCtx;
+use crate::{ApiCtx, API_ORIGIN};
 
 async fn call(ctx: &ApiCtx, op: Op, args: Value) -> Result<Value, ApiError> {
-    dispatch(&ctx.app, &ctx.sink, op, args).await
+    dispatch_from(&ctx.app, &ctx.sink, op, args, API_ORIGIN).await
 }
 
 fn invalid(message: impl Into<String>) -> ApiError {

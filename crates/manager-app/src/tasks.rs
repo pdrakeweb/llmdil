@@ -235,6 +235,7 @@ pub(crate) async fn finish(state: &AppState, id: &str, status: TaskStatus, detai
         let abort_requested = state.task_controls.abort_requested(id);
         if let Some(rec) = tasks.get_mut(id) {
             settle(rec, status, detail, abort_requested);
+            crate::event_bus::publish_task(state, rec);
         }
     }
     // After the record is settled, so a waiting abort reads the final
@@ -313,6 +314,7 @@ pub(crate) async fn abort(
                             grace.as_millis()
                         )),
                     );
+                    crate::event_bus::publish_task(&enforcer_state, rec);
                 }
             }
         }

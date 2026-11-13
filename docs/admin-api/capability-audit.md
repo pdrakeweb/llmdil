@@ -310,7 +310,7 @@ machine's actual state into the checklist).
 - Entry: `get_logs`, main.rs:2578. UI: yes.
 - In: `scope: string` (a process id, `"gateway"`, `"wizard"`, `"all"`, or an archived scope id from the payload's scope list)`, level?: "error"|"warn"|"info"|"debug"` (heuristic line match)`, search?: string` (substring over line text)`, query?: string` (substring over line text + source)`, since_ms?: i64, until_ms?: i64` (inclusive)`, order?: "asc"|"desc"` (default desc)`, offset?: u64, limit?: u64` (default 200).
 - Out: `{lines: [{ts, stream, line, source, archived}], total_matching, total, truncated, scopes: [{id, previous}]}`.
-- Side effects: reads supervisor ring buffers (live and retained previous-run rings) plus the file-backed gateway and wizard logs under the data dir. Read-only, but the only log access is this paged pull — there is no live tail channel (see §14).
+- Side effects: reads supervisor ring buffers (live and retained previous-run rings) plus the file-backed gateway and wizard logs under the data dir. Read-only. Live tailing of the supervised-process scopes is the `log-line` event on the Admin API event stream (see §14); there is no log-follow command.
 
 
 ## 7. Gateway and the activation plan
@@ -650,15 +650,26 @@ job), not require the client to replay the composition:
 
 ### Push events (Tauri events, not commands)
 
-Emitted today: `telemetry-update` (from `get_gpu_telemetry`),
+Operation-emitted: `telemetry-update` (from `get_gpu_telemetry`),
 `wizard-progress` (step/audit runs), `download-progress` (download
-worker), `backend-status` (start/stop/restart). Declared in
-`src-tauri/src/main.rs` (`pub mod events`) but **never emitted**:
-`log-line`, `telemetry-tick`, `task-progress`, `gateway-request`,
-`alert-raised`, `vram-changed`, `config-changed`. The desktop UI is
-therefore mostly poll-driven despite the event names; a REST design
-should decide deliberately between polling resources and a real
-stream (SSE/WebSocket) rather than inheriting this split.
+worker), `backend-status` (start/stop/restart). Every name declared
+in `manager_app::events` now has a producer on the app event bus
+(`crates/manager-app/src/event_bus.rs`): `task-progress` (task
+created / settled), `config-changed` (a successful non-read
+operation that changed the saved config; section names only),
+`gateway-request` (a recorded `gateway_test_routing` decision),
+`alert-raised` (notification-monitor failure / activation
+transitions), and — from a background loop that runs only while
+someone subscribes — `telemetry-tick` (once per completed telemetry
+poll, ≤ 1/s), `vram-changed` (per-GPU used-VRAM moves past a
+threshold), and `log-line` (new supervised-process output). The bus
+tee sits in the registry dispatch shared by the Tauri IPC adapters
+and the Admin API, so a desktop-originated action reaches API
+subscribers exactly like the same action over HTTP, tagged with an
+`origin` (`desktop` | `api` | `app`). The bus is consumed by the
+Admin API's `GET /api/v1/events` (rest-api.md §6.17); the desktop UI
+still subscribes to no events and remains poll-driven — polling is
+the correctness path, the stream is additive.
 
 ## 15. Counts, and capabilities with awkward fits for REST
 
@@ -680,7 +691,7 @@ exist (`backend_test_request` vs the registered `test_backend`, §2).
 
 1. **Long-blocking synchronous calls.** `run_wizard_step` blocks until the step finishes (budgets to 600 s; the start-gateway step internally reinstalls packages and confirms health). `model_verify_checksum` blocks for minutes on multi-GiB files. `gateway_quiesce_wait` blocks 5–600 s *by design*. These need an async job model (202 + job resource + polling/stream), not request/response timeouts.
 2. **Background work with event-only progress.** `download_model` returns immediately; progress, pause state, the post-download verification phase, and terminal errors are observable only through `download-progress` events and by polling `list_models`. A REST client needs a first-class download resource with state, or a stream.
-3. **No live log channel.** `get_logs` is a paged pull and works fine as REST, but live tailing does not exist — the `log-line` event is declared and never emitted. Streaming logs over the API is new machinery, not a port.
+3. **Live log channel is stream-only.** `get_logs` is a paged pull and works fine as REST. Live tailing exists only as the `log-line` event on `GET /api/v1/events` (supervised-process output, rate-limited, live-only; the file-backed gateway/wizard scopes are not streamed) — there is no log-follow operation.
 4. **Interactive elevation (UAC).** The start-gateway step's firewall reconciliation and install-llamacpp's host preparation run elevated scripts: a UAC prompt appears on the **server's console**, and a remote caller cannot see or answer it (a decline degrades to a warning). API-triggered steps that need elevation will block on a prompt nobody remote can see, or must pre-decline.
 5. **Desktop-session actions.** `open_url` and `open_folder` act on the managed machine's interactive desktop (browser, Explorer). They have no remote meaning; exclude them or replace them with returned data (URLs, paths).
 6. **Secret disclosure.** `gateway_master_key` returns the LiteLLM master key in plaintext (and creates it on first call). Over an admin API this is the most sensitive read in the system — highest role, audit logging, and arguably a reveal-once pattern rather than a plain GET.
