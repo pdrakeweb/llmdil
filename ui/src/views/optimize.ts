@@ -52,7 +52,7 @@ function fmtElapsed(secs: number): string {
   return m > 0 ? `${m} min ${s} s` : `${s} s`;
 }
 
-function fmtAge(secs: number): string {
+export function fmtAge(secs: number): string {
   if (secs < 60) return `${secs} s`;
   if (secs < 3600) return `${Math.floor(secs / 60)} min`;
   if (secs < 86400) return `${Math.floor(secs / 3600)} h`;
@@ -63,7 +63,7 @@ function fmtAge(secs: number): string {
  *  configuration) differs from `other` (a stored entry), in the
  *  design §5.3 order and naming — the client-side mirror of the
  *  store's diff, over the payload's snapshots (§10). */
-function diffInputFields(current: MeasurementInputs, other: MeasurementInputs): string[] {
+export function diffInputFields(current: MeasurementInputs, other: MeasurementInputs): string[] {
   const out: string[] = [];
   if (current.n_ctx !== other.n_ctx) out.push("context");
   if (current.n_batch !== other.n_batch) out.push("batch");
@@ -79,7 +79,7 @@ function diffInputFields(current: MeasurementInputs, other: MeasurementInputs): 
 
 /** Placement in short form from an inputs snapshot: "GPU 0+1",
  *  or "CPU" for an empty GPU set. */
-function placementShort(inputs: MeasurementInputs): string {
+export function placementShort(inputs: MeasurementInputs): string {
   if (!inputs.gpus.length) return "CPU";
   return `GPU ${inputs.gpus.map((g) => g.split(":")[0]).join("+")}`;
 }

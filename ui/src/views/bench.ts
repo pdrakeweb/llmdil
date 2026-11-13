@@ -34,7 +34,7 @@ function fmtDateMs(ms: number | null | undefined): string {
   return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" });
 }
 
-function fmtElapsed(ms: number): string {
+export function fmtElapsed(ms: number): string {
   const s = Math.max(0, Math.floor(ms / 1000));
   const m = Math.floor(s / 60);
   return m > 0 ? `${m} min ${s % 60} s` : `${s} s`;
@@ -44,7 +44,7 @@ function fmtNum(v: number | null | undefined): string {
   return v == null ? "—" : trim1(v);
 }
 
-function fmtVram(mib: number | null): string {
+export function fmtVram(mib: number | null): string {
   if (mib == null) return "—";
   return mib >= 1024 ? `${trim1(mib / 1024)} GiB` : `${fmtCount(mib)} MiB`;
 }
@@ -68,7 +68,7 @@ const DEPTH_VALUES = [0, 8192, 30720];
 const SPEC_VALUES = ["none", "ngram-mod", "draft-simple", "combined"];
 const NMIN_VALUES = [4, 16, 48];
 
-function armLabel(v: BenchArmVariant): string {
+export function armLabel(v: BenchArmVariant): string {
   const parts: string[] = [];
   if (v.cache_k || v.cache_v) parts.push(`KV ${v.cache_k ?? "—"}/${v.cache_v ?? "—"}`);
   if (v.flash_attn) parts.push(`FA ${v.flash_attn}`);
@@ -90,7 +90,7 @@ function armLabel(v: BenchArmVariant): string {
  *  partial --n-cpu-moe spelling at the position's block-index bound
  *  (`bounds`, the backend's n_cpu_moe_by_position; absent = the
  *  position itself). */
-function offloadExprFor(layers: number, moeLayers: number, bounds?: number[]): string {
+export function offloadExprFor(layers: number, moeLayers: number, bounds?: number[]): string {
   if (layers <= 0) return "";
   if (layers >= moeLayers) return "-ot exps=CPU";
   return `--n-cpu-moe ${bounds?.[layers] ?? layers}`;
@@ -107,7 +107,7 @@ function layersForBound(bound: number, bounds?: number[]): number {
 
 /** The position an offload expression names, in layers (null when
  *  the expression is a custom form the preview cannot judge). */
-function offloadLayersOf(expr: string, moeLayers: number, bounds?: number[]): number | null {
+export function offloadLayersOf(expr: string, moeLayers: number, bounds?: number[]): number | null {
   const t = expr.trim();
   if (t === "") return 0;
   const ncmoe = /^(?:--n-cpu-moe|-ncmoe)[=\s](\d+)$/.exec(t);
@@ -123,13 +123,13 @@ function offloadLayersOf(expr: string, moeLayers: number, bounds?: number[]): nu
 /** Sweep positions offered for an MoE backend: no offload,
  *  quarter steps of the MoE layer count, full offload, plus the
  *  backend's current position when it is not already one of them. */
-function offloadChoices(off: BackendOffload): number[] {
+export function offloadChoices(off: BackendOffload): number[] {
   const m = off.moe_layers;
   const set = new Set<number>([0, Math.round(m / 4), Math.round(m / 2), Math.round((3 * m) / 4), m, off.layers]);
   return [...set].sort((a, b) => a - b);
 }
 
-function offloadPosLabel(n: number, off: BackendOffload): string {
+export function offloadPosLabel(n: number, off: BackendOffload): string {
   if (n === 0) return "No offload";
   if (n === off.moe_layers) return "All experts";
   return `-ncmoe ${off.n_cpu_moe_by_position?.[n] ?? n}`;
@@ -137,7 +137,7 @@ function offloadPosLabel(n: number, off: BackendOffload): string {
 
 /** The client-knowable pruning rules (§3.2); the server's
  *  validation remains authoritative at run time. */
-function pruneReason(v: BenchArmVariant, requestDraftModelId: string | null, off: BackendOffload | null = null): string | null {
+export function pruneReason(v: BenchArmVariant, requestDraftModelId: string | null, off: BackendOffload | null = null): string | null {
   const cv = v.cache_v ?? null;
   if ((cv === "q8_0" || cv === "q4_0") && v.flash_attn === "off") {
     return "Quantized V cache with flash attention off — llama.cpp refuses this pairing";
@@ -162,7 +162,7 @@ function pruneReason(v: BenchArmVariant, requestDraftModelId: string | null, off
   return null;
 }
 
-function expandDims(dims: BenchArmVariant[][]): BenchArmVariant[] {
+export function expandDims(dims: BenchArmVariant[][]): BenchArmVariant[] {
   let arms: BenchArmVariant[] = [{}];
   for (const dim of dims) {
     if (!dim.length) continue;
@@ -173,7 +173,7 @@ function expandDims(dims: BenchArmVariant[][]): BenchArmVariant[] {
   return arms;
 }
 
-function presetArms(preset: "kv" | "spec" | "combined", draftModelId: string, draftNMax: number, draftDevice: string): BenchArmVariant[] {
+export function presetArms(preset: "kv" | "spec" | "combined", draftModelId: string, draftNMax: number, draftDevice: string): BenchArmVariant[] {
   if (preset === "kv") {
     return [["f16", "f16"], ["q8_0", "q8_0"], ["f16", "q8_0"], ["q4_0", "q4_0"]]
       .map(([k, v]) => ({ cache_k: k, cache_v: v, depth: 8192, spec: "none" }));
