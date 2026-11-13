@@ -79,7 +79,10 @@ pub use experiment::{
     ExperimentResult, ExperimentStatus, ExperimentValidation, RegisteredModelFile,
     BATCH_TIMEOUT_SECS, EXPERIMENT_TIMEOUT_SECS, MAX_EXPERIMENTS, TEMP_BACKEND_ID_PREFIX,
 };
-pub use fit::{evaluate_fit, layout_requirement, residency_per_gpu, FitOutcome, LayoutFacts};
+pub use fit::{
+    evaluate_fit, layout_requirement, layout_requirement_mapped, residency_per_gpu, FitOutcome,
+    LayoutFacts,
+};
 pub use measure::{
     benchmark_prompts, estimate_prompts, facts as measurement_facts, headline_figures,
     measurement_fingerprint, median, normalize_raw_flags, BenchResult, BenchRun, BenchmarkPrompt,

@@ -1804,7 +1804,8 @@ fn raw_device_selection(raw: Option<&str>) -> RawDeviceSelection {
     let Some(raw) = raw else {
         return RawDeviceSelection::None;
     };
-    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let owned = manager_models::split_raw_flags(raw);
+    let tokens: Vec<&str> = owned.iter().map(String::as_str).collect();
     let mut set = std::collections::BTreeSet::new();
     let mut any = false;
     let mut i = 0;
@@ -1923,7 +1924,8 @@ fn backend_gpu_visibility(b: &manager_config::BackendConfig) -> GpuVisibility {
 /// it with an empty CUDA_VISIBLE_DEVICES (code-review 4.7).
 fn raw_flags_pin_cpu_only(raw: Option<&str>) -> bool {
     let Some(raw) = raw else { return false };
-    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let owned = manager_models::split_raw_flags(raw);
+    let tokens: Vec<&str> = owned.iter().map(String::as_str).collect();
     let mut last: Option<&str> = None;
     let mut i = 0;
     while i < tokens.len() {
@@ -2101,7 +2103,14 @@ fn backend_spec(
         // - When the launch is GPU-restricted, device-selection flags
         //   are remapped onto the visible subset (placement is the
         //   source of truth — see the fn docs).
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        // Tokenized like a shell would for the operator's quotes —
+        // `'…'`/`"…"` group and are removed — but with every
+        // backslash literal (regexes in `-ot` need them); there is
+        // no shell, so whitespace-splitting alone handed
+        // llama-server literal quote characters
+        // (see manager_models::split_raw_flags for the full rule).
+        let owned = manager_models::split_raw_flags(raw);
+        let tokens: Vec<&str> = owned.iter().map(String::as_str).collect();
         let mut i = 0;
         while i < tokens.len() {
             let t = tokens[i];
@@ -5810,7 +5819,7 @@ fn resolve_new_backend_offload(
             info.moe_layers, cc.0, cc.1, eval.nearest_verified_layers, info.moe_layers
         )));
     }
-    let target = manager_models::offload_for_layers(layers, info.moe_layers);
+    let target = info.offload_for(layers);
     let raw_flags = manager_models::set_expert_offload(backend.raw_flags.as_deref(), target);
     Ok(NewBackendOffload {
         raw_flags,
@@ -6017,7 +6026,7 @@ pub async fn op_backend_add(
         // backend created for Nemotron starts at --n-cpu-moe 16
         // rather than with no offload at all. A position chosen
         // in the add form replaces it below.
-        raw_flags: model_default_raw_flags(&model),
+        raw_flags: model_default_raw_flags_at(&cfg.data_dir, &model),
         // A created backend starts in structured flags mode; the
         // operator opts into advanced mode per backend afterward.
         flags_advanced: false,
@@ -6156,7 +6165,7 @@ pub async fn op_backend_add_preview(
             tensor_split: tensor_split.clone(),
             split_mode,
         },
-        raw_flags: model_default_raw_flags(&model),
+        raw_flags: model_default_raw_flags_at(&cfg.data_dir, &model),
         flags_advanced: false,
         restart_policy: manager_config::RestartPolicy {
             max_retries: 5,
@@ -6258,12 +6267,54 @@ pub async fn op_backend_update_flags(
 /// without operator flags of its own: backend creation, model
 /// assignment, and the catalog definition refresh.
 fn catalog_default_raw_flags(model_id: &str) -> Option<String> {
+    catalog_default_raw_flags_mapped(model_id, None)
+}
+
+/// [`catalog_default_raw_flags`] with the model's MoE block map:
+/// the catalog pin counts MoE LAYERS, so a partial pin is written
+/// at the `--n-cpu-moe` block-index bound that moves exactly that
+/// many (code review v0.1.60 item 11). Without a map (the file is
+/// not downloaded or not parsed) the pin is written as is — exact
+/// for models whose MoE blocks start at block 0, an Estimate
+/// otherwise.
+fn catalog_default_raw_flags_mapped(
+    model_id: &str,
+    map: Option<&manager_models::MoeBlockMap>,
+) -> Option<String> {
     manager_models::curated_models()
         .into_iter()
         .find(|s| s.id == model_id)
         .and_then(|s| {
-            manager_models::offload_flag_string(manager_models::catalog_default_offload(&s))
+            let offload = match manager_models::catalog_default_offload(&s) {
+                manager_models::ExpertOffload::CpuMoeLayers(n) => {
+                    manager_models::offload_for_moe_layers(n, s.moe_layers.unwrap_or(n), map)
+                }
+                other => other,
+            };
+            manager_models::offload_flag_string(offload)
         })
+}
+
+/// The MoE block map of `model`'s GGUF, when the file is present
+/// and its header parses with an expert tensor index.
+fn model_moe_block_map(
+    data_dir: &std::path::Path,
+    model: &manager_config::ModelConfig,
+) -> Option<manager_models::MoeBlockMap> {
+    let path = resolve_under_data_dir(data_dir, &model.gguf_path);
+    let layout = gguf_layout_cached(&path)?;
+    manager_models::MoeBlockMap::from_tensors(&layout.expert_tensors)
+}
+
+/// [`model_default_raw_flags`] resolved against the model's GGUF
+/// (when present under `data_dir`): MoE-layer defaults are written
+/// at their block-index bound (see
+/// [`catalog_default_raw_flags_mapped`]).
+fn model_default_raw_flags_at(
+    data_dir: &std::path::Path,
+    model: &manager_config::ModelConfig,
+) -> Option<String> {
+    model_default_raw_flags_mapped(model, model_moe_block_map(data_dir, model).as_ref())
 }
 
 /// The raw flags a backend serving `model` starts with, resolved
@@ -6276,8 +6327,17 @@ fn catalog_default_raw_flags(model_id: &str) -> Option<String> {
 /// the path that gives a user-added MoE model the same creation
 /// default a catalog model gets. `None` when neither source pins
 /// a default that writes tokens.
+/// (No block map: see [`model_default_raw_flags_at`].)
+#[cfg(test)]
 fn model_default_raw_flags(model: &manager_config::ModelConfig) -> Option<String> {
-    if let Some(flags) = catalog_default_raw_flags(&model.id) {
+    model_default_raw_flags_mapped(model, None)
+}
+
+fn model_default_raw_flags_mapped(
+    model: &manager_config::ModelConfig,
+    map: Option<&manager_models::MoeBlockMap>,
+) -> Option<String> {
+    if let Some(flags) = catalog_default_raw_flags_mapped(&model.id, map) {
         return Some(flags);
     }
     let layers = model.moe_layers?;
@@ -6285,9 +6345,10 @@ fn model_default_raw_flags(model: &manager_config::ModelConfig) -> Option<String
     if layers == 0 {
         return None;
     }
-    manager_models::offload_flag_string(manager_models::offload_for_layers(
+    manager_models::offload_flag_string(manager_models::offload_for_moe_layers(
         default.min(layers),
         layers,
+        map,
     ))
 }
 
@@ -6361,7 +6422,7 @@ pub async fn op_backend_set_offload(
     // against. Computed before the mutable borrow is taken, and it
     // shadows the pre-lock value: everything below uses the
     // under-lock count.
-    let eval = {
+    let (eval, block_map) = {
         let b_ref = new_cfg
             .backends
             .iter()
@@ -6376,7 +6437,7 @@ pub async fn op_backend_set_offload(
             ))
         })?;
         let (placed_ccs, cpu_only) = placed_offload_placement(b_ref, &gpus);
-        evaluate_offload_position(
+        let eval = evaluate_offload_position(
             &info.restrictions,
             &id,
             layers,
@@ -6384,7 +6445,8 @@ pub async fn op_backend_set_offload(
             placed_ccs,
             cpu_only,
             &journal,
-        )
+        );
+        (eval, info.block_map)
     };
     let moe_layers = eval.moe_layers;
     // Guardrail enforcement (tracker #37), still before any
@@ -6416,7 +6478,9 @@ pub async fn op_backend_set_offload(
             "offload of {layers} layers exceeds the model's {moe_layers} MoE layers"
         )));
     }
-    let target = manager_models::offload_for_layers(layers, moe_layers);
+    // `layers` is a MoE-layer count; the flag is written at the
+    // block-index bound that moves exactly that many (item 11).
+    let target = manager_models::offload_for_moe_layers(layers, moe_layers, block_map.as_ref());
     let new_raw = manager_models::set_expert_offload(b.raw_flags.as_deref(), target);
     let changed = new_raw != b.raw_flags;
     b.raw_flags = new_raw.clone();
@@ -6434,10 +6498,10 @@ pub async fn op_backend_set_offload(
             manager_models::ExpertOffload::AllExperts => {
                 format!("Backend `{id}` expert offload set to all {moe_layers} MoE layers")
             }
-            manager_models::ExpertOffload::CpuMoeLayers(n) => {
-                format!("Backend `{id}` expert offload set to {n} of {moe_layers} MoE layers")
+            manager_models::ExpertOffload::CpuMoeLayers(_) => {
+                format!("Backend `{id}` expert offload set to {layers} of {moe_layers} MoE layers")
             }
-            // offload_for_layers never selects operator patterns.
+            // offload_for_moe_layers never selects operator patterns.
             manager_models::ExpertOffload::TensorOverrides => {
                 format!("Backend `{id}` expert offload set by tensor overrides")
             }
@@ -7362,7 +7426,7 @@ fn cache_preview_json(
             let cache_shares = manager_models::moe_cache_shares(
                 u64::from(moe_cache_mib),
                 split,
-                offload.layers(layout.moe_layers.unwrap_or(0)),
+                layout.offloaded_moe_layers(offload),
                 layout.moe_layers.unwrap_or(0),
                 placed.len(),
             );
@@ -7415,7 +7479,7 @@ fn cache_preview_json(
             let cache_shares = manager_models::moe_cache_shares(
                 u64::from(moe_cache_mib),
                 split,
-                offload.layers(layout.moe_layers.unwrap_or(0)),
+                layout.offloaded_moe_layers(offload),
                 layout.moe_layers.unwrap_or(0),
                 placed.len(),
             );
@@ -7666,7 +7730,9 @@ pub async fn op_backend_set_flags_mode(
 ///
 /// Validation is warn, never block: the string is checked with
 /// [`manager_models::raw_flag_warnings`] and the warnings ride
-/// the response, but any string saves — an unrecognized flag may
+/// the response, but any string saves (except one llama-server is
+/// certain to refuse at startup, [`manager_models::raw_flag_errors`])
+/// — an unrecognized flag may
 /// be exactly what the operator needs, and llama-server's own
 /// start is the real check. The input is normalized the way the
 /// launch tokenizer sees it: leading/trailing whitespace is not
@@ -7689,6 +7755,17 @@ pub async fn op_backend_set_raw_flags(
     let new_raw: Option<String> = raw_flags
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // The one exception to warn-never-block: a string llama-server
+    // is certain to refuse at startup (an `-ot` pattern with a
+    // comma inside `{m,n}`, a class or a group — llama-server
+    // splits -ot on every comma) is refused here, with a message
+    // that suggests an alternation instead.
+    if let Some(err) = manager_models::raw_flag_errors(new_raw.as_deref())
+        .into_iter()
+        .next()
+    {
+        return Err(ApiError::InvalidInput(err.message));
+    }
     let warnings = manager_models::raw_flag_warnings(new_raw.as_deref());
     let mut cfg = state.config.write().await;
     let pre_cfg = cfg.clone();
@@ -9342,7 +9419,7 @@ pub async fn op_model_assign(
     // The model's default offload flags (catalog pin, or the
     // operator's declared default on the model record), resolved
     // before the mutable backend borrow below.
-    let default_flags = model_default_raw_flags(model);
+    let default_flags = model_default_raw_flags_at(&cfg.data_dir, model);
     let flags_untouched = {
         let backend = cfg
             .backends
@@ -9668,6 +9745,26 @@ struct WeightLayout {
     green_limit_layers: Option<u32>,
 }
 
+impl WeightLayout {
+    /// The model's MoE block map (which block indices carry
+    /// experts), when the layout came from a GGUF parse with an
+    /// expert tensor index: what converts the slider's MoE-layer
+    /// count to and from `--n-cpu-moe`'s block-index bound (code
+    /// review v0.1.60 item 11). `None` for catalog-only and
+    /// estimated layouts, where the conversion is the identity.
+    fn moe_block_map(&self) -> Option<manager_models::MoeBlockMap> {
+        self.expert_tensors
+            .as_deref()
+            .and_then(manager_models::MoeBlockMap::from_tensors)
+    }
+
+    /// MoE layers on system RAM under `offload`, through the block
+    /// map (see [`manager_models::ExpertOffload::moe_layers_offloaded`]).
+    fn offloaded_moe_layers(&self, offload: manager_models::ExpertOffload) -> u32 {
+        offload.moe_layers_offloaded(self.moe_layers.unwrap_or(0), self.moe_block_map().as_ref())
+    }
+}
+
 fn resolve_weight_layout(
     cfg: &AppConfig,
     b: &manager_config::BackendConfig,
@@ -9795,7 +9892,7 @@ fn backend_memory_requirement(
     // placement projection — prices the cache the server will
     // allocate. A backend with no token prices exactly as before.
     req.moe_cache_mib = manager_models::moe_cache_mib(b.raw_flags.as_deref()).unwrap_or(0) as u64;
-    req.moe_cache_offload_layers = offload.layers(layout.moe_layers.unwrap_or(0));
+    req.moe_cache_offload_layers = layout.offloaded_moe_layers(offload);
     req.moe_cache_moe_layers = layout.moe_layers.unwrap_or(0);
     Some(req)
 }
@@ -9896,6 +9993,21 @@ struct OffloadInfo {
     /// The catalog's per-architecture offload restrictions for the
     /// backend's model (empty outside the curated catalog).
     restrictions: Vec<manager_models::OffloadRestriction>,
+    /// The model's MoE block map when the GGUF was parsed: `layers`
+    /// and every position written back convert through it
+    /// ([`OffloadInfo::offload_for`]). `None` = identity (catalog
+    /// or estimated layout).
+    block_map: Option<manager_models::MoeBlockMap>,
+}
+
+impl OffloadInfo {
+    /// The offload a slider position (`layers` MoE layers on
+    /// system RAM) writes: `--n-cpu-moe` at the block-index bound
+    /// that moves exactly that many MoE layers (see
+    /// [`manager_models::offload_for_moe_layers`]).
+    fn offload_for(&self, layers: u32) -> manager_models::ExpertOffload {
+        manager_models::offload_for_moe_layers(layers, self.moe_layers, self.block_map.as_ref())
+    }
 }
 
 fn backend_offload_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> Option<OffloadInfo> {
@@ -9913,10 +10025,25 @@ fn backend_offload_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> O
     }
     let (green_end, yellow_end) = manager_models::offload_bands(moe_layers, green_limit_layers);
     let offload = manager_models::expert_offload(b.raw_flags.as_deref());
+    // The slider counts MoE layers; the saved `--n-cpu-moe` value
+    // is a block-index bound. With the GGUF's block map the
+    // position reads back as the MoE blocks the bound moves (code
+    // review v0.1.60 item 11); without one it is the value itself.
+    let block_map = layout.moe_block_map();
+    let layers = offload.moe_layers_offloaded(moe_layers, block_map.as_ref());
     // Custom spelling: rewriting the detected position back through
     // the canonical writer must reproduce the saved tokens exactly
     // (after token normalization, so spacing alone never counts).
-    let canonical = manager_models::set_expert_offload(b.raw_flags.as_deref(), offload);
+    // With a block map the canonical form is the one the slider
+    // writes for the position, so a bound between MoE blocks (or
+    // past the last one) reads as custom.
+    let canonical_offload = match (offload, &block_map) {
+        (manager_models::ExpertOffload::CpuMoeLayers(_), Some(map)) => {
+            manager_models::offload_for_moe_layers(layers, moe_layers, Some(map))
+        }
+        _ => offload,
+    };
+    let canonical = manager_models::set_expert_offload(b.raw_flags.as_deref(), canonical_offload);
     let custom = token_normalized_flags(b.raw_flags.as_deref())
         != token_normalized_flags(canonical.as_deref());
     let restrictions = layout
@@ -9932,7 +10059,8 @@ fn backend_offload_info(cfg: &AppConfig, b: &manager_config::BackendConfig) -> O
     );
     Some(OffloadInfo {
         moe_layers,
-        layers: offload.layers(moe_layers),
+        layers,
+        block_map,
         expert_bytes,
         total_bytes: layout.total_bytes,
         green_limit_layers,
@@ -10009,6 +10137,17 @@ fn offload_row_json(o: &OffloadInfo, eval: Option<&OffloadEvaluation>) -> Value 
         "green_end": o.green_end,
         "yellow_end": o.yellow_end,
         "sys_bytes_by_position": o.sys_bytes_by_position,
+        // The `--n-cpu-moe` value each slider position writes
+        // (index = MoE layers on system RAM): the block-index bound
+        // that moves exactly that many MoE layers (review item 11).
+        // Endpoints are written as no tokens / `-ot exps=CPU`; their
+        // entries are the bounds for reference only. Additive.
+        "n_cpu_moe_by_position": (0..=o.moe_layers)
+            .map(|k| match &o.block_map {
+                Some(map) => map.bound_for_layers(k),
+                None => k,
+            })
+            .collect::<Vec<u32>>(),
         "custom": o.custom,
         "guardrail": guardrail,
     })
@@ -12461,6 +12600,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_flags_save_refuses_an_override_comma_llama_server_would_split() {
+        let (state, dir) = advanced_test_state(test_cfg());
+        let sink = test_sink();
+        op_backend_set_flags_mode(&state, &sink, "planner".to_string(), true)
+            .await
+            .unwrap();
+        let err = op_backend_set_raw_flags(
+            &state,
+            &sink,
+            "planner".to_string(),
+            Some(r#"-ot "blk\.[0-9]{1,2}\.ffn_.*_exps=CPU""#.to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, ApiError::InvalidInput(m) if m.contains("alternation")),
+            "{err}"
+        );
+        // Nothing was saved.
+        let cfg = state.config.read().await.clone();
+        let b = cfg.backends.iter().find(|b| b.id == "planner").unwrap();
+        assert!(b.raw_flags.as_deref().is_none_or(|r| !r.contains("{1,2}")));
+        // The alternation spelling saves.
+        let r = op_backend_set_raw_flags(
+            &state,
+            &sink,
+            "planner".to_string(),
+            Some(r#"-ot "blk\.([0-9]|[1-9][0-9])\.ffn_.*_exps=CPU""#.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["changed"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn raw_flags_save_requires_mode_journals_and_warns_without_blocking() {
         let mut cfg = test_cfg();
         cfg.backends
@@ -14481,6 +14656,30 @@ mod tests {
         assert!(spec.args.iter().any(|a| a == "--threads"));
     }
 
+    #[test]
+    fn backend_spec_strips_raw_flag_quotes_and_keeps_backslashes() {
+        // No shell runs llama-server: a quoted `-ot` value must
+        // reach it unquoted (it refused buffer `CPU"` before), with
+        // the regex's backslashes intact, exactly like the unquoted
+        // spelling.
+        let cfg = test_cfg();
+        let mut b = backend(&cfg, "planner");
+        let tail = |spec: &ProcessSpec| {
+            let pos = spec.args.iter().position(|a| a == "-ot").unwrap();
+            spec.args[pos..].to_vec()
+        };
+        b.raw_flags = Some(r"-ot blk\..=CPU --alias x".into());
+        let plain = tail(&backend_spec(&cfg, &b, &[]));
+        assert_eq!(plain, vec!["-ot", r"blk\..=CPU", "--alias", "x"]);
+        b.raw_flags = Some(r#"-ot "blk\..=CPU" --alias 'x'"#.into());
+        assert_eq!(tail(&backend_spec(&cfg, &b, &[])), plain);
+        b.raw_flags = Some(r#"-ot "blk\..=CPU" --alias """#.into());
+        assert_eq!(
+            tail(&backend_spec(&cfg, &b, &[])),
+            vec!["-ot", r"blk\..=CPU", "--alias", ""]
+        );
+    }
+
     /// Register a catalog model in a test config and point a
     /// backend at its file, so model resolution finds it.
     fn serve_model(
@@ -14862,15 +15061,84 @@ mod tests {
         assert_eq!(r.basis, manager_models::MemoryBasis::Estimate);
         // --n-cpu-moe 10 is a block-index bound: blocks 3..=9.
         assert_eq!(req("--n-cpu-moe 10").sys_weights_mib, 7);
-        // The slider table agrees with the requirement.
+        // The slider counts MoE layers: the saved bound 10 reads
+        // back as the 7 MoE layers it moves, and the table entry
+        // at that position agrees with the requirement.
         let b = uncreated_backend(
             "lead-dense",
             "models/lead-dense.gguf",
             Some("--n-cpu-moe 10".to_string()),
         );
         let info = backend_offload_info(&cfg, &b).unwrap();
-        assert_eq!(info.sys_bytes_by_position[10], 7 * 1024 * 1024);
+        assert_eq!(info.layers, 7);
+        assert_eq!(info.sys_bytes_by_position[7], 7 * 1024 * 1024);
+        assert_eq!(info.sys_bytes_by_position[10], 10 * 1024 * 1024);
         assert_eq!(info.sys_bytes_by_position[37], 37 * 1024 * 1024);
+        // Position 10 (10 MoE layers) writes bound 13.
+        assert_eq!(
+            info.offload_for(10),
+            manager_models::ExpertOffload::CpuMoeLayers(13)
+        );
+        assert_eq!(req("--n-cpu-moe 13").sys_weights_mib, 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offload_slider_converts_moe_layers_to_block_bounds() {
+        // Review item 11: 2 leading dense blocks + 4 MoE blocks.
+        let dir = gguf_probe_dir("item11");
+        std::fs::write(
+            dir.join("models").join("lead2.gguf"),
+            gguf_lead_dense_header(2, 4),
+        )
+        .unwrap();
+        let mut cfg = test_cfg();
+        cfg.data_dir = dir.clone();
+        register_test_model(&mut cfg, "lead2-moe", "models/lead2.gguf");
+        cfg.models.last_mut().unwrap().moe_layers = Some(4);
+        cfg.models.last_mut().unwrap().default_offload_layers = Some(2);
+        let info_for = |raw: Option<&str>| {
+            let b = uncreated_backend("lead2", "models/lead2.gguf", raw.map(str::to_string));
+            backend_offload_info(&cfg, &b).unwrap()
+        };
+        // Slider "2 MoE layers" writes --n-cpu-moe 4 ...
+        let info = info_for(None);
+        assert_eq!(info.moe_layers, 4);
+        let target = info.offload_for(2);
+        assert_eq!(
+            manager_models::set_expert_offload(None, target).as_deref(),
+            Some("--n-cpu-moe 4")
+        );
+        // ... and reads back as 2, canonical.
+        let info = info_for(Some("--n-cpu-moe 4"));
+        assert_eq!(info.layers, 2);
+        assert!(!info.custom);
+        // The row tells the UI which flag value each position writes.
+        assert_eq!(
+            offload_row_json(&info, None)["n_cpu_moe_by_position"],
+            json!([0, 3, 4, 5, 6])
+        );
+        // The model's declared default (2 MoE layers) is written
+        // at the same bound when the file is present ...
+        let model = cfg.models.last().unwrap().clone();
+        assert_eq!(
+            model_default_raw_flags_at(&cfg.data_dir, &model).as_deref(),
+            Some("--n-cpu-moe 4")
+        );
+        // ... and as-is without a parsed layout (no file).
+        assert_eq!(
+            model_default_raw_flags(&model).as_deref(),
+            Some("--n-cpu-moe 2")
+        );
+        // An existing config written with the old semantics
+        // (`--n-cpu-moe 2`, inside the dense prefix) displays what
+        // llama.cpp really does — no MoE layer — and is marked
+        // custom, since the slider would write it differently.
+        let info = info_for(Some("--n-cpu-moe 2"));
+        assert_eq!(info.layers, 0);
+        assert!(info.custom);
+        let info = info_for(Some("--n-cpu-moe 3"));
+        assert_eq!(info.layers, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

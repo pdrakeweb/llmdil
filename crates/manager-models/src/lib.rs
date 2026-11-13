@@ -33,7 +33,7 @@ pub use cache::{
     predicted_shares, price_ladder, set_cache_selection, CacheFitInputs, CacheRung, CacheSelection,
     CacheType, FlashAttn, HEADROOM_RESERVE_PERCENT, PREDICTED_BEST_LADDER,
 };
-pub use flags::{raw_flag_warnings, FlagWarning};
+pub use flags::{raw_flag_errors, raw_flag_warnings, split_raw_flags, FlagWarning};
 pub use gguf::{parse_gguf_layout, GgufError, GgufLayout, KvGeometry, RsGeometry};
 pub use guardrails::{
     nearest_allowed, offload_status, restriction_for, AllowedOffload, OffloadRestriction,
@@ -41,7 +41,8 @@ pub use guardrails::{
 };
 pub use memory::{
     expert_offload, memory_requirement, offload_bands, offload_flag_string, offload_for_layers,
-    set_expert_offload, sys_bytes_by_position, ExpertOffload, MemoryBasis, MemoryRequirement,
+    offload_for_moe_layers, set_expert_offload, sys_bytes_by_position, ExpertOffload, MemoryBasis,
+    MemoryRequirement, MoeBlockMap,
 };
 pub use moe_cache::{
     auto_moe_cache_budget, moe_cache_mib, moe_cache_shares, set_moe_cache,

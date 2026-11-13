@@ -642,7 +642,7 @@ pub(crate) fn fingerprint_inputs(
     // when the backend's model is offload-capable, else the raw
     // flags' own resolution.
     let offload = match crate::backend_offload_info(cfg, b) {
-        Some(info) => manager_models::offload_for_layers(info.layers, info.moe_layers),
+        Some(info) => info.offload_for(info.layers),
         None => manager_models::expert_offload(b.raw_flags.as_deref()),
     };
     MeasurementFingerprintInputs {
@@ -704,6 +704,9 @@ pub(crate) fn driver_versions_for(
 pub(crate) struct Gathered {
     pub(crate) measure: MeasureInputs,
     pub(crate) live: LiveSnapshot,
+    /// MoE block maps by model id for the parsed layouts in
+    /// `live.layouts` (see `manager_optimize::fit::others_residency_mapped`).
+    pub(crate) moe_block_maps: HashMap<String, manager_models::MoeBlockMap>,
     candidates: Vec<ConsultCandidate>,
     pub(crate) running: HashMap<String, bool>,
     /// Each configured backend's current measurement
@@ -868,11 +871,18 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
     // Layout facts per model: from serving backends' resolved
     // layouts; catalog-only facts for models no backend serves.
     let mut layouts: HashMap<String, LayoutFacts> = HashMap::new();
+    // MoE block maps for the same parsed layouts: the fit model
+    // prices `--n-cpu-moe` by block index through them (code
+    // review v0.1.60 item 11). Catalog-only facts have none.
+    let mut moe_block_maps: HashMap<String, manager_models::MoeBlockMap> = HashMap::new();
     for b in &cfg.backends {
         if let (Some(model), Some(l)) = (
             crate::model_for_backend(cfg, b),
             crate::resolve_weight_layout(cfg, b),
         ) {
+            if let Some(map) = l.moe_block_map() {
+                moe_block_maps.insert(model.id.clone(), map);
+            }
             layouts.insert(
                 model.id.clone(),
                 LayoutFacts {
@@ -941,6 +951,7 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
     Gathered {
         measure,
         live,
+        moe_block_maps,
         candidates,
         running,
         fingerprints,
@@ -1014,7 +1025,7 @@ fn plan_item_predicted(
                 if layers != info.layers {
                     merged.raw_flags = manager_models::set_expert_offload(
                         merged.raw_flags.as_deref(),
-                        manager_models::offload_for_layers(layers, info.moe_layers),
+                        info.offload_for(layers),
                     );
                 }
             }
@@ -1396,7 +1407,7 @@ async fn resolve_lookup_backend(
             if let Some(layers) = req.offload_layers {
                 if let Some(info) = crate::backend_offload_info(cfg, &merged) {
                     if layers != info.layers {
-                        let target = manager_models::offload_for_layers(layers, info.moe_layers);
+                        let target = info.offload_for(layers);
                         merged.raw_flags =
                             manager_models::set_expert_offload(merged.raw_flags.as_deref(), target);
                     }
@@ -1468,7 +1479,7 @@ async fn resolve_lookup_backend(
             tensor_split,
             split_mode,
         },
-        raw_flags: crate::model_default_raw_flags(model),
+        raw_flags: crate::model_default_raw_flags_at(&cfg.data_dir, model),
         flags_advanced: false,
         restart_policy: manager_config::RestartPolicy {
             max_retries: 5,
@@ -1487,7 +1498,7 @@ async fn resolve_lookup_backend(
     } else {
         if let Some(layers) = req.offload_layers {
             if let Some(info) = crate::backend_offload_info(cfg, &backend) {
-                let target = manager_models::offload_for_layers(layers, info.moe_layers);
+                let target = info.offload_for(layers);
                 backend.raw_flags =
                     manager_models::set_expert_offload(backend.raw_flags.as_deref(), target);
             }

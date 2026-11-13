@@ -99,9 +99,10 @@ pub fn suggested_default_offload(
         return (None, false);
     };
     let largest_bytes = largest_mib * 1024 * 1024;
-    // Position N is written as `--n-cpu-moe N`, which llama.cpp
-    // resolves by block index: price it from the tensor index when
-    // the parse carried one (the same table the slider shows).
+    // Position N counts MoE layers; it is written as the
+    // `--n-cpu-moe` block-index bound that moves the first N MoE
+    // blocks: price it from the tensor index when the parse
+    // carried one (the same table the slider shows).
     let sys = manager_models::memory::sys_bytes_by_position_with_tensors(
         layout.expert_bytes,
         Some(&layout.expert_bytes_by_block),

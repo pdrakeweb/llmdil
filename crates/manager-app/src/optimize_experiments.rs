@@ -550,9 +550,10 @@ async fn run_experiment_inner(
                 )
             } else {
                 let free = gathered.live.free_vram_mib_per_gpu.clone();
-                let (run_res, acct_res) = manager_optimize::fit::others_residency(
+                let (run_res, acct_res) = manager_optimize::fit::others_residency_mapped(
                     &temp_cfg,
                     &gathered.live.layouts,
+                    &gathered.moe_block_maps,
                     &gathered.live.backend_running,
                     &temp_id,
                     n_gpus,
@@ -573,9 +574,10 @@ async fn run_experiment_inner(
                     for id in &proposal.requires_stopping {
                         running2.insert(id.clone(), false);
                     }
-                    let (run2, acct2) = manager_optimize::fit::others_residency(
+                    let (run2, acct2) = manager_optimize::fit::others_residency_mapped(
                         &temp_cfg,
                         &gathered.live.layouts,
+                        &gathered.moe_block_maps,
                         &running2,
                         &temp_id,
                         n_gpus,
