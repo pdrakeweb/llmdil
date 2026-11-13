@@ -18,6 +18,8 @@
 //! - [`validate`]: the validation simulation (§5): items applied in
 //!   plan order to a cloned `AppConfig`, checked with
 //!   `manager_config::validate` plus the fit evaluator.
+//! - [`schema`]: the structured-output JSON schema for the plan
+//!   contract (Phase 3), derived from the parser's own allowlists.
 //! - [`probe`]: the CPU / system-RAM inventory probe (§2.1) — data
 //!   that exists nowhere else in the app.
 //! - [`discover`]: the Hugging Face discovery pre-pass (addendum
@@ -38,6 +40,7 @@ pub mod measure;
 pub mod parse;
 pub mod plan;
 pub mod probe;
+pub mod schema;
 pub mod tuning;
 pub mod validate;
 
@@ -96,6 +99,7 @@ pub use plan::{
     config_fingerprint, ApplyOutcome, Confidence, Decision, ExcludedItem, Plan, PlanItem, PlanKind,
 };
 pub use probe::{probe_hardware, HardwareProbe};
+pub use schema::{plan_json_schema, plan_response_format, AUTHORED_KINDS};
 pub use tuning::{
     adopt_is_default, cache_fa_offered, cache_ladder, context_cache_values, context_values,
     moe_cache_values, offload_values, placement_values, plan_filter, planned_arm_count, rank_arms,

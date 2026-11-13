@@ -4130,6 +4130,38 @@ export interface OptimizeState {
    *  sweep's progress record and the most recent finished
    *  sweep, either possibly null. */
   tuning: { running: TuningSweep | null; latest: TuningSweep | null };
+  /** Streaming progress of the running consultation (Optimize
+   *  Phase 3): text chunks received (≈ tokens), partial answer
+   *  size, time to first token. Null when no consultation is
+   *  streaming; absent from older builds and the sample payload. */
+  consult_progress?: OptimizeConsultProgress | null;
+  /** The Rust apply executor is running (Phase 3). */
+  applying?: boolean;
+}
+
+export interface OptimizeConsultProgress {
+  backend_id: string;
+  chunks: number;
+  content_bytes: number;
+  reasoning_bytes: number;
+  elapsed_ms: number;
+  first_token_ms: number | null;
+  /** At least one chunk has arrived (generation, not prompt
+   *  processing). */
+  streaming: boolean;
+}
+
+/** optimize_apply_plan's `apply_result` (Phase 3 executor). */
+export interface OptimizeApplyResult {
+  dry_run: boolean;
+  destructive: boolean;
+  config_changed: boolean;
+  steps: { item_id: number; kind: string; target: string | null; operations: string[] }[];
+  skipped: { item_id: number; reason: string }[];
+  applied?: number[];
+  failed?: { item_id: number; error: string } | null;
+  not_attempted?: number[];
+  rolled_back?: boolean;
 }
 
 /** One arm's full configuration (Addendum B §B.1), resolved:
@@ -4388,6 +4420,22 @@ export function optimizeTuningAdopt(sweepId: string, adoptAnyway?: boolean) {
  *  (the Phase 4 orchestrator reports progress through this). */
 export function optimizeSetItemOutcome(itemId: number, outcome: "applied" | "failed" | "not_attempted", error?: string) {
   return optimizeStateCmd("optimize_set_item_outcome", { itemId, outcome, error: error ?? null });
+}
+
+/** optimize_apply_plan — the Rust apply executor (Phase 3):
+ *  re-validates, then executes the accepted items of one phase
+ *  (non-destructive, or the deletes) through the existing ops in
+ *  plan order, halting on the first failure. `dryRun` reports the
+ *  operations without executing. Desktop only: in sample mode the
+ *  caller keeps its own orchestration (`live: false`). */
+export async function optimizeApplyPlan(destructive: boolean, dryRun = false): Promise<CallResult<(OptimizeState & { apply_result: OptimizeApplyResult }) | null>> {
+  if (!isTauri()) return { data: null, live: false };
+  try {
+    const data = await invoke<OptimizeState & { apply_result: OptimizeApplyResult }>("optimize_apply_plan", { destructive, dryRun });
+    return { data, live: true };
+  } catch (e) {
+    return { data: null, live: true, error: errOf(e) };
+  }
 }
 
 /** optimize_discard_plan — drop the stored plan and its decisions. */

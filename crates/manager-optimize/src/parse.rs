@@ -44,6 +44,7 @@ mod provision;
 mod test_fixtures;
 
 pub use extract::{extract_json_object, json_object_candidates};
+pub(crate) use normalize::change_fields;
 pub use provision::reground_experiment_provisioning;
 
 use grounding::{assign_create_port, ground_backend_model_refs, ground_model_add_params};

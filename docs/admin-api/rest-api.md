@@ -1308,7 +1308,7 @@ complete list, grouped by reason:
 | WinML — peripheral (decision 10) | `winml_probe` (R), `winml_status` (R), `winml_register` (D), `winml_unregister` (D) |
 | Notifications — desktop-only (toast delivery is a shell concern) | `notifications_set_config` (C), `notifications_send_test` (L) |
 | Windows services — desktop-only in v1 (SCM elevation is a shell concern) | `services_list` (R), `services_register` (D), `services_unregister` (D) |
-| Optimize — desktop-only in v1 | `optimize_get_state` (R), `optimize_validate_plan` (R), `optimize_save_purpose` (C), `optimize_set_item_state` (C), `optimize_set_item_outcome` (C), `optimize_discard_plan` (C), `optimize_set_experiment_state` (C), `optimize_consult` (L), `optimize_discover` (L), `optimize_cancel_consult` (L), `optimize_measure_backend` (L), `optimize_cancel_job` (L), `optimize_run_baseline` (L), `optimize_run_experiments` (L), `optimize_estimate_backend` (L), `optimize_estimate_experiments` (L) |
+| Optimize — desktop-only in v1 | `optimize_get_state` (R), `optimize_validate_plan` (R), `optimize_save_purpose` (C), `optimize_set_item_state` (C), `optimize_set_item_outcome` (C), `optimize_discard_plan` (C), `optimize_apply_plan` (D), `optimize_set_experiment_state` (C), `optimize_consult` (L), `optimize_discover` (L), `optimize_cancel_consult` (L), `optimize_measure_backend` (L), `optimize_cancel_job` (L), `optimize_run_baseline` (L), `optimize_run_experiments` (L), `optimize_estimate_backend` (L), `optimize_estimate_experiments` (L) |
 
 ### 6.17 API-layer routes (no backing registry operation)
 

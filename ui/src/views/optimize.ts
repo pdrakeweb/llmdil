@@ -5,25 +5,28 @@
    from the item's normalized change payload or the Rust-side
    validation (expected effects are app-computed, §1.3).
 
-   Apply (Phase 4) is orchestrated here through the existing
-   mutation commands only: non-destructive accepted items in plan
-   order, then destructive items behind their own confirm —
-   halt on first failure, outcomes recorded per item through
-   optimize_set_item_outcome. Apply saves configuration; it never
+   Apply (Phase 4) runs non-destructive accepted items in plan
+   order, then destructive items behind their own confirm — halt
+   on first failure, outcomes recorded per item. In the desktop
+   app it is the Rust executor (optimize_apply_plan, Phase 3),
+   which calls the same existing ops server-side; in sample mode
+   it is orchestrated here through the mutation commands, with
+   outcomes through optimize_set_item_outcome. Apply saves
+   configuration; it never
    restarts anything — activation stays with the banner /
    Activation Plan flow (§5.3). */
 
 import {
   addBackend, applyBackendConfig, deleteBackend, downloadModel, getAppConfig, getBackends,
   getBackendConfig, getModels, getOptimizeState, measurementDelete, modelAdd, modelAssign,
-  optimizeCancelConsult, optimizeCancelJob, optimizeChangeSummary, optimizeConsult,
+  optimizeApplyPlan, optimizeCancelConsult, optimizeCancelJob, optimizeChangeSummary, optimizeConsult,
   optimizeDiscardPlan, optimizeDiscover, optimizeEstimateBackend, optimizeEstimateExperiments, optimizeIsDestructive, optimizeKindLabel,
   optimizeMeasureBackend, optimizeRunBaseline, optimizeRunExperiments, optimizeSavePurpose, optimizeSetExperimentState, optimizeSetItemOutcome, optimizeSetItemState,
   optimizeTuningAdopt, optimizeTuningPreview, optimizeTuningRun,
   setBackendMoeCache, setBackendOffload, stopBackend, updateBackendFlags, updateGatewayConfig,
 } from "../api";
 import type {
-  CallResult, MeasurementInputs, OptimizeCandidate, OptimizeCandidates, OptimizeExperiment, OptimizeMeasurementEntry, OptimizePlanItem, OptimizeState,
+  CallResult, MeasurementInputs, OptimizeCandidate, OptimizeCandidates, OptimizeConsultProgress, OptimizeExperiment, OptimizeMeasurementEntry, OptimizePlanItem, OptimizeState,
   TuningArm, TuningCoords, TuningPreview, TuningSweep,
 } from "../api";
 import { fmtCount, trim1 } from "../charts";
@@ -50,6 +53,18 @@ function fmtElapsed(secs: number): string {
   const m = Math.floor(secs / 60);
   const s = secs % 60;
   return m > 0 ? `${m} min ${s} s` : `${s} s`;
+}
+
+/** The streaming consultation's progress (Phase 3), appended to
+ *  the Consulting indicator: tokens so far and the partial
+ *  answer's size, or the prompt-processing wait before the first
+ *  token. Empty when the server reports no progress (older
+ *  builds, sample mode). */
+function consultProgressText(p: OptimizeConsultProgress | null | undefined): string {
+  if (!p) return "";
+  if (!p.streaming) return " · waiting for the first token (prompt processing)";
+  const size = (n: number) => n >= 1024 ? `${trim1(n / 1024)} KB` : `${n} B`;
+  return ` · ${fmtCount(p.chunks)} tokens · ${size(p.content_bytes)} of answer${p.reasoning_bytes ? ` · ${size(p.reasoning_bytes)} reasoning` : ""}`;
 }
 
 export function fmtAge(secs: number): string {
@@ -110,6 +125,10 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   let loadError: string | null = null;
   let disposed = false;
   let elapsedTimer: number | null = null;
+  /** Streaming-progress poll (Phase 3): while a consultation runs,
+   *  re-read only `consult_progress` and update the indicator's
+   *  text in place (no repaint, so nothing being edited is lost). */
+  let progressTimer: number | null = null;
   let consultStart = 0;
   /** Armed two-step confirms, by key ("consult", "discard", "destructive"). */
   const armed = new Set<string>();
@@ -450,8 +469,8 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       <div class="opt-rows">${plan.items.map((i) => planRow(i, st)).join("")}</div>
       ${experimentsHtml(st)}
       ${nonDestructive.length || destructive.length ? `<div class="opt-applybar">
-        ${nonDestructive.length ? `<button class="btn primary" data-opt-act="apply" ${applyRunning ? "disabled" : ""}>${icon("check")} Apply accepted (${nonDestructive.length})</button>` : ""}
-        ${destructive.length ? `<button class="btn danger ${armed.has("destructive") ? "armed" : ""}" data-opt-act="apply-destructive" ${applyRunning ? "disabled" : ""}>${icon("trash")} ${armed.has("destructive") ? `Confirm deletes (${destructive.length})` : `Apply destructive (${destructive.length})`}</button>` : ""}
+        ${nonDestructive.length ? `<button class="btn primary" data-opt-act="apply" ${applyRunning || st.applying ? "disabled" : ""}>${icon("check")} Apply accepted (${nonDestructive.length})</button>` : ""}
+        ${destructive.length ? `<button class="btn danger ${armed.has("destructive") ? "armed" : ""}" data-opt-act="apply-destructive" ${applyRunning || st.applying ? "disabled" : ""}>${icon("trash")} ${armed.has("destructive") ? `Confirm deletes (${destructive.length})` : `Apply destructive (${destructive.length})`}</button>` : ""}
         <span class="opt-note">Apply saves the configuration only — nothing restarts. Activation stays with the banner / Activation Plan flow.</span>
       </div>` : ""}
       ${statusLine ? `<div class="opt-status">${esc(statusLine)}</div>` : ""}
@@ -964,7 +983,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       </div>
       <div class="opt-consult-actions">
         ${consulting
-          ? `<span class="opt-consulting">${icon("clock")} Consulting${consultStartMs !== null ? ` <span id="optElapsed">${fmtElapsed(Math.max(0, Math.floor((Date.now() - consultStartMs) / 1000)))}</span>` : ""} — a large model on local hardware can take several minutes.</span>
+          ? `<span class="opt-consulting">${icon("clock")} Consulting${consultStartMs !== null ? ` <span id="optElapsed">${fmtElapsed(Math.max(0, Math.floor((Date.now() - consultStartMs) / 1000)))}</span>` : ""}<span id="optProgress">${esc(consultProgressText(st.consult_progress))}</span> — a large model on local hardware can take several minutes.</span>
              <button class="btn danger" data-opt-act="cancel-consult">${icon("x")} Cancel</button>`
           : `<button class="btn primary" data-opt-act="consult" ${running.length ? "" : "disabled"}>${icon("target")} ${armed.has("consult") ? "Replace the current plan?" : st.plan ? "Consult again" : "Consult"}</button>
              <button class="btn" data-opt-act="sample">${icon("layers")} Sample plan</button>
@@ -1014,6 +1033,24 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     } else if (!consulting && elapsedTimer !== null) {
       window.clearInterval(elapsedTimer);
       elapsedTimer = null;
+    }
+    // Streaming progress (Phase 3): poll the payload's
+    // consult_progress while a consultation runs — this page's own
+    // or another window's — and rewrite only the indicator text.
+    if (consulting && progressTimer === null) {
+      progressTimer = window.setInterval(() => {
+        void (async () => {
+          if (disposed || !state?.consulting) return;
+          const r = await getOptimizeState();
+          if (disposed || !state || !r.data) return;
+          state.consult_progress = r.data.consult_progress ?? null;
+          const el = hostEl.querySelector("#optProgress");
+          if (el) el.textContent = consultProgressText(state.consult_progress);
+        })();
+      }, 3000);
+    } else if (!consulting && progressTimer !== null) {
+      window.clearInterval(progressTimer);
+      progressTimer = null;
     }
     // Same for a server-described Estimate/Measure job (tracker
     // #69): a window that did not start the job still ticks its
@@ -1514,6 +1551,33 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     applyRunning = true;
     statusLine = "";
     paint();
+    // Phase 3: the desktop app applies through the Rust executor
+    // (optimize_apply_plan) — the same ops, re-validated and run
+    // server-side in plan order with halt-on-first-failure. The
+    // orchestration below stays for sample mode (no backend).
+    const viaRust = await optimizeApplyPlan(destructivePhase);
+    if (viaRust.live) {
+      if (disposed) return;
+      if (viaRust.error) {
+        statusLine = `Apply failed — ${viaRust.error}`;
+      } else if (viaRust.data) {
+        state = viaRust.data;
+        const res = viaRust.data.apply_result;
+        const activate = "Applied changes are saved, not live: activate them from the banner or the Activation Plan page.";
+        if (res.failed) {
+          statusLine = `Apply stopped at item ${res.failed.item_id} — ${res.failed.error}. Items after it were not attempted. ${activate}`;
+        } else if (!res.steps.length && res.skipped.length) {
+          statusLine = `Nothing applied — ${res.skipped.map((s) => `item ${s.item_id}: ${s.reason}`).join("; ")}.`;
+        } else {
+          statusLine = "Applied. The changes are saved, not live — activate them from the banner or the Activation Plan page.";
+        }
+      }
+      applyRunning = false;
+      armed.delete("destructive");
+      await refresh();
+      if (statusLine) paint();
+      return;
+    }
     let failed = false;
     for (const item of queue) {
       if (disposed) break;
@@ -1849,6 +1913,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   return () => {
     disposed = true;
     if (pollTimer !== null) window.clearInterval(pollTimer);
+    if (progressTimer !== null) window.clearInterval(progressTimer);
     if (jobTimer !== null) window.clearInterval(jobTimer);
     if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
     if (measureTimer !== null) window.clearInterval(measureTimer);

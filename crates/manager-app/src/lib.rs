@@ -65,8 +65,10 @@ mod mcp_local;
 pub mod notify;
 pub mod openrouter_spend;
 pub mod optimize;
+pub mod optimize_apply;
 pub mod optimize_eval;
 pub mod optimize_experiments;
+mod optimize_stream;
 pub mod optimize_tuning;
 
 pub use app_update::{
@@ -91,6 +93,7 @@ pub use optimize::{
     op_optimize_save_purpose, op_optimize_set_item_outcome, op_optimize_set_item_state,
     op_optimize_validate_plan,
 };
+pub use optimize_apply::op_optimize_apply_plan;
 pub use optimize_eval::op_optimize_run_baseline;
 pub use optimize_experiments::{
     op_optimize_estimate_experiments, op_optimize_run_experiments, op_optimize_set_experiment_state,
@@ -488,6 +491,9 @@ pub struct AppState {
     /// its failure on the Optimize page, not silently leave the
     /// previous plan looking current.
     optimize_consult_error: Mutex<Option<(String, i64)>>,
+    /// Optimize Phase 3 live state: streaming-consultation progress
+    /// and the Rust apply executor's one-at-a-time claim.
+    optimize_live: optimize_stream::OptimizeLive,
     /// Shared cancellation slot for GPU-bound Optimize jobs
     /// (Phase 5: measurements and experiment batches): one such job
     /// at a time, separate from the consult slot because a
@@ -709,6 +715,7 @@ impl AppState {
             optimize_abort: Mutex::new(None),
             optimize_consult_started_unix_ms: Mutex::new(None),
             optimize_consult_error: Mutex::new(None),
+            optimize_live: Default::default(),
             optimize_job_abort: Mutex::new(None),
             bench_abort: Mutex::new(None),
             bench_generate_abort: Mutex::new(None),
