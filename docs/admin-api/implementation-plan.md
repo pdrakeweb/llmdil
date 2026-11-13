@@ -253,7 +253,7 @@ operations. The seams, as they exist in the code today:
    cancel/restore.
 6. **Existing patterns the API inherits rather than invents:**
    long work is already modeled — the task registry
-   (`record_task`/`finish_task`, `tasks_list`, `task_abort`) for
+   (`record_task`/`finish_task`, `tasks_list`, `task_abort` — with real cooperative cancellation: a per-task cancellation token, routed to the operation's own cancel op where one exists, terminal `aborted` once the work stopped or a bounded grace period elapsed; `crates/manager-app/src/tasks.rs`) for
    downloads and updates, and busy signaling with a named running
    step for the wizard. The REST surface for long operations is
    "start → 202 + task id → poll task (or event stream)", a direct
@@ -326,7 +326,7 @@ start-gateway, update check/apply — all via the task registry:
 202 + task id, task polling endpoint, and an SSE event stream fed
 by the `EventSink` broadcast (backend status, download progress,
 wizard progress, task progress — the same four event kinds the UI
-receives today). **Gates:** task lifecycle tests including abort;
+receives today). **Gates:** task lifecycle tests including abort (in place: download abort stops the transfer, routing to an op's own cancel, finished-task no-op, grace-period forced abort);
 SSE reconnect/resume test; a soak test driving a full model
 download through the API against the fake ops layer.
 

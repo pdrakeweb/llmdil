@@ -15,7 +15,9 @@ use async_trait::async_trait;
 use manager_config::{AppConfig, McpExposure, McpServerConfig, McpTransport};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1677,6 +1679,28 @@ impl Wizard {
     /// first failure or the first blocked step; call again to resume after
     /// `retry` / `skip` / `mark_manual`.
     pub async fn run_all(&mut self, ctx: &WizardContext) -> WizardReport {
+        self.run_all_inner(ctx, None).await
+    }
+
+    /// [`Self::run_all`] that also stops when `cancel` resolves: the
+    /// running step is stopped exactly as a budget expiry stops it
+    /// (its command's process tree killed, blocking work asked to
+    /// stop) and recorded `Failed` with an operator-cancelled message,
+    /// and no further step starts. The task registry's abort drives
+    /// this (cooperative task cancellation).
+    pub async fn run_all_until(
+        &mut self,
+        ctx: &WizardContext,
+        cancel: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
+    ) -> WizardReport {
+        self.run_all_inner(ctx, Some(cancel)).await
+    }
+
+    async fn run_all_inner(
+        &mut self,
+        ctx: &WizardContext,
+        mut cancel: Option<Pin<&mut (dyn Future<Output = ()> + Send + '_)>>,
+    ) -> WizardReport {
         self.touch_started();
         let ids = self.step_ids();
         for id in ids {
@@ -1698,8 +1722,15 @@ impl Wizard {
             if blocked.is_some() {
                 break; // leave Queued; UI shows "waiting on"
             }
-            let outcome = self.execute_step(ctx, &id).await;
-            if outcome.state == StepState::Failed {
+            let (outcome, cancelled) = self
+                .execute_step_inner(
+                    ctx,
+                    &id,
+                    step_budget(&id),
+                    cancel.as_mut().map(|c| c.as_mut()),
+                )
+                .await;
+            if cancelled || outcome.state == StepState::Failed {
                 break;
             }
         }
@@ -1732,6 +1763,39 @@ impl Wizard {
         }
         self.touch_started();
         Ok(self.execute_step(ctx, id).await)
+    }
+
+    /// [`Self::run_step`] that also stops when `cancel` resolves (see
+    /// [`Self::run_all_until`]). Returns the outcome and whether the
+    /// step was stopped by `cancel`.
+    pub async fn run_step_until(
+        &mut self,
+        ctx: &WizardContext,
+        id: &str,
+        cancel: Pin<&mut (dyn Future<Output = ()> + Send + '_)>,
+    ) -> Result<(StepOutcome, bool), WizardError> {
+        let prereqs: Vec<String> = self
+            .find(id)
+            .ok_or_else(|| WizardError::UnknownStep(id.to_string()))?
+            .prerequisites();
+        for pre in &prereqs {
+            let ok = self
+                .states
+                .get(pre.as_str())
+                .copied()
+                .map(StepState::satisfies_prerequisite)
+                .unwrap_or(false);
+            if !ok {
+                return Err(WizardError::PrerequisiteFailed {
+                    step: id.to_string(),
+                    waiting_on: pre.clone(),
+                });
+            }
+        }
+        self.touch_started();
+        Ok(self
+            .execute_step_inner(ctx, id, step_budget(id), Some(cancel))
+            .await)
     }
 
     /// Reset a failed step to `Queued` so it can run again. No-op otherwise.
@@ -1798,23 +1862,40 @@ impl Wizard {
     }
 
     async fn execute_step(&mut self, ctx: &WizardContext, id: &str) -> StepOutcome {
-        self.execute_step_with_budget(ctx, id, step_budget(id))
+        self.execute_step_inner(ctx, id, step_budget(id), None)
             .await
+            .0
     }
 
+    #[cfg(test)]
     async fn execute_step_with_budget(
         &mut self,
         ctx: &WizardContext,
         id: &str,
         budget: Duration,
     ) -> StepOutcome {
+        self.execute_step_inner(ctx, id, budget, None).await.0
+    }
+
+    /// Run one step under `budget`, also stopping when `cancel`
+    /// resolves. Returns the outcome and whether `cancel` stopped it.
+    async fn execute_step_inner(
+        &mut self,
+        ctx: &WizardContext,
+        id: &str,
+        budget: Duration,
+        cancel: Option<Pin<&mut (dyn Future<Output = ()> + Send + '_)>>,
+    ) -> (StepOutcome, bool) {
         // Defensive: both callers resolve the step via find() first, so this
         // is unreachable in practice — but an unknown id must fail closed,
         // not panic.
         if self.find(id).is_none() {
-            return StepOutcome::failed(
-                format!("unknown step: {id}"),
-                vec!["execute_step called for an unregistered step".to_string()],
+            return (
+                StepOutcome::failed(
+                    format!("unknown step: {id}"),
+                    vec!["execute_step called for an unregistered step".to_string()],
+                ),
+                false,
             );
         }
         let step_name = self
@@ -1843,28 +1924,58 @@ impl Wizard {
         // dropped future cannot cancel (archive extraction) is asked
         // to stop via request_cancellation, so a timed-out step frees
         // the wizard instead of wedging it for the rest of the session.
+        // An operator cancellation (`cancel`) stops the step the same
+        // way: the step future is dropped and blocking work is asked
+        // to stop.
+        let mut cancelled = false;
         let raw = match self.find(id) {
-            Some(step) => match tokio::time::timeout(budget, step.run(ctx)).await {
-                Ok(r) => r,
-                Err(_) => {
-                    ctx.ops.request_cancellation();
-                    Ok(StepOutcome::failed(
-                        format!(
-                            "step '{step_name}' timed out after {} and was stopped",
-                            budget_label(budget)
-                        ),
-                        vec![format!(
-                            "the step exceeded its {} budget and was aborted; \
-                             re-run the step to retry",
-                            budget_label(budget)
-                        )],
-                    ))
+            Some(step) => {
+                let timed = tokio::time::timeout(budget, step.run(ctx));
+                let stopped = async {
+                    match cancel {
+                        Some(c) => c.await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = stopped => {
+                        cancelled = true;
+                        ctx.ops.request_cancellation();
+                        Ok(StepOutcome::failed(
+                            format!("step '{step_name}' was cancelled by the operator"),
+                            vec![
+                                "the step was cancelled and stopped; re-run the step to retry"
+                                    .to_string(),
+                            ],
+                        ))
+                    }
+                    res = timed => match res {
+                        Ok(r) => r,
+                        Err(_) => {
+                            ctx.ops.request_cancellation();
+                            Ok(StepOutcome::failed(
+                                format!(
+                                    "step '{step_name}' timed out after {} and was stopped",
+                                    budget_label(budget)
+                                ),
+                                vec![format!(
+                                    "the step exceeded its {} budget and was aborted; \
+                                     re-run the step to retry",
+                                    budget_label(budget)
+                                )],
+                            ))
+                        }
+                    },
                 }
-            },
+            }
             None => {
-                return StepOutcome::failed(
-                    format!("unknown step: {id}"),
-                    vec!["step unregistered during execution".to_string()],
+                return (
+                    StepOutcome::failed(
+                        format!("unknown step: {id}"),
+                        vec!["step unregistered during execution".to_string()],
+                    ),
+                    false,
                 )
             }
         };
@@ -1903,7 +2014,7 @@ impl Wizard {
                 manual_command: outcome.manual_command.clone(),
             },
         );
-        outcome
+        (outcome, cancelled)
     }
 }
 
@@ -2879,6 +2990,35 @@ mod tests {
         // shows it and a retry is possible.
         assert_eq!(w.state("hang"), Some(StepState::Failed));
         assert_eq!(w.report().steps[0].state, StepState::Failed);
+    }
+
+    #[tokio::test]
+    async fn step_run_stops_when_cancelled() {
+        let c = ctx();
+        let mut w =
+            Wizard::new(vec![Box::new(HangStep)], RunMode::Install).expect("unique step ids");
+        let cancel = std::pin::pin!(tokio::time::sleep(Duration::from_millis(50)));
+        let started = Instant::now();
+        let (outcome, cancelled) = w.run_step_until(&c, "hang", cancel).await.unwrap();
+        assert!(cancelled);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(outcome.state, StepState::Failed);
+        assert!(outcome.message.contains("cancelled"), "{}", outcome.message);
+        assert_eq!(w.state("hang"), Some(StepState::Failed));
+    }
+
+    #[tokio::test]
+    async fn run_all_until_stops_before_later_steps() {
+        let c = ctx();
+        let mut w = Wizard::new(
+            vec![Box::new(HangStep), Box::new(ScriptStep::ok("after"))],
+            RunMode::Install,
+        )
+        .expect("unique step ids");
+        let cancel = std::pin::pin!(tokio::time::sleep(Duration::from_millis(50)));
+        w.run_all_until(&c, cancel).await;
+        assert_eq!(w.state("hang"), Some(StepState::Failed));
+        assert_eq!(w.state("after"), Some(StepState::Queued));
     }
 
     #[tokio::test]

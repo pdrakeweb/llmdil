@@ -14,6 +14,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true }
+# CancellationToken for the task registry's cooperative abort
+# (already in the lockfile via reqwest).
+tokio-util = "0.7"
 chrono = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }

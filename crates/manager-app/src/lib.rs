@@ -95,6 +95,7 @@ pub use optimize_tuning::{
     op_optimize_tuning_adopt, op_optimize_tuning_preview, op_optimize_tuning_run,
 };
 pub mod registry;
+pub(crate) mod tasks;
 
 // ---------------------------------------------------------------------------
 // Events (Rust -> UI, spec §14)
@@ -409,6 +410,8 @@ pub struct AppState {
     /// std Mutex: only synchronous set/clear/read.
     wizard_step_running: std::sync::Mutex<Option<(String, std::time::Instant)>>,
     tasks: Mutex<HashMap<String, TaskRecord>>,
+    /// Per-task cancellation tokens and abort routing (see [`tasks`]).
+    task_controls: tasks::TaskControls,
     task_counter: AtomicU64,
     /// Live model-download handles by model id (spec §14 download commands).
     downloads: Mutex<HashMap<String, DownloadHandle>>,
@@ -680,6 +683,7 @@ impl AppState {
             wizard_steps_cache: RwLock::new(None),
             wizard_step_running: std::sync::Mutex::new(None),
             tasks: Mutex::new(HashMap::new()),
+            task_controls: tasks::TaskControls::default(),
             task_counter: AtomicU64::new(1),
             downloads: Mutex::new(HashMap::new()),
             download_outcomes: Mutex::new(HashMap::new()),
@@ -787,15 +791,16 @@ impl AppState {
             detail,
             created_ms: now_ms(),
         };
+        // The control exists before the record, so an abort that
+        // finds the record running always finds its token.
+        self.task_controls.register(&id);
         self.tasks.lock().await.insert(id.clone(), record);
         id
     }
 
+    /// Settle a task's terminal state (abort-aware; see [`tasks`]).
     async fn finish_task(&self, id: &str, status: TaskStatus, detail: Value) {
-        if let Some(rec) = self.tasks.lock().await.get_mut(id) {
-            rec.status = status;
-            rec.detail = detail;
-        }
+        tasks::finish(self, id, status, detail).await;
     }
 
     async fn wizard_ctx(&self, mode: RunMode) -> WizardContext {
@@ -3715,12 +3720,29 @@ pub async fn op_run_wizard_step(
         .wizard_step_running
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some((step_id.clone(), std::time::Instant::now()));
-    let outcome_result = guard.run_step(&ctx, &step_id).await;
+    // task_abort cancels the token: the runner stops the step (its
+    // command's process tree is killed) and records it failed.
+    let cancel_token = state.task_controls.token(&task_id);
+    let outcome_result = guard
+        .run_step_until(&ctx, &step_id, std::pin::pin!(cancel_token.cancelled()))
+        .await;
     *state
         .wizard_step_running
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
-    let mut outcome: StepOutcome = outcome_result.map_err(ApiError::from)?;
+    let (mut outcome, step_cancelled): (StepOutcome, bool) = match outcome_result {
+        Ok(r) => r,
+        Err(e) => {
+            state
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Failed,
+                    json!({ "error": e.to_string() }),
+                )
+                .await;
+            return Err(ApiError::from(e));
+        }
+    };
     // The step returned its config edits instead of saving them;
     // apply them under the config lock (PS-4). A failed save fails
     // the step.
@@ -3774,7 +3796,11 @@ pub async fn op_run_wizard_step(
     state
         .finish_task(
             &task_id,
-            TaskStatus::Done,
+            if step_cancelled {
+                TaskStatus::Aborted
+            } else {
+                TaskStatus::Done
+            },
             serde_json::to_value(&outcome).unwrap_or(Value::Null),
         )
         .await;
@@ -3787,8 +3813,11 @@ pub async fn op_run_wizard_step(
     } else {
         format!("{step_name}: {}", outcome.message)
     };
-    match outcome.state {
-        StepState::Done => {
+    // An operator-aborted step stays silent, like a cancelled
+    // download: the operator already knows.
+    let toast_state = (!step_cancelled).then_some(outcome.state);
+    match toast_state {
+        Some(StepState::Done) => {
             notify::notify(
                 sink.as_ref(),
                 state,
@@ -3798,7 +3827,7 @@ pub async fn op_run_wizard_step(
             )
             .await;
         }
-        StepState::Failed => {
+        Some(StepState::Failed) => {
             if step_id == "start-gateway" && activation_plan_pending(state).await {
                 notify::notify(
                     sink.as_ref(),
@@ -3822,7 +3851,7 @@ pub async fn op_run_wizard_step(
                 .await;
             }
         }
-        StepState::Manual => {
+        Some(StepState::Manual) => {
             notify::notify(
                 sink.as_ref(),
                 state,
@@ -3866,7 +3895,12 @@ pub async fn op_run_audit(state: &Arc<AppState>, sink: &Arc<dyn EventSink>) -> A
             }));
         }
     };
-    let _ = guard.run_all(&ctx).await;
+    // task_abort stops the running check and starts no further one.
+    let cancel_token = state.task_controls.token(&task_id);
+    let _ = guard
+        .run_all_until(&ctx, std::pin::pin!(cancel_token.cancelled()))
+        .await;
+    let audit_cancelled = cancel_token.is_cancelled();
     // Audit-verified models return verified_at stamps (PS-4).
     state.apply_wizard_config_edits(&mut guard).await;
     let report: WizardReport = guard.report();
@@ -3923,7 +3957,11 @@ pub async fn op_run_audit(state: &Arc<AppState>, sink: &Arc<dyn EventSink>) -> A
     state
         .finish_task(
             &task_id,
-            TaskStatus::Done,
+            if audit_cancelled {
+                TaskStatus::Aborted
+            } else {
+                TaskStatus::Done
+            },
             json!({ "done": done, "total": total }),
         )
         .await;
@@ -4203,6 +4241,17 @@ pub async fn op_download_model(
     // check-and-insert above is complete; the entry now guards against
     // a second worker for this model.
     drop(downloads);
+    // The transfer is a tracked task: task_abort routes to
+    // cancel_download (the worker removes the partial file).
+    let task_id = state
+        .record_task("model_download", json!({ "model_id": id, "dest": dest }))
+        .await;
+    state.task_controls.set_canceller(
+        &task_id,
+        tasks::TaskCanceller::Download {
+            model_id: id.clone(),
+        },
+    );
     // Starting a new attempt clears the previous terminal outcome and
     // any earlier verification stamp: until this attempt's file passes
     // verification the model counts as unverified (the start
@@ -4233,6 +4282,7 @@ pub async fn op_download_model(
     let watcher_state = Arc::clone(state);
     let watcher_id = id.clone();
     let watcher_dest = dest.clone();
+    let watcher_task = task_id.clone();
     tokio::spawn(async move {
         let outcome = watcher_handle.wait().await;
         let st = watcher_state;
@@ -4370,6 +4420,16 @@ pub async fn op_download_model(
                         msg.clone(),
                     )),
                 };
+                st.finish_task(
+                    &watcher_task,
+                    if failed.is_some() {
+                        TaskStatus::Failed
+                    } else {
+                        TaskStatus::Done
+                    },
+                    json!({ "model_id": watcher_id, "error": failed, "verified": verified }),
+                )
+                .await;
                 st.record_download_outcome(
                     &watcher_id,
                     DownloadOutcome {
@@ -4387,8 +4447,20 @@ pub async fn op_download_model(
                 // Operator-initiated: neither a completion nor a
                 // failure — clear the outcome instead of recording one.
                 st.clear_download_outcome(&watcher_id, attempt).await;
+                st.finish_task(
+                    &watcher_task,
+                    TaskStatus::Aborted,
+                    json!({ "model_id": watcher_id, "cancelled": true }),
+                )
+                .await;
             }
             Err(e) => {
+                st.finish_task(
+                    &watcher_task,
+                    TaskStatus::Failed,
+                    json!({ "model_id": watcher_id, "error": format!("download failed: {e}") }),
+                )
+                .await;
                 // Transfer failures are not verification failures and
                 // do not gate backend start.
                 st.record_download_outcome(
@@ -4411,7 +4483,7 @@ pub async fn op_download_model(
             }
         }
     });
-    Ok(json!({ "model_id": id, "dest": dest }))
+    Ok(json!({ "model_id": id, "dest": dest, "task_id": task_id }))
 }
 
 /// Cancel an in-flight download (partial file removed by the worker).
@@ -10495,20 +10567,15 @@ pub async fn op_placement_apply(
 // Tasks / diagnostics
 // ---------------------------------------------------------------------------
 
-/// Best-effort abort of a tracked task.
+/// Abort a tracked task: cancels its work cooperatively (routing to the
+/// operation's own cancel op where one exists) and waits a bounded
+/// grace period for it to stop. See [`tasks`].
 pub async fn op_task_abort(
     state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
+    sink: &Arc<dyn EventSink>,
     task_id: String,
 ) -> ApiResult {
-    let mut tasks = state.tasks.lock().await;
-    match tasks.get_mut(&task_id) {
-        Some(rec) => {
-            rec.status = TaskStatus::Aborted;
-            Ok(json!({ "ok": true, "task_id": task_id }))
-        }
-        None => Err(ApiError::NotFound(format!("task {task_id}"))),
-    }
+    tasks::abort(state, sink, task_id).await
 }
 
 /// All tracked tasks.
@@ -10901,16 +10968,36 @@ pub async fn op_vscode_install_extensions(
         RunMode::Install,
         Arc::new(RealSystemOps::default()),
     );
-    let mut wizard = Wizard::new(
+    let mut wizard = match Wizard::new(
         vec![Box::new(VscodeExtensions::default())],
         RunMode::Install,
-    )?;
-    let report = wizard.run_all(&ctx).await;
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            state
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Failed,
+                    json!({ "error": e.to_string() }),
+                )
+                .await;
+            return Err(e.into());
+        }
+    };
+    // task_abort stops the install (the `code` child is killed).
+    let cancel_token = state.task_controls.token(&task_id);
+    let report = wizard
+        .run_all_until(&ctx, std::pin::pin!(cancel_token.cancelled()))
+        .await;
     let (done, total) = report.progress();
     state
         .finish_task(
             &task_id,
-            TaskStatus::Done,
+            if cancel_token.is_cancelled() {
+                TaskStatus::Aborted
+            } else {
+                TaskStatus::Done
+            },
             json!({ "done": done, "total": total }),
         )
         .await;

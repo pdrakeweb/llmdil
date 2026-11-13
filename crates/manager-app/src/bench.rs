@@ -487,6 +487,9 @@ pub async fn op_bench_prompt_generate(
         }
         *slot = Some(tx);
     }
+    state
+        .task_controls
+        .set_canceller(&task_id, crate::tasks::TaskCanceller::BenchPromptGenerate);
     let model_name = crate::model_for_backend(&cfg, &backend)
         .map(|m| m.id.clone())
         .unwrap_or_else(|| backend.id.clone());
@@ -1899,6 +1902,12 @@ pub async fn op_bench_run_start(
         let mut slot = state.bench_abort.lock().await;
         *slot = Some(tx);
     }
+    state.task_controls.set_canceller(
+        &task_id,
+        crate::tasks::TaskCanceller::BenchRun {
+            sweep_id: sweep_id.clone(),
+        },
+    );
     {
         let mut slot = state.bench_job.lock().await;
         *slot = Some(BenchJob {

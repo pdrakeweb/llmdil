@@ -1822,6 +1822,9 @@ pub async fn op_optimize_consult(
             }
             *slot = Some(tx);
         }
+        state
+            .task_controls
+            .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeConsult);
         record_consult_start(state).await;
         let model_name = crate::model_for_backend(&cfg, &backend)
             .map(|m| m.id.clone())
@@ -2309,6 +2312,9 @@ pub async fn op_optimize_measure_backend(
         }
         *slot = Some(tx);
     }
+    state
+        .task_controls
+        .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeJob);
     let job_started_ms = record_job_start(state, "measure", &backend_id).await;
     // Loopback by construction, as with consultations (§3).
     let base_url = format!("http://127.0.0.1:{}", backend.port);
@@ -2538,6 +2544,9 @@ pub async fn op_optimize_estimate_backend(
         }
         *slot = Some(tx);
     }
+    state
+        .task_controls
+        .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeJob);
     let job_started_ms = record_job_start(state, "estimate", &backend_id).await;
     // Loopback by construction, as with measurements (§3).
     let base_url = format!("http://127.0.0.1:{}", backend.port);

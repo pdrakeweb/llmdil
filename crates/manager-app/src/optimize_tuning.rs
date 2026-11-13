@@ -1362,6 +1362,9 @@ pub async fn op_optimize_tuning_run(
         }
         *slot = Some(tx);
     }
+    state
+        .task_controls
+        .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeJob);
     let task_state = state.clone();
     let task_backend = backend_id.clone();
     tokio::spawn(async move {
@@ -1373,8 +1376,15 @@ pub async fn op_optimize_tuning_run(
             let mut slot = task_state.optimize_job_abort.lock().await;
             *slot = None;
         }
+        // A sweep stopped by optimize_cancel_job (or task_abort,
+        // which routes there) ends early; record it as aborted.
+        let status = if task_state.task_controls.abort_requested(&task_id) {
+            TaskStatus::Aborted
+        } else {
+            TaskStatus::Done
+        };
         task_state
-            .finish_task(&task_id, TaskStatus::Done, json!({ "backend": backend_id }))
+            .finish_task(&task_id, status, json!({ "backend": backend_id }))
             .await;
     });
     crate::optimize::state_payload(state).await

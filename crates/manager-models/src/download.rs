@@ -494,10 +494,29 @@ async fn download_inner(
         if ranged {
             request = request.header("Range", format!("bytes={offset}-"));
         }
-        let mut response = request
-            .send()
-            .await
-            .map_err(|e| ModelError::Network(e.to_string()))?;
+        // The request phase (connect, TLS, headers) honors cancel
+        // too: a server that accepts the connection and never answers
+        // must not hold a cancelled download open — the client has no
+        // overall timeout, so without this the worker sat in `send()`
+        // indefinitely and the cancel only took effect once a body
+        // arrived.
+        let send = request.send();
+        tokio::pin!(send);
+        let mut response = loop {
+            let notified = shared.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if shared.current_state() == WorkerState::Cancelled {
+                let _ = tokio::fs::remove_file(&part).await;
+                return Err(ModelError::Cancelled(spec.id.clone()));
+            }
+            tokio::select! {
+                res = &mut send => {
+                    break res.map_err(|e| ModelError::Network(e.to_string()))?;
+                }
+                _ = &mut notified => continue,
+            }
+        };
         let status = response.status();
 
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
@@ -897,6 +916,49 @@ mod tests {
             !partial_path(&dest).exists(),
             "partial file must be removed on cancel"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A server that accepts the connection and never answers parks
+    /// the worker in the request phase; cancel must still end it
+    /// promptly (the client has no overall timeout).
+    #[tokio::test]
+    async fn download_cancel_during_unanswered_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let held2 = Arc::clone(&held);
+        let accepted = Arc::new(AtomicBool::new(false));
+        let accepted2 = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted2.store(true, Ordering::SeqCst);
+                // Keep the socket open and silent.
+                held2.lock().unwrap().push(socket);
+            }
+        });
+        let dir = test_temp_dir("dl-cancel-silent");
+        let dest = dir.join("model.gguf");
+        let mut spec = test_spec("silent", 10);
+        spec.url = format!("http://{addr}/file");
+        let handle = download(&spec, &dest, |_| {}).await.unwrap();
+        for _ in 0..200 {
+            if accepted.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(accepted.load(Ordering::SeqCst), "worker never connected");
+        handle.cancel().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), handle.wait())
+            .await
+            .expect("cancel must end a download stuck in the request phase");
+        assert!(
+            matches!(result, Err(ModelError::Cancelled(_))),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(!dest.exists());
+        assert!(!partial_path(&dest).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
