@@ -25,7 +25,7 @@ function check(cond, msg) {
 // code those checks always scanned, no more and no less.
 const API_SOURCES = [join(root, "src", "api.ts"),
   ...readdirSync(join(root, "src", "api")).filter((f) => f.endsWith(".ts")).sort().map((f) => join(root, "src", "api", f))];
-const STATIC_VIEW_SOURCES = ["static"].map((v) => join(root, "src", "views", `${v}.ts`));
+const STATIC_VIEW_SOURCES = ["static", "common", "gpus", "logs", "settingsPanels", "settings", "wizard"].map((v) => join(root, "src", "views", `${v}.ts`));
 const readAll = (files) => files.map((f) => readFileSync(f, "utf8")).join("\n");
 const readApiSrc = () => readAll(API_SOURCES);
 const readStaticSrc = () => readAll(STATIC_VIEW_SOURCES);
