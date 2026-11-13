@@ -41,7 +41,7 @@ pub async fn op_update_gateway_config(
     _sink: &Arc<dyn EventSink>,
     patch: Value,
 ) -> ApiResult {
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     let mut v = serde_json::to_value(&new_cfg.gateway)?;
@@ -54,6 +54,7 @@ pub async fn op_update_gateway_config(
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
     let journaled = record_gateway_change(
         state,
+        &live,
         &pre_cfg,
         &new_cfg,
         "gateway_config",
@@ -82,9 +83,13 @@ pub async fn op_update_gateway_config(
 /// saved change no plan will ever show (code-review 4.3). The
 /// journal's own resolution uses the running backends' real start
 /// times, so already-live backend-scope entries prune correctly
-/// (4.1).
+/// (4.1). Those come from `live`, gathered by
+/// [`config_write_for_journal`] BEFORE the config write lock was
+/// taken (PS-11): the journal writers never wait on the supervisor
+/// while holding `config.write()`.
 pub(crate) async fn record_gateway_change(
     state: &AppState,
+    live: &JournalLiveness,
     pre: &AppConfig,
     post: &AppConfig,
     kind: &str,
@@ -121,8 +126,6 @@ pub(crate) async fn record_gateway_change(
             }
         }
     }
-    let started_at = backend_start_times(state, pre).await;
-    let running = backend_running_ids(state, pre).await;
     let configured: std::collections::HashSet<String> =
         post.backends.iter().map(|b| b.id.clone()).collect();
     activation::record_change(
@@ -133,9 +136,9 @@ pub(crate) async fn record_gateway_change(
         summary,
         "gateway",
         Vec::new(),
-        &started_at,
+        &live.started_at,
         &configured,
-        &running,
+        &live.running,
     )
     .map(activation::JournalRecords::one)
     .map_err(ApiError::Io)
@@ -150,14 +153,13 @@ pub(crate) async fn record_gateway_change(
 /// Same record-before-save contract as [`record_gateway_change`].
 pub(crate) async fn record_backend_change(
     state: &AppState,
+    live: &JournalLiveness,
     pre: &AppConfig,
     post: &AppConfig,
     kind: &str,
     summary: String,
     backend_id: &str,
 ) -> Result<activation::JournalRecords, ApiError> {
-    let started_at = backend_start_times(state, pre).await;
-    let running = backend_running_ids(state, pre).await;
     let configured: std::collections::HashSet<String> =
         post.backends.iter().map(|b| b.id.clone()).collect();
     activation::record_change(
@@ -168,12 +170,89 @@ pub(crate) async fn record_backend_change(
         summary,
         "backend",
         vec![backend_id.to_string()],
-        &started_at,
+        &live.started_at,
         &configured,
-        &running,
+        &live.running,
     )
     .map(activation::JournalRecords::one)
     .map_err(ApiError::Io)
+}
+
+/// Backend liveness for the activation journal writers
+/// ([`record_gateway_change`], [`record_backend_change`]): the live
+/// backends' start instants and the live set, from ONE
+/// [`lifecycle::backend_liveness_for`] snapshot. Only
+/// [`config_write_for_journal`] builds it, before it takes the config
+/// write lock (PS-11).
+pub(crate) struct JournalLiveness {
+    started_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    running: std::collections::HashSet<String>,
+}
+
+impl JournalLiveness {
+    fn from_liveness(live: &HashMap<String, lifecycle::BackendLive>) -> Self {
+        Self {
+            started_at: live
+                .values()
+                .filter(|l| l.state.is_live())
+                .filter_map(|l| l.started_at.map(|at| (l.id.clone(), at)))
+                .collect(),
+            running: running_ids_of(live),
+        }
+    }
+}
+
+/// The parts of a configuration [`lifecycle::backend_liveness_for`]
+/// reads: the configured backends' ids and ports, and the
+/// supervision mode. Two configurations with equal inputs yield the
+/// same liveness at the same instant.
+fn liveness_inputs(cfg: &AppConfig) -> (Vec<(&str, u16)>, manager_config::SupervisionMode) {
+    (
+        cfg.backends
+            .iter()
+            .map(|b| (b.id.as_str(), b.port))
+            .collect(),
+        cfg.supervision.mode,
+    )
+}
+
+/// Take the config write lock for a journaled edit, with the backend
+/// liveness the journal needs gathered FIRST (finding PS-11,
+/// docs/code-review-v0.1.60.md). Liveness takes the supervisor lock,
+/// which a backend start holds for up to ~10 s; gathered under
+/// `config.write()` (as it used to be), every status/list poll
+/// queued behind the parked writer. Here the supervisor (and the SCM
+/// snapshot) are read against a config clone with NO config guard
+/// held, and the write lock is taken afterwards.
+///
+/// The race: another writer can change the configuration between
+/// the clone and the write lock. The snapshot is kept only when the
+/// locked configuration has the same liveness inputs (backend ids,
+/// ports, supervision mode — [`liveness_inputs`]); otherwise the
+/// guard is dropped and both steps repeat, so the liveness handed
+/// to the journal is always the liveness of the configuration being
+/// written. Time-wise the snapshot can only be older than the record
+/// by the wait for the write lock; that staleness is safe for the
+/// journal: an older start time resolves fewer entries (kept as
+/// pending, the record-before-save safe direction), and a backend
+/// that (re)started since the snapshot launched from the saved
+/// configuration that already carried every existing entry, so
+/// pruning its entries as already effective stays correct.
+pub(crate) async fn config_write_for_journal(
+    state: &AppState,
+) -> (
+    tokio::sync::RwLockWriteGuard<'_, AppConfig>,
+    JournalLiveness,
+) {
+    loop {
+        let snapshot = state.config.read().await.clone();
+        let live = lifecycle::backend_liveness_for(state, &snapshot).await;
+        let guard = state.config.write().await;
+        if liveness_inputs(&guard) == liveness_inputs(&snapshot) {
+            return (guard, JournalLiveness::from_liveness(&live));
+        }
+        drop(guard);
+    }
 }
 
 /// Persist a configuration whose change was journaled ahead of the
@@ -324,7 +403,7 @@ pub async fn op_gateway_set_backend_group(
         }
         None => None,
     };
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     if !new_cfg.backends.iter().any(|b| b.id == id) {
@@ -365,6 +444,7 @@ pub async fn op_gateway_set_backend_group(
         };
         let journaled = record_gateway_change(
             state,
+            &live,
             &pre_cfg,
             &new_cfg,
             "gateway_set_backend_group",
@@ -417,7 +497,7 @@ pub async fn op_gateway_create_group(
             "group name must be lowercase letters, digits, and hyphens".to_string(),
         ));
     }
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     if new_cfg.gateway.groups.iter().any(|g| g.name == name) {
@@ -435,6 +515,7 @@ pub async fn op_gateway_create_group(
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
     let journaled = record_gateway_change(
         state,
+        &live,
         &pre_cfg,
         &new_cfg,
         "gateway_create_group",
@@ -461,7 +542,7 @@ pub async fn op_gateway_delete_group(
     name: String,
 ) -> ApiResult {
     let name = name.trim().to_string();
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     let pos = new_cfg
@@ -481,6 +562,7 @@ pub async fn op_gateway_delete_group(
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
     let journaled = record_gateway_change(
         state,
+        &live,
         &pre_cfg,
         &new_cfg,
         "gateway_delete_group",
@@ -560,7 +642,10 @@ pub async fn op_gateway_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>
     // never count here) — or live config drift while the gateway
     // is up serving the stale file.
     let (activation_pending, activation_changes) = {
-        let cfg = state.config.read().await;
+        // A clone, not a held read guard (PS-11): liveness below waits on
+        // the supervisor, and a read guard held across that wait queues
+        // every config writer (and, behind it, every later reader).
+        let cfg = state.config.read().await.clone();
         let journal = activation::load_journal(&state.data_dir);
         let started_at = backend_start_times(state, &cfg).await;
         let running = backend_running_ids(state, &cfg).await;
@@ -663,13 +748,14 @@ pub async fn op_gateway_set_bind_host(
             "bind host {host:?} is not an IP address"
         )));
     }
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     new_cfg.gateway.bind_host = host.clone();
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
     let journaled = record_gateway_change(
         state,
+        &live,
         &pre_cfg,
         &new_cfg,
         "gateway_bind",

@@ -26,10 +26,17 @@
 //!    tokio's `RwLock` queues every later reader, so the inversion
 //!    deadlocked the whole app). Within downloads: handles →
 //!    outcomes → verifying.
-//! 3. **config → supervisor (PS-11, deferred).** The activation
-//!    journal's `record_*_change` helpers run under `config.write()`
-//!    and read backend start times from the supervisor. No
-//!    supervisor → config path exists; keep it that way.
+//! 3. **Supervisor liveness BEFORE config.write (PS-11).** Journaled
+//!    edits take the config write lock through
+//!    `ops::gateway::config_write_for_journal`, which gathers backend
+//!    liveness (supervisor + SCM snapshot) against a config clone
+//!    with no config guard held, then takes `config.write()` and
+//!    hands the snapshot to `record_*_change`; it retries when the
+//!    locked config's liveness inputs (backend ids/ports, supervision
+//!    mode) changed in between. The activation status readers
+//!    (`op_gateway_status`, `activation_unresolved`) read liveness
+//!    against a config clone, not a held read guard. No supervisor →
+//!    config path exists either; keep it that way.
 //! 4. **Never initialize telemetry under the config write lock.** The
 //!    first `telemetry()` call reads the config while building the
 //!    poll loop; callers fetch telemetry/inventory before (or without)

@@ -63,7 +63,7 @@ pub async fn op_backend_set_offload(
         inventory
     };
     let journal = activation::load_journal(&state.data_dir);
-    let mut cfg = state.config.write().await;
+    let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
     // Re-resolve and re-validate UNDER the write lock (code-review
@@ -159,6 +159,7 @@ pub async fn op_backend_set_offload(
         };
         let journaled = record_backend_change(
             state,
+            &live,
             &pre_cfg,
             &new_cfg,
             "backend_set_offload",
