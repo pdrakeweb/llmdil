@@ -995,6 +995,9 @@ check(apiSrcGw.includes("memory?: BackendAddMemory | null"), "BackendAddPreview 
 check(staticSrcNar.includes("data-add-split-bar") && /data-add-split-bar[\s\S]{0,400}stackedBar\(segs/.test(staticSrcNar), "add-backend form renders the split preview as a segmented bar");
 check(/preview\.memory \?\? null[\s\S]{0,900}"GPU RAM"[\s\S]{0,300}"System RAM"/.test(staticSrcNar), "add-backend strip renders GPU RAM / System RAM tiles from the preview memory");
 check(!staticSrcNar.includes("Split: ${esc(summary)}"), "add-backend placement no longer repeats the split as a text line");
+// OpenRouter tier card: spent-vs-cap meter in the audit's designated
+// slot, fed by gateway_status.openrouter_spend.
+check(/const spendRow = spend && spend\.fraction !== null[\s\S]{0,1600}meter\(Math\.min\(100, spend\.fraction \* 100\)/.test(staticSrcNar) && staticSrcNar.includes("${spendRow}"), "OpenRouter tier card renders the spent-vs-cap meter from openrouter_spend");
 
 if (failures > 0) { console.error(`\n${failures} smoke check(s) failed`); process.exit(1); }
 console.log("\nsmoke: all checks passed");

@@ -7226,6 +7226,17 @@ function gatewayPaint(
       <div style="margin-top:6px"><label style="font-size:12px;color:var(--text2)">Models, one per line
         <textarea id="gwOrAllowInput" rows="3" style="display:block;width:100%;font-size:12px;margin-top:4px">${esc(or.model_allowlist.join("\n"))}</textarea></label>
       <div class="card-actions" style="margin-top:6px"><button class="btn" id="gwOrAllowSave" style="padding:1px 7px;font-size:11px">Save allowlist</button></div></div>` : ""}`;
+    // Spent-vs-cap (openrouter-tier audit's designated slot, now that
+    // gateway_status carries the spend ledger): "Spent today: $X"
+    // with a thin meter whose fill is spent / cap — the cap itself
+    // lives once, in the Daily cap field above. Light red once the
+    // cap is reached (no further OpenRouter traffic). Omitted when
+    // the payload carries no spend or the cap is zero (no share).
+    const spend = status.openrouter_spend ?? null;
+    const spendRow = spend && spend.fraction !== null && spend.cap_usd > 0
+      ? `<div data-or-spend><div style="display:flex;justify-content:space-between;gap:16px"><span class="k">Spent today<span class="info-tip" title="${esc(`The app's spend ledger for OpenRouter traffic today; the bar fills toward the daily cap ($${spend.cap_usd.toFixed(2)}). The cap itself is enforced inside the gateway (LiteLLM provider budget, 1-day window).`)}">${icon("info")}</span></span><span class="v" style="font-size:12px">$${spend.spent_today_usd.toFixed(2)}${spend.capped ? ` <span class="chip status-tag status-bad" title="The daily cap is reached: no OpenRouter traffic is sent until the window resets.">cap reached</span>` : ""}</span></div>
+      <div style="margin-top:4px" title="${esc(`Spent: ${trim1(Math.min(1, spend.fraction) * 100)}% of the daily cap`)}">${meter(Math.min(100, spend.fraction * 100), 300, 6, spend.capped ? C.red : C.blue)}</div></div>`
+      : "";
     return `<div class="card" style="margin-bottom:12px${or.enabled ? "" : ";opacity:.65"}"><div class="sec-title">${icon("gateway")} OpenRouter fallback tier
       <span class="spacer" style="flex:1"></span>
       ${or.enabled
@@ -7236,6 +7247,7 @@ function gatewayPaint(
       <div style="display:flex;justify-content:space-between;gap:16px;align-items:center"><span class="k">Credential<span class="info-tip" title="The Credential Manager target holding the OpenRouter key. When the gateway starts, the key is read from Windows Credential Manager (this reference) and passed to LiteLLM as OPENROUTER_API_KEY. The key itself is never stored in the configuration. Clear the field and save to remove the reference.">${icon("info")}</span></span><span style="display:flex;gap:6px;align-items:center"><input id="gwOrCredInput" type="text" value="${esc(or.cred_ref ?? "")}" placeholder="Credential Manager target" style="width:220px;font-size:12px"><button class="btn" id="gwOrCredSave" style="padding:1px 7px;font-size:11px">Save</button>${or.cred_ref ? `<button class="btn" id="gwOrCredCopyBtn" title="Copy credential reference" aria-label="Copy credential reference" style="padding:1px 7px;font-size:11px">${icon("copy")}</button>` : ""}</span></div>
       ${credStatusRow}
       <div style="display:flex;justify-content:space-between;gap:16px;align-items:center"><span class="k">Daily cap<span class="info-tip" title="Spending cap per day.">${icon("info")}</span></span><span style="display:flex;gap:6px;align-items:center"><span style="font-size:12px">$</span><input id="gwOrCapInput" type="number" min="0" step="0.5" value="${or.daily_cap_usd}" style="width:90px;font-size:12px"><button class="btn" id="gwOrCapSave" style="padding:1px 7px;font-size:11px">Save</button></span></div>
+      ${spendRow}
       ${allowRow}
     </div>
     <div class="card-actions">${enableSwitch({ on: or.enabled, name: "OpenRouter fallback tier", attrs: `id="gwOrToggle"` })}</div>
