@@ -2413,6 +2413,7 @@ dependencies = [
 name = "manager-app"
 version = "0.1.60"
 dependencies = [
+ "async-trait",
  "chrono",
  "manager-bench",
  "manager-config",
