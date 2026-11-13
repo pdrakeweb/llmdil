@@ -96,6 +96,7 @@ pub use optimize_experiments::{
 pub use optimize_tuning::{
     op_optimize_tuning_adopt, op_optimize_tuning_preview, op_optimize_tuning_run,
 };
+pub mod event_bus;
 pub mod registry;
 pub(crate) mod tasks;
 
@@ -103,18 +104,19 @@ pub(crate) mod tasks;
 // Events (Rust -> UI, spec §14)
 // ---------------------------------------------------------------------------
 
-/// Frontend event names. The primary streams are emitted below;
-/// BACKEND_STATUS is emitted by the backend start/stop/restart commands;
-/// the rest are reserved per spec §14 and go live with their producers.
+/// Frontend event names. Every name has a producer; [`event_bus`]
+/// carries them all (with their origin) to Admin API subscribers.
 pub mod events {
     pub const TELEMETRY_UPDATE: &str = "telemetry-update";
     pub const WIZARD_PROGRESS: &str = "wizard-progress";
     pub const DOWNLOAD_PROGRESS: &str = "download-progress";
     // Emitted by the backend start/stop/restart commands.
     pub const BACKEND_STATUS: &str = "backend-status";
-    // Reserved (spec §14): emitted by future producers. LOG_LINE is
-    // declared (with its LogLinePayload shape) but nothing emits it yet;
-    // log records reach the UI through the get_logs command instead.
+    // Produced for the app event bus (see `event_bus`): log-line,
+    // telemetry-tick and vram-changed by its background producers
+    // (only while subscribed), task-progress by the task registry,
+    // alert-raised by the notification monitor, gateway-request and
+    // config-changed after a successful dispatch.
     pub const LOG_LINE: &str = "log-line";
     pub const TELEMETRY_TICK: &str = "telemetry-tick";
     pub const TASK_PROGRESS: &str = "task-progress";
@@ -396,6 +398,8 @@ pub struct AppState {
     /// before the shipper starts; sending is a no-op until a shipper
     /// subscribes.
     logship_tap: manager_logship::RecordTap,
+    /// The app-level event bus (see [`event_bus`]).
+    event_bus: event_bus::AppEventBus,
     wizard_install: OnceCell<Mutex<Wizard>>,
     wizard_audit: OnceCell<Mutex<Wizard>>,
     /// Last setup_get_steps payload, refreshed whenever the install
@@ -680,6 +684,7 @@ impl AppState {
             logship: std::sync::Mutex::new(logship::LogshipSlot::default()),
             logship_apply: Mutex::new(()),
             logship_tap: manager_logship::RecordTap::new(),
+            event_bus: event_bus::AppEventBus::default(),
             wizard_install: OnceCell::new(),
             wizard_audit: OnceCell::new(),
             wizard_steps_cache: RwLock::new(None),
@@ -796,7 +801,12 @@ impl AppState {
         // The control exists before the record, so an abort that
         // finds the record running always finds its token.
         self.task_controls.register(&id);
-        self.tasks.lock().await.insert(id.clone(), record);
+        let mut tasks = self.tasks.lock().await;
+        // Published under the lock: a subscriber that GETs the task
+        // on this event finds it, and no settle event can overtake it.
+        event_bus::publish_task(self, &record);
+        tasks.insert(id.clone(), record);
+        drop(tasks);
         tasks::task_started(&id, kind);
         id
     }

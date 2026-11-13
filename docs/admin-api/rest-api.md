@@ -1323,12 +1323,51 @@ The 15 derived routes are enumerated in `DERIVED_ROUTES`
 `GET /diagnostics/bundles/{bundle_id}/content`, and:
 
 #### `GET /api/v1/events` — `read` (any authenticated role)
-Server-Sent Events stream of the app's operation events
-(backend status, download progress, wizard progress, task
-progress), each with a process-global id. Live-only: nothing is
-replayed on reconnect; ids let a client detect gaps, and every
-fact the stream carries is also reachable by GET (PLAN.md §9).
-It is an API-layer route, **not** a registry operation.
+Server-Sent Events stream of the app event bus
+(`manager_app::event_bus`), each event with a process-global id.
+Live-only: nothing is replayed on reconnect; ids let a client
+detect gaps, and every fact the stream carries is also reachable
+by GET (PLAN.md §9). It is an API-layer route, **not** a registry
+operation.
+
+The bus carries every event **whichever surface caused it**: an
+operation run from the desktop UI (Tauri IPC) emits exactly the
+events the same operation run through this API does — the tee sits
+in the registry dispatch both paths share, not in HTTP handlers.
+Each `data` object carries an additive `origin`: `desktop` (desktop
+IPC), `api` (this API), or `app` (background work: pollers,
+monitors, watchers). Event SSE `event:` names and producers:
+
+| Event | Producer | Payload (same shape as) |
+|---|---|---|
+| `backend-status` | backend start/stop/restart | `{id, event}` |
+| `download-progress` | model download worker | `{model_id, downloaded_bytes, total_bytes, fraction}` |
+| `wizard-progress` | setup step / audit runs | `{task_id, step_id, state, done, total, message}` |
+| `telemetry-update` | each `get_gpu_telemetry` call | `{samples, at_ms}` |
+| `task-progress` | a task created (`running`) or settled (`done`/`failed`/`aborted`, incl. a forced abort) | one `GET /operations` row (`TaskRecord`) |
+| `config-changed` | any non-read operation that **succeeded** and changed the saved config (before/after diff) | `{op, sections: [top-level section names], at_ms}` — names only, never values |
+| `gateway-request` | a successful `gateway_test_routing` (the decision it recorded) | one `GET /gateway/routing/recent` row |
+| `alert-raised` | the notification monitor's failure / activation transitions (independent of toast settings; completions are not alerts) | `{category: failures\|activation, title, body, at_ms}` |
+| `telemetry-tick` | the GPU telemetry poller, observed once per completed poll, at most 1/s | `{samples, at_ms}` — `get_gpu_telemetry`'s samples in crate shape (no processes, sparklines, or peaks); `at_ms` is the poll time |
+| `vram-changed` | the same polls: a GPU's used VRAM moved ≥ max(256 MiB, 2 % of the card) from the last reported level (first observation is a silent baseline; down GPUs skipped) | `{index, name, vram_used_mib, vram_total_mib, previous_mib, delta_mib, at_ms}` |
+| `log-line` | new lines in the supervisor's captured process output (the rings `get_logs` reads), followed every 500 ms | `{scope, level, line, ts_ms, stream, archived?}`; at most 50 per scope per pass, the rest summarized in one `{…, skipped: n}` notice line |
+| `app_update_changed` | `app_update_*` operations | the `app_update_status` shape |
+
+Semantics: a failed operation emits no dispatch-level event
+(`config-changed`, `gateway-request`); events an operation emitted
+before failing are delivered as emitted. `config-changed` covers
+changes made by operations only (not background watchers, e.g. the
+post-download verification stamp) and is attributed to the
+operation that observed the diff. `telemetry-tick`, `vram-changed`
+and `log-line` come from a background producer loop that runs only
+while at least one subscriber is connected; it observes the
+telemetry poller and the supervisor without starting either
+(telemetry flows once the poller is running — it starts on first
+telemetry use). `log-line` covers supervised processes only: the
+file-backed `gateway` and `wizard` scopes of `get_logs` are not
+streamed, and lines present when the stream starts are not
+replayed. Every payload is data the `read` class can already GET,
+so the stream needs no per-role filtering.
 
 The remaining 24 API-layer routes are the auth/admin surface
 (`AUTH_ROUTES` in `manager-api/src/auth_routes.rs`), specified by
@@ -1440,7 +1479,9 @@ the store; history is otherwise append-only. → `{ "deleted": true,
    snapshots, download progress is state polling, and the poll
    model remains the correctness path throughout. As built, an
    SSE channel was added on top of it — `GET /api/v1/events`
-   (§6.17), an API-layer route fed by the `EventSink` broadcast.
+   (§6.17), an API-layer route fed by the app event bus (every
+   operation event from desktop and API callers alike, plus
+   background telemetry, VRAM, log, task, and alert producers).
    No capability needs the stream to map completely, and a client
    that never opens it loses nothing.
 8. **File pickers: none.** No audited command depends on a file

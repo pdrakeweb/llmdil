@@ -366,7 +366,7 @@ async fn sse_stream_carries_operation_events() {
         .and_then(|v| v.to_str().ok())
         .is_some_and(|t| t.contains("text/event-stream")));
 
-    // An event emitted through the API sink arrives framed as SSE.
+    // An event published on the app event bus arrives framed as SSE.
     // Emit until the first framed chunk arrives: a lone event can
     // sit in the server's write buffer until the next flush, so
     // the test drives the stream the way real operation traffic
@@ -374,9 +374,10 @@ async fn sse_stream_carries_operation_events() {
     // flowing).
     let chunk = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            ctx.sink.emit(
+            ctx.app.event_bus().publish(
                 "backend-status",
                 json!({ "id": "planner", "running": true }),
+                manager_app::event_bus::EventOrigin::Api,
             );
             match tokio::time::timeout(Duration::from_millis(400), resp.chunk()).await {
                 Ok(Ok(Some(bytes))) => break bytes,
@@ -392,10 +393,113 @@ async fn sse_stream_carries_operation_events() {
     assert!(text.contains("event: backend-status"), "chunk: {text}");
     assert!(text.contains("planner"), "chunk: {text}");
     assert!(text.contains("id:"), "chunk: {text}");
+    assert!(text.contains(r#""origin":"api""#), "chunk: {text}");
 
     // Close the client stream first: graceful shutdown waits for
     // connections to drain, and an SSE stream never drains on its
     // own.
+    drop(resp);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server.shutdown()).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Read SSE chunks, calling `drive` before each wait, until the
+/// accumulated text contains `needle`.
+async fn read_until<F, Fut>(resp: &mut reqwest::Response, needle: &str, mut drive: F) -> String
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut text = String::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            drive().await;
+            match tokio::time::timeout(Duration::from_millis(400), resp.chunk()).await {
+                Ok(Ok(Some(bytes))) => {
+                    text.push_str(&String::from_utf8_lossy(&bytes));
+                    if text.contains(needle) {
+                        break;
+                    }
+                }
+                Ok(Ok(None)) => panic!("stream ended"),
+                Ok(Err(e)) => panic!("stream error: {e}"),
+                Err(_) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {needle} within timeout; got: {text}"));
+    text
+}
+
+/// Desktop-origin parity: an operation invoked through the desktop
+/// (IPC) dispatch path reaches an API event subscriber exactly as the
+/// same operation through the HTTP API does, tagged with its origin.
+/// The subscriber is a viewer: the stream stays `read`-class.
+#[tokio::test]
+async fn sse_stream_carries_desktop_and_api_operation_events() {
+    let (ctx, dir) = test_ctx().await;
+    let admin = seed_token(&ctx, "root", RoleName::Admin).await;
+    let viewer = seed_token(&ctx, "look", RoleName::Viewer).await;
+    let server = manager_api::ApiServer::start_ctx(
+        ctx.clone(),
+        manager_api::ApiOptions {
+            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 0,
+            tls: None,
+        },
+    )
+    .await
+    .unwrap();
+    let base = format!("http://{}", server.addr());
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut resp = client
+        .get(format!("{base}/api/v1/events"))
+        .header("authorization", format!("Bearer {viewer}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Desktop path: the shell's registry dispatch with its own sink.
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let next_ms = || 2000 + (calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2) * 1000;
+    let text = read_until(&mut resp, r#""origin":"desktop""#, || {
+        let app = ctx.app.clone();
+        // Alternate values so every call really changes the config.
+        let ms = next_ms();
+        async move {
+            let sink: Arc<dyn manager_app::EventSink> = Arc::new(manager_app::NoopSink);
+            manager_app::registry::dispatch(
+                &app,
+                &sink,
+                manager_app::registry::Op::TelemetrySetInterval,
+                json!({ "ms": ms }),
+            )
+            .await
+            .unwrap();
+        }
+    })
+    .await;
+    assert!(text.contains("event: config-changed"), "{text}");
+    assert!(text.contains(r#""op":"telemetry_set_interval""#), "{text}");
+
+    // API path: the same operation over HTTP.
+    let text = read_until(&mut resp, r#""origin":"api""#, || {
+        let ms = next_ms();
+        let req = client
+            .put(format!("{base}/api/v1/telemetry/interval"))
+            .header("authorization", format!("Bearer {admin}"))
+            .header("content-type", "application/json")
+            .body(json!({ "ms": ms }).to_string());
+        async move {
+            let r = req.send().await.unwrap();
+            assert!(r.status().is_success(), "{}", r.status());
+        }
+    })
+    .await;
+    assert!(text.contains("event: config-changed"), "{text}");
+
     drop(resp);
     let _ = tokio::time::timeout(Duration::from_secs(5), server.shutdown()).await;
     let _ = std::fs::remove_dir_all(&dir);

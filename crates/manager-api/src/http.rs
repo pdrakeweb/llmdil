@@ -23,7 +23,7 @@ use manager_app::registry::{HttpMethod, Op, OpSpec, RouteMode, OP_SPECS};
 use manager_app::ApiError;
 
 use crate::composites;
-use crate::ApiCtx;
+use crate::{ApiCtx, API_ORIGIN};
 
 /// One registered route, recorded during construction so tests can
 /// enumerate the live surface against the registry.
@@ -256,8 +256,14 @@ async fn handle_op(
         let (id, record) = ctx.operations.begin(spec.name);
         let spawn_ctx = ctx.clone();
         tokio::spawn(async move {
-            match manager_app::registry::dispatch(&spawn_ctx.app, &spawn_ctx.sink, spec.op, args)
-                .await
+            match manager_app::registry::dispatch_from(
+                &spawn_ctx.app,
+                &spawn_ctx.sink,
+                spec.op,
+                args,
+                API_ORIGIN,
+            )
+            .await
             {
                 Ok(value) => {
                     if spec.op == Op::RunWizardStep && value.get("busy") == Some(&json!(true)) {
@@ -281,7 +287,11 @@ async fn handle_op(
     // The operations list merges the app's task records with the
     // API-side operation records.
     if spec.op == Op::TasksList {
-        return match manager_app::registry::dispatch(&ctx.app, &ctx.sink, spec.op, args).await {
+        return match manager_app::registry::dispatch_from(
+            &ctx.app, &ctx.sink, spec.op, args, API_ORIGIN,
+        )
+        .await
+        {
             Ok(mut value) => {
                 if let Some(arr) = value.as_array_mut() {
                     let known: std::collections::HashSet<String> = arr
@@ -318,7 +328,8 @@ async fn handle_op(
             Err(e) => error_response(&ctx, &e, None),
         };
     }
-    match manager_app::registry::dispatch(&ctx.app, &ctx.sink, spec.op, args).await {
+    match manager_app::registry::dispatch_from(&ctx.app, &ctx.sink, spec.op, args, API_ORIGIN).await
+    {
         Ok(value) => shape_success(&ctx, spec, value),
         Err(e) => error_response(&ctx, &e, None),
     }
@@ -516,7 +527,7 @@ fn home_dir_string() -> Option<String> {
 // ---------------------------------------------------------------------------
 
 async fn dispatch_read(ctx: &ApiCtx, op: Op, args: Value) -> Result<Value, Box<Response>> {
-    manager_app::registry::dispatch(&ctx.app, &ctx.sink, op, args)
+    manager_app::registry::dispatch_from(&ctx.app, &ctx.sink, op, args, API_ORIGIN)
         .await
         .map_err(|e| Box::new(error_response(ctx, &e, None)))
 }
@@ -806,18 +817,39 @@ impl futures_core::Stream for MpscEventStream {
     }
 }
 
+/// The SSE `data` for one bus event: the producer's payload with an
+/// additive `origin` (`desktop` | `api` | `app`) when the payload is
+/// an object that does not already carry one.
+fn sse_data(env: &manager_app::event_bus::BusEvent) -> String {
+    let mut payload = env.payload.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.entry("origin")
+            .or_insert_with(|| json!(env.origin.as_str()));
+    }
+    payload.to_string()
+}
+
+/// `GET /events`: the app event bus (every UI event, whichever surface
+/// caused it — desktop IPC, this API, or background producers). The
+/// subscription also keeps the bus's background producers running.
 async fn handle_events(State(ctx): State<Arc<ApiCtx>>) -> Response {
-    let mut events = ctx.events.subscribe();
+    let mut events = manager_app::event_bus::subscribe(&ctx.app);
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
         loop {
-            match events.recv().await {
+            let next = tokio::select! {
+                // A disconnected client drops its subscription now,
+                // not at the next event, so idle producers stop.
+                _ = tx.closed() => break,
+                next = events.recv() => next,
+            };
+            match next {
                 Ok(env) => {
                     let id = EVENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let event = axum::response::sse::Event::default()
                         .id(id.to_string())
-                        .event(env.event)
-                        .data(env.payload.to_string());
+                        .event(env.event.clone())
+                        .data(sse_data(&env));
                     if tx.send(Ok(event)).await.is_err() {
                         break;
                     }

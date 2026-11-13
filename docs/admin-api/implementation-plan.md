@@ -326,7 +326,11 @@ start-gateway, update check/apply — all via the task registry:
 202 + task id, task polling endpoint, and an SSE event stream fed
 by the `EventSink` broadcast (backend status, download progress,
 wizard progress, task progress — the same four event kinds the UI
-receives today). **Gates:** task lifecycle tests including abort (in place: download abort stops the transfer, routing to an op's own cancel, finished-task no-op, grace-period forced abort);
+receives today). *As built:* the stream reads the app-level event
+bus (`manager_app::event_bus`), which the registry dispatch tees
+for desktop and API callers alike (`origin` tag), and every
+declared event name has a producer — see rest-api.md §6.17.
+**Gates:** task lifecycle tests including abort (in place: download abort stops the transfer, routing to an op's own cancel, finished-task no-op, grace-period forced abort);
 SSE reconnect/resume test; a soak test driving a full model
 download through the API against the fake ops layer.
 
