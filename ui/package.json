@@ -13,5 +13,5 @@
     "test:lifecycle": "node scripts/lifecycle-check.mjs"
   },
   "type": "module",
-  "version": "0.1.60"
+  "version": "0.1.61"
 }
