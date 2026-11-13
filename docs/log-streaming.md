@@ -61,7 +61,9 @@ identically in the interactive app and in Session 0 service mode.
    }
    ```
 
-4. Restart the app. The shipper starts after config load; its own
+4. Restart the app: a hand-edited `config.json` is read at start.
+   (Settings saved through the app itself apply at once — see
+   "Applying changes".) The shipper's own
    local log is `<data_dir>/logs/shipper.log` (never shipped).
 
 ## Read surface (Muse, over Tailscale only)
@@ -205,22 +207,64 @@ per source —
 - `waiting`: a backend with no service log and no captured output
   yet;
 - `unavailable`: on, but the process gave the shipper no feed;
+- `local_only`: on, but held because the endpoint is not loopback
+  (audit);
 - `not_running`: on in the config, but the shipper is not running
   (streaming off, no endpoint, or no token).
 
 ### Applying changes
 
-The shipper reads the config once, when the app starts; there is no
-restart path short of restarting the app. A saved toggle that
-differs from what the running shipper started with is reported as
-`restart_pending` and shown on the card. Backends added to the
-config after start ship from their ring once they run (process
-mode); their service-mode files are tailed from the next start.
+Saved `log_streaming` settings apply as they are saved — no app
+restart. After every config save (and after the endpoint Flip) the
+app compares the saved settings with what the running shipper was
+started with and, if they differ, stops it and starts a new one.
+The comparison covers the whole `log_streaming` section, plus the
+backend ids while `sources.backends` is on.
 
-### Not in Phase 2
+A restart loses nothing and ships nothing twice: as it stops, the
+old shipper parks the records it holds in memory (the pending batch
+and the queue) in the spool; tail offsets and the sequence counter
+persist; and the new shipper starts only after the old one has
+ended, then delivers the parked records first, in order. The same
+parking happens at ordinary app exit. If the old shipper has not
+stopped within 20 s (an in-flight POST can hold it for its HTTP
+timeout), no new one is started and the card says so.
 
-- No live apply of toggle changes (above).
-- No Settings editor for the toggles: they remain the `sources`
-  section of `config.json`.
-- SEC-16 (refusing non-loopback `http://` endpoints) is an open
-  decision and is not implemented.
+The source switches are on the card (Settings → Supervision → Log
+receiver → Log shipper) and save through `update_config`. The
+master switch (`enabled`), endpoint, machine name and level floor
+remain `config.json` values; saving them through any config edit
+applies them the same way. The ingest token is read when a shipper
+starts, so a rotated token is picked up by the next settings change
+or app start.
+
+Backends added to or removed from the config through the backend
+operations (rather than a config save) are picked up by the next
+settings change or app start; a backend running in process mode
+ships from its ring meanwhile.
+
+### Endpoint policy (SEC-16)
+
+Batches carry the ingest token in a header. Plain `http://` is
+therefore accepted only for a loopback endpoint — `127.0.0.0/8`,
+`[::1]`, `localhost` or a `.localhost` name — which covers the
+local receiver (`http://127.0.0.1:8473`). Any other host must be
+`https://`. A refused endpoint is still saved (config validation is
+unchanged), but the shipper does not start: the reason is written
+to `shipper.log` and shown on the card, and no log file is read.
+The check is made both before the shipper is spawned and inside it,
+where the POST is made.
+
+### Audit stays local
+
+Audit records carry usernames and source addresses. The `audit`
+source ships only when the endpoint is loopback. With any other
+endpoint it is held: its status is `local_only`, and the audit file
+is not read.
+
+### Not built
+
+- A Settings editor for the master switch, endpoint, machine name
+  and level floor.
+- A per-backend opt-in: `sources.backends` covers every backend
+  (decided: the global switch is enough).

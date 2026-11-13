@@ -128,6 +128,7 @@ pub async fn op_log_receiver_status(
         "shipper": crate::logship::shipper_surface(
             &cfg.log_streaming,
             crate::logship::log_streaming_status(state).as_ref(),
+            crate::logship::log_streaming_note(state).as_deref(),
         ),
     }))
 }
@@ -450,8 +451,8 @@ async fn remove_inner(exe: std::path::PathBuf) -> ApiResult {
 /// script's -FlipEndpoint): back up config.json beside itself with
 /// a timestamped name, set `log_streaming.endpoint` through the
 /// validated save path, and report the backup. Nothing else in the
-/// config changes; the app must restart for the shipper to pick
-/// the new endpoint up. Deliberately separate from deploy.
+/// config changes; the shipper restarts onto the new endpoint as
+/// part of the flip. Deliberately separate from deploy.
 pub async fn op_log_receiver_flip_endpoint(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
@@ -479,6 +480,9 @@ pub async fn op_log_receiver_flip_endpoint(
     new_cfg.log_streaming.endpoint = LOCAL_RECEIVER_ENDPOINT.to_string();
     manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
     *cfg = new_cfg;
+    drop(cfg);
+    // The shipper restarts onto the new endpoint now.
+    crate::logship::apply_log_streaming(state).await;
     Ok(json!({
         "ok": true,
         "endpoint": LOCAL_RECEIVER_ENDPOINT,

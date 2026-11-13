@@ -14,6 +14,7 @@
 //! It is failure-isolated (§6.6): it cannot block, fail, or take
 //! down the app.
 
+pub mod endpoint;
 pub mod record;
 pub mod redact;
 pub mod secrets;
@@ -22,6 +23,7 @@ pub mod spool;
 pub mod tail;
 pub mod tap;
 
+pub use endpoint::{check_endpoint, is_loopback_endpoint};
 pub use record::{audit_level, classify_level, ShipLevel, WireRecord};
 pub use redact::Redactor;
 pub use shipper::{spawn, ShipperConfig, ShipperHandle, ShipperStatus, SourceState, SourceStatus};
