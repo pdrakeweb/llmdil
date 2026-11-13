@@ -52,9 +52,11 @@ use crate::*;
 
 mod downloads;
 mod task_registry;
+mod wizard;
 
 pub(crate) use downloads::{DownloadOutcome, DownloadsState};
 pub(crate) use task_registry::TaskRegistry;
+pub(crate) use wizard::WizardState;
 
 /// Shared backend state. Subsystems are lazily initialized (`OnceCell`) so
 /// a failure surfaces on first use of that subsystem, never at startup.
@@ -95,21 +97,8 @@ pub struct AppState {
     pub(crate) logship_tap: manager_logship::RecordTap,
     /// The app-level event bus (see [`event_bus`]).
     pub(crate) event_bus: event_bus::AppEventBus,
-    pub(crate) wizard_install: OnceCell<Mutex<Wizard>>,
-    pub(crate) wizard_audit: OnceCell<Mutex<Wizard>>,
-    /// Last setup_get_steps payload, refreshed whenever the install
-    /// wizard's state is read or mutated under its lock. Served when
-    /// the wizard lock is held by a running step, so the checklist
-    /// never sits blank for the duration of a step.
-    pub(crate) wizard_steps_cache: RwLock<Option<Value>>,
-    /// The install-wizard step currently executing (id + start
-    /// instant), set by `run_wizard_step` just before the step runs
-    /// and cleared when it returns. A caller that finds the wizard
-    /// lock held reads this to report *what* is running and for how
-    /// long instead of a bare "busy" — and the rejection is written
-    /// to the wizard log, so the state is diagnosable afterwards.
-    /// std Mutex: only synchronous set/clear/read.
-    pub(crate) wizard_step_running: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+    /// The setup wizard (see [`wizard::WizardState`]).
+    pub(crate) wizard: WizardState,
     /// The tracked-task registry (see [`task_registry::TaskRegistry`]).
     pub(crate) tasks: TaskRegistry,
     /// The model-download subsystem (see [`downloads::DownloadsState`]).
@@ -390,10 +379,7 @@ impl AppState {
             logship_apply: Mutex::new(()),
             logship_tap: manager_logship::RecordTap::new(),
             event_bus: event_bus::AppEventBus::default(),
-            wizard_install: OnceCell::new(),
-            wizard_audit: OnceCell::new(),
-            wizard_steps_cache: RwLock::new(None),
-            wizard_step_running: std::sync::Mutex::new(None),
+            wizard: WizardState::default(),
             tasks: TaskRegistry::default(),
             downloads: DownloadsState::default(),
             backend_spec_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -653,17 +639,7 @@ impl AppState {
     }
 
     pub(crate) async fn wizard(&self, mode: RunMode) -> &Mutex<Wizard> {
-        let cell = match mode {
-            RunMode::Install => &self.wizard_install,
-            RunMode::Audit => &self.wizard_audit,
-        };
-        cell.get_or_init(|| async {
-            Mutex::new(
-                Wizard::new(default_steps(), mode)
-                    .expect("default_steps() has unique step ids by construction"),
-            )
-        })
-        .await
+        self.wizard.get(mode).await
     }
 
     /// The full gateway drift check for hydration/restore: the
@@ -894,7 +870,7 @@ impl AppState {
         // current configuration (see Wizard::hydrate).
         let gateway_current = self.gateway_config_current(&ctx.config).await;
         guard.hydrate(&report, gateway_current);
-        *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
+        *self.wizard.steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
 
     /// Persist the install wizard's current report to
@@ -1026,7 +1002,7 @@ impl AppState {
         let cfg = self.config.read().await.clone();
         let gateway_current = self.gateway_config_current(&cfg).await;
         guard.restore(&persisted.report, gateway_current);
-        *self.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
+        *self.wizard.steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
 
     /// Runtime views of the persisted MCP registry, in registry order

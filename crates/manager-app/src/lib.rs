@@ -43,7 +43,7 @@ use manager_telemetry::{
 };
 use manager_wizard::{
     ops::{prev_log_path, RealSystemOps},
-    steps::{continue_config_yaml, default_steps, merge_env_contents, VscodeExtensions},
+    steps::{continue_config_yaml, merge_env_contents, VscodeExtensions},
     RunMode, StepOutcome, StepState, SystemOps, Wizard, WizardContext, WizardReport,
 };
 use serde::{Deserialize, Serialize};

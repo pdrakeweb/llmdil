@@ -226,7 +226,8 @@ pub(crate) async fn run_wizard_step_inner(
         Ok(guard) => guard,
         Err(_) => {
             let running = state
-                .wizard_step_running
+                .wizard
+                .step_running
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
@@ -308,7 +309,8 @@ pub(crate) async fn run_wizard_step_inner(
     // Track the in-flight step for the busy arm above; cleared on
     // every path out of the run, including a step error.
     *state
-        .wizard_step_running
+        .wizard
+        .step_running
         .lock()
         .unwrap_or_else(|e| e.into_inner()) =
         Some((step_id.to_string(), std::time::Instant::now()));
@@ -326,7 +328,8 @@ pub(crate) async fn run_wizard_step_inner(
         .run_step_until(&ctx, step_id, std::pin::pin!(cancelled))
         .await;
     *state
-        .wizard_step_running
+        .wizard
+        .step_running
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
     let (mut outcome, step_cancelled): (StepOutcome, bool) = match outcome_result {
@@ -367,7 +370,7 @@ pub(crate) async fn run_wizard_step_inner(
         ),
     );
     let (done, _) = guard.progress();
-    *state.wizard_steps_cache.write().await = Some(wizard_steps_payload(&guard));
+    *state.wizard.steps_cache.write().await = Some(wizard_steps_payload(&guard));
     // The step's display name, for the notification below (the
     // report is dropped with the guard).
     let step_name = guard
@@ -714,7 +717,7 @@ pub async fn op_setup_get_steps(state: &Arc<AppState>, _sink: &Arc<dyn EventSink
     match wizard.try_lock() {
         Ok(guard) => {
             let payload = wizard_steps_payload(&guard);
-            *state.wizard_steps_cache.write().await = Some(payload.clone());
+            *state.wizard.steps_cache.write().await = Some(payload.clone());
             drop(guard);
             // Reading the steps is also a healing trigger for the
             // launch-routing flag (the wizard view polls this while
@@ -727,7 +730,7 @@ pub async fn op_setup_get_steps(state: &Arc<AppState>, _sink: &Arc<dyn EventSink
             // blocking on it here left the checklist blank for the
             // duration of the step. Serve the last known snapshot,
             // flagged busy, instead.
-            match state.wizard_steps_cache.read().await.clone() {
+            match state.wizard.steps_cache.read().await.clone() {
                 Some(mut payload) => {
                     payload["busy"] = json!(true);
                     Ok(payload)
