@@ -502,3 +502,25 @@ async fn admin_audit_readback() {
     let (status, _) = call(&ctx, Method::GET, "/api/v1/admin/audit", Some(&operator), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn lifecycle_routes_are_operator_class() {
+    // Gateway restart / stop / database stop and the log receiver
+    // start / stop / restart are class L: a viewer is refused before
+    // any lifecycle machinery runs, and an anonymous caller is 401.
+    let (ctx, _dir) = test_ctx().await;
+    let viewer = seed_token(&ctx, "look", RoleName::Viewer).await;
+    for uri in [
+        "/api/v1/gateway/restart",
+        "/api/v1/gateway/stop",
+        "/api/v1/gateway/database/stop",
+        "/api/v1/log-receiver/start",
+        "/api/v1/log-receiver/stop",
+        "/api/v1/log-receiver/restart",
+    ] {
+        let (status, _) = call(&ctx, Method::POST, uri, Some(&viewer), Some(json!({}))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        let (status, _) = call(&ctx, Method::POST, uri, None, Some(json!({}))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+    }
+}

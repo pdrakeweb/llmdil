@@ -192,9 +192,9 @@ macro_rules! for_each_operation {
             (UpdateConfig, update_config, C, op_update_config, [patch: Value], None),
             // Backends
             (ListBackends, list_backends, R, op_list_backends, [], Some(route(HttpMethod::Get, "/api/v1/backends"))),
-            (StartBackend, start_backend, L, op_start_backend, [id: String, allow_wddm_overcommit: Option<bool>], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/start"))),
-            (StopBackend, stop_backend, L, op_stop_backend, [id: String, graceful: bool], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/stop"))),
-            (RestartBackend, restart_backend, L, op_restart_backend, [id: String, graceful: bool, allow_wddm_overcommit: Option<bool>], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/restart"))),
+            (StartBackend, start_backend, L, op_start_backend, [id: String, allow_wddm_overcommit: Option<bool>, origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/start"))),
+            (StopBackend, stop_backend, L, op_stop_backend, [id: String, graceful: bool, origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/stop"))),
+            (RestartBackend, restart_backend, L, op_restart_backend, [id: String, graceful: bool, allow_wddm_overcommit: Option<bool>, origin: Option<String>, wait_ready_secs: Option<u64>], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/restart"))),
             (TestBackend, test_backend, L, op_test_backend, [id: String, prompt: String], Some(route(HttpMethod::Post, "/api/v1/backends/{id}/test"))),
             (BackendGetConfig, backend_get_config, SConfig, op_backend_get_config, [id: String], Some(route(HttpMethod::Get, "/api/v1/backends/{id}/config"))),
             (BackendPreviewDiff, backend_preview_diff, R, op_backend_preview_diff, [id: String, patch: Value], Some(route(HttpMethod::Post, "/api/v1/backends/{id}/config/preview-diff"))),
@@ -223,7 +223,7 @@ macro_rules! for_each_operation {
             (BackendDelete, backend_delete, D, op_backend_delete, [id: String], Some(route(HttpMethod::Delete, "/api/v1/backends/{id}"))),
             (BackendGetLaunchCommand, backend_get_launch_command, SDisclosure, op_backend_get_launch_command, [id: String], Some(route(HttpMethod::Get, "/api/v1/backends/{id}/launch-command"))),
             // Wizard / setup
-            (RunWizardStep, run_wizard_step, D, op_run_wizard_step, [step_id: String], Some(route_async(HttpMethod::Post, "/api/v1/setup/steps/{step_id}/run"))),
+            (RunWizardStep, run_wizard_step, D, op_run_wizard_step, [step_id: String, origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/setup/steps/{step_id}/run"))),
             (RunAudit, run_audit, L, op_run_audit, [], Some(route_async(HttpMethod::Post, "/api/v1/setup/audit"))),
             (SetupGetPrerequisites, setup_get_prerequisites, R, op_setup_get_prerequisites, [], Some(route(HttpMethod::Get, "/api/v1/setup/prerequisites"))),
             (SetupRetryStep, setup_retry_step, D, op_setup_retry_step, [step_id: String], Some(route_async(HttpMethod::Post, "/api/v1/setup/steps/{step_id}/retry"))),
@@ -278,9 +278,20 @@ macro_rules! for_each_operation {
             (GetGatewayConfig, get_gateway_config, SConfig, op_get_gateway_config, [], Some(route(HttpMethod::Get, "/api/v1/gateway/config"))),
             (UpdateGatewayConfig, update_gateway_config, C, op_update_gateway_config, [patch: Value], Some(route_wrap(HttpMethod::Patch, "/api/v1/gateway/config", "patch"))),
             (GatewayStatus, gateway_status, R, op_gateway_status, [], Some(route(HttpMethod::Get, "/api/v1/gateway/status"))),
-            (GatewayStop, gateway_stop, L, op_gateway_stop, [], Some(route(HttpMethod::Post, "/api/v1/gateway/stop"))),
+            // Gateway lifecycle (service-lifecycle design WP6): restart is
+            // one server-side operation that never stops PostgreSQL; stop
+            // stops the gateway only unless stop_postgres is set; the
+            // database stop is its own operation, refused while the
+            // gateway is live. All three are long-running (AsyncOp).
+            (GatewayRestart, gateway_restart, L, op_gateway_restart, [origin: Option<String>, drain: Option<bool>], Some(route_async(HttpMethod::Post, "/api/v1/gateway/restart"))),
+            (GatewayStop, gateway_stop, L, op_gateway_stop, [stop_postgres: Option<bool>, origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/gateway/stop"))),
+            (PostgresStop, postgres_stop, L, op_postgres_stop, [origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/gateway/database/stop"))),
             (GatewayActivationPlan, gateway_activation_plan, R, op_gateway_activation_plan, [], Some(route(HttpMethod::Get, "/api/v1/activation-plan"))),
             (GatewayActivationCancel, gateway_activation_cancel, D, op_gateway_activation_cancel, [], Some(route(HttpMethod::Post, "/api/v1/activation-plan/cancel"))),
+            // The one server-side activation apply (service-lifecycle WP7):
+            // the desktop shell calls it directly; the REST route stays the
+            // composite path, re-pointed at this op in WP8.
+            (ActivationApply, activation_apply, L, op_activation_apply, [mode: Option<String>, source: Option<String>], None),
             // Internal bookkeeping: performed by the server after a
             // successful apply or gateway (re)start, not a client route.
             (GatewayActivationComplete, gateway_activation_complete, L, op_gateway_activation_complete, [], None),
@@ -345,6 +356,13 @@ macro_rules! for_each_operation {
             (LogReceiverDeploy, log_receiver_deploy, D, op_log_receiver_deploy, [], None),
             (LogReceiverRemove, log_receiver_remove, D, op_log_receiver_remove, [], None),
             (LogReceiverFlipEndpoint, log_receiver_flip_endpoint, C, op_log_receiver_flip_endpoint, [], None),
+            // Log receiver lifecycle (service-lifecycle WP8): unelevated
+            // SCM start/stop/restart (the registration DACL grants the
+            // operator start/stop), through the shared stop_and_wait /
+            // start_and_wait helpers, with markers in receiver.lifecycle.log.
+            (LogReceiverStart, log_receiver_start, L, op_log_receiver_start, [origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/log-receiver/start"))),
+            (LogReceiverStop, log_receiver_stop, L, op_log_receiver_stop, [origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/log-receiver/stop"))),
+            (LogReceiverRestart, log_receiver_restart, L, op_log_receiver_restart, [origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/log-receiver/restart"))),
             // Optimize — desktop-only in v1 (consultation spends local
             // backend capacity; plan state lives beside the config).
             (OptimizeGetState, optimize_get_state, R, op_optimize_get_state, [], None),
@@ -500,7 +518,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 152);
+        assert_eq!(OP_SPECS.len(), 158);
     }
 
     #[test]

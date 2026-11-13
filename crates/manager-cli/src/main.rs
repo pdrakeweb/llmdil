@@ -28,6 +28,9 @@ const REFRESH_ENV: &str = "LLMDIL_API_REFRESH_TOKEN";
 const PASSWORD_ENV: &str = "LLMDIL_API_PASSWORD";
 const ENROLL_ENV: &str = "LLMDIL_ENROLL_CODE";
 const TOTP_ENV: &str = "LLMDIL_TOTP_CODE";
+/// The lifecycle origin the CLI names on lifecycle operations (it lands
+/// in the service's lifecycle markers and events).
+const CLI_ORIGIN: &str = "cli";
 
 #[derive(Parser)]
 #[command(
@@ -94,8 +97,44 @@ enum Command {
     GatewayStatus,
     /// Start the gateway (202 operation, polled to completion)
     GatewayStart,
-    /// Stop the gateway (202 operation, polled to completion)
+    /// Restart the gateway (202 operation, polled to completion).
+    /// PostgreSQL keeps running across the restart.
+    GatewayRestart {
+        /// Wait for in-flight gateway requests to finish first (up to
+        /// 120 s; a timeout restarts anyway)
+        #[arg(long)]
+        drain: bool,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Stop the gateway (202 operation, polled to completion). Only
+    /// the gateway stops unless --with-database is given.
     GatewayStop {
+        /// Also stop the app-managed PostgreSQL server
+        #[arg(long)]
+        with_database: bool,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Stop the app-managed PostgreSQL server (202 operation, polled).
+    /// Refused while the gateway is running: stop the gateway first.
+    GatewayDatabaseStop {
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Start the log receiver service (202 operation, polled)
+    LogReceiverStart,
+    /// Stop the log receiver service (202 operation, polled)
+    LogReceiverStop {
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Restart the log receiver service (202 operation, polled)
+    LogReceiverRestart {
         /// Skip the confirmation prompt
         #[arg(long)]
         yes: bool,
@@ -375,7 +414,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             allow_wddm_overcommit,
         } => {
             let mut client = authed_client(&cli)?;
-            let mut body = serde_json::json!({});
+            let mut body = serde_json::json!({ "origin": CLI_ORIGIN });
             if *allow_wddm_overcommit {
                 body["allow_wddm_overcommit"] = serde_json::json!(true);
             }
@@ -392,7 +431,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             run_operation(
                 &mut client,
                 &format!("/api/v1/backends/{id}/stop"),
-                serde_json::json!({ "graceful": graceful }),
+                serde_json::json!({ "graceful": graceful, "origin": CLI_ORIGIN }),
             )
             .await?;
         }
@@ -406,7 +445,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             run_operation(
                 &mut client,
                 &format!("/api/v1/backends/{id}/restart"),
-                serde_json::json!({ "graceful": graceful }),
+                serde_json::json!({ "graceful": graceful, "origin": CLI_ORIGIN }),
             )
             .await?;
         }
@@ -423,13 +462,67 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             )
             .await?;
         }
-        Command::GatewayStop { yes } => {
-            confirm("stop gateway", *yes)?;
+        Command::GatewayRestart { drain, yes } => {
+            confirm("restart gateway", *yes)?;
+            let mut client = authed_client(&cli)?;
+            run_operation(
+                &mut client,
+                "/api/v1/gateway/restart",
+                serde_json::json!({ "drain": drain, "origin": CLI_ORIGIN }),
+            )
+            .await?;
+        }
+        Command::GatewayStop { with_database, yes } => {
+            let action = if *with_database {
+                "stop gateway and database"
+            } else {
+                "stop gateway"
+            };
+            confirm(action, *yes)?;
             let mut client = authed_client(&cli)?;
             run_operation(
                 &mut client,
                 "/api/v1/gateway/stop",
-                serde_json::json!({}),
+                serde_json::json!({ "stop_postgres": with_database, "origin": CLI_ORIGIN }),
+            )
+            .await?;
+        }
+        Command::GatewayDatabaseStop { yes } => {
+            confirm("stop the gateway database (PostgreSQL)", *yes)?;
+            let mut client = authed_client(&cli)?;
+            run_operation(
+                &mut client,
+                "/api/v1/gateway/database/stop",
+                serde_json::json!({ "origin": CLI_ORIGIN }),
+            )
+            .await?;
+        }
+        Command::LogReceiverStart => {
+            let mut client = authed_client(&cli)?;
+            run_operation(
+                &mut client,
+                "/api/v1/log-receiver/start",
+                serde_json::json!({ "origin": CLI_ORIGIN }),
+            )
+            .await?;
+        }
+        Command::LogReceiverStop { yes } => {
+            confirm("stop log receiver", *yes)?;
+            let mut client = authed_client(&cli)?;
+            run_operation(
+                &mut client,
+                "/api/v1/log-receiver/stop",
+                serde_json::json!({ "origin": CLI_ORIGIN }),
+            )
+            .await?;
+        }
+        Command::LogReceiverRestart { yes } => {
+            confirm("restart log receiver", *yes)?;
+            let mut client = authed_client(&cli)?;
+            run_operation(
+                &mut client,
+                "/api/v1/log-receiver/restart",
+                serde_json::json!({ "origin": CLI_ORIGIN }),
             )
             .await?;
         }
@@ -791,4 +884,65 @@ fn stdin_secret_count(cli: &Cli) -> usize {
         count += usize::from(*code_stdin);
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        let mut full = vec![
+            "llmdil-cli",
+            "--base-url",
+            "https://127.0.0.1:1",
+            "--fingerprint",
+            "00",
+        ];
+        full.extend_from_slice(args);
+        Cli::try_parse_from(full).expect("parses")
+    }
+
+    #[test]
+    fn gateway_restart_parses_with_drain() {
+        match parse(&["gateway-restart", "--drain", "--yes"]).command {
+            Command::GatewayRestart { drain, yes } => assert!(drain && yes),
+            _ => panic!("expected gateway-restart"),
+        }
+        match parse(&["gateway-restart"]).command {
+            Command::GatewayRestart { drain, yes } => assert!(!drain && !yes),
+            _ => panic!("expected gateway-restart"),
+        }
+    }
+
+    #[test]
+    fn gateway_stop_keeps_the_database_unless_asked() {
+        match parse(&["gateway-stop", "--yes"]).command {
+            Command::GatewayStop { with_database, .. } => assert!(!with_database),
+            _ => panic!("expected gateway-stop"),
+        }
+        match parse(&["gateway-stop", "--with-database"]).command {
+            Command::GatewayStop { with_database, .. } => assert!(with_database),
+            _ => panic!("expected gateway-stop"),
+        }
+        assert!(matches!(
+            parse(&["gateway-database-stop", "--yes"]).command,
+            Command::GatewayDatabaseStop { yes: true }
+        ));
+    }
+
+    #[test]
+    fn log_receiver_lifecycle_commands_parse() {
+        assert!(matches!(
+            parse(&["log-receiver-start"]).command,
+            Command::LogReceiverStart
+        ));
+        assert!(matches!(
+            parse(&["log-receiver-stop", "--yes"]).command,
+            Command::LogReceiverStop { yes: true }
+        ));
+        assert!(matches!(
+            parse(&["log-receiver-restart"]).command,
+            Command::LogReceiverRestart { yes: false }
+        ));
+    }
 }

@@ -23,7 +23,10 @@ pub mod fake;
 pub mod ops;
 pub mod steps;
 
-pub use ops::{gateway_pid_path, stop_gateway};
+pub use ops::{
+    gateway_pid_path, pick_gateway_pid, resolve_gateway_pid, stop_gateway, stop_gateway_and_wait,
+    FoundBy, GatewayStopOutcome,
+};
 
 /// Number of log lines surfaced inline on a failed step (spec §4.1).
 pub const LOG_TAIL_LINES: usize = 20;
@@ -637,15 +640,67 @@ pub trait SystemOps: Send + Sync {
         })
     }
     /// Stop a registered Windows service and wait until it reaches
-    /// the stopped state. A service that is not registered is not an
-    /// error: there is nothing to stop.
-    async fn service_stop(&self, name: &str) -> Result<(), WizardError> {
+    /// the stopped state (the shared
+    /// [`manager_services::stop_and_wait`]). The typed outcome says
+    /// what actually happened — `NotRegistered` (nothing to stop),
+    /// `AlreadyStopped`, or `Stopped { waited_ms }` — so callers log
+    /// honestly instead of always claiming a stop.
+    async fn service_stop(
+        &self,
+        name: &str,
+    ) -> Result<manager_services::StopOutcome, WizardError> {
         Err(WizardError::IoError {
             path: PathBuf::from("scm"),
             reason: format!(
                 "service supervision is not supported by this system-ops implementation (service '{name}')"
             ),
         })
+    }
+    /// Persist a service definition (the file the service host reads
+    /// at start) under `<data_dir>/services/`, returning its path. The
+    /// default writes it atomically via
+    /// [`manager_services::write_definition`]; the test double keeps
+    /// it in its fake filesystem.
+    async fn write_service_definition(
+        &self,
+        data_dir: &Path,
+        def: &manager_services::ServiceDefinition,
+    ) -> Result<PathBuf, WizardError> {
+        manager_services::write_definition(data_dir, def).map_err(|e| WizardError::IoError {
+            path: manager_services::definition_path(data_dir, &def.name),
+            reason: e.to_string(),
+        })
+    }
+    /// Whether a Windows service named `name` is registered with the
+    /// SCM. Used to route the gateway's start/stop: service mode only
+    /// applies when the gateway service actually exists (the same
+    /// "mode AND registered" rule the backends use). A query failure
+    /// reads as not registered. The default reports nothing
+    /// registered.
+    async fn service_registered(&self, _name: &str) -> bool {
+        false
+    }
+    /// The SCM state of the service `name`, when it can be queried
+    /// (`None`: not supported / query failed). Used by the gateway's
+    /// final health re-check in service mode.
+    async fn service_state(&self, _name: &str) -> Option<manager_services::ServiceState> {
+        None
+    }
+    /// Append one lifecycle marker line (see
+    /// [`manager_supervisor::lifecycle::marker_line`]) to a service's
+    /// lifecycle log. Best-effort: never fails. The default writes
+    /// the file (rotating past 1 MiB); the test double records the
+    /// call instead.
+    fn append_marker(&self, path: &Path, line: &str) {
+        manager_supervisor::lifecycle::append_marker(path, line)
+    }
+    /// The pid owning the LISTEN socket on `port`, when the platform
+    /// can tell (Windows TCP table). Used to find a gateway that is
+    /// still serving although no pid file records it (a pid file
+    /// lost to a mode flip, a crash in the spawn/pid-write window,
+    /// an older build). The default cannot tell.
+    fn port_owner_pid(&self, _port: u16) -> Option<u32> {
+        None
     }
     /// Whether a process with `pid` is currently alive.
     fn process_alive(&self, pid: u32) -> bool;
@@ -1225,6 +1280,106 @@ struct GatewaySpawnState {
 /// Path of the spawn-state record: `<data_dir>/gateway/spawn-state.json`.
 pub fn gateway_spawn_state_path(data_dir: &Path) -> PathBuf {
     data_dir.join("gateway").join("spawn-state.json")
+}
+
+/// The gateway's own lifecycle marker log:
+/// `<data_dir>/logs/gateway.lifecycle.log` — the same file the
+/// service host writes in service mode (`gateway_definition`'s
+/// `lifecycle_log`), so both modes' markers land in one scope.
+pub fn gateway_lifecycle_log(data_dir: &Path) -> PathBuf {
+    data_dir.join("logs").join("gateway.lifecycle.log")
+}
+
+/// The app-managed PostgreSQL server's lifecycle marker log:
+/// `<data_dir>/logs/postgres.lifecycle.log` (next to `postgres.log`).
+pub fn postgres_lifecycle_log(data_dir: &Path) -> PathBuf {
+    data_dir.join("logs").join("postgres.lifecycle.log")
+}
+
+/// Write one lifecycle marker for `service` (`"gateway"`,
+/// `"postgres"`) into `scope_log` through the ops layer (the test
+/// double records it). Best-effort, never fails.
+pub(crate) fn mark(
+    ops: &dyn SystemOps,
+    scope_log: &Path,
+    service: &str,
+    event: &str,
+    detail: Option<&str>,
+) {
+    let line = manager_supervisor::lifecycle::marker_line(
+        chrono::Utc::now(),
+        service,
+        event,
+        detail,
+        None,
+    );
+    ops.append_marker(scope_log, &line);
+}
+
+/// Path of the gateway "applied" stamp:
+/// `<data_dir>/gateway/applied.json`. Written only after a
+/// start-gateway run fully succeeds; the activation plan resolves
+/// gateway-scope entries against its `at` instead of the YAML mtime
+/// (finding CR-1: the YAML is written before the stop, the
+/// PostgreSQL start, the spawn and the health waits, so a failed
+/// restart used to mark the plan applied).
+pub fn gateway_applied_stamp_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("gateway").join("applied.json")
+}
+
+/// The applied stamp's on-disk form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GatewayAppliedStamp {
+    /// When the YAML this successful start runs with was written.
+    at: chrono::DateTime<chrono::Utc>,
+    /// The gateway pid that started successfully.
+    pid: u32,
+}
+
+/// Serialize an applied stamp (see [`gateway_applied_stamp_path`]) for
+/// the caller to persist — the start-gateway step writes it through
+/// its ops layer so step tests stay hermetic.
+pub fn gateway_applied_stamp_json(
+    yaml_written_at: chrono::DateTime<chrono::Utc>,
+    pid: u32,
+) -> String {
+    serde_json::to_string_pretty(&GatewayAppliedStamp {
+        at: yaml_written_at,
+        pid,
+    })
+    .unwrap_or_default()
+}
+
+/// Write the applied stamp atomically (temp file + rename), for
+/// callers outside a wizard step.
+pub fn write_gateway_applied_stamp(
+    data_dir: &Path,
+    yaml_written_at: chrono::DateTime<chrono::Utc>,
+    pid: u32,
+) -> std::io::Result<()> {
+    let path = gateway_applied_stamp_path(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, gateway_applied_stamp_json(yaml_written_at, pid))?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// Parse an applied stamp's `at`. `None` for anything unparseable.
+pub fn parse_gateway_applied_at(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    serde_json::from_str::<GatewayAppliedStamp>(text)
+        .ok()
+        .map(|s| s.at)
+}
+
+/// When the configuration the running gateway serves was written, as
+/// recorded by the last fully successful start-gateway run. `None`
+/// when no (parseable) stamp exists — pre-upgrade installs, where the
+/// caller falls back to the YAML mtime.
+pub fn gateway_applied_at(data_dir: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let text = std::fs::read_to_string(gateway_applied_stamp_path(data_dir)).ok()?;
+    parse_gateway_applied_at(&text)
 }
 
 fn yaml_fingerprint(yaml: &str) -> String {
@@ -1946,6 +2101,56 @@ pub fn is_pinned_hash(sha: &str) -> bool {
 mod tests {
     use super::*;
     use crate::fake::FakeSystemOps;
+
+    #[test]
+    fn gateway_applied_stamp_roundtrips_and_rejects_garbage() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-12T10:00:00.123Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let json = gateway_applied_stamp_json(at, 4242);
+        assert_eq!(parse_gateway_applied_at(&json), Some(at));
+        assert_eq!(parse_gateway_applied_at("not json"), None);
+        assert_eq!(parse_gateway_applied_at("{\"pid\": 1}"), None);
+
+        let dir = std::env::temp_dir().join(format!("wizard-applied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(gateway_applied_at(&dir), None);
+        write_gateway_applied_stamp(&dir, at, 4242).unwrap();
+        assert_eq!(gateway_applied_at(&dir), Some(at));
+        assert!(!gateway_applied_stamp_path(&dir)
+            .with_extension("json.tmp")
+            .exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lifecycle_log_paths_live_in_the_logs_dir() {
+        let d = Path::new("/data");
+        assert_eq!(
+            gateway_lifecycle_log(d),
+            PathBuf::from("/data/logs/gateway.lifecycle.log")
+        );
+        assert_eq!(
+            postgres_lifecycle_log(d),
+            PathBuf::from("/data/logs/postgres.lifecycle.log")
+        );
+        // The service host writes the same file in service mode.
+        let def = manager_services::gateway_definition(
+            manager_services::LaunchSpec {
+                program: PathBuf::from("python.exe"),
+                args: Vec::new(),
+                env: Vec::new(),
+                workdir: None,
+            },
+            d.join("logs").join("gateway.stdout.log"),
+            d.join("logs").join("gateway.stderr.log"),
+            gateway_pid_path(d),
+        );
+        assert_eq!(
+            manager_services::lifecycle_log_path(&def),
+            Some(gateway_lifecycle_log(d))
+        );
+    }
 
     /// Minimal scripted step for runner tests.
     struct ScriptStep {

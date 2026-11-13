@@ -1502,6 +1502,7 @@ version = "0.1.60"
 name = "manager-services"
 version = "0.1.60"
 dependencies = [
+ "chrono",
  "manager-supervisor",
  "serde",
  "serde_json",
@@ -1569,6 +1570,7 @@ dependencies = [
  "manager-mxc",
  "manager-present",
  "manager-services",
+ "manager-supervisor",
  "manager-telemetry",
  "manager-winml",
  "reqwest",

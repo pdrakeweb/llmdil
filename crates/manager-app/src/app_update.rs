@@ -773,6 +773,11 @@ pub async fn begin_apply(state: &Arc<AppState>) -> Result<Value, ApiError> {
     cmd.spawn()
         .map_err(|e| ApiError::Io(format!("spawning the update helper: {e}")))?;
 
+    // Every managed service stays running across the restart: record
+    // that in each one's own log and release the supervised backends
+    // deliberately before the process exits (ACT-12 / OS-9).
+    crate::lifecycle::on_app_exit(state, "update").await;
+
     // Exit promptly: the helper is waiting on this pid, and the
     // installer cannot replace a running executable. The short
     // delay lets the op response reach the caller first.

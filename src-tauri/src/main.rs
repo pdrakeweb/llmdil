@@ -232,16 +232,23 @@ fn main() {
                 let state = handle.state::<Arc<AppState>>().inner().clone();
                 manager_app::bench::startup_sweep(&state).await;
             });
-            // Notification monitor: watch backend states, gateway
-            // liveness, and the activation plan for the transitions
-            // the toast taxonomy fires on (see notify::monitor_tick).
+            // Lifecycle monitor: first reconcile the registry with
+            // what is already running (adopt orphaned backends, seed
+            // intent, write "observed running at app start" markers),
+            // then every 3 s detect crashes of every managed service
+            // against operator intent and fire the toasts (see
+            // manager_app::lifecycle_monitor and notify::monitor_tick).
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<Arc<AppState>>().inner().clone();
-                let sink: Arc<dyn EventSink> = Arc::new(TauriSink(handle));
+                // Not dispatched through the registry, so its events
+                // are offered to the log shipper explicitly.
+                let sink: Arc<dyn EventSink> =
+                    manager_app::logship::tap_sink(&state, Arc::new(TauriSink(handle)));
+                manager_app::lifecycle::startup_reconcile(&state, sink.as_ref()).await;
                 loop {
                     manager_app::notify::monitor_tick(&state, sink.as_ref()).await;
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 }
             });
             // Gateway metrics poller: scrape LiteLLM's Prometheus
@@ -356,8 +363,22 @@ fn main() {
             Ok(())
         })
         .invoke_handler(manager_app::for_each_operation!(tauri_handler))
-        .run(tauri::generate_context!())
-        .expect("failed to run Local LLM Service Manager");
+        .build(tauri::generate_context!())
+        .expect("failed to build Local LLM Service Manager")
+        .run(|app, event| {
+            // App exit (tray Quit, last window closed): the managed
+            // services are left running on purpose; record that in
+            // each one's own log, release the supervised backends and
+            // stop the log shipper (OS-9).
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<Arc<AppState>>() {
+                    let state = state.inner().clone();
+                    tauri::async_runtime::block_on(async move {
+                        manager_app::lifecycle::on_app_exit(&state, "exit").await;
+                    });
+                }
+            }
+        });
 }
 
 /// Start the API on all interfaces with TLS and reconcile the

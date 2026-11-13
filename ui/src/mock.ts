@@ -3,22 +3,76 @@
    layout can be evaluated without a backend. */
 
 import { walk } from "./charts";
-import type { GpuHistoryData, OptimizeExperiment, OptimizePlanItem, OptimizeState, OptimizeValidation } from "./api";
+import type { BackendRow, GatewayStatusData, GpuHistoryData, OptimizeExperiment, OptimizePlanItem, OptimizeState, OptimizeValidation } from "./api";
 import type { BackendInfo, DashboardModel, GpuInfo, WizardStepState } from "./types";
 
 export function mockBackends(): BackendInfo[] {
   return [
-    { id: "gateway", name: "gateway", port: 4000, status: "ok", health: 100, model: "", quant: "",
+    { id: "gateway", name: "gateway", port: 4000, status: "ok", lifecycle: "running", health: 100, model: "", quant: "",
       throughput_toks: 0, vram_held_gb: 0, requests_1h: 1284, errors_1h: 0, spark: walk(40, 32, 8, 7) },
-    { id: "planner", name: "planner", port: 8081, status: "ok", health: 92, model: "Qwen3.8-27B", quant: "Q4_K_M",
+    { id: "planner", name: "planner", port: 8081, status: "ok", lifecycle: "running", health: 92, model: "Qwen3.8-27B", quant: "Q4_K_M",
       throughput_toks: 8.4, vram_held_gb: 10.2, requests_1h: 0, errors_1h: 0, spark: walk(40, 8.4, 2.5, 11) },
-    { id: "coder-30b", name: "coder-30b", port: 8082, status: "ok", health: 96, model: "Qwen3-Coder-30B", quant: "Q4_K_M",
+    { id: "coder-30b", name: "coder-30b", port: 8082, status: "ok", lifecycle: "running", health: 96, model: "Qwen3-Coder-30B", quant: "Q4_K_M",
       throughput_toks: 22.6, vram_held_gb: 18.6, requests_1h: 0, errors_1h: 0, spark: walk(40, 22.6, 5, 21) },
-    { id: "coder-7b", name: "coder-7b", port: 8083, status: "ok", health: 88, model: "Qwen2.5-Coder-7B", quant: "Q5_K_M",
+    { id: "coder-7b", name: "coder-7b", port: 8083, status: "ok", lifecycle: "running", health: 88, model: "Qwen2.5-Coder-7B", quant: "Q5_K_M",
       throughput_toks: 41.2, vram_held_gb: 5.8, requests_1h: 0, errors_1h: 0, spark: walk(40, 41.2, 7, 31) },
-    { id: "tool-runner", name: "tool-runner", port: 8084, status: "starting", health: 60, model: "Qwen3-8B", quant: "Q8_0",
+    { id: "tool-runner", name: "tool-runner", port: 8084, status: "starting", lifecycle: "starting", health: 60, model: "Qwen3-8B", quant: "Q8_0",
       throughput_toks: 0, vram_held_gb: 1.1, requests_1h: 0, errors_1h: 0, spark: walk(40, 1, 1, 41) },
   ];
+}
+
+/** Sample-mode list_backends rows (the wire shape the service store
+ *  holds), derived from mockBackends(): the gateway entry is not a
+ *  backend row. Each carries its lifecycle state. */
+export function mockBackendRows(): BackendRow[] {
+  return mockBackends()
+    .filter((b) => b.id !== "gateway")
+    .map((b) => ({
+      id: b.id,
+      enabled: true,
+      configured: true,
+      port: b.port,
+      model_file: b.model,
+      state: b.lifecycle,
+      lifecycle: b.lifecycle,
+      transition: null,
+      service_managed: false,
+      pid: null,
+      adopted: false,
+      restarts: 0,
+      uptime_secs: null,
+      requests_1h: b.requests_1h,
+      errors_1h: b.errors_1h,
+      throughput_toks: b.throughput_toks,
+      health: b.health,
+      spark: b.spark,
+    }));
+}
+
+/** Sample-mode gateway_status: the gateway running, PostgreSQL running,
+ *  nothing in flight. */
+export function mockGatewayStatus(): GatewayStatusData {
+  return {
+    port: 4000,
+    groups: 4,
+    routing_rules: 0,
+    up: true,
+    state: "running",
+    transition: null,
+    intent: "running",
+    pid: null,
+    service_managed: false,
+    failure: null,
+    postgres: { installed: true, state: "running", pid: null, port: 5432, port_mismatch: false, transition: null },
+    activation_applying: null,
+    routing_log_len: 0,
+    openrouter_cred_present: null,
+    bind_host: "0.0.0.0",
+    lan_ip: null,
+    activation_pending: false,
+    activation_changes: 0,
+    litellm_version: null,
+  };
 }
 
 export function mockGpus(): GpuInfo[] {
@@ -115,6 +169,7 @@ export function mockDashboard(): DashboardModel {
       { model: "qwen3-8b", backendId: "tool-runner", backendStatus: "starting", segments: [{ gpu: "p100-1", pct: 100, frac: 1 }] },
     ],
     gatewayUp: true,
+    gatewayState: "running",
     gatewayStrategy: "least-busy",
     stale: false,
     updatedAt: Date.now(),

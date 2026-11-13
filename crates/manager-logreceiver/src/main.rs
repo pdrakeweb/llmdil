@@ -1035,11 +1035,40 @@ fn deploy_windows(
     let control = manager_services::scm::platform_control();
     match control.query(&def.name) {
         Ok(status) if !matches!(status.state, manager_services::ServiceState::NotInstalled) => {
-            let _ = control.stop(&def.name);
+            // Stop and wait, unregister, then wait for the old
+            // registration to disappear: re-registering while the old
+            // instance is still stop-pending fails with
+            // ERROR_SERVICE_MARKED_FOR_DELETE.
+            match manager_services::stop_and_wait(
+                &control,
+                &def.name,
+                manager_services::ServiceTimeouts::stop(&def.name),
+            ) {
+                Ok(outcome) => deploy_log(
+                    data_dir,
+                    &format!("deploy: existing service stopped ({outcome:?})"),
+                ),
+                Err(e) => {
+                    return fail(
+                        data_dir,
+                        format!("could not stop the existing service: {e}"),
+                    )
+                }
+            }
             if let Err(e) = control.unregister(&def.name) {
                 return fail(
                     data_dir,
                     format!("could not replace the existing registration: {e}"),
+                );
+            }
+            if let Err(e) = manager_services::wait_until_absent(
+                &control,
+                &def.name,
+                manager_services::ServiceTimeouts::unregister(&def.name),
+            ) {
+                return fail(
+                    data_dir,
+                    format!("the old registration did not go away: {e}"),
                 );
             }
         }
@@ -1054,22 +1083,14 @@ fn deploy_windows(
         return fail(data_dir, e);
     }
     // 5. Start and verify: SCM Running, then ingest /healthz ok.
-    if let Err(e) = control.start(&def.name) {
+    // A start that falls back to Stopped fails here with the shim's
+    // reason (credential/env, spawn, or the receiver's exit code).
+    if let Err(e) = manager_services::start_and_wait(
+        &control,
+        &def.name,
+        manager_services::ServiceTimeouts::start(&def.name),
+    ) {
         return fail(data_dir, format!("service start failed: {e}"));
-    }
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut running = false;
-    while Instant::now() < deadline {
-        match control.query(&def.name) {
-            Ok(status) if matches!(status.state, manager_services::ServiceState::Running) => {
-                running = true;
-                break;
-            }
-            _ => std::thread::sleep(Duration::from_millis(250)),
-        }
-    }
-    if !running {
-        return fail(data_dir, "service did not reach Running within 30 s".into());
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut healthy = false;
@@ -1128,13 +1149,25 @@ fn cmd_remove(args: &[String]) -> u8 {
             Ok(status) if matches!(status.state, manager_services::ServiceState::NotInstalled) => {
                 println!("service '{name}' is not registered");
             }
-            Ok(_) => match control.unregister(name) {
-                Ok(()) => println!("unregistered service '{name}'"),
-                Err(e) => {
-                    eprintln!("remove: {e}");
-                    code = 1;
+            Ok(_) => {
+                match manager_services::stop_and_wait(
+                    &control,
+                    name,
+                    manager_services::ServiceTimeouts::stop(name),
+                ) {
+                    Ok(outcome) => println!("service '{name}' stopped ({outcome:?})"),
+                    // Unregister anyway: the service is then deleted
+                    // when its process exits.
+                    Err(e) => eprintln!("remove: stop did not complete: {e}"),
                 }
-            },
+                match control.unregister(name) {
+                    Ok(()) => println!("unregistered service '{name}'"),
+                    Err(e) => {
+                        eprintln!("remove: {e}");
+                        code = 1;
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("remove: could not query service '{name}': {e}");
                 code = 1;

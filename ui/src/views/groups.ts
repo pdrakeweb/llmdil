@@ -32,6 +32,7 @@ import type {
 } from "../api";
 import { trim1 } from "../charts";
 import { esc } from "../html";
+import { fromWire, lifecycleDot, lifecycleLabel, serviceStore } from "../lifecycle";
 import { icon } from "../icons";
 import { predictedCardTip, sameModelFile } from "./static";
 
@@ -154,11 +155,9 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
     return m ? m.name : b.model_file.split(/[\\/]/).pop() ?? b.model_file;
   };
 
-  const dotClass = (state: string): string =>
-    state === "running" ? "ok"
-      : state === "failed" ? "err"
-        : state === "starting" || state === "stopping" ? "warn"
-          : "idle";
+  /** The backend's effective lifecycle state (wire state + the shared
+   *  store's pending overlay — a restart from any surface shows). */
+  const stateOf = (b: BackendRow) => serviceStore.backendState(b);
 
   /* Exclusion states, mirroring the Gateway view's group cards:
    * a member or fallback renders muted with the reason when the
@@ -212,7 +211,9 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
       ? b.predicted.predicted_per_second
       : null;
     const pStarted = predictRefreshing.get(b.id);
-    const pCanMeasure = b.state === "running";
+    // Measuring needs a backend that is serving now: running, not
+    // merely live (starting/restarting cannot answer the benchmark).
+    const pCanMeasure = stateOf(b) === "running";
     const pTitle = pStarted !== undefined
       ? "Measurement running"
       : !pCanMeasure
@@ -227,7 +228,7 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
         : `<span style="color:var(--text3)">Not measured</span>`} ${pBtn}</div>${pNote ? `<div class="group-mini-line" style="color:var(--err)">${esc(pNote)}</div>` : ""}`;
     const isPending = pending !== null && pending.id === b.id;
     return `<div class="group-mini-card" draggable="true" data-group-card="${esc(b.id)}" data-group-lane="${esc(laneKey)}">
-      <div class="group-mini-head"><span class="dot ${dotClass(b.state)}"></span><span class="group-mini-id">${esc(b.id)}</span><span style="color:var(--text3);font-family:var(--mono);font-size:12px">:${b.port}</span>${menu}</div>
+      <div class="group-mini-head"><span title="${esc(lifecycleLabel(stateOf(b), b.transition ?? null))}">${lifecycleDot(stateOf(b))}</span><span class="group-mini-id">${esc(b.id)}</span><span style="color:var(--text3);font-family:var(--mono);font-size:12px">:${b.port}</span>${menu}</div>
       <div class="group-mini-line">Model: <span style="color:var(--text)">${esc(modelName(b))}</span></div>
       ${predicted}
       ${b.placement ? `<div class="group-mini-line">Placement: <span style="color:var(--text)">${esc(b.placement)}</span></div>` : ""}
@@ -358,7 +359,7 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
   async function doPredictRefresh(id: string): Promise<void> {
     if (predictRefreshing.has(id)) return;
     const row = byId().get(id);
-    if (!row || row.state !== "running") return;
+    if (!row || fromWire(row.lifecycle ?? row.state) !== "running") return;
     predictRefreshing.set(id, Date.now());
     predictNotes.delete(id);
     paint();

@@ -3,10 +3,12 @@
    framework can replace this file later without changing command contracts. */
 
 import "./styles.css";
-import { appUpdateRestart, getActivationPlan, getAppConfig, getAppUpdateStatus, getBackends, getGatewayStatus, getSetupStatus, getStatus, isTauri } from "./api";
+import { appUpdateRestart, getActivationPlan, getAppConfig, getAppUpdateStatus, getSetupStatus, getStatus, isTauri } from "./api";
 import type { ActivationPlanData, AppUpdateInfo } from "./api";
+import { META, lifecycleDot, lifecycleLabel, serviceStore } from "./lifecycle";
+import type { ServiceSnapshot } from "./lifecycle";
 import { stackedBar } from "./charts";
-import { esc } from "./html";
+import { esc, setHtml } from "./html";
 import { icon, type IconName } from "./icons";
 import { renderBench, wireBench } from "./views/bench";
 import { mountDashboard } from "./views/dashboard";
@@ -45,11 +47,6 @@ const ROUTES: Route[] = [
 let cleanup: (() => void) | null = null;
 /** Incremented per render; async mounts that lose the race clean up after themselves. */
 let renderGen = 0;
-/** The sidebar footer's own refresh timer. The footer otherwise only
- *  repaints on navigation, so a gateway that dies while the operator
- *  stays on one view would keep showing its last-probed state. Started
- *  once (guarded), never stacked by repeated render() calls. */
-let sideFootTimer: number | null = null;
 
 function shell(): string {
   return `<aside class="sidebar">
@@ -76,7 +73,11 @@ function shell(): string {
  * hides it: saved-but-not-live changes stay visible here until
  * they are applied or cancelled. */
 let bannerPlan: ActivationPlanData | null = null;
-let bannerActing = false;
+/** This window's own Apply call is in flight (a click guard only: the
+ *  Apply buttons' disabled state and the "Applying…" line come from
+ *  the server's activation_applying, so an apply started on ANY
+ *  surface — another view, REST, CLI — disables them here too). */
+let bannerApplyInFlight = false;
 let bannerStatus = "";
 let bannerStatusErr = false;
 /** Manual-command block from a failed start-gateway outcome during
@@ -87,7 +88,17 @@ function paintActivationBanner(): void {
   const el = document.getElementById("activationBanner");
   if (!el) return;
   const plan = bannerPlan;
-  if (!plan || !plan.pending) { el.innerHTML = ""; return; }
+  // The server-side apply in progress (any surface). The banner stays
+  // rendered while it runs, even when the plan already resolved, so
+  // the operator sees "Applying… <step>" until it finishes (ACT-5).
+  const applying = serviceStore.get().gateway?.activation_applying ?? null;
+  if (!plan || (!plan.pending && !applying)) { setHtml(el, ""); return; }
+  if (!plan.pending && applying) {
+    setHtml(el, `<div class="activation-banner">
+    <span class="ab-text">${icon("clock")} <b>Applying the activation plan…</b></span>
+    <span class="ab-status">${esc(applying.message)}</span></div>`);
+    return;
+  }
   // The banner renders the plan card's summary variant (one line:
   // warn icon, the pending count as Label: Value, the scope
   // segmented bar, Review + Apply) with the shell's own state; the
@@ -101,7 +112,13 @@ function paintActivationBanner(): void {
         ...(backend ? [{ pct: (backend / n) * 100, color: "#4a9eff", label: `Backend: ${backend}` }] : []),
         ...(gateway ? [{ pct: (gateway / n) * 100, color: "#a371f7", label: `Gateway: ${gateway}` }] : []),
       ], 340, 8)}<span style="font-size:11px;color:var(--text3);white-space:nowrap">${[backend ? "Backend" : "", gateway ? "Gateway" : ""].filter(Boolean).join(" · ")}</span>`;
-  const dis = bannerActing ? " disabled" : "";
+  const dis = bannerApplyInFlight || applying ? " disabled" : "";
+  // Drain/Apply key on the gateway's lifecycle state from the shared
+  // store (running/not responding = restart it; anything else = the
+  // single Apply, which starts it), the plan's probe as the fallback.
+  const gwState = serviceStore.gatewayState();
+  const gwLive = gwState !== null ? META[gwState].isLive : plan.gateway_up;
+  const status = applying && !bannerApplyInFlight ? `Applying… ${applying.message}` : bannerStatus;
   // The same actions the plan card offers, under the same labels and
   // modes: drain-or-restart when the gateway is up with a gateway
   // change pending, otherwise the single Apply plan (start) action.
@@ -112,20 +129,20 @@ function paintActivationBanner(): void {
   const tip = esc(planApplyLine(plan));
   const applyBtns = !plan.actionable
     ? ""
-    : plan.gateway_pending && plan.gateway_up
+    : plan.gateway_pending && gwLive
       ? `<button class="btn" data-ab-act="drain" title="${tip}"${dis}>${icon("pause")} Drain Requests and Apply</button>
       <button class="btn" data-ab-act="apply-now" title="${tip}"${dis}>${icon("restart")} Apply now</button>`
       : `<button class="btn" data-ab-act="apply" title="${tip}"${dis}>${icon("play")} Apply plan</button>`;
-  el.innerHTML = `<div class="activation-banner">
+  setHtml(el, `<div class="activation-banner">
     <span class="ab-text">${icon("warn")} <b>Activation Plan pending</b> — Pending changes: ${n}</span>
     <span style="display:inline-flex;align-items:center;gap:8px;flex:0 1 340px;min-width:160px">${bar}</span>
-    ${bannerStatus ? `<span class="ab-status${bannerStatusErr ? " err" : ""}">${esc(bannerStatus)}</span>` : ""}
+    ${status ? `<span class="ab-status${bannerStatusErr && status === bannerStatus ? " err" : ""}">${esc(status)}</span>` : ""}
     <span class="ab-actions">
       <button class="btn" data-ab-act="review" title="Review activation plan"${dis}>${icon("eye")} Review</button>
       ${applyBtns}
     </span>
     ${plan.actionable ? `<span style="flex-basis:100%">${esc(planApplyLine(plan))}</span>` : ""}</div>`
-    + (bannerManual ? `<pre style="margin:0 12px 8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px;text-align:left">${esc(bannerManual)}</pre><div style="padding:0 12px 8px"><button class="btn icon-only" data-ab-act="copy-manual" title="Copy commands" aria-label="Copy commands">${icon("copy")}</button></div>` : "");
+    + (bannerManual ? `<pre style="margin:0 12px 8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px;text-align:left">${esc(bannerManual)}</pre><div style="padding:0 12px 8px"><button class="btn icon-only" data-ab-act="copy-manual" title="Copy commands" aria-label="Copy commands">${icon("copy")}</button></div>` : ""));
 }
 
 async function refreshActivationBanner(): Promise<void> {
@@ -162,8 +179,8 @@ async function onBannerClick(ev: Event): Promise<void> {
     drain: "quiesce", "apply-now": "restart", apply: "start",
   };
   const mode = act ? modes[act] : undefined;
-  if (!mode || bannerActing || !bannerPlan) return;
-  bannerActing = true;
+  if (!mode || bannerApplyInFlight || serviceStore.get().gateway?.activation_applying || !bannerPlan) return;
+  bannerApplyInFlight = true;
   const setStatus = (text: string, err = false): void => {
     bannerStatus = text;
     bannerStatusErr = err;
@@ -176,8 +193,9 @@ async function onBannerClick(ev: Event): Promise<void> {
   setStatus("Applying the activation plan…");
   const plan = bannerPlan;
   const ok = await applyActivationPlan(plan, mode, setStatus, setManual);
-  bannerActing = false;
-  if (ok) bannerStatus = "Activation plan applied — the saved changes are live.";
+  bannerApplyInFlight = false;
+  // The server's result message is already in bannerStatus (setStatus).
+  void ok;
   paintActivationBanner();
   await refreshActivationBanner();
   void render();
@@ -239,26 +257,14 @@ async function onUpdateBannerClick(ev: Event): Promise<void> {
   // On success the process exits; nothing further renders.
 }
 
-/** Sidebar status footer, driven by live data when available. */
-async function renderSideFoot(): Promise<void> {
-  const el = document.getElementById("sideFoot");
-  if (!el) return;
-  if (!isTauri()) {
-    el.innerHTML = `<div class="row"><span class="dot idle"></span> disconnected · sample data</div>`;
-    return;
-  }
-  const [s, b, gw, cfg] = await Promise.all([getStatus(), getBackends(), getGatewayStatus(), getAppConfig()]);
-  if (s.error || b.error) {
-    el.innerHTML = `<div class="row"><span class="dot err"></span> backend unreachable</div>`;
-    return;
-  }
-  const up = b.data.filter((x) => x.state === "running").length;
-  const mxc = (cfg.data?.mxc as { mode?: string } | undefined)?.mode;
-  // The LiteLLM row keys to the gateway probe: an errored status call
-  // paints no port and no green dot (the state is unknown, not up).
-  const gwRow = gw.error
-    ? `<div class="row"><span class="dot err"></span> LiteLLM status unknown</div>`
-    : `<div class="row"><span class="dot ${gw.data.up ? "ok" : "err"}"></span> LiteLLM :${gw.data.port}${gw.data.up ? "" : " · down"}</div>`;
+/** Sidebar footer data that is not lifecycle (config-load outcome,
+ *  MXC mode): fetched on navigation, not on every store refresh. */
+let sideFootStatic: { reachable: boolean; cfgRow: string; mxc: string | null } | null = null;
+
+async function refreshSideFootStatic(): Promise<void> {
+  if (!isTauri()) return;
+  const [s, cfg] = await Promise.all([getStatus(), getAppConfig()]);
+  if (s.error) { sideFootStatic = { reachable: false, cfgRow: "", mxc: null }; paintSideFoot(serviceStore.get()); return; }
   // Abnormal-condition row only (design rule 5): the config came from
   // the .bak copy or from built-in defaults (code review v0.1.60 F2).
   // Details (error, preserved copies) live in the tooltip.
@@ -266,11 +272,63 @@ async function renderSideFoot(): Promise<void> {
   const cfgRow = cl && (cl.source === "backup" || cl.source === "defaults")
     ? `<div class="row" title="${esc([cl.error ?? "", ...cl.preserved.map((p) => `Preserved: ${p}`)].filter(Boolean).join("\n"))}"><span class="dot err"></span> Config: ${cl.source === "backup" ? "restored from .bak" : "defaults (load failed)"}</div>`
     : "";
+  const mxc = (cfg.data?.mxc as { mode?: string } | undefined)?.mode ?? null;
+  sideFootStatic = { reachable: true, cfgRow, mxc };
+  paintSideFoot(serviceStore.get());
+}
+
+/** Sidebar status footer, painted from the shared service store on
+ *  every refresh: the gateway by its lifecycle state (a restart reads
+ *  "restarting…", an operator stop "stopped" — never a bare "down"),
+ *  the backend count by the shared rule (enabled + configured
+ *  backends, the same counts as the Dashboard and the Service Map). */
+function paintSideFoot(snap: ServiceSnapshot): void {
+  const el = document.getElementById("sideFoot");
+  if (!el) return;
+  if (!snap.live) {
+    el.innerHTML = `<div class="row"><span class="dot idle"></span> disconnected · sample data</div>`;
+    return;
+  }
+  if (snap.updatedAt === 0) return; // first refresh still in flight
+  if ((sideFootStatic && !sideFootStatic.reachable) || (snap.backendsError && !snap.backends.length)) {
+    el.innerHTML = `<div class="row"><span class="dot err"></span> backend unreachable</div>`;
+    return;
+  }
+  const gwState = serviceStore.gatewayState();
+  // An errored status call paints no port and no green dot (the state
+  // is unknown, not up).
+  const gwRow = !snap.gateway || gwState === null
+    ? `<div class="row"><span class="dot idle"></span> LiteLLM status unknown</div>`
+    : `<div class="row" title="${esc(lifecycleLabel(gwState, serviceStore.transitionOf("gateway", snap.gateway.transition)))}">${lifecycleDot(gwState)} LiteLLM :${snap.gateway.port}${gwState === "running" ? "" : ` · ${esc(lifecycleLabel(gwState))}`}</div>`;
+  const sum = serviceStore.summary();
+  const backDot = sum.backendsFailed ? "err"
+    : sum.backendsTotal && sum.backendsRunning === sum.backendsTotal ? "ok"
+    : sum.backendsTransitioning ? "warn"
+    : sum.backendsTotal ? "warn" : "idle";
+  const changing = sum.backendsTransitioning ? ` · ${sum.backendsTransitioning} changing` : "";
+  const mxc = sideFootStatic?.mxc ?? null;
   el.innerHTML = `
-    ${cfgRow}
+    ${sideFootStatic?.cfgRow ?? ""}
     ${gwRow}
-    <div class="row"><span class="dot ${b.data.length && up === b.data.length ? "ok" : "warn"}"></span> ${up}/${b.data.length} backends up</div>
+    <div class="row"><span class="dot ${backDot}"></span> ${sum.backendsRunning}/${sum.backendsTotal} backends up${changing}</div>
     <div class="row"><span class="dot warn"></span> MXC · ${mxc ? esc(mxc) : "unknown"}</div>`;
+}
+
+/** Repaint the sidebar and the activation banner from every store
+ *  refresh; reload the plan when a server-side apply starts or ends
+ *  (the banner's pending count changes then). Subscribed once for the
+ *  app's lifetime — this subscription also keeps the shared store
+ *  polling on every page (UI-10). */
+let lastApplying = false;
+function onStoreSnapshot(snap: ServiceSnapshot): void {
+  paintSideFoot(snap);
+  const applying = Boolean(snap.gateway?.activation_applying);
+  if (applying !== lastApplying) {
+    lastApplying = applying;
+    void refreshActivationBanner();
+  } else {
+    paintActivationBanner();
+  }
 }
 
 function renderTaskbar(): void {
@@ -419,10 +477,10 @@ async function render(): Promise<void> {
   renderTaskbar();
   void refreshActivationBanner();
   void refreshUpdateBanner();
-  void renderSideFoot();
-  if (sideFootTimer === null) {
-    sideFootTimer = window.setInterval(() => { void renderSideFoot(); }, 15000);
-  }
+  void refreshSideFootStatic();
+  // Navigation is a good moment to re-read lifecycle state too (cheap;
+  // coalesced with any poll in flight).
+  void serviceStore.refresh();
 }
 
 async function main(): Promise<void> {
@@ -434,7 +492,11 @@ async function main(): Promise<void> {
   document.getElementById("updateBanner")?.addEventListener("click", (ev) => void onUpdateBannerClick(ev));
   void refreshActivationBanner();
   void refreshUpdateBanner();
-  window.setInterval(() => { void refreshActivationBanner(); }, 10000);
+  // The sidebar and the banner's lifecycle parts follow the shared
+  // store; the plan itself (pending changes) is re-read on a slower
+  // cadence and whenever an apply starts or ends.
+  serviceStore.subscribe(onStoreSnapshot);
+  window.setInterval(() => { void refreshActivationBanner(); }, 15000);
   window.setInterval(() => { void refreshUpdateBanner(); }, 30000);
   // First launch: open the setup wizard until it is marked complete.
   if (isTauri() && !location.hash) {

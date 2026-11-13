@@ -9,7 +9,8 @@
     "build": "tsc --noEmit && vite build",
     "dev": "vite",
     "preview": "vite preview",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "test:lifecycle": "node scripts/lifecycle-check.mjs"
   },
   "type": "module",
   "version": "0.1.60"

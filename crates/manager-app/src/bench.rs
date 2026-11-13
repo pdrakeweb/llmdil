@@ -420,17 +420,17 @@ pub async fn op_bench_prompt_generate(
         ));
     }
     let cfg = state.config.read().await.clone();
-    // Running set from the supervisor, exactly as the interlock
+    // Running set from the shared liveness view, exactly as the interlock
     // reads it.
-    let running: HashSet<String> = {
-        let mut sup = state.supervisor().await.lock().await;
-        sup.reap_exited();
-        sup.status()
-            .into_iter()
-            .filter(|s| s.pid.is_some())
-            .map(|s| s.id)
-            .collect()
-    };
+    // The running set is the shared liveness view (supervisor and
+    // SCM alike): a service-managed backend holding the GPU counts
+    // exactly like a supervised one.
+    let running: HashSet<String> = crate::lifecycle::backend_liveness(state)
+        .await
+        .into_values()
+        .filter(|l| l.state.is_live())
+        .map(|l| l.id)
+        .collect();
     let backend = match &backend_id {
         Some(id) => {
             let b = cfg
@@ -1582,7 +1582,7 @@ async fn execute_sweep(
 
 pub async fn op_bench_run_start(
     state: &Arc<AppState>,
-    _sink: &Arc<dyn crate::EventSink>,
+    sink: &Arc<dyn crate::EventSink>,
     request: Value,
 ) -> crate::ApiResult {
     let req: SweepRequest = serde_json::from_value(request)
@@ -1749,15 +1749,15 @@ pub async fn op_bench_run_start(
     // sweep starts — either already stopped, or named in the
     // operator's confirmed stop list. Bench never stops a
     // backend on its own say-so, and never restarts one.
-    let running: HashSet<String> = {
-        let mut sup = state.supervisor().await.lock().await;
-        sup.reap_exited();
-        sup.status()
-            .into_iter()
-            .filter(|s| s.pid.is_some())
-            .map(|s| s.id)
-            .collect()
-    };
+    // The running set is the shared liveness view (supervisor and
+    // SCM alike): a service-managed backend holding the GPU counts
+    // exactly like a supervised one.
+    let running: HashSet<String> = crate::lifecycle::backend_liveness(state)
+        .await
+        .into_values()
+        .filter(|l| l.state.is_live())
+        .map(|l| l.id)
+        .collect();
     let conflicts = interlock_conflicts(&cfg, &running, &target);
     let uncovered: Vec<&String> = conflicts
         .iter()
@@ -1775,12 +1775,14 @@ pub async fn op_bench_run_start(
     }
     let mut stopped_names: Vec<String> = Vec::new();
     for id in &conflicts {
-        let mut sup = state.supervisor().await.lock().await;
-        match sup.stop(id, false).await {
-            Ok(()) => stopped_names.push(id.clone()),
+        let opts = crate::backend_lifecycle::BackendOpOpts::new(
+            crate::lifecycle::Origin::Bench,
+        );
+        match crate::backend_lifecycle::stop_backend(state, sink, id, opts).await {
+            Ok(_) => stopped_names.push(id.clone()),
             Err(e) => {
                 return Err(ApiError::InvalidInput(format!(
-                    "stopping backend '{id}' for the sweep failed: {e:?}"
+                    "stopping backend '{id}' for the sweep failed: {e}"
                 )))
             }
         }

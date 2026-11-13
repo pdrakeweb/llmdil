@@ -20,7 +20,7 @@ import {
   optimizeDiscardPlan, optimizeDiscover, optimizeEstimateBackend, optimizeEstimateExperiments, optimizeIsDestructive, optimizeKindLabel,
   optimizeMeasureBackend, optimizeRunBaseline, optimizeRunExperiments, optimizeSavePurpose, optimizeSetExperimentState, optimizeSetItemOutcome, optimizeSetItemState,
   optimizeTuningAdopt, optimizeTuningPreview, optimizeTuningRun,
-  setBackendMoeCache, setBackendOffload, stopBackend, updateBackendFlags, updateGatewayConfig,
+  setBackendMoeCache, setBackendOffload, updateBackendFlags, updateGatewayConfig,
 } from "../api";
 import type {
   CallResult, MeasurementInputs, OptimizeCandidate, OptimizeCandidates, OptimizeExperiment, OptimizeMeasurementEntry, OptimizePlanItem, OptimizeState,
@@ -28,6 +28,8 @@ import type {
 } from "../api";
 import { fmtCount, trim1 } from "../charts";
 import { esc } from "../html";
+import { META, fromWire, lifecycleChip, runLifecycle, serviceStore } from "../lifecycle";
+import type { LifecycleState } from "../lifecycle";
 import { icon } from "../icons";
 
 export function renderOptimize(): string {
@@ -502,6 +504,14 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
    *  anchored in the card's own action row. Replaces the single
    *  flex row whose figures read as one continuous blob of text
    *  with buttons floating at its end. */
+  /** A backend's lifecycle state for the measurement cards: the shared
+   *  store's effective state (a restart reads "restarting…"), else the
+   *  optimize payload's running flag. */
+  function optBackendState(id: string, running: boolean): LifecycleState {
+    const row = serviceStore.get().backends.find((r) => r.id === id);
+    return row ? serviceStore.backendState(row) : running ? "running" : "stopped";
+  }
+
   function measureRow(b: OptimizeState["backends"][number], busy: boolean): string {
     const m = b.measured;
     // The estimate (tracker #56) renders beside the measured
@@ -512,7 +522,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       <div class="opt-measure-head">
         <span class="opt-target">${esc(b.id)}</span>
         ${b.short_name || b.model_id ? `<span class="opt-measure-sub">${esc(b.short_name ?? b.model_id ?? "")}</span>` : ""}
-        <span class="opt-measure-state">${b.running ? "Running" : "Stopped"}</span>
+        <span class="opt-measure-state">${lifecycleChip(optBackendState(b.id, b.running))}</span>
       </div>
       ${m ? `<div class="opt-measure-figs-block">${measureFigRows(m)}</div>` : e ? "" : `<div class="opt-note">Not measured</div>`}
       ${e ? `<div class="opt-measure-figs-block"><div class="opt-kv"><span class="opt-kv-label">Estimate —</span></div>${measureFigRows(e)}</div>` : ""}
@@ -909,7 +919,9 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       return;
     }
     const st = state;
-    const running = st.backends.filter((b) => b.running);
+    // Running = serving now, from the shared lifecycle state (a backend
+    // mid-restart is not offered as a consultant).
+    const running = st.backends.filter((b) => optBackendState(b.id, b.running) === "running");
     const purposeShown = st.purpose_is_seed ? st.purpose_seed : st.purpose;
     const summary = st.context_summary;
     const contextLine = `GPUs: ${summary.gpus} · Backends: ${summary.backends} · Groups: ${summary.groups} · Models: ${summary.models}${summary.traffic_window_label ? ` · Traffic window: ${esc(summary.traffic_window_label)}` : ""}`;
@@ -1373,13 +1385,18 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       case "backend.delete": {
         const rows = unwrap(await getBackends());
         const row = rows.find((b) => b.id === target);
-        if (row && row.state === "running") {
-          unwrap(await stopBackend(target));
+        const rowState = row ? fromWire(row.lifecycle ?? row.state) : "stopped";
+        if (META[rowState].isLive || META[rowState].isTransition) {
+          // Through the shared runner: the stop shows as "stopping…"
+          // on every surface and is logged with origin "optimize".
+          const sr = await runLifecycle({ kind: "backend", id: target }, "stop", { origin: "optimize" });
+          if (!sr.ok) throw new Error(sr.message);
           const deadline = Date.now() + 30000;
           for (;;) {
             const now = unwrap(await getBackends());
-            const s = now.find((b) => b.id === target)?.state;
-            if (s === "stopped" || s === undefined) break;
+            const nr = now.find((b) => b.id === target);
+            const s = nr ? fromWire(nr.lifecycle ?? nr.state) : undefined;
+            if (s === undefined || s === "stopped" || s === "failed") break;
             if (Date.now() > deadline) throw new Error(`backend '${target}' did not stop within 30 s`);
             await new Promise((r) => window.setTimeout(r, 1000));
           }

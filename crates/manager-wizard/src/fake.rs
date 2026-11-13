@@ -128,6 +128,29 @@ struct FakeState {
     vscode_cli: Option<String>,
     free_space: u64,
     head_lengths: HashMap<String, u64>,
+    /// Service names `service_registered` reports as registered.
+    registered_services: HashSet<String>,
+    /// Scripted SCM state per service (`service_state`); a
+    /// registered service with no scripted state reads as Running.
+    service_states: HashMap<String, manager_services::ServiceState>,
+    /// Scripted `service_stop` outcome per service; unscripted:
+    /// `NotRegistered` for an unregistered service, else
+    /// `Stopped { waited_ms: 0 }`.
+    service_stop_outcomes: HashMap<String, manager_services::StopOutcome>,
+    /// Every service name passed to `service_stop`, in order.
+    service_stops: Vec<String>,
+    /// Every service name passed to `service_start_gateway`, in order.
+    service_starts: Vec<String>,
+    /// Every (path, line) passed to `append_marker`, in order.
+    markers: Vec<(PathBuf, String)>,
+    /// Scripted LISTEN-socket owner per port (`port_owner_pid`).
+    port_owners: HashMap<u16, u32>,
+    /// Commands (by argv key) whose execution ends a live pid — a
+    /// `pg_ctl stop` taking the postmaster down.
+    command_kills: HashMap<String, u32>,
+    /// SCM state a service takes right after `service_start_gateway`
+    /// succeeds (unscripted: Running).
+    service_states_after_start: HashMap<String, manager_services::ServiceState>,
 }
 
 impl Default for FakeState {
@@ -171,6 +194,15 @@ impl Default for FakeState {
             // the disk-space pre-check.
             free_space: u64::MAX,
             head_lengths: HashMap::new(),
+            registered_services: HashSet::new(),
+            service_states: HashMap::new(),
+            service_stop_outcomes: HashMap::new(),
+            service_stops: Vec::new(),
+            service_starts: Vec::new(),
+            markers: Vec::new(),
+            port_owners: HashMap::new(),
+            command_kills: HashMap::new(),
+            service_states_after_start: HashMap::new(),
         }
     }
 }
@@ -368,6 +400,107 @@ impl FakeSystemOps {
         self.state.lock().unwrap().killed_pids.clone()
     }
 
+    /// Script a command (matched on exact argv) whose execution ends
+    /// the live process `pid` (e.g. `pg_ctl stop` ending the
+    /// postmaster). The command's own result is scripted separately
+    /// (unscripted: success).
+    pub fn with_command_kills_pid(&self, argv: &[&str], pid: u32) -> &Self {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        self.state
+            .lock()
+            .unwrap()
+            .command_kills
+            .insert(key(&argv), pid);
+        self
+    }
+
+    /// Script a Windows service as registered (`service_registered`).
+    pub fn with_registered_service(&self, name: &str) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .registered_services
+            .insert(name.to_string());
+        self
+    }
+
+    /// Script a service's SCM state (`service_state`).
+    pub fn with_service_state(&self, name: &str, state: manager_services::ServiceState) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .service_states
+            .insert(name.to_string(), state);
+        self
+    }
+
+    /// Script the SCM state a service reports right after a
+    /// successful `service_start_gateway` (e.g. Stopped: it fell over
+    /// once started).
+    pub fn with_service_state_after_start(
+        &self,
+        name: &str,
+        state: manager_services::ServiceState,
+    ) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .service_states_after_start
+            .insert(name.to_string(), state);
+        self
+    }
+
+    /// Script the outcome `service_stop` reports for a service.
+    pub fn with_service_stop_outcome(
+        &self,
+        name: &str,
+        outcome: manager_services::StopOutcome,
+    ) -> &Self {
+        self.state
+            .lock()
+            .unwrap()
+            .service_stop_outcomes
+            .insert(name.to_string(), outcome);
+        self
+    }
+
+    /// Every service name passed to `service_stop`, in order.
+    pub fn service_stops(&self) -> Vec<String> {
+        self.state.lock().unwrap().service_stops.clone()
+    }
+
+    /// Every service name passed to `service_start_gateway`, in order.
+    pub fn service_starts(&self) -> Vec<String> {
+        self.state.lock().unwrap().service_starts.clone()
+    }
+
+    /// Script the pid owning the LISTEN socket on `port` (the pid
+    /// also reads as running).
+    pub fn with_port_owner(&self, port: u16, pid: u32) -> &Self {
+        let mut st = self.state.lock().unwrap();
+        st.port_owners.insert(port, pid);
+        st.live_pids.insert(pid);
+        drop(st);
+        self
+    }
+
+    /// Every (path, line) passed to `append_marker`, in order.
+    pub fn markers(&self) -> Vec<(PathBuf, String)> {
+        self.state.lock().unwrap().markers.clone()
+    }
+
+    /// The marker lines written to `path`, in order.
+    pub fn markers_in(&self, path: &Path) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .markers
+            .iter()
+            .filter(|(p, _)| p == path)
+            .map(|(_, l)| l.clone())
+            .collect()
+    }
+
     pub fn with_home(&self, home: PathBuf) -> &Self {
         self.state.lock().unwrap().home = Some(home);
         self
@@ -538,6 +671,10 @@ impl SystemOps for FakeSystemOps {
         let mut st = self.state.lock().unwrap();
         st.executed.push(cmd.argv.clone());
         st.executed_cmds.push(cmd.clone());
+        if let Some(pid) = st.command_kills.get(&key(&cmd.argv)).copied() {
+            st.live_pids.remove(&pid);
+            st.port_owners.retain(|_, owner| *owner != pid);
+        }
         match st.commands.get(&key(&cmd.argv)).cloned() {
             Some(behavior) => behavior.into_result(&cmd.argv),
             // Default: succeed quietly so tests only script what they assert on.
@@ -583,7 +720,103 @@ impl SystemOps for FakeSystemOps {
         }
         st.live_pids.remove(&pid);
         st.killed_pids.push(pid);
+        // A killed process no longer owns any listening socket.
+        st.port_owners.retain(|_, owner| *owner != pid);
         Ok(())
+    }
+
+    async fn service_start_gateway(
+        &self,
+        def: &manager_services::ServiceDefinition,
+    ) -> Result<u32, WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.service_starts.push(def.name.clone());
+        if !st.registered_services.contains(&def.name) {
+            return Err(WizardError::IoError {
+                path: PathBuf::from("scm"),
+                reason: format!("the gateway service '{}' is not registered", def.name),
+            });
+        }
+        let after = st
+            .service_states_after_start
+            .get(&def.name)
+            .copied()
+            .unwrap_or(manager_services::ServiceState::Running);
+        st.service_states.insert(def.name.clone(), after);
+        if !st.spawn_dies {
+            st.live_pids.insert(4242);
+        }
+        Ok(4242)
+    }
+
+    async fn service_stop(
+        &self,
+        name: &str,
+    ) -> Result<manager_services::StopOutcome, WizardError> {
+        let mut st = self.state.lock().unwrap();
+        st.service_stops.push(name.to_string());
+        let registered = st.registered_services.contains(name);
+        let outcome = match st.service_stop_outcomes.get(name) {
+            Some(o) => *o,
+            None if !registered => manager_services::StopOutcome::NotRegistered,
+            None => manager_services::StopOutcome::Stopped { waited_ms: 0 },
+        };
+        if registered {
+            st.service_states
+                .insert(name.to_string(), manager_services::ServiceState::Stopped);
+        }
+        Ok(outcome)
+    }
+
+    async fn write_service_definition(
+        &self,
+        data_dir: &Path,
+        def: &manager_services::ServiceDefinition,
+    ) -> Result<PathBuf, WizardError> {
+        let path = manager_services::definition_path(data_dir, &def.name);
+        let json = serde_json::to_vec_pretty(def).map_err(|e| WizardError::IoError {
+            path: path.clone(),
+            reason: e.to_string(),
+        })?;
+        self.state.lock().unwrap().files.insert(path.clone(), json);
+        Ok(path)
+    }
+
+    async fn service_registered(&self, name: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .registered_services
+            .contains(name)
+    }
+
+    async fn service_state(&self, name: &str) -> Option<manager_services::ServiceState> {
+        let st = self.state.lock().unwrap();
+        if !st.registered_services.contains(name) {
+            return Some(manager_services::ServiceState::NotInstalled);
+        }
+        Some(
+            st.service_states
+                .get(name)
+                .copied()
+                .unwrap_or(manager_services::ServiceState::Running),
+        )
+    }
+
+    fn append_marker(&self, path: &Path, line: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .markers
+            .push((path.to_path_buf(), line.to_string()));
+    }
+
+    fn port_owner_pid(&self, port: u16) -> Option<u32> {
+        let st = self.state.lock().unwrap();
+        st.port_owners
+            .get(&port)
+            .copied()
+            .filter(|pid| st.live_pids.contains(pid))
     }
 
     async fn download(
