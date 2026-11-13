@@ -2215,6 +2215,11 @@ pub async fn test_tool_call(base_url: &str) -> Result<ToolCallProbeResult, Super
     ))
 }
 
+// Streaming, structured-output consultation transport (Optimize
+// Phase 3): a sibling of `chat_completion` in its own module.
+mod chat_stream;
+pub use chat_stream::{consult_completion, ConsultCompletion, StreamProgress};
+
 /// One chat message for [`chat_completion`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
