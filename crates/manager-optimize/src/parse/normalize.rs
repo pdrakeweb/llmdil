@@ -82,6 +82,40 @@ pub(super) fn req_f32_vec(obj: &Map<String, Value>, key: &str) -> Option<Vec<Val
     Some(out)
 }
 
+/// The `change` fields a kind's mapping admits (design §4): the
+/// single source for both [`normalize_change`] (any other field
+/// demotes the item to advice) and the structured-output schema
+/// (`crate::schema`, Phase 3), so the schema the consulted model
+/// is constrained to and the parser reading its answer cannot
+/// drift apart. Kinds whose change is empty admit nothing.
+pub(crate) fn change_fields(kind: PlanKind) -> &'static [&'static str] {
+    match kind {
+        PlanKind::BackendCreate => &[
+            "model_id",
+            "group",
+            "port",
+            "n_ctx",
+            "n_batch",
+            "tensor_split",
+            "offload_layers",
+            "moe_cache_mib",
+        ],
+        PlanKind::BackendDelete | PlanKind::GroupDelete | PlanKind::ModelDownload => &[],
+        PlanKind::BackendSetContext => &["n_ctx"],
+        PlanKind::BackendSetFlags => &["n_ctx", "n_batch"],
+        PlanKind::BackendSetOffload => &["offload_layers", "moe_cache_mib"],
+        PlanKind::BackendSetPlacement => &["tensor_split", "split_mode"],
+        PlanKind::BackendSetModel => &["model_id"],
+        PlanKind::BackendSetEnabled => &["enabled"],
+        PlanKind::GroupSetMembers => &["members"],
+        PlanKind::GroupSetStrategy => &["strategy"],
+        PlanKind::GroupSetFallbacks => &["fallbacks"],
+        PlanKind::GroupCreate => &["members", "strategy", "fallbacks"],
+        PlanKind::ModelAdd => &["source_url", "quant", "sha256", "params_b"],
+        PlanKind::Advice => &["text"],
+    }
+}
+
 /// Validate and normalize one item's change payload for its kind.
 /// Only the fields the kind's mapping admits survive, so what
 /// validation and apply see is exactly what the app can execute.
@@ -98,33 +132,13 @@ pub(super) fn normalize_change(kind: PlanKind, change: &Value) -> ChangeVerdict 
     if obj.contains_key("raw_flags") {
         return ChangeVerdict::Demote;
     }
-    let allowed: &[&str] = match kind {
-        PlanKind::BackendCreate => &[
-            "model_id",
-            "group",
-            "port",
-            "n_ctx",
-            "n_batch",
-            "tensor_split",
-            "offload_layers",
-            "moe_cache_mib",
-        ],
-        PlanKind::BackendDelete | PlanKind::GroupDelete | PlanKind::ModelDownload => {
-            return ChangeVerdict::Ok(json!({}));
-        }
-        PlanKind::BackendSetContext => &["n_ctx"],
-        PlanKind::BackendSetFlags => &["n_ctx", "n_batch"],
-        PlanKind::BackendSetOffload => &["offload_layers", "moe_cache_mib"],
-        PlanKind::BackendSetPlacement => &["tensor_split", "split_mode"],
-        PlanKind::BackendSetModel => &["model_id"],
-        PlanKind::BackendSetEnabled => &["enabled"],
-        PlanKind::GroupSetMembers => &["members"],
-        PlanKind::GroupSetStrategy => &["strategy"],
-        PlanKind::GroupSetFallbacks => &["fallbacks"],
-        PlanKind::GroupCreate => &["members", "strategy", "fallbacks"],
-        PlanKind::ModelAdd => &["source_url", "quant", "sha256", "params_b"],
-        PlanKind::Advice => &["text"],
-    };
+    if matches!(
+        kind,
+        PlanKind::BackendDelete | PlanKind::GroupDelete | PlanKind::ModelDownload
+    ) {
+        return ChangeVerdict::Ok(json!({}));
+    }
+    let allowed = change_fields(kind);
     // A field the mapping does not admit: the reasoning may be
     // sound but the mutation is not one the app can validate.
     if obj.keys().any(|k| !allowed.contains(&k.as_str())) {
