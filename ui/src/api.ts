@@ -869,6 +869,12 @@ export interface BackendOffload {
    *  priced by the backend with true per-block sums. May be absent in
    *  older payloads — callers fall back to a uniform expert share. */
   sys_bytes_by_position?: number[];
+  /** The `--n-cpu-moe` value each slider position 0..=moe_layers
+   *  writes: llama.cpp reads it as a block-index bound, so for a
+   *  model with leading or interleaved dense blocks it differs
+   *  from the MoE-layer count. Absent in older payloads — callers
+   *  fall back to the position itself. */
+  n_cpu_moe_by_position?: number[];
   /** True when the saved offload spelling in raw flags is not the
    *  canonical slider form for its position (hand-written, e.g.
    *  --cpu-moe or -ncmoe). */

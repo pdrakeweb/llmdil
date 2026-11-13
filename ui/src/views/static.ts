@@ -1585,7 +1585,9 @@ function offloadTipText(o: BackendOffload, layers: number): string {
 function offloadTokenText(o: BackendOffload, layers: number): string {
   if (layers <= 0) return "no offload tokens";
   if (layers >= o.moe_layers) return "-ot exps=CPU";
-  return `--n-cpu-moe ${layers}`;
+  // The position counts MoE layers; the flag value is the backend's
+  // block-index bound for it (they differ past leading dense blocks).
+  return `--n-cpu-moe ${o.n_cpu_moe_by_position?.[layers] ?? layers}`;
 }
 
 /* ---------------- MTP draft control (tracker #53) ----------------

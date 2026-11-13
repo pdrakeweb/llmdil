@@ -45,6 +45,10 @@ pub enum ExpertOffload {
     /// effective bound is the largest). See [`overrides`] for the
     /// source this follows. Without the model's tensor names the
     /// requirement still approximates it as the first N MoE blocks.
+    /// The value is the FLAG's bound, not a MoE-layer count: slider
+    /// positions convert through [`MoeBlockMap`]
+    /// ([`offload_for_moe_layers`],
+    /// [`ExpertOffload::moe_layers_offloaded`]).
     CpuMoeLayers(u32),
     /// `-ot` / `--override-tensor` patterns that place SOME but not
     /// all routed experts on the CPU (a block-range recipe such as
@@ -88,6 +92,112 @@ pub fn offload_for_layers(layers: u32, moe_layers: u32) -> ExpertOffload {
         ExpertOffload::AllExperts
     } else {
         ExpertOffload::CpuMoeLayers(layers)
+    }
+}
+
+/// Where a model's MoE blocks sit among its blocks: the ascending,
+/// distinct block indices of the blocks that carry routed-expert
+/// tensors (from the GGUF tensor index).
+///
+/// The offload slider, its guardrail ranges and the catalog pins
+/// count MoE LAYERS ("16 of 24 MoE layers"), but llama.cpp reads
+/// `--n-cpu-moe B` as a BLOCK-INDEX bound (the experts of blocks
+/// with index `< B`; see [`overrides`]). For a model whose MoE
+/// blocks do not start at block 0 — leading dense blocks, or
+/// dense and MoE blocks interleaved — the two differ, and this map
+/// converts between them:
+///
+/// - writing `N` MoE layers: `B = (block index of the N-th MoE
+///   block) + 1` ([`MoeBlockMap::bound_for_layers`]);
+/// - reading `--n-cpu-moe B`: the number of MoE blocks with index
+///   `< B` ([`MoeBlockMap::layers_for_bound`]).
+///
+/// Without a map (a catalog-only layout before download) the
+/// conversions are the identity — the pre-map behaviour, which is
+/// exact for models whose MoE blocks are blocks `0..N` and
+/// otherwise remains an Estimate.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MoeBlockMap {
+    blocks: Vec<u32>,
+}
+
+impl MoeBlockMap {
+    /// The map of the MoE blocks named in a routed-expert tensor
+    /// index. `None` when no tensor names a block (a dense model,
+    /// or names this crate cannot attribute).
+    pub fn from_tensors(tensors: &[ExpertTensor]) -> Option<Self> {
+        Self::from_block_indices(
+            tensors
+                .iter()
+                .filter_map(|t| overrides::exps_block_index(&t.name))
+                .filter_map(|i| u32::try_from(i).ok()),
+        )
+    }
+
+    /// The map of the given MoE block indices (any order,
+    /// duplicates ignored). `None` when there are none.
+    pub fn from_block_indices(indices: impl IntoIterator<Item = u32>) -> Option<Self> {
+        let mut blocks: Vec<u32> = indices.into_iter().collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        (!blocks.is_empty()).then_some(MoeBlockMap { blocks })
+    }
+
+    /// How many MoE blocks the map knows.
+    pub fn moe_layers(&self) -> u32 {
+        self.blocks.len() as u32
+    }
+
+    /// The `--n-cpu-moe` bound that moves exactly the first
+    /// `layers` MoE blocks: the block index of the `layers`-th MoE
+    /// block plus one (0 for 0; past the last MoE block, the bound
+    /// of the last one).
+    pub fn bound_for_layers(&self, layers: u32) -> u32 {
+        if layers == 0 {
+            return 0;
+        }
+        let k = (layers as usize).min(self.blocks.len());
+        self.blocks[k - 1].saturating_add(1)
+    }
+
+    /// The number of MoE blocks `--n-cpu-moe bound` moves: those
+    /// with block index `< bound`.
+    pub fn layers_for_bound(&self, bound: u32) -> u32 {
+        self.blocks.partition_point(|&b| b < bound) as u32
+    }
+}
+
+impl ExpertOffload {
+    /// [`ExpertOffload::layers`] in MoE layers through the model's
+    /// block map: a [`ExpertOffload::CpuMoeLayers`] value is the
+    /// `--n-cpu-moe` block-index bound, so it reads back as the
+    /// number of MoE blocks below it. Without a map this is exactly
+    /// [`ExpertOffload::layers`].
+    pub fn moe_layers_offloaded(&self, moe_layers: u32, map: Option<&MoeBlockMap>) -> u32 {
+        match (self, map) {
+            (ExpertOffload::CpuMoeLayers(bound), Some(map)) => {
+                map.layers_for_bound(*bound).min(moe_layers)
+            }
+            _ => self.layers(moe_layers),
+        }
+    }
+}
+
+/// [`offload_for_layers`] for a slider position counted in MoE
+/// layers, converted through the model's block map: a partial
+/// position writes the block-index bound that moves exactly that
+/// many MoE layers. Without a map this is exactly
+/// [`offload_for_layers`].
+pub fn offload_for_moe_layers(
+    layers: u32,
+    moe_layers: u32,
+    map: Option<&MoeBlockMap>,
+) -> ExpertOffload {
+    match (offload_for_layers(layers, moe_layers), map) {
+        (ExpertOffload::CpuMoeLayers(n), Some(map)) => {
+            ExpertOffload::CpuMoeLayers(map.bound_for_layers(n))
+        }
+        (offload, _) => offload,
     }
 }
 
@@ -568,12 +678,13 @@ pub fn memory_requirement_with_tensors(
 
 /// [`sys_bytes_by_position`] with the model's routed-expert tensor
 /// index, mirroring [`memory_requirement_with_tensors`]: a partial
-/// position `k` (`0 < k < moe_layers`) is written as
-/// `--n-cpu-moe k`, which llama.cpp resolves by BLOCK INDEX, so
-/// entry `k` sums the experts of blocks with index `< k`; the full
-/// position is written as `-ot exps=CPU` and stays
-/// `expert_bytes`. Without an index this is exactly
-/// [`sys_bytes_by_position`].
+/// position `k` (`0 < k < moe_layers`, in MoE layers) is written as
+/// `--n-cpu-moe B` with `B` the block-index bound that moves the
+/// first `k` MoE blocks ([`MoeBlockMap::bound_for_layers`]), so
+/// entry `k` sums the experts of blocks with index `< B` — the
+/// first `k` MoE blocks' experts; the full position is written as
+/// `-ot exps=CPU` and stays `expert_bytes`. Without an index this
+/// is exactly [`sys_bytes_by_position`].
 pub fn sys_bytes_by_position_with_tensors(
     expert_bytes: u64,
     expert_bytes_by_block: Option<&[u64]>,
@@ -586,7 +697,14 @@ pub fn sys_bytes_by_position_with_tensors(
     if moe_layers == 0 {
         return vec![0];
     }
-    let mut out = overrides::block_bound_prefix_bytes(tensors, moe_layers);
+    let Some(map) = MoeBlockMap::from_tensors(tensors) else {
+        return sys_bytes_by_position(expert_bytes, expert_bytes_by_block, moe_layers);
+    };
+    let max_bound = map.bound_for_layers(moe_layers);
+    let by_bound = overrides::block_bound_prefix_bytes(tensors, max_bound);
+    let mut out: Vec<u64> = (0..=moe_layers)
+        .map(|k| by_bound[map.bound_for_layers(k) as usize])
+        .collect();
     if let Some(last) = out.last_mut() {
         *last = expert_bytes;
     }
@@ -1525,21 +1643,27 @@ mod tests {
     #[test]
     fn position_table_with_tensors_follows_block_indices() {
         // Leading dense blocks 0..=1, 6 MoE blocks (2..=7): slider
-        // position k writes `--n-cpu-moe k`, so the table entry for
-        // k is what that flag really moves; the full position
-        // writes `-ot exps=CPU` and is every expert.
+        // position k (MoE layers) writes `--n-cpu-moe k+2`, so the
+        // table entry for k is what that flag really moves — the
+        // first k MoE blocks; the full position writes
+        // `-ot exps=CPU` and is every expert.
         let t = moe_tensors(2, 8);
+        let map = MoeBlockMap::from_tensors(&t).unwrap();
         let expert: u64 = t.iter().map(|t| t.bytes).sum();
         let table = sys_bytes_by_position_with_tensors(expert, None, 6, Some(&t));
         assert_eq!(table.len(), 7);
         assert_eq!(table[0], 0);
-        assert_eq!(table[2], 0);
-        assert_eq!(table[3], 4 * GIB);
-        assert_eq!(table[5], 3 * 4 * GIB);
+        assert_eq!(table[2], 2 * 4 * GIB);
+        assert_eq!(table[3], 3 * 4 * GIB);
+        assert_eq!(table[5], 5 * 4 * GIB);
         assert_eq!(table[6], expert);
-        // Every partial entry agrees with the requirement.
+        // Every partial entry agrees with the requirement of the
+        // flag the slider writes for it.
         for k in 1..6u32 {
-            let r = price(&format!("--n-cpu-moe {k}"), &t);
+            let ExpertOffload::CpuMoeLayers(b) = offload_for_moe_layers(k, 6, Some(&map)) else {
+                panic!("partial position");
+            };
+            let r = price(&format!("--n-cpu-moe {b}"), &t);
             assert_eq!(r.sys_weights_mib, mib(table[k as usize]), "k={k}");
         }
         // Without an index the legacy table is unchanged.
@@ -1547,6 +1671,103 @@ mod tests {
             sys_bytes_by_position_with_tensors(expert, None, 6, None),
             sys_bytes_by_position(expert, None, 6)
         );
+    }
+
+    #[test]
+    fn moe_layers_convert_to_block_bounds_with_leading_dense_blocks() {
+        // 2 leading dense blocks + 4 MoE blocks (2..=5).
+        let t = moe_tensors(2, 6);
+        let map = MoeBlockMap::from_tensors(&t).unwrap();
+        assert_eq!(map.moe_layers(), 4);
+        // "2 MoE layers" writes --n-cpu-moe 4 ...
+        let off = offload_for_moe_layers(2, 4, Some(&map));
+        assert_eq!(off, ExpertOffload::CpuMoeLayers(4));
+        assert_eq!(
+            set_expert_offload(None, off).as_deref(),
+            Some("--n-cpu-moe 4")
+        );
+        // ... which moves exactly 2 MoE blocks ...
+        assert_eq!(price("--n-cpu-moe 4", &t).sys_weights_mib, 2 * 4 * 1024);
+        // ... and reads back as 2.
+        let read = expert_offload(Some("--n-cpu-moe 4"));
+        assert_eq!(read.moe_layers_offloaded(4, Some(&map)), 2);
+        // Ends: 0 is no offload, all is the -ot form.
+        assert_eq!(
+            offload_for_moe_layers(0, 4, Some(&map)),
+            ExpertOffload::None
+        );
+        assert_eq!(
+            offload_for_moe_layers(4, 4, Some(&map)),
+            ExpertOffload::AllExperts
+        );
+        // An existing config's bound displays as what it moves:
+        // --n-cpu-moe 2 sits inside the dense prefix (0 MoE layers),
+        // 3 moves one, 99 moves all four.
+        for (bound, layers) in [(1, 0), (2, 0), (3, 1), (5, 3), (6, 4), (99, 4)] {
+            assert_eq!(
+                ExpertOffload::CpuMoeLayers(bound).moe_layers_offloaded(4, Some(&map)),
+                layers,
+                "bound {bound}"
+            );
+        }
+        // Every slider position round-trips.
+        for k in 0..=4 {
+            assert_eq!(
+                offload_for_moe_layers(k, 4, Some(&map)).moe_layers_offloaded(4, Some(&map)),
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn moe_layers_convert_to_block_bounds_when_interleaved() {
+        // Dense and MoE blocks alternate: MoE blocks 1, 3, 5, 7.
+        let map = MoeBlockMap::from_block_indices([7, 1, 5, 3, 3]).unwrap();
+        assert_eq!(map.moe_layers(), 4);
+        assert_eq!(map.bound_for_layers(1), 2);
+        assert_eq!(map.bound_for_layers(2), 4);
+        assert_eq!(map.bound_for_layers(3), 6);
+        assert_eq!(map.bound_for_layers(9), 8);
+        assert_eq!(map.layers_for_bound(4), 2);
+        assert_eq!(map.layers_for_bound(5), 2);
+        assert_eq!(map.layers_for_bound(0), 0);
+        assert_eq!(
+            offload_for_moe_layers(3, 4, Some(&map)),
+            ExpertOffload::CpuMoeLayers(6)
+        );
+        let t: Vec<ExpertTensor> = [1u32, 3, 5, 7]
+            .into_iter()
+            .map(|b| ExpertTensor {
+                name: format!("blk.{b}.ffn_up_exps.weight"),
+                bytes: GIB,
+            })
+            .collect();
+        assert_eq!(MoeBlockMap::from_tensors(&t), Some(map.clone()));
+        let table = sys_bytes_by_position_with_tensors(4 * GIB, None, 4, Some(&t));
+        assert_eq!(table, vec![0, GIB, 2 * GIB, 3 * GIB, 4 * GIB]);
+    }
+
+    #[test]
+    fn moe_layers_without_a_map_keep_the_flag_value() {
+        // Catalog-only layouts: no block map, identity conversion
+        // (the pre-map behaviour, priced at Catalog/Estimate).
+        assert_eq!(
+            offload_for_moe_layers(16, 24, None),
+            ExpertOffload::CpuMoeLayers(16)
+        );
+        assert_eq!(
+            ExpertOffload::CpuMoeLayers(16).moe_layers_offloaded(24, None),
+            16
+        );
+        assert_eq!(MoeBlockMap::from_tensors(&[]), None);
+        // A map whose MoE blocks are blocks 0..N is the identity.
+        let map = MoeBlockMap::from_tensors(&moe_tensors(0, 24)).unwrap();
+        for k in 0..=24 {
+            assert_eq!(
+                offload_for_moe_layers(k, 24, Some(&map)),
+                offload_for_layers(k, 24)
+            );
+        }
     }
 
     #[test]

@@ -41,7 +41,8 @@ pub use guardrails::{
 };
 pub use memory::{
     expert_offload, memory_requirement, offload_bands, offload_flag_string, offload_for_layers,
-    set_expert_offload, sys_bytes_by_position, ExpertOffload, MemoryBasis, MemoryRequirement,
+    offload_for_moe_layers, set_expert_offload, sys_bytes_by_position, ExpertOffload, MemoryBasis,
+    MemoryRequirement, MoeBlockMap,
 };
 pub use moe_cache::{
     auto_moe_cache_budget, moe_cache_mib, moe_cache_shares, set_moe_cache,
