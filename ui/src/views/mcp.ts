@@ -93,7 +93,7 @@ function draftFromServer(s: McpServerRow): McpFormDraft {
  *  trim or lowercase normalisation, so neither does this check;
  *  an id that fails here would be rejected at save. Returns the
  *  inline error text, or "" when the id is valid. */
-function mcpIdError(id: string): string {
+export function mcpIdError(id: string): string {
   if (!id) return "Id is required.";
   if (!/^[a-z][a-z0-9_]*$/.test(id)) {
     return "Id must match ^[a-z][a-z0-9_]*$ — a lowercase letter, then lowercase letters, digits, or underscores.";

@@ -82,6 +82,11 @@ jobs:
       - name: UI smoke
         run: npm run smoke
         working-directory: ui
+      # Unit tests of the UI's pure logic (vitest; ui/test/). The job
+      # name above is kept as-is so required-check names do not change.
+      - name: UI unit tests
+        run: npm test
+        working-directory: ui
 
   linux:
     name: Workspace (Linux)
