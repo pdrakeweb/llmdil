@@ -189,6 +189,49 @@ impl TaskControls {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Log correlation (T-05)
+// ---------------------------------------------------------------------------
+
+/// The span a registry operation runs in (`registry::dispatch`
+/// instruments every operation with it). `task_id` and `task_kind`
+/// start empty; [`task_started`] fills them when the operation
+/// records its task, so every event the operation logs from then on
+/// — including from work it spawns with `in_current_span` — carries
+/// the task it belongs to in the JSON app log.
+pub(crate) fn op_span(op: &'static str) -> tracing::Span {
+    tracing::info_span!(
+        "op",
+        op,
+        task_id = tracing::field::Empty,
+        task_kind = tracing::field::Empty
+    )
+}
+
+/// A task was recorded: stamp it onto the enclosing operation span
+/// (when there is one) and log the start. The event carries the id
+/// and kind itself too, so a task recorded outside any operation span
+/// still correlates. Only the id and kind are logged — the record's
+/// detail stays out of the log.
+pub(crate) fn task_started(id: &str, kind: &str) {
+    let span = tracing::Span::current();
+    if span.has_field("task_id") {
+        span.record("task_id", id);
+        span.record("task_kind", kind);
+    }
+    tracing::info!(task_id = id, task_kind = kind, "task started");
+}
+
+/// A task settled: log its final status (after the abort rules).
+fn task_finished(id: &str, kind: &str, status: TaskStatus) {
+    match status {
+        TaskStatus::Failed => {
+            tracing::warn!(task_id = id, task_kind = kind, status = ?status, "task finished")
+        }
+        _ => tracing::info!(task_id = id, task_kind = kind, status = ?status, "task finished"),
+    }
+}
+
 /// Insert `key` into a detail value, wrapping a non-object detail.
 fn annotate(detail: &mut Value, key: &str, value: Value) {
     if !detail.is_object() {
@@ -230,12 +273,16 @@ fn settle(rec: &mut TaskRecord, status: TaskStatus, detail: Value, abort_request
 
 /// Body of `AppState::finish_task`.
 pub(crate) async fn finish(state: &AppState, id: &str, status: TaskStatus, detail: Value) {
-    {
+    let settled = {
         let mut tasks = state.tasks.lock().await;
         let abort_requested = state.task_controls.abort_requested(id);
-        if let Some(rec) = tasks.get_mut(id) {
+        tasks.get_mut(id).map(|rec| {
             settle(rec, status, detail, abort_requested);
-        }
+            (rec.kind.clone(), rec.status)
+        })
+    };
+    if let Some((kind, final_status)) = settled {
+        task_finished(id, &kind, final_status);
     }
     // After the record is settled, so a waiting abort reads the final
     // status.
@@ -359,6 +406,61 @@ mod tests {
 
     fn sink() -> Arc<dyn EventSink> {
         Arc::new(crate::NoopSink)
+    }
+
+    /// T-05: inside an operation span, a recorded task stamps its id
+    /// and kind onto the span, so the operation's own events carry
+    /// them in the JSON app log — as do the task's start and finish
+    /// events, which also name it directly.
+    #[tokio::test]
+    async fn task_events_carry_task_id_in_app_log() {
+        let (state, dir) = test_state("log");
+        let writer = crate::logging::RotatingFileWriter::new(
+            crate::logging::app_log_path(&dir),
+            crate::logging::APP_LOG_MAX_BYTES,
+        );
+        let _guard = tracing::subscriber::set_default(crate::logging::file_subscriber(writer));
+        let st = Arc::clone(&state);
+        let task_id = tracing::Instrument::instrument(
+            async move {
+                tracing::info!("before the task");
+                let id = st.record_task("audit", json!({})).await;
+                tracing::info!("work inside the task");
+                st.finish_task(&id, TaskStatus::Failed, json!({ "error": "x" }))
+                    .await;
+                id
+            },
+            op_span("run_audit"),
+        )
+        .await;
+        let lines = crate::logging::app_log_lines(&dir, 100);
+        let parsed: Vec<Value> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("JSON line"))
+            .collect();
+        let by_message = |m: &str| {
+            parsed
+                .iter()
+                .find(|v| v["fields"]["message"] == m)
+                .unwrap_or_else(|| panic!("no {m:?} in {lines:?}"))
+                .clone()
+        };
+        let before = by_message("before the task");
+        assert_eq!(before["span"]["op"], "run_audit");
+        assert!(before["span"].get("task_id").is_none(), "{before}");
+        let work = by_message("work inside the task");
+        assert_eq!(work["span"]["name"], "op");
+        assert_eq!(work["span"]["op"], "run_audit");
+        assert_eq!(work["span"]["task_id"], task_id.as_str());
+        assert_eq!(work["span"]["task_kind"], "audit");
+        assert_eq!(work["spans"][0]["task_id"], task_id.as_str());
+        let started = by_message("task started");
+        assert_eq!(started["fields"]["task_id"], task_id.as_str());
+        let finished = by_message("task finished");
+        assert_eq!(finished["fields"]["task_id"], task_id.as_str());
+        assert_eq!(finished["fields"]["status"], "Failed");
+        assert_eq!(finished["level"], "WARN");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     async fn status_of(state: &AppState, id: &str) -> (TaskStatus, Value) {

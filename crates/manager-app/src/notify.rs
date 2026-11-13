@@ -93,7 +93,7 @@ pub async fn notify(
         return;
     }
     if let Err(e) = send_toast(sink, title, body) {
-        eprintln!("notification ({category:?}) not shown: {e}");
+        tracing::warn!("notification ({category:?}) not shown: {e}");
     }
 }
 

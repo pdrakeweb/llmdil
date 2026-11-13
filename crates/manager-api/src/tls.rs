@@ -218,7 +218,7 @@ pub fn ensure_cert(data_dir: &Path, sans: &CertSans) -> io::Result<CertLoad> {
     let cert_path = dir.join("server.crt");
     let key_path = dir.join("server.key");
     let regenerate_for = |source: CertSource, detail: String| -> io::Result<CertLoad> {
-        eprintln!(
+        tracing::warn!(
             "admin api tls: generating a new certificate ({}): {detail}",
             source.as_str()
         );
@@ -272,7 +272,7 @@ pub fn ensure_cert(data_dir: &Path, sans: &CertSans) -> io::Result<CertLoad> {
         Ok(text) => match CertSans::decode(&text) {
             Some(recorded) if recorded.encode() == stored.sans.encode() => {}
             Some(_) => {
-                eprintln!(
+                tracing::warn!(
                     "admin api tls: sans.txt disagreed with the stored certificate; rewritten from it"
                 );
                 std::fs::write(&sans_path, stored.sans.encode())?;
@@ -285,7 +285,7 @@ pub fn ensure_cert(data_dir: &Path, sans: &CertSans) -> io::Result<CertLoad> {
             }
         },
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            eprintln!("admin api tls: sans.txt missing; written from the stored certificate");
+            tracing::info!("admin api tls: sans.txt missing; written from the stored certificate");
             std::fs::write(&sans_path, stored.sans.encode())?;
         }
         Err(e) => {

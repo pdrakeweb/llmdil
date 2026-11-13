@@ -178,12 +178,12 @@ pub fn load_journal(data_dir: &Path) -> ActivationJournal {
                 // a repair is possible, and say so in the log.
                 let preserved = preserve_corrupt_journal(&path);
                 match preserved {
-                    Ok(dest) => eprintln!(
+                    Ok(dest) => tracing::warn!(
                         "activation journal: {} is unreadable ({e}); preserved as {} and starting empty",
                         path.display(),
                         dest.display()
                     ),
-                    Err(err) => eprintln!(
+                    Err(err) => tracing::warn!(
                         "activation journal: {} is unreadable ({e}) and could not be preserved: {err}",
                         path.display()
                     ),

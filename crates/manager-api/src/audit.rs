@@ -82,12 +82,12 @@ impl AuditLog {
             let from = self.archive_path(n);
             if from.exists() {
                 if let Err(e) = std::fs::rename(&from, self.archive_path(n + 1)) {
-                    eprintln!("admin api audit: archive shift failed: {e}");
+                    tracing::warn!("admin api audit: archive shift failed: {e}");
                 }
             }
         }
         if let Err(e) = std::fs::rename(&self.path, self.archive_path(1)) {
-            eprintln!("admin api audit: rotation failed: {e}");
+            tracing::warn!("admin api audit: rotation failed: {e}");
         }
     }
 
@@ -122,13 +122,13 @@ impl AuditLog {
                 {
                     Ok(mut f) => {
                         if let Err(e) = writeln!(f, "{line}") {
-                            eprintln!("admin api audit: write failed: {e}");
+                            tracing::warn!("admin api audit: write failed: {e}");
                         }
                     }
-                    Err(e) => eprintln!("admin api audit: open failed: {e}"),
+                    Err(e) => tracing::warn!("admin api audit: open failed: {e}"),
                 }
             }
-            Err(e) => eprintln!("admin api audit: serialize failed: {e}"),
+            Err(e) => tracing::warn!("admin api audit: serialize failed: {e}"),
         }
     }
 

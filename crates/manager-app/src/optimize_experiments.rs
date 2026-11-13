@@ -77,7 +77,7 @@ fn load_journal(state: &AppState) -> ExperimentJournal {
 
 fn save_journal(state: &AppState, journal: &ExperimentJournal) {
     if let Err(e) = journal.save(&journal_path(state)) {
-        eprintln!("optimize-experiments: journal save failed: {e}");
+        tracing::warn!("optimize-experiments: journal save failed: {e}");
     }
 }
 
@@ -123,7 +123,7 @@ pub async fn startup_sweep(state: &AppState) {
             }
             if manager_config::save(&new_cfg, &state.config_path).is_ok() {
                 *live = new_cfg;
-                eprintln!(
+                tracing::info!(
                     "optimize-experiments: startup sweep removed leftover temp backends from config: {}",
                     removed.join(", ")
                 );
@@ -139,11 +139,11 @@ pub async fn startup_sweep(state: &AppState) {
                 || manager_supervisor::process_image_is(pid, "llama-server");
             if alive && image {
                 match manager_wizard::ops::kill_process(pid) {
-                    Ok(()) => eprintln!(
+                    Ok(()) => tracing::info!(
                         "optimize-experiments: startup sweep terminated leftover {} (pid {pid})",
                         record.temp_id
                     ),
-                    Err(e) => eprintln!(
+                    Err(e) => tracing::warn!(
                         "optimize-experiments: startup sweep could not terminate {} (pid {pid}): {e}",
                         record.temp_id
                     ),

@@ -21,6 +21,7 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 manager-config = { path = "../manager-config" }
 manager-wizard = { path = "../manager-wizard" }
 manager-supervisor = { path = "../manager-supervisor" }
@@ -38,3 +39,6 @@ manager-winml = { path = "../manager-winml" }
 [dev-dependencies]
 # Test-only WizardStep impls (the trait is #[async_trait]).
 async-trait = { workspace = true }
+# Reading diagnostics bundles back in tests (already a manager-config
+# dependency).
+zip = { workspace = true }

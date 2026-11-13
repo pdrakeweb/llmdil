@@ -57,6 +57,7 @@ pub mod gateway_stats;
 pub mod gpu_history;
 pub mod hf_forms;
 pub mod log_receiver;
+pub mod logging;
 pub mod logship;
 mod mcp_local;
 pub mod notify;
@@ -796,6 +797,7 @@ impl AppState {
         // finds the record running always finds its token.
         self.task_controls.register(&id);
         self.tasks.lock().await.insert(id.clone(), record);
+        tasks::task_started(&id, kind);
         id
     }
 
@@ -895,20 +897,20 @@ impl AppState {
                             true
                         }
                         Ok(_) => {
-                            eprintln!("gpu inventory: nvidia-smi reported no GPUs");
+                            tracing::warn!("gpu inventory: nvidia-smi reported no GPUs");
                             false
                         }
                         Err(e) => {
-                            eprintln!("gpu inventory: could not parse nvidia-smi output: {e}");
+                            tracing::warn!("gpu inventory: could not parse nvidia-smi output: {e}");
                             false
                         }
                     },
                     Ok(Err(e)) => {
-                        eprintln!("gpu inventory: nvidia-smi query failed: {e}");
+                        tracing::warn!("gpu inventory: nvidia-smi query failed: {e}");
                         false
                     }
                     Err(_) => {
-                        eprintln!("gpu inventory: nvidia-smi query timed out after 10s");
+                        tracing::warn!("gpu inventory: nvidia-smi query timed out after 10s");
                         false
                     }
                 };
@@ -928,18 +930,18 @@ impl AppState {
                                     if !inventory.is_empty() {
                                         lock_telemetry(&store_retry)
                                             .set_inventory(inventory);
-                                        eprintln!(
+                                        tracing::info!(
                                             "gpu inventory: loaded on retry after {delay_secs}s"
                                         );
                                         return;
                                     }
                                 }
                             }
-                            eprintln!(
+                            tracing::warn!(
                                 "gpu inventory: retry after {delay_secs}s did not load an inventory"
                             );
                         }
-                        eprintln!(
+                        tracing::warn!(
                             "gpu inventory: giving up after retries; launches stay unrestricted until the next app start"
                         );
                     });
@@ -1620,7 +1622,7 @@ async fn ensure_catalog_models(state: &AppState) {
 fn install_seeded(live: &mut AppConfig, next: AppConfig, needs_save: bool, path: &PathBuf) {
     if needs_save {
         if let Err(e) = manager_config::save(&next, path) {
-            eprintln!("catalog seeding: could not save the configuration: {e}");
+            tracing::warn!("catalog seeding: could not save the configuration: {e}");
             return;
         }
     }
@@ -4293,7 +4295,7 @@ pub async fn op_download_model(
     let watcher_id = id.clone();
     let watcher_dest = dest.clone();
     let watcher_task = task_id.clone();
-    tokio::spawn(async move {
+    let watcher = async move {
         let outcome = watcher_handle.wait().await;
         let st = watcher_state;
         // Display name for the completion/failure toasts: the
@@ -4352,7 +4354,7 @@ pub async fn op_download_model(
                                         }
                                     })
                                 {
-                                    eprintln!(
+                                    tracing::warn!(
                                         "download watcher: could not save the verification of {watcher_id}: {e}"
                                     );
                                 }
@@ -4381,7 +4383,7 @@ pub async fn op_download_model(
                                                 }
                                             },
                                         ) {
-                                            eprintln!(
+                                            tracing::warn!(
                                                 "download watcher: could not save the cleared verification of {watcher_id}: {e}"
                                             );
                                         }
@@ -4492,7 +4494,9 @@ pub async fn op_download_model(
                 .await;
             }
         }
-    });
+    };
+    // The watcher logs inside the download task's operation span.
+    tokio::spawn(tracing::Instrument::in_current_span(watcher));
     Ok(json!({ "model_id": id, "dest": dest, "task_id": task_id }))
 }
 
@@ -5084,7 +5088,7 @@ fn chain_journaled(
 /// (a plan asking for a restart nobody needed) — and is logged.
 fn roll_back_journal(state: &AppState, journaled: &activation::JournalRecords) {
     if let Err(err) = journaled.roll_back(&state.data_dir) {
-        eprintln!(
+        tracing::warn!(
             "activation journal: could not roll back {} entries after a failed save: {err}",
             journaled.ids().len()
         );
@@ -10758,6 +10762,16 @@ pub async fn op_tasks_list(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) ->
     Ok(serde_json::to_value(list)?)
 }
 
+/// The app's own JSON Lines log (`logs/app.log` + its `.prev`, see
+/// [`logging`]) as the bundle's "app" scope: every tracing event the
+/// process logged, task-correlated, oldest first and verbatim so the
+/// bundle's `logs/app.log` stays machine-readable. `None` when the
+/// app has not logged anything yet.
+fn app_log_scope(data_dir: &std::path::Path) -> Option<(String, Vec<String>)> {
+    let lines = logging::app_log_lines(data_dir, logging::DIAGNOSTICS_MAX_LINES);
+    (!lines.is_empty()).then(|| ("app".to_string(), lines))
+}
+
 /// Export a diagnostics bundle (spec §14 `diagnostics_export_bundle`):
 /// zip of config snapshot + per-scope recent logs + telemetry snapshot +
 /// versions file. Returns the bundle path.
@@ -10859,6 +10873,9 @@ pub async fn op_diagnostics_export_bundle(
             })
             .collect();
         log_scopes.push(("wizard".to_string(), lines));
+    }
+    if let Some(scope) = app_log_scope(&state.data_dir) {
+        log_scopes.push(scope);
     }
     let versions = vec![
         ("app".to_string(), env!("CARGO_PKG_VERSION").to_string()),
@@ -11543,6 +11560,35 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    /// T-05: the diagnostics bundle carries the JSON Lines app log
+    /// (rotated `.prev` first, then the live file) as `logs/app.log`,
+    /// and omits the scope when the app has logged nothing.
+    #[test]
+    fn diagnostics_bundle_includes_app_log() {
+        let dir = unique_test_dir("llm-mgr-diag-applog");
+        assert!(app_log_scope(&dir).is_none());
+        let path = logging::app_log_path(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(prev_log_path(&path), "{\"n\":1}\n").unwrap();
+        std::fs::write(&path, "{\"n\":2}\n{\"n\":3}\n").unwrap();
+        let scope = app_log_scope(&dir).expect("app scope");
+        assert_eq!(scope.0, "app");
+        let bundle = manager_config::export_diagnostics(
+            &AppConfig::default_config(),
+            &[scope],
+            "{}",
+            &[],
+            &dir.join("diagnostics"),
+        )
+        .unwrap();
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&bundle).unwrap()).unwrap();
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name("logs/app.log").unwrap(), &mut text)
+            .unwrap();
+        assert_eq!(text, "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// An AppState over a temp dir for the advanced-flags op

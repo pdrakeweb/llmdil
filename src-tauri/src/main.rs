@@ -138,6 +138,10 @@ fn main() {
             std::process::exit(manager_app::app_update::run_apply_helper(&args));
         }
     }
+    // The one logging pipeline (T-05): stderr plus the JSON Lines
+    // `<data_dir>/logs/app.log` the diagnostics bundle carries.
+    // Installed before anything logs; RUST_LOG overrides the level.
+    manager_app::logging::init(&manager_config::default_data_dir());
     tauri::Builder::default()
         // Toast notifications (Settings → Notifications). The plugin
         // is driven from Rust via the EventSink toast capability —
@@ -174,13 +178,14 @@ fn main() {
             // startup itself saves (catalog seeding, setup
             // reconciliation) and every save rotates the primary over
             // `.bak`. The outcome is recorded on AppState so `get_status`
-            // reports it to the UI (eprintln! is invisible in the
+            // reports it to the UI (a log line alone lands only in
+            // stderr and app.log, which the operator never sees in the
             // windowless release build).
             let data_dir = manager_config::default_data_dir();
             let config_path = data_dir.join("config.json");
             let startup = manager_config::load_for_startup(&config_path);
             if let Some(e) = &startup.error {
-                eprintln!(
+                tracing::warn!(
                     "config load fell back to {:?} ({e}): {}",
                     startup.source,
                     config_path.display()
@@ -203,7 +208,7 @@ fn main() {
                 match tauri::async_runtime::block_on(manager_api::UserStore::load(&api_data_dir)) {
                     Ok(store) => store,
                     Err(e) => {
-                        eprintln!(
+                        tracing::warn!(
                             "admin api: user store failed to load ({e}); using an empty store"
                         );
                         manager_api::UserStore::in_memory()
@@ -330,7 +335,7 @@ fn main() {
                             *slot.inner().server.lock().unwrap() = Some(server);
                         }
                         Err(e) => {
-                            eprintln!("admin api: failed to start: {e}");
+                            tracing::error!("admin api: failed to start: {e}");
                             *slot.inner().note.lock().unwrap() = Some(e);
                         }
                     }
@@ -360,7 +365,7 @@ fn main() {
                             tray = tray.icon(icon.clone());
                         }
                         if let Err(e) = tray.build(app) {
-                            eprintln!("tray icon failed: {e}");
+                            tracing::warn!("tray icon failed: {e}");
                         }
                     }
                 }
@@ -402,7 +407,7 @@ async fn start_admin_api(
         // The API still serves on the LAN interfaces the host
         // firewall already permits; the settings page shows the
         // note and offers the repair by toggling.
-        eprintln!("admin api: firewall rule not applied: {e}");
+        tracing::warn!("admin api: firewall rule not applied: {e}");
     }
     Ok(server)
 }

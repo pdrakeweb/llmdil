@@ -89,7 +89,7 @@ fn load_prompts(state: &AppState) -> mb::PromptLibrary {
     let mut lib = mb::PromptLibrary::load(&prompts_path(state)).unwrap_or_default();
     if lib.materialize_shipped() {
         if let Err(e) = lib.save(&prompts_path(state)) {
-            eprintln!("bench: prompt library save failed: {e}");
+            tracing::warn!("bench: prompt library save failed: {e}");
         }
     }
     lib
@@ -101,7 +101,7 @@ fn load_results(state: &AppState) -> mb::BenchResults {
 
 fn save_results(state: &AppState, results: &mb::BenchResults) {
     if let Err(e) = results.save(&results_path(state)) {
-        eprintln!("bench: results save failed: {e}");
+        tracing::warn!("bench: results save failed: {e}");
     }
 }
 
@@ -194,7 +194,7 @@ fn load_journal(state: &AppState) -> BenchJournal {
 
 fn save_journal(state: &AppState, journal: &BenchJournal) {
     if let Err(e) = journal.save(&journal_path(state)) {
-        eprintln!("bench: journal save failed: {e}");
+        tracing::warn!("bench: journal save failed: {e}");
     }
 }
 
@@ -237,7 +237,7 @@ pub async fn startup_sweep(state: &AppState) {
             }
             if manager_config::save(&new_cfg, &state.config_path).is_ok() {
                 *live = new_cfg;
-                eprintln!(
+                tracing::info!(
                     "bench: startup sweep removed leftover temp backends from config: {}",
                     removed.join(", ")
                 );
@@ -253,11 +253,11 @@ pub async fn startup_sweep(state: &AppState) {
                 || manager_supervisor::process_image_is(pid, "llama-server");
             if alive && image {
                 match manager_wizard::ops::kill_process(pid) {
-                    Ok(()) => eprintln!(
+                    Ok(()) => tracing::info!(
                         "bench: startup sweep terminated leftover {} (pid {pid})",
                         record.temp_id
                     ),
-                    Err(e) => eprintln!(
+                    Err(e) => tracing::warn!(
                         "bench: startup sweep could not terminate {} (pid {pid}): {e}",
                         record.temp_id
                     ),
