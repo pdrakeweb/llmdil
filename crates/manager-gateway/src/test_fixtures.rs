@@ -55,6 +55,7 @@ pub(crate) fn four_backend_config() -> AppConfig {
             "qwen/qwen3-235b-a22b-thinking".to_string(),
             "qwen/qwen3-coder-480b-a35b".to_string(),
         ],
+        overflow: Default::default(),
     };
     cfg
 }

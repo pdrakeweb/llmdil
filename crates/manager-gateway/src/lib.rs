@@ -23,10 +23,18 @@
 //!   [`pick_backend`] does not route live traffic — it backs only the
 //!   routing-trace explainer behind the gateway view's test-routing action
 //!   (`gateway_test_routing` in the Tauri layer).
-//! - Rubric-based escalation is decided at runtime by the local planner model;
-//!   this crate evaluates the verdict via [`RubricInput`].
-//! - Overflow "for N seconds" is tracked by the app; this crate evaluates the
-//!   rule via [`OverflowSignal`] against [`OverflowThresholds`].
+//! - Rubric-based escalation would be decided at runtime by the local planner
+//!   model; this crate evaluates a verdict via [`RubricInput`], but no
+//!   decider is wired into the request path (the spec leaves the rubric,
+//!   score scale and threshold undefined).
+//! - Overflow "for N seconds" is tracked at request time by the generated
+//!   routing callback (`llmdil_routing.py`), which owns the per-group
+//!   in-flight / latency clock; its breach rule is
+//!   [`OverflowThresholds::breached`], baked from the config via
+//!   [`overflow_escalation_table`] (opt-in, `gateway.openrouter.overflow`).
+//! - The OpenRouter daily cap is LiteLLM's provider budget
+//!   (`router_settings.provider_budget_config`), emitted by
+//!   [`generate_config_yaml`]; a zero cap emits no OpenRouter deployments.
 
 mod config_yaml;
 mod context_overflow;

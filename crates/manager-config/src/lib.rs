@@ -284,6 +284,7 @@ impl AppConfig {
                     cred_ref: None,
                     daily_cap_usd: 5.0,
                     model_allowlist: Vec::new(),
+                    overflow: OverflowEscalationConfig::default(),
                 },
                 request_log_len: 100,
             },
