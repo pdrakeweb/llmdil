@@ -60,6 +60,7 @@ pub mod log_receiver;
 pub mod logship;
 mod mcp_local;
 pub mod notify;
+pub mod openrouter_spend;
 pub mod optimize;
 pub mod optimize_eval;
 pub mod optimize_experiments;
@@ -8053,10 +8054,16 @@ pub async fn op_gateway_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>
             pending.len() + usize::from(drift && up),
         )
     };
+    // OpenRouter daily spend vs cap (spec §7), from the app's ledger.
+    let openrouter_spend = {
+        let cfg = state.config.read().await;
+        openrouter_spend::status_for(&state.data_dir, &cfg)
+    };
     Ok(json!({
         "port": port,
         "bind_host": bind_host,
         "lan_ip": lan_ip,
+        "openrouter_spend": openrouter_spend,
         "groups": groups,
         "routing_rules": routing_rules,
         "up": up,
@@ -8718,6 +8725,8 @@ pub async fn poll_gateway_metrics_once(state: &AppState) {
     if let Some(body) = body {
         let snap = gateway_stats::parse_metrics(&body, std::time::Instant::now());
         state.gateway_stats.lock().await.record(snap);
+        // OpenRouter daily spend ledger (spec §7) from the same scrape.
+        openrouter_spend::record_scrape(&state.data_dir, &body);
     }
 }
 

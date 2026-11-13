@@ -380,9 +380,23 @@ in the API as in the app.
   "port": 4000, "bind_host": "0.0.0.0", "lan_ip": "192.168.5.23",
   "groups": 5, "routing_rules": 0, "up": true,
   "routing_log_len": 0, "openrouter_cred_present": null,
-  "activation_pending": true, "activation_changes": 3
+  "activation_pending": true, "activation_changes": 3,
+  "openrouter_spend": {
+    "enabled": true, "tier_active": true,
+    "spent_today_usd": 4.1, "cap_usd": 5.0, "fraction": 0.82,
+    "capped": false, "warn": true,
+    "resets": "local_midnight", "budget_window": "1d"
+  }
 }
 ```
+
+`openrouter_spend` (additive) is the app's measurement of today's
+OpenRouter spend (local day, from the gateway's `litellm_spend_metric`
+counters) against `gateway.openrouter.daily_cap_usd`. The cap itself is
+enforced inside the gateway by LiteLLM's provider budget
+(`router_settings.provider_budget_config.openrouter`, 1-day window);
+`capped` is true when the tier is enabled and the cap is zero or
+reached, `warn` at ≥80% of the cap.
 
 `groups` counts enabled groups only (derived as in §4.4: at least one
 member backend enabled) — the groups the gateway actually serves, not

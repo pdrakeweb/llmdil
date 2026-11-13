@@ -22,7 +22,7 @@ import {
   verifyModel, deleteModel, modelSetEnabled, modelAdd, modelSetShortName, modelSetOffloadSpec, modelSetMtp,
   modelHfLookup, modelHfSuggest, modelHfHeader,
   getLogs, exportDiagnostics, openFolder, getGatewayConfig, getGatewayStatus, getGatewayYaml,
-  getGatewayMasterKey, setGatewayBindHost,
+  getGatewayMasterKey, setGatewayBindHost, openRouterSpendBannerHtml,
   updateGatewayConfig, effectiveGatewayStrategy, gatewayStop,
   getActivationPlan, activationCancelChanges, activationComplete, quiesceWait,
   recordActivationExecution, getActivationHistory, getActivationExecution,
@@ -7575,7 +7575,11 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     if (!pr.error && pr.data) lastPlan = pr.data;
     if (!mdls.error) lastModels = mdls.data;
     const err = st.error ?? cfg.error;
-    setBanner(root, "gwBanner", bannerHtml({ live: st.live && cfg.live, error: err }));
+    // The OpenRouter spend-cap banner (spec §7) rides with the status
+    // banner: cap reached, or spend at ≥80% of it.
+    const spendBanner = st.error ? "" : openRouterSpendBannerHtml(st.data.openrouter_spend, icon("warn"));
+    setBanner(root, "gwBanner", bannerHtml({ live: st.live && cfg.live, error: err })
+      + (spendBanner ? `<div style="margin-bottom:12px">${spendBanner}</div>` : ""));
     const b = root.querySelector("#gwBody");
     if (!b) return;
     if (err) { b.innerHTML = emptyHtml(`Gateway configuration unavailable: ${err}`); return; }

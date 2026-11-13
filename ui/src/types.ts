@@ -154,6 +154,9 @@ export interface DashboardModel {
    *  the gateway card is absent and this message is shown as its own
    *  banner, while backends/telemetry data stays fresh. */
   gatewayError?: string;
+  /** OpenRouter daily spend vs cap from gateway_status (spec §7);
+   *  drives the Dashboard spend-cap banner. */
+  openrouterSpend?: import("./api").OpenRouterSpend | null;
   stale: boolean;
   updatedAt: number;
 }

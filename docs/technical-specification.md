@@ -557,6 +557,26 @@ guardrails: per-day spend cap (default set at setup, user-editable), free-tier
 models preferred in the fallback model list; cap breach → fallbacks disabled
 with a Dashboard banner (fail closed to local, never silently spend).
 
+*Implementation (LiteLLM-native, requests never pass through Rust):*
+(1) failover is LiteLLM's `fallbacks` chain. (2) Overflow is opt-in
+(`gateway.openrouter.overflow`: `enabled`, `queue_depth`,
+`p99_latency_ms`, `sustained_secs`); the generated `llmdil_routing.py`
+callback tracks per-group in-flight requests and a 60 s completed-latency
+window, and once a breach has held `sustained_secs` sends that group's
+new requests to `openrouter` with the group as the request-level
+fallback. Only groups whose own fallback chain lists `openrouter`
+escalate. (3) Rubric escalation is not implemented: it needs a
+decider-model prompt, score scale and threshold that this spec does not
+define, and it would add a local planner call to every request. The
+daily cap is `router_settings.provider_budget_config.openrouter`
+(`budget_limit` = cap, `time_period: 1d`), which filters every
+OpenRouter deployment out once spend reaches it; a $0 cap generates no
+OpenRouter deployments at all (LiteLLM reads a zero budget as
+unlimited). LiteLLM keeps the window in memory, so a gateway restart
+starts a fresh window; the app's spend ledger (local-midnight reset,
+persists across restarts) drives the `gateway_status.openrouter_spend`
+payload and the Dashboard/Gateway banner (capped, or ≥80%).
+
 ## 8. MCP integration
 
 GitHub and Google Drive MCP servers, each with mode local | remote | disabled.
