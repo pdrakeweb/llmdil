@@ -118,3 +118,5 @@ Keep the header, the payload, and every Q12 behavior. Rebuild the body as: ident
 
 ### Numbers-in-one-place resolution
 Each number gets exactly one home in the card: utilization in the ring, VRAM used/total on the bar line, per-process VRAM in the bar segments (and repeated only inside the collapsed process detail, which is detail-on-demand, not a second visible rendering), temperature/power in their tiles, model share in the model bar. The view-level overview strip duplication (Q6 note) should be resolved in the same pass: either the overview keeps Util/VRAM/Temp/Power and the cards drop the tiles, or the overview becomes navigation-only (status + name). Recommendation: overview keeps the numbers (it's the cross-GPU comparison surface), cards keep the residency bar + tiles — accept the overview as the one sanctioned repetition, or drop Temp/Power from the overview. Flagged for the parent to decide; not scored against this card.
+
+Status (2026-11-12): resolved per the recommendation above — the overview strip keeps the numbers as the sanctioned cross-GPU comparison repetition; cards keep residency bar + tiles. See IMPLEMENTATION.md.
