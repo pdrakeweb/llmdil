@@ -98,6 +98,7 @@ pub use optimize_tuning::{
 };
 pub mod registry;
 pub(crate) mod tasks;
+pub mod updates;
 
 // ---------------------------------------------------------------------------
 // Events (Rust -> UI, spec §14)
@@ -3669,6 +3670,20 @@ pub async fn op_run_wizard_step(
     sink: &Arc<dyn EventSink>,
     step_id: String,
 ) -> ApiResult {
+    run_wizard_step_linked(state, sink, step_id, None).await
+}
+
+/// [`op_run_wizard_step`] with an optional parent cancellation token:
+/// cancelling `parent` stops the step exactly like a `task_abort` of
+/// the step's own task. Component updates (`updates` module) run the
+/// wizard's install steps through this, so aborting the update task
+/// reaches the step it is running.
+pub(crate) async fn run_wizard_step_linked(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    step_id: String,
+    parent: Option<tokio_util::sync::CancellationToken>,
+) -> ApiResult {
     let task_id = state
         .record_task("wizard_step", json!({ "step_id": step_id }))
         .await;
@@ -3735,8 +3750,15 @@ pub async fn op_run_wizard_step(
     // task_abort cancels the token: the runner stops the step (its
     // command's process tree is killed) and records it failed.
     let cancel_token = state.task_controls.token(&task_id);
+    let parent = parent.unwrap_or_default();
+    let cancelled = async {
+        tokio::select! {
+            _ = cancel_token.cancelled() => {}
+            _ = parent.cancelled() => {}
+        }
+    };
     let outcome_result = guard
-        .run_step_until(&ctx, &step_id, std::pin::pin!(cancel_token.cancelled()))
+        .run_step_until(&ctx, &step_id, std::pin::pin!(cancelled))
         .await;
     *state
         .wizard_step_running
@@ -11453,26 +11475,24 @@ pub async fn op_winml_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) 
 // Updates (§14)
 // ---------------------------------------------------------------------------
 
-/// Check all components for updates. Explicitly deferred: spec §16 puts
-/// Updates in P6 (post-v1); per-component pin/auto-update toggles work now.
-pub async fn op_updates_check_all(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
-    let _ = state;
-    Err(ApiError::Unsupported(
-        "Update checking ships in P6; per-component pin/auto-update toggles work now".to_string(),
-    ))
+/// Check every managed component (installed / latest / pinned /
+/// update available); per-component feed failures are reported, not
+/// fatal. See the `updates` module.
+pub async fn op_updates_check_all(state: &Arc<AppState>, sink: &Arc<dyn EventSink>) -> ApiResult {
+    updates::op_check_all(state, sink).await
 }
 
-/// Apply an update. Explicitly deferred: spec §16 puts Updates in P6
-/// (post-v1); per-component pin/auto-update toggles work now.
+/// Apply an update to one component, or to every applicable unpinned
+/// component (`component_id = "all"`), as a cancellable task. LiteLLM
+/// requires an explicit `version` (it moves only by a newer pin). See
+/// the `updates` module.
 pub async fn op_updates_apply(
-    _state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
     component_id: String,
+    version: Option<String>,
 ) -> ApiResult {
-    let _ = component_id;
-    Err(ApiError::Unsupported(
-        "Update checking ships in P6; per-component pin/auto-update toggles work now".to_string(),
-    ))
+    updates::op_apply(state, sink, component_id, version).await
 }
 
 /// Pin a component to a version and persist it: the pin is set on a

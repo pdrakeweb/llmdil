@@ -3235,9 +3235,90 @@ export async function setNotificationConfig(config: NotificationSettings): Promi
   }
 }
 
+/** One component row of updates_check_all (manager-app `updates`). */
+export interface ComponentUpdateReport {
+  id: string;
+  name: string;
+  installed_version: string | null;
+  latest_available: string | null;
+  /** What Apply installs: the built-in verified pin (llama.cpp), or
+   *  the newest acceptable release (LiteLLM — applied as a new pin). */
+  target_version: string | null;
+  pinned: boolean;
+  pinned_version: string | null;
+  auto_update: boolean;
+  update_available: boolean;
+  applyable: boolean;
+  note: string | null;
+  /** This component's release feed failed; the rest of the check stands. */
+  check_error: string | null;
+  source: string | null;
+}
+
+export interface ComponentUpdateCheck {
+  checked_at: string;
+  components: ComponentUpdateReport[];
+}
+
+/** updates_check_all — installed / latest / pinned per component.
+ *  Per-component feed failures come back as check_error. */
+export async function updatesCheckAll(): Promise<CallResult<ComponentUpdateCheck | null>> {
+  if (!isTauri()) return { data: null, live: false, error: "updates_check_all is not available in sample mode" };
+  try {
+    const data = await invoke<ComponentUpdateCheck>("updates_check_all");
+    return { data, live: true };
+  } catch (e) {
+    return { data: null, live: true, error: errOf(e) };
+  }
+}
+
+/** updates_apply — start an update as a cancellable task (task_id is
+ *  null when there was nothing to do). LiteLLM needs `version`: it
+ *  moves only by a newer explicit pin. componentId "all" applies every
+ *  applicable unpinned component. */
+export async function updatesApply(componentId: string, version: string | null): Promise<CallResult<{ task_id: string | null; message?: string } | null>> {
+  if (!isTauri()) return { data: null, live: false, error: "updates_apply is not available in sample mode" };
+  try {
+    const data = await invoke<{ task_id: string | null; message?: string }>("updates_apply", { componentId, version });
+    return { data, live: true };
+  } catch (e) {
+    return { data: null, live: true, error: errOf(e) };
+  }
+}
+
+/** One tracked long-running operation (tasks_list). */
+export interface TaskRecordWire {
+  id: string;
+  kind: string;
+  status: "running" | "done" | "failed" | "aborted";
+  detail: unknown;
+  created_ms: number;
+}
+
+/** tasks_list — every tracked task. */
+export async function tasksList(): Promise<CallResult<TaskRecordWire[]>> {
+  if (!isTauri()) return { data: [], live: false };
+  try {
+    const data = await invoke<TaskRecordWire[]>("tasks_list");
+    return { data, live: true };
+  } catch (e) {
+    return { data: [], live: true, error: errOf(e) };
+  }
+}
+
+/** task_abort — cancel a running task (bounded wait for it to stop). */
+export async function taskAbort(taskId: string): Promise<CallResult<unknown>> {
+  if (!isTauri()) return { data: null, live: false, error: "task_abort is not available in sample mode" };
+  try {
+    const data = await invoke<unknown>("task_abort", { taskId });
+    return { data, live: true };
+  } catch (e) {
+    return { data: null, live: true, error: errOf(e) };
+  }
+}
+
 /** updates_pin — pin a component to a version (or clear the pin with
- *  null) and persist it. The pin/auto toggles have dedicated ops even
- *  though update *checking* is still an Unsupported stub. */
+ *  null) and persist it. */
 export async function updatesPin(componentId: string, version: string | null): Promise<CallResult<{ ok: boolean; persisted?: boolean }>> {
   if (!isTauri()) return { data: { ok: false }, live: false, error: "updates_pin is not available in sample mode" };
   try {
