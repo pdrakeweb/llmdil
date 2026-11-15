@@ -349,7 +349,60 @@ impl StartGateway {
         }
     }
 
+    /// Where the embedded hash lock is written for `uv pip install -r`:
+    /// `<data_dir>/python/gateway-requirements.lock`, next to the venv
+    /// (outside it, so `uv venv --clear` cannot remove it mid-run).
+    pub(crate) fn requirements_lock_path(&self, ctx: &WizardContext) -> PathBuf {
+        ctx.data_dir
+            .join("python")
+            .join(crate::gateway_lock::GATEWAY_LOCK_FILE_NAME)
+    }
+
+    /// Whether this run's package install can be hash-verified: `Ok`
+    /// when the checked-in lock covers the configured LiteLLM pin,
+    /// else `Err` with the operator warning (finding F1 follow-up —
+    /// an operator pin the lock does not cover installs by version
+    /// pin only, and the step says so; never silently).
+    pub(crate) fn hash_lock_mode(&self, ctx: &WizardContext) -> Result<(), String> {
+        let pin = self.litellm_pinned_version(ctx);
+        crate::gateway_lock::gateway_hash_lock_status(&pin)
+            .map_err(|reason| crate::gateway_lock::unverified_install_warning(&pin, &reason))
+    }
+
+    /// Write the embedded lock to [`Self::requirements_lock_path`]
+    /// (always rewritten: the file on disk is never trusted as-is).
+    pub(crate) async fn write_requirements_lock(&self, ctx: &WizardContext) -> Result<(), String> {
+        let path = self.requirements_lock_path(ctx);
+        ctx.ops
+            .write_file(&path, crate::gateway_lock::active_gateway_lock().as_bytes())
+            .await
+            .map_err(|e| {
+                format!(
+                    "could not write the gateway hash lock to {}: {e}",
+                    path.display()
+                )
+            })
+    }
+
+    /// The package install. With a covering hash lock
+    /// ([`Self::hash_lock_mode`]): `uv pip install --require-hashes -r
+    /// <lock>` — the full resolved set, every artifact checked against
+    /// its recorded sha256 (the lock pins the same three requirements
+    /// listed below plus their dependencies). Otherwise the plain pinned
+    /// install below, which the step reports as not hash-verified.
     pub(crate) fn pip_command(&self, ctx: &WizardContext, uv: &std::path::Path) -> PlannedCommand {
+        if self.hash_lock_mode(ctx).is_ok() {
+            return PlannedCommand::new(vec![
+                uv.display().to_string(),
+                "pip".to_string(),
+                "install".to_string(),
+                "--python".to_string(),
+                self.venv_python(ctx).display().to_string(),
+                "--require-hashes".to_string(),
+                "-r".to_string(),
+                self.requirements_lock_path(ctx).display().to_string(),
+            ]);
+        }
         PlannedCommand::new(vec![
             uv.display().to_string(),
             "pip".to_string(),

@@ -1,4 +1,5 @@
 mod clients_and_misc;
+mod gateway_hash_lock;
 mod gateway_install;
 mod gateway_prisma_mcp;
 mod hardware_models;

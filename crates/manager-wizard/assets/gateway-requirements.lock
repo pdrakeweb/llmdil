@@ -1,0 +1,13 @@
+# PLACEHOLDER -- NOT YET GENERATED.
+#
+# This file must hold the hash-locked (`--hash=sha256:...`) resolution of
+# gateway-requirements.in for CPython 3.12 on Windows x86_64, produced by
+# `uv pip compile --generate-hashes` (see
+# tools/gateway-lock/Update-GatewayLock.ps1). It has never been generated:
+# the machine this mechanism was written on had no uv, and hashes are
+# never written by hand.
+#
+# While this file lists no requirements, the start-gateway step installs
+# the pinned packages WITHOUT hash verification and says so ("not
+# hash-verified") in its outcome. Generating the lock switches it to
+# `uv pip install --require-hashes -r gateway-requirements.lock`.

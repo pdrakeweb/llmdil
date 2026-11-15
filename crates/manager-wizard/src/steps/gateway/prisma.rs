@@ -314,7 +314,26 @@ impl StartGateway {
     /// resolver considers some prisma already installed (its
     /// dist-info survives the package-directory removal in
     /// [`Self::ensure_prisma_pin`]).
-    fn prisma_pin_command(&self, ctx: &WizardContext, uv: &Path) -> PlannedCommand {
+    ///
+    /// With a covering hash lock ([`Self::hash_lock_mode`]) the
+    /// reinstall resolves from the lock under `--require-hashes`, so
+    /// the replacement prisma is the hash-verified artifact (the lock
+    /// pins exactly [`crate::PRISMA_PINNED_VERSION`]).
+    pub(crate) fn prisma_pin_command(&self, ctx: &WizardContext, uv: &Path) -> PlannedCommand {
+        if self.hash_lock_mode(ctx).is_ok() {
+            return PlannedCommand::new(vec![
+                uv.display().to_string(),
+                "pip".to_string(),
+                "install".to_string(),
+                "--python".to_string(),
+                self.venv_python(ctx).display().to_string(),
+                "--reinstall-package".to_string(),
+                "prisma".to_string(),
+                "--require-hashes".to_string(),
+                "-r".to_string(),
+                self.requirements_lock_path(ctx).display().to_string(),
+            ]);
+        }
         PlannedCommand::new(vec![
             uv.display().to_string(),
             "pip".to_string(),
@@ -379,6 +398,14 @@ impl StartGateway {
                     log.clone(),
                 )
             })?;
+        }
+        match self.hash_lock_mode(ctx) {
+            Ok(()) => {
+                if let Err(e) = self.write_requirements_lock(ctx).await {
+                    return Err(StepOutcome::failed(e, log.clone()));
+                }
+            }
+            Err(warning) => push_log(ctx, log, format!("warning: {warning}")),
         }
         let cmd = self.prisma_pin_command(ctx, uv);
         const PIN_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
