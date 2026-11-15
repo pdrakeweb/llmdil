@@ -1,0 +1,9 @@
+# Input for the hash-locked gateway venv requirements
+# (gateway-requirements.lock). The start-gateway step installs exactly
+# these three requirements; keep the pins equal to the Rust constants
+# (manager_config::DEFAULT_LITELLM_PIN, manager_wizard::PRISMA_PINNED_VERSION)
+# -- a unit test fails when they drift. Regenerate the lock with
+# tools/gateway-lock/Update-GatewayLock.ps1 after any change here.
+litellm[proxy]==1.105.1
+prisma==0.11.0
+prometheus-client

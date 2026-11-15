@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 pub mod config_edit;
 pub mod fake;
+pub mod gateway_lock;
 mod gateway_state;
 mod mcp;
 mod model;

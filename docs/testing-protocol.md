@@ -368,3 +368,18 @@ When you add a field to a payload, update its golden in the same
 commit. When you add a new golden, add it to the table above, and add
 any new volatile field to the test's key list rather than to the
 fixture.
+
+## 10. Gateway hash lock
+
+The gateway venv installs from `crates/manager-wizard/assets/gateway-requirements.lock`
+under `uv pip install --require-hashes` when the LiteLLM pin matches it
+(module docs: `crates/manager-wizard/src/gateway_lock.rs`). After bumping
+`manager_config::DEFAULT_LITELLM_PIN` or `manager_wizard::PRISMA_PINNED_VERSION`:
+
+1. Update the pins in `crates/manager-wizard/assets/gateway-requirements.in`.
+2. Regenerate: `pwsh tools/gateway-lock/Update-GatewayLock.ps1` (needs `uv`;
+   resolves for CPython 3.12 on `x86_64-pc-windows-msvc`). Never edit hashes by hand.
+3. `cargo test -p manager-wizard gateway_lock` — `checked_in_gateway_lock_matches_pins`
+   fails while the `.in` pins, the lock and the constants disagree.
+
+`Update-GatewayLock.ps1 -Check` re-resolves and fails when the committed lock is stale.

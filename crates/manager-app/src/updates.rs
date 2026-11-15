@@ -1183,6 +1183,12 @@ async fn apply_litellm(
         );
     }
     run.note(format!("pin set to {}", u.to));
+    // F1 follow-up: an explicit pin the checked-in hash lock does not
+    // cover installs by version pin only — said here, never silently.
+    let unverified = manager_wizard::gateway_lock::gateway_hash_lock_warning(&u.to);
+    if let Some(w) = &unverified {
+        run.note(format!("warning: {w}"));
+    }
     let attempt: Result<(), String> = async {
         env.run_step(manager_wizard::steps::STEP_START_GATEWAY, Some(cancel))
             .await?;
@@ -1250,7 +1256,13 @@ async fn apply_litellm(
         u,
         run,
         UpdateOutcome::Updated,
-        format!("LiteLLM updated to {} (pin moved)", u.to),
+        match &unverified {
+            Some(_) => format!(
+                "LiteLLM updated to {} (pin moved) — not hash-verified",
+                u.to
+            ),
+            None => format!("LiteLLM updated to {} (pin moved)", u.to),
+        },
         None,
     )
 }

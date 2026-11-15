@@ -161,6 +161,32 @@ impl StartGateway {
             }
             previous_stopped = true;
         }
+        // Hash enforcement (finding F1 follow-up): a covering lock is
+        // written next to the venv and the install runs under
+        // --require-hashes; any other pin installs by version only and
+        // the outcome carries the "not hash-verified" warning.
+        let mut unverified_install: Option<String> = None;
+        if !setup_cmds.is_empty() {
+            match self.hash_lock_mode(ctx) {
+                Ok(()) => {
+                    if let Err(e) = self.write_requirements_lock(ctx).await {
+                        return Ok(StepOutcome::failed(e, log).with_manual_command(manual));
+                    }
+                    push_log(
+                        ctx,
+                        &mut log,
+                        format!(
+                            "installing from the hash lock {} (--require-hashes)",
+                            self.requirements_lock_path(ctx).display()
+                        ),
+                    );
+                }
+                Err(warning) => {
+                    push_log(ctx, &mut log, format!("warning: {warning}"));
+                    unverified_install = Some(warning);
+                }
+            }
+        }
         for cmd in &setup_cmds {
             match run_command_logged(ctx, &mut log, cmd, Some(SETUP_COMMAND_TIMEOUT)).await {
                 Ok(out) if out.success() => {
@@ -612,6 +638,9 @@ impl StartGateway {
         if let Some(fw) = self.ensure_gateway_firewall(ctx, &mut log).await {
             log.push(format!("warning: {fw}"));
             message = format!("{message} — warning: {fw}");
+        }
+        if let Some(w) = &unverified_install {
+            message = format!("{message} — warning: {w}");
         }
         if !mcp_load_failed.is_empty() {
             message = format!(

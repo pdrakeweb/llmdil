@@ -683,6 +683,24 @@ async fn litellm_apply_moves_the_pin_and_restarts_the_gateway() {
         env.calls(),
         vec!["stop_gateway", "set_pin 1.106.0", "run_step start-gateway"]
     );
+    // F1 follow-up: a pin the checked-in hash lock does not cover is
+    // reported as not hash-verified, in the log and the result message.
+    // (The lock only ever covers DEFAULT_LITELLM_PIN.)
+    assert_ne!(manager_config::DEFAULT_LITELLM_PIN, "1.106.0");
+    assert!(manager_wizard::gateway_lock::gateway_hash_lock_warning("1.106.0").is_some());
+    assert!(
+        results[0].message.contains("not hash-verified"),
+        "{:?}",
+        results[0]
+    );
+    assert!(
+        results[0]
+            .log
+            .iter()
+            .any(|l| l.starts_with("warning:") && l.contains("not hash-verified")),
+        "{:?}",
+        results[0]
+    );
 }
 
 #[tokio::test]
