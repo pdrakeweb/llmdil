@@ -423,9 +423,7 @@ async fn supervise(
             Err(e) => {
                 append_shipper_log(
                     &config.data_dir,
-                    &format!(
-                        "shipper task ended abnormally ({e}); restarting in 5 s"
-                    ),
+                    &format!("shipper task ended abnormally ({e}); restarting in 5 s"),
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {},
@@ -492,7 +490,10 @@ async fn run_loop(
     {
         Ok(c) => c,
         Err(e) => {
-            append_shipper_log(&config.data_dir, &format!("shipper cannot build HTTP client: {e}"));
+            append_shipper_log(
+                &config.data_dir,
+                &format!("shipper cannot build HTTP client: {e}"),
+            );
             return;
         }
     };
@@ -695,7 +696,9 @@ async fn run_loop(
         }
         let batch_ready = !batch.is_empty()
             && (batch.len() >= BATCH_MAX
-                || batch_since.map(|t| now.duration_since(t) >= BATCH_WINDOW).unwrap_or(false)
+                || batch_since
+                    .map(|t| now.duration_since(t) >= BATCH_WINDOW)
+                    .unwrap_or(false)
                 || spool.segment_count() > 0);
         if batch_ready && now >= next_attempt {
             // A spool segment sends as-is; a live batch is `batch`.
@@ -781,9 +784,7 @@ async fn run_loop(
                                     &config.data_dir,
                                     &format!("shipper spool append failed: {se}"),
                                 );
-                                set_status(&status, |s| {
-                                    s.dropped_spool += batch.len() as u64
-                                });
+                                set_status(&status, |s| s.dropped_spool += batch.len() as u64);
                             }
                         }
                     }

@@ -652,7 +652,10 @@ mod tests {
         std::fs::write(&path, "old\n").unwrap();
         rotate_log(&path).unwrap();
         assert!(!path.exists());
-        assert_eq!(std::fs::read_to_string(prev_log_path(&path)).unwrap(), "old\n");
+        assert_eq!(
+            std::fs::read_to_string(prev_log_path(&path)).unwrap(),
+            "old\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

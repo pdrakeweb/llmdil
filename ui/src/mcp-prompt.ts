@@ -30,7 +30,7 @@ function rowHtml(s: McpStartPreflightServer): string {
       ${s.signup_url ? `<button class="btn" data-prompt-act="link" data-prompt-id="${esc(s.id)}">${icon("external")} Get an API key</button>` : ""}
       <input type="password" data-prompt-input placeholder="${esc(s.env_keys[0] ?? "API key")}" autocomplete="off" aria-label="Credential value for ${esc(s.display_name)}">
       <button class="btn" data-prompt-act="store" data-prompt-id="${esc(s.id)}">${icon("shield")} Store credential</button>
-      <button class="btn" data-prompt-act="skip" data-prompt-id="${esc(s.id)}">Skip</button>
+      <button class="btn icon-only" data-prompt-act="skip" data-prompt-id="${esc(s.id)}" title="Skip ${esc(s.display_name)}" aria-label="Skip ${esc(s.display_name)}">${icon("x")}</button>
     </div>
     <div class="mcp-prompt-msg" data-prompt-msg></div>
   </div>`;
@@ -62,7 +62,7 @@ export async function promptForUnarmedMcpCredentials(): Promise<boolean> {
       <p class="modal-sub">These servers are registered with the gateway but have no stored credential, so the gateway starts without them. Store a credential now to include its server in this start.</p>
       ${servers.map(rowHtml).join("")}
       <div class="modal-actions">
-        <button class="btn" data-prompt-act="cancel">Cancel start</button>
+        <button class="btn" data-prompt-act="cancel">${icon("x")} Cancel start</button>
         <button class="btn primary" data-prompt-act="continue">${icon("play")} Continue start</button>
       </div>
     </div>`;

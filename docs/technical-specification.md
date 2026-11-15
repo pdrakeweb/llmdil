@@ -18,9 +18,18 @@ Known divergences between this spec and the shipped product:
   App updates ship as GitHub release installers; the in-app Updates surface
   covers components (llama.cpp, LiteLLM, models, extensions), not the app
   itself.
-- **Telemetry (§5, §16, §17.7):** shipped NVML-primary with the `nvidia-smi`
-  XML parser as fallback (`manager_telemetry::default_telemetry_stack`) —
-  the reverse of the v1 plan stated here.
+- **Telemetry (§5, §16, §17.7), as built:** the active GPU source is the
+  `nvidia-smi` XML parser (`NvidiaSmiSource`). `default_telemetry_stack`
+  composes `FallbackSource<NvmlSource, NvidiaSmiSource>`, but `NvmlSource`
+  in `crates/manager-telemetry/src/nvml.rs` is a stub: runtime loading of
+  `nvml.dll` is not implemented, every NVML poll returns
+  `NvmlUnavailable`, and the fallback therefore always selects
+  `nvidia-smi`. NVML remains deferred (§5, §17.7). On Windows,
+  `ProcessMemoryFixupSource` adds per-process VRAM from PDH "GPU Process
+  Memory" counters, with DXGI adapter enumeration mapping LUIDs to GPU
+  indexes, because nvidia-smi/NVML report no per-process figure under the
+  WDDM driver model. (Some module docs in `manager-telemetry` still say
+  "NVML primary"; the stub behaviour above is authoritative.)
 - **Model catalog (§4.6):** the v0.1.0 table below is superseded. The curated
   catalog is six entries at `CATALOG_REVISION` 3 — the original four slots
   (with the coder slot now Qwen3-Coder-Next-80B), plus `qwen3.8-27b-mtp`
@@ -98,8 +107,8 @@ execution.
   from app state.
 - **Telemetry:** `nvidia-smi --query --xml` parser as the active v1 source, behind a
   `TelemetrySource` trait seam; NVML runtime loading (`nvml.dll`) is a
-  documented follow-up (see §5). The trait boundary means no caller changes
-  when NVML wiring lands.
+  documented follow-up (see §5) and is still a stub as built. The trait
+  boundary means no caller changes when NVML wiring lands.
 - **Sandboxing:** `mxc-sdk` Rust crate; `wxc-exec.exe` CLI fallback.
 - **Installer:** `tauri-bundler` NSIS target; MSI retained as an option.
   `tauri-plugin-updater` for app self-update.
@@ -444,8 +453,9 @@ Editor & MCP | Windows ML | Updates | Diagnostics.
 
 **Sources (v0.1.0).** Active: `nvidia-smi --query --xml` (device handles,
 per-GPU metrics; per-process attribution is best-effort on this path).
-Deferred: NVML runtime loading (`nvml.dll` via the `TelemetrySource` trait
-seam in `manager-telemetry`) — Pascal-era NVML quirks on the P100s make the
+Deferred (still deferred as built: `nvml.rs` is a stub, and PDH/DXGI
+supplement per-process VRAM on Windows, see §17.7): NVML runtime loading
+(`nvml.dll` via the `TelemetrySource` trait seam in `manager-telemetry`) — Pascal-era NVML quirks on the P100s make the
 `smi` path the reliable v1 choice; NVML lands in a hardening pass with no
 caller changes required. Telemetry source per GPU is shown in the
 UI ("NVML" / "nvidia-smi fallback").
@@ -556,6 +566,26 @@ Windows Credential Manager, injected into the LiteLLM process env only. Cost
 guardrails: per-day spend cap (default set at setup, user-editable), free-tier
 models preferred in the fallback model list; cap breach → fallbacks disabled
 with a Dashboard banner (fail closed to local, never silently spend).
+
+*Implementation (LiteLLM-native, requests never pass through Rust):*
+(1) failover is LiteLLM's `fallbacks` chain. (2) Overflow is opt-in
+(`gateway.openrouter.overflow`: `enabled`, `queue_depth`,
+`p99_latency_ms`, `sustained_secs`); the generated `llmdil_routing.py`
+callback tracks per-group in-flight requests and a 60 s completed-latency
+window, and once a breach has held `sustained_secs` sends that group's
+new requests to `openrouter` with the group as the request-level
+fallback. Only groups whose own fallback chain lists `openrouter`
+escalate. (3) Rubric escalation is not implemented: it needs a
+decider-model prompt, score scale and threshold that this spec does not
+define, and it would add a local planner call to every request. The
+daily cap is `router_settings.provider_budget_config.openrouter`
+(`budget_limit` = cap, `time_period: 1d`), which filters every
+OpenRouter deployment out once spend reaches it; a $0 cap generates no
+OpenRouter deployments at all (LiteLLM reads a zero budget as
+unlimited). LiteLLM keeps the window in memory, so a gateway restart
+starts a fresh window; the app's spend ledger (local-midnight reset,
+persists across restarts) drives the `gateway_status.openrouter_spend`
+payload and the Dashboard/Gateway banner (capped, or ≥80%).
 
 ## 8. MCP integration
 

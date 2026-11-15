@@ -23,7 +23,7 @@ use manager_app::registry::{HttpMethod, Op, OpSpec, RouteMode, OP_SPECS};
 use manager_app::ApiError;
 
 use crate::composites;
-use crate::ApiCtx;
+use crate::{ApiCtx, API_ORIGIN};
 
 /// One registered route, recorded during construction so tests can
 /// enumerate the live surface against the registry.
@@ -99,8 +99,7 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
         )
         .route(
             "/api/v1/gateway/groups/{name}",
-            axum::routing::patch(handle_group_patch)
-                .delete(handle_group_delete),
+            axum::routing::patch(handle_group_patch).delete(handle_group_delete),
         )
         .route(
             "/api/v1/gateway/start",
@@ -120,21 +119,51 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
         records.push(RouteRecord { method, path });
     }
     router = router
-        .route("/api/v1/auth/login", axum::routing::post(crate::auth_routes::handle_login))
-        .route("/api/v1/auth/totp", axum::routing::post(crate::auth_routes::handle_totp))
-        .route("/api/v1/auth/refresh", axum::routing::post(crate::auth_routes::handle_refresh))
-        .route("/api/v1/enroll", axum::routing::post(crate::auth_routes::handle_enroll))
+        .route(
+            "/api/v1/auth/login",
+            axum::routing::post(crate::auth_routes::handle_login),
+        )
+        .route(
+            "/api/v1/auth/totp",
+            axum::routing::post(crate::auth_routes::handle_totp),
+        )
+        .route(
+            "/api/v1/auth/refresh",
+            axum::routing::post(crate::auth_routes::handle_refresh),
+        )
+        .route(
+            "/api/v1/enroll",
+            axum::routing::post(crate::auth_routes::handle_enroll),
+        )
         .route("/api/v1/auth/me", get(crate::auth_routes::handle_me))
-        .route("/api/v1/auth/logout", axum::routing::post(crate::auth_routes::handle_logout))
-        .route("/api/v1/auth/password", axum::routing::post(crate::auth_routes::handle_change_password))
-        .route("/api/v1/auth/sessions", get(crate::auth_routes::handle_list_sessions))
+        .route(
+            "/api/v1/auth/logout",
+            axum::routing::post(crate::auth_routes::handle_logout),
+        )
+        .route(
+            "/api/v1/auth/password",
+            axum::routing::post(crate::auth_routes::handle_change_password),
+        )
+        .route(
+            "/api/v1/auth/sessions",
+            get(crate::auth_routes::handle_list_sessions),
+        )
         .route(
             "/api/v1/auth/sessions/{id}",
             axum::routing::delete(crate::auth_routes::handle_revoke_session),
         )
-        .route("/api/v1/auth/totp/enroll", axum::routing::post(crate::auth_routes::handle_totp_enroll))
-        .route("/api/v1/auth/totp/verify", axum::routing::post(crate::auth_routes::handle_totp_verify))
-        .route("/api/v1/auth/totp/disable", axum::routing::post(crate::auth_routes::handle_totp_disable))
+        .route(
+            "/api/v1/auth/totp/enroll",
+            axum::routing::post(crate::auth_routes::handle_totp_enroll),
+        )
+        .route(
+            "/api/v1/auth/totp/verify",
+            axum::routing::post(crate::auth_routes::handle_totp_verify),
+        )
+        .route(
+            "/api/v1/auth/totp/disable",
+            axum::routing::post(crate::auth_routes::handle_totp_disable),
+        )
         .route(
             "/api/v1/admin/users",
             get(crate::auth_routes::handle_admin_list_users)
@@ -178,11 +207,7 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
     // envelope, not the framework's bare 404.
     let router = router.fallback(|state: State<Arc<ApiCtx>>| async move {
         let State(ctx) = state;
-        error_response(
-            &ctx,
-            &ApiError::NotFound("no such route".to_string()),
-            None,
-        )
+        error_response(&ctx, &ApiError::NotFound("no such route".to_string()), None)
     });
     let mw_state = crate::auth_routes::AuthMwState {
         ctx: ctx.clone(),
@@ -231,9 +256,14 @@ async fn handle_op(
         let (id, record) = ctx.operations.begin(spec.name);
         let spawn_ctx = ctx.clone();
         tokio::spawn(async move {
-            let result =
-                manager_app::registry::dispatch(&spawn_ctx.app, &spawn_ctx.sink, spec.op, args)
-                    .await;
+            let result = manager_app::registry::dispatch_from(
+                &spawn_ctx.app,
+                &spawn_ctx.sink,
+                spec.op,
+                args,
+                API_ORIGIN,
+            )
+            .await;
             finish_operation(&spawn_ctx, &id, spec.name, result);
         });
         return (axum::http::StatusCode::ACCEPTED, axum::Json(record)).into_response();
@@ -241,7 +271,11 @@ async fn handle_op(
     // The operations list merges the app's task records with the
     // API-side operation records.
     if spec.op == Op::TasksList {
-        return match manager_app::registry::dispatch(&ctx.app, &ctx.sink, spec.op, args).await {
+        return match manager_app::registry::dispatch_from(
+            &ctx.app, &ctx.sink, spec.op, args, API_ORIGIN,
+        )
+        .await
+        {
             Ok(mut value) => {
                 if let Some(arr) = value.as_array_mut() {
                     let known: std::collections::HashSet<String> = arr
@@ -265,8 +299,7 @@ async fn handle_op(
         if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
             if ctx.operations.get(task_id).is_some() {
                 ctx.operations.abort(task_id);
-                return axum::Json(json!({ "ok": true, "task_id": task_id }))
-                    .into_response();
+                return axum::Json(json!({ "ok": true, "task_id": task_id })).into_response();
             }
         }
     }
@@ -279,7 +312,8 @@ async fn handle_op(
             Err(e) => error_response(&ctx, &e, None),
         };
     }
-    match manager_app::registry::dispatch(&ctx.app, &ctx.sink, spec.op, args).await {
+    match manager_app::registry::dispatch_from(&ctx.app, &ctx.sink, spec.op, args, API_ORIGIN).await
+    {
         Ok(value) => shape_success(&ctx, spec, value),
         Err(e) => error_response(&ctx, &e, None),
     }
@@ -519,7 +553,7 @@ fn home_dir_string() -> Option<String> {
 // ---------------------------------------------------------------------------
 
 async fn dispatch_read(ctx: &ApiCtx, op: Op, args: Value) -> Result<Value, Box<Response>> {
-    manager_app::registry::dispatch(&ctx.app, &ctx.sink, op, args)
+    manager_app::registry::dispatch_from(&ctx.app, &ctx.sink, op, args, API_ORIGIN)
         .await
         .map_err(|e| Box::new(error_response(ctx, &e, None)))
 }
@@ -656,10 +690,7 @@ async fn handle_model_patch(
     }
 }
 
-async fn handle_group_create(
-    State(ctx): State<Arc<ApiCtx>>,
-    body: axum::body::Bytes,
-) -> Response {
+async fn handle_group_create(State(ctx): State<Arc<ApiCtx>>, body: axum::body::Bytes) -> Response {
     let parsed = match parse_body(&ctx, &body) {
         Ok(v) => v,
         Err(r) => return *r,
@@ -685,10 +716,7 @@ async fn handle_group_patch(
     }
 }
 
-async fn handle_group_delete(
-    State(ctx): State<Arc<ApiCtx>>,
-    Path(name): Path<String>,
-) -> Response {
+async fn handle_group_delete(State(ctx): State<Arc<ApiCtx>>, Path(name): Path<String>) -> Response {
     match composites::delete_group(&ctx, &name).await {
         Ok(v) => axum::Json(v).into_response(),
         Err(e) => error_response(&ctx, &e, None),
@@ -746,7 +774,10 @@ async fn handle_bundle_content(
             (
                 axum::http::StatusCode::OK,
                 [
-                    (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        "application/zip".to_string(),
+                    ),
                     (
                         axum::http::header::CONTENT_DISPOSITION,
                         format!("attachment; filename=\"{name}\""),
@@ -770,9 +801,7 @@ async fn handle_bundle_content(
 static EVENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 struct MpscEventStream {
-    rx: tokio::sync::mpsc::Receiver<
-        Result<axum::response::sse::Event, std::convert::Infallible>,
-    >,
+    rx: tokio::sync::mpsc::Receiver<Result<axum::response::sse::Event, std::convert::Infallible>>,
 }
 
 impl futures_core::Stream for MpscEventStream {
@@ -786,18 +815,39 @@ impl futures_core::Stream for MpscEventStream {
     }
 }
 
+/// The SSE `data` for one bus event: the producer's payload with an
+/// additive `origin` (`desktop` | `api` | `app`) when the payload is
+/// an object that does not already carry one.
+fn sse_data(env: &manager_app::event_bus::BusEvent) -> String {
+    let mut payload = env.payload.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.entry("origin")
+            .or_insert_with(|| json!(env.origin.as_str()));
+    }
+    payload.to_string()
+}
+
+/// `GET /events`: the app event bus (every UI event, whichever surface
+/// caused it — desktop IPC, this API, or background producers). The
+/// subscription also keeps the bus's background producers running.
 async fn handle_events(State(ctx): State<Arc<ApiCtx>>) -> Response {
-    let mut events = ctx.events.subscribe();
+    let mut events = manager_app::event_bus::subscribe(&ctx.app);
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
         loop {
-            match events.recv().await {
+            let next = tokio::select! {
+                // A disconnected client drops its subscription now,
+                // not at the next event, so idle producers stop.
+                _ = tx.closed() => break,
+                next = events.recv() => next,
+            };
+            match next {
                 Ok(env) => {
                     let id = EVENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let event = axum::response::sse::Event::default()
                         .id(id.to_string())
-                        .event(env.event)
-                        .data(env.payload.to_string());
+                        .event(env.event.clone())
+                        .data(sse_data(&env));
                     if tx.send(Ok(event)).await.is_err() {
                         break;
                     }
@@ -878,10 +928,14 @@ mod tests {
         assert!(operation_outcome(Ok(json!({ "task_id": "t4" }))).is_ok());
 
         // An op error keeps its text and has no detail.
-        let (message, detail) =
-            operation_outcome(Err(ApiError::Busy("gateway restart already in progress".into())))
-                .unwrap_err();
-        assert!(message.contains("gateway restart already in progress"), "{message}");
+        let (message, detail) = operation_outcome(Err(ApiError::Busy(
+            "gateway restart already in progress".into(),
+        )))
+        .unwrap_err();
+        assert!(
+            message.contains("gateway restart already in progress"),
+            "{message}"
+        );
         assert!(detail.is_none());
     }
 

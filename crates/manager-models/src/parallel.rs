@@ -159,10 +159,7 @@ mod tests {
             Some(LLAMA_CPP_PARALLEL_AUTO)
         );
         // Last wins; malformed reads as unset.
-        assert_eq!(
-            parallel_slots(Some("--parallel 4 --parallel 1")),
-            Some(1)
-        );
+        assert_eq!(parallel_slots(Some("--parallel 4 --parallel 1")), Some(1));
         assert_eq!(parallel_slots(Some("--parallel abc")), None);
         assert_eq!(parallel_slots(Some("--parallel")), None);
     }

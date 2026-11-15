@@ -310,7 +310,7 @@ machine's actual state into the checklist).
 - Entry: `get_logs`, main.rs:2578. UI: yes.
 - In: `scope: string` (a process id, `"gateway"`, `"wizard"`, `"all"`, or an archived scope id from the payload's scope list)`, level?: "error"|"warn"|"info"|"debug"` (heuristic line match)`, search?: string` (substring over line text)`, query?: string` (substring over line text + source)`, since_ms?: i64, until_ms?: i64` (inclusive)`, order?: "asc"|"desc"` (default desc)`, offset?: u64, limit?: u64` (default 200).
 - Out: `{lines: [{ts, stream, line, source, archived}], total_matching, total, truncated, scopes: [{id, previous}]}`.
-- Side effects: reads supervisor ring buffers (live and retained previous-run rings) plus the file-backed gateway and wizard logs under the data dir. Read-only, but the only log access is this paged pull — there is no live tail channel (see §14).
+- Side effects: reads supervisor ring buffers (live and retained previous-run rings) plus the file-backed gateway and wizard logs under the data dir. Read-only. Live tailing of the supervised-process scopes is the `log-line` event on the Admin API event stream (see §14); there is no log-follow command.
 
 
 ## 7. Gateway and the activation plan
@@ -328,7 +328,7 @@ a pre-change config snapshot supports cancel.
 ### `get_gateway_config` — read
 - What: The gateway section of the config, with derived per-group enablement.
 - Entry: `get_gateway_config`, main.rs:2676. UI: yes.
-- In: none. Out: `GatewayConfig {port, bind_host, groups: [{name, members, strategy, fallbacks, enabled, enabled_members}], routing_rules: [{id, description, source, litellm_fragment}], request_log_len, openrouter: {enabled, cred_ref, daily_cap_usd, model_allowlist} | null}`. `enabled`/`enabled_members` are derived by `manager-gateway` (a group is enabled iff ≥1 member backend is enabled); never stored.
+- In: none. Out: `GatewayConfig {port, bind_host, groups: [{name, members, strategy, fallbacks, enabled, enabled_members}], routing_rules: [{id, description, source, litellm_fragment}], request_log_len, openrouter: {enabled, cred_ref, daily_cap_usd, model_allowlist} | null, effective_strategy: string | null}`. `enabled`/`enabled_members` are derived by `manager-gateway` (a group is enabled iff ≥1 member backend is enabled); never stored. `effective_strategy` is the global routing strategy the generated config applies (`manager_gateway::effective_global_strategy`; null when nothing would be generated).
 - Side effects: none.
 
 ### `update_gateway_config` — mutate
@@ -456,14 +456,14 @@ because any API consumer of per-process VRAM depends on this path.
 ### `tasks_list` — read
 - What: All tracked background task records.
 - Entry: `tasks_list`, main.rs:5176. UI: **no**.
-- In: none. Out: `[TaskRecord {id, kind, detail, status, ...}]` (in-memory, session-only; kinds include `wizard_step`, `audit`, `backend_start/stop/restart`, `vscode_install_extensions`).
+- In: none. Out: `[TaskRecord {id, kind, detail, status, ...}]` (in-memory, session-only; kinds include `wizard_step`, `audit`, `backend_start/stop/restart`, `vscode_install_extensions`, `model_download`, `bench-run`, `bench-prompt-generate`, and the `optimize-*` jobs). A record abort-requested before it finished carries `abort_requested: true` in `detail`; a forced abort carries `abort_forced`, `abort_note`, and later `late_outcome`.
 - Side effects: none.
 
-### `task_abort` — mutate (bookkeeping only)
-- What: Mark a task record as Aborted.
+### `task_abort` — mutate (cooperative cancellation)
+- What: Cancel a running task's work and report the state it reached (`crates/manager-app/src/tasks.rs`).
 - Entry: `task_abort`, main.rs:5163. UI: **no**.
-- In: `task_id: string`. Out: `{ok: true, task_id}`; NotFound error for an unknown id.
-- Side effects: **flips the record's status only — it does not cancel the underlying work.** No cancellation token is wired to steps, downloads, or processes; real cancellation exists only per-operation (`cancel_download`, `stop_backend`, `gateway_stop`). A REST abort endpoint modeled on this command would claim an effect it does not have.
+- In: `task_id: string`. Out: `{ok: true, task_id, status, stopped, forced, routed_to?: {op, result}}`; for a task already in a terminal state `{ok: true, task_id, status, already_finished: true}` with the record unchanged (it used to be overwritten with `aborted`); NotFound error for an unknown id. All fields beyond `{ok, task_id}` are additive.
+- Side effects: every task carries a cancellation token. The abort cancels it and, where the operation owns a cancel mechanism, routes to it: `model_download` → `cancel_download` (the worker stops the transfer, including a request still waiting on the server, and removes the partial file as an operator cancel always has); `bench-run` → `bench_run_cancel`; `bench-prompt-generate` → `bench_prompt_generate_cancel`; `optimize-consult` → `optimize_cancel_consult`; `optimize-measure`, `optimize-estimate`, `optimize-eval-baseline`, `optimize-experiments` / `optimize-estimate-experiments`, `optimize-tuning` → `optimize_cancel_job`. `wizard_step`, `audit`, and `vscode_install_extensions` observe the token directly: the wizard runner stops the running step exactly as a budget expiry does (its command's process tree killed, blocking extraction asked to stop), records it failed with an operator-cancelled message, starts no further step, and the config edits of a stopped step are never applied. The call then waits up to a 10 s grace period; work that stopped records its own terminal state (a non-success finish after an abort is `aborted`). Work that ignores the token — `backend_start/stop/restart`, `model_assign`, `placement_apply` (short supervisor/config operations, deliberately not interrupted mid-lifecycle) — is marked `aborted` after the grace period with `abort_note` saying it may still be running; its eventual outcome lands in `detail.late_outcome` without overwriting the abort. API-side operation records (the manager-api `OperationStore` for 202 routes) are still bookkeeping-only; abort the app task the operation started (also listed in `GET /operations`) for real cancellation.
 
 ### `diagnostics_export_bundle` — mutate (file-producing)
 - What: Export a diagnostics zip: config snapshot, per-scope recent logs (up to 5,000 lines each, including file-backed gateway and wizard scopes), telemetry snapshot, versions file.
@@ -556,9 +556,9 @@ target names only.
 
 ### `winml_probe` — read (active probe)
 - What: Probe the WinMLServer secondary backend and record its limits.
-- Entry: `winml_probe`, main.rs:5683. UI: **no**.
+- Entry: `winml_probe`, main.rs:5683. UI: yes — the WinML card's **Re-check capabilities** button (Settings → General; tech spec §6.5 / P7).
 - In: none. Out: the probe report (`WinMlRegistration`-adjacent: availability + `WinMlLimits` — no tensor split, max 1 registered model, coarse GPU selection, experimental).
-- Side effects: HTTP probe of `http://127.0.0.1:<winml port>` (default 8090), 10 s transport timeout.
+- Side effects: HTTP probe of `http://127.0.0.1:<winml port>` (default 8090), 10 s transport timeout. With a model registered the probe goes through `WinMlRegistry::recheck_capabilities` on the registered port and refreshes the in-memory registration's limits (and a missing adapter hint); no persisted state changes.
 
 ### `winml_register` — mutate
 - What: Register a model with the Windows ML backend (tool-runner-class models only; the registry refuses ineligible classes).
@@ -625,7 +625,7 @@ several whole feature areas (MCP, WinML, updates policy) exist *only* here:
 - **Editor MCP config generation** — `manager_mcp::editor_mcp_config` generates the `mcpServers` JSON for Continue/Cline; used only in crate tests. Nothing writes it anywhere.
 - **Config backup-fallback signal** — `manager_config::load_detailed` reports `used_backup` (the config was recovered from the `.bak` last-known-good copy); the app loads with plain `load` at startup and the fact never surfaces.
 - **Supervisor graceful drain** — `SupervisedProcess::drain` (30 s default) exists only as part of stop/restart; there is no standalone drain-a-process capability.
-- **Global routing-strategy resolution** — `manager_gateway::resolve_global_strategy` has no command; the UI reimplements it in TypeScript (`effectiveGatewayStrategy` in `ui/src/api.ts`). Two implementations of one rule — the API should have exactly one, server-side.
+- ~~**Global routing-strategy resolution**~~ — resolved (Nov 2026): `manager_gateway::effective_global_strategy` (the generator's own rule over the groups it includes) is returned as `effective_strategy` on `get_gateway_config`; the UI's TypeScript copy (`effectiveGatewayStrategy`) is removed and the smoke harness keeps it out. The TS copy had also drifted: it counted configured rather than enabled members and ignored fallback-only groups.
 - **Catalog management** — the curated model catalog (`manager_models::curated_models`, `CATALOG_REVISION`) is compiled in; `ensure_catalog_models` (main.rs) seeds/repairs stored model metadata against it implicitly on config writes. There is no catalog read endpoint, no refresh trigger, and no way to see the catalog except through `list_models`.
 - **Orphan backend adoption** — at launch the app adopts llama-server processes started by a previous session (tracked by pid). Adoption is automatic and invisible as a capability; adopted backends show an `adopted` flag in `list_backends` and are stoppable, but there is no adopt/release operation.
 - **Gateway metrics polling** — a background loop scrapes LiteLLM's Prometheus endpoint every 15 s into `GatewayStatsStore` (`src-tauri/src/gateway_stats.rs`), producing the trailing-hour `requests_1h` / `errors_1h` / `throughput_toks` on `list_backends` and the in-flight gauge `gateway_quiesce_wait` reads. No command exposes the store, the raw metrics, or the poller's health.
@@ -650,15 +650,26 @@ job), not require the client to replay the composition:
 
 ### Push events (Tauri events, not commands)
 
-Emitted today: `telemetry-update` (from `get_gpu_telemetry`),
+Operation-emitted: `telemetry-update` (from `get_gpu_telemetry`),
 `wizard-progress` (step/audit runs), `download-progress` (download
-worker), `backend-status` (start/stop/restart). Declared in
-`src-tauri/src/main.rs` (`pub mod events`) but **never emitted**:
-`log-line`, `telemetry-tick`, `task-progress`, `gateway-request`,
-`alert-raised`, `vram-changed`, `config-changed`. The desktop UI is
-therefore mostly poll-driven despite the event names; a REST design
-should decide deliberately between polling resources and a real
-stream (SSE/WebSocket) rather than inheriting this split.
+worker), `backend-status` (start/stop/restart). Every name declared
+in `manager_app::events` now has a producer on the app event bus
+(`crates/manager-app/src/event_bus.rs`): `task-progress` (task
+created / settled), `config-changed` (a successful non-read
+operation that changed the saved config; section names only),
+`gateway-request` (a recorded `gateway_test_routing` decision),
+`alert-raised` (notification-monitor failure / activation
+transitions), and — from a background loop that runs only while
+someone subscribes — `telemetry-tick` (once per completed telemetry
+poll, ≤ 1/s), `vram-changed` (per-GPU used-VRAM moves past a
+threshold), and `log-line` (new supervised-process output). The bus
+tee sits in the registry dispatch shared by the Tauri IPC adapters
+and the Admin API, so a desktop-originated action reaches API
+subscribers exactly like the same action over HTTP, tagged with an
+`origin` (`desktop` | `api` | `app`). The bus is consumed by the
+Admin API's `GET /api/v1/events` (rest-api.md §6.17); the desktop UI
+still subscribes to no events and remains poll-driven — polling is
+the correctness path, the stream is additive.
 
 ## 15. Counts, and capabilities with awkward fits for REST
 
@@ -680,11 +691,11 @@ exist (`backend_test_request` vs the registered `test_backend`, §2).
 
 1. **Long-blocking synchronous calls.** `run_wizard_step` blocks until the step finishes (budgets to 600 s; the start-gateway step internally reinstalls packages and confirms health). `model_verify_checksum` blocks for minutes on multi-GiB files. `gateway_quiesce_wait` blocks 5–600 s *by design*. These need an async job model (202 + job resource + polling/stream), not request/response timeouts.
 2. **Background work with event-only progress.** `download_model` returns immediately; progress, pause state, the post-download verification phase, and terminal errors are observable only through `download-progress` events and by polling `list_models`. A REST client needs a first-class download resource with state, or a stream.
-3. **No live log channel.** `get_logs` is a paged pull and works fine as REST, but live tailing does not exist — the `log-line` event is declared and never emitted. Streaming logs over the API is new machinery, not a port.
+3. **Live log channel is stream-only.** `get_logs` is a paged pull and works fine as REST. Live tailing exists only as the `log-line` event on `GET /api/v1/events` (supervised-process output, rate-limited, live-only; the file-backed gateway/wizard scopes are not streamed) — there is no log-follow operation.
 4. **Interactive elevation (UAC).** The start-gateway step's firewall reconciliation and install-llamacpp's host preparation run elevated scripts: a UAC prompt appears on the **server's console**, and a remote caller cannot see or answer it (a decline degrades to a warning). API-triggered steps that need elevation will block on a prompt nobody remote can see, or must pre-decline.
 5. **Desktop-session actions.** `open_url` and `open_folder` act on the managed machine's interactive desktop (browser, Explorer). They have no remote meaning; exclude them or replace them with returned data (URLs, paths).
 6. **Secret disclosure.** `gateway_master_key` returns the LiteLLM master key in plaintext (and creates it on first call). Over an admin API this is the most sensitive read in the system — highest role, audit logging, and arguably a reveal-once pattern rather than a plain GET.
-7. **`task_abort` does not abort.** It flips a bookkeeping record's status; the underlying work continues. A REST design must not inherit this semantics — real cancellation exists only per-operation today.
+7. **`task_abort` abort semantics (resolved).** It used to flip a bookkeeping record's status while the work continued. It now cancels cooperatively — a per-task cancellation token, routed to the operation's own cancel op where one exists — and reports `aborted` only once the work stopped or a bounded grace period elapsed (then with a note that it may still be running); see `task_abort` above. Remaining gap: the API-side records of 202 operations are still bookkeeping-only.
 8. **Busy/lock semantics instead of queueing.** Wizard execution serializes on one lock and concurrent calls return `busy` + the running step + elapsed seconds. The API should preserve this as an explicit conflict response, not hide it behind a blocking wait.
 9. **Session-only state.** MCP server modes, the routing-test trace ring, task records, and the gateway stats windows live in app memory and vanish on app restart. REST resources modeled on them are ephemeral whether the design admits it or not; MCP modes in particular look like configuration but are not persisted.
 10. **File-path responses.** `diagnostics_export_bundle` and `telemetry_save_snapshot` return server-side paths, not content. The API needs file transfer (or a two-step create-then-download) for both.

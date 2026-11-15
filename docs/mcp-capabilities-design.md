@@ -425,6 +425,42 @@ the §4.3 floor. The manager never sets
 `LITELLM_MCP_STDIO_EXTRA_COMMANDS`; the allowlist stays at
 LiteLLM's default seven commands.
 
+**Local exposure (review v0.1.60 PS-5).** Local servers are spawned
+by the app itself, from the persisted registry entry (any server —
+built-in, curated, or operator-added — not only the legacy two).
+The mapping: `Local` + `stdio` + non-empty command is a spawnable
+local process; every other `Local` combination (http transport,
+empty command, a credential that `env_keys` needs but Credential
+Manager lacks) is an explicit error, checked when the exposure is
+set or the server saved (`mcp_save_server` refuses the static
+cases and reports runtime ones as `local_ready` / `local_error`)
+and again at every start. The spawn rules live in
+`manager_mcp::local` (`prepare_spawn`) and bind every writer of MCP
+server config, including any future Admin API endpoint:
+
+- The program is launched directly (`std::process::Command` via the
+  supervisor), never through a shell the app builds (`cmd /c` etc.).
+- A bare command is resolved against the absolute `PATH` entries
+  only; on Windows only the `PATHEXT` extensions are tried, so
+  `npx` resolves to `npx.cmd`, never the POSIX shim beside it. A
+  command given as a path must be absolute, `..`-free, and inside
+  a known install directory (Program Files, the per-user
+  Programs / npm / `.local\bin` directories, the app data dir).
+- The stdio allowlist and banned args (§3.2) are re-checked at
+  spawn, against the resolved file name too.
+- The credential value is read only at spawn, injected under every
+  `env_keys` name (the §4.2 convention), and never logged, put in
+  an error, or kept in the supervisor's registered spec after the
+  spawn.
+- Editing the spawn definition of a running Local server (exposure,
+  transport, command, args, env keys, `cred_ref`) or deleting it
+  stops the old process first; an edited server that was running is
+  started again with the new definition.
+- A Local server that exits on its own is reported as `failed`
+  (`process_state` on `mcp_list`). It is not restarted
+  automatically: there is no app-level crash-restart loop for any
+  supervised process yet (review PL-m5).
+
 ### 5.2 Fetch and SSRF
 
 The named threat is a model-chosen URL reaching a LAN service

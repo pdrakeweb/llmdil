@@ -261,8 +261,7 @@ mod tests {
                     activation: "next_start".to_string(),
                     outcome: "skipped".to_string(),
                     detail: Some(
-                        "Already effective — takes effect at the backend's next start"
-                            .to_string(),
+                        "Already effective — takes effect at the backend's next start".to_string(),
                     ),
                 },
                 ActivationExecutionItem {
@@ -338,11 +337,7 @@ mod tests {
         assert_eq!(history.executions.len(), HISTORY_CAP);
         // The first five are gone; the retained run is exactly the
         // newest HISTORY_CAP, in order.
-        let retained: Vec<&str> = history
-            .executions
-            .iter()
-            .map(|e| e.id.as_str())
-            .collect();
+        let retained: Vec<&str> = history.executions.iter().map(|e| e.id.as_str()).collect();
         let expected: Vec<&str> = ids[5..].iter().map(|s| s.as_str()).collect();
         assert_eq!(retained, expected);
         let _ = std::fs::remove_dir_all(&dir);

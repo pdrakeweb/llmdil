@@ -20,7 +20,7 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use manager_logship::{ShipperConfig, ShipLevel};
+use manager_logship::{ShipLevel, ShipperConfig};
 
 // Literal-layer sentinels (handed to the shipper as the deployment's
 // known Credential Manager values).
@@ -216,14 +216,20 @@ async fn sentinel_redaction_end_to_end() {
         "the plain line must survive verbatim: {shipped_lines:?}"
     );
     assert!(
-        shipped_lines.iter().filter(|l| l.contains("«redacted»")).count() >= 8,
+        shipped_lines
+            .iter()
+            .filter(|l| l.contains("«redacted»"))
+            .count()
+            >= 8,
         "redaction marker must appear across the secret-bearing lines: {shipped_lines:?}"
     );
 
     // No sentinel in ANY captured byte. The token is the transport
     // credential: allowed in the Authorization header only.
     let all = String::from_utf8_lossy(&capture.all_bytes()).to_string();
-    for sentinel in [MASTER, PGPASS, MCPENV, BEARER, APIKEY, JWT, URLTOKEN, DSNPASS, SKKEY] {
+    for sentinel in [
+        MASTER, PGPASS, MCPENV, BEARER, APIKEY, JWT, URLTOKEN, DSNPASS, SKKEY,
+    ] {
         assert!(
             !all.contains(sentinel),
             "sentinel leaked onto the wire: {sentinel}"
@@ -232,7 +238,10 @@ async fn sentinel_redaction_end_to_end() {
     for req in capture.requests.lock().unwrap().iter() {
         let pos = find_subslice(req, b"\r\n\r\n").unwrap();
         let body = String::from_utf8_lossy(&req[pos + 4..]).to_string();
-        assert!(!body.contains(TOKEN), "ingest token leaked into a batch body");
+        assert!(
+            !body.contains(TOKEN),
+            "ingest token leaked into a batch body"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&dir);

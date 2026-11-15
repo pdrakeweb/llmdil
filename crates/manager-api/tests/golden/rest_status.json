@@ -1,0 +1,11 @@
+{
+  "body": {
+    "backends_configured": 4,
+    "gateway_port": 4000,
+    "mxc_mode": "learning",
+    "status": "ok",
+    "version": "<string>",
+    "winml_enabled": false
+  },
+  "status": 200
+}

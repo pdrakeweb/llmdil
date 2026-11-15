@@ -22,6 +22,12 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+mod op_types;
+pub use op_types::{
+    camel_case, render_schema_json, render_ts, request_params, request_schema, ParamInfo, ParamType,
+};
+
+pub use crate::event_bus::EventOrigin;
 use crate::{ApiError, AppState, EventSink};
 
 /// Capability classes (auth plan §1; PLAN.md §2.6 — the auth taxonomy
@@ -371,6 +377,11 @@ macro_rules! for_each_operation {
             (OptimizeSetItemState, optimize_set_item_state, C, op_optimize_set_item_state, [item_id: usize, decision: String], None),
             (OptimizeSetItemOutcome, optimize_set_item_outcome, C, op_optimize_set_item_outcome, [item_id: usize, outcome: String, error: Option<String>], None),
             (OptimizeDiscardPlan, optimize_discard_plan, C, op_optimize_discard_plan, [], None),
+            // Rust apply executor (optimize design §5.2, Phase 3):
+            // executes accepted items through the existing ops.
+            // Class D because the destructive phase deletes
+            // backends and groups (backend_delete is D).
+            (OptimizeApplyPlan, optimize_apply_plan, D, op_optimize_apply_plan, [destructive: Option<bool>, dry_run: Option<bool>], None),
             (OptimizeSetExperimentState, optimize_set_experiment_state, C, op_optimize_set_experiment_state, [experiment_id: usize, decision: String], None),
             (OptimizeConsult, optimize_consult, L, op_optimize_consult, [backend_id: Option<String>, sample: Option<bool>, directive: Option<String>, candidate_repos: Option<Vec<String>>], None),
             (OptimizeDiscover, optimize_discover, L, op_optimize_discover, [directive: String], None),
@@ -424,7 +435,7 @@ macro_rules! for_each_operation {
             (WinmlStatus, winml_status, R, op_winml_status, [], None),
             // Updates
             (UpdatesCheckAll, updates_check_all, R, op_updates_check_all, [], Some(route(HttpMethod::Post, "/api/v1/updates/check"))),
-            (UpdatesApply, updates_apply, D, op_updates_apply, [component_id: String], Some(route(HttpMethod::Post, "/api/v1/updates/components/{component_id}/apply"))),
+            (UpdatesApply, updates_apply, D, op_updates_apply, [component_id: String, version: Option<String>], Some(route(HttpMethod::Post, "/api/v1/updates/components/{component_id}/apply"))),
             (UpdatesPin, updates_pin, C, op_updates_pin, [component_id: String, version: Option<String>], Some(route(HttpMethod::Put, "/api/v1/updates/components/{component_id}/pin"))),
             (UpdatesSetAuto, updates_set_auto, C, op_updates_set_auto, [component_id: String, enabled: bool], Some(route(HttpMethod::Put, "/api/v1/updates/components/{component_id}/auto"))),
             // App self-update (Settings → Updates & diagnostics):
@@ -472,32 +483,156 @@ macro_rules! gen_op_specs {
 }
 for_each_operation!(gen_op_specs);
 
+macro_rules! gen_requests {
+    ($(($variant:ident, $name:ident, $class:ident, $op:ident, [$($pname:ident : $pty:ty),*], $route:expr)),*) => {
+        /// Typed request envelopes: one struct per registered
+        /// operation, named after its [`Op`] variant, with one field
+        /// per declared parameter under the declared (snake_case)
+        /// name. Generated from the same declaration as [`Op`]; do
+        /// not edit.
+        ///
+        /// `from_args` (and the `Deserialize` impl, which delegates
+        /// to it) reads each field with the registry's per-argument
+        /// rule — a missing key reads as `null`, so `Option`
+        /// arguments are `None` and a missing required argument is
+        /// `InvalidInput("argument `name`: …")`; unknown keys are
+        /// ignored — so the accepted wire format is unchanged.
+        pub mod requests {
+            use super::{arg, ApiError, Value};
+
+            $(
+                #[doc = concat!("Arguments of `", stringify!($name), "`.")]
+                #[derive(Debug, Clone, serde::Serialize)]
+                pub struct $variant {
+                    $(pub $pname: $pty),*
+                }
+
+                impl $variant {
+                    /// Read the declared arguments out of an argument
+                    /// object, in declaration order.
+                    #[allow(unused_variables)] // no-argument operations
+                    pub fn from_args(args: &Value) -> Result<Self, ApiError> {
+                        Ok(Self {
+                            $($pname: arg::<$pty>(args, stringify!($pname))?),*
+                        })
+                    }
+                }
+
+                impl<'de> serde::Deserialize<'de> for $variant {
+                    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                        let args = <Value as serde::Deserialize>::deserialize(d)?;
+                        Self::from_args(&args).map_err(serde::de::Error::custom)
+                    }
+                }
+            )*
+        }
+
+        /// The declared parameters of `op` (see [`request_params`]).
+        fn gen_request_params(op: Op) -> Vec<op_types::ParamInfo> {
+            match op {
+                $(Op::$variant => vec![$(op_types::ParamInfo::of::<$pty>(stringify!($pname))),*],)*
+            }
+        }
+
+        /// The [`Op`] variant's identifier (names the generated
+        /// request struct and TS interface).
+        fn variant_name(op: Op) -> &'static str {
+            match op {
+                $(Op::$variant => stringify!($variant),)*
+            }
+        }
+
+        /// Parse `args` into `op`'s request struct and serialize it
+        /// back (contract tests).
+        #[cfg(test)]
+        fn parse_request(op: Op, args: &Value) -> Result<Value, ApiError> {
+            match op {
+                $(Op::$variant => Ok(serde_json::to_value(requests::$variant::from_args(args)?)
+                    .expect("request serializes")),)*
+            }
+        }
+    };
+}
+for_each_operation!(gen_requests);
+
 macro_rules! gen_dispatch {
     ($(($variant:ident, $name:ident, $class:ident, $op:ident, [$($pname:ident : $pty:ty),*], $route:expr)),*) => {
         /// Run one operation by its registry handle. The match is
         /// exhaustive with no wildcard arm — a registered operation
         /// without a dispatch arm does not compile.
-        pub async fn dispatch(
+        async fn run_op(
             state: &Arc<AppState>,
             sink: &Arc<dyn EventSink>,
             op: Op,
             args: Value,
         ) -> Result<Value, ApiError> {
-            // Every operation's events also reach the log shipper's
-            // in-process feed (source `app`); a no-op while log
-            // streaming is off.
-            let sink = &crate::logship::tap_sink(state, Arc::clone(sink));
-            match op {
-                $(
-                    Op::$variant => {
-                        crate::$op(state, sink, $(arg::<$pty>(&args, stringify!($pname))?),*).await
+            // Every operation runs inside an `op` span; a task the
+            // operation records stamps its task_id and kind onto it
+            // (see `tasks::op_span`), so the operation's log events
+            // carry the task they belong to.
+            let span = crate::tasks::op_span(spec(op).name);
+            tracing::Instrument::instrument(
+                async move {
+                    match op {
+                        $(
+                            Op::$variant => {
+                                // The typed request envelope reads the
+                                // declared arguments exactly as the
+                                // per-argument reads always did (see
+                                // `requests`), then hands its fields on.
+                                let requests::$variant { $($pname),* } =
+                                    requests::$variant::from_args(&args)?;
+                                crate::$op(state, sink, $($pname),*).await
+                            }
+                        )*
                     }
-                )*
-            }
+                },
+                span,
+            )
+            .await
         }
     };
 }
 for_each_operation!(gen_dispatch);
+
+/// Run one operation invoked from the desktop UI (Tauri IPC) — the
+/// shell's entry point. Same as [`dispatch_from`] with
+/// [`EventOrigin::Desktop`].
+pub async fn dispatch(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    op: Op,
+    args: Value,
+) -> Result<Value, ApiError> {
+    dispatch_from(state, sink, op, args, EventOrigin::Desktop).await
+}
+
+/// Run one operation on behalf of `origin`. This is the single choke
+/// point every surface shares: the operation's events go to the
+/// caller's sink, to the log shipper's in-process feed (source `app`;
+/// a no-op while log streaming is off), and to the app event bus
+/// tagged with `origin` — so an action taken in the desktop UI
+/// reaches Admin API event subscribers exactly as the same action
+/// through the API does. After a successful run the dispatch-level
+/// events (`config-changed`, `gateway-request`) are emitted the same
+/// way (see [`crate::event_bus::after_dispatch`]).
+pub async fn dispatch_from(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    op: Op,
+    args: Value,
+    origin: EventOrigin,
+) -> Result<Value, ApiError> {
+    let sink = crate::event_bus::bus_sink(state, Arc::clone(sink), origin);
+    let sink = &crate::logship::tap_sink(state, sink);
+    crate::event_bus::with_origin(origin, async {
+        let watch = crate::event_bus::before_dispatch(state, op).await;
+        let result = run_op(state, sink, op, args).await;
+        crate::event_bus::after_dispatch(state, sink, op, &result, watch).await;
+        result
+    })
+    .await
+}
 
 /// The spec for one operation.
 pub fn spec(op: Op) -> &'static OpSpec {
@@ -518,7 +653,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 158);
+        assert_eq!(OP_SPECS.len(), 159);
     }
 
     #[test]
@@ -585,8 +720,23 @@ mod tests {
     #[test]
     fn frontend_invocations_are_all_registered() {
         let api_ts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/api.ts");
-        let src = std::fs::read_to_string(&api_ts)
+        let mut src = std::fs::read_to_string(&api_ts)
             .unwrap_or_else(|e| panic!("read {}: {e}", api_ts.display()));
+        // api.ts is a barrel over its per-domain modules in ui/src/api/
+        // (T-02h); the invoke call sites live there, so scan them all.
+        let api_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/api");
+        let mut parts: Vec<std::path::PathBuf> = std::fs::read_dir(&api_dir)
+            .unwrap_or_else(|e| panic!("read dir {}: {e}", api_dir.display()))
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "ts"))
+            .collect();
+        parts.sort();
+        for p in &parts {
+            src.push('\n');
+            src.push_str(
+                &std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())),
+            );
+        }
         // Scan for invoke<T>("name", ...) / invoke("name", ...) call
         // sites: after `invoke`, allow a generic argument list, then
         // `(`, then the quoted command name as the first argument.
@@ -698,17 +848,23 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_reaches_the_operation() {
-        // updates_check_all is a stub that always errors Unsupported;
-        // reaching it through dispatch proves the arm is wired.
+        // updates_apply on a report-only component errors Unsupported
+        // before any I/O; reaching it through dispatch proves the arm
+        // is wired (and that the optional `version` may be omitted).
         let state = Arc::new(AppState::new(
             manager_config::AppConfig::default_config(),
             std::path::PathBuf::from("/nonexistent/config.json"),
             std::path::PathBuf::from("/nonexistent"),
         ));
         let sink: Arc<dyn EventSink> = Arc::new(crate::NoopSink);
-        let err = dispatch(&state, &sink, Op::UpdatesCheckAll, serde_json::json!({}))
-            .await
-            .unwrap_err();
+        let err = dispatch(
+            &state,
+            &sink,
+            Op::UpdatesApply,
+            serde_json::json!({ "component_id": "postgres" }),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ApiError::Unsupported(_)), "{err}");
     }
 }

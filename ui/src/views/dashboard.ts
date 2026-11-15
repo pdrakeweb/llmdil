@@ -12,7 +12,7 @@
    Backend failures keep the last good model and show an error banner —
    never fabricated data presented as live. */
 
-import { getDashboard, systemVerdict } from "../api";
+import { getDashboard, openRouterSpendBannerHtml, systemVerdict } from "../api";
 import type { SystemVerdict } from "../api";
 import {
   LIFECYCLE_COLORS, META, lifecycleChip, lifecycleColor, lifecycleDot, lifecycleEdge, lifecycleLabel,
@@ -58,6 +58,9 @@ let startAllError: string | null = null;
  *  failing does not fail the poll (backends/telemetry stay fresh), so
  *  it gets its own banner line instead of the backend-error one. */
 let lastGatewayError: string | null = null;
+/** OpenRouter spend-cap banner HTML from the latest successful poll
+ *  (spec §7: cap reached or ≥80% of it); empty when neither. */
+let lastSpendBanner = "";
 let tickTimer: number | null = null;
 /** Set by the mount's teardown: an in-flight poll that resolves after
  *  navigation must not render into the next route's #view. */
@@ -590,6 +593,7 @@ function headerHtml(live: boolean, stale: boolean, updatedAgo: string, verdict: 
   ${startAll}
   ${lastError ? `<div style="padding:12px 20px 0"><div class="banner">${icon("warn")} backend error — showing last known data: ${esc(lastError)}</div></div>` : ""}
   ${lastGatewayError ? `<div style="padding:12px 20px 0"><div class="banner">${icon("warn")} Gateway status unavailable: ${esc(lastGatewayError)}</div></div>` : ""}
+  ${lastSpendBanner ? `<div style="padding:12px 20px 0">${lastSpendBanner}</div>` : ""}
   ${restartError ? `<div style="padding:12px 20px 0"><div class="banner" id="restartNotice">${icon("warn")} ${esc(restartError)}</div></div>` : ""}
   ${startAllError ? `<div style="padding:12px 20px 0"><div class="banner" id="startAllNotice">${icon("warn")} ${esc(startAllError)}</div></div>` : ""}
   ${!live ? `<div style="padding:12px 20px 0"><div class="banner">${icon("warn")} disconnected — showing sample data (not running under Tauri)</div></div>` : ""}`;
@@ -720,6 +724,7 @@ async function doPoll(snap?: ServiceSnapshot): Promise<void> {
     // poll: lastOk advances (the data IS fresh) and the failure shows
     // as its own banner, not as backend staleness.
     lastGatewayError = r.data.gatewayError ?? null;
+    lastSpendBanner = openRouterSpendBannerHtml(r.data.openrouterSpend, icon("warn"));
     lastOk = Date.now();
   }
   render();

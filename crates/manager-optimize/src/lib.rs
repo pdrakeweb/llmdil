@@ -18,6 +18,8 @@
 //! - [`validate`]: the validation simulation (§5): items applied in
 //!   plan order to a cloned `AppConfig`, checked with
 //!   `manager_config::validate` plus the fit evaluator.
+//! - [`schema`]: the structured-output JSON schema for the plan
+//!   contract (Phase 3), derived from the parser's own allowlists.
 //! - [`probe`]: the CPU / system-RAM inventory probe (§2.1) — data
 //!   that exists nowhere else in the app.
 //! - [`discover`]: the Hugging Face discovery pre-pass (addendum
@@ -38,6 +40,7 @@ pub mod measure;
 pub mod parse;
 pub mod plan;
 pub mod probe;
+pub mod schema;
 pub mod tuning;
 pub mod validate;
 
@@ -46,15 +49,6 @@ pub use context::{
     model_short_name, resolve_model, BackendMeasured, ConsultCandidate, ContextMeta,
     ExperimentResultFact, GpuContext, HardwareContext, MeasureInputs, ThroughputFact,
     TrafficWindow,
-};
-pub use experiment::{
-    apply_experiment_decision, experiment_fingerprint, experiment_result_fact, fit_verdict_text,
-    is_hf_form, is_temp_backend_id, lowest_free_port, resolve_candidate, temp_backend_config,
-    temp_backend_id, validate_experiment, validate_experiment_for_plan, ActiveExperiment,
-    CandidateResolution, ExperimentEstimate, ExperimentFlags, ExperimentJournal,
-    ExperimentMeasured, ExperimentPredicted, ExperimentProposal, ExperimentProvisioning,
-    ExperimentResult, ExperimentStatus, ExperimentValidation, RegisteredModelFile,
-    BATCH_TIMEOUT_SECS, EXPERIMENT_TIMEOUT_SECS, MAX_EXPERIMENTS, TEMP_BACKEND_ID_PREFIX,
 };
 pub use discover::{
     candidates_from_model, collapse_candidates, family_filter_keeps, family_tokens_for_terms,
@@ -67,9 +61,10 @@ pub use discover::{
     PoolRepo, QuantFile, SearchPage, DISCOVERY_CONCURRENCY, DISCOVERY_DEADLINE,
     DISCOVERY_REQUEST_TIMEOUT, EARLY_EXIT_MIN_REPOS, FAMILY_TOKENS, FIT_DOES_NOT_FIT, FIT_FITS,
     FIT_FITS_WITH_SPLIT, FIT_UNCHECKED, HF_DEFAULT_BASE_URL, HF_HEADER_RANGE_CAP_BYTES,
-    HF_HEADER_RANGE_INITIAL_BYTES, MAX_CANDIDATES_PER_REPO, MAX_LOOKUP_REPOS, MAX_PAGES_PER_VARIANT,
-    MAX_POOL_REPOS, MAX_QUERY_TERMS, MAX_QUERY_VARIANTS, MAX_RECORD_FETCHES, MAX_SEARCH_REPOS,
-    MIN_POOL_DOWNLOADS, SEARCH_PAGE_LIMIT, SHORTLIST_CAP, STALE_DAYS, STALE_DOWNLOADS,
+    HF_HEADER_RANGE_INITIAL_BYTES, MAX_CANDIDATES_PER_REPO, MAX_LOOKUP_REPOS,
+    MAX_PAGES_PER_VARIANT, MAX_POOL_REPOS, MAX_QUERY_TERMS, MAX_QUERY_VARIANTS, MAX_RECORD_FETCHES,
+    MAX_SEARCH_REPOS, MIN_POOL_DOWNLOADS, SEARCH_PAGE_LIMIT, SHORTLIST_CAP, STALE_DAYS,
+    STALE_DOWNLOADS,
 };
 pub use eval::{
     aggregate_results, compare, eval_suite, failed_task, output_excerpt, passes, score_task,
@@ -78,27 +73,40 @@ pub use eval::{
     ScoreDelta, EVAL_SUITE_VERSION, EVAL_TEMPERATURE, EVAL_TIME_BOX_SECS, MAX_TASK_OUTPUT_TOKENS,
     SCREENING_CAVEAT, SUITE_TOKEN_BUDGET,
 };
-pub use fit::{evaluate_fit, layout_requirement, residency_per_gpu, FitOutcome, LayoutFacts};
+pub use experiment::{
+    apply_experiment_decision, experiment_fingerprint, experiment_result_fact, fit_verdict_text,
+    is_hf_form, is_temp_backend_id, lowest_free_port, resolve_candidate, temp_backend_config,
+    temp_backend_config_mapped, temp_backend_id, validate_experiment, validate_experiment_for_plan,
+    ActiveExperiment, CandidateResolution, ExperimentEstimate, ExperimentFlags, ExperimentJournal,
+    ExperimentMeasured, ExperimentPredicted, ExperimentProposal, ExperimentProvisioning,
+    ExperimentResult, ExperimentStatus, ExperimentValidation, RegisteredModelFile,
+    BATCH_TIMEOUT_SECS, EXPERIMENT_TIMEOUT_SECS, MAX_EXPERIMENTS, TEMP_BACKEND_ID_PREFIX,
+};
+pub use fit::{
+    evaluate_fit, layout_requirement, layout_requirement_mapped, residency_per_gpu, FitOutcome,
+    LayoutFacts,
+};
 pub use measure::{
     benchmark_prompts, estimate_prompts, facts as measurement_facts, headline_figures,
     measurement_fingerprint, median, normalize_raw_flags, BenchResult, BenchRun, BenchmarkPrompt,
     EstimateEntry, HeadlineFigures, MeasurementEntry, MeasurementFingerprintInputs,
     MeasurementInputs, MeasurementSource, MeasurementStore, BENCHMARK_TEMPERATURE,
-    ESTIMATE_LONG_MAX_TOKENS, ESTIMATE_RUNS, ESTIMATE_SHORT_MAX_TOKENS, LONG_MAX_TOKENS, LONG_PROMPT,
-    MEASURED_RUNS, SHORT_MAX_TOKENS, SHORT_PROMPT,
+    ESTIMATE_LONG_MAX_TOKENS, ESTIMATE_RUNS, ESTIMATE_SHORT_MAX_TOKENS, LONG_MAX_TOKENS,
+    LONG_PROMPT, MEASURED_RUNS, SHORT_MAX_TOKENS, SHORT_PROMPT,
 };
 pub use parse::{parse_plan, reground_experiment_provisioning, ParseError};
 pub use plan::{
     config_fingerprint, ApplyOutcome, Confidence, Decision, ExcludedItem, Plan, PlanItem, PlanKind,
 };
 pub use probe::{probe_hardware, HardwareProbe};
+pub use schema::{plan_json_schema, plan_response_format, AUTHORED_KINDS};
 pub use tuning::{
     adopt_is_default, cache_fa_offered, cache_ladder, context_cache_values, context_values,
-    moe_cache_values, offload_values, placement_values, plan_filter, planned_arm_count,
-    rank_arms, slot_values, spec_values, thermal_tripped, tuning_temp_backend, winner_index,
-    ArmPricing, ArmStatus, Descent, ResidencyVerdict, SweepPlan, SweepState, TuningArm,
-    TuningConfirmation, TuningCoords, TuningExclusion, TuningGpu, TuningInputs, TuningStore,
-    TuningSweep, AXIS_ORDER, THERMAL_ABORT_C, THERMAL_ABORT_STREAK, TUNING_ARM_TIMEOUT_SECS,
-    TUNING_MAX_ARMS, TUNING_SWEEP_TIMEOUT_SECS,
+    moe_cache_values, offload_values, placement_values, plan_filter, planned_arm_count, rank_arms,
+    slot_values, spec_values, thermal_tripped, tuning_temp_backend, tuning_temp_backend_mapped,
+    winner_index, ArmPricing, ArmStatus, Descent, ResidencyVerdict, SweepPlan, SweepState,
+    TuningArm, TuningConfirmation, TuningCoords, TuningExclusion, TuningGpu, TuningInputs,
+    TuningStore, TuningSweep, AXIS_ORDER, THERMAL_ABORT_C, THERMAL_ABORT_STREAK,
+    TUNING_ARM_TIMEOUT_SECS, TUNING_MAX_ARMS, TUNING_SWEEP_TIMEOUT_SECS,
 };
 pub use validate::{validate_plan, ItemValidation, LiveSnapshot, ValidationStatus};

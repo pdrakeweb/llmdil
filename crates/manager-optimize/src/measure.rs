@@ -594,8 +594,7 @@ impl MeasurementStore {
                 None => true,
                 Some((b, bd)) => {
                     diffs.len() < bd.len()
-                        || (diffs.len() == bd.len()
-                            && winner_key(entry) >= winner_key(b))
+                        || (diffs.len() == bd.len() && winner_key(entry) >= winner_key(b))
                 }
             };
             if replace {
@@ -624,11 +623,7 @@ impl MeasurementStore {
 
     /// The estimate for one backend under its current
     /// fingerprint, when one exists.
-    pub fn current_estimate(
-        &self,
-        backend_id: &str,
-        fingerprint: &str,
-    ) -> Option<&EstimateEntry> {
+    pub fn current_estimate(&self, backend_id: &str, fingerprint: &str) -> Option<&EstimateEntry> {
         self.estimates
             .iter()
             .find(|e| e.backend_id == backend_id && e.fingerprint == fingerprint)
@@ -689,6 +684,8 @@ fn offload_label(offload: ExpertOffload) -> String {
         ExpertOffload::None => "none".to_string(),
         ExpertOffload::AllExperts => "all_experts".to_string(),
         ExpertOffload::CpuMoeLayers(n) => format!("cpu_moe_layers:{n}"),
+        // The patterns themselves are in the fingerprint's raw flags.
+        ExpertOffload::TensorOverrides => "tensor_overrides".to_string(),
     }
 }
 
@@ -820,9 +817,9 @@ pub fn facts(
     backend_ids.sort();
     let mut out = Vec::new();
     let push_fact = |out: &mut Vec<ThroughputFact>,
-                         backend_id: &str,
-                         entry: &MeasurementEntry,
-                         superseded: bool| {
+                     backend_id: &str,
+                     entry: &MeasurementEntry,
+                     superseded: bool| {
         let measured_at = DateTime::parse_from_rfc3339(&entry.measured_at)
             .map(|t| t.with_timezone(&Utc))
             .unwrap_or(now);
@@ -1044,10 +1041,7 @@ mod tests {
             loaded.current("planner", "fp1").unwrap().app_version,
             "0.1.34"
         );
-        assert_eq!(
-            loaded.lookup("fp1").unwrap().app_version,
-            "0.1.34"
-        );
+        assert_eq!(loaded.lookup("fp1").unwrap().app_version, "0.1.34");
         assert!(loaded.current("planner", "nope").is_none());
         assert!(loaded.lookup("nope").is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1126,10 +1120,7 @@ mod tests {
         // the estimates list.
         assert_eq!(store.estimates.len(), 1);
         assert_eq!(store.estimates[0].fingerprint, "fp-a");
-        assert_eq!(
-            store.estimates[0].short.predicted_per_second,
-            Some(99.0)
-        );
+        assert_eq!(store.estimates[0].short.predicted_per_second, Some(99.0));
         // The next save persists v2 with both lists, and the
         // reloaded store equals the migrated one.
         store.save(&path).unwrap();
@@ -1237,7 +1228,12 @@ mod tests {
         // and the nearest remaining candidate is B at two
         // differing fields.
         let (winner, diffs) = store
-            .near_match("m1", Some("abc123"), None, &snapshot(16384, 512, &["0:GPU A"]))
+            .near_match(
+                "m1",
+                Some("abc123"),
+                None,
+                &snapshot(16384, 512, &["0:GPU A"]),
+            )
             .expect("entry B is the near match for the exact-A target");
         assert_eq!(winner.fingerprint, "fp-b");
         assert_eq!(diffs, vec!["batch", "GPU set"]);
@@ -1285,8 +1281,7 @@ mod tests {
             prompts
                 .iter()
                 .map(|p| {
-                    (p.text.len() as f64 / 4.0 / 810.0 + p.max_tokens as f64 / 21.0)
-                        * runs as f64
+                    (p.text.len() as f64 / 4.0 / 810.0 + p.max_tokens as f64 / 21.0) * runs as f64
                 })
                 .sum()
         };
@@ -1331,7 +1326,10 @@ mod tests {
         assert_eq!(store.entries.len(), 2);
         assert_eq!(store.estimates.len(), 1);
         assert_eq!(
-            store.current_estimate("planner", "fp1").unwrap().estimated_at,
+            store
+                .current_estimate("planner", "fp1")
+                .unwrap()
+                .estimated_at,
             "2026-10-17T12:30:00Z"
         );
         store.upsert_estimate(estimate_entry("fp1", "planner", "2026-10-17T14:00:00Z"));
@@ -1355,8 +1353,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         // A pre-#56 file (no "estimates" key) loads with an
         // empty estimate list and its entries intact.
-        let legacy: MeasurementStore =
-            serde_json::from_str(r#"{ "entries": [] }"#).unwrap();
+        let legacy: MeasurementStore = serde_json::from_str(r#"{ "entries": [] }"#).unwrap();
         assert!(legacy.estimates.is_empty());
     }
 

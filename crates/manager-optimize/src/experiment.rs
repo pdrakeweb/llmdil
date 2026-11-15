@@ -405,8 +405,7 @@ fn non_candidate_problems(
     // the pin, never inferred (§B.1) — and within the control's
     // range; a slot count must be at least 1.
     if let Some(n) = proposal.flags.mtp_n_max {
-        if !(manager_models::mtp::MTP_N_MAX_MIN..=manager_models::mtp::MTP_N_MAX_MAX).contains(&n)
-        {
+        if !(manager_models::mtp::MTP_N_MAX_MIN..=manager_models::mtp::MTP_N_MAX_MAX).contains(&n) {
             problems.push(format!(
                 "mtp_n_max {n} is outside the draft-length range {}..={}",
                 manager_models::mtp::MTP_N_MAX_MIN,
@@ -562,7 +561,10 @@ pub fn apply_experiment_decision(
     experiment_id: usize,
     decision: Decision,
 ) -> Option<Vec<String>> {
-    let pos = plan.experiments.iter().position(|e| e.id == experiment_id)?;
+    let pos = plan
+        .experiments
+        .iter()
+        .position(|e| e.id == experiment_id)?;
     let provisioning = plan.experiments[pos].provisioning.clone();
     let mut newly_denied: Vec<String> = Vec::new();
     if decision == Decision::Denied && plan.experiments[pos].decision != Decision::Denied {
@@ -664,9 +666,10 @@ pub fn resolve_candidate(
     }
     if is_hf_form(candidate) {
         let file_name = candidate.rsplit('/').next().unwrap_or_default();
-        if let Some(m) = registered.iter().find(|m| {
-            m.path.file_name().map(|n| n.to_string_lossy()) == Some(file_name.into())
-        }) {
+        if let Some(m) = registered
+            .iter()
+            .find(|m| m.path.file_name().map(|n| n.to_string_lossy()) == Some(file_name.into()))
+        {
             return if file_exists(&m.path) {
                 CandidateResolution::OnDisk {
                     model_id: candidate.to_string(),
@@ -683,7 +686,10 @@ pub fn resolve_candidate(
                 path: under_models,
             }
         } else {
-            not_on_disk(candidate, "no file with that name is in the models directory")
+            not_on_disk(
+                candidate,
+                "no file with that name is in the models directory",
+            )
         };
     }
     not_on_disk(
@@ -704,9 +710,7 @@ pub fn lowest_free_port(used: &HashSet<u16>, gateway_port: u16, postgres_port: u
     let mut used = used.clone();
     used.insert(gateway_port);
     used.insert(postgres_port);
-    (8081..=8999)
-        .find(|p| !used.contains(p))
-        .unwrap_or(8999)
+    (8081..=8999).find(|p| !used.contains(p)).unwrap_or(8999)
 }
 
 /// The preflight fit verdict, stated in numbers (§A.3 step 1):
@@ -784,10 +788,24 @@ pub fn temp_backend_config(
     port: u16,
     moe_layers: Option<u32>,
 ) -> BackendConfig {
+    temp_backend_config_mapped(proposal, model_file, port, moe_layers, None)
+}
+
+/// [`temp_backend_config`] with the model's MoE block map: the
+/// proposal's `offload_layers` counts MoE layers and is written at
+/// its `--n-cpu-moe` block-index bound (code review v0.1.60 item
+/// 11). `None` is the identity.
+pub fn temp_backend_config_mapped(
+    proposal: &ExperimentProposal,
+    model_file: PathBuf,
+    port: u16,
+    moe_layers: Option<u32>,
+    moe_block_map: Option<&manager_models::MoeBlockMap>,
+) -> BackendConfig {
     let split = proposal.flags.tensor_split.clone().unwrap_or_default();
     let mut raw_flags = proposal.flags.offload_layers.and_then(|n| {
         let offload = match moe_layers {
-            Some(moe) => manager_models::offload_for_layers(n, moe),
+            Some(moe) => manager_models::offload_for_moe_layers(n, moe, moe_block_map),
             None => manager_models::ExpertOffload::CpuMoeLayers(n),
         };
         manager_models::set_expert_offload(None, offload)
@@ -850,9 +868,7 @@ pub fn experiment_result_fact(result: &ExperimentResult) -> crate::context::Expe
     let (prompt, predicted, ttft, short_pred, long_pred) = match &result.measured {
         Some(m) => (
             m.long.prompt_per_second.or(m.short.prompt_per_second),
-            m.short
-                .predicted_per_second
-                .or(m.long.predicted_per_second),
+            m.short.predicted_per_second.or(m.long.predicted_per_second),
             m.short.ttft_ms.or(m.long.ttft_ms),
             m.short.predicted_per_second,
             m.long.predicted_per_second,
@@ -1052,8 +1068,8 @@ mod tests {
             mtp: None,
         });
         for cand in [
-            "my-model",              // registered
-            "qwen3-coder-30b",       // curated catalog id
+            "my-model",                                          // registered
+            "qwen3-coder-30b",                                   // curated catalog id
             "Qwen/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf", // HF form
         ] {
             let v = validate_experiment(&proposal(cand), &c, &[], None);
@@ -1141,6 +1157,31 @@ mod tests {
     }
 
     #[test]
+    fn temp_backend_writes_moe_layers_at_their_block_bound() {
+        // Review item 11: 2 leading dense blocks, 48 MoE blocks
+        // (2..=49). 24 MoE layers is `--n-cpu-moe 26`.
+        let map = manager_models::MoeBlockMap::from_block_indices(2..50);
+        let mut p = proposal("qwen3-coder-30b");
+        p.flags.offload_layers = Some(24);
+        let temp = temp_backend_config_mapped(
+            &p,
+            PathBuf::from("models/coder.gguf"),
+            18099,
+            Some(48),
+            map.as_ref(),
+        );
+        assert_eq!(temp.raw_flags.as_deref(), Some("--n-cpu-moe 26"));
+        // Endpoints are unaffected; no map is the identity.
+        p.flags.offload_layers = Some(48);
+        let temp =
+            temp_backend_config_mapped(&p, PathBuf::from("m.gguf"), 1, Some(48), map.as_ref());
+        assert_eq!(temp.raw_flags.as_deref(), Some("-ot exps=CPU"));
+        p.flags.offload_layers = Some(24);
+        let temp = temp_backend_config_mapped(&p, PathBuf::from("m.gguf"), 1, Some(48), None);
+        assert_eq!(temp.raw_flags.as_deref(), Some("--n-cpu-moe 24"));
+    }
+
+    #[test]
     fn temp_backend_carries_the_expert_cache_token() {
         // Full offload + cache: the token rides the all-experts
         // form the offload encoding writes.
@@ -1204,7 +1245,10 @@ mod tests {
         // Catalog id with no registered model: not on disk.
         match resolve_candidate("catalog-only", &registered, &catalog, models_dir, exists) {
             CandidateResolution::NotOnDisk { message } => {
-                assert!(message.contains("register and download it in the Models view"), "{message}");
+                assert!(
+                    message.contains("register and download it in the Models view"),
+                    "{message}"
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -1243,7 +1287,10 @@ mod tests {
             }];
             match resolve_candidate(cand, &registered2, &catalog, models_dir, exists) {
                 CandidateResolution::NotOnDisk { message } => {
-                    assert!(message.contains("register and download it in the Models view"), "{cand}: {message}");
+                    assert!(
+                        message.contains("register and download it in the Models view"),
+                        "{cand}: {message}"
+                    );
                 }
                 other => panic!("{cand}: {other:?}"),
             }
@@ -1265,14 +1312,11 @@ mod tests {
         assert!(alongside.contains("fits alongside"), "{alongside}");
         assert!(alongside.contains("9000 MiB"), "{alongside}");
         assert!(alongside.contains("12000 MiB"), "{alongside}");
-        let stopping = fit_verdict_text(
-            9000,
-            12000,
-            false,
-            true,
-            &["coder".to_string()],
+        let stopping = fit_verdict_text(9000, 12000, false, true, &["coder".to_string()]);
+        assert!(
+            stopping.contains("fits only after stopping coder"),
+            "{stopping}"
         );
-        assert!(stopping.contains("fits only after stopping coder"), "{stopping}");
         let no = fit_verdict_text(24000, 12000, false, false, &["coder".to_string()]);
         assert!(no.contains("does not fit"), "{no}");
         assert!(no.contains("24000 MiB"), "{no}");
@@ -1440,10 +1484,7 @@ mod tests {
                 reason: None,
             }],
         );
-        r.comparison = Some(crate::eval::compare(
-            &run.scores,
-            &aggregate_results(&[]),
-        ));
+        r.comparison = Some(crate::eval::compare(&run.scores, &aggregate_results(&[])));
         r.eval = Some(run);
         let text = serde_json::to_string(&r).unwrap();
         let back: ExperimentResult = serde_json::from_str(&text).unwrap();

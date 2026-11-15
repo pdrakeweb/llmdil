@@ -1,11 +1,12 @@
 //! Validation warnings for hand-edited raw llama-server flags
 //! (tracker #60, the advanced flags editor).
 //!
-//! The editor's rule is warn, never block: any string saves, and
-//! these warnings are how the app says what it noticed. The check
-//! tokenizes with the same whitespace split every flag decoder in
-//! this crate uses ([`super::memory::expert_offload`],
-//! [`super::mtp::mtp_draft`]) and judges tokens against the flag
+//! The editor's rule is warn, never block — with one exception,
+//! [`raw_flag_errors`]: a string llama-server is certain to reject
+//! at startup. Any other string saves, and these warnings are how
+//! the app says what it noticed. The check tokenizes with
+//! [`split_raw_flags`], the launcher's own tokenizer (shell-like
+//! quotes, literal backslashes), and judges tokens against the flag
 //! set the codebase itself recognizes — the flags its decoders
 //! own, the flags its launch builder emits or interprets, and the
 //! placement/GPU flags its placement code decodes. A flag outside
@@ -68,56 +69,428 @@ fn flag_spec(name: &str) -> Option<&'static FlagSpec> {
     use ValueKind::*;
     static SPECS: &[(&str, &FlagSpec)] = &[
         // Owned by this crate's decoders (memory.rs / mtp.rs).
-        ("--n-cpu-moe", &FlagSpec { canonical: "--n-cpu-moe", reserved: false, arity: Value(Int) }),
-        ("-ncmoe", &FlagSpec { canonical: "--n-cpu-moe", reserved: false, arity: Value(Int) }),
-        ("--cpu-moe", &FlagSpec { canonical: "--cpu-moe", reserved: false, arity: None }),
-        ("-cmoe", &FlagSpec { canonical: "--cpu-moe", reserved: false, arity: None }),
-        ("--override-tensor", &FlagSpec { canonical: "--override-tensor", reserved: false, arity: MultiValue(Any) }),
-        ("-ot", &FlagSpec { canonical: "--override-tensor", reserved: false, arity: MultiValue(Any) }),
-        ("--cache-type-k", &FlagSpec { canonical: "--cache-type-k", reserved: false, arity: Value(Any) }),
-        ("-ctk", &FlagSpec { canonical: "--cache-type-k", reserved: false, arity: Value(Any) }),
-        ("--cache-type-v", &FlagSpec { canonical: "--cache-type-v", reserved: false, arity: Value(Any) }),
-        ("-ctv", &FlagSpec { canonical: "--cache-type-v", reserved: false, arity: Value(Any) }),
-        ("--flash-attn", &FlagSpec { canonical: "--flash-attn", reserved: false, arity: Value(Any) }),
-        ("-fa", &FlagSpec { canonical: "--flash-attn", reserved: false, arity: Value(Any) }),
-        ("--spec-type", &FlagSpec { canonical: "--spec-type", reserved: false, arity: Value(Any) }),
-        ("--spec-draft-n-max", &FlagSpec { canonical: "--spec-draft-n-max", reserved: false, arity: Value(Int) }),
-        ("--parallel", &FlagSpec { canonical: "--parallel", reserved: false, arity: Value(Int) }),
-        ("-np", &FlagSpec { canonical: "--parallel", reserved: false, arity: Value(Int) }),
+        (
+            "--n-cpu-moe",
+            &FlagSpec {
+                canonical: "--n-cpu-moe",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "-ncmoe",
+            &FlagSpec {
+                canonical: "--n-cpu-moe",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--cpu-moe",
+            &FlagSpec {
+                canonical: "--cpu-moe",
+                reserved: false,
+                arity: None,
+            },
+        ),
+        (
+            "-cmoe",
+            &FlagSpec {
+                canonical: "--cpu-moe",
+                reserved: false,
+                arity: None,
+            },
+        ),
+        (
+            "--override-tensor",
+            &FlagSpec {
+                canonical: "--override-tensor",
+                reserved: false,
+                arity: MultiValue(Any),
+            },
+        ),
+        (
+            "-ot",
+            &FlagSpec {
+                canonical: "--override-tensor",
+                reserved: false,
+                arity: MultiValue(Any),
+            },
+        ),
+        (
+            "--cache-type-k",
+            &FlagSpec {
+                canonical: "--cache-type-k",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "-ctk",
+            &FlagSpec {
+                canonical: "--cache-type-k",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--cache-type-v",
+            &FlagSpec {
+                canonical: "--cache-type-v",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "-ctv",
+            &FlagSpec {
+                canonical: "--cache-type-v",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--flash-attn",
+            &FlagSpec {
+                canonical: "--flash-attn",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "-fa",
+            &FlagSpec {
+                canonical: "--flash-attn",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--spec-type",
+            &FlagSpec {
+                canonical: "--spec-type",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--spec-draft-n-max",
+            &FlagSpec {
+                canonical: "--spec-draft-n-max",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--parallel",
+            &FlagSpec {
+                canonical: "--parallel",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "-np",
+            &FlagSpec {
+                canonical: "--parallel",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
         // Emitted from the structured flags by the launch builder
         // (backend_spec): repeating one in raw flags overrides the
         // structured value at llama.cpp's sequential parse.
-        ("--model", &FlagSpec { canonical: "--model", reserved: false, arity: Value(Any) }),
-        ("-m", &FlagSpec { canonical: "--model", reserved: false, arity: Value(Any) }),
-        ("--port", &FlagSpec { canonical: "--port", reserved: false, arity: Value(Int) }),
-        ("--ctx-size", &FlagSpec { canonical: "--ctx-size", reserved: false, arity: Value(Int) }),
-        ("-c", &FlagSpec { canonical: "--ctx-size", reserved: false, arity: Value(Int) }),
-        ("--batch-size", &FlagSpec { canonical: "--batch-size", reserved: false, arity: Value(Int) }),
-        ("-b", &FlagSpec { canonical: "--batch-size", reserved: false, arity: Value(Int) }),
-        ("--tensor-split", &FlagSpec { canonical: "--tensor-split", reserved: false, arity: Value(Any) }),
-        ("-ts", &FlagSpec { canonical: "--tensor-split", reserved: false, arity: Value(Any) }),
-        ("--split-mode", &FlagSpec { canonical: "--split-mode", reserved: false, arity: Value(Any) }),
+        (
+            "--model",
+            &FlagSpec {
+                canonical: "--model",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "-m",
+            &FlagSpec {
+                canonical: "--model",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--port",
+            &FlagSpec {
+                canonical: "--port",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--ctx-size",
+            &FlagSpec {
+                canonical: "--ctx-size",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "-c",
+            &FlagSpec {
+                canonical: "--ctx-size",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--batch-size",
+            &FlagSpec {
+                canonical: "--batch-size",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "-b",
+            &FlagSpec {
+                canonical: "--batch-size",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--tensor-split",
+            &FlagSpec {
+                canonical: "--tensor-split",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "-ts",
+            &FlagSpec {
+                canonical: "--tensor-split",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--split-mode",
+            &FlagSpec {
+                canonical: "--split-mode",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
         // Interpreted or remapped by the launch builder's
         // placement code (device selection follows placement).
-        ("--device", &FlagSpec { canonical: "--device", reserved: false, arity: Value(Any) }),
-        ("-dev", &FlagSpec { canonical: "--device", reserved: false, arity: Value(Any) }),
-        ("--main-gpu", &FlagSpec { canonical: "--main-gpu", reserved: false, arity: Value(Int) }),
-        ("--gpu-layers", &FlagSpec { canonical: "--gpu-layers", reserved: false, arity: Value(Int) }),
-        ("--n-gpu-layers", &FlagSpec { canonical: "--gpu-layers", reserved: false, arity: Value(Int) }),
-        ("-ngl", &FlagSpec { canonical: "--gpu-layers", reserved: false, arity: Value(Int) }),
-        ("--threads", &FlagSpec { canonical: "--threads", reserved: false, arity: Value(Int) }),
-        ("-t", &FlagSpec { canonical: "--threads", reserved: false, arity: Value(Int) }),
+        (
+            "--device",
+            &FlagSpec {
+                canonical: "--device",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "-dev",
+            &FlagSpec {
+                canonical: "--device",
+                reserved: false,
+                arity: Value(Any),
+            },
+        ),
+        (
+            "--main-gpu",
+            &FlagSpec {
+                canonical: "--main-gpu",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--gpu-layers",
+            &FlagSpec {
+                canonical: "--gpu-layers",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--n-gpu-layers",
+            &FlagSpec {
+                canonical: "--gpu-layers",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "-ngl",
+            &FlagSpec {
+                canonical: "--gpu-layers",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "--threads",
+            &FlagSpec {
+                canonical: "--threads",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
+        (
+            "-t",
+            &FlagSpec {
+                canonical: "--threads",
+                reserved: false,
+                arity: Value(Int),
+            },
+        ),
         // App-owned launch flags: --jinja is emitted by the app
         // itself; its negation and --host are filtered out of raw
         // flags at launch (backends bind loopback behind the
         // gateway, and tool calling depends on --jinja), so
         // writing them is a no-op the operator should hear about.
-        ("--jinja", &FlagSpec { canonical: "--jinja", reserved: false, arity: None }),
-        ("--no-jinja", &FlagSpec { canonical: "--no-jinja", reserved: true, arity: None }),
-        ("--no_jinja", &FlagSpec { canonical: "--no-jinja", reserved: true, arity: None }),
-        ("--host", &FlagSpec { canonical: "--host", reserved: true, arity: Value(Any) }),
+        (
+            "--jinja",
+            &FlagSpec {
+                canonical: "--jinja",
+                reserved: false,
+                arity: None,
+            },
+        ),
+        (
+            "--no-jinja",
+            &FlagSpec {
+                canonical: "--no-jinja",
+                reserved: true,
+                arity: None,
+            },
+        ),
+        (
+            "--no_jinja",
+            &FlagSpec {
+                canonical: "--no-jinja",
+                reserved: true,
+                arity: None,
+            },
+        ),
+        (
+            "--host",
+            &FlagSpec {
+                canonical: "--host",
+                reserved: true,
+                arity: Value(Any),
+            },
+        ),
     ];
     SPECS.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
+}
+
+/// Split raw llama-server flags into argv the way the launcher
+/// passes them (no shell is involved). The rule is a deliberately
+/// small subset of POSIX shell word splitting:
+///
+/// - unquoted whitespace separates arguments;
+/// - `'…'` and `"…"` group their contents into the current
+///   argument (whitespace included) and the quote characters are
+///   removed; quoted and unquoted text that touch form one
+///   argument (`-ot="a b"=CPU` is the one argument `-ot=a b=CPU`);
+/// - a backslash is ALWAYS literal — inside or outside quotes,
+///   before a quote or not. Raw flags carry regexes
+///   (`-ot "blk\.1\.ffn_.*_exps=CPU"`) whose backslashes must
+///   reach llama-server untouched, so there is no escape
+///   character at all; a literal `"` is written inside `'…'` and
+///   a literal `'` inside `"…"`;
+/// - an empty pair of quotes (`""` / `''`) is an empty argument;
+/// - an unterminated quote runs to the end of the string.
+///
+/// So `-ot "blk\..=CPU"`, `-ot 'blk\..=CPU'` and `-ot blk\..=CPU`
+/// all produce the same argv.
+pub fn split_raw_flags(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    // An argument is open once any character or quote pair has
+    // started it — so `""` yields an empty argument.
+    let mut open = false;
+    let mut quote: Option<char> = None;
+    for c in raw.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => cur.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                open = true;
+            }
+            None if c.is_whitespace() => {
+                if open {
+                    out.push(std::mem::take(&mut cur));
+                    open = false;
+                }
+            }
+            None => {
+                cur.push(c);
+                open = true;
+            }
+        }
+    }
+    if open {
+        out.push(cur);
+    }
+    out
+}
+
+/// Errors that make a raw-flags string unusable at llama-server
+/// startup, so the advanced editor's save refuses it (unlike
+/// [`raw_flag_warnings`], which never blocks).
+///
+/// Today one rule: llama-server splits an `-ot` /
+/// `--override-tensor` value on EVERY comma
+/// (`string_split(value, ',')`, see
+/// [`super::memory::overrides`]), so a pattern whose own syntax
+/// contains a comma — a `{m,n}` quantifier, or a comma in a
+/// character class or group — is cut apart and rejected at
+/// startup. The value is judged after [`split_raw_flags`]
+/// tokenization, exactly as it would be launched.
+pub fn raw_flag_errors(raw_flags: Option<&str>) -> Vec<FlagWarning> {
+    let Some(raw) = raw_flags else {
+        return Vec::new();
+    };
+    let tokens = split_raw_flags(raw);
+    let mut errors = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i].as_str();
+        let (flag, value) = if t == "-ot" || t == "--override-tensor" {
+            i += 1;
+            (t, tokens.get(i).map(String::as_str))
+        } else if let Some(v) = t.strip_prefix("-ot=") {
+            ("-ot", Some(v))
+        } else if let Some(v) = t.strip_prefix("--override-tensor=") {
+            ("--override-tensor", Some(v))
+        } else {
+            i += 1;
+            continue;
+        };
+        i += 1;
+        let Some(value) = value else { continue };
+        let naive = value.split(',').count();
+        let meant = super::memory::overrides::split_overrides(value).len();
+        if naive != meant {
+            errors.push(FlagWarning {
+                token: value.to_string(),
+                message: format!(
+                    "`{flag} {value}`: llama-server splits {flag} values on every comma, \
+                     so a comma inside a `{{m,n}}` quantifier, a character class or a group \
+                     breaks the pattern and the server refuses to start; write the \
+                     repetition as an alternation instead (for example \
+                     `blk\\.(1[0-9]|2[0-3])\\.` rather than `blk\\.[12][0-9]{{0,1}}\\.`), \
+                     or use one {flag} per override"
+                ),
+            });
+        }
+    }
+    errors
 }
 
 /// Warnings for a raw-flags string, in token order. An empty or
@@ -129,7 +502,8 @@ pub fn raw_flag_warnings(raw_flags: Option<&str>) -> Vec<FlagWarning> {
     let Some(raw) = raw_flags else {
         return Vec::new();
     };
-    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let owned = split_raw_flags(raw);
+    let tokens: Vec<&str> = owned.iter().map(String::as_str).collect();
     let mut warnings: Vec<FlagWarning> = Vec::new();
     let mut seen: Vec<&'static str> = Vec::new();
     let mut i = 0;
@@ -237,9 +611,7 @@ pub fn raw_flag_warnings(raw_flags: Option<&str>) -> Vec<FlagWarning> {
                         if kind == ValueKind::Int && v.parse::<i64>().is_err() {
                             warnings.push(FlagWarning {
                                 token: t.to_string(),
-                                message: format!(
-                                    "`{name}` expects a number; `{v}` is not one"
-                                ),
+                                message: format!("`{name}` expects a number; `{v}` is not one"),
                             });
                         }
                     }
@@ -355,5 +727,75 @@ mod tests {
         let w = raw_flag_warnings(Some("--cpu-moe=yes"));
         assert_eq!(w.len(), 1);
         assert!(w[0].message.contains("takes no value"));
+    }
+
+    fn argv(raw: &str) -> Vec<String> {
+        split_raw_flags(raw)
+    }
+
+    #[test]
+    fn quoted_and_unquoted_flags_tokenize_identically() {
+        let plain = argv(r"-ot blk\..=CPU --threads 8");
+        assert_eq!(plain, vec!["-ot", r"blk\..=CPU", "--threads", "8"]);
+        assert_eq!(argv(r#"-ot "blk\..=CPU" --threads 8"#), plain);
+        assert_eq!(argv(r"-ot 'blk\..=CPU' --threads 8"), plain);
+        // Quotes touching unquoted text join into one argument.
+        assert_eq!(
+            argv(r#"-ot="blk\.(1|2)\.ffn_.*_exps=CPU""#),
+            vec![r"-ot=blk\.(1|2)\.ffn_.*_exps=CPU"]
+        );
+        // Whitespace inside quotes is kept; runs outside collapse.
+        assert_eq!(argv("  --a   'x  y'\t\n--b "), vec!["--a", "x  y", "--b"]);
+    }
+
+    #[test]
+    fn backslashes_are_always_literal() {
+        // A regex's escapes survive, inside and outside quotes —
+        // including a backslash right before a closing quote.
+        assert_eq!(
+            argv(r#"-ot "blk\.[0-9]\.ffn_up_exps\.weight=CPU""#),
+            vec!["-ot", r"blk\.[0-9]\.ffn_up_exps\.weight=CPU"]
+        );
+        assert_eq!(argv(r#""a\\" b"#), vec![r"a\\", "b"]);
+        assert_eq!(argv(r"a\ b"), vec![r"a\", "b"]);
+        // The other quote kind is literal inside a quoted run.
+        assert_eq!(argv(r#"'say "hi"' "it's""#), vec![r#"say "hi""#, "it's"]);
+    }
+
+    #[test]
+    fn empty_quotes_and_unterminated_quotes() {
+        assert_eq!(argv(r#"--alias "" -x"#), vec!["--alias", "", "-x"]);
+        assert_eq!(argv("''"), vec![""]);
+        assert!(argv("").is_empty());
+        assert!(argv("   ").is_empty());
+        // An unterminated quote runs to the end of the string.
+        assert_eq!(argv(r#"-ot "a b"#), vec!["-ot", "a b"]);
+    }
+
+    #[test]
+    fn quoted_values_do_not_warn() {
+        assert!(messages(r#"-ot "blk\..=CPU" --parallel '1'"#).is_empty());
+    }
+
+    #[test]
+    fn override_comma_inside_a_quantifier_is_an_error() {
+        let e = raw_flag_errors(Some(r#"-ot "blk\.[0-9]{1,2}\.ffn_up_exps=CPU""#));
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].token, r"blk\.[0-9]{1,2}\.ffn_up_exps=CPU");
+        assert!(e[0].message.contains("every comma"));
+        assert!(e[0].message.contains("alternation"));
+        // Both spellings, and a comma in a class or group.
+        assert_eq!(
+            raw_flag_errors(Some("--override-tensor=a{1,2}=CPU")).len(),
+            1
+        );
+        assert_eq!(raw_flag_errors(Some("-ot [,]=CPU")).len(), 1);
+        assert_eq!(raw_flag_errors(Some("-ot (a,b)=CPU")).len(), 1);
+        // Top-level comma lists, alternations and other flags are fine.
+        assert!(raw_flag_errors(Some("-ot exps=CPU,blk\\.1\\.=CUDA0")).is_empty());
+        assert!(raw_flag_errors(Some(r"-ot blk\.(1[0-9]|2[0-3])\.=CPU")).is_empty());
+        assert!(raw_flag_errors(Some("--threads 8 --n-cpu-moe 4")).is_empty());
+        assert!(raw_flag_errors(None).is_empty());
+        assert!(raw_flag_errors(Some("-ot")).is_empty());
     }
 }

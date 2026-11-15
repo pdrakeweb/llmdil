@@ -51,14 +51,38 @@ pub const AUTH_ROUTES: &[(&str, &str, AuthClass)] = &[
     ("POST", "/api/v1/auth/logout", AuthClass::Authenticated),
     ("POST", "/api/v1/auth/password", AuthClass::Authenticated),
     ("GET", "/api/v1/auth/sessions", AuthClass::Authenticated),
-    ("DELETE", "/api/v1/auth/sessions/{id}", AuthClass::Authenticated),
+    (
+        "DELETE",
+        "/api/v1/auth/sessions/{id}",
+        AuthClass::Authenticated,
+    ),
     ("POST", "/api/v1/auth/totp/enroll", AuthClass::Authenticated),
     ("POST", "/api/v1/auth/totp/verify", AuthClass::Authenticated),
-    ("POST", "/api/v1/auth/totp/disable", AuthClass::Authenticated),
-    ("GET", "/api/v1/admin/users", AuthClass::Class(CapClass::UserAdmin)),
-    ("POST", "/api/v1/admin/users", AuthClass::Class(CapClass::UserAdmin)),
-    ("PATCH", "/api/v1/admin/users/{id}", AuthClass::Class(CapClass::UserAdmin)),
-    ("DELETE", "/api/v1/admin/users/{id}", AuthClass::Class(CapClass::UserAdmin)),
+    (
+        "POST",
+        "/api/v1/auth/totp/disable",
+        AuthClass::Authenticated,
+    ),
+    (
+        "GET",
+        "/api/v1/admin/users",
+        AuthClass::Class(CapClass::UserAdmin),
+    ),
+    (
+        "POST",
+        "/api/v1/admin/users",
+        AuthClass::Class(CapClass::UserAdmin),
+    ),
+    (
+        "PATCH",
+        "/api/v1/admin/users/{id}",
+        AuthClass::Class(CapClass::UserAdmin),
+    ),
+    (
+        "DELETE",
+        "/api/v1/admin/users/{id}",
+        AuthClass::Class(CapClass::UserAdmin),
+    ),
     (
         "POST",
         "/api/v1/admin/users/{id}/reset-password",
@@ -74,8 +98,16 @@ pub const AUTH_ROUTES: &[(&str, &str, AuthClass)] = &[
         "/api/v1/admin/users/{id}/sessions/{session_id}",
         AuthClass::Class(CapClass::UserAdmin),
     ),
-    ("GET", "/api/v1/admin/api-tokens", AuthClass::Class(CapClass::UserAdmin)),
-    ("POST", "/api/v1/admin/api-tokens", AuthClass::Class(CapClass::UserAdmin)),
+    (
+        "GET",
+        "/api/v1/admin/api-tokens",
+        AuthClass::Class(CapClass::UserAdmin),
+    ),
+    (
+        "POST",
+        "/api/v1/admin/api-tokens",
+        AuthClass::Class(CapClass::UserAdmin),
+    ),
     (
         "DELETE",
         "/api/v1/admin/api-tokens/{id}",
@@ -170,9 +202,10 @@ fn resolve_template<'a>(
         if tsegs.len() != path_segs.len() {
             continue;
         }
-        let matches = tsegs.iter().zip(&path_segs).all(|(t, p)| {
-            (t.starts_with('{') && t.ends_with('}')) || t == p
-        });
+        let matches = tsegs
+            .iter()
+            .zip(&path_segs)
+            .all(|(t, p)| (t.starts_with('{') && t.ends_with('}')) || t == p);
         if matches {
             return Some(class);
         }
@@ -211,7 +244,7 @@ pub async fn auth_middleware(
     let source_ip = req
         .extensions()
         .get::<ConnectInfo<crate::PeerAddr>>()
-        .map(|c| c.0.0.ip().to_string())
+        .map(|c| c.0 .0.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     req.extensions_mut().insert(SourceIp(source_ip.clone()));
 
@@ -237,6 +270,29 @@ pub async fn auth_middleware(
             match token {
                 Some(token) => match mw.ctx.auth.validate_bearer(&token).await {
                     Some(p) => {
+                        // SEC-03: an account flagged must-change (admin
+                        // reset) reaches only the change-password path.
+                        // The flag is read from the user store by
+                        // validate_bearer, for sessions and API tokens.
+                        if p.must_change_password && !password_change_exempt(&class_method, &path) {
+                            mw.ctx.audit.append(&AuditEntry {
+                                ts_ms: now_ms(),
+                                actor: p.username.clone(),
+                                auth_type: p.auth_type.as_str().to_string(),
+                                source_ip: source_ip.clone(),
+                                action: format!(
+                                    "{method} {}",
+                                    template_for_audit(&mw.table, &method, &path)
+                                ),
+                                target: audit_target(&path),
+                                result: "password_change_required".to_string(),
+                                request_id: request_id.clone(),
+                            });
+                            return finish(
+                                auth_error_response(&AuthError::PasswordChangeRequired),
+                                &request_id,
+                            );
+                        }
                         if let AuthClass::Class(c) = class {
                             if !role_allows(p.role, c) {
                                 return finish(
@@ -304,6 +360,22 @@ pub async fn auth_middleware(
         }
     }
     finish(resp, &request_id)
+}
+
+/// Routes open to a principal whose account must change its password
+/// (SEC-03, auth plan §3.6): the change itself, logging out, and
+/// reading `/auth/me` (which reports the flag). `method` is the
+/// class-resolution method, so HEAD counts as GET.
+pub const PASSWORD_CHANGE_EXEMPT: &[(&str, &str)] = &[
+    ("POST", "/api/v1/auth/password"),
+    ("POST", "/api/v1/auth/logout"),
+    ("GET", "/api/v1/auth/me"),
+];
+
+fn password_change_exempt(method: &Method, path: &str) -> bool {
+    PASSWORD_CHANGE_EXEMPT
+        .iter()
+        .any(|(m, p)| *m == method.as_str() && *p == path)
 }
 
 fn finish(mut resp: Response, request_id: &str) -> Response {
@@ -390,18 +462,21 @@ fn auth_error_response(e: &AuthError) -> Response {
             m,
             None,
         ),
-        AuthError::Forbidden(m) => error_response_raw(
-            StatusCode::FORBIDDEN,
-            "FORBIDDEN",
-            "Forbidden",
-            m,
-            None,
-        ),
+        AuthError::Forbidden(m) => {
+            error_response_raw(StatusCode::FORBIDDEN, "FORBIDDEN", "Forbidden", m, None)
+        }
         AuthError::NotFound(m) => error_response_raw(
             StatusCode::NOT_FOUND,
             "NOT_FOUND",
             "NotFound",
             &format!("not found: {m}"),
+            None,
+        ),
+        AuthError::PasswordChangeRequired => error_response_raw(
+            StatusCode::FORBIDDEN,
+            "PASSWORD_CHANGE_REQUIRED",
+            "PasswordChangeRequired",
+            "this account must change its password first (POST /api/v1/auth/password)",
             None,
         ),
         AuthError::Internal => error_response_raw(
@@ -423,6 +498,9 @@ fn tokens_body(pair: &crate::auth::TokenPair, user: &UserView) -> Value {
         "access_expires_ms": pair.access_expires_ms,
         "refresh_expires_ms": pair.refresh_expires_ms,
         "user": user,
+        // SEC-03: additive top-level copy of the account flag, so a
+        // client routes to change-password without digging into `user`.
+        "must_change_password": user.must_change_password,
     })
 }
 
@@ -477,16 +555,40 @@ pub async fn handle_login(
         .await
     {
         Ok(LoginOutcome::Tokens { pair, user }) => {
-            audit_auth(&ctx, &user.username, "session", &ip, "POST /api/v1/auth/login", "ok", &rid);
+            audit_auth(
+                &ctx,
+                &user.username,
+                "session",
+                &ip,
+                "POST /api/v1/auth/login",
+                "ok",
+                &rid,
+            );
             axum::Json(tokens_body(&pair, &user)).into_response()
         }
         Ok(LoginOutcome::TotpRequired { challenge_id }) => {
-            audit_auth(&ctx, &body.username, "session", &ip, "POST /api/v1/auth/login", "totp_required", &rid);
+            audit_auth(
+                &ctx,
+                &body.username,
+                "session",
+                &ip,
+                "POST /api/v1/auth/login",
+                "totp_required",
+                &rid,
+            );
             axum::Json(json!({ "totp_required": true, "challenge_id": challenge_id }))
                 .into_response()
         }
         Err(e) => {
-            audit_auth(&ctx, &body.username, "session", &ip, "POST /api/v1/auth/login", "invalid_credentials", &rid);
+            audit_auth(
+                &ctx,
+                &body.username,
+                "session",
+                &ip,
+                "POST /api/v1/auth/login",
+                "invalid_credentials",
+                &rid,
+            );
             auth_error_response(&e)
         }
     }
@@ -501,20 +603,46 @@ pub struct TotpBody {
 }
 
 /// POST /api/v1/auth/totp: second login step. One guess per challenge; after a failure
-/// the client logs in again.
+/// the client logs in again. Public route, so success and failure are both audited
+/// here (SEC-13): TOTP logins and TOTP guesses are recorded like password logins.
 pub async fn handle_totp(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(ip): axum::Extension<SourceIp>,
     axum::Json(body): axum::Json<TotpBody>,
 ) -> Response {
     let ip = source_ip(&ip);
+    let rid = uuid::Uuid::new_v4().to_string();
+    // Resolve the actor before the attempt consumes the challenge.
+    let challenged = ctx.auth.totp_challenge_username(&body.challenge_id).await;
     match ctx
         .auth
         .complete_totp_login(&body.challenge_id, &body.code, &ip)
         .await
     {
-        Ok((pair, user)) => axum::Json(tokens_body(&pair, &user)).into_response(),
-        Err(e) => auth_error_response(&e),
+        Ok((pair, user)) => {
+            audit_auth(
+                &ctx,
+                &user.username,
+                "session",
+                &ip,
+                "POST /api/v1/auth/totp",
+                "ok",
+                &rid,
+            );
+            axum::Json(tokens_body(&pair, &user)).into_response()
+        }
+        Err(e) => {
+            audit_auth(
+                &ctx,
+                challenged.as_deref().unwrap_or("unknown"),
+                "session",
+                &ip,
+                "POST /api/v1/auth/totp",
+                "invalid_credentials",
+                &rid,
+            );
+            auth_error_response(&e)
+        }
     }
 }
 
@@ -537,8 +665,31 @@ pub async fn handle_refresh(
     match ctx.auth.refresh(&body.refresh_token).await {
         Ok((pair, user)) => axum::Json(tokens_body(&pair, &user)).into_response(),
         Err(AuthError::SessionRevoked) => {
-            audit_auth(&ctx, "unknown", "session", &ip, "POST /api/v1/auth/refresh", "refresh_reuse_detected", &rid);
+            audit_auth(
+                &ctx,
+                "unknown",
+                "session",
+                &ip,
+                "POST /api/v1/auth/refresh",
+                "refresh_reuse_detected",
+                &rid,
+            );
             auth_error_response(&AuthError::SessionRevoked)
+        }
+        Err(AuthError::PasswordChangeRequired) => {
+            // SEC-03: refresh is public, so the middleware gate never
+            // saw this; audit the refusal here like the gate does.
+            let owner = ctx.auth.refresh_token_owner(&body.refresh_token).await;
+            audit_auth(
+                &ctx,
+                owner.as_deref().unwrap_or("unknown"),
+                "session",
+                &ip,
+                "POST /api/v1/auth/refresh",
+                "password_change_required",
+                &rid,
+            );
+            auth_error_response(&AuthError::PasswordChangeRequired)
         }
         Err(e) => auth_error_response(&e),
     }
@@ -565,11 +716,27 @@ pub async fn handle_enroll(
     let device = body.device_name.as_deref().unwrap_or("unknown device");
     match ctx.auth.redeem_enrollment_code(&body.code, device).await {
         Ok((pair, user)) => {
-            audit_auth(&ctx, &user.username, "enrollment", &ip, "POST /api/v1/enroll", "ok", &rid);
+            audit_auth(
+                &ctx,
+                &user.username,
+                "enrollment",
+                &ip,
+                "POST /api/v1/enroll",
+                "ok",
+                &rid,
+            );
             (StatusCode::CREATED, axum::Json(tokens_body(&pair, &user))).into_response()
         }
         Err(e) => {
-            audit_auth(&ctx, "unknown", "enrollment", &ip, "POST /api/v1/enroll", "invalid_credentials", &rid);
+            audit_auth(
+                &ctx,
+                "unknown",
+                "enrollment",
+                &ip,
+                "POST /api/v1/enroll",
+                "invalid_credentials",
+                &rid,
+            );
             auth_error_response(&e)
         }
     }
@@ -582,10 +749,16 @@ pub async fn handle_me(
 ) -> Response {
     let view = ctx
         .users
-        .read(|f| f.users.iter().find(|u| u.id == p.user_id).map(UserView::from))
+        .read(|f| {
+            f.users
+                .iter()
+                .find(|u| u.id == p.user_id)
+                .map(UserView::from)
+        })
         .await;
     match view {
         Some(user) => axum::Json(json!({
+            "must_change_password": user.must_change_password,
             "user": user,
             "auth_type": p.auth_type.as_str(),
             "session_id": p.session_id,
@@ -698,17 +871,20 @@ pub async fn handle_revoke_session(
     axum::Json(json!({ "ok": true })).into_response()
 }
 
-/// Optional body of `POST /api/v1/auth/totp/enroll`.
+/// Body of `POST /api/v1/auth/totp/enroll`. The body and the field stay
+/// syntactically optional so a missing password is an
+/// `INVALID_CREDENTIALS` step-up failure counted toward the lockout,
+/// not a 400 that would escape it.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct TotpEnrollBody {
-    /// Step-up for replacing a live TOTP factor (code-review B-6):
-    /// the account password. Absent/ignored for first enrollment.
+    /// Step-up: the account password, required for first enrollment
+    /// (SEC-04) and for replacing a live factor (code-review B-6).
     pub password: Option<String>,
 }
 
 /// POST /api/v1/auth/totp/enroll: start (re-)enrollment, returning the secret and otpauth
-/// URI. Session-only; replacing a live factor needs the password (code-review B-6).
+/// URI. Session-only; always needs the account password as step-up (SEC-04, B-6).
 pub async fn handle_totp_enroll(
     State(ctx): State<Arc<ApiCtx>>,
     axum::Extension(p): axum::Extension<Principal>,
@@ -747,7 +923,11 @@ pub async fn handle_totp_verify(
     if let Some(r) = refuse_api_token(&p) {
         return r;
     }
-    match ctx.auth.totp_verify_enrollment(&p.user_id, &body.code).await {
+    match ctx
+        .auth
+        .totp_verify_enrollment(&p.user_id, &body.code)
+        .await
+    {
         Ok(codes) => axum::Json(json!({ "recovery_codes": codes })).into_response(),
         Err(e) => auth_error_response(&e),
     }
@@ -840,9 +1020,7 @@ pub async fn handle_admin_update_user(
         Some(r) => match RoleName::parse(r) {
             Some(parsed) => Some(parsed),
             None => {
-                return auth_error_response(&AuthError::InvalidInput(format!(
-                    "unknown role `{r}`"
-                )))
+                return auth_error_response(&AuthError::InvalidInput(format!("unknown role `{r}`")))
             }
         },
         None => None,
@@ -873,10 +1051,8 @@ pub async fn handle_admin_reset_password(
     Path(id): Path<String>,
 ) -> Response {
     match ctx.auth.admin_reset_password(&id).await {
-        Ok(temp) => {
-            axum::Json(json!({ "temporary_password": temp, "must_change_password": true }))
-                .into_response()
-        }
+        Ok(temp) => axum::Json(json!({ "temporary_password": temp, "must_change_password": true }))
+            .into_response(),
         Err(e) => auth_error_response(&e),
     }
 }
@@ -1038,8 +1214,7 @@ pub async fn handle_admin_audit(
         .unwrap_or(100)
         .min(1000);
     let entries = ctx.audit.read_recent(offset, limit);
-    axum::Json(json!({ "entries": entries, "offset": offset, "limit": limit }))
-        .into_response()
+    axum::Json(json!({ "entries": entries, "offset": offset, "limit": limit })).into_response()
 }
 
 /// POST /api/v1/admin/enrollment-codes (201): a one-time pairing code for an enabled

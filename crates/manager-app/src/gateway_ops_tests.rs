@@ -238,6 +238,7 @@ fn wizard_run_payload_carries_ok() {
 fn gateway_restart_execution_records_the_gateway_entries() {
     let at = chrono::Utc::now();
     let entry = activation::ActivationEntry {
+        id: "e1".to_string(),
         ts: "2026-11-12T10:00:00+00:00".to_string(),
         kind: "gateway_config".to_string(),
         summary: "routing rule added".to_string(),

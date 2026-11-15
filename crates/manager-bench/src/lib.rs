@@ -24,7 +24,8 @@ pub mod prompts;
 pub mod results;
 
 pub use arm::{
-    expand, offload_expr_for_layers, offload_layers_of, preset_combined, preset_kv, preset_spec,
+    expand, layers_for_n_cpu_moe, offload_expr_for_layers, offload_expr_for_layers_mapped,
+    offload_layers_of, offload_layers_of_mapped, preset_combined, preset_kv, preset_spec,
     project_minutes, prune_arms, ArmOutcome, ArmSpec, ArmVariant, CacheType, DraftDevice,
     FlashAttn, OffloadGuardrail, PresetSweep, PruneContext, SpecKind,
 };
@@ -33,9 +34,7 @@ pub use comparability::{
 };
 pub use flags::arm_raw_flags;
 pub use logs::{parse_acceptance_line, parse_statistics_line, AcceptanceSample, DrafterStats};
-pub use prompts::{
-    padding_blocks, shipped_prompts, PromptEntry, PromptLibrary, PromptOrigin,
-};
+pub use prompts::{padding_blocks, shipped_prompts, PromptEntry, PromptLibrary, PromptOrigin};
 pub use results::{
     condition_winners, median, summarize, ArmRecord, ArmStatus, ArmSummary, BenchResults,
     ConditionWinner, DrafterAgg, InterlockRecord, RunRow, SweepRecord,

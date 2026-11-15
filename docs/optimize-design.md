@@ -1,7 +1,9 @@
 # Optimize Page — Design
 
 Status: shipped — Phases 0–5 and Addendum A are implemented in
-releases through v0.1.40 (core logic in `crates/manager-optimize`;
+releases through v0.1.40; Phase 3 (streaming progress, structured
+output, the Rust apply executor) landed Nov 12, 2026 — see §7
+(core logic in `crates/manager-optimize`;
 app glue in `crates/manager-app/src/optimize.rs`,
 `optimize_eval.rs`, and `optimize_experiments.rs`). Two v0.1.40
 behavior notes: plan-build model grounding (tracker #51) — a
@@ -334,7 +336,10 @@ context JSON in a fenced block. Temperature 0.2. `max_tokens`
 4,096. No `response_format` dependence in v1 — llama.cpp's JSON
 modes vary by build, so the contract is enforced by the salvage
 parser (§4), with structured-output parameters a Phase 3 upgrade
-if a build proves to support them.
+if a build proves to support them. (Phase 3, implemented: the
+request is now streamed and carries the plan's JSON schema as
+`response_format`, with a fallback ladder for builds that reject
+either — §7.)
 
 Implementation: `test_request` (manager-supervisor) is fixed-shape
 (30 s timeout, 16 max tokens, placeholder model) and cannot be
@@ -361,6 +366,8 @@ uses), with:
   than letting llama-server truncate the prompt silently.
 - Progress is elapsed time plus tokens-so-far when the response
   reports usage at the end; v1 shows elapsed only (non-streaming).
+  Phase 3 streams: elapsed plus live tokens-so-far and partial
+  answer size (`consult_progress`).
 - Cancellation: the existing `task_abort` only flips bookkeeping —
   it cancels no work (known limitation from the capability audit).
   Real cancellation stores the request's abort handle in `AppState`
@@ -517,6 +524,8 @@ today. A Rust-side executor that duplicates them would create a
 second mutation path; consolidating one belongs to the ops-layer
 extraction already planned for the admin API, and Optimize should
 consume that layer when it exists rather than grow its own (§7).
+(Phase 3, implemented: that layer exists, and `optimize_apply_plan`
+now executes on top of it under the rules below — §7.)
 
 Rules:
 
@@ -684,6 +693,51 @@ survive an app restart, and decisions are the operator's work.
    structured-output parameters where the llama.cpp build supports
    them, a Rust-side apply executor on top of the admin API's
    ops-layer extraction when that lands.
+
+   **Status (Nov 12, 2026): implemented.**
+   - *Streaming progress* — `manager_supervisor::consult_completion`
+     (`crates/manager-supervisor/src/chat_stream.rs`) sends the
+     consultation with `stream: true`, accumulates the SSE deltas,
+     and reports progress per chunk; `op_optimize_consult` records
+     it in the state payload's additive `consult_progress` field
+     (`chunks` ≈ tokens, `content_bytes`, `reasoning_bytes`,
+     `first_token_ms`, `streaming`), and the page's Consulting
+     indicator shows it beside the elapsed time. Cancellation is
+     unchanged (future drop via `optimize_cancel_consult`; the task
+     token is also honoured). A server that answers `stream: true`
+     with plain JSON is read as a non-streaming completion.
+   - *Structured output* — the request carries
+     `response_format: {"type": "json_schema", "json_schema":
+     {"name": "optimization_plan", "schema": …}}` (llama-server
+     converts it to a sampling grammar). The schema is built in
+     `crates/manager-optimize/src/schema.rs` from the parser's own
+     per-kind `change` allowlist (`change_fields`, shared with
+     `normalize_change`); tests assert a minimal schema-conformant
+     item of every authored kind survives the salvage parser. A
+     build that rejects a request shape (4xx other than
+     401/403/404/408/429, or 500/501) is retried down the ladder
+     stream+schema → stream → schema → v1 request; each rejection is
+     written to the Optimize log. The salvage parser stays the
+     reader of record in every case.
+   - *Rust apply executor* — the ops-layer extraction has landed
+     (`manager-app`'s `op_*` functions), so §5.2's objection no
+     longer holds: `optimize_apply_plan` (registry op, class D,
+     desktop-only; `crates/manager-app/src/optimize_apply.rs`)
+     re-validates the stored plan against live state, then runs
+     the accepted, non-invalid, not-yet-applied items of one phase
+     (non-destructive, or deletes when `destructive: true`) through
+     the same `op_*` functions the UI orchestration called, in plan
+     order — their own activation-journal entries land as before —
+     halting on the first failure (later items recorded Not
+     attempted; no rollback). `dry_run: true` returns each item's
+     operations without executing. Consultation and apply exclude
+     each other. The desktop page applies through it; sample mode
+     keeps the TS orchestration.
+   - *Not verified here:* which shipped llama.cpp builds honour
+     `json_schema` (versus accepting and ignoring it) and the
+     streaming behaviour of the 27B/80B planners on Pete's hardware
+     — both need a live run; the fallbacks make either outcome
+     safe.
 
 ## 8. Decisions for Pete
 

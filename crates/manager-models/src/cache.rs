@@ -110,9 +110,7 @@ impl CacheType {
     /// Bytes for one cache row of `elems` elements at this type.
     pub fn row_bytes(&self, elems: u64) -> u64 {
         let (block_elems, block_bytes) = self.block_geometry();
-        elems
-            .div_ceil(block_elems)
-            .saturating_mul(block_bytes)
+        elems.div_ceil(block_elems).saturating_mul(block_bytes)
     }
 }
 
@@ -235,19 +233,13 @@ pub fn cache_selection(raw_flags: Option<&str>) -> CacheSelection {
     };
     let tokens: Vec<&str> = raw.split_whitespace().collect();
     let mut sel = CacheSelection::default();
-    if let Some(t) = last_flag_value(&tokens, "--cache-type-k", "-ctk")
-        .and_then(CacheType::parse)
-    {
+    if let Some(t) = last_flag_value(&tokens, "--cache-type-k", "-ctk").and_then(CacheType::parse) {
         sel.k = t;
     }
-    if let Some(t) = last_flag_value(&tokens, "--cache-type-v", "-ctv")
-        .and_then(CacheType::parse)
-    {
+    if let Some(t) = last_flag_value(&tokens, "--cache-type-v", "-ctv").and_then(CacheType::parse) {
         sel.v = t;
     }
-    if let Some(f) = last_flag_value(&tokens, "--flash-attn", "-fa")
-        .and_then(FlashAttn::parse)
-    {
+    if let Some(f) = last_flag_value(&tokens, "--flash-attn", "-fa").and_then(FlashAttn::parse) {
         sel.flash_attn = f;
     }
     sel
@@ -441,11 +433,7 @@ pub const PREDICTED_BEST_LADDER: [CacheSelection; 4] = [
 /// projection's stale-split rule). This is the distribution
 /// [`predicted_fits`] judges; the cache preview payload carries
 /// the same shares as each target's required figure.
-pub fn predicted_shares(
-    total_mib: u64,
-    split: &[f32],
-    gpu_total_mib: &[u64],
-) -> Option<Vec<u64>> {
+pub fn predicted_shares(total_mib: u64, split: &[f32], gpu_total_mib: &[u64]) -> Option<Vec<u64>> {
     if gpu_total_mib.is_empty() {
         return None;
     }
@@ -481,9 +469,10 @@ pub fn predicted_shares(
 /// nothing to fit against.
 pub fn predicted_fits(total_mib: u64, split: &[f32], gpu_total_mib: &[u64]) -> bool {
     match predicted_shares(total_mib, split, gpu_total_mib) {
-        Some(shares) => shares.iter().zip(gpu_total_mib.iter()).all(|(share, total)| {
-            *share <= total * (100 - HEADROOM_RESERVE_PERCENT) / 100
-        }),
+        Some(shares) => shares
+            .iter()
+            .zip(gpu_total_mib.iter())
+            .all(|(share, total)| *share <= total * (100 - HEADROOM_RESERVE_PERCENT) / 100),
         None => false,
     }
 }
@@ -493,8 +482,8 @@ pub fn price_ladder(inputs: &CacheFitInputs) -> Vec<CacheRung> {
     PREDICTED_BEST_LADDER
         .iter()
         .map(|selection| {
-            let kv_bytes = kv_bytes_per_token(&inputs.kv, selection)
-                .saturating_mul(inputs.n_ctx as u64);
+            let kv_bytes =
+                kv_bytes_per_token(&inputs.kv, selection).saturating_mul(inputs.n_ctx as u64);
             let kv_mib = kv_bytes.div_ceil(MIB);
             let total_mib = inputs
                 .gpu_weights_mib
@@ -567,7 +556,10 @@ mod tests {
     fn decode_unoffered_or_malformed_values_read_as_defaults() {
         // q5_0 is a real llama.cpp cache type v1 does not offer:
         // it decodes to the default position, never an invented one.
-        assert_eq!(cache_selection(Some("--cache-type-k q5_0")).k, CacheType::F16);
+        assert_eq!(
+            cache_selection(Some("--cache-type-k q5_0")).k,
+            CacheType::F16
+        );
         assert_eq!(cache_selection(Some("--cache-type-k")).k, CacheType::F16);
         assert_eq!(
             cache_selection(Some("--flash-attn banana")).flash_attn,
@@ -653,10 +645,7 @@ mod tests {
             .as_deref(),
             Some("--threads 8")
         );
-        assert_eq!(
-            set_cache_selection(Some("--cache-type-k q8_0"), None),
-            None
-        );
+        assert_eq!(set_cache_selection(Some("--cache-type-k q8_0"), None), None);
         // Round-trip across starts and targets.
         for raw in [
             None,

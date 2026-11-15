@@ -43,12 +43,13 @@ use serde_json::json;
 
 use manager_config::AppConfig;
 use manager_optimize::{
-    benchmark_prompts, compare, estimate_prompts, evaluate_fit, fit_verdict_text, is_temp_backend_id,
-    lowest_free_port, resolve_candidate, temp_backend_config, temp_backend_id, ActiveExperiment,
-    BenchResult, BenchRun, CandidateResolution, Decision, ExperimentEstimate, ExperimentJournal,
-    ExperimentMeasured, ExperimentProposal, ExperimentResult, ExperimentStatus,
-    MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, RegisteredModelFile,
-    BATCH_TIMEOUT_SECS, BENCHMARK_TEMPERATURE, ESTIMATE_RUNS, EXPERIMENT_TIMEOUT_SECS, MEASURED_RUNS,
+    benchmark_prompts, compare, estimate_prompts, evaluate_fit, fit_verdict_text,
+    is_temp_backend_id, lowest_free_port, resolve_candidate, temp_backend_config_mapped,
+    temp_backend_id, ActiveExperiment, BenchResult, BenchRun, CandidateResolution, Decision,
+    ExperimentEstimate, ExperimentJournal, ExperimentMeasured, ExperimentProposal,
+    ExperimentResult, ExperimentStatus, MeasurementEntry, MeasurementFingerprintInputs,
+    MeasurementStore, RegisteredModelFile, BATCH_TIMEOUT_SECS, BENCHMARK_TEMPERATURE,
+    ESTIMATE_RUNS, EXPERIMENT_TIMEOUT_SECS, MEASURED_RUNS,
 };
 use manager_supervisor::ProcessState;
 
@@ -79,7 +80,7 @@ fn load_journal(state: &AppState) -> ExperimentJournal {
 
 fn save_journal(state: &AppState, journal: &ExperimentJournal) {
     if let Err(e) = journal.save(&journal_path(state)) {
-        eprintln!("optimize-experiments: journal save failed: {e}");
+        tracing::warn!("optimize-experiments: journal save failed: {e}");
     }
 }
 
@@ -125,7 +126,7 @@ pub async fn startup_sweep(state: &AppState) {
             }
             if manager_config::save(&new_cfg, &state.config_path).is_ok() {
                 *live = new_cfg;
-                eprintln!(
+                tracing::info!(
                     "optimize-experiments: startup sweep removed leftover temp backends from config: {}",
                     removed.join(", ")
                 );
@@ -141,11 +142,11 @@ pub async fn startup_sweep(state: &AppState) {
                 || manager_supervisor::process_image_is(pid, "llama-server");
             if alive && image {
                 match manager_wizard::ops::kill_process(pid) {
-                    Ok(()) => eprintln!(
+                    Ok(()) => tracing::info!(
                         "optimize-experiments: startup sweep terminated leftover {} (pid {pid})",
                         record.temp_id
                     ),
-                    Err(e) => eprintln!(
+                    Err(e) => tracing::warn!(
                         "optimize-experiments: startup sweep could not terminate {} (pid {pid}): {e}",
                         record.temp_id
                     ),
@@ -212,9 +213,8 @@ pub async fn op_optimize_set_experiment_state(
     // The cascade lives in manager-optimize with the plan
     // types; denial memory records every fingerprint that
     // transitioned to denied, the experiment's included.
-    let newly_denied =
-        manager_optimize::apply_experiment_decision(plan, experiment_id, decision)
-            .ok_or_else(|| ApiError::NotFound(format!("experiment {experiment_id}")))?;
+    let newly_denied = manager_optimize::apply_experiment_decision(plan, experiment_id, decision)
+        .ok_or_else(|| ApiError::NotFound(format!("experiment {experiment_id}")))?;
     for fp in newly_denied {
         if !file.denied_fingerprints.contains(&fp) {
             file.denied_fingerprints.push(fp);
@@ -222,9 +222,7 @@ pub async fn op_optimize_set_experiment_state(
     }
     crate::optimize::opt_log1(
         state,
-        &format!(
-            "experiment {experiment_id} (candidate {candidate}) decision -> {decision:?}"
-        ),
+        &format!("experiment {experiment_id} (candidate {candidate}) decision -> {decision:?}"),
     );
     crate::optimize::save_plan_file(state, &file).map_err(ApiError::InvalidInput)?;
     crate::optimize::state_payload(state).await
@@ -287,7 +285,8 @@ impl InnerOutcome {
 }
 
 fn fmt_rate(v: Option<f64>) -> String {
-    v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "—".to_string())
+    v.map(|x| format!("{x:.1}"))
+        .unwrap_or_else(|| "—".to_string())
 }
 
 /// Guaranteed cleanup for one temp backend: stop it (when
@@ -325,20 +324,25 @@ pub(crate) async fn cleanup_temp(state: &AppState, temp_id: &str) {
 pub(crate) async fn wait_healthy(state: &AppState, temp_id: &str, port: u16) -> Result<(), String> {
     // The shared readiness poll (backend_lifecycle); a temp backend is
     // not a managed service, so "gone" is read from its supervisor row.
-    crate::backend_lifecycle::poll_health_until(port, HEALTH_TIMEOUT, Duration::from_secs(1), || async {
-        let mut sup = state.supervisor().await.lock().await;
-        sup.reap_exited();
-        match sup.status().into_iter().find(|s| s.id == temp_id) {
-            Some(s) if s.state == ProcessState::Failed => Some(format!(
-                "temp backend {temp_id} exited before becoming healthy"
-            )),
-            Some(s) if s.pid.is_none() => Some(format!(
-                "temp backend {temp_id} is not running (state {:?})",
-                s.state
-            )),
-            _ => None,
-        }
-    })
+    crate::backend_lifecycle::poll_health_until(
+        port,
+        HEALTH_TIMEOUT,
+        Duration::from_secs(1),
+        || async {
+            let mut sup = state.supervisor().await.lock().await;
+            sup.reap_exited();
+            match sup.status().into_iter().find(|s| s.id == temp_id) {
+                Some(s) if s.state == ProcessState::Failed => Some(format!(
+                    "temp backend {temp_id} exited before becoming healthy"
+                )),
+                Some(s) if s.pid.is_none() => Some(format!(
+                    "temp backend {temp_id} is not running (state {:?})",
+                    s.state
+                )),
+                _ => None,
+            }
+        },
+    )
     .await
     .map_err(|e| match e {
         crate::backend_lifecycle::ReadyError::Gone(reason) => reason,
@@ -497,12 +501,18 @@ async fn run_experiment_inner(
     // facts (GGUF layout or catalog pin, as resolved by
     // `crate::optimize::gather`) — the same source the fit
     // preflight below prices from. `None` when unknown.
-    let moe_layers = gathered
-        .live
-        .layouts
-        .get(&model_id)
-        .and_then(|f| f.moe_layers);
-    let temp = temp_backend_config(proposal, model_file.clone(), port, moe_layers);
+    // The block map rides the same facts: the proposal's
+    // offload_layers (MoE layers) is written at its --n-cpu-moe
+    // block-index bound (review item 11).
+    let facts = gathered.live.layouts.get(&model_id);
+    let moe_layers = facts.and_then(|f| f.moe_layers);
+    let temp = temp_backend_config_mapped(
+        proposal,
+        model_file.clone(),
+        port,
+        moe_layers,
+        facts.and_then(|f| f.moe_block_map.as_ref()),
+    );
     // A cloned config carrying the temp backend (and, for an
     // unregistered HF candidate, a synthetic model entry so
     // the existing resolution machinery can price it). Never
@@ -621,8 +631,7 @@ async fn run_experiment_inner(
         let stored = crate::optimize_eval::load_baseline(state);
         let fresh = stored.as_ref().and_then(|b| {
             let is_fresh = b.suite_version == manager_optimize::EVAL_SUITE_VERSION
-                && gathered.fingerprints.get(&b.backend_id)
-                    == Some(&b.config_fingerprint);
+                && gathered.fingerprints.get(&b.backend_id) == Some(&b.config_fingerprint);
             if is_fresh {
                 Some(b.clone())
             } else {
@@ -649,8 +658,7 @@ async fn run_experiment_inner(
                             &bmodel,
                         )
                         .await;
-                        let record =
-                            manager_optimize::BaselineRecord::from_run(&run, fp);
+                        let record = manager_optimize::BaselineRecord::from_run(&run, fp);
                         let _ = crate::optimize_eval::save_baseline(state, record.clone());
                         Some(record)
                     } else {
@@ -775,8 +783,12 @@ async fn run_experiment_inner(
             }
         }
         let mut iter = results.into_iter();
-        let short = iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
-        let long = iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
+        let short = iter
+            .next()
+            .unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
+        let long = iter
+            .next()
+            .unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
         let detail = "Estimate only — abbreviated benchmark (one run per prompt, reduced generation budgets). Confirm with a full experiment run before acting on it.".to_string();
         return InnerOutcome {
             status: ExperimentStatus::Completed,
@@ -837,18 +849,19 @@ async fn run_experiment_inner(
                     latency_ms: sample.latency_ms,
                 }),
                 Err(e) => {
-                    return InnerOutcome::failed(
-                        format!("benchmark run failed: {e}"),
-                        preflight,
-                    );
+                    return InnerOutcome::failed(format!("benchmark run failed: {e}"), preflight);
                 }
             }
         }
         results.push(BenchResult::from_runs(runs));
     }
     let mut iter = results.into_iter();
-    let short = iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
-    let long = iter.next().unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
+    let short = iter
+        .next()
+        .unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
+    let long = iter
+        .next()
+        .unwrap_or_else(|| BenchResult::from_runs(Vec::new()));
     let measured = ExperimentMeasured {
         short: short.clone(),
         long: long.clone(),
@@ -870,9 +883,9 @@ async fn run_experiment_inner(
             .ok()
             .filter(|m| m.is_file())
             .map(|m| m.len());
-        let model_for_fp = registered_model.as_ref().or_else(|| {
-            temp_cfg.models.iter().find(|m| m.id == model_id)
-        });
+        let model_for_fp = registered_model
+            .as_ref()
+            .or_else(|| temp_cfg.models.iter().find(|m| m.id == model_id));
         let fp_inputs = temp_fingerprint_inputs(&temp, model_for_fp, file_size, &gpu_pairs);
         let fp = manager_optimize::measurement_fingerprint(&fp_inputs);
         // The v2 provenance (predicted-throughput design §4.2):
@@ -899,9 +912,7 @@ async fn run_experiment_inner(
                 .map(|n| n.to_string_lossy().into_owned()),
             model_sha256: fp_sha256,
             model_size_bytes: fp_size_bytes,
-            inputs: Some(manager_optimize::MeasurementInputs::from_fingerprint_inputs(
-                &fp_inputs,
-            )),
+            inputs: Some(manager_optimize::MeasurementInputs::from_fingerprint_inputs(&fp_inputs)),
             driver_version: crate::optimize::driver_versions_for(
                 &fp_inputs,
                 &gathered.gpu_driver_versions,
@@ -1083,10 +1094,7 @@ pub(crate) async fn restart_stopped(
         }
     );
     if !failed.is_empty() {
-        note.push_str(&format!(
-            " Restart failed for: {}.",
-            failed.join(", ")
-        ));
+        note.push_str(&format!(" Restart failed for: {}.", failed.join(", ")));
     }
     note
 }
@@ -1100,9 +1108,13 @@ pub(crate) async fn restart_stopped(
 /// lifecycle, preflight, stopping, cleanup, and budgets; an
 /// estimate pass runs only the abbreviated benchmark and
 /// records its figures on the proposal as an estimate.
-async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, sink: &std::sync::Arc<dyn crate::EventSink>, mode: RunMode) -> crate::ApiResult {
+async fn run_experiment_batch(
+    state: &std::sync::Arc<crate::AppState>,
+    sink: &std::sync::Arc<dyn crate::EventSink>,
+    mode: RunMode,
+) -> crate::ApiResult {
     {
-        let slot = state.optimize_job_abort.lock().await;
+        let slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             return Err(ApiError::InvalidInput(
                 "a measurement or experiment job is already running".to_string(),
@@ -1122,7 +1134,8 @@ async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, sink: &st
         .collect();
     if batch.is_empty() {
         return Err(ApiError::InvalidInput(
-            "no accepted experiments in the current plan; accept at least one proposal to run it".to_string(),
+            "no accepted experiments in the current plan; accept at least one proposal to run it"
+                .to_string(),
         ));
     }
     if batch.len() > manager_optimize::MAX_EXPERIMENTS {
@@ -1176,7 +1189,7 @@ async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, sink: &st
     let batch_id = task_id.clone();
     let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
     {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             state
                 .finish_task(
@@ -1191,6 +1204,10 @@ async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, sink: &st
         }
         *slot = Some(tx);
     }
+    state
+        .tasks
+        .controls
+        .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeJob);
     let mut ctx = BatchCtx {
         consulted_backend: plan.consulted_backend.clone(),
         batch_running: gathered0
@@ -1206,14 +1223,15 @@ async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, sink: &st
         state,
         &format!(
             "experiment {}batch {batch_id}: {} experiments: {}",
-            if mode == RunMode::Estimate { "estimate " } else { "" },
+            if mode == RunMode::Estimate {
+                "estimate "
+            } else {
+                ""
+            },
             batch.len(),
             batch
                 .iter()
-                .map(|e| format!(
-                    "#{} {} (serves: {})",
-                    e.id, e.candidate_model_id, e.serves
-                ))
+                .map(|e| format!("#{} {} (serves: {})", e.id, e.candidate_model_id, e.serves))
                 .collect::<Vec<_>>()
                 .join("; ")
         ),
@@ -1264,8 +1282,8 @@ async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, sink: &st
                 proposal.id, proposal.candidate_model_id
             ),
         );
-        let remaining_batch = Duration::from_secs(BATCH_TIMEOUT_SECS)
-            .saturating_sub(batch_start.elapsed());
+        let remaining_batch =
+            Duration::from_secs(BATCH_TIMEOUT_SECS).saturating_sub(batch_start.elapsed());
         let budget = Duration::from_secs(EXPERIMENT_TIMEOUT_SECS).min(remaining_batch);
         let inner = run_experiment_inner(state, sink, &cfg, proposal, &mut ctx, mode);
         // Cancellation and timeout drop the inner future; the
@@ -1319,8 +1337,7 @@ async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, sink: &st
             // Estimate-mode failures still record a result so
             // the failure is visible on the proposal; the detail
             // is prefixed so it can never read as a full run's.
-            let detail = if mode == RunMode::Estimate
-                && outcome.status == ExperimentStatus::Failed
+            let detail = if mode == RunMode::Estimate && outcome.status == ExperimentStatus::Failed
             {
                 format!("Estimate: {}", outcome.detail)
             } else {
@@ -1380,7 +1397,7 @@ async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, sink: &st
         }
     }
     {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         *slot = None;
     }
     let (status, detail) = if cancelled {
@@ -1398,8 +1415,16 @@ async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, sink: &st
         state,
         &format!(
             "experiment {}batch {batch_id} end: {completed} {}, {failed} failed{}",
-            if mode == RunMode::Estimate { "estimate " } else { "" },
-            if mode == RunMode::Estimate { "estimated" } else { "completed" },
+            if mode == RunMode::Estimate {
+                "estimate "
+            } else {
+                ""
+            },
+            if mode == RunMode::Estimate {
+                "estimated"
+            } else {
+                "completed"
+            },
             if cancelled { ", cancelled" } else { "" }
         ),
     );
@@ -1420,7 +1445,10 @@ async fn run_experiment_batch(state: &std::sync::Arc<crate::AppState>, sink: &st
 /// Run the plan's accepted experiments as one full batch
 /// (§A.3): benchmark + optional screening eval, recorded as
 /// experiment results.
-pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
+pub async fn op_optimize_run_experiments(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
+) -> crate::ApiResult {
     run_experiment_batch(state, _sink, RunMode::Full).await
 }
 
@@ -1430,7 +1458,10 @@ pub async fn op_optimize_run_experiments(state: &std::sync::Arc<crate::AppState>
 /// temp backend and records the figures on the proposal as an
 /// estimate, so a batch can be screened before full runs are
 /// committed.
-pub async fn op_optimize_estimate_experiments(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>) -> crate::ApiResult {
+pub async fn op_optimize_estimate_experiments(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
+) -> crate::ApiResult {
     run_experiment_batch(state, _sink, RunMode::Estimate).await
 }
 
@@ -1482,7 +1513,11 @@ mod tests {
             default_offload_layers: None,
             mtp: None,
         });
-        let state = Arc::new(AppState::new(cfg.clone(), dir.join("config.json"), dir.clone()));
+        let state = Arc::new(AppState::new(
+            cfg.clone(),
+            dir.join("config.json"),
+            dir.clone(),
+        ));
         // Initialize the telemetry store, then replace its
         // inventory with the fixture. The init's own probe finds
         // no inventory in a test environment; on a machine with
@@ -1546,7 +1581,15 @@ mod tests {
             stopped_to_restart: Vec::new(),
             used_ports: HashSet::new(),
         };
-        let outcome = run_experiment_inner(&state, &(std::sync::Arc::new(crate::NoopSink) as std::sync::Arc<dyn crate::EventSink>), &cfg, &proposal, &mut ctx, RunMode::Full).await;
+        let outcome = run_experiment_inner(
+            &state,
+            &(std::sync::Arc::new(crate::NoopSink) as std::sync::Arc<dyn crate::EventSink>),
+            &cfg,
+            &proposal,
+            &mut ctx,
+            RunMode::Full,
+        )
+        .await;
         assert_eq!(outcome.status, ExperimentStatus::Failed);
         assert!(
             outcome.detail.contains("outside the verified range"),
@@ -1584,7 +1627,12 @@ mod tests {
         coder.raw_flags = Some("--n-cpu-moe 40".to_string());
         // restart_stopped's preflight reads the saved config.
         *state.config.write().await = cfg;
-        let note = restart_stopped(&state, &(std::sync::Arc::new(crate::NoopSink) as std::sync::Arc<dyn crate::EventSink>), &["coder".to_string()]).await;
+        let note = restart_stopped(
+            &state,
+            &(std::sync::Arc::new(crate::NoopSink) as std::sync::Arc<dyn crate::EventSink>),
+            &["coder".to_string()],
+        )
+        .await;
         assert!(
             note.contains("Restart failed for: coder"),
             "the refusal must be stated as a restart failure, got: {note}"
@@ -1594,7 +1642,10 @@ mod tests {
             "the note must carry the preflight's guardrail reason, got: {note}"
         );
         let sup = state.supervisor().await.lock().await;
-        assert!(sup.status().iter().all(|s| s.id != "coder" || s.pid.is_none()));
+        assert!(sup
+            .status()
+            .iter()
+            .all(|s| s.id != "coder" || s.pid.is_none()));
         drop(sup);
         let _ = std::fs::remove_dir_all(&dir);
     }

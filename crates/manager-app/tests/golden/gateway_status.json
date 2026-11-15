@@ -1,0 +1,40 @@
+{
+  "activation_applying": null,
+  "activation_changes": 0,
+  "activation_pending": false,
+  "bind_host": "127.0.0.1",
+  "failure": null,
+  "found_by": null,
+  "groups": 0,
+  "intent": null,
+  "lan_ip": null,
+  "litellm_version": null,
+  "openrouter_cred_present": null,
+  "openrouter_spend": {
+    "budget_window": "1d",
+    "cap_usd": 5.0,
+    "capped": false,
+    "enabled": false,
+    "fraction": 0.0,
+    "resets": "local_midnight",
+    "spent_today_usd": 0.0,
+    "tier_active": false,
+    "warn": false
+  },
+  "pid": null,
+  "port": 59100,
+  "postgres": {
+    "installed": false,
+    "pid": null,
+    "port": 54329,
+    "port_mismatch": null,
+    "state": "not_installed",
+    "transition": null
+  },
+  "routing_log_len": 0,
+  "routing_rules": 0,
+  "service_managed": false,
+  "state": "stopped",
+  "transition": null,
+  "up": false
+}

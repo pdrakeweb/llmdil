@@ -212,10 +212,7 @@ fn decimate(points: Vec<HistoryPoint>, max: usize) -> (Vec<HistoryPoint>, usize)
         return (points, 1);
     }
     let group = points.len().div_ceil(max);
-    let out: Vec<HistoryPoint> = points
-        .chunks(group)
-        .map(average_points)
-        .collect();
+    let out: Vec<HistoryPoint> = points.chunks(group).map(average_points).collect();
     (out, group)
 }
 
@@ -226,12 +223,7 @@ impl GpuHistoryStore {
     /// failing source's last-known values), record nothing — an
     /// outage is a gap, not a flat line. Then compaction runs, so
     /// the retention caps hold after every tick.
-    pub fn record(
-        &mut self,
-        now_ms: i64,
-        samples: &[GpuSample],
-        throughput: &HashMap<u32, f32>,
-    ) {
+    pub fn record(&mut self, now_ms: i64, samples: &[GpuSample], throughput: &HashMap<u32, f32>) {
         for sample in samples {
             if sample.down {
                 continue;
@@ -296,9 +288,7 @@ impl GpuHistoryStore {
                     })
                     .collect();
             }
-            series
-                .archive
-                .retain(|p| p.ts_ms >= archive_cutoff);
+            series.archive.retain(|p| p.ts_ms >= archive_cutoff);
             if series.archive.len() > ARCHIVE_CAP {
                 let excess = series.archive.len() - ARCHIVE_CAP;
                 series.archive.drain(..excess);
@@ -461,7 +451,7 @@ pub async fn record_gpu_history_once(state: &AppState) {
         .map(|b| (b.id.clone(), b.port))
         .collect();
     let series = {
-        let stats = state.gateway_stats.lock().await;
+        let stats = state.gateway.stats.lock().await;
         stats.series_stats(&pairs)
     };
     let mut rates: Vec<(f32, GpuPlacement)> = Vec::new();
@@ -501,10 +491,7 @@ pub async fn record_gpu_history_once(state: &AppState) {
                     let total: f32 = shares.iter().map(|(_, f)| f).sum();
                     if total > 0.0 {
                         GpuPlacement::Split(
-                            shares
-                                .into_iter()
-                                .map(|(i, f)| (i, f / total))
-                                .collect(),
+                            shares.into_iter().map(|(i, f)| (i, f / total)).collect(),
                         )
                     } else {
                         GpuPlacement::None
@@ -628,7 +615,9 @@ mod tests {
         );
         save_history(&dir, &store).expect("saved");
         let loaded = load_history(&dir);
-        let series = loaded.query(0, 3_600_000, t0 + SAMPLE_INTERVAL_MS).expect("series");
+        let series = loaded
+            .query(0, 3_600_000, t0 + SAMPLE_INTERVAL_MS)
+            .expect("series");
         assert_eq!(series.points.len(), 2);
         assert_eq!(series.points[0].throughput_toks, Some(22.5));
         assert_eq!(
@@ -647,14 +636,18 @@ mod tests {
         down.down = true;
         store.record(t0, &[down], &HashMap::new());
         assert!(
-            store.query(0, 3_600_000, t0).is_none_or(|s| s.points.is_empty()),
+            store
+                .query(0, 3_600_000, t0)
+                .is_none_or(|s| s.points.is_empty()),
             "a down GPU records no point"
         );
         // A sample older than one interval is a failing source's
         // last-known value: recording it would flat-line the chart.
         store.record(t0, &[sample(1, t0 - 60_000, 55.0)], &HashMap::new());
         assert!(
-            store.query(1, 3_600_000, t0).is_none_or(|s| s.points.is_empty()),
+            store
+                .query(1, 3_600_000, t0)
+                .is_none_or(|s| s.points.is_empty()),
             "a stale sample records no point"
         );
     }
@@ -771,7 +764,11 @@ mod tests {
         let mut b = point(SAMPLE_INTERVAL_MS, 62.0);
         b.power_w = Some(120.0);
         let avg = average_points(&[a, b]);
-        assert_eq!(avg.power_w, Some(120.0), "average over measured values only");
+        assert_eq!(
+            avg.power_w,
+            Some(120.0),
+            "average over measured values only"
+        );
         let mut c = point(0, 60.0);
         c.power_w = None;
         let avg = average_points(&[c, c]);

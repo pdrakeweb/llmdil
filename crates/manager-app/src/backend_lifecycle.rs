@@ -97,7 +97,10 @@ impl Route {
 }
 
 fn pid_file(state: &AppState, id: &str) -> std::path::PathBuf {
-    state.data_dir.join("logs").join(format!("backend-{id}.pid"))
+    state
+        .data_dir
+        .join("logs")
+        .join(format!("backend-{id}.pid"))
 }
 
 /// Whether the supervisor holds a live process for `id`.
@@ -155,7 +158,13 @@ async fn backend_port(state: &AppState, id: &str) -> Option<u16> {
 }
 
 fn mark(state: &AppState, id: &str, event: &str, detail: Option<&str>, origin: Origin) {
-    lifecycle::mark(&state.data_dir, &backend_key(id), event, detail, Some(origin));
+    lifecycle::mark(
+        &state.data_dir,
+        &backend_key(id),
+        event,
+        detail,
+        Some(origin),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +318,8 @@ async fn stop_inner(
             Ok(format!(
                 "{} pid {} after {:.1} s",
                 if graceful { "drained" } else { "killed" },
-                pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()),
+                pid.map(|p| p.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
                 started.elapsed().as_secs_f64()
             ))
         }
@@ -520,8 +530,8 @@ fn watch_readiness(state: &Arc<AppState>, sink: &Arc<dyn EventSink>, id: &str, o
     tokio::spawn(async move {
         // A wait that ends early (stopped, crashed, replaced) is the
         // monitor's or the next operation's to report.
-        let _ = wait_backend_ready(&state, sink.as_ref(), &id, BACKGROUND_READY_TIMEOUT, origin)
-            .await;
+        let _ =
+            wait_backend_ready(&state, sink.as_ref(), &id, BACKGROUND_READY_TIMEOUT, origin).await;
     });
 }
 
@@ -611,9 +621,18 @@ async fn conclude_start(
             // Not waited for readiness: the model is still loading, so
             // the start settles `starting`; the "ready" event (watcher or
             // monitor) moves it to `running`.
-            let ready_state = opts.wait_ready.is_none().then_some(LifecycleState::Starting);
+            let ready_state = opts
+                .wait_ready
+                .is_none()
+                .then_some(LifecycleState::Starting);
             lifecycle::finish_with(state, sink.as_ref(), guard, Ok(detail), ready_state);
-            end_task(state, &task_id, TaskStatus::Done, json!({ "backend_id": id })).await;
+            end_task(
+                state,
+                &task_id,
+                TaskStatus::Done,
+                json!({ "backend_id": id }),
+            )
+            .await;
             if let Some((layers, moe_layers, port)) = probe_ctx {
                 crate::spawn_offload_probe(sink, state, id, layers, moe_layers, port);
             }
@@ -659,7 +678,9 @@ pub async fn start_backend(
     let probe_ctx = crate::offload_probe_context(state, id).await;
     let task_id = begin_task(state, &opts, "backend_start", json!({ "backend_id": id })).await;
     let guard = begin_op(state, sink, id, TransitionKind::Starting, &opts, &task_id).await?;
-    state.lifecycle.set_intent(&backend_key(id), Intent::Running);
+    state
+        .lifecycle
+        .set_intent(&backend_key(id), Intent::Running);
     let outcome: StartOutcome = async {
         let route = start_route(state, id).await;
         let (detail, pid) = spawn_inner(state, id, route, opts.origin).await?;
@@ -689,12 +710,20 @@ pub async fn stop_backend(
     )
     .await;
     let guard = begin_op(state, sink, id, TransitionKind::Stopping, &opts, &task_id).await?;
-    state.lifecycle.set_intent(&backend_key(id), Intent::Stopped);
+    state
+        .lifecycle
+        .set_intent(&backend_key(id), Intent::Stopped);
     let route = stop_route(state, id).await;
     match stop_inner(state, id, route, opts.graceful, opts.origin).await {
         Ok(detail) => {
             lifecycle::finish(state, sink.as_ref(), guard, Ok(detail));
-            end_task(state, &task_id, TaskStatus::Done, json!({ "backend_id": id })).await;
+            end_task(
+                state,
+                &task_id,
+                TaskStatus::Done,
+                json!({ "backend_id": id }),
+            )
+            .await;
             Ok(json!({
                 "task_id": task_id,
                 "backend_id": id,
@@ -738,7 +767,9 @@ pub async fn restart_backend(
     )
     .await;
     let guard = begin_op(state, sink, id, TransitionKind::Restarting, &opts, &task_id).await?;
-    state.lifecycle.set_intent(&backend_key(id), Intent::Running);
+    state
+        .lifecycle
+        .set_intent(&backend_key(id), Intent::Running);
     let outcome: StartOutcome = async {
         let route = stop_route(state, id).await;
         let stopped = stop_inner(state, id, route, opts.graceful, opts.origin).await?;

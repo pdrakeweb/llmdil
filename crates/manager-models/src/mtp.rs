@@ -255,7 +255,9 @@ mod tests {
         );
         // Comma list sharing the flag.
         assert_eq!(
-            mtp_draft(Some("--spec-type ngram-cache,draft-mtp --spec-draft-n-max 1")),
+            mtp_draft(Some(
+                "--spec-type ngram-cache,draft-mtp --spec-draft-n-max 1"
+            )),
             MtpDraft::On(Some(1))
         );
     }
@@ -334,7 +336,9 @@ mod tests {
         let after = set_mtp_draft(Some(before), MtpDraft::On(Some(3)));
         assert_eq!(
             after.as_deref(),
-            Some("--parallel 1 -c 262144 --flash-attn on --spec-type draft-mtp --spec-draft-n-max 3")
+            Some(
+                "--parallel 1 -c 262144 --flash-attn on --spec-type draft-mtp --spec-draft-n-max 3"
+            )
         );
         // The app's own planner-mtp spelling round-trips exactly.
         let canonical = "--parallel 1 --spec-type draft-mtp --spec-draft-n-max 2";
@@ -358,7 +362,10 @@ mod tests {
         );
         // Off from an only-MTP flag string leaves nothing.
         assert_eq!(
-            set_mtp_draft(Some("--spec-type draft-mtp --spec-draft-n-max 2"), MtpDraft::Off),
+            set_mtp_draft(
+                Some("--spec-type draft-mtp --spec-draft-n-max 2"),
+                MtpDraft::Off
+            ),
             None
         );
         // Off when already off is a no-op rewrite.

@@ -51,7 +51,12 @@ impl KeyInputs {
     /// The comparability key for these inputs; identical to calling
     /// [`comparability_key`] with the fields unpacked.
     pub fn key(&self) -> String {
-        comparability_key(&self.model, &self.prompt_sha, self.temperature, &self.llama_build)
+        comparability_key(
+            &self.model,
+            &self.prompt_sha,
+            self.temperature,
+            &self.llama_build,
+        )
     }
 
     /// The canonical multi-line string the key hashes. One

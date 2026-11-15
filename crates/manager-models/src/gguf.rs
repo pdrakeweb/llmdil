@@ -95,6 +95,17 @@ impl RsGeometry {
     }
 }
 
+/// One routed-expert tensor from the GGUF tensor directory: its
+/// name exactly as the header spells it (`blk.N.ffn_up_exps.weight`)
+/// and its data size. `--override-tensor` patterns are regexes over
+/// tensor names, so pricing a partial `-ot` offload needs the names,
+/// not only the per-block sums.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertTensor {
+    pub name: String,
+    pub bytes: u64,
+}
+
 /// The memory layout of one GGUF file, from its header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GgufLayout {
@@ -111,6 +122,14 @@ pub struct GgufLayout {
     /// prices from this, since per-block sizes are not uniform in
     /// dynamically-quantized files. Empty for dense models.
     pub expert_bytes_by_block: Vec<u64>,
+    /// Every routed-expert tensor (the tensors [`is_expert_tensor`]
+    /// counts into [`GgufLayout::expert_bytes`]), in directory
+    /// order, with its name: the index `--override-tensor` patterns
+    /// and `--n-cpu-moe`'s block-index rule are resolved against
+    /// (see [`super::memory::memory_requirement_with_tensors`]).
+    /// Shared behind an `Arc` because layouts are cached and cloned
+    /// per request. Empty for dense models.
+    pub expert_tensors: std::sync::Arc<[ExpertTensor]>,
     /// `<arch>.block_count` when present.
     pub block_count: Option<u32>,
     /// Number of blocks that carry routed-expert tensors, when any
@@ -392,9 +411,8 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
     // hybrid filter_attn is `il < hparams.n_layer() &&
     // !is_recr(il)`, and `n_layer()` is `n_layer_all -
     // n_layer_nextn`.)
-    let trunk_blocks = block_count.map(|blocks| {
-        blocks.saturating_sub(get("nextn_predict_layers").unwrap_or(0))
-    });
+    let trunk_blocks =
+        block_count.map(|blocks| blocks.saturating_sub(get("nextn_predict_layers").unwrap_or(0)));
     let kv = match (
         trunk_blocks,
         get("attention.head_count_kv"),
@@ -403,8 +421,13 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
     ) {
         (Some(blocks), Some(heads), Some(klen), Some(vlen)) => {
             let interval = get("full_attention_interval").unwrap_or(0);
+            // llama.cpp (src/models/qwen3next.cpp, load_arch_hparams):
+            // `is_recr_impl[i] = (i < n_layer()) && ((i + 1) %
+            // full_attn_interval != 0)` — the full-attention (KV)
+            // trunk layers are the 4th, 8th, …, so their count is
+            // floor(trunk / interval), not the ceiling (P-11a).
             let kv_layers = if interval > 1 {
-                blocks.div_ceil(interval)
+                blocks / interval
             } else {
                 blocks
             };
@@ -437,8 +460,10 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
                 let embd_s = cap((d_state as u64).saturating_mul(d_inner as u64));
                 let embd_r = cap(
                     (if d_conv > 0 { d_conv - 1 } else { 0 } as u64).saturating_mul(
-                        (d_inner as u64)
-                            .saturating_add(2u64.saturating_mul(n_group as u64).saturating_mul(d_state as u64)),
+                        (d_inner as u64).saturating_add(
+                            2u64.saturating_mul(n_group as u64)
+                                .saturating_mul(d_state as u64),
+                        ),
                     ),
                 );
                 Some(RsGeometry {
@@ -455,6 +480,7 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
     let mut has_nextn_tensors = false;
     let mut tensor_bytes: u64 = 0;
     let mut expert_bytes: u64 = 0;
+    let mut expert_tensors: Vec<ExpertTensor> = Vec::new();
     let mut expert_by_block: std::collections::BTreeMap<u32, u64> =
         std::collections::BTreeMap::new();
     for _ in 0..tensor_count {
@@ -494,6 +520,7 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
                 let entry = expert_by_block.entry(idx).or_insert(0);
                 *entry = entry.saturating_add(size);
             }
+            expert_tensors.push(ExpertTensor { name, bytes: size });
         }
     }
     let moe_block_count = if expert_by_block.is_empty() {
@@ -507,6 +534,7 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
         tensor_bytes,
         expert_bytes,
         expert_bytes_by_block,
+        expert_tensors: expert_tensors.into(),
         block_count,
         moe_block_count,
         nextn_predict_layers,
@@ -588,6 +616,30 @@ mod tests {
         }
     }
 
+    /// P-5: the expert tensors are indexed by name and size, in
+    /// directory order — the input `-ot` pattern pricing matches
+    /// against. Non-expert tensors (embeddings, shared experts)
+    /// are not in it.
+    #[test]
+    fn records_expert_tensor_index() {
+        let layout = parse_gguf_layout(&sample_header()).unwrap();
+        assert_eq!(
+            &*layout.expert_tensors,
+            &[
+                ExpertTensor {
+                    name: "blk.0.ffn_gate_exps.weight".to_string(),
+                    bytes: 144
+                },
+                ExpertTensor {
+                    name: "blk.0.ffn_down.3.weight".to_string(),
+                    bytes: 34
+                },
+            ]
+        );
+        let sum: u64 = layout.expert_tensors.iter().map(|t| t.bytes).sum();
+        assert_eq!(sum, layout.expert_bytes);
+    }
+
     #[test]
     fn parses_layout_and_expert_split() {
         let layout = parse_gguf_layout(&sample_header()).unwrap();
@@ -629,10 +681,7 @@ mod tests {
             key_length: 256,
             value_length: 128,
         };
-        assert_eq!(
-            asym.bytes_per_token_typed(Q8_0, Q4_0),
-            2 * (272 + 72)
-        );
+        assert_eq!(asym.bytes_per_token_typed(Q8_0, Q4_0), 2 * (272 + 72));
     }
 
     #[test]
@@ -651,6 +700,27 @@ mod tests {
         let layout = parse_gguf_layout(&b).unwrap();
         assert_eq!(layout.kv.unwrap().kv_layers, 12);
         assert_eq!(layout.kv.unwrap().bytes_per_token(), 24_576);
+    }
+
+    /// P-11a (docs/code-review-v0.1.60.md): with a block count that is
+    /// not a multiple of the interval, llama.cpp's full-attention
+    /// layers are those with `(i + 1) % interval == 0` — 10 blocks at
+    /// interval 4 carry KV in layers 3 and 7 only (2, not ceil = 3).
+    #[test]
+    fn full_attention_interval_counts_floor_of_trunk() {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&6u64.to_le_bytes());
+        w_kv_str(&mut b, "general.architecture", "testarch");
+        w_kv_u32(&mut b, "testarch.block_count", 10);
+        w_kv_u32(&mut b, "testarch.attention.head_count_kv", 2);
+        w_kv_u32(&mut b, "testarch.attention.key_length", 256);
+        w_kv_u32(&mut b, "testarch.attention.value_length", 256);
+        w_kv_u32(&mut b, "testarch.full_attention_interval", 4);
+        let layout = parse_gguf_layout(&b).unwrap();
+        assert_eq!(layout.kv.unwrap().kv_layers, 2);
     }
 
     #[test]
@@ -714,7 +784,12 @@ mod tests {
         w_kv_u32(&mut b, "testarch.nextn_predict_layers", 1);
         w_kv_u32(&mut b, "testarch.expert_count", 8);
         for blk in 0..48 {
-            w_tensor(&mut b, &format!("blk.{blk}.ffn_gate_exps.weight"), &[256], 12);
+            w_tensor(
+                &mut b,
+                &format!("blk.{blk}.ffn_gate_exps.weight"),
+                &[256],
+                12,
+            );
         }
         w_tensor(&mut b, "blk.48.nextn.eh_proj.weight", &[16], 1);
         w_tensor(&mut b, "blk.48.nextn.enorm.weight", &[16], 1);

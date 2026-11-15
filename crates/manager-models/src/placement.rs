@@ -279,9 +279,7 @@ pub fn propose_placement_full(
 ) -> Result<PlacementProjection, ModelError> {
     validate_split(split, free_vram_mib_per_gpu.len())?;
     let n = split.len();
-    let pick = |v: &[u64]| -> Vec<u64> {
-        (0..n).map(|i| v.get(i).copied().unwrap_or(0)).collect()
-    };
+    let pick = |v: &[u64]| -> Vec<u64> { (0..n).map(|i| v.get(i).copied().unwrap_or(0)).collect() };
     let required = pick(required_mib);
     let current = pick(current_mib);
     let totals = pick(gpu_total_mib);

@@ -1,0 +1,2747 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "GENERATED from the manager-app operation registry; do not edit. Regenerate: UPDATE_GENERATED=1 cargo test -p manager-app --lib generated_. One schema per operation for its snake_case argument object (dispatch / admin API).",
+  "ops": {
+    "activation_apply": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "activation_apply",
+      "type": "object"
+    },
+    "app_update_check": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "app_update_check",
+      "type": "object"
+    },
+    "app_update_download": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "app_update_download",
+      "type": "object"
+    },
+    "app_update_restart": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "app_update_restart",
+      "type": "object"
+    },
+    "app_update_set_auto": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "title": "app_update_set_auto",
+      "type": "object"
+    },
+    "app_update_set_checking": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "title": "app_update_set_checking",
+      "type": "object"
+    },
+    "app_update_status": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "app_update_status",
+      "type": "object"
+    },
+    "backend_add": {
+      "additionalProperties": false,
+      "properties": {
+        "cache_k": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache_v": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "create_group": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "flash_attn": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "gpu_indices": {
+          "anyOf": [
+            {
+              "items": {
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "group": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "model_id": {
+          "type": "string"
+        },
+        "n_batch": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "n_ctx": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "offload_layers": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "offload_override": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parallel": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "port": {
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "model_id",
+        "port",
+        "group",
+        "create_group",
+        "enabled"
+      ],
+      "title": "backend_add",
+      "type": "object"
+    },
+    "backend_add_preview": {
+      "additionalProperties": false,
+      "properties": {
+        "gpu_indices": {
+          "anyOf": [
+            {
+              "items": {
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model_id": {
+          "type": "string"
+        },
+        "n_ctx": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parallel": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "model_id"
+      ],
+      "title": "backend_add_preview",
+      "type": "object"
+    },
+    "backend_apply_config": {
+      "additionalProperties": false,
+      "properties": {
+        "apply_mode": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "patch": {
+          "description": "Any JSON document (validated by the operation)."
+        }
+      },
+      "required": [
+        "id",
+        "patch",
+        "apply_mode"
+      ],
+      "title": "backend_apply_config",
+      "type": "object"
+    },
+    "backend_cache_preview": {
+      "additionalProperties": false,
+      "properties": {
+        "cache_k": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache_v": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "flash_attn": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "moe_cache_mib": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "n_ctx": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "slots": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "backend_cache_preview",
+      "type": "object"
+    },
+    "backend_clear_offload_override": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "backend_clear_offload_override",
+      "type": "object"
+    },
+    "backend_delete": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "backend_delete",
+      "type": "object"
+    },
+    "backend_get_config": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "backend_get_config",
+      "type": "object"
+    },
+    "backend_get_launch_command": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "backend_get_launch_command",
+      "type": "object"
+    },
+    "backend_preview_diff": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "patch": {
+          "description": "Any JSON document (validated by the operation)."
+        }
+      },
+      "required": [
+        "id",
+        "patch"
+      ],
+      "title": "backend_preview_diff",
+      "type": "object"
+    },
+    "backend_set_cache": {
+      "additionalProperties": false,
+      "properties": {
+        "cache_k": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache_v": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "flash_attn": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "backend_set_cache",
+      "type": "object"
+    },
+    "backend_set_flags_mode": {
+      "additionalProperties": false,
+      "properties": {
+        "advanced": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "advanced"
+      ],
+      "title": "backend_set_flags_mode",
+      "type": "object"
+    },
+    "backend_set_moe_cache": {
+      "additionalProperties": false,
+      "properties": {
+        "auto": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "mib": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "backend_set_moe_cache",
+      "type": "object"
+    },
+    "backend_set_mtp": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "n_max": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "backend_set_mtp",
+      "type": "object"
+    },
+    "backend_set_offload": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_override": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "layers": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "layers"
+      ],
+      "title": "backend_set_offload",
+      "type": "object"
+    },
+    "backend_set_offload_override": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "layers": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "placed_ccs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "layers",
+        "placed_ccs"
+      ],
+      "title": "backend_set_offload_override",
+      "type": "object"
+    },
+    "backend_set_parallel": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "slots": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "backend_set_parallel",
+      "type": "object"
+    },
+    "backend_set_raw_flags": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "raw_flags": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "backend_set_raw_flags",
+      "type": "object"
+    },
+    "backend_test_tool_call": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "backend_test_tool_call",
+      "type": "object"
+    },
+    "backend_update_flags": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "n_batch": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "n_ctx": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "n_ctx",
+        "n_batch"
+      ],
+      "title": "backend_update_flags",
+      "type": "object"
+    },
+    "bench_prompt_delete": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "bench_prompt_delete",
+      "type": "object"
+    },
+    "bench_prompt_generate": {
+      "additionalProperties": false,
+      "properties": {
+        "backend_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": "string"
+        },
+        "purpose": {
+          "type": "string"
+        },
+        "size": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "purpose",
+        "description",
+        "size"
+      ],
+      "title": "bench_prompt_generate",
+      "type": "object"
+    },
+    "bench_prompt_generate_cancel": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "bench_prompt_generate_cancel",
+      "type": "object"
+    },
+    "bench_prompt_save": {
+      "additionalProperties": false,
+      "properties": {
+        "entry": {
+          "description": "Any JSON document (validated by the operation)."
+        }
+      },
+      "required": [
+        "entry"
+      ],
+      "title": "bench_prompt_save",
+      "type": "object"
+    },
+    "bench_prompts_list": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "bench_prompts_list",
+      "type": "object"
+    },
+    "bench_result_delete": {
+      "additionalProperties": false,
+      "properties": {
+        "sweep_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sweep_id"
+      ],
+      "title": "bench_result_delete",
+      "type": "object"
+    },
+    "bench_results_list": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "bench_results_list",
+      "type": "object"
+    },
+    "bench_run_cancel": {
+      "additionalProperties": false,
+      "properties": {
+        "sweep_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sweep_id"
+      ],
+      "title": "bench_run_cancel",
+      "type": "object"
+    },
+    "bench_run_start": {
+      "additionalProperties": false,
+      "properties": {
+        "request": {
+          "description": "Any JSON document (validated by the operation)."
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "bench_run_start",
+      "type": "object"
+    },
+    "cancel_download": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "cancel_download",
+      "type": "object"
+    },
+    "diagnostics_export_bundle": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "diagnostics_export_bundle",
+      "type": "object"
+    },
+    "download_model": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "download_model",
+      "type": "object"
+    },
+    "gateway_activation_cancel": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "gateway_activation_cancel",
+      "type": "object"
+    },
+    "gateway_activation_complete": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "gateway_activation_complete",
+      "type": "object"
+    },
+    "gateway_activation_history": {
+      "additionalProperties": false,
+      "properties": {
+        "execution_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "gateway_activation_history",
+      "type": "object"
+    },
+    "gateway_activation_plan": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "gateway_activation_plan",
+      "type": "object"
+    },
+    "gateway_activation_record_execution": {
+      "additionalProperties": false,
+      "properties": {
+        "record": {
+          "description": "Any JSON document (validated by the operation)."
+        }
+      },
+      "required": [
+        "record"
+      ],
+      "title": "gateway_activation_record_execution",
+      "type": "object"
+    },
+    "gateway_create_group": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "gateway_create_group",
+      "type": "object"
+    },
+    "gateway_delete_group": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "gateway_delete_group",
+      "type": "object"
+    },
+    "gateway_master_key": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "gateway_master_key",
+      "type": "object"
+    },
+    "gateway_preview_yaml": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "gateway_preview_yaml",
+      "type": "object"
+    },
+    "gateway_quiesce_wait": {
+      "additionalProperties": false,
+      "properties": {
+        "timeout_secs": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "timeout_secs"
+      ],
+      "title": "gateway_quiesce_wait",
+      "type": "object"
+    },
+    "gateway_recent_requests": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "gateway_recent_requests",
+      "type": "object"
+    },
+    "gateway_restart": {
+      "additionalProperties": false,
+      "properties": {
+        "drain": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "gateway_restart",
+      "type": "object"
+    },
+    "gateway_set_backend_group": {
+      "additionalProperties": false,
+      "properties": {
+        "group": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "gateway_set_backend_group",
+      "type": "object"
+    },
+    "gateway_set_bind_host": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "host"
+      ],
+      "title": "gateway_set_bind_host",
+      "type": "object"
+    },
+    "gateway_status": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "gateway_status",
+      "type": "object"
+    },
+    "gateway_stop": {
+      "additionalProperties": false,
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stop_postgres": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "gateway_stop",
+      "type": "object"
+    },
+    "gateway_test_routing": {
+      "additionalProperties": false,
+      "properties": {
+        "request": {
+          "description": "Any JSON document (validated by the operation)."
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "gateway_test_routing",
+      "type": "object"
+    },
+    "get_config": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "get_config",
+      "type": "object"
+    },
+    "get_gateway_config": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "get_gateway_config",
+      "type": "object"
+    },
+    "get_gpu_history": {
+      "additionalProperties": false,
+      "properties": {
+        "range": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "range"
+      ],
+      "title": "get_gpu_history",
+      "type": "object"
+    },
+    "get_gpu_telemetry": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "get_gpu_telemetry",
+      "type": "object"
+    },
+    "get_logs": {
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "offset": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "order": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "query": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope": {
+          "type": "string"
+        },
+        "search": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "since_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "until_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "scope"
+      ],
+      "title": "get_logs",
+      "type": "object"
+    },
+    "get_mxc_policy": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "get_mxc_policy",
+      "type": "object"
+    },
+    "get_status": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "get_status",
+      "type": "object"
+    },
+    "list_backends": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "list_backends",
+      "type": "object"
+    },
+    "list_models": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "list_models",
+      "type": "object"
+    },
+    "log_receiver_deploy": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "log_receiver_deploy",
+      "type": "object"
+    },
+    "log_receiver_flip_endpoint": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "log_receiver_flip_endpoint",
+      "type": "object"
+    },
+    "log_receiver_remove": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "log_receiver_remove",
+      "type": "object"
+    },
+    "log_receiver_restart": {
+      "additionalProperties": false,
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "log_receiver_restart",
+      "type": "object"
+    },
+    "log_receiver_start": {
+      "additionalProperties": false,
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "log_receiver_start",
+      "type": "object"
+    },
+    "log_receiver_status": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "log_receiver_status",
+      "type": "object"
+    },
+    "log_receiver_stop": {
+      "additionalProperties": false,
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "log_receiver_stop",
+      "type": "object"
+    },
+    "mcp_delete_server": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "mcp_delete_server",
+      "type": "object"
+    },
+    "mcp_list": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "mcp_list",
+      "type": "object"
+    },
+    "mcp_save_server": {
+      "additionalProperties": false,
+      "properties": {
+        "server": {
+          "description": "manager_config::McpServerConfig",
+          "type": "object"
+        }
+      },
+      "required": [
+        "server"
+      ],
+      "title": "mcp_save_server",
+      "type": "object"
+    },
+    "mcp_set_exposure": {
+      "additionalProperties": false,
+      "properties": {
+        "exposure": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "exposure"
+      ],
+      "title": "mcp_set_exposure",
+      "type": "object"
+    },
+    "mcp_start_preflight": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "mcp_start_preflight",
+      "type": "object"
+    },
+    "mcp_store_credential": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "value"
+      ],
+      "title": "mcp_store_credential",
+      "type": "object"
+    },
+    "mcp_test_connection": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "mcp_test_connection",
+      "type": "object"
+    },
+    "measurement_delete": {
+      "additionalProperties": false,
+      "properties": {
+        "fingerprint": {
+          "type": "string"
+        },
+        "measured_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fingerprint",
+        "measured_at"
+      ],
+      "title": "measurement_delete",
+      "type": "object"
+    },
+    "measurement_lookup": {
+      "additionalProperties": false,
+      "properties": {
+        "request": {
+          "description": "Any JSON document (validated by the operation)."
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "measurement_lookup",
+      "type": "object"
+    },
+    "model_add": {
+      "additionalProperties": false,
+      "properties": {
+        "default_offload_layers": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "file_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "moe_layers": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mtp": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "params_b": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "quant": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "source_url"
+      ],
+      "title": "model_add",
+      "type": "object"
+    },
+    "model_assign": {
+      "additionalProperties": false,
+      "properties": {
+        "backend_id": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "split": {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "backend_id",
+        "split"
+      ],
+      "title": "model_assign",
+      "type": "object"
+    },
+    "model_delete": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "model_delete",
+      "type": "object"
+    },
+    "model_hf_header": {
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "repo_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo_id",
+        "file"
+      ],
+      "title": "model_hf_header",
+      "type": "object"
+    },
+    "model_hf_lookup": {
+      "additionalProperties": false,
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "suggest": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "model_hf_lookup",
+      "type": "object"
+    },
+    "model_pause_download": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "model_pause_download",
+      "type": "object"
+    },
+    "model_resume_download": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "model_resume_download",
+      "type": "object"
+    },
+    "model_set_enabled": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "enabled"
+      ],
+      "title": "model_set_enabled",
+      "type": "object"
+    },
+    "model_set_mtp": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "mtp": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "model_set_mtp",
+      "type": "object"
+    },
+    "model_set_offload_spec": {
+      "additionalProperties": false,
+      "properties": {
+        "default_offload_layers": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "moe_layers": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "model_set_offload_spec",
+      "type": "object"
+    },
+    "model_set_short_name": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "title": "model_set_short_name",
+      "type": "object"
+    },
+    "model_verify_checksum": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "model_verify_checksum",
+      "type": "object"
+    },
+    "mxc_get_activity_report": {
+      "additionalProperties": false,
+      "properties": {
+        "since_ms": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "mxc_get_activity_report",
+      "type": "object"
+    },
+    "mxc_propose_tightening": {
+      "additionalProperties": false,
+      "properties": {
+        "report": {
+          "description": "Any JSON document (validated by the operation)."
+        }
+      },
+      "required": [
+        "report"
+      ],
+      "title": "mxc_propose_tightening",
+      "type": "object"
+    },
+    "mxc_run_self_test": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "mxc_run_self_test",
+      "type": "object"
+    },
+    "mxc_set_mode": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "learning",
+            "enforced",
+            "disabled"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "mxc_set_mode",
+      "type": "object"
+    },
+    "notifications_send_test": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "notifications_send_test",
+      "type": "object"
+    },
+    "notifications_set_config": {
+      "additionalProperties": false,
+      "properties": {
+        "config": {
+          "description": "manager_config::NotificationConfig",
+          "type": "object"
+        }
+      },
+      "required": [
+        "config"
+      ],
+      "title": "notifications_set_config",
+      "type": "object"
+    },
+    "open_folder": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "open_folder",
+      "type": "object"
+    },
+    "open_url": {
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "title": "open_url",
+      "type": "object"
+    },
+    "optimize_apply_plan": {
+      "additionalProperties": false,
+      "properties": {
+        "destructive": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dry_run": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "optimize_apply_plan",
+      "type": "object"
+    },
+    "optimize_cancel_consult": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "optimize_cancel_consult",
+      "type": "object"
+    },
+    "optimize_cancel_job": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "optimize_cancel_job",
+      "type": "object"
+    },
+    "optimize_consult": {
+      "additionalProperties": false,
+      "properties": {
+        "backend_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidate_repos": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "directive": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sample": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "optimize_consult",
+      "type": "object"
+    },
+    "optimize_discard_plan": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "optimize_discard_plan",
+      "type": "object"
+    },
+    "optimize_discover": {
+      "additionalProperties": false,
+      "properties": {
+        "directive": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "directive"
+      ],
+      "title": "optimize_discover",
+      "type": "object"
+    },
+    "optimize_estimate_backend": {
+      "additionalProperties": false,
+      "properties": {
+        "backend_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend_id"
+      ],
+      "title": "optimize_estimate_backend",
+      "type": "object"
+    },
+    "optimize_estimate_experiments": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "optimize_estimate_experiments",
+      "type": "object"
+    },
+    "optimize_get_state": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "optimize_get_state",
+      "type": "object"
+    },
+    "optimize_measure_backend": {
+      "additionalProperties": false,
+      "properties": {
+        "backend_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend_id"
+      ],
+      "title": "optimize_measure_backend",
+      "type": "object"
+    },
+    "optimize_run_baseline": {
+      "additionalProperties": false,
+      "properties": {
+        "backend_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend_id"
+      ],
+      "title": "optimize_run_baseline",
+      "type": "object"
+    },
+    "optimize_run_experiments": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "optimize_run_experiments",
+      "type": "object"
+    },
+    "optimize_save_purpose": {
+      "additionalProperties": false,
+      "properties": {
+        "scope": {
+          "type": "string"
+        },
+        "target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "text"
+      ],
+      "title": "optimize_save_purpose",
+      "type": "object"
+    },
+    "optimize_set_experiment_state": {
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "type": "string"
+        },
+        "experiment_id": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "experiment_id",
+        "decision"
+      ],
+      "title": "optimize_set_experiment_state",
+      "type": "object"
+    },
+    "optimize_set_item_outcome": {
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "item_id": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "outcome": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "item_id",
+        "outcome"
+      ],
+      "title": "optimize_set_item_outcome",
+      "type": "object"
+    },
+    "optimize_set_item_state": {
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "type": "string"
+        },
+        "item_id": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "item_id",
+        "decision"
+      ],
+      "title": "optimize_set_item_state",
+      "type": "object"
+    },
+    "optimize_tuning_adopt": {
+      "additionalProperties": false,
+      "properties": {
+        "adopt_anyway": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sweep_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sweep_id"
+      ],
+      "title": "optimize_tuning_adopt",
+      "type": "object"
+    },
+    "optimize_tuning_preview": {
+      "additionalProperties": false,
+      "properties": {
+        "backend_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend_id"
+      ],
+      "title": "optimize_tuning_preview",
+      "type": "object"
+    },
+    "optimize_tuning_run": {
+      "additionalProperties": false,
+      "properties": {
+        "backend_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend_id"
+      ],
+      "title": "optimize_tuning_run",
+      "type": "object"
+    },
+    "optimize_validate_plan": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "optimize_validate_plan",
+      "type": "object"
+    },
+    "placement_apply": {
+      "additionalProperties": false,
+      "properties": {
+        "backend_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model_id": {
+          "type": "string"
+        },
+        "split": {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "model_id",
+        "split"
+      ],
+      "title": "placement_apply",
+      "type": "object"
+    },
+    "placement_propose": {
+      "additionalProperties": false,
+      "properties": {
+        "backend_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model_id": {
+          "type": "string"
+        },
+        "split": {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "model_id",
+        "split"
+      ],
+      "title": "placement_propose",
+      "type": "object"
+    },
+    "postgres_stop": {
+      "additionalProperties": false,
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [],
+      "title": "postgres_stop",
+      "type": "object"
+    },
+    "restart_backend": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_wddm_overcommit": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "graceful": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "wait_ready_secs": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "graceful"
+      ],
+      "title": "restart_backend",
+      "type": "object"
+    },
+    "run_audit": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "run_audit",
+      "type": "object"
+    },
+    "run_wizard_step": {
+      "additionalProperties": false,
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "step_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id"
+      ],
+      "title": "run_wizard_step",
+      "type": "object"
+    },
+    "services_list": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "services_list",
+      "type": "object"
+    },
+    "services_register": {
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "title": "services_register",
+      "type": "object"
+    },
+    "services_unregister": {
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "title": "services_unregister",
+      "type": "object"
+    },
+    "setup_get_commands": {
+      "additionalProperties": false,
+      "properties": {
+        "step_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id"
+      ],
+      "title": "setup_get_commands",
+      "type": "object"
+    },
+    "setup_get_prerequisites": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "setup_get_prerequisites",
+      "type": "object"
+    },
+    "setup_get_steps": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "setup_get_steps",
+      "type": "object"
+    },
+    "setup_mark_complete": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "setup_mark_complete",
+      "type": "object"
+    },
+    "setup_mark_manual": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "step_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id",
+        "path",
+        "version"
+      ],
+      "title": "setup_mark_manual",
+      "type": "object"
+    },
+    "setup_retry_step": {
+      "additionalProperties": false,
+      "properties": {
+        "step_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id"
+      ],
+      "title": "setup_retry_step",
+      "type": "object"
+    },
+    "setup_skip_step": {
+      "additionalProperties": false,
+      "properties": {
+        "note": {
+          "type": "string"
+        },
+        "step_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id",
+        "note"
+      ],
+      "title": "setup_skip_step",
+      "type": "object"
+    },
+    "setup_status": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "setup_status",
+      "type": "object"
+    },
+    "setup_step_help_url": {
+      "additionalProperties": false,
+      "properties": {
+        "step_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id"
+      ],
+      "title": "setup_step_help_url",
+      "type": "object"
+    },
+    "start_backend": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_wddm_overcommit": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "start_backend",
+      "type": "object"
+    },
+    "stop_backend": {
+      "additionalProperties": false,
+      "properties": {
+        "graceful": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "graceful"
+      ],
+      "title": "stop_backend",
+      "type": "object"
+    },
+    "task_abort": {
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "title": "task_abort",
+      "type": "object"
+    },
+    "tasks_list": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "tasks_list",
+      "type": "object"
+    },
+    "telemetry_reset_peaks": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "telemetry_reset_peaks",
+      "type": "object"
+    },
+    "telemetry_save_snapshot": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "telemetry_save_snapshot",
+      "type": "object"
+    },
+    "telemetry_set_interval": {
+      "additionalProperties": false,
+      "properties": {
+        "ms": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ms"
+      ],
+      "title": "telemetry_set_interval",
+      "type": "object"
+    },
+    "test_backend": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "prompt": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "prompt"
+      ],
+      "title": "test_backend",
+      "type": "object"
+    },
+    "update_config": {
+      "additionalProperties": false,
+      "properties": {
+        "patch": {
+          "description": "Any JSON document (validated by the operation)."
+        }
+      },
+      "required": [
+        "patch"
+      ],
+      "title": "update_config",
+      "type": "object"
+    },
+    "update_gateway_config": {
+      "additionalProperties": false,
+      "properties": {
+        "patch": {
+          "description": "Any JSON document (validated by the operation)."
+        }
+      },
+      "required": [
+        "patch"
+      ],
+      "title": "update_gateway_config",
+      "type": "object"
+    },
+    "update_mxc_policy": {
+      "additionalProperties": false,
+      "properties": {
+        "policy": {
+          "description": "Any JSON document (validated by the operation)."
+        }
+      },
+      "required": [
+        "policy"
+      ],
+      "title": "update_mxc_policy",
+      "type": "object"
+    },
+    "updates_apply": {
+      "additionalProperties": false,
+      "properties": {
+        "component_id": {
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "component_id"
+      ],
+      "title": "updates_apply",
+      "type": "object"
+    },
+    "updates_check_all": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "updates_check_all",
+      "type": "object"
+    },
+    "updates_pin": {
+      "additionalProperties": false,
+      "properties": {
+        "component_id": {
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "component_id"
+      ],
+      "title": "updates_pin",
+      "type": "object"
+    },
+    "updates_set_auto": {
+      "additionalProperties": false,
+      "properties": {
+        "component_id": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "component_id",
+        "enabled"
+      ],
+      "title": "updates_set_auto",
+      "type": "object"
+    },
+    "vscode_install_extensions": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "vscode_install_extensions",
+      "type": "object"
+    },
+    "vscode_write_config": {
+      "additionalProperties": false,
+      "properties": {
+        "backup": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "backup"
+      ],
+      "title": "vscode_write_config",
+      "type": "object"
+    },
+    "winml_probe": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "winml_probe",
+      "type": "object"
+    },
+    "winml_register": {
+      "additionalProperties": false,
+      "properties": {
+        "model_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "model_id"
+      ],
+      "title": "winml_register",
+      "type": "object"
+    },
+    "winml_status": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "winml_status",
+      "type": "object"
+    },
+    "winml_unregister": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "winml_unregister",
+      "type": "object"
+    }
+  }
+}

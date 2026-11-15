@@ -109,8 +109,9 @@ Every error response uses one envelope:
 - `code` is the stable machine-readable form (SCREAMING_SNAKE of `kind`),
   plus REST-layer codes that have no app counterpart: `BUSY` (a singleton
   resource is already running something), `OPERATION_FAILED` (an operation's
-  terminal error, §3), and the auth codes the auth plan will define
-  (`UNAUTHENTICATED`, `FORBIDDEN`).
+  terminal error, §3), and the auth codes (`UNAUTHENTICATED`,
+  `FORBIDDEN`, `INVALID_CREDENTIALS`, `SESSION_REVOKED`,
+  `PASSWORD_CHANGE_REQUIRED`; see §6.17).
 - `message` is the app's error string, unparsed. Clients display it; they
   never branch on it.
 - HTTP status mapping:
@@ -119,6 +120,9 @@ Every error response uses one envelope:
   |---|---|---|
   | Invalid argument / body fails validation | 400 | `INVALID_INPUT` |
   | Referenced backend/model/group/step/operation absent | 404 | `NOT_FOUND` |
+  | Missing, invalid, expired or revoked bearer | 401 | `UNAUTHENTICATED` |
+  | Role may not use the endpoint; API token on account self-service | 403 | `FORBIDDEN` |
+  | Account flagged must-change-password (after an admin reset) on any route but `POST /auth/password`, `POST /auth/logout`, `GET /auth/me`; also `POST /auth/refresh` | 403 | `PASSWORD_CHANGE_REQUIRED` |
   | Singleton busy (wizard step already running, download already in flight, plan apply already running), or a lifecycle operation already in flight on the same service (app kind `Busy`, e.g. "gateway restart already in progress (started by activation 12 s ago)") | 409 | `BUSY` |
   | Config patch fails validation | 422 | `CONFIG` |
   | Capability deferred in the app itself | 501 | `UNSUPPORTED` |
@@ -377,13 +381,18 @@ post-download proposal (deep-discovery design Part 2, P2-D7).
                        "litellm_fragment": "…" } ],
   "request_log_len": 0,
   "openrouter": { "enabled": false, "cred_ref": null,
-                  "daily_cap_usd": 0, "model_allowlist": [] }
+                  "daily_cap_usd": 0, "model_allowlist": [] },
+  "effective_strategy": "latency-based"
 }
 ```
 
 Group `enabled`/`enabled_members` are derived by the app (a group is
 enabled iff at least one member backend is enabled); they are read-only
-in the API as in the app.
+in the API as in the app. `effective_strategy` is the one global
+routing strategy the generated gateway config applies, computed by the
+generator's own rule (`manager_gateway::effective_global_strategy`);
+`null` when no config would be generated. Clients display it and never
+re-derive it.
 
 ### 4.5 Gateway status (`gateway_status`)
 
@@ -400,9 +409,23 @@ in the API as in the app.
   "activation_applying": null,
   "routing_log_len": 0, "openrouter_cred_present": null,
   "activation_pending": true, "activation_changes": 3,
+  "openrouter_spend": {
+    "enabled": true, "tier_active": true,
+    "spent_today_usd": 4.1, "cap_usd": 5.0, "fraction": 0.82,
+    "capped": false, "warn": true,
+    "resets": "local_midnight", "budget_window": "1d"
+  },
   "litellm_version": "1.x"
 }
 ```
+
+`openrouter_spend` (additive) is the app's measurement of today's
+OpenRouter spend (local day, from the gateway's `litellm_spend_metric`
+counters) against `gateway.openrouter.daily_cap_usd`. The cap itself is
+enforced inside the gateway by LiteLLM's provider budget
+(`router_settings.provider_budget_config.openrouter`, 1-day window);
+`capped` is true when the tier is enabled and the cap is zero or
+reached, `warn` at ≥80% of the cap.
 
 - `state` is the shared lifecycle state every surface renders:
   `running`, `starting`, `restarting`, `stopping`, `stopped`,
@@ -1417,7 +1440,7 @@ complete list, grouped by reason:
 | Windows services — desktop-only in v1 (SCM elevation is a shell concern) | `services_list` (R), `services_register` (D), `services_unregister` (D) |
 | Log receiver deployment — desktop-only (elevated deploy/remove through the shell's runas pattern; the status names local paths) | `log_receiver_status` (R), `log_receiver_deploy` (D), `log_receiver_remove` (D), `log_receiver_flip_endpoint` (C) — its unelevated start/stop/restart are routed (§6.5a) |
 | Bench — desktop-only in v1 | `bench_prompts_list` (R), `bench_prompt_save` (C), `bench_prompt_delete` (D), `bench_prompt_generate` (L), `bench_prompt_generate_cancel` (L), `bench_run_start` (L), `bench_run_cancel` (L), `bench_results_list` (R), `bench_result_delete` (D) |
-| Optimize — desktop-only in v1 | `optimize_get_state` (R), `optimize_validate_plan` (R), `optimize_save_purpose` (C), `optimize_set_item_state` (C), `optimize_set_item_outcome` (C), `optimize_discard_plan` (C), `optimize_set_experiment_state` (C), `optimize_consult` (L), `optimize_discover` (L), `optimize_cancel_consult` (L), `optimize_measure_backend` (L), `optimize_cancel_job` (L), `optimize_run_baseline` (L), `optimize_run_experiments` (L), `optimize_estimate_backend` (L), `optimize_estimate_experiments` (L), `optimize_tuning_preview` (R), `optimize_tuning_run` (L), `optimize_tuning_adopt` (C) |
+| Optimize — desktop-only in v1 | `optimize_get_state` (R), `optimize_validate_plan` (R), `optimize_save_purpose` (C), `optimize_set_item_state` (C), `optimize_set_item_outcome` (C), `optimize_discard_plan` (C), `optimize_apply_plan` (D), `optimize_set_experiment_state` (C), `optimize_consult` (L), `optimize_discover` (L), `optimize_cancel_consult` (L), `optimize_measure_backend` (L), `optimize_cancel_job` (L), `optimize_run_baseline` (L), `optimize_run_experiments` (L), `optimize_estimate_backend` (L), `optimize_estimate_experiments` (L), `optimize_tuning_preview` (R), `optimize_tuning_run` (L), `optimize_tuning_adopt` (C) |
 
 ### 6.17 API-layer routes (no backing registry operation)
 
@@ -1432,12 +1455,52 @@ The 15 derived routes are enumerated in `DERIVED_ROUTES`
 `GET /diagnostics/bundles/{bundle_id}/content`, and:
 
 #### `GET /api/v1/events` — `read` (any authenticated role)
-Server-Sent Events stream of the app's operation events
-(backend status, download progress, wizard progress, task
-progress), each with a process-global id. Live-only: nothing is
-replayed on reconnect; ids let a client detect gaps, and every
-fact the stream carries is also reachable by GET (PLAN.md §9).
-It is an API-layer route, **not** a registry operation.
+Server-Sent Events stream of the app event bus
+(`manager_app::event_bus`), each event with a process-global id.
+Live-only: nothing is replayed on reconnect; ids let a client
+detect gaps, and every fact the stream carries is also reachable
+by GET (PLAN.md §9). It is an API-layer route, **not** a registry
+operation.
+
+The bus carries every event **whichever surface caused it**: an
+operation run from the desktop UI (Tauri IPC) emits exactly the
+events the same operation run through this API does — the tee sits
+in the registry dispatch both paths share, not in HTTP handlers.
+Each `data` object carries an additive `origin`: `desktop` (desktop
+IPC), `api` (this API), or `app` (background work: pollers,
+monitors, watchers). Event SSE `event:` names and producers:
+
+| Event | Producer | Payload (same shape as) |
+|---|---|---|
+| `backend-status` | backend start/stop/restart (beside `service-lifecycle`) | `{id, event, state, origin, error?}` — `origin` here is the lifecycle origin (`ui`, `dashboard`, `activation`, …), so the bus's additive origin is not added |
+| `service-lifecycle` | every lifecycle transition of every managed service (gateway, postgres, log-receiver, `backend:<id>`): operation begin/end and monitor-observed changes | `{key, kind, id?, event, state, origin, detail?, at}` — `origin` is the lifecycle origin, as for `backend-status` |
+| `download-progress` | model download worker | `{model_id, downloaded_bytes, total_bytes, fraction}` |
+| `wizard-progress` | setup step / audit runs | `{task_id, step_id, state, done, total, message}` |
+| `telemetry-update` | each `get_gpu_telemetry` call | `{samples, at_ms}` |
+| `task-progress` | a task created (`running`) or settled (`done`/`failed`/`aborted`, incl. a forced abort) | one `GET /operations` row (`TaskRecord`) |
+| `config-changed` | any non-read operation that **succeeded** and changed the saved config (before/after diff) | `{op, sections: [top-level section names], at_ms}` — names only, never values |
+| `gateway-request` | a successful `gateway_test_routing` (the decision it recorded) | one `GET /gateway/routing/recent` row |
+| `alert-raised` | the notification monitor's failure / activation transitions (independent of toast settings; completions are not alerts) | `{category: failures\|activation, title, body, at_ms}` |
+| `telemetry-tick` | the GPU telemetry poller, observed once per completed poll, at most 1/s | `{samples, at_ms}` — `get_gpu_telemetry`'s samples in crate shape (no processes, sparklines, or peaks); `at_ms` is the poll time |
+| `vram-changed` | the same polls: a GPU's used VRAM moved ≥ max(256 MiB, 2 % of the card) from the last reported level (first observation is a silent baseline; down GPUs skipped) | `{index, name, vram_used_mib, vram_total_mib, previous_mib, delta_mib, at_ms}` |
+| `log-line` | new lines in the supervisor's captured process output (the rings `get_logs` reads), followed every 500 ms | `{scope, level, line, ts_ms, stream, archived?}`; at most 50 per scope per pass, the rest summarized in one `{…, skipped: n}` notice line |
+| `app_update_changed` | `app_update_*` operations | the `app_update_status` shape |
+
+Semantics: a failed operation emits no dispatch-level event
+(`config-changed`, `gateway-request`); events an operation emitted
+before failing are delivered as emitted. `config-changed` covers
+changes made by operations only (not background watchers, e.g. the
+post-download verification stamp) and is attributed to the
+operation that observed the diff. `telemetry-tick`, `vram-changed`
+and `log-line` come from a background producer loop that runs only
+while at least one subscriber is connected; it observes the
+telemetry poller and the supervisor without starting either
+(telemetry flows once the poller is running — it starts on first
+telemetry use). `log-line` covers supervised processes only: the
+file-backed `gateway` and `wizard` scopes of `get_logs` are not
+streamed, and lines present when the stream starts are not
+replayed. Every payload is data the `read` class can already GET,
+so the stream needs no per-role filtering.
 
 The remaining 24 API-layer routes are the auth/admin surface
 (`AUTH_ROUTES` in `manager-api/src/auth_routes.rs`), specified by
@@ -1453,6 +1516,33 @@ The remaining 24 API-layer routes are the auth/admin surface
 `GET|POST /admin/api-tokens`, `DELETE /admin/api-tokens/{id}`,
 `POST /admin/enrollment-codes`, `GET /admin/audit` — all under
 `/api/v1`.
+
+**Must-change-password (SEC-03).** `POST /admin/users/{id}/reset-password`
+sets a temporary password, flags the account must-change, and revokes
+every session **and API token** of the user in one store write. Until
+the user changes the password:
+
+- `POST /auth/login` (and `POST /auth/totp` for a TOTP account, which
+  still completes) returns tokens for a short session (15 minutes for
+  both tokens, not 30 days). Token responses from login, TOTP, enroll
+  and refresh carry an additive top-level `"must_change_password":
+  <bool>` alongside `user.must_change_password`; `GET /auth/me` carries
+  the same top-level field.
+- Every authenticated route except `POST /auth/password`,
+  `POST /auth/logout` and `GET /auth/me` answers **403
+  `PASSWORD_CHANGE_REQUIRED`** — for session tokens and API tokens
+  alike (the flag is read from the user record on every request).
+  `POST /auth/refresh` is refused the same way, without rotating.
+  Each refusal is audited (`result: "password_change_required"`).
+- `POST /auth/password` (`{ "current_password", "new_password" }`)
+  clears the flag; the calling session stays valid (and becomes
+  refreshable) and the account's other sessions are revoked.
+
+**TOTP enrollment step-up (SEC-04).** `POST /auth/totp/enroll` takes
+`{ "password": "<account password>" }` for first enrollment as well as
+for replacing a live factor; a missing or wrong password answers 401
+`INVALID_CREDENTIALS` and counts toward the account lockout. A
+must-change account gets `PASSWORD_CHANGE_REQUIRED` first.
 
 ### 6.18 Measurements
 
@@ -1522,7 +1612,9 @@ the store; history is otherwise append-only. → `{ "deleted": true,
    snapshots, download progress is state polling, and the poll
    model remains the correctness path throughout. As built, an
    SSE channel was added on top of it — `GET /api/v1/events`
-   (§6.17), an API-layer route fed by the `EventSink` broadcast.
+   (§6.17), an API-layer route fed by the app event bus (every
+   operation event from desktop and API callers alike, plus
+   background telemetry, VRAM, log, task, and alert producers).
    No capability needs the stream to map completely, and a client
    that never opens it loses nothing.
 8. **File pickers: none.** No audited command depends on a file

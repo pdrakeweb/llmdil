@@ -78,7 +78,10 @@ fn slots_busy_reads_is_processing() {
 fn readiness_gone_rules() {
     assert!(readiness_gone(None, None).is_err());
     assert_eq!(readiness_gone(Some(&live_row(Some(7), None)), None), Ok(7));
-    assert_eq!(readiness_gone(Some(&live_row(Some(7), None)), Some(7)), Ok(7));
+    assert_eq!(
+        readiness_gone(Some(&live_row(Some(7), None)), Some(7)),
+        Ok(7)
+    );
     // The process waited on was replaced.
     let replaced = readiness_gone(Some(&live_row(Some(8), None)), Some(7)).unwrap_err();
     assert!(replaced.contains("replaced"), "{replaced}");
@@ -88,11 +91,16 @@ fn readiness_gone_rules() {
     let reason = readiness_gone(Some(&gone), Some(7)).unwrap_err();
     assert!(reason.contains("port 8081 in use"), "{reason}");
     // An operator stop ends the wait; a restart in flight does not.
-    assert!(
-        readiness_gone(Some(&live_row(Some(7), Some(TransitionKind::Stopping))), None).is_err()
-    );
+    assert!(readiness_gone(
+        Some(&live_row(Some(7), Some(TransitionKind::Stopping))),
+        None
+    )
+    .is_err());
     assert_eq!(
-        readiness_gone(Some(&live_row(Some(7), Some(TransitionKind::Restarting))), None),
+        readiness_gone(
+            Some(&live_row(Some(7), Some(TransitionKind::Restarting))),
+            None
+        ),
         Ok(7)
     );
 }
@@ -341,9 +349,15 @@ async fn stop_drain_does_not_hold_the_supervisor_lock() {
         drop(state.supervisor().await.lock().await);
     })
     .await;
-    assert!(locked.is_ok(), "the supervisor mutex is held during the drain");
-    let listed =
-        tokio::time::timeout(Duration::from_secs(5), crate::op_list_backends(&state, &sink)).await;
+    assert!(
+        locked.is_ok(),
+        "the supervisor mutex is held during the drain"
+    );
+    let listed = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::op_list_backends(&state, &sink),
+    )
+    .await;
     assert!(
         matches!(listed, Ok(Ok(_))),
         "list_backends blocked during the drain"

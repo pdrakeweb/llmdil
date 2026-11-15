@@ -126,7 +126,8 @@ mod tests {
 
     #[test]
     fn acceptance_line_parses_kit_format() {
-        let line = "draft acceptance = 0.54321 (   123 accepted /     227 generated), mean len =  2.07";
+        let line =
+            "draft acceptance = 0.54321 (   123 accepted /     227 generated), mean len =  2.07";
         let s = parse_acceptance_line(line).expect("kit line parses");
         assert_eq!(s.accepted, 123);
         assert_eq!(s.generated, 227);
@@ -150,10 +151,7 @@ mod tests {
         assert_eq!(parse_acceptance_line("prompt eval time = 123 ms"), None);
         assert_eq!(parse_acceptance_line("draft acceptance = x"), None);
         assert_eq!(parse_acceptance_line(""), None);
-        assert_eq!(
-            parse_statistics_line("prompt eval time = 123 ms"),
-            None
-        );
+        assert_eq!(parse_statistics_line("prompt eval time = 123 ms"), None);
     }
 
     #[test]

@@ -97,7 +97,10 @@ mod tests {
             .encode_utf16()
             .flat_map(|u| u.to_le_bytes())
             .collect();
-        assert_eq!(decode_credential_blob(&utf16).as_deref(), Some("secret-value"));
+        assert_eq!(
+            decode_credential_blob(&utf16).as_deref(),
+            Some("secret-value")
+        );
         assert_eq!(
             decode_credential_blob(b"plain-utf8-value").as_deref(),
             Some("plain-utf8-value")

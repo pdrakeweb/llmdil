@@ -1,0 +1,17 @@
+{
+  "body": {
+    "auth_type": "session",
+    "must_change_password": false,
+    "session_id": "<string>",
+    "user": {
+      "created_ms": "<number>",
+      "disabled": false,
+      "id": "<string>",
+      "must_change_password": false,
+      "role": "operator",
+      "totp_enabled": false,
+      "username": "operator"
+    }
+  },
+  "status": 200
+}

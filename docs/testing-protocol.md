@@ -147,7 +147,7 @@ that instruct one as defective.
    Prometheus runner (the workflow's `runner` input, default
    `prometheus`) and watches the run. The gate set: full workspace
    check + clippy + test, `src-tauri` check + clippy + test, UI
-   install + build + smoke.
+   install + build + smoke + unit tests (§9.1).
 3. Read results back from the helper's JSON report: path taken
    (`prometheus` or `fallback-windows-latest`), run id/URL, per-job and
    per-step results. A green claim without the report is not evidence.
@@ -282,3 +282,104 @@ values below are the settled protocol.
 - **[JC-7]** The §2.5 exception path (a change that cannot be exercised
   any other way) names Pete or the dispatching chat as decider; Pete had
   not specified an exception process.
+
+## 9. UI unit tests and golden payloads
+
+Two suites pin contracts that the build and the smoke script do not
+check. Both run in the branch tier, and both are cheap enough to run
+locally under §2.4.
+
+### 9.1 UI unit tests (vitest)
+
+`ui/test/*.test.ts` holds unit tests for the UI's pure logic: number
+and duration formatters (`trim1` and its siblings mirror
+`crates/manager-present`), HTML escaping, the history chart's
+gap rule, the bench offload/arm/prune helpers, the optimize
+diff/summary helpers, MCP id validation, and the Tauri boundary
+(sample-mode detection, plus the `list_backends` /
+`get_gpu_telemetry` / `gateway_status` normalisers, exercised through
+a stubbed `window.__TAURI__.core.invoke`).
+
+```sh
+cd ui
+npm ci
+npm test            # tsc over src/ + test/, then vitest run
+npx vitest          # watch mode while editing
+```
+
+- The tests run in Node with no DOM library; a test that needs
+  `window` stubs it with `vi.stubGlobal`.
+- They live in `ui/test/`, outside `src/`, so the production `tsc`
+  pass and the smoke script's `invoke` scan never see them.
+  `tsconfig.test.json` typechecks them.
+- To test a view helper, add `export` to the existing function and
+  keep the runtime behaviour as it is. Do not refactor a view to make
+  it testable.
+- CI: `gates.yml` (the `ui` job) and `prometheus-gates.yml` run
+  `npm test` after the smoke step.
+
+### 9.2 Golden payloads (Rust)
+
+The JSON payloads that the UI, CLI and Android client parse are pinned
+by golden files:
+
+| Suite | Goldens | Covers |
+|---|---|---|
+| `manager-app` unit module `golden_tests` (`src/golden_tests.rs`) | `crates/manager-app/tests/golden/*.json` | `get_status`, `list_backends`, `get_gpu_telemetry`, `gateway_status`, `list_models` (each dispatched through the operation registry) |
+| `manager-api` integration test `golden_auth` | `crates/manager-api/tests/golden/*.json` | `POST /auth/login` (success and invalid credentials), `GET /auth/me` (with and without a token), `GET /status` (status code + body) |
+
+The fixture is deterministic. It uses the default config with every
+port moved to 59100 and above, so a real gateway or backend on the
+host is never probed or adopted. The gateway is bound to loopback. A
+pinned telemetry store holds a fixed two-GPU inventory, so the live
+poller never starts.
+
+Before comparing, the harness (`crates/manager-app/tests/support/golden.rs`,
+shared through `#[path]`) normalises the payload:
+
+- Volatile keys (timestamps, tokens, ids, the build version) become
+  type placeholders such as `"<number>"` and `"<string>"`, so a type
+  change still shows up as a diff.
+- The scratch data dir becomes `<DATA_DIR>`.
+- Config-relative paths use `/` on every platform.
+
+A mismatch fails with a line diff, `-` for expected and `+` for
+actual.
+
+Run them:
+
+```sh
+cargo test -p manager-app --lib golden
+cargo test -p manager-api --test golden_auth
+```
+
+Regenerate after an **intended** payload change, then review the
+golden diff the same way you review code. Every consumer of that
+payload has to agree with it.
+
+```sh
+UPDATE_GOLDEN=1 cargo test -p manager-app --lib golden
+UPDATE_GOLDEN=1 cargo test -p manager-api --test golden_auth
+```
+
+(PowerShell: `$env:UPDATE_GOLDEN=1; cargo test ...; Remove-Item Env:UPDATE_GOLDEN`.)
+
+When you add a field to a payload, update its golden in the same
+commit. When you add a new golden, add it to the table above, and add
+any new volatile field to the test's key list rather than to the
+fixture.
+
+## 10. Gateway hash lock
+
+The gateway venv installs from `crates/manager-wizard/assets/gateway-requirements.lock`
+under `uv pip install --require-hashes` when the LiteLLM pin matches it
+(module docs: `crates/manager-wizard/src/gateway_lock.rs`). After bumping
+`manager_config::DEFAULT_LITELLM_PIN` or `manager_wizard::PRISMA_PINNED_VERSION`:
+
+1. Update the pins in `crates/manager-wizard/assets/gateway-requirements.in`.
+2. Regenerate: `pwsh tools/gateway-lock/Update-GatewayLock.ps1` (needs `uv`;
+   resolves for CPython 3.12 on `x86_64-pc-windows-msvc`). Never edit hashes by hand.
+3. `cargo test -p manager-wizard gateway_lock` — `checked_in_gateway_lock_matches_pins`
+   fails while the `.in` pins, the lock and the constants disagree.
+
+`Update-GatewayLock.ps1 -Check` re-resolves and fails when the committed lock is stale.

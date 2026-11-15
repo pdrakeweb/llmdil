@@ -148,6 +148,11 @@ pub struct MeasureInputs {
     /// the caller. Empty — and the `experiment_results` block
     /// absent — until an experiment batch has run.
     pub experiment_results: Vec<ExperimentResultFact>,
+    /// MoE block maps by model id, for models whose GGUF was
+    /// parsed with an expert tensor index (code review v0.1.60
+    /// item 11): a backend's `--n-cpu-moe` bound is reported as
+    /// the MoE layers it really moves. Absent = identity.
+    pub moe_block_maps: HashMap<String, manager_models::MoeBlockMap>,
 }
 
 /// Counts and provenance for the page's context summary line and
@@ -206,7 +211,16 @@ pub fn model_short_name(cfg: &AppConfig, model: &ModelConfig) -> String {
         .unwrap_or_else(|| model.id.clone())
 }
 
-fn offload_json(backend: &BackendConfig, moe_layers: Option<u32>) -> Value {
+/// The decoded offload block for one backend. `layers` under
+/// `cpu_moe_layers` is the raw `--n-cpu-moe` value (a block-index
+/// bound); `offloaded_layers` is the MoE layers it really moves,
+/// through the model's block map when one is known (item 11) —
+/// the unit `offload_layers` in plan items uses.
+fn offload_json(
+    backend: &BackendConfig,
+    moe_layers: Option<u32>,
+    block_map: Option<&manager_models::MoeBlockMap>,
+) -> Value {
     let offload = manager_models::expert_offload(backend.raw_flags.as_deref());
     let mut v = match offload {
         manager_models::ExpertOffload::None => json!({ "setting": "none" }),
@@ -214,9 +228,10 @@ fn offload_json(backend: &BackendConfig, moe_layers: Option<u32>) -> Value {
         manager_models::ExpertOffload::CpuMoeLayers(n) => {
             json!({ "setting": "cpu_moe_layers", "layers": n })
         }
+        manager_models::ExpertOffload::TensorOverrides => json!({ "setting": "tensor_overrides" }),
     };
     if let Some(moe) = moe_layers {
-        v["offloaded_layers"] = json!(offload.layers(moe));
+        v["offloaded_layers"] = json!(offload.moe_layers_offloaded(moe, block_map));
         v["moe_layers"] = json!(moe);
     }
     v
@@ -299,7 +314,8 @@ pub fn build_context(
                     .find(|s| s.id == m.id)
                     .and_then(|s| s.moe_layers)
             });
-            v["offload"] = offload_json(b, moe_layers);
+            let block_map = model.and_then(|m| measure.moe_block_maps.get(&m.id));
+            v["offload"] = offload_json(b, moe_layers, block_map);
             if let Some(req) = measure.requirements.get(&b.id) {
                 let mut r = json!({
                     "gpu_ram_mib": req.gpu_weights_mib,
@@ -407,8 +423,7 @@ pub fn build_context(
     // no served prompts, no log lines.
     let mut measured = json!({});
     if !measure.backend_states.is_empty() {
-        let mut rows: Vec<(&String, &BackendMeasured)> =
-            measure.backend_states.iter().collect();
+        let mut rows: Vec<(&String, &BackendMeasured)> = measure.backend_states.iter().collect();
         rows.sort_by(|a, b| a.0.cmp(b.0));
         measured["backends"] = Value::Array(
             rows.iter()
@@ -479,8 +494,7 @@ pub fn build_context(
                 v
             }).collect::<Vec<_>>(),
         });
-        meta.measured_blocks
-            .push("measured throughput".to_string());
+        meta.measured_blocks.push("measured throughput".to_string());
     }
     // Discovered candidates (addendum A.5, Phase 5c): the
     // pre-pass's vetted, fit-checked HF facts, distinct from
@@ -545,14 +559,9 @@ pub fn build_context(
                 })
                 .collect(),
         );
-        meta.measured_blocks
-            .push("experiment results".to_string());
+        meta.measured_blocks.push("experiment results".to_string());
     }
-    if measured
-        .as_object()
-        .map(|o| !o.is_empty())
-        .unwrap_or(false)
-    {
+    if measured.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
         doc["measured"] = measured;
     }
 
@@ -890,16 +899,14 @@ mod tests {
                 basis: manager_models::MemoryBasis::Estimate,
             },
         );
-        measure
-            .backend_states
-            .insert(
-                "tool-runner".to_string(),
-                BackendMeasured {
-                    state: "running".to_string(),
-                    uptime_secs: Some(60),
-                    process_vram: vec![(0, None), (1, Some(4200))],
-                },
-            );
+        measure.backend_states.insert(
+            "tool-runner".to_string(),
+            BackendMeasured {
+                state: "running".to_string(),
+                uptime_secs: Some(60),
+                process_vram: vec![(0, None), (1, Some(4200))],
+            },
+        );
         let (doc, meta) = build_context(&cfg, &measure, "0.1.33", "tool-runner");
         let backend = doc["backends"]
             .as_array()
@@ -928,6 +935,25 @@ mod tests {
             .unwrap()
             .iter()
             .any(|c| c["id"] == "qwen3-coder-30b"));
+    }
+
+    #[test]
+    fn offload_fact_reports_moe_layers_through_the_block_map() {
+        // Review item 11: `layers` is the raw flag value,
+        // `offloaded_layers` the MoE layers it moves (2 leading
+        // dense blocks: `--n-cpu-moe 18` moves 16 of 48).
+        let mut b = AppConfig::default_config().backends[0].clone();
+        b.raw_flags = Some("--n-cpu-moe 18".to_string());
+        let map = manager_models::MoeBlockMap::from_block_indices(2..50).unwrap();
+        let v = offload_json(&b, Some(48), Some(&map));
+        assert_eq!(v["layers"], json!(18));
+        assert_eq!(v["offloaded_layers"], json!(16));
+        assert_eq!(v["moe_layers"], json!(48));
+        // No map: the identity, as before.
+        assert_eq!(
+            offload_json(&b, Some(48), None)["offloaded_layers"],
+            json!(18)
+        );
     }
 
     #[test]
@@ -1012,12 +1038,18 @@ mod tests {
         assert_eq!(r["basis"], json!("measured"));
         assert_eq!(r["generation_per_second"]["short"], json!(35.0));
         assert_eq!(r["screen"]["overall"]["passed"], json!(11));
-        assert!(meta.measured_blocks.iter().any(|b| b == "experiment results"));
+        assert!(meta
+            .measured_blocks
+            .iter()
+            .any(|b| b == "experiment results"));
         // The system prompt states the experiments contract and
         // the §A.4 replacement-claim instruction verbatim-ish.
         let (system, _user) = build_prompts("P", "", &doc, &meta);
         assert!(system.contains("\"experiments\" array"), "{system}");
-        assert!(system.contains("the run itself never downloads"), "{system}");
+        assert!(
+            system.contains("the run itself never downloads"),
+            "{system}"
+        );
         assert!(system.contains("screen at/above baseline, no baseline-passing category at zero, and higher measured speed"), "{system}");
     }
 
@@ -1072,7 +1104,10 @@ mod tests {
         let (system, _user) = build_prompts("MY PURPOSE", "", &doc, &meta);
         assert!(system.contains("\"candidates\" section"), "{system}");
         assert!(system.contains("Hugging Face"), "{system}");
-        assert!(system.contains("distinct from the curated catalog"), "{system}");
+        assert!(
+            system.contains("distinct from the curated catalog"),
+            "{system}"
+        );
         assert!(system.contains("fit verdict"), "{system}");
     }
 

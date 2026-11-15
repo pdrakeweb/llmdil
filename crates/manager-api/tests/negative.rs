@@ -15,14 +15,17 @@ use manager_api::users::RoleName;
 use manager_api::{build_router, ApiCtx, UserStore};
 use manager_app::AppState;
 
+/// A scratch data dir unique within this run: pid + a process-wide
+/// counter. A clock-only name could collide between tests started in
+/// parallel, letting one test remove the other's data dir.
+fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()))
+}
+
 async fn test_ctx() -> (Arc<ApiCtx>, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!(
-        "llm-api-negative-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = unique_test_dir("llm-api-negative");
     std::fs::create_dir_all(&dir).unwrap();
     let config_path = dir.join("config.json");
     let app = Arc::new(AppState::new(
@@ -55,6 +58,7 @@ async fn seed(ctx: &Arc<ApiCtx>, username: &str, role: RoleName) -> (String, Str
         must_change_password: false,
         totp_enabled: false,
         recovery_code_hashes: vec![],
+        last_totp_step: None,
         created_ms: manager_api::users::now_ms(),
         updated_ms: manager_api::users::now_ms(),
     };
@@ -86,7 +90,10 @@ async fn call_raw(
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 fn bearer(token: &str) -> Vec<(&str, String)> {
@@ -95,7 +102,9 @@ fn bearer(token: &str) -> Vec<(&str, String)> {
 
 fn assert_envelope(body: &Value, code: &str) {
     assert_eq!(body["error"]["code"], code, "body: {body}");
-    assert!(body["error"]["message"].as_str().is_some_and(|m| !m.is_empty()));
+    assert!(body["error"]["message"]
+        .as_str()
+        .is_some_and(|m| !m.is_empty()));
 }
 
 #[tokio::test]
@@ -136,7 +145,14 @@ async fn expired_and_revoked_sessions_are_refused() {
     let (user_id, token) = seed(&ctx, "victim", RoleName::Admin).await;
 
     // Sanity: the fresh token works.
-    let (status, _) = call_raw(&ctx, Method::GET, "/api/v1/status", &bearer(&token), Body::empty()).await;
+    let (status, _) = call_raw(
+        &ctx,
+        Method::GET,
+        "/api/v1/status",
+        &bearer(&token),
+        Body::empty(),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // Expire the session in the store.
@@ -149,7 +165,14 @@ async fn expired_and_revoked_sessions_are_refused() {
         })
         .await
         .unwrap();
-    let (status, body) = call_raw(&ctx, Method::GET, "/api/v1/status", &bearer(&token), Body::empty()).await;
+    let (status, body) = call_raw(
+        &ctx,
+        Method::GET,
+        "/api/v1/status",
+        &bearer(&token),
+        Body::empty(),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_envelope(&body, "UNAUTHENTICATED");
 
@@ -182,7 +205,14 @@ async fn disabled_user_tokens_die() {
         })
         .await
         .unwrap();
-    let (status, _) = call_raw(&ctx, Method::GET, "/api/v1/status", &bearer(&token), Body::empty()).await;
+    let (status, _) = call_raw(
+        &ctx,
+        Method::GET,
+        "/api/v1/status",
+        &bearer(&token),
+        Body::empty(),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -193,7 +223,14 @@ async fn role_escalation_attempts_are_refused() {
     let (_oid, operator) = seed(&ctx, "o", RoleName::Operator).await;
 
     // Viewer reaching for user administration.
-    let (status, body) = call_raw(&ctx, Method::GET, "/api/v1/admin/users", &bearer(&viewer), Body::empty()).await;
+    let (status, body) = call_raw(
+        &ctx,
+        Method::GET,
+        "/api/v1/admin/users",
+        &bearer(&viewer),
+        Body::empty(),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_envelope(&body, "FORBIDDEN");
     // Operator reaching for a config write.

@@ -18,6 +18,19 @@ function check(cond, msg) {
   else { console.error(`FAIL ${msg}`); failures++; }
 }
 
+// Source-pattern checks below were written against two single files,
+// src/api.ts and src/views/static.ts. Both are now barrels over their
+// split modules (T-02h), so each "file" read is the barrel plus every
+// module split out of it, concatenated in a fixed order — the same
+// code those checks always scanned, no more and no less.
+const API_SOURCES = [join(root, "src", "api.ts"),
+  ...readdirSync(join(root, "src", "api")).filter((f) => f.endsWith(".ts")).sort().map((f) => join(root, "src", "api", f))];
+const STATIC_VIEW_SOURCES = ["static", "common", "gpus", "activationPlan", "backendFlags", "backendCard", "backends",
+  "models", "logs", "gateway", "settingsPanels", "settings", "wizard"].map((v) => join(root, "src", "views", `${v}.ts`));
+const readAll = (files) => files.map((f) => readFileSync(f, "utf8")).join("\n");
+const readApiSrc = () => readAll(API_SOURCES);
+const readStaticSrc = () => readAll(STATIC_VIEW_SOURCES);
+
 const indexHtml = join(dist, "index.html");
 check(existsSync(indexHtml), "dist/index.html exists");
 
@@ -32,7 +45,7 @@ const html = existsSync(indexHtml) ? readFileSync(indexHtml, "utf8") : "";
 check(/assets\/.*\.js/.test(html), "index.html references the JS bundle");
 
 const bundle = jsFiles.map((f) => readFileSync(join(assetsDir, f), "utf8")).join("\n");
-for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_offload_override", "backend_clear_offload_override", "backend_set_mtp", "backend_set_moe_cache", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_set_mtp", "model_delete", "model_assign", "model_hf_lookup", "model_hf_header", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_restart", "postgres_stop", "activation_apply", "services_list", "log_receiver_status", "log_receiver_start", "log_receiver_stop", "log_receiver_restart", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "optimize_tuning_preview", "optimize_tuning_run", "optimize_tuning_adopt", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart"]) {
+for (const cmd of ["get_status", "list_backends", "get_gpu_telemetry", "run_wizard_step", "setup_get_steps", "run_audit", "setup_mark_complete", "start_backend", "stop_backend", "restart_backend", "backend_get_launch_command", "backend_apply_config", "backend_set_offload", "backend_set_offload_override", "backend_clear_offload_override", "backend_set_mtp", "backend_set_moe_cache", "backend_set_parallel", "backend_set_cache", "backend_cache_preview", "backend_add", "backend_add_preview", "test_backend", "list_models", "download_model", "cancel_download", "model_pause_download", "model_resume_download", "model_verify_checksum", "model_set_short_name", "model_set_offload_spec", "model_set_mtp", "model_delete", "model_assign", "model_hf_lookup", "model_hf_header", "get_logs", "placement_propose", "placement_apply", "diagnostics_export_bundle", "get_gateway_config", "gateway_status", "gateway_stop", "gateway_restart", "postgres_stop", "activation_apply", "services_list", "log_receiver_status", "log_receiver_start", "log_receiver_stop", "log_receiver_restart", "gateway_preview_yaml", "update_gateway_config", "get_config", "get_mxc_policy", "mxc_set_mode", "mxc_run_self_test", "telemetry_reset_peaks", "telemetry_save_snapshot", "telemetry_set_interval", "optimize_measure_backend", "optimize_estimate_backend", "optimize_run_experiments", "optimize_estimate_experiments", "optimize_tuning_preview", "optimize_tuning_run", "optimize_tuning_adopt", "measurement_lookup", "measurement_delete", "gateway_set_backend_group", "gateway_create_group", "gateway_delete_group", "get_gpu_history", "update_config", "updates_pin", "updates_set_auto", "app_update_status", "app_update_check", "app_update_set_checking", "app_update_set_auto", "app_update_download", "app_update_restart", "winml_probe"]) {
 
   check(bundle.includes(cmd), `bundle references Tauri command "${cmd}"`);
 }
@@ -206,7 +219,7 @@ check(bundle.includes("#/logs?scope=optimize&follow=1"), "bundle contains the Op
 // view-mode pattern) applied from an expandable section.
 check(bundle.includes("Recent searches"), "bundle contains the Recent searches section label");
 check(bundle.includes("llm.logs.recents"), "bundle contains the Logs recents storage key");
-const logsSrc = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+const logsSrc = readStaticSrc();
 check(logsSrc.includes("let logsViewState"), "Logs session state lives at module level in static.ts");
 check(logsSrc.includes("function recordLogSearch"), "Logs recents recording exists in static.ts");
 check(logsSrc.includes("LOGS_RECENTS_CAP = 30"), "Logs recents cap is 30 in static.ts");
@@ -221,8 +234,11 @@ check(bundle.includes("aria-checked"), "bundle exposes switch state via aria-che
 const allSrc = walkTs(join(root, "src")).map((f) => readFileSync(f, "utf8")).join("\n");
 check(allSrc.includes("function enableSwitch"), "shared enableSwitch component exists in ui/src");
 check(!allSrc.includes('? "ban" : "check"'), "no action-icon enable/disable toggle remains in ui/src");
-for (const view of ["views/static.ts", "views/mcp.ts"]) {
-  check(readFileSync(join(root, "src", view), "utf8").includes("enableSwitch("),
+for (const [view, src] of [
+  ["views/static.ts (with its split view modules)", readStaticSrc()],
+  ["views/mcp.ts", readFileSync(join(root, "src", "views", "mcp.ts"), "utf8")],
+]) {
+  check(src.includes("enableSwitch("),
     `${view} renders its enable/disable controls via enableSwitch`);
 }
 // Add-backend launch parameters (tracker #49): the add form hosts
@@ -292,7 +308,7 @@ check(optimizeSrc.includes('data-opt-act="tuning-preview"'), "Optimize view rend
 check(optimizeSrc.includes('data-opt-act="tuning-run"'), "Optimize view renders the tuning Run sweep action (Addendum B)");
 check(optimizeSrc.includes('data-opt-act="tuning-adopt"'), "Optimize view renders the tuning Adopt winner action (Addendum B)");
 check(optimizeSrc.includes("Incumbent stands"), "Optimize view states when the incumbent stands (Addendum B)");
-const staticSrcB = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+const staticSrcB = readStaticSrc();
 check(staticSrcB.includes('data-back-act="tuning"'), "Backend card menu renders the Optimize this backend action (Addendum B)");
 check(staticSrcB.includes("Optimize this backend"), "Backend card menu labels the tuning action (Addendum B)");
 
@@ -303,7 +319,7 @@ check(staticSrcB.includes("Optimize this backend"), "Backend card menu labels th
 // carried count.
 check(optimizeSrc.includes('typeof c.params_b === "number" ? (c.params_b as number) : undefined'),
   "Optimize apply forwards a model.add item's params_b to modelAdd (tracker #38)");
-const apiSrc38 = readFileSync(join(root, "src", "api.ts"), "utf8");
+const apiSrc38 = readApiSrc();
 check(apiSrc38.includes("Params: ${num(c.params_b)} B"),
   "Optimize change summary shows a model.add item's carried params_b (tracker #38)");
 
@@ -378,7 +394,7 @@ const lanesRule = stylesSrc.split(".groups-lanes {")[1]?.split("}")[0] ?? "";
 check(lanesRule.includes("flex-wrap: wrap"), "Groups lanes container wraps lanes onto additional rows (flex-wrap: wrap)");
 check(!lanesRule.includes("overflow-x: auto"), "Groups lanes container has no horizontal scroll (no overflow-x: auto)");
 check(bundle.includes("#/groups"), "bundle contains the Groups route (#/groups)");
-check(readFileSync(join(root, "src", "views", "static.ts"), "utf8").includes("Edit membership"),
+check(readStaticSrc().includes("Edit membership"),
   "Gateway Routing card links to the Groups editor (Edit membership)");
 
 // Backend card declutter (Oct 20, 2026): the card face carries no
@@ -393,7 +409,7 @@ check(readFileSync(join(root, "src", "views", "static.ts"), "utf8").includes("Ed
 // and a latest-log-lines block fed by the open-Details tail
 // fetch. The harness renders no DOM, so these pin the source
 // fragments of that contract, in the established style.
-const backendSrc = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+const backendSrc = readStaticSrc();
 const cardFnSrc = backendSrc.slice(backendSrc.indexOf("function backendCard("), backendSrc.indexOf("export function renderBackends"));
 check(cardFnSrc.includes('data-back-menu-item data-back-act="toolcall"'), "backend card menu carries the Test tool calls item");
 check(cardFnSrc.includes("View all logs"), "backend card menu carries the View all logs item");
@@ -479,7 +495,7 @@ check(bundle.includes("backend-stats-predicted"), "bundle contains the predicted
 // measured draw renders with its limit alongside.
 check(logsSrc.includes('power_absence === "driver_not_available"'), "GPUs view gates the 'not measured' power value on the driver-N/A state");
 check(logsSrc.includes("/ ${trim1(g.power_limit_w)} W"), "GPUs card renders the power draw with the limit alongside");
-check(readFileSync(join(root, "src", "api.ts"), "utf8").includes("power_absence: s.power_absence ?? undefined"),
+check(readApiSrc().includes("power_absence: s.power_absence ?? undefined"),
   "telemetry adapt maps power_absence from the payload");
 check(readFileSync(join(root, "src", "views", "dashboard.ts"), "utf8").includes('power_absence === "driver_not_available" ? "not measured" : "—"'),
   "dashboard power value gates 'not measured' on the driver-N/A state");
@@ -488,7 +504,7 @@ check(readFileSync(join(root, "src", "views", "dashboard.ts"), "utf8").includes(
 // a 1h/24h/7d range selector and one chart per metric, fed by
 // get_gpu_history; the chart helper breaks series at time gaps and
 // unmeasured values instead of interpolating across them.
-const gpuHistSrc = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+const gpuHistSrc = readStaticSrc();
 check(gpuHistSrc.includes('id="gpuHistory"'), "GPUs view renders the history section container");
 check(gpuHistSrc.includes("data-hist-range"), "GPUs history renders the range selector (data-hist-range)");
 check(gpuHistSrc.includes("data-hist-metric"), "GPUs history renders per-metric chart containers (data-hist-metric)");
@@ -506,7 +522,7 @@ check(chartsSrc.includes("3 * s.intervalMs"), "historyChart breaks series at gap
 check(bundle.includes("addModelMoeLayers"), "bundle contains the Add Model MoE layers field");
 check(bundle.includes("addModelMoeDefault"), "bundle contains the Add Model default offload field");
 check(bundle.includes("MoE layers"), "bundle contains the MoE declaration field label");
-const staticSrc = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+const staticSrc = readStaticSrc();
 check(staticSrc.includes('data-model-act="offload"'), "Models view renders the offload declaration editor button");
 check(staticSrc.includes('data-model-act="offload-save"'), "Models view renders the declaration save action");
 check(staticSrc.includes("Expert offload"), "Models view renders the Expert offload card figure");
@@ -744,7 +760,14 @@ check(staticSrc.includes("start it to refresh the prediction"), "Backends Refres
 check(groupsSrc.includes("start it to refresh the prediction"), "Groups Refresh states the not-running reason in place");
 check(staticSrc.includes("data-pred-elapsed"), "Backends card renders the refresh Measuring elapsed state");
 check(groupsSrc.includes("data-group-pred-elapsed"), "Groups card renders the refresh Measuring elapsed state");
-const optimizeRsSrc = readFileSync(join(root, "..", "crates", "manager-app", "src", "optimize.rs"), "utf8");
+// optimize.rs was decomposed into optimize/*.rs (T-02a); scan the
+// parent module and every submodule so the checks keep their strength.
+const optimizeRsDir = join(root, "..", "crates", "manager-app", "src", "optimize");
+const optimizeRsSrc = [
+  readFileSync(join(root, "..", "crates", "manager-app", "src", "optimize.rs"), "utf8"),
+  ...readdirSync(optimizeRsDir).filter((f) => f.endsWith(".rs")).sort()
+    .map((f) => readFileSync(join(optimizeRsDir, f), "utf8")),
+].join("\n");
 check(optimizeRsSrc.includes("mutual exclusion refusal"), "benchmark/consultation starts log the mutual-exclusion refusal (tracker #70)");
 check(optimizeRsSrc.includes("fn try_claim_optimize_op"), "the per-backend running-operation claim is a named predicate in the optimize paths (tracker #70)");
 check(optimizeRsSrc.includes("consultations and benchmarks on the same backend are mutually exclusive"), "the mutual-exclusion refusal names the rule and the running operation (tracker #70)");
@@ -755,7 +778,7 @@ check(optimizeRsSrc.includes("consultations and benchmarks on the same backend a
 // surfaces the supervisor's recorded failure_reason under the
 // header in "Label: Value" form. The row type declares both
 // fields so the payload contract is explicit.
-const apiSrc = readFileSync(join(root, "src", "api.ts"), "utf8");
+const apiSrc = readApiSrc();
 check(apiSrc.includes("rs_ram_mib?: number | null"), "BackendRow declares the recurrent-state cache field");
 check(apiSrc.includes("failure_reason?: string | null"), "BackendRow declares the recorded failure reason");
 check(staticSrc.includes('["State cache"'), "Backends card renders the State cache tile");
@@ -782,7 +805,7 @@ check(bundle.includes("Use predicted best"), "bundle contains the predicted-best
 // save path. The compiled/source fragments of those controls must
 // survive the build — a value with no editor is the defect class
 // this sweep removed.
-const settingsSrc = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+const settingsSrc = readStaticSrc();
 check(settingsSrc.includes('id="setTelInterval"'), "Settings renders the telemetry poll interval editor (setTelInterval)");
 check(settingsSrc.includes('id="setWinmlToggle"'), "Settings renders the Windows ML switch (setWinmlToggle)");
 check(settingsSrc.includes('id="setWinmlPort"'), "Settings renders the Windows ML port editor (setWinmlPort)");
@@ -841,7 +864,7 @@ check(bundle.includes("fully CPU-offloaded backend this can take several minutes
 // The old single-string line ("Weights: … · KV: … · Total: … vs
 // GPU 0 … GiB · fits") must not return in either form (the shared
 // cachePreviewHtml renderer serves the Edit and Add forms).
-const staticSrcFit = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+const staticSrcFit = readStaticSrc();
 check(staticSrcFit.includes("function cachePreviewHtml"), "shared cachePreviewHtml renderer exists in static.ts");
 check(staticSrcFit.includes('row("KV cache"'), "cache fit block renders the KV cache as its own row");
 check(staticSrcFit.includes('row("State cache"'), "cache fit block renders the State cache as its own row");
@@ -926,7 +949,7 @@ if (fmt) {
   check(fmt.fmtCount(512.6) === "513", "fmtCount rounds to an integer");
   check(fmt.fmtPct(0.125) === "12.5", "fmtPct renders a fraction as a one-decimal percent figure");
 }
-const staticSrcNum = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+const staticSrcNum = readStaticSrc();
 const dashSrcNum = readFileSync(join(root, "src", "views", "dashboard.ts"), "utf8");
 const mapSrcNum = readFileSync(join(root, "src", "views", "serviceMap.ts"), "utf8");
 const optSrcNum = readFileSync(join(root, "src", "views", "optimize.ts"), "utf8");
@@ -964,9 +987,49 @@ check(!allSrc.includes("Sample mode \\u2014 open the installed app") && !allSrc.
 const optSrcNar = readFileSync(join(root, "src", "views", "optimize.ts"), "utf8");
 check(!optSrcNar.includes('<span class="opt-note">Accepted experiments run'), "Optimize experiments explanation is not a visible note (button tooltips only)");
 check(!optSrcNar.includes('<p class="opt-note">Every stored measurement'), "Optimize measurements description is not a visible paragraph (info-tip only)");
-const staticSrcNar = readFileSync(join(root, "src", "views", "static.ts"), "utf8");
+const staticSrcNar = readStaticSrc();
 check(staticSrcNar.includes('"banner mode-live"'), "wizard live mode renders as a neutral status banner, not warning styling");
 check(!staticSrcNar.includes("wiz-side"), "wizard sidebar narrative block is removed from static.ts");
+
+// Capability audit §13.2: the effective global routing strategy is
+// computed server-side (get_gateway_config.effective_strategy); the
+// UI must not carry a second implementation of the rule.
+const apiSrcGw = readApiSrc();
+check(!allSrc.includes("effectiveGatewayStrategy"), "no TypeScript re-implementation of the gateway strategy rule (effectiveGatewayStrategy) remains in ui/src");
+check(apiSrcGw.includes("raw.effective_strategy"), "getGatewayConfig reads the backend-computed effective_strategy");
+
+// Admin API bind choice (auth-plan §5): the Remote Access card carries
+// the selector, saved as admin_api.bind_mode (+ bind_ip), and shows
+// the loopback-fallback reason the shell reports.
+check(staticSrcNar.includes("data-ra-bind-save") && staticSrcNar.includes('id="raBind"'), "Remote Access card has the Admin API bind selector");
+check(staticSrcNar.includes('bind_mode: "interface", bind_ip:'), "bind selector saves an interface choice with its address");
+check(staticSrcNar.includes("status.bind_fallback"), "Remote Access card shows the bind fallback reason");
+
+// Pairing QR (PLAN.md §3.8): rendered by the shell, inlined on the
+// pairing block through the guard that accepts only a bare <svg>.
+check(staticSrcNar.includes("pairingQrHtml(enroll.qr_svg)"), "pairing block renders the shell's QR");
+check(/function pairingQrHtml[\s\S]{0,600}<script/.test(staticSrcNar), "pairing QR guard rejects scriptable SVG");
+
+// Add-a-backend card (design audit Q3/Q8 remainder): the summary
+// strip carries GPU RAM / System RAM tiles from backend_add_preview's
+// memory object and the split preview is a segmented bar, not the
+// old "Split:" text line.
+check(apiSrcGw.includes("memory?: BackendAddMemory | null"), "BackendAddPreview carries the memory requirement object");
+check(staticSrcNar.includes("data-add-split-bar") && /data-add-split-bar[\s\S]{0,400}stackedBar\(segs/.test(staticSrcNar), "add-backend form renders the split preview as a segmented bar");
+check(/preview\.memory \?\? null[\s\S]{0,900}"GPU RAM"[\s\S]{0,300}"System RAM"/.test(staticSrcNar), "add-backend strip renders GPU RAM / System RAM tiles from the preview memory");
+check(!staticSrcNar.includes("Split: ${esc(summary)}"), "add-backend placement no longer repeats the split as a text line");
+// Rule 15 sweep of the MCP surfaces (buttons audit follow-up): the
+// URL copy, form Cancel, and prompt Skip are icon-only with a name;
+// Cancel start (aborts the operation) carries its word and an icon.
+const mcpSrcR15 = readFileSync(join(root, "src", "views", "mcp.ts"), "utf8");
+const mcpPromptR15 = readFileSync(join(root, "src", "mcp-prompt.ts"), "utf8");
+check(mcpSrcR15.includes('title="Copy URL" aria-label="Copy URL"') && !mcpSrcR15.includes('font-size:11px">Copy</button>'), "MCP URL copy button is icon-only with an accessible name");
+check(mcpSrcR15.includes('class="btn icon-only" data-mcp-act="form-cancel" title="Cancel" aria-label="Cancel"'), "MCP form Cancel is icon-only with an accessible name");
+check(/data-prompt-act="skip"[^>]*aria-label="Skip /.test(mcpPromptR15) && !mcpPromptR15.includes('">Skip</button>'), "MCP credential prompt Skip is icon-only with an accessible name");
+check(mcpPromptR15.includes('data-prompt-act="cancel">${icon("x")} Cancel start'), "MCP credential prompt Cancel start keeps its word and carries an icon");
+// OpenRouter tier card: spent-vs-cap meter in the audit's designated
+// slot, fed by gateway_status.openrouter_spend.
+check(/const spendRow = spend && spend\.fraction !== null[\s\S]{0,1600}meter\(Math\.min\(100, spend\.fraction \* 100\)/.test(staticSrcNar) && staticSrcNar.includes("${spendRow}"), "OpenRouter tier card renders the spent-vs-cap meter from openrouter_spend");
 
 if (failures > 0) { console.error(`\n${failures} smoke check(s) failed`); process.exit(1); }
 console.log("\nsmoke: all checks passed");

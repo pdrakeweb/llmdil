@@ -749,10 +749,7 @@ impl SystemOps for FakeSystemOps {
         Ok(4242)
     }
 
-    async fn service_stop(
-        &self,
-        name: &str,
-    ) -> Result<manager_services::StopOutcome, WizardError> {
+    async fn service_stop(&self, name: &str) -> Result<manager_services::StopOutcome, WizardError> {
         let mut st = self.state.lock().unwrap();
         st.service_stops.push(name.to_string());
         let registered = st.registered_services.contains(name);

@@ -18,9 +18,7 @@ pub struct HardwareProbe {
 /// critical path.
 pub fn probe_hardware() -> HardwareProbe {
     let mut probe = HardwareProbe {
-        cpu_cores: std::thread::available_parallelism()
-            .ok()
-            .map(|n| n.get()),
+        cpu_cores: std::thread::available_parallelism().ok().map(|n| n.get()),
         ..Default::default()
     };
     #[cfg(windows)]

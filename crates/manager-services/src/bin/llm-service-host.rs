@@ -41,9 +41,7 @@ fn main() -> ExitCode {
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find(|w| w[0] == flag)
-        .map(|w| w[1].clone())
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }
 
 /// Append a line to `<data_dir>/logs/service-manage.log` so elevated
@@ -113,10 +111,21 @@ fn cmd_register(args: &[String]) -> u8 {
         };
         let image_path = def.image_path(&host_exe, &def_path);
         // `password` drops (zeroed) when this block ends, on every path.
-        match manager_services::scm::platform_control().register(&def, &image_path, Some(password.as_str())) {
+        match manager_services::scm::platform_control().register(
+            &def,
+            &image_path,
+            Some(password.as_str()),
+        ) {
             Ok(()) => {
                 if let Some(dir) = &data_dir {
-                    manage_log(dir, &format!("registered {} as {}", def.name, def.account.as_deref().unwrap_or("?")));
+                    manage_log(
+                        dir,
+                        &format!(
+                            "registered {} as {}",
+                            def.name,
+                            def.account.as_deref().unwrap_or("?")
+                        ),
+                    );
                 }
                 0
             }
@@ -287,9 +296,7 @@ fn utf16_to_string(buf: &[u16]) -> String {
 /// [`SecretString`] and the raw dialog buffer is zeroed immediately;
 /// the caller passes it only to SCM and drops it on every path.
 #[cfg(windows)]
-fn prompt_service_account_password(
-    def: &manager_services::ServiceDefinition,
-) -> CredentialPrompt {
+fn prompt_service_account_password(def: &manager_services::ServiceDefinition) -> CredentialPrompt {
     use windows_sys::Win32::Foundation::{ERROR_CANCELLED, NO_ERROR};
     use windows_sys::Win32::Security::Credentials::{
         CredUIPromptForCredentialsW, CREDUI_FLAGS_ALWAYS_SHOW_UI, CREDUI_FLAGS_DO_NOT_PERSIST,
@@ -347,9 +354,7 @@ fn prompt_service_account_password(
         return CredentialPrompt::Cancelled;
     }
     if rc != NO_ERROR {
-        return CredentialPrompt::Failed(format!(
-            "credential prompt failed (CredUI error {rc})"
-        ));
+        return CredentialPrompt::Failed(format!("credential prompt failed (CredUI error {rc})"));
     }
     let username = utf16_to_string(&username_buf);
     let mut password_units: Vec<u16> = {
@@ -396,13 +401,16 @@ mod windows_host {
     use std::path::Path;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0,
-    };
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0};
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_APPEND_DATA, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
         OPEN_ALWAYS, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Services::{
         RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
@@ -411,14 +419,9 @@ mod windows_host {
         SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_STOP_PENDING,
         SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
     };
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-        TerminateJobObject, JobObjectExtendedLimitInformation,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    };
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject, PROCESS_INFORMATION,
-        STARTF_USESTDHANDLES, STARTUPINFOW,
+        CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
+        PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
     };
 
     const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
@@ -594,7 +597,10 @@ mod windows_host {
         // which ends this wait.
         let child = {
             let guard = HOST.lock().expect("host state");
-            guard.as_ref().map(|s| s.child).unwrap_or(std::ptr::null_mut())
+            guard
+                .as_ref()
+                .map(|s| s.child)
+                .unwrap_or(std::ptr::null_mut())
         };
         let mut exit_code: u32 = 0;
         let mut exit_known = false;
@@ -607,7 +613,12 @@ mod windows_host {
         let (requested, started, pid, def) = {
             let guard = HOST.lock().expect("host state");
             match guard.as_ref() {
-                Some(h) => (h.stop_requested, h.child_started, h.child_pid, Some(h.def.clone())),
+                Some(h) => (
+                    h.stop_requested,
+                    h.child_started,
+                    h.child_pid,
+                    Some(h.def.clone()),
+                ),
                 None => (false, None, 0, None),
             }
         };
@@ -833,11 +844,13 @@ mod windows_host {
             }
         }
         let resolved = resolve_env(&def, cred_read).map_err(|e| {
-            marker(&def, "start failed", Some(&format!("environment resolution: {e}")));
+            marker(
+                &def,
+                "start failed",
+                Some(&format!("environment resolution: {e}")),
+            );
             if let Some(stderr_log) = &def.stderr_log {
-                let _ = std::fs::create_dir_all(
-                    stderr_log.parent().unwrap_or(Path::new(".")),
-                );
+                let _ = std::fs::create_dir_all(stderr_log.parent().unwrap_or(Path::new(".")));
                 let _ = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -916,14 +929,16 @@ mod windows_host {
             )
         };
         // Read before CloseHandle below can overwrite it.
-        let spawn_error = if ok == 0 { unsafe { GetLastError() } } else { 0 };
+        let spawn_error = if ok == 0 {
+            unsafe { GetLastError() }
+        } else {
+            0
+        };
         // The child holds its own copies of the stdio handles now.
         for h in [stdout, stderr].into_iter().flatten() {
             unsafe { CloseHandle(h) };
         }
-        if stdin != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
-            && !stdin.is_null()
-        {
+        if stdin != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE && !stdin.is_null() {
             unsafe { CloseHandle(stdin) };
         }
         if ok == 0 {
@@ -951,8 +966,7 @@ mod windows_host {
         // the job, and TerminateJobObject is the stop path.
         let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
         if !job.is_null() {
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
-                unsafe { std::mem::zeroed() };
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             unsafe {
                 SetInformationJobObject(

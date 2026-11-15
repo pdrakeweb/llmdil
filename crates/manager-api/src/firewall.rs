@@ -1,7 +1,9 @@
 //! Windows Firewall reconciliation for the API listener
 //! (PLAN.md §2.4 / decision 2): one inbound rule for the API port,
 //! scoped to the local subnet plus the Tailscale range
-//! (100.64.0.0/10) — the machine binds all interfaces, the firewall
+//! (100.64.0.0/10) — the default bind is all interfaces (a specific
+//! interface address is the stricter option, under the same rule; a
+//! loopback-only bind needs no rule — [`rule_needed`]), the firewall
 //! is what keeps the port off the WAN side, and Pete does not
 //! port-forward it. The rule is created when the API is enabled and
 //! removed when it is disabled; state changes go through the
@@ -21,6 +23,17 @@ pub fn rule_name(port: u16) -> String {
 /// Remote scopes for the rule: `localsubnet` plus the Tailscale
 /// CGNAT range.
 pub const REMOTE_SCOPES: &str = "localsubnet,100.64.0.0/10";
+
+/// Whether a listener bound to `bind` needs the inbound rule. A
+/// loopback-only listener is unreachable from other machines whatever
+/// the firewall says, so the rule is neither created nor reported as
+/// missing. All-interfaces and specific-interface binds both get the
+/// same rule — the remote scope ([`REMOTE_SCOPES`]) is what limits
+/// who can connect; a specific-interface bind only narrows which
+/// local address answers, so it never widens what the rule admits.
+pub fn rule_needed(bind: std::net::IpAddr) -> bool {
+    !bind.is_loopback()
+}
 
 /// State of the API port's firewall rule, as reported by the status check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,9 +273,18 @@ mod tests {
     fn rule_identity() {
         assert_eq!(rule_name(47821), "LLMdil Admin API (47821)");
         assert!(REMOTE_SCOPES.contains("100.64.0.0/10"));
-        assert!(netsh_show_argv(47821)
-            .iter()
-            .any(|a| a.contains("47821")));
+        assert!(netsh_show_argv(47821).iter().any(|a| a.contains("47821")));
+    }
+
+    /// The rule follows the bind choice (auth-plan §5): loopback needs
+    /// none; every non-loopback bind gets the same scoped rule.
+    #[test]
+    fn rule_needed_follows_the_bind() {
+        assert!(!rule_needed("127.0.0.1".parse().unwrap()));
+        assert!(!rule_needed("::1".parse().unwrap()));
+        assert!(rule_needed("0.0.0.0".parse().unwrap()));
+        assert!(rule_needed("192.168.1.20".parse().unwrap()));
+        assert!(rule_needed("100.101.102.103".parse().unwrap()));
     }
 
     #[tokio::test]

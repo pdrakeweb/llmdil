@@ -10,8 +10,8 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use manager_api::auth::MemoryCredentialStore;
-use manager_api::users::{hash_password, now_ms, User};
 use manager_api::auth_routes::route_class_table;
+use manager_api::users::{hash_password, now_ms, User};
 use manager_api::users::{RoleName, UserStore};
 use manager_api::{build_router, ApiCtx};
 use manager_app::registry::{role_allows, OP_SPECS};
@@ -21,10 +21,11 @@ use tower::ServiceExt;
 const PW: &str = "a-unique-passphrase";
 
 async fn ctx_with_users() -> (Arc<ApiCtx>, std::path::PathBuf, [String; 4]) {
-    let dir = std::env::temp_dir().join(format!(
-        "manager-api-matrix-{}",
-        std::process::id()
-    ));
+    // pid + a per-call counter: a pid-only name was shared by every
+    // test in this binary, each removing the dir the others ran in.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("manager-api-matrix-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut cfg = manager_config::AppConfig::default_config();
@@ -41,9 +42,7 @@ async fn ctx_with_users() -> (Arc<ApiCtx>, std::path::PathBuf, [String; 4]) {
     // costs seconds per call on this VM, and the password paths
     // have their own dedicated flow tests.
     static TEST_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let hash = TEST_HASH
-        .get_or_init(|| hash_password(PW).unwrap())
-        .clone();
+    let hash = TEST_HASH.get_or_init(|| hash_password(PW).unwrap()).clone();
     let roles = [
         RoleName::Viewer,
         RoleName::Operator,
@@ -63,6 +62,7 @@ async fn ctx_with_users() -> (Arc<ApiCtx>, std::path::PathBuf, [String; 4]) {
             must_change_password: false,
             totp_enabled: false,
             recovery_code_hashes: vec![],
+            last_totp_step: None,
             created_ms: now_ms(),
             updated_ms: now_ms(),
         };
@@ -122,10 +122,7 @@ fn class_table_covers_every_route() {
     let table = route_class_table();
     let (ctx, dir) = {
         // Reuse the router records from a minimal ctx.
-        let dir = std::env::temp_dir().join(format!(
-            "manager-api-coverage-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("manager-api-coverage-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut cfg = manager_config::AppConfig::default_config();
@@ -181,10 +178,18 @@ async fn get_routes_follow_the_matrix() {
         for (i, role) in roles.iter().enumerate() {
             let st = status(&router, "GET", &uri, Some(&tokens[i]), None).await;
             if role_allows(*role, spec.class) {
-                assert_ne!(st, StatusCode::FORBIDDEN, "{role:?} GET {uri} must pass the guard");
+                assert_ne!(
+                    st,
+                    StatusCode::FORBIDDEN,
+                    "{role:?} GET {uri} must pass the guard"
+                );
                 assert_ne!(st, StatusCode::UNAUTHORIZED, "{role:?} GET {uri}");
             } else {
-                assert_eq!(st, StatusCode::FORBIDDEN, "{role:?} GET {uri} must be refused");
+                assert_eq!(
+                    st,
+                    StatusCode::FORBIDDEN,
+                    "{role:?} GET {uri} must be refused"
+                );
             }
             checked += 1;
         }
@@ -322,16 +327,29 @@ async fn api_tokens_cannot_use_account_self_service() {
         let st = status(&router, "POST", path, Some(&api_token), Some(body)).await;
         assert_eq!(st, StatusCode::FORBIDDEN, "API token on {path}");
     }
-    // The owner's session can still begin enrollment.
+    // The owner's session can still begin enrollment — with the
+    // password step-up, which first enrollment needs too (SEC-04).
     let st = status(
         &router,
         "POST",
         "/api/v1/auth/totp/enroll",
         Some(&tokens[3]),
-        Some("{}"),
+        Some(r#"{"password":"a-unique-passphrase"}"#),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
+    // Without it, or with a wrong one: 401.
+    for body in ["{}", r#"{"password":"not-the-password"}"#] {
+        let st = status(
+            &router,
+            "POST",
+            "/api/v1/auth/totp/enroll",
+            Some(&tokens[3]),
+            Some(body),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "body {body}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -352,8 +370,13 @@ async fn http_login_refresh_reuse_flow() {
             .await
             .unwrap();
         let st = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-        (st, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            st,
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        )
     };
     assert_eq!(st, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"]["code"], "INVALID_CREDENTIALS");
@@ -371,7 +394,9 @@ async fn http_login_refresh_reuse_flow() {
             ))
             .await
             .unwrap();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
     };
     let body = login(router.clone()).await;
@@ -398,7 +423,9 @@ async fn http_login_refresh_reuse_flow() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["error"]["code"], "SESSION_REVOKED");
     let _ = std::fs::remove_dir_all(&dir);
@@ -411,7 +438,14 @@ async fn http_enrollment_and_admin_flows() {
     let (router, _) = build_router(ctx.clone());
 
     // Operator may not administer users.
-    let st = status(&router, "GET", "/api/v1/admin/users", Some(&tokens[1]), None).await;
+    let st = status(
+        &router,
+        "GET",
+        "/api/v1/admin/users",
+        Some(&tokens[1]),
+        None,
+    )
+    .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
 
     // Admin creates a user, then an enrollment code for them; the
@@ -429,7 +463,9 @@ async fn http_enrollment_and_admin_flows() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let user_id = created["user"]["id"].as_str().unwrap().to_string();
 
@@ -443,8 +479,10 @@ async fn http_enrollment_and_admin_flows() {
         ))
         .await
         .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let code = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["code"]
         .as_str()
         .unwrap()
@@ -455,14 +493,14 @@ async fn http_enrollment_and_admin_flows() {
             "POST",
             "/api/v1/enroll",
             None,
-            Some(&format!(
-                r#"{{"code": "{code}", "device_name": "pixel"}}"#
-            )),
+            Some(&format!(r#"{{"code": "{code}", "device_name": "pixel"}}"#)),
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let enrolled: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let access = enrolled["access_token"].as_str().unwrap();
     let st = status(&router, "GET", "/api/v1/status", Some(access), None).await;
@@ -495,7 +533,9 @@ async fn http_enrollment_and_admin_flows() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let issued: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let token_value = issued["value"].as_str().unwrap().to_string();
     let token_id = issued["api_token"]["id"].as_str().unwrap().to_string();

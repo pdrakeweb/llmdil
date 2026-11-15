@@ -300,7 +300,15 @@ any user exists. Rules:
 - **Reset by admin**: an admin sets a temporary password for a
   user; the account is flagged must-change, all sessions revoked,
   and the temporary password works only to reach the change-
-  password endpoint. Audited.
+  password endpoint. Audited. As built (SEC-03): the reset also
+  revokes the user's API tokens, in the same store write; a
+  flagged login (TOTP step included) gets a 15-minute session;
+  every route except `POST /auth/password`, `POST /auth/logout`
+  and `GET /auth/me` answers 403 `PASSWORD_CHANGE_REQUIRED` for
+  the flagged user's sessions and API tokens, refresh is refused,
+  and each refusal is audited. The desktop's local admin commands
+  (Tauri IPC, not HTTP) are not gated — the desktop is the local
+  admin, and it has no self-service password or TOTP commands.
 - **Local reset**: if every admin is locked out, the desktop app
   (local access = physical access = already root on this machine)
   offers password reset for any account. This is the recovery path
@@ -312,7 +320,10 @@ any user exists. Rules:
 ### 3.7 TOTP (optional second factor)
 
 Recommendation: **implement TOTP as an optional per-user second
-factor in v1, not required.** Enrollment: user scans a QR (secret
+factor in v1, not required.** Enrollment (as built: from a signed-in
+session, never an API token, with the account password as step-up
+for first enrollment and re-enrollment alike — SEC-04; failures count
+toward the lockout): user scans a QR (secret
 generated server-side and stored in the OS credential store —
 never in the user store file, as built; see §4), 8 single-use
 recovery codes shown once and stored hashed. When enabled for a
@@ -426,6 +437,19 @@ by name, payloads by target id only.
 - The log is append-only from the API's perspective: no endpoint
   truncates or edits it; rotation is by file size with dated
   rollovers, matching the app's existing log handling.
+- Desktop admin actions (SEC-13, as built) land in the same file,
+  format and rotation, whether or not the API is running: actor
+  `desktop`, auth type `local`, source IP `local`, result `ok` /
+  `error`. Audited: create / update / delete user, reset password
+  and create enrollment code (action strings identical to the API
+  routes, e.g. `DELETE /api/v1/admin/users/{id}`, target the user
+  id, or the username on create), and the desktop-only
+  `admin_api_enable` / `admin_api_disable`, `firewall_rule_apply` /
+  `firewall_rule_remove` and `tls_cert_regenerate`. Reads (status,
+  user list, pairing payload, audit view) are not. The entry carries
+  the outcome only — never the password, temporary password,
+  enrollment code or key. Written by `manager_api::audit::record_local`;
+  every writer in the process shares one `AuditLog::shared` instance.
 - Exposed read-only at `GET /api/v1/admin/audit` (admin only),
   newest first, paginated — same shape the Logs view already uses.
 
@@ -446,12 +470,37 @@ by name, payloads by target id only.
   scoped firewall rule for the gateway, so this follows existing
   precedent; or a single specified interface address for stricter
   setups.
+  As built (Nov 2026): `admin_api.bind_mode` = `loopback` | `all` |
+  `interface` (+ `admin_api.bind_ip`), chosen on the Remote Access
+  card from this machine's current addresses. The field is additive
+  and defaults to `all`, so every configuration written before it
+  keeps exactly its listening surface. A configured interface address
+  that is not assigned to the machine when the listener starts falls
+  back to **loopback**, never wider, and the reason shows in the
+  status (`bind_fallback`); a wildcard is refused as an interface
+  address. The firewall rule (same remote scope) is reconciled for
+  `all` and `interface`; a loopback listener needs none, so none is
+  created and the status reports it as not needed. The bind is
+  desktop-only configuration: the raw config patch has no REST route
+  (rest-api decision 11), so a remote client cannot widen it.
 - **TLS — decision with a recommendation.** Options:
   1. **Self-signed certificate + client pinning (recommended).**
      At enable time the server generates a self-signed cert
      (SANs: machine hostname, LAN IP, Tailscale IP, `prometheus`
      mDNS-style alias where available; 2-year validity, regenerated
-     on demand from the desktop UI). The desktop Remote Access page
+     on demand from the desktop UI). As built (SEC-08): later starts
+     load the stored key and certificate; a new one is generated only
+     when the material is missing, unreadable/corrupt (including
+     `sans.txt`), mismatched (key vs. certificate), or expired /
+     within 30 days of expiry — each branch logged and reported as
+     `cert_source` in the Remote Access status. A changed LAN or
+     Tailscale address never regenerates (pinned clients do not check
+     names); it shows as informational `san_drift` beside the
+     Regenerate button, the only path that changes the key or SANs.
+     rcgen's default validity (to year 4096) is used, not 2 years.
+     The private key (SEC-N3) is held in Windows Credential Manager
+     for the desktop user, not as a plaintext file; status reports
+     `key_storage`. The desktop Remote Access page
      shows the cert fingerprint and a QR code encoding
      `{ base_url, cert_sha256 }`; the Android app scans it at
      pairing and pins the fingerprint (TOFU with an out-of-band

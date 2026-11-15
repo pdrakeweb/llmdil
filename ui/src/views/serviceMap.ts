@@ -50,7 +50,7 @@ function gpuDot(g: GpuInfo): string {
   }
 }
 
-function fmtUptime(secs: number): string {
+export function fmtUptime(secs: number): string {
   if (secs < 60) return `${secs}s`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m`;
   const h = Math.floor(secs / 3600);

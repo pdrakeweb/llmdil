@@ -493,13 +493,7 @@ where
                     for (i, &b) in data.iter().enumerate() {
                         if b == b'\n' {
                             append_capped(&mut line, &data[start..i], &mut truncated);
-                            push_captured_line(
-                                &ring,
-                                which,
-                                &line,
-                                truncated,
-                                fatal.as_ref(),
-                            );
+                            push_captured_line(&ring, which, &line, truncated, fatal.as_ref());
                             line.clear();
                             truncated = false;
                             start = i + 1;
@@ -2348,6 +2342,11 @@ pub async fn test_tool_call(base_url: &str) -> Result<ToolCallProbeResult, Super
     ))
 }
 
+// Streaming, structured-output consultation transport (Optimize
+// Phase 3): a sibling of `chat_completion` in its own module.
+mod chat_stream;
+pub use chat_stream::{consult_completion, ConsultCompletion, StreamProgress};
+
 /// One chat message for [`chat_completion`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -2416,9 +2415,7 @@ fn interpret_chat_completion(
         .map_err(|e| SupervisorError::Http(format!("unparseable response body: {e}")))?;
     let message = json
         .pointer("/choices/0/message")
-        .ok_or_else(|| {
-            SupervisorError::Http("response has no first-choice message".to_string())
-        })?;
+        .ok_or_else(|| SupervisorError::Http("response has no first-choice message".to_string()))?;
     let content = message_text(message, "content");
     let reasoning = message_text(message, "reasoning_content");
     let finish_reason = json
@@ -2638,8 +2635,16 @@ pub async fn benchmark_completion(
     max_tokens: u32,
     timeout: Duration,
 ) -> Result<BenchmarkSample, SupervisorError> {
-    benchmark_completion_seeded(base_url, model, messages, temperature, max_tokens, None, timeout)
-        .await
+    benchmark_completion_seeded(
+        base_url,
+        model,
+        messages,
+        temperature,
+        max_tokens,
+        None,
+        timeout,
+    )
+    .await
 }
 
 /// [`benchmark_completion`] with a fixed sampling seed (Bench
@@ -4342,7 +4347,9 @@ mod tests {
         assert_eq!(r.finish_reason.as_deref(), Some("tool_calls"));
         assert!(r.chat_template_tool_use);
         assert_eq!(
-            r.chat_template_caps.as_ref().and_then(|c| c["supports_tools"].as_bool()),
+            r.chat_template_caps
+                .as_ref()
+                .and_then(|c| c["supports_tools"].as_bool()),
             Some(true)
         );
         assert!(r.detail.contains("probe_get_weather"), "{}", r.detail);
@@ -4435,7 +4442,10 @@ mod tests {
         let body = r#"{"choices":[{"message":{"content":"","reasoning_content":"thinking at length about the plan"},"finish_reason":"length"}],"usage":{"prompt_tokens":4500,"completion_tokens":4096}}"#;
         let err = interpret_chat_completion(200, body, 200_000, 4096).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("spent the full 4096-token budget on reasoning"), "{msg}");
+        assert!(
+            msg.contains("spent the full 4096-token budget on reasoning"),
+            "{msg}"
+        );
         assert!(msg.contains("finish_reason length"), "{msg}");
         assert!(msg.contains("completion_tokens 4096"), "{msg}");
     }

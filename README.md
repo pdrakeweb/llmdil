@@ -8,7 +8,7 @@ supervises, and monitors a local LLM serving stack on a single workstation.
 Target machine: Dell Precision 7865 — Threadripper PRO 5945WX, RTX A4000 16 GB
 + 2× Tesla P100 16 GB, Windows 11 Pro.
 
-Current release: **v0.1.60** (November 6, 2026).
+Current release: **v0.1.62** (November 15, 2026).
 
 ## What it does
 
@@ -46,6 +46,12 @@ Current release: **v0.1.60** (November 6, 2026).
   single-GPU models
 - Manages MXC (Microsoft Execution Containers) sandbox policies for agent tool
   execution
+- Updates components (llama.cpp, LiteLLM, models, extensions) from the
+  in-app Updates surface
+- Optional OpenRouter cloud tier with a configurable daily spend cap
+- Admin API bind choice and a device-pairing QR code; a `GET /api/v1/events`
+  event stream (SSE) that mirrors the desktop UI's events; running tasks
+  can be cancelled cooperatively
 - Exposes an Admin API whose settings and admin users are managed from the
   desktop UI (Settings → Remote Access), and reports activity through
   Windows toast notifications (Operations / Failures / Activation
