@@ -8,7 +8,7 @@ supervises, and monitors a local LLM serving stack on a single workstation.
 Target machine: Dell Precision 7865 — Threadripper PRO 5945WX, RTX A4000 16 GB
 + 2× Tesla P100 16 GB, Windows 11 Pro.
 
-Current release: **v0.1.61** (November 12, 2026).
+Current release: **v0.1.62** (November 15, 2026).
 
 ## What it does
 

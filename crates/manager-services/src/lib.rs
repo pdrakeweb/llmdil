@@ -1676,12 +1676,13 @@ mod tests {
         assert_eq!(def.lifecycle_log, None);
         assert!(!def.failure_actions.restart_on_child_exit);
         // The marker log is derived from the stdout log for it.
+        // NOTE: do not build the expected path with `with_file_name`
+        // on this Windows-style path — on non-Windows hosts the whole
+        // string is one path component, so `with_file_name` replaces
+        // it entirely and yields just the file name.
         assert_eq!(
             lifecycle_log_path(&def),
-            Some(
-                PathBuf::from("C:\\data\\logs\\backend-planner.stdout.log")
-                    .with_file_name("backend-planner.lifecycle.log")
-            )
+            Some(PathBuf::from(r"C:\data\logs\backend-planner.lifecycle.log"))
         );
         // An old status payload without the specific code, too.
         let s: ServiceStatus = serde_json::from_str(
