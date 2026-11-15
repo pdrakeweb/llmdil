@@ -654,47 +654,62 @@ async fn admin_api_set_enabled(
     enabled: bool,
 ) -> Result<Value, String> {
     let st = state.inner().clone();
-    let mut api = admin_api_config(&st, &app).await?;
-    let port = api.port;
-    let sink: Arc<dyn EventSink> = Arc::new(TauriSink(app.clone()));
-    manager_app::registry::dispatch(
-        &st,
-        &sink,
-        Op::UpdateConfig,
-        json!({ "patch": { "admin_api": { "enabled": enabled, "port": port } } }),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    api.enabled = enabled;
-    if enabled {
-        let data_dir = st.data_dir().to_path_buf();
-        match start_admin_api(
-            st.clone(),
-            data_dir,
-            auth.inner().0.clone(),
-            &api,
-            slot.inner(),
+    let outcome: Result<(), String> = async {
+        let mut api = admin_api_config(&st, &app).await?;
+        let port = api.port;
+        let sink: Arc<dyn EventSink> = Arc::new(TauriSink(app.clone()));
+        manager_app::registry::dispatch(
+            &st,
+            &sink,
+            Op::UpdateConfig,
+            json!({ "patch": { "admin_api": { "enabled": enabled, "port": port } } }),
         )
         .await
-        {
-            Ok(server) => {
-                *slot.inner().server.lock().unwrap() = Some(server);
-                *slot.inner().note.lock().unwrap() = None;
+        .map_err(|e| e.to_string())?;
+        api.enabled = enabled;
+        if enabled {
+            let data_dir = st.data_dir().to_path_buf();
+            match start_admin_api(
+                st.clone(),
+                data_dir,
+                auth.inner().0.clone(),
+                &api,
+                slot.inner(),
+            )
+            .await
+            {
+                Ok(server) => {
+                    *slot.inner().server.lock().unwrap() = Some(server);
+                    *slot.inner().note.lock().unwrap() = None;
+                }
+                Err(e) => {
+                    *slot.inner().note.lock().unwrap() = Some(e.clone());
+                    return Err(e);
+                }
             }
-            Err(e) => {
-                *slot.inner().note.lock().unwrap() = Some(e.clone());
-                return Err(e);
+        } else {
+            let server = slot.inner().server.lock().unwrap().take();
+            if let Some(server) = server {
+                server.shutdown().await;
+            }
+            let removed = manager_api::firewall::remove(port).await;
+            // SEC-13: the rule removal is its own audited change.
+            manager_api::audit::record_local(st.data_dir(), "firewall_rule_remove", None, &removed);
+            if let Err(e) = removed {
+                *slot.inner().note.lock().unwrap() =
+                    Some(format!("firewall rule removal failed: {e}"));
             }
         }
-    } else {
-        let server = slot.inner().server.lock().unwrap().take();
-        if let Some(server) = server {
-            server.shutdown().await;
-        }
-        if let Err(e) = manager_api::firewall::remove(port).await {
-            *slot.inner().note.lock().unwrap() = Some(format!("firewall rule removal failed: {e}"));
-        }
+        Ok(())
     }
+    .await;
+    let action = if enabled {
+        "admin_api_enable"
+    } else {
+        "admin_api_disable"
+    };
+    manager_api::audit::record_local(st.data_dir(), action, None, &outcome);
+    outcome?;
     admin_api_get_status(app, state, slot, auth).await
 }
 
@@ -719,63 +734,94 @@ async fn admin_api_list_users(auth: State<'_, AdminAuth>) -> Result<Value, Strin
 
 #[tauri::command]
 async fn admin_api_create_user(
+    state: State<'_, Arc<AppState>>,
     auth: State<'_, AdminAuth>,
     username: String,
     password: String,
     role: String,
 ) -> Result<Value, String> {
-    let role = RoleName::parse(&role).ok_or_else(|| format!("unknown role `{role}`"))?;
-    let view = auth
-        .inner()
-        .0
-        .create_user(&username, &password, role)
-        .await
-        .map_err(|e| e.to_string())?;
-    serde_json::to_value(view).map_err(|e| e.to_string())
+    let r: Result<Value, String> = async {
+        let role = RoleName::parse(&role).ok_or_else(|| format!("unknown role `{role}`"))?;
+        let view = auth
+            .inner()
+            .0
+            .create_user(&username, &password, role)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(view).map_err(|e| e.to_string())
+    }
+    .await;
+    // SEC-13: same action string as the API route; never the password.
+    let data_dir = state.inner().data_dir();
+    manager_api::audit::record_local(data_dir, "POST /api/v1/admin/users", Some(&username), &r);
+    r
 }
 
 #[tauri::command]
 async fn admin_api_update_user(
+    state: State<'_, Arc<AppState>>,
     auth: State<'_, AdminAuth>,
     id: String,
     role: Option<String>,
     disabled: Option<bool>,
 ) -> Result<Value, String> {
-    let role = match role {
-        Some(r) => Some(RoleName::parse(&r).ok_or_else(|| format!("unknown role `{r}`"))?),
-        None => None,
-    };
-    let view = auth
-        .inner()
-        .0
-        .update_user(&id, role, disabled)
-        .await
-        .map_err(|e| e.to_string())?;
-    serde_json::to_value(view).map_err(|e| e.to_string())
+    let r: Result<Value, String> = async {
+        let role = match role {
+            Some(r) => Some(RoleName::parse(&r).ok_or_else(|| format!("unknown role `{r}`"))?),
+            None => None,
+        };
+        let view = auth
+            .inner()
+            .0
+            .update_user(&id, role, disabled)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(view).map_err(|e| e.to_string())
+    }
+    .await;
+    let data_dir = state.inner().data_dir();
+    manager_api::audit::record_local(data_dir, "PATCH /api/v1/admin/users/{id}", Some(&id), &r);
+    r
 }
 
 #[tauri::command]
-async fn admin_api_delete_user(auth: State<'_, AdminAuth>, id: String) -> Result<Value, String> {
+async fn admin_api_delete_user(
+    state: State<'_, Arc<AppState>>,
+    auth: State<'_, AdminAuth>,
+    id: String,
+) -> Result<Value, String> {
     // The desktop operator is the local administrator; the actor id
     // is a sentinel that is never a user id, so the self-delete
     // guard cannot trip here — the last-admin guard still applies.
-    auth.inner()
+    let r = auth
+        .inner()
         .0
         .delete_user("desktop", &id)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string());
+    let data_dir = state.inner().data_dir();
+    manager_api::audit::record_local(data_dir, "DELETE /api/v1/admin/users/{id}", Some(&id), &r);
+    r?;
     Ok(json!({ "ok": true }))
 }
 
 #[tauri::command]
-async fn admin_api_reset_password(auth: State<'_, AdminAuth>, id: String) -> Result<Value, String> {
-    let temp = auth
+async fn admin_api_reset_password(
+    state: State<'_, Arc<AppState>>,
+    auth: State<'_, AdminAuth>,
+    id: String,
+) -> Result<Value, String> {
+    let r = auth
         .inner()
         .0
         .admin_reset_password(&id)
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(json!({ "temporary_password": temp }))
+        .map_err(|e| e.to_string());
+    // Records only the outcome: the temporary password never reaches the log.
+    let data_dir = state.inner().data_dir();
+    let action = "POST /api/v1/admin/users/{id}/reset-password";
+    manager_api::audit::record_local(data_dir, action, Some(&id), &r);
+    Ok(json!({ "temporary_password": r? }))
 }
 
 /// The pairing payload for the enrollment QR (without a code):
@@ -818,7 +864,11 @@ async fn admin_api_create_enrollment(
         .0
         .create_enrollment_code(&user_id)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string());
+    // SEC-13: the outcome only, never the code.
+    let action = "POST /api/v1/admin/enrollment-codes";
+    manager_api::audit::record_local(&data_dir, action, Some(&user_id), &code);
+    let code = code?;
     let base_url = api_base_url(slot.inner(), &api);
     let cert = manager_api::tls::stored_fingerprint(&data_dir);
     // The QR (PLAN.md §3.8) encodes exactly the three values returned
@@ -847,38 +897,53 @@ async fn admin_api_regenerate_cert(
     auth: State<'_, AdminAuth>,
 ) -> Result<Value, String> {
     let st = state.inner().clone();
-    let api = admin_api_config(&st, &app).await?;
     let data_dir = st.data_dir().to_path_buf();
-    // The only path that changes the key or the SANs (SEC-08): the
-    // current addresses are taken here, at the operator's request.
-    manager_api::tls::regenerate(&data_dir, &cert_sans())
-        .map_err(|e| format!("certificate regeneration failed: {e}"))?;
-    *slot.inner().cert.lock().unwrap() = Some((
-        manager_api::tls::CertSource::RegeneratedByOperator.as_str(),
-        None,
-    ));
-    let running = slot.inner().server.lock().unwrap().is_some();
-    if running {
-        let old = slot.inner().server.lock().unwrap().take();
-        if let Some(old) = old {
-            old.shutdown().await;
-        }
-        match start_admin_api(st, data_dir, auth.inner().0.clone(), &api, slot.inner()).await {
-            Ok(server) => {
-                *slot.inner().server.lock().unwrap() = Some(server);
-                // The restart loaded the material regenerated above;
-                // keep reporting why it changed.
-                *slot.inner().cert.lock().unwrap() = Some((
-                    manager_api::tls::CertSource::RegeneratedByOperator.as_str(),
-                    None,
-                ));
+    let outcome: Result<(), String> = async {
+        let api = admin_api_config(&st, &app).await?;
+        // The only path that changes the key or the SANs (SEC-08): the
+        // current addresses are taken here, at the operator's request.
+        manager_api::tls::regenerate(&data_dir, &cert_sans())
+            .map_err(|e| format!("certificate regeneration failed: {e}"))?;
+        *slot.inner().cert.lock().unwrap() = Some((
+            manager_api::tls::CertSource::RegeneratedByOperator.as_str(),
+            None,
+        ));
+        let running = slot.inner().server.lock().unwrap().is_some();
+        if running {
+            let old = slot.inner().server.lock().unwrap().take();
+            if let Some(old) = old {
+                old.shutdown().await;
             }
-            Err(e) => {
-                *slot.inner().note.lock().unwrap() = Some(e.clone());
-                return Err(e);
+            let restarted = start_admin_api(
+                st.clone(),
+                data_dir.clone(),
+                auth.inner().0.clone(),
+                &api,
+                slot.inner(),
+            )
+            .await;
+            match restarted {
+                Ok(server) => {
+                    *slot.inner().server.lock().unwrap() = Some(server);
+                    // The restart loaded the material regenerated above;
+                    // keep reporting why it changed.
+                    *slot.inner().cert.lock().unwrap() = Some((
+                        manager_api::tls::CertSource::RegeneratedByOperator.as_str(),
+                        None,
+                    ));
+                }
+                Err(e) => {
+                    *slot.inner().note.lock().unwrap() = Some(e.clone());
+                    return Err(e);
+                }
             }
         }
+        Ok(())
     }
+    .await;
+    // SEC-13: no key material, only the outcome.
+    manager_api::audit::record_local(&data_dir, "tls_cert_regenerate", None, &outcome);
+    outcome?;
     admin_api_get_status(app, state, slot, auth).await
 }
 
@@ -895,18 +960,23 @@ async fn admin_api_apply_firewall_rule(
     slot: State<'_, ApiServerSlot>,
     auth: State<'_, AdminAuth>,
 ) -> Result<Value, String> {
-    let api = admin_api_config(state.inner(), &app).await?;
-    // Consistent with the bind choice: a loopback-only listener needs
-    // no inbound rule, so none is created for it.
-    if !manager_api::firewall::rule_needed(effective_bind(slot.inner(), &api).addr) {
-        return Err(
-            "no firewall rule is needed: the Admin API listens on loopback only".to_string(),
-        );
+    let outcome: Result<(), String> = async {
+        let api = admin_api_config(state.inner(), &app).await?;
+        // Consistent with the bind choice: a loopback-only listener needs
+        // no inbound rule, so none is created for it.
+        if !manager_api::firewall::rule_needed(effective_bind(slot.inner(), &api).addr) {
+            return Err(
+                "no firewall rule is needed: the Admin API listens on loopback only".to_string(),
+            );
+        }
+        manager_api::firewall::ensure(api.port)
+            .await
+            .map_err(|e| format!("firewall rule failed: {e}"))
     }
-    let port = api.port;
-    manager_api::firewall::ensure(port)
-        .await
-        .map_err(|e| format!("firewall rule failed: {e}"))?;
+    .await;
+    let data_dir = state.inner().data_dir();
+    manager_api::audit::record_local(data_dir, "firewall_rule_apply", None, &outcome);
+    outcome?;
     admin_api_get_status(app, state, slot, auth).await
 }
 
@@ -918,7 +988,7 @@ async fn admin_api_get_audit(
     limit: Option<usize>,
 ) -> Result<Value, String> {
     let data_dir = state.inner().data_dir().to_path_buf();
-    let audit = manager_api::AuditLog::new(&data_dir);
+    let audit = manager_api::AuditLog::shared(&data_dir);
     let entries = audit.read_recent(0, limit.unwrap_or(20).min(200));
     Ok(json!({ "entries": entries }))
 }
