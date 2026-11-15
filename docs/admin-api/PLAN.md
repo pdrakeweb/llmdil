@@ -915,11 +915,17 @@ operation events with process-global ids. Live-only: nothing is
 replayed on reconnect; ids let a client detect gaps.
 
 **Deviations.**
-- TLS private key custody: a key file under
-  `<data_dir>/admin-api/tls/` rather than Windows Credential
-  Manager. The in-process server reads it at startup before any
-  UI exists; the directory is per-user app data alongside
-  `admin-users.json`. Moving custody is future hardening.
+- TLS private key custody (resolved, SEC-N3): on Windows the key is
+  a per-user Credential Manager generic credential
+  (`llmdil/admin-api/tls-key/<id>`, named by
+  `<data_dir>/admin-api/tls/key-store.txt`); the certificate,
+  fingerprint and SANs stay as files. A plaintext `server.key` from
+  earlier versions is imported at startup, read back, and deleted
+  only once the protected copy matches; the certificate and
+  fingerprint are unchanged, so pairings survive. If Credential
+  Manager refuses the key the plaintext file stays in use. The
+  Remote Access status reports `key_storage` (`credential_manager` |
+  `file`). Other platforms keep the plaintext file.
 - QR rendering (resolved Nov 2026): the desktop pairing surface
   shows the payload (`base_url`, `cert_sha256`, enrollment code) as
   copyable values **and** as a QR code encoding the same three values

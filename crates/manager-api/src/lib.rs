@@ -27,6 +27,9 @@ pub mod firewall;
 pub mod http;
 pub mod operations;
 pub mod pairing;
+/// The `SecretStore` platform seam (T-06), owned by `manager-wizard`
+/// (which holds the Credential Manager FFI) and re-exported here.
+pub use manager_wizard::secrets;
 pub mod tls;
 pub mod users;
 

@@ -156,8 +156,11 @@ impl From<&User> for UserView {
 // ---------------------------------------------------------------------------
 
 /// Custody for TOTP secrets: the OS credential store in production
-/// (via the wizard's SystemOps), memory in tests. Secrets never
-/// touch `admin-users.json`.
+/// (via the wizard's SystemOps, which reach Credential Manager through
+/// the [`crate::secrets::SecretStore`] seam), memory in tests. This
+/// async, text-valued adapter keeps the wizard's UTF-16LE credential
+/// encoding; byte-valued callers use `SecretStore` directly. Secrets
+/// never touch `admin-users.json`.
 #[async_trait::async_trait]
 pub trait CredentialStore: Send + Sync {
     /// The secret stored under `target`, or `None` when there is none. Never log it.

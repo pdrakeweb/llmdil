@@ -630,6 +630,9 @@ async fn admin_api_get_status(
         "cert_source": cert_source,
         "cert_detail": cert_detail,
         "cert_not_after_ms": cert_not_after_ms,
+        // SEC-N3: where the private key lives ("credential_manager" |
+        // "file"; null before any certificate exists).
+        "key_storage": manager_api::tls::key_storage(&data_dir).map(|k| k.as_str()),
         "san_drift": !san_drift.is_empty(),
         "san_drift_ips": san_drift,
         "firewall": firewall,
