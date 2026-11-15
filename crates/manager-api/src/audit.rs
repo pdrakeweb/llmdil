@@ -11,9 +11,22 @@
 //! `<file>.prev.2` … `<file>.prev.<ARCHIVES>`; the oldest is dropped.
 //! The entry being written always lands (in the fresh file, or in the
 //! current one if rotation fails). Reads span the archives.
+//!
+//! Desktop admin actions (SEC-13) land in the same file through
+//! [`record_local`]: actor `desktop`, auth type `local`, source IP
+//! `local`. Every writer in the process goes through [`AuditLog::shared`],
+//! so the API server and the desktop shell serialize on one mutex and
+//! rotate one file.
 
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Actor recorded for actions taken in the desktop app (SEC-13).
+pub const LOCAL_ACTOR: &str = "desktop";
+/// Auth type recorded for desktop actions: the operator is the local
+/// administrator, authenticated by the OS session, not by the API.
+pub const LOCAL_AUTH_TYPE: &str = "local";
 
 /// Rotate the live file once appending would take it past this size
 /// (~1 MiB, matching the wizard and gateway logs).
@@ -55,6 +68,22 @@ impl AuditLog {
             lock: Mutex::new(()),
             rotate_bytes: ROTATE_BYTES,
         }
+    }
+
+    /// The process-wide log for `data_dir`. Every writer (the API
+    /// server across restarts, the desktop shell) shares this one
+    /// instance, so appends never interleave and only one writer
+    /// rotates the file. Touches no files.
+    pub fn shared(data_dir: &Path) -> Arc<Self> {
+        static LOGS: OnceLock<Mutex<HashMap<PathBuf, Arc<AuditLog>>>> = OnceLock::new();
+        let log = Self::new(data_dir);
+        let mut logs = LOGS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        logs.entry(log.path.clone())
+            .or_insert_with(|| Arc::new(log))
+            .clone()
     }
 
     /// Archive `n` (1-based): `<file>.prev`, then `<file>.prev.<n>`.
@@ -162,9 +191,144 @@ impl AuditLog {
     }
 }
 
+/// The entry for a desktop admin action (SEC-13): actor
+/// [`LOCAL_ACTOR`], auth type [`LOCAL_AUTH_TYPE`], result `ok` or
+/// `error`. Only the action name and the target identity are taken
+/// from the caller, so no password, temporary password, enrollment
+/// code or key material can reach the log through this path.
+pub fn local_entry(action: &str, target: Option<&str>, ok: bool) -> AuditEntry {
+    AuditEntry {
+        ts_ms: crate::users::now_ms(),
+        actor: LOCAL_ACTOR.to_string(),
+        auth_type: LOCAL_AUTH_TYPE.to_string(),
+        source_ip: "local".to_string(),
+        action: action.to_string(),
+        // Bounded like every other identity field (SEC-05).
+        target: target.map(|t| t.chars().take(crate::auth::MAX_USERNAME_LEN).collect()),
+        result: if ok { "ok" } else { "error" }.to_string(),
+        request_id: uuid::Uuid::new_v4().to_string(),
+    }
+}
+
+/// Audit a desktop admin action into `<data_dir>`'s Admin API audit
+/// log — the same file, format and rotation as API entries, written
+/// whether or not the API server is running. `action` matches the
+/// API's action string where the API has the same operation (e.g.
+/// `DELETE /api/v1/admin/users/{id}`), so one action reads the same
+/// from either surface. The outcome's value and error are not
+/// recorded, only whether it succeeded.
+pub fn record_local<T, E>(
+    data_dir: &Path,
+    action: &str,
+    target: Option<&str>,
+    outcome: &Result<T, E>,
+) {
+    AuditLog::shared(data_dir).append(&local_entry(action, target, outcome.is_ok()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "manager-api-audit-{tag}-{}-{}",
+            std::process::id(),
+            crate::users::generate_token()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// SEC-13: a desktop action is one entry with exactly the standard
+    /// fields, actor `desktop`, auth type `local`, `ok`/`error` result.
+    #[test]
+    fn record_local_writes_desktop_entry() {
+        let dir = temp_dir("local");
+        let ok: Result<serde_json::Value, String> =
+            Ok(serde_json::json!({ "temporary_password": "s3cret-temp" }));
+        record_local(
+            &dir,
+            "POST /api/v1/admin/users/{id}/reset-password",
+            Some("user-1"),
+            &ok,
+        );
+        let err: Result<(), String> = Err("enrollment code ABCD-1234 rejected".into());
+        record_local(
+            &dir,
+            "POST /api/v1/admin/enrollment-codes",
+            Some("user-2"),
+            &err,
+        );
+
+        let text = std::fs::read_to_string(dir.join("logs").join("admin-api-audit.jsonl")).unwrap();
+        // Neither the success value nor the error text reaches the log.
+        assert!(!text.contains("s3cret-temp"));
+        assert!(!text.contains("ABCD-1234"));
+        assert!(!text.contains("temporary_password"));
+
+        let recent = AuditLog::shared(&dir).read_recent(0, 10);
+        assert_eq!(recent.len(), 2);
+        let mut keys: Vec<&str> = recent[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "action",
+                "actor",
+                "auth_type",
+                "request_id",
+                "result",
+                "source_ip",
+                "target",
+                "ts_ms"
+            ]
+        );
+        assert_eq!(recent[0]["actor"], "desktop");
+        assert_eq!(recent[0]["auth_type"], "local");
+        assert_eq!(recent[0]["source_ip"], "local");
+        assert_eq!(recent[0]["action"], "POST /api/v1/admin/enrollment-codes");
+        assert_eq!(recent[0]["target"], "user-2");
+        assert_eq!(recent[0]["result"], "error");
+        assert_eq!(recent[1]["result"], "ok");
+        assert_eq!(recent[1]["target"], "user-1");
+        assert_ne!(recent[0]["request_id"], recent[1]["request_id"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One log instance per data dir, so the API server and the
+    /// desktop shell serialize on the same mutex.
+    #[test]
+    fn shared_is_one_instance_per_data_dir() {
+        let a = temp_dir("shared-a");
+        let b = temp_dir("shared-b");
+        assert!(Arc::ptr_eq(&AuditLog::shared(&a), &AuditLog::shared(&a)));
+        assert!(!Arc::ptr_eq(&AuditLog::shared(&a), &AuditLog::shared(&b)));
+    }
+
+    /// Desktop entries go through the same size rotation as API ones.
+    #[test]
+    fn record_local_rotates() {
+        let dir = temp_dir("local-rotate");
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let live = logs.join("admin-api-audit.jsonl");
+        let filler = serde_json::to_string(&entry(0)).unwrap() + "\n";
+        let lines = (ROTATE_BYTES as usize / filler.len()) + 1;
+        std::fs::write(&live, filler.repeat(lines)).unwrap();
+        record_local(&dir, "tls_cert_regenerate", None, &Ok::<(), ()>(()));
+        assert!(logs.join("admin-api-audit.jsonl.prev").exists());
+        assert!(std::fs::metadata(&live).unwrap().len() <= ROTATE_BYTES);
+        let newest = AuditLog::shared(&dir).read_recent(0, 1);
+        assert_eq!(newest[0]["action"], "tls_cert_regenerate");
+        assert_eq!(newest[0]["target"], serde_json::Value::Null);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn append_and_read_recent() {

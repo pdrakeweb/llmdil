@@ -437,6 +437,19 @@ by name, payloads by target id only.
 - The log is append-only from the API's perspective: no endpoint
   truncates or edits it; rotation is by file size with dated
   rollovers, matching the app's existing log handling.
+- Desktop admin actions (SEC-13, as built) land in the same file,
+  format and rotation, whether or not the API is running: actor
+  `desktop`, auth type `local`, source IP `local`, result `ok` /
+  `error`. Audited: create / update / delete user, reset password
+  and create enrollment code (action strings identical to the API
+  routes, e.g. `DELETE /api/v1/admin/users/{id}`, target the user
+  id, or the username on create), and the desktop-only
+  `admin_api_enable` / `admin_api_disable`, `firewall_rule_apply` /
+  `firewall_rule_remove` and `tls_cert_regenerate`. Reads (status,
+  user list, pairing payload, audit view) are not. The entry carries
+  the outcome only — never the password, temporary password,
+  enrollment code or key. Written by `manager_api::audit::record_local`;
+  every writer in the process shares one `AuditLog::shared` instance.
 - Exposed read-only at `GET /api/v1/admin/audit` (admin only),
   newest first, paginated — same shape the Logs view already uses.
 

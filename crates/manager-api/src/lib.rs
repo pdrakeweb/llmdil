@@ -152,7 +152,9 @@ impl ApiCtx {
             .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
         let events = Arc::new(BroadcastSink::new());
         let sink: Arc<dyn EventSink> = events.clone();
-        let audit = Arc::new(AuditLog::new(&data_dir));
+        // The process-wide instance: desktop actions (SEC-13) append
+        // to the same file under the same lock.
+        let audit = AuditLog::shared(&data_dir);
         // Lockout events happen inside the auth service (SEC-13).
         auth.attach_audit(audit.clone());
         Arc::new(Self {
