@@ -1,5 +1,24 @@
 use super::*;
 
+/// True when an install argv pins prisma to exactly
+/// `PRISMA_PINNED_VERSION`: as an explicit `prisma==X` requirement, or
+/// (F1 hash-locked install) via `--require-hashes -r <lock>` where the
+/// active gateway lock pins that version.
+fn pins_prisma_exactly(argv: &[String]) -> bool {
+    let pin = format!("prisma=={}", crate::PRISMA_PINNED_VERSION);
+    if argv.iter().any(|a| a == &pin) {
+        return true;
+    }
+    argv.iter().any(|a| a == "--require-hashes")
+        && argv.iter().any(|a| a == "-r")
+        && crate::gateway_lock::parse_requirements_lock(&crate::gateway_lock::active_gateway_lock())
+            .map(|reqs| {
+                reqs.iter()
+                    .any(|r| r.name == "prisma" && r.version == crate::PRISMA_PINNED_VERSION)
+            })
+            .unwrap_or(false)
+}
+
 /// Plant the files that make `postgres_installed` true in the
 /// fake fs (binaries in place + the install marker).
 pub(super) fn with_postgres_installed(ops: &FakeSystemOps, ctx: &WizardContext) {
@@ -997,13 +1016,7 @@ async fn start_gateway_reinstalls_pinned_prisma_and_clears_stale_client_on_misma
         .iter()
         .position(|c| c.argv.iter().any(|a| a == "--reinstall-package"))
         .expect("the pinned prisma reinstall ran");
-    assert!(
-        executed[pin_at]
-            .argv
-            .iter()
-            .any(|a| a == &format!("prisma=={}", crate::PRISMA_PINNED_VERSION)),
-        "{executed:?}"
-    );
+    assert!(pins_prisma_exactly(&executed[pin_at].argv), "{executed:?}");
     // ... before the first connect probe.
     let probe_at = executed
         .iter()
@@ -1159,12 +1172,11 @@ async fn start_gateway_spawn_env_database_path() {
     if let Some(v) = env.get("PRISMA_HEALTH_WATCHDOG_ENABLED") {
         assert_eq!(v, "false");
     }
-    // The install that built this venv pinned prisma exactly.
+    // The install that built this venv pinned prisma exactly — either
+    // as an explicit requirement or through the hash lock (F1).
     let executed = ops.executed_commands();
     assert!(
-        executed.iter().any(|argv| argv
-            .iter()
-            .any(|a| a == &format!("prisma=={}", crate::PRISMA_PINNED_VERSION))),
+        executed.iter().any(|argv| pins_prisma_exactly(argv)),
         "{executed:?}"
     );
     // Database-free: neither variable.
