@@ -760,7 +760,14 @@ check(staticSrc.includes("start it to refresh the prediction"), "Backends Refres
 check(groupsSrc.includes("start it to refresh the prediction"), "Groups Refresh states the not-running reason in place");
 check(staticSrc.includes("data-pred-elapsed"), "Backends card renders the refresh Measuring elapsed state");
 check(groupsSrc.includes("data-group-pred-elapsed"), "Groups card renders the refresh Measuring elapsed state");
-const optimizeRsSrc = readFileSync(join(root, "..", "crates", "manager-app", "src", "optimize.rs"), "utf8");
+// optimize.rs was decomposed into optimize/*.rs (T-02a); scan the
+// parent module and every submodule so the checks keep their strength.
+const optimizeRsDir = join(root, "..", "crates", "manager-app", "src", "optimize");
+const optimizeRsSrc = [
+  readFileSync(join(root, "..", "crates", "manager-app", "src", "optimize.rs"), "utf8"),
+  ...readdirSync(optimizeRsDir).filter((f) => f.endsWith(".rs")).sort()
+    .map((f) => readFileSync(join(optimizeRsDir, f), "utf8")),
+].join("\n");
 check(optimizeRsSrc.includes("mutual exclusion refusal"), "benchmark/consultation starts log the mutual-exclusion refusal (tracker #70)");
 check(optimizeRsSrc.includes("fn try_claim_optimize_op"), "the per-backend running-operation claim is a named predicate in the optimize paths (tracker #70)");
 check(optimizeRsSrc.includes("consultations and benchmarks on the same backend are mutually exclusive"), "the mutual-exclusion refusal names the rule and the running operation (tracker #70)");
