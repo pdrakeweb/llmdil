@@ -258,6 +258,12 @@ Reconciled 2026-11-12. Implemented since this review (see the inline notes on ea
 
 ## Needs Pete's decision
 
+**Owner decisions recorded (Nov 15, 2026):**
+- **Admin API default bind for new installs:** keep `bind_mode: all` (enabling the API makes it reachable on LAN/Tailscale; loopback and single-interface remain selectable).
+- **SEC-13 desktop auditing:** desktop `admin_api_*` mutations are audited as actor `desktop`, auth type `local` (implemented, see SEC-13).
+- **MoE slider semantics:** keep "N MoE layers" written as the `--n-cpu-moe` block-index bound (item 11b).
+- **OpenRouter `$0` daily cap:** means no OpenRouter traffic (spend nothing), not unlimited.
+
 1. ~~**SEC-03** — enforce `must_change_password`.~~ Decided and fixed (see SEC-03 above).
 2. ~~**SEC-04 (remainder)** — password step-up for first TOTP enrollment.~~ Decided and fixed (see SEC-04 above).
 3. ~~**SEC-08** — stop regenerating the TLS certificate on SAN drift at startup.~~ Decided and fixed (see SEC-08 above).
