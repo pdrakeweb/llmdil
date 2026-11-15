@@ -1,5 +1,8 @@
 //! Windows-only helpers: elevated launch, registry lookup, VS Code CLI discovery, and Credential Manager access.
 
+// Only the Windows items use the parent's imports; on other targets
+// the module compiles (tests) with nothing to import.
+#[cfg_attr(not(windows), allow(unused_imports))]
 use super::*;
 
 /// Shared GET implementation behind the trait's plain and

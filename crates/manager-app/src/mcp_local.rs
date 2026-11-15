@@ -287,16 +287,28 @@ mod tests {
                 dir.join("node.exe"),
             )
         };
+        #[cfg(windows)]
+        std::fs::copy(src, &dst).unwrap();
+        // Elsewhere a wrapper script, not a copy: multi-call coreutils
+        // builds (e.g. uutils on newer Ubuntu runners) pick the utility
+        // from argv[0], so a `sleep` binary copied as `node` exits 1.
         #[cfg(not(windows))]
-        let (src, dst) = (
-            ["/bin/sleep", "/usr/bin/sleep"]
+        let dst = {
+            use std::os::unix::fs::PermissionsExt;
+            let sleep = ["/bin/sleep", "/usr/bin/sleep"]
                 .into_iter()
                 .map(PathBuf::from)
                 .find(|p| p.exists())
-                .unwrap(),
-            dir.join("node"),
-        );
-        std::fs::copy(src, &dst).unwrap();
+                .unwrap();
+            let dst = dir.join("node");
+            std::fs::write(
+                &dst,
+                format!("#!/bin/sh\nexec {} \"$@\"\n", sleep.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
+            dst
+        };
         (dst.to_string_lossy().into_owned(), node_args(secs))
     }
 
