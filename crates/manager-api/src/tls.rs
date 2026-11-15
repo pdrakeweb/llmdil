@@ -8,12 +8,249 @@
 //! or near expiry, never because an address changed, and the SANs
 //! change only through the desktop's explicit Regenerate
 //! ([`regenerate`]). Address drift is reported by [`san_drift`].
+//!
+//! ## Where the private key lives (SEC-N3)
+//!
+//! The certificate, `fingerprint.txt` and `sans.txt` are public and
+//! stay as files. The private key, on Windows, is a Credential Manager
+//! generic credential for the current user (through the
+//! [`SecretStore`] seam), under a target
+//! `llmdil/admin-api/tls-key/<id>`; `key-store.txt` beside the
+//! certificate names that target. Credential Manager encrypts it at
+//! rest with the user's DPAPI master key, so the key is no longer
+//! readable from a copy of `%APPDATA%` (backups, sync tools, another
+//! account or an offline disk). It does not defend against code already
+//! running as the same user, which can read the credential like the
+//! app does. rcgen's default key (ECDSA P-256, PKCS#8 PEM, about 240
+//! bytes) is well inside the 2560-byte credential blob limit, so the
+//! DPAPI-file alternative is not needed.
+//!
+//! Each new key goes to a fresh target and `key-store.txt` is switched
+//! to it only after the value reads back intact; the previous target is
+//! then deleted. A per-key target (rather than one fixed name) means a
+//! second data directory for the same user can never overwrite this
+//! one's key.
+//!
+//! Migration: at startup a plaintext `server.key` (written by v0.1.62
+//! and earlier) that matches `server.crt` is imported, read back and
+//! compared, and only then deleted. Any failure keeps the plaintext
+//! file in use (status reports `key_storage: "file"`); the certificate
+//! and fingerprint never change, so paired clients keep working.
+//! When Credential Manager rejects a newly generated key the key is
+//! written as plaintext `server.key`, as before, and reported the same
+//! way. Other platforms keep the plaintext file.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sha2::Digest;
+
+use crate::secrets::SecretStore;
+
+/// Names the Credential Manager target holding the private key.
+const KEY_REF_FILE: &str = "key-store.txt";
+/// `key-store.txt` content prefix (the only backend so far).
+const KEY_REF_CREDMAN: &str = "credential_manager:";
+/// Credential Manager target prefix for TLS keys.
+pub const KEY_TARGET_PREFIX: &str = "llmdil/admin-api/tls-key/";
+
+/// Where the listener's private key is kept (status `key_storage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStorage {
+    /// A Credential Manager generic credential (Windows).
+    CredentialManager,
+    /// Plaintext `server.key` (non-Windows, or a migration or store
+    /// write that did not complete).
+    File,
+}
+
+impl KeyStorage {
+    /// Stable wire spelling for the Admin API status. (`"dpapi_file"`
+    /// is reserved for a DPAPI-protected file should a key ever exceed
+    /// the credential size limit; nothing produces it today.)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyStorage::CredentialManager => "credential_manager",
+            KeyStorage::File => "file",
+        }
+    }
+}
+
+/// The protected key store for this platform: Credential Manager on
+/// Windows; `None` (plaintext file) elsewhere.
+pub fn platform_key_store() -> Option<&'static dyn SecretStore> {
+    #[cfg(windows)]
+    {
+        Some(crate::secrets::platform_secret_store())
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// The Credential Manager target `key-store.txt` names; `Ok(None)`
+/// when there is no such file; `InvalidData` when it is malformed.
+fn read_key_ref(dir: &Path) -> io::Result<Option<String>> {
+    match std::fs::read_to_string(dir.join(KEY_REF_FILE)) {
+        Ok(text) => text
+            .trim()
+            .strip_prefix(KEY_REF_CREDMAN)
+            .filter(|t| t.starts_with(KEY_TARGET_PREFIX) && t.len() > KEY_TARGET_PREFIX.len())
+            .map(|t| Some(t.to_string()))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "key-store.txt is corrupt")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write `key-store.txt` via a temporary file and rename, so a crash
+/// never leaves it half-written.
+fn write_key_ref(dir: &Path, target: &str) -> io::Result<()> {
+    let tmp = dir.join(format!("{KEY_REF_FILE}.tmp"));
+    std::fs::write(&tmp, format!("{KEY_REF_CREDMAN}{target}"))?;
+    std::fs::rename(&tmp, dir.join(KEY_REF_FILE))
+}
+
+/// Put `key_pem` under a fresh target and confirm it reads back
+/// byte-for-byte. On any failure the fresh target is removed and
+/// nothing else has changed.
+fn stage_protected_key(store: &dyn SecretStore, key_pem: &str) -> Result<String, String> {
+    let target = format!("{KEY_TARGET_PREFIX}{}", uuid::Uuid::new_v4().simple());
+    let outcome = match store.write(&target, key_pem.as_bytes()) {
+        Err(e) => Err(format!("cannot store the key: {e}")),
+        Ok(()) => match store.read(&target) {
+            Ok(Some(back)) if back == key_pem.as_bytes() => Ok(()),
+            Ok(Some(_)) => Err("the stored key read back different".to_string()),
+            Ok(None) => Err("the stored key did not read back".to_string()),
+            Err(e) => Err(format!("cannot read the stored key back: {e}")),
+        },
+    };
+    match outcome {
+        Ok(()) => Ok(target),
+        Err(e) => {
+            let _ = store.delete(&target);
+            Err(e)
+        }
+    }
+}
+
+/// Make the staged `target` the key of record: switch `key-store.txt`
+/// to it, then delete the previous target and any plaintext
+/// `server.key`. A failure to switch removes the staged target and
+/// leaves the previous state in place.
+fn commit_protected_key(dir: &Path, store: &dyn SecretStore, target: &str) -> io::Result<()> {
+    let previous = read_key_ref(dir).ok().flatten();
+    if let Err(e) = write_key_ref(dir, target) {
+        let _ = store.delete(target);
+        return Err(e);
+    }
+    if let Some(old) = previous.filter(|old| old != target) {
+        if let Err(e) = store.delete(&old) {
+            tracing::warn!("admin api tls: could not delete the previous key credential: {e}");
+        }
+    }
+    remove_plaintext_key(dir);
+    Ok(())
+}
+
+fn remove_plaintext_key(dir: &Path) {
+    match std::fs::remove_file(dir.join("server.key")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("admin api tls: could not delete the plaintext server.key: {e}"),
+    }
+}
+
+/// SEC-N3 migration: import a plaintext `server.key` that belongs to
+/// `server.crt` into the protected store, and delete the file only
+/// once the protected copy reads back intact. A key that does not
+/// match (or any failure) is left for the normal load path, which
+/// keeps using the file.
+fn migrate_plaintext_key(dir: &Path, store: &dyn SecretStore) {
+    let key_path = dir.join("server.key");
+    if !key_path.exists() {
+        return;
+    }
+    let (Ok(cert_pem), Ok(key_pem)) = (
+        std::fs::read_to_string(dir.join("server.crt")),
+        std::fs::read_to_string(&key_path),
+    ) else {
+        return;
+    };
+    if key_matches_cert(&cert_pem, &key_pem) != Ok(true) {
+        return;
+    }
+    let committed = stage_protected_key(store, &key_pem).and_then(|target| {
+        commit_protected_key(dir, store, &target).map_err(|e| format!("key-store.txt: {e}"))
+    });
+    match committed {
+        Ok(()) => tracing::info!(
+            "admin api tls: moved the private key from server.key into Credential Manager"
+        ),
+        Err(e) => tracing::warn!("admin api tls: keeping the plaintext server.key ({e})"),
+    }
+}
+
+/// The private key the stored material uses.
+enum KeyRead {
+    Found(String),
+    Missing(String),
+    Corrupt(String),
+}
+
+fn read_key(dir: &Path, store: Option<&dyn SecretStore>) -> io::Result<KeyRead> {
+    if let Some(store) = store {
+        match read_key_ref(dir) {
+            Ok(Some(target)) => {
+                return match store.read(&target) {
+                    Ok(Some(bytes)) => Ok(match String::from_utf8(bytes) {
+                        Ok(pem) => KeyRead::Found(pem),
+                        Err(_) => KeyRead::Corrupt("the stored key is not PEM text".to_string()),
+                    }),
+                    Ok(None) => Ok(KeyRead::Missing(
+                        "the private key is missing from Credential Manager".to_string(),
+                    )),
+                    // A store failure may be transient: fail this start
+                    // rather than replace a key paired clients pin.
+                    Err(e) => Err(io::Error::other(format!(
+                        "cannot read the private key from Credential Manager: {e}"
+                    ))),
+                };
+            }
+            Ok(None) => {}
+            Err(e) => return Ok(KeyRead::Corrupt(e.to_string())),
+        }
+    }
+    let key_path = dir.join("server.key");
+    if !key_path.exists() {
+        return Ok(KeyRead::Missing("server.key is missing".to_string()));
+    }
+    Ok(match std::fs::read_to_string(&key_path) {
+        Ok(pem) => KeyRead::Found(pem),
+        Err(e) => KeyRead::Corrupt(format!("cannot read the stored material: {e}")),
+    })
+}
+
+/// Where the stored private key lives; `None` when there is none. A
+/// plaintext `server.key` on disk reports `File` even beside a
+/// protected copy, since the key is then exposed regardless.
+pub fn key_storage(data_dir: &Path) -> Option<KeyStorage> {
+    key_storage_with(data_dir, platform_key_store())
+}
+
+/// [`key_storage`] against an explicit store (`None`: file only).
+pub fn key_storage_with(data_dir: &Path, store: Option<&dyn SecretStore>) -> Option<KeyStorage> {
+    let dir = tls_dir(data_dir);
+    if dir.join("server.key").exists() {
+        return Some(KeyStorage::File);
+    }
+    match (store, read_key_ref(&dir)) {
+        (Some(_), Ok(Some(_))) => Some(KeyStorage::CredentialManager),
+        _ => None,
+    }
+}
 
 /// Certificate, key, and the pinning fingerprint (hex SHA-256 of the
 /// certificate DER).
@@ -31,7 +268,7 @@ fn tls_dir(data_dir: &Path) -> PathBuf {
 /// The names a certificate should cover: DNS names (hostname,
 /// `localhost`) and IP addresses (loopback, the LAN address, the
 /// Tailscale address when present). Clients pin the fingerprint,
-/// so SAN changes force a re-pair — regeneration is an explicit
+/// so SAN changes force a re-pair â€” regeneration is an explicit
 /// enable-time decision, not a silent drift.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertSans {
@@ -89,7 +326,7 @@ impl CertSans {
 pub const CERT_RENEW_WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 /// Why the certificate the listener uses is the one it is (SEC-08).
-/// Generation happens only on the explicit branches below — never
+/// Generation happens only on the explicit branches below â€” never
 /// because the machine's addresses changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CertSource {
@@ -134,6 +371,8 @@ pub struct CertLoad {
     pub material: TlsMaterial,
     pub source: CertSource,
     pub detail: Option<String>,
+    /// Where the private key is kept after this load (SEC-N3).
+    pub key_storage: KeyStorage,
 }
 
 /// What a stored certificate covers and until when.
@@ -191,14 +430,38 @@ fn key_matches_cert(cert_pem: &str, key_pem: &str) -> Result<bool, String> {
 }
 
 /// Write a full set of material; `sans.txt` records the SANs actually
-/// in the new certificate.
-fn store_material(data_dir: &Path, material: &TlsMaterial, sans: &CertSans) -> io::Result<()> {
+/// in the new certificate. With a `store` the key goes to the protected
+/// store (SEC-N3); if the store refuses it, the key is written as
+/// plaintext `server.key` (the pre-SEC-N3 behaviour, reported as
+/// `key_storage: "file"`) rather than leaving the listener without TLS.
+fn store_material(
+    data_dir: &Path,
+    material: &TlsMaterial,
+    sans: &CertSans,
+    store: Option<&dyn SecretStore>,
+) -> io::Result<()> {
     let dir = tls_dir(data_dir);
     std::fs::create_dir_all(&dir)?;
+    let staged = store.map(|s| (s, stage_protected_key(s, &material.key_pem)));
     std::fs::write(dir.join("server.crt"), &material.cert_pem)?;
-    std::fs::write(dir.join("server.key"), &material.key_pem)?;
     std::fs::write(dir.join("fingerprint.txt"), &material.fingerprint_sha256)?;
     std::fs::write(dir.join("sans.txt"), sans.encode())?;
+    match staged {
+        Some((store, Ok(target))) => commit_protected_key(&dir, store, &target)?,
+        Some((store, Err(e))) => {
+            tracing::warn!(
+                "admin api tls: Credential Manager refused the new key ({e}); writing server.key"
+            );
+            std::fs::write(dir.join("server.key"), &material.key_pem)?;
+            // The file is now the key of record; retire the old
+            // protected copy so the load path cannot pick it up.
+            if let Ok(Some(old)) = read_key_ref(&dir) {
+                std::fs::remove_file(dir.join(KEY_REF_FILE))?;
+                let _ = store.delete(&old);
+            }
+        }
+        None => std::fs::write(dir.join("server.key"), &material.key_pem)?,
+    }
     Ok(())
 }
 
@@ -213,40 +476,55 @@ fn store_material(data_dir: &Path, material: &TlsMaterial, sans: &CertSans) -> i
 /// break every pairing. Address drift is reported by [`san_drift`]; the
 /// SANs change only through [`regenerate`]. `sans.txt` is rewritten to
 /// the stored certificate's own SANs when it disagrees.
+///
+/// The private key is read from (and a new one written to) the
+/// platform's protected store, after migrating a plaintext `server.key`
+/// into it (SEC-N3, see the module docs).
 pub fn ensure_cert(data_dir: &Path, sans: &CertSans) -> io::Result<CertLoad> {
+    ensure_cert_with(data_dir, sans, platform_key_store())
+}
+
+/// [`ensure_cert`] against an explicit key store (`None`: plaintext
+/// `server.key`).
+pub fn ensure_cert_with(
+    data_dir: &Path,
+    sans: &CertSans,
+    store: Option<&dyn SecretStore>,
+) -> io::Result<CertLoad> {
     let dir = tls_dir(data_dir);
     let cert_path = dir.join("server.crt");
-    let key_path = dir.join("server.key");
+    if let Some(store) = store {
+        migrate_plaintext_key(&dir, store);
+    }
+    let storage = || key_storage_with(data_dir, store).unwrap_or(KeyStorage::File);
     let regenerate_for = |source: CertSource, detail: String| -> io::Result<CertLoad> {
         tracing::warn!(
             "admin api tls: generating a new certificate ({}): {detail}",
             source.as_str()
         );
         let material = generate_with_sans(sans)?;
-        store_material(data_dir, &material, sans)?;
+        store_material(data_dir, &material, sans, store)?;
         Ok(CertLoad {
             material,
             source,
             detail: Some(detail),
+            key_storage: storage(),
         })
     };
-    if !cert_path.exists() || !key_path.exists() {
-        let missing = if cert_path.exists() {
-            "server.key"
-        } else {
-            "server.crt"
-        };
+    if !cert_path.exists() {
         return regenerate_for(
             CertSource::GeneratedMissing,
-            format!("{missing} is missing"),
+            "server.crt is missing".to_string(),
         );
     }
-    let (cert_pem, key_pem) = match (
-        std::fs::read_to_string(&cert_path),
-        std::fs::read_to_string(&key_path),
-    ) {
-        (Ok(c), Ok(k)) => (c, k),
-        (Err(e), _) | (_, Err(e)) => {
+    let key_pem = match read_key(&dir, store)? {
+        KeyRead::Found(pem) => pem,
+        KeyRead::Missing(why) => return regenerate_for(CertSource::GeneratedMissing, why),
+        KeyRead::Corrupt(why) => return regenerate_for(CertSource::RegeneratedCorrupt, why),
+    };
+    let cert_pem = match std::fs::read_to_string(&cert_path) {
+        Ok(c) => c,
+        Err(e) => {
             return regenerate_for(
                 CertSource::RegeneratedCorrupt,
                 format!("cannot read the stored material: {e}"),
@@ -262,7 +540,7 @@ pub fn ensure_cert(data_dir: &Path, sans: &CertSans) -> io::Result<CertLoad> {
         Ok(false) => {
             return regenerate_for(
                 CertSource::RegeneratedKeyMismatch,
-                "server.key does not belong to server.crt".to_string(),
+                "the private key does not belong to server.crt".to_string(),
             )
         }
         Err(e) => return regenerate_for(CertSource::RegeneratedCorrupt, e),
@@ -322,6 +600,7 @@ pub fn ensure_cert(data_dir: &Path, sans: &CertSans) -> io::Result<CertLoad> {
         },
         source: CertSource::Loaded,
         detail: None,
+        key_storage: storage(),
     })
 }
 
@@ -334,8 +613,8 @@ pub fn stored_cert(data_dir: &Path) -> Option<StoredCert> {
 
 /// Informational SAN drift (SEC-08): the addresses in `current` that
 /// the stored certificate does not list. Empty when there is no drift
-/// or no certificate. Drift never triggers regeneration — pinned
-/// clients ignore SANs — and is shown beside the Regenerate action.
+/// or no certificate. Drift never triggers regeneration â€” pinned
+/// clients ignore SANs â€” and is shown beside the Regenerate action.
 pub fn san_drift(data_dir: &Path, current: &CertSans) -> Vec<std::net::IpAddr> {
     let Some(stored) = stored_cert(data_dir) else {
         return Vec::new();
@@ -350,10 +629,21 @@ pub fn san_drift(data_dir: &Path, current: &CertSans) -> Vec<std::net::IpAddr> {
 
 /// Replace the stored certificate with a fresh one covering
 /// `sans` (certificate rotation from the desktop settings). The
-/// fingerprint changes, so paired clients must re-pair.
+/// fingerprint changes, so paired clients must re-pair. The new key
+/// goes to the platform's protected store (SEC-N3).
 pub fn regenerate(data_dir: &Path, sans: &CertSans) -> io::Result<TlsMaterial> {
+    regenerate_with(data_dir, sans, platform_key_store())
+}
+
+/// [`regenerate`] against an explicit key store (`None`: plaintext
+/// `server.key`).
+pub fn regenerate_with(
+    data_dir: &Path,
+    sans: &CertSans,
+    store: Option<&dyn SecretStore>,
+) -> io::Result<TlsMaterial> {
     let material = generate_with_sans(sans)?;
-    store_material(data_dir, &material, sans)?;
+    store_material(data_dir, &material, sans, store)?;
     Ok(material)
 }
 
@@ -389,7 +679,8 @@ pub fn stored_fingerprint(data_dir: &Path) -> Option<String> {
 }
 
 /// Load the stored certificate, generating a fresh self-signed one
-/// on first use.
+/// on first use. Plaintext files only and no SEC-08 checks: for tests
+/// and tools. The listener uses [`ensure_cert`].
 pub fn load_or_generate(data_dir: &Path) -> io::Result<TlsMaterial> {
     let dir = tls_dir(data_dir);
     let cert_path = dir.join("server.crt");
@@ -454,7 +745,7 @@ type Handshake = Option<(
 /// (finding SEC-07, `docs/code-review-v0.1.60.md`). axum calls
 /// `accept` one connection at a time, so a handshake awaited inline
 /// let a single client that opened TCP and never sent a ClientHello
-/// block every other connection indefinitely — an unauthenticated DoS
+/// block every other connection indefinitely â€” an unauthenticated DoS
 /// from the LAN or tailnet.
 pub struct TlsListener {
     listener: tokio::net::TcpListener,
@@ -594,16 +885,16 @@ mod tests {
             key_pem: key.serialize_pem(),
             fingerprint_sha256: hex_sha256(cert.der()),
         };
-        store_material(dir, &material, sans).unwrap();
+        store_material(dir, &material, sans, None).unwrap();
     }
 
     /// SEC-08: first start generates; later starts load the same
-    /// material, even when the machine's addresses moved — that is
+    /// material, even when the machine's addresses moved â€” that is
     /// reported as drift instead, and sans.txt keeps the cert's SANs.
     #[test]
     fn missing_generates_then_drift_keeps_the_key() {
         let dir = temp_dir("drift");
-        let first = ensure_cert(&dir, &sans_with("192.168.1.10")).unwrap();
+        let first = ensure_cert_with(&dir, &sans_with("192.168.1.10"), None).unwrap();
         assert_eq!(first.source, CertSource::GeneratedMissing);
         assert_eq!(
             read(&dir, "sans.txt"),
@@ -615,7 +906,7 @@ mod tests {
             first.material.fingerprint_sha256
         );
         // Same addresses: loaded.
-        let again = ensure_cert(&dir, &sans_with("192.168.1.10")).unwrap();
+        let again = ensure_cert_with(&dir, &sans_with("192.168.1.10"), None).unwrap();
         assert_eq!(again.source, CertSource::Loaded);
         assert_eq!(
             again.material.fingerprint_sha256,
@@ -623,7 +914,7 @@ mod tests {
         );
         // DHCP moved the LAN address: still loaded, same key.
         let moved = sans_with("192.168.1.77");
-        let after = ensure_cert(&dir, &moved).unwrap();
+        let after = ensure_cert_with(&dir, &moved, None).unwrap();
         assert_eq!(after.source, CertSource::Loaded);
         assert_eq!(
             after.material.fingerprint_sha256,
@@ -637,7 +928,7 @@ mod tests {
         );
         assert!(san_drift(&dir, &sans_with("192.168.1.10")).is_empty());
         // Only the explicit regenerate picks up the new address.
-        let rotated = regenerate(&dir, &moved).unwrap();
+        let rotated = regenerate_with(&dir, &moved, None).unwrap();
         assert_ne!(
             rotated.fingerprint_sha256,
             first.material.fingerprint_sha256
@@ -650,9 +941,9 @@ mod tests {
     #[test]
     fn missing_key_generates() {
         let dir = temp_dir("nokey");
-        let first = ensure_cert(&dir, &CertSans::loopback()).unwrap();
+        let first = ensure_cert_with(&dir, &CertSans::loopback(), None).unwrap();
         std::fs::remove_file(tls_dir(&dir).join("server.key")).unwrap();
-        let next = ensure_cert(&dir, &CertSans::loopback()).unwrap();
+        let next = ensure_cert_with(&dir, &CertSans::loopback(), None).unwrap();
         assert_eq!(next.source, CertSource::GeneratedMissing);
         assert_ne!(
             next.material.fingerprint_sha256,
@@ -664,10 +955,10 @@ mod tests {
     #[test]
     fn key_mismatch_regenerates() {
         let dir = temp_dir("mismatch");
-        let first = ensure_cert(&dir, &CertSans::loopback()).unwrap();
+        let first = ensure_cert_with(&dir, &CertSans::loopback(), None).unwrap();
         let other = rcgen::KeyPair::generate().unwrap();
         std::fs::write(tls_dir(&dir).join("server.key"), other.serialize_pem()).unwrap();
-        let next = ensure_cert(&dir, &CertSans::loopback()).unwrap();
+        let next = ensure_cert_with(&dir, &CertSans::loopback(), None).unwrap();
         assert_eq!(next.source, CertSource::RegeneratedKeyMismatch);
         assert_ne!(
             next.material.fingerprint_sha256,
@@ -675,7 +966,9 @@ mod tests {
         );
         assert!(key_matches_cert(&next.material.cert_pem, &next.material.key_pem).unwrap());
         assert_eq!(
-            ensure_cert(&dir, &CertSans::loopback()).unwrap().source,
+            ensure_cert_with(&dir, &CertSans::loopback(), None)
+                .unwrap()
+                .source,
             CertSource::Loaded
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -689,7 +982,7 @@ mod tests {
             let dir = temp_dir(tag);
             store_with_expiry(&dir, &CertSans::loopback(), not_after);
             let old_fp = read(&dir, "fingerprint.txt");
-            let next = ensure_cert(&dir, &CertSans::loopback()).unwrap();
+            let next = ensure_cert_with(&dir, &CertSans::loopback(), None).unwrap();
             assert_eq!(next.source, CertSource::RegeneratedExpiring, "{tag}");
             assert_ne!(next.material.fingerprint_sha256, old_fp, "{tag}");
             let _ = std::fs::remove_dir_all(&dir);
@@ -698,7 +991,9 @@ mod tests {
         let dir = temp_dir("valid");
         store_with_expiry(&dir, &CertSans::loopback(), now + 90 * day);
         assert_eq!(
-            ensure_cert(&dir, &CertSans::loopback()).unwrap().source,
+            ensure_cert_with(&dir, &CertSans::loopback(), None)
+                .unwrap()
+                .source,
             CertSource::Loaded
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -707,15 +1002,15 @@ mod tests {
     #[test]
     fn corrupt_material_regenerates_and_missing_sans_is_rewritten() {
         let dir = temp_dir("corrupt");
-        let first = ensure_cert(&dir, &sans_with("10.0.0.5")).unwrap();
+        let first = ensure_cert_with(&dir, &sans_with("10.0.0.5"), None).unwrap();
         // sans.txt missing: rewritten from the certificate, key kept.
         std::fs::remove_file(tls_dir(&dir).join("sans.txt")).unwrap();
-        let next = ensure_cert(&dir, &CertSans::loopback()).unwrap();
+        let next = ensure_cert_with(&dir, &CertSans::loopback(), None).unwrap();
         assert_eq!(next.source, CertSource::Loaded);
         assert_eq!(read(&dir, "sans.txt"), sans_with("10.0.0.5").encode());
         // sans.txt well-formed but wrong: rewritten, key kept.
         std::fs::write(tls_dir(&dir).join("sans.txt"), "dns:elsewhere").unwrap();
-        let next = ensure_cert(&dir, &CertSans::loopback()).unwrap();
+        let next = ensure_cert_with(&dir, &CertSans::loopback(), None).unwrap();
         assert_eq!(next.source, CertSource::Loaded);
         assert_eq!(
             next.material.fingerprint_sha256,
@@ -724,14 +1019,16 @@ mod tests {
         assert_eq!(read(&dir, "sans.txt"), sans_with("10.0.0.5").encode());
         // sans.txt corrupt: regenerated.
         std::fs::write(tls_dir(&dir).join("sans.txt"), "garbage,ip:not-an-ip").unwrap();
-        let next = ensure_cert(&dir, &CertSans::loopback()).unwrap();
+        let next = ensure_cert_with(&dir, &CertSans::loopback(), None).unwrap();
         assert_eq!(next.source, CertSource::RegeneratedCorrupt);
         // Certificate corrupt: regenerated.
         std::fs::write(tls_dir(&dir).join("server.crt"), "not a certificate").unwrap();
-        let next = ensure_cert(&dir, &CertSans::loopback()).unwrap();
+        let next = ensure_cert_with(&dir, &CertSans::loopback(), None).unwrap();
         assert_eq!(next.source, CertSource::RegeneratedCorrupt);
         assert_eq!(
-            ensure_cert(&dir, &CertSans::loopback()).unwrap().source,
+            ensure_cert_with(&dir, &CertSans::loopback(), None)
+                .unwrap()
+                .source,
             CertSource::Loaded
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -750,5 +1047,293 @@ mod tests {
         assert_eq!(m.fingerprint_sha256, m2.fingerprint_sha256);
         assert!(server_config(&m).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- SEC-N3: the private key in the protected store -------------
+
+    use crate::secrets::{MemorySecretStore, SecretStoreError};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A memory store whose writes or reads can be made to fail.
+    #[derive(Default)]
+    struct FaultyStore {
+        inner: MemorySecretStore,
+        fail_write: AtomicBool,
+        corrupt_read: AtomicBool,
+        fail_read: AtomicBool,
+    }
+
+    impl SecretStore for FaultyStore {
+        fn read(&self, key: &str) -> Result<Option<Vec<u8>>, SecretStoreError> {
+            if self.fail_read.load(Ordering::SeqCst) {
+                return Err(SecretStoreError::Storage("injected read failure".into()));
+            }
+            let v = self.inner.read(key)?;
+            if self.corrupt_read.load(Ordering::SeqCst) {
+                return Ok(v.map(|mut b| {
+                    b.truncate(b.len() / 2);
+                    b
+                }));
+            }
+            Ok(v)
+        }
+        fn write(&self, key: &str, value: &[u8]) -> Result<(), SecretStoreError> {
+            if self.fail_write.load(Ordering::SeqCst) {
+                return Err(SecretStoreError::TooLarge {
+                    len: value.len(),
+                    max: 0,
+                });
+            }
+            self.inner.write(key, value)
+        }
+        fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
+            self.inner.delete(key)
+        }
+    }
+
+    fn has(dir: &Path, name: &str) -> bool {
+        tls_dir(dir).join(name).exists()
+    }
+
+    fn protected_key(dir: &Path, store: &dyn SecretStore) -> String {
+        let target = read_key_ref(&tls_dir(dir)).unwrap().unwrap();
+        String::from_utf8(store.read(&target).unwrap().unwrap()).unwrap()
+    }
+
+    /// Generate and reload entirely through the protected store: no
+    /// plaintext key on disk, one credential.
+    #[test]
+    fn protected_store_generate_and_load() {
+        let dir = temp_dir("protected");
+        let store = MemorySecretStore::default();
+        let first = ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+        assert_eq!(first.source, CertSource::GeneratedMissing);
+        assert_eq!(first.key_storage, KeyStorage::CredentialManager);
+        assert!(!has(&dir, "server.key"), "no plaintext key is written");
+        assert_eq!(store.len(), 1);
+        assert_eq!(protected_key(&dir, &store), first.material.key_pem);
+        assert_eq!(
+            key_storage_with(&dir, Some(&store)),
+            Some(KeyStorage::CredentialManager)
+        );
+        let again = ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+        assert_eq!(again.source, CertSource::Loaded);
+        assert_eq!(again.key_storage, KeyStorage::CredentialManager);
+        assert_eq!(
+            again.material.fingerprint_sha256,
+            first.material.fingerprint_sha256
+        );
+        assert_eq!(again.material.key_pem, first.material.key_pem);
+        assert!(server_config(&again.material).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regenerate writes the new key to the protected store, retires
+    /// the previous credential and removes any plaintext key.
+    #[test]
+    fn regenerate_writes_protected() {
+        let dir = temp_dir("regen-protected");
+        let store = MemorySecretStore::default();
+        // Start from plaintext material (as written by v0.1.62).
+        let old = ensure_cert_with(&dir, &CertSans::loopback(), None).unwrap();
+        assert!(has(&dir, "server.key"));
+        let rotated = regenerate_with(&dir, &sans_with("10.1.2.3"), Some(&store)).unwrap();
+        assert_ne!(rotated.fingerprint_sha256, old.material.fingerprint_sha256);
+        assert!(!has(&dir, "server.key"));
+        assert_eq!(protected_key(&dir, &store), rotated.key_pem);
+        assert_eq!(store.len(), 1);
+        // A second rotation replaces the credential rather than adding one.
+        let again = regenerate_with(&dir, &sans_with("10.1.2.4"), Some(&store)).unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(protected_key(&dir, &store), again.key_pem);
+        let load = ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+        assert_eq!(load.source, CertSource::Loaded);
+        assert_eq!(load.material.fingerprint_sha256, again.fingerprint_sha256);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-N3 migration: a plaintext key is imported and deleted, and
+    /// the certificate and fingerprint paired clients pin are unchanged.
+    #[test]
+    fn migration_imports_then_removes_plaintext_and_keeps_fingerprint() {
+        let dir = temp_dir("migrate");
+        let old = ensure_cert_with(&dir, &sans_with("192.168.4.4"), None).unwrap();
+        let cert_before = read(&dir, "server.crt");
+        assert_eq!(
+            key_storage_with(&dir, None),
+            Some(KeyStorage::File),
+            "pre-migration material is a plaintext file"
+        );
+        let store = MemorySecretStore::default();
+        let load = ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+        assert_eq!(load.source, CertSource::Loaded);
+        assert_eq!(load.key_storage, KeyStorage::CredentialManager);
+        assert_eq!(
+            load.material.fingerprint_sha256,
+            old.material.fingerprint_sha256
+        );
+        assert_eq!(load.material.key_pem, old.material.key_pem);
+        assert_eq!(read(&dir, "server.crt"), cert_before);
+        assert_eq!(
+            stored_fingerprint(&dir).unwrap(),
+            old.material.fingerprint_sha256
+        );
+        assert!(!has(&dir, "server.key"), "plaintext key deleted");
+        assert_eq!(protected_key(&dir, &store), old.material.key_pem);
+        // Idempotent: the next start just loads.
+        let next = ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+        assert_eq!(next.source, CertSource::Loaded);
+        assert_eq!(
+            next.material.fingerprint_sha256,
+            old.material.fingerprint_sha256
+        );
+        assert_eq!(store.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A protected copy that does not read back intact (or cannot be
+    /// written) never costs the plaintext key: the file stays in use,
+    /// the fingerprint is unchanged and no credential is left behind.
+    #[test]
+    fn migration_read_back_failure_keeps_the_plaintext() {
+        for (tag, corrupt, fail_write) in [("corrupt-read", true, false), ("no-write", false, true)]
+        {
+            let dir = temp_dir(tag);
+            let old = ensure_cert_with(&dir, &CertSans::loopback(), None).unwrap();
+            let store = FaultyStore::default();
+            store.corrupt_read.store(corrupt, Ordering::SeqCst);
+            store.fail_write.store(fail_write, Ordering::SeqCst);
+            let load = ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+            assert_eq!(load.source, CertSource::Loaded, "{tag}");
+            assert_eq!(load.key_storage, KeyStorage::File, "{tag}");
+            assert_eq!(
+                load.material.fingerprint_sha256, old.material.fingerprint_sha256,
+                "{tag}"
+            );
+            assert_eq!(read(&dir, "server.key"), old.material.key_pem, "{tag}");
+            assert!(!has(&dir, KEY_REF_FILE), "{tag}");
+            assert!(store.inner.is_empty(), "{tag}: staged credential removed");
+            // Once the store works, the next start migrates.
+            store.corrupt_read.store(false, Ordering::SeqCst);
+            store.fail_write.store(false, Ordering::SeqCst);
+            let next = ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+            assert_eq!(next.key_storage, KeyStorage::CredentialManager, "{tag}");
+            assert_eq!(
+                next.material.fingerprint_sha256, old.material.fingerprint_sha256,
+                "{tag}"
+            );
+            assert!(!has(&dir, "server.key"), "{tag}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A plaintext key that does not belong to the certificate is not
+    /// imported; the SEC-08 mismatch branch replaces it, protected.
+    #[test]
+    fn mismatched_plaintext_is_not_imported() {
+        let dir = temp_dir("migrate-mismatch");
+        let first = ensure_cert_with(&dir, &CertSans::loopback(), None).unwrap();
+        let other = rcgen::KeyPair::generate().unwrap();
+        std::fs::write(tls_dir(&dir).join("server.key"), other.serialize_pem()).unwrap();
+        let store = MemorySecretStore::default();
+        let next = ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+        assert_eq!(next.source, CertSource::RegeneratedKeyMismatch);
+        assert_ne!(
+            next.material.fingerprint_sha256,
+            first.material.fingerprint_sha256
+        );
+        assert_eq!(next.key_storage, KeyStorage::CredentialManager);
+        assert!(!has(&dir, "server.key"));
+        assert_eq!(protected_key(&dir, &store), next.material.key_pem);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store that refuses a new key leaves a working plaintext key
+    /// (the pre-SEC-N3 behaviour), reported as `file`.
+    #[test]
+    fn store_refusing_a_new_key_falls_back_to_the_file() {
+        let dir = temp_dir("fallback");
+        let store = FaultyStore::default();
+        store.fail_write.store(true, Ordering::SeqCst);
+        let load = ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+        assert_eq!(load.source, CertSource::GeneratedMissing);
+        assert_eq!(load.key_storage, KeyStorage::File);
+        assert_eq!(read(&dir, "server.key"), load.material.key_pem);
+        assert!(!has(&dir, KEY_REF_FILE));
+        // With a protected copy already of record, the fallback retires it.
+        let dir2 = temp_dir("fallback-retire");
+        let store2 = FaultyStore::default();
+        ensure_cert_with(&dir2, &CertSans::loopback(), Some(&store2)).unwrap();
+        assert_eq!(store2.inner.len(), 1);
+        store2.fail_write.store(true, Ordering::SeqCst);
+        let rotated = regenerate_with(&dir2, &CertSans::loopback(), Some(&store2)).unwrap();
+        assert!(!has(&dir2, KEY_REF_FILE));
+        assert!(store2.inner.is_empty());
+        let load = ensure_cert_with(&dir2, &CertSans::loopback(), Some(&store2)).unwrap();
+        assert_eq!(load.source, CertSource::Loaded);
+        assert_eq!(load.material.fingerprint_sha256, rotated.fingerprint_sha256);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// A credential deleted out from under `key-store.txt` is missing
+    /// material; a store read error fails the start instead of
+    /// replacing the key paired clients pin.
+    #[test]
+    fn missing_credential_generates_but_read_error_fails_closed() {
+        let dir = temp_dir("cred-missing");
+        let store = FaultyStore::default();
+        let first = ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+        store.fail_read.store(true, Ordering::SeqCst);
+        assert!(ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).is_err());
+        assert_eq!(
+            stored_fingerprint(&dir).unwrap(),
+            first.material.fingerprint_sha256,
+            "a read error must not regenerate"
+        );
+        store.fail_read.store(false, Ordering::SeqCst);
+        let target = read_key_ref(&tls_dir(&dir)).unwrap().unwrap();
+        store.delete(&target).unwrap();
+        let next = ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+        assert_eq!(next.source, CertSource::GeneratedMissing);
+        assert_ne!(
+            next.material.fingerprint_sha256,
+            first.material.fingerprint_sha256
+        );
+        // Corrupt key-store.txt: regenerated as corrupt material.
+        std::fs::write(tls_dir(&dir).join(KEY_REF_FILE), "garbage").unwrap();
+        let next = ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+        assert_eq!(next.source, CertSource::RegeneratedCorrupt);
+        assert_eq!(next.key_storage, KeyStorage::CredentialManager);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real Credential Manager path end to end, in a temporary data
+    /// directory. Every credential it creates is deleted. Ignored by
+    /// default because it writes to the current user's credential store;
+    /// run with `--ignored` on Windows.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "touches the real user credential store"]
+    fn credential_manager_migration_round_trip() {
+        let store = crate::secrets::CredentialManagerSecretStore;
+        let dir = temp_dir("credman");
+        let old = ensure_cert_with(&dir, &CertSans::loopback(), None).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            let load = ensure_cert_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+            assert_eq!(load.key_storage, KeyStorage::CredentialManager);
+            assert_eq!(
+                load.material.fingerprint_sha256,
+                old.material.fingerprint_sha256
+            );
+            assert!(!has(&dir, "server.key"));
+            let rotated = regenerate_with(&dir, &CertSans::loopback(), Some(&store)).unwrap();
+            assert_eq!(protected_key(&dir, &store), rotated.key_pem);
+        });
+        if let Ok(Some(target)) = read_key_ref(&tls_dir(&dir)) {
+            let _ = store.delete(&target);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap();
     }
 }

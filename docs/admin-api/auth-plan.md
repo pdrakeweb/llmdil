@@ -484,7 +484,10 @@ by name, payloads by target id only.
      Tailscale address never regenerates (pinned clients do not check
      names); it shows as informational `san_drift` beside the
      Regenerate button, the only path that changes the key or SANs.
-     rcgen's default validity (to year 4096) is used, not 2 years. The desktop Remote Access page
+     rcgen's default validity (to year 4096) is used, not 2 years.
+     The private key (SEC-N3) is held in Windows Credential Manager
+     for the desktop user, not as a plaintext file; status reports
+     `key_storage`. The desktop Remote Access page
      shows the cert fingerprint and a QR code encoding
      `{ base_url, cert_sha256 }`; the Android app scans it at
      pairing and pins the fingerprint (TOFU with an out-of-band

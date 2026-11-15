@@ -78,7 +78,7 @@ Runner-up Majors worth triage next: the Admin API TLS listener blocked by one id
 
 - **SEC-N1** `crates/manager-wizard/src/lib.rs:157-175`: `generate_master_key` draws from SipHash `RandomState`, not a CSPRNG. **Fixed after this review: `63a6d4d`** — 32 bytes from `getrandom` (already in the lock via `zip`), same `sk-` + 64 hex format. Test: `master_key_format_is_unchanged_and_keys_are_distinct`.
 - **SEC-N2** `auth.rs:1124-1125`: recovery/enrollment code character 7 has 16, not 32, possible values (UUID v4 version nibble): 39 bits instead of 40. **Fixed after this review: `851ebc3`** — all eight characters from `getrandom`. Test: `recovery_code_uses_full_alphabet_in_every_position`.
-- **SEC-N3** `tls.rs:77-79`: `server.key` is plaintext PEM under `%APPDATA%`; the module doc's "phase 2 moves it to Credential Manager" never happened. Deferred (doc truth-up belongs with the decision).
+- **SEC-N3** `tls.rs:77-79`: `server.key` is plaintext PEM under `%APPDATA%`; the module doc's "phase 2 moves it to Credential Manager" never happened. **Fixed:** on Windows the key is a per-user Credential Manager generic credential (`llmdil/admin-api/tls-key/<id>`, named by `tls/key-store.txt`; rcgen's P-256 PKCS#8 PEM is ~240 bytes, well under the 2560-byte blob limit, so no DPAPI-file fallback was needed). Startup imports a plaintext `server.key` that matches `server.crt`, reads the protected copy back, and deletes the file only after it matches; any failure keeps the file. Certificate and fingerprint are unchanged (SEC-08 pairings survive). Regenerate writes to Credential Manager; a store refusal falls back to the file. A store read error fails the start instead of regenerating. Status gains `key_storage` (`credential_manager` | `file`). Non-Windows keeps the file. Access goes through the new T-06 `SecretStore` seam (`manager_wizard::secrets`, re-exported as `manager_api::secrets`). Tests: `tls::tests::{protected_store_generate_and_load, regenerate_writes_protected, migration_imports_then_removes_plaintext_and_keeps_fingerprint, migration_read_back_failure_keeps_the_plaintext, mismatched_plaintext_is_not_imported, store_refusing_a_new_key_falls_back_to_the_file, missing_credential_generates_but_read_error_fails_closed}`, plus `#[ignore]`d real Credential Manager round trips.
 - **SEC-N4** `redact.rs:262`: `sk-` matched without a word boundary (`task-scheduler1` over-redacts). Deferred (over-redaction is the safe failure).
 
 ### Reviewed and found clean
@@ -249,7 +249,7 @@ Reconciled 2026-11-12. Implemented since this review (see the inline notes on ea
 
 - **F1 follow-up: hash-locked requirements** for the gateway venv (`uv pip install --require-hashes` from a generated lock): needs a lock-generation step and a refresh workflow; the version pin closes the immediate exposure.
 - **SEC-13 remainder:** desktop `admin_api_*` auditing (the desktop actor/auth_type values are an owner choice).
-- **SEC-N3:** TLS key (`server.key`) in Credential Manager rather than plaintext PEM.
+- ~~**SEC-N3:** TLS key (`server.key`) in Credential Manager rather than plaintext PEM.~~ Done (see SEC-N3 above).
 - **SEC-N4:** `sk-` redaction without a word boundary (log streaming area).
 - **PL-\*** (service lifecycle owner): PL-M2, PL-m1, PL-m2, PL-m4, PL-m5, PL-m6, PL-m7, PL-n1.
 - **Rubric escalation:** the escalation behaviour is undefined in the spec.

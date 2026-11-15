@@ -36,6 +36,10 @@ export interface AdminApiStatus {
   /** What was wrong when the shell regenerated on its own. */
   cert_detail?: string | null;
   cert_not_after_ms?: number | null;
+  /** Where the TLS private key lives (SEC-N3): credential_manager |
+   *  file (dpapi_file reserved); null before a certificate exists.
+   *  Optional: older shells do not send it. */
+  key_storage?: string | null;
   /** Informational: current machine addresses the certificate does
    *  not list. Never acted on automatically — pinned clients ignore
    *  SANs; only Regenerate (which forces a re-pair) updates them. */
