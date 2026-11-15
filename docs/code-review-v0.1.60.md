@@ -249,7 +249,7 @@ All other invoke argument keys (backend action family, `backend_add`/preview, mo
 
 Reconciled 2026-11-12. Implemented since this review (see the inline notes on each finding): PS-4, PS-5, PS-6, PS-8, PS-9, PS-10, PS-11, PS-12, P-4, P-5, P-9, P-10, P-11a..c, D-2 (whole-tree rustfmt, `7bb9439`), SEC-03, SEC-04, SEC-05 rotation, SEC-08, SEC-13 (TOTP/lockout), SEC-14, SEC-15, SEC-16, SEC-N1, SEC-N2. Still open:
 
-- **F1 follow-up: generate the gateway hash lock.** The `--require-hashes` install path, fallback warning, regeneration script and CI pin test are in (2026-11-15); `crates/manager-wizard/assets/gateway-requirements.lock` is still the placeholder. Run `tools/gateway-lock/Update-GatewayLock.ps1` on a machine with uv, review, commit.
+- ~~**F1 follow-up: generate the gateway hash lock.**~~ Done (2026-11-15): `crates/manager-wizard/assets/gateway-requirements.lock` generated with uv 0.13.0 (`uv pip compile crates/manager-wizard/assets/gateway-requirements.in --generate-hashes --python-version 3.12 --python-platform x86_64-pc-windows-msvc`, 121 pinned packages incl. `litellm==1.105.1`, `prisma==0.11.0`). The default pin now installs with `--require-hashes`; an operator pin other than the lock's still falls back with the "not hash-verified" warning. Regenerate with `tools/gateway-lock/Update-GatewayLock.ps1` whenever the pins move (the `checked_in_gateway_lock_matches_pins` test fails until you do).
 - **SEC-13 remainder:** desktop `admin_api_*` auditing (the desktop actor/auth_type values are an owner choice).
 - **SEC-N3:** TLS key (`server.key`) in Credential Manager rather than plaintext PEM.
 - **SEC-N4:** `sk-` redaction without a word boundary (log streaming area).
