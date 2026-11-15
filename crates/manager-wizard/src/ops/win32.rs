@@ -205,62 +205,33 @@ pub(crate) fn find_vscode_cli_windows() -> Option<String> {
     None
 }
 
-/// Read a generic credential's blob via CredReadW (advapi32). Returns
-/// `None` on any failure (missing target, empty blob, undecodable
-/// content). The returned value is a secret: it is never logged and
-/// never written to disk by callers — it goes straight into a spawned
-/// process's environment.
+/// Read a generic credential's blob through the Credential Manager
+/// [`SecretStore`](crate::secrets::SecretStore) seam (CredReadW) and
+/// decode it as text. Returns `None` on any failure (missing target,
+/// empty blob, undecodable content). The returned value is a secret: it
+/// is never logged and never written to disk by callers — it goes
+/// straight into a spawned process's environment.
 #[cfg(windows)]
 pub(crate) fn cred_read_windows(target: &str) -> Option<String> {
-    use windows_sys::Win32::Security::Credentials::{
-        CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
-    };
-    let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut cred: *mut CREDENTIALW = std::ptr::null_mut();
-    let ok = unsafe { CredReadW(wide.as_ptr(), CRED_TYPE_GENERIC, 0, &mut cred) };
-    if ok == 0 || cred.is_null() {
-        return None;
-    }
-    let value = unsafe {
-        let size = (*cred).CredentialBlobSize as usize;
-        let ptr = (*cred).CredentialBlob;
-        if ptr.is_null() || size == 0 {
-            None
-        } else {
-            decode_credential_blob(std::slice::from_raw_parts(ptr, size))
-        }
-    };
-    unsafe { CredFree(cred as *const std::ffi::c_void) };
-    value.filter(|v| !v.is_empty())
+    use crate::secrets::{CredentialManagerSecretStore, SecretStore};
+    let blob = CredentialManagerSecretStore.read(target).ok().flatten()?;
+    decode_credential_blob(&blob).filter(|v| !v.is_empty())
 }
 
-/// Store a generic credential via CredWriteW (advapi32), replacing
-/// any existing value for the target. The blob is written as
+/// Store a generic credential through the Credential Manager
+/// [`SecretStore`](crate::secrets::SecretStore) seam (CredWriteW),
+/// replacing any existing value for the target. The blob is written as
 /// UTF-16LE text — the encoding cmdkey / PowerShell-written secrets
 /// use and the one [`cred_read_windows`] decodes natively. Persisted
 /// per-user on this machine (CRED_PERSIST_LOCAL_MACHINE).
 #[cfg(windows)]
 pub(crate) fn cred_write_windows(target: &str, secret: &str) -> Option<()> {
-    use windows_sys::Win32::Security::Credentials::{
-        CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
-    };
-    let mut target_wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+    use crate::secrets::{CredentialManagerSecretStore, SecretStore};
     let blob: Vec<u8> = secret
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .collect();
-    let mut cred: CREDENTIALW = unsafe { std::mem::zeroed() };
-    cred.Type = CRED_TYPE_GENERIC;
-    cred.TargetName = target_wide.as_mut_ptr();
-    cred.CredentialBlobSize = blob.len() as u32;
-    cred.CredentialBlob = blob.as_ptr() as *mut u8;
-    cred.Persist = CRED_PERSIST_LOCAL_MACHINE;
-    let ok = unsafe { CredWriteW(&cred, 0) };
-    if ok == 0 {
-        None
-    } else {
-        Some(())
-    }
+    CredentialManagerSecretStore.write(target, &blob).ok()
 }
 
 /// Decode a credential blob: generic credentials written by cmdkey /

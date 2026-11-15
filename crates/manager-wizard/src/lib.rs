@@ -27,6 +27,7 @@ mod gateway_state;
 mod mcp;
 mod model;
 pub mod ops;
+pub mod secrets;
 pub mod steps;
 mod system_ops;
 mod wizard;
