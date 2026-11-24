@@ -99,12 +99,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Workspace tests
         run: cargo test --workspace
-      # Advisory for now: clippy -D warnings is proven green on Windows
-      # (the blocking clippy gate is in the windows job below), but the
-      # non-Windows cfg paths have never been linted. Drop
-      # continue-on-error once this step has gone green on Linux.
-      - name: Workspace clippy (advisory on Linux)
-        continue-on-error: true
+      # Lints the non-Windows cfg paths; the windows job lints the rest.
+      - name: Workspace clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   windows:
