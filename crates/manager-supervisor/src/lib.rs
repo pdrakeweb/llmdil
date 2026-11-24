@@ -1975,18 +1975,35 @@ impl LogLevelFilter {
 pub struct TestResult {
     pub status: u16,
     pub content: Option<String>,
+    /// The model's reasoning text, when the server splits it out.
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub latency_ms: u64,
 }
 
+impl TestResult {
+    /// Whether the backend really generated something: a 2xx status and
+    /// answer or reasoning text. Reasoning counts because a model that
+    /// ignores the no-thinking request can spend the short token budget
+    /// before its answer.
+    pub fn answered(&self) -> bool {
+        let text = |t: &Option<String>| t.as_deref().is_some_and(|t| !t.trim().is_empty());
+        (200..300).contains(&self.status) && (text(&self.content) || text(&self.reasoning_content))
+    }
+}
+
 /// Minimal inference test request: HTTP POST to
 /// `{base_url}/v1/chat/completions` with a tiny prompt, returning the first
-/// choice's content plus usage when the server reports it.
+/// choice's content plus usage when the server reports it. Thinking is
+/// turned off (templates that do not know the switch ignore it): with 16
+/// tokens a thinking model would never reach its answer.
 ///
 /// `base_url` is e.g. `http://127.0.0.1:8081`. Non-2xx responses are not
 /// errors here — the status is reported and content is `None` — but
-/// transport failures and unparseable bodies are.
+/// transport failures and unparseable bodies are. `Ok` is therefore not
+/// proof of a working backend: use [`TestResult::answered`].
 pub async fn test_request(base_url: &str, prompt: &str) -> Result<TestResult, SupervisorError> {
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
@@ -1994,6 +2011,7 @@ pub async fn test_request(base_url: &str, prompt: &str) -> Result<TestResult, Su
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 16,
         "stream": false,
+        "chat_template_kwargs": {"enable_thinking": false},
     });
     // NOTE: built without reqwest's `json` feature (workspace keeps reqwest
     // minimal); body serialization and response parsing go through
@@ -2020,10 +2038,13 @@ pub async fn test_request(base_url: &str, prompt: &str) -> Result<TestResult, Su
         .map_err(|e| SupervisorError::Http(e.to_string()))?;
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| SupervisorError::Http(format!("unparseable response body: {e}")))?;
-    let content = json
-        .pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let text_at = |path: &str| {
+        json.pointer(path)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let content = text_at("/choices/0/message/content");
+    let reasoning_content = text_at("/choices/0/message/reasoning_content");
     let prompt_tokens = json
         .pointer("/usage/prompt_tokens")
         .and_then(|v| v.as_u64())
@@ -2035,6 +2056,7 @@ pub async fn test_request(base_url: &str, prompt: &str) -> Result<TestResult, Su
     Ok(TestResult {
         status,
         content,
+        reasoning_content,
         prompt_tokens,
         completion_tokens,
         latency_ms,
@@ -4497,6 +4519,39 @@ mod tests {
         assert_eq!(r.status, 200);
         assert_eq!(r.content.as_deref(), Some("ok"));
         assert_eq!(r.prompt_tokens, None);
+    }
+
+    /// Field failure on real hardware: a thinking model spent the test's
+    /// 16 tokens on reasoning, so a healthy backend looked broken. The
+    /// request asks for no thinking; when a template ignores that, the
+    /// reasoning text is reported.
+    #[tokio::test]
+    async fn test_request_disables_thinking_and_reports_reasoning() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let req = read_http_request(&mut sock).await;
+            let _ = tx.send(String::from_utf8_lossy(&req).to_string());
+            let body = r#"{"choices":[{"message":{"content":"","reasoning_content":"The user wants"},"finish_reason":"length"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let r = test_request(&format!("http://127.0.0.1:{port}"), "hi")
+            .await
+            .unwrap();
+        let req = rx.await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(v["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(v["max_tokens"], 16);
+        let out = serde_json::to_value(&r).unwrap();
+        assert_eq!(out["reasoning_content"], "The user wants");
     }
 
     #[tokio::test]

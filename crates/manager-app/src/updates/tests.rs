@@ -846,3 +846,59 @@ async fn apply_op_runs_as_a_task_and_records_history() {
     assert!(payload["plan"]["updates"].as_array().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The backend test reports a non-2xx answer in its payload instead of
+/// failing, so the post-update check must read the payload: accepting
+/// any `Ok` kept a broken build instead of rolling back.
+#[test]
+fn smoke_verdict_needs_a_2xx_answer_with_generated_text() {
+    let r = |status: u16, content: Value, reasoning: Value| {
+        smoke_verdict(json!({
+            "status": status, "content": content, "reasoning_content": reasoning,
+            "prompt_tokens": null, "completion_tokens": null, "latency_ms": 5
+        }))
+    };
+    assert!(r(200, json!("OK"), Value::Null).is_ok());
+    // A model that only got as far as reasoning still generated text.
+    assert!(r(200, json!(""), json!("The user wants")).is_ok());
+    let err = r(500, Value::Null, Value::Null).unwrap_err();
+    assert!(err.contains("HTTP 500"), "{err}");
+    assert!(r(503, Value::Null, Value::Null).is_err());
+    assert!(r(500, json!("OK"), Value::Null).is_err());
+    let err = r(200, json!(" "), Value::Null).unwrap_err();
+    assert!(err.contains("no generated text"), "{err}");
+    // A payload without a status is never an answer.
+    assert!(smoke_verdict(json!({})).is_err());
+}
+
+/// The same through the real backend test against a stub server: an
+/// HTTP 500 with a JSON error body is an `Ok` from the op and must
+/// still fail the check.
+#[tokio::test]
+async fn a_backend_answering_http_500_fails_the_post_update_check() {
+    use crate::test_support::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let _ = sock.read(&mut buf).await;
+        let body = r#"{"error":{"message":"failed to decode"}}"#;
+        let resp = format!(
+            "HTTP/1.1 500 x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = sock.write_all(resp.as_bytes()).await;
+    });
+    let mut cfg = test_cfg();
+    let id = cfg.backends[0].id.clone();
+    cfg.backends[0].port = port;
+    let (state, dir) = advanced_test_state(cfg);
+    let v = crate::op_test_backend(&state, &test_sink(), id, "Reply with OK.".into())
+        .await
+        .expect("a non-2xx answer is reported in the payload");
+    assert_eq!(v["status"], 500);
+    assert!(smoke_verdict(v).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

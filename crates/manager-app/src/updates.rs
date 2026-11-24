@@ -1282,6 +1282,21 @@ fn api_err(e: ApiError) -> String {
     e.to_string()
 }
 
+/// Whether a backend test's payload proves the backend works after an
+/// update. The test reports a non-2xx answer in its payload rather than
+/// failing, so an `Ok` from the op alone proves nothing.
+fn smoke_verdict(result: Value) -> Result<(), String> {
+    let r: manager_supervisor::TestResult = serde_json::from_value(result)
+        .map_err(|e| format!("unreadable backend test result: {e}"))?;
+    if r.answered() {
+        Ok(())
+    } else if (200..300).contains(&r.status) {
+        Err(format!("HTTP {} with no generated text", r.status))
+    } else {
+        Err(format!("HTTP {}", r.status))
+    }
+}
+
 #[async_trait]
 impl UpdateEnv for AppUpdateEnv {
     async fn running_backends(&self) -> Vec<String> {
@@ -1366,7 +1381,10 @@ impl UpdateEnv for AppUpdateEnv {
                     )
                     .await
                     {
-                        Ok(_) => return Ok(()),
+                        Ok(v) => match smoke_verdict(v) {
+                            Ok(()) => return Ok(()),
+                            Err(e) => last = e,
+                        },
                         Err(e) => last = e.to_string(),
                     }
                 }

@@ -867,9 +867,26 @@ export async function applyBackendConfig(
 export interface BackendTestResult {
   status: number;
   content: string | null;
+  /** Reasoning text, when the server splits it out (absent on older builds). */
+  reasoning_content?: string | null;
   prompt_tokens: number | null;
   completion_tokens: number | null;
   latency_ms: number;
+}
+
+/** The card note for a finished backend test. Mirrors the Rust
+ *  TestResult::answered: a 2xx status with answer or reasoning text. */
+export function backendTestNote(r: BackendTestResult): { text: string; err: boolean } {
+  const ok = r.status >= 200 && r.status < 300;
+  const reply = (r.content ?? "").trim();
+  if (ok && reply) {
+    const excerpt = reply.length > 120 ? `${reply.slice(0, 120)}…` : reply;
+    return { text: `Test reply (${r.latency_ms} ms): ${excerpt}`, err: false };
+  }
+  if (ok && (r.reasoning_content ?? "").trim()) {
+    return { text: `Test passed (${r.latency_ms} ms): the model is generating, but spent the short test on reasoning.`, err: false };
+  }
+  return { text: `Test failed: HTTP ${r.status}${ok ? " — no reply content" : ""}.`, err: true };
 }
 
 /** test_backend — one prompt against a running backend's

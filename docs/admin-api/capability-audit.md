@@ -92,7 +92,7 @@ and listed again in §13).
 ### `test_backend` — read (active probe)
 - What: One inference request against a running backend.
 - Entry: `test_backend`, main.rs:1766. UI: yes, **but under the wrong name** — `ui/src/api.ts` invokes `"backend_test_request"` while the registered command is `test_backend`; the invoke cannot resolve and the wrapper degrades to an error result (latent defect found by this audit).
-- In: `id: string, prompt: string`. Out: `TestResult {status, content, prompt_tokens, completion_tokens, latency_ms}` (a non-2xx HTTP status is reported in the payload, not thrown).
+- In: `id: string, prompt: string`. Out: `TestResult {status, content, reasoning_content, prompt_tokens, completion_tokens, latency_ms}` (a non-2xx HTTP status is reported in the payload, not thrown).
 - Side effects: network — POSTs to the backend's `http://127.0.0.1:<port>/v1/chat/completions`; consumes inference on that backend. No state change.
 
 ### `backend_get_config` — read

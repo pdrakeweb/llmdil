@@ -81,6 +81,7 @@ export {
   getBackendLaunchCommand,
   getBackendConfig,
   applyBackendConfig,
+  backendTestNote,
   testBackend,
 } from "./api/backends";
 export type {

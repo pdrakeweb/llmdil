@@ -633,9 +633,13 @@ file, placement) and fails the operation with the preflight message.
 against the running backend. Response (`BackendTestResult`):
 
 ```json
-{ "status": 200, "content": "…", "prompt_tokens": 12,
-  "completion_tokens": 64, "latency_ms": 1823 }
+{ "status": 200, "content": "…", "reasoning_content": null,
+  "prompt_tokens": 12, "completion_tokens": 16, "latency_ms": 1823 }
 ```
+
+The request asks for no thinking and at most 16 tokens.
+`reasoning_content` is set when the model reasoned anyway; a 2xx with
+either text means the backend is generating.
 
 A non-2xx from the backend is reported in `status`, not as an API
 error, mirroring the app. Duration is model-bound: clients should

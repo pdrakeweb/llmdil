@@ -1,7 +1,7 @@
 /* Backends view: data loading, painting and every card action
    (split from static.ts). */
 
-import { addBackend, applyBackendConfig, backendAddPreview, backendCachePreview, clearBackendOffloadOverride, deleteBackend, getActivationPlan, getBackendConfig, getBackendLaunchCommand, getBackends, getGatewayConfig, getGpuTelemetry, getLogs, getModels, measurementLookup, modelAssign, optimizeMeasureBackend, placementApply, placementPropose, setBackendCache, setBackendFlagsMode, setBackendMoeCache, setBackendMtp, setBackendOffload, setBackendOffloadOverride, setBackendParallel, setBackendRawFlags, testBackend, testBackendToolCall, updateBackendFlags } from "../api";
+import { addBackend, applyBackendConfig, backendAddPreview, backendCachePreview, backendTestNote, clearBackendOffloadOverride, deleteBackend, getActivationPlan, getBackendConfig, getBackendLaunchCommand, getBackends, getGatewayConfig, getGpuTelemetry, getLogs, getModels, measurementLookup, modelAssign, optimizeMeasureBackend, placementApply, placementPropose, setBackendCache, setBackendFlagsMode, setBackendMoeCache, setBackendMtp, setBackendOffload, setBackendOffloadOverride, setBackendParallel, setBackendRawFlags, testBackend, testBackendToolCall, updateBackendFlags } from "../api";
 import type { ActivationPlanData, BackendAddPreview, BackendRow, CachePreview, CacheSelectionLike, CacheTypeName, FlashAttnName, GatewayGroup, LogRow, MeasurementLookupRequest, ModelRow, PlacementProjectionData } from "../api";
 import { fmtCount, fmtGb, stackedBar, trim1 } from "../charts";
 import { esc } from "../html";
@@ -2114,15 +2114,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
       if (act === "test") {
         const r = await testBackend(id, "Reply with the single word: ready");
         if (disposed) return;
-        if (r.error) {
-          msgs.set(id, { text: `Test failed: ${r.error}`, err: true });
-        } else if (r.data.content) {
-          const reply = r.data.content.trim();
-          const excerpt = reply.length > 120 ? `${reply.slice(0, 120)}…` : reply;
-          msgs.set(id, { text: `Test reply (${r.data.latency_ms} ms): ${excerpt}`, err: false });
-        } else {
-          msgs.set(id, { text: `Test failed: HTTP ${r.data.status} — no reply content.`, err: true });
-        }
+        msgs.set(id, r.error ? { text: `Test failed: ${r.error}`, err: true } : backendTestNote(r.data));
         paint();
         return;
       }

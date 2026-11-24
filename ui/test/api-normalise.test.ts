@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GatewayConfigData, OpenRouterSpend } from "../src/api";
 import {
-  getDashboard, getGatewayStatus, getGpuTelemetry, getStatus, isTauri, listBackends,
+  backendTestNote, getDashboard, getGatewayStatus, getGpuTelemetry, getStatus, isTauri, listBackends,
   openRouterSpendBannerHtml, systemVerdict, wizardBusyMessage,
 } from "../src/api";
 
@@ -221,5 +221,16 @@ describe("openRouterSpendBannerHtml", () => {
   it("explains a reached cap and a zero cap", () => {
     expect(openRouterSpendBannerHtml(spend({ capped: true, spent_today_usd: 5 }), "!")).toContain("reached the $5.00 daily cap");
     expect(openRouterSpendBannerHtml(spend({ capped: true, cap_usd: 0 }), "!")).toContain("the OpenRouter daily cap is $0.00");
+  });
+});
+
+describe("backendTestNote", () => {
+  const r = (o: Partial<Parameters<typeof backendTestNote>[0]>) =>
+    ({ status: 200, content: null, prompt_tokens: null, completion_tokens: null, latency_ms: 7, ...o });
+  it("passes on answer or reasoning text, and only on 2xx", () => {
+    expect(backendTestNote(r({ content: " ready " }))).toEqual({ text: "Test reply (7 ms): ready", err: false });
+    expect(backendTestNote(r({ content: "", reasoning_content: "The user wants" })).err).toBe(false);
+    expect(backendTestNote(r({ content: "  " }))).toEqual({ text: "Test failed: HTTP 200 — no reply content.", err: true });
+    expect(backendTestNote(r({ status: 500, content: "x" }))).toEqual({ text: "Test failed: HTTP 500.", err: true });
   });
 });
