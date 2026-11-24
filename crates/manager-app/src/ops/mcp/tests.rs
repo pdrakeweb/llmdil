@@ -135,3 +135,12 @@ fn mcp_credential_hint_prefers_stored_then_seed() {
     other.credential_hint = None;
     assert_eq!(mcp_credential_hint(&other), None);
 }
+
+/// The presence check behind the MCP page and the OpenRouter card must
+/// not report a credential that was never stored (read-only lookup of a
+/// name nothing creates).
+#[test]
+fn credential_presence_is_false_for_an_absent_target() {
+    let target = format!("llmdil/test/absent/{}", std::process::id());
+    assert!(!credential_target_exists(&target));
+}

@@ -265,8 +265,8 @@ pub trait SystemOps: Send + Sync {
     async fn sha256_file(&self, path: &Path) -> Result<String, WizardError>;
     /// GPU inventory probe (nvidia-smi).
     async fn gpu_inventory(&self) -> Result<Vec<GpuDescriptor>, WizardError>;
-    /// Check a Windows Credential Manager target exists. The value is never
-    /// read — presence only.
+    /// Check a Windows Credential Manager target exists (with a non-empty
+    /// value). Presence only — the value is never returned.
     async fn credential_exists(&self, target: &str) -> Result<bool, WizardError>;
     /// Read a credential's value from Windows Credential Manager by
     /// target name; `None` when the target is absent or the platform has

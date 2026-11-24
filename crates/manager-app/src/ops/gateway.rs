@@ -623,11 +623,11 @@ pub async fn op_gateway_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>
     } else {
         None
     };
-    // The cmdkey presence check is a blocking subprocess call; run it
-    // off the async worker like the MCP presence checks.
+    // The presence check is a blocking OS call; run it off the async
+    // worker like the MCP presence checks.
     let openrouter_cred_present: Option<bool> = match cred_ref.filter(|r| !r.is_empty()) {
         Some(target) => Some(
-            tokio::task::spawn_blocking(move || cmdkey_target_exists(&target))
+            tokio::task::spawn_blocking(move || credential_target_exists(&target))
                 .await
                 .unwrap_or(false),
         ),

@@ -778,17 +778,14 @@ impl SystemOps for RealSystemOps {
     async fn credential_exists(&self, target: &str) -> Result<bool, WizardError> {
         #[cfg(windows)]
         {
-            // tokio Command below: creation_flags is inherent on
-            // Windows, so no std CommandExt import is needed here.
-            let mut cmd = tokio::process::Command::new("cmdkey");
-            cmd.arg(format!("/list:{target}"));
-            // CREATE_NO_WINDOW: this probe runs from a GUI process.
-            cmd.creation_flags(0x08000000);
-            let out = cmd.output().await.map_err(|e| WizardError::IoError {
-                path: PathBuf::from("cmdkey"),
-                reason: e.to_string(),
-            })?;
-            Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).contains(target))
+            // Asked of Credential Manager directly: `cmdkey /list:X`
+            // echoes X in its header even when nothing is stored.
+            crate::secrets::platform_secret_store()
+                .exists(target)
+                .map_err(|e| WizardError::IoError {
+                    path: PathBuf::from("Credential Manager"),
+                    reason: e.to_string(),
+                })
         }
         #[cfg(not(windows))]
         {

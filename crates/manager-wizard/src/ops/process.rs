@@ -15,7 +15,7 @@ pub(crate) fn pid_is_signalable(pid: u32) -> bool {
 /// Whether a process with `pid` is currently alive.
 ///
 /// Windows: `tasklist` filtered to the pid (same shell-out approach as
-/// the cmdkey presence checks elsewhere in this crate — no extra FFI).
+/// the other subprocess probes in this crate — no extra FFI).
 /// Unix: `kill(pid, 0)` via `/bin/kill -0`.
 pub fn process_alive(pid: u32) -> bool {
     if !pid_is_signalable(pid) {

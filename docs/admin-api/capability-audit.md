@@ -341,7 +341,7 @@ a pre-change config snapshot supports cancel.
 - What: Gateway liveness and summary state.
 - Entry: `gateway_status`, main.rs:3672. UI: yes.
 - In: none. Out: `{port, bind_host, lan_ip, groups (configured count), routing_rules (count), up, routing_log_len, openrouter_cred_present: bool|null, activation_pending, activation_changes}`.
-- Side effects: network probe of the gateway (`GET /v1/models` on the probe host, ~1 s); a `cmdkey` subprocess presence check for the OpenRouter credential (presence only, value never read); reads the activation journal. Note: `groups` counts *configured* groups, while the generated config includes only *enabled* groups — the two numbers can differ.
+- Side effects: network probe of the gateway (`GET /v1/models` on the probe host, ~1 s); a Credential Manager presence check for the OpenRouter credential (presence only, value never returned); reads the activation journal. Note: `groups` counts *configured* groups, while the generated config includes only *enabled* groups — the two numbers can differ.
 
 ### `gateway_stop` — lifecycle
 - What: Stop the running gateway (and the app-managed PostgreSQL after it).
@@ -482,7 +482,7 @@ Modes are held **in memory only** — there is no MCP section in
 - What: MCP servers with live status and per-key credential presence.
 - Entry: `mcp_list`, main.rs:5310. UI: **no**.
 - In: none. Out: `[{id, name, mode, transport, running, env_keys, credential_presence: [[key, present]]}]`.
-- Side effects: `cmdkey` subprocess presence checks (values never read); reads supervisor state.
+- Side effects: Credential Manager presence checks (values never returned); reads supervisor state.
 
 ### `mcp_test_connection` — read (active probe)
 - What: Test one MCP server: local = is its supervised process running; remote = HTTP health probe (5 s).
@@ -630,7 +630,7 @@ several whole feature areas (MCP, WinML, updates policy) exist *only* here:
 - **Orphan backend adoption** — at launch the app adopts llama-server processes started by a previous session (tracked by pid). Adoption is automatic and invisible as a capability; adopted backends show an `adopted` flag in `list_backends` and are stoppable, but there is no adopt/release operation.
 - **Gateway metrics polling** — a background loop scrapes LiteLLM's Prometheus endpoint every 15 s into `GatewayStatsStore` (`src-tauri/src/gateway_stats.rs`), producing the trailing-hour `requests_1h` / `errors_1h` / `throughput_toks` on `list_backends` and the in-flight gauge `gateway_quiesce_wait` reads. No command exposes the store, the raw metrics, or the poller's health.
 - **MXC policy decision point** — `manager_mxc::decide` (the actual allow/prompt/deny evaluation the sandbox runtime uses) has no command; only its offline derivatives (self-test, tightening proposals) are exposed.
-- **Credential writes** — the app *reads* credential presence (`cmdkey`) in several places and *writes* exactly two credentials, both inside the gateway machinery: the LiteLLM master key and the Postgres password (generate + store in Windows Credential Manager on first use). There is no general credential read/write capability, and secret values never appear in config or policy files — references only. (`gateway_master_key`, §7, is the one place a secret value crosses the command boundary.)
+- **Credential writes** — the app *reads* credential presence (Credential Manager, via the `SecretStore` seam) in several places and *writes* exactly two credentials, both inside the gateway machinery: the LiteLLM master key and the Postgres password (generate + store in Windows Credential Manager on first use). There is no general credential read/write capability, and secret values never appear in config or policy files — references only. (`gateway_master_key`, §7, is the one place a secret value crosses the command boundary.)
 
 ## 14. UI flows that compose multiple commands
 

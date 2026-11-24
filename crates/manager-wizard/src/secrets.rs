@@ -48,6 +48,12 @@ pub trait SecretStore: Send + Sync {
     fn write(&self, key: &str, value: &[u8]) -> Result<(), SecretStoreError>;
     /// Remove the value under `key`. Removing an absent key succeeds.
     fn delete(&self, key: &str) -> Result<(), SecretStoreError>;
+    /// Whether a non-empty value is stored under `key`. An empty value
+    /// counts as absent: the Admin API's credential "delete" writes an
+    /// empty value, and every reader treats one as no credential.
+    fn exists(&self, key: &str) -> Result<bool, SecretStoreError> {
+        Ok(self.read(key)?.is_some_and(|v| !v.is_empty()))
+    }
 }
 
 /// In-memory store (tests, and callers that must not touch the OS
@@ -119,8 +125,15 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 #[cfg(windows)]
-impl SecretStore for CredentialManagerSecretStore {
-    fn read(&self, key: &str) -> Result<Option<Vec<u8>>, SecretStoreError> {
+impl CredentialManagerSecretStore {
+    /// Run `f` over the blob stored under `key` (in the buffer
+    /// CredReadW allocated, freed before returning); `Ok(None)` when
+    /// there is no such credential.
+    fn with_blob<R>(
+        &self,
+        key: &str,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Option<R>, SecretStoreError> {
         use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_FOUND};
         use windows_sys::Win32::Security::Credentials::{
             CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
@@ -142,18 +155,33 @@ impl SecretStore for CredentialManagerSecretStore {
         }
         // SAFETY: `cred` is valid per the successful CredReadW above;
         // the blob pointer/size pair describes its value.
-        let value = unsafe {
+        let blob: &[u8] = unsafe {
             let size = (*cred).CredentialBlobSize as usize;
             let ptr = (*cred).CredentialBlob;
             if ptr.is_null() || size == 0 {
-                Vec::new()
+                &[]
             } else {
-                std::slice::from_raw_parts(ptr, size).to_vec()
+                std::slice::from_raw_parts(ptr, size)
             }
         };
-        // SAFETY: freeing the exact pointer CredReadW returned.
+        let out = f(blob);
+        // SAFETY: freeing the exact pointer CredReadW returned; `blob`
+        // is not used after this.
         unsafe { CredFree(cred as *const std::ffi::c_void) };
-        Ok(Some(value))
+        Ok(Some(out))
+    }
+}
+
+#[cfg(windows)]
+impl SecretStore for CredentialManagerSecretStore {
+    fn read(&self, key: &str) -> Result<Option<Vec<u8>>, SecretStoreError> {
+        self.with_blob(key, <[u8]>::to_vec)
+    }
+
+    /// Only the size is looked at; the value is never copied out of the
+    /// buffer Windows returned.
+    fn exists(&self, key: &str) -> Result<bool, SecretStoreError> {
+        Ok(self.with_blob(key, |b| !b.is_empty())?.unwrap_or(false))
     }
 
     fn write(&self, key: &str, value: &[u8]) -> Result<(), SecretStoreError> {
@@ -241,11 +269,22 @@ mod tests {
     }
 
     #[test]
+    fn exists_means_a_non_empty_value() {
+        let store = MemorySecretStore::default();
+        assert!(!store.exists("k").unwrap());
+        store.write("k", b"value").unwrap();
+        assert!(store.exists("k").unwrap());
+        store.write("k", b"").unwrap();
+        assert!(!store.exists("k").unwrap());
+    }
+
+    #[test]
     fn unsupported_store_fails_without_panicking() {
         let store = UnsupportedSecretStore;
         assert_eq!(store.read("k"), Err(SecretStoreError::NotSupported));
         assert_eq!(store.write("k", b"v"), Err(SecretStoreError::NotSupported));
         assert_eq!(store.delete("k"), Err(SecretStoreError::NotSupported));
+        assert_eq!(store.exists("k"), Err(SecretStoreError::NotSupported));
     }
 
     /// Real Credential Manager round trip under a unique target that is
@@ -262,7 +301,11 @@ mod tests {
         let key = format!("llmdil/test/secret-store/{hex}");
         let result = std::panic::catch_unwind(|| {
             assert_eq!(store.read(&key).unwrap(), None);
+            assert!(!store.exists(&key).unwrap());
+            store.write(&key, b"").unwrap();
+            assert!(!store.exists(&key).unwrap());
             store.write(&key, b"round trip").unwrap();
+            assert!(store.exists(&key).unwrap());
             assert_eq!(
                 store.read(&key).unwrap().as_deref(),
                 Some(&b"round trip"[..])

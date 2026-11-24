@@ -454,3 +454,19 @@ fn stop_gateway_kills_recorded_process() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(exited, "recorded process was not terminated");
 }
+
+/// `cmdkey /list:<target>` echoes the target in its header even when
+/// nothing is stored, so a presence check that searched its output for
+/// the target answered "present" for every name. Read-only: looks up a
+/// random target that cannot exist.
+#[tokio::test]
+async fn credential_exists_is_false_for_an_absent_target() {
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).unwrap();
+    let hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let target = format!("llmdil/test/absent/{hex}");
+    assert!(!RealSystemOps::default()
+        .credential_exists(&target)
+        .await
+        .unwrap());
+}

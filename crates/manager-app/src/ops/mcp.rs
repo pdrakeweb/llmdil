@@ -22,12 +22,12 @@ pub async fn op_mcp_list(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> A
     };
     let running: HashMap<String, bool> =
         statuses.iter().map(|s| (s.id.clone(), s.running)).collect();
-    // Presence checks are blocking cmdkey calls; run off the async worker.
+    // Presence checks are blocking OS calls; run off the async worker.
     let servers_for_presence = servers.clone();
     let found_targets: Vec<Option<String>> = tokio::task::spawn_blocking(move || {
         servers_for_presence
             .iter()
-            .map(|s| manager_mcp::credential_target_found(s, cmdkey_target_exists))
+            .map(|s| manager_mcp::credential_target_found(s, credential_target_exists))
             .collect()
     })
     .await
@@ -156,24 +156,12 @@ pub async fn op_mcp_start_preflight(
 }
 
 /// Check whether a Windows Credential Manager target exists.
-/// Presence only — the value is never read. Off Windows, always false.
-pub(crate) fn cmdkey_target_exists(target: &str) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let mut cmd = std::process::Command::new("cmdkey");
-        cmd.arg(format!("/list:{target}"));
-        // CREATE_NO_WINDOW: this probe runs from a GUI process.
-        cmd.creation_flags(0x08000000);
-        cmd.output()
-            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(target))
-            .unwrap_or(false)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = target;
-        false
-    }
+/// Presence only — the value is never returned. False when the store
+/// cannot be read, and always off Windows.
+pub(crate) fn credential_target_exists(target: &str) -> bool {
+    manager_wizard::secrets::platform_secret_store()
+        .exists(target)
+        .unwrap_or(false)
 }
 
 /// Connection test for one MCP server (spec §14 `mcp_test_connection`),
