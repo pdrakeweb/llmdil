@@ -144,6 +144,24 @@ pub fn catalog_moe_layers(id: &str, source_url: &str) -> Option<u32> {
         .and_then(|s| s.moe_layers)
 }
 
+/// The catalog's offload restrictions for a model, resolved like
+/// [`catalog_mtp_pin`]: by id first, then by source URL, so a
+/// catalog file registered under an operator-chosen id is governed
+/// too. Empty outside the catalog.
+pub fn catalog_offload_restrictions(id: &str, source_url: &str) -> Vec<OffloadRestriction> {
+    let models = curated_models();
+    models
+        .iter()
+        .find(|s| s.id == id)
+        .or_else(|| {
+            models
+                .iter()
+                .find(|s| !source_url.is_empty() && s.url == source_url)
+        })
+        .map(|s| s.offload_restrictions.clone())
+        .unwrap_or_default()
+}
+
 /// The curated catalog's MTP capability pin for a model (see
 /// [`ModelSpec::mtp`]): `Some(pin)` when the catalog knows the
 /// model — an exact id match wins; otherwise an exact source-URL
@@ -411,7 +429,17 @@ pub fn curated_models() -> Vec<ModelSpec> {
             // lengths 128 (2 KV heads) — 7 * 2 * (128 + 128) * 2 B.
             kv_bytes_per_token: Some(7_168),
             default_offload_layers: Some(16),
-            offload_restrictions: Vec::new(),
+            // Pascal guardrail (same class as Coder-Next's): at
+            // --n-cpu-moe 46 (20 of the 24 MoE layers) on a Tesla
+            // P100 (compute capability (6, 0)) the backend started
+            // healthy and died on its first request with the CUDA
+            // invalid-argument launch error; full offload on the
+            // same backend answers normally. Endpoints only on
+            // (6, 0); the partial default stands everywhere else.
+            offload_restrictions: vec![OffloadRestriction {
+                compute_capability: (6, 0),
+                allowed: AllowedOffload::EndpointsOnly,
+            }],
             mtp: false,
             url: "https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF/resolve/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf"
                 .to_string(),
@@ -705,29 +733,26 @@ mod tests {
     }
 
     #[test]
-    fn catalog_offload_restrictions_pin_coder_next_pascal_only() {
-        // Tracker #37: exactly one curated restriction — the
-        // coder's (6, 0) EndpointsOnly pin from the Pascal CUDA
-        // invalid-argument incident at --n-cpu-moe 46. Every other
-        // curated entry carries none; in particular Nemotron's
-        // 16-of-24 partial design point stays unrestricted.
-        let models = curated_models();
-        let coder = models.iter().find(|m| m.id == "qwen3-coder-30b").unwrap();
-        assert_eq!(
-            coder.offload_restrictions,
-            vec![OffloadRestriction {
-                compute_capability: (6, 0),
-                allowed: AllowedOffload::EndpointsOnly,
-            }]
-        );
-        assert_eq!(
-            restriction_for(coder, (6, 0)),
-            Some(&coder.offload_restrictions[0])
-        );
-        for m in &models {
-            if m.id != "qwen3-coder-30b" {
+    fn catalog_offload_restrictions_pin_the_pascal_moe_models() {
+        // Both MoE entries failed on a P100 under partial expert
+        // offload with the CUDA invalid-argument launch error; the
+        // dense entries carry no restriction.
+        let pin = vec![OffloadRestriction {
+            compute_capability: (6, 0),
+            allowed: AllowedOffload::EndpointsOnly,
+        }];
+        let moe = ["qwen3-coder-30b", "nemotron-3.5-lightning-30b"];
+        for m in &curated_models() {
+            if moe.contains(&m.id.as_str()) {
+                assert_eq!(m.offload_restrictions, pin, "{}", m.id);
+                assert_eq!(restriction_for(m, (6, 0)), Some(&pin[0]));
+                // Resolved by id, and by URL under another id.
+                assert_eq!(catalog_offload_restrictions(&m.id, ""), pin);
+                assert_eq!(catalog_offload_restrictions("mine", &m.url), pin);
+            } else {
                 assert!(m.offload_restrictions.is_empty(), "{}", m.id);
             }
         }
+        assert!(catalog_offload_restrictions("mine", "").is_empty());
     }
 }

@@ -680,8 +680,17 @@ fn offload_block_reason_other_gpu_is_allowed() {
 }
 
 #[test]
-fn offload_block_reason_unrestricted_model_is_allowed() {
+fn offload_block_reason_blocks_nemotron_partial_on_pascal() {
     let restrictions = catalog_restrictions("nemotron-3.5-lightning-30b");
+    let reason = |layers, cc| offload_block_reason(&restrictions, layers, 24, &[cc], false, false);
+    assert!(reason(20, (6, 0)).is_some());
+    assert_eq!(reason(24, (6, 0)), None);
+    assert_eq!(reason(20, (8, 6)), None);
+}
+
+#[test]
+fn offload_block_reason_unrestricted_model_is_allowed() {
+    let restrictions = catalog_restrictions("qwen3-8b");
     assert!(restrictions.is_empty());
     assert_eq!(
         offload_block_reason(&restrictions, 16, 24, &[(6, 0)], false, false),

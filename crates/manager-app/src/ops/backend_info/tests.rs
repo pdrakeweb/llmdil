@@ -1201,7 +1201,7 @@ fn offload_info_payload_fields_for_coder_and_nemotron() {
         "the `=` spelling is not the canonical form for the position"
     );
     assert_eq!(info.sys_bytes_by_position.len(), 25);
-    assert!(info.restrictions.is_empty());
+    assert_eq!(info.restrictions.len(), 1);
 }
 
 #[test]

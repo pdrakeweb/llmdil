@@ -2,6 +2,106 @@
 
 use crate::*;
 
+/// Free memory per GPU index now, from the latest telemetry
+/// snapshot. A down GPU has no usable reading and is absent.
+pub(crate) async fn gpu_free_now(state: &AppState) -> HashMap<u32, u64> {
+    let store = state.telemetry().await;
+    let samples = lock_telemetry(&store).snapshot();
+    samples
+        .iter()
+        .filter(|s| !s.down && s.vram_total_mib > 0)
+        .map(|s| (s.index, s.free_vram_mib()))
+        .collect()
+}
+
+/// Add the free-memory verdict to per-GPU fit entries (objects with
+/// `gpu`, `required_mib`, `total_mib`, `driver_model`): `free_mib`,
+/// `fits_free`, `will_page_mib`, `fit_text`. Returns the overall
+/// `fits_now`. `credit` is the backend's own residency per GPU.
+pub(crate) fn annotate_free_fit(
+    per_gpu: &mut [Value],
+    free: &HashMap<u32, u64>,
+    credit: &HashMap<u32, u64>,
+) -> Option<bool> {
+    let verdicts: Vec<Option<bool>> = per_gpu
+        .iter_mut()
+        .map(|e| {
+            let gpu = e["gpu"].as_u64().unwrap_or(u64::MAX) as u32;
+            let free_mib = free.get(&gpu).copied();
+            e["free_mib"] = json!(free_mib);
+            let (Some(required), Some(total)) =
+                (e["required_mib"].as_u64(), e["total_mib"].as_u64())
+            else {
+                e["fits_free"] = Value::Null;
+                e["will_page_mib"] = json!(0);
+                e["fit_text"] = Value::Null;
+                return None;
+            };
+            let f = manager_models::free_fit(
+                required,
+                total,
+                free_mib,
+                credit.get(&gpu).copied().unwrap_or(0),
+                e["driver_model"] == "wddm",
+            );
+            e["fits_free"] = json!(f.fits_free);
+            e["will_page_mib"] = json!(f.will_page_mib);
+            e["fit_text"] = json!(f.text);
+            f.fits_free
+        })
+        .collect();
+    manager_models::fits_now(&verdicts)
+}
+
+/// Add the free-memory verdict to every `list_backends` row carrying
+/// a `fit` object: `fit.per_gpu[].{free_mib, fits_free,
+/// will_page_mib, fit_text}` and `fit.fits_now`. A running backend's
+/// own requirement is credited. `fit.state` keeps its against-total
+/// meaning.
+pub async fn annotate_rows_fits_now(state: &AppState, rows: &mut [Value]) {
+    let free = gpu_free_now(state).await;
+    for row in rows {
+        let live = matches!(
+            row["state"].as_str(),
+            Some("running" | "starting" | "restarting" | "degraded" | "stopping")
+        );
+        let Some(per_gpu) = row["fit"]["per_gpu"].as_array_mut() else {
+            continue;
+        };
+        let credit: HashMap<u32, u64> = per_gpu
+            .iter()
+            .filter(|_| live)
+            .filter_map(|e| Some((e["gpu"].as_u64()? as u32, e["required_mib"].as_u64()?)))
+            .collect();
+        let now = annotate_free_fit(per_gpu, &free, &credit);
+        row["fit"]["fits_now"] = json!(now);
+    }
+}
+
+/// A backend's own residency per GPU when its process is live (the
+/// credit basis [`annotate_free_fit`] takes); empty when it is not.
+pub(crate) async fn own_residency(
+    state: &AppState,
+    cfg: &AppConfig,
+    b: &manager_config::BackendConfig,
+    gpus: &[GpuInfo],
+) -> HashMap<u32, u64> {
+    let live = lifecycle::backend_liveness_for(state, cfg)
+        .await
+        .get(&b.id)
+        .is_some_and(|l| l.process_pid().is_some());
+    match (live, backend_memory_requirement(cfg, b)) {
+        (true, Some(req)) => {
+            manager_optimize::residency_per_gpu(&req, &b.flags.tensor_split, gpus.len())
+                .into_iter()
+                .zip(gpus)
+                .map(|(mib, g)| (g.index, mib))
+                .collect()
+        }
+        _ => HashMap::new(),
+    }
+}
+
 /// Project a tensor split onto discovered VRAM (spec §14
 /// `placement_propose`). The model resolves from the curated catalog
 /// first, else from the config (size = the on-disk file when downloaded,
@@ -456,5 +556,40 @@ pub async fn op_placement_apply(
                 .await;
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(required: u64) -> Value {
+        json!({"gpu": 1, "required_mib": required, "total_mib": 16_376, "driver_model": "wddm"})
+    }
+
+    #[test]
+    fn free_fit_annotation_credits_own_residency_and_keeps_unknown_null() {
+        let free = HashMap::from([(1u32, 355u64)]);
+        let mut per = vec![entry(7_330)];
+        assert_eq!(
+            annotate_free_fit(&mut per, &free, &HashMap::new()),
+            Some(false)
+        );
+        assert_eq!(per[0]["free_mib"], 355);
+        assert_eq!(per[0]["fits_free"], false);
+        assert_eq!(per[0]["will_page_mib"], 6_975);
+        assert_eq!(per[0]["fit_text"], "Will page 6.8 GiB to system RAM");
+        // Its own residency is what fills the card: a restart fits.
+        let own = HashMap::from([(1u32, 7_330u64)]);
+        assert_eq!(annotate_free_fit(&mut per, &free, &own), Some(true));
+        assert_eq!(per[0]["fit_text"], "Fits");
+        // No reading for the GPU: no claim.
+        let mut per = vec![entry(7_330)];
+        assert_eq!(
+            annotate_free_fit(&mut per, &HashMap::new(), &HashMap::new()),
+            None
+        );
+        assert!(per[0]["free_mib"].is_null());
+        assert!(per[0]["fits_free"].is_null());
     }
 }

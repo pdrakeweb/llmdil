@@ -442,7 +442,32 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
     }
 }
 
+/// The configuration a plan was made against, for its staleness
+/// check: what plan items change or depend on — backends, models,
+/// gateway routing — without the records the app keeps beside them
+/// (verification stamps, tool-call probes, model assignments), which
+/// change on their own and never invalidate a plan. Serialized through
+/// `Value`, whose maps are ordered, so the hash does not depend on
+/// in-memory map order.
 pub(crate) fn current_config_hash(cfg: &AppConfig) -> String {
-    let bytes = serde_json::to_vec(cfg).unwrap_or_default();
-    config_fingerprint(&bytes)
+    let mut v = json!({
+        "backends": cfg.backends,
+        "models": cfg.models,
+        "groups": cfg.gateway.groups,
+        "gateway_port": cfg.gateway.port,
+        "openrouter": cfg.gateway.openrouter,
+    });
+    for b in v["backends"].as_array_mut().into_iter().flatten() {
+        if let Some(b) = b.as_object_mut() {
+            b.remove("tool_call_probe");
+        }
+    }
+    for m in v["models"].as_array_mut().into_iter().flatten() {
+        if let Some(m) = m.as_object_mut() {
+            for key in ["verified_at", "verified_sha256", "assigned_backends"] {
+                m.remove(key);
+            }
+        }
+    }
+    config_fingerprint(v.to_string().as_bytes())
 }

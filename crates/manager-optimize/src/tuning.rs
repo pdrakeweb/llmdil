@@ -222,9 +222,6 @@ pub struct TuningGpu {
     pub total_mib: u64,
     /// Compute capability, e.g. (8, 6); (0, 0) = unknown.
     pub compute_capability: (u32, u32),
-    /// Whether the pinned llama.cpp can run flash attention
-    /// on this architecture (§B.1: absent on Pascal sm_60).
-    pub fa_supported: bool,
 }
 
 /// Everything sweep planning resolves about the target,
@@ -390,9 +387,9 @@ pub fn moe_cache_values(offload_layers: Option<u32>, free_after_mib: u64) -> Vec
 /// prediction was wrong" is a measured outcome. When no
 /// prediction could be priced, only the incumbent's values
 /// are offered (an unpriced parameter is not swept, §B.1).
-/// Flash-attention-on values are offered only when every
-/// placed GPU supports it; the caller filters through
-/// [`cache_fa_offered`].
+/// Flash attention is offered on every architecture: the pinned
+/// build runs it on Pascal too (observed on compute capability
+/// 6.0 with f16, q8_0 and q4_0 V caches).
 pub fn context_cache_values(inputs: &TuningInputs) -> Vec<CacheSelection> {
     let inc = inputs.incumbent.cache;
     let mut out: Vec<CacheSelection> = vec![inc];
@@ -433,16 +430,6 @@ pub fn context_cache_values(inputs: &TuningInputs) -> Vec<CacheSelection> {
         out.push(flipped);
     }
     out
-}
-
-/// Whether a cache selection may be offered on a placement:
-/// flash attention on requires every placed GPU to support
-/// it (§B.1 capability gating — absent, not disabled).
-pub fn cache_fa_offered(sel: &CacheSelection, placed: &[&TuningGpu]) -> bool {
-    if sel.flash_attn != manager_models::FlashAttn::On {
-        return true;
-    }
-    !placed.is_empty() && placed.iter().all(|g| g.fa_supported)
 }
 
 // ---------------------------------------------------------------------------
@@ -830,6 +817,30 @@ pub fn winner_index(arms: &[TuningArm]) -> Option<usize> {
     rank_arms(arms).into_iter().find(|&i| arms[i].rankable())
 }
 
+/// Smallest generation-rate lead, percent, that is not noise.
+pub const WIN_MARGIN_PCT: f64 = 2.0;
+
+/// Whether `a`'s median generation rate beats `b`'s beyond noise: by
+/// at least [`WIN_MARGIN_PCT`] and by more than either side's own
+/// run-to-run spread.
+pub fn beats(a: &crate::BenchResult, b: &crate::BenchResult) -> bool {
+    let (Some(ga), Some(gb)) = (a.predicted_per_second, b.predicted_per_second) else {
+        return false;
+    };
+    if gb <= 0.0 {
+        return ga > 0.0;
+    }
+    let lead = (ga - gb) / gb * 100.0;
+    lead >= WIN_MARGIN_PCT && lead > a.spread_pct() && lead > b.spread_pct()
+}
+
+/// A backend a job stopped and could not start again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreFailure {
+    pub id: String,
+    pub error: String,
+}
+
 /// The confirmation arm's outcome (§B.6): reproducibility of
 /// the winner's figure plus the §A.4 screening gate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -895,6 +906,9 @@ pub struct TuningSweep {
     pub truncated: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Backends the sweep stopped and could not start again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restore_failures: Vec<RestoreFailure>,
     /// The winning arm was adopted into the backend's saved
     /// configuration through the structured save ops (§B.6).
     pub adopted: bool,
@@ -1054,13 +1068,12 @@ mod tests {
     use super::*;
     use manager_models::{CacheType, FlashAttn};
 
-    fn gpu(index: u32, total: u64, cc: (u32, u32), fa: bool) -> TuningGpu {
+    fn gpu(index: u32, total: u64, cc: (u32, u32)) -> TuningGpu {
         TuningGpu {
             index,
             name: format!("GPU{index}"),
             total_mib: total,
             compute_capability: cc,
-            fa_supported: fa,
         }
     }
 
@@ -1081,7 +1094,7 @@ mod tests {
             moe_layers: Some(48),
             mtp_capable: true,
             ctx_max: 262144,
-            gpus: vec![gpu(0, 16384, (8, 6), true), gpu(1, 16384, (6, 0), false)],
+            gpus: vec![gpu(0, 16384, (8, 6)), gpu(1, 16384, (6, 0))],
             predicted_cache: Some(CacheSelection {
                 k: CacheType::Q8_0,
                 v: CacheType::Q4_0,
@@ -1142,16 +1155,26 @@ mod tests {
     }
 
     #[test]
-    fn fa_on_is_not_offered_on_pascal() {
-        let inp = inputs();
-        let pascal = &inp.gpus[1];
-        let on = CacheSelection {
-            k: CacheType::F16,
-            v: CacheType::F16,
-            flash_attn: FlashAttn::On,
+    fn a_winner_must_beat_the_incumbent_beyond_noise() {
+        let runs = |rates: &[f64]| {
+            crate::BenchResult::from_runs(
+                rates
+                    .iter()
+                    .map(|r| crate::BenchRun {
+                        prompt_per_second: None,
+                        predicted_per_second: Some(*r),
+                        ttft_ms: None,
+                        latency_ms: 0,
+                        prompt_n: None,
+                    })
+                    .collect(),
+            )
         };
-        assert!(!cache_fa_offered(&on, &[pascal]));
-        assert!(cache_fa_offered(&on, &[&inp.gpus[0]]));
+        // Under 2 %: noise. Over 2 % with tight runs: a win.
+        assert!(!beats(&runs(&[50.5]), &runs(&[50.0])));
+        assert!(beats(&runs(&[52.0]), &runs(&[50.0])));
+        // 4 % ahead, but the runs themselves spread over 10 %.
+        assert!(!beats(&runs(&[47.0, 52.0, 53.0]), &runs(&[50.0])));
     }
 
     #[test]

@@ -129,6 +129,30 @@ pub fn offload_status(
     OffloadStatus::Verified
 }
 
+/// A warning (never a block) for partial expert offload on a
+/// Pascal-class GPU (compute capability 6.x) with no catalog pin for
+/// it: both catalog MoE models crashed there under partial offload,
+/// so an unpinned model's partial position is suspect, not verified.
+pub fn pascal_partial_warning(
+    restrictions: &[OffloadRestriction],
+    layers: u32,
+    moe_layers: u32,
+    placed_ccs: &[(u32, u32)],
+    cpu_only: bool,
+) -> Option<String> {
+    if cpu_only || layers == 0 || layers >= moe_layers {
+        return None;
+    }
+    let cc = placed_ccs
+        .iter()
+        .find(|cc| cc.0 == 6 && !restrictions.iter().any(|r| r.compute_capability == **cc))?;
+    Some(format!(
+        "partial expert offload ({layers} of {moe_layers} layers) on compute capability {}.{} \
+         crashed llama.cpp with other MoE models; 0 or {moe_layers} layers is safer",
+        cc.0, cc.1
+    ))
+}
+
 /// The nearest allowed position to `layers` under the restriction
 /// governing compute capability `cc`, for snapping a blocked (or
 /// about-to-be-blocked) slider position to a legal one. When no
@@ -213,18 +237,43 @@ mod tests {
     }
 
     #[test]
-    fn nemotron_partial_design_point_is_verified_everywhere() {
-        // Nemotron carries no restriction: its 16-of-24 partial
-        // design point must stay allowed on Pascal and elsewhere.
+    fn nemotron_pascal_allows_endpoints_only() {
+        // 20 of 24 died on the first request on a P100; 24 of 24
+        // answered. The partial default stands on other GPUs.
         let nemotron = spec("nemotron-3.5-lightning-30b");
-        assert!(nemotron.offload_restrictions.is_empty());
-        for cc in [(6, 0), (8, 6)] {
+        let restrictions = &nemotron.offload_restrictions;
+        for (layers, cc, want) in [
+            (0, (6, 0), OffloadStatus::Verified),
+            (24, (6, 0), OffloadStatus::Verified),
+            (16, (6, 0), OffloadStatus::Blocked),
+            (20, (6, 0), OffloadStatus::Blocked),
+            (16, (8, 6), OffloadStatus::Verified),
+            (20, (8, 6), OffloadStatus::Verified),
+        ] {
             assert_eq!(
-                offload_status(&nemotron.offload_restrictions, 16, 24, &[cc], false),
-                OffloadStatus::Verified,
-                "cc {cc:?}"
+                offload_status(restrictions, layers, 24, &[cc], false),
+                want,
+                "layers {layers} cc {cc:?}"
             );
         }
+        assert_eq!(nearest_allowed(restrictions, (6, 0), 16, 24), 24);
+    }
+
+    #[test]
+    fn partial_offload_on_pascal_warns_without_a_pin() {
+        assert!(pascal_partial_warning(&[], 20, 24, &[(6, 1)], false).is_some());
+        assert!(pascal_partial_warning(&[], 20, 24, &[(8, 6), (6, 0)], false).is_some());
+        // Endpoints, newer architectures, CPU-only, and pinned
+        // architectures (the block covers those) do not warn.
+        assert_eq!(pascal_partial_warning(&[], 0, 24, &[(6, 0)], false), None);
+        assert_eq!(pascal_partial_warning(&[], 24, 24, &[(6, 0)], false), None);
+        assert_eq!(pascal_partial_warning(&[], 20, 24, &[(8, 6)], false), None);
+        assert_eq!(pascal_partial_warning(&[], 20, 24, &[(6, 0)], true), None);
+        let pinned = coder().offload_restrictions;
+        assert_eq!(
+            pascal_partial_warning(&pinned, 20, 48, &[(6, 0)], false),
+            None
+        );
     }
 
     #[test]
@@ -302,11 +351,7 @@ mod tests {
             23
         );
         // A model with no restrictions at all.
-        let nemotron = spec("nemotron-3.5-lightning-30b");
-        assert_eq!(
-            nearest_allowed(&nemotron.offload_restrictions, (6, 0), 16, 24),
-            16
-        );
+        assert_eq!(nearest_allowed(&[], (6, 0), 16, 24), 16);
     }
 
     #[test]
@@ -315,8 +360,8 @@ mod tests {
         let restriction = restriction_for(&coder, (6, 0)).expect("Pascal restriction");
         assert_eq!(restriction.allowed, AllowedOffload::EndpointsOnly);
         assert_eq!(restriction_for(&coder, (8, 6)), None);
-        let nemotron = spec("nemotron-3.5-lightning-30b");
-        assert_eq!(restriction_for(&nemotron, (6, 0)), None);
+        let dense = spec("qwen3-8b");
+        assert_eq!(restriction_for(&dense, (6, 0)), None);
     }
 
     #[test]

@@ -489,3 +489,41 @@ async fn job_record_lifecycle() {
     record_job_success(&state, current).await;
     assert!(state.optimize.job.lock().await.is_none());
 }
+
+#[test]
+fn plan_staleness_ignores_bookkeeping() {
+    let mut base = AppConfig::default_config();
+    base.models.push(manager_config::ModelConfig {
+        id: "m".to_string(),
+        gguf_path: PathBuf::from("models/m.gguf"),
+        quant: "Q4_K_M".to_string(),
+        params_b: 7.0,
+        sha256: "a".repeat(64),
+        verified_at: None,
+        verified_sha256: None,
+        source_url: String::new(),
+        assigned_backends: Vec::new(),
+        enabled: true,
+        display_name: None,
+        moe_layers: None,
+        default_offload_layers: None,
+        mtp: None,
+    });
+    let hash = current_config_hash(&base);
+    assert_eq!(hash, current_config_hash(&base.clone()));
+    // Verification stamps, probes and UI state are not a change.
+    let mut cfg = base.clone();
+    cfg.models[0].verified_at = Some(chrono::Utc::now());
+    cfg.models[0].verified_sha256 = Some("ab".repeat(32));
+    cfg.backends[0].tool_call_probe = Some(manager_config::ToolCallProbe {
+        outcome: manager_config::ToolCallProbeOutcome::Verified,
+        at_ms: 1,
+    });
+    cfg.setup_completed = !cfg.setup_completed;
+    cfg.optimize_purpose = "coding".to_string();
+    assert_eq!(hash, current_config_hash(&cfg));
+    // A serving change is.
+    let mut cfg = base.clone();
+    cfg.backends[0].flags.n_ctx += 1024;
+    assert_ne!(hash, current_config_hash(&cfg));
+}

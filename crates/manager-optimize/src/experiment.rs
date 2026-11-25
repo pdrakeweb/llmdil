@@ -390,6 +390,37 @@ fn moe_cache_problems(
     Vec::new()
 }
 
+/// An expert-offload position (or an all-experts request) needs a
+/// candidate that has experts — the same rule plan items are held to.
+/// A candidate the app does not know yet (an HF file the plan will
+/// register) is not judged here.
+fn offload_problems(
+    proposal: &ExperimentProposal,
+    cfg: &AppConfig,
+    layouts: Option<&HashMap<String, crate::fit::LayoutFacts>>,
+) -> Vec<String> {
+    let Some(layers) = proposal.flags.offload_layers.filter(|n| *n > 0) else {
+        return Vec::new();
+    };
+    let candidate = proposal.candidate_model_id.trim();
+    match candidate_moe_layers(candidate, cfg, layouts) {
+        Some(moe) if layers > moe => vec![format!(
+            "offload_layers {layers} exceeds the {moe} MoE layers of candidate '{candidate}'"
+        )],
+        Some(_) => Vec::new(),
+        None if !cfg.models.iter().any(|m| m.id == candidate)
+            && !manager_models::curated_models()
+                .iter()
+                .any(|s| s.id == candidate) =>
+        {
+            Vec::new()
+        }
+        None => vec![format!(
+            "offload_layers cannot be encoded for candidate '{candidate}': it is a dense model or its MoE layer count is unknown"
+        )],
+    }
+}
+
 /// The non-candidate problems (flags and `requires_stopping`
 /// ids), shared by both validation entry points.
 fn non_candidate_problems(
@@ -398,6 +429,7 @@ fn non_candidate_problems(
     layouts: Option<&HashMap<String, crate::fit::LayoutFacts>>,
 ) -> Vec<String> {
     let mut problems: Vec<String> = Vec::new();
+    problems.extend(offload_problems(proposal, cfg, layouts));
     problems.extend(moe_cache_problems(proposal, cfg, layouts));
     // Addendum B extension E1: an MTP draft length is only
     // encodable for a candidate the catalog (or the model
@@ -702,15 +734,20 @@ pub fn resolve_candidate(
 // Ports, fit text, and the temporary backend
 // ---------------------------------------------------------------------------
 
-/// The lowest free port from 8081 up, skipping every used port
-/// (configured backends, this batch's earlier temp backends)
-/// plus the gateway and Postgres ports — the `backend.create`
-/// parser's rule, mirrored for temp backends.
+/// First port for temporary backends: clear of the range backends
+/// are configured in (8081 up) and of the Windows ML server's 8090.
+pub const TEMP_PORT_BASE: u16 = 8400;
+
+/// The lowest free port from [`TEMP_PORT_BASE`] up, skipping every
+/// used port (configured ports, this batch's earlier temp backends)
+/// plus the gateway and Postgres ports.
 pub fn lowest_free_port(used: &HashSet<u16>, gateway_port: u16, postgres_port: u16) -> u16 {
     let mut used = used.clone();
     used.insert(gateway_port);
     used.insert(postgres_port);
-    (8081..=8999).find(|p| !used.contains(p)).unwrap_or(8999)
+    (TEMP_PORT_BASE..=8999)
+        .find(|p| !used.contains(p))
+        .unwrap_or(8999)
 }
 
 /// The preflight fit verdict, stated in numbers (§A.3 step 1):
@@ -1157,6 +1194,23 @@ mod tests {
     }
 
     #[test]
+    fn validation_refuses_offload_for_a_dense_candidate() {
+        let cfg = AppConfig::default_config();
+        let check = |candidate: &str, layers: u32| {
+            let mut p = proposal(candidate);
+            p.flags.offload_layers = Some(layers);
+            validate_experiment(&p, &cfg, &[], None).status
+        };
+        // Dense: refused. 0 is no offload. MoE: up to its layers.
+        assert_eq!(check("qwen3-8b", 24), ValidationStatus::Invalid);
+        assert_eq!(check("qwen3-8b", 0), ValidationStatus::Valid);
+        assert_eq!(check("qwen3-coder-30b", 48), ValidationStatus::Valid);
+        assert_eq!(check("qwen3-coder-30b", 49), ValidationStatus::Invalid);
+        // Not registered yet: judged when it is.
+        assert_eq!(check("owner/repo/moe.gguf", 24), ValidationStatus::Valid);
+    }
+
+    #[test]
     fn temp_backend_writes_moe_layers_at_their_block_bound() {
         // Review item 11: 2 leading dense blocks, 48 MoE blocks
         // (2..=49). 24 MoE layers is `--n-cpu-moe 26`.
@@ -1299,11 +1353,13 @@ mod tests {
 
     #[test]
     fn lowest_free_port_skips_configured_gateway_and_postgres() {
-        let used: HashSet<u16> = [8081, 8082, 8084].into_iter().collect();
-        assert_eq!(lowest_free_port(&used, 4000, 54329), 8083);
-        let used: HashSet<u16> = [8081].into_iter().collect();
-        // Gateway on 8082 must be skipped even though unused.
-        assert_eq!(lowest_free_port(&used, 8082, 54329), 8083);
+        let used: HashSet<u16> = [8400, 8401, 8403].into_iter().collect();
+        assert_eq!(lowest_free_port(&used, 4000, 54329), 8402);
+        let used: HashSet<u16> = [8400].into_iter().collect();
+        // Gateway on 8401 must be skipped even though unused.
+        assert_eq!(lowest_free_port(&used, 8401, 54329), 8402);
+        // Never the Windows ML default, whatever is configured.
+        assert!(lowest_free_port(&HashSet::new(), 4000, 54329) > 8090);
     }
 
     #[test]
@@ -1394,12 +1450,14 @@ mod tests {
                 predicted_per_second: Some(44.0),
                 ttft_ms: Some(120.0),
                 latency_ms: 1000,
+                prompt_n: Some(200),
             }]),
             long: BenchResult::from_runs(vec![BenchRun {
                 prompt_per_second: Some(700.0),
                 predicted_per_second: Some(40.0),
                 ttft_ms: Some(5000.0),
                 latency_ms: 6000,
+                prompt_n: Some(200),
             }]),
             batch_id: "estimate-batch".to_string(),
             temp_backend_id: "opt-exp-1".to_string(),

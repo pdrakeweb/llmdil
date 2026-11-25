@@ -10,8 +10,14 @@ Status: shipped — present in v0.1.40. The enforcement described
 below is in `crates/manager-models/src/guardrails.rs` (catalog pin
 and `offload_status` evaluation), the apply-time and launch-preflight
 paths in `crates/manager-app`, and the slider rendering in the UI;
-the one catalog pin remains Qwen3-Coder-Next-80B on compute
-capability (6, 0), endpoints only.
+two catalog pins exist, both on compute capability (6, 0), endpoints
+only: Qwen3-Coder-Next-80B and Nemotron 3.5 Lightning 30B-A3B.
+
+The second pin (Nov 2026): Nemotron 3.5 Lightning at `--n-cpu-moe 46`
+(20 of its 24 MoE layers) on a Tesla P100, llama.cpp b11658, started
+healthy and died on its first request with `CUDA error: invalid
+argument` in `ggml_cuda_kernel_launch` (exit 0xc0000409). The control,
+the same backend with `-ot exps=CPU` (24 of 24), answered normally.
 
 ## The incident in one paragraph
 
@@ -41,14 +47,24 @@ comfortably.
 
 - **Per model, not global.** A global on/off selector would erase
   genuine partial design points — Nemotron's catalog default is 16 of
-  its 24 MoE layers offloaded, by design. The slider stays.
+  its 24 MoE layers offloaded, by design (on architectures without a
+  pin). The slider stays.
 - **Per architecture.** The restriction is a property of the model on
   a GPU architecture, not of the model alone. The same Coder-Next
   partial position is unrestricted on the RTX A4000 (8.6).
-- **Exactly one restriction is pinned today:** Qwen3-Coder-Next-80B on
-  compute capability (6, 0) — endpoints only (0 layers offloaded, or
-  all 48). More restrictions are catalog data, added the same way when
-  a model × architecture pair earns one.
+- **Two restrictions are pinned today,** both endpoints only on compute
+  capability (6, 0): Qwen3-Coder-Next-80B (0 or all 48 layers) and
+  Nemotron 3.5 Lightning 30B-A3B (0 or all 24). More restrictions are
+  catalog data, added the same way when a model × architecture pair
+  earns one. Pins resolve from the live catalog by model id or source
+  URL, so existing configurations pick them up without a rewrite.
+- **A default never lands on a blocked position.** Where a backend is
+  created or a model assigned without an explicit offload choice, the
+  model's default is snapped to the nearest allowed position for the
+  placed GPUs (Nemotron's 16 becomes 24 on a P100).
+- **Other MoE models on compute capability 6.x only warn.** A partial
+  position with no pin carries `offload.warning` on the backend row and
+  the add preview; nothing is refused.
 
 ## Where the guardrail lives
 

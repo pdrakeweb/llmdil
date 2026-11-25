@@ -60,6 +60,10 @@ pub(crate) struct OptimizeState {
     /// another window) still surfaces instead of leaving stale
     /// in-progress copy forever.
     pub(crate) job_error: Mutex<Option<(String, i64)>>,
+    /// Backends the last GPU job (sweep / experiment batch) stopped
+    /// and could not start again; the state payload reports those
+    /// still not running, as `restore_failures`.
+    pub(crate) restore_failures: std::sync::Mutex<Vec<manager_optimize::RestoreFailure>>,
     /// Per-backend record of the currently running Optimize
     /// operation (tracker #70): backend id -> the operation
     /// holding that backend, in one of the two families

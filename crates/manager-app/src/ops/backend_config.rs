@@ -345,6 +345,34 @@ pub(crate) fn resolve_new_backend_offload(
     })
 }
 
+/// Move a model's DEFAULT offload off a guardrail-blocked position:
+/// rewrites `b`'s raw flags to the nearest allowed position for its
+/// placement. Only for flags nobody chose — an operator's position
+/// is refused, never clamped (docs/offload-guardrails.md).
+pub(crate) fn snap_default_offload(
+    cfg: &AppConfig,
+    b: &mut manager_config::BackendConfig,
+    gpus: &[GpuInfo],
+) {
+    let Some(info) = backend_offload_info(cfg, b) else {
+        return;
+    };
+    let (placed_ccs, cpu_only) = placed_offload_placement(b, gpus);
+    let eval = evaluate_offload_position(
+        &info.restrictions,
+        &b.id,
+        info.layers,
+        info.moe_layers,
+        placed_ccs,
+        cpu_only,
+        &activation::ActivationJournal::default(),
+    );
+    if eval.status == manager_models::OffloadStatus::Blocked {
+        let target = info.offload_for(eval.nearest_verified_layers);
+        b.raw_flags = manager_models::set_expert_offload(b.raw_flags.as_deref(), target);
+    }
+}
+
 /// The `--split-mode` spelling for a structured split mode.
 pub(crate) fn split_mode_str(mode: manager_config::SplitMode) -> &'static str {
     match mode {
@@ -577,6 +605,8 @@ pub async fn op_backend_add(
         if resolved.record_override {
             offload_override_to_record = Some((layers, resolved.placed_ccs));
         }
+    } else {
+        snap_default_offload(&new_cfg, &mut backend, &gpu_inventory);
     }
     // A chosen parallel slot count is written into the constructed
     // backend's raw flags — after the offload resolution above,
@@ -672,7 +702,7 @@ pub async fn op_backend_add_preview(
         },
     };
     // The transient backend creation would build, at its defaults.
-    let backend = manager_config::BackendConfig {
+    let mut backend = manager_config::BackendConfig {
         id: String::new(),
         enabled: true,
         model_file: model.gguf_path.clone(),
@@ -693,6 +723,7 @@ pub async fn op_backend_add_preview(
         tool_call_probe: None,
         purpose: String::new(),
     };
+    snap_default_offload(&cfg, &mut backend, &gpu_inventory);
     let offload = backend_offload_info(&cfg, &backend).map(|info| {
         let journal = activation::load_journal(&state.data_dir);
         let eval = evaluate_backend_offload(&cfg, &backend, &gpu_inventory, &journal);
@@ -705,9 +736,10 @@ pub async fn op_backend_add_preview(
     // controls from the same payload the Edit Flags form renders
     // from, with the predicted-best rung as the starting point.
     // Null when the model's layout cannot be resolved.
+    let free = gpu_free_now(state).await;
     let cache = resolve_weight_layout(&cfg, &backend).map(|layout| {
         let targets = cache_fit_targets(&backend, &gpu_inventory);
-        cache_preview_json(
+        let mut preview = cache_preview_json(
             &layout,
             manager_models::expert_offload(backend.raw_flags.as_deref()),
             manager_models::cache_selection(backend.raw_flags.as_deref()),
@@ -717,9 +749,17 @@ pub async fn op_backend_add_preview(
                 .unwrap_or_else(|| manager_models::effective_slots(backend.raw_flags.as_deref())),
             manager_models::moe_cache_mib(backend.raw_flags.as_deref()).unwrap_or(0),
             targets.as_ref(),
-        )
+        );
+        annotate_targets_free_fit(&mut preview, &free, &HashMap::new());
+        preview
     });
-    let memory = add_preview_memory_json(&cfg, &backend, n_ctx, parallel, &gpu_inventory);
+    let mut memory = add_preview_memory_json(&cfg, &backend, n_ctx, parallel, &gpu_inventory);
+    // The free-memory verdict beside the figures: a new backend
+    // holds nothing yet, so nothing is credited.
+    if let Some(per_gpu) = memory["per_gpu"].as_array_mut() {
+        let now = annotate_free_fit(per_gpu, &free, &HashMap::new());
+        memory["fits_now"] = json!(now);
+    }
     Ok(json!({
         "model_id": model_id,
         "offload": offload,
@@ -787,6 +827,10 @@ pub(crate) fn add_preview_memory_json(
                 "share": share,
                 "required_mib": residency[pos],
                 "total_mib": g.total_vram_mib,
+                "driver_model": g.driver_model.map(|d| match d {
+                    DriverModel::Wddm => "wddm",
+                    DriverModel::Tcc => "tcc",
+                }),
             }))
         })
         .collect();

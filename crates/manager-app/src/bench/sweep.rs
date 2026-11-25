@@ -60,7 +60,7 @@ pub(super) fn newest_log_record(
 
 /// Parse one request window's lines into a run row.
 pub(super) fn run_row_from(
-    sample: &manager_supervisor::BenchmarkSample,
+    sample: &crate::bench_client::Sample,
     lines: &[String],
     warmup: bool,
     prompt_tokens: Option<u32>,
@@ -106,6 +106,37 @@ pub(super) fn run_row_from(
         }
     }
     row
+}
+
+/// Stops the VRAM sampler when the arm ends, however it ends (a
+/// cancelled arm's future is dropped).
+struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// MiB in use across the GPUs a backend is placed on.
+async fn placed_used_mib(state: &AppState, b: &BackendConfig) -> Option<u64> {
+    let store = state.telemetry().await;
+    let samples = crate::lock_telemetry(&store).snapshot();
+    used_on_placed(b, &samples)
+}
+
+fn used_on_placed(b: &BackendConfig, samples: &[crate::GpuSample]) -> Option<u64> {
+    let placed = match crate::backend_gpu_visibility(b) {
+        crate::GpuVisibility::Gpus(indices) => indices,
+        crate::GpuVisibility::CpuOnly => return None,
+        crate::GpuVisibility::Undetermined => samples.iter().map(|s| s.index).collect(),
+    };
+    let used: Vec<u64> = samples
+        .iter()
+        .filter(|s| placed.contains(&s.index) && !s.down)
+        .map(|s| s.vram_used_mib)
+        .collect();
+    (!used.is_empty()).then(|| used.iter().sum())
 }
 
 /// Immutable per-sweep context the arm runner needs.
@@ -188,7 +219,9 @@ pub(super) async fn run_arm(
     // -- Start preflight (§6.3): the same gate every app-mediated
     // start passes, evaluated against the cloned config carrying
     // the temp backend. Its verdicts carry the numbers.
-    if let Err(e) = crate::backend_start_preflight_for(state, &temp_cfg, &temp, false).await {
+    if let Err(e) =
+        crate::optimize_experiments::preflight_after_release(state, &temp_cfg, &temp).await
+    {
         out.status = mb::ArmStatus::PreflightFailed;
         out.detail = Some(format!("start preflight refused this arm: {e}"));
         return out;
@@ -207,6 +240,11 @@ pub(super) async fn run_arm(
         });
         save_journal(state, &journal);
     }
+
+    // The device memory in use before the spawn: where the driver
+    // reports no per-process figure (WDDM), the arm's peak is the
+    // rise over this.
+    let used_before = placed_used_mib(state, &temp).await;
 
     // -- Register the spec directly and spawn.
     let pid: Option<u32> = {
@@ -272,10 +310,12 @@ pub(super) async fn run_arm(
     // -- VRAM peak sampling for the arm's duration (§5.1).
     let peak = Arc::new(std::sync::Mutex::new(Option::<u64>::None));
     let sampler_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _stop_sampler = StopOnDrop(Arc::clone(&sampler_stop));
     let sampler = if let Some(pid) = pid {
         let store = state.telemetry().await;
         let peak = Arc::clone(&peak);
         let stop = Arc::clone(&sampler_stop);
+        let placed = temp.clone();
         Some(tokio::spawn(async move {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 {
@@ -286,6 +326,14 @@ pub(super) async fn run_arm(
                         .filter(|p| p.pid == pid)
                         .filter_map(|p| p.vram_mib)
                         .sum();
+                    let total = if total > 0 {
+                        total
+                    } else {
+                        used_on_placed(&placed, &guard.snapshot())
+                            .zip(used_before)
+                            .map(|(now, before)| now.saturating_sub(before))
+                            .unwrap_or(0)
+                    };
                     if total > 0 {
                         let mut slot = peak.lock().unwrap_or_else(|e| e.into_inner());
                         *slot = Some(slot.map(|p| p.max(total)).unwrap_or(total));
@@ -319,14 +367,10 @@ pub(super) async fn run_arm(
             let sup = state.supervisor().await.lock().await;
             newest_log_record(&sup, &temp_id)
         };
-        let messages = vec![manager_supervisor::ChatMessage {
-            role: "user".to_string(),
-            content: measured_prompt.clone(),
-        }];
-        match manager_supervisor::benchmark_completion_seeded(
+        match crate::bench_client::complete(
             &base_url,
             &ctx.model_id,
-            &messages,
+            &measured_prompt,
             ctx.temperature,
             *cap,
             Some(FIXED_SEED),
@@ -389,7 +433,7 @@ pub(super) async fn execute_sweep(
     rx: &mut tokio::sync::oneshot::Receiver<()>,
 ) -> bool {
     let arm_count = outcomes.len();
-    let mut used_ports: HashSet<u16> = ctx.cfg.backends.iter().map(|b| b.port).collect();
+    let mut used_ports = crate::optimize_experiments::occupied_ports(&ctx.cfg);
     let mut cancelled = false;
     let mut baseline_output: Option<String> = None;
     let mut stop_note: Option<String> = None;
@@ -539,11 +583,7 @@ pub(super) async fn execute_sweep(
     if cancelled {
         record.partial = true;
     }
-    record.status = if record.partial {
-        "partial".to_string()
-    } else {
-        "complete".to_string()
-    };
+    record.status = mb::final_status(&record.arms, record.partial).to_string();
     record.ended_ms = Some(now_ms());
     save_sweep(state, record);
     cancelled

@@ -72,6 +72,73 @@ pub fn fit_state(required_mib: u64, total_mib: u64, is_wddm: bool) -> (FitState,
     }
 }
 
+/// One GPU's fit against the memory free NOW, beside the
+/// against-total [`FitState`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreeFit {
+    /// The requirement fits measured free memory plus the memory the
+    /// backend itself already holds there (a restart frees it first).
+    /// `None` when free memory is unknown.
+    pub fits_free: Option<bool>,
+    /// MiB that will page to system RAM on a WDDM GPU: the excess
+    /// over free memory (over total when free is unknown). 0 on a
+    /// GPU that cannot page.
+    pub will_page_mib: u64,
+    /// Ready-made wording, e.g. "Will page 11.9 GiB to system RAM".
+    pub text: String,
+}
+
+/// Judge one GPU's requirement against free memory. `credit_mib` is
+/// the backend's own current residency on the GPU (0 when it is not
+/// running).
+pub fn free_fit(
+    required_mib: u64,
+    total_mib: u64,
+    free_mib: Option<u64>,
+    credit_mib: u64,
+    is_wddm: bool,
+) -> FreeFit {
+    let available = free_mib.map(|f| f.saturating_add(credit_mib).min(total_mib));
+    let fits_free = available.map(|a| required_mib <= a);
+    let will_page_mib = if is_wddm {
+        required_mib.saturating_sub(available.unwrap_or(total_mib))
+    } else {
+        0
+    };
+    let text = if will_page_mib > 0 {
+        format!(
+            "Will page {:.1} GiB to system RAM",
+            will_page_mib as f64 / 1024.0
+        )
+    } else if required_mib > total_mib {
+        format!("Does not fit: needs {required_mib} MiB of {total_mib} MiB")
+    } else if fits_free == Some(false) {
+        format!(
+            "Fits the GPU, but needs {required_mib} MiB and only {} MiB is available now",
+            available.unwrap_or(0)
+        )
+    } else {
+        "Fits".to_string()
+    };
+    FreeFit {
+        fits_free,
+        will_page_mib,
+        text,
+    }
+}
+
+/// Every GPU fits free memory now: false when any does not, `None`
+/// when none does not but some (or no) GPU could be judged.
+pub fn fits_now(per_gpu: &[Option<bool>]) -> Option<bool> {
+    if per_gpu.contains(&Some(false)) {
+        Some(false)
+    } else if per_gpu.is_empty() || per_gpu.contains(&None) {
+        None
+    } else {
+        Some(true)
+    }
+}
+
 /// The worst [`FitState`] across per-GPU states (empty = fits:
 /// no GPU was judged, the no-telemetry posture).
 pub fn worst_fit_state(states: &[FitState]) -> FitState {
@@ -214,6 +281,28 @@ mod tests {
                 free_mib: 0
             }
         ));
+    }
+
+    #[test]
+    fn free_fit_judges_free_memory_and_credits_own_residency() {
+        // The observed card: 7,330 MiB required, 355 MiB free.
+        let f = free_fit(7_330, 16_276, Some(355), 0, false);
+        assert_eq!((f.fits_free, f.will_page_mib), (Some(false), 0));
+        assert!(f.text.contains("355 MiB"), "{}", f.text);
+        // The same backend running there itself: a restart fits.
+        let f = free_fit(7_330, 16_276, Some(355), 7_330, false);
+        assert_eq!((f.fits_free, f.text.as_str()), (Some(true), "Fits"));
+        // WDDM pages the excess over FREE, not over total.
+        let f = free_fit(17_224, 16_376, Some(5_000), 0, true);
+        assert_eq!(f.will_page_mib, 12_224);
+        assert_eq!(f.text, "Will page 11.9 GiB to system RAM");
+        // Free unknown: no claim; paging falls back to the total.
+        let f = free_fit(17_224, 16_376, None, 0, true);
+        assert_eq!((f.fits_free, f.will_page_mib), (None, 848));
+        assert_eq!(fits_now(&[Some(true), Some(true)]), Some(true));
+        assert_eq!(fits_now(&[Some(true), Some(false), None]), Some(false));
+        assert_eq!(fits_now(&[Some(true), None]), None);
+        assert_eq!(fits_now(&[]), None);
     }
 
     #[test]

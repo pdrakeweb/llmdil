@@ -198,14 +198,18 @@ impl<'a> Reader<'a> {
 }
 
 /// One metadata value, reduced to what the layout needs: integers
-/// keep their value, everything else is a marker (strings are kept
-/// only for `general.architecture`, handled by the caller through
-/// `want_string`).
+/// keep their value, everything else is a marker (strings and
+/// integer arrays are kept only for the keys the caller asks for).
 enum MetaValue {
     Int(u64),
+    Ints(Vec<u64>),
     Str(String),
     Other,
 }
+
+/// Longest per-layer integer array kept (`head_count_kv`,
+/// `feed_forward_length`): one entry per block, never thousands.
+const MAX_KEPT_INTS: u64 = 4096;
 
 /// Deepest metadata-array nesting the parser will follow. Real
 /// GGUF metadata nests at most a level or two (arrays of scalars);
@@ -223,7 +227,7 @@ const MAX_META_DEPTH: u32 = 32;
 fn read_meta_value(
     r: &mut Reader<'_>,
     ty: u32,
-    keep_string: bool,
+    keep: bool,
     depth: u32,
 ) -> Result<MetaValue, GgufError> {
     match ty {
@@ -241,9 +245,13 @@ fn read_meta_value(
         } // INT16
         4 => Ok(MetaValue::Int(r.u32()? as u64)), // UINT32
         5 => {
-            r.skip(4)?;
-            Ok(MetaValue::Other)
-        } // INT32
+            // INT32: kept when non-negative (per-layer arrays are
+            // commonly written as INT32).
+            let v = r.u32()? as i32;
+            Ok(u64::try_from(v)
+                .map(MetaValue::Int)
+                .unwrap_or(MetaValue::Other))
+        }
         6 => {
             r.skip(4)?;
             Ok(MetaValue::Other)
@@ -255,7 +263,7 @@ fn read_meta_value(
         8 => {
             // STRING
             let s = r.string()?;
-            Ok(if keep_string {
+            Ok(if keep {
                 MetaValue::Str(s)
             } else {
                 MetaValue::Other
@@ -268,10 +276,19 @@ fn read_meta_value(
             }
             let elem_ty = r.u32()?;
             let n = r.u64()?;
+            let keep_ints = keep && depth == 0 && n <= MAX_KEPT_INTS;
+            let mut ints = Vec::new();
             for _ in 0..n {
-                read_meta_value(r, elem_ty, false, depth + 1)?;
+                let v = read_meta_value(r, elem_ty, false, depth + 1)?;
+                if let (true, MetaValue::Int(v)) = (keep_ints, v) {
+                    ints.push(v);
+                }
             }
-            Ok(MetaValue::Other)
+            Ok(if keep_ints && ints.len() as u64 == n {
+                MetaValue::Ints(ints)
+            } else {
+                MetaValue::Other
+            })
         }
         10 => Ok(MetaValue::Int(r.u64()?)), // UINT64
         11 => {
@@ -368,11 +385,17 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
 
     let mut arch = String::new();
     let mut ints: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut arrays: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
     for _ in 0..kv_count {
         let key = r.string()?;
         let ty = r.u32()?;
-        let keep = key == "general.architecture";
+        let keep = key == "general.architecture"
+            || key.ends_with(".attention.head_count_kv")
+            || key.ends_with(".feed_forward_length");
         match read_meta_value(&mut r, ty, keep, 0)? {
+            MetaValue::Ints(v) => {
+                arrays.insert(key, v);
+            }
             MetaValue::Int(v) => {
                 ints.insert(key, v);
             }
@@ -413,12 +436,46 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
     // n_layer_nextn`.)
     let trunk_blocks =
         block_count.map(|blocks| blocks.saturating_sub(get("nextn_predict_layers").unwrap_or(0)));
-    let kv = match (
-        trunk_blocks,
-        get("attention.head_count_kv"),
-        get("attention.key_length"),
-        get("attention.value_length"),
-    ) {
+    // Per-layer arrays over the trunk: hybrid models write one KV head
+    // count (0 = no KV cache in that layer) and one feed-forward length
+    // per block.
+    let per_layer = |suffix: &str| -> Option<&[u64]> {
+        let blocks = trunk_blocks? as usize;
+        let v = arrays.get(&format!("{arch}.{suffix}"))?;
+        (v.len() >= blocks).then(|| &v[..blocks])
+    };
+    let layer_heads = per_layer("attention.head_count_kv");
+    let head_count = get("attention.head_count").filter(|n| *n > 0);
+    // llama.cpp's defaults: the head dimension is embedding_length /
+    // head_count when no key/value length is written, and
+    // head_count_kv is head_count when absent.
+    let head_dim = head_count.and_then(|n| Some(get("embedding_length")? / n));
+    let klen = get("attention.key_length").or(head_dim);
+    let vlen = get("attention.value_length").or(head_dim);
+    let scalar_heads = get("attention.head_count_kv").or_else(|| {
+        // Only when the key is truly absent: an unreadable one is
+        // unknown geometry, not the default.
+        let key = format!("{arch}.attention.head_count_kv");
+        if ints.contains_key(&key) || arrays.contains_key(&key) {
+            None
+        } else {
+            head_count
+        }
+    });
+    let kv = match (trunk_blocks, scalar_heads, klen, vlen) {
+        (Some(_), _, Some(klen), Some(vlen)) if layer_heads.is_some() => {
+            let heads = layer_heads.unwrap_or_default();
+            let kv_layers = heads.iter().filter(|h| **h > 0).count() as u32;
+            let total: u64 = heads.iter().fold(0, |a, h| a.saturating_add(*h));
+            (kv_layers > 0).then(|| KvGeometry {
+                kv_layers,
+                // Uniform in practice; a mixed list rounds up.
+                head_count_kv: u32::try_from(total.div_ceil(u64::from(kv_layers)))
+                    .unwrap_or(u32::MAX),
+                key_length: klen,
+                value_length: vlen,
+            })
+        }
         (Some(blocks), Some(heads), Some(klen), Some(vlen)) => {
             let interval = get("full_attention_interval").unwrap_or(0);
             // llama.cpp (src/models/qwen3next.cpp, load_arch_hparams):
@@ -450,7 +507,17 @@ pub fn parse_gguf_layout(bytes: &[u8]) -> Result<GgufLayout, GgufError> {
     let rs = match (trunk_blocks, get("ssm.state_size"), get("ssm.inner_size")) {
         (Some(blocks), Some(d_state), Some(d_inner)) if d_state > 0 && d_inner > 0 => {
             let kv_layers = kv.map(|k| k.kv_layers).unwrap_or(0);
-            let recr_layers = blocks.saturating_sub(kv_layers);
+            // With per-layer arrays (Nemotron-H) the recurrent layers
+            // are exactly those with neither KV heads nor a
+            // feed-forward; otherwise the complement of the KV layers.
+            let recr_layers = match (layer_heads, per_layer("feed_forward_length")) {
+                (Some(heads), Some(ff)) => heads
+                    .iter()
+                    .zip(ff)
+                    .filter(|(h, f)| **h == 0 && **f == 0)
+                    .count() as u32,
+                _ => blocks.saturating_sub(kv_layers),
+            };
             if recr_layers == 0 {
                 None
             } else {
@@ -682,6 +749,75 @@ mod tests {
             value_length: 128,
         };
         assert_eq!(asym.bytes_per_token_typed(Q8_0, Q4_0), 2 * (272 + 72));
+    }
+
+    fn w_kv_i32s(out: &mut Vec<u8>, key: &str, v: &[i32]) {
+        w_str(out, key);
+        out.extend_from_slice(&9u32.to_le_bytes()); // ARRAY
+        out.extend_from_slice(&5u32.to_le_bytes()); // INT32
+        out.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        for x in v {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+
+    fn header(kv_count: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&kv_count.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn per_layer_head_counts_give_hybrid_geometry() {
+        // Nemotron-H's shape: per-block KV heads and feed-forward
+        // lengths, the last block a nextn block. Trunk: 2 attention
+        // layers, 2 feed-forward layers, 3 Mamba layers.
+        let mut b = header(10);
+        w_kv_str(&mut b, "general.architecture", "hyb");
+        w_kv_u32(&mut b, "hyb.block_count", 8);
+        w_kv_u32(&mut b, "hyb.nextn_predict_layers", 1);
+        w_kv_i32s(
+            &mut b,
+            "hyb.attention.head_count_kv",
+            &[0, 2, 0, 0, 2, 0, 0, 2],
+        );
+        w_kv_i32s(
+            &mut b,
+            "hyb.feed_forward_length",
+            &[0, 0, 64, 0, 0, 64, 0, 64],
+        );
+        w_kv_u32(&mut b, "hyb.attention.key_length", 128);
+        w_kv_u32(&mut b, "hyb.attention.value_length", 128);
+        w_kv_u32(&mut b, "hyb.ssm.state_size", 4);
+        w_kv_u32(&mut b, "hyb.ssm.inner_size", 8);
+        w_kv_u32(&mut b, "hyb.ssm.conv_kernel", 2);
+        let l = parse_gguf_layout(&b).unwrap();
+        assert_eq!(
+            l.kv,
+            Some(KvGeometry {
+                kv_layers: 2,
+                head_count_kv: 2,
+                key_length: 128,
+                value_length: 128,
+            })
+        );
+        assert_eq!(l.rs.unwrap().recr_layers, 3);
+    }
+
+    #[test]
+    fn missing_key_lengths_fall_back_to_the_head_dimension() {
+        // Qwen2.5's header: no key/value length; 3584 / 28 = 128.
+        let mut b = header(5);
+        w_kv_str(&mut b, "general.architecture", "qwen2");
+        w_kv_u32(&mut b, "qwen2.block_count", 28);
+        w_kv_u32(&mut b, "qwen2.embedding_length", 3584);
+        w_kv_u32(&mut b, "qwen2.attention.head_count", 28);
+        w_kv_u32(&mut b, "qwen2.attention.head_count_kv", 4);
+        let kv = parse_gguf_layout(&b).unwrap().kv.expect("geometry");
+        assert_eq!(kv.bytes_per_token(), 57_344);
     }
 
     #[test]

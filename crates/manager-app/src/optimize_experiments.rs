@@ -45,11 +45,11 @@ use manager_config::AppConfig;
 use manager_optimize::{
     benchmark_prompts, compare, estimate_prompts, evaluate_fit, fit_verdict_text,
     is_temp_backend_id, lowest_free_port, resolve_candidate, temp_backend_config_mapped,
-    temp_backend_id, ActiveExperiment, BenchResult, BenchRun, CandidateResolution, Decision,
+    temp_backend_id, ActiveExperiment, BenchResult, CandidateResolution, Decision,
     ExperimentEstimate, ExperimentJournal, ExperimentMeasured, ExperimentProposal,
     ExperimentResult, ExperimentStatus, MeasurementEntry, MeasurementFingerprintInputs,
-    MeasurementStore, RegisteredModelFile, BATCH_TIMEOUT_SECS, BENCHMARK_TEMPERATURE,
-    ESTIMATE_RUNS, EXPERIMENT_TIMEOUT_SECS, MEASURED_RUNS,
+    MeasurementStore, RegisteredModelFile, BATCH_TIMEOUT_SECS, ESTIMATE_RUNS,
+    EXPERIMENT_TIMEOUT_SECS, MEASURED_RUNS,
 };
 use manager_supervisor::ProcessState;
 
@@ -313,6 +313,71 @@ pub(crate) async fn cleanup_temp(state: &AppState, temp_id: &str) {
     }
 }
 
+/// How long a start waits for a just-stopped backend's VRAM to be
+/// released (the driver frees it, and telemetry reports it, some
+/// seconds after the process exits).
+const VRAM_RELEASE_WAIT: Duration = Duration::from_secs(20);
+
+/// Whether a preflight refusal is the one that waiting can cure: not
+/// enough free memory right now. The gate's own wording.
+fn waits_for_vram(e: &ApiError) -> bool {
+    e.to_string()
+        .contains("insufficient free memory on the GPU")
+}
+
+/// The start preflight, retried for up to [`VRAM_RELEASE_WAIT`] while
+/// the only thing wrong is memory a stopped backend still appears to
+/// hold. Every other refusal is final at once.
+pub(crate) async fn preflight_after_release(
+    state: &AppState,
+    cfg: &AppConfig,
+    b: &manager_config::BackendConfig,
+) -> Result<(), ApiError> {
+    retry_for(
+        VRAM_RELEASE_WAIT,
+        Duration::from_secs(1),
+        waits_for_vram,
+        || crate::backend_start_preflight_for(state, cfg, b, false),
+    )
+    .await
+}
+
+/// Run `attempt` until it succeeds, fails with an error `retryable`
+/// rejects, or `limit` has passed.
+async fn retry_for<F, Fut>(
+    limit: Duration,
+    pause: Duration,
+    retryable: impl Fn(&ApiError) -> bool,
+    attempt: F,
+) -> Result<(), ApiError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), ApiError>>,
+{
+    let deadline = Instant::now() + limit;
+    loop {
+        match attempt().await {
+            Err(e) if retryable(&e) && Instant::now() < deadline => {
+                tokio::time::sleep(pause).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Ports a temporary backend must not take: every configured one
+/// (backends, Windows ML, the admin API) and every port something is
+/// already listening on in the temporary range.
+pub(crate) fn occupied_ports(cfg: &AppConfig) -> HashSet<u16> {
+    let mut used: HashSet<u16> = cfg.backends.iter().map(|b| b.port).collect();
+    used.extend([cfg.winml.port, cfg.admin_api.port]);
+    used.extend(
+        (manager_optimize::TEMP_PORT_BASE..manager_optimize::TEMP_PORT_BASE + 50)
+            .filter(|p| manager_supervisor::port_owner_pid(*p).is_some()),
+    );
+    used
+}
+
 /// Wait for a spawned temp backend to answer Healthy on the
 /// existing health probe. No backend probes are registered
 /// anywhere in the app (the supervisor's probe registry is
@@ -493,7 +558,7 @@ async fn run_experiment_inner(
     let gathered = crate::optimize::gather(state, cfg).await;
 
     // -- Temp backend configuration (in-memory only).
-    let mut used_ports: HashSet<u16> = cfg.backends.iter().map(|b| b.port).collect();
+    let mut used_ports = occupied_ports(cfg);
     used_ports.extend(ctx.used_ports.iter().copied());
     let port = lowest_free_port(&used_ports, cfg.gateway.port, cfg.postgres.port);
     ctx.used_ports.insert(port);
@@ -694,7 +759,7 @@ async fn run_experiment_inner(
     // preflight's reason instead of spawning at that position —
     // before any journal record or spec registration, so a
     // refused experiment leaves nothing to clean up.
-    if let Err(e) = crate::backend_start_preflight_for(state, &temp_cfg, &temp, false).await {
+    if let Err(e) = preflight_after_release(state, &temp_cfg, &temp).await {
         return InnerOutcome::failed(
             format!("start preflight refused the experiment's temp backend: {e}"),
             preflight,
@@ -814,46 +879,21 @@ async fn run_experiment_inner(
     let base_url = format!("http://127.0.0.1:{port}");
     let mut results: Vec<BenchResult> = Vec::new();
     for prompt in benchmark_prompts() {
-        let messages = vec![manager_supervisor::ChatMessage {
-            role: "user".to_string(),
-            content: prompt.text.to_string(),
-        }];
-        if let Err(e) = manager_supervisor::benchmark_completion(
+        match crate::optimize::benchmark_one_prompt(
             &base_url,
             &model_id,
-            &messages,
-            BENCHMARK_TEMPERATURE,
-            prompt.max_tokens,
+            &prompt,
+            true,
+            MEASURED_RUNS,
             EXP_RUN_TIMEOUT,
         )
         .await
         {
-            return InnerOutcome::failed(format!("benchmark warm-up failed: {e}"), preflight);
-        }
-        let mut runs: Vec<BenchRun> = Vec::new();
-        for _ in 0..MEASURED_RUNS {
-            match manager_supervisor::benchmark_completion(
-                &base_url,
-                &model_id,
-                &messages,
-                BENCHMARK_TEMPERATURE,
-                prompt.max_tokens,
-                EXP_RUN_TIMEOUT,
-            )
-            .await
-            {
-                Ok(sample) => runs.push(BenchRun {
-                    prompt_per_second: sample.prompt_per_second,
-                    predicted_per_second: sample.predicted_per_second,
-                    ttft_ms: sample.ttft_ms,
-                    latency_ms: sample.latency_ms,
-                }),
-                Err(e) => {
-                    return InnerOutcome::failed(format!("benchmark run failed: {e}"), preflight);
-                }
+            Ok(result) => results.push(result),
+            Err(e) => {
+                return InnerOutcome::failed(format!("benchmark failed: {e}"), preflight);
             }
         }
-        results.push(BenchResult::from_runs(runs));
     }
     let mut iter = results.into_iter();
     let short = iter
@@ -1044,19 +1084,28 @@ fn record_estimate(
 /// Restart the requires_stopping backends the batch stopped
 /// (those running at batch start, still stopped now), through the
 /// shared backend lifecycle start (either run mode; markers, events,
-/// intent), waiting for each to answer `/health`. Returns the note
-/// stated in each of the batch's result details.
+/// intent), waiting for each to answer `/health`. The temp backend's
+/// VRAM is released some seconds after it stops, so a start refused
+/// for memory is retried (see [`preflight_after_release`]). Returns
+/// the note stated in each of the batch's result details and the
+/// failures, which also reach the state payload (`restore_failures`).
 pub(crate) async fn restart_stopped(
     state: &std::sync::Arc<AppState>,
     sink: &std::sync::Arc<dyn crate::EventSink>,
     ids: &[String],
-) -> String {
+) -> (String, Vec<manager_optimize::RestoreFailure>) {
     if ids.is_empty() {
-        return String::new();
+        return (String::new(), Vec::new());
     }
     crate::ensure_backend_specs(state).await;
     let mut restarted: Vec<String> = Vec::new();
-    let mut failed: Vec<String> = Vec::new();
+    let mut failed: Vec<manager_optimize::RestoreFailure> = Vec::new();
+    let mut fail = |id: &String, error: String| {
+        failed.push(manager_optimize::RestoreFailure {
+            id: id.clone(),
+            error,
+        });
+    };
     for id in ids {
         let running = crate::lifecycle::backend_liveness(state)
             .await
@@ -1071,8 +1120,13 @@ pub(crate) async fn restart_stopped(
         // backend whose saved position the guardrails now block
         // is not relaunched unpreflighted; the refusal is stated
         // in the note like any other restart failure.
-        if let Err(e) = crate::backend_start_preflight(state, id, false).await {
-            failed.push(format!("{id} (start preflight refused the restart: {e})"));
+        let cfg = state.config.read().await.clone();
+        let Some(b) = cfg.backends.iter().find(|b| &b.id == id) else {
+            fail(id, "no longer configured".to_string());
+            continue;
+        };
+        if let Err(e) = preflight_after_release(state, &cfg, b).await {
+            fail(id, format!("start preflight refused the restart: {e}"));
             continue;
         }
         let opts = crate::backend_lifecycle::BackendOpOpts {
@@ -1082,7 +1136,7 @@ pub(crate) async fn restart_stopped(
         };
         match crate::backend_lifecycle::start_backend(state, sink, id, opts).await {
             Ok(_) => restarted.push(id.clone()),
-            Err(e) => failed.push(format!("{id} ({e})")),
+            Err(e) => fail(id, e.to_string()),
         }
     }
     let mut note = format!(
@@ -1094,9 +1148,18 @@ pub(crate) async fn restart_stopped(
         }
     );
     if !failed.is_empty() {
-        note.push_str(&format!(" Restart failed for: {}.", failed.join(", ")));
+        let list: Vec<String> = failed
+            .iter()
+            .map(|f| format!("{} ({})", f.id, f.error))
+            .collect();
+        note.push_str(&format!(" Restart failed for: {}.", list.join(", ")));
     }
-    note
+    *state
+        .optimize
+        .restore_failures
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = failed.clone();
+    (note, failed)
 }
 
 /// Run the plan's accepted experiments as one batch (§A.3):
@@ -1368,7 +1431,8 @@ async fn run_experiment_batch(
     // Restart what the batch stopped (any outcome, including
     // cancellation and deadline), and state it in every result
     // this batch recorded — journal history and plan alike.
-    let note = restart_stopped(state, sink, &ctx.stopped_to_restart.clone()).await;
+    let (note, restore_failures) =
+        restart_stopped(state, sink, &ctx.stopped_to_restart.clone()).await;
     if !note.is_empty() {
         let mut journal = load_journal(state);
         journal.append_batch_detail(&batch_id, &note);
@@ -1403,12 +1467,12 @@ async fn run_experiment_batch(
     let (status, detail) = if cancelled {
         (
             TaskStatus::Aborted,
-            json!({ "batch": batch_id, "completed": completed, "failed": failed, "cancelled": true }),
+            json!({ "batch": batch_id, "completed": completed, "failed": failed, "cancelled": true, "restore_failures": restore_failures }),
         )
     } else {
         (
             TaskStatus::Done,
-            json!({ "batch": batch_id, "completed": completed, "failed": failed }),
+            json!({ "batch": batch_id, "completed": completed, "failed": failed, "restore_failures": restore_failures }),
         )
     };
     crate::optimize::opt_log1(
@@ -1627,7 +1691,7 @@ mod tests {
         coder.raw_flags = Some("--n-cpu-moe 40".to_string());
         // restart_stopped's preflight reads the saved config.
         *state.config.write().await = cfg;
-        let note = restart_stopped(
+        let (note, failures) = restart_stopped(
             &state,
             &(std::sync::Arc::new(crate::NoopSink) as std::sync::Arc<dyn crate::EventSink>),
             &["coder".to_string()],
@@ -1641,6 +1705,8 @@ mod tests {
             note.contains("outside the verified range"),
             "the note must carry the preflight's guardrail reason, got: {note}"
         );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].id, "coder");
         let sup = state.supervisor().await.lock().await;
         assert!(sup
             .status()
@@ -1648,5 +1714,52 @@ mod tests {
             .all(|s| s.id != "coder" || s.pid.is_none()));
         drop(sup);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_start_waits_for_released_vram_but_not_for_other_refusals() {
+        let refusal = |text: &str| ApiError::InvalidInput(text.to_string());
+        let vram = "GPU 0 needs 9398 MiB but only 9058 MiB is free (of 16276 MiB) — insufficient free memory on the GPU";
+        let tries = std::sync::atomic::AtomicUsize::new(0);
+        let next = || tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pause = Duration::from_millis(1);
+        let limit = Duration::from_secs(5);
+        // Released on the third look.
+        let r = retry_for(limit, pause, waits_for_vram, || async {
+            if next() < 2 {
+                Err(refusal(vram))
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(next(), 3);
+        // Any other refusal is final.
+        tries.store(0, std::sync::atomic::Ordering::SeqCst);
+        let r = retry_for(limit, pause, waits_for_vram, || async {
+            next();
+            Err(refusal("model file is missing"))
+        })
+        .await;
+        assert!(r.is_err());
+        assert_eq!(next(), 1);
+        // And the wait is bounded.
+        let r = retry_for(Duration::ZERO, pause, waits_for_vram, || async {
+            Err(refusal(vram))
+        })
+        .await;
+        assert!(r.unwrap_err().to_string().contains("9058"));
+    }
+
+    #[test]
+    fn temp_ports_skip_every_configured_port() {
+        let mut cfg = AppConfig::default_config();
+        cfg.winml.port = manager_optimize::TEMP_PORT_BASE;
+        cfg.admin_api.port = manager_optimize::TEMP_PORT_BASE + 1;
+        cfg.backends[0].port = manager_optimize::TEMP_PORT_BASE + 2;
+        let used = occupied_ports(&cfg);
+        let port = lowest_free_port(&used, cfg.gateway.port, cfg.postgres.port);
+        assert!(port >= manager_optimize::TEMP_PORT_BASE + 3, "{port}");
     }
 }

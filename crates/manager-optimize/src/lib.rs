@@ -81,6 +81,7 @@ pub use experiment::{
     ExperimentMeasured, ExperimentPredicted, ExperimentProposal, ExperimentProvisioning,
     ExperimentResult, ExperimentStatus, ExperimentValidation, RegisteredModelFile,
     BATCH_TIMEOUT_SECS, EXPERIMENT_TIMEOUT_SECS, MAX_EXPERIMENTS, TEMP_BACKEND_ID_PREFIX,
+    TEMP_PORT_BASE,
 };
 pub use fit::{
     evaluate_fit, layout_requirement, layout_requirement_mapped, residency_per_gpu, FitOutcome,
@@ -101,12 +102,12 @@ pub use plan::{
 pub use probe::{probe_hardware, HardwareProbe};
 pub use schema::{plan_json_schema, plan_response_format, AUTHORED_KINDS};
 pub use tuning::{
-    adopt_is_default, cache_fa_offered, cache_ladder, context_cache_values, context_values,
-    moe_cache_values, offload_values, placement_values, plan_filter, planned_arm_count, rank_arms,
-    slot_values, spec_values, thermal_tripped, tuning_temp_backend, tuning_temp_backend_mapped,
-    winner_index, ArmPricing, ArmStatus, Descent, ResidencyVerdict, SweepPlan, SweepState,
+    adopt_is_default, beats, cache_ladder, context_cache_values, context_values, moe_cache_values,
+    offload_values, placement_values, plan_filter, planned_arm_count, rank_arms, slot_values,
+    spec_values, thermal_tripped, tuning_temp_backend, tuning_temp_backend_mapped, winner_index,
+    ArmPricing, ArmStatus, Descent, ResidencyVerdict, RestoreFailure, SweepPlan, SweepState,
     TuningArm, TuningConfirmation, TuningCoords, TuningExclusion, TuningGpu, TuningInputs,
     TuningStore, TuningSweep, AXIS_ORDER, THERMAL_ABORT_C, THERMAL_ABORT_STREAK,
-    TUNING_ARM_TIMEOUT_SECS, TUNING_MAX_ARMS, TUNING_SWEEP_TIMEOUT_SECS,
+    TUNING_ARM_TIMEOUT_SECS, TUNING_MAX_ARMS, TUNING_SWEEP_TIMEOUT_SECS, WIN_MARGIN_PCT,
 };
 pub use validate::{validate_plan, ItemValidation, LiveSnapshot, ValidationStatus};

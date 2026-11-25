@@ -58,6 +58,7 @@ pub mod activation_history;
 pub mod app_update;
 pub mod backend_lifecycle;
 pub mod bench;
+mod bench_client;
 #[cfg(test)]
 mod gateway_ops_tests;
 pub mod gateway_stats;

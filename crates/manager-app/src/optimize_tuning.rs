@@ -30,7 +30,6 @@
 //! before anything runs. A stop failure refuses the sweep
 //! rather than degrading to contended measurement.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,11 +40,11 @@ use manager_config::AppConfig;
 use manager_optimize::{
     benchmark_prompts, compare, lowest_free_port, plan_filter, planned_arm_count, rank_arms,
     residency_per_gpu, thermal_tripped, tuning_temp_backend_mapped, winner_index, ActiveExperiment,
-    ArmPricing, ArmStatus, BenchResult, BenchRun, Descent, ExperimentJournal, ExperimentMeasured,
+    ArmPricing, ArmStatus, BenchResult, Descent, ExperimentJournal, ExperimentMeasured,
     MeasurementEntry, MeasurementFingerprintInputs, MeasurementStore, ResidencyVerdict, SweepPlan,
     SweepState, TuningArm, TuningConfirmation, TuningCoords, TuningExclusion, TuningGpu,
-    TuningInputs, TuningStore, TuningSweep, AXIS_ORDER, BENCHMARK_TEMPERATURE, MEASURED_RUNS,
-    TUNING_ARM_TIMEOUT_SECS, TUNING_MAX_ARMS, TUNING_SWEEP_TIMEOUT_SECS,
+    TuningInputs, TuningStore, TuningSweep, AXIS_ORDER, MEASURED_RUNS, TUNING_ARM_TIMEOUT_SECS,
+    TUNING_MAX_ARMS, TUNING_SWEEP_TIMEOUT_SECS,
 };
 
 use crate::{ApiError, AppState, TaskStatus};
@@ -136,12 +135,6 @@ pub(crate) async fn build_tuning_inputs(
             name: g.name.clone(),
             total_mib: g.total_vram_mib,
             compute_capability: g.compute_capability,
-            // Flash attention is offered only on architectures
-            // the pinned llama.cpp runs it on: Pascal (sm_60)
-            // is the documented exclusion (§B.1); unknown
-            // capability (0,0) is not offered either — absent,
-            // not offered-and-disabled.
-            fa_supported: g.compute_capability >= (7, 0),
         })
         .collect();
     let all_indices: Vec<u32> = gpus.iter().map(|g| g.index).collect();
@@ -279,38 +272,21 @@ fn price_coords(
 
 /// The guardrail verdict for one arm (§B.3 filter 2): the
 /// model's offload restrictions evaluated for the
-/// architectures the arm's placement actually lands on, plus
-/// the flash-attention capability gate (§B.1). `Some(reason)`
-/// excludes the arm at planning with the restriction cited.
+/// architectures the arm's placement actually lands on.
+/// `Some(reason)` excludes the arm at planning with the
+/// restriction cited. Flash attention is not gated by
+/// architecture: the pinned build runs it on Pascal.
 fn guardrail_reason(
     cfg: &AppConfig,
     backend: &manager_config::BackendConfig,
     inputs: &TuningInputs,
     coords: &TuningCoords,
 ) -> Option<String> {
-    if coords.cache.flash_attn == manager_models::FlashAttn::On {
-        for idx in &coords.gpu_indices {
-            if let Some(g) = inputs.gpus.iter().find(|g| g.index == *idx) {
-                if !g.fa_supported {
-                    return Some(format!(
-                        "flash attention is not offered on GPU {} ({}): the pinned llama.cpp cannot run it on compute capability {}.{}",
-                        g.index, g.name, g.compute_capability.0, g.compute_capability.1
-                    ));
-                }
-            }
-        }
-    }
     let layers = coords.offload_layers?;
     let moe = inputs.moe_layers?;
     let restrictions = crate::backend_offload_info(cfg, backend)
         .map(|i| i.restrictions)
-        .unwrap_or_else(|| {
-            manager_models::curated_models()
-                .into_iter()
-                .find(|s| s.id == inputs.model_id)
-                .map(|s| s.offload_restrictions)
-                .unwrap_or_default()
-        });
+        .unwrap_or_else(|| manager_models::catalog_offload_restrictions(&inputs.model_id, ""));
     if restrictions.is_empty() {
         return None;
     }
@@ -602,11 +578,15 @@ async fn run_arm(
         eval: None,
         comparison: None,
     };
-    // Planning filter (§B.3): an excluded arm never spawns.
-    if let Some(reason) = exclusion_reason(cfg, backend, inputs, coords) {
-        arm.status = ArmStatus::Excluded;
-        arm.detail = Some(reason);
-        return fail(&arm);
+    // Planning filter (§B.3): an excluded arm never spawns. The
+    // incumbent is always an arm: it is the figure every other arm
+    // is compared with, and the owner is already running it.
+    if axis != "incumbent" {
+        if let Some(reason) = exclusion_reason(cfg, backend, inputs, coords) {
+            arm.status = ArmStatus::Excluded;
+            arm.detail = Some(reason);
+            return fail(&arm);
+        }
     }
     let gathered = crate::optimize::gather(state, cfg).await;
     let model_id = inputs.model_id.clone();
@@ -614,9 +594,8 @@ async fn run_arm(
     let gguf_abs = model
         .map(|m| crate::resolve_under_data_dir(&cfg.data_dir, &m.gguf_path))
         .unwrap_or_else(|| crate::resolve_under_data_dir(&cfg.data_dir, &backend.model_file));
-    let mut used_ports: HashSet<u16> = cfg.backends.iter().map(|b| b.port).collect();
+    let used_ports = crate::optimize_experiments::occupied_ports(cfg);
     let port = lowest_free_port(&used_ports, cfg.gateway.port, cfg.postgres.port);
-    used_ports.insert(port);
     let temp = tuning_temp_backend_mapped(
         backend,
         coords,
@@ -631,7 +610,9 @@ async fn run_arm(
     // Start preflight (the same gate every app-mediated start
     // passes): a refused arm is a failed arm with the
     // preflight's reason (§B.3).
-    if let Err(e) = crate::backend_start_preflight_for(state, &temp_cfg, &temp, false).await {
+    if let Err(e) =
+        crate::optimize_experiments::preflight_after_release(state, &temp_cfg, &temp).await
+    {
         arm.detail = Some(format!("start preflight refused the arm: {e}"));
         return fail(&arm);
     }
@@ -762,48 +743,22 @@ async fn run_arm(
     let mut results: Vec<BenchResult> = Vec::new();
     let mut peak = arm.temp_start_c;
     for prompt in benchmark_prompts() {
-        let messages = vec![manager_supervisor::ChatMessage {
-            role: "user".to_string(),
-            content: prompt.text.to_string(),
-        }];
-        if let Err(e) = manager_supervisor::benchmark_completion(
+        match crate::optimize::benchmark_one_prompt(
             &base_url,
             &model_id,
-            &messages,
-            BENCHMARK_TEMPERATURE,
-            prompt.max_tokens,
+            &prompt,
+            true,
+            MEASURED_RUNS,
             Duration::from_secs(TUNING_ARM_TIMEOUT_SECS),
         )
         .await
         {
-            arm.detail = Some(format!("benchmark warm-up failed: {e}"));
-            return fail(&arm);
-        }
-        let mut runs: Vec<BenchRun> = Vec::new();
-        for _ in 0..MEASURED_RUNS {
-            match manager_supervisor::benchmark_completion(
-                &base_url,
-                &model_id,
-                &messages,
-                BENCHMARK_TEMPERATURE,
-                prompt.max_tokens,
-                Duration::from_secs(TUNING_ARM_TIMEOUT_SECS),
-            )
-            .await
-            {
-                Ok(sample) => runs.push(BenchRun {
-                    prompt_per_second: sample.prompt_per_second,
-                    predicted_per_second: sample.predicted_per_second,
-                    ttft_ms: sample.ttft_ms,
-                    latency_ms: sample.latency_ms,
-                }),
-                Err(e) => {
-                    arm.detail = Some(format!("benchmark run failed: {e}"));
-                    return fail(&arm);
-                }
+            Ok(result) => results.push(result),
+            Err(e) => {
+                arm.detail = Some(format!("benchmark failed: {e}"));
+                return fail(&arm);
             }
         }
-        results.push(BenchResult::from_runs(runs));
         for (_, t) in gpu_temps(state, &coords.gpu_indices).await {
             peak = Some(peak.map(|p: f32| p.max(t)).unwrap_or(t));
         }
@@ -909,6 +864,27 @@ async fn run_arm(
 // The sweep
 // ---------------------------------------------------------------------------
 
+/// Whether the incumbent stands: no arm was measured, the winner is
+/// the incumbent, or the winner's lead over the measured incumbent is
+/// within noise ([`manager_optimize::beats`]) — no clear winner.
+fn incumbent_stands(sweep: &TuningSweep) -> bool {
+    let Some(winner) = sweep.winner_arm.and_then(|w| sweep.arms.get(w)) else {
+        return true;
+    };
+    if winner.coords == sweep.incumbent {
+        return true;
+    }
+    let incumbent = sweep
+        .arms
+        .iter()
+        .find(|a| a.axis == "incumbent" && a.rankable())
+        .and_then(|a| a.measured.as_ref());
+    match (&winner.measured, incumbent) {
+        (Some(w), Some(i)) => !manager_optimize::beats(&w.long, &i.long),
+        _ => false,
+    }
+}
+
 /// Run one sweep to completion. Owns the parked backends'
 /// restart and the sweep record's final state on every exit
 /// path. Cancellation arrives through `rx` (the shared job
@@ -955,6 +931,7 @@ async fn run_sweep(
         confirmation: None,
         truncated: None,
         detail: None,
+        restore_failures: Vec::new(),
         adopted: false,
         adopted_at: None,
         adopted_anyway: false,
@@ -1260,7 +1237,9 @@ async fn run_sweep(
     }
 
     // Restart what the sweep parked, whatever its outcome.
-    let note = crate::optimize_experiments::restart_stopped(&state, &sink, &stopped).await;
+    let (note, restore_failures) =
+        crate::optimize_experiments::restart_stopped(&state, &sink, &stopped).await;
+    sweep.restore_failures = restore_failures;
     if !note.is_empty() {
         crate::optimize::opt_log1(&state, &format!("tuning {sweep_id}: {note}"));
     }
@@ -1273,24 +1252,27 @@ async fn run_sweep(
         sweep.state = SweepState::Cancelled;
         sweep.detail = Some("sweep cancelled by the operator".to_string());
     } else {
-        sweep.state = SweepState::Completed;
         sweep.winner_arm = winner_index(&sweep.arms);
-        sweep.incumbent_stands = match sweep.winner_arm {
-            None => true,
-            Some(w) => {
-                let winner = &sweep.arms[w];
-                let incumbent_gen = sweep
-                    .arms
-                    .iter()
-                    .find(|a| a.axis == "incumbent")
-                    .and_then(|a| a.gen_long());
-                winner.coords == sweep.incumbent
-                    || match (winner.gen_long(), incumbent_gen) {
-                        (Some(wg), Some(ig)) => wg <= ig,
-                        _ => winner.coords == sweep.incumbent,
-                    }
-            }
-        };
+        if sweep.winner_arm.is_none() {
+            // Nothing was measured: not a completed sweep.
+            sweep.state = SweepState::Failed;
+            sweep.detail = Some("no arm could be measured".to_string());
+        } else {
+            sweep.state = SweepState::Completed;
+        }
+        sweep.incumbent_stands = incumbent_stands(&sweep);
+    }
+    if !sweep.restore_failures.is_empty() {
+        let ids: Vec<&str> = sweep
+            .restore_failures
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect();
+        let text = format!("could not restart: {}", ids.join(", "));
+        sweep.detail = Some(match sweep.detail.take() {
+            Some(d) => format!("{d}; {text}"),
+            None => text,
+        });
     }
     {
         let mut store = load_tuning_store(&state);
@@ -1574,4 +1556,86 @@ fn ranked_json(sweep: &TuningSweep) -> Value {
         .iter()
         .map(|&i| serde_json::to_value(&sweep.arms[i]).unwrap_or(Value::Null))
         .collect::<Vec<_>>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arm(index: usize, axis: &str, ctx: u32, gen: f64) -> TuningArm {
+        let result = BenchResult::from_runs(vec![manager_optimize::BenchRun {
+            prompt_per_second: Some(600.0),
+            predicted_per_second: Some(gen),
+            ttft_ms: None,
+            latency_ms: 1,
+            prompt_n: Some(200),
+        }]);
+        TuningArm {
+            index,
+            axis: axis.to_string(),
+            coords: coords(ctx),
+            status: ArmStatus::Completed,
+            detail: None,
+            measured: Some(ExperimentMeasured {
+                short: result.clone(),
+                long: result,
+            }),
+            residency: Some(ResidencyVerdict::VerifiedExclusive),
+            free_vram_mib: Vec::new(),
+            temp_start_c: None,
+            temp_peak_c: None,
+            fingerprint: None,
+        }
+    }
+
+    fn coords(n_ctx: u32) -> TuningCoords {
+        TuningCoords {
+            gpu_indices: vec![0],
+            tensor_split: Vec::new(),
+            offload_layers: None,
+            moe_cache_mib: None,
+            mtp_n_max: None,
+            n_ctx,
+            cache: manager_models::CacheSelection::default(),
+            parallel_slots: 1,
+        }
+    }
+
+    fn sweep(arms: Vec<TuningArm>) -> TuningSweep {
+        TuningSweep {
+            id: "t".to_string(),
+            backend_id: "b".to_string(),
+            model_id: "m".to_string(),
+            state: SweepState::Completed,
+            started_at: String::new(),
+            finished_at: None,
+            incumbent: coords(32_768),
+            stop_list: Vec::new(),
+            winner_arm: winner_index(&arms),
+            arms,
+            exclusions: Vec::new(),
+            incumbent_stands: false,
+            confirmation: None,
+            truncated: None,
+            detail: None,
+            restore_failures: Vec::new(),
+            adopted: false,
+            adopted_at: None,
+            adopted_anyway: false,
+        }
+    }
+
+    #[test]
+    fn the_incumbent_stands_unless_clearly_beaten() {
+        let stands = |other: f64| {
+            incumbent_stands(&sweep(vec![
+                arm(0, "incumbent", 32_768, 50.0),
+                arm(1, "context", 16_384, other),
+            ]))
+        };
+        assert!(!stands(55.0));
+        assert!(stands(50.5));
+        assert!(stands(40.0));
+        assert!(incumbent_stands(&sweep(Vec::new())));
+    }
 }

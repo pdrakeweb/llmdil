@@ -209,6 +209,22 @@ pub struct BenchRun {
     pub predicted_per_second: Option<f64>,
     pub ttft_ms: Option<f64>,
     pub latency_ms: u64,
+    /// Prompt tokens the server actually processed for the run.
+    /// Absent on runs stored before the prompt cache was disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_n: Option<u32>,
+}
+
+impl BenchRun {
+    /// A stored run whose prompt figure came from llama-server's
+    /// prompt cache: recorded before `prompt_n` was, with a prompt
+    /// rate no better than generation (the ~1 uncached token).
+    fn cached_prompt(&self) -> bool {
+        match (self.prompt_per_second, self.predicted_per_second) {
+            (Some(p), Some(g)) => self.prompt_n.is_none() && p <= g * 1.5,
+            _ => false,
+        }
+    }
 }
 
 /// One prompt's stored result: the median rates and TTFT (the
@@ -233,6 +249,37 @@ impl BenchResult {
             ttft_ms: median_of(&runs, |r| r.ttft_ms),
             runs,
         }
+    }
+
+    /// Run-to-run spread of the generation rate, percent of the
+    /// median; 0 with fewer than two runs.
+    pub fn spread_pct(&self) -> f64 {
+        let rates: Vec<f64> = self
+            .runs
+            .iter()
+            .filter_map(|r| r.predicted_per_second)
+            .collect();
+        let max = rates.iter().copied().fold(f64::MIN, f64::max);
+        let min = rates.iter().copied().fold(f64::MAX, f64::min);
+        match median(&rates) {
+            Some(m) if m > 0.0 && rates.len() > 1 => (max - min) / m * 100.0,
+            _ => 0.0,
+        }
+    }
+
+    /// Drop prompt figures (and the TTFT, which skipped the prompt
+    /// too) that came from the prompt cache; generation figures are
+    /// sound and stay.
+    fn drop_cached_prompt_figures(&mut self) {
+        if !self.runs.iter().any(BenchRun::cached_prompt) {
+            return;
+        }
+        let mut runs = std::mem::take(&mut self.runs);
+        for r in runs.iter_mut().filter(|r| r.cached_prompt()) {
+            r.prompt_per_second = None;
+            r.ttft_ms = None;
+        }
+        *self = Self::from_runs(runs);
     }
 }
 
@@ -483,6 +530,14 @@ impl MeasurementStore {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         store.version = STORE_FORMAT_VERSION;
+        for e in &mut store.entries {
+            e.short.drop_cached_prompt_figures();
+            e.long.drop_cached_prompt_figures();
+        }
+        for e in &mut store.estimates {
+            e.short.drop_cached_prompt_figures();
+            e.long.drop_cached_prompt_figures();
+        }
         store
     }
 
@@ -891,12 +946,45 @@ mod tests {
         assert_eq!(median(&[f64::NAN, 5.0]), Some(5.0));
     }
 
+    #[test]
+    fn cached_prompt_figures_are_dropped_on_load() {
+        let old = |p: f64| BenchRun {
+            prompt_n: None,
+            ..run(p, 36.9, 30.0)
+        };
+        // Stored behind the prompt cache: prompt ≈ generation.
+        let mut bogus = BenchResult::from_runs(vec![old(36.6), old(36.1), old(36.4)]);
+        bogus.drop_cached_prompt_figures();
+        assert_eq!(bogus.prompt_per_second, None);
+        assert_eq!(bogus.ttft_ms, None);
+        assert_eq!(bogus.predicted_per_second, Some(36.9));
+        // A real prompt rate, and any run that recorded prompt_n,
+        // stand.
+        for mut sound in [
+            BenchResult::from_runs(vec![old(616.0)]),
+            BenchResult::from_runs(vec![run(36.0, 36.9, 30.0)]),
+        ] {
+            let before = sound.clone();
+            sound.drop_cached_prompt_figures();
+            assert_eq!(sound, before);
+        }
+    }
+
+    #[test]
+    fn spread_is_percent_of_the_median() {
+        let r = |g| run(500.0, g, 1.0);
+        assert_eq!(BenchResult::from_runs(vec![r(50.0)]).spread_pct(), 0.0);
+        let s = BenchResult::from_runs(vec![r(48.0), r(50.0), r(53.0)]).spread_pct();
+        assert!((s - 10.0).abs() < 1e-9, "{s}");
+    }
+
     fn run(prompt: f64, predicted: f64, ttft: f64) -> BenchRun {
         BenchRun {
             prompt_per_second: Some(prompt),
             predicted_per_second: Some(predicted),
             ttft_ms: Some(ttft),
             latency_ms: 1000,
+            prompt_n: Some(200),
         }
     }
 

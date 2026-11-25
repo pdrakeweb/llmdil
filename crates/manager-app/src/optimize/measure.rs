@@ -18,40 +18,23 @@ pub(crate) async fn benchmark_one_prompt(
     runs: usize,
     timeout: Duration,
 ) -> Result<BenchResult, String> {
-    let messages = vec![manager_supervisor::ChatMessage {
-        role: "user".to_string(),
-        content: prompt.text.to_string(),
-    }];
-    if warm_up {
-        manager_supervisor::benchmark_completion(
+    let run = || {
+        crate::bench_client::complete(
             base_url,
             model,
-            &messages,
+            prompt.text,
             BENCHMARK_TEMPERATURE,
             prompt.max_tokens,
+            None,
             timeout,
         )
-        .await
-        .map_err(|e| e.to_string())?;
+    };
+    if warm_up {
+        run().await.map_err(|e| format!("warm-up: {e}"))?;
     }
     let mut samples = Vec::new();
     for _ in 0..runs {
-        let sample = manager_supervisor::benchmark_completion(
-            base_url,
-            model,
-            &messages,
-            BENCHMARK_TEMPERATURE,
-            prompt.max_tokens,
-            timeout,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        samples.push(manager_optimize::BenchRun {
-            prompt_per_second: sample.prompt_per_second,
-            predicted_per_second: sample.predicted_per_second,
-            ttft_ms: sample.ttft_ms,
-            latency_ms: sample.latency_ms,
-        });
+        samples.push(run().await?.bench_run());
     }
     Ok(BenchResult::from_runs(samples))
 }
@@ -688,11 +671,22 @@ pub async fn op_optimize_set_item_outcome(
 
 /// Re-validate the stored plan against live state. Validation
 /// states are derived on every state read, so this simply
-/// returns the refreshed payload.
+/// returns the refreshed payload, with the plan's configuration
+/// hash brought up to date: re-validating IS the answer to "the
+/// configuration changed since this plan".
 pub async fn op_optimize_validate_plan(
     state: &std::sync::Arc<crate::AppState>,
     _sink: &std::sync::Arc<dyn crate::EventSink>,
 ) -> crate::ApiResult {
+    let current = {
+        let cfg = state.config.read().await;
+        current_config_hash(&cfg)
+    };
+    let mut file = load_plan_file_current(state).await;
+    if let Some(plan) = file.plan.as_mut().filter(|p| p.config_hash != current) {
+        plan.config_hash = current;
+        save_plan_file(state, &file).map_err(ApiError::InvalidInput)?;
+    }
     state_payload(state).await
 }
 
