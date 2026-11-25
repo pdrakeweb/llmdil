@@ -127,6 +127,22 @@ impl Failure {
     }
 }
 
+/// The automatic restarts of a crashed backend (`restart_policy`), as
+/// the backend rows report them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AutoRestart {
+    /// The attempt that is scheduled, running or last made (1-based).
+    pub attempt: u32,
+    pub max: u32,
+    /// When the scheduled attempt is due; `None` once it began.
+    pub next_at_ms: Option<i64>,
+    /// No further attempt will be made.
+    pub gave_up: bool,
+    /// When the attempt began (the stable-run clock).
+    #[serde(skip)]
+    pub began: Option<Instant>,
+}
+
 /// Everything the registry knows about one service.
 #[derive(Debug, Clone, Default)]
 pub struct ServiceRecord {
@@ -146,6 +162,9 @@ pub struct ServiceRecord {
     pub last_settled_at: Option<DateTime<Utc>>,
     /// Gateway: the last liveness probe (when, answered).
     pub last_probe: Option<(Instant, bool)>,
+    /// Backends: pending or exhausted automatic restarts. An operator
+    /// stop or start drops it.
+    pub auto_restart: Option<AutoRestart>,
 }
 
 /// Why [`LifecycleRegistry::try_begin`] refused: another operation
@@ -286,12 +305,24 @@ impl LifecycleRegistry {
         lock(&self.records).values().any(|r| r.transition.is_some())
     }
 
-    /// Record operator intent; bumps the generation.
+    /// Record operator intent; bumps the generation. A stop cancels any
+    /// pending automatic restart.
     pub fn set_intent(&self, key: &str, intent: Intent) {
         self.with(key, |r| {
             r.intent = Some(intent);
             r.generation += 1;
+            if intent == Intent::Stopped {
+                r.auto_restart = None;
+            }
         });
+    }
+
+    pub fn auto_restart(&self, key: &str) -> Option<AutoRestart> {
+        lock(&self.records).get(key).and_then(|r| r.auto_restart)
+    }
+
+    pub fn set_auto_restart(&self, key: &str, auto_restart: Option<AutoRestart>) {
+        self.with(key, |r| r.auto_restart = auto_restart);
     }
 
     pub fn intent(&self, key: &str) -> Option<Intent> {
@@ -500,6 +531,10 @@ pub async fn begin(
         .lifecycle
         .try_begin(key, kind, origin)
         .map_err(|busy| ApiError::Busy(busy.to_string()))?;
+    // Any other operation supersedes the automatic restarts.
+    if origin != Origin::RestartPolicy {
+        state.lifecycle.set_auto_restart(key, None);
+    }
     // The previous failure is kept until the operation succeeds
     // ([`finish`] clears it): a start refused or abandoned after this
     // point must not make a failed service read `stopped`.

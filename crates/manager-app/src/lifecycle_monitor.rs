@@ -20,7 +20,8 @@
 //!    SERVICE_LIFECYCLE for every observed change.
 //!
 //! It returns [`MonitorEvent`]s; `notify::monitor_tick` turns them into
-//! toasts. Policy (state model §5): nothing is restarted automatically.
+//! toasts. A crashed backend is restarted per its `restart_policy` (see
+//! [`restart`]); no other service is restarted automatically.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -32,6 +33,9 @@ use crate::lifecycle::{
 };
 use crate::{AppState, EventSink};
 
+mod restart;
+pub use restart::run_due as run_due_restarts;
+
 /// One state-driven event the notification layer reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MonitorEvent {
@@ -41,6 +45,8 @@ pub enum MonitorEvent {
         id: String,
         exit_status: Option<String>,
         reason: Option<String>,
+        /// Its restart policy brings it back (see [`restart`]).
+        restarting: bool,
     },
     /// The gateway the operator expects up went down.
     GatewayDown { reason: String },
@@ -595,13 +601,23 @@ async fn backends(state: &AppState, sink: &dyn EventSink, events: &mut Vec<Monit
                         fatal.get(id).cloned(),
                     )
                 };
-                let reason = crash_reason(exit_status.as_deref(), cause.as_deref());
+                let mut reason = crash_reason(exit_status.as_deref(), cause.as_deref());
+                // Before the event, so a row read on it already shows the
+                // scheduled restart.
+                if !row.service_managed {
+                    reason = restart::on_failed_run(state, id, reason).await;
+                }
                 record_crash(state, sink, &key, &reason, exit_code, marked.contains(&key));
-                events.push(MonitorEvent::Crashed {
-                    id: id.clone(),
-                    exit_status,
-                    reason: cause,
-                });
+                // One toast for the first crash and one for giving up.
+                let retry = state.lifecycle.auto_restart(&key).filter(|r| !r.gave_up);
+                if retry.is_none_or(|r| r.attempt == 1) {
+                    events.push(MonitorEvent::Crashed {
+                        id: id.clone(),
+                        exit_status,
+                        reason: cause,
+                        restarting: retry.is_some(),
+                    });
+                }
             }
             Some(Detected::Recovered) => record_recovery(state, sink, &key, row.state),
             None => emit_change(sink, &key, prev, row.state, transition),

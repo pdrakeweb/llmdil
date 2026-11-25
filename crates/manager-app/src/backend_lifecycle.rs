@@ -258,10 +258,12 @@ async fn stop_inner(
     graceful: bool,
     origin: Origin,
 ) -> Result<String, ApiError> {
+    let mut idle = Idle::Unknown;
     if graceful {
         if let Some(port) = backend_port(state, id).await {
             let started = Instant::now();
-            if !wait_backend_idle(port, IDLE_DRAIN_TIMEOUT).await {
+            idle = wait_backend_idle(port, IDLE_DRAIN_TIMEOUT).await;
+            if idle == Idle::Busy {
                 mark(
                     state,
                     id,
@@ -308,8 +310,11 @@ async fn stop_inner(
             };
             let pid = proc.pid();
             let started = Instant::now();
-            // Drain or kill with no supervisor lock held.
-            let result = manager_supervisor::stop_process(&mut proc, graceful).await;
+            // Drain or kill with no supervisor lock held. Windows has no
+            // graceful signal: draining an idle backend only waits for an
+            // exit that never comes.
+            let drain = graceful && !(cfg!(windows) && idle == Idle::Yes);
+            let result = manager_supervisor::stop_process(&mut proc, drain).await;
             {
                 let mut sup = state.supervisor().await.lock().await;
                 sup.finish_stop(id, proc, &result);
@@ -326,35 +331,47 @@ async fn stop_inner(
     }
 }
 
+/// What [`wait_backend_idle`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Idle {
+    /// No request is in flight.
+    Yes,
+    /// Requests were still in flight when the wait ran out.
+    Busy,
+    /// `/slots` did not say (disabled, or the server did not answer).
+    Unknown,
+}
+
 /// Wait until the backend at `port` has no slot processing a request,
-/// up to `timeout`. True when idle (or when `/slots` is unavailable:
-/// nothing to wait for), false on timeout.
-async fn wait_backend_idle(port: u16, timeout: Duration) -> bool {
+/// up to `timeout`. A server that is still loading (503) has no request
+/// in flight.
+async fn wait_backend_idle(port: u16, timeout: Duration) -> Idle {
     let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
     else {
-        return true;
+        return Idle::Unknown;
     };
     let url = format!("http://127.0.0.1:{port}/slots");
     let deadline = Instant::now() + timeout;
     loop {
-        let busy = match client.get(&url).send().await {
+        let slots = match client.get(&url).send().await {
+            Ok(resp) if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
+                return Idle::Yes
+            }
             Ok(resp) if resp.status().is_success() => resp
                 .bytes()
                 .await
                 .ok()
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-                .is_some_and(|v| slots_busy(&v)),
-            _ => false,
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
+            _ => None,
         };
-        if !busy {
-            return true;
+        match slots {
+            None => return Idle::Unknown,
+            Some(slots) if !slots_busy(&slots) => return Idle::Yes,
+            Some(_) if Instant::now() >= deadline => return Idle::Busy,
+            Some(_) => tokio::time::sleep(Duration::from_millis(500)).await,
         }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -678,6 +695,22 @@ pub async fn start_backend(
     let probe_ctx = crate::offload_probe_context(state, id).await;
     let task_id = begin_task(state, &opts, "backend_start", json!({ "backend_id": id })).await;
     let guard = begin_op(state, sink, id, TransitionKind::Starting, &opts, &task_id).await?;
+    if opts.origin == Origin::RestartPolicy
+        && state.lifecycle.auto_restart(&backend_key(id)).is_none()
+    {
+        // Stopped or started by someone else while the preflight ran.
+        drop(guard);
+        mark(state, id, "restart cancelled", None, opts.origin);
+        let e = ApiError::Busy(format!("the automatic restart of {id} was cancelled"));
+        end_task(
+            state,
+            &task_id,
+            TaskStatus::Failed,
+            json!({ "backend_id": id, "error": e.to_string() }),
+        )
+        .await;
+        return Err(e);
+    }
     state
         .lifecycle
         .set_intent(&backend_key(id), Intent::Running);

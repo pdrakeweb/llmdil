@@ -2,6 +2,7 @@
   "backends": [
     {
       "adopted": false,
+      "auto_restart": null,
       "cache": {
         "custom": false,
         "flash_attn": "auto",
@@ -59,6 +60,7 @@
     },
     {
       "adopted": false,
+      "auto_restart": null,
       "cache": {
         "custom": false,
         "flash_attn": "auto",
@@ -235,6 +237,7 @@
     },
     {
       "adopted": false,
+      "auto_restart": null,
       "cache": {
         "custom": false,
         "flash_attn": "auto",
@@ -292,6 +295,7 @@
     },
     {
       "adopted": false,
+      "auto_restart": null,
       "cache": {
         "custom": false,
         "flash_attn": "auto",
