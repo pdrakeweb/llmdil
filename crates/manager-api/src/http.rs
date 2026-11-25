@@ -13,17 +13,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, MethodFilter};
 use axum::Router;
 use serde_json::{json, Map, Value};
 
-use manager_app::registry::{HttpMethod, Op, OpSpec, RouteMode, OP_SPECS};
-use manager_app::ApiError;
+use manager_app::registry::{request_params, HttpMethod, Op, OpSpec, Role, RouteMode, OP_SPECS};
+use manager_app::{ApiError, Refusal, TaskStatus};
 
 use crate::composites;
-use crate::{ApiCtx, API_ORIGIN};
+use crate::operations::{AbortTarget, OpFailure, OpOutcome};
+use crate::{ApiCtx, Principal, API_ORIGIN};
 
 /// One registered route, recorded during construction so tests can
 /// enumerate the live surface against the registry.
@@ -51,6 +52,12 @@ pub const DERIVED_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/api/v1/gateway/groups/{name}"),
     ("POST", "/api/v1/gateway/start"),
     ("POST", "/api/v1/activation-plan/apply"),
+    // The second file of the generated gateway configuration, and the
+    // saved telemetry snapshots (their POST is a registry route).
+    ("GET", "/api/v1/gateway/generated-routing"),
+    ("GET", "/api/v1/telemetry/snapshots"),
+    ("GET", "/api/v1/telemetry/snapshots/{id}"),
+    ("DELETE", "/api/v1/telemetry/snapshots/{id}"),
     // Phase 4: retained diagnostics bundle content + the event stream.
     ("GET", "/api/v1/diagnostics/bundles/{bundle_id}/content"),
     ("GET", "/api/v1/events"),
@@ -76,8 +83,8 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
         });
         router = router.route(
             route.path,
-            axum::routing::on(filter, move |state, path, query, body| {
-                handle_op(spec, state, path, query, body)
+            axum::routing::on(filter, move |state, principal, path, query, body| {
+                handle_op(spec, state, principal, path, query, body)
             }),
         );
     }
@@ -108,6 +115,15 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
         .route(
             "/api/v1/activation-plan/apply",
             axum::routing::post(handle_activation_apply),
+        )
+        .route(
+            "/api/v1/gateway/generated-routing",
+            get(handle_generated_routing),
+        )
+        .route("/api/v1/telemetry/snapshots", get(handle_snapshots))
+        .route(
+            "/api/v1/telemetry/snapshots/{id}",
+            get(handle_snapshot_one).delete(handle_snapshot_delete),
         )
         .route(
             "/api/v1/diagnostics/bundles/{bundle_id}/content",
@@ -240,6 +256,7 @@ fn method_str(m: HttpMethod) -> &'static str {
 async fn handle_op(
     spec: &'static OpSpec,
     State(ctx): State<Arc<ApiCtx>>,
+    Extension(principal): Extension<Principal>,
     Path(path_params): Path<HashMap<String, String>>,
     Query(query): Query<HashMap<String, String>>,
     body: axum::body::Bytes,
@@ -256,54 +273,35 @@ async fn handle_op(
     // record's detail carries the outcome the synchronous call
     // would have returned.
     if spec.route.map(|r| r.mode) == Some(RouteMode::AsyncOp) {
-        let (id, record) = ctx.operations.begin(spec.name);
-        let spawn_ctx = ctx.clone();
-        tokio::spawn(async move {
-            let result = manager_app::registry::dispatch_from(
-                &spawn_ctx.app,
-                &spawn_ctx.sink,
-                spec.op,
-                args,
-                API_ORIGIN,
-            )
-            .await;
-            finish_operation(&spawn_ctx, &id, spec.name, result);
+        // What can be refused now is refused now (400, 404, 409).
+        if let Err(message) = check_args(spec, &args) {
+            return error_response(&ctx, &ApiError::InvalidInput(message), None);
+        }
+        if let Err(refusal) = manager_app::precheck_operation(&ctx.app, spec.op, &args).await {
+            return refusal_response(&ctx, refusal);
+        }
+        let work_ctx = ctx.clone();
+        return spawn_operation(&ctx, spec.name, async move {
+            run_async_op(&work_ctx, spec.op, args).await
         });
-        return (axum::http::StatusCode::ACCEPTED, axum::Json(record)).into_response();
     }
     // The operations list merges the app's task records with the
     // API-side operation records.
     if spec.op == Op::TasksList {
-        return match manager_app::registry::dispatch_from(
-            &ctx.app, &ctx.sink, spec.op, args, API_ORIGIN,
-        )
-        .await
-        {
-            Ok(mut value) => {
-                if let Some(arr) = value.as_array_mut() {
-                    let known: std::collections::HashSet<String> = arr
-                        .iter()
-                        .filter_map(|t| t["id"].as_str().map(str::to_string))
-                        .collect();
-                    for record in ctx.operations.list() {
-                        if !known.contains(record["id"].as_str().unwrap_or("")) {
-                            arr.push(record);
-                        }
-                    }
-                }
-                (axum::http::StatusCode::OK, axum::Json(value)).into_response()
+        return match dispatch_read(&ctx, spec.op, args).await {
+            Ok(tasks) => {
+                let rows = operation_rows(&ctx, &principal, tasks);
+                (axum::http::StatusCode::OK, axum::Json(rows)).into_response()
             }
-            Err(e) => error_response(&ctx, &e, None),
+            Err(r) => *r,
         };
     }
-    // Abort: API-side records flip in the API store (bookkeeping
-    // parity with the app); anything else is an app task.
+    // Abort: an API-side record's abort is routed to the app tasks its
+    // work recorded; anything else is an app task.
     if spec.op == Op::TaskAbort {
-        if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
-            if ctx.operations.get(task_id).is_some() {
-                ctx.operations.abort(task_id);
-                return axum::Json(json!({ "ok": true, "task_id": task_id })).into_response();
-            }
+        let id = args["task_id"].as_str().unwrap_or_default().to_string();
+        if let Some(target) = ctx.operations.request_abort(&id) {
+            return axum::Json(abort_operation(&ctx, &id, target).await).into_response();
         }
     }
     // PATCH /gateway/config composition: a bind_host field routes
@@ -317,44 +315,270 @@ async fn handle_op(
     }
     match manager_app::registry::dispatch_from(&ctx.app, &ctx.sink, spec.op, args, API_ORIGIN).await
     {
-        Ok(value) => shape_success(&ctx, spec, value),
+        Ok(value) => shape_success(&ctx, spec, &principal, value),
         Err(e) => error_response(&ctx, &e, None),
     }
 }
+
+/// Create the operation record, run `work` in the background, answer 202.
+fn spawn_operation<F>(ctx: &Arc<ApiCtx>, kind: &'static str, work: F) -> Response
+where
+    F: std::future::Future<Output = Result<Value, ApiError>> + Send + 'static,
+{
+    let (id, record, link) = ctx.operations.begin(kind);
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let result = manager_app::with_task_link(link, work).await;
+        finish_operation(&ctx, &id, kind, result).await;
+    });
+    (axum::http::StatusCode::ACCEPTED, axum::Json(record)).into_response()
+}
+
+/// Dispatch an asynchronous operation; a start additionally waits for the
+/// model when `wait_ready_secs` asks for it.
+async fn run_async_op(ctx: &ApiCtx, op: Op, args: Value) -> Result<Value, ApiError> {
+    let start = (op == Op::StartBackend).then(|| args.clone());
+    let mut value =
+        manager_app::registry::dispatch_from(&ctx.app, &ctx.sink, op, args, API_ORIGIN).await?;
+    if let Some(args) = start {
+        let secs = args["wait_ready_secs"].as_u64().unwrap_or(0);
+        if secs > 0 {
+            manager_app::wait_started_backend(
+                &ctx.app,
+                &ctx.sink,
+                args["id"].as_str().unwrap_or_default(),
+                secs,
+                args["origin"].as_str(),
+                API_ORIGIN,
+            )
+            .await?;
+            value["ready"] = json!(true);
+        }
+    }
+    Ok(value)
+}
+
+/// Abort a record: cancel the app tasks its work recorded and wait a
+/// moment for the work to end; work that has no task, or does not stop,
+/// is marked aborted with a note.
+async fn abort_operation(ctx: &ApiCtx, id: &str, target: AbortTarget) -> Value {
+    let link = match target {
+        AbortTarget::Finished(status) => {
+            return json!({
+                "ok": true, "task_id": id, "status": status, "already_finished": true,
+            })
+        }
+        AbortTarget::Running(link) => link,
+    };
+    link.request_abort();
+    let mut tasks = Vec::new();
+    for task_id in link.task_ids() {
+        let args = json!({ "task_id": task_id });
+        match manager_app::registry::dispatch_from(
+            &ctx.app,
+            &ctx.sink,
+            Op::TaskAbort,
+            args,
+            API_ORIGIN,
+        )
+        .await
+        {
+            Ok(v) => tasks.push(v),
+            Err(e) => tasks.push(json!({ "task_id": task_id, "error": e.to_string() })),
+        }
+    }
+    let status = || {
+        let record = ctx.operations.get(id).unwrap_or_default();
+        record["status"].as_str().unwrap_or_default().to_string()
+    };
+    if !tasks.is_empty() {
+        for _ in 0..20 {
+            if status() != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    let stopped = status() != "running";
+    ctx.operations.force_abort(
+        id,
+        "this operation cannot be stopped, or did not stop in time; it may still be running",
+    );
+    json!({
+        "ok": true, "task_id": id, "status": status(),
+        "stopped": stopped, "forced": !stopped, "tasks": tasks,
+    })
+}
+
+/// `GET /operations`: the API records and the app's task records, newest
+/// first. The two rows of one unit of work name each other (`task_id`,
+/// `operation_id`).
+fn operation_rows(ctx: &ApiCtx, principal: &Principal, tasks: Value) -> Vec<Value> {
+    let records = ctx.operations.list();
+    let mut rows: Vec<Value> = Vec::new();
+    for task in tasks.as_array().into_iter().flatten() {
+        let operation = records
+            .iter()
+            .find(|(_, ids)| ids.iter().any(|id| task["id"] == id.as_str()))
+            .map(|(record, _)| record["id"].clone());
+        rows.push(task_row(task.clone(), operation));
+    }
+    rows.extend(records.into_iter().map(|(record, _)| record));
+    let id = |r: &Value| r["id"].as_str().unwrap_or_default().to_string();
+    rows.sort_by_key(|r| std::cmp::Reverse((r["created_ms"].as_i64().unwrap_or(0), id(r))));
+    rows.into_iter()
+        .map(|r| visible_to(ctx, principal, r))
+        .collect()
+}
+
+/// An app task record in the operation shape (rest-api.md §3.1).
+fn task_row(mut task: Value, operation: Option<Value>) -> Value {
+    let failed = task["status"] == "failed";
+    let kind = task["detail"]["error_kind"].as_str().map(str::to_string);
+    task["error_code"] = json!(failed.then(|| match &kind {
+        Some(k) => code_of_kind(k),
+        None => OPERATION_FAILED,
+    }));
+    task["error_kind"] = json!(failed.then(|| kind.unwrap_or("OperationFailed".into())));
+    task["operation_id"] = json!(operation);
+    task
+}
+
+/// Local paths in an operation's payload are for administrators: every
+/// other role sees the machine's roots replaced.
+fn visible_to(ctx: &ApiCtx, principal: &Principal, mut value: Value) -> Value {
+    if principal.role != Role::Admin {
+        scrub_value(&mut value, &ctx.data_dir);
+    }
+    value
+}
+
+/// The code of a failure an operation reports about itself.
+const OPERATION_FAILED: &str = "OPERATION_FAILED";
 
 /// The terminal outcome of an asynchronous operation, by the one
 /// shared lifecycle rule ([`manager_app::lifecycle::payload_failure`]):
 /// a payload with `busy: true` or `ok: false` is a failed operation
 /// whose error is the payload's message and whose detail is the whole
 /// payload (CR-2: a failed or manual start-gateway step, a refused
-/// run, or an activation apply with a failed item). `Ok` is a done
-/// operation; `Err` keeps the op error's text.
-pub fn operation_outcome(
-    result: Result<Value, ApiError>,
-) -> Result<Value, (String, Option<Value>)> {
+/// run, or an activation apply with a failed item). An audit that found
+/// another one running is refused the same way. The code is the one a
+/// synchronous route would have answered.
+pub fn operation_outcome(result: Result<Value, ApiError>) -> Result<Value, OpFailure> {
     match result {
-        Ok(value) => match manager_app::lifecycle::payload_failure(&value) {
-            Some(message) => Err((message, Some(value))),
-            None => Ok(value),
-        },
-        Err(e) => Err((e.to_string(), None)),
+        Ok(value) => {
+            let already = value.get("already_running") == Some(&json!(true));
+            let busy = already || value.get("busy") == Some(&json!(true));
+            let message = match manager_app::lifecycle::payload_failure(&value) {
+                Some(message) => message,
+                None if already => "busy: an audit is already running".to_string(),
+                None => return Ok(value),
+            };
+            let (code, kind) = if busy {
+                ("BUSY", "Busy")
+            } else {
+                (OPERATION_FAILED, "OperationFailed")
+            };
+            Err(OpFailure {
+                message,
+                code,
+                kind,
+                detail: Some(value),
+            })
+        }
+        Err(e) => Err(OpFailure {
+            message: e.to_string(),
+            code: code_of_kind(e.kind()),
+            kind: e.kind(),
+            detail: None,
+        }),
     }
 }
 
 /// Record an asynchronous operation's terminal state (see
 /// [`operation_outcome`]). Every 202 route ends here: the registry's
 /// AsyncOp routes and the gateway-start / activation-apply composites.
-fn finish_operation(ctx: &ApiCtx, id: &str, kind: &str, result: Result<Value, ApiError>) {
-    match operation_outcome(result) {
-        Ok(value) => ctx.operations.complete(id, kind, Ok(value)),
-        Err((message, detail)) => {
-            let message = sanitize(&message, &ctx.data_dir);
-            match detail {
-                Some(detail) => ctx.operations.fail_with_detail(id, &message, detail),
-                None => ctx.operations.complete(id, kind, Err(message)),
-            }
+/// A download's dispatch returns when the transfer began: its operation
+/// follows the app task to its end.
+async fn finish_operation(
+    ctx: &ApiCtx,
+    id: &str,
+    kind: &'static str,
+    result: Result<Value, ApiError>,
+) {
+    let mut outcome = match operation_outcome(result) {
+        Ok(value) => OpOutcome::Done(value),
+        Err(f) => OpOutcome::Failed(f),
+    };
+    if let OpOutcome::Done(payload) = &outcome {
+        if kind == "download_model" || kind == "model_resume_download" {
+            outcome = transfer_outcome(ctx, id, payload.clone()).await;
         }
+    } else if aborted_task(ctx, id).await {
+        let OpOutcome::Failed(f) = outcome else {
+            return;
+        };
+        outcome = OpOutcome::Aborted(f.detail);
     }
+    if let OpOutcome::Failed(f) = &mut outcome {
+        f.message = sanitize(&f.message, &ctx.data_dir);
+    }
+    ctx.operations.complete(id, kind, outcome);
+}
+
+/// Whether one of the operation's app tasks was aborted (by its own id).
+async fn aborted_task(ctx: &ApiCtx, id: &str) -> bool {
+    let Ok(tasks) = dispatch_read(ctx, Op::TasksList, json!({})).await else {
+        return false;
+    };
+    tasks.as_array().into_iter().flatten().any(|t| {
+        t["status"] == "aborted"
+            && t["id"]
+                .as_str()
+                .and_then(|t| ctx.operations.operation_of_task(t))
+                .as_deref()
+                == Some(id)
+    })
+}
+
+/// Follow a download's app task to its end.
+async fn transfer_outcome(ctx: &ApiCtx, id: &str, mut payload: Value) -> OpOutcome {
+    let task_id = match payload["task_id"].as_str() {
+        Some(t) => t.to_string(),
+        // A resume continues the transfer another operation began.
+        None => match running_download(ctx, payload["model_id"].as_str()).await {
+            Some(t) => t,
+            None => return OpOutcome::Done(payload),
+        },
+    };
+    ctx.operations.link_task(id, &task_id);
+    let Some(task) = manager_app::wait_task_settled(&ctx.app, &task_id).await else {
+        return OpOutcome::Done(payload);
+    };
+    if let (Some(p), Some(d)) = (payload.as_object_mut(), task.detail.as_object()) {
+        p.extend(d.clone());
+    }
+    match task.status {
+        TaskStatus::Aborted => OpOutcome::Aborted(Some(payload)),
+        TaskStatus::Failed => OpOutcome::Failed(OpFailure {
+            message: task.error.unwrap_or("the download failed".into()),
+            code: "MODELS",
+            kind: "Models",
+            detail: Some(payload),
+        }),
+        _ => OpOutcome::Done(payload),
+    }
+}
+
+/// The app task of the transfer in flight for a model.
+async fn running_download(ctx: &ApiCtx, model_id: Option<&str>) -> Option<String> {
+    let tasks = dispatch_read(ctx, Op::TasksList, json!({})).await.ok()?;
+    let task = tasks.as_array()?.iter().find(|t| {
+        t["kind"] == "model_download"
+            && t["status"] == "running"
+            && t["detail"]["model_id"].as_str() == model_id
+    })?;
+    task["id"].as_str().map(str::to_string)
 }
 
 /// Assemble the operation argument object from the request parts.
@@ -372,7 +596,17 @@ fn assemble_args(
     }
     for (k, v) in query {
         if spec.params.contains(&k.as_str()) {
-            obj.insert(k.clone(), coerce_query_value(v));
+            let schema = param_schema(spec.op, k);
+            let value = query_value(&schema, v).map_err(|want| {
+                Box::new(error_response_raw(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "INVALID_INPUT",
+                    "InvalidInput",
+                    &format!("query parameter `{k}`: expected {want}"),
+                    None,
+                ))
+            })?;
+            obj.insert(k.clone(), value);
         }
     }
     if !body.is_empty() {
@@ -400,7 +634,7 @@ fn assemble_args(
                     ))
                 })?;
                 for (k, v) in fields {
-                    if !spec.params.contains(&k.as_str()) {
+                    if !spec.params.contains(&k.as_str()) && api_param(spec.op, k).is_none() {
                         return Err(Box::new(error_response_raw(
                             axum::http::StatusCode::BAD_REQUEST,
                             "INVALID_INPUT",
@@ -434,35 +668,140 @@ fn assemble_args(
     Ok(Value::Object(obj))
 }
 
-/// Query strings are strings; numeric/bool arguments are coerced so
-/// e.g. `?limit=20` reaches a `u64` parameter as a number.
-fn coerce_query_value(raw: &str) -> Value {
-    if let Ok(n) = raw.parse::<i64>() {
-        return json!(n);
-    }
-    if let Ok(n) = raw.parse::<f64>() {
-        return json!(n);
-    }
-    match raw {
-        "true" => return json!(true),
-        "false" => return json!(false),
-        _ => {}
-    }
-    Value::String(raw.to_string())
+/// A body field this layer adds to an operation's own arguments: its
+/// JSON Schema.
+fn api_param(op: Op, name: &str) -> Option<Value> {
+    (op == Op::StartBackend && name == "wait_ready_secs")
+        .then(|| json!({ "type": ["integer", "null"], "minimum": 0 }))
 }
 
-fn shape_success(ctx: &ApiCtx, spec: &OpSpec, value: Value) -> Response {
-    // The wizard-step singleton: the app reports a busy run as a
-    // successful payload; on the wire it is a 409 (rest-api.md §2).
-    if spec.op == Op::RunWizardStep && value.get("busy") == Some(&json!(true)) {
-        return error_response_raw(
-            axum::http::StatusCode::CONFLICT,
-            "BUSY",
-            "Busy",
-            "a wizard step is already running",
-            Some(value),
-        );
+/// The declared JSON Schema of one argument (any value when unknown).
+fn param_schema(op: Op, name: &str) -> Value {
+    request_params(op)
+        .into_iter()
+        .find(|p| p.name == name)
+        .map(|p| p.json_schema)
+        .unwrap_or(json!({}))
+}
+
+/// Refuse a missing or wrongly typed argument in the words of the
+/// operation's own parse, before anything is queued.
+fn check_args(spec: &OpSpec, args: &Value) -> Result<(), String> {
+    for p in request_params(spec.op) {
+        let value = args.get(p.name).unwrap_or(&Value::Null);
+        if value.is_null() && !p.required {
+            continue;
+        }
+        if value.is_null() && args.get(p.name).is_none() {
+            return Err(format!("argument `{}` is required", p.name));
+        }
+        if !schema_accepts(&p.json_schema, value) {
+            return Err(format!(
+                "argument `{}`: expected {}",
+                p.name,
+                schema_text(&p.json_schema)
+            ));
+        }
     }
+    for (name, value) in args.as_object().into_iter().flatten() {
+        if let Some(schema) = api_param(spec.op, name) {
+            if !schema_accepts(&schema, value) {
+                return Err(format!(
+                    "argument `{name}`: expected {}",
+                    schema_text(&schema)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The type names of a generated parameter schema (empty: any value).
+fn schema_types(schema: &Value) -> Vec<&str> {
+    match schema.get("type") {
+        Some(Value::String(t)) => vec![t],
+        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `value` fits a generated parameter schema (type, enum and
+/// integer range; documents are the operation's to check).
+fn schema_accepts(schema: &Value, value: &Value) -> bool {
+    if let Some(any) = schema.get("anyOf").and_then(Value::as_array) {
+        return any.iter().any(|s| schema_accepts(s, value));
+    }
+    if let Some(names) = schema.get("enum").and_then(Value::as_array) {
+        return names.contains(value);
+    }
+    let types = schema_types(schema);
+    let int = |k: &str| schema.get(k).and_then(Value::as_i64);
+    types.is_empty()
+        || types.iter().any(|t| match *t {
+            "string" => value.is_string(),
+            "boolean" => value.is_boolean(),
+            "number" => value.is_number(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            "null" => value.is_null(),
+            "integer" => match (value.as_i64(), value.as_u64()) {
+                (Some(n), _) => {
+                    int("minimum").is_none_or(|m| n >= m) && int("maximum").is_none_or(|m| n <= m)
+                }
+                (None, Some(_)) => int("maximum").is_none(),
+                _ => false,
+            },
+            _ => true,
+        })
+}
+
+/// What a parameter schema wants, for a refusal.
+fn schema_text(schema: &Value) -> String {
+    if let Some(any) = schema.get("anyOf").and_then(Value::as_array) {
+        return any.first().map(schema_text).unwrap_or_default();
+    }
+    if let Some(names) = schema.get("enum").and_then(Value::as_array) {
+        let names: Vec<String> = names.iter().map(Value::to_string).collect();
+        return format!("one of {}", names.join(", "));
+    }
+    match schema_types(schema).first() {
+        Some(&"integer") if schema.get("minimum").is_some() => "a whole number, 0 or more".into(),
+        Some(&"integer") => "a whole number".into(),
+        Some(&"boolean") => "true or false".into(),
+        Some(t) => format!("a value of type {t}"),
+        None => "a JSON value".into(),
+    }
+}
+
+/// Query strings are strings: the parameter's declared type says how one
+/// is read (`?limit=20` is a number, `?search=20` is text). The error is
+/// what was expected.
+fn query_value(schema: &Value, raw: &str) -> Result<Value, String> {
+    let inner = schema
+        .get("anyOf")
+        .and_then(|any| any.get(0))
+        .unwrap_or(schema);
+    let parsed = match schema_types(inner).first().copied() {
+        Some("integer") => raw
+            .parse::<i64>()
+            .map(|n| json!(n))
+            .or_else(|_| raw.parse::<u64>().map(|n| json!(n)))
+            .ok(),
+        Some("number") => raw
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(|n| json!(n)),
+        Some("boolean") => raw.parse::<bool>().ok().map(|b| json!(b)),
+        Some("string") | None => Some(json!(raw)),
+        Some(_) => serde_json::from_str(raw).ok(),
+    };
+    parsed
+        .filter(|v| schema_accepts(inner, v))
+        .ok_or_else(|| schema_text(inner))
+}
+
+fn shape_success(ctx: &ApiCtx, spec: &OpSpec, principal: &Principal, value: Value) -> Response {
     // Generated gateway YAML crosses as text, not a JSON wrapper.
     if spec.op == Op::GatewayPreviewYaml {
         if let Some(yaml) = value.get("yaml").and_then(Value::as_str) {
@@ -479,7 +818,10 @@ fn shape_success(ctx: &ApiCtx, spec: &OpSpec, value: Value) -> Response {
         Some(RouteMode::Accepted) => axum::http::StatusCode::ACCEPTED,
         _ => axum::http::StatusCode::OK,
     };
-    let _ = ctx;
+    let value = match spec.op {
+        Op::TelemetrySaveSnapshot => visible_to(ctx, principal, value),
+        _ => value,
+    };
     (status, axum::Json(value)).into_response()
 }
 
@@ -491,25 +833,54 @@ fn shape_success(ctx: &ApiCtx, spec: &OpSpec, value: Value) -> Response {
 /// the REST layer owns presentation (PLAN.md §3.3).
 pub fn error_mapping(e: &ApiError) -> (axum::http::StatusCode, &'static str, &'static str) {
     use axum::http::StatusCode as S;
-    match e {
-        ApiError::InvalidInput(_) => (S::BAD_REQUEST, "INVALID_INPUT", "InvalidInput"),
-        ApiError::NotFound(_) => (S::NOT_FOUND, "NOT_FOUND", "NotFound"),
-        ApiError::Config(_) => (S::UNPROCESSABLE_ENTITY, "CONFIG", "Config"),
-        ApiError::Unsupported(_) => (S::NOT_IMPLEMENTED, "UNSUPPORTED", "Unsupported"),
-        ApiError::ContractGap(_) => (S::NOT_IMPLEMENTED, "CONTRACT_GAP", "ContractGap"),
-        ApiError::Supervisor(_) => (S::INTERNAL_SERVER_ERROR, "SUPERVISOR", "Supervisor"),
-        ApiError::Wizard(_) => (S::INTERNAL_SERVER_ERROR, "WIZARD", "Wizard"),
-        ApiError::Telemetry(_) => (S::INTERNAL_SERVER_ERROR, "TELEMETRY", "Telemetry"),
-        ApiError::Gateway(_) => (S::INTERNAL_SERVER_ERROR, "GATEWAY", "Gateway"),
-        ApiError::Models(_) => (S::INTERNAL_SERVER_ERROR, "MODELS", "Models"),
-        ApiError::Mxc(_) => (S::INTERNAL_SERVER_ERROR, "MXC", "Mxc"),
-        ApiError::Mcp(_) => (S::INTERNAL_SERVER_ERROR, "MCP", "Mcp"),
-        ApiError::WinMl(_) => (S::INTERNAL_SERVER_ERROR, "WINML", "WinMl"),
-        ApiError::Services(_) => (S::INTERNAL_SERVER_ERROR, "SERVICES", "Services"),
-        ApiError::Io(_) => (S::INTERNAL_SERVER_ERROR, "IO", "Io"),
-        ApiError::Json(_) => (S::INTERNAL_SERVER_ERROR, "JSON", "Json"),
-        ApiError::Busy(_) => (S::CONFLICT, "BUSY", "Busy"),
+    let status = match e {
+        ApiError::InvalidInput(_) => S::BAD_REQUEST,
+        ApiError::NotFound(_) => S::NOT_FOUND,
+        ApiError::Config(_) => S::UNPROCESSABLE_ENTITY,
+        ApiError::Unsupported(_) | ApiError::ContractGap(_) => S::NOT_IMPLEMENTED,
+        ApiError::Busy(_) => S::CONFLICT,
+        ApiError::Supervisor(_)
+        | ApiError::Wizard(_)
+        | ApiError::Telemetry(_)
+        | ApiError::Gateway(_)
+        | ApiError::Models(_)
+        | ApiError::Mxc(_)
+        | ApiError::Mcp(_)
+        | ApiError::WinMl(_)
+        | ApiError::Services(_)
+        | ApiError::Io(_)
+        | ApiError::Json(_) => S::INTERNAL_SERVER_ERROR,
+    };
+    (status, code_of_kind(e.kind()), e.kind())
+}
+
+/// The REST code of an error kind ([`ApiError::kind`]).
+fn code_of_kind(kind: &str) -> &'static str {
+    match kind {
+        "InvalidInput" => "INVALID_INPUT",
+        "NotFound" => "NOT_FOUND",
+        "Config" => "CONFIG",
+        "Unsupported" => "UNSUPPORTED",
+        "ContractGap" => "CONTRACT_GAP",
+        "Supervisor" => "SUPERVISOR",
+        "Wizard" => "WIZARD",
+        "Telemetry" => "TELEMETRY",
+        "Gateway" => "GATEWAY",
+        "Models" => "MODELS",
+        "Mxc" => "MXC",
+        "Mcp" => "MCP",
+        "WinMl" => "WINML",
+        "Services" => "SERVICES",
+        "Io" => "IO",
+        "Json" => "JSON",
+        "Busy" => "BUSY",
+        _ => OPERATION_FAILED,
     }
+}
+
+/// A refusal made before the work started.
+fn refusal_response(ctx: &ApiCtx, refusal: Refusal) -> Response {
+    error_response(ctx, &refusal.error, refusal.details)
 }
 
 /// Map an `ApiError` onto the JSON error envelope. The message passes through
@@ -541,20 +912,63 @@ pub fn error_response_raw(
     (status, axum::Json(body)).into_response()
 }
 
+/// The longest error message that crosses the wire. Long enough for a
+/// memory refusal that names every GPU and who uses it.
+const MAX_MESSAGE_CHARS: usize = 4000;
+
 /// Error strings from the app embed argv and filesystem paths; the
 /// REST layer scrubs the machine's roots before one crosses the
 /// wire and caps the length.
 pub fn sanitize(message: &str, data_dir: &std::path::Path) -> String {
-    let mut out = message.replace(&data_dir.display().to_string(), "<data-dir>");
-    if let Some(home) = home_dir_string() {
-        if !home.is_empty() {
-            out = out.replace(&home, "<home>");
-        }
-    }
-    if out.chars().count() > 400 {
-        out = out.chars().take(400).collect::<String>() + "…";
+    let mut out = scrub_roots(message, data_dir);
+    if out.chars().count() > MAX_MESSAGE_CHARS {
+        out = out.chars().take(MAX_MESSAGE_CHARS).collect::<String>() + "…";
     }
     out
+}
+
+/// Replace the data directory and the home directory, however they are
+/// spelled (letter case, slashes, doubled backslashes of a quoted path).
+fn scrub_roots(text: &str, data_dir: &std::path::Path) -> String {
+    let mut out = text.to_string();
+    let roots = [
+        (data_dir.display().to_string(), "<data-dir>"),
+        (home_dir_string().unwrap_or_default(), "<home>"),
+    ];
+    for (root, name) in roots {
+        let root = root.trim_end_matches(['/', '\\']);
+        if root.len() > 3 {
+            out = replace_path(&out, &root.replace('\\', "\\\\"), name);
+            out = replace_path(&out, root, name);
+        }
+    }
+    out
+}
+
+/// Replace `path` in `text`, ignoring ASCII case and slash direction.
+fn replace_path(text: &str, path: &str, with: &str) -> String {
+    // Both keep every byte offset.
+    let fold = |s: &str| s.to_ascii_lowercase().replace('/', "\\");
+    let (hay, needle) = (fold(text), fold(path));
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    while let Some(at) = hay[from..].find(&needle) {
+        out.push_str(&text[from..from + at]);
+        out.push_str(with);
+        from += at + needle.len();
+    }
+    out.push_str(&text[from..]);
+    out
+}
+
+/// [`scrub_roots`] for every string in a payload.
+fn scrub_value(value: &mut Value, data_dir: &std::path::Path) {
+    match value {
+        Value::String(s) => *s = scrub_roots(s, data_dir),
+        Value::Array(items) => items.iter_mut().for_each(|v| scrub_value(v, data_dir)),
+        Value::Object(fields) => fields.values_mut().for_each(|v| scrub_value(v, data_dir)),
+        _ => {}
+    }
 }
 
 fn home_dir_string() -> Option<String> {
@@ -623,17 +1037,70 @@ async fn handle_model_one(State(ctx): State<Arc<ApiCtx>>, Path(id): Path<String>
     }
 }
 
-async fn handle_operation_one(State(ctx): State<Arc<ApiCtx>>, Path(id): Path<String>) -> Response {
-    if let Some(record) = ctx.operations.get(&id) {
-        return axum::Json(record).into_response();
-    }
-    match dispatch_read(&ctx, Op::TasksList, json!({})).await {
-        Ok(list) => match find_by_id(&list, "tasks", &id) {
-            Some(t) => axum::Json(t).into_response(),
-            None => not_found(&ctx, "operation", &id),
+async fn handle_operation_one(
+    State(ctx): State<Arc<ApiCtx>>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> Response {
+    let row = match ctx.operations.get(&id) {
+        Some(record) => record,
+        None => match dispatch_read(&ctx, Op::TasksList, json!({})).await {
+            Ok(list) => match find_by_id(&list, "tasks", &id) {
+                Some(t) => {
+                    let operation = ctx.operations.operation_of_task(&id);
+                    task_row(t, operation.map(Value::from))
+                }
+                None => return not_found(&ctx, "operation", &id),
+            },
+            Err(r) => return *r,
+        },
+    };
+    axum::Json(visible_to(&ctx, &principal, row)).into_response()
+}
+
+/// The second generated gateway file (`llmdil_routing.py`).
+async fn handle_generated_routing(State(ctx): State<Arc<ApiCtx>>) -> Response {
+    match dispatch_read(&ctx, Op::GatewayPreviewYaml, json!({})).await {
+        Ok(v) => match v.get("routing_py").and_then(Value::as_str) {
+            Some(text) => (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/x-python")],
+                text.to_string(),
+            )
+                .into_response(),
+            None => error_response(
+                &ctx,
+                &ApiError::NotFound(
+                    "no routing file is generated: no routing rule or overflow setting needs one"
+                        .to_string(),
+                ),
+                None,
+            ),
         },
         Err(r) => *r,
     }
+}
+
+fn json_result(ctx: &ApiCtx, result: Result<Value, ApiError>) -> Response {
+    match result {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => error_response(ctx, &e, None),
+    }
+}
+
+async fn handle_snapshots(State(ctx): State<Arc<ApiCtx>>) -> Response {
+    json_result(&ctx, manager_app::telemetry_snapshots(&ctx.app))
+}
+
+async fn handle_snapshot_one(State(ctx): State<Arc<ApiCtx>>, Path(id): Path<String>) -> Response {
+    json_result(&ctx, manager_app::telemetry_snapshot(&ctx.app, &id))
+}
+
+async fn handle_snapshot_delete(
+    State(ctx): State<Arc<ApiCtx>>,
+    Path(id): Path<String>,
+) -> Response {
+    json_result(&ctx, manager_app::telemetry_snapshot_delete(&ctx.app, &id))
 }
 
 async fn handle_log_scopes(State(ctx): State<Arc<ApiCtx>>) -> Response {
@@ -731,23 +1198,34 @@ async fn handle_group_patch(
     }
 }
 
-async fn handle_group_delete(State(ctx): State<Arc<ApiCtx>>, Path(name): Path<String>) -> Response {
-    match composites::delete_group(&ctx, &name).await {
-        Ok(v) => axum::Json(v).into_response(),
-        Err(e) => error_response(&ctx, &e, None),
-    }
+async fn handle_group_delete(
+    State(ctx): State<Arc<ApiCtx>>,
+    Path(name): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let cascade = match query.get("cascade").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => {
+            let e = ApiError::InvalidInput("`cascade` must be true or false".to_string());
+            return error_response(&ctx, &e, None);
+        }
+    };
+    json_result(&ctx, composites::delete_group(&ctx, &name, cascade).await)
 }
 
 async fn handle_gateway_start(State(ctx): State<Arc<ApiCtx>>) -> Response {
     // The start-gateway step is minutes-scale: it runs as an
     // operation like its registry route does.
-    let (id, record) = ctx.operations.begin("gateway_start");
-    let spawn_ctx = ctx.clone();
-    tokio::spawn(async move {
-        let result = composites::gateway_start(&spawn_ctx).await;
-        finish_operation(&spawn_ctx, &id, "gateway_start", result);
-    });
-    (axum::http::StatusCode::ACCEPTED, axum::Json(record)).into_response()
+    let step = json!({ "step_id": "start-gateway" });
+    if let Err(refusal) = manager_app::precheck_operation(&ctx.app, Op::RunWizardStep, &step).await
+    {
+        return refusal_response(&ctx, refusal);
+    }
+    let work_ctx = ctx.clone();
+    spawn_operation(&ctx, "gateway_start", async move {
+        composites::gateway_start(&work_ctx).await
+    })
 }
 
 async fn handle_activation_apply(
@@ -764,13 +1242,15 @@ async fn handle_activation_apply(
     if let Err(e) = composites::validate_apply_body(&parsed) {
         return error_response(&ctx, &e, None);
     }
-    let (id, record) = ctx.operations.begin("activation_apply");
-    let spawn_ctx = ctx.clone();
-    tokio::spawn(async move {
-        let result = composites::activation_apply(&spawn_ctx, parsed).await;
-        finish_operation(&spawn_ctx, &id, "activation_apply", result);
-    });
-    (axum::http::StatusCode::ACCEPTED, axum::Json(record)).into_response()
+    if let Err(refusal) =
+        manager_app::precheck_operation(&ctx.app, Op::ActivationApply, &parsed).await
+    {
+        return refusal_response(&ctx, refusal);
+    }
+    let work_ctx = ctx.clone();
+    spawn_operation(&ctx, "activation_apply", async move {
+        composites::activation_apply(&work_ctx, parsed).await
+    })
 }
 
 async fn handle_bundle_content(
@@ -833,8 +1313,13 @@ impl futures_core::Stream for MpscEventStream {
 /// The SSE `data` for one bus event: the producer's payload with an
 /// additive `origin` (`desktop` | `api` | `app`) when the payload is
 /// an object that does not already carry one.
-fn sse_data(env: &manager_app::event_bus::BusEvent) -> String {
+/// A task record carries the paths its operation row does, and goes by
+/// the same rule (`visible_to`).
+fn sse_data(ctx: &ApiCtx, principal: &Principal, env: &manager_app::event_bus::BusEvent) -> String {
     let mut payload = env.payload.clone();
+    if env.event == manager_app::events::TASK_PROGRESS {
+        payload = visible_to(ctx, principal, payload);
+    }
     if let Some(obj) = payload.as_object_mut() {
         obj.entry("origin")
             .or_insert_with(|| json!(env.origin.as_str()));
@@ -845,7 +1330,10 @@ fn sse_data(env: &manager_app::event_bus::BusEvent) -> String {
 /// `GET /events`: the app event bus (every UI event, whichever surface
 /// caused it — desktop IPC, this API, or background producers). The
 /// subscription also keeps the bus's background producers running.
-async fn handle_events(State(ctx): State<Arc<ApiCtx>>) -> Response {
+async fn handle_events(
+    State(ctx): State<Arc<ApiCtx>>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
     let mut events = manager_app::event_bus::subscribe(&ctx.app);
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
@@ -862,7 +1350,7 @@ async fn handle_events(State(ctx): State<Arc<ApiCtx>>) -> Response {
                     let event = axum::response::sse::Event::default()
                         .id(id.to_string())
                         .event(env.event.clone())
-                        .data(sse_data(&env));
+                        .data(sse_data(&ctx, &principal, &env));
                     if tx.send(Ok(event)).await.is_err() {
                         break;
                     }
@@ -893,16 +1381,86 @@ mod tests {
         let msg = format!("failed at {}/models/x.gguf", dir.display());
         let out = sanitize(&msg, dir);
         assert_eq!(out, "failed at <data-dir>/models/x.gguf");
-        let long = "x".repeat(500);
-        assert!(sanitize(&long, dir).chars().count() <= 401);
+        // A memory refusal for several GPUs stays whole.
+        let refusal = "x".repeat(2000);
+        assert_eq!(sanitize(&refusal, dir), refusal);
+        let long = "x".repeat(5000);
+        assert!(sanitize(&long, dir).chars().count() <= MAX_MESSAGE_CHARS + 1);
     }
 
     #[test]
-    fn coercion_prefers_numbers_then_bool() {
-        assert_eq!(coerce_query_value("42"), json!(42));
-        assert_eq!(coerce_query_value("4.5"), json!(4.5));
-        assert_eq!(coerce_query_value("true"), json!(true));
-        assert_eq!(coerce_query_value("abc"), json!("abc"));
+    fn scrubbing_ignores_how_a_path_is_spelled() {
+        let dir = std::path::Path::new("D:\\LLM\\Data");
+        for text in [
+            "D:\\LLM\\Data\\x.zip",
+            "d:\\llm\\data\\x.zip",
+            "D:/LLM/Data/x.zip",
+            "\"D:\\\\LLM\\\\Data\\\\x.zip\"",
+        ] {
+            let mut v = json!({ "a": [{ "path": text }], "n": 1 });
+            scrub_value(&mut v, dir);
+            let out = v["a"][0]["path"].as_str().unwrap();
+            assert!(out.contains("<data-dir>"), "{text} -> {out}");
+            assert!(!out.to_lowercase().contains("llm"), "{text} -> {out}");
+        }
+        assert_eq!(scrub_roots("größer als 3 GB", dir), "größer als 3 GB");
+    }
+
+    #[test]
+    fn query_values_are_read_by_type() {
+        let text = json!({ "anyOf": [{ "type": "string" }, { "type": "null" }] });
+        for raw in ["42", "inf", "true", "nan", ""] {
+            assert_eq!(query_value(&text, raw), Ok(json!(raw)));
+        }
+        let count = json!({ "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] });
+        assert_eq!(query_value(&count, "42"), Ok(json!(42)));
+        for raw in ["-1", "4.5", "x", ""] {
+            assert!(query_value(&count, raw).is_err(), "{raw}");
+        }
+        let flag = json!({ "type": "boolean" });
+        assert_eq!(query_value(&flag, "true"), Ok(json!(true)));
+        assert!(query_value(&flag, "1").is_err());
+        let share = json!({ "type": "number" });
+        assert_eq!(query_value(&share, "4.5"), Ok(json!(4.5)));
+        assert!(query_value(&share, "inf").is_err());
+    }
+
+    #[test]
+    fn arguments_are_checked_against_the_declaration() {
+        let spec = |op| manager_app::registry::spec(op);
+        let stop = spec(Op::StopBackend);
+        assert!(check_args(stop, &json!({ "id": "a", "graceful": true })).is_ok());
+        assert!(check_args(stop, &json!({ "id": "a" })).is_err());
+        assert!(check_args(stop, &json!({ "id": "a", "graceful": 1 })).is_err());
+        let start = spec(Op::StartBackend);
+        for (secs, ok) in [
+            (json!(5), true),
+            (json!(0), true),
+            (Value::Null, true),
+            (json!(-1), false),
+            (json!("5"), false),
+        ] {
+            let args = json!({ "id": "a", "wait_ready_secs": secs });
+            assert_eq!(check_args(start, &args).is_ok(), ok, "{args}");
+        }
+    }
+
+    /// Every operation's own sample arguments pass the check that runs
+    /// before its route answers 202.
+    #[test]
+    fn sample_arguments_pass_the_check() {
+        for spec in OP_SPECS {
+            let args: Map<String, Value> = request_params(spec.op)
+                .into_iter()
+                .map(|p| (p.name.to_string(), p.sample))
+                .collect();
+            assert_eq!(
+                check_args(spec, &Value::Object(args)),
+                Ok(()),
+                "{}",
+                spec.name
+            );
+        }
     }
 
     #[test]
@@ -914,17 +1472,27 @@ mod tests {
             "ok": false,
             "outcome": { "state": "failed", "message": "gateway did not answer" },
         });
-        let (message, detail) = operation_outcome(Ok(failed.clone())).unwrap_err();
-        assert_eq!(message, "the operation failed");
-        assert_eq!(detail, Some(failed));
+        let f = operation_outcome(Ok(failed.clone())).unwrap_err();
+        assert_eq!(f.message, "the operation failed");
+        assert_eq!((f.code, f.kind), ("OPERATION_FAILED", "OperationFailed"));
+        assert_eq!(f.detail, Some(failed));
 
         // A refused run (busy) fails too, naming what is running.
         let busy = json!({
             "task_id": "t2", "busy": true, "ok": false, "outcome": null,
             "running_step": "gateway restarting (activation)",
         });
-        let (message, _) = operation_outcome(Ok(busy)).unwrap_err();
-        assert_eq!(message, "busy: gateway restarting (activation) is running");
+        let f = operation_outcome(Ok(busy)).unwrap_err();
+        assert_eq!(
+            f.message,
+            "busy: gateway restarting (activation) is running"
+        );
+        assert_eq!(f.code, "BUSY");
+
+        // An audit that did not run because another one does.
+        let audit = json!({ "task_id": "t", "already_running": true, "done": 0, "steps": [] });
+        let f = operation_outcome(Ok(audit)).unwrap_err();
+        assert_eq!((f.code, f.kind), ("BUSY", "Busy"));
 
         // An activation apply with a failed item fails with its message
         // (ACT-1/GW-7), keeping the items and execution id as detail.
@@ -933,9 +1501,9 @@ mod tests {
             "message": "gateway restart failed: port in use",
             "execution_id": "e1", "items": [],
         });
-        let (message, detail) = operation_outcome(Ok(apply)).unwrap_err();
-        assert_eq!(message, "gateway restart failed: port in use");
-        assert_eq!(detail.unwrap()["execution_id"], "e1");
+        let f = operation_outcome(Ok(apply)).unwrap_err();
+        assert_eq!(f.message, "gateway restart failed: port in use");
+        assert_eq!(f.detail.unwrap()["execution_id"], "e1");
 
         // Success: ok true, or a payload with no ok/busy at all.
         let done = json!({ "task_id": "t3", "ok": true, "outcome": { "state": "done" } });
@@ -943,15 +1511,13 @@ mod tests {
         assert!(operation_outcome(Ok(json!({ "task_id": "t4" }))).is_ok());
 
         // An op error keeps its text and has no detail.
-        let (message, detail) = operation_outcome(Err(ApiError::Busy(
+        let f = operation_outcome(Err(ApiError::Busy(
             "gateway restart already in progress".into(),
         )))
         .unwrap_err();
-        assert!(
-            message.contains("gateway restart already in progress"),
-            "{message}"
-        );
-        assert!(detail.is_none());
+        assert!(f.message.contains("already in progress"), "{}", f.message);
+        assert_eq!((f.code, f.kind), ("BUSY", "Busy"));
+        assert!(f.detail.is_none());
     }
 
     #[test]

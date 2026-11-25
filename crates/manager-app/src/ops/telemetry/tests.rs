@@ -218,3 +218,20 @@ fn metrics_fetch_direct_200_and_error_status() {
     let port = metrics_test_server(std::collections::HashMap::new(), 1);
     assert_eq!(fetch_gateway_metrics("127.0.0.1", port, "k"), None);
 }
+
+/// D11: an interval that cannot be saved is not applied either.
+#[tokio::test]
+async fn an_unsaved_interval_is_not_applied() {
+    let cfg = AppConfig::default_config();
+    let before = cfg.telemetry.poll_interval_ms;
+    let dir = crate::test_support::unique_test_dir("llm-mgr-interval");
+    // The config path is a directory, so no save can succeed.
+    std::fs::create_dir_all(dir.join("config.json").join("x")).unwrap();
+    let state = Arc::new(AppState::new(cfg, dir.join("config.json"), dir.clone()));
+    let sink = crate::test_support::test_sink();
+    assert!(op_telemetry_set_interval(&state, &sink, 5000)
+        .await
+        .is_err());
+    assert_eq!(state.config.read().await.telemetry.poll_interval_ms, before);
+    let _ = std::fs::remove_dir_all(&dir);
+}

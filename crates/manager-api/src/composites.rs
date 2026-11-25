@@ -215,8 +215,17 @@ pub async fn create_group(ctx: &ApiCtx, body: Value) -> Result<Value, ApiError> 
     create_group_inner(ctx, body).await
 }
 
+/// The name follows the app's own rule, and a body with a name alone IS
+/// the app's create (an empty group).
 async fn create_group_inner(ctx: &ApiCtx, body: Value) -> Result<Value, ApiError> {
-    let group = normalize_group(&body)?;
+    let mut group = normalize_group(&body)?;
+    let trimmed = group_name(&group).unwrap_or_default().trim().to_string();
+    manager_config::validate_group_name(&trimmed).map_err(invalid)?;
+    if body.as_object().is_some_and(|o| o.len() == 1) {
+        call(ctx, Op::GatewayCreateGroup, json!({ "name": trimmed })).await?;
+        return Ok(json!({ "name": trimmed }));
+    }
+    group["name"] = json!(trimmed);
     let name = group_name(&group).unwrap_or_default().to_string();
     let mut groups = gateway_groups(ctx).await?;
     if groups.iter().any(|g| group_name(g) == Some(name.as_str())) {
@@ -255,13 +264,15 @@ async fn patch_group_inner(ctx: &ApiCtx, name: &str, body: Value) -> Result<Valu
     Ok(json!({ "name": name }))
 }
 
-/// DELETE /api/v1/gateway/groups/{name}.
-pub async fn delete_group(ctx: &ApiCtx, name: &str) -> Result<Value, ApiError> {
+/// DELETE /api/v1/gateway/groups/{name}: the app's own delete, which
+/// refuses a group with members; with `cascade` the group goes with its
+/// membership.
+pub async fn delete_group(ctx: &ApiCtx, name: &str, cascade: bool) -> Result<Value, ApiError> {
     let _guard = ctx.config_write_lock.lock().await;
-    delete_group_inner(ctx, name).await
-}
-
-async fn delete_group_inner(ctx: &ApiCtx, name: &str) -> Result<Value, ApiError> {
+    if !cascade {
+        call(ctx, Op::GatewayDeleteGroup, json!({ "name": name })).await?;
+        return Ok(json!({ "deleted": name }));
+    }
     let mut groups = gateway_groups(ctx).await?;
     let before = groups.len();
     groups.retain(|g| group_name(g) != Some(name));
@@ -328,6 +339,9 @@ pub async fn activation_apply(ctx: &ApiCtx, body: Value) -> Result<Value, ApiErr
 /// route handler in place of a direct dispatch.
 pub async fn update_gateway_config(ctx: &ApiCtx, patch: Value) -> Result<Value, ApiError> {
     let _guard = ctx.config_write_lock.lock().await;
+    // The whole patch first, so a bad field beside `bind_host` does not
+    // leave the bind address saved.
+    manager_app::check_gateway_patch(&ctx.app, patch.clone()).await?;
     let mut patch = patch;
     let bind = patch.as_object_mut().and_then(|o| o.remove("bind_host"));
     let mut bind_result: Option<Value> = None;

@@ -536,6 +536,15 @@ pub async fn op_get_logs(
     limit: Option<u64>,
 ) -> ApiResult {
     let limit = limit.unwrap_or(200) as usize;
+    // Strict like `order`: an unknown level used to answer unfiltered.
+    let level = match level.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(l) => Some(LogLevelFilter::parse(l).ok_or_else(|| {
+            ApiError::InvalidInput(format!(
+                "unknown log level {l:?}; expected \"error\", \"warn\", \"info\" or \"debug\""
+            ))
+        })?),
+    };
     let backend_ids: Vec<String> = state
         .config
         .read()
@@ -592,7 +601,7 @@ pub async fn op_get_logs(
             None => scopes.push(json!({ "id": id, "previous": previous })),
         }
     }
-    if let Some(filter) = level.as_deref().and_then(LogLevelFilter::parse) {
+    if let Some(filter) = level {
         records.retain(|r| filter.matches(&r.record.line));
     }
     if let Some(search) = &search {

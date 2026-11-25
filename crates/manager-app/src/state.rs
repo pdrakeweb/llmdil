@@ -350,12 +350,16 @@ impl AppState {
 
     pub(crate) async fn record_task(&self, kind: &str, detail: Value) -> String {
         let id = self.tasks.next_id();
+        let now = now_ms();
         let record = TaskRecord {
             id: id.clone(),
             kind: kind.to_string(),
             status: TaskStatus::Running,
             detail,
-            created_ms: now_ms(),
+            created_ms: now,
+            started_ms: now,
+            finished_ms: None,
+            error: None,
         };
         // The control exists before the record, so an abort that
         // finds the record running always finds its token.
@@ -366,6 +370,7 @@ impl AppState {
         event_bus::publish_task(self, &record);
         tasks.insert(id.clone(), record);
         drop(tasks);
+        tasks::link_task(self, &id);
         tasks::task_started(&id, kind);
         id
     }

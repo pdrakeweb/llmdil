@@ -380,8 +380,9 @@ pub fn drift_unexplained(drift_pending: bool, pending: &[ActivationEntry]) -> bo
 }
 
 /// The backends an edit touched, for a gateway-scope entry's
-/// `targets`: those whose own configuration or group membership
-/// differs, in configuration order, then the removed ones.
+/// `targets`: those whose own configuration, group membership or
+/// group's routing differs, in configuration order, then the removed
+/// ones.
 pub fn touched_backends(pre: &AppConfig, post: &AppConfig) -> Vec<String> {
     let view = |cfg: &AppConfig, id: &str| {
         let backend = cfg
@@ -389,12 +390,12 @@ pub fn touched_backends(pre: &AppConfig, post: &AppConfig) -> Vec<String> {
             .iter()
             .find(|b| b.id == id)
             .and_then(|b| serde_json::to_value(b).ok());
-        let groups: Vec<String> = cfg
+        let groups: Vec<_> = cfg
             .gateway
             .groups
             .iter()
             .filter(|g| g.members.iter().any(|m| m == id))
-            .map(|g| g.name.clone())
+            .map(|g| (g.name.clone(), g.strategy, g.fallbacks.clone()))
             .collect();
         (backend, groups)
     };

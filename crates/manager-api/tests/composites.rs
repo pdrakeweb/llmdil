@@ -184,10 +184,20 @@ async fn group_crud_round_trip() {
     assert_eq!(g1["strategy"], "least-busy");
     assert_eq!(g1["members"][0], "planner", "patch merges, not replaces");
 
+    // It has a member: only a cascade deletes it (D08).
     let (status, _) = call(
         &ctx,
         Method::DELETE,
         "/api/v1/gateway/groups/g1",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = call(
+        &ctx,
+        Method::DELETE,
+        "/api/v1/gateway/groups/g1?cascade=true",
         Some(&admin),
         None,
     )

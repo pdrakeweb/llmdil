@@ -773,6 +773,31 @@ pub async fn op_start_backend(
     backend_lifecycle::start_backend(state, sink, &id, opts).await
 }
 
+/// Wait until a backend that was just started answers `/health` (the
+/// Admin API's `wait_ready_secs` on start; the restart operation has its
+/// own). The start itself already ended, so a wait that runs out leaves
+/// the backend loading.
+pub async fn wait_started_backend(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    id: &str,
+    secs: u64,
+    origin: Option<&str>,
+    event_origin: event_bus::EventOrigin,
+) -> Result<(), ApiError> {
+    let sink = event_bus::bus_sink(state, Arc::clone(sink), event_origin);
+    let sink = logship::tap_sink(state, sink);
+    backend_lifecycle::wait_backend_ready(
+        state,
+        sink.as_ref(),
+        id,
+        Duration::from_secs(secs),
+        op_origin(origin),
+    )
+    .await
+    .map_err(|e| ApiError::Supervisor(format!("backend {id} {e}")))
+}
+
 /// Stop a backend, gracefully (drain) or immediately. A thin wrapper
 /// over [`backend_lifecycle::stop_backend`].
 pub async fn op_stop_backend(
@@ -846,13 +871,17 @@ pub async fn op_test_backend(
     id: String,
     prompt: String,
 ) -> ApiResult {
-    let cfg = state.config.read().await;
-    let backend = cfg
-        .backends
-        .iter()
-        .find(|b| b.id == id)
-        .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
-    let base_url = format!("http://127.0.0.1:{}", backend.port);
+    // The read guard is dropped before the request: held across it, a
+    // save (and every read behind it) waited for the model's answer.
+    let base_url = {
+        let cfg = state.config.read().await;
+        let backend = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+        format!("http://127.0.0.1:{}", backend.port)
+    };
     let result = test_request(&base_url, &prompt)
         .await
         .map_err(ApiError::from)?;

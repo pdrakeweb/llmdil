@@ -240,7 +240,8 @@ Coverage positions across the documents:
   MCP mode toggles — while still specifying them for completeness.
   The auth classes already cover them (Class X, admin-only)
   **[auth §1]**, so adding them later is additive. Decision 10.
-- **Stubs stay stubs.** `updates_check_all` and `updates_apply`
+- **Stubs stay stubs.** (Superseded: both are implemented and routed,
+  apply for admins; rest-api.md §6.14.) `updates_check_all` and `updates_apply`
   always error `Unsupported` in the app today **[audit §12]**;
   the contract reserves their paths and returns `501 UNSUPPORTED`
   **[rest §6.14]**. **[impl D7]** additionally recommends
@@ -432,9 +433,8 @@ From **[rest]**, the contract the Android client is built against:
   keeps it (download byte progress on the model resource), so the
   operation is a completion handle, not the progress channel.
   `POST /operations/{id}/abort` maps to the app's task abort with
-  its real semantics stated plainly: it is bookkeeping-level
-  best-effort per kind, and the response reports the resulting
-  state (§2.5).
+  its real semantics stated plainly: it is best-effort per kind, and
+  the response reports the resulting state (§2.5, rest-api.md §6.10).
 - **Collections** return the app's envelope key, complete and
   unpaged (operator-scale lists). The one true paged query is logs,
   keeping `get_logs`' exact semantics (offset/limit, filters,
@@ -887,9 +887,8 @@ truth:
 - `GET /api/v1/events` (SSE) is an API-layer derived route, not a
   registry operation; the audit-log read path is
   `GET /api/v1/admin/audit` (§3.4's `GET /admin/audit` omits the
-  prefix). Both `POST /updates/check` and
-  `POST /updates/components/{component_id}/apply` return 501
-  UNSUPPORTED from the app's stubs.
+  prefix). (`POST /updates/check` and the component apply, stubs when
+  this was written, are implemented since; rest-api.md §6.14.)
 
 **Registry drift mechanism.** As specified in section 3.1:
 `for_each_operation!` in manager-app is the single declaration;
@@ -912,9 +911,10 @@ read-modify-write sequences are serialized by a per-context lock.
 **Asynchronous endpoints.** AsyncOp routes, gateway start, and
 the activation apply answer 202 with an API-side operation record
 (TaskRecord shape), retained for the process lifetime and merged
-into `GET /operations`. Abort is bookkeeping with the app's
-semantics: the record flips to aborted; the underlying work is
-not cancellable and its completion never overwrites the abort.
+into `GET /operations`. A record knows the app task its work runs as;
+its abort cancels that task. Work without a task cannot be cancelled:
+its record is marked aborted and keeps what the work did later. A
+finished record is never rewritten (rest-api.md §6.10).
 
 **Events.** `GET /api/v1/events` (SSE) carries the app's
 operation events with process-global ids. Live-only: nothing is

@@ -251,6 +251,9 @@ pub(crate) fn fetch_backend_slots(port: u16) -> Option<String> {
     Some(resp.body)
 }
 
+/// The poll intervals a save accepts, besides 0 (off).
+const TELEMETRY_INTERVAL_MS: std::ops::RangeInclusive<u64> = 500..=60_000;
+
 /// Set the telemetry poll interval. Persisted immediately via
 /// `manager_config::save`; the running poller's cadence is fixed when
 /// the poller starts (PollHandle exposes no re-cadence), so the new
@@ -264,9 +267,17 @@ pub async fn op_telemetry_set_interval(
     // the poller starts (PollHandle exposes no re-cadence), so the new
     // interval takes effect on the next app start; the GPUs view labels
     // the control accordingly.
+    if ms != 0 && !TELEMETRY_INTERVAL_MS.contains(&ms) {
+        return Err(ApiError::InvalidInput(format!(
+            "the poll interval must be 0 (off) or {} to {} ms",
+            TELEMETRY_INTERVAL_MS.start(),
+            TELEMETRY_INTERVAL_MS.end()
+        )));
+    }
     let mut cfg = state.config.write().await;
-    cfg.telemetry.poll_interval_ms = ms;
-    manager_config::save(&cfg, &state.config_path)?;
+    mutate_save_install(&mut cfg, &state.config_path, |cfg| {
+        cfg.telemetry.poll_interval_ms = ms;
+    })?;
     Ok(json!({ "ok": true, "poll_interval_ms": ms }))
 }
 
@@ -285,11 +296,61 @@ pub async fn op_telemetry_save_snapshot(
     _sink: &Arc<dyn EventSink>,
 ) -> ApiResult {
     let samples: Vec<GpuSample> = lock_telemetry(&state.telemetry().await).snapshot();
-    let path = state
-        .data_dir
-        .join(format!("telemetry-snapshot-{}.json", now_ms()));
+    let at = now_ms();
+    let path = snapshot_path(&state.data_dir, at);
     std::fs::write(&path, serde_json::to_string_pretty(&samples)?).map_err(ApiError::from)?;
-    Ok(json!({ "path": path }))
+    Ok(json!({ "path": path, "id": at.to_string(), "created_ms": at }))
+}
+
+/// A snapshot's file; its id is the moment it was taken (epoch ms).
+fn snapshot_path(data_dir: &std::path::Path, at_ms: u64) -> PathBuf {
+    data_dir.join(format!("telemetry-snapshot-{at_ms}.json"))
+}
+
+/// The file of snapshot `id`, which must be one the list names.
+fn existing_snapshot(state: &AppState, id: &str) -> Result<(u64, PathBuf), ApiError> {
+    id.parse::<u64>()
+        .ok()
+        .filter(|at| at.to_string() == id)
+        .map(|at| (at, snapshot_path(&state.data_dir, at)))
+        .filter(|(_, path)| path.is_file())
+        .ok_or_else(|| ApiError::NotFound(format!("telemetry snapshot {id}")))
+}
+
+/// The saved telemetry snapshots, newest first:
+/// `{snapshots: [{id, created_ms, size_bytes}]}`.
+pub fn telemetry_snapshots(state: &AppState) -> ApiResult {
+    let mut found: Vec<(u64, u64)> = std::fs::read_dir(&state.data_dir)?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let id = name
+                .strip_prefix("telemetry-snapshot-")?
+                .strip_suffix(".json")?;
+            let (at, path) = existing_snapshot(state, id).ok()?;
+            Some((at, std::fs::metadata(path).ok()?.len()))
+        })
+        .collect();
+    found.sort_unstable_by(|a, b| b.cmp(a));
+    let rows: Vec<Value> = found
+        .into_iter()
+        .map(|(at, size)| json!({ "id": at.to_string(), "created_ms": at, "size_bytes": size }))
+        .collect();
+    Ok(json!({ "snapshots": rows }))
+}
+
+/// One saved snapshot: `{id, created_ms, samples}`.
+pub fn telemetry_snapshot(state: &AppState, id: &str) -> ApiResult {
+    let (at, path) = existing_snapshot(state, id)?;
+    let samples: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    Ok(json!({ "id": id, "created_ms": at, "samples": samples }))
+}
+
+/// Delete one saved snapshot.
+pub fn telemetry_snapshot_delete(state: &AppState, id: &str) -> ApiResult {
+    let (_, path) = existing_snapshot(state, id)?;
+    std::fs::remove_file(path)?;
+    Ok(json!({ "id": id, "deleted": true }))
 }
 
 pub(crate) struct MetricsHttpResponse {

@@ -146,6 +146,8 @@ fn derived_class(method: &str, path: &str) -> AuthClass {
         // Same class as the app's own delete (destructive).
         ("DELETE", "/api/v1/gateway/groups/{name}") => op_class("gateway_delete_group"),
         ("PATCH", "/api/v1/models/{id}") => op_class("model_set_enabled"),
+        ("GET", "/api/v1/gateway/generated-routing") => op_class("gateway_preview_yaml"),
+        ("DELETE", "/api/v1/telemetry/snapshots/{id}") => AuthClass::Class(CapClass::D),
         ("POST", "/api/v1/gateway/start") => op_class("run_wizard_step"),
         ("POST", "/api/v1/activation-plan/apply") => AuthClass::Class(CapClass::L),
         ("GET", "/api/v1/diagnostics/bundles/{bundle_id}/content") => {
@@ -233,7 +235,8 @@ pub struct AuthMwState {
 }
 
 /// Middleware: request id -> principal resolution -> role guard ->
-/// handler -> mutation audit. Runs around the whole router.
+/// handler -> audit of mutations, refusals and disclosures. Runs
+/// around the whole router.
 pub async fn auth_middleware(
     State(mw): State<AuthMwState>,
     mut req: axum::extract::Request,
@@ -297,6 +300,19 @@ pub async fn auth_middleware(
                         }
                         if let AuthClass::Class(c) = class {
                             if !role_allows(p.role, c) {
+                                mw.ctx.audit.append(&AuditEntry {
+                                    ts_ms: now_ms(),
+                                    actor: p.username.clone(),
+                                    auth_type: p.auth_type.as_str().to_string(),
+                                    source_ip: source_ip.clone(),
+                                    action: format!(
+                                        "{method} {}",
+                                        template_for_audit(&mw.table, &method, &path)
+                                    ),
+                                    target: audit_target(&path),
+                                    result: StatusCode::FORBIDDEN.as_u16().to_string(),
+                                    request_id: request_id.clone(),
+                                });
                                 return finish(
                                     error_response_raw(
                                         StatusCode::FORBIDDEN,
@@ -342,12 +358,13 @@ pub async fn auth_middleware(
     if let Some(p) = &principal {
         req.extensions_mut().insert(p.clone());
     }
-    let is_mutation = matches!(
+    // Reads are not audited, except the disclosure ones (auth plan §4.3).
+    let audited = matches!(
         method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    );
+    ) || class == Some(AuthClass::Class(CapClass::SDisclosure));
     let resp = next.run(req).await;
-    if is_mutation {
+    if audited {
         if let Some(p) = &principal {
             mw.ctx.audit.append(&AuditEntry {
                 ts_ms: now_ms(),
