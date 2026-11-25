@@ -458,6 +458,17 @@ fn check_offload_expr(expr: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// The other half of "never alongside a measurement or experiment job":
+/// those do not start while a sweep runs.
+pub(crate) async fn refuse_during_sweep(state: &AppState) -> Result<(), ApiError> {
+    match state.bench.job.lock().await.is_some() {
+        true => Err(ApiError::Busy(
+            "a bench sweep is running; wait for it to end or cancel it".to_string(),
+        )),
+        false => Ok(()),
+    }
+}
+
 /// The refusal while another sweep holds the job slot.
 fn sweep_running() -> ApiError {
     ApiError::Busy("a bench sweep is already running".to_string())

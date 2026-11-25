@@ -249,6 +249,24 @@ pub(crate) fn note_drain_timeout(items: &mut [ActivationExecutionItem], quiesce:
     }
 }
 
+/// The start-gateway step's own warnings ("LiteLLM gateway running on
+/// :4001 — warning: the Windows firewall was not changed …"): the part
+/// of its message an applied change must not hide. Pure.
+pub(crate) fn gateway_step_warning(message: &str) -> Option<String> {
+    let (_, rest) = message.split_once(" — warning: ")?;
+    Some(rest.replace(" — warning: ", "; ").trim().to_string())
+}
+
+/// Say on every gateway item what the gateway's start warned about.
+pub(crate) fn note_gateway_warning(items: &mut [ActivationExecutionItem], warning: &str) {
+    for item in items.iter_mut().filter(|i| i.scope != "backend") {
+        item.detail = Some(match item.detail.take() {
+            Some(d) => format!("{d} Warning: {warning}"),
+            None => format!("Warning: {warning}"),
+        });
+    }
+}
+
 /// The execution status after the gateway step (the last step: reaching
 /// it means every step was attempted, so a failure there completes the
 /// execution with failures rather than aborting it). Pure.
@@ -476,6 +494,7 @@ pub async fn op_activation_apply(
                 Some(Origin::Activation),
                 Some(&line),
             );
+            let mut warning: Option<String> = None;
             let (ok, error) = match crate::op_gateway_restart(
                 state,
                 sink,
@@ -489,6 +508,7 @@ pub async fn op_activation_apply(
                         quiesce = p.get("quiesce").cloned();
                     }
                     if p["ok"] == json!(true) {
+                        warning = p["message"].as_str().and_then(gateway_step_warning);
                         (true, String::new())
                     } else {
                         manual_command = p["manual_command"].as_str().map(str::to_string);
@@ -525,16 +545,20 @@ pub async fn op_activation_apply(
             };
             mark_gateway_result(&mut items, ok, &error);
             note_drain_timeout(&mut items, quiesce.as_ref());
+            if let Some(w) = &warning {
+                note_gateway_warning(&mut items, w);
+            }
             gateway_restarted = ok;
             status = completed_status(&items);
             message = if ok {
-                match quiesce.as_ref().filter(|q| q["timed_out"] == json!(true)) {
-                    Some(q) => format!(
-                        "Gateway restarted — the saved changes are live. {}",
-                        crate::drain_timeout_detail(q)
-                    ),
-                    None => "Gateway restarted — the saved changes are live.".to_string(),
+                let mut text = "Gateway restarted — the saved changes are live.".to_string();
+                if let Some(q) = quiesce.as_ref().filter(|q| q["timed_out"] == json!(true)) {
+                    text.push_str(&format!(" {}", crate::drain_timeout_detail(q)));
                 }
+                if let Some(w) = &warning {
+                    text.push_str(&format!(" Warning: {w}"));
+                }
+                text
             } else {
                 error
             };

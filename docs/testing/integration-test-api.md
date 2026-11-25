@@ -406,14 +406,14 @@ $ConfigPath = $cfg0.config_path
 $MOE2    = '<id of another MoE model>'
 $SMALL   = '<id of a registered model that is not downloaded>'
 $WDDM    = 1        # index of a WDDM GPU, from nvidia-smi
-$N       = (Invoke-Llmdil GET '/telemetry/gpus').Body.samples.Count
+$GpuCount = (Invoke-Llmdil GET '/telemetry/gpus').Body.samples.Count
 function Get-SavedConfig { Get-Content $ConfigPath -Raw | ConvertFrom-Json -Depth 60 }
 function Get-SavedBackend([string]$Id) { (Get-SavedConfig).backends | Where-Object id -eq $Id }
 function Get-Pid([string]$Id) { $b = Get-Backend $Id; if ($b.child_pid) { $b.child_pid } else { $b.pid } }
 function Get-Argv([string]$Id) { (Get-CimInstance Win32_Process -Filter "ProcessId=$(Get-Pid $Id)").CommandLine }
 function Get-Props([string]$Id) { Invoke-RestMethod "http://127.0.0.1:$((Get-Backend $Id).port)/props" }
 function Get-GpuUsed { nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits }
-function One-Gpu([int]$g) { ,@(0..($N - 1) | ForEach-Object { $_ -eq $g ? 1.0 : 0.0 }) }
+function One-Gpu([int]$g) { ,@(0..($GpuCount - 1) | ForEach-Object { $_ -eq $g ? 1.0 : 0.0 }) }
 ```
 
 ## 3. Prepare
@@ -459,7 +459,7 @@ screen.
 | S-4 ★ | `GET /backends`, `GET /backends/{id}` | Rows have `id`, `group`, `model_file`, `state`; displayed name = `name` of the model with that `gguf_path` in `GET /models`. `GET /backends/nope` → `404 NOT_FOUND`. Sort, filter, menus: N/A (screen-only) | `config.json` |
 | S-5 | `GET /models`, `GET /models/{id}` | `on_disk`, `size_bytes`, `verified_at`. `GET /models/nope` → `404`. Forms: N/A (screen-only) | File size on disk |
 | S-6 ★ | Block below | | The log file |
-| S-7 ★ | `GET /gateway/config`, `/gateway/status`, `/gateway/generated-config` | `effective_strategy` and `status.groups` (enabled groups); YAML is `text/yaml`; `/gateway/generated-routing` is the second file (`404` without a rule). Running versus saved labels: N/A (screen-only); `status.port` is the port the gateway runs on | `gateway/config.yaml` |
+| S-7 ★ | `GET /gateway/config`, `/gateway/status`, `/gateway/generated-config` | `effective_strategy` and `status.groups` (enabled groups); YAML is `text/yaml`; `/gateway/generated-routing` is the second file (`404` without a rule). Running versus saved labels: N/A (screen-only); `status.port` is the saved port, `status.running_port` the one the gateway listens on | `gateway/config.yaml` |
 | S-8 | `GET /gateway/groups`, `/activation-plan`, `/activation-plan/history`, `GET /config` (`.mcp`) | 200. `GET /mcp/servers`, `/optimize`, `/bench/prompts`, `/bench/results` → 200 | Files in the data directory |
 | S-9 | `GET /config` | Equal to `config.json` field by field, apart from `config_path` | `config.json` |
 | S-10 | `GET /setup/status`, `/setup/steps`, `/setup/prerequisites`; `POST /setup/audit` | `setup_completed` true; `steps`, `done`, `total`; audit operation `done`; `409 BUSY` while another audit runs: repeat | Scope `wizard` in the logs |
@@ -578,8 +578,8 @@ Add-Bad @{ id = 'qa-qwen8b' }                 400 'INVALID_INPUT' '*already exis
 Add-Bad @{ id = 'QA!' }                       400 'INVALID_INPUT' '*lowercase*'
 Add-Bad @{ gpu_indices = @() }                400 'INVALID_INPUT' '*at least one GPU*'
 Add-Bad @{ gpu_indices = @(99) }              400 'INVALID_INPUT' '*not in the telemetry*'
-Add-Bad @{ port = (Get-Backend 'qa-coder7b').port } 422 'CONFIG' '*claimed by both*'
-Add-Bad @{ port = $cfg0.gateway.port }        422 'CONFIG' '*claimed by both*'
+Add-Bad @{ port = (Get-Backend 'qa-coder7b').port } 422 'CONFIG' '*is used by both*'
+Add-Bad @{ port = $cfg0.gateway.port }        422 'CONFIG' '*is used by both*'
 Add-Bad @{ port = 0 }                         400 'INVALID_INPUT'
 Add-Bad @{ port = 70000 }                     400 'INVALID_INPUT' '*port*'
 Add-Bad @{ port = $null }                     400 'INVALID_INPUT' '*port*'
@@ -866,8 +866,8 @@ Assert W-7 ((Set-QaRule @()).Status -eq 200) 'delete'
 Assert W-7 (@((Get-SavedConfig).gateway.routing_rules | Where-Object id -match '^qa-').Count -eq 0) 'gone from config.json'
 
 # W-8 fallbacks
-Assert-ApiError W-8 (Invoke-Llmdil PATCH '/gateway/groups/qa-small' -Body @{ fallbacks = @('qa-none') })  422 'CONFIG' '*unknown fallback*'
-Assert-ApiError W-8 (Invoke-Llmdil PATCH '/gateway/groups/qa-small' -Body @{ fallbacks = @('qa-small') }) 422 'CONFIG' '*unknown fallback*'
+Assert-ApiError W-8 (Invoke-Llmdil PATCH '/gateway/groups/qa-small' -Body @{ fallbacks = @('qa-none') })  400 'INVALID_INPUT' '*unknown fallback*'
+Assert-ApiError W-8 (Invoke-Llmdil PATCH '/gateway/groups/qa-small' -Body @{ fallbacks = @('qa-small') }) 400 'INVALID_INPUT' '*unknown fallback*'
 Assert W-8 ((Invoke-Llmdil PATCH '/gateway/groups/qa-small' -Body @{ fallbacks = @('qa-nemo') }).Status -eq 200) 'valid one saved'
 Assert W-8 ((Invoke-Llmdil PATCH '/gateway/groups/qa-small' -Body @{ fallbacks = 'x' }).Status -eq 400) 'wrong type refused'
 $null = Invoke-Llmdil PATCH '/gateway/groups/qa-small' -Body @{ fallbacks = @() }
@@ -889,7 +889,7 @@ Assert W-11 ((Invoke-Gateway 'qa-no-such-model').Status -eq 404) 'wrong model'
 | Id | Notes |
 |---|---|
 | W-1 | Second source: requests in scope `gateway` and both llama-server logs. The counts come from a poll every 15 s |
-| W-4 | Fallback names are **backend** ids or `openrouter`, not groups |
+| W-4 | Fallback names are **backend** ids or `openrouter`, not groups; the gateway reaches the backend through its group, so a fallback whose group has another name must show in `gateway/config.yaml` under that group's name |
 | W-8 | A fallback that is itself a member of the group is accepted (200): record ODD |
 | W-9 | Drag, menu and `Escape`: N/A (screen-only). Count the rows after moving and moving back; expected one net change or none |
 | W-10 | `PATCH /gateway/groups/qa-moe` `{"strategy":"least-busy"}` (`simple-shuffle`, `least-busy`, `latency-based`; anything else `400`), then `GET /gateway/config` → `effective_strategy`. "Why" is N/A (screen-only). The strategy is **global**: if `effective_strategy` changes, put it back before any apply |
@@ -982,13 +982,13 @@ Assert-ApiError M-2 (Invoke-Llmdil GET '/models/qa-model') 404 'NOT_FOUND'
 ```powershell
 # T-2 (ask first; the firewall step may open a Windows prompt on the machine)
 $old = (Get-SavedConfig).gateway.port
-Assert-ApiError T-2 (Invoke-Llmdil PATCH '/gateway/config' -Body @{ port = (Get-Backend 'qa-qwen8b').port }) 422 'CONFIG' '*claimed by both*'
-Assert-ApiError T-2 (Invoke-Llmdil PATCH '/gateway/config' -Body @{ port = 0 }) 422 'CONFIG' '*port 0*'
+Assert-ApiError T-2 (Invoke-Llmdil PATCH '/gateway/config' -Body @{ port = (Get-Backend 'qa-qwen8b').port }) 400 'INVALID_INPUT' '*is used by both*'
+Assert-ApiError T-2 (Invoke-Llmdil PATCH '/gateway/config' -Body @{ port = 0 }) 400 'INVALID_INPUT' '*1 to 65535*'
 Assert-ApiError T-2 (Invoke-Llmdil PATCH '/gateway/config' -Body @{ port = 70000 }) 400 'INVALID_INPUT'
 $new = Get-FreePort 18400
 Assert T-2 ((Invoke-Llmdil PATCH '/gateway/config' -Body @{ port = $new }).Status -eq 200) 'saved'
 Assert T-2 ((Get-Plan).pending) 'the plan shows it'
-Assert T-2 ((Invoke-Llmdil GET '/gateway/status').Body.port -eq $old) 'status still shows the running port'
+Assert T-2 ((Invoke-Llmdil GET '/gateway/status').Body.running_port -eq $old) 'status still shows the running port'
 $null = Assert-OperationDone T-2 (Invoke-Llmdil POST '/gateway/restart' -Body @{})
 Assert T-2 ([bool](Get-NetTCPConnection -State Listen -LocalPort $new -ErrorAction Ignore)) 'listens on the new port'
 $null = Invoke-Llmdil PATCH '/gateway/config' -Body @{ port = $old }

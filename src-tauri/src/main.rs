@@ -512,11 +512,21 @@ fn primary_lan_ip() -> Option<std::net::IpAddr> {
     }
 }
 
-/// The machine's Tailscale IPv4, when the Tailscale CLI answers.
+/// The machine's Tailscale IPv4, when the Tailscale CLI answers. The
+/// CLI waits for its service, so it gets two seconds: a stuck one must
+/// not keep the API from starting.
 fn tailscale_ip() -> Option<std::net::IpAddr> {
-    let out = std::process::Command::new("tailscale")
-        .args(["ip", "-4"])
-        .output()
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            std::process::Command::new("tailscale")
+                .args(["ip", "-4"])
+                .output(),
+        );
+    });
+    let out = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .ok()?
         .ok()?;
     if !out.status.success() {
         return None;

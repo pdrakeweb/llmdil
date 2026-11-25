@@ -367,3 +367,35 @@ fn drain_timeout_is_recorded_on_gateway_items() {
     assert!(detail.contains("timed out with 2 request(s)"), "{detail}");
     assert!(items[1].detail.is_none());
 }
+
+/// The start-gateway step succeeds with a warning when the Windows
+/// approval is declined: the apply says so.
+#[test]
+fn a_gateway_start_warning_is_part_of_the_result() {
+    assert_eq!(
+        gateway_step_warning("LiteLLM gateway running on :4001 — database active"),
+        None
+    );
+    let w = gateway_step_warning(
+        "LiteLLM gateway running on :4001 — warning: the Windows firewall was not changed — warning: x",
+    )
+    .unwrap();
+    assert_eq!(w, "the Windows firewall was not changed; x");
+    let mut items = vec![crate::activation_history::ActivationExecutionItem {
+        ts: String::new(),
+        kind: "gateway_config".to_string(),
+        summary: "x".to_string(),
+        scope: "gateway".to_string(),
+        targets: Vec::new(),
+        activation: "gateway_restart".to_string(),
+        outcome: "applied".to_string(),
+        detail: None,
+    }];
+    note_gateway_warning(&mut items, &w);
+    assert!(items[0]
+        .detail
+        .as_deref()
+        .unwrap()
+        .starts_with("Warning: the Windows"));
+    assert_eq!(items[0].outcome, "applied");
+}

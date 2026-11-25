@@ -460,6 +460,59 @@ impl StartGateway {
         self.prisma_package_dir(ctx).join("client.py")
     }
 
+    /// LiteLLM's own schema inside the venv.
+    pub(crate) fn litellm_schema_path(&self, ctx: &WizardContext) -> PathBuf {
+        let packages = self.prisma_package_dir(ctx);
+        packages
+            .parent()
+            .unwrap_or(&packages)
+            .join("litellm")
+            .join("proxy")
+            .join("schema.prisma")
+    }
+
+    /// The LiteLLM schema the client was last generated from: one
+    /// regeneration per schema, whatever the generator writes beside
+    /// the client.
+    pub(crate) fn generated_schema_stamp(&self, ctx: &WizardContext) -> PathBuf {
+        self.prisma_package_dir(ctx).join("llmdil-schema.prisma")
+    }
+
+    /// Whether the generated client belongs to another LiteLLM version.
+    /// The connect probe passes with an old client, but the gateway then
+    /// fails on every table that version did not have. Unreadable files
+    /// say nothing.
+    async fn generated_schema_is_stale(&self, ctx: &WizardContext) -> bool {
+        let read = |p: PathBuf| async move {
+            let bytes = ctx.ops.read_file(&p).await.ok()?;
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            Some(
+                text.lines()
+                    .map(str::trim_end)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        };
+        let Some(current) = read(self.litellm_schema_path(ctx)).await else {
+            return false;
+        };
+        // Without a stamp: the copy the generator keeps beside the client.
+        let used = match read(self.generated_schema_stamp(ctx)).await {
+            Some(s) => Some(s),
+            None => read(self.prisma_package_dir(ctx).join("schema.prisma")).await,
+        };
+        used.is_some_and(|used| used.trim() != current.trim())
+    }
+
+    async fn record_generated_schema(&self, ctx: &WizardContext) {
+        if let Ok(bytes) = ctx.ops.read_file(&self.litellm_schema_path(ctx)).await {
+            let _ = ctx
+                .ops
+                .write_file(&self.generated_schema_stamp(ctx), &bytes)
+                .await;
+        }
+    }
+
     /// Durable record of an in-progress Prisma repair:
     /// `<data_dir>/gateway/prisma-repair.json`. Written BEFORE the
     /// repair's first mutation and updated per phase; removed only
@@ -546,7 +599,15 @@ impl StartGateway {
         let (installed, version_probe_detail) = self.installed_prisma_version_probe(ctx).await;
         let version_ok = installed.as_deref() == Some(crate::PRISMA_PINNED_VERSION);
         let client_present = ctx.ops.file_exists(&self.generated_client_path(ctx)).await;
-        if version_ok && client_present {
+        let stale = client_present && self.generated_schema_is_stale(ctx).await;
+        if version_ok && client_present && stale {
+            push_log(
+                ctx,
+                log,
+                "LiteLLM's database schema is not the one the Prisma client was generated from (a LiteLLM update) — regenerating the client"
+                    .to_string(),
+            );
+        } else if version_ok && client_present {
             if self.prisma_probe_failure(ctx, database_url).await.is_none() {
                 push_log(
                     ctx,
@@ -587,7 +648,7 @@ impl StartGateway {
         self.write_prisma_repair_state(ctx, "pin", log).await;
         self.ensure_prisma_pin(ctx, uv, log).await?;
         self.write_prisma_repair_state(ctx, "probe", log).await;
-        if self.prisma_probe_failure(ctx, database_url).await.is_none() {
+        if !stale && self.prisma_probe_failure(ctx, database_url).await.is_none() {
             log.push("Prisma client verified after the pin repair".to_string());
             let _ = ctx
                 .ops
@@ -595,10 +656,12 @@ impl StartGateway {
                 .await;
             return Ok(());
         }
-        log.push(
-            "Prisma client probe failed — generating the client before the gateway starts"
-                .to_string(),
-        );
+        if !stale {
+            log.push(
+                "Prisma client probe failed — generating the client before the gateway starts"
+                    .to_string(),
+            );
+        }
         self.write_prisma_repair_state(ctx, "generate", log).await;
         let schema = self.resolve_prisma_schema(ctx, database_url, log).await?;
         log.push(format!(
@@ -607,6 +670,7 @@ impl StartGateway {
         ));
         self.run_prisma_generate(ctx, database_url, &schema, log)
             .await?;
+        self.record_generated_schema(ctx).await;
         self.write_prisma_repair_state(ctx, "verify", log).await;
         match self.prisma_probe_failure(ctx, database_url).await {
             None => {

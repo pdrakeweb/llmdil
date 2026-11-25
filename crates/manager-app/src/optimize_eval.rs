@@ -195,6 +195,7 @@ pub async fn op_optimize_run_baseline(
     _sink: &std::sync::Arc<dyn crate::EventSink>,
     backend_id: String,
 ) -> crate::ApiResult {
+    crate::bench::refuse_during_sweep(state).await?;
     {
         let slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
@@ -270,7 +271,7 @@ pub async fn op_optimize_run_baseline(
                 "a measurement or experiment job is already running".to_string(),
             ));
         }
-        *slot = Some(tx);
+        *slot = Some(crate::state::JobSlot::new(tx));
     }
     state
         .tasks

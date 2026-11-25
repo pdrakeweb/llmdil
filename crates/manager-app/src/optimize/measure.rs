@@ -119,6 +119,7 @@ pub async fn op_optimize_measure_backend(
     _sink: &std::sync::Arc<dyn crate::EventSink>,
     backend_id: String,
 ) -> crate::ApiResult {
+    crate::bench::refuse_during_sweep(state).await?;
     {
         let slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
@@ -166,7 +167,7 @@ pub async fn op_optimize_measure_backend(
                 "a measurement or experiment job is already running".to_string(),
             ));
         }
-        *slot = Some(tx);
+        *slot = Some(crate::state::JobSlot::new(tx));
     }
     state
         .tasks
@@ -352,6 +353,7 @@ pub async fn op_optimize_estimate_backend(
     _sink: &std::sync::Arc<dyn crate::EventSink>,
     backend_id: String,
 ) -> crate::ApiResult {
+    crate::bench::refuse_during_sweep(state).await?;
     {
         let slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
@@ -399,7 +401,7 @@ pub async fn op_optimize_estimate_backend(
                 "a measurement or experiment job is already running".to_string(),
             ));
         }
-        *slot = Some(tx);
+        *slot = Some(crate::state::JobSlot::new(tx));
     }
     state
         .tasks
@@ -551,15 +553,15 @@ pub async fn op_optimize_cancel_job(
 ) -> crate::ApiResult {
     let sender = {
         let mut slot = state.optimize.job_abort.lock().await;
-        slot.take()
+        slot.as_mut().and_then(|s| s.take_abort())
     };
     match sender {
         Some(tx) => {
             let _ = tx.send(());
             // Mutual exclusion (tracker #70): as with a cancelled
             // consultation, the cancel clears the benchmark's
-            // per-backend record now, so a consultation may start
-            // on that backend immediately.
+            // per-backend record now. The slot stays occupied until
+            // the job has ended (see JobSlot).
             clear_running_ops(state, OptimizeOpFamily::Benchmark);
             Ok(json!({ "cancelled": true }))
         }

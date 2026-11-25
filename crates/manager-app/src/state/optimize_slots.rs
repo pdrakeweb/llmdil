@@ -43,7 +43,7 @@ pub(crate) struct OptimizeState {
     /// at a time, separate from the consult slot because a
     /// consultation and a measurement are different jobs with
     /// different lifetimes.
-    pub(crate) job_abort: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    pub(crate) job_abort: Mutex<Option<JobSlot>>,
     /// The running Estimate/Measure job's descriptor (tracker
     /// #69): kind, backend, and start time, recorded beside the
     /// job slot so the state payload can tell ANY page instance
@@ -79,4 +79,24 @@ pub(crate) struct OptimizeState {
     /// clear the family they cancel. std Mutex: claims, releases,
     /// and the guard's Drop are all synchronous.
     pub(crate) running_ops: std::sync::Mutex<HashMap<String, OptimizeRunningOp>>,
+}
+
+/// The occupied job slot. Cancelling takes the handle and leaves the
+/// slot occupied: a cancelled job is still putting back what it stopped,
+/// and the next one must not take the memory it needs. The job itself
+/// frees the slot when it ends.
+#[derive(Debug)]
+pub(crate) struct JobSlot {
+    abort: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl JobSlot {
+    pub(crate) fn new(abort: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self { abort: Some(abort) }
+    }
+
+    /// The cancel handle, once.
+    pub(crate) fn take_abort(&mut self) -> Option<tokio::sync::oneshot::Sender<()>> {
+        self.abort.take()
+    }
 }

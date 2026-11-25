@@ -647,7 +647,7 @@ mod tests {
         let (state, dir) = test_state("route");
         let task_id = state.record_task("optimize-measure", json!({})).await;
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        *state.optimize.job_abort.lock().await = Some(tx);
+        *state.optimize.job_abort.lock().await = Some(crate::state::JobSlot::new(tx));
         state
             .tasks
             .controls
@@ -672,7 +672,8 @@ mod tests {
         assert_eq!(out["routed_to"]["result"]["cancelled"], true, "{out}");
         assert_eq!(out["stopped"], true, "{out}");
         assert_eq!(out["status"], "aborted", "{out}");
-        assert!(state.optimize.job_abort.lock().await.is_none());
+        // The slot is freed by the job, not by its cancel.
+        assert!(state.optimize.job_abort.lock().await.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

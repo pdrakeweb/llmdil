@@ -757,7 +757,10 @@ backend that is not running is `failed`, not an error.
 backend must be running. One job at a time; a consultation on the
 same backend refuses it (a failed operation naming the running one).
 The detail is the Optimize state (§6.19); results land in
-`measurements` and on the backend row's `predicted`.
+`measurements`. Only a full measurement becomes the backend row's
+`predicted`; an estimate stays an estimate. Nothing of this starts
+while a Bench sweep runs (`BUSY`), nor the other way round; a cancelled
+job keeps the slot until it has restarted what it stopped.
 
 #### `GET /api/v1/backends/{backend_id}/tuning` — `read`
 #### `POST /api/v1/backends/{backend_id}/tuning/run` — `control` — **Op**

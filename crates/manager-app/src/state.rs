@@ -70,7 +70,7 @@ pub(crate) use activation_slots::ActivationState;
 pub(crate) use bench_slots::BenchState;
 pub(crate) use downloads::{DownloadOutcome, DownloadsState};
 pub(crate) use gateway::GatewayState;
-pub(crate) use optimize_slots::OptimizeState;
+pub(crate) use optimize_slots::{JobSlot, OptimizeState};
 pub(crate) use task_registry::TaskRegistry;
 pub(crate) use telemetry::TelemetryState;
 pub(crate) use wizard::WizardState;

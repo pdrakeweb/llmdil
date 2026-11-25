@@ -147,7 +147,13 @@ impl StartGateway {
                 None
             }
             Err(e) => Some(format!(
-                "the Windows firewall was not changed ({e}); wanted: {what}{}",
+                "the Windows firewall was not changed ({}); wanted: {what}{}",
+                // ERROR_CANCELLED: refused, or the prompt ran out.
+                if e.to_string().contains("error 1223") {
+                    "the approval prompt was declined or not answered in time".to_string()
+                } else {
+                    e.to_string()
+                },
                 if add.is_some() {
                     ". Clients on the local network may be unable to connect until then"
                 } else {

@@ -1015,7 +1015,18 @@ pub async fn backend_liveness_for(
     let owned: std::collections::HashSet<String> = lock(&state.backend_spec_ids).clone();
     let sup: Vec<ProcessStatus> = {
         let sup = state.supervisor().await.lock().await;
-        sup.status()
+        let mut rows = sup.status();
+        // A process that died since the monitor's last look: the exit
+        // is the reason until the monitor records it.
+        for s in rows
+            .iter_mut()
+            .filter(|s| s.state == ProcessState::Failed && s.failure_reason.is_none())
+        {
+            s.failure_reason = sup.last_exit_status(&s.id).map(|x| {
+                crate::lifecycle_monitor::crash_reason(Some(x.to_string().as_str()), None)
+            });
+        }
+        rows
     }
     .into_iter()
     .filter(|s| owned.contains(&s.id) || configured.iter().any(|(id, _)| *id == s.id))

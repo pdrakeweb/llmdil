@@ -839,6 +839,60 @@ async fn start_gateway_keeps_matching_prisma_pin_untouched() {
     );
 }
 
+/// After a LiteLLM update the client generated from the old schema still
+/// connects, so the probe alone called it healthy: it is regenerated
+/// once, and the next start changes nothing.
+#[tokio::test]
+async fn start_gateway_regenerates_the_client_of_an_older_schema() {
+    let ops = Arc::new(FakeSystemOps::new());
+    with_bundled_uv(&ops);
+    ops.with_http_get(
+        "http://127.0.0.1:4000/v1/models",
+        FakeSystemOps::http_ok(r#"{"data":[]}"#),
+    );
+    let step = StartGateway {
+        health_retries: 3,
+        health_interval_ms: 1,
+        db_sustain_ms: 0,
+    };
+    let ctx = ctx_with(ops.clone(), RunMode::Install);
+    with_postgres_installed(&ops, &ctx);
+    ops.with_file(step.generated_client_path(&ctx), b"# generated".to_vec());
+    let schema = step.litellm_schema_path(&ctx);
+    ops.with_file(schema.clone(), b"model A {}\nmodel B {}\n".to_vec());
+    ops.with_file(
+        step.prisma_package_dir(&ctx).join("schema.prisma"),
+        b"model A {}\r\n".to_vec(),
+    );
+    let version_argv = prisma_version_argv(&step, &ctx);
+    let version_refs: Vec<&str> = version_argv.iter().map(String::as_str).collect();
+    ops.with_command(&version_refs, FakeSystemOps::ok_output("0.11.0\n"));
+    let probe_argv = prisma_probe_argv(&step, &ctx);
+    let probe_refs: Vec<&str> = probe_argv.iter().map(String::as_str).collect();
+    ops.with_command(&probe_refs, FakeSystemOps::ok_output(""));
+    let py = step.venv_python(&ctx).display().to_string();
+    ops.with_command(
+        &[py.as_str(), "-c", PRISMA_SCHEMA_SCRIPT],
+        FakeSystemOps::ok_output(&format!(
+            "{}
+",
+            schema.display()
+        )),
+    );
+    let generated = |ops: &FakeSystemOps| {
+        ops.executed_commands()
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "generate"))
+            .count()
+    };
+    let out = step.run(&ctx).await.unwrap();
+    assert_eq!(out.state, StepState::Done, "{out:?}");
+    assert_eq!(generated(&ops), 1, "{:?}", ops.executed_commands());
+    let out = step.run(&ctx).await.unwrap();
+    assert_eq!(out.state, StepState::Done, "{out:?}");
+    assert_eq!(generated(&ops), 1, "regenerated again");
+}
+
 /// (g2) Verify-first fast path: pinned version + generated
 /// client present + connect probe passing means the start
 /// mutates NOTHING — no reinstall, no generation, no repair

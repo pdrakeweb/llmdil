@@ -46,6 +46,24 @@ pub const LOCAL_API_KEY: &str = "local";
 /// LiteLLM process environment at spawn — never written to the YAML.
 pub const OPENROUTER_API_KEY_ENV: &str = "os.environ/OPENROUTER_API_KEY";
 
+/// The group a fallback's backend is served under. Fallbacks are backend
+/// ids; LiteLLM knows groups, so a backend whose group has another name
+/// is reached through that group.
+fn group_serving<'a>(
+    config: &AppConfig,
+    included: &[(&'a ModelGroup, Vec<LiteLlmModelEntry>)],
+    backend_id: &str,
+) -> Option<&'a str> {
+    config
+        .backends
+        .iter()
+        .find(|b| b.id == backend_id && b.enabled)?;
+    included
+        .iter()
+        .find(|(g, _)| g.members.iter().any(|m| m == backend_id))
+        .map(|(g, _)| g.name.as_str())
+}
+
 /// Canonical alias for the OpenRouter fallback deployments.
 pub const OPENROUTER_MODEL_NAME: &str = "openrouter";
 
@@ -375,16 +393,19 @@ pub fn generate_config_yaml(config: &AppConfig) -> Result<String, GatewayError> 
         .flat_map(|(_, es)| es.iter().map(|e| e.model_name.as_str()))
         .collect();
     for (group, _) in &group_entries {
-        let chain: Vec<&str> = group
-            .fallbacks
-            .iter()
-            .map(String::as_str)
-            .filter(|f| {
-                // Drop fallbacks with no deployments (e.g. openrouter when
-                // the cloud tier is disabled); never emit dangling refs.
-                known_names.contains(f) || *f == group.name.as_str()
-            })
-            .collect();
+        let mut chain: Vec<&str> = Vec::new();
+        for f in &group.fallbacks {
+            // Drop fallbacks with no deployments (e.g. openrouter when
+            // the cloud tier is disabled); never emit dangling refs.
+            let name = if known_names.contains(&f.as_str()) || *f == group.name {
+                Some(f.as_str())
+            } else {
+                group_serving(config, &group_entries, f).filter(|g| *g != group.name)
+            };
+            if let Some(name) = name.filter(|n| !chain.contains(n)) {
+                chain.push(name);
+            }
+        }
         if chain.is_empty() {
             continue;
         }
@@ -1195,6 +1216,45 @@ mod tests {
         assert!(yaml.contains("- tool-runner: [openrouter]"));
         assert!(yaml.contains("os.environ/OPENROUTER_API_KEY"));
         assert!(!yaml.contains("sk-"), "no real secrets in generated YAML");
+    }
+
+    /// A fallback is a backend id. One whose group has another name used
+    /// to be dropped without a word.
+    #[test]
+    fn a_fallback_backend_is_reached_through_its_group() {
+        let mut cfg = four_backend_config();
+        cfg.gateway.groups.push(ModelGroup {
+            name: "spare".to_string(),
+            members: vec!["tool-runner".to_string()],
+            strategy: RoutingStrategy::SimpleShuffle,
+            fallbacks: vec![],
+            purpose: String::new(),
+        });
+        for g in cfg.gateway.groups.iter_mut() {
+            if g.name == "tool-runner" {
+                g.name = "tools".to_string();
+            }
+            g.members
+                .retain(|m| g.name != "tools" || m != "tool-runner");
+            if g.name == "coder" {
+                g.fallbacks = vec!["tool-runner".to_string()];
+            }
+            if g.name == "spare" {
+                g.fallbacks = vec!["tool-runner".to_string()];
+            }
+        }
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(yaml.contains("- coder: [spare]"), "{yaml}");
+        // Its own group is no fallback.
+        assert!(!yaml.contains("- spare: ["), "{yaml}");
+        // Disabled: not served, so not a fallback.
+        for b in cfg.backends.iter_mut() {
+            if b.id == "tool-runner" {
+                b.enabled = false;
+            }
+        }
+        let yaml = generate_config_yaml(&cfg).expect("generate");
+        assert!(!yaml.contains("- coder: ["), "{yaml}");
     }
 
     #[test]

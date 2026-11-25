@@ -1176,6 +1176,7 @@ async fn run_experiment_batch(
     sink: &std::sync::Arc<dyn crate::EventSink>,
     mode: RunMode,
 ) -> crate::ApiResult {
+    crate::bench::refuse_during_sweep(state).await?;
     {
         let slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
@@ -1265,7 +1266,7 @@ async fn run_experiment_batch(
                 "a measurement or experiment job is already running".to_string(),
             ));
         }
-        *slot = Some(tx);
+        *slot = Some(crate::state::JobSlot::new(tx));
     }
     state
         .tasks

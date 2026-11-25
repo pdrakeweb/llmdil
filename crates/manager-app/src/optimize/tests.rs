@@ -349,9 +349,14 @@ async fn start_allowed_after_cancel() {
     let _bench =
         OptimizeOpGuard::claim(&state, "coder", OptimizeOpFamily::Benchmark, "measure").unwrap();
     let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
-    *state.optimize.job_abort.lock().await = Some(tx);
+    *state.optimize.job_abort.lock().await = Some(crate::state::JobSlot::new(tx));
     let r = op_optimize_cancel_job(&state, &sink).await.unwrap();
     assert_eq!(r["cancelled"], json!(true));
+    // Cancelled, but not over: the slot is the job's until it ends, and
+    // a second cancel has nothing to do.
+    assert!(state.optimize.job_abort.lock().await.is_some());
+    let r = op_optimize_cancel_job(&state, &sink).await.unwrap();
+    assert_eq!(r["cancelled"], json!(false));
     assert!(running_ops_empty(&state));
     let _consult = OptimizeOpGuard::claim(
         &state,

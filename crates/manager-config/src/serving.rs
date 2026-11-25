@@ -101,8 +101,23 @@ pub struct ServerFlags {
     pub n_ctx: u32,
     pub n_batch: u32,
     /// Per-GPU fractions; must sum to 1.0 when non-empty.
+    #[serde(serialize_with = "short_f32s")]
     pub tensor_split: Vec<f32>,
     pub split_mode: SplitMode,
+}
+
+/// An `f32` as the decimal it is written as (31.6, not
+/// 31.600000381469727): a JSON value holds `f64`.
+fn short(v: f32) -> f64 {
+    v.to_string().parse().unwrap_or(f64::from(v))
+}
+
+fn short_f32<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64(short(*v))
+}
+
+fn short_f32s<S: serde::Serializer>(v: &[f32], s: S) -> Result<S::Ok, S::Error> {
+    s.collect_seq(v.iter().map(|x| short(*x)))
 }
 
 /// llama.cpp tensor-split placement mode.
@@ -308,6 +323,7 @@ pub struct ModelConfig {
     pub id: String,
     pub gguf_path: PathBuf,
     pub quant: String,
+    #[serde(serialize_with = "short_f32")]
     pub params_b: f32,
     pub sha256: String,
     pub verified_at: Option<DateTime<Utc>>,

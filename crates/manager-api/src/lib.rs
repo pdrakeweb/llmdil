@@ -274,12 +274,13 @@ impl ApiServer {
                 let config = tls::server_config(material)?;
                 let listener = tls::TlsListener::new(tcp, config);
                 tokio::spawn(async move {
-                    let _ = axum::serve(
+                    let end = axum::serve(
                         listener,
                         router.into_make_service_with_connect_info::<PeerAddr>(),
                     )
                     .with_graceful_shutdown(shutdown_fut)
                     .await;
+                    tracing::info!("admin api: stopped listening on {addr}: {end:?}");
                 })
             }
             None => tokio::spawn(async move {
@@ -291,6 +292,7 @@ impl ApiServer {
                 .await;
             }),
         };
+        tracing::info!("admin api: listening on {addr}");
         Ok(Self {
             addr,
             shutdown: Some(tx),
