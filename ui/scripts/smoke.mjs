@@ -690,9 +690,9 @@ check(staticSrcLf.includes("if (saved && !disposed) {\n        ruleForm.open = f
   "Gateway rule form closes only on a persisted save (rule 17)");
 check(!staticSrcLf.includes("ruleForm.open = false;\n      await patchRules"),
   "Gateway rule form no longer closes ahead of the save outcome");
-check(staticSrcLf.includes('if (r.error) { gwMsg(`Change not saved: ${r.error}`, true); return; }'),
+check(staticSrcLf.includes('if (r.error) { gwMsg(`Change not saved: ${r.error}`, true, at); return; }'),
   "Gateway gwSave failure returns without a repaint (permanent-field input preserved)");
-check(staticSrcLf.includes("gwMsg(okText);\n      await load();"),
+check(staticSrcLf.includes("gwMsg(okText, false, at);\n      await load();"),
   "Gateway gwSave success repaints the field in its new saved state");
 check(staticSrcLf.includes('if (r.error) { setMsg(`Create user failed: ${r.error}`, true); return; }'),
   "Settings Create user failure returns without a repaint (input preserved)");

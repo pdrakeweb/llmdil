@@ -216,7 +216,7 @@ export function wireWizard(root: HTMLElement): () => void {
   const logEl = root.querySelector("#wizLog");
   const logLine = (text: string, cls = "lvl-info") => {
     if (!logEl) return;
-    const t = new Date().toLocaleTimeString("en-GB");
+    const t = new Date().toLocaleTimeString();
     logEl.insertAdjacentHTML("beforeend", `<div class="ln"><span class="t">${t}</span> <span class="${cls}">${esc(text)}</span></div>`);
   };
 

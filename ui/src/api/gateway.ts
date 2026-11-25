@@ -223,6 +223,32 @@ export interface GatewayStatusData {
   /** OpenRouter daily spend vs cap (spec §7), from the app's spend
    *  ledger; absent/null when the backend did not report it. */
   openrouter_spend?: OpenRouterSpend | null;
+  /** The port the live gateway process listens on; null/absent when it
+   *  is not running or the payload predates the field. `port` is the
+   *  SAVED port. */
+  running_port?: number | null;
+  /** The saved port differs from the running one. */
+  port_pending?: boolean;
+  /** The global strategy the running gateway applies, when reported. */
+  running_strategy?: string | null;
+  /** Per group: the strategy the running gateway applies. */
+  applied_strategies?: Record<string, string>;
+}
+
+/** Per-group strategies as reported by the running gateway: a map, or a
+ *  list of rows naming the group and its applied strategy. */
+export function parseAppliedStrategies(raw: unknown): Record<string, string> | undefined {
+  const out: Record<string, string> = {};
+  if (Array.isArray(raw)) {
+    for (const r of raw as Record<string, unknown>[]) {
+      const name = r?.name ?? r?.group;
+      const s = r?.applied_strategy ?? r?.strategy;
+      if (typeof name === "string" && typeof s === "string") out[name] = s;
+    }
+  } else if (raw && typeof raw === "object") {
+    for (const [k, v] of Object.entries(raw)) if (typeof v === "string") out[k] = v;
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 /** gateway_status.openrouter_spend. The cap itself is enforced inside
@@ -393,7 +419,7 @@ export async function getGatewayStatus(): Promise<CallResult<GatewayStatusData>>
       : fromWire(raw.state);
     return {
       data: {
-        port: typeof raw.port === "number" ? raw.port : 0,
+        port: typeof raw.saved_port === "number" ? raw.saved_port : typeof raw.port === "number" ? raw.port : 0,
         groups: typeof raw.groups === "number" ? raw.groups : 0,
         routing_rules: typeof raw.routing_rules === "number" ? raw.routing_rules : 0,
         up,
@@ -413,6 +439,10 @@ export async function getGatewayStatus(): Promise<CallResult<GatewayStatusData>>
         activation_changes: typeof raw.activation_changes === "number" ? raw.activation_changes : 0,
         litellm_version: typeof raw.litellm_version === "string" ? raw.litellm_version : null,
         openrouter_spend: parseOpenRouterSpend(raw.openrouter_spend),
+        running_port: numOrNull(raw.running_port),
+        port_pending: raw.port_pending === true,
+        running_strategy: typeof raw.running_strategy === "string" ? raw.running_strategy : null,
+        applied_strategies: parseAppliedStrategies(raw.applied_strategies ?? raw.group_strategies),
       },
       live: true,
     };

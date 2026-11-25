@@ -2,6 +2,9 @@
    Matches the approved mockups: graphics/design-b-hybrid/. */
 
 :root {
+  /* Native controls (selects, number spinners, scrollbars) follow the
+     dark theme. */
+  color-scheme: dark;
   --bg: #12151a;
   --bg2: #0e1116;
   --panel: #1b1f26;
@@ -13,6 +16,8 @@
   --accent: #4a9eff;
   --ok: #3fb950;
   --warn: #d29922;
+  --amber: #d29922;
+  --line: #2b313b;
   --err: #f85149;
   --purple: #a371f7;
   --teal: #39c5cf;
@@ -38,6 +43,16 @@ body {
 }
 
 #app { display: flex; height: 100vh; }
+
+/* Defaults for form controls and links. Zero specificity (:where), so
+   any class or inline style wins. */
+:where(input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"]), select, textarea) {
+  background: var(--panel2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 5px 8px; font-family: inherit; font-size: 12px;
+}
+:where(a) { color: #79b8ff; }
+:where(input, select, textarea):focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
 
 /* ---------- Sidebar ---------- */
 .sidebar {
@@ -95,6 +110,10 @@ body {
 .btn.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
 .btn.primary:hover { background: #2f7df0; }
 .btn:disabled { opacity: 0.5; cursor: default; }
+/* Start/Restart share one slot: one width, so a state change moves
+   nothing. */
+.btn[data-lc-act="start"], .btn[data-lc-act="restart"],
+.btn[data-back-act="start"], .btn[data-back-act="restart"] { min-width: 88px; justify-content: center; }
 
 /* Enable/disable switch (design rule 16): a two-position slider
    that shows state — green track + knob right + check glyph when
@@ -390,15 +409,15 @@ a.menu-item { text-decoration: none; }
 .legend { display: flex; gap: 14px; margin-top: 10px; font-size: 11px; color: var(--text3); }
 .legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
 
-/* Tables (console views, process tables) */
-table.tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
-table.tbl th {
+/* Tables (console views, process tables, plan and projection tables) */
+table.tbl, table.dtab { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.tbl th, table.dtab th {
   text-align: left; color: var(--text3); font-weight: 500; font-size: 10px;
   text-transform: uppercase; letter-spacing: 0.05em;
   padding: 6px 10px; border-bottom: 1px solid var(--border);
 }
-table.tbl td { padding: 7px 10px; border-bottom: 1px solid #232a34; font-family: var(--mono); }
-table.tbl tr:last-child td { border-bottom: 0; }
+table.tbl td, table.dtab td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #232a34; font-family: var(--mono); }
+table.tbl tr:last-child td, table.dtab tr:last-child td { border-bottom: 0; }
 
 /* Task drawer footer */
 .taskbar {
@@ -421,11 +440,12 @@ table.tbl tr:last-child td { border-bottom: 0; }
    neutral styling — warning styling is for abnormal conditions. */
 .banner.mode-live { background: var(--bg2); border-color: var(--border); color: var(--text2); }
 
-/* Global activation-plan header: sits at the very top of the main
-   column, above every view's title, whenever a plan is pending. */
+/* Global activation-plan bar: docked under the view, above the task
+   bar, whenever a plan is pending. Docked at the bottom so its arrival
+   never shifts the page. */
 .activation-banner {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  background: #2a2410; border-bottom: 1px solid #4a3d14; color: #e8c547;
+  background: #2a2410; border-top: 1px solid #4a3d14; color: #e8c547;
   padding: 8px 14px; font-size: 12px;
 }
 .activation-banner .ab-text { display: inline-flex; align-items: center; gap: 6px; }
@@ -433,7 +453,7 @@ table.tbl tr:last-child td { border-bottom: 0; }
 .activation-banner .ab-status.err { color: var(--err); }
 .activation-banner .ab-actions { margin-left: auto; display: inline-flex; gap: 6px; }
 
-/* Global app-update header: same slot family as the activation
+/* Global app-update bar: same slot family as the activation
    banner, shown whenever a verified update is staged and waiting
    on a restart. State-derived — it renders from the staged record,
    so it survives navigation and app restarts. Info-blue rather
@@ -441,7 +461,7 @@ table.tbl tr:last-child td { border-bottom: 0; }
    is available. */
 .update-banner {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  background: #10233a; border-bottom: 1px solid #1d4066; color: #7db8f0;
+  background: #10233a; border-top: 1px solid #1d4066; color: #7db8f0;
   padding: 8px 14px; font-size: 12px;
 }
 .update-banner .ab-text { display: inline-flex; align-items: center; gap: 6px; }

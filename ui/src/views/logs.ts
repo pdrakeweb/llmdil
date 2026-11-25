@@ -127,12 +127,12 @@ function fmtRanAt(ts: string): string {
   const d = new Date(ts);
   return Number.isNaN(d.getTime())
     ? ts
-    : d.toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+    : d.toLocaleString(undefined, { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
 export function fmtDateTime(ts: string): string {
   const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString("en-GB");
+  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString(undefined);
 }
 
 /** One log line: visible time stays HH:MM:SS, the full date-time is on
@@ -305,7 +305,7 @@ export async function wireLogs(root: HTMLElement, initialScope?: string, initial
   const renderPicker = (): void => {
     if (!pickerEl) return;
     const { y, m } = pickerView;
-    const monthName = new Date(y, m, 1).toLocaleDateString("en-GB", { month: "long", year: "numeric" });
+    const monthName = new Date(y, m, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
     const startDay = new Date(y, m, 1).getDay();
     const daysInMonth = new Date(y, m + 1, 0).getDate();
     const daysInPrev = new Date(y, m, 0).getDate();

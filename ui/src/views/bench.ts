@@ -32,7 +32,7 @@ const TARGET_MINUTES = 20;
 function fmtDateMs(ms: number | null | undefined): string {
   if (ms == null) return "—";
   const d = new Date(ms);
-  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" });
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
 export function fmtElapsed(ms: number): string {

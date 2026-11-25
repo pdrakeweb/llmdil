@@ -66,7 +66,7 @@ export function emptyHtml(text: string): string {
 export function fmtBytes(n: number | null): string {
   if (n === null) return "\u2014";
   if (n <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let v = n;
   let u = 0;
   while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
@@ -96,12 +96,12 @@ export function fmtElapsed(secs: number): string {
 
 export function fmtTime(ts: string): string {
   const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? ts : d.toLocaleTimeString("en-GB");
+  return Number.isNaN(d.getTime()) ? ts : d.toLocaleTimeString();
 }
 
 export function fmtDate(ts: string): string {
   const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? ts : d.toLocaleDateString("en-GB");
+  return Number.isNaN(d.getTime()) ? ts : d.toLocaleDateString();
 }
 
 /** The backend cadence buckets: Off, anything up to 1500 ms runs at 1s,

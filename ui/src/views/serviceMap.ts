@@ -225,7 +225,7 @@ function topologySvg(d: MapData): string {
   gpus.forEach((g, j) => {
     const pct = g.vram_total_gb > 0 ? Math.round((g.vram_used_gb / g.vram_total_gb) * 100) : 0;
     node(COL.gpus, spreadY(j, gpus.length), g.name,
-      `${fmtGb(g.vram_used_gb)} / ${fmtGb(g.vram_total_gb)} GB VRAM`,
+      `${fmtGb(g.vram_used_gb)} / ${fmtGb(g.vram_total_gb)} GiB VRAM`,
       gpuDot(g), "", { pct, color: pct >= 80 ? C.amber : C.green, label: `${pct}%` });
   });
 
@@ -269,7 +269,7 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
 
   const updated = root.querySelector("#mapUpdated");
   if (updated) {
-    updated.textContent = `${d.live ? "live data" : "sample data"} \u00b7 updated ${new Date(d.updatedAt).toLocaleTimeString("en-GB")}` + (d.stale ? " \u00b7 telemetry stale" : "");
+    updated.textContent = `${d.live ? "live data" : "sample data"} \u00b7 updated ${new Date(d.updatedAt).toLocaleTimeString()}` + (d.stale ? " \u00b7 telemetry stale" : "");
   }
 
   const canvas = root.querySelector("#mapCanvas");
@@ -306,7 +306,7 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
     ...(d.live && d.postgresState ? [["PostgreSQL", lifecycleLabel(d.postgresState)] as [string, string]] : []),
     ["Routing rules", String(d.gateway.routing_rules)],
     ["GPUs", `${d.gpus.length} detected`],
-    ["VRAM used (all processes)", d.gpus.length ? `${fmtGb(vramUsed)} / ${fmtGb(vramTotal)} GB` : "—"],
+    ["VRAM used (all processes)", d.gpus.length ? `${fmtGb(vramUsed)} / ${fmtGb(vramTotal)} GiB` : "—"],
   ];
   const summaryEl = root.querySelector("#mapSummary");
   if (summaryEl) {

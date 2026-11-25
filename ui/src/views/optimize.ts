@@ -48,7 +48,7 @@ function fmtGiB(mib: number): string {
 
 function fmtTime(ts: string): string {
   const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" });
+  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
 function fmtElapsed(secs: number): string {
@@ -65,7 +65,7 @@ function fmtElapsed(secs: number): string {
 function consultProgressText(p: OptimizeConsultProgress | null | undefined): string {
   if (!p) return "";
   if (!p.streaming) return " · waiting for the first token (prompt processing)";
-  const size = (n: number) => n >= 1024 ? `${trim1(n / 1024)} KB` : `${n} B`;
+  const size = (n: number) => n >= 1024 ? `${trim1(n / 1024)} KiB` : `${n} B`;
   return ` · ${fmtCount(p.chunks)} tokens · ${size(p.content_bytes)} of answer${p.reasoning_bytes ? ` · ${size(p.reasoning_bytes)} reasoning` : ""}`;
 }
 

@@ -2,6 +2,7 @@
    Under Tauri, invoke() calls window.__TAURI__.core.invoke; in a plain
    browser isTauri() is false and callers fall back to sample data. */
 
+import { plainError } from "../errors";
 import type { OpName } from "../generated/ops";
 
 declare global {
@@ -54,5 +55,5 @@ export interface CallResult<T> {
 }
 
 export function errOf(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
+  return plainError(e instanceof Error ? e.message : String(e));
 }

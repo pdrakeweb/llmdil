@@ -41,11 +41,13 @@ import type { BackendRow, CallResult, GatewayStatusData, LogReceiverInfo, Servic
 import { esc } from "./html";
 import {
   META,
+  actionJustSwapped,
   elapsedSince,
   fromScm,
   fromWire,
   lifecycleActions,
   lifecycleLabel,
+  noteOfferedActions,
   summarize,
 } from "./lifecycle-state";
 import type {
@@ -157,7 +159,9 @@ export function renderLifecycleActions(
 ): string {
   const key = targetKey(target);
   const blockedReason = ctx.blockedReason ?? applyBlockedReason(target);
-  return lifecycleActions(s, { ...ctx, kind: target.kind, ...(blockedReason ? { blockedReason } : {}) })
+  const specs = lifecycleActions(s, { ...ctx, kind: target.kind, ...(blockedReason ? { blockedReason } : {}) });
+  noteOfferedActions(key, specs);
+  return specs
     .filter((a) => !opts.only || opts.only.includes(a.action))
     .map((a) => {
       const label = opts.labels?.[a.action] ?? a.label;
@@ -194,6 +198,7 @@ export function wireLifecycleActions(
     const target = parseTargetKey(el.dataset.lcTarget ?? "");
     if (!target || (action !== "start" && action !== "stop" && action !== "restart")) return;
     ev.preventDefault();
+    if (actionJustSwapped(targetKey(target))) return;
     if (opts.confirm && !(await opts.confirm(target, action))) return;
     el.disabled = true;
     const result = await runLifecycle(target, action, {

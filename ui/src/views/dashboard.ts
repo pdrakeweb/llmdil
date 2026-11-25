@@ -166,7 +166,7 @@ function serviceCard(b: BackendInfo, isGateway: boolean): string {
   const m2v = isGateway
     ? (b.errors_1h !== undefined ? fmtCount(b.errors_1h) : "—")
     : (b.vram_held_gb !== undefined ? fmtGb(b.vram_held_gb) : "—");
-  const m2u = isGateway || b.vram_held_gb === undefined ? "" : " GB";
+  const m2u = isGateway || b.vram_held_gb === undefined ? "" : " GiB";
   // The ring's arc encodes a share, never a raw count. The gateway's
   // arc is its trailing-hour success share (1 - errors/requests)
   // with the integer percent centered; with no requests the share is
@@ -235,7 +235,7 @@ function gpuStripCard(g: GpuInfo): string {
     vramHtml = `<div class="mrow"><span class="mlabel">VRAM</span><span class="mval">not measured</span></div>`;
   } else {
     const usedPct = (g.vram_used_gb / g.vram_total_gb) * 100;
-    const vramVal = `${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GB · ${trim1(usedPct)}%`;
+    const vramVal = `${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GiB · ${trim1(usedPct)}%`;
     let segments: { pct: number; color: string; label?: string }[];
     let keyHtml = "";
     if (procs.length && procs.some((p) => p.vram_mib === null)) {
@@ -246,16 +246,16 @@ function gpuStripCard(g: GpuInfo): string {
       segments = procs.map((p, i) => ({
         pct: ((p.vram_mib ?? 0) / totalMib) * 100,
         color: palette[i % palette.length],
-        label: `${procLabel(p)} — ${fmtGb((p.vram_mib ?? 0) / 1024)} GB`,
+        label: `${procLabel(p)} — ${fmtGb((p.vram_mib ?? 0) / 1024)} GiB`,
       }));
       const attributed = procs.reduce((a, p) => a + (p.vram_mib ?? 0), 0);
       const otherMib = g.vram_used_gb * 1024 - attributed;
       if (otherMib > 0) {
-        segments.push({ pct: (otherMib / totalMib) * 100, color: "#6d7686", label: `other — ${fmtGb(otherMib / 1024)} GB` });
+        segments.push({ pct: (otherMib / totalMib) * 100, color: "#6d7686", label: `other — ${fmtGb(otherMib / 1024)} GiB` });
       }
       keyHtml = `<div class="legend" style="margin-top:4px">${segments.map((s) => `<span><span class="sw" style="background:${s.color}"></span>${esc((s.label ?? "").split(" — ")[0])}</span>`).join("")}</div>`;
     } else {
-      segments = [{ pct: usedPct, color: C.purple, label: `VRAM used — ${fmtGb(g.vram_used_gb)} GB` }];
+      segments = [{ pct: usedPct, color: C.purple, label: `VRAM used — ${fmtGb(g.vram_used_gb)} GiB` }];
     }
     vramHtml = `<div class="mrow"><span class="mlabel">VRAM</span><span class="mval">${vramVal}</span></div>
       <div class="mrow"><span></span><span>${stackedBar(segments, 220, 8)}</span></div>
@@ -410,7 +410,7 @@ function consoleView(m: DashboardModel): string {
     const vramPct = Math.round((g.vram_used_gb / g.vram_total_gb) * 100);
     return `<tr><td>${gpuDot(g.status)} ${esc(g.name)}</td><td>${trim1(g.util_pct)}%</td>
       <td>${meter(g.util_pct, 120, 8, C.blue)}</td>
-      <td>${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GB</td>
+      <td>${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GiB</td>
       <td>${meter(vramPct, 120, 8, C.purple)}</td>
       <td>${trim1(g.temp_c)}°C</td><td>${g.power_w == null ? (g.power_absence === "driver_not_available" ? "not measured" : "—") : `${trim1(g.power_w)} W`}</td></tr>`;
   }).join("");
