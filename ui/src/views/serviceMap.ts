@@ -12,7 +12,7 @@
    fabricated: with no backends configured the canvas shows an empty state,
    and in the browser (live=false) a sample-mode banner says so. */
 
-import { getAppConfig, getGpuTelemetry, getModels, systemVerdict } from "../api";
+import { getAppConfig, getGpuTelemetry, getModels, getStatus, systemVerdict } from "../api";
 import type { BackendRow, GatewayStatusData, ModelRow } from "../api";
 import { fitText, fmtGb, gaugeRing, trim1 } from "../charts";
 import { icon } from "../icons";
@@ -421,6 +421,8 @@ export async function wireServiceMap(root: HTMLElement): Promise<() => void> {
   let lastTele: Awaited<ReturnType<typeof getGpuTelemetry>> | null = null;
   let lastCfg: Awaited<ReturnType<typeof getAppConfig>> | null = null;
   let lastModels: ModelRow[] = [];
+  /** False only when the app says the MXC runtime is not installed. */
+  let mxcInstalled = true;
   let lastLoadAt = 0;
 
   const paint = (snap: ServiceSnapshot): void => {
@@ -467,7 +469,7 @@ export async function wireServiceMap(root: HTMLElement): Promise<() => void> {
       gateway,
       gatewayError: snap.live && !snap.gateway,
       backendsError: snap.backendsError,
-      mxcMode: typeof mxc?.mode === "string" ? mxc.mode : null,
+      mxcMode: !mxcInstalled ? "not installed" : typeof mxc?.mode === "string" ? mxc.mode : null,
       splits: splitsFromConfig(cfg.data),
       residency,
       live,
@@ -483,9 +485,10 @@ export async function wireServiceMap(root: HTMLElement): Promise<() => void> {
     loading = true;
     lastLoadAt = Date.now();
     try {
-      const [g, cfg, mr] = await Promise.all([getGpuTelemetry(), getAppConfig(), getModels()]);
+      const [g, cfg, mr, st] = await Promise.all([getGpuTelemetry(), getAppConfig(), getModels(), getStatus()]);
       if (disposed) return;
       if (!mr.error) lastModels = mr.data;
+      mxcInstalled = st.data.mxc_runtime_installed !== false;
       lastTele = g;
       lastCfg = cfg;
       paint(serviceStore.get());

@@ -586,6 +586,8 @@ export function fitChipHtml(f: {
   fitsNow?: boolean | null;
   neededMib?: number | null;
   freeMib?: number | null;
+  /** The GPU the figures are for. */
+  gpu?: number | null;
 }): string {
   const gib = (mib: number): string => fmtGb(mib / 1024);
   if (!f.state) return "";
@@ -596,7 +598,7 @@ export function fitChipHtml(f: {
     return `<span class="chip status-tag status-bad" title="The requirement exceeds the placed GPUs' total VRAM.">Does not fit</span>`;
   }
   if (f.fitsNow === false) {
-    const figs = f.neededMib != null && f.freeMib != null ? `: needs ${gib(f.neededMib)} GiB, free ${gib(f.freeMib)} GiB` : "";
+    const figs = f.neededMib != null && f.freeMib != null ? `${f.gpu != null ? ` on GPU ${f.gpu}` : ""}: needs ${gib(f.neededMib)} GiB, free ${gib(f.freeMib)} GiB` : "";
     return `<span class="chip status-tag status-transition" title="The requirement is within total VRAM, but other processes hold too much of it at the moment.">Not enough free now${figs}</span>`;
   }
   if (f.fitsNow === true) return `<span class="chip status-tag status-on" title="The requirement fits the memory that is free now.">Fits</span>`;

@@ -143,6 +143,22 @@ pub fn applied_gateway_yaml(data_dir: &Path) -> Option<String> {
     (yaml_fingerprint(&yaml) == spawn.yaml_sha256).then_some(yaml)
 }
 
+/// One firewall change in words: "open TCP 4001 for the local network
+/// and close TCP 4000 in the Windows firewall". The approval prompt
+/// itself can only name the program, so every surface that announces
+/// the prompt says this.
+pub fn firewall_change_text(open: Option<u16>, close: &[u16]) -> String {
+    let mut parts = Vec::new();
+    if let Some(p) = open {
+        parts.push(format!("open TCP {p} for the local network"));
+    }
+    if !close.is_empty() {
+        let ports: Vec<String> = close.iter().map(u16::to_string).collect();
+        parts.push(format!("close TCP {}", ports.join(", ")));
+    }
+    format!("{} in the Windows firewall", parts.join(" and "))
+}
+
 /// Whether saved changes the gateway reads from its command line —
 /// port and bind address — wait for a gateway restart: `(port, bind)`.
 /// Both false when no spawn is recorded.

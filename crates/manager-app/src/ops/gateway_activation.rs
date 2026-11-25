@@ -132,7 +132,9 @@ pub async fn op_gateway_activation_plan(
         || pending_entries.iter().any(|e| e.scope != "backend")
         || changes.iter().any(|c| c["activation"] == "gateway_restart");
     let actionable = gateway_pending || changes.iter().any(|c| c["activation"] == "restart");
-    let admin_approval = gateway_pending && firewall_update_pending(&cfg, &state.data_dir);
+    let admin_approval = gateway_pending
+        .then(|| firewall_approval_reason(&cfg, &state.data_dir))
+        .flatten();
     Ok(json!({
         "pending": pending,
         "gateway_up": probe_up,
@@ -145,11 +147,8 @@ pub async fn op_gateway_activation_plan(
         "backend_restart_ids": backend_restart_ids,
         // Applying changes the gateway's port or network access, so the
         // firewall rule changes with it (A17).
-        "admin_approval_required": admin_approval,
-        "admin_approval_reason": admin_approval.then_some(
-            "Windows will ask for administrator approval to update the firewall rule \
-             for the gateway."
-        ),
+        "admin_approval_required": admin_approval.is_some(),
+        "admin_approval_reason": admin_approval,
         "changes": changes,
         "snapshot_available": journal.snapshot.is_some() && !pending_entries.is_empty(),
         // The server-side activation apply in flight, null when idle:
@@ -900,16 +899,32 @@ pub(crate) async fn running_gateway_view(state: &AppState) -> (lifecycle::Gatewa
     (lifecycle::gateway_view(state).await, port)
 }
 
-/// Whether applying the saved gateway changes updates the Windows
-/// firewall rule: the port or bind address changes and one side of the
-/// change is reachable from the network.
-pub(crate) fn firewall_update_pending(cfg: &AppConfig, data_dir: &std::path::Path) -> bool {
-    let (port, bind) = manager_wizard::gateway_listen_pending(cfg, data_dir);
-    let loopback = |host: &str| host == "127.0.0.1";
-    (port || bind)
-        && !(loopback(&cfg.gateway.bind_host)
-            && manager_wizard::recorded_gateway_spawn(data_dir)
-                .is_some_and(|s| loopback(&s.fingerprint.bind_host)))
+/// What the gateway's next start asks Windows to approve when its saved
+/// port or network access differs from the running one; `None` when the
+/// firewall stays as it is. The start only prompts for rules that are
+/// really missing or left over, so this can announce a prompt that does
+/// not come, never hide one.
+pub(crate) fn firewall_approval_reason(
+    cfg: &AppConfig,
+    data_dir: &std::path::Path,
+) -> Option<String> {
+    let running = manager_wizard::recorded_gateway_spawn(data_dir)?.fingerprint;
+    let lan = |host: &str| host != "127.0.0.1";
+    let gw = &cfg.gateway;
+    let same = running.port == gw.port;
+    let open = (lan(&gw.bind_host) && !(same && lan(&running.bind_host))).then_some(gw.port);
+    let close: Vec<u16> = (lan(&running.bind_host) && !(same && lan(&gw.bind_host)))
+        .then_some(running.port)
+        .into_iter()
+        .collect();
+    if open.is_none() && close.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Windows will ask for administrator approval to {}. Its prompt names \
+         \"Network Command Shell\" (netsh).",
+        manager_wizard::firewall_change_text(open, &close)
+    ))
 }
 
 /// One-shot gateway liveness probe: connect to <host>:<port> with a

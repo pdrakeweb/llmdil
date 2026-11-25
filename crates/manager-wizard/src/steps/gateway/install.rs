@@ -597,6 +597,9 @@ impl StartGateway {
         // check at the next launch compares the record
         // against the then-current configuration, YAML and
         // spawn-only inputs alike (code-review 2.3).
+        // The port the previous gateway listened on, before this start's
+        // record replaces it: its firewall rule is closed below.
+        let previous_port;
         {
             let fingerprint = crate::gateway_spawn_fingerprint(
                 &ctx.config,
@@ -607,6 +610,13 @@ impl StartGateway {
             );
             let state_json =
                 crate::gateway_spawn_state_json(&fingerprint, &yaml, litellm_version.as_deref());
+            previous_port = ctx
+                .ops
+                .read_file(&crate::gateway_spawn_state_path(&ctx.data_dir))
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice::<crate::GatewaySpawnState>(&b).ok())
+                .map(|s| s.fingerprint.port);
             match ctx
                 .ops
                 .write_file(
@@ -635,7 +645,10 @@ impl StartGateway {
         // The gateway is healthy; reconcile the Windows
         // firewall rule with the bind address so LAN clients
         // can actually reach a LAN-bound gateway.
-        if let Some(fw) = self.ensure_gateway_firewall(ctx, &mut log).await {
+        if let Some(fw) = self
+            .ensure_gateway_firewall(ctx, previous_port, &mut log)
+            .await
+        {
             log.push(format!("warning: {fw}"));
             message = format!("{message} — warning: {fw}");
         }

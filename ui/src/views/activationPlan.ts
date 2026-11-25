@@ -85,7 +85,7 @@ function planNameList(names: string[]): string {
  * line as visible text next to the Apply actions, not only in the
  * buttons' tooltip. */
 export function planApplyLine(plan: ActivationPlanData): string {
-  return planApplyCore(plan) + (planNeedsElevation(plan) ? " Windows will ask for administrator approval." : "");
+  return planApplyCore(plan) + (planNeedsElevation(plan) ? ` ${plan.admin_approval_reason ?? "Windows will ask for administrator approval."}` : "");
 }
 
 function planApplyCore(plan: ActivationPlanData): string {
@@ -445,8 +445,8 @@ function planChangeCell(c: ActivationChange): string {
 /** The Target cell: scope absorbed as a Label: Value ("Backend:
  * coder" / "Gateway"), every backend named. */
 function planTargetCell(c: ActivationChange): string {
-  if (c.scope !== "backend") return "Gateway";
   const targets = c.targets ?? [];
+  if (c.scope !== "backend") return `Gateway${targets.length ? `: ${esc(targets.join(", "))}` : ""}`;
   if (!targets.length) return "Backend";
   return `Backend: ${esc(targets.join(", "))}`;
 }

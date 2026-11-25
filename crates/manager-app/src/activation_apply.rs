@@ -459,7 +459,7 @@ pub async fn op_activation_apply(
         if plan.gateway_pending {
             let drain = apply_mode == ApplyMode::Drain;
             let line = if drain {
-                "Waiting for in-flight gateway requests, then restarting the gateway…".to_string()
+                "Draining gateway requests and restarting the gateway…".to_string()
             } else {
                 "Restarting the gateway…".to_string()
             };

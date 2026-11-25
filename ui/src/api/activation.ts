@@ -54,6 +54,8 @@ export interface ActivationPlanData {
   /** Applying needs a Windows administrator approval (a firewall rule
    *  change). Absent on older payloads; either spelling. */
   admin_approval_required?: boolean;
+  /** What Windows will ask approval for, in words. */
+  admin_approval_reason?: string | null;
 }
 
 /** Whether applying the plan makes Windows ask for approval. */

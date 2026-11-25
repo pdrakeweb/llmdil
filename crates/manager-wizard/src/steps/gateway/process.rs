@@ -5,24 +5,6 @@ use super::*;
 /// The app's gateway firewall rules are named `<prefix><port>)`.
 const FIREWALL_RULE_PREFIX: &str = "Local LLM Gateway (TCP ";
 
-/// The ports a previous `firewall.cmd` of this data directory names.
-/// Only these can be stale: another copy of the app keeps its own
-/// script, so its rule is never picked up. `added` keeps the ports the
-/// script opened, leaving out those it only closed.
-pub(crate) fn recorded_firewall_ports(script: &str, added: bool) -> Vec<u16> {
-    let mut ports: Vec<u16> = script
-        .lines()
-        .filter(|l| !added || l.contains(" add rule "))
-        .filter_map(|l| {
-            let rest = l.split_once(FIREWALL_RULE_PREFIX)?.1;
-            rest.split_once(')')?.0.parse().ok()
-        })
-        .collect();
-    ports.sort_unstable();
-    ports.dedup();
-    ports
-}
-
 impl StartGateway {
     /// The exact bootstrap the venv's `litellm` console script runs
     /// (verified against the litellm 1.105.1 wheel's entry_points.txt:
@@ -55,59 +37,39 @@ impl StartGateway {
     }
 
     fn firewall_script_path(&self, ctx: &WizardContext) -> PathBuf {
-        ctx.data_dir.join("gateway").join("firewall.cmd")
+        ctx.data_dir.join("gateway").join("firewall.netsh")
     }
 
+    /// The elevated command is netsh itself, not a command shell:
+    /// Windows then names "Network Command Shell" in its approval
+    /// prompt, and the elevated program can do nothing but the network
+    /// configuration lines in the script. Absolute, so nothing on the
+    /// PATH stands in for it.
     pub(crate) fn firewall_elevated_command(&self, ctx: &WizardContext) -> PlannedCommand {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
         PlannedCommand::new(vec![
-            "cmd.exe".to_string(),
-            "/c".to_string(),
+            format!("{root}\\System32\\netsh.exe"),
+            "-f".to_string(),
             self.firewall_script_path(ctx).display().to_string(),
         ])
     }
 
-    /// The elevated script: delete every stale rule and, unless this
-    /// port's rule is already right (`keep`), this port's; then (for a
-    /// LAN bind) add this port's rule.
-    fn firewall_script_contents(
-        &self,
-        ctx: &WizardContext,
-        add: bool,
-        keep: bool,
-        stale: &[u16],
-    ) -> String {
-        let port = ctx.config.gateway.port;
-        let mut script = "@echo off\r\n".to_string();
-        for p in stale.iter().chain((!keep).then_some(&port)) {
+    /// The netsh script: close `remove`, then open `add`.
+    fn firewall_script_contents(remove: &[u16], add: Option<u16>) -> String {
+        let mut script = String::new();
+        for p in remove {
             script.push_str(&format!(
-                "netsh advfirewall firewall delete rule name=\"{}\" >nul 2>&1\r\n",
+                "advfirewall firewall delete rule name=\"{}\"\r\n",
                 Self::firewall_rule_name(*p)
             ));
         }
-        if add {
+        if let Some(port) = add {
             script.push_str(&format!(
-                "netsh advfirewall firewall add rule name=\"{}\" dir=in action=allow protocol=TCP localport={port} profile=private remoteip=localsubnet\r\n",
+                "advfirewall firewall add rule name=\"{}\" dir=in action=allow protocol=TCP localport={port} profile=private remoteip=localsubnet\r\n",
                 Self::firewall_rule_name(port)
             ));
         }
         script
-    }
-
-    /// Ports, other than the configured one, that this data directory
-    /// opened earlier and that still have a rule. With the current rule
-    /// in place (`added`) a declined cleanup is not asked for again:
-    /// its script closes a port and opens none.
-    async fn stale_firewall_ports(&self, ctx: &WizardContext, added: bool) -> Vec<u16> {
-        let Ok(script) = ctx.ops.read_file(&self.firewall_script_path(ctx)).await else {
-            return Vec::new();
-        };
-        let mut stale = Vec::new();
-        for port in recorded_firewall_ports(&String::from_utf8_lossy(&script), added) {
-            if port != ctx.config.gateway.port && self.firewall_rule_exists(ctx, port).await {
-                stale.push(port);
-            }
-        }
-        stale
     }
 
     async fn firewall_rule_exists(&self, ctx: &WizardContext, port: u16) -> bool {
@@ -117,49 +79,56 @@ impl StartGateway {
         )
     }
 
-    /// Reconcile the firewall rule with the bind configuration: a
-    /// LAN bind needs the rule, a loopback bind removes it. The
-    /// rule query is unprivileged, so a matching state costs no UAC
-    /// prompt; a mismatch runs one elevated script, which also removes
-    /// the rules this app left for earlier ports. A declined or
-    /// failed elevation is a warning, never a step failure — the
-    /// gateway itself is already healthy, and loopback clients are
-    /// unaffected by the rule either way.
+    /// Reconcile the firewall rule with the bind configuration: a LAN
+    /// bind needs the rule, a loopback bind removes it, and the port the
+    /// gateway listened on before this start is closed. The rule query
+    /// is unprivileged, so a matching state costs no UAC prompt; a
+    /// mismatch runs one elevated netsh script. A declined or failed
+    /// elevation is a warning, never a step failure — the gateway itself
+    /// is already healthy, and loopback clients are unaffected by the
+    /// rule either way.
     pub(crate) async fn ensure_gateway_firewall(
         &self,
         ctx: &WizardContext,
+        previous_port: Option<u16>,
         log: &mut Vec<String>,
     ) -> Option<String> {
-        let want_rule = ctx.config.gateway.bind_host != "127.0.0.1";
-        let have_rule = self
-            .firewall_rule_exists(ctx, ctx.config.gateway.port)
-            .await;
-        // This port's rule is already right: only leftovers can need work.
-        let keep = want_rule && have_rule;
-        let stale = self.stale_firewall_ports(ctx, keep).await;
-        if keep {
-            log.push("Windows firewall rule for LAN gateway access already present".to_string());
-            if stale.is_empty() {
-                return None;
+        let port = ctx.config.gateway.port;
+        let want = ctx.config.gateway.bind_host != "127.0.0.1";
+        let have = self.firewall_rule_exists(ctx, port).await;
+        let mut remove = Vec::new();
+        if let Some(old) = previous_port.filter(|p| *p != port) {
+            if self.firewall_rule_exists(ctx, old).await {
+                remove.push(old);
             }
         }
-        if !want_rule && !have_rule && stale.is_empty() {
-            log.push("gateway binds loopback only; no firewall rule needed".to_string());
+        if have && !want {
+            remove.push(port);
+        }
+        let add = (want && !have).then_some(port);
+        if remove.is_empty() && add.is_none() {
+            log.push(
+                if want {
+                    "Windows firewall rule for LAN gateway access already present"
+                } else {
+                    "gateway binds loopback only; no firewall rule needed"
+                }
+                .to_string(),
+            );
             return None;
         }
+        let what = crate::firewall_change_text(add, &remove);
         push_log(
             ctx,
             log,
-            "Windows will ask for administrator approval to update the firewall rule for the gateway"
-                .to_string(),
+            format!("Windows will ask for administrator approval to {what}"),
         );
         let script = self.firewall_script_path(ctx);
         if let Err(e) = ctx
             .ops
             .write_file(
                 &script,
-                self.firewall_script_contents(ctx, want_rule && !keep, keep, &stale)
-                    .as_bytes(),
+                Self::firewall_script_contents(&remove, add).as_bytes(),
             )
             .await
         {
@@ -174,38 +143,15 @@ impl StartGateway {
             .await
         {
             Ok(_) => {
-                if !keep {
-                    log.push(if want_rule {
-                        format!(
-                            "Windows firewall rule added: inbound TCP {} (Private profile, local subnet)",
-                            ctx.config.gateway.port
-                        )
-                    } else {
-                        "Windows firewall rule for LAN gateway access removed".to_string()
-                    });
-                }
-                if !stale.is_empty() {
-                    log.push(format!(
-                        "removed the firewall rule(s) for earlier gateway ports: {}",
-                        stale
-                            .iter()
-                            .map(u16::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
+                log.push(format!("Windows firewall updated: {what}"));
                 None
             }
-            Err(e) if keep => Some(format!(
-                "the firewall rule for an earlier gateway port was not removed ({e})"
-            )),
             Err(e) => Some(format!(
-                "the Windows firewall rule was not {} ({e}); {}",
-                if want_rule { "added" } else { "removed" },
-                if want_rule {
-                    "clients on the local network may be unable to connect until the rule exists"
+                "the Windows firewall was not changed ({e}); wanted: {what}{}",
+                if add.is_some() {
+                    ". Clients on the local network may be unable to connect until then"
                 } else {
-                    "a stale allow rule for the gateway port remains, inert while the gateway binds loopback"
+                    ""
                 }
             )),
         }

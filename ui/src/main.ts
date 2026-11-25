@@ -520,7 +520,7 @@ async function main(): Promise<void> {
   // store; the plan itself (pending changes) is re-read on a slower
   // cadence and whenever an apply starts or ends.
   serviceStore.subscribe(onStoreSnapshot);
-  window.setInterval(() => { void refreshActivationBanner(); }, 15000);
+  window.setInterval(() => { void refreshActivationBanner(); }, 5000);
   window.setInterval(() => { void refreshUpdateBanner(); }, 30000);
   // First launch: open the setup wizard while setup is not marked
   // complete AND a part the app cannot run without is missing. An

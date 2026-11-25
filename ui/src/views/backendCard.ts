@@ -59,24 +59,31 @@ export function fitNow(
   b: BackendRow,
   gpuFreeMiB: Map<number, number>,
   res: readonly ResidencyRow[],
-): { fitsNow: boolean | null; neededMib: number | null; freeMib: number | null } {
+): { fitsNow: boolean | null; neededMib: number | null; freeMib: number | null; gpu: number | null } {
   const rows = b.fit?.per_gpu ?? [];
   let need = 0;
   let free = 0;
   let known = rows.length > 0;
   let fits = true;
+  // The figures name the GPU that is short: sums over the split can
+  // read as enough while one GPU is not.
+  let short: { gpu: number; need: number; free: number } | null = null;
   for (const r of rows) {
     const held = res.find((x) => x.gpu === r.gpu);
     const f = r.free_mib ?? (gpuFreeMiB.has(r.gpu) && held?.mib !== null ? (gpuFreeMiB.get(r.gpu) ?? 0) + (held?.mib ?? 0) : null);
     need += r.required_mib;
     if (f === null) { known = false; continue; }
     free += f;
-    if (!(r.fits_free ?? r.required_mib <= f)) fits = false;
+    if (!(r.fits_free ?? r.required_mib <= f)) {
+      fits = false;
+      short ??= { gpu: r.gpu, need: r.required_mib, free: f };
+    }
   }
   return {
     fitsNow: typeof b.fits_now === "boolean" ? b.fits_now : known ? fits : null,
-    neededMib: rows.length ? need : null,
-    freeMib: known ? free : null,
+    neededMib: short ? short.need : rows.length ? need : null,
+    freeMib: short ? short.free : known ? free : null,
+    gpu: short ? short.gpu : null,
   };
 }
 
@@ -637,9 +644,13 @@ export function backendCard(
     const freeAll = p.split.reduce((a, frac, i) => a + (frac > 0 ? p.free_mib?.[i] ?? 0 : 0), 0);
     const freeFits = p.split.map((frac, i) => frac === 0 || p.free_mib?.[i] === undefined ? null : (p.fits_free?.[i] ?? (p.additional_mib?.[i] ?? p.per_gpu_mib[i]) <= p.free_mib[i]));
     const nowFits = p.fits_now ?? (freeFits.some((x) => x === false) ? false : freeFits.some((x) => x === true) ? true : null);
+    const shortAt = freeFits.findIndex((x) => x === false);
     const fitChip = fitChipHtml({
       state: worstState ?? (p.fits ? "fits" : "does_not_fit"), pagedMib: pagedTotal,
-      fitsNow: nowFits, neededMib: additional, freeMib: freeAll,
+      fitsNow: nowFits,
+      neededMib: shortAt >= 0 ? p.additional_mib?.[shortAt] ?? p.per_gpu_mib[shortAt] : additional,
+      freeMib: shortAt >= 0 ? p.free_mib?.[shortAt] ?? null : freeAll,
+      gpu: shortAt >= 0 ? p.gpu_indices?.[shortAt] ?? shortAt : null,
     });
     return `<div style="margin-top:10px">
       ${p.down_indices && p.down_indices.length ? `<div style="font-size:12px;color:var(--err);margin-bottom:6px" title="${p.down_indices.map((i) => `GPU ${i}`).join(", ")} ${p.down_indices.length === 1 ? "is" : "are"} down and ${p.down_indices.length === 1 ? "is" : "are"} treated as having no free VRAM.">${p.down_indices.map((i) => `GPU ${i}`).join(", ")}: down — no free VRAM</div>` : ""}
