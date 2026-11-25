@@ -213,6 +213,107 @@ fn vram_gate_credit_covers_a_restart() {
     assert_eq!(failures[0].free_mib, 1024 + 13 * 1024);
 }
 
+fn process_sample(
+    pid: u32,
+    gpu_index: u32,
+    vram_mib: Option<u64>,
+) -> manager_telemetry::ProcessSample {
+    manager_telemetry::ProcessSample {
+        pid,
+        name: "llama-server.exe".into(),
+        vram_mib,
+        gpu_index,
+        backend_id: None,
+    }
+}
+
+/// A6b: the credit is what the running process measurably holds, not
+/// what the replacement needs.
+#[test]
+fn own_residency_is_measured_per_gpu() {
+    let required = [(0, 9_000), (1, 14_196)];
+    let readings = [
+        vram_reading(0, 16_384, 16_000),
+        vram_reading(1, 16_376, 4_600),
+    ];
+    let credit = |processes: &[manager_telemetry::ProcessSample]| {
+        own_residency(7, processes, &required, &readings)
+    };
+    // Another process's memory is never credited; a GPU the process
+    // holds nothing on gives nothing back.
+    assert_eq!(
+        credit(&[
+            process_sample(7, 1, Some(8_000)),
+            process_sample(8, 1, Some(3_776)),
+        ]),
+        [(0, 0), (1, 8_000)]
+    );
+    // Unmeasured: the requirement, bounded by what is in use at all.
+    assert_eq!(credit(&[]), [(0, 384), (1, 11_776)]);
+    assert_eq!(credit(&[process_sample(7, 1, None)]), [(0, 0), (1, 11_776)]);
+}
+
+/// A6b through the gate: a restart whose GPU has too little memory even
+/// after its own stop is refused like a manual start, and it passes when
+/// its own freed memory is enough.
+#[tokio::test]
+async fn a_restart_is_gated_on_its_own_freed_memory() {
+    let mut cfg = test_cfg();
+    let spec = &manager_models::curated_models()[0];
+    serve_model(&mut cfg, "planner", &spec.id, "models/p.gguf", None);
+    cfg.backends
+        .iter_mut()
+        .find(|b| b.id == "planner")
+        .unwrap()
+        .flags
+        .tensor_split = Vec::new();
+    let (state, dir) = advanced_test_state(cfg);
+    let cfg = state.config.read().await.clone();
+    let b = backend(&cfg, "planner");
+    let need = {
+        let req = backend_memory_requirement(&cfg, &b).expect("a catalog requirement");
+        manager_optimize::residency_per_gpu(&req, &[], 1)[0]
+    };
+    let total = need + 1_000;
+    let pid = std::process::id();
+    ensure_backend_specs(&state).await;
+    state
+        .supervisor()
+        .await
+        .lock()
+        .await
+        .adopt("planner", pid)
+        .unwrap();
+    // `own` MiB held by the running backend, `other` by everything else.
+    let set = |own: u64, other: u64| {
+        let store = state.telemetry.get().unwrap().clone();
+        let mut guard = lock_telemetry(&store);
+        guard.update(vec![GpuSample::fresh(
+            0,
+            "GPU 0",
+            0.0,
+            own + other,
+            total,
+            40.0,
+            50.0,
+            manager_telemetry::TelemetrySourceKind::NvidiaSmi,
+        )]);
+        guard.update_processes(vec![process_sample(pid, 0, Some(own))]);
+    };
+    set(need - 2_000, 900);
+    vram_start_gate(&state, &cfg, &b, false).await.unwrap();
+    set(need - 2_000, 2_500);
+    let err = vram_start_gate(&state, &cfg, &b, false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!("needs {need} MiB but only {} MiB", need - 1_500)),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn vram_gate_down_gpu_is_unavailable_not_short() {
     // The thermal-offline shape: the placed GPU fell out of

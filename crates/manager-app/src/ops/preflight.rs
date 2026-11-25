@@ -186,9 +186,10 @@ pub(crate) struct VramGateFailure {
     pub(crate) class: VramGateClass,
     pub(crate) required_mib: u64,
     /// The free MiB the gate compared against: measured free plus
-    /// the starting backend's own credited residency when it is
-    /// already running (a restart frees its current weights before
-    /// the new spawn allocates, so its own hold is not a shortage).
+    /// the starting backend's own residency ([`own_residency`]) when
+    /// it is already running (a restart frees its current weights
+    /// before the new spawn allocates, so its own hold is not a
+    /// shortage).
     /// Zero for a GPU with no usable reading.
     pub(crate) free_mib: u64,
     pub(crate) total_mib: u64,
@@ -232,6 +233,37 @@ pub(crate) fn requirement_breakdown(req: &manager_models::MemoryRequirement) -> 
         terms.push(format!("expert cache {} MiB", req.moe_cache_mib));
     }
     terms.join(" + ")
+}
+
+/// What the backend's own running process gives back on each GPU of
+/// `required` when a restart stops it: the memory measured for `pid`.
+/// Where telemetry has no figure for the process, its requirement share,
+/// never more than the GPU has in use.
+pub(crate) fn own_residency(
+    pid: u32,
+    processes: &[manager_telemetry::ProcessSample],
+    required: &[(u32, u64)],
+    readings: &[VramGateReading],
+) -> Vec<(u32, u64)> {
+    let own: Vec<_> = processes.iter().filter(|p| p.pid == pid).collect();
+    required
+        .iter()
+        .map(|&(index, req)| {
+            let measured: Option<u64> = own
+                .iter()
+                .filter(|p| p.gpu_index == index)
+                .map(|p| p.vram_mib)
+                .sum();
+            let used = readings
+                .iter()
+                .find(|r| r.index == index)
+                .map_or(0, |r| r.total_mib.saturating_sub(r.free_mib));
+            match measured.filter(|_| !own.is_empty()) {
+                Some(mib) => (index, mib),
+                None => (index, req.min(used)),
+            }
+        })
+        .collect()
 }
 
 /// The pure start-gate math. Every placed GPU is judged first
@@ -352,10 +384,10 @@ pub(crate) async fn vram_start_gate(
     // Telemetry snapshot first, supervisor status second; neither
     // lock is held while the other is taken (the order the other
     // preflight readers follow).
-    let mut samples = {
+    let (mut samples, processes) = {
         let store = state.telemetry().await;
-        let snapshot = lock_telemetry(&store).snapshot();
-        snapshot
+        let guard = lock_telemetry(&store);
+        (guard.snapshot(), guard.last_processes().to_vec())
     };
     samples.sort_by_key(|s| s.index);
     if samples.is_empty() {
@@ -396,17 +428,17 @@ pub(crate) async fn vram_start_gate(
         .filter(|(_, st)| matches!(st, ProcessState::Running | ProcessState::Starting))
         .map(|(id, _)| id.as_str())
         .collect();
-    // A restart's own current residency is credited back: the
-    // running process frees its weights before the replacement
-    // allocates. The credit basis is the configured split applied
-    // to the current requirement — the placement projection's
-    // credit basis, for the same reason (no launched-split record
-    // exists separate from the configured one).
-    let credit: Vec<(u32, u64)> = if running.contains(b.id.as_str()) {
-        required.clone()
-    } else {
-        Vec::new()
-    };
+    // A restart's own current residency is credited back, in both run
+    // modes: the running process frees it before the replacement
+    // allocates. The saved configuration describes the replacement, not
+    // the running process, so its requirement is no measure of that:
+    // crediting it passed every restart.
+    let credit: Vec<(u32, u64)> = lifecycle::backend_liveness_for(state, cfg)
+        .await
+        .get(&b.id)
+        .and_then(lifecycle::BackendLive::process_pid)
+        .map(|pid| own_residency(pid, &processes, &required, &readings))
+        .unwrap_or_default();
     let failures = vram_gate_failures(&placed, &required, &readings, &credit);
     if failures.is_empty() {
         return Ok(());
