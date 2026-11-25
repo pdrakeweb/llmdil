@@ -18,6 +18,9 @@ const PARALLEL_PRESETS = [1, 2, 4, 8];
  *  backend_set_parallel validates (manager_models::parallel). */
 export const PARALLEL_MIN = 1;
 export const PARALLEL_MAX = 1024;
+/** The context length's range, as backend_update_flags validates it. */
+export const CTX_MIN = 1024;
+export const CTX_MAX = 1048576;
 /** The slot count llama.cpp's `--parallel` default (auto, -1)
  *  initializes on the pinned build, banner-verified — see
  *  manager_models::parallel. The unset field state names it so
@@ -72,9 +75,9 @@ function offloadLayersLabel(o: BackendOffload, layers: number): string {
  *  gains a sentence naming the GPU architecture it is unverified
  *  on and the override rule for saving it. */
 function offloadTipText(o: BackendOffload, layers: number): string {
-  const base = "Routed-expert weights for the first N MoE layers run from system RAM instead of the GPU, freeing GPU memory at some speed cost. Green is this model's catalog default \u2014 the most offload that stays fast; past it, CPU expert computation increasingly dominates generation speed. Figures are weights only; the KV cache stays on the GPU. The slider saves when released and applies on the backend's next start.";
+  const base = "Routed-expert weights for the first N MoE layers run from system RAM instead of the GPU, freeing GPU memory at some speed cost. Green is this model's catalog default \u2014 the most offload that stays fast; past it, CPU expert computation increasingly dominates generation speed. Figures are weights only; the KV cache stays on the GPU. Applies on the backend's next start.";
   if (!offloadIsUntested(o, layers) || !o.guardrail) return base;
-  return `${base} This position is outside the range verified for this model's GPU architecture (compute capability ${o.guardrail.compute_capability}): partial offload positions are not verified there, and saving requires an explicit override while starts without one are refused.`;
+  return `${base} This position is outside the range verified for this model's GPU architecture (compute capability ${o.guardrail.compute_capability}): partial offload positions are not verified there, and saving one needs an explicit override while starts without one are refused.`;
 }
 
 /** The flag tokens a slider position writes — the canonical forms
@@ -254,12 +257,12 @@ export function predictedLineHtml(exact: PredictedThroughput | null, near: Predi
 }
 
 /** The --parallel conflict line's text. MTP drafting needs a
- *  single slot; the MTP control surfaces an explicit conflicting
- *  slot count and never rewrites it — the Parallel slots field
- *  in the same form is where the operator sets it (tracker #61),
- *  and the line says so. */
-export function mtpConflictText(parallel: number): string {
-  return `Parallel slots: ${parallel} — MTP drafting needs --parallel 1; set Parallel slots to 1 in the Flags form — the next start will not draft until then`;
+ *  single slot; the MTP control surfaces any other setting — auto
+ *  included, which starts several slots — and never rewrites it: the
+ *  Parallel slots field in the same form is where the operator sets
+ *  it (tracker #61), and the line says so. */
+export function mtpConflictText(parallel: number | null): string {
+  return `Parallel slots: ${parallel === null ? `auto (${PARALLEL_LLAMA_AUTO_SLOTS})` : parallel} — MTP drafting needs --parallel 1; set Parallel slots to 1 in the Edit form — the next start will not draft until then`;
 }
 
 /* ---------------- Advanced flags validation (tracker #60) ----------------
@@ -283,6 +286,11 @@ const FLAG_SPECS: ReadonlyArray<readonly [string, string, boolean, FlagArity]> =
   ["--n-cpu-moe", "--n-cpu-moe", false, V("int")], ["-ncmoe", "--n-cpu-moe", false, V("int")],
   ["--cpu-moe", "--cpu-moe", false, { kind: "none" }], ["-cmoe", "--cpu-moe", false, { kind: "none" }],
   ["-ot", "--override-tensor", false, { kind: "multi", value: "any" }], ["--override-tensor", "--override-tensor", false, { kind: "multi", value: "any" }],
+  ["--cache-type-k", "--cache-type-k", false, V("any")], ["-ctk", "--cache-type-k", false, V("any")],
+  ["--cache-type-v", "--cache-type-v", false, V("any")], ["-ctv", "--cache-type-v", false, V("any")],
+  ["--flash-attn", "--flash-attn", false, V("any")], ["-fa", "--flash-attn", false, V("any")],
+  ["--moe-cache-mib", "--moe-cache-mib", false, V("int")],
+  ["--fit", "--fit", false, V("any")], ["-fit", "--fit", false, V("any")],
   ["--spec-type", "--spec-type", false, V("any")],
   ["--spec-draft-n-max", "--spec-draft-n-max", false, V("int")],
   ["--parallel", "--parallel", false, V("int")], ["-np", "--parallel", false, V("int")],
@@ -294,7 +302,8 @@ const FLAG_SPECS: ReadonlyArray<readonly [string, string, boolean, FlagArity]> =
   ["--split-mode", "--split-mode", false, V("any")],
   ["--device", "--device", false, V("any")], ["-dev", "--device", false, V("any")],
   ["--main-gpu", "--main-gpu", false, V("int")],
-  ["--gpu-layers", "--gpu-layers", false, V("int")], ["--n-gpu-layers", "--gpu-layers", false, V("int")], ["-ngl", "--gpu-layers", false, V("int")],
+  // "auto" and "all" are llama.cpp's own spellings beside a count.
+  ["--gpu-layers", "--gpu-layers", false, V("any")], ["--n-gpu-layers", "--gpu-layers", false, V("any")], ["-ngl", "--gpu-layers", false, V("any")],
   ["--threads", "--threads", false, V("int")], ["-t", "--threads", false, V("int")],
   ["--jinja", "--jinja", false, { kind: "none" }],
   ["--host", "--host", true, V("any")],
@@ -413,27 +422,33 @@ function offloadTrackBackground(o: BackendOffload): string {
 export function flagsCtxBatchHtml(o: {
   ctx: number;
   batch: number;
+  /** The Custom… choice, explicit: it stays chosen while the number
+   *  equals a preset. */
+  ctxCustom: boolean;
+  batchCustom: boolean;
   ctxMax: number | null;
   fieldAttr: string;
   disabled: boolean;
 }): string {
   const dis = o.disabled ? " disabled" : "";
+  const ctxC = o.ctxCustom || !CTX_PRESETS.includes(o.ctx);
+  const batchC = o.batchCustom || !BATCH_PRESETS.includes(o.batch);
   return `<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px">
         <label style="font-size:12px;color:var(--text2)">Context length (-c)
           <span style="display:flex;gap:6px;margin-top:4px">
             <select ${o.fieldAttr}="ctx-preset" style="${SELECT_STYLE};flex:1;min-width:0"${dis}>
-              ${CTX_PRESETS.map((v) => `<option value="${v}"${v === o.ctx ? " selected" : ""}>${fmtCount(v)} (${ctxShort(v)})${v === 32768 ? " \u2014 default" : ""}${o.ctxMax && v > o.ctxMax ? " \u2014 beyond rated" : ""}</option>`).join("")}
-              <option value="custom"${CTX_PRESETS.includes(o.ctx) ? "" : " selected"}>Custom\u2026</option>
+              ${CTX_PRESETS.map((v) => `<option value="${v}"${!ctxC && v === o.ctx ? " selected" : ""}>${fmtCount(v)} (${ctxShort(v)})${v === 32768 ? " \u2014 default" : ""}${o.ctxMax && v > o.ctxMax ? " \u2014 beyond rated" : ""}</option>`).join("")}
+              <option value="custom"${ctxC ? " selected" : ""}>Custom\u2026</option>
             </select>
-            ${CTX_PRESETS.includes(o.ctx) ? "" : `<input ${o.fieldAttr}="ctx-custom" type="number" value="${o.ctx}" min="1024" max="1048576" style="${SELECT_STYLE};width:110px"${dis}>`}
+            ${!ctxC ? "" : `<input ${o.fieldAttr}="ctx-custom" type="number" value="${Number.isFinite(o.ctx) ? o.ctx : ""}" min="${CTX_MIN}" max="${CTX_MAX}" aria-label="Custom context length" style="${SELECT_STYLE};width:110px"${dis}>`}
           </span></label>
         <label style="font-size:12px;color:var(--text2)">Batch size (-b)
           <span style="display:flex;gap:6px;margin-top:4px">
             <select ${o.fieldAttr}="batch-preset" style="${SELECT_STYLE};flex:1;min-width:0"${dis}>
-              ${BATCH_PRESETS.map((v) => `<option value="${v}"${v === o.batch ? " selected" : ""}>${fmtCount(v)}${v === 512 ? " \u2014 default" : ""}</option>`).join("")}
-              <option value="custom"${BATCH_PRESETS.includes(o.batch) ? "" : " selected"}>Custom\u2026</option>
+              ${BATCH_PRESETS.map((v) => `<option value="${v}"${!batchC && v === o.batch ? " selected" : ""}>${fmtCount(v)}${v === 512 ? " \u2014 default" : ""}</option>`).join("")}
+              <option value="custom"${batchC ? " selected" : ""}>Custom\u2026</option>
             </select>
-            ${BATCH_PRESETS.includes(o.batch) ? "" : `<input ${o.fieldAttr}="batch-custom" type="number" value="${o.batch}" min="1" style="${SELECT_STYLE};width:110px"${dis}>`}
+            ${!batchC ? "" : `<input ${o.fieldAttr}="batch-custom" type="number" value="${Number.isFinite(o.batch) ? o.batch : ""}" min="1" aria-label="Custom batch size" style="${SELECT_STYLE};width:110px"${dis}>`}
           </span></label>
       </div>`;
 }
@@ -461,22 +476,24 @@ export function parallelTokenText(value: number | null): string {
  *  what the current selection writes. */
 export function flagsParallelHtml(o: {
   value: number | null;
+  /** The Custom… choice, explicit (see flagsCtxBatchHtml). */
+  custom: boolean;
   savedCustom: boolean;
   fieldAttr: string;
   disabled: boolean;
 }): string {
   const dis = o.disabled ? " disabled" : "";
   const v = o.value;
-  const isCustom = v !== null && !PARALLEL_PRESETS.includes(v);
+  const isCustom = v !== null && (o.custom || !PARALLEL_PRESETS.includes(v));
   return `<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px;align-items:end">
         <label style="font-size:12px;color:var(--text2)">Parallel slots (--parallel)<span class="info-tip" title="Request slots the server runs concurrently; each slot is an independent sequence with its own share of the work. An explicit count divides the context length across the slots; Auto (llama.cpp's default) keeps one unified KV cache at the full context. 1 suits a single request stream, and MTP drafting needs 1.">${icon("info")}</span>
           <span style="display:flex;gap:6px;margin-top:4px">
             <select ${o.fieldAttr}="parallel-preset" style="${SELECT_STYLE};flex:1;min-width:0"${dis}>
               <option value="default"${v === null ? " selected" : ""}>Auto \u2014 llama.cpp default</option>
-              ${PARALLEL_PRESETS.map((p) => `<option value="${p}"${p === v ? " selected" : ""}>${p}</option>`).join("")}
+              ${PARALLEL_PRESETS.map((p) => `<option value="${p}"${!isCustom && p === v ? " selected" : ""}>${p}</option>`).join("")}
               <option value="custom"${isCustom ? " selected" : ""}>Custom\u2026</option>
             </select>
-            ${isCustom ? `<input ${o.fieldAttr}="parallel-custom" type="number" value="${v}" min="${PARALLEL_MIN}" max="${PARALLEL_MAX}" style="${SELECT_STYLE};width:110px"${dis}>` : ""}
+            ${isCustom ? `<input ${o.fieldAttr}="parallel-custom" type="number" value="${Number.isFinite(v) ? v : ""}" aria-label="Custom parallel slots" min="${PARALLEL_MIN}" max="${PARALLEL_MAX}" style="${SELECT_STYLE};width:110px"${dis}>` : ""}
           </span></label>
         <div style="font-size:12px;color:var(--text2)"><span style="font-family:var(--mono)">${esc(parallelTokenText(v))}</span>${o.savedCustom ? `<span title="The saved flags spell parallel slots in a form the control does not write (an -np or = spelling, repeated tokens, ...). Saving from the field writes the canonical --parallel N; every other flag is preserved."> \u00b7 custom flags</span>` : ""}</div>
       </div>`;
@@ -498,6 +515,92 @@ export const FLASH_ATTN_MODES: FlashAttnName[] = ["auto", "on", "off"];
  *  forms the app itself writes (backend_set_cache). */
 export function cacheTokenText(sel: CacheSelectionLike): string {
   return `--cache-type-k ${sel.k} --cache-type-v ${sel.v} --flash-attn ${sel.flash_attn}`;
+}
+
+/** A GPU's figures for pricing a placement draft. */
+export interface RepriceGpu { gpu: number; total_mib: number; free_mib: number | null; wddm: boolean }
+
+/** The preview with the form's other drafts priced in: backend_cache_
+ *  preview prices the SAVED offload position and placement, so a moved
+ *  MoE slider (`weightsMib`, the GPU-resident weights at the draft
+ *  position) and a changed GPU selection (`gpus`: an even split, what
+ *  saving a new selection writes) are applied here — as is an expert-cache draft (`moeCacheMib`)
+ *  where the server priced none — under the same
+ *  rules (required against total VRAM; over total pages on WDDM). */
+export function repriceCachePreview(
+  p: CachePreview,
+  d: { weightsMib?: number; moeCacheMib?: number; gpus?: RepriceGpu[] },
+): CachePreview {
+  const dWeights = d.weightsMib !== undefined ? d.weightsMib - p.weights_mib : 0;
+  const delta = dWeights + (d.moeCacheMib !== undefined ? d.moeCacheMib - p.moe_cache_mib : 0);
+  if (!delta && !dWeights && !d.gpus) return p;
+  const total = p.total_mib + delta;
+  const old = p.targets ?? [];
+  const oldSum = old.reduce((a, t) => a + (t.required_mib ?? 0), 0);
+  const targets = (d.gpus ?? old).map((g) => {
+    const prev = old.find((t) => t.gpu === g.gpu);
+    const wddm = "wddm" in g ? g.wddm : g.driver_model === "wddm";
+    const free = g.free_mib ?? prev?.free_mib ?? null;
+    const share = d.gpus ? 1 / d.gpus.length
+      : oldSum > 0 && prev?.required_mib != null ? prev.required_mib / oldSum : null;
+    const required = share === null ? null : Math.ceil(total * share);
+    const over = required === null ? 0 : Math.max(0, required - g.total_mib);
+    return {
+      gpu: g.gpu, total_mib: g.total_mib, required_mib: required,
+      fits: required === null ? null : required <= (g.total_mib * (100 - p.headroom_reserve_percent)) / 100,
+      driver_model: prev?.driver_model ?? (wddm ? "wddm" as const : null),
+      fit_state: required === null ? null : !over ? "fits" as const : wddm ? "wddm_paged" as const : "does_not_fit" as const,
+      paged_mib: over && wddm ? over : 0,
+      free_mib: free,
+      fits_free: required === null || free === null ? null : required <= free,
+    };
+  });
+  const shares = targets.map((t) => (t.required_mib ?? 0) / Math.max(1, total));
+  const rungs = p.ladder.map((r) => {
+    const rt = r.total_mib + delta;
+    const fits = targets.length > 0 && targets.every((t, i) => rt * shares[i] <= (t.total_mib * (100 - p.headroom_reserve_percent)) / 100);
+    return { ...r, total_mib: rt, fits };
+  });
+  return {
+    ...p,
+    weights_mib: p.weights_mib + dWeights,
+    sys_weights_mib: Math.max(0, p.sys_weights_mib - dWeights),
+    moe_cache_mib: d.moeCacheMib ?? p.moe_cache_mib,
+    total_mib: total,
+    targets,
+    fits_current: targets.length ? targets.every((t) => t.fits === true) : null,
+    fits_now: targets.length && targets.every((t) => t.fits_free !== null) ? targets.every((t) => t.fits_free === true) : null,
+    ladder: rungs,
+    best: rungs.find((r) => r.fits) ?? null,
+  };
+}
+
+/** The one fit chip, honest about what fits NOW: "Fits" only within
+ *  free memory; paging states its amount and never reads as a fit;
+ *  a requirement within total but over free memory names both
+ *  figures. Empty when nothing can be judged. */
+export function fitChipHtml(f: {
+  state: "fits" | "wddm_paged" | "does_not_fit" | null | undefined;
+  pagedMib?: number | null;
+  /** Null/undefined = unknown: the chip then claims total VRAM only. */
+  fitsNow?: boolean | null;
+  neededMib?: number | null;
+  freeMib?: number | null;
+}): string {
+  const gib = (mib: number): string => fmtGb(mib / 1024);
+  if (!f.state) return "";
+  if (f.state === "wddm_paged") {
+    return `<span class="chip status-tag status-transition" title="The requirement exceeds total VRAM on a WDDM GPU; the excess pages to system RAM and the start asks for confirmation.">Will page ${gib(f.pagedMib ?? 0)} GiB</span>`;
+  }
+  if (f.state === "does_not_fit") {
+    return `<span class="chip status-tag status-bad" title="The requirement exceeds the placed GPUs' total VRAM.">Does not fit</span>`;
+  }
+  if (f.fitsNow === false) {
+    const figs = f.neededMib != null && f.freeMib != null ? `: needs ${gib(f.neededMib)} GiB, free ${gib(f.freeMib)} GiB` : "";
+    return `<span class="chip status-tag status-transition" title="The requirement is within total VRAM, but other processes hold too much of it at the moment.">Not enough free now${figs}</span>`;
+  }
+  if (f.fitsNow === true) return `<span class="chip status-tag status-on" title="The requirement fits the memory that is free now.">Fits</span>`;
+  return `<span class="chip status-tag status-off" title="Within total VRAM. Free memory is not measured.">Within total VRAM</span>`;
 }
 
 /** Whether the selection is the pairing llama.cpp refuses: a
@@ -553,21 +656,8 @@ export function cachePreviewHtml(preview: CachePreview | null, sel: CacheSelecti
   }
   rows.push(`<div style="font-weight:600;color:var(--text)">Total: ${gib(preview.total_mib)} GiB<span class="info-tip" title="Predicted footprint of the current selection, priced by the same requirement model as the start gate: GPU weights at the current offload, KV at the selected cache types and the form's context, and the recurrent-state cache when the model carries one. A selection fits when its per-GPU total is within ${preview.headroom_reserve_percent}% headroom of the target's VRAM — the reserve covers the compute buffers the requirement model does not price. Predicted best is the highest-quality rung that fits: f16, then q8_0/q8_0, then q8_0/q4_0 (V degrades before K), then q4_0/q4_0, flash attention on at every rung.">${icon("info")}</span></div>`);
   for (const t of preview.targets ?? []) {
-    // The capacity chip is the three-state classification
-    // against total VRAM (the start gate's basis) when the
-    // server carries it: a WDDM GPU over total is a paged fit
-    // with its amount, never a plain "Does not fit" the gate
-    // would allow on confirmation — and never a plain "Fits"
-    // the gate would refuse.
-    const chip = t.fit_state === "wddm_paged"
-      ? ` <span class="chip status-tag status-transition">Fits — ${gib(t.paged_mib ?? 0)} GiB paged</span>`
-      : t.fit_state === "does_not_fit"
-        ? ` <span class="chip status-tag status-bad">Does not fit</span>`
-        : t.fit_state === "fits"
-          ? ` <span class="chip status-tag status-on">Fits</span>`
-          : t.fits === null || t.fits === undefined
-            ? ""
-            : ` <span class="chip status-tag ${t.fits ? "status-on" : "status-bad"}">${t.fits ? "Fits" : "Does not fit"}</span>`;
+    const state = t.fit_state ?? (t.fits === true ? "fits" : t.fits === false ? "does_not_fit" : null);
+    const chip = ` ${fitChipHtml({ state, pagedMib: t.paged_mib, fitsNow: t.fits_free ?? null, neededMib: t.required_mib, freeMib: t.free_mib })}`;
     const value = t.required_mib === null || t.required_mib === undefined
       ? `${gib(t.total_mib)} GiB`
       : `${gib(t.required_mib)} GiB of ${gib(t.total_mib)} GiB`;
@@ -596,7 +686,9 @@ export function cachePreviewHtml(preview: CachePreview | null, sel: CacheSelecti
 export function flagsCacheHtml(o: {
   sel: CacheSelectionLike;
   savedCustom: boolean;
-  savedPresent: boolean;
+  /** Whether the shown selection IS the saved state and no cache token
+   *  is saved for it (the edit form only). */
+  savedAbsent: boolean;
   preview: CachePreview | null;
   fieldAttr: string;
   bestAttr: string;
@@ -616,7 +708,7 @@ export function flagsCacheHtml(o: {
         ${selHtml("cache-v", "V cache type", CACHE_TYPES, o.sel.v, "The element type the value cache is stored in. A quantized V cache requires flash attention (auto promotes to on; off is refused by llama.cpp and by this form).")}
         ${selHtml("flash-attn", "Flash attention", FLASH_ATTN_MODES, o.sel.flash_attn, "Flash attention computes attention in tiles, cutting memory traffic. Auto lets llama.cpp decide (and promotes to on when a quantized V cache or a tensor split requires it); on forces it; off disables it. On the pinned build it is supported on every GPU the app targets, Pascal included (generic tile kernel).")}
       </div>
-      <div style="font-size:12px;color:var(--text2);margin-top:4px"><span style="font-family:var(--mono)">${esc(cacheTokenText(o.sel))}</span>${o.savedCustom ? `<span title="The saved flags spell the cache settings in a form the controls do not write (a -ctk or = spelling, a partial selection, ...). Saving from these controls writes the canonical tokens; every other flag is preserved."> · custom flags</span>` : ""}${o.savedPresent ? "" : `<span title="No cache tokens are saved for this backend: it runs at llama.cpp's defaults (f16/f16, flash attention auto), exactly as before these controls existed. Saving from these controls writes the tokens."> · llama.cpp defaults (no tokens saved)</span>`}</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:4px"><span style="font-family:var(--mono)">${esc(cacheTokenText(o.sel))}</span>${o.savedCustom ? `<span title="The saved flags spell the cache settings in a form the controls do not write (a -ctk or = spelling, a partial selection, ...). Saving from these controls writes the canonical tokens; every other flag is preserved."> · custom flags</span>` : ""}${o.savedAbsent ? `<span title="No cache tokens are saved for this backend: it runs at llama.cpp's defaults (f16/f16, flash attention auto). Changing a control saves the tokens."> · llama.cpp defaults (no tokens saved)</span>` : ""}</div>
       <div data-cache-slot>${cachePreviewHtml(o.preview, o.sel, o.bestAttr)}</div>
     </div>`;
 }
@@ -690,24 +782,60 @@ export function paintOffloadReadout(card: Element, o: BackendOffload, n: number)
  *  Default (auto) choice; choosing Custom seeds the input from
  *  the current selection — the auto slot count when unset — so
  *  the operator edits a real number, never a blank. */
+export interface FlagsFieldDraft {
+  ctx: number;
+  batch: number;
+  parallel: number | null;
+  /** The Custom… choices, explicit state: a custom value equal to a
+   *  preset keeps the numeric input. */
+  ctxCustom: boolean;
+  batchCustom: boolean;
+  parallelCustom: boolean;
+}
+
+/** A draft for saved values (a non-preset value is custom already). */
+export function newFlagsFields(ctx: number, batch: number, parallel: number | null): FlagsFieldDraft {
+  return {
+    ctx, batch, parallel,
+    ctxCustom: !CTX_PRESETS.includes(ctx),
+    batchCustom: !BATCH_PRESETS.includes(batch),
+    parallelCustom: parallel !== null && !PARALLEL_PRESETS.includes(parallel),
+  };
+}
+
+/** What is wrong with the context/batch/parallel draft, or null — the
+ *  bounds the save ops apply, in the form's own terms. An explicit
+ *  saved `--parallel -1` (auto) is accepted unchanged. */
+export function flagsFieldError(d: FlagsFieldDraft): string | null {
+  if (!Number.isInteger(d.ctx) || d.ctx < CTX_MIN || d.ctx > CTX_MAX) return `Context length must be a whole number between ${fmtCount(CTX_MIN)} and ${fmtCount(CTX_MAX)}.`;
+  if (!Number.isInteger(d.batch) || d.batch < 1 || d.batch > d.ctx) return `Batch size must be a whole number between 1 and the context length (${fmtCount(d.ctx)}).`;
+  if (d.parallel !== null && d.parallel !== -1 && (!Number.isInteger(d.parallel) || d.parallel < PARALLEL_MIN || d.parallel > PARALLEL_MAX)) return `Parallel slots must be a whole number between ${PARALLEL_MIN} and ${fmtCount(PARALLEL_MAX)}.`;
+  return null;
+}
+
 export function applyFlagsField(
-  draft: { ctx: number; batch: number; parallel: number | null },
+  draft: FlagsFieldDraft,
   field: string,
   value: string,
   isChange: boolean,
 ): boolean {
-  if (field === "ctx-custom") { draft.ctx = Number(value); return false; }
-  if (field === "batch-custom") { draft.batch = Number(value); return false; }
-  if (field === "parallel-custom") { draft.parallel = Number(value); return false; }
+  // An emptied custom input is NaN (invalid), not 0.
+  const num = value.trim() === "" ? NaN : Number(value);
+  if (field === "ctx-custom") { draft.ctx = num; return false; }
+  if (field === "batch-custom") { draft.batch = num; return false; }
+  if (field === "parallel-custom") { draft.parallel = num; return false; }
   if (isChange && field === "ctx-preset") {
+    draft.ctxCustom = value === "custom";
     if (value !== "custom") draft.ctx = Number(value);
     return true;
   }
   if (isChange && field === "batch-preset") {
+    draft.batchCustom = value === "custom";
     if (value !== "custom") draft.batch = Number(value);
     return true;
   }
   if (isChange && field === "parallel-preset") {
+    draft.parallelCustom = value === "custom";
     if (value === "default") draft.parallel = null;
     else if (value === "custom") draft.parallel = draft.parallel ?? PARALLEL_LLAMA_AUTO_SLOTS;
     else draft.parallel = Number(value);
@@ -721,18 +849,20 @@ export function applyFlagsField(
  *  model (its rated context from the catalog), for annotating
  *  presets beyond the rating. offloadLayers is the offload slider's
  *  draft position (MoE layers on system RAM), null when the
- *  backend's model is not offload-capable. offloadPendingLayers is
+ *  backend's model is not offload-capable. offloadPending is
  *  a released draft position the guardrail blocks, awaiting the
- *  operator's override/snap decision in the form, else null.
+ *  operator's override/snap decision in the form (override = the
+ *  decision to save it anyway), else null. modelChanged: the Model
+ *  draft differs from the saved model — the model-specific controls
+ *  (offload, expert cache, MTP) wait for that save.
  *  mtpPosition is the MTP draft control's chosen value (0 = Off,
  *  1..4 = draft tokens), null when the backend's model is not
  *  MTP-capable. moeCacheOn / moeCacheMib are the expert-cache
  *  control's draft: the switch state and the chosen size (the
  *  size draft is retained while the switch is off, so toggling
  *  back on restores it); the size is null when the backend has
- *  never carried a cache and none has been chosen. parallel is the Parallel slots field's draft
- *  selection: the explicit slot count, or null for the unset
- *  state (llama.cpp's default, auto). advanced/rawText/rawWarnings
+ *  never carried a cache and none has been chosen. fields carries the context, batch
+ *  and parallel drafts. advanced/rawText/rawWarnings
  *  carry the advanced flags editor's draft (tracker #60): while
  *  advanced is on, the raw text is the single source of truth and
  *  the structured fields are inert. editModelId is the Edit
@@ -740,16 +870,16 @@ export function applyFlagsField(
  *  panel's Model select ("" when the backend's file matches no
  *  registered model), applied through model_assign only when the
  *  panel saves — the card face carries no model control. */
-export interface FlagsDraft { ctx: number; batch: number; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPendingLayers: number | null; mtpPosition: number | null; moeCacheOn: boolean; moeCacheMib: number | null; parallel: number | null; cacheSel: CacheSelectionLike | null; cachePreview: CachePreview | null; advanced: boolean; rawText: string; rawWarnings: FlagWarningLike[]; editModelId: string }
+export interface FlagsDraft { fields: FlagsFieldDraft; moeCacheAuto: boolean; modelChanged: boolean; ctxMax: number | null; modelId: string | null; offloadLayers: number | null; offloadPending: { layers: number; override: boolean } | null; mtpPosition: number | null; moeCacheOn: boolean; moeCacheMib: number | null; cacheSel: CacheSelectionLike | null; cachePreview: CachePreview | null; advanced: boolean; rawText: string; rawWarnings: FlagWarningLike[]; editModelId: string }
 
 /** State for the in-card Placement form (tensor split editing,
  *  moved here from the GPUs page — Pete's direction, 2026-10-16),
  *  non-null only for the backend whose form is open. gpus mirrors
  *  the latest telemetry GPU list for the include/exclude
- *  checkboxes; excluded holds the unchecked GPU indices;
- *  projection is the last successful propose result for this
- *  backend; busy disables the form's buttons while a propose or
- *  apply invoke is in flight. */
+ *  checkboxes; excluded holds the unchecked GPU indices (a draft the
+ *  Edit panel's Save writes); projection is the last successful
+ *  propose result for this backend; busy disables the section's
+ *  controls while a propose invoke is in flight. */
 export interface PlaceCardState {
   gpus: { index: number; name: string }[];
   excluded: Set<number>;

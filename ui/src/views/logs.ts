@@ -127,12 +127,20 @@ function fmtRanAt(ts: string): string {
   const d = new Date(ts);
   return Number.isNaN(d.getTime())
     ? ts
-    : d.toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+    : d.toLocaleString(undefined, { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
 export function fmtDateTime(ts: string): string {
   const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString("en-GB");
+  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString(undefined);
+}
+
+/** How a line is highlighted: llama.cpp's level letter (" E " / " W "
+ *  after its timestamp), CUDA failures, and the words error/fatal. */
+export function logSeverity(line: string): "error" | "warn" | null {
+  if (/^.{0,40}? E /.test(line) || /\bCUDA (?:error|out of memory)|cuda.*(?:error|failed)|out of memory|\b(?:error|fatal|panicked)\b[:!]?/i.test(line)) return "error";
+  if (/^.{0,40}? W /.test(line) || /\bwarn(?:ing)?\b/i.test(line)) return "warn";
+  return null;
 }
 
 /** One log line: visible time stays HH:MM:SS, the full date-time is on
@@ -145,7 +153,8 @@ function logRow(r: LogRow, showSource: boolean): string {
   // what every service's own log scope records for start / stop /
   // restart / exit — styled so they stand out in a busy stream.
   const lc = r.line.includes("[lifecycle]") ? " log-lifecycle" : "";
-  return `<div class="ln${lc}"><span class="t" title="${esc(fmtDateTime(r.ts))}">${esc(fmtTime(r.ts))}</span>${src} <span class="chip">${esc(r.stream)}</span>${arch} ${esc(r.line)}</div>`;
+  const sev = lc ? null : logSeverity(r.line);
+  return `<div class="ln${lc}${sev ? ` lvl-${sev}` : ""}"><span class="t" title="${esc(fmtDateTime(r.ts))}">${esc(fmtTime(r.ts))}</span>${src} <span class="chip">${esc(r.stream)}</span>${arch} ${esc(r.line)}</div>`;
 }
 
 export function renderLogs(): string {
@@ -178,7 +187,7 @@ export function renderLogs(): string {
     <label style="font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:6px">
       <input id="logFollow" type="checkbox"/> Follow</label>
   </div>
-  <div id="logMsg" style="font-size:12px;margin-top:6px"></div>
+  <div id="logMsg" style="font-size:12px;margin-top:6px;min-height:16px"></div>
   <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;border-top:1px solid var(--border);margin-top:10px;padding-top:10px">
     <button class="btn icon-only" id="logPrev" title="Previous page" aria-label="Previous page">${icon("chevL")}</button>
     <button class="btn icon-only" id="logNext" title="Next page" aria-label="Next page">${icon("chevR")}</button>
@@ -305,7 +314,7 @@ export async function wireLogs(root: HTMLElement, initialScope?: string, initial
   const renderPicker = (): void => {
     if (!pickerEl) return;
     const { y, m } = pickerView;
-    const monthName = new Date(y, m, 1).toLocaleDateString("en-GB", { month: "long", year: "numeric" });
+    const monthName = new Date(y, m, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
     const startDay = new Date(y, m, 1).getDay();
     const daysInMonth = new Date(y, m + 1, 0).getDate();
     const daysInPrev = new Date(y, m, 0).getDate();
@@ -639,7 +648,7 @@ export async function wireLogs(root: HTMLElement, initialScope?: string, initial
   /** Any filter change (scope, level, text, time bounds, sort, page
    *  size) restarts paging at page 1 — and is a search being run:
    *  it updates the session state and is captured into the recents
-   *  (tracker #59). Refresh, pager turns, and Follow toggles only
+   *  (tracker #59); typed text is captured when finished. Refresh, pager turns, and Follow toggles only
    *  re-run or navigate the current search, so they sync the
    *  session state without capturing. */
   const onFilterChange = (): void => { page = 1; syncLogsState(); captureSearch(); void load(); };
@@ -651,10 +660,12 @@ export async function wireLogs(root: HTMLElement, initialScope?: string, initial
       searchTimer = null;
       page = 1;
       syncLogsState();
-      captureSearch();
       void load();
     }, 300);
   };
+  /** The text is recorded as a recent search once it is finished (Enter
+   *  or leaving the field), never per keystroke. */
+  const onSearchDone = (): void => { syncLogsState(); if (searchInput?.value.trim()) captureSearch(); };
   const onPrev = (): void => { if (page > 1) { page -= 1; syncLogsState(); void load(); } };
   const onNext = (): void => { page += 1; syncLogsState(); void load(); };
   const onFollow = (): void => {
@@ -687,6 +698,7 @@ export async function wireLogs(root: HTMLElement, initialScope?: string, initial
   sortSel?.addEventListener("change", onFilterChange);
   limitSel?.addEventListener("change", onFilterChange);
   searchInput?.addEventListener("input", onSearch);
+  searchInput?.addEventListener("change", onSearchDone);
   followChk?.addEventListener("change", onFollow);
   refreshBtn?.addEventListener("click", onRefresh);
   prevBtn?.addEventListener("click", onPrev);
@@ -725,6 +737,7 @@ export async function wireLogs(root: HTMLElement, initialScope?: string, initial
     sortSel?.removeEventListener("change", onFilterChange);
     limitSel?.removeEventListener("change", onFilterChange);
     searchInput?.removeEventListener("input", onSearch);
+    searchInput?.removeEventListener("change", onSearchDone);
     followChk?.removeEventListener("change", onFollow);
     refreshBtn?.removeEventListener("click", onRefresh);
     prevBtn?.removeEventListener("click", onPrev);

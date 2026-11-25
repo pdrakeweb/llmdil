@@ -81,3 +81,12 @@ One line, no list, no prose:
 | Manual command `<pre>` (`562–566`) | Same block + copy button, both variants |
 | Dismissed one-liner (`584–588`) | Merged into the summary variant |
 | Banner markup (`main.ts:76–94`) | Replaced by the summary variant; banner Apply gains the full view's mode semantics |
+
+## Update (Nov 2026): one docked bar
+
+- The global activation bar is docked under the view, above the task bar. It
+  polls, so it can appear seconds after a page is painted; at the top of the
+  main column that moved every control by its height.
+- The Backends and Gateway views no longer carry the summary variant: the bar
+  is the one place outside the Activation Plan view that shows a pending plan.
+- The Target cell names every backend of a change.

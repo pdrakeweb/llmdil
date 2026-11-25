@@ -1,7 +1,7 @@
 /* Activation plan panel, shared by the Backends and Models views
    (split from static.ts). */
 
-import { activationApply, activationCancelChanges, getActivationExecution, getActivationHistory, getActivationPlan } from "../api";
+import { activationApply, activationCancelChanges, getActivationExecution, getActivationHistory, getActivationPlan, planNeedsElevation } from "../api";
 import type { ActivationChange, ActivationExecution, ActivationExecutionSummary, ActivationPlanData } from "../api";
 import { fmtCount, stackedBar } from "../charts";
 import { esc } from "../html";
@@ -85,6 +85,10 @@ function planNameList(names: string[]): string {
  * line as visible text next to the Apply actions, not only in the
  * buttons' tooltip. */
 export function planApplyLine(plan: ActivationPlanData): string {
+  return planApplyCore(plan) + (planNeedsElevation(plan) ? " Windows will ask for administrator approval." : "");
+}
+
+function planApplyCore(plan: ActivationPlanData): string {
   const restarting = plan.backend_restart_ids ?? [];
   const backendTargets: string[] = [];
   for (const c of plan.changes) {
@@ -301,11 +305,18 @@ export async function applyActivationPlan(
     return false;
   }
   const ok = r.data.ok;
-  const message = r.data.message
+  const quiesce = r.data.quiesce;
+  const drainNote = quiesce?.timed_out ? ` Drain timed out with ${fmtCount(quiesce.in_flight)} request${quiesce.in_flight === 1 ? "" : "s"} still in flight.` : "";
+  const message = drainedMessage(r.data.message, drainNote)
     || (ok ? "Activation plan applied — the saved changes are live." : `Activation apply failed${r.error ? `: ${r.error}` : "."}`);
   setStatus(message, !ok);
   if (r.data.manual_command) setManual?.(r.data.manual_command);
   return ok;
+}
+
+/** The server's message with the drain note, unless it says so itself. */
+function drainedMessage(message: string, note: string): string {
+  return message && note && !/timed out/i.test(message) ? message + note : message;
 }
 
 /** Shared click handling for the plan card's buttons, used by the
@@ -432,14 +443,12 @@ function planChangeCell(c: ActivationChange): string {
 }
 
 /** The Target cell: scope absorbed as a Label: Value ("Backend:
- * coder" / "Gateway"). A long target list is capped in the cell;
- * the full list rides the tooltip. */
+ * coder" / "Gateway"), every backend named. */
 function planTargetCell(c: ActivationChange): string {
   if (c.scope !== "backend") return "Gateway";
   const targets = c.targets ?? [];
   if (!targets.length) return "Backend";
-  const shown = targets.slice(0, 2).join(", ") + (targets.length > 2 ? ` +${targets.length - 2}` : "");
-  return `<span title="Backend: ${esc(targets.join(", "))}">Backend: ${esc(shown)}</span>`;
+  return `Backend: ${esc(targets.join(", "))}`;
 }
 
 export async function wireActivationPlan(root: HTMLElement): Promise<() => void> {
@@ -487,7 +496,7 @@ export async function wireActivationPlan(root: HTMLElement): Promise<() => void>
     const modeLabel = detail.mode === "quiesce" || detail.mode === "drain" ? "Drain and apply"
       : detail.mode === "restart" || detail.mode === "now" ? "Apply now"
       : detail.mode === "start" ? "Apply plan" : (detail.mode ?? "");
-    const meta = `<div style="font-size:12px;color:var(--text2);margin-top:6px">Mode: <b style="color:var(--text)">${esc(modeLabel)}</b> · Source: <b style="color:var(--text)">${esc(detail.source)}</b> · Gateway: ${lifecycleChip(detail.gateway_up ? "running" : "stopped", "The gateway's state when this apply started")}${detail.drift ? ` · Gateway config: <b style="color:var(--text)">drifted</b>` : ""}</div>`;
+    const meta = `<div style="font-size:12px;color:var(--text2);margin-top:6px">Mode: <b style="color:var(--text)">${esc(modeLabel)}</b> · Source: <b style="color:var(--text)">${esc(detail.source)}</b> · Gateway: ${lifecycleChip(detail.gateway_up ? "running" : "stopped", "The gateway's state when this apply started")}${detail.drift ? ` · Gateway config: <b style="color:var(--text)">drifted</b>` : ""}${detail.quiesce?.timed_out ? ` · Drain: <b style="color:#e3b341">timed out${typeof detail.quiesce.in_flight === "number" ? ` (${fmtCount(detail.quiesce.in_flight)} in flight)` : ""}</b>` : ""}</div>`;
     if (!detail.items.length) {
       return `${meta}<div style="font-size:12px;color:var(--text2);margin-top:6px">No plan changes — the apply addressed gateway drift only.</div>`;
     }

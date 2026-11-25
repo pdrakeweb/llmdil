@@ -1,15 +1,15 @@
 /* Gateway view (split from static.ts). */
 
-import { getActivationPlan, getBackendConfig, getBackends, getGatewayConfig, getGatewayMasterKey, getGatewayStatus, getGatewayYaml, getModels, openRouterSpendBannerHtml, openUrl, setGatewayBindHost, updateGatewayConfig } from "../api";
-import type { ActivationPlanData, BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, ModelRow } from "../api";
+import { getBackendConfig, getBackends, getGatewayConfig, getGatewayMasterKey, getGatewayStatus, getGatewayYaml, getModels, openRouterSpendBannerHtml, openUrl, setGatewayBindHost, updateGatewayConfig } from "../api";
+import type { BackendRow, GatewayConfigData, GatewayGroup, GatewayRule, GatewayRuleKind, GatewayStatusData, ModelRow } from "../api";
 import { fmtCount, meter, stackedBar, trim1 } from "../charts";
+import { portError } from "../errors";
 import { esc, setHtml } from "../html";
 import { icon } from "../icons";
-import { META, lifecycleChip, lifecycleDot, lifecycleLabel, renderLifecycleActions, serviceStore, wireLifecycleActions } from "../lifecycle";
+import { META, fromWire, lifecycleChip, lifecycleDot, lifecycleLabel, renderLifecycleActions, serviceStore, wireLifecycleActions } from "../lifecycle";
 import type { LifecycleResult, LifecycleState } from "../lifecycle";
 import { enableSwitch } from "../switch";
-import { activationPlanHtml, handlePlanAction, manualCommandHtml, newPlanUi } from "./activationPlan";
-import type { PlanUiState } from "./activationPlan";
+import { handlePlanAction, manualCommandHtml, newPlanUi } from "./activationPlan";
 import { C, bannerHtml, emptyHtml, loadingHtml, sameModelFile, setBanner, topbar } from "./common";
 
 /* ---------------- Gateway ---------------- */
@@ -24,6 +24,14 @@ interface RuleFormState {
   target: string;
   optimalTokens: string;
   advisory: boolean;
+}
+
+/** Where a message belongs: the field or form it is about. Errors render
+ *  beside it, never at the top of a page scrolled out of view. */
+type GwMsgs = Map<string, { text: string; err: boolean }>;
+
+function msgHtml(m: { text: string; err: boolean } | undefined): string {
+  return m ? `<span style="color:${m.err ? "var(--err)" : "var(--text2)"}">${esc(m.text)}</span>` : "";
 }
 
 /** The freshest gateway status: the shared store's snapshot when it
@@ -103,8 +111,7 @@ function gatewayPaint(
   backendsError: string | null,
   masterKey: string | null,
   keyRevealed: boolean,
-  plan: ActivationPlanData | null,
-  planUi: PlanUiState,
+  msgs: GwMsgs,
   routingTab: "flow" | "groups",
   orModelsOpen: boolean,
   openFragments: Set<string>,
@@ -114,7 +121,12 @@ function gatewayPaint(
   genTab: "yaml" | "routing",
   routingPyText: string | null,
 ): string {
-  const port = status.port || cfg.port;
+  /** The saved port (the editable field) and the port clients reach
+   *  now: the running one while the gateway runs on another. */
+  const savedPort = status.port || cfg.port;
+  const live = freshGatewayStatus(status);
+  const port = META[gatewayLc(status).state].isLive ? live.running_port ?? savedPort : savedPort;
+  const slot = (key: string): string => `<div data-gw-msg="${esc(key)}" style="font-size:12px;min-height:0">${msgHtml(msgs.get(key))}</div>`;
   const backendById = new Map(backends.map((b) => [b.id, b]));
   /** Is this member dropped at generation time, and why? A backend
    *  member is dropped when disabled; the openrouter member when its
@@ -202,7 +214,7 @@ function gatewayPaint(
   const summary = `<div class="card" style="margin-bottom:12px"><div class="sec-title" id="gwLcTitle">${gatewayLcTitleHtml(status)}</div>
     <div id="gwPgRow">${gatewayPgRowHtml(status)}</div>
     <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px">
-      ${([["Port", String(port)], ["Groups", fmtCount(status.groups), "Enabled groups — a group counts when at least one of its member backends is enabled; the gateway serves enabled groups only."], ["Routing rules", fmtCount(status.routing_rules)], ["Routing test traces", fmtCount(status.routing_log_len), "Routing test traces are dry-run decisions recorded from routing tests this session — live requests are not logged."], ["LiteLLM", status.litellm_version ?? "not measured", "The LiteLLM version the start-gateway step probed in the gateway venv at the last spawn (MCP design §4.3). Not measured until a spawn records one."]] as [string, string, string?][])
+      ${([["Port", port === savedPort ? String(port) : `${port} (saved: ${savedPort})`], ["Groups", fmtCount(status.groups), "Enabled groups — a group counts when at least one of its member backends is enabled; the gateway serves enabled groups only."], ["Routing rules", fmtCount(status.routing_rules)], ["Routing test traces", fmtCount(status.routing_log_len), "Routing test traces are dry-run decisions recorded from routing tests this session — live requests are not logged."], ["LiteLLM", status.litellm_version ?? "not measured", "The LiteLLM version the start-gateway step probed in the gateway venv at the last spawn (MCP design §4.3). Not measured until a spawn records one."]] as [string, string, string?][])
 
         .map(([k, v, tip]) => `<div class="kv"><span class="k">${k}${tip ? `<span class="info-tip" title="${esc(tip)}">${icon("info")}</span>` : ""}</span><span class="v" style="font-size:13px">${esc(v)}</span></div>`).join("")}
     </div>
@@ -230,12 +242,12 @@ function gatewayPaint(
     <div style="font-size:12px;color:var(--text2);display:grid;gap:4px">
       <div>Base URL: <span style="font-family:var(--mono);color:var(--text)">http://127.0.0.1:${port}/v1</span>
         <button class="btn icon-only" id="gwBaseUrlCopyBtn" title="Copy base URL" aria-label="Copy base URL">${icon("copy")}</button></div>
-      <div>Port:<span class="info-tip" title="The gateway's listen port, saved to the configuration through update_gateway_config and validated against every other claimed port. Applies when the gateway next starts; the activation plan tracks the restart.">${icon("info")}</span> <input id="gwPortInput" type="number" min="1" max="65535" value="${port}" style="width:90px;font-size:12px">
-        <button class="btn" id="gwPortApply" style="padding:1px 7px;font-size:11px">Apply</button></div>
+      <div>Port:<span class="info-tip" title="The gateway's listen port, saved to the configuration through update_gateway_config and validated against every other claimed port. Applies when the gateway next starts; the activation plan tracks the restart.">${icon("info")}</span> <input id="gwPortInput" type="number" min="1" max="65535" value="${savedPort}" style="width:90px;font-size:12px">
+        <button class="btn" id="gwPortApply" style="padding:1px 7px;font-size:11px">Apply</button>${port === savedPort ? "" : ` <span class="chip status-tag status-transition" title="The running gateway listens on ${port}; the saved port applies when it restarts.">running on ${port}</span>`}${slot("port")}</div>
       <div>Network access:${bindTip ? `<span class="info-tip" title="${esc(bindTip)}">${icon("info")}</span>` : ""} <select id="gwBindSelect" class="input" style="width:auto;display:inline-block;padding:2px 6px">
           <option value="0.0.0.0"${status.bind_host !== "127.0.0.1" ? " selected" : ""}>Local network (all interfaces)</option>
           <option value="127.0.0.1"${status.bind_host === "127.0.0.1" ? " selected" : ""}>This computer only (127.0.0.1)</option>
-        </select></div>
+        </select>${slot("bind")}</div>
       ${status.bind_host !== "127.0.0.1" && status.lan_ip
         ? `<div>LAN base URL: <span style="font-family:var(--mono);color:var(--text)">http://${esc(status.lan_ip)}:${port}/v1</span><span class="info-tip" title="Other machines use this address with the master key. The VS Code LiteLLM extension takes it without /v1.">${icon("info")}</span>
         <button class="btn icon-only" id="gwLanUrlCopyBtn" title="Copy LAN base URL" aria-label="Copy LAN base URL">${icon("copy")}</button></div>`
@@ -243,6 +255,7 @@ function gatewayPaint(
       <div>Master key:<span class="info-tip" title="${esc(masterKeyTip)}">${icon("info")}</span> <span style="font-family:var(--mono);color:var(--text)">${masterKey === null ? "not loaded" : keyRevealed ? esc(masterKey) : "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"}</span>
         <button class="btn icon-only" id="gwKeyRevealBtn" title="${keyRevealed ? "Hide master key" : "Reveal master key"}" aria-label="${keyRevealed ? "Hide master key" : "Reveal master key"}">${icon(keyRevealed ? "eyeOff" : "eye")}</button>
         <button class="btn icon-only" id="gwKeyCopyBtn" title="Copy master key" aria-label="Copy master key">${icon("copy")}</button></div>
+      ${slot("endpoint")}
     </div></div>`;
 
   const or = cfg.openrouter;
@@ -296,6 +309,7 @@ function gatewayPaint(
       ${spendRow}
       ${allowRow}
     </div>
+    ${slot("openrouter")}
     <div class="card-actions">${enableSwitch({ on: or.enabled, name: "OpenRouter fallback tier", attrs: `id="gwOrToggle"` })}</div>
   </div>`;
   })();
@@ -303,6 +317,8 @@ function gatewayPaint(
   // Computed by the backend (get_gateway_config.effective_strategy)
   // with the config generator's own rule; never re-derived here.
   const effStrategy = cfg.effective_strategy;
+  const runStrategy = live.running_strategy ?? null;
+  const applied: Record<string, string> = live.applied_strategies ?? {};
 
   /* ---- Routing section: one section, two views (Flow | Groups).
    * The section top carries the one answer-level fact — the
@@ -358,19 +374,27 @@ function gatewayPaint(
     const m = g.members.length;
     const enabledCount = g.members.filter((name) => !memberExcluded(name)).length;
     // One segment per member, equal width — segments encode
-    // membership and state, not a share. Green reaches the
-    // generated config; gray is excluded. The fraction lives only
-    // in the bar's tooltip; member names are the bar's keys, each
-    // in its segment's color.
+    // membership and state, not a share: the member's lifecycle
+    // state color, gray when excluded from the generated config.
+    // The fraction lives only in the bar's tooltip; member names are
+    // the bar's keys, each in its segment's color.
+    const memberLc = (name: string): { color: string; label: string } => {
+      const b = backendById.get(name);
+      if (memberExcluded(name)) return { color: C.grey, label: "disabled" };
+      if (!b) return { color: C.blue, label: "" };
+      const st = serviceStore.effective(`backend:${b.id}`, fromWire(b.lifecycle ?? b.state));
+      return { color: META[st].color, label: META[st].label };
+    };
     const bar = m
       ? `<div style="margin-top:10px"><span title="Enabled: ${enabledCount} of ${m}" style="display:block">${stackedBar(g.members.map((name) => ({
           pct: 100 / m,
-          color: memberExcluded(name) ? "#6d7686" : C.green,
-          label: name,
+          color: memberLc(name).color,
+          label: [name, memberLc(name).label].filter(Boolean).join(" — "),
         })), 300, 10)}</span>
         <div style="font-size:12px;margin-top:4px;display:flex;gap:10px;flex-wrap:wrap">${g.members.map((name) => {
           const ex = memberExcluded(name);
-          return `<span style="color:${ex ? "var(--text3)" : C.green}"${ex ? ` title="Disabled — dropped from the generated gateway config"` : ""}>${esc(name)}</span>`;
+          const lc = memberLc(name);
+          return `<span style="color:${ex ? "var(--text3)" : lc.color}" title="${ex ? "Disabled — dropped from the generated gateway config" : esc(lc.label)}">${esc(name)}</span>`;
         }).join("")}</div></div>`
       : "";
     const fallbacks = g.fallbacks.length
@@ -384,7 +408,7 @@ function gatewayPaint(
       : "";
     return `<div class="card"${g.enabled ? "" : ` style="opacity:.65"`}>
       <h3>${esc(g.name)}${g.enabled ? "" : ` <span class="chip status-tag status-off" title="No enabled backends — omitted from the generated gateway config">disabled</span>`}
-        <span class="spacer" style="flex:1"></span><span class="chip">${esc(g.strategy)}</span></h3>
+        <span class="spacer" style="flex:1"></span><span class="chip" title="Saved strategy">${esc(g.strategy)}</span>${applied[g.name] && applied[g.name] !== g.strategy ? ` <span class="chip status-tag status-transition" title="The strategy the running gateway applies to this group">running: ${esc(applied[g.name])}</span>` : ""}</h3>
       ${bar}
       ${fallbacks}
       <div style="display:flex;gap:6px;align-items:center;margin-top:8px;flex-wrap:wrap">
@@ -392,12 +416,13 @@ function gatewayPaint(
         <button class="btn" data-group-fallbacks-save="${esc(g.name)}" style="padding:1px 7px;font-size:11px">Save</button>
         <span class="info-tip" title="The ordered fallback chain for this group: backend ids, or openrouter for the cloud tier, comma-separated. Saved through update_gateway_config and validated — an unknown name is refused. Applies when the gateway next starts.">${icon("info")}</span>
       </div>
+      ${slot(`group:${g.name}`)}
     </div>`;
   };
 
   const routing = cfg.groups.length
     ? `<div class="card" style="margin-bottom:12px"><div class="sec-title">${icon("gateway")} Routing<span class="spacer" style="flex:1"></span><a class="btn" href="#/groups">${icon("pencil")} Edit membership</a></div>
-      ${effStrategy ? `<div style="font-size:12px;color:var(--text2)">Effective strategy: <b style="color:var(--text)">${esc(effStrategy)}</b><span class="info-tip" title="LiteLLM applies ONE global routing strategy — the strategy chips on the groups are labels, not per-group settings.">${icon("info")}</span></div>` : ""}
+      ${effStrategy ? `<div style="font-size:12px;color:var(--text2)">Effective strategy: <b style="color:var(--text)">${esc(effStrategy)}</b><span class="info-tip" title="LiteLLM applies ONE global routing strategy — the strategy chips on the groups are labels, not per-group settings.">${icon("info")}</span>${runStrategy && runStrategy !== effStrategy ? ` <span class="chip status-tag status-transition" title="The running gateway still applies this strategy; the saved one applies when it restarts.">running: ${esc(runStrategy)}</span>` : ""}</div>` : ""}
       <div class="viewsel" role="tablist" style="margin-top:10px">
         <button data-routing-tab="flow"${routingTab === "flow" ? ` class="active"` : ""}>Flow</button>
         <button data-routing-tab="groups"${routingTab === "groups" ? ` class="active"` : ""}>Groups</button>
@@ -540,7 +565,7 @@ function gatewayPaint(
     return `<div class="card" style="margin-top:12px"><div class="sec-title">${icon("gateway")} Routing rules<span class="info-tip" title="A context-overflow rule reroutes a request too large for its model group to the target group instead of failing it, and past the optimal window the serving model adds a one-line note advising a compacted or fresh conversation. Changes take effect when the gateway restarts — save, then apply the Activation Plan.">${icon("info")}</span>
       <span class="spacer" style="flex:1"></span>
       <button class="btn" id="gwRuleAddBtn">${icon("plus")} Add rule</button></div>
-      ${bar}${rows}${ruleFormHtml()}</div>`;
+      ${bar}${rows}${ruleFormHtml()}${slot("rules")}</div>`;
   })();
 
   /* ---- Generated config: one section, two views (design §7) —
@@ -577,6 +602,7 @@ function gatewayPaint(
       <button class="btn icon-only" id="gwYamlDownloadBtn" title="Download ${genTab === "routing" ? "llmdil_routing.py" : "config.yaml"}" aria-label="Download ${genTab === "routing" ? "llmdil_routing.py" : "config.yaml"}">${icon("download")}</button>
       <button class="btn icon-only" id="gwYamlBtn" title="${yamlOpen ? "Hide preview" : "Preview generated config"}" aria-label="${yamlOpen ? "Hide preview" : "Preview generated config"}">${icon(yamlOpen ? "eyeOff" : "eye")}</button>
     </div>
+    ${slot("yaml")}
     ${genTabs}
     ${yamlOpen && !yamlErr ? (activeGenText === null
       ? `<pre style="margin-top:10px;padding:12px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:11px">Loading\u2026</pre>`
@@ -584,13 +610,12 @@ function gatewayPaint(
          <pre style="margin-top:6px;padding:12px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto">${esc(activeGenText)}</pre>`) : ""}
   </div>`;
 
-  return activationPlanHtml(plan, planUi, "summary") + backendsNote + summary + gwActions + endpoint + openrouter + routing + rules + yaml;
+  return backendsNote + summary + gwActions + slot("top") + endpoint + openrouter + routing + rules + yaml;
 }
 
 export function renderGateway(): string {
   return `${topbar("Gateway")}
   <div class="view"><div id="gwBanner"></div>
-  <div id="gwMsg" style="font-size:12px;margin-bottom:8px"></div>
   <div id="gwBody">${loadingHtml("Loading gateway configuration\u2026")}</div></div>`;
 }
 
@@ -614,8 +639,7 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
    *  so repaints do not re-read the credential store. */
   let masterKey: string | null = null;
   let keyRevealed = false;
-  /** Gateway activation plan, painted at the top of the view. */
-  let lastPlan: ActivationPlanData | null = null;
+  /** Holds the manual-command block's text for its Copy button. */
   const planUi = newPlanUi();
   /** Routing section tab (Flow | Groups), the OpenRouter allowlist
    * expandable, and the routing-rule Fragment expandables — view
@@ -637,21 +661,30 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
   let genTab: "yaml" | "routing" = "yaml";
   let routingPyText: string | null = null;
 
-  const gwMsg = (text: string, isErr = false): void => {
-    const m = root.querySelector("#gwMsg");
-    if (m) m.innerHTML = text ? `<span style="color:${isErr ? "var(--err)" : "var(--text2)"}">${esc(text)}</span>` : "";
+  const msgs: GwMsgs = new Map();
+  /** Show a message in its slot (the form or field it is about). A new
+   *  message replaces the others; it survives the body repaint. */
+  const gwMsg = (text: string, isErr = false, at = "top"): void => {
+    msgs.clear();
+    if (text) msgs.set(at, { text, err: isErr });
+    let shown: HTMLElement | null = null;
+    root.querySelectorAll<HTMLElement>("[data-gw-msg]").forEach((m) => {
+      const own = m.getAttribute("data-gw-msg") === at;
+      m.innerHTML = own ? msgHtml(msgs.get(at)) : "";
+      if (own) shown = m;
+    });
+    if (isErr) (shown as HTMLElement | null)?.scrollIntoView({ block: "nearest" });
+    paintManual();
   };
 
   /** Append a manual-command block under the gateway message (a
    * failed start-gateway outcome carries one: the exact commands
-   * to start the gateway by hand). #gwMsg lives outside #gwBody,
-   * so the block survives the load() repaint that follows. The
-   * command is also recorded on the plan UI state so the block's
+   * to start the gateway by hand); it stays until the next lifecycle
+   * result. The command is held on the plan UI state so the block's
    * Copy button (data-plan-act="copy-manual") copies this text. */
-  const gwShowManual = (cmd: string): void => {
-    planUi.manualCommand = cmd;
-    const m = root.querySelector("#gwMsg");
-    if (m) m.insertAdjacentHTML("beforeend", manualCommandHtml(cmd));
+  const paintManual = (): void => {
+    const m = root.querySelector('[data-gw-msg="top"]');
+    if (m && planUi.manualCommand && !m.querySelector("pre")) m.insertAdjacentHTML("beforeend", manualCommandHtml(planUi.manualCommand));
   };
 
   /** Fetch the master key on first use and cache it in the closure. */
@@ -659,7 +692,7 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     if (masterKey !== null) return masterKey;
     const r = await getGatewayMasterKey();
     if (r.error || !r.data.master_key) {
-      gwMsg(`Master key unavailable: ${r.error ?? "empty response"}`, true);
+      gwMsg(`Master key unavailable: ${r.error ?? "empty response"}`, true, "endpoint");
       return null;
     }
     masterKey = r.data.master_key;
@@ -667,9 +700,8 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
   };
 
   const load = async (): Promise<void> => {
-    const [st, cfg, backs, pr, mdls] = await Promise.all([getGatewayStatus(), getGatewayConfig(), getBackends(), getActivationPlan(), getModels()]);
+    const [st, cfg, backs, mdls] = await Promise.all([getGatewayStatus(), getGatewayConfig(), getBackends(), getModels()]);
     if (disposed) return;
-    if (!pr.error && pr.data) lastPlan = pr.data;
     if (!mdls.error) lastModels = mdls.data;
     const err = st.error ?? cfg.error;
     // The OpenRouter spend-cap banner (spec §7) rides with the status
@@ -688,9 +720,10 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     }
     lastCfg = cfg.data;
     lastStatus = st.data;
-    lastPort = st.data.port || cfg.data.port;
+    lastPort = (META[st.data.state].isLive ? st.data.running_port : null) ?? (st.data.port || cfg.data.port);
     lastLanIp = st.data.lan_ip ?? null;
-    b.innerHTML = gatewayPaint(st.data, cfg.data, backs.data, lastModels, yamlOpen, yamlText, yamlErr, backs.error ?? null, masterKey, keyRevealed, lastPlan, planUi, routingTab, orModelsOpen, openFragments, ruleForm, confirmRuleDelete, ruleRawFlags, genTab, routingPyText);
+    b.innerHTML = gatewayPaint(st.data, cfg.data, backs.data, lastModels, yamlOpen, yamlText, yamlErr, backs.error ?? null, masterKey, keyRevealed, msgs, routingTab, orModelsOpen, openFragments, ruleForm, confirmRuleDelete, ruleRawFlags, genTab, routingPyText);
+    paintManual();
   };
 
   /** Fetch the generated config when a Copy/Download click needs
@@ -734,11 +767,11 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     if (disposed) return false;
     let saved = false;
     if (r.error) {
-      gwMsg(`Routing rule change failed: ${r.error}`, true);
+      gwMsg(`Routing rule change failed: ${r.error}`, true, "rules");
     } else if (!r.data.persisted) {
-      gwMsg("The change was applied to the in-memory configuration only — it was not saved and will be lost when the app restarts.", true);
+      gwMsg("The change was applied to the in-memory configuration only — it was not saved and will be lost when the app restarts.", true, "rules");
     } else {
-      gwMsg(okMsg);
+      gwMsg(okMsg, false, "rules");
       saved = true;
     }
     await load();
@@ -775,7 +808,9 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
 
     const pt = t.closest("[data-plan-act]") as HTMLElement | null;
     if (pt) {
-      await handlePlanAction(pt.getAttribute("data-plan-act") ?? "", planUi, () => { void load(); }, load, lastPlan);
+      // Only the manual-command block's Copy button lives here; the plan
+      // itself is the shell's activation banner.
+      await handlePlanAction(pt.getAttribute("data-plan-act") ?? "", planUi, () => gwMsg(planUi.status, planUi.statusErr), load, null);
       return;
     }
 
@@ -805,9 +840,9 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
       if (!ref) return;
       try {
         await navigator.clipboard.writeText(ref);
-        gwMsg("Credential reference copied to the clipboard.");
+        gwMsg("Credential reference copied to the clipboard.", false, "openrouter");
       } catch {
-        gwMsg("Copy failed — copy the credential reference manually.", true);
+        gwMsg("Copy failed — copy the credential reference manually.", true, "openrouter");
       }
       return;
     }
@@ -817,9 +852,9 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
       if (text === null || disposed) return;
       try {
         await navigator.clipboard.writeText(text);
-        gwMsg("Generated config copied to the clipboard.");
+        gwMsg("Generated config copied to the clipboard.", false, "yaml");
       } catch {
-        gwMsg("Copy failed — open the preview and copy it manually.", true);
+        gwMsg("Copy failed — open the preview and copy it manually.", true, "yaml");
       }
       await load();
       return;
@@ -890,7 +925,7 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
       const optimalText = ruleForm.optimalTokens.trim();
       const optimal = optimalText === "" ? null : Number(optimalText);
       if (optimal !== null && (!Number.isFinite(optimal) || optimal <= 0 || Math.floor(optimal) !== optimal)) {
-        gwMsg("Optimal tokens must be a positive whole number, or empty for the default (half the serving window).", true);
+        gwMsg("Optimal tokens must be a positive whole number, or empty for the default (half the serving window).", true, "rules");
         return;
       }
       const editing = ruleForm.editingId !== null
@@ -967,9 +1002,9 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
       if (key === null || disposed) return;
       try {
         await navigator.clipboard.writeText(key);
-        gwMsg("Master key copied to the clipboard.");
+        gwMsg("Master key copied to the clipboard.", false, "endpoint");
       } catch {
-        gwMsg("Copy failed \u2014 Reveal the key and copy it manually.", true);
+        gwMsg("Copy failed \u2014 Reveal the key and copy it manually.", true, "endpoint");
       }
       return;
     }
@@ -977,9 +1012,9 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     if (t.closest("#gwBaseUrlCopyBtn")) {
       try {
         await navigator.clipboard.writeText(`http://127.0.0.1:${lastPort}/v1`);
-        gwMsg("Base URL copied to the clipboard.");
+        gwMsg("Base URL copied to the clipboard.", false, "endpoint");
       } catch {
-        gwMsg("Copy failed \u2014 copy the base URL manually.", true);
+        gwMsg("Copy failed \u2014 copy the base URL manually.", true, "endpoint");
       }
       return;
     }
@@ -988,9 +1023,9 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
       if (!lastLanIp) return;
       try {
         await navigator.clipboard.writeText(`http://${lastLanIp}:${lastPort}/v1`);
-        gwMsg("LAN base URL copied to the clipboard.");
+        gwMsg("LAN base URL copied to the clipboard.", false, "endpoint");
       } catch {
-        gwMsg("Copy failed \u2014 copy the LAN base URL manually.", true);
+        gwMsg("Copy failed \u2014 copy the LAN base URL manually.", true, "endpoint");
       }
       return;
     }
@@ -1010,11 +1045,11 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
       const r = await updateGatewayConfig({ openrouter: { enabled: !or.enabled } });
       if (disposed) return;
       if (r.error) {
-        gwMsg(`OpenRouter tier change failed: ${r.error}`, true);
+        gwMsg(`OpenRouter tier change failed: ${r.error}`, true, "openrouter");
       } else if (!r.data.persisted) {
-        gwMsg("The change was applied to the in-memory configuration only \u2014 it was not saved and will be lost when the app restarts.", true);
+        gwMsg("The change was applied to the in-memory configuration only \u2014 it was not saved and will be lost when the app restarts.", true, "openrouter");
       } else {
-        gwMsg(or.enabled ? "OpenRouter tier disabled and saved." : "OpenRouter tier enabled and saved.");
+        gwMsg(or.enabled ? "OpenRouter tier disabled and saved." : "OpenRouter tier enabled and saved.", false, "openrouter");
       }
       await load();
     }
@@ -1028,46 +1063,44 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
      *  shows in #gwMsg (which lives outside the repainted body).
      *  A repaint on failure would discard the typed value and
      *  redisplay the old saved one. */
-    const gwSave = async (patch: Record<string, unknown>, okText: string): Promise<void> => {
+    const gwSave = async (patch: Record<string, unknown>, okText: string, at: string): Promise<void> => {
       const r = await updateGatewayConfig(patch);
       if (disposed) return;
-      if (r.error) { gwMsg(`Change not saved: ${r.error}`, true); return; }
-      if (!r.data.persisted) { gwMsg("The change was applied to the in-memory configuration only — it was not saved and will be lost when the app restarts.", true); return; }
-      gwMsg(okText);
+      if (r.error) { gwMsg(`Change not saved: ${r.error}`, true, at); return; }
+      if (!r.data.persisted) { gwMsg("The change was applied to the in-memory configuration only — it was not saved and will be lost when the app restarts.", true, at); return; }
+      gwMsg(okText, false, at);
       await load();
     };
 
     if (t.closest("#gwPortApply")) {
-      const port = Math.round(Number((root.querySelector("#gwPortInput") as HTMLInputElement | null)?.value));
-      if (!Number.isFinite(port) || port < 1 || port > 65535) {
-        gwMsg("Gateway port must be between 1 and 65535.", true);
-        return;
-      }
-      await gwSave({ port }, "Gateway port saved — applies at the next gateway start.");
+      const port = Number((root.querySelector("#gwPortInput") as HTMLInputElement | null)?.value);
+      const bad = portError(port);
+      if (bad) { gwMsg(bad, true, "port"); return; }
+      await gwSave({ port }, "Gateway port saved — applies at the next gateway start.", "port");
       return;
     }
 
     if (t.closest("#gwOrCredSave")) {
       const v = ((root.querySelector("#gwOrCredInput") as HTMLInputElement | null)?.value ?? "").trim();
       await gwSave({ openrouter: { cred_ref: v === "" ? null : v } },
-        v === "" ? "Credential reference cleared and saved." : "Credential reference saved.");
+        v === "" ? "Credential reference cleared and saved." : "Credential reference saved.", "openrouter");
       return;
     }
 
     if (t.closest("#gwOrCapSave")) {
       const cap = Number((root.querySelector("#gwOrCapInput") as HTMLInputElement | null)?.value);
       if (!Number.isFinite(cap) || cap < 0) {
-        gwMsg("Daily cap must be a number of dollars, 0 or more.", true);
+        gwMsg("Daily cap must be a number of dollars, 0 or more.", true, "openrouter");
         return;
       }
-      await gwSave({ openrouter: { daily_cap_usd: cap } }, "OpenRouter daily cap saved.");
+      await gwSave({ openrouter: { daily_cap_usd: cap } }, "OpenRouter daily cap saved.", "openrouter");
       return;
     }
 
     if (t.closest("#gwOrAllowSave")) {
       const raw = (root.querySelector("#gwOrAllowInput") as HTMLTextAreaElement | null)?.value ?? "";
       const list = [...new Set(raw.split(/[\n,]/).map((s) => s.trim()).filter(Boolean))];
-      await gwSave({ openrouter: { model_allowlist: list } }, "OpenRouter model allowlist saved.");
+      await gwSave({ openrouter: { model_allowlist: list } }, "OpenRouter model allowlist saved.", "openrouter");
       return;
     }
 
@@ -1083,7 +1116,7 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
         name: g.name, members: g.members, strategy: g.strategy, purpose: g.purpose,
         fallbacks: g.name === name ? list : g.fallbacks,
       }));
-      await gwSave({ groups }, `Fallbacks for ${name} saved — applies at the next gateway start.`);
+      await gwSave({ groups }, `Fallbacks for ${name} saved — applies at the next gateway start.`, `group:${name}`);
       return;
     }
   };
@@ -1093,10 +1126,10 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
     const host = (sel as HTMLSelectElement).value;
     const r = await setGatewayBindHost(host);
     if (r.error) {
-      gwMsg(`Network access not saved: ${r.error}`, true);
+      gwMsg(`Network access not saved: ${r.error}`, true, "bind");
       return;
     }
-    gwMsg("Network access saved — applies at the next gateway restart; the start-gateway step also reconciles the Windows firewall rule.");
+    gwMsg("Network access saved — applies at the next gateway restart; the start-gateway step also reconciles the Windows firewall rule.", false, "bind");
     await load();
   };
   /** Rule-form field changes update the draft in the closure (the
@@ -1127,8 +1160,8 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
   // Start/Restart offer the MCP credential prompt first.
   const unwireLc = wireLifecycleActions(root, (r: LifecycleResult) => {
     if (disposed) return;
+    planUi.manualCommand = r.manualCommand ?? "";
     gwMsg(r.message, !r.ok && !r.cancelled);
-    if (r.manualCommand) gwShowManual(r.manualCommand);
     void load();
   }, { origin: "ui" });
   // The lifecycle title, actions and PostgreSQL row repaint in place
@@ -1156,7 +1189,10 @@ export async function wireGateway(root: HTMLElement): Promise<() => void> {
   // user is reading it, so the periodic repaint waits for the next
   // cycle; click-driven loads are unaffected.
   const timer = window.setInterval(() => {
-    if (!disposed && !root.querySelector("#gwBody:hover")) void load();
+    // Nor while a field has the focus: the repaint would discard what
+    // is being typed.
+    const typing = document.activeElement?.closest("#gwBody") && document.activeElement.matches("input, select, textarea");
+    if (!disposed && !typing && !root.querySelector("#gwBody:hover")) void load();
   }, 5000);
 
   return () => {

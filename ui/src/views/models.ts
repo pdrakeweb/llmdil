@@ -3,7 +3,8 @@
 import { cancelDownload, deleteModel, downloadModel, getBackends, getModels, isTauri, modelAdd, modelHfHeader, modelHfLookup, modelHfSuggest, modelSetEnabled, modelSetMtp, modelSetOffloadSpec, modelSetShortName, pauseModelDownload, resumeModelDownload, verifyModel } from "../api";
 import type { HfHeaderResult, HfLookupQuant, HfLookupRepo, ModelRow } from "../api";
 import { fmtCount, meter, stackedBar, trim1 } from "../charts";
-import { esc } from "../html";
+import { confirmDialog } from "../dialog";
+import { editingIn, esc, keepFocus } from "../html";
 import { icon } from "../icons";
 import { enableSwitch } from "../switch";
 import { C, SELECT_STYLE, bannerHtml, emptyHtml, fmtBytes, fmtDate, loadingHtml, modelShortName, onOvGoto, ovStatusBtn, sameModelFile, setBanner, topbar } from "./common";
@@ -79,7 +80,16 @@ function parseHfSourceUrl(url: string): { repo: string; file: string } | null {
   return file ? { repo, file } : null;
 }
 
-function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }, rename?: { draft: string } | null, detailsOpen = false, offload?: { layers: string; def: string; moe: boolean; mtp: boolean } | null, hfRefetch?: HfHeaderResult | null): string {
+/** "42% · 35 MiB/s" for a download with bytes on the row; parts that
+ *  are not known are left out. */
+export function downloadProgressText(partial: number, total: number | null, bytesPerSec: number | null): string {
+  return [
+    total !== null && total > 0 ? `${Math.min(100, Math.floor((partial / total) * 100))}%` : "",
+    bytesPerSec !== null && bytesPerSec > 0 ? `${fmtBytes(bytesPerSec)}/s` : "",
+  ].filter(Boolean).join(" \u00b7 ");
+}
+
+function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }, rename?: { draft: string } | null, detailsOpen = false, offload?: { layers: string; def: string; moe: boolean; mtp: boolean } | null, hfRefetch?: HfHeaderResult | null, rate: number | null = null): string {
   const note = notes.get(m.id);
   const noteHtml = note
     ? `<div style="margin-top:8px;font-size:12px;color:${note.err ? "var(--err)" : "var(--text2)"}">${esc(note.text)}</div>` : "";
@@ -112,11 +122,15 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
    * size when known, else the catalog estimate). The byte counts
    * appear once, as the value beside the bar — the Size tile no
    * longer repeats them. */
-  const dlTotal = m.on_disk ? m.size_bytes : m.catalog_size_bytes;
-  const progressHtml = (inFlight || partial > 0) && dlTotal !== null && dlTotal > 0 && partial > 0
+  const dlTotal = m.total_bytes ?? (m.on_disk ? m.size_bytes : m.catalog_size_bytes);
+  const exactTotal = m.total_bytes != null || m.on_disk;
+  const speed = downloadProgressText(partial, dlTotal, inFlight && !m.paused ? m.bytes_per_sec ?? rate : null);
+  const progressHtml = (inFlight || partial > 0) && partial > 0 && (dlTotal === null || dlTotal <= 0)
+    ? `<div style="font-size:12px;color:var(--text2);margin-top:8px">Downloaded: ${esc(fmtBytes(partial))}${speed ? ` \u00b7 ${esc(speed)}` : ""}</div>`
+    : (inFlight || partial > 0) && dlTotal !== null && dlTotal > 0 && partial > 0
     ? `<div style="display:flex;gap:10px;align-items:center;margin-top:8px">
         <span style="flex:1">${meter((partial / dlTotal) * 100, 300, 8, C.blue)}</span>
-        <span style="font-size:12px;color:var(--text2)">Downloaded: ${esc(fmtBytes(partial))} of ${m.on_disk ? "" : "~"}${esc(fmtBytes(dlTotal))}${m.on_disk ? "" : " (estimate)"}</span>
+        <span style="font-size:12px;color:var(--text2)">Downloaded: ${esc(fmtBytes(partial))} of ${exactTotal ? "" : "~"}${esc(fmtBytes(dlTotal))}${exactTotal ? "" : " (estimate)"}${speed ? ` \u00b7 ${esc(speed)}` : ""}</span>
       </div>`
     : "";
   let actions: string;
@@ -332,9 +346,9 @@ function modelAddFormHtml(): string {
 export function renderModels(): string {
   return `${topbar("Models", `<button class="btn" id="modelAdd" title="Add model">${icon("plus")} Add model</button>`)}
   <div class="view"><div id="modelBanner"></div>
+  <div id="modelAddForm"></div>
   <div id="modelOverview"></div>
-  <div id="modelBody">${loadingHtml("Loading models…")}</div>
-  <div id="modelAddForm"></div></div>`;
+  <div id="modelBody">${loadingHtml("Loading models…")}</div></div>`;
 }
 
 export async function wireModels(root: HTMLElement): Promise<() => void> {
@@ -412,6 +426,18 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
   let modelStats = new Map<string, { backends: number; req?: number; err?: number; toks?: number }>();
   let pollTimer: number | null = null;
   let disposed = false;
+  /** Download speed per model from successive polls' byte counts. */
+  const dlSamples = new Map<string, { bytes: number; at: number; rate: number | null }>();
+  const sampleDownloads = (rows: ModelRow[]): void => {
+    for (const m of rows) {
+      if (!m.downloading || m.paused) { dlSamples.delete(m.id); continue; }
+      const bytes = m.partial_bytes ?? 0;
+      const prev = dlSamples.get(m.id);
+      const secs = prev ? (Date.now() - prev.at) / 1000 : 0;
+      if (prev && secs < 1) continue;
+      dlSamples.set(m.id, { bytes, at: Date.now(), rate: prev && bytes >= prev.bytes ? (bytes - prev.bytes) / secs : null });
+    }
+  };
 
   /** Poll every 2s while any download is in flight (or verifying) so
    *  progress and the terminal state (complete, verified, failed)
@@ -475,16 +501,14 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       return;
     }
     lastRows = r.data;
-    // While a rename or offload input has focus, a poll repaint
-    // would drop the caret mid-word; the drafts are synced to
-    // wire state, so skipping one repaint loses nothing.
-    const active = document.activeElement as HTMLElement | null;
-    const formFocused = (renameFor !== null && !!active?.hasAttribute?.("data-model-rename-input"))
-      || (offloadFor !== null && (!!active?.hasAttribute?.("data-model-offload-layers") || !!active?.hasAttribute?.("data-model-offload-default")));
-    if (!formFocused) {
+    sampleDownloads(lastRows);
+    // While a card form's input has focus, a poll repaint would drop the
+    // caret mid-word; the drafts are synced to wire state, so skipping
+    // one repaint loses nothing.
+    if (!editingIn(b)) keepFocus(root, () => {
       if (mov) mov.innerHTML = modelOverviewHtml(lastRows, modelStats);
-      b.innerHTML = `<div class="cards-fluid">${lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id), renameFor === m.id ? { draft: renameDraft } : null, openModelDetails.has(m.id), offloadFor === m.id ? { layers: offloadDraftLayers, def: offloadDraftDefault, moe: offloadDraftMoe, mtp: offloadDraftMtp } : null, hfRefetchResults.get(m.id) ?? null)).join("")}</div>`;
-    }
+      b.innerHTML = `<div class="cards-fluid">${lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id), renameFor === m.id ? { draft: renameDraft } : null, openModelDetails.has(m.id), offloadFor === m.id ? { layers: offloadDraftLayers, def: offloadDraftDefault, moe: offloadDraftMoe, mtp: offloadDraftMtp } : null, hfRefetchResults.get(m.id) ?? null, dlSamples.get(m.id)?.rate ?? null)).join("")}</div>`;
+    });
     syncPoll();
   };
 
@@ -549,7 +573,7 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     }
 
     if (act === "cancel") {
-      if (!confirm(`Cancel the download of ${id}? The downloaded progress will be discarded — the partial file is deleted.`)) return;
+      if (!await confirmDialog({ title: `Cancel the download of ${id}?`, body: "The downloaded progress will be discarded — the partial file is deleted.", confirmLabel: "Cancel download", cancelLabel: "Keep downloading", danger: true })) return;
       const r = await cancelDownload(id);
       if (r.error) {
         notes.set(id, { text: `Cancel failed: ${r.error}`, err: true });
@@ -749,7 +773,7 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     }
 
     if (act === "delete") {
-      if (!confirm(`Delete model ${id}? This removes the downloaded file and its config entry. The delete is refused while a backend references the model.`)) return;
+      if (!await confirmDialog({ title: `Delete model ${id}?`, body: "This removes the downloaded file and its config entry. The delete is refused while a backend references the model.", confirmLabel: "Delete", danger: true })) return;
       const r = await deleteModel(id);
       if (r.error) {
         notes.set(id, { text: `Delete failed: ${r.error}`, err: true });
@@ -775,6 +799,8 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     if (!addModelHost) return;
     if (addModelHost.innerHTML) { closeAddModelForm(); return; }
     addModelHost.innerHTML = modelAddFormHtml();
+    addModelHost.scrollIntoView({ block: "start" });
+    (addModelHost.querySelector("#addModelName") as HTMLElement | null)?.focus({ preventScroll: true });
     const optToggle = addModelHost.querySelector("#addModelOptToggle") as HTMLButtonElement | null;
     optToggle?.addEventListener("click", () => {
       const box = addModelHost.querySelector("#addModelOptional") as HTMLElement | null;

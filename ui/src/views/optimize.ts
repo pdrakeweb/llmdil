@@ -26,11 +26,12 @@ import {
   setBackendMoeCache, setBackendOffload, updateBackendFlags, updateGatewayConfig,
 } from "../api";
 import type {
-  CallResult, MeasurementInputs, OptimizeCandidate, OptimizeCandidates, OptimizeConsultProgress, OptimizeExperiment, OptimizeMeasurementEntry, OptimizePlanItem, OptimizeState,
+  CallResult, MeasurementInputs, OptimizeCandidate, OptimizeCandidates, OptimizeConsultProgress, OptimizeExperiment, OptimizeMeasurementEntry, OptimizePlanItem, OptimizeState, RestoreFailure,
   TuningArm, TuningCoords, TuningPreview, TuningSweep,
 } from "../api";
 import { fmtCount, trim1 } from "../charts";
-import { esc } from "../html";
+import { confirmDialog } from "../dialog";
+import { editingIn, esc, keepFocus } from "../html";
 import { META, fromWire, lifecycleChip, runLifecycle, serviceStore } from "../lifecycle";
 import type { LifecycleState } from "../lifecycle";
 import { icon } from "../icons";
@@ -48,7 +49,7 @@ function fmtGiB(mib: number): string {
 
 function fmtTime(ts: string): string {
   const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" });
+  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
 function fmtElapsed(secs: number): string {
@@ -65,7 +66,7 @@ function fmtElapsed(secs: number): string {
 function consultProgressText(p: OptimizeConsultProgress | null | undefined): string {
   if (!p) return "";
   if (!p.streaming) return " · waiting for the first token (prompt processing)";
-  const size = (n: number) => n >= 1024 ? `${trim1(n / 1024)} KB` : `${n} B`;
+  const size = (n: number) => n >= 1024 ? `${trim1(n / 1024)} KiB` : `${n} B`;
   return ` · ${fmtCount(p.chunks)} tokens · ${size(p.content_bytes)} of answer${p.reasoning_bytes ? ` · ${size(p.reasoning_bytes)} reasoning` : ""}`;
 }
 
@@ -217,6 +218,21 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   let tuningPreviewData: TuningPreview | null = null;
   let tuningBusy = false;
   let tuningError = "";
+  /** The consultant picked in the form (a repaint keeps it). */
+  let consultSel: string | null = null;
+  /** What the last Re-validate found, shown beside its button. */
+  let revalidateNote = "";
+  /** When each state payload was first painted: ages count on from it. */
+  const seenAt = new WeakMap<OptimizeState, number>();
+  const payloadAt = (st: OptimizeState): number => {
+    const at = seenAt.get(st) ?? Date.now();
+    seenAt.set(st, at);
+    return at;
+  };
+  /** An age that keeps counting (see ageTimer). */
+  const ageHtml = (sinceMs: number): string => `<span data-opt-since="${Math.round(sinceMs)}">${fmtAge(Math.max(0, Math.floor((Date.now() - sinceMs) / 1000)))}</span>`;
+  const restoreFailuresHtml = (list: RestoreFailure[] | null | undefined): string => !list?.length ? "" :
+    `<div class="banner" style="margin-top:8px">${icon("err")} <span>Not started again after the run: ${list.map((x) => `<b>${esc(x.id)}</b> — ${esc(x.error)}`).join("; ")}. <a href="#/backends">Backends</a></span></div>`;
   const candidateKey = (c: OptimizeCandidate): string => `${c.repo_id}\n${c.file}`;
 
   const shortName = (modelId: string): string => {
@@ -458,6 +474,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         ${plan.sample ? `<span class="chip">Sample plan</span>` : ""}
         ${plan.config_stale ? `<span class="stale-tag">Configuration changed since this plan</span>
           <button class="btn" data-opt-act="revalidate">${icon("restart")} Re-validate</button>` : ""}
+        ${revalidateNote ? `<span class="opt-plan-meta" role="status">${esc(revalidateNote)}</span>` : ""}
         <span class="grow"></span>
         <button class="btn icon-only" data-opt-act="discard" title="Discard plan">${icon("x")}</button>
       </div>
@@ -484,13 +501,13 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     const draft = drafts.get(key) ?? current;
     if (!open) {
       return `<div class="opt-purpose-row">
-        <span class="opt-purpose-label">${esc(label)}</span>
+        ${label ? `<span class="opt-purpose-label">${esc(label)}</span>` : ""}
         <span class="opt-purpose-text">${current.trim() ? esc(current) : `<em>No purpose set${isSeed ? " — a generated description is used" : ""}</em>`}</span>
         <button class="btn" data-opt-purpose-edit="${esc(key)}">Edit</button>
       </div>`;
     }
     return `<div class="opt-purpose-row edit">
-      <span class="opt-purpose-label">${esc(label)}</span>
+      ${label ? `<span class="opt-purpose-label">${esc(label)}</span>` : ""}
       <textarea class="opt-purpose-input" data-opt-purpose-input="${esc(key)}" rows="3">${esc(draft)}</textarea>
       <button class="btn primary" data-opt-purpose-save="${esc(key)}">Save purpose</button>
       <button class="btn" data-opt-purpose-cancel="${esc(key)}">Cancel</button>
@@ -513,7 +530,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       f.prompt_per_second !== null ? optKv("Prompt", `${trim1(f.prompt_per_second)} tok/s`) : "",
       f.predicted_per_second !== null ? optKv("Generation", `${trim1(f.predicted_per_second)} tok/s`) : "",
       f.ttft_ms !== null ? optKv("TTFT", `${trim1(f.ttft_ms)} ms`) : "",
-      optKv("Age", fmtAge(f.age_secs)),
+      `<div class="opt-kv"><span class="opt-kv-label">Age:</span> <span class="opt-kv-value">${ageHtml((state ? payloadAt(state) : Date.now()) - f.age_secs * 1000)}</span></div>`,
     ].join("");
   }
 
@@ -544,7 +561,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         <span class="opt-measure-state">${lifecycleChip(optBackendState(b.id, b.running))}</span>
       </div>
       ${m ? `<div class="opt-measure-figs-block">${measureFigRows(m)}</div>` : e ? "" : `<div class="opt-note">Not measured</div>`}
-      ${e ? `<div class="opt-measure-figs-block"><div class="opt-kv"><span class="opt-kv-label">Estimate —</span></div>${measureFigRows(e)}</div>` : ""}
+      ${e ? `<div class="opt-measure-figs-block"><div class="opt-kv"><span class="opt-kv-label">Estimate</span></div>${measureFigRows(e)}</div>` : ""}
       <div class="opt-measure-actions">
         <button class="btn" data-opt-measure="${esc(b.id)}" ${busy ? "disabled" : ""}>${icon("bolt")} Measure</button>
         <button class="btn" data-opt-estimate="${esc(b.id)}" ${busy ? "disabled" : ""}>${icon("gauge")} Estimate</button>
@@ -712,7 +729,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
     const stored = st.candidates;
     const visible = stored?.items.filter((c) => !candidateRemoved.has(candidateKey(c))) ?? [];
     const rows = visible.map((c) => `<div class="opt-candidate-row">
-        <span class="opt-candidate-figs">Repo: ${esc(c.repo_id)} · File: ${esc(c.file)} · Size: ${fmtGiB(c.size_bytes / 1048576)} · Params: ${trim1(c.params_b)} B · Fit: ${esc(candidateFitLabel(c.fit))}</span>
+        <span class="opt-candidate-figs">Repo: ${esc(c.repo_id)}</span><span class="opt-candidate-figs">File: ${esc(c.file)}</span><span class="opt-candidate-figs">Size: ${fmtGiB(c.size_bytes / 1048576)} · Params: ${trim1(c.params_b)} B · Fit: ${esc(candidateFitLabel(c.fit))}</span>
         <button class="btn icon-only" data-opt-candidate-remove="${esc(candidateKey(c))}" title="Remove candidate ${esc(c.repo_id)}" aria-label="Remove candidate ${esc(c.repo_id)} ${esc(c.file)}">${icon("x")}</button>
       </div>`).join("");
     return `<div class="opt-candidates">
@@ -764,7 +781,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         <div class="opt-measure-figs-block">
           ${optKv("Overall", `${b.overall.passed}/${b.overall.total}`)}
           ${optKv("Run", fmtTime(b.run_at))}
-          ${Number.isFinite(age) && age >= 0 ? optKv("Age", fmtAge(age)) : ""}
+          ${Number.isFinite(age) && age >= 0 ? `<div class="opt-kv"><span class="opt-kv-label">Age:</span> <span class="opt-kv-value">${ageHtml(new Date(b.run_at).getTime())}</span></div>` : ""}
           ${optKv("Suite version", String(b.suite_version))}
           ${Object.entries(b.per_category).map(([k, s]) => optKv(evalCategoryLabel(k), `${s.passed}/${s.total}`)).join("")}
         </div>
@@ -882,6 +899,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       <div class="opt-field-label" style="margin-top:10px">Sweep results — ${esc(sweep.backend_id)}</div>
       ${sweep.state === "running" ? `<span class="opt-consulting">${icon("clock")} Sweep running — arm ${sweep.arms.length} measured</span>
         <button class="btn danger" data-opt-act="cancel-job">${icon("x")} Cancel</button>` : ""}
+      ${restoreFailuresHtml(sweep.restore_failures)}
       ${sweep.truncated ? `<div class="opt-note">${esc(sweep.truncated)}</div>` : ""}
       ${sweep.detail ? `<div class="opt-note">${esc(sweep.detail)}</div>` : ""}
       <table class="opt-table"><thead><tr><th>Arm</th><th>Generation tok/s</th><th>Prompt tok/s</th><th>TTFT ms</th><th>Δ</th><th>Conditions</th><th>Status</th></tr></thead>
@@ -967,7 +985,9 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       ?? (jobKind === "estimate" && estimateStart > 0 ? estimateStart
         : jobKind === "measure" && measureStart > 0 ? measureStart : null);
     const jobFailure = lastJobError || st.job_error || "";
-    host.innerHTML = `
+    const consultPick = running.some((b) => b.id === consultSel) ? consultSel : st.default_backend;
+    payloadAt(st);
+    keepFocus(hostEl, () => { hostEl.innerHTML = `
     <div class="card" id="optConsultCard">
       <div class="opt-consult-grid">
         <div>
@@ -976,13 +996,12 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
           ${st.purpose_is_seed ? `<div class="opt-note">This description was generated from your setup. Edit it to make it yours — every consultation uses it.</div>` : ""}
           <div class="opt-field-label" style="margin-top:10px">Directive (optional)</div>
           <textarea id="optDirective" class="opt-directive-input" rows="2" placeholder="Scope this consultation — e.g. reduce coder latency">${esc(directiveDraft ?? st.last_directive ?? "")}</textarea>
-          ${candidatesHtml(st)}
         </div>
         <div>
           <div class="opt-field-label">Consulting</div>
           <div class="opt-consult-row">
             ${running.length
-              ? `<select id="optBackendSel" style="${SELECT_STYLE}">${running.map((b) => `<option value="${esc(b.id)}" ${b.id === st.default_backend ? "selected" : ""}>${esc(b.id)}${b.short_name ? ` · ${esc(b.short_name)}` : ""}</option>`).join("")}</select>`
+              ? `<select id="optBackendSel" style="${SELECT_STYLE}">${running.map((b) => `<option value="${esc(b.id)}" ${b.id === consultPick ? "selected" : ""}>${esc(b.id)}${b.short_name ? ` · ${esc(b.short_name)}` : ""}</option>`).join("")}</select>`
               : `<span class="opt-note">No backend is running — start one to consult it, or generate a sample plan.</span>`}
           </div>
           ${st.better_backend ? `<div class="opt-note">${esc(st.better_backend.short_name ?? st.better_backend.id)} (${esc(st.better_backend.id)}) would be the stronger consultant but is stopped — start it to consult it.</div>` : ""}
@@ -993,15 +1012,16 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
           </details>
         </div>
       </div>
+      ${candidatesHtml(st)}
       <div class="opt-consult-actions">
         ${consulting
           ? `<span class="opt-consulting">${icon("clock")} Consulting${consultStartMs !== null ? ` <span id="optElapsed">${fmtElapsed(Math.max(0, Math.floor((Date.now() - consultStartMs) / 1000)))}</span>` : ""}<span id="optProgress">${esc(consultProgressText(st.consult_progress))}</span> — a large model on local hardware can take several minutes.</span>
              <button class="btn danger" data-opt-act="cancel-consult">${icon("x")} Cancel</button>`
-          : `<button class="btn primary" data-opt-act="consult" ${running.length ? "" : "disabled"}>${icon("target")} ${armed.has("consult") ? "Replace the current plan?" : st.plan ? "Consult again" : "Consult"}</button>
-             <button class="btn" data-opt-act="sample">${icon("layers")} Sample plan</button>
-             ${armed.has("consult") ? `<span class="opt-note">A new consultation replaces the plan and its decisions. Click again to confirm.</span>` : ""}`}
+          : `<button class="btn primary" data-opt-act="consult" ${running.length ? "" : "disabled"}>${icon("target")} ${st.plan ? "Consult again" : "Consult"}</button>
+             <button class="btn" data-opt-act="sample">${icon("layers")} Sample plan</button>`}
       </div>
       ${consultFailure ? `<div class="banner">${icon("err")} Consultation failed — ${esc(consultFailure)}${st.plan ? ` The plan below is the previous plan, from ${esc(fmtTime(st.plan.created_at))}.` : ""}</div>` : ""}
+      ${restoreFailuresHtml(st.restore_failures)}
       ${jobFailure && !measuring ? `<div class="banner">${icon("err")} ${esc(jobFailure)}</div>` : ""}
       ${statusLine && !st.plan ? `<div class="opt-status">${esc(statusLine)}</div>` : ""}
       ${running.length ? `<div class="opt-measurements">
@@ -1026,7 +1046,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       ${st.groups.map((g) => purposeEditor(`group:${g.name}`, `Group: ${g.name}`, g.purpose)).join("")}
       ${st.backends.map((b) => purposeEditor(`backend:${b.id}`, `Backend: ${b.id}`, b.purpose)).join("")}
     </details>
-    ${measurementsHtml(st)}`;
+    ${measurementsHtml(st)}`; });
     // Keep the elapsed ticker alive for any consultation this
     // page can see, not only one it started: entering the page
     // mid-run starts it from the server's start time; the run
@@ -1105,6 +1125,18 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
       lastJobError = r.data.job_error ?? "";
     }
     paint();
+  }
+
+  /** A new consultation (or sample) replaces the stored plan and its
+   *  decisions: ask first whenever there is one. */
+  async function confirmReplacePlan(): Promise<boolean> {
+    if (!state?.plan) return true;
+    return confirmDialog({
+      title: "Replace the current plan?",
+      body: `A new consultation replaces the plan from ${state.plan.consulted_backend} (${fmtTime(state.plan.created_at)}) and its decisions.`,
+      confirmLabel: "Replace plan",
+      danger: true,
+    });
   }
 
   async function runConsult(sample: boolean, directiveOverride?: string): Promise<void> {
@@ -1746,19 +1778,11 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         void optimizeCancelJob();
         return;
       case "consult": {
-        const hasDecisions = state?.plan?.items.some((i) => i.decision !== "undecided" || i.apply_outcome);
-        if (state?.plan && hasDecisions && !armed.has("consult")) {
-          armed.add("consult");
-          paint();
-          window.setTimeout(() => { armed.delete("consult"); if (!disposed) paint(); }, 5000);
-          return;
-        }
-        armed.delete("consult");
-        void runConsult(false);
+        void (async () => { if (await confirmReplacePlan() && !disposed) await runConsult(false); })();
         return;
       }
       case "sample":
-        void runConsult(true);
+        void (async () => { if (await confirmReplacePlan() && !disposed) await runConsult(true); })();
         return;
       case "discover":
         void runDiscover();
@@ -1770,7 +1794,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         void runEstimateExperiments();
         return;
       case "consult-results":
-        void runConsult(false, state?.plan?.directive ?? "");
+        void (async () => { if (await confirmReplacePlan() && !disposed) await runConsult(false, state?.plan?.directive ?? ""); })();
         return;
       case "cancel-consult":
         void optimizeCancelConsult();
@@ -1800,7 +1824,17 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
         return;
       }
       case "revalidate":
-        void refresh();
+        revalidateNote = "Re-validating…";
+        paint();
+        void (async () => {
+          await refresh();
+          if (disposed) return;
+          const v = state?.plan?.validations ?? [];
+          const count = (s: string): number => v.filter((x) => x.status === s).length;
+          revalidateNote = loadError ? `Re-validation failed — ${loadError}`
+            : `Re-validated ${new Date().toLocaleTimeString()}: ${count("valid")} valid · ${count("warning")} warnings · ${count("invalid")} invalid`;
+          paint();
+        })();
         return;
       case "apply":
         void runApplyPhase(false);
@@ -1879,6 +1913,7 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
 
   hostEl.addEventListener("change", (ev) => {
     const t = ev.target as HTMLElement;
+    if (t.id === "optBackendSel") { consultSel = (t as HTMLSelectElement).value; return; }
     if (t.id === "optTuningSel") {
       tuningSel = (t as HTMLSelectElement).value;
       tuningPreviewData = null;
@@ -1920,15 +1955,17 @@ export async function wireOptimize(root: HTMLElement): Promise<() => void> {
   // caret mid-edit; the next tick retries.
   pollTimer = window.setInterval(() => {
     if (disposed || !(state?.measuring || state?.tuning?.running)) return;
-    const active = document.activeElement;
-    if (active && hostEl.contains(active)
-      && (active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement || active instanceof HTMLSelectElement)) {
-      return;
-    }
+    if (editingIn(hostEl)) return;
     void refresh();
+  }, 5000);
+  const ageTimer = window.setInterval(() => {
+    hostEl.querySelectorAll<HTMLElement>("[data-opt-since]").forEach((el) => {
+      el.textContent = fmtAge(Math.max(0, Math.floor((Date.now() - Number(el.dataset.optSince)) / 1000)));
+    });
   }, 5000);
   return () => {
     disposed = true;
+    window.clearInterval(ageTimer);
     if (pollTimer !== null) window.clearInterval(pollTimer);
     if (progressTimer !== null) window.clearInterval(progressTimer);
     if (jobTimer !== null) window.clearInterval(jobTimer);

@@ -122,6 +122,10 @@ export interface BackendRow {
    *  from the same requirement model as the start gate). Absent
    *  when placement or telemetry cannot judge the backend. */
   fit?: BackendFit;
+  /** The requirement fits the memory free now; null/absent = unknown. */
+  fits_now?: boolean | null;
+  /** The crash-restart schedule; null/absent when none is running. */
+  auto_restart?: BackendAutoRestart | null;
   /** The supervisor's recorded reason for the backend's last
    *  spawn/load failure, when one was recorded (e.g. the
    *  device-unavailable fail-fast verdict); null otherwise. */
@@ -286,6 +290,19 @@ export interface BackendFitGpu {
   state: FitStateName;
   /** MiB paging to system RAM (WDDM-paged GPUs only; else 0). */
   paged_mib: number;
+  /** Free VRAM now, and whether the requirement fits it (the
+   *  backend's own holding credited). Absent on older payloads. */
+  free_mib?: number | null;
+  fits_free?: boolean | null;
+}
+
+/** The crash-restart schedule of a backend that exited unexpectedly. */
+export interface BackendAutoRestart {
+  attempt: number;
+  max: number;
+  /** When the next attempt runs (epoch ms), or null. */
+  next_at_ms: number | null;
+  gave_up: boolean;
 }
 
 /** A backend's three-state fit (list_backends payload): the worst
@@ -379,7 +396,10 @@ export interface CachePreview {
    *  the total over the targets. `fit_state` is the three-state
    *  classification against total VRAM (the start gate's basis)
    *  and `paged_mib` the WDDM paging amount for that GPU. */
-  targets: { gpu: number; total_mib: number; required_mib: number | null; fits: boolean | null; driver_model?: "wddm" | "tcc" | null; fit_state?: FitStateName | null; paged_mib?: number }[] | null;
+  targets: { gpu: number; total_mib: number; required_mib: number | null; fits: boolean | null; driver_model?: "wddm" | "tcc" | null; fit_state?: FitStateName | null; paged_mib?: number; free_mib?: number | null; fits_free?: boolean | null }[] | null;
+  /** The whole requirement fits the memory free now; absent on older
+   *  payloads. */
+  fits_now?: boolean | null;
   headroom_reserve_percent: number;
   fits_current: boolean | null;
   ladder: CacheRungLike[];
@@ -765,7 +785,7 @@ export interface BackendAddMemory {
   rs_ram_mib: number | null;
   moe_cache_mib: number;
   basis: string | null;
-  per_gpu: { gpu: number; share: number; required_mib: number; total_mib: number }[];
+  per_gpu: { gpu: number; share: number; required_mib: number; total_mib: number; free_mib?: number | null; fits_free?: boolean | null }[];
 }
 
 /** backend_add_preview — the add form's model-dependent parameter

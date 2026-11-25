@@ -15,6 +15,8 @@ export type Status = "ok" | "degraded" | "starting" | "stopping" | "restarting" 
 export interface StatusResponse {
   status: string;
   version: string;
+  /** Whether the MXC runtime is installed; absent on older shells. */
+  mxc_runtime_installed?: boolean;
   /** Startup config-load outcome (code review v0.1.60 F2); absent in
    *  mock data and older shells. `backup`: config.json was unreadable
    *  and config.json.bak was used. `defaults`: neither loaded, the app

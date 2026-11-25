@@ -109,6 +109,7 @@ export type {
   OffloadOverrideResult,
   RawFlagWarning,
   BackendAddPreview,
+  BackendAutoRestart,
   BackendAddMemory,
   BackendConfigData,
   BackendApplyMode,
@@ -202,6 +203,7 @@ export type {
 } from "./api/mcp";
 export {
   getActivationPlan,
+  planNeedsElevation,
   activationCancelChanges,
   activationComplete,
   activationApply,
@@ -349,6 +351,7 @@ export type {
   OptimizeApplyResult,
   TuningCoords,
   TuningArm,
+  RestoreFailure,
   TuningSweep,
   TuningPreview,
   OptimizeJob,

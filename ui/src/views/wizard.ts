@@ -2,6 +2,7 @@
 
 import { getBackends, getWizardCommands, getWizardSteps, isTauri, markSetupComplete, openUrl, runAudit, runWizardStep, wizardBusyMessage } from "../api";
 import type { PlannedCommandWire } from "../api";
+import { alertDialog, confirmDialog } from "../dialog";
 import { esc } from "../html";
 import { icon } from "../icons";
 import { META, fromWire, runLifecycle } from "../lifecycle";
@@ -216,7 +217,7 @@ export function wireWizard(root: HTMLElement): () => void {
   const logEl = root.querySelector("#wizLog");
   const logLine = (text: string, cls = "lvl-info") => {
     if (!logEl) return;
-    const t = new Date().toLocaleTimeString("en-GB");
+    const t = new Date().toLocaleTimeString();
     logEl.insertAdjacentHTML("beforeend", `<div class="ln"><span class="t">${t}</span> <span class="${cls}">${esc(text)}</span></div>`);
   };
 
@@ -325,7 +326,7 @@ export function wireWizard(root: HTMLElement): () => void {
 
   const runBtn = root.querySelector("#runBtn") as HTMLButtonElement | null;
   runBtn?.addEventListener("click", async () => {
-    if (!isTauri()) { alert("Sample mode: setup runs in the installed app."); return; }
+    if (!isTauri()) { await alertDialog("Sample mode", "Setup runs in the installed app."); return; }
     if (busy) return;
     busy = true;
     hideStale = true;
@@ -372,7 +373,7 @@ export function wireWizard(root: HTMLElement): () => void {
 
   const audit = root.querySelector("#auditBtn");
   audit?.addEventListener("click", async () => {
-    if (!isTauri()) { alert("Sample mode: audit would re-run all checks here."); return; }
+    if (!isTauri()) { await alertDialog("Sample mode", "The audit re-runs all checks in the installed app."); return; }
     if (busy) return;
     busy = true;
     hideStale = true;
@@ -414,9 +415,9 @@ export function wireWizard(root: HTMLElement): () => void {
     if (busy) return;
     if (isTauri()) {
       const remaining = steps.filter((s) => !(s.state === "done" || s.state === "manual" || s.state === "skipped")).length;
-      if (remaining > 0 && !confirm(`${remaining} setup step(s) are not complete. Mark setup complete anyway?`)) return;
+      if (remaining > 0 && !await confirmDialog({ title: "Mark setup complete?", body: `${remaining} setup step${remaining === 1 ? " is" : "s are"} not complete.`, confirmLabel: "Mark complete" })) return;
       const r = await markSetupComplete();
-      if (r.error) { alert(`Could not mark setup complete: ${r.error}`); return; }
+      if (r.error) { await alertDialog("Could not mark setup complete", r.error); return; }
     }
     location.hash = "#/dashboard";
   });
@@ -445,7 +446,7 @@ export function wireWizard(root: HTMLElement): () => void {
       helpBtn.setAttribute("disabled", "");
       const r = await openUrl(url);
       helpBtn.removeAttribute("disabled");
-      if (r.error) alert(`Could not open the download page: ${r.error}`);
+      if (r.error) await alertDialog("Could not open the download page", r.error);
       return;
     }
     const copyBtn = t.closest("[data-copy-step]") as HTMLElement | null;

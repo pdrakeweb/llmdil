@@ -4,11 +4,12 @@ import { getAppConfig, getBackends, getGpuHistory, getGpuTelemetry, getModels, r
 import type { BackendRow, GpuHistoryData, GpuHistoryPoint, ModelRow } from "../api";
 import { fmtCount, fmtGb, gaugeRing, historyChart, historyChartX, historyChartY, sparkline, stackedBar, trim1 } from "../charts";
 import type { HistoryChartGeom, HistoryChartSeries } from "../charts";
-import { esc } from "../html";
+import { esc, keepFocus } from "../html";
+import { pageState } from "../viewState";
 import { icon } from "../icons";
 import { META, fromWire } from "../lifecycle";
 import type { GpuInfo } from "../types";
-import { C, SELECT_STYLE, bannerHtml, baseName, cadenceBucket, dot, emptyHtml, loadingHtml, onOvGoto, ovStatusBtn, sameModelFile, setBanner, topbar } from "./common";
+import { C, SELECT_STYLE, bannerHtml, baseName, cadenceBucket, dot, emptyHtml, loadingHtml, modelDisplayName, onOvGoto, ovStatusBtn, setBanner, topbar } from "./common";
 
 /* ---------------- GPUs ---------------- */
 
@@ -33,15 +34,16 @@ function gpuCard(g: GpuInfo, expanded: Set<string>, modelRows: GpuModelRow[] = [
   // chip's tooltip and the body renders de-emphasized below.
   const staleChip = g.status === "degraded" ? ` <span class="chip" title="Telemetry for this GPU is stale — readings are the last reported values.">stale</span>` : "";
   const downChip = down ? ` <span class="chip badge-err" title="Down — not reported by the telemetry source in recent polls; the readings shown are the last known values. A GPU that has fallen off the bus (nvidia-smi reports it as lost) recovers only on a system reboot.">down</span>` : "";
-  const peakTip = g.temp_peak_c !== undefined ? ` title="Peak ${trim1(g.temp_peak_c)} \u00b0C since last reset or app start"` : "";
+  // The peak is a value of its own (Reset peaks clears it).
+  const peak = g.temp_peak_c !== undefined ? ` <span style="color:var(--text3)" title="Highest temperature since the last reset or app start">\u00b7 peak ${trim1(g.temp_peak_c)} \u00b0C</span>` : "";
   const memUtil = g.mem_util_pct !== undefined
     ? `<div class="mrow"><span class="mlabel">Memory util</span><span class="mval">${trim1(g.mem_util_pct)}%</span></div>` : "";
   const fan = g.fan_pct !== undefined
     ? `<div class="mrow"><span class="mlabel">Fan</span><span class="mval">${trim1(g.fan_pct)}%</span></div>` : "";
   const tempSpark = g.temp_spark && g.temp_spark.length
-    ? `<div class="mrow"><span></span>${sparkline(g.temp_spark, 240, 26, C.amber)}</div>` : "";
+    ? `<div class="mrow"><span></span>${sparkline(g.temp_spark, 240, 26, C.amber, 0.18, 10)}</div>` : "";
   const powerSpark = g.power_w != null && g.power_spark && g.power_spark.length
-    ? `<div class="mrow"><span></span>${sparkline(g.power_spark, 240, 26, C.green)}</div>` : "";
+    ? `<div class="mrow"><span></span>${sparkline(g.power_spark, 240, 26, C.green, 0.18, 20)}</div>` : "";
   /* ---- VRAM residency bar: the card's prime visual. One segment
    * per resident process, width = its measured share of total
    * VRAM; the unattributed remainder (used - measured) is a neutral
@@ -157,7 +159,7 @@ function gpuCard(g: GpuInfo, expanded: Set<string>, modelRows: GpuModelRow[] = [
         ${gaugeRing(g.util_pct, 84, C.blue, trim1(g.util_pct), "UTIL")}
       </div>
       <div class="gpu-metrics">
-        <div class="mrow"><span class="mlabel">Temperature</span><span class="mval"${peakTip}>${trim1(g.temp_c)} \u00b0C</span></div>
+        <div class="mrow"><span class="mlabel">Temperature</span><span class="mval">${trim1(g.temp_c)} \u00b0C${peak}</span></div>
         ${tempSpark}
         ${powerRow}
         ${memUtil}
@@ -168,6 +170,9 @@ function gpuCard(g: GpuInfo, expanded: Set<string>, modelRows: GpuModelRow[] = [
       </div>
     </div>`;
 }
+
+/** The page's list controls, kept across visits. */
+const gpusView = pageState("gpus", { sort: "index", filter: "" });
 
 export function renderGpus(): string {
   return `${topbar("GPUs", `
@@ -182,17 +187,14 @@ export function renderGpus(): string {
     <button class="btn icon-only" id="gpuSnapshot" title="Snapshot" aria-label="Save telemetry snapshot">${icon("download")}</button>`)}
   <div class="view"><div id="gpuBanner"></div>
   <div id="gpuMeta" style="font-size:12px;color:var(--text3);margin-bottom:8px"></div>
-  <div id="gpuMsg" style="font-size:12px;margin-bottom:8px"></div>
+  <div id="gpuMsg" style="font-size:12px;min-height:16px;margin-bottom:8px"></div>
   <div id="gpuOverview" style="margin-bottom:10px"></div>
   <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
     <label style="font-size:12px;color:var(--text2)">Sort
       <select id="gpuSortSel" style="${SELECT_STYLE}">
-        <option value="index">GPU index</option>
-        <option value="util">Utilization</option>
-        <option value="vram">VRAM used</option>
-        <option value="temp">Temperature</option>
+        ${[["index", "GPU index"], ["util", "Utilization"], ["vram", "VRAM used"], ["temp", "Temperature"]].map(([v, l]) => `<option value="${v}"${gpusView.sort === v ? " selected" : ""}>${l}</option>`).join("")}
       </select></label>
-    <input id="gpuFilter" type="text" placeholder="Filter by GPU name" style="background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:5px 8px;font-size:12px;min-width:180px">
+    <input id="gpuFilter" type="text" value="${esc(gpusView.filter)}" placeholder="Filter by GPU name" aria-label="Filter GPUs" style="min-width:180px">
   </div>
   <div id="gpuBody">${loadingHtml("Loading GPU telemetry\u2026")}</div>
   <div id="gpuHistory"></div></div>`;
@@ -210,14 +212,18 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
    *  for the GPU cards — held outside the repainted DOM so the 2 s
    *  telemetry repaint cannot collapse a row the operator opened. */
   const expandedProcs = new Set<string>();
-  let gpuSort = "index";
-  let gpuFilter = "";
-  const paintBody = (): void => {
+  const paintBody = (): void => keepFocus(root, paintBodyNow);
+  const paintBodyNow = (): void => {
+    const f = gpusView.filter.trim().toLowerCase();
+    let list = lastGpus.filter((g) => !f || g.name.toLowerCase().includes(f) || `gpu ${g.id}`.includes(f));
+    if (gpusView.sort === "util") list = [...list].sort((a, z) => z.util_pct - a.util_pct);
+    else if (gpusView.sort === "vram") list = [...list].sort((a, z) => z.vram_used_gb - a.vram_used_gb);
+    else if (gpusView.sort === "temp") list = [...list].sort((a, z) => z.temp_c - a.temp_c);
     const ov = root.querySelector("#gpuOverview");
     if (ov) {
-      ov.innerHTML = lastGpus.length ? `<div class="ovlist ov-g">
+      ov.innerHTML = list.length ? `<div class="ovlist ov-g">
         <div class="ov-head"><span></span><span>GPU</span><span>Util</span><span>VRAM</span><span>Temp</span><span>Power</span><span>Processes</span></div>
-        ${lastGpus.map((g) => {
+        ${list.map((g) => {
           const btn = g.status === "ok" ? ovStatusBtn("ok", "check", `card-gpu-${g.id}`, `${g.name}: ok — go to card`)
             : g.status === "down" ? ovStatusBtn("err", "err", `card-gpu-${g.id}`, `${g.name}: down — go to card`)
             : g.status === "degraded" || g.status === "starting" ? ovStatusBtn("warn", "warn", `card-gpu-${g.id}`, `${g.name}: ${g.status} — go to card`)
@@ -227,11 +233,6 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     }
     const b = root.querySelector("#gpuBody");
     if (!b) return;
-    const f = gpuFilter.trim().toLowerCase();
-    let list = lastGpus.filter((g) => !f || g.name.toLowerCase().includes(f));
-    if (gpuSort === "util") list = [...list].sort((a, z) => z.util_pct - a.util_pct);
-    else if (gpuSort === "vram") list = [...list].sort((a, z) => z.vram_used_gb - a.vram_used_gb);
-    else if (gpuSort === "temp") list = [...list].sort((a, z) => z.temp_c - a.temp_c);
     b.innerHTML = list.length
       ? `<div class="cards3">${list.map((g) => gpuCard(g, expandedProcs, modelRowsFor(g))).join("")}</div>`
       : emptyHtml("No GPUs match the filter.");
@@ -452,7 +453,6 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
     const rows: GpuModelRow[] = [];
     for (const b of gpuBackends) {
       if (!b.configured || !META[fromWire(b.lifecycle ?? b.state)].isLive) continue;
-      const mdl = gpuModels.find((m) => sameModelFile(b.model_file, m.gguf_path));
       // Sum of the measured rows for this backend on this GPU; null
       // when no row was measured (WDDM, counters unavailable) — an
       // unmeasured backend must not read as holding 0, and must not
@@ -466,9 +466,9 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
       const split = b.tensor_split ?? [];
       const frac = pos >= 0 && split.length ? split[pos] : undefined;
       if (frac !== undefined && frac > 0) {
-        rows.push({ model: mdl?.id ?? baseName(b.model_file), backend: b.id, pct: Math.round(frac * 100), mib: measured });
+        rows.push({ model: modelDisplayName(b.model_file, gpuModels), backend: b.id, pct: Math.round(frac * 100), mib: measured });
       } else if (!split.length && measured !== null && measured >= 1024) {
-        rows.push({ model: mdl?.id ?? baseName(b.model_file), backend: b.id, pct: 100, mib: measured });
+        rows.push({ model: modelDisplayName(b.model_file, gpuModels), backend: b.id, pct: 100, mib: measured });
       }
     }
     return rows;
@@ -514,8 +514,8 @@ export async function wireGpus(root: HTMLElement): Promise<() => void> {
   pollSel?.addEventListener("change", onPollChange);
   const gpuSortSel = root.querySelector("#gpuSortSel") as HTMLSelectElement | null;
   const gpuFilterInput = root.querySelector("#gpuFilter") as HTMLInputElement | null;
-  gpuSortSel?.addEventListener("change", () => { gpuSort = gpuSortSel.value; paintBody(); });
-  gpuFilterInput?.addEventListener("input", () => { gpuFilter = gpuFilterInput.value; paintBody(); });
+  gpuSortSel?.addEventListener("change", () => { gpusView.sort = gpuSortSel.value; paintBody(); });
+  gpuFilterInput?.addEventListener("input", () => { gpusView.filter = gpuFilterInput.value; paintBody(); });
   // Named so the cleanup can remove it: `root` is the persistent #view
   // container (code review v0.1.60 UI-7).
   const onProcToggle = (ev: Event): void => {

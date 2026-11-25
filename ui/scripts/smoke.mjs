@@ -283,7 +283,7 @@ check(readFileSync(join(root, "src", "views", "dashboard.ts"), "utf8").includes(
 const optimizeSrc = readFileSync(join(root, "src", "views", "optimize.ts"), "utf8");
 check(optimizeSrc.includes("data-opt-estimate"), "Optimize view renders the per-backend Estimate button (data-opt-estimate)");
 check(optimizeSrc.includes('data-opt-act="estimate-experiments"'), "Optimize view renders the Estimate experiments action");
-check(optimizeSrc.includes("Estimate —"), "Optimize view renders estimate figures under the Estimate label");
+check(optimizeSrc.includes('opt-kv-label">Estimate</span>'), "Optimize view renders estimate figures under the Estimate label");
 
 // Bench MoE offload axis + results tabs: the Run form carries
 // the expert-offload dimension for MoE backends, the results
@@ -433,8 +433,19 @@ check((cardFnSrc.split('href="#/logs?scope=${esc(encodeURIComponent(b.id))}&foll
   "the menu, the Details latest-lines caption, and the failed-block caption each link to this backend's filtered Logs view");
 check(backendSrc.includes("openDetails.has(row.id)"), "log tails fetch for backends whose Details are open");
 check(backendSrc.includes("const closeEditSession"), "a successful Edit save closes the whole Edit surface (closeEditSession)");
-check((backendSrc.split("closeEditSession();").length - 1) >= 3, "both Edit saves and the Edit toggle close through closeEditSession");
-check(backendSrc.includes('if (mres === "failed") { paint(); return; }'), "a failed model assignment keeps the Edit surface open with its input intact");
+check((backendSrc.split("closeEditSession();").length - 1) >= 3, "the shared Save, X and the Edit toggle close through closeEditSession");
+check(/if \(err\) \{ failed = [\s\S]{0,300}?break; \}/.test(backendSrc) && backendSrc.includes("if (!failed) closeEditSession();"),
+  "a failed write (the model assignment included) stops the Save and keeps the Edit surface open");
+// Edit panel: one rule — every control is a draft until Save (audit B11).
+{
+  const draftBlock = backendSrc.slice(backendSrc.indexOf("Edit panel drafts"), backendSrc.indexOf("Save one offload position outside"));
+  check(draftBlock.length > 500 && !/setBackend(?:Offload|Mtp|MoeCache|Cache|Parallel)\(/.test(draftBlock),
+    "no Edit panel control writes on change (KV/flash, offload, expert cache, MTP, parallel are drafts until Save)");
+  const stepsBlock = backendSrc.slice(backendSrc.indexOf("const structuredSteps"), backendSrc.indexOf("const runSave"));
+  for (const fn of ["updateBackendFlags(", "setBackendParallel(", "setBackendCache(", "setBackendOffload(", "setBackendMoeCache(", "setBackendMtp(", "placementApply("])
+    check(stepsBlock.includes(fn), `the Edit panel's Save carries ${fn}…)`);
+  check(/act === "flags-cancel"\) \{\s*closeEditSession\(\);/.test(backendSrc.replace(/\r\n/g, "\n")), "X discards every Edit panel draft");
+}
 check(bundle.includes("View all logs"), "bundle contains the View all logs menu label");
 check(bundle.includes("Latest log lines"), "bundle contains the Latest log lines caption");
 
@@ -690,9 +701,9 @@ check(staticSrcLf.includes("if (saved && !disposed) {\n        ruleForm.open = f
   "Gateway rule form closes only on a persisted save (rule 17)");
 check(!staticSrcLf.includes("ruleForm.open = false;\n      await patchRules"),
   "Gateway rule form no longer closes ahead of the save outcome");
-check(staticSrcLf.includes('if (r.error) { gwMsg(`Change not saved: ${r.error}`, true); return; }'),
+check(staticSrcLf.includes('if (r.error) { gwMsg(`Change not saved: ${r.error}`, true, at); return; }'),
   "Gateway gwSave failure returns without a repaint (permanent-field input preserved)");
-check(staticSrcLf.includes("gwMsg(okText);\n      await load();"),
+check(staticSrcLf.includes("gwMsg(okText, false, at);\n      await load();"),
   "Gateway gwSave success repaints the field in its new saved state");
 check(staticSrcLf.includes('if (r.error) { setMsg(`Create user failed: ${r.error}`, true); return; }'),
   "Settings Create user failure returns without a repaint (input preserved)");
@@ -708,27 +719,17 @@ check(mcpSrcFc.includes("closeForm();\n    await load();"), "MCP server form clo
 check(mcpSrcFc.includes("formError = r.error;\n      paintForm();"), "MCP server form failure keeps the form open with the draft intact (baseline)");
 check(optimizeSrc.replace(/\r\n/g, "\n").includes("if (r.error) { statusLine = r.error; paint(); return; }"),
   "Optimize purpose save failure keeps the editor open with the error (baseline)");
-check(staticSrcLf.includes("closeEditSession();\n          await load();"),
+check(staticSrcLf.includes("if (!failed) closeEditSession();\n      await load();"),
   "Backend Edit success closes the Edit session before repainting the card (baseline)");
-// KV cache / flash-attention controls (v0.1.46, audited in the
-// rule 17 completion pass, Oct 21, 2026): in the Edit form they
-// are commit-on-change sub-controls in the MTP/parallel idiom —
-// a rejected commit reverts the draft to the saved selection
-// with the error on the card and the Edit session stays open;
-// a landed commit shows the saved tokens in the card message
-// and reloads. In the Add form they are draft fields: the draft
-// lives in wire state (pCache), and the refused pairing is
-// rejected at submit with the error in the form.
-check(staticSrcLf.includes("KV cache not saved: ${r.error}"),
-  "KV cache commit failure surfaces the error on the card (rule 17)");
-check(staticSrcLf.includes("if (!ok && !disposed) {\n      flagsCacheSel = saved;"),
-  "KV cache rejected commit reverts the draft to the saved selection (rule 17)");
-check(staticSrcLf.includes("KV cache saved (${cacheTokenText(sel)})"),
-  "KV cache successful commit reports the saved selection on the card (rule 17)");
+// KV cache / flash-attention controls: drafts in both forms. The Edit
+// draft (flagsCacheSel) and the Add draft (pCache) live in wire state;
+// the refused pairing is rejected at Save/submit with the error in the
+// form.
+check(staticSrcLf.includes("Not saved: ${s.label}"), "a failed Edit write surfaces its error on the card (rule 17)");
 check(staticSrcLf.includes("pCache = sel; paintParams();"),
   "Add-form KV selects sync into the wire draft (repaints cannot lose it, rule 17)");
-check((staticSrcLf.match(/A quantized V cache requires flash attention/g) || []).length >= 2,
-  "Quantized-V + flash-attention-off is named and refused in both the Edit commit path and the Add submit validation (rule 17)");
+check(staticSrcLf.includes("A quantized V cache requires flash attention") && (staticSrcLf.match(/CACHE_PAIR_ERROR/g) || []).length >= 4,
+  "Quantized-V + flash-attention-off is named and refused in both the Edit Save and the Add submit validation (rule 17)");
 
 // Predicted throughput field + refresh (Oct 20, 2026): the
 // field renders on EVERY backend card (the Backends stat tile
@@ -870,13 +871,15 @@ check(staticSrcFit.includes('row("KV cache"'), "cache fit block renders the KV c
 check(staticSrcFit.includes('row("State cache"'), "cache fit block renders the State cache as its own row");
 check(staticSrcFit.includes("preview.rs_mib !== null"), "cache fit block renders the State cache row only when the figure exists");
 check(staticSrcFit.includes("preview.kv_mib === null"), "cache fit block keeps the unknown-KV branch (no priced total, no fit claim)");
-check(staticSrcFit.includes('t.fits ? "status-on" : "status-bad"'), "cache fit block renders the per-GPU verdict as a status chip");
+check(/row\(`GPU \$\{t\.gpu\}`, value, chip\)/.test(staticSrcFit) && staticSrcFit.includes("const chip = ` ${fitChipHtml("), "cache fit block renders the per-GPU verdict as a status chip");
+check((staticSrcFit.match(/fitChipHtml\(\{/g) || []).length >= 3, "card, form and projection share the one fit chip");
+check(!/Fits — \$\{/.test(staticSrcFit), "a paged requirement never reads as a fit");
 check(staticSrcFit.includes("GiB of"), "cache fit block renders each GPU's required share of its total");
 check(bundle.includes(" GiB of "), "bundle carries the per-GPU capacity phrasing (share of total)");
 check(!staticSrcFit.includes("does not fit at this context"), "cache fit block no longer appends the verdict to the one-line string");
 check(!staticSrcFit.includes("vs ${targets}"), "cache fit block no longer joins GPU totals into a 'vs' string");
 check(!bundle.includes("does not fit at this context"), "bundle no longer carries the one-line fit verdict");
-check(staticSrcFit.includes('p.fits ? "status-on" : "status-bad"'), "placement projection renders its Fit verdict as a status chip");
+check(staticSrcFit.includes("const fitChip = fitChipHtml({"), "placement projection renders its Fit verdict as a status chip");
 
 // MoE expert-cache fit consistency (Oct 23, 2026): the cache is
 // itemized wherever weights/KV/state are, the preview prices the
@@ -1016,7 +1019,7 @@ check(/function pairingQrHtml[\s\S]{0,600}<script/.test(staticSrcNar), "pairing 
 // old "Split:" text line.
 check(apiSrcGw.includes("memory?: BackendAddMemory | null"), "BackendAddPreview carries the memory requirement object");
 check(staticSrcNar.includes("data-add-split-bar") && /data-add-split-bar[\s\S]{0,400}stackedBar\(segs/.test(staticSrcNar), "add-backend form renders the split preview as a segmented bar");
-check(/preview\.memory \?\? null[\s\S]{0,900}"GPU RAM"[\s\S]{0,300}"System RAM"/.test(staticSrcNar), "add-backend strip renders GPU RAM / System RAM tiles from the preview memory");
+check(/preview\.memory \?\? null[\s\S]{0,900}"GPU RAM"[\s\S]{0,600}"System RAM"/.test(staticSrcNar), "add-backend strip renders GPU RAM / System RAM tiles from the preview memory");
 check(!staticSrcNar.includes("Split: ${esc(summary)}"), "add-backend placement no longer repeats the split as a text line");
 // Rule 15 sweep of the MCP surfaces (buttons audit follow-up): the
 // URL copy, form Cancel, and prompt Skip are icon-only with a name;
@@ -1030,6 +1033,33 @@ check(mcpPromptR15.includes('data-prompt-act="cancel">${icon("x")} Cancel start'
 // OpenRouter tier card: spent-vs-cap meter in the audit's designated
 // slot, fed by gateway_status.openrouter_spend.
 check(/const spendRow = spend && spend\.fraction !== null[\s\S]{0,1600}meter\(Math\.min\(100, spend\.fraction \* 100\)/.test(staticSrcNar) && staticSrcNar.includes("${spendRow}"), "OpenRouter tier card renders the spent-vs-cap meter from openrouter_spend");
+
+// UI audit (Nov 2026): behaviours a source pin can hold.
+{
+  const srcAll = walkTs(join(root, "src")).map((p) => [p.slice(root.length + 1).replace(/\\/g, "/"), readFileSync(p, "utf8").replace(/\r\n/g, "\n")]);
+  const srcOf = (name) => srcAll.find(([p]) => p === name)?.[1] ?? "";
+  const native = srcAll.filter(([, s]) => /(?<![\w.])(?:window\.)?(?:confirm|alert|prompt)\(/.test(s.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, ""))).map(([p]) => p);
+  check(native.length === 0, `no native confirm()/alert()/prompt() dialogs${native.length ? ` (found in ${native.join(", ")})` : ""}`);
+  check(!srcAll.some(([, s]) => s.includes('"en-GB"')), "dates use the OS locale");
+  const css = readFileSync(join(root, "src", "styles.css"), "utf8");
+  check(css.includes("color-scheme: dark"), "native controls follow the dark theme");
+  check(/table\.tbl, table\.dtab, table\.opt-table \{/.test(css), "plan, projection and sweep tables share the table style");
+  const mainUi = srcOf("src/main.ts");
+  check(mainUi.indexOf('id="view"') < mainUi.indexOf('id="activationBanner"'), "the activation bar is docked under the view (its arrival shifts nothing)");
+  check(mainUi.includes("rememberScroll();") && mainUi.includes("restoreScroll(route.hash);"), "scroll position is kept per route");
+  for (const v of ["src/views/backends.ts", "src/views/gateway.ts"]) check(!srcOf(v).includes("activationPlanHtml"), `${v} does not repeat the activation plan beside the shell's bar`);
+  const models = srcOf("src/views/models.ts");
+  check(models.indexOf('<div id="modelAddForm">') < models.indexOf('<div id="modelOverview">'), "the Add model form opens at the top of the page");
+  const bench = srcOf("src/views/bench.ts");
+  check(!bench.includes("Sweep started: ${r.data.sweep_id}") && bench.includes("if (disposed || (!runBusy && !sweeps.some("), "bench polls from the moment a sweep is started");
+  check(bench.indexOf("interlock = null;\n    setStatus(\"\", false, \"run\");") > 0, "the interlock panel closes when the run starts");
+  const opt = srcOf("src/views/optimize.ts");
+  check((opt.match(/await confirmReplacePlan\(\)/g) ?? []).length >= 3, "every consultation asks before replacing a stored plan");
+  check(srcOf("src/views/backends.ts").includes("actionJustSwapped(`backend:${id}`)") && srcOf("src/lifecycle.ts").includes("actionJustSwapped(targetKey(target))"), "a click on a just-swapped lifecycle button is ignored");
+  check(srcOf("src/views/groups.ts").includes('ev.key === "Escape" && openMenus.size'), "Escape closes the group move menu");
+  check(srcOf("src/views/mcp.ts").includes("s.blocked_reason"), "MCP cards show why a server is blocked");
+  check(opt.includes("restoreFailuresHtml(sweep.restore_failures)"), "a tuning sweep names the backends it could not start again");
+}
 
 if (failures > 0) { console.error(`\n${failures} smoke check(s) failed`); process.exit(1); }
 console.log("\nsmoke: all checks passed");
