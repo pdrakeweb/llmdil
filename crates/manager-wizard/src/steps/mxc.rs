@@ -64,6 +64,31 @@ fn mxc_host_prep_path(ctx: &WizardContext) -> PathBuf {
     mxc_bin_dir(ctx).join("wxc-host-prep.exe")
 }
 
+/// The app-installed MXC runtime: `None` when it is not installed,
+/// else the version install-mxc recorded. The step's marker must be
+/// present and the `wxc-exec.exe` beside it still on disk. A copy on
+/// PATH does not count: it was never checked against the pin.
+pub fn installed_mxc_runtime(data_dir: &Path) -> Option<MxcRuntime> {
+    let root = data_dir.join("mxc");
+    let text = std::fs::read_to_string(root.join(".installed.json")).ok()?;
+    let marker: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if !root.join("bin").join("x64").join("wxc-exec.exe").is_file() {
+        return None;
+    }
+    Some(MxcRuntime {
+        version: marker
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
+}
+
+/// An installed MXC runtime (see [`installed_mxc_runtime`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MxcRuntime {
+    pub version: Option<String>,
+}
+
 /// Resolve the wxc-exec invocation for the MXC steps: the
 /// app-installed runtime when install-mxc has placed it, else the
 /// bare program name (a system install on PATH).

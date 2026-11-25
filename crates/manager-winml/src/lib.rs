@@ -163,12 +163,17 @@ impl ReqwestProbeTransport {
 impl WinMlProbeTransport for ReqwestProbeTransport {
     async fn get(&self, url: &str) -> Result<ProbeHttpResponse, WinMlError> {
         let resp = self.client.get(url).send().await.map_err(|e| {
+            // Plain words for the two ordinary cases; the reqwest text
+            // ("error sending request for url ...") names no cause.
+            let server = url.trim_end_matches("/v1/models");
             if e.is_timeout() {
-                WinMlError::Timeout(e.to_string())
+                WinMlError::Timeout(format!("WinMLServer at {server} did not answer in time"))
             } else if e.is_connect() {
-                WinMlError::Unavailable(e.to_string())
+                WinMlError::Unavailable(format!(
+                    "nothing is answering at {server}. WinMLServer is not installed or not running."
+                ))
             } else {
-                WinMlError::ProbeFailed(e.to_string())
+                WinMlError::ProbeFailed(e.without_url().to_string())
             }
         })?;
         let status = resp.status().as_u16();
@@ -669,6 +674,24 @@ mod tests {
         let t = FakeTransport::failing(WinMlError::Unavailable("refused".to_string()));
         let err = probe(&t, "http://127.0.0.1:8090").await.unwrap_err();
         assert!(matches!(err, WinMlError::Unavailable(_)));
+    }
+
+    /// A machine without WinMLServer gets a plain sentence, not the
+    /// HTTP client's "error sending request for url".
+    #[tokio::test]
+    async fn unreachable_server_is_reported_in_plain_words() {
+        // A port nothing listens on: bound, then released.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let t = ReqwestProbeTransport::new(Duration::from_secs(10)).unwrap();
+        let err = probe(&t, &base_url(port)).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("error sending request"), "{msg}");
+        assert!(msg.contains(&format!("127.0.0.1:{port}")), "{msg}");
+        assert!(msg.contains("WinMLServer"), "{msg}");
     }
 
     #[tokio::test]

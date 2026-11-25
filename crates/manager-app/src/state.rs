@@ -681,29 +681,26 @@ impl AppState {
     /// machine checks — left it false, so a user with a functionally
     /// complete setup was routed back to the wizard on every launch
     /// (field-confirmed 2026-10-17: every step passing, flag false).
-    /// When the wizard's report shows every step Done, Manual, or
-    /// Skipped — the Finish dialog's own completeness predicate — the
-    /// flag is set and persisted, so launch routing (the UI reads the
-    /// flag via `setup_status`) sends the user to the Dashboard.
-    /// Best effort: a failed save keeps the in-memory value and the
-    /// next trigger retries.
+    /// When the wizard's report is complete
+    /// ([`WizardReport::setup_complete`]: the required steps ended,
+    /// the optional ones may never have run) the flag is set and
+    /// persisted, so launch routing (the UI reads the flag via
+    /// `setup_status`) sends the user to the Dashboard. The report
+    /// saved by the previous session counts too: at launch the UI asks
+    /// before `restore_wizard` has run. Best effort: a failed save
+    /// keeps the in-memory value and the next trigger retries.
     pub async fn reconcile_setup_completed(&self) {
         if self.config.read().await.setup_completed {
             return;
         }
         let complete = {
+            // try_lock: a step holds this lock for its whole run and
+            // reconciles when it ends; a reader must not wait for it.
             let wizard = self.wizard(RunMode::Install).await;
-            let guard = wizard.lock().await;
-            let report = guard.report();
-            !report.steps.is_empty()
-                && report.steps.iter().all(|s| {
-                    matches!(
-                        s.state,
-                        manager_wizard::StepState::Done
-                            | manager_wizard::StepState::Manual
-                            | manager_wizard::StepState::Skipped
-                    )
-                })
+            let live = wizard.try_lock().is_ok_and(|g| g.report().setup_complete());
+            live || self
+                .saved_wizard()
+                .is_some_and(|p| p.report.setup_complete())
         };
         if !complete {
             return;
@@ -720,7 +717,7 @@ impl AppState {
                 append_wizard_log(
                     &self.data_dir,
                     &[format!(
-                        "[{}] setup_completed reconciled: every wizard step is done/manual/skipped, so the flag was set without a Finish click",
+                        "[{}] setup_completed reconciled: every required wizard step is done/manual/skipped, so the flag was set without a Finish click",
                         chrono::Utc::now().to_rfc3339()
                     )],
                 );
@@ -877,14 +874,18 @@ impl AppState {
         failed
     }
 
+    /// The wizard report saved by [`Self::persist_wizard`]; `None`
+    /// when it is missing or unreadable.
+    fn saved_wizard(&self) -> Option<PersistedWizard> {
+        let text = std::fs::read_to_string(self.data_dir.join("wizard-state.json")).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
     /// Restore persisted wizard progress at launch, before the
     /// hydration audit fills still-Queued steps from machine checks.
     /// A missing or unreadable file leaves the wizard untouched.
     pub async fn restore_wizard(&self) {
-        let Ok(text) = std::fs::read_to_string(self.data_dir.join("wizard-state.json")) else {
-            return;
-        };
-        let Ok(persisted) = serde_json::from_str::<PersistedWizard>(&text) else {
+        let Some(persisted) = self.saved_wizard() else {
             return;
         };
         // A step persisted as Running was in flight when the app
@@ -909,10 +910,18 @@ impl AppState {
         let mut guard = wizard.lock().await;
         // Same drift rule as hydration: a persisted start-gateway
         // Done is adopted only while the gateway config on disk
-        // still matches the current configuration.
+        // still matches the current configuration, or the gateway is
+        // running (see Wizard::restore).
         let cfg = self.config.read().await.clone();
         let gateway_current = self.gateway_config_current(&cfg).await;
-        guard.restore(&persisted.report, gateway_current);
+        let gateway_running = {
+            let host = manager_wizard::steps::gateway_probe_host(&cfg);
+            let port = cfg.gateway.port;
+            tokio::task::spawn_blocking(move || crate::probe_gateway(&host, port))
+                .await
+                .unwrap_or(false)
+        };
+        guard.restore(&persisted.report, gateway_current, gateway_running);
         *self.wizard.steps_cache.write().await = Some(wizard_steps_payload(&guard));
     }
 

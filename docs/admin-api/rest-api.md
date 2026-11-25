@@ -1337,6 +1337,12 @@ Evaluation only; applying a proposal is `PUT /mxc/policy`.
 The `updates` section of `GET /config` (per-component
 `pinned_version`, `auto_update`, `last_checked`).
 
+#### `GET /api/v1/updates/components` — `read`
+`updates_list`. `{ "checked_at": time | null, "components": [...] }`,
+the rows of the check below without contacting any feed: upstream
+versions and feed errors from the last check (`checked_at`), installed
+and pinned versions as of now.
+
 #### `POST /api/v1/updates/check` — `read`
 `updates_check_all`. Routed, but the app operation is a stub:
 it returns `501 UNSUPPORTED` ("Update checking ships in P6"),
@@ -1356,7 +1362,9 @@ implements it; the contract reserves the path.
 
 #### `PUT /api/v1/updates/components/{component_id}/auto` — `config`
 `updates_set_auto`. Body: `{ "enabled": true }` →
-`{ "ok", "persisted", "component_id", "auto_update" }`.
+`{ "ok", "persisted", "component_id", "auto_update" }`. `true` is
+refused (`UNSUPPORTED`) for a component whose row says
+`auto_update_supported: false`, which today is every one.
 
 #### App self-update — `GET /api/v1/app-update` — `read`
 `app_update_status`. LLMdil's own update state, distinct from the

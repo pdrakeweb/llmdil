@@ -375,7 +375,8 @@ verification, the state file under `<data_dir>/app-update/`, and
 the apply-helper entry the shell runs before the UI starts. Component
 updates (spec §12) live in `updates`: `updates_check_all` (installed vs
 upstream vs pin per wizard-managed component, per-component feed
-errors) and `updates_apply` (a cancellable task that stops dependents
+errors), `updates_list` (the last check's results over the current
+install, no network) and `updates_apply` (a cancellable task that stops dependents
 through the existing ops, re-runs the wizard install step, verifies,
 restarts/smokes, and rolls back on failure; LiteLLM moves only by an
 explicit newer pin). `registry` holds the single operation

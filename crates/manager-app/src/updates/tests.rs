@@ -464,6 +464,105 @@ async fn check_all_caches_and_stamps_last_checked() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// B18: the last check survives navigation and restarts, with its time,
+/// and its rows follow what is installed and pinned now.
+#[tokio::test]
+async fn list_serves_the_last_check_against_the_current_install() {
+    let dir = unique_dir("upd-list");
+    write_markers(&dir, Some("b11000"), Some("1.105.1"));
+    let state = Arc::new(AppState::new(
+        AppConfig::default_config(),
+        dir.join("config.json"),
+        dir.clone(),
+    ));
+    let sink: Arc<dyn EventSink> = Arc::new(crate::NoopSink);
+    let row = |v: &Value, id: &str| -> Value {
+        v["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    // Never checked: installed versions, no upstream claims.
+    let v = op_list(&state, &sink).await.unwrap();
+    assert!(v["checked_at"].is_null());
+    let llama = row(&v, LLAMACPP_COMPONENT);
+    assert_eq!(llama["installed_version"], "b11000");
+    assert!(llama["latest_available"].is_null());
+    assert!(llama["check_error"].is_null());
+
+    let mut feed = full_feed();
+    feed = feed.with(MXC_NPM_LATEST_URL, Err("HTTP 503"));
+    let checked = check_all_with(&state, &feed).await.unwrap();
+    // The install moves after the check.
+    write_markers(&dir, Some("b11500"), Some("1.105.1"));
+    let v = op_list(&state, &sink).await.unwrap();
+    assert_eq!(v["checked_at"], checked["checked_at"]);
+    let llama = row(&v, LLAMACPP_COMPONENT);
+    assert_eq!(llama["installed_version"], "b11500");
+    assert_eq!(llama["latest_available"], "b12340");
+    assert_eq!(row(&v, LITELLM_COMPONENT)["latest_available"], "1.108.1");
+    assert_eq!(row(&v, MXC_COMPONENT)["check_error"], "HTTP 503");
+    for id in COMPONENTS {
+        assert_eq!(row(&v, id)["auto_update_supported"], false, "{id}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B18: a LiteLLM that is not installed is reported so, never as
+/// updatable.
+#[tokio::test]
+async fn litellm_not_installed_is_not_updatable() {
+    let dir = unique_dir("upd-litellm-absent");
+    let cfg = AppConfig::default_config();
+    let reports = check_components(&cfg, &dir, &full_feed()).await;
+    let litellm = by_id(&reports, LITELLM_COMPONENT);
+    assert_eq!(litellm.latest_available.as_deref(), Some("1.108.1"));
+    assert!(!litellm.update_available && !litellm.applyable);
+    let note = litellm.note.as_deref().unwrap();
+    assert!(note.contains("not installed"), "{note}");
+    // Installed but never measured says that instead.
+    std::fs::create_dir_all(dir.join("python").join("venv")).unwrap();
+    let reports = check_components(&cfg, &dir, &full_feed()).await;
+    let note = by_id(&reports, LITELLM_COMPONENT).note.clone().unwrap();
+    assert!(note.contains("not measured"), "{note}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B18: a pin names a managed component and a version that can be
+/// installed (or already is).
+#[tokio::test]
+async fn pins_are_validated() {
+    let dir = unique_dir("upd-pin");
+    write_markers(&dir, Some("b11000"), None);
+    let verified = LlamaCppPin::default_pin().tag;
+    for (component, version) in [
+        (LLAMACPP_COMPONENT, verified.as_str()),
+        (LLAMACPP_COMPONENT, "b11000"),
+        (LITELLM_COMPONENT, "1.108.1"),
+    ] {
+        validate_pin(&dir, component, Some(version)).unwrap();
+    }
+    validate_pin(&dir, POSTGRES_COMPONENT, None).unwrap();
+    for (component, version) in [
+        (LLAMACPP_COMPONENT, "b99999"),
+        (LLAMACPP_COMPONENT, "latest"),
+        (LITELLM_COMPONENT, "1.2"),
+        (LITELLM_COMPONENT, "1.108.0rc1"),
+        (LITELLM_COMPONENT, LITELLM_KNOWN_BAD[0]),
+        (POSTGRES_COMPONENT, "99.0-1"),
+        (MXC_COMPONENT, "x"),
+    ] {
+        let err = validate_pin(&dir, component, Some(version)).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidInput(_)), "{version}: {err}");
+    }
+    let err = validate_pin(&dir, "nonsense", None).unwrap_err();
+    assert!(matches!(err, ApiError::NotFound(_)), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // -- planning --------------------------------------------------------------
 
 #[tokio::test]

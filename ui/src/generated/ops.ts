@@ -158,6 +158,7 @@ export type OpName =
   | "winml_unregister"
   | "winml_status"
   | "updates_check_all"
+  | "updates_list"
   | "updates_apply"
   | "updates_pin"
   | "updates_set_auto"
@@ -929,6 +930,9 @@ export interface WinmlStatusArgs {}
 /** Arguments of `updates_check_all`. */
 export interface UpdatesCheckAllArgs {}
 
+/** Arguments of `updates_list`. */
+export interface UpdatesListArgs {}
+
 /** Arguments of `updates_apply`. */
 export interface UpdatesApplyArgs {
   readonly componentId: string;
@@ -1121,6 +1125,7 @@ export interface OpArgs {
   winml_unregister: WinmlUnregisterArgs;
   winml_status: WinmlStatusArgs;
   updates_check_all: UpdatesCheckAllArgs;
+  updates_list: UpdatesListArgs;
   updates_apply: UpdatesApplyArgs;
   updates_pin: UpdatesPinArgs;
   updates_set_auto: UpdatesSetAutoArgs;

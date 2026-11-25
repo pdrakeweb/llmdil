@@ -313,6 +313,29 @@ impl WizardReport {
         (done, total)
     }
 
+    /// Whether setup is complete: every required step ended Done,
+    /// Manual or Skipped (a skip is the operator's or the step's own
+    /// decision), and no optional step ([`steps::OPTIONAL_STEPS`]) is
+    /// running or failed — an optional step that was never run does
+    /// not hold setup open. False for an Audit report (its skips only
+    /// mean "not a check") and when a required step is missing.
+    pub fn setup_complete(&self) -> bool {
+        self.mode == RunMode::Install
+            && steps::default_steps().iter().all(|step| {
+                let state = self
+                    .steps
+                    .iter()
+                    .find(|s| s.id == step.id())
+                    .map(|s| s.state)
+                    .unwrap_or(StepState::Queued);
+                match state {
+                    StepState::Done | StepState::Manual | StepState::Skipped => true,
+                    StepState::Queued => steps::OPTIONAL_STEPS.contains(&step.id()),
+                    StepState::Running | StepState::Failed => false,
+                }
+            })
+    }
+
     /// Fraction 0.0–1.0 for the completion bar.
     pub fn fraction(&self) -> f64 {
         let (done, total) = self.progress();

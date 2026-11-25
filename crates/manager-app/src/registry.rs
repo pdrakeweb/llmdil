@@ -435,6 +435,7 @@ macro_rules! for_each_operation {
             (WinmlStatus, winml_status, R, op_winml_status, [], None),
             // Updates
             (UpdatesCheckAll, updates_check_all, R, op_updates_check_all, [], Some(route(HttpMethod::Post, "/api/v1/updates/check"))),
+            (UpdatesList, updates_list, R, op_updates_list, [], Some(route(HttpMethod::Get, "/api/v1/updates/components"))),
             (UpdatesApply, updates_apply, D, op_updates_apply, [component_id: String, version: Option<String>], Some(route(HttpMethod::Post, "/api/v1/updates/components/{component_id}/apply"))),
             (UpdatesPin, updates_pin, C, op_updates_pin, [component_id: String, version: Option<String>], Some(route(HttpMethod::Put, "/api/v1/updates/components/{component_id}/pin"))),
             (UpdatesSetAuto, updates_set_auto, C, op_updates_set_auto, [component_id: String, enabled: bool], Some(route(HttpMethod::Put, "/api/v1/updates/components/{component_id}/auto"))),
@@ -653,7 +654,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 159);
+        assert_eq!(OP_SPECS.len(), 160);
     }
 
     #[test]

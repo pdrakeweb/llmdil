@@ -2649,6 +2649,13 @@
       "title": "updates_check_all",
       "type": "object"
     },
+    "updates_list": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "updates_list",
+      "type": "object"
+    },
     "updates_pin": {
       "additionalProperties": false,
       "properties": {

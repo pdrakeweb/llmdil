@@ -36,6 +36,49 @@ fn fake_winml_server() -> u16 {
     port
 }
 
+/// A12: without the MXC runtime the self-test says what it checked,
+/// `enforced` is refused on every path, and the status says so.
+#[tokio::test]
+async fn mxc_enforced_needs_the_runtime() {
+    let (state, dir) = advanced_test_state(test_cfg());
+    let sink = test_sink();
+    let status = op_get_status(&state, &sink).await.unwrap();
+    assert_eq!(status["mxc_runtime_installed"], false);
+    let test = op_mxc_run_self_test(&state, &sink).await.unwrap();
+    assert_eq!(test["runtime_installed"], false);
+    assert!(test["runtime_version"].is_null());
+    assert_eq!(test["checked"], "policy_only");
+    assert!(test["detail"].as_str().unwrap().contains("not installed"));
+
+    let err = op_mxc_set_mode(&state, &sink, MxcMode::Enforced)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not installed"), "{err}");
+    let patch = json!({ "mxc": { "mode": "enforced" } });
+    let err = op_update_config(&state, &sink, patch).await.unwrap_err();
+    assert!(err.to_string().contains("not installed"), "{err}");
+    assert_eq!(state.config.read().await.mxc.mode, MxcMode::Learning);
+    for mode in [MxcMode::Disabled, MxcMode::Learning] {
+        op_mxc_set_mode(&state, &sink, mode).await.unwrap();
+    }
+
+    // The marker alone is not an install: the executable must exist.
+    let mxc = dir.join("mxc");
+    std::fs::create_dir_all(mxc.join("bin").join("x64")).unwrap();
+    std::fs::write(mxc.join(".installed.json"), r#"{"version":"1.0.0"}"#).unwrap();
+    assert!(op_mxc_set_mode(&state, &sink, MxcMode::Enforced)
+        .await
+        .is_err());
+    std::fs::write(mxc.join("bin").join("x64").join("wxc-exec.exe"), b"x").unwrap();
+    op_mxc_set_mode(&state, &sink, MxcMode::Enforced)
+        .await
+        .unwrap();
+    let test = op_mxc_run_self_test(&state, &sink).await.unwrap();
+    assert_eq!(test["runtime_installed"], true);
+    assert_eq!(test["runtime_version"], "1.0.0");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Tech spec §6.5 / P7: "Re-check capabilities" (winml_probe from
 /// the WinML card) re-probes through the registry when a model is
 /// registered, refreshing the registration — here the adapter hint
