@@ -696,6 +696,7 @@ async fn user_declared_moe_model_round_trip() {
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -732,6 +733,7 @@ async fn user_declared_moe_model_round_trip() {
         "qwen3.8-27b-moe".to_string(),
         None,
         Some(65536),
+        None,
         None,
     )
     .await
@@ -1149,9 +1151,17 @@ async fn dense_user_model_gets_no_offload_control() {
         .clone();
     assert_eq!(b.raw_flags, None);
     assert!(backend_offload_info(&saved, &b).is_none());
-    let preview = op_backend_add_preview(&state, &sink, "dense-7b".to_string(), None, None, None)
-        .await
-        .unwrap();
+    let preview = op_backend_add_preview(
+        &state,
+        &sink,
+        "dense-7b".to_string(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert!(preview["offload"].is_null());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1225,4 +1235,88 @@ fn backend_cache_info_distinguishes_pre_feature_and_custom() {
     let info = backend_cache_info(&b);
     assert!(info.present);
     assert!(info.custom);
+}
+
+/// The previews price an unsaved MoE position and placement (G02, G03)
+/// with the figures the saved configuration would get, refuse what the
+/// save refuses, and write nothing.
+#[tokio::test]
+async fn previews_price_an_unsaved_position_and_placement() {
+    let mut cfg = test_cfg();
+    serve_model(
+        &mut cfg,
+        "coder",
+        "qwen3-coder-30b",
+        "models/Qwen3-Coder-Next-UD-Q4_K_M.gguf",
+        Some("--n-cpu-moe 40"),
+    );
+    let (state, dir) = advanced_test_state(cfg);
+    let sink = test_sink();
+    let gpus = test_gpus();
+    lock_telemetry(&state.telemetry().await).set_inventory(gpus.clone());
+    let cache = |layers: Option<u32>, gpu_indices: Option<Vec<u32>>| {
+        op_backend_cache_preview(
+            &state,
+            &sink,
+            "coder".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            layers,
+            gpu_indices,
+        )
+    };
+    let add = |layers: Option<u32>| {
+        op_backend_add_preview(
+            &state,
+            &sink,
+            "qwen3-coder-30b".to_string(),
+            Some(vec![gpus[0].index]),
+            None,
+            None,
+            layers,
+        )
+    };
+    let saved = cache(None, None).await.unwrap();
+    let same = cache(Some(40), None).await.unwrap();
+    assert_eq!(saved, same, "the saved position, spelled out");
+    let fewer = cache(Some(20), None).await.unwrap();
+    assert!(fewer["weights_mib"].as_u64() > saved["weights_mib"].as_u64());
+    assert!(fewer["sys_weights_mib"].as_u64() < saved["sys_weights_mib"].as_u64());
+    // The add form's preview agrees, position by position.
+    for (layers, want) in [(20, &fewer), (40, &saved)] {
+        let p = add(Some(layers)).await.unwrap();
+        assert_eq!(p["offload"]["layers"], layers);
+        assert_eq!(p["memory"]["gpu_ram_mib"], want["weights_mib"]);
+        assert_eq!(p["memory"]["sys_ram_mib"], want["sys_weights_mib"]);
+        assert_eq!(p["cache"]["weights_mib"], want["weights_mib"]);
+    }
+    // A placement: the named GPUs, evenly.
+    let placed = cache(None, Some(vec![gpus[0].index, gpus[1].index]))
+        .await
+        .unwrap();
+    let targets = placed["targets"].as_array().unwrap();
+    assert_eq!(
+        targets.iter().map(|t| t["gpu"].clone()).collect::<Vec<_>>(),
+        [json!(gpus[0].index), json!(gpus[1].index)]
+    );
+    for bad in [
+        cache(Some(49), None).await,
+        cache(None, Some(vec![99])).await,
+    ] {
+        assert!(matches!(bad, Err(ApiError::InvalidInput(_))), "{bad:?}");
+    }
+    assert!(matches!(
+        add(Some(49)).await,
+        Err(ApiError::InvalidInput(_))
+    ));
+    let live = state.config.read().await;
+    let b = live.backends.iter().find(|b| b.id == "coder").unwrap();
+    assert_eq!(b.raw_flags.as_deref(), Some("--n-cpu-moe 40"));
+    assert!(!state.config_path.exists(), "nothing was saved");
+    drop(live);
+    let _ = std::fs::remove_dir_all(&dir);
 }

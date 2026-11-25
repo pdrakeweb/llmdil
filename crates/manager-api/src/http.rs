@@ -248,6 +248,9 @@ async fn handle_op(
         Ok(a) => a,
         Err(resp) => return *resp,
     };
+    if let Some(resp) = crate::guards::refuse(&ctx, spec, &args) {
+        return resp;
+    }
     // Asynchronous operations (rest-api.md §3.1): create the
     // operation record, spawn the dispatch, answer 202. The
     // record's detail carries the outcome the synchronous call
@@ -365,7 +368,7 @@ fn assemble_args(
 ) -> Result<Value, Box<Response>> {
     let mut obj = Map::new();
     for (k, v) in path_params {
-        obj.insert(k.clone(), Value::String(v.clone()));
+        obj.insert(k.clone(), crate::guards::path_value(spec, k, v));
     }
     for (k, v) in query {
         if spec.params.contains(&k.as_str()) {
@@ -473,6 +476,7 @@ fn shape_success(ctx: &ApiCtx, spec: &OpSpec, value: Value) -> Response {
     }
     let status = match spec.route.map(|r| r.mode) {
         Some(RouteMode::Created) => axum::http::StatusCode::CREATED,
+        Some(RouteMode::Accepted) => axum::http::StatusCode::ACCEPTED,
         _ => axum::http::StatusCode::OK,
     };
     let _ = ctx;

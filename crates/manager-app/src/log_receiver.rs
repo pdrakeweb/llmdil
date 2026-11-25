@@ -102,7 +102,7 @@ pub async fn op_log_receiver_status(
         .as_ref()
         .filter(|s| !matches!(s.state, manager_services::ServiceState::NotInstalled));
     let receiver_exe = receiver_exe_path();
-    Ok(json!({
+    let mut out = json!({
         "service_name": manager_services::LOG_RECEIVER_SERVICE_NAME,
         "registered": live.is_some(),
         // The raw SCM state (kept for older clients); `lifecycle` is the
@@ -130,7 +130,10 @@ pub async fn op_log_receiver_status(
             crate::logship::log_streaming_status(state).as_ref(),
             crate::logship::log_streaming_note(state).as_deref(),
         ),
-    }))
+    });
+    // Local paths stay on the machine: the Admin API omits them.
+    crate::event_bus::omit_for_api(&mut out, &["receiver_exe", "data_dir"]);
+    Ok(out)
 }
 
 /// Drive the receiver's service through one lifecycle transition with

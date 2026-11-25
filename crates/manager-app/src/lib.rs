@@ -99,11 +99,11 @@ pub use log_receiver::{
     op_log_receiver_restart, op_log_receiver_start, op_log_receiver_status, op_log_receiver_stop,
 };
 pub use optimize::{
-    op_measurement_delete, op_measurement_lookup, op_optimize_cancel_consult,
-    op_optimize_cancel_job, op_optimize_consult, op_optimize_discard_plan, op_optimize_discover,
-    op_optimize_estimate_backend, op_optimize_get_state, op_optimize_measure_backend,
-    op_optimize_save_purpose, op_optimize_set_item_outcome, op_optimize_set_item_state,
-    op_optimize_validate_plan,
+    consult_replace_refusal, op_measurement_delete, op_measurement_lookup,
+    op_optimize_cancel_consult, op_optimize_cancel_job, op_optimize_consult,
+    op_optimize_discard_plan, op_optimize_discover, op_optimize_estimate_backend,
+    op_optimize_get_state, op_optimize_measure_backend, op_optimize_save_purpose,
+    op_optimize_set_item_outcome, op_optimize_set_item_state, op_optimize_validate_plan,
 };
 pub use optimize_apply::op_optimize_apply_plan;
 pub use optimize_eval::op_optimize_run_baseline;

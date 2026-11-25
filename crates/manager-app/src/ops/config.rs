@@ -126,6 +126,22 @@ pub async fn op_update_config(
     Ok(json!({ "ok": true, "persisted": true }))
 }
 
+/// Set the supervision mode (Settings → Supervision): which of the two
+/// the next lifecycle operation uses. Nothing is started, stopped or
+/// registered here.
+pub async fn op_settings_set_supervision(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    mode: manager_config::SupervisionMode,
+) -> ApiResult {
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    new_cfg.supervision.mode = mode;
+    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+    *cfg = new_cfg;
+    Ok(json!({ "ok": true, "mode": mode, "persisted": true }))
+}
+
 /// Replace the notification preferences (Settings → Notifications).
 /// Save-then-install, exactly like `update_config`: the file is
 /// validated and written first; the in-memory config changes only
@@ -155,10 +171,19 @@ pub async fn op_notifications_set_config(
 /// `windows_setting` is `off` when Windows Settings switches
 /// notifications off (for all apps or for this one), else `on`, and
 /// null where it cannot be read.
+///
+/// An Admin API caller's sink has no OS toast, so its test goes to the
+/// desktop shell's; without a shell there is nothing to test.
 pub async fn op_notifications_send_test(
-    _state: &Arc<AppState>,
+    state: &Arc<AppState>,
     sink: &Arc<dyn EventSink>,
 ) -> ApiResult {
+    let sink = match event_bus::current_origin() {
+        event_bus::EventOrigin::Api => state.desktop_sink().ok_or_else(|| {
+            ApiError::Unsupported("no desktop shell is attached to show a notification".to_string())
+        })?,
+        _ => Arc::clone(sink),
+    };
     notify::send_toast(
         sink.as_ref(),
         "LLMdil test notification",

@@ -24,6 +24,7 @@ pub mod auth_routes;
 pub mod bind;
 pub mod composites;
 pub mod firewall;
+pub mod guards;
 pub mod http;
 pub mod operations;
 pub mod pairing;

@@ -244,6 +244,7 @@ async fn consultation_refused_during_benchmark() {
         Some(false),
         None,
         None,
+        None,
     )
     .await;
     match r {
@@ -526,4 +527,38 @@ fn plan_staleness_ignores_bookkeeping() {
     let mut cfg = base.clone();
     cfg.backends[0].flags.n_ctx += 1024;
     assert_ne!(hash, current_config_hash(&cfg));
+}
+
+/// Over the Admin API a consultation that would replace a plan needs
+/// `replace: true`; the window (and everyone without a plan) does not.
+#[tokio::test]
+async fn an_api_consultation_replaces_a_plan_only_on_request() {
+    let (state, dir) = crate::test_support::advanced_test_state(AppConfig::default_config());
+    let sink = mutex_sink();
+    let consult = |replace: Option<bool>, origin| {
+        let (state, sink) = (state.clone(), sink.clone());
+        async move {
+            crate::registry::dispatch_from(
+                &state,
+                &sink,
+                crate::registry::Op::OptimizeConsult,
+                json!({ "sample": true, "replace": replace }),
+                origin,
+            )
+            .await
+        }
+    };
+    use crate::event_bus::EventOrigin::{Api, Desktop};
+    consult(None, Api).await.expect("no plan yet");
+    assert!(consult_replace_refusal(&state, None).is_some());
+    assert!(consult_replace_refusal(&state, Some(true)).is_none());
+    for replace in [None, Some(false)] {
+        let r = consult(replace, Api).await;
+        assert!(matches!(r, Err(ApiError::Busy(_))), "{r:?}");
+    }
+    consult(None, Desktop)
+        .await
+        .expect("the window is not asked");
+    consult(Some(true), Api).await.expect("confirmed");
+    let _ = std::fs::remove_dir_all(&dir);
 }

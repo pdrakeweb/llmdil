@@ -151,6 +151,23 @@ impl ParamType for manager_config::MxcMode {
     }
 }
 
+impl ParamType for manager_config::SupervisionMode {
+    fn json_schema() -> Value {
+        json!({"type": "string", "enum": ["process", "service"]})
+    }
+    fn ts_type() -> String {
+        "\"process\" | \"service\"".to_string()
+    }
+    fn sample() -> Value {
+        // Exhaustive: an added mode stops compiling here.
+        use manager_config::SupervisionMode as M;
+        const _EXHAUSTIVE: fn(M) = |m| match m {
+            M::Process | M::Service => {}
+        };
+        json!(M::Process)
+    }
+}
+
 impl<T: ParamType> ParamType for Vec<T> {
     fn json_schema() -> Value {
         json!({"type": "array", "items": T::json_schema()})

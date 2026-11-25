@@ -102,6 +102,12 @@ pub enum RouteMode {
     AsyncOp,
     /// Creates a resource: 201 with the operation result.
     Created,
+    /// The operation itself starts background work and returns at
+    /// once with the work's own task record (`id` = task id, plus the
+    /// operation's fields): 202 with that result. Refusals stay
+    /// synchronous errors, and the id polls and aborts through
+    /// `/operations`.
+    Accepted,
 }
 
 /// One operation's declared REST route. Path placeholders are named
@@ -146,6 +152,21 @@ pub const fn route_async(method: HttpMethod, path: &'static str) -> RouteSpec {
         path,
         body_wrap: None,
         mode: RouteMode::AsyncOp,
+    }
+}
+
+/// A route whose operation starts background work and returns its
+/// task record (202); the body is one named argument's value.
+pub const fn route_accepted_wrap(
+    method: HttpMethod,
+    path: &'static str,
+    wrap: &'static str,
+) -> RouteSpec {
+    RouteSpec {
+        method,
+        path,
+        body_wrap: Some(wrap),
+        mode: RouteMode::Accepted,
     }
 }
 
@@ -196,6 +217,9 @@ macro_rules! for_each_operation {
             // Excluded from REST v1 (PLAN.md decision 11: the broad raw
             // config patch; domain endpoints cover the same ground).
             (UpdateConfig, update_config, C, op_update_config, [patch: Value], None),
+            // The one narrow settings section writable over REST; every
+            // other section stays with its domain endpoint.
+            (SettingsSetSupervision, settings_set_supervision, C, op_settings_set_supervision, [mode: manager_config::SupervisionMode], Some(route(HttpMethod::Put, "/api/v1/settings/supervision"))),
             // Backends
             (ListBackends, list_backends, R, op_list_backends, [], Some(route(HttpMethod::Get, "/api/v1/backends"))),
             (StartBackend, start_backend, L, op_start_backend, [id: String, allow_wddm_overcommit: Option<bool>, origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/start"))),
@@ -206,7 +230,7 @@ macro_rules! for_each_operation {
             (BackendPreviewDiff, backend_preview_diff, R, op_backend_preview_diff, [id: String, patch: Value], Some(route(HttpMethod::Post, "/api/v1/backends/{id}/config/preview-diff"))),
             (BackendApplyConfig, backend_apply_config, C, op_backend_apply_config, [id: String, patch: Value, apply_mode: String], Some(route(HttpMethod::Patch, "/api/v1/backends/{id}/config"))),
             (BackendAdd, backend_add, C, op_backend_add, [id: String, model_id: String, port: u16, group: String, create_group: bool, enabled: bool, n_ctx: Option<u32>, n_batch: Option<u32>, offload_layers: Option<u32>, offload_override: Option<bool>, gpu_indices: Option<Vec<u32>>, parallel: Option<u32>, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>], Some(route_created(HttpMethod::Post, "/api/v1/backends"))),
-            (BackendAddPreview, backend_add_preview, R, op_backend_add_preview, [model_id: String, gpu_indices: Option<Vec<u32>>, n_ctx: Option<u32>, parallel: Option<u32>], None),
+            (BackendAddPreview, backend_add_preview, R, op_backend_add_preview, [model_id: String, gpu_indices: Option<Vec<u32>>, n_ctx: Option<u32>, parallel: Option<u32>, offload_layers: Option<u32>], Some(route(HttpMethod::Post, "/api/v1/backends/preview"))),
             (BackendUpdateFlags, backend_update_flags, C, op_backend_update_flags, [id: String, n_ctx: u32, n_batch: u32], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/flags"))),
             (BackendSetOffload, backend_set_offload, C, op_backend_set_offload, [id: String, layers: u32, allow_override: Option<bool>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/offload"))),
             // Deliberate guardrail overrides for the SAVED position
@@ -220,7 +244,7 @@ macro_rules! for_each_operation {
             (BackendSetParallel, backend_set_parallel, C, op_backend_set_parallel, [id: String, slots: Option<u32>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/parallel"))),
             (BackendSetCache, backend_set_cache, C, op_backend_set_cache, [id: String, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/cache"))),
             (BackendSetMoeCache, backend_set_moe_cache, C, op_backend_set_moe_cache, [id: String, mib: Option<u32>, auto: Option<bool>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/moe-cache"))),
-            (BackendCachePreview, backend_cache_preview, R, op_backend_cache_preview, [id: String, n_ctx: Option<u32>, slots: Option<u32>, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>, moe_cache_mib: Option<u32>], None),
+            (BackendCachePreview, backend_cache_preview, R, op_backend_cache_preview, [id: String, n_ctx: Option<u32>, slots: Option<u32>, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>, moe_cache_mib: Option<u32>, offload_layers: Option<u32>, gpu_indices: Option<Vec<u32>>], Some(route(HttpMethod::Post, "/api/v1/backends/{id}/cache/preview"))),
             // Advanced flags mode (tracker #60): the raw-flags save
             // (advanced mode only; validation warns, never blocks)
             // and the mode flip itself (writes no flags).
@@ -265,11 +289,9 @@ macro_rules! for_each_operation {
             // Add Model form helpers (deep-discovery design
             // Part 2, §P2.11): the shallow HF lookup behind the
             // pick list and its type-ahead, and the pick-time
-            // GGUF header read. Read-class, desktop-only in v1
-            // (route None, documented in rest-api.md §6.16) —
-            // they serve the form, not the API surface.
-            (ModelHfLookup, model_hf_lookup, R, op_model_hf_lookup, [query: String, suggest: Option<bool>], None),
-            (ModelHfHeader, model_hf_header, R, op_model_hf_header, [repo_id: String, file: String], None),
+            // GGUF header read. Read-class.
+            (ModelHfLookup, model_hf_lookup, R, op_model_hf_lookup, [query: String, suggest: Option<bool>], Some(route(HttpMethod::Post, "/api/v1/models/lookup"))),
+            (ModelHfHeader, model_hf_header, R, op_model_hf_header, [repo_id: String, file: String], Some(route(HttpMethod::Post, "/api/v1/models/header"))),
             (ModelSetEnabled, model_set_enabled, C, op_model_set_enabled, [id: String, enabled: bool], None),
             // PATCH /models/{id} composite over this, model_set_short_name
             // and model_set_enabled (rest-api.md §6.3); no 1:1 route.
@@ -335,30 +357,34 @@ macro_rules! for_each_operation {
             (TaskAbort, task_abort, L, op_task_abort, [task_id: String], Some(route(HttpMethod::Post, "/api/v1/operations/{task_id}/abort"))),
             (TasksList, tasks_list, R, op_tasks_list, [], Some(route(HttpMethod::Get, "/api/v1/operations"))),
             (DiagnosticsExportBundle, diagnostics_export_bundle, SDisclosure, op_diagnostics_export_bundle, [], Some(route_async(HttpMethod::Post, "/api/v1/diagnostics/bundles"))),
-            // MCP / VS Code — peripheral, excluded from REST v1
-            // (PLAN.md decision 10); Tauri surface unchanged.
-            (McpList, mcp_list, R, op_mcp_list, [], None),
-            (McpStartPreflight, mcp_start_preflight, R, op_mcp_start_preflight, [], None),
-            (McpTestConnection, mcp_test_connection, X, op_mcp_test_connection, [id: String], None),
+            // MCP: reads and the connection test are routed; saving,
+            // deleting, exposing a server and storing its credential
+            // stay without a route (rest-api.md §6.16: a registered
+            // server is a command the app runs, and a secret).
+            (McpList, mcp_list, R, op_mcp_list, [], Some(route(HttpMethod::Get, "/api/v1/mcp/servers"))),
+            (McpStartPreflight, mcp_start_preflight, R, op_mcp_start_preflight, [], Some(route(HttpMethod::Get, "/api/v1/mcp/preflight"))),
+            (McpTestConnection, mcp_test_connection, X, op_mcp_test_connection, [id: String], Some(route(HttpMethod::Post, "/api/v1/mcp/servers/{id}/test"))),
             (McpSetExposure, mcp_set_exposure, X, op_mcp_set_exposure, [id: String, exposure: String], None),
             (McpSaveServer, mcp_save_server, X, op_mcp_save_server, [server: manager_config::McpServerConfig], None),
             (McpDeleteServer, mcp_delete_server, X, op_mcp_delete_server, [id: String], None),
             (McpStoreCredential, mcp_store_credential, X, op_mcp_store_credential, [id: String, value: String], None),
-            (BackendTestToolCall, backend_test_tool_call, L, op_backend_test_tool_call, [id: String], None),
-            // Notifications — desktop-only (toast delivery is a shell
-            // concern); the config itself rides update_config.
-            (NotificationsSetConfig, notifications_set_config, C, op_notifications_set_config, [config: manager_config::NotificationConfig], None),
-            (NotificationsSendTest, notifications_send_test, L, op_notifications_send_test, [], None),
-            // Windows services — desktop-only (SCM elevation is a
-            // shell concern in v1).
-            (ServicesList, services_list, R, op_services_list, [], None),
+            (BackendTestToolCall, backend_test_tool_call, L, op_backend_test_tool_call, [id: String], Some(route(HttpMethod::Post, "/api/v1/backends/{id}/test-tool-call"))),
+            // Notifications: the preferences, and the test toast (shown
+            // by the desktop shell, see AppState::set_desktop_sink).
+            (NotificationsSetConfig, notifications_set_config, C, op_notifications_set_config, [config: manager_config::NotificationConfig], Some(route_wrap(HttpMethod::Put, "/api/v1/notifications", "config"))),
+            (NotificationsSendTest, notifications_send_test, L, op_notifications_send_test, [], Some(route(HttpMethod::Post, "/api/v1/notifications/test"))),
+            // Windows services: the list is a read; registering and
+            // unregistering prompt for elevation and a password at the
+            // console and stay without a route.
+            (ServicesList, services_list, R, op_services_list, [], Some(route(HttpMethod::Get, "/api/v1/services"))),
             (ServicesRegister, services_register, D, op_services_register, [target: String], None),
             (ServicesUnregister, services_unregister, D, op_services_unregister, [target: String], None),
-            // Log receiver — desktop-only (deployment runs the
-            // bundled receiver binary elevated through the shell's
-            // runas pattern; the endpoint flip is a separate
-            // deliberate op, never bundled into deploy).
-            (LogReceiverStatus, log_receiver_status, R, op_log_receiver_status, [], None),
+            // Log receiver: the status is a read (no local paths over
+            // REST); deployment runs the bundled receiver binary
+            // elevated through the shell's runas pattern and stays
+            // desktop-only, as does the endpoint flip, a separate
+            // deliberate op, never bundled into deploy.
+            (LogReceiverStatus, log_receiver_status, R, op_log_receiver_status, [], Some(route(HttpMethod::Get, "/api/v1/log-receiver"))),
             (LogReceiverDeploy, log_receiver_deploy, D, op_log_receiver_deploy, [], None),
             (LogReceiverRemove, log_receiver_remove, D, op_log_receiver_remove, [], None),
             (LogReceiverFlipEndpoint, log_receiver_flip_endpoint, C, op_log_receiver_flip_endpoint, [], None),
@@ -369,56 +395,58 @@ macro_rules! for_each_operation {
             (LogReceiverStart, log_receiver_start, L, op_log_receiver_start, [origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/log-receiver/start"))),
             (LogReceiverStop, log_receiver_stop, L, op_log_receiver_stop, [origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/log-receiver/stop"))),
             (LogReceiverRestart, log_receiver_restart, L, op_log_receiver_restart, [origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/log-receiver/restart"))),
-            // Optimize — desktop-only in v1 (consultation spends local
-            // backend capacity; plan state lives beside the config).
-            (OptimizeGetState, optimize_get_state, R, op_optimize_get_state, [], None),
-            (OptimizeValidatePlan, optimize_validate_plan, R, op_optimize_validate_plan, [], None),
-            (OptimizeSavePurpose, optimize_save_purpose, C, op_optimize_save_purpose, [scope: String, target: Option<String>, text: String], None),
-            (OptimizeSetItemState, optimize_set_item_state, C, op_optimize_set_item_state, [item_id: usize, decision: String], None),
-            (OptimizeSetItemOutcome, optimize_set_item_outcome, C, op_optimize_set_item_outcome, [item_id: usize, outcome: String, error: Option<String>], None),
-            (OptimizeDiscardPlan, optimize_discard_plan, C, op_optimize_discard_plan, [], None),
+            // Optimize. The long operations are AsyncOp and cancel
+            // through their task (tasks::TaskCanceller) or the two
+            // cancel routes.
+            (OptimizeGetState, optimize_get_state, R, op_optimize_get_state, [], Some(route(HttpMethod::Get, "/api/v1/optimize"))),
+            (OptimizeValidatePlan, optimize_validate_plan, C, op_optimize_validate_plan, [], Some(route(HttpMethod::Post, "/api/v1/optimize/plan/validate"))),
+            (OptimizeSavePurpose, optimize_save_purpose, C, op_optimize_save_purpose, [scope: String, target: Option<String>, text: String], Some(route(HttpMethod::Put, "/api/v1/optimize/purpose"))),
+            (OptimizeSetItemState, optimize_set_item_state, C, op_optimize_set_item_state, [item_id: usize, decision: String], Some(route(HttpMethod::Put, "/api/v1/optimize/plan/items/{item_id}"))),
+            (OptimizeSetItemOutcome, optimize_set_item_outcome, C, op_optimize_set_item_outcome, [item_id: usize, outcome: String, error: Option<String>], Some(route(HttpMethod::Put, "/api/v1/optimize/plan/items/{item_id}/outcome"))),
+            (OptimizeDiscardPlan, optimize_discard_plan, D, op_optimize_discard_plan, [], Some(route(HttpMethod::Delete, "/api/v1/optimize/plan"))),
             // Rust apply executor (optimize design §5.2, Phase 3):
             // executes accepted items through the existing ops.
             // Class D because the destructive phase deletes
             // backends and groups (backend_delete is D).
-            (OptimizeApplyPlan, optimize_apply_plan, D, op_optimize_apply_plan, [destructive: Option<bool>, dry_run: Option<bool>], None),
-            (OptimizeSetExperimentState, optimize_set_experiment_state, C, op_optimize_set_experiment_state, [experiment_id: usize, decision: String], None),
-            (OptimizeConsult, optimize_consult, L, op_optimize_consult, [backend_id: Option<String>, sample: Option<bool>, directive: Option<String>, candidate_repos: Option<Vec<String>>], None),
-            (OptimizeDiscover, optimize_discover, L, op_optimize_discover, [directive: String], None),
-            (OptimizeCancelConsult, optimize_cancel_consult, L, op_optimize_cancel_consult, [], None),
-            (OptimizeMeasureBackend, optimize_measure_backend, L, op_optimize_measure_backend, [backend_id: String], None),
+            (OptimizeApplyPlan, optimize_apply_plan, D, op_optimize_apply_plan, [destructive: Option<bool>, dry_run: Option<bool>], Some(route_async(HttpMethod::Post, "/api/v1/optimize/plan/apply"))),
+            (OptimizeSetExperimentState, optimize_set_experiment_state, C, op_optimize_set_experiment_state, [experiment_id: usize, decision: String], Some(route(HttpMethod::Put, "/api/v1/optimize/experiments/{experiment_id}"))),
+            (OptimizeConsult, optimize_consult, L, op_optimize_consult, [backend_id: Option<String>, sample: Option<bool>, directive: Option<String>, candidate_repos: Option<Vec<String>>, replace: Option<bool>], Some(route_async(HttpMethod::Post, "/api/v1/optimize/consult"))),
+            (OptimizeDiscover, optimize_discover, L, op_optimize_discover, [directive: String], Some(route_async(HttpMethod::Post, "/api/v1/optimize/discover"))),
+            (OptimizeCancelConsult, optimize_cancel_consult, L, op_optimize_cancel_consult, [], Some(route(HttpMethod::Post, "/api/v1/optimize/consult/cancel"))),
+            (OptimizeMeasureBackend, optimize_measure_backend, L, op_optimize_measure_backend, [backend_id: String], Some(route_async(HttpMethod::Post, "/api/v1/backends/{backend_id}/measure"))),
             // Predicted throughput (design §6.2, §10): the lookup
             // is a pure read over the measurement store plus the
             // live configuration; the delete is the history
-            // view's per-entry control. Both carry REST routes
-            // by design §11, unlike the rest of this section.
+            // view's per-entry control.
             (MeasurementLookup, measurement_lookup, R, op_measurement_lookup, [request: Value], Some(route_wrap(HttpMethod::Post, "/api/v1/measurements/lookup", "request"))),
             (MeasurementDelete, measurement_delete, D, op_measurement_delete, [fingerprint: String, measured_at: String], Some(route(HttpMethod::Delete, "/api/v1/measurements"))),
-            (OptimizeEstimateBackend, optimize_estimate_backend, L, op_optimize_estimate_backend, [backend_id: String], None),
-            (OptimizeCancelJob, optimize_cancel_job, L, op_optimize_cancel_job, [], None),
-            (OptimizeRunBaseline, optimize_run_baseline, L, op_optimize_run_baseline, [backend_id: String], None),
-            (OptimizeRunExperiments, optimize_run_experiments, L, op_optimize_run_experiments, [], None),
-            (OptimizeEstimateExperiments, optimize_estimate_experiments, L, op_optimize_estimate_experiments, [], None),
-            // Bench — desktop-only (Bench design §7, D15): sweeps
-            // launch temporary backends and stop running ones
-            // under the interlock; REST parity is deferred by
-            // name in the design.
-            (BenchPromptsList, bench_prompts_list, R, op_bench_prompts_list, [], None),
-            (BenchPromptSave, bench_prompt_save, C, op_bench_prompt_save, [entry: Value], None),
-            (BenchPromptDelete, bench_prompt_delete, D, op_bench_prompt_delete, [id: String], None),
-            (BenchPromptGenerate, bench_prompt_generate, L, op_bench_prompt_generate, [purpose: String, description: String, size: String, backend_id: Option<String>], None),
-            (BenchPromptGenerateCancel, bench_prompt_generate_cancel, L, op_bench_prompt_generate_cancel, [], None),
-            (BenchRunStart, bench_run_start, L, op_bench_run_start, [request: Value], None),
-            (BenchRunCancel, bench_run_cancel, L, op_bench_run_cancel, [sweep_id: String], None),
-            (BenchResultsList, bench_results_list, R, op_bench_results_list, [], None),
-            (BenchResultDelete, bench_result_delete, D, op_bench_result_delete, [sweep_id: String], None),
+            (OptimizeEstimateBackend, optimize_estimate_backend, L, op_optimize_estimate_backend, [backend_id: String], Some(route_async(HttpMethod::Post, "/api/v1/backends/{backend_id}/estimate"))),
+            (OptimizeCancelJob, optimize_cancel_job, L, op_optimize_cancel_job, [], Some(route(HttpMethod::Post, "/api/v1/optimize/job/cancel"))),
+            (OptimizeRunBaseline, optimize_run_baseline, L, op_optimize_run_baseline, [backend_id: String], Some(route_async(HttpMethod::Post, "/api/v1/backends/{backend_id}/baseline"))),
+            (OptimizeRunExperiments, optimize_run_experiments, L, op_optimize_run_experiments, [], Some(route_async(HttpMethod::Post, "/api/v1/optimize/experiments/run"))),
+            (OptimizeEstimateExperiments, optimize_estimate_experiments, L, op_optimize_estimate_experiments, [], Some(route_async(HttpMethod::Post, "/api/v1/optimize/experiments/estimate"))),
+            // Bench (Bench design §7): sweeps launch temporary
+            // backends and stop the running ones the caller named
+            // under the interlock. bench_run_start answers at once
+            // with the sweep id and its task.
+            (BenchPromptsList, bench_prompts_list, R, op_bench_prompts_list, [], Some(route(HttpMethod::Get, "/api/v1/bench/prompts"))),
+            (BenchPromptSave, bench_prompt_save, C, op_bench_prompt_save, [entry: Value], Some(route_wrap(HttpMethod::Post, "/api/v1/bench/prompts", "entry"))),
+            (BenchPromptDelete, bench_prompt_delete, D, op_bench_prompt_delete, [id: String], Some(route(HttpMethod::Delete, "/api/v1/bench/prompts/{id}"))),
+            (BenchPromptGenerate, bench_prompt_generate, L, op_bench_prompt_generate, [purpose: String, description: String, size: String, backend_id: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/bench/prompts/generate"))),
+            (BenchPromptGenerateCancel, bench_prompt_generate_cancel, L, op_bench_prompt_generate_cancel, [], Some(route(HttpMethod::Post, "/api/v1/bench/prompts/generate/cancel"))),
+            (BenchRunStart, bench_run_start, L, op_bench_run_start, [request: Value], Some(route_accepted_wrap(HttpMethod::Post, "/api/v1/bench/runs", "request"))),
+            (BenchRunCancel, bench_run_cancel, L, op_bench_run_cancel, [sweep_id: String], Some(route(HttpMethod::Post, "/api/v1/bench/runs/{sweep_id}/cancel"))),
+            (BenchResultsList, bench_results_list, R, op_bench_results_list, [], Some(route(HttpMethod::Get, "/api/v1/bench/results"))),
+            (BenchResultDelete, bench_result_delete, D, op_bench_result_delete, [sweep_id: String], Some(route(HttpMethod::Delete, "/api/v1/bench/results/{sweep_id}"))),
             // Per-backend tuning (Addendum B §B.2): preview is a
             // pure read over live state; run holds the shared
             // job slot for the sweep; adopt writes the winner
             // through the structured save ops.
-            (OptimizeTuningPreview, optimize_tuning_preview, R, op_optimize_tuning_preview, [backend_id: String], None),
-            (OptimizeTuningRun, optimize_tuning_run, L, op_optimize_tuning_run, [backend_id: String], None),
-            (OptimizeTuningAdopt, optimize_tuning_adopt, C, op_optimize_tuning_adopt, [sweep_id: String, adopt_anyway: Option<bool>], None),
+            (OptimizeTuningPreview, optimize_tuning_preview, R, op_optimize_tuning_preview, [backend_id: String], Some(route(HttpMethod::Get, "/api/v1/backends/{backend_id}/tuning"))),
+            (OptimizeTuningRun, optimize_tuning_run, L, op_optimize_tuning_run, [backend_id: String], Some(route_async(HttpMethod::Post, "/api/v1/backends/{backend_id}/tuning/run"))),
+            (OptimizeTuningAdopt, optimize_tuning_adopt, C, op_optimize_tuning_adopt, [sweep_id: String, adopt_anyway: Option<bool>], Some(route(HttpMethod::Post, "/api/v1/optimize/tuning/{sweep_id}/adopt"))),
+            // VS Code — excluded from REST (decision 10: they write to
+            // the managed machine's user profile).
             (VscodeInstallExtensions, vscode_install_extensions, X, op_vscode_install_extensions, [], None),
             (VscodeWriteConfig, vscode_write_config, X, op_vscode_write_config, [backup: bool], None),
             // MXC
@@ -654,7 +682,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 160);
+        assert_eq!(OP_SPECS.len(), 161);
     }
 
     #[test]

@@ -326,8 +326,21 @@ pub async fn op_bench_prompts_list(
 pub async fn op_bench_prompt_save(
     state: &Arc<AppState>,
     _sink: &Arc<dyn crate::EventSink>,
-    entry: Value,
+    mut entry: Value,
 ) -> crate::ApiResult {
+    // The fields this op sets itself may be absent (an API client has
+    // no reason to know them).
+    if let Some(obj) = entry.as_object_mut() {
+        for (key, value) in [
+            ("id", json!("")),
+            ("sha256", json!("")),
+            ("origin", json!(mb::PromptOrigin::User)),
+            ("version", json!(1)),
+            ("updated_ms", json!(0)),
+        ] {
+            obj.entry(key).or_insert(value);
+        }
+    }
     let mut entry: mb::PromptEntry = serde_json::from_value(entry)
         .map_err(|e| ApiError::InvalidInput(format!("invalid prompt entry: {e}")))?;
     if entry.name.trim().is_empty() {
@@ -353,10 +366,13 @@ pub async fn op_bench_prompt_save(
     }
     entry.sha256 = mb::prompt_sha256(&entry.body);
     entry.updated_ms = now_ms();
+    let id = entry.id.clone();
     lib.upsert(entry);
     lib.save(&prompts_path(state))
         .map_err(|e| ApiError::InvalidInput(format!("prompt save failed: {e}")))?;
-    Ok(prompts_payload(&lib))
+    let mut payload = prompts_payload(&lib);
+    payload["id"] = json!(id);
+    Ok(payload)
 }
 
 pub async fn op_bench_prompt_delete(
@@ -418,6 +434,42 @@ fn check_temperature(t: f32) -> Result<(), ApiError> {
     }
 }
 
+/// A custom arm's offload expression may only place tensors: it is
+/// appended to the temporary backend's command line, so any other
+/// token would be a llama-server flag of the caller's choosing.
+fn check_offload_expr(expr: &str) -> Result<(), ApiError> {
+    const VALUE_FLAGS: &[&str] = &["-ot", "--override-tensor", "--n-cpu-moe", "-ncmoe"];
+    let mut tokens = expr.split_whitespace();
+    while let Some(t) = tokens.next() {
+        let flag = t.split_once('=').map(|(f, _)| f).unwrap_or(t);
+        let ok = match t {
+            "--cpu-moe" | "-cmoe" => true,
+            _ if !VALUE_FLAGS.contains(&flag) => false,
+            _ if t != flag => true,
+            _ => tokens.next().is_some_and(|v| !v.starts_with('-')),
+        };
+        if !ok {
+            return Err(ApiError::InvalidInput(format!(
+                "offload_expr '{expr}' may hold only expert-offload flags ({}, --cpu-moe)",
+                VALUE_FLAGS.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The refusal while another sweep holds the job slot.
+fn sweep_running() -> ApiError {
+    ApiError::Busy("a bench sweep is already running".to_string())
+}
+
+/// Start a sweep. Everything that can be refused is refused here; the
+/// rest — stopping the conflicting backends the caller named, and the
+/// arms — runs in its own task, so the caller gets the sweep id at
+/// once. The answer is the results payload plus `sweep_id` and the
+/// task record's `id` / `kind` / `status`; progress is
+/// `bench_results_list` (the sweep's `progress`, then its final
+/// `status`), and the task carries the outcome.
 pub async fn op_bench_run_start(
     state: &Arc<AppState>,
     sink: &Arc<dyn crate::EventSink>,
@@ -430,14 +482,21 @@ pub async fn op_bench_run_start(
     // measurement/experiment job (they contend for the same
     // GPUs the interlock reasons about).
     if state.bench.job.lock().await.is_some() {
-        return Err(ApiError::InvalidInput(
-            "a bench sweep is already running".to_string(),
-        ));
+        return Err(sweep_running());
     }
     if state.optimize.job_abort.lock().await.is_some() {
-        return Err(ApiError::InvalidInput(
+        return Err(ApiError::Busy(
             "a measurement or experiment job is already running".to_string(),
         ));
+    }
+    for expr in req
+        .dimensions
+        .iter()
+        .flatten()
+        .flatten()
+        .filter_map(|v| v.offload_expr.as_deref())
+    {
+        check_offload_expr(expr)?;
     }
     let cfg = state.config.read().await.clone();
     let target = cfg
@@ -616,18 +675,6 @@ pub async fn op_bench_run_start(
             "running backends conflict with this sweep and must be stopped first: {names} [conflicts: {names}]"
         )));
     }
-    let mut stopped_names: Vec<String> = Vec::new();
-    for id in &conflicts {
-        let opts = crate::backend_lifecycle::BackendOpOpts::new(crate::lifecycle::Origin::Bench);
-        match crate::backend_lifecycle::stop_backend(state, sink, id, opts).await {
-            Ok(_) => stopped_names.push(id.clone()),
-            Err(e) => {
-                return Err(ApiError::InvalidInput(format!(
-                    "stopping backend '{id}' for the sweep failed: {e}"
-                )))
-            }
-        }
-    }
 
     // Draft device argument, resolved against the launch's
     // visibility restriction: the target's placed GPUs are the
@@ -670,7 +717,7 @@ pub async fn op_bench_run_start(
         size_bytes: std::fs::metadata(&model_abs).map(|m| m.len()).unwrap_or(0),
         sha256: model_entry.as_ref().and_then(|m| m.verified_sha256.clone()),
     };
-    let mut record = mb::SweepRecord {
+    let record = mb::SweepRecord {
         id: sweep_id.clone(),
         status: "running".to_string(),
         started_ms: now_ms(),
@@ -689,7 +736,8 @@ pub async fn op_bench_run_start(
         correctness_control: req.correctness_control,
         interlock: mb::InterlockRecord {
             running_before: conflicts.clone(),
-            stopped_confirmed: stopped_names.clone(),
+            // Filled in as the stops happen.
+            stopped_confirmed: Vec::new(),
         },
         baseline_arm_index,
         projected_minutes: projected,
@@ -719,20 +767,38 @@ pub async fn op_bench_run_start(
             })
             .collect(),
     };
+    // Claim the one job slot before anything is written: two starts
+    // that both passed the early check end here.
+    {
+        let mut slot = state.bench.job.lock().await;
+        if slot.is_some() {
+            return Err(sweep_running());
+        }
+        *slot = Some(BenchJob {
+            sweep_id: sweep_id.clone(),
+            progress: BenchProgress {
+                arm_index: 0,
+                arm_count: outcomes.len(),
+                phase: if conflicts.is_empty() {
+                    "launching".to_string()
+                } else {
+                    "stopping backends".to_string()
+                },
+                run: 0,
+                started_unix_ms: now_ms(),
+            },
+        });
+    }
     save_sweep(state, &record);
 
-    let task_id = state
-        .record_task(
-            "bench-run",
-            json!({
-                "sweep_id": sweep_id,
-                "backend": target.id,
-                "prompt": prompt.id,
-                "arms": outcomes.len(),
-            }),
-        )
-        .await;
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+    let task_detail = json!({
+        "sweep_id": sweep_id,
+        "backend": target.id,
+        "prompt": prompt.id,
+        "arms": outcomes.len(),
+    });
+    let task_id = state.record_task("bench-run", task_detail.clone()).await;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     {
         let mut slot = state.bench.abort.lock().await;
         *slot = Some(tx);
@@ -743,37 +809,100 @@ pub async fn op_bench_run_start(
             sweep_id: sweep_id.clone(),
         },
     );
-    {
-        let mut slot = state.bench.job.lock().await;
-        *slot = Some(BenchJob {
-            sweep_id: sweep_id.clone(),
-            progress: BenchProgress {
-                arm_index: 0,
-                arm_count: outcomes.len(),
-                phase: "launching".to_string(),
-                run: 0,
-                started_unix_ms: now_ms(),
-            },
-        });
-    }
-    let ctx = SweepCtx {
-        cfg: cfg.clone(),
-        target: target.clone(),
-        model_id: model_entry
-            .as_ref()
-            .map(|m| m.id.clone())
-            .unwrap_or_else(|| target.id.clone()),
-        temperature: req.temperature,
-        draft_path: draft_path.clone(),
-        draft_device_arg: draft_device_arg.clone(),
+    let job = SweepJob {
+        ctx: SweepCtx {
+            model_id: model_entry
+                .as_ref()
+                .map(|m| m.id.clone())
+                .unwrap_or_else(|| target.id.clone()),
+            cfg,
+            target,
+            temperature: req.temperature,
+            draft_path,
+            draft_device_arg,
+        },
+        record,
+        outcomes,
+        conflicts,
+        prompt_body: prompt.body,
+        correctness_control: req.correctness_control,
+        confirm_at_06: req.confirm_at_06,
+        task_id: task_id.clone(),
+        rx,
     };
+    let (run_state, run_sink) = (Arc::clone(state), Arc::clone(sink));
+    let origin = crate::event_bus::current_origin();
+    tokio::spawn(tracing::Instrument::in_current_span(async move {
+        crate::event_bus::with_origin(origin, run_sweep(&run_state, &run_sink, job)).await;
+    }));
+    let mut payload = results_payload(state, &load_results(state));
+    payload["sweep_id"] = json!(sweep_id);
+    payload["id"] = json!(task_id);
+    payload["kind"] = json!("bench-run");
+    payload["status"] = json!("running");
+    payload["detail"] = task_detail;
+    Ok(payload)
+}
+
+/// Everything a started sweep needs to run on its own.
+struct SweepJob {
+    ctx: SweepCtx,
+    record: mb::SweepRecord,
+    outcomes: Vec<mb::ArmOutcome>,
+    conflicts: Vec<String>,
+    prompt_body: String,
+    correctness_control: bool,
+    confirm_at_06: bool,
+    task_id: String,
+    rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Run a started sweep to its end: free the GPU, run the arms, the
+/// optional confirmation pass, release the job slot, settle the task.
+async fn run_sweep(state: &Arc<AppState>, sink: &Arc<dyn crate::EventSink>, job: SweepJob) {
+    let SweepJob {
+        ctx,
+        mut record,
+        outcomes,
+        conflicts,
+        prompt_body,
+        correctness_control,
+        confirm_at_06,
+        task_id,
+        mut rx,
+    } = job;
+    let sweep_id = record.id.clone();
+    for id in &conflicts {
+        let opts = crate::backend_lifecycle::BackendOpOpts::new(crate::lifecycle::Origin::Bench);
+        if let Err(e) = crate::backend_lifecycle::stop_backend(state, sink, id, opts).await {
+            let why = format!("stopping backend '{id}' for the sweep failed: {e}");
+            for arm in record.arms.iter_mut() {
+                arm.status = mb::ArmStatus::Cancelled;
+                arm.detail = Some(why.clone());
+            }
+            record.status = "failed".to_string();
+            record.ended_ms = Some(now_ms());
+            save_sweep(state, &record);
+            release_job(state).await;
+            state
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Failed,
+                    json!({ "sweep_id": sweep_id, "error": why }),
+                )
+                .await;
+            return;
+        }
+        record.interlock.stopped_confirmed.push(id.clone());
+        save_sweep(state, &record);
+    }
     let mut cancelled = execute_sweep(
         state,
         &ctx,
         &mut record,
         outcomes.clone(),
-        &prompt.body,
-        req.correctness_control,
+        &prompt_body,
+        correctness_control,
         &mut rx,
     )
     .await;
@@ -781,7 +910,7 @@ pub async fn op_bench_run_start(
     // Optional confirmation pass at temperature 0.6 (§2.1): a
     // separate record — the temperature differs, so the
     // comparability key differs — over the same arms.
-    if req.confirm_at_06 && req.temperature == 0.0 && !cancelled {
+    if confirm_at_06 && ctx.temperature == 0.0 && !cancelled {
         let mut confirm_record = record.clone();
         confirm_record.id = format!("{sweep_id}-confirm");
         confirm_record.temperature = mb::CONFIRM_TEMPERATURE;
@@ -806,19 +935,15 @@ pub async fn op_bench_run_start(
             }
         }
         let confirm_ctx = SweepCtx {
-            cfg: cfg.clone(),
-            target: target.clone(),
-            model_id: ctx.model_id.clone(),
             temperature: mb::CONFIRM_TEMPERATURE,
-            draft_path: draft_path.clone(),
-            draft_device_arg: draft_device_arg.clone(),
+            ..ctx
         };
         let confirm_cancelled = execute_sweep(
             state,
             &confirm_ctx,
             &mut confirm_record,
             outcomes,
-            &prompt.body,
+            &prompt_body,
             false,
             &mut rx,
         )
@@ -826,31 +951,25 @@ pub async fn op_bench_run_start(
         cancelled = cancelled || confirm_cancelled;
     }
 
-    {
-        let mut slot = state.bench.abort.lock().await;
-        *slot = None;
-    }
-    {
-        let mut slot = state.bench.job.lock().await;
-        *slot = None;
-    }
-    if cancelled {
-        state
-            .finish_task(
-                &task_id,
-                TaskStatus::Aborted,
-                json!({ "sweep_id": sweep_id, "cancelled": true }),
-            )
-            .await;
-        return Err(ApiError::InvalidInput("bench sweep cancelled".to_string()));
-    }
-    state
-        .finish_task(&task_id, TaskStatus::Done, json!({ "sweep_id": sweep_id }))
-        .await;
-    let results = load_results(state);
-    let mut payload = results_payload(state, &results);
-    payload["sweep_id"] = json!(sweep_id);
-    Ok(payload)
+    release_job(state).await;
+    let (status, detail) = if cancelled {
+        (
+            TaskStatus::Aborted,
+            json!({ "sweep_id": sweep_id, "cancelled": true }),
+        )
+    } else {
+        (
+            TaskStatus::Done,
+            json!({ "sweep_id": sweep_id, "status": record.status }),
+        )
+    };
+    state.finish_task(&task_id, status, detail).await;
+}
+
+/// The sweep is over: free the cancel handle and the job slot.
+async fn release_job(state: &AppState) {
+    *state.bench.abort.lock().await = None;
+    *state.bench.job.lock().await = None;
 }
 
 pub async fn op_bench_run_cancel(

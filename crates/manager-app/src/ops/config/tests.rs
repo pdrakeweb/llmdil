@@ -132,6 +132,17 @@ async fn settings_controls_round_trip_through_real_ops() {
     let loaded = manager_config::load(&state.config_path).unwrap();
     assert!(loaded.notifications.enabled);
 
+    // Supervision mode.
+    use manager_config::SupervisionMode::{Process, Service};
+    for mode in [Service, Process] {
+        let r = op_settings_set_supervision(&state, &sink, mode)
+            .await
+            .unwrap();
+        assert_eq!(r["persisted"], true);
+        let loaded = manager_config::load(&state.config_path).unwrap();
+        assert_eq!(loaded.supervision.mode, mode);
+    }
+
     // Telemetry poll interval.
     op_telemetry_set_interval(&state, &sink, 2500)
         .await

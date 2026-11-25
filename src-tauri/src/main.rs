@@ -293,6 +293,7 @@ fn main() {
                 // are offered to the log shipper explicitly.
                 let sink: Arc<dyn EventSink> =
                     manager_app::logship::tap_sink(&state, Arc::new(TauriSink(handle)));
+                state.set_desktop_sink(Arc::clone(&sink));
                 manager_app::lifecycle::startup_reconcile(&state, sink.as_ref()).await;
                 loop {
                     manager_app::notify::monitor_tick(&state, sink.as_ref()).await;

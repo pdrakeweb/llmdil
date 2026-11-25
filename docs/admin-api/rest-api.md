@@ -3,11 +3,11 @@
 Status: implemented. The API shipped with the admin-API build
 (PLAN.md §9) and this contract describes the shipped surface as of
 v0.1.50. The source of truth for routes is the operation registry —
-`crates/manager-app/src/registry.rs` (`for_each_operation!`): 158
-operations, of which 89 carry a REST route and 69 are explicit
+`crates/manager-app/src/registry.rs` (`for_each_operation!`): 161
+operations, of which 132 carry a REST route and 29 are explicit
 `None` exclusions (§6.16). Derived/composite and auth/admin routes
 are API-layer routes in `crates/manager-api` (§6.17); the full live
-surface is 128 route records (89 registry + 15 derived + 24
+surface is 171 route records (132 registry + 15 derived + 24
 auth/admin).
 Scope: an HTTP API served by the Service Manager on a dedicated **admin port**
 on the managed machine (separate from the LiteLLM gateway port), exposing the
@@ -111,7 +111,7 @@ Every error response uses one envelope:
   resource is already running something), `OPERATION_FAILED` (an operation's
   terminal error, §3), and the auth codes (`UNAUTHENTICATED`,
   `FORBIDDEN`, `INVALID_CREDENTIALS`, `SESSION_REVOKED`,
-  `PASSWORD_CHANGE_REQUIRED`; see §6.17).
+  `PASSWORD_CHANGE_REQUIRED`; see §6.17), and `PLAN_EXISTS` (§6.19).
 - `message` is the app's error string, unparsed. Clients display it; they
   never branch on it.
 - HTTP status mapping:
@@ -124,6 +124,7 @@ Every error response uses one envelope:
   | Role may not use the endpoint; API token on account self-service | 403 | `FORBIDDEN` |
   | Account flagged must-change-password (after an admin reset) on any route but `POST /auth/password`, `POST /auth/logout`, `GET /auth/me`; also `POST /auth/refresh` | 403 | `PASSWORD_CHANGE_REQUIRED` |
   | Singleton busy (wizard step already running, download already in flight, plan apply already running), or a lifecycle operation already in flight on the same service (app kind `Busy`, e.g. "gateway restart already in progress (started by activation 12 s ago)") | 409 | `BUSY` |
+  | `POST /optimize/consult` without `replace` while a plan exists | 409 | `PLAN_EXISTS` |
   | Config patch fails validation | 422 | `CONFIG` |
   | Capability deferred in the app itself | 501 | `UNSUPPORTED` |
   | App contract gap (a crate API cannot express the operation) | 501 | `CONTRACT_GAP` |
@@ -236,6 +237,10 @@ Why this model, over retained synchronous endpoints:
   field (`api`, `cli`, …) that lands in the service's lifecycle log
   markers and `service-lifecycle` events. The REST layer fills in
   `api` when the caller names none; the CLI sends `cli`.
+- **Started work.** `POST /bench/runs` is the one `202` whose body is
+  the app's own task record (`id` = the task's id) plus the
+  operation's fields: refusals are synchronous errors, and the id
+  polls and aborts under `/operations` like any other.
 - Cancellation: `POST /operations/{id}/abort` (§6.10). Not every kind is
   abortable — a wizard step mid-subprocess may only be abandonable; the
   operation's terminal state says what happened.
@@ -547,36 +552,38 @@ not reported) — never an interpolated value.
 
 ## 5. Endpoint index
 
-93 implemented client-facing endpoints: 78 registry operation
+147 implemented client-facing endpoints: 132 registry operation
 routes + 15 derived/API-layer routes (§6.17). A further 24
-auth/admin routes (§6.17) bring the live surface to 117 route
-records (see the header for the registry's own count, which also
-includes the measurement and update routes). ("Op" = returns `202` + operation, §3.) Specified but not
-implemented in v1: the gateway master key (decision 4), raw
-`PATCH /config` (decision 11), and the peripheral domains
-(decision 10) — §6.16 accounts for every registry operation with
-no route.
+auth/admin routes (§6.17) bring the live surface to 171 route
+records. ("Op" = returns `202` + operation, §3.) Specified but not
+implemented: the gateway master key (decision 4) and raw
+`PATCH /config` (decision 11) — §6.16 accounts for every registry
+operation with no route.
 
 | Domain | Count | Endpoints |
 |---|---|---|
 | Server / status | 2 | `GET /server` (public identity), `GET /status` |
-| Backends | 21 | list, create, get, delete, config get/patch, diff preview, start/stop/restart (Op), test, flags, offload, offload override set/clear, mtp, parallel, raw flags, flags mode, group membership, launch command |
-| Models | 11 | list, create, get, delete, patch, download (Op) + pause/resume/cancel, verify (Op), assign |
+| Backends | 31 | list, create, get, delete, add preview, cache preview, config get/patch, diff preview, start/stop/restart (Op), test, tool-call test, flags, offload, offload override set/clear, mtp, parallel, cache, moe cache, raw flags, flags mode, group membership, launch command; measure, estimate, baseline (Op), tuning preview, tuning run (Op) |
+| Models | 13 | list, create, get, delete, patch, download (Op) + pause/resume/cancel, verify (Op), assign; lookup, header |
 | Placement | 2 | propose, apply |
 | Gateway | 14 | status, config get/patch, generated config, start (Op), restart (Op), stop (Op), database stop (Op), groups list + CRUD (4), routing test, routing recent — plus master key specified, NOT IMPLEMENTED (§6.5) |
-| Log receiver | 3 | start, stop, restart (Op) (§6.5a) |
+| Log receiver | 4 | status, start, stop, restart (Op) (§6.5a) |
 | Activation plan | 5 | get, apply (Op), quiesce-wait, cancel, execution history |
 | Wizard / setup | 11 | steps, status, prerequisites, run (Op), retry, skip, mark-manual, commands, help URL, complete, audit (Op) |
 | Logs | 2 | query, scopes |
-| Telemetry | 4 | GPUs, interval, reset peaks, snapshot |
+| Telemetry | 5 | GPUs, history, interval, reset peaks, snapshot |
 | Operations | 3 | list, get, abort |
 | Diagnostics | 2 | create bundle (Op), download bundle |
 | Events | 1 | `GET /events` (SSE stream, §6.17) |
-| Config / settings | 1 | get — plus raw patch specified, NOT IMPLEMENTED (§6.12) |
+| Config / settings | 2 | get, supervision mode — plus raw patch specified, NOT IMPLEMENTED (§6.12) |
 | MXC | 6 | policy get/put, mode, self-test, activity, tightening proposals |
 | Measurements | 2 | lookup (§6.18), delete (§6.18) |
-| Updates | 5 | list, check, apply, pin, auto |
-| Peripheral (MCP, VS Code, WinML) | 0 | Excluded from API v1 (decision 10) — §6.15/§6.16 |
+| Updates | 12 | list, components, check, apply, pin, auto; app update status, check, checking, auto, download, restart |
+| MCP | 3 | servers, preflight, connection test (§6.15) |
+| Optimize | 15 | state; purpose; plan validate, item decision, item outcome, apply (Op), discard; experiment decision, run (Op), estimate (Op); consult (Op) + cancel, discover (Op), job cancel, tuning adopt (§6.19) |
+| Bench | 9 | prompts list/save/delete, generate (Op) + cancel, run (Op) + cancel, results list/delete (§6.20) |
+| Notifications and services | 3 | notification settings, test notification, Windows services list (§6.21) |
+| VS Code, WinML | 0 | Excluded — §6.16 |
 
 ## 6. Endpoint reference
 
@@ -634,6 +641,29 @@ count written into the created backend's raw flags as `--parallel N`,
 validated as in `backend_set_parallel`). Each omitted field keeps
 its creation default.
 
+#### `POST /api/v1/backends/preview` — `read` — synchronous
+`backend_add_preview`. Body: `{ "model_id", "gpu_indices"?, "n_ctx"?,
+"parallel"?, "offload_layers"? }`. What `POST /backends` with these
+values would carry; nothing is written. → `{ model_id, offload,
+cache, tensor_split, split_mode, memory }`: `offload` as on the
+backend row (null without expert offload), `cache` as below, `memory`
+the requirement with `per_gpu[]` (`gpu`, `share`, `required_mib`,
+`total_mib`, free-memory verdict) and `fits_now`. `offload_layers`
+prices an explicit MoE position instead of the model's default; a
+guardrail-blocked position is priced and marked, not refused; a
+position past the model's layers is `400`, as is any position on a
+model without expert offload.
+
+#### `POST /api/v1/backends/{id}/cache/preview` — `read` — synchronous
+`backend_cache_preview`. Body (all optional; absent = saved value):
+`{ "n_ctx", "slots", "cache_k", "cache_v", "flash_attn",
+"moe_cache_mib", "offload_layers", "gpu_indices" }`. → predicted
+footprint (`weights_mib`, `sys_weights_mib`, `kv_mib`, `rs_mib`,
+`moe_cache_mib`, `total_mib`), `targets[]` per GPU, `ladder[]`,
+`best`, `fits_current`, `fits_now`. `offload_layers` and
+`gpu_indices` price an unsaved position and placement (an even split
+over the named GPUs); bounds as above.
+
 #### `DELETE /api/v1/backends/{id}` — `destructive`
 `backend_delete` → `{ "backend_id", "deleted": true }`. Refused
 (`409`/`Supervisor`) while the backend is running, as in the app.
@@ -666,6 +696,31 @@ error, mirroring the app. Duration is model-bound: clients should
 allow up to 300 s. This is the one synchronous control call; it is
 kept synchronous because the app has no task wrapper for it and its
 result is the response body itself.
+
+#### `POST /api/v1/backends/{id}/test-tool-call` — `control` — synchronous
+`backend_test_tool_call`. No body. Sends one real tool-call request
+to the backend and saves the outcome as its `tool_call_probe`. →
+`{ outcome (verified | unparsed | failed), finish_reason,
+chat_template_tool_use, chat_template_caps, detail, latency_ms }`. A
+backend that is not running is `failed`, not an error.
+
+#### `POST /api/v1/backends/{backend_id}/measure` — `control` — **Op**
+#### `POST /api/v1/backends/{backend_id}/estimate` — `control` — **Op**
+#### `POST /api/v1/backends/{backend_id}/baseline` — `control` — **Op**
+`optimize_measure_backend` (full profile), `optimize_estimate_backend`
+(abbreviated), `optimize_run_baseline` (screening evaluation). The
+backend must be running. One job at a time; a consultation on the
+same backend refuses it (a failed operation naming the running one).
+The detail is the Optimize state (§6.19); results land in
+`measurements` and on the backend row's `predicted`.
+
+#### `GET /api/v1/backends/{backend_id}/tuning` — `read`
+#### `POST /api/v1/backends/{backend_id}/tuning/run` — `control` — **Op**
+`optimize_tuning_preview` → `{ backend_id, model_id, incumbent, plan }`;
+`optimize_tuning_run` runs the planned arms on temporary backends,
+stopping the backends in the way and starting them again at the end.
+The sweep is in the Optimize state's `tuning`; its winner is adopted
+with `POST /optimize/tuning/{sweep_id}/adopt` (§6.19).
 
 #### `GET /api/v1/backends/{id}/config` — `read`
 `backend_get_config` → §4.2.
@@ -853,6 +908,18 @@ value is refused with a validation error. →
 enabled; with no pin supplied it starts with no pinned hash
 (unverified until a pin exists — the app
 treats a missing pin as "no verification possible", never as verified).
+
+#### `POST /api/v1/models/lookup` — `read` — synchronous
+`model_hf_lookup`. Body: `{ "query", "suggest"? }`. Asks Hugging Face.
+With `suggest: true` → `{ suggest, repos: [{ repo_id, downloads }] }`;
+otherwise full rows with each quantized file's `size_bytes`,
+`sha256`, `source_url` and fit against free GPU memory. An empty
+query, and a search that failed, are `400`.
+
+#### `POST /api/v1/models/header` — `read` — synchronous
+`model_hf_header`. Body: `{ "repo_id", "file" }`. → `{ repo_id, file,
+catalog, sha256, header }`: the file's MoE geometry, MTP signal and
+suggested default offload, or `header: null` when it cannot be read.
 
 #### `DELETE /api/v1/models/{id}` — `destructive`
 `model_delete` → `{ "model_id", "deleted": true, "bytes_freed": n }`.
@@ -1059,6 +1126,14 @@ gateway config (§4.4) and change only through `PATCH /gateway/config`.
 `GET /gateway/config` is their read path. (See §7.)
 
 ### 6.5a Log receiver
+
+#### `GET /api/v1/log-receiver` — `read`
+`log_receiver_status` → `{ service_name, registered, state, lifecycle,
+transition, exit_code, failure_reason, ingest_port, ingest_ok, pid,
+receiver_present, ingest_token_seeded, read_token_seeded, endpoint,
+endpoint_is_local, streaming_enabled, shipper }`. The two local paths
+the window shows (`receiver_exe`, `data_dir`) are not in the API's
+answer for any role.
 
 #### `POST /api/v1/log-receiver/start` — `control` — **Op**
 #### `POST /api/v1/log-receiver/stop` — `control` — **Op**
@@ -1317,6 +1392,14 @@ including the dead `notifications` field); the domain endpoints
 above are the preferred path, and the roles plan should treat raw
 config patch as its own capability.
 
+#### `PUT /api/v1/settings/supervision` — `config`
+`settings_set_supervision`. Body: `{ "mode": "process" | "service" }`.
+→ `{ "ok", "mode", "persisted" }`. Saves which supervision the next
+start, stop or restart uses; nothing is started, stopped or
+registered (registering services needs the console, §6.16). The one
+settings section without a domain endpoint of its own. `view_modes`
+has no route: no screen reads it.
+
 ### 6.13 MXC
 
 #### `GET /api/v1/mxc/policy` — `read`
@@ -1427,52 +1510,53 @@ for the exit, runs the staged installer silently, records the
 outcome in the state file, and relaunches. → `{ "ok",
 "restarting", "version" }`.
 
-### 6.15 Peripheral capabilities (MCP, VS Code, WinML) — excluded from v1
+### 6.15 MCP
 
-These app capabilities exist but sit outside the manager's core
-domains. As built (PLAN.md decision 10), **none of them has a REST
-route in v1**: every operation below is registered with route
-`None` in the registry (§6.16), the Tauri surface is unchanged, and
-adding any of them later is additive. The draft endpoint shapes
-once sketched here are withdrawn; two draft details are also stale
-against the current app — the MCP mode operation is now
-`mcp_set_exposure` (`{ "exposure": "…" }`, replacing
-`mcp_set_mode`), and the MCP surface has grown beyond the three
-operations the draft knew (`mcp_save_server`,
-`mcp_delete_server`, `mcp_store_credential`,
-`mcp_start_preflight`).
+The reads and the connection test are routed. Writing the registry
+is not: see §6.16.
 
-| App operation | Registry class | Status |
-|---|---|---|
-| `mcp_list`, `mcp_start_preflight` | R | No route (decision 10) |
-| `mcp_test_connection`, `mcp_set_exposure`, `mcp_save_server`, `mcp_delete_server`, `mcp_store_credential` | X | No route (decision 10) |
-| `vscode_install_extensions`, `vscode_write_config` | X | No route (decision 10) |
-| `winml_status`, `winml_probe` | R | No route (decision 10) |
-| `winml_register`, `winml_unregister` | D | No route (decision 10) |
+#### `GET /api/v1/mcp/servers` — `read`
+`mcp_list` → an array of servers: `id`, `display_name`, `transport`,
+`exposure`, `command`, `args`, `url`, `env_keys`, `cred_ref` (a
+Credential Manager target *name*), `allowed_tools`, `metered`,
+`rpm_limit`, `running`, `process_state`, `blocked_reason`,
+`credential_required`, `credential_present`, `credential_status`.
+Never a credential value. The registry part is what `GET /config`
+already shows.
+
+#### `GET /api/v1/mcp/preflight` — `read`
+`mcp_start_preflight` → `{ servers: [ … ] }`: the gateway servers the
+next gateway start would leave out because their credential is
+missing.
+
+#### `POST /api/v1/mcp/servers/{id}/test` — authorization class X (admin) — synchronous
+`mcp_test_connection` → `{ id, ok, detail, … }`. Tests a server as its
+exposure runs it. Admin only: the server may be a command the app
+runs.
 
 ### 6.16 Registry exclusions — every operation with no route
 
-The registry holds 158 operations: 89 routed (§6.1–§6.14,
-§6.18) and 69 with route `None`. A `None` route is an explicit
-exclusion, never an oversight (registry module docs); the
-complete list, grouped by reason:
+The registry holds 161 operations: 132 routed and 29 with route
+`None`. A `None` route is an explicit exclusion, never an oversight
+(registry module docs). PLAN.md decisions 10 and 11 were reversed by
+the owner except for what follows; the security-sensitive ones are
+pinned by a test (`auth_matrix.rs`
+`security_exclusions_have_no_route`). The complete list:
 
 | Reason | Operations |
 |---|---|
-| Raw config patch excluded (decision 11) | `update_config` (C) |
-| Master-key value never mirrored (decision 4) | `gateway_master_key` (SDisclosure) |
-| Desktop-only actions (§7.1–7.2) | `open_url` (L), `open_folder` (L) |
-| No 1:1 route — served inside a composition | `gateway_set_bind_host` (C, inside `PATCH /gateway/config`); `model_set_short_name` (C), `model_set_enabled` (C), `model_set_offload_spec` (C) and `model_set_mtp` (C), inside `PATCH /models/{id}`; `gateway_activation_complete` (L, server bookkeeping after apply/(re)start, §6.6); `gateway_activation_record_execution` (C, execution bookkeeping recorded by the desktop apply funnel, §6.6); `gateway_create_group` (C) and `gateway_delete_group` (D), served by the derived group routes (§6.5/§6.17); `activation_apply` (L), served by `POST /activation-plan/apply` (§6.6) |
-| Desktop-only preview | `backend_cache_preview` (R) — the MoE cache form's preview; `backend_add_preview` (R) — the add-backend form's placement preview; creation itself is `POST /backends` |
-| Model form helpers — desktop-only in v1 | `model_hf_lookup` (R), `model_hf_header` (R) — the Add Model form's Hugging Face lookup/pick and pick-time GGUF header read (deep-discovery design Part 2); creation itself is `POST /models` |
-| MCP — peripheral (decision 10) | `mcp_list` (R), `mcp_start_preflight` (R), `mcp_test_connection` (X), `mcp_set_exposure` (X), `mcp_save_server` (X), `mcp_delete_server` (X), `mcp_store_credential` (X), `backend_test_tool_call` (L, gateway MCP tool-call test) |
-| VS Code — peripheral (decision 10) | `vscode_install_extensions` (X), `vscode_write_config` (X) |
+| **Security:** the raw patch reaches every section of the configuration, MCP commands and the Admin API's own settings included (decision 11) | `update_config` (C) |
+| **Security:** the master key's value never crosses the API (decision 4) | `gateway_master_key` (SDisclosure) |
+| **Security:** registering or exposing an MCP server chooses a command the app starts, or a remote endpoint that gets a credential; storing one writes a secret | `mcp_save_server` (X), `mcp_set_exposure` (X), `mcp_delete_server` (X), `mcp_store_credential` (X) |
+| **Security:** asks for elevation and the account password at the console | `services_register` (D), `services_unregister` (D) |
+| **Security:** asks for elevation at the console and creates tokens; the endpoint flip sends the logs somewhere else | `log_receiver_deploy` (D), `log_receiver_remove` (D), `log_receiver_flip_endpoint` (C) |
+| Acts on the desktop session (§7.1–7.2) | `open_url` (L), `open_folder` (L) |
+| Writes to the user's editor profile, the master key included | `vscode_install_extensions` (X), `vscode_write_config` (X) |
 | WinML — peripheral (decision 10) | `winml_probe` (R), `winml_status` (R), `winml_register` (D), `winml_unregister` (D) |
-| Notifications — desktop-only (toast delivery is a shell concern) | `notifications_set_config` (C), `notifications_send_test` (L) |
-| Windows services — desktop-only in v1 (SCM elevation is a shell concern) | `services_list` (R), `services_register` (D), `services_unregister` (D) |
-| Log receiver deployment — desktop-only (elevated deploy/remove through the shell's runas pattern; the status names local paths) | `log_receiver_status` (R), `log_receiver_deploy` (D), `log_receiver_remove` (D), `log_receiver_flip_endpoint` (C) — its unelevated start/stop/restart are routed (§6.5a) |
-| Bench — desktop-only in v1 | `bench_prompts_list` (R), `bench_prompt_save` (C), `bench_prompt_delete` (D), `bench_prompt_generate` (L), `bench_prompt_generate_cancel` (L), `bench_run_start` (L), `bench_run_cancel` (L), `bench_results_list` (R), `bench_result_delete` (D) |
-| Optimize — desktop-only in v1 | `optimize_get_state` (R), `optimize_validate_plan` (R), `optimize_save_purpose` (C), `optimize_set_item_state` (C), `optimize_set_item_outcome` (C), `optimize_discard_plan` (C), `optimize_apply_plan` (D), `optimize_set_experiment_state` (C), `optimize_consult` (L), `optimize_discover` (L), `optimize_cancel_consult` (L), `optimize_measure_backend` (L), `optimize_cancel_job` (L), `optimize_run_baseline` (L), `optimize_run_experiments` (L), `optimize_estimate_backend` (L), `optimize_estimate_experiments` (L), `optimize_tuning_preview` (R), `optimize_tuning_run` (L), `optimize_tuning_adopt` (C) |
+| No 1:1 route — served inside a composition | `gateway_set_bind_host` (C, inside `PATCH /gateway/config`); `model_set_short_name` (C), `model_set_enabled` (C), `model_set_offload_spec` (C) and `model_set_mtp` (C), inside `PATCH /models/{id}`; `gateway_activation_complete` (L, server bookkeeping after apply/(re)start, §6.6); `gateway_activation_record_execution` (C, execution bookkeeping recorded by the desktop apply funnel, §6.6); `gateway_create_group` (C) and `gateway_delete_group` (D), served by the derived group routes (§6.5/§6.17); `activation_apply` (L), served by `POST /activation-plan/apply` (§6.6) |
+
+The PostgreSQL port has no operation of its own and so no route: it
+is part of the raw patch.
 
 ### 6.17 API-layer routes (no backing registry operation)
 
@@ -1581,8 +1665,7 @@ must-change account gets `PASSWORD_CHANGE_REQUIRED` first.
 The Optimize measurement store (predicted-throughput design §11):
 two routed operations, added because the history view's per-entry
 delete and the backend forms' draft lookup are cross-surface by
-nature — unlike the rest of the Optimize domain (§6.16), which
-stays desktop-only.
+nature. The rest of the Optimize domain is §6.19.
 
 #### `POST /api/v1/measurements/lookup` — `read`
 `measurement_lookup`. Body: `{ "request": { … } }` — a draft
@@ -1603,6 +1686,104 @@ one or two named fields. Absences are nulls, never zero-filled.
 an entry is identified by the pair. Removes that one entry from
 the store; history is otherwise append-only. → `{ "deleted": true,
 "fingerprint", "measured_at" }`; `404` when no such entry exists.
+
+### 6.19 Optimize
+
+The *state* below is `optimize_get_state`'s payload: `purpose`,
+`groups`, `backends`, `context_summary`, `context`,
+`default_backend`, `plan` (items, experiments and their live
+validation; null without one), `measurements`, `candidates`,
+`eval_baseline`, `consulting`, `consult_progress`, `consult_error`,
+`applying`, `measuring`, `job`, `job_error`, `restore_failures`,
+`running_ops`, `tuning`. Every route here answers it, or carries it
+as the operation's detail.
+
+| Route | Class | Operation | Body |
+|---|---|---|---|
+| `GET /api/v1/optimize` | R | `optimize_get_state` | |
+| `PUT /api/v1/optimize/purpose` | C | `optimize_save_purpose` | `{ "scope": "deployment \| group \| backend", "target"?, "text" }` |
+| `POST /api/v1/optimize/plan/validate` | C | `optimize_validate_plan` — re-checks the plan and records it as valid for the current configuration | |
+| `PUT /api/v1/optimize/plan/items/{item_id}` | C | `optimize_set_item_state` | `{ "decision": "accepted \| denied \| undecided" }` |
+| `PUT /api/v1/optimize/plan/items/{item_id}/outcome` | C | `optimize_set_item_outcome` | `{ "outcome": "applied \| failed \| not_attempted", "error"? }` |
+| `POST /api/v1/optimize/plan/apply` (**Op**) | D | `optimize_apply_plan` | `{ "destructive"?, "dry_run"? }` |
+| `DELETE /api/v1/optimize/plan` | D | `optimize_discard_plan` | |
+| `PUT /api/v1/optimize/experiments/{experiment_id}` | C | `optimize_set_experiment_state` | `{ "decision" }` |
+| `POST /api/v1/optimize/experiments/run`, `…/estimate` (**Op**) | L | `optimize_run_experiments`, `optimize_estimate_experiments` — the accepted ones | |
+| `POST /api/v1/optimize/consult` (**Op**) | L | `optimize_consult` | `{ "backend_id"?, "sample"?, "directive"?, "candidate_repos"?, "replace"? }` |
+| `POST /api/v1/optimize/consult/cancel` | L | `optimize_cancel_consult` → `{ "cancelled" }` | |
+| `POST /api/v1/optimize/discover` (**Op**) | L | `optimize_discover` | `{ "directive" }` |
+| `POST /api/v1/optimize/job/cancel` | L | `optimize_cancel_job` → `{ "cancelled" }`: measure, estimate, baseline, experiments, tuning | |
+| `POST /api/v1/optimize/tuning/{sweep_id}/adopt` | C | `optimize_tuning_adopt` | `{ "adopt_anyway"? }` |
+
+Measure, estimate, baseline and tuning are under the backend (§6.2).
+
+- **Replacing a plan.** A consultation replaces the stored plan and
+  its decisions. While a plan exists `POST /optimize/consult`
+  answers `409 PLAN_EXISTS` unless the body has `"replace": true`
+  (sample consultations too). The window asks instead.
+- **Apply** runs the accepted items one after the other: the
+  non-destructive ones, or with `destructive` only the deletes. An
+  item that fails stops the rest and the operation ends `failed`,
+  with `apply_result` (`steps`, `applied`, `failed`, `not_attempted`,
+  `skipped`) in the detail. It cannot be aborted; what was applied
+  stays. `dry_run` only reports the steps.
+- **Abort.** Consult, discover, measure, estimate, baseline,
+  experiments and tuning are tasks with a real cancel: abort the
+  task in `/operations`, or use the two cancel routes. A cancelled
+  operation ends `failed` or `aborted`; a tuning or experiment run
+  starts the backends it stopped again, and `restore_failures` names
+  those it could not.
+
+### 6.20 Bench
+
+| Route | Class | Operation | Body → answer |
+|---|---|---|---|
+| `GET /api/v1/bench/prompts` | R | `bench_prompts_list` | → `{ prompts }` |
+| `POST /api/v1/bench/prompts` | C | `bench_prompt_save` — creates, or replaces the entry with this `id` | `{ "id"?, "name", "purpose", "body" }` → `{ id, prompts }` |
+| `DELETE /api/v1/bench/prompts/{id}` | D | `bench_prompt_delete` — a shipped prompt comes back with its shipped text | → `{ prompts }` |
+| `POST /api/v1/bench/prompts/generate` (**Op**) | L | `bench_prompt_generate` — asks a running backend for a draft; saves nothing | `{ "purpose", "description", "size": "short \| standard", "backend_id"? }` → detail `{ text, backend_id, model }` |
+| `POST /api/v1/bench/prompts/generate/cancel` | L | `bench_prompt_generate_cancel` | → `{ cancelled }` |
+| `POST /api/v1/bench/runs` (`202`) | L | `bench_run_start` | below |
+| `POST /api/v1/bench/runs/{sweep_id}/cancel` | L | `bench_run_cancel` | → `{ cancelled }` |
+| `GET /api/v1/bench/results` | R | `bench_results_list` | → `{ sweeps }`; the running one carries `progress` |
+| `DELETE /api/v1/bench/results/{sweep_id}` | D | `bench_result_delete` | → `{ sweeps }`; `400` while it runs |
+
+`POST /bench/runs` body: `{ "backend_id", "prompt_id", "temperature"?,
+"preset"? (kv | spec | combined) or "dimensions", "draft_model_id"?,
+"baseline_arm_index"?, "correctness_control"?, "confirm_at_06"?,
+"stop_backend_ids"? }`. It answers as soon as the sweep is accepted:
+`202` `{ id, kind: "bench-run", status: "running", detail, sweep_id,
+sweeps }`. `id` is the task for `/operations` (poll, abort); progress
+and results are under `sweep_id` in `GET /bench/results`. Refused at
+once: `404` unknown backend or prompt; `400` temperature outside 0–2,
+unknown preset, running backends in the way that `stop_backend_ids`
+does not name (the message lists them), or an `offload_expr` with
+anything but expert-offload flags; `409 BUSY` while another sweep or
+measurement runs. The named backends are stopped as the sweep's first
+step (`progress.phase` = `stopping backends`) and are not started
+again; if one cannot be stopped the sweep ends `failed` and the task
+says why. The sweep's final `status` is `complete`, `partial` or
+`failed`. A sweep record names its model file with the local path (as
+`data_dir` in `GET /config` does).
+
+### 6.21 Notifications and Windows services
+
+#### `PUT /api/v1/notifications` — `config`
+`notifications_set_config`. Body: `{ "enabled", "operations"?,
+"failures"?, "activation"? }` — replaces the preferences; an absent
+category is on, an unknown field `400`. Read them in `GET /config`.
+
+#### `POST /api/v1/notifications/test` — `control` — synchronous
+`notifications_send_test`: one toast **on the managed machine**. →
+`{ ok, delivery_confirmed: false, windows_setting, detail }`; `501
+UNSUPPORTED` when no desktop window is attached.
+
+#### `GET /api/v1/services` — `read`
+`services_list` → `{ mode, host_present, services: [{ target, kind,
+service_name, registered, state, lifecycle, transition, pid,
+child_pid, exit_code, failure_reason }] }`. The Windows account and
+the local path the window shows are not in the API's answer.
+Registering and unregistering stay at the console (§6.16).
 
 ## 7. Capabilities that do not map cleanly
 
@@ -1662,7 +1843,7 @@ the store; history is otherwise append-only. → `{ "deleted": true,
 
 Resolved since the draft: all four questions below were decided
 in `PLAN.md` §4 (port/exposure, decision 1–2; peripheral domains
-excluded, decision 10; operation retention = process lifetime,
+excluded, decision 10, since reversed except §6.16; operation retention = process lifetime,
 decision 15; raw config patch excluded, decision 11). The list is
 kept as the review record.
 
