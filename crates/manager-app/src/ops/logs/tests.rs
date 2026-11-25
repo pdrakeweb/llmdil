@@ -219,3 +219,60 @@ async fn get_logs_serves_file_backed_lifecycle_scopes() {
     assert_eq!(page(&all).len(), 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// B3: a file line carries its own time (LiteLLM's time of day,
+/// PostgreSQL's date and time); an unstamped line takes the stamped
+/// line before it, never the read time, and file order holds.
+#[test]
+fn file_lines_carry_their_own_timestamps() {
+    let dir = unique_test_dir("llm-mgr-line-ts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gateway.stderr.log");
+    let local = |s: &str| {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    };
+    std::fs::write(
+        &path,
+        "boot\n23:59:58 - LiteLLM:ERROR: a.py:1 - late\nTraceback\n\
+         \u{1b}[92m00:00:02 - LiteLLM Proxy:WARNING: b.py:2 - early\u{1b}[0m\n\
+         2026-11-25 12:55:29.833 EST [8712] LOG:  local\n\
+         2026-11-25 23:00:00.000 UTC [8712] LOG:  utc\n",
+    )
+    .unwrap();
+    let files = [(path, LogStream::Stderr)];
+    let (records, _) = timed_file_records("gateway", &files, false);
+    let by = |needle: &str| {
+        records
+            .iter()
+            .find(|r| r.record.line.contains(needle))
+            .unwrap()
+    };
+    assert_eq!(by("local").record.ts, local("2026-11-25 12:55:29.833"));
+    assert_eq!(
+        by("utc").record.ts.to_rfc3339(),
+        "2026-11-25T23:00:00+00:00"
+    );
+    // Time-only stamps are dated backwards from the next known instant,
+    // across midnight.
+    assert_eq!(by("early").record.ts, local("2026-11-25 00:00:02.0"));
+    assert_eq!(by("late").record.ts, local("2026-11-24 23:59:58.0"));
+    assert!(!by("late").estimated);
+    let trace = by("Traceback");
+    assert_eq!(trace.record.ts, by("late").record.ts);
+    assert!(trace.estimated && by("boot").estimated);
+    // From/To: an unstamped line stays while it can lie in the window.
+    let ms = |s: &str| Some(local(s).timestamp_millis());
+    assert!(trace.within(ms("2026-11-25 00:00:00.0"), None));
+    assert!(!trace.within(ms("2026-11-25 00:00:03.0"), None));
+    assert!(!trace.within(None, ms("2026-11-24 23:00:00.0")));
+    let mut sorted: Vec<&TimedRecord> = records.iter().collect();
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.record.ts));
+    let order: Vec<&str> = sorted.iter().map(|r| r.record.line.as_str()).collect();
+    let file_order: Vec<&str> = records.iter().map(|r| r.record.line.as_str()).collect();
+    assert_eq!(order, file_order);
+    let _ = std::fs::remove_dir_all(&dir);
+}

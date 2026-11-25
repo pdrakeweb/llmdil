@@ -2,7 +2,7 @@
 //!
 //! Generates LiteLLM `config.yaml` from [`AppConfig`]. The generated file
 //! is never hand-edited: it is regenerated from the app config whenever
-//! the gateway is (re)started from the Setup Wizard (the start-gateway
+//! the gateway is (re)started (the start-gateway
 //! step writes a fresh file before spawning LiteLLM). [`diff_config_yaml`]
 //! is a library utility for comparing two generated documents; no UI
 //! flow currently calls it.
@@ -14,12 +14,10 @@
 //! `tool-runner` (least-busy, + WinML :8090 if registered) → OpenRouter.
 //!
 //! Resolved spec ambiguities:
-//! - LiteLLM's `router_settings.routing_strategy` is global, but our groups
-//!   want per-group strategies. [`generate_config_yaml`] emits the global
-//!   setting from the first multi-member group's strategy (falling back to the
-//!   planner group's, then the first group's). Per-group strategies are
-//!   recorded in the generated YAML for reference only: live traffic is
-//!   routed by LiteLLM under that single global strategy. The app's
+//! - Per-group strategies: [`generate_config_yaml`] emits the first
+//!   configured group's strategy as `router_settings.routing_strategy` and
+//!   a `routing_groups` entry for each multi-deployment group that differs
+//!   (LiteLLM >= [`ROUTING_GROUPS_MIN_VERSION`]). The app's
 //!   [`pick_backend`] does not route live traffic — it backs only the
 //!   routing-trace explainer behind the gateway view's test-routing action
 //!   (`gateway_test_routing` in the Tauri layer).

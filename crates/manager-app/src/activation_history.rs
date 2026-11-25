@@ -111,6 +111,10 @@ pub struct ActivationExecution {
     pub gateway_up: bool,
     #[serde(default)]
     pub gateway_pending: bool,
+    /// The drain phase's result (`{drained, in_flight, timed_out}`);
+    /// absent when the apply did not drain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiesce: Option<serde_json::Value>,
     #[serde(default)]
     pub items: Vec<ActivationExecutionItem>,
 }
@@ -232,6 +236,7 @@ mod tests {
     /// already-effective skip, one gateway change.
     fn sample_execution(status: &str) -> ActivationExecution {
         ActivationExecution {
+            quiesce: None,
             id: String::new(),
             started_at: "2026-10-18T12:00:00+00:00".to_string(),
             finished_at: "2026-10-18T12:00:42+00:00".to_string(),

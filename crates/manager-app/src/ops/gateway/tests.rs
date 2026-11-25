@@ -402,3 +402,214 @@ async fn journaled_edit_regathers_liveness_when_backends_change_meanwhile() {
     drop(cfg);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The enabled default fleet with a recorded successful gateway start:
+/// the generated files and the spawn record on disk.
+async fn started_state() -> (Arc<AppState>, PathBuf) {
+    let (state, dir) = advanced_test_state(test_cfg());
+    ensure_catalog_models(&state).await;
+    {
+        let mut cfg = state.config.write().await;
+        cfg.gateway.port = 40093;
+        cfg.gateway.bind_host = "127.0.0.1".to_string();
+    }
+    let cfg = state.config.read().await.clone();
+    record_start(&dir, &cfg);
+    (state, dir)
+}
+
+fn record_start(dir: &std::path::Path, cfg: &AppConfig) {
+    let armed = manager_wizard::config_with_armed_gateway_mcp_servers(cfg, |_| false);
+    let yaml = manager_gateway::generate_config_yaml(&armed).unwrap();
+    std::fs::create_dir_all(dir.join("gateway")).unwrap();
+    std::fs::write(dir.join("gateway").join("config.yaml"), &yaml).unwrap();
+    let fp = manager_wizard::gateway_spawn_fingerprint(cfg, false, None, None, &[]);
+    std::fs::write(
+        manager_wizard::gateway_spawn_state_path(dir),
+        manager_wizard::gateway_spawn_state_json(&fp, &yaml, Some("1.111.0")),
+    )
+    .unwrap();
+}
+
+/// A16/B2/C10b: a port save is a pending gateway change whose summary
+/// names it; an unusable port is refused in plain words.
+#[tokio::test]
+async fn a_port_change_is_journaled_and_a_bad_port_is_refused_plainly() {
+    let (state, dir) = started_state().await;
+    let sink = test_sink();
+    for bad in [json!(0), json!(70000), json!(-1), json!("4000")] {
+        let e = op_update_gateway_config(&state, &sink, json!({ "port": bad }))
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("from 1 to 65535"), "{e}");
+    }
+    let taken = state.config.read().await.backends[0].port;
+    let e = op_update_gateway_config(&state, &sink, json!({ "port": taken }))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("is used by both the gateway and"), "{e}");
+    assert!(!e.contains("validation failed"), "{e}");
+    assert!(activation::load_journal(&dir).entries.is_empty());
+
+    op_update_gateway_config(&state, &sink, json!({ "port": 40094 }))
+        .await
+        .unwrap();
+    let journal = activation::load_journal(&dir);
+    assert_eq!(journal.entries.len(), 1);
+    assert_eq!(journal.entries[0].scope, "gateway");
+    assert_eq!(
+        journal.entries[0].summary,
+        "Gateway settings changed: port (40093 → 40094)"
+    );
+    // Back to the running port: nothing is left to apply.
+    op_update_gateway_config(&state, &sink, json!({ "port": 40093 }))
+        .await
+        .unwrap();
+    assert!(activation::load_journal(&dir).entries.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B1/B2: moving a backend names it, and moving it back leaves nothing
+/// pending.
+#[tokio::test]
+async fn moving_a_backend_and_back_leaves_no_pending_entry() {
+    let (state, dir) = started_state().await;
+    let sink = test_sink();
+    let mv = |group: &str| {
+        op_gateway_set_backend_group(&state, &sink, "coder".to_string(), Some(group.to_string()))
+    };
+    mv("planner").await.unwrap();
+    let journal = activation::load_journal(&dir);
+    assert_eq!(journal.entries.len(), 1);
+    assert_eq!(journal.entries[0].targets, ["coder"]);
+    assert!(journal.entries[0].summary.contains("`coder`"));
+    mv("coder").await.unwrap();
+    assert!(activation::load_journal(&dir).entries.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B6: the reserved cloud-tier name and an over-long name are refused,
+/// on create and on rename; stored names keep working.
+#[tokio::test]
+async fn reserved_and_overlong_group_names_are_refused() {
+    let (state, dir) = advanced_test_state(test_cfg());
+    let sink = test_sink();
+    let e = op_gateway_create_group(&state, &sink, "openrouter".to_string())
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("reserved"), "{e}");
+    let e = op_gateway_create_group(&state, &sink, "g".repeat(60))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("limit is 48"), "{e}");
+    let mut groups = serde_json::to_value(&state.config.read().await.gateway.groups).unwrap();
+    groups[0]["name"] = json!("OpenRouter");
+    let e = op_update_gateway_config(&state, &sink, json!({ "groups": groups }))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("reserved"), "{e}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Answer every connection with a minimal HTTP reply, like a running
+/// gateway's liveliness endpoint.
+fn stub_gateway() -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { return };
+            let _ = s.read(&mut [0u8; 1024]);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        }
+    });
+    port
+}
+
+/// A16/A17/B5: with another port saved, the status is judged at the
+/// running gateway's port, reports both, describes the applied config,
+/// and the plan announces the administrator prompt.
+#[tokio::test]
+async fn status_describes_the_running_gateway_after_a_port_save() {
+    let (state, dir) = started_state().await;
+    let sink = test_sink();
+    let running = stub_gateway();
+    {
+        let mut cfg = state.config.write().await;
+        cfg.gateway.port = running;
+        cfg.gateway.bind_host = "0.0.0.0".to_string();
+        record_start(&dir, &cfg);
+    }
+    let before = op_gateway_status(&state, &sink).await.unwrap();
+    assert_eq!(before["running_port"], json!(running));
+    assert_eq!(before["port_pending"], false);
+
+    op_update_gateway_config(&state, &sink, json!({ "port": 40095 }))
+        .await
+        .unwrap();
+    let mut groups = serde_json::to_value(&state.config.read().await.gateway.groups).unwrap();
+    groups[0]["strategy"] = json!("least-busy");
+    op_update_gateway_config(&state, &sink, json!({ "groups": groups }))
+        .await
+        .unwrap();
+    // A probe of the saved port (the monitor's) answered "down".
+    state.lifecycle.set_probe(lifecycle::GATEWAY, false);
+    let v = op_gateway_status(&state, &sink).await.unwrap();
+    assert_eq!(v["up"], true, "{v}");
+    assert_eq!(v["port"], 40095);
+    assert_eq!(v["running_port"], json!(running));
+    assert_eq!(v["port_pending"], true);
+    assert_eq!(v["activation_changes"], 2, "{v}");
+    assert_eq!(v["groups"], before["groups"]);
+    assert_eq!(v["effective_strategy"], before["effective_strategy"]);
+    assert_eq!(v["saved_effective_strategy"], "least-busy");
+    let plan = op_gateway_activation_plan(&state, &sink).await.unwrap();
+    assert_eq!(plan["gateway_up"], true, "{plan}");
+    assert_eq!(plan["changes"].as_array().unwrap().len(), 2, "{plan}");
+    assert_eq!(plan["drift"], false);
+    assert_eq!(plan["files_differ"], true);
+    assert_eq!(plan["admin_approval_required"], true);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A18: cancelling an edit the gateway's files do not carry leaves them
+/// alone and no drift behind — also with a Gateway MCP server the
+/// running gateway was started without (unarmed).
+#[tokio::test]
+async fn cancelling_a_backend_edit_creates_no_gateway_drift() {
+    let (state, dir) = started_state().await;
+    let sink = test_sink();
+    let yaml_path = dir.join("gateway").join("config.yaml");
+    // Another spelling of the same content: a rewrite would be visible.
+    let yaml = std::fs::read_to_string(&yaml_path).unwrap() + "\n";
+    std::fs::write(&yaml_path, &yaml).unwrap();
+    state.config.write().await.gateway.port = stub_gateway();
+    record_start(&dir, &*state.config.read().await);
+    std::fs::write(&yaml_path, &yaml).unwrap();
+    let pre = state.config.read().await.clone();
+    let mut post = pre.clone();
+    post.gateway.request_log_len += 1;
+    activation::record_change(
+        &dir,
+        &pre,
+        &post,
+        "gateway_config",
+        "edit".to_string(),
+        "gateway",
+        Vec::new(),
+        &HashMap::new(),
+        &Default::default(),
+        &Default::default(),
+    )
+    .unwrap();
+    *state.config.write().await = post;
+    let r = op_gateway_activation_cancel(&state, &sink).await.unwrap();
+    assert_eq!(r["cancelled"], true, "{r}");
+    assert_eq!(r["yaml_regenerated"], true, "{r}");
+    assert_eq!(std::fs::read_to_string(&yaml_path).unwrap(), yaml);
+    let cfg = state.config.read().await.clone();
+    assert!(!activation::config_drift(&cfg, &dir, |_| false));
+    let _ = std::fs::remove_dir_all(&dir);
+}

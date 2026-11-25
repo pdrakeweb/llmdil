@@ -6,20 +6,132 @@ use crate::*;
 /// Lines read from the tail of each file-backed log file.
 pub(crate) const FILE_SCOPE_TAIL_LINES: usize = 2000;
 
+/// One file-backed log line with what is known about when it was
+/// written: exactly its own stamp, or somewhere between `lo` and `hi`
+/// (`estimated`).
+pub(crate) struct TimedRecord {
+    pub record: LogRecord,
+    lo: chrono::DateTime<chrono::Utc>,
+    hi: chrono::DateTime<chrono::Utc>,
+    pub estimated: bool,
+}
+
+impl TimedRecord {
+    fn exact(record: LogRecord) -> Self {
+        Self {
+            lo: record.ts,
+            hi: record.ts,
+            estimated: false,
+            record,
+        }
+    }
+
+    /// Whether the line can have been written inside the (inclusive)
+    /// window. A line without its own stamp is dropped only when it
+    /// surely lies outside.
+    fn within(&self, since_ms: Option<i64>, until_ms: Option<i64>) -> bool {
+        since_ms.is_none_or(|s| self.hi.timestamp_millis() >= s)
+            && until_ms.is_none_or(|u| self.lo.timestamp_millis() <= u)
+    }
+}
+
+/// The timestamp a log line starts with.
+enum LineStamp {
+    Full(chrono::DateTime<chrono::Utc>),
+    /// LiteLLM's `HH:MM:SS - ` prefix: local time of day, no date.
+    Clock(chrono::NaiveTime),
+}
+
+/// Read a line's own timestamp: the app's `[<rfc3339>]`, a bare RFC
+/// 3339 stamp, `YYYY-MM-DD HH:MM:SS[.fff]` (PostgreSQL; local time
+/// unless the zone says UTC/GMT), or LiteLLM's `HH:MM:SS - `.
+fn line_stamp(line: &str) -> Option<LineStamp> {
+    if let Some(ts) = manager_supervisor::lifecycle::parse_line_ts(line) {
+        return Some(LineStamp::Full(ts));
+    }
+    // Skip a leading ANSI color sequence.
+    let text = line
+        .strip_prefix("\x1b[")
+        .and_then(|r| r.split_once('m'))
+        .map_or(line, |(_, rest)| rest);
+    if !text.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut words = text.split_whitespace();
+    let (first, second, third) = (words.next()?, words.next()?, words.next());
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(first) {
+        return Some(LineStamp::Full(ts.with_timezone(&chrono::Utc)));
+    }
+    if second == "-" {
+        return chrono::NaiveTime::parse_from_str(first, "%H:%M:%S")
+            .ok()
+            .map(LineStamp::Clock);
+    }
+    let naive = chrono::NaiveDateTime::parse_from_str(
+        &format!("{first} {}", second.replace(',', ".")),
+        "%Y-%m-%d %H:%M:%S%.f",
+    )
+    .ok()?;
+    Some(LineStamp::Full(match third {
+        Some("UTC" | "GMT") => naive.and_utc(),
+        _ => local_to_utc(naive)?,
+    }))
+}
+
+fn local_to_utc(naive: chrono::NaiveDateTime) -> Option<chrono::DateTime<chrono::Utc>> {
+    naive
+        .and_local_timezone(chrono::Local)
+        .earliest()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// Resolve every line's stamp (`None`: the line carries none). Walks
+/// from the end: a time-only stamp is dated by the next known instant
+/// after it, starting from the file's modification time.
+fn resolve_stamps(
+    lines: &[&str],
+    mtime: chrono::DateTime<chrono::Utc>,
+) -> Vec<Option<chrono::DateTime<chrono::Utc>>> {
+    let mut anchor = mtime;
+    let mut out = vec![None; lines.len()];
+    for (i, line) in lines.iter().enumerate().rev() {
+        let ts = match line_stamp(line) {
+            Some(LineStamp::Full(ts)) => Some(ts),
+            Some(LineStamp::Clock(t)) => {
+                let day = anchor.with_timezone(&chrono::Local).date_naive();
+                let same_day = local_to_utc(day.and_time(t));
+                match same_day {
+                    // A little slack: the writer's clock and the file
+                    // time are not read at the same instant.
+                    Some(ts) if ts <= anchor + chrono::Duration::seconds(5) => Some(ts),
+                    _ => day.pred_opt().and_then(|d| local_to_utc(d.and_time(t))),
+                }
+            }
+            None => None,
+        };
+        if let Some(ts) = ts {
+            anchor = ts;
+            out[i] = Some(ts);
+        }
+    }
+    out
+}
+
 /// Records of a file-backed log scope: each file in `files` (and, with
 /// `with_prev`, its rotated `.prev` run, marked archived), stamped as
-/// `source`. A line that starts with an `[<rfc3339>]` stamp (lifecycle
-/// markers, wizard/optimize lines) carries its own timestamp; any other
-/// line (raw LiteLLM / llama-server / PostgreSQL output) is stamped
-/// with its file's modification time. Lines are emitted newest-first
-/// within each file so same-timestamp groups keep their order under
-/// the caller's stable sort. At most the last 2,000 lines of each file
-/// are read. Returns the records and whether any `.prev` run exists.
-pub(crate) fn file_scope_records(
+/// `source`. A line with its own timestamp ([`line_stamp`]) carries it.
+/// Any other line takes the time of the stamped line before it (the
+/// first one after it, at the head of the file); in a file with no
+/// stamps at all, the file's modification time — never the read time —
+/// and is marked estimated. Lines are emitted newest-first within each
+/// file so same-timestamp groups keep their order under the caller's
+/// stable sort. At most the last 2,000 lines of each file are read.
+/// Returns the records and whether any `.prev` run exists.
+pub(crate) fn timed_file_records(
     source: &str,
     files: &[(PathBuf, LogStream)],
     with_prev: bool,
-) -> (Vec<LogRecord>, bool) {
+) -> (Vec<TimedRecord>, bool) {
     let mut records = Vec::new();
     let mut has_previous = false;
     for (base, stream) in files {
@@ -36,23 +148,73 @@ pub(crate) fn file_scope_records(
             if archived {
                 has_previous = true;
             }
-            let mtime = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
+            let meta = std::fs::metadata(&path).ok();
+            let mtime = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
                 .map(chrono::DateTime::<chrono::Utc>::from)
-                .unwrap_or_else(|_| chrono::Utc::now());
+                .unwrap_or_else(chrono::Utc::now);
+            let created = meta
+                .and_then(|m| m.created().ok())
+                .map(chrono::DateTime::<chrono::Utc>::from)
+                .filter(|c| *c <= mtime)
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
             let text = String::from_utf8_lossy(&bytes);
-            for line in text.lines().rev().take(FILE_SCOPE_TAIL_LINES) {
-                records.push(LogRecord {
-                    ts: manager_supervisor::lifecycle::parse_line_ts(line).unwrap_or(mtime),
-                    stream: *stream,
-                    line: line.to_string(),
-                    source: source.to_string(),
-                    archived,
+            let all: Vec<&str> = text.lines().collect();
+            let lines = &all[all.len().saturating_sub(FILE_SCOPE_TAIL_LINES)..];
+            let stamps = resolve_stamps(lines, mtime);
+            let first = stamps.iter().flatten().next().copied();
+            let mut prev: Option<chrono::DateTime<chrono::Utc>> = None;
+            let mut next_after: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+                vec![None; lines.len()];
+            let mut upcoming = None;
+            for i in (0..lines.len()).rev() {
+                next_after[i] = upcoming;
+                upcoming = stamps[i].or(upcoming);
+            }
+            let mut file_records: Vec<TimedRecord> = Vec::with_capacity(lines.len());
+            for (i, line) in lines.iter().enumerate() {
+                prev = stamps[i].or(prev);
+                let ts = prev.or(first).unwrap_or(mtime);
+                let estimated = stamps[i].is_none();
+                file_records.push(TimedRecord {
+                    record: LogRecord {
+                        ts,
+                        stream: *stream,
+                        line: line.to_string(),
+                        source: source.to_string(),
+                        archived,
+                    },
+                    lo: if estimated {
+                        prev.unwrap_or(created)
+                    } else {
+                        ts
+                    },
+                    hi: if estimated {
+                        next_after[i].unwrap_or(mtime).max(ts)
+                    } else {
+                        ts
+                    },
+                    estimated,
                 });
             }
+            records.extend(file_records.into_iter().rev());
         }
     }
     (records, has_previous)
+}
+
+/// [`timed_file_records`] without the timing detail.
+pub(crate) fn file_scope_records(
+    source: &str,
+    files: &[(PathBuf, LogStream)],
+    with_prev: bool,
+) -> (Vec<LogRecord>, bool) {
+    let (records, has_previous) = timed_file_records(source, files, with_prev);
+    (
+        records.into_iter().map(|r| r.record).collect(),
+        has_previous,
+    )
 }
 
 /// Whether a file-backed scope has anything to show (a non-empty file
@@ -313,7 +475,8 @@ pub(crate) fn optimize_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord
 /// optional case-insensitive substring over line text; `query` is an
 /// optional case-insensitive substring over line text and source.
 /// `since_ms`/`until_ms` optionally bound record timestamps (epoch
-/// milliseconds, both inclusive). All filters apply before counting
+/// milliseconds, both inclusive); a file line without its own
+/// timestamp is kept when it can lie inside the window. All filters apply before counting
 /// and paging, so the reported total is the filtered total.
 ///
 /// Ordering is by timestamp: newest-first (`order` absent or
@@ -329,7 +492,9 @@ pub(crate) fn optimize_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord
 /// paging, and `truncated` says whether paging cut records on either
 /// side of the page. `scopes` lists every retained scope as
 /// `{id, previous}`, where `previous` means the id also has an
-/// archived previous-run ring (incl. previous run).
+/// archived previous-run ring (incl. previous run). A line whose `ts`
+/// is not its own (an unstamped file line) carries
+/// `ts_estimated: true`.
 #[allow(clippy::too_many_arguments)] // argument list is the registry contract
 pub async fn op_get_logs(
     state: &Arc<AppState>,
@@ -360,7 +525,7 @@ pub async fn op_get_logs(
     // read), and a file-only scope never waits for it (BE-11): it
     // lists the supervisor scopes only when the lock is free.
     let file_only = FILE_ONLY_SCOPES.contains(&scope.as_str());
-    let (mut records, sup_scopes): (Vec<LogRecord>, Vec<manager_supervisor::LogScope>) =
+    let (sup_records, sup_scopes): (Vec<LogRecord>, Vec<manager_supervisor::LogScope>) =
         if file_only {
             match state.supervisor().await.try_lock() {
                 Ok(sup) => (Vec::new(), sup.log_scopes()),
@@ -373,6 +538,7 @@ pub async fn op_get_logs(
                 sup.log_scopes(),
             )
         };
+    let mut records: Vec<TimedRecord> = sup_records.into_iter().map(TimedRecord::exact).collect();
     let mut scopes: Vec<Value> = sup_scopes
         .into_iter()
         .map(|s| json!({ "id": s.id, "previous": s.previous }))
@@ -380,7 +546,7 @@ pub async fn op_get_logs(
     for (id, files) in file_log_scopes(&state.data_dir, &backend_ids) {
         let wanted = scope == "all" || scope == id;
         let (present, previous) = if wanted {
-            let (file_records, previous) = file_scope_records(&id, &files, true);
+            let (file_records, previous) = timed_file_records(&id, &files, true);
             let present = !file_records.is_empty();
             records.extend(file_records);
             (present, previous)
@@ -401,27 +567,21 @@ pub async fn op_get_logs(
         }
     }
     if let Some(filter) = level.as_deref().and_then(LogLevelFilter::parse) {
-        records.retain(|r| filter.matches(&r.line));
+        records.retain(|r| filter.matches(&r.record.line));
     }
     if let Some(search) = &search {
         let needle = search.to_lowercase();
-        records.retain(|r| r.line.to_lowercase().contains(&needle));
+        records.retain(|r| r.record.line.to_lowercase().contains(&needle));
     }
     if let Some(query) = &query {
         let needle = query.to_lowercase();
         records.retain(|r| {
-            r.line.to_lowercase().contains(&needle) || r.source.to_lowercase().contains(&needle)
+            r.record.line.to_lowercase().contains(&needle)
+                || r.record.source.to_lowercase().contains(&needle)
         });
     }
-    // Time window, both bounds inclusive. Every record carries a
-    // capture timestamp (file-backed gateway/wizard records are
-    // stamped with their file's mtime), so the comparison is direct.
-    if since_ms.is_some() || until_ms.is_some() {
-        records.retain(|r| {
-            let ms = r.ts.timestamp_millis();
-            since_ms.is_none_or(|s| ms >= s) && until_ms.is_none_or(|u| ms <= u)
-        });
-    }
+    // Time window, both bounds inclusive.
+    records.retain(|r| r.within(since_ms, until_ms));
     // Newest first; the sort is stable, so records sharing a timestamp
     // keep their source order (gateway files emit newest-first).
     // "asc" is the exact mirror — the sorted vec reversed — so
@@ -429,7 +589,7 @@ pub async fn op_get_logs(
     // their source order in the oldest-first view too, instead of
     // flipping within the group, and page boundaries mirror between
     // the two orders.
-    records.sort_by_key(|r| std::cmp::Reverse(r.ts));
+    records.sort_by_key(|r| std::cmp::Reverse(r.record.ts));
     // `order` is strict: an unrecognized value is a caller bug and
     // is refused, not silently treated as the default (code-review
     // 4.17).
@@ -444,9 +604,16 @@ pub async fn op_get_logs(
     }
     let total_matching = records.len();
     let offset = offset.unwrap_or(0) as usize;
-    let page: Vec<LogRecord> = records.into_iter().skip(offset).take(limit).collect();
+    let mut page: Vec<Value> = Vec::new();
+    for r in records.into_iter().skip(offset).take(limit) {
+        let mut line = serde_json::to_value(&r.record)?;
+        if r.estimated {
+            line["ts_estimated"] = json!(true);
+        }
+        page.push(line);
+    }
     Ok(json!({
-        "lines": serde_json::to_value(&page)?,
+        "lines": page,
         "total_matching": total_matching,
         "total": total_matching,
         // Paging cut records when any matched record sits outside

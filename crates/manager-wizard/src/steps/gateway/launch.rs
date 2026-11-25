@@ -151,7 +151,12 @@ pub fn gateway_service_launch(config: &AppConfig, data_dir: &Path) -> manager_se
 /// itself. Probing through loopback keeps health checks working
 /// regardless of LAN state.
 pub fn gateway_probe_host(config: &AppConfig) -> String {
-    match config.gateway.bind_host.as_str() {
+    probe_host_for_bind(&config.gateway.bind_host)
+}
+
+/// [`gateway_probe_host`] for a bind address alone.
+pub fn probe_host_for_bind(bind_host: &str) -> String {
+    match bind_host {
         "0.0.0.0" | "::" => "127.0.0.1".to_string(),
         other => other.to_string(),
     }

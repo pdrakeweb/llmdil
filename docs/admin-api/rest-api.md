@@ -388,8 +388,10 @@ post-download proposal (deep-discovery design Part 2, P2-D7).
 
 Group `enabled`/`enabled_members` are derived by the app (a group is
 enabled iff at least one member backend is enabled); they are read-only
-in the API as in the app. `effective_strategy` is the one global
-routing strategy the generated gateway config applies, computed by the
+in the API as in the app. `group_strategies` (`[{group, strategy}]`)
+is the strategy the generated config applies to each group it
+includes. `effective_strategy` is the generated config's global
+routing strategy, the default of groups without their own, computed by the
 generator's own rule (`manager_gateway::effective_global_strategy`);
 `null` when no config would be generated. Clients display it and never
 re-derive it.
@@ -427,6 +429,15 @@ enforced inside the gateway by LiteLLM's provider budget
 `capped` is true when the tier is enabled and the cap is zero or
 reached, `warn` at ≥80% of the cap.
 
+- `port` is the saved port; `running_port` the one the running gateway
+  answers on (`null` while down) and `port_pending` whether they differ.
+- `groups`, `effective_strategy` and `group_strategies`
+  (`[{group, strategy}]`) describe the running gateway's applied
+  config; `saved_groups`, `saved_effective_strategy` and
+  `saved_group_strategies` are present only where the saved
+  configuration differs.
+- `requests_1h`, `errors_1h`, `stats_window_secs`: client requests the
+  gateway answered over the trailing hour (`null` until measured).
 - `state` is the shared lifecycle state every surface renders:
   `running`, `starting`, `restarting`, `stopping`, `stopped`,
   `failed`, `degraded` (process alive but not answering), `unknown`.
@@ -464,9 +475,18 @@ the configured total (Pete, 2026-10-17, tracker #11).
   "changes": [ { "ts": "…", "kind": "…", "summary": "…",
                  "scope": "backend", "targets": ["coder"],
                  "activation": "restart" } ],
+  "admin_approval_required": false, "admin_approval_reason": null,
   "snapshot_available": true
 }
 ```
+
+One edit is one change: a record the gateway and a backend both must
+pick up is one row (scope `gateway`), and drift that a pending gateway
+change explains is not listed again (`drift` is then `false`,
+`files_differ` `true`). `targets` names the backends an edit touched, in
+both scopes. `admin_approval_required` says that applying changes the
+gateway's port or network access, for which Windows asks for
+administrator approval (firewall rule).
 
 When live config drift is the pending work, `changes` carries a
 synthesized item with `kind: "gateway_drift"` (scope `gateway`,
@@ -1207,7 +1227,7 @@ operation.
 | `level` | heuristic filter: `error` \| `warn` \| `info` \| `debug` |
 | `search` | case-insensitive substring over line text |
 | `query` | case-insensitive substring over line text and source |
-| `since_ms`, `until_ms` | epoch-ms bounds, inclusive |
+| `since_ms`, `until_ms` | epoch-ms bounds, inclusive; a line whose own time is unknown (`ts_estimated: true`) is kept when it can lie inside |
 | `order` | `desc` (default, newest first) \| `asc` |
 | `offset`, `limit` | paging; `limit` defaults to 200 |
 

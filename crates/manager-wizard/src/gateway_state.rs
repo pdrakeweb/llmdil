@@ -113,9 +113,9 @@ pub fn gateway_spawn_fingerprint(
 /// `<data_dir>/gateway/spawn-state.json`: the spawn fingerprint and
 /// the hash of the generated YAML it spawned with.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct GatewaySpawnState {
-    fingerprint: GatewaySpawnFingerprint,
-    pub(crate) yaml_sha256: String,
+pub struct GatewaySpawnState {
+    pub fingerprint: GatewaySpawnFingerprint,
+    pub yaml_sha256: String,
     /// The LiteLLM version the start-gateway step probed in the
     /// gateway venv before this spawn (MCP design §4.3), or `None`
     /// when it could not be determined. Serde-defaulted so spawn
@@ -124,7 +124,36 @@ pub(crate) struct GatewaySpawnState {
     /// line); it is not part of the drift comparison — a LiteLLM
     /// upgrade is an `updates` concern, not a config change.
     #[serde(default)]
-    pub(crate) litellm_version: Option<String>,
+    pub litellm_version: Option<String>,
+}
+
+/// What the last successful gateway start was spawned with, or `None`
+/// when no (parseable) record exists.
+pub fn recorded_gateway_spawn(data_dir: &Path) -> Option<GatewaySpawnState> {
+    let text = std::fs::read_to_string(gateway_spawn_state_path(data_dir)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The `config.yaml` the last successful gateway start was spawned
+/// with; `None` when there is no record or the file has been rewritten
+/// since (a failed start).
+pub fn applied_gateway_yaml(data_dir: &Path) -> Option<String> {
+    let spawn = recorded_gateway_spawn(data_dir)?;
+    let yaml = std::fs::read_to_string(data_dir.join("gateway").join("config.yaml")).ok()?;
+    (yaml_fingerprint(&yaml) == spawn.yaml_sha256).then_some(yaml)
+}
+
+/// Whether saved changes the gateway reads from its command line —
+/// port and bind address — wait for a gateway restart: `(port, bind)`.
+/// Both false when no spawn is recorded.
+pub fn gateway_listen_pending(config: &AppConfig, data_dir: &Path) -> (bool, bool) {
+    match recorded_gateway_spawn(data_dir) {
+        Some(s) => (
+            s.fingerprint.port != config.gateway.port,
+            s.fingerprint.bind_host != config.gateway.bind_host,
+        ),
+        None => (false, false),
+    }
 }
 
 /// Path of the spawn-state record: `<data_dir>/gateway/spawn-state.json`.
@@ -274,9 +303,9 @@ pub fn gateway_spawn_state_json(
 /// probe could not determine one). Callers render `None` as
 /// "not measured" — never as a guess (design principle 12).
 pub fn recorded_litellm_version(data_dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(gateway_spawn_state_path(data_dir)).ok()?;
-    let state: GatewaySpawnState = serde_json::from_str(&text).ok()?;
-    state.litellm_version.filter(|v| !v.trim().is_empty())
+    recorded_gateway_spawn(data_dir)?
+        .litellm_version
+        .filter(|v| !v.trim().is_empty())
 }
 
 /// Whether the running gateway's recorded spawn state still matches
@@ -346,10 +375,7 @@ pub fn gateway_config_is_current(
             }
         }
     }
-    let Ok(state_text) = std::fs::read_to_string(gateway_spawn_state_path(data_dir)) else {
-        return false;
-    };
-    let Ok(state) = serde_json::from_str::<GatewaySpawnState>(&state_text) else {
+    let Some(state) = recorded_gateway_spawn(data_dir) else {
         return false;
     };
     state.fingerprint == *current && state.yaml_sha256 == yaml_fingerprint(&on_disk)

@@ -234,6 +234,21 @@ pub(crate) fn mark_gateway_result(items: &mut [ActivationExecutionItem], ok: boo
     }
 }
 
+/// The drain timed out and the gateway was restarted under running
+/// requests: say so on every gateway item that has no other detail.
+/// Pure.
+pub(crate) fn note_drain_timeout(items: &mut [ActivationExecutionItem], quiesce: Option<&Value>) {
+    let Some(q) = quiesce.filter(|q| q["timed_out"] == json!(true)) else {
+        return;
+    };
+    let detail = crate::drain_timeout_detail(q);
+    for item in items.iter_mut() {
+        if item.scope != "backend" && item.detail.is_none() {
+            item.detail = Some(detail.clone());
+        }
+    }
+}
+
 /// The execution status after the gateway step (the last step: reaching
 /// it means every step was attempted, so a failure there completes the
 /// execution with failures rather than aborting it). Pure.
@@ -509,10 +524,17 @@ pub async fn op_activation_apply(
                 }
             };
             mark_gateway_result(&mut items, ok, &error);
+            note_drain_timeout(&mut items, quiesce.as_ref());
             gateway_restarted = ok;
             status = completed_status(&items);
             message = if ok {
-                "Gateway restarted — the saved changes are live.".to_string()
+                match quiesce.as_ref().filter(|q| q["timed_out"] == json!(true)) {
+                    Some(q) => format!(
+                        "Gateway restarted — the saved changes are live. {}",
+                        crate::drain_timeout_detail(q)
+                    ),
+                    None => "Gateway restarted — the saved changes are live.".to_string(),
+                }
             } else {
                 error
             };
@@ -532,6 +554,7 @@ pub async fn op_activation_apply(
         drift: plan.drift,
         gateway_up: plan.gateway_up,
         gateway_pending: plan.gateway_pending,
+        quiesce: quiesce.clone(),
         items: items.clone(),
     };
     let execution_id = activation_history::record_execution(&state.data_dir, &mut execution);

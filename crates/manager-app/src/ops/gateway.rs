@@ -21,13 +21,24 @@ pub async fn op_get_gateway_config(state: &Arc<AppState>, _sink: &Arc<dyn EventS
             group_json["enabled_members"] = json!(enabled_members);
         }
     }
-    // The one global routing strategy the generated gateway config
-    // applies, computed by the generator's own rule (additive field;
+    // The global routing strategy of the generated gateway config (the
+    // default of groups without their own), computed by the generator's own rule (additive field;
     // null when no config would be generated). Clients display it
     // and never re-derive it (capability audit §13.2).
     v["effective_strategy"] =
         serde_json::to_value(manager_gateway::effective_global_strategy(&cfg))?;
+    // Per included group, the strategy really applied to it: its own, or
+    // the global one when it has a single member or the pinned LiteLLM
+    // has no per-group strategies.
+    v["group_strategies"] = group_strategies_json(&manager_gateway::applied_group_strategies(&cfg));
     Ok(v)
+}
+
+fn group_strategies_json(groups: &[(String, manager_config::RoutingStrategy)]) -> Value {
+    groups
+        .iter()
+        .map(|(group, strategy)| json!({ "group": group, "strategy": strategy }))
+        .collect()
 }
 
 /// Merge a JSON patch into the gateway config and persist: the patch is
@@ -44,27 +55,130 @@ pub async fn op_update_gateway_config(
     let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
+    if let Some(port) = patch.get("port") {
+        check_gateway_port(port)?;
+    }
     let mut v = serde_json::to_value(&new_cfg.gateway)?;
     merge_json(&mut v, patch);
     new_cfg.gateway = serde_json::from_value(v)?;
+    // A new or renamed group goes by the one naming rule; stored names
+    // that predate it stay as they are.
+    for g in &new_cfg.gateway.groups {
+        if !pre_cfg.gateway.groups.iter().any(|p| p.name == g.name) {
+            manager_config::validate_group_name(&g.name).map_err(ApiError::InvalidInput)?;
+        }
+    }
     // Validate before journaling, like the other journaling sites: an
     // invalid patch used to write a "Gateway configuration changed"
     // entry and then fail the save, leaving a phantom pending change
     // that cancel refused (finding PS-6, docs/code-review-v0.1.60.md).
-    manager_config::validate(&new_cfg).map_err(ApiError::from)?;
+    validate_plain(&new_cfg)?;
+    // The port and bind address travel on the gateway's command line,
+    // not in the YAML: journal them regardless.
+    let listen_changed = pre_cfg.gateway.port != new_cfg.gateway.port
+        || pre_cfg.gateway.bind_host != new_cfg.gateway.bind_host;
     let journaled = record_gateway_change(
         state,
         &live,
         &pre_cfg,
         &new_cfg,
         "gateway_config",
-        "Gateway configuration changed".to_string(),
-        false,
+        gateway_change_summary(&pre_cfg, &new_cfg)?,
+        listen_changed,
     )
     .await?;
     save_journaled(state, &new_cfg, &journaled)?;
     *cfg = new_cfg;
+    drop(cfg);
+    drop_net_zero_gateway_entries(state).await;
     Ok(json!({ "ok": true, "persisted": true }))
+}
+
+/// Refuse an unusable gateway port in plain words (the typed parse
+/// would answer "invalid value: integer `70000`, expected u16").
+fn check_gateway_port(port: &Value) -> Result<(), ApiError> {
+    match port.as_u64() {
+        Some(1..=65535) => Ok(()),
+        _ => Err(ApiError::InvalidInput(format!(
+            "the gateway port must be a whole number from 1 to 65535 (got {port})"
+        ))),
+    }
+}
+
+/// [`manager_config::validate`] with the problems alone as the message
+/// (no "config error: validation failed:" in front).
+fn validate_plain(cfg: &AppConfig) -> Result<(), ApiError> {
+    manager_config::validate(cfg).map_err(|e| match e {
+        manager_config::ConfigError::Validation(problems) => ApiError::InvalidInput(problems),
+        other => ApiError::from(other),
+    })
+}
+
+/// Which gateway settings an edit changed, with old and new values
+/// where they are short: "Gateway settings changed: port (4000 → 4001),
+/// groups".
+fn gateway_change_summary(pre: &AppConfig, post: &AppConfig) -> Result<String, ApiError> {
+    let (a, b) = (
+        serde_json::to_value(&pre.gateway)?,
+        serde_json::to_value(&post.gateway)?,
+    );
+    let mut fields: Vec<String> = Vec::new();
+    for (key, new) in b.as_object().into_iter().flatten() {
+        let old = a.get(key).unwrap_or(&Value::Null);
+        if old != new {
+            fields.push(field_change_text(key, old, new));
+        }
+    }
+    if fields.is_empty() {
+        return Ok("Gateway settings changed".to_string());
+    }
+    Ok(format!("Gateway settings changed: {}", fields.join(", ")))
+}
+
+/// One changed field for a plan summary: `name (old → new)` for short
+/// plain values, else the name alone.
+pub(crate) fn field_change_text(name: &str, old: &Value, new: &Value) -> String {
+    let short = |v: &Value| match v {
+        Value::Null => Some("none".to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) if s.chars().count() <= 24 => Some(s.clone()),
+        _ => None,
+    };
+    match (short(old), short(new)) {
+        (Some(o), Some(n)) => format!("{name} ({o} → {n})"),
+        _ => name.to_string(),
+    }
+}
+
+/// Drop the pending gateway-scope entries when together they changed
+/// nothing: the configuration generates exactly what the last
+/// successful start was spawned with, on the same port and bind
+/// address (a backend moved to another group and back). Best-effort —
+/// a kept entry only asks for a restart nobody needs.
+pub(crate) async fn drop_net_zero_gateway_entries(state: &AppState) {
+    let journal = activation::load_journal(&state.data_dir);
+    if !journal.entries.iter().any(|e| e.scope == "gateway") {
+        return;
+    }
+    let cfg = state.config.read().await.clone();
+    let listen = manager_wizard::gateway_listen_pending(&cfg, &state.data_dir);
+    if listen != (false, false) || manager_wizard::applied_gateway_yaml(&state.data_dir).is_none() {
+        return;
+    }
+    let presence = mcp_credential_presence(&[&cfg]).await;
+    if activation::config_drift(&cfg, &state.data_dir, |t| presence.contains(t)) {
+        return;
+    }
+    match activation::clear_gateway_scope(&state.data_dir) {
+        Ok(()) if !journal.entries.iter().any(|e| e.scope == "backend") => {
+            // Resolved by undoing it: no "plan applied" toast.
+            let mut watch = state.notify_watch.lock().unwrap_or_else(|e| e.into_inner());
+            watch.activation_cancelled = true;
+        }
+        Ok(()) => {}
+        Err(e) => tracing::warn!("activation journal: net-zero entries not dropped: {e}"),
+    }
 }
 
 /// Journal a change for the gateway activation plan when it
@@ -135,7 +249,7 @@ pub(crate) async fn record_gateway_change(
         kind,
         summary,
         "gateway",
-        Vec::new(),
+        activation::touched_backends(pre, post),
         &live.started_at,
         &configured,
         &live.running,
@@ -454,6 +568,8 @@ pub async fn op_gateway_set_backend_group(
         .await?;
         save_journaled(state, &new_cfg, &journaled)?;
         *cfg = new_cfg;
+        drop(cfg);
+        drop_net_zero_gateway_entries(state).await;
     }
     Ok(json!({
         "backend_id": id,
@@ -483,20 +599,7 @@ pub async fn op_gateway_create_group(
     name: String,
 ) -> ApiResult {
     let name = name.trim().to_string();
-    // The slug rule backend_add applies to group names (kept in
-    // step deliberately: one naming rule for groups everywhere).
-    let valid_slug = !name.is_empty()
-        && name.len() <= 48
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !name.starts_with('-')
-        && !name.ends_with('-');
-    if !valid_slug {
-        return Err(ApiError::InvalidInput(
-            "group name must be lowercase letters, digits, and hyphens".to_string(),
-        ));
-    }
+    manager_config::validate_group_name(&name).map_err(ApiError::InvalidInput)?;
     let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
     let mut new_cfg = cfg.clone();
@@ -585,18 +688,28 @@ pub async fn op_gateway_delete_group(
 /// manager-gateway): the generated config serves enabled groups
 /// only, so the configured total would misstate what the gateway
 /// runs (Pete, 2026-10-17, tracker #11).
+/// `groups`, `effective_strategy` and `group_strategies` describe the
+/// RUNNING gateway (its applied config); `saved_groups` and
+/// `saved_effective_strategy` are present when the saved configuration
+/// differs. `running_port` is the port it answers on, `port_pending`
+/// whether another one is saved. `requests_1h`/`errors_1h` count client
+/// requests over the trailing hour (`null` until measured).
 /// `routing_log_len` is the routing decision ring's actual current
 /// entry count (not its capacity). `openrouter_cred_present` reports
 /// whether the cloud tier's configured credential reference exists in
 /// Windows Credential Manager (presence only — the value is never
 /// read); it is null when no reference is configured.
 pub async fn op_gateway_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
-    let (port, bind_host, groups, routing_rules, cred_ref) = {
+    let (port, bind_host, saved_groups, saved_routing, routing_rules, cred_ref) = {
         let cfg = state.config.read().await;
         (
             cfg.gateway.port,
             cfg.gateway.bind_host.clone(),
             manager_gateway::enabled_group_count(&cfg),
+            manager_gateway::AppliedRouting {
+                strategy: manager_gateway::effective_global_strategy(&cfg),
+                groups: manager_gateway::applied_group_strategies(&cfg),
+            },
             cfg.gateway.routing_rules.len(),
             cfg.gateway.openrouter.cred_ref.clone(),
         )
@@ -604,7 +717,7 @@ pub async fn op_gateway_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>
     // The derived lifecycle views (transition, SCM state, probe, live
     // pid, intent, failure): read with no config guard held, they take
     // it themselves.
-    let view = lifecycle::gateway_view(state).await;
+    let (view, endpoint_port) = running_gateway_view(state).await;
     let pg = lifecycle::postgres_view(state).await;
     let up = view.up;
     // While a gateway operation or an activation apply is in flight
@@ -660,27 +773,49 @@ pub async fn op_gateway_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>
             up_for_pending,
         );
         let presence = mcp_credential_presence(&[&cfg]).await;
-        let drift = activation::config_drift(&cfg, &state.data_dir, |t| presence.contains(t));
+        let drift = activation::drift_unexplained(
+            activation::drift_is_pending(
+                activation::config_drift(&cfg, &state.data_dir, |t| presence.contains(t)),
+                up_for_pending,
+            ),
+            &pending,
+        );
         (
-            !pending.is_empty() || (drift && up_for_pending),
-            // The count the activation plan itself reports:
-            // journal entries plus the plan's synthesized drift
-            // item when drift is pending work (tracker #57) —
-            // never "pending" beside a zero count.
-            pending.len() + usize::from(drift && up_for_pending),
+            !pending.is_empty() || drift,
+            // The count the activation plan itself reports: its rows
+            // plus the synthesized drift item when drift is pending
+            // work of its own (tracker #57) — never "pending" beside
+            // a zero count.
+            activation::plan_rows(&pending).len() + usize::from(drift),
         )
     };
+    // What the running gateway serves, from the config it was started
+    // with (B5); the saved configuration when nothing runs.
+    let running = up
+        .then(|| manager_wizard::applied_gateway_yaml(&state.data_dir))
+        .flatten()
+        .and_then(|yaml| manager_gateway::applied_routing(&yaml));
+    let routing = running.as_ref().unwrap_or(&saved_routing);
+    let groups = running.as_ref().map_or(saved_groups, |r| r.groups.len());
+    let window = state.gateway.stats.lock().await.gateway_window();
     // OpenRouter daily spend vs cap (spec §7), from the app's ledger.
     let openrouter_spend = {
         let cfg = state.config.read().await;
         openrouter_spend::status_for(&state.data_dir, &cfg)
     };
-    Ok(json!({
+    let mut status = json!({
         "port": port,
+        "running_port": up.then_some(endpoint_port),
+        "port_pending": up && endpoint_port != port,
         "bind_host": bind_host,
         "lan_ip": lan_ip,
         "openrouter_spend": openrouter_spend,
         "groups": groups,
+        "effective_strategy": routing.strategy,
+        "group_strategies": group_strategies_json(&routing.groups),
+        "requests_1h": window.map(|w| w.requests),
+        "errors_1h": window.map(|w| w.errors),
+        "stats_window_secs": window.map(|w| w.window_secs),
         "routing_rules": routing_rules,
         // The liveness probe alone (kept for older clients); `state`
         // is the lifecycle state every surface renders.
@@ -715,7 +850,19 @@ pub async fn op_gateway_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>
         // (MCP design §4.3); null when no spawn state has recorded
         // one — the UI renders that as "not measured".
         "litellm_version": manager_wizard::recorded_litellm_version(&state.data_dir),
-    }))
+    });
+    if let Some(running) = &running {
+        if running.groups.len() != saved_routing.groups.len() {
+            status["saved_groups"] = json!(saved_routing.groups.len());
+        }
+        if running.strategy != saved_routing.strategy {
+            status["saved_effective_strategy"] = json!(saved_routing.strategy);
+        }
+        if running.groups != saved_routing.groups {
+            status["saved_group_strategies"] = group_strategies_json(&saved_routing.groups);
+        }
+    }
+    Ok(status)
 }
 
 /// The workstation's primary LAN IPv4 address, or None when it
@@ -765,6 +912,8 @@ pub async fn op_gateway_set_bind_host(
     .await?;
     save_journaled(state, &new_cfg, &journaled)?;
     *cfg = new_cfg;
+    drop(cfg);
+    drop_net_zero_gateway_entries(state).await;
     Ok(json!({ "bind_host": host, "restart_required": true }))
 }
 

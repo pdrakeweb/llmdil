@@ -891,6 +891,81 @@ async fn start_gateway_adds_firewall_rule_when_missing() {
     assert!(text.contains("remoteip=localsubnet"), "{text}");
 }
 
+/// A17: a start on a new port removes this app's rules for earlier
+/// ports in the same elevated script, leaves every other rule alone,
+/// and says beforehand that Windows will ask for approval.
+#[tokio::test]
+async fn start_gateway_on_a_new_port_removes_the_old_ports_rule() {
+    let ops = Arc::new(FakeSystemOps::new());
+    with_bundled_uv(&ops);
+    ops.with_http_get(
+        "http://127.0.0.1:4001/v1/models",
+        FakeSystemOps::http_ok(r#"{"data":[]}"#),
+    );
+    let show = |name: &str| {
+        ["netsh", "advfirewall", "firewall", "show", "rule", name]
+            .map(str::to_string)
+            .to_vec()
+    };
+    let missing = show("name=Local LLM Gateway (TCP 4001)");
+    ops.with_command_failure(
+        &missing.iter().map(String::as_str).collect::<Vec<_>>(),
+        1,
+        "No rules match the specified criteria.",
+    );
+    ops.with_command(
+        &show("name=all")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        FakeSystemOps::ok_output(
+            "Rule Name:       Local LLM Gateway (TCP 4000)\r\nEnabled: Yes\r\n\
+             Regelname:       Local LLM Gateway (TCP 4002)\r\n\
+             Rule Name:       My Local LLM Gateway (TCP 4003)\r\n\
+             Rule Name:       Local LLM Gateway (TCP 4004) custom\r\n",
+        ),
+    );
+    let mut config = test_config_with_models();
+    config.gateway.port = 4001;
+    let ctx = WizardContext::new(
+        config,
+        PathBuf::from("/data"),
+        RunMode::Install,
+        ops.clone(),
+    );
+    let step = StartGateway {
+        health_retries: 3,
+        health_interval_ms: 1,
+        db_sustain_ms: 0,
+    };
+    let out = step.run(&ctx).await.unwrap();
+    assert_eq!(out.state, StepState::Done, "{out:?}");
+    assert_eq!(ops.elevated_calls().len(), 1);
+    let script = ops
+        .file_bytes(&PathBuf::from("/data/gateway/firewall.cmd"))
+        .expect("firewall script written");
+    let text = String::from_utf8(script).unwrap();
+    for port in [4000, 4002, 4001] {
+        assert!(
+            text.contains(&format!(
+                "delete rule name=\"Local LLM Gateway (TCP {port})\""
+            )),
+            "{text}"
+        );
+    }
+    assert!(!text.contains("4003") && !text.contains("4004"), "{text}");
+    assert!(
+        text.contains("add rule name=\"Local LLM Gateway (TCP 4001)\""),
+        "{text}"
+    );
+    assert!(
+        out.log_tail
+            .iter()
+            .any(|l| l.contains("administrator approval")),
+        "{out:?}"
+    );
+}
+
 /// Firewall reconciliation, remove path: loopback-bound with the
 /// rule present (the fake's default command success) — one
 /// elevated delete.

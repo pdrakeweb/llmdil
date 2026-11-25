@@ -749,7 +749,7 @@ mod tests {
     fn routing_yaml_gains_callback_and_safety_net() {
         let yaml = generate_config_yaml(&routing_fixture()).expect("generate");
         assert!(
-            yaml.contains("  callbacks: llmdil_routing.proxy_handler_instance\n"),
+            yaml.contains("  callbacks: [prometheus, llmdil_routing.proxy_handler_instance]\n"),
             "callbacks key missing:\n{yaml}"
         );
         assert!(yaml.contains("  context_window_fallbacks:\n"));
@@ -830,7 +830,7 @@ mod tests {
         assert!(crate::overflow_escalation_table(&cfg).is_none());
         assert!(generate_routing_callback(&cfg).is_none());
         let yaml = generate_config_yaml(&cfg).expect("generate");
-        assert!(!yaml.contains("callbacks: llmdil_routing"), "{yaml}");
+        assert!(!yaml.contains("llmdil_routing"), "{yaml}");
     }
 
     #[test]
@@ -878,7 +878,7 @@ mod tests {
         assert!(py.contains("RULE_TABLE = json.loads(\"null\")"), "{py}");
         let yaml = generate_config_yaml(&cfg).expect("generate");
         assert!(
-            yaml.contains("  callbacks: llmdil_routing.proxy_handler_instance\n"),
+            yaml.contains("  callbacks: [prometheus, llmdil_routing.proxy_handler_instance]\n"),
             "{yaml}"
         );
         // The context-overflow safety net stays rule-only.
