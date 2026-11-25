@@ -65,10 +65,13 @@ describe("honest fit", () => {
   const gpu = { gpu: 0, required_mib: 10000, total_mib: 16000, driver_model: "wddm" as const, state: "fits" as const, paged_mib: 0 };
   it("credits what the backend itself holds and lets the payload decide", () => {
     const fit = { state: "fits" as const, paged_mib: 0, per_gpu: [gpu] };
-    expect(fitNow(row(fit), new Map([[0, 4000]]), [])).toEqual({ fitsNow: false, neededMib: 10000, freeMib: 4000 });
+    expect(fitNow(row(fit), new Map([[0, 4000]]), [])).toEqual({ fitsNow: false, neededMib: 10000, freeMib: 4000, gpu: 0 });
     expect(fitNow(row(fit), new Map([[0, 4000]]), [{ gpu: 0, name: "", mib: 7000 }]).fitsNow).toBe(true);
     expect(fitNow(row(fit), new Map([[0, 4000]]), [{ gpu: 0, name: "", mib: null }]).fitsNow).toBeNull();
     expect(fitNow(row(fit, true), new Map(), []).fitsNow).toBe(true);
+    // A split: the figures are the short GPU's, not the sum over both.
+    const split = { ...fit, per_gpu: [gpu, { ...gpu, gpu: 1 }] };
+    expect(fitNow(row(split), new Map([[0, 24000], [1, 4000]]), [])).toEqual({ fitsNow: false, neededMib: 10000, freeMib: 4000, gpu: 1 });
   });
 });
 
