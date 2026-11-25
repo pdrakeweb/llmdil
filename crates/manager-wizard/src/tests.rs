@@ -211,7 +211,7 @@ fn restore_adopts_all_outcomes_and_marks_interrupted() {
         ],
     };
     let mut w = wizard(&[("a", false), ("b", false), ("c", false)]);
-    w.restore(&persisted, true);
+    w.restore(&persisted, true, false);
     let after = w.report();
     let get = |id: &str| after.steps.iter().find(|s| s.id == id).unwrap();
     // Done and Failed are adopted verbatim — progress and the
@@ -252,6 +252,7 @@ fn restore_rejects_other_mode_and_never_overwrites_session_state() {
             steps: vec![step_report("a", StepState::Failed)],
         },
         true,
+        false,
     );
     assert_eq!(w.report().steps[0].state, StepState::Queued);
 }
@@ -317,7 +318,7 @@ fn restore_does_not_adopt_start_gateway_done_when_config_drifted() {
         steps: vec![gateway_step_report(StepState::Done)],
     };
     let mut w = wizard(&[(steps::STEP_START_GATEWAY, false)]);
-    w.restore(&persisted, false);
+    w.restore(&persisted, false, false);
     assert_eq!(w.state(steps::STEP_START_GATEWAY), Some(StepState::Queued));
     // Failures are the user's progress and still restore under drift.
     let persisted_failed = WizardReport {
@@ -325,12 +326,98 @@ fn restore_does_not_adopt_start_gateway_done_when_config_drifted() {
         steps: vec![gateway_step_report(StepState::Failed)],
     };
     let mut w2 = wizard(&[(steps::STEP_START_GATEWAY, false)]);
-    w2.restore(&persisted_failed, false);
+    w2.restore(&persisted_failed, false, false);
     assert_eq!(w2.state(steps::STEP_START_GATEWAY), Some(StepState::Failed));
     // Current config: the persisted Done restores as before.
     let mut w3 = wizard(&[(steps::STEP_START_GATEWAY, false)]);
-    w3.restore(&persisted, true);
+    w3.restore(&persisted, true, false);
     assert_eq!(w3.state(steps::STEP_START_GATEWAY), Some(StepState::Done));
+}
+
+/// A second reader of the saved state must not turn the running
+/// gateway's Done into Queued: it stays Done, with the drift note,
+/// which goes away once the configuration is current again.
+#[test]
+fn restore_keeps_start_gateway_done_while_the_gateway_runs() {
+    let persisted = WizardReport {
+        mode: RunMode::Install,
+        steps: vec![gateway_step_report(StepState::Done)],
+    };
+    let mut w = wizard(&[(steps::STEP_START_GATEWAY, false)]);
+    w.restore(&persisted, false, true);
+    let drifted = w.report();
+    assert_eq!(drifted.steps[0].state, StepState::Done);
+    assert!(drifted.steps[0]
+        .note
+        .as_deref()
+        .unwrap()
+        .contains("changed"));
+
+    let mut w2 = wizard(&[(steps::STEP_START_GATEWAY, false)]);
+    w2.restore(&drifted, true, true);
+    assert_eq!(w2.report().steps[0].state, StepState::Done);
+    assert_eq!(w2.report().steps[0].note, None);
+}
+
+fn full_report(mode: RunMode, state_of: impl Fn(&str) -> StepState) -> WizardReport {
+    WizardReport {
+        mode,
+        steps: steps::default_steps()
+            .iter()
+            .map(|s| StepReport {
+                id: s.id().to_string(),
+                name: s.name().to_string(),
+                state: state_of(s.id()),
+                message: String::new(),
+                duration_ms: 0,
+                log_tail: Vec::new(),
+                note: None,
+                manual_command: None,
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn setup_is_complete_without_the_optional_steps() {
+    let optional = |id: &str| steps::OPTIONAL_STEPS.contains(&id);
+    // Required steps done, optional ones never run.
+    let pending_optional = |id: &str| {
+        if optional(id) {
+            StepState::Queued
+        } else {
+            StepState::Done
+        }
+    };
+    assert!(full_report(RunMode::Install, pending_optional).setup_complete());
+    assert!(!full_report(RunMode::Audit, pending_optional).setup_complete());
+    // Each required step holds setup open while it is pending.
+    for step in steps::default_steps() {
+        let id = step.id().to_string();
+        let report = full_report(RunMode::Install, |s| {
+            if s == id {
+                StepState::Queued
+            } else {
+                StepState::Done
+            }
+        });
+        assert_eq!(report.setup_complete(), optional(&id), "{id}");
+    }
+    // A failed optional step is unfinished business.
+    let failed = full_report(RunMode::Install, |s| {
+        if s == steps::STEP_MXC_POLICIES {
+            StepState::Failed
+        } else {
+            StepState::Done
+        }
+    });
+    assert!(!failed.setup_complete());
+    // A report without the required steps is not a complete one.
+    let empty = WizardReport {
+        mode: RunMode::Install,
+        steps: Vec::new(),
+    };
+    assert!(!empty.setup_complete());
 }
 
 #[test]

@@ -1,6 +1,50 @@
 use super::*;
 use crate::test_support::*;
 
+/// B20: the checklist a working install ends with — required steps
+/// done, optional ones skipped or never run — completes setup on the
+/// first status read of the next launch, before the wizard restores.
+#[tokio::test]
+async fn setup_status_completes_a_working_install() {
+    let (state, dir) = advanced_test_state(test_cfg());
+    let sink = test_sink();
+    let status = op_setup_status(&state, &sink).await.unwrap();
+    assert_eq!(status["setup_completed"], false, "a fresh install");
+
+    let mut report = Wizard::new(manager_wizard::steps::default_steps(), RunMode::Install)
+        .unwrap()
+        .report();
+    for s in &mut report.steps {
+        s.state = match s.id.as_str() {
+            "install-mxc" => StepState::Queued,
+            "mxc-policies" | "winml-register" => StepState::Skipped,
+            _ => StepState::Done,
+        };
+    }
+    let save = |report: &WizardReport| {
+        let text = serde_json::to_string(&json!({ "version": 1, "report": report })).unwrap();
+        std::fs::write(dir.join("wizard-state.json"), text).unwrap();
+    };
+    // A required step still pending: not complete.
+    let mut pending = report.clone();
+    pending
+        .steps
+        .iter_mut()
+        .find(|s| s.id == "start-gateway")
+        .unwrap()
+        .state = StepState::Queued;
+    save(&pending);
+    let status = op_setup_status(&state, &sink).await.unwrap();
+    assert_eq!(status["setup_completed"], false);
+
+    save(&report);
+    let status = op_setup_status(&state, &sink).await.unwrap();
+    assert_eq!(status["setup_completed"], true);
+    let saved = manager_config::load(&state.config_path).unwrap();
+    assert!(saved.setup_completed, "persisted");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A wizard step that, while it runs, lets the app make its own
 /// config change (clone-save-install, like every op), then returns
 /// typed config edits computed from its stale snapshot.

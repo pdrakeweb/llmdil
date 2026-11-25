@@ -456,6 +456,10 @@ server config, including any future Admin API endpoint:
   transport, command, args, env keys, `cred_ref`) or deleting it
   stops the old process first; an edited server that was running is
   started again with the new definition.
+- The app starts a Local server when its exposure is set to Local (or
+  a running one is edited), never at app launch: an stdio server serves
+  the program that launched it, and the app is not an MCP client.
+  `mcp_list` says so (`starts_with_app: false`, `blocked_reason`).
 - A Local server that exits on its own is reported as `failed`
   (`process_state` on `mcp_list`). It is not restarted
   automatically: there is no app-level crash-restart loop for any

@@ -71,6 +71,13 @@ pub const LLAMACPP_COMPONENT: &str = "llamacpp";
 pub const POSTGRES_COMPONENT: &str = "postgres";
 /// Component key of the MXC runtime.
 pub const MXC_COMPONENT: &str = "mxc";
+/// Every managed component, in display order.
+pub const COMPONENTS: &[&str] = &[
+    LLAMACPP_COMPONENT,
+    LITELLM_COMPONENT,
+    POSTGRES_COMPONENT,
+    MXC_COMPONENT,
+];
 /// `updates_apply` target meaning every applicable, unpinned component.
 pub const ALL_COMPONENTS: &str = "all";
 
@@ -339,7 +346,11 @@ pub struct ComponentReport {
     pub target_version: Option<String>,
     pub pinned: bool,
     pub pinned_version: Option<String>,
+    /// Always false while `auto_update_supported` is.
     pub auto_update: bool,
+    /// The app can update this component on its own. False for every
+    /// component today: nothing in the app applies one unattended.
+    pub auto_update_supported: bool,
     /// `target_version` is newer than what is installed (or pinned,
     /// for LiteLLM).
     pub update_available: bool,
@@ -353,23 +364,81 @@ pub struct ComponentReport {
     pub source: Option<String>,
 }
 
+/// Whether the app can update `component` unattended. Nothing does:
+/// llama.cpp and LiteLLM move only through `updates_apply`, the others
+/// only through Setup.
+pub(crate) fn auto_update_supported(_component: &str) -> bool {
+    false
+}
+
+/// What the release feeds said: the newest version (`None`: none
+/// found, or not checked) or why the feed failed.
+type Latest = Result<Option<String>, String>;
+
+/// One check's feed results.
+struct LatestVersions {
+    llamacpp: Latest,
+    litellm: Latest,
+    mxc: Latest,
+}
+
+impl LatestVersions {
+    async fn fetch(feed: &dyn ReleaseFeed) -> Self {
+        let (llama, litellm, mxc) = tokio::join!(
+            feed.get_text(LLAMACPP_RELEASES_URL),
+            feed.get_text(LITELLM_PYPI_URL),
+            feed.get_text(MXC_NPM_LATEST_URL),
+        );
+        Self {
+            llamacpp: llama.and_then(|b| latest_llamacpp_build(&b)),
+            litellm: litellm.and_then(|b| latest_litellm_release(&b)),
+            mxc: mxc.and_then(|b| npm_latest_version(&b)).map(Some),
+        }
+    }
+
+    /// The results recorded in a saved check (`last-check.json`).
+    fn from_saved(saved: &Value) -> Self {
+        let latest = |id: &str| -> Latest {
+            let row = saved
+                .get("components")
+                .and_then(Value::as_array)
+                .and_then(|rows| rows.iter().find(|r| r["id"] == id));
+            let text = |field: &str| {
+                row.and_then(|r| r.get(field))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            match text("check_error") {
+                Some(e) => Err(e),
+                None => Ok(text("latest_available")),
+            }
+        };
+        Self {
+            llamacpp: latest(LLAMACPP_COMPONENT),
+            litellm: latest(LITELLM_COMPONENT),
+            mxc: latest(MXC_COMPONENT),
+        }
+    }
+}
+
 /// Check every managed component against its release source.
 pub async fn check_components(
     cfg: &AppConfig,
     data_dir: &Path,
     feed: &dyn ReleaseFeed,
 ) -> Vec<ComponentReport> {
-    let (llama_body, litellm_body, mxc_body) = tokio::join!(
-        feed.get_text(LLAMACPP_RELEASES_URL),
-        feed.get_text(LITELLM_PYPI_URL),
-        feed.get_text(MXC_NPM_LATEST_URL),
-    );
+    component_reports(cfg, data_dir, LatestVersions::fetch(feed).await)
+}
+
+/// The component rows for what is installed and pinned now, against
+/// `versions`.
+fn component_reports(
+    cfg: &AppConfig,
+    data_dir: &Path,
+    versions: LatestVersions,
+) -> Vec<ComponentReport> {
     let auto = |c: &str| {
-        cfg.updates
-            .components
-            .get(c)
-            .map(|c| c.auto_update)
-            .unwrap_or(false)
+        auto_update_supported(c) && cfg.updates.components.get(c).is_some_and(|c| c.auto_update)
     };
 
     // llama.cpp
@@ -377,7 +446,7 @@ pub async fn check_components(
         let pin = LlamaCppPin::default_pin();
         let installed = installed_version(data_dir, LLAMACPP_COMPONENT);
         let pinned = pinned_version(cfg, LLAMACPP_COMPONENT);
-        let (latest, check_error) = match llama_body.and_then(|b| latest_llamacpp_build(&b)) {
+        let (latest, check_error) = match versions.llamacpp {
             Ok(v) => (v, None),
             Err(e) => (None, Some(e)),
         };
@@ -414,6 +483,7 @@ pub async fn check_components(
             pinned: pinned.is_some(),
             pinned_version: pinned,
             auto_update: auto(LLAMACPP_COMPONENT),
+            auto_update_supported: auto_update_supported(LLAMACPP_COMPONENT),
             update_available,
             applyable,
             note: (!notes.is_empty()).then(|| notes.join("; ")),
@@ -426,22 +496,27 @@ pub async fn check_components(
     let litellm = {
         let pin = litellm_pin(cfg);
         let installed = installed_version(data_dir, LITELLM_COMPONENT);
-        let (latest, check_error) = match litellm_body.and_then(|b| latest_litellm_release(&b)) {
+        let (latest, check_error) = match versions.litellm {
             Ok(v) => (v, None),
             Err(e) => (None, Some(e)),
         };
-        let current = installed.clone().unwrap_or_else(|| pin.clone());
-        let update_available = latest
-            .as_deref()
-            .is_some_and(|l| version_newer(l, &current) && version_newer(l, &pin));
+        // Nothing to update until LiteLLM is installed and measured.
+        let update_available = match (latest.as_deref(), installed.as_deref()) {
+            (Some(l), Some(i)) => version_newer(l, i) && version_newer(l, &pin),
+            _ => false,
+        };
         let mut notes = vec![
             "always pinned (finding F1): Apply moves the pin to the chosen version; nothing updates LiteLLM automatically"
                 .to_string(),
         ];
         if installed.is_none() {
-            notes.push(format!(
-                "installed version not measured yet (no gateway start recorded); the pin is {pin}"
-            ));
+            notes.push(if data_dir.join("python").join("venv").is_dir() {
+                format!(
+                    "installed version not measured yet (no gateway start recorded); the pin is {pin}"
+                )
+            } else {
+                format!("not installed — run the start-gateway setup step; it installs the pin {pin}")
+            });
         } else if installed.as_deref() != Some(pin.as_str()) {
             notes.push(format!(
                 "the gateway last ran {} but the pin is {pin}; the next gateway start installs the pin",
@@ -457,6 +532,7 @@ pub async fn check_components(
             pinned: true,
             pinned_version: Some(pin),
             auto_update: auto(LITELLM_COMPONENT),
+            auto_update_supported: auto_update_supported(LITELLM_COMPONENT),
             update_available,
             applyable: update_available,
             note: Some(notes.join("; ")),
@@ -482,6 +558,7 @@ pub async fn check_components(
             pinned: pinned.is_some(),
             pinned_version: pinned,
             auto_update: auto(POSTGRES_COMPONENT),
+            auto_update_supported: auto_update_supported(POSTGRES_COMPONENT),
             update_available,
             applyable: false,
             note: Some(
@@ -498,8 +575,8 @@ pub async fn check_components(
         let pin = MxcSdkPin::default_pin();
         let installed = installed_version(data_dir, MXC_COMPONENT);
         let pinned = pinned_version(cfg, MXC_COMPONENT);
-        let (latest, check_error) = match mxc_body.and_then(|b| npm_latest_version(&b)) {
-            Ok(v) => (Some(v), None),
+        let (latest, check_error) = match versions.mxc {
+            Ok(v) => (v, None),
             Err(e) => (None, Some(e)),
         };
         let update_available = installed
@@ -526,6 +603,7 @@ pub async fn check_components(
             pinned: pinned.is_some(),
             pinned_version: pinned,
             auto_update: auto(MXC_COMPONENT),
+            auto_update_supported: auto_update_supported(MXC_COMPONENT),
             update_available,
             applyable: false,
             note: Some(notes.join("; ")),
@@ -539,6 +617,27 @@ pub async fn check_components(
 
 fn updates_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("updates")
+}
+
+fn last_check_path(data_dir: &Path) -> PathBuf {
+    updates_dir(data_dir).join("last-check.json")
+}
+
+/// `updates_list`: the component rows without contacting any feed. The
+/// upstream side (latest version, feed error) is the last check's, its
+/// time in `checked_at` (null: never checked); the local side (what is
+/// installed, pinned, applyable) is read now.
+pub async fn op_list(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
+    let cfg = state.config.read().await.clone();
+    let saved: Value = std::fs::read_to_string(last_check_path(&state.data_dir))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+    let components = component_reports(&cfg, &state.data_dir, LatestVersions::from_saved(&saved));
+    Ok(json!({
+        "checked_at": saved.get("checked_at").cloned().unwrap_or(Value::Null),
+        "components": components,
+    }))
 }
 
 /// Best-effort JSON write (cache / history): never fails the caller.
@@ -562,10 +661,7 @@ pub(crate) async fn check_all_with(state: &Arc<AppState>, feed: &dyn ReleaseFeed
         "checked_at": checked_at.to_rfc3339(),
         "components": components,
     });
-    write_json_best_effort(
-        &updates_dir(&state.data_dir).join("last-check.json"),
-        &payload,
-    );
+    write_json_best_effort(&last_check_path(&state.data_dir), &payload);
     // Stamp last_checked on the components the config already tracks
     // (clone → save → install; a failed save leaves memory as it was
     // and does not fail the check). Entries are never created here.
@@ -634,6 +730,40 @@ fn validate_litellm_version(version: &str) -> Result<(), ApiError> {
         )));
     }
     Ok(())
+}
+
+/// Validate an operator's pin: a managed component and a version it
+/// can be held at. LiteLLM takes any final release; the binary
+/// components install only this build's verified version, so a pin
+/// names that one or the one already installed.
+pub(crate) fn validate_pin(
+    data_dir: &Path,
+    component: &str,
+    version: Option<&str>,
+) -> Result<(), ApiError> {
+    if !COMPONENTS.contains(&component) {
+        return Err(ApiError::NotFound(format!("component {component}")));
+    }
+    let Some(version) = version else {
+        return Ok(());
+    };
+    let verified = match component {
+        LLAMACPP_COMPONENT => LlamaCppPin::default_pin().tag,
+        POSTGRES_COMPONENT => PostgresPin::default_pin().version,
+        MXC_COMPONENT => MxcSdkPin::default_pin().version,
+        _ => return validate_litellm_version(version),
+    };
+    let installed = installed_version(data_dir, component);
+    if version == verified || installed.as_deref() == Some(version) {
+        return Ok(());
+    }
+    Err(ApiError::InvalidInput(format!(
+        "{component} cannot be pinned to '{version}': this build installs only {verified}{}",
+        match installed {
+            Some(i) if i != verified => format!(" (installed: {i})"),
+            _ => String::new(),
+        }
+    )))
 }
 
 /// Plan an apply. Pure apart from the PyPI lookup that vets an
@@ -1451,15 +1581,12 @@ impl UpdateEnv for AppUpdateEnv {
         }
     }
     async fn set_litellm_pin(&self, version: &str) -> Result<(), String> {
-        crate::op_updates_pin(
-            &self.state,
-            &self.sink,
-            LITELLM_COMPONENT.to_string(),
-            Some(version.to_string()),
-        )
-        .await
-        .map(|_| ())
-        .map_err(api_err)
+        // Not op_updates_pin: the plan validated the target, and a
+        // rollback must be able to restore whatever pin was in force.
+        crate::save_component_pin(&self.state, LITELLM_COMPONENT, Some(version.to_string()))
+            .await
+            .map(|_| ())
+            .map_err(api_err)
     }
     async fn installed_version(&self, component: &str) -> Option<String> {
         installed_version(&self.state.data_dir, component)

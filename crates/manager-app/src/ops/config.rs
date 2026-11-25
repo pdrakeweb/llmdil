@@ -12,6 +12,8 @@ pub async fn op_get_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) ->
         "gateway_port": cfg.gateway.port,
         "winml_enabled": cfg.winml.enabled,
         "mxc_mode": cfg.mxc.mode,
+        "mxc_runtime_installed": manager_wizard::steps::installed_mxc_runtime(&state.data_dir)
+            .is_some(),
     });
     // Additive field (finding F2): present only when the shell recorded
     // the startup load outcome.
@@ -58,6 +60,11 @@ pub async fn op_update_config(
     let mut v = serde_json::to_value(&*cfg)?;
     merge_json(&mut v, patch);
     let mut new_cfg: AppConfig = serde_json::from_value(v)?;
+    // The mode rule of mxc_set_mode holds here too; a mode already in
+    // the file is not a change and does not block other edits.
+    if new_cfg.mxc.mode != cfg.mxc.mode {
+        check_mxc_mode(&state.data_dir, new_cfg.mxc.mode)?;
+    }
     // Reserved temp-backend namespace (code review B-3): a patch
     // may not introduce a NEW backend whose id falls in the
     // `opt-exp-*` experiment namespace — the same reservation
@@ -142,6 +149,12 @@ pub async fn op_notifications_set_config(
 /// path, and a master switch set to off must not make it look broken
 /// — the card reports the switch state separately. A send error is
 /// returned so the card can show why delivery failed.
+///
+/// `ok` means Windows accepted the toast. Whether it appeared is not
+/// knowable from here, so `delivery_confirmed` is always false;
+/// `windows_setting` is `off` when Windows Settings switches
+/// notifications off (for all apps or for this one), else `on`, and
+/// null where it cannot be read.
 pub async fn op_notifications_send_test(
     _state: &Arc<AppState>,
     sink: &Arc<dyn EventSink>,
@@ -152,8 +165,25 @@ pub async fn op_notifications_send_test(
         "Toast delivery is working. Event notifications follow the switches on this card.",
     )
     .map_err(ApiError::Io)?;
-    Ok(json!({ "ok": true }))
+    #[cfg(windows)]
+    let off = Some(manager_wizard::ops::toasts_switched_off(TOAST_APP_ID));
+    #[cfg(not(windows))]
+    let off: Option<bool> = None;
+    Ok(json!({
+        "ok": true,
+        "delivery_confirmed": false,
+        "app_user_model_id": TOAST_APP_ID,
+        "windows_setting": off.map(|off| if off { "off" } else { "on" }),
+        "detail": match off {
+            Some(true) => "Sent, but notifications for LLMdil are switched off in Windows Settings, so Windows will not show it.",
+            _ => "Sent to Windows. If nothing appeared, look in the notification center and check Do Not Disturb.",
+        },
+    }))
 }
+
+/// The AppUserModelID the shell's toasts are sent under (the
+/// `identifier` in src-tauri/tauri.conf.json).
+const TOAST_APP_ID: &str = "com.pdrakeweb.llm-manager";
 
 #[cfg(test)]
 mod tests;

@@ -742,8 +742,10 @@ pub async fn op_setup_get_steps(state: &Arc<AppState>, _sink: &Arc<dyn EventSink
 }
 
 /// Whether the user has finished the setup wizard. The UI opens the wizard
-/// on launch until this is true.
+/// on launch until this is true, so a complete checklist sets the flag
+/// here first (`AppState::reconcile_setup_completed`).
 pub async fn op_setup_status(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
+    state.reconcile_setup_completed().await;
     let cfg = state.config.read().await;
     Ok(json!({ "setup_completed": cfg.setup_completed }))
 }

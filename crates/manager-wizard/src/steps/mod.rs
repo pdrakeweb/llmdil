@@ -58,6 +58,16 @@ pub const STEP_INSTALL_MXC: &str = "install-mxc";
 pub const STEP_MXC_POLICIES: &str = "mxc-policies";
 pub const STEP_SMOKE_TEST: &str = "smoke-test";
 
+/// Steps setup can be finished without: editor integration, MCP
+/// servers, Windows ML and the MXC sandbox.
+pub const OPTIONAL_STEPS: &[&str] = &[
+    STEP_VSCODE_EXTENSIONS,
+    STEP_MCP_SERVERS,
+    STEP_WINML_REGISTER,
+    STEP_INSTALL_MXC,
+    STEP_MXC_POLICIES,
+];
+
 /// Resolve a possibly-relative path against the data dir.
 fn resolve_dest(data_dir: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {

@@ -3,6 +3,7 @@
     "backends_configured": 4,
     "gateway_port": 4000,
     "mxc_mode": "learning",
+    "mxc_runtime_installed": false,
     "status": "ok",
     "version": "<string>",
     "winml_enabled": false

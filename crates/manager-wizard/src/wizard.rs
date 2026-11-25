@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Why a start-gateway Done is not (or not fully) trusted after the
+/// saved configuration moved on.
+const GATEWAY_DRIFT_NOTE: &str = "gateway configuration changed since the gateway was started";
+
 /// Ordered auto-runner for the wizard steps.
 ///
 /// Semantics:
@@ -188,10 +192,8 @@ impl Wizard {
                 // instance already holds Done for the step, the note
                 // would contradict the displayed state.
                 if !matches!(current, Some(StepState::Done | StepState::Manual)) {
-                    self.notes.insert(
-                        step.id.clone(),
-                        "gateway configuration changed since the gateway was started".to_string(),
-                    );
+                    self.notes
+                        .insert(step.id.clone(), GATEWAY_DRIFT_NOTE.to_string());
                 }
                 continue;
             }
@@ -216,11 +218,20 @@ impl Wizard {
     /// other mode is rejected wholesale (audit outcomes must go
     /// through `hydrate`, never restore). The one outcome restore
     /// does not adopt verbatim is a completed start-gateway when
-    /// `gateway_config_current` is false: the persisted Done records
-    /// the configuration the gateway was started with, and drift
-    /// since then means the step has to run again (same rule as
-    /// [`Self::hydrate`]), so it comes back Queued with a note.
-    pub fn restore(&mut self, report: &WizardReport, gateway_config_current: bool) {
+    /// `gateway_config_current` is false. With the gateway stopped the
+    /// step has to run again, so it comes back Queued with a note.
+    /// While the gateway is running (`gateway_running`) the step did
+    /// complete — pending changes are the activation plan's concern —
+    /// so it stays Done with the note: a second reader of the saved
+    /// state (another instance, or one that cannot read the gateway's
+    /// credentials) must not turn a running gateway back into an
+    /// unfinished step.
+    pub fn restore(
+        &mut self,
+        report: &WizardReport,
+        gateway_config_current: bool,
+        gateway_running: bool,
+    ) {
         if report.mode != self.mode {
             return;
         }
@@ -233,13 +244,21 @@ impl Wizard {
                 continue;
             }
             if step.id == steps::STEP_START_GATEWAY
-                && !gateway_config_current
                 && matches!(step.state, StepState::Done | StepState::Manual)
             {
-                self.notes.insert(
-                    step.id.clone(),
-                    "gateway configuration changed since the gateway was started".to_string(),
-                );
+                if !gateway_config_current && !gateway_running {
+                    self.notes
+                        .insert(step.id.clone(), GATEWAY_DRIFT_NOTE.to_string());
+                    continue;
+                }
+                let mut r = step.clone();
+                if !gateway_config_current {
+                    r.note = Some(GATEWAY_DRIFT_NOTE.to_string());
+                } else if r.note.as_deref() == Some(GATEWAY_DRIFT_NOTE) {
+                    r.note = None;
+                }
+                self.states.insert(step.id.clone(), r.state);
+                self.reports.insert(step.id.clone(), r);
                 continue;
             }
             if step.state == StepState::Running {

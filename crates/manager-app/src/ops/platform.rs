@@ -18,7 +18,28 @@ pub async fn op_get_mxc_policy(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>
         Ok(text) => (serde_json::from_str::<Value>(&text)?, "file"),
         Err(_) => (serde_json::to_value(Policy::default_policy())?, "default"),
     };
-    Ok(json!({ "policy": policy, "source": source, "mode": cfg.mxc.mode }))
+    let runtime = manager_wizard::steps::installed_mxc_runtime(&state.data_dir);
+    Ok(json!({
+        "policy": policy,
+        "source": source,
+        "mode": cfg.mxc.mode,
+        "runtime_installed": runtime.is_some(),
+        "runtime_version": runtime.and_then(|r| r.version),
+    }))
+}
+
+/// Refuse `enforced` without a runtime to enforce it: accepting the mode
+/// would show a protection that does not exist. Learning and disabled
+/// promise nothing and are always allowed.
+pub(crate) fn check_mxc_mode(data_dir: &std::path::Path, mode: MxcMode) -> Result<(), ApiError> {
+    if mode == MxcMode::Enforced && manager_wizard::steps::installed_mxc_runtime(data_dir).is_none()
+    {
+        return Err(ApiError::InvalidInput(
+            "the MXC runtime is not installed, so nothing can enforce the policy. Run the Install MXC runtime setup step first."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate and store a new sandbox policy. The validator returns a
@@ -60,12 +81,14 @@ pub async fn op_update_mxc_policy(
 /// Set the MXC enforcement mode and persist it: the mode is set on a
 /// clone of the config, the clone is saved via `manager_config::save`,
 /// and only a successful save installs it in memory. `persisted` is
-/// true only after that save.
+/// true only after that save. `enforced` is refused while the MXC
+/// runtime is not installed ([`check_mxc_mode`]).
 pub async fn op_mxc_set_mode(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
     mode: MxcMode,
 ) -> ApiResult {
+    check_mxc_mode(&state.data_dir, mode)?;
     let mut cfg = state.config.write().await;
     let mut new_cfg = cfg.clone();
     new_cfg.mxc.mode = mode;
@@ -76,13 +99,28 @@ pub async fn op_mxc_set_mode(
 
 /// Run the MXC policy self-test against the current policy. Harmless by
 /// construction: probes are pure policy evaluations, nothing is executed
-/// and no network traffic is sent.
+/// and no network traffic is sent. `checked` is always `policy_only`:
+/// the result says nothing about the runtime, whose presence is
+/// reported beside it (`runtime_installed`, `runtime_version`).
 pub async fn op_mxc_run_self_test(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
     let cfg = state.config.read().await;
     let policy = current_mxc_policy(&cfg)?;
     let cases = manager_mxc::self_test(&policy);
     let summary = manager_mxc::summarize_self_test(&cases);
-    Ok(json!({ "cases": cases, "summary": summary }))
+    let runtime = manager_wizard::steps::installed_mxc_runtime(&state.data_dir);
+    let detail = if runtime.is_some() {
+        "Checked the policy rules only; the MXC runtime was not exercised."
+    } else {
+        "Checked the policy rules only. The MXC runtime is not installed, so nothing is sandboxed."
+    };
+    Ok(json!({
+        "cases": cases,
+        "summary": summary,
+        "checked": "policy_only",
+        "detail": detail,
+        "runtime_installed": runtime.is_some(),
+        "runtime_version": runtime.and_then(|r| r.version),
+    }))
 }
 
 /// Learning-mode activity report from `<data_dir>/mxc-activity-report.json`;
@@ -213,6 +251,13 @@ pub async fn op_updates_check_all(state: &Arc<AppState>, sink: &Arc<dyn EventSin
     updates::op_check_all(state, sink).await
 }
 
+/// The component rows without a network check: the last check's
+/// results with its time, over what is installed and pinned now. See
+/// the `updates` module.
+pub async fn op_updates_list(state: &Arc<AppState>, sink: &Arc<dyn EventSink>) -> ApiResult {
+    updates::op_list(state, sink).await
+}
+
 /// Apply an update to one component, or to every applicable unpinned
 /// component (`component_id = "all"`), as a cancellable task. LiteLLM
 /// requires an explicit `version` (it moves only by a newer pin). See
@@ -226,44 +271,68 @@ pub async fn op_updates_apply(
     updates::op_apply(state, sink, component_id, version).await
 }
 
-/// Pin a component to a version and persist it: the pin is set on a
-/// clone of the config, the clone is saved via `manager_config::save`,
-/// and only a successful save installs it in memory. `persisted` is
-/// true only after that save; on failure the in-memory config is
-/// unchanged and the error surfaces.
+/// Pin a component to a version (`None`: unpin) and persist it. An
+/// unknown component, a malformed version and a version this build
+/// cannot install are refused (`updates::validate_pin`).
 pub async fn op_updates_pin(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
     component_id: String,
     version: Option<String>,
 ) -> ApiResult {
-    let mut cfg = state.config.write().await;
-    let mut new_cfg = cfg.clone();
-    new_cfg
-        .updates
-        .components
-        .entry(component_id.clone())
-        .and_modify(|c| c.pinned_version = version.clone())
-        .or_insert(ComponentUpdate {
-            pinned_version: version.clone(),
-            auto_update: true,
-            last_checked: None,
-        });
-    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
-    *cfg = new_cfg;
+    let version = version
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    updates::validate_pin(&state.data_dir, &component_id, version.as_deref())?;
+    save_component_pin(state, &component_id, version.clone()).await?;
     Ok(
         json!({ "ok": true, "persisted": true, "component_id": component_id, "pinned_version": version }),
     )
 }
 
+/// Persist a component's pin, unvalidated: the pin is set on a clone of
+/// the config, the clone is saved via `manager_config::save`, and only
+/// a successful save installs it in memory.
+pub(crate) async fn save_component_pin(
+    state: &AppState,
+    component_id: &str,
+    version: Option<String>,
+) -> Result<(), ApiError> {
+    let mut cfg = state.config.write().await;
+    let mut new_cfg = cfg.clone();
+    new_cfg
+        .updates
+        .components
+        .entry(component_id.to_string())
+        .and_modify(|c| c.pinned_version = version.clone())
+        .or_insert(ComponentUpdate {
+            pinned_version: version,
+            auto_update: false,
+            last_checked: None,
+        });
+    manager_config::save(&new_cfg, &state.config_path).map_err(ApiError::from)?;
+    *cfg = new_cfg;
+    Ok(())
+}
+
 /// Toggle auto-update for a component and persist it: same
-/// clone → save → install pattern as [`updates_pin`].
+/// clone → save → install pattern as [`save_component_pin`]. Turning
+/// it on is refused for a component the app cannot update on its own
+/// (`auto_update_supported` on its row).
 pub async fn op_updates_set_auto(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
     component_id: String,
     enabled: bool,
 ) -> ApiResult {
+    if !updates::COMPONENTS.contains(&component_id.as_str()) {
+        return Err(ApiError::NotFound(format!("component {component_id}")));
+    }
+    if enabled && !updates::auto_update_supported(&component_id) {
+        return Err(ApiError::Unsupported(format!(
+            "{component_id} has no automatic updates; update it from the Components list"
+        )));
+    }
     let mut cfg = state.config.write().await;
     let mut new_cfg = cfg.clone();
     new_cfg

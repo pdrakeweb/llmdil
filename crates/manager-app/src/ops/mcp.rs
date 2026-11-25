@@ -32,45 +32,52 @@ pub async fn op_mcp_list(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> A
     })
     .await
     .map_err(|e| ApiError::Mcp(format!("presence check failed: {e}")))?;
-    let entries: Vec<McpListEntry> = registry
-        .iter()
-        .zip(servers.iter())
-        .zip(found_targets.iter())
-        .map(|((cfg, spec), found)| {
-            let present = found.is_some();
-            McpListEntry {
-                id: cfg.id.clone(),
-                display_name: spec.name.clone(),
-                name: spec.name.clone(),
-                transport: cfg.transport,
-                exposure: cfg.exposure,
-                mode: spec.mode,
-                command: cfg.command.clone(),
-                args: cfg.args.clone(),
-                url: cfg.url.clone(),
-                env_keys: cfg.env_keys.clone(),
-                cred_ref: cfg.cred_ref.clone(),
-                signup_url: mcp_signup_url(cfg),
-                credential_hint: mcp_credential_hint(cfg),
-                allowed_tools: cfg.allowed_tools.clone(),
-                metered: cfg.metered,
-                rpm_limit: cfg.rpm_limit,
-                running: running.get(&cfg.id).copied().unwrap_or(false),
-                process_state: process_states
-                    .get(&cfg.id)
-                    .copied()
-                    .unwrap_or(ProcessState::Stopped),
-                credential_present: present,
-                credential_status: if present {
-                    "present".to_string()
-                } else {
-                    "missing".to_string()
-                },
-                credential_target_found: found.clone(),
-                credential_presence: cfg.env_keys.iter().map(|k| (k.clone(), present)).collect(),
+    let mut entries: Vec<McpListEntry> = Vec::with_capacity(registry.len());
+    for ((cfg, spec), found) in registry.iter().zip(&servers).zip(&found_targets) {
+        let present = found.is_some();
+        let required = !cfg.env_keys.is_empty();
+        let process_state = process_states
+            .get(&cfg.id)
+            .copied()
+            .unwrap_or(ProcessState::Stopped);
+        // The gateway reads the server's own target only; the first
+        // accepted target is that one.
+        let credential_stored = present && *found == cfg.cred_ref;
+        let blocked_reason =
+            mcp_local::blocked_reason(state, cfg, process_state, credential_stored).await;
+        entries.push(McpListEntry {
+            id: cfg.id.clone(),
+            display_name: spec.name.clone(),
+            name: spec.name.clone(),
+            transport: cfg.transport,
+            exposure: cfg.exposure,
+            mode: spec.mode,
+            command: cfg.command.clone(),
+            args: cfg.args.clone(),
+            url: cfg.url.clone(),
+            env_keys: cfg.env_keys.clone(),
+            cred_ref: cfg.cred_ref.clone(),
+            signup_url: mcp_signup_url(cfg),
+            credential_hint: mcp_credential_hint(cfg),
+            allowed_tools: cfg.allowed_tools.clone(),
+            metered: cfg.metered,
+            rpm_limit: cfg.rpm_limit,
+            running: running.get(&cfg.id).copied().unwrap_or(false),
+            process_state,
+            starts_with_app: false,
+            blocked_reason,
+            credential_required: required,
+            credential_present: present,
+            credential_status: match (present, required) {
+                (true, _) => "present",
+                (false, true) => "missing",
+                (false, false) => "not_required",
             }
-        })
-        .collect();
+            .to_string(),
+            credential_target_found: found.clone(),
+            credential_presence: cfg.env_keys.iter().map(|k| (k.clone(), present)).collect(),
+        });
+    }
     Ok(serde_json::to_value(&entries)?)
 }
 
@@ -198,19 +205,23 @@ pub async fn op_mcp_test_connection(
             if let Err(e) = manager_mcp::local::local_launch(entry) {
                 return Ok(json!({ "id": id, "ok": false, "detail": e.to_string() }));
             }
-            let running = {
+            let process_state = {
                 let mut sup = state.supervisor().await.lock().await;
                 sup.reap_exited();
-                manager_mcp::list_status(&sup, std::slice::from_ref(server))
-                    .into_iter()
-                    .next()
-                    .map(|s| s.running)
-                    .unwrap_or(false)
+                mcp_local::process_state(&sup, &id)
+            };
+            let detail = if process_state == ProcessState::Running {
+                "supervised process running".to_string()
+            } else {
+                match mcp_local::blocked_reason(state, entry, process_state, false).await {
+                    Some(why) => format!("supervised process not running: {why}"),
+                    None => "supervised process not running".to_string(),
+                }
             };
             Ok(json!({
                 "id": id,
-                "ok": running,
-                "detail": if running { "supervised process running" } else { "supervised process not running" },
+                "ok": process_state == ProcessState::Running,
+                "detail": detail,
             }))
         }
         manager_mcp::McpMode::Remote => {
@@ -436,11 +447,20 @@ pub(crate) struct McpListEntry {
     /// `failed` ...): `failed` once a Local server that exited on its
     /// own was reaped (PS-5 crash visibility; additive field).
     pub process_state: ProcessState,
+    /// Whether the app starts this server when it opens. Always false:
+    /// see [`mcp_local::blocked_reason`].
+    pub starts_with_app: bool,
+    /// Why an enabled server is not usable right now, in plain words;
+    /// null when it is running, served by the gateway, or disabled.
+    pub blocked_reason: Option<String>,
+    /// The server declares env keys, so it needs a credential.
+    pub credential_required: bool,
     /// Credential presence over the accepted targets (see
     /// `credential_target_found`): true when any accepted target
     /// exists.
     pub credential_present: bool,
-    /// `"present"` | `"missing"` — the §9 card wording.
+    /// `"present"` | `"missing"` | `"not_required"` — the §9 card
+    /// wording.
     pub credential_status: String,
     /// Which accepted Credential Manager target was found, when
     /// one was (dual-target acceptance, design §10.1: for the two

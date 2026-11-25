@@ -122,6 +122,69 @@ pub(crate) async fn check_runnable(
     local::check_credential_presence(&spec, |t| present.as_deref() == Some(t))
 }
 
+/// Why a start of this Local server would fail right now, in plain
+/// words (`None`: it can start). The same checks as [`check_runnable`].
+async fn start_problem(state: &AppState, cfg: &McpServerConfig) -> Option<String> {
+    Some(match check_runnable(state, cfg).await.err()? {
+        LocalSpecError::CredentialMissing { .. } => {
+            "credential missing: store it to start this server".to_string()
+        }
+        LocalSpecError::CommandNotFound { command, .. } => format!("{command} not found on PATH"),
+        e => e.to_string(),
+    })
+}
+
+/// Why an enabled server is not usable right now, in plain words, or
+/// `None`. `state_now` is its process state; `credential_stored` is
+/// whether its own `cred_ref` is in the credential store (the target
+/// the gateway reads).
+///
+/// The app starts a Local server when its exposure is set to Local, and
+/// never at app launch: an stdio server serves the program that
+/// launched it, and the app has no MCP client of its own. Gateway
+/// servers are started by the gateway, which leaves out one whose
+/// credential is missing.
+pub(crate) async fn blocked_reason(
+    state: &AppState,
+    cfg: &McpServerConfig,
+    state_now: ProcessState,
+    credential_stored: bool,
+) -> Option<String> {
+    match cfg.exposure {
+        McpExposure::Disabled => None,
+        McpExposure::Gateway => {
+            if cfg.env_keys.is_empty() || credential_stored {
+                return None;
+            }
+            let named = cfg
+                .cred_ref
+                .as_deref()
+                .is_some_and(|r| !r.trim().is_empty());
+            Some(if named {
+                "credential missing: the gateway leaves this server out until it is stored"
+                    .to_string()
+            } else {
+                "no credential target is set, so the gateway leaves this server out".to_string()
+            })
+        }
+        McpExposure::Local => {
+            if state_now == ProcessState::Running {
+                return None;
+            }
+            if let Some(problem) = start_problem(state, cfg).await {
+                return Some(problem);
+            }
+            Some(if state_now == ProcessState::Failed {
+                "the process exited on its own; see its log. Turn it off and on to start it again"
+                    .to_string()
+            } else {
+                "not started: LLMdil does not start local servers when it opens. Turn it off and on to start it"
+                    .to_string()
+            })
+        }
+    }
+}
+
 /// Start a Local server from its registry entry. Every check runs
 /// again here (a config edited on disk never went through save-time
 /// validation). A live process under the same id is stopped first so
@@ -254,6 +317,82 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
+
+    async fn row(state: &Arc<AppState>, id: &str) -> Value {
+        op_mcp_list(state, &sink())
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap()
+            .clone()
+    }
+
+    /// B19: a stopped Local server, and a gateway server without its
+    /// credential, say why; a server that needs no credential is not
+    /// missing one.
+    #[tokio::test]
+    async fn rows_say_why_a_server_is_not_running() {
+        let (state, dir) = test_state("blocked");
+        let (command, args) = fake_node(&dir, 60);
+        let mut local = operator_server("blocked_local", &command, args);
+        local.exposure = McpExposure::Local;
+        let mut free = operator_server("blocked_free", "node", Vec::new());
+        free.env_keys = Vec::new();
+        free.cred_ref = None;
+        let mut gateway = operator_server("blocked_gateway", "npx", Vec::new());
+        gateway.exposure = McpExposure::Gateway;
+        gateway.metered = true;
+        gateway.allowed_tools = Some(vec!["t".into()]);
+        gateway.rpm_limit = Some(20);
+        for server in [&local, &free, &gateway] {
+            op_mcp_save_server(&state, &sink(), server.clone())
+                .await
+                .unwrap();
+        }
+
+        // The save left the Local server without a credential.
+        let r = row(&state, "blocked_local").await;
+        assert_eq!(r["credential_required"], true);
+        assert_eq!(r["credential_status"], "missing");
+        assert_eq!(r["starts_with_app"], false);
+        let why = r["blocked_reason"].as_str().unwrap();
+        assert!(why.starts_with("credential missing"), "{why}");
+        let t = op_mcp_test_connection(&state, &sink(), "blocked_local".into())
+            .await
+            .unwrap();
+        assert_eq!(t["ok"], false);
+        assert!(t["detail"].as_str().unwrap().contains(why), "{t}");
+
+        // Startable, but nothing started it.
+        creds::set("test/blocked_local", "v");
+        let why = row(&state, "blocked_local").await["blocked_reason"].clone();
+        assert!(why.as_str().unwrap().starts_with("not started"), "{why}");
+
+        // The command is gone.
+        let mut gone = local.clone();
+        gone.command = Some(dir.join("npx").to_string_lossy().into_owned());
+        let why = blocked_reason(&state, &gone, ProcessState::Stopped, true)
+            .await
+            .unwrap();
+        assert!(why.contains("not found"), "{why}");
+
+        // No credential needed: not missing; disabled: not blocked.
+        let r = row(&state, "blocked_free").await;
+        assert_eq!(r["credential_required"], false);
+        assert_eq!(r["credential_status"], "not_required");
+        assert!(r["blocked_reason"].is_null(), "{r}");
+
+        // The gateway leaves it out.
+        let why = row(&state, "blocked_gateway").await["blocked_reason"].clone();
+        assert!(
+            why.as_str().unwrap().starts_with("credential missing"),
+            "{why}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn test_state(tag: &str) -> (Arc<AppState>, PathBuf) {
         let dir = std::env::temp_dir().join(format!(

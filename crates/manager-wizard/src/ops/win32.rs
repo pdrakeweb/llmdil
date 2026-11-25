@@ -160,6 +160,42 @@ fn reg_default_string(
     }
 }
 
+/// A DWORD value under `HKEY_CURRENT_USER`; `None` on any failure
+/// (missing key/value, other type).
+#[cfg(windows)]
+fn reg_user_dword(subkey: &str, value: &str) -> Option<u32> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let mut data: u32 = 0;
+    let mut len = std::mem::size_of::<u32>() as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide(subkey).as_ptr(),
+            wide(value).as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&mut data as *mut u32).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(data)
+}
+
+/// Whether Windows Settings has notifications switched off, for every
+/// app or for `app_id`. Windows writes these values only when they
+/// differ from the default (on). Do Not Disturb / Focus is not covered:
+/// it has no documented value to read.
+#[cfg(windows)]
+pub fn toasts_switched_off(app_id: &str) -> bool {
+    const ROOT: &str = r"Software\Microsoft\Windows\CurrentVersion";
+    reg_user_dword(&format!(r"{ROOT}\PushNotifications"), "ToastEnabled") == Some(0)
+        || reg_user_dword(
+            &format!(r"{ROOT}\Notifications\Settings\{app_id}"),
+            "Enabled",
+        ) == Some(0)
+}
+
 /// Locate the VS Code CLI without relying on this process's PATH.
 ///
 /// A GUI process inherits the environment of whatever launched it,

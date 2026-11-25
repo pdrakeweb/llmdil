@@ -1,6 +1,23 @@
 use super::*;
 use crate::test_support::*;
 
+/// T-95: the test toast reports what is known and claims no delivery;
+/// the app id it reads settings for is the shell's identifier.
+#[tokio::test]
+async fn test_notification_claims_no_delivery() {
+    let (state, dir) = advanced_test_state(test_cfg());
+    let v = op_notifications_send_test(&state, &test_sink())
+        .await
+        .unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["delivery_confirmed"], false);
+    let conf =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src-tauri/tauri.conf.json");
+    let conf: Value = serde_json::from_str(&std::fs::read_to_string(conf).unwrap()).unwrap();
+    assert_eq!(v["app_user_model_id"], conf["identifier"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// F2 (docs/code-review-v0.1.60.md): `get_status` carries the
 /// startup config-load outcome once the shell records it, and
 /// omits the field otherwise.
@@ -171,26 +188,27 @@ async fn settings_controls_round_trip_through_real_ops() {
     op_updates_pin(&state, &sink, "litellm".to_string(), None)
         .await
         .unwrap();
-    op_updates_set_auto(&state, &sink, "litellm".to_string(), true)
+    // Nothing updates LiteLLM automatically: refused, not stored (B18).
+    let err = op_updates_set_auto(&state, &sink, "litellm".to_string(), true)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Unsupported(_)), "{err}");
     let loaded = manager_config::load(&state.config_path).unwrap();
     let comp = loaded.updates.components.get("litellm").unwrap();
     // LiteLLM is never left unpinned (finding F1,
     // docs/code-review-v0.1.60.md): the unpin persists, and the
-    // load-time backfill restores the default pin. The auto flag is
-    // the operator's and round-trips untouched.
+    // load-time backfill restores the default pin.
     assert_eq!(
         comp.pinned_version.as_deref(),
         Some(manager_config::DEFAULT_LITELLM_PIN)
     );
-    assert!(comp.auto_update);
+    assert!(!comp.auto_update);
     // Unpin round-trips as None for components without a default pin.
     op_updates_pin(
         &state,
         &sink,
         "llamacpp".to_string(),
-        Some("b1".to_string()),
+        Some(manager_wizard::steps::LlamaCppPin::default_pin().tag),
     )
     .await
     .unwrap();

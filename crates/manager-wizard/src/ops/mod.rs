@@ -117,6 +117,8 @@ mod win32;
 use self::command::*;
 use self::http::*;
 pub use self::process::*;
+#[cfg(windows)]
+pub use self::win32::toasts_switched_off;
 #[cfg(any(windows, test))]
 use self::win32::*;
 
