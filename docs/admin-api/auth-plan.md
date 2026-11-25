@@ -43,7 +43,12 @@ construction), `tasks_list`, `placement_propose` (a dry-run
 calculation), `gateway_preview_yaml`, `gateway_test_routing`,
 `gateway_activation_plan`, `backend_preview_diff`,
 `setup_status` and the other setup reads, `winml_status`,
-`mxc_get_activity_report`, `updates_check_all`, `mcp_list`.
+`mxc_get_activity_report`, `updates_check_all`, `mcp_list`,
+`mcp_start_preflight`, `services_list`, `log_receiver_status`
+(both without local paths over the API), `backend_add_preview`,
+`backend_cache_preview`, `model_hf_lookup`, `model_hf_header`,
+`optimize_get_state`, `optimize_tuning_preview`,
+`bench_prompts_list`, `bench_results_list`.
 
 ### Class S — sensitive reads (credential-adjacent)
 
@@ -77,7 +82,13 @@ routeless — server bookkeeping, never a client call) / plan apply
 (executes already-saved changes), `download_model`, `model_pause_download`,
 `model_resume_download`, `cancel_download`, `task_abort`,
 `model_verify_checksum`, `telemetry_reset_peaks`,
-`telemetry_save_snapshot`.
+`telemetry_save_snapshot`, `backend_test_tool_call`,
+`notifications_send_test`, and the Optimize and Bench work that
+loads, stops or starts backends (consult, discover, measure,
+estimate, baseline, experiments, tuning run, prompt generation,
+bench runs) with its cancels. A bench arm's `offload_expr` ends up
+on a command line, so it may hold expert-offload flags only;
+anything else needs Class C's raw flags.
 
 ### Class C — configuration edits
 
@@ -89,7 +100,11 @@ registry class C, routed), `model_add`, `model_assign`,
 `model_set_enabled`, `model_set_short_name`, `placement_apply`,
 `gateway_set_bind_host`, `telemetry_set_interval`,
 `updates_pin`, `updates_set_auto`, `setup_mark_complete` and the
-other setup state marks.
+other setup state marks, `settings_set_supervision`,
+`notifications_set_config`, `bench_prompt_save`, and the Optimize
+plan's decisions (`optimize_save_purpose`, `optimize_set_item_state`,
+`optimize_set_item_outcome`, `optimize_set_experiment_state`,
+`optimize_validate_plan`, `optimize_tuning_adopt`).
 
 ### Class D — destructive and install-level operations
 
@@ -97,6 +112,9 @@ Irreversible, expensive, or code-changing operations:
 `backend_delete`, `model_delete` (deletes a downloaded GGUF —
 tens of GiB), `gateway_activation_cancel` (restores a prior
 configuration snapshot, discarding the pending one),
+`optimize_apply_plan` (its items can delete backends and groups),
+`optimize_discard_plan`, `bench_prompt_delete`,
+`bench_result_delete`,
 `updates_apply` (replaces installed component binaries),
 `run_wizard_step` / `setup_retry_step` (installs software: venv,
 Postgres, Prisma — long-running, machine-changing),

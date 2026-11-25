@@ -11,6 +11,7 @@ export type OpName =
   | "get_status"
   | "get_config"
   | "update_config"
+  | "settings_set_supervision"
   | "list_backends"
   | "start_backend"
   | "stop_backend"
@@ -181,6 +182,11 @@ export interface UpdateConfigArgs {
   readonly patch: unknown;
 }
 
+/** Arguments of `settings_set_supervision`. */
+export interface SettingsSetSupervisionArgs {
+  readonly mode: "process" | "service";
+}
+
 /** Arguments of `list_backends`. */
 export interface ListBackendsArgs {}
 
@@ -256,6 +262,7 @@ export interface BackendAddPreviewArgs {
   readonly gpuIndices?: number[] | null;
   readonly nCtx?: number | null;
   readonly parallel?: number | null;
+  readonly offloadLayers?: number | null;
 }
 
 /** Arguments of `backend_update_flags`. */
@@ -320,6 +327,8 @@ export interface BackendCachePreviewArgs {
   readonly cacheV?: string | null;
   readonly flashAttn?: string | null;
   readonly moeCacheMib?: number | null;
+  readonly offloadLayers?: number | null;
+  readonly gpuIndices?: number[] | null;
 }
 
 /** Arguments of `backend_set_raw_flags`. */
@@ -776,6 +785,7 @@ export interface OptimizeConsultArgs {
   readonly sample?: boolean | null;
   readonly directive?: string | null;
   readonly candidateRepos?: string[] | null;
+  readonly replace?: boolean | null;
 }
 
 /** Arguments of `optimize_discover`. */
@@ -978,6 +988,7 @@ export interface OpArgs {
   get_status: GetStatusArgs;
   get_config: GetConfigArgs;
   update_config: UpdateConfigArgs;
+  settings_set_supervision: SettingsSetSupervisionArgs;
   list_backends: ListBackendsArgs;
   start_backend: StartBackendArgs;
   stop_backend: StopBackendArgs;

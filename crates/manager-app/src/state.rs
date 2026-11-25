@@ -106,6 +106,8 @@ pub struct AppState {
     pub(crate) logship_tap: manager_logship::RecordTap,
     /// The app-level event bus (see [`event_bus`]).
     pub(crate) event_bus: event_bus::AppEventBus,
+    /// The desktop shell's own sink (see [`AppState::set_desktop_sink`]).
+    pub(crate) desktop_sink: std::sync::OnceLock<Arc<dyn EventSink>>,
     /// The setup wizard (see [`wizard::WizardState`]).
     pub(crate) wizard: WizardState,
     /// The tracked-task registry (see [`task_registry::TaskRegistry`]).
@@ -298,6 +300,7 @@ impl AppState {
             telemetry: TelemetryState::default(),
             logship: std::sync::Mutex::new(logship::LogshipSlot::default()),
             logship_apply: Mutex::new(()),
+            desktop_sink: std::sync::OnceLock::new(),
             logship_tap: manager_logship::RecordTap::new(),
             event_bus: event_bus::AppEventBus::default(),
             wizard: WizardState::default(),
@@ -597,6 +600,18 @@ impl AppState {
         manager_wizard::gateway_config_is_current(cfg, &self.data_dir, &fingerprint, |t| {
             mcp_present.contains(t)
         })
+    }
+
+    /// Register the desktop shell's sink, once at startup: operations
+    /// dispatched by a surface without an OS toast (the Admin API) use
+    /// it where the toast is their whole purpose.
+    pub fn set_desktop_sink(&self, sink: Arc<dyn EventSink>) {
+        let _ = self.desktop_sink.set(sink);
+    }
+
+    /// The desktop shell's sink, when a shell registered one.
+    pub(crate) fn desktop_sink(&self) -> Option<Arc<dyn EventSink>> {
+        self.desktop_sink.get().cloned()
     }
 
     /// The configured supervision mode (process | service).

@@ -792,7 +792,9 @@ pub(crate) fn annotate_targets_free_fit(
 /// so the form can price its current draft by sending only what
 /// changed. The selection defaults likewise (each member
 /// independently here, unlike the set op's all-or-nothing rule:
-/// a preview freezes nothing).
+/// a preview freezes nothing). `offload_layers` and `gpu_indices`
+/// price an unsaved MoE position and placement (an even split over
+/// the named GPUs, as placement saves it).
 #[allow(clippy::too_many_arguments)] // argument list is the registry contract
 pub async fn op_backend_cache_preview(
     state: &Arc<AppState>,
@@ -804,30 +806,37 @@ pub async fn op_backend_cache_preview(
     cache_v: Option<String>,
     flash_attn: Option<String>,
     moe_cache_mib: Option<u32>,
+    offload_layers: Option<u32>,
+    gpu_indices: Option<Vec<u32>>,
 ) -> ApiResult {
-    // The layout resolves under the config read; the telemetry
-    // inventory is fetched after the guard drops (the telemetry
-    // accessor reads the config while initializing — it must
-    // never be called while this command holds a config guard).
-    let (layout, backend, snap) = {
-        let cfg = state.config.read().await;
-        let b = cfg
-            .backends
-            .iter()
-            .find(|b| b.id == id)
-            .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
-        let layout = resolve_weight_layout(&cfg, b).ok_or_else(|| {
-            ApiError::InvalidInput(format!(
-                "backend {id}'s model cannot be resolved; its footprint cannot be priced"
-            ))
-        })?;
-        (layout, b.clone(), cfg.clone())
-    };
+    // The telemetry accessor reads the config while initializing — it
+    // must never be called while this command holds a config guard.
+    let snap = state.config.read().await.clone();
+    let saved_backend = snap
+        .backends
+        .iter()
+        .find(|b| b.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
     let gpus = {
         let store = state.telemetry().await;
         let inventory = lock_telemetry(&store).inventory();
         inventory
     };
+    let mut backend = saved_backend.clone();
+    if let Some(selected) = &gpu_indices {
+        let indices: Vec<u32> = gpus.iter().map(|g| g.index).collect();
+        let (split, mode) = split_for_gpu_selection(&indices, selected)?;
+        backend.flags.tensor_split = split;
+        backend.flags.split_mode = mode;
+    }
+    if let Some(layers) = offload_layers {
+        apply_offload_draft(&snap, &mut backend, layers)?;
+    }
+    let layout = resolve_weight_layout(&snap, &backend).ok_or_else(|| {
+        ApiError::InvalidInput(format!(
+            "backend {id}'s model cannot be resolved; its footprint cannot be priced"
+        ))
+    })?;
     let offload = manager_models::expert_offload(backend.raw_flags.as_deref());
     let saved = manager_models::cache_selection(backend.raw_flags.as_deref());
     let eff_ctx = n_ctx.unwrap_or(backend.flags.n_ctx);
@@ -875,7 +884,7 @@ pub async fn op_backend_cache_preview(
     // The free-memory verdict beside the against-total one; the
     // running backend's own (saved) residency is credited.
     let free = gpu_free_now(state).await;
-    let credit = own_residency(state, &snap, &backend, &gpus).await;
+    let credit = own_residency(state, &snap, saved_backend, &gpus).await;
     annotate_targets_free_fit(&mut payload, &free, &credit);
     Ok(payload)
 }

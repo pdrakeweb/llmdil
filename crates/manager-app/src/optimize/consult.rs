@@ -64,6 +64,18 @@ pub async fn op_optimize_save_purpose(
     state_payload(state).await
 }
 
+/// The refusal of an Admin API consultation that would replace the
+/// stored plan (and its decisions) without saying so; the window shows
+/// the plan and asks. `None` when nothing would be lost or the caller
+/// passed `replace`.
+pub fn consult_replace_refusal(state: &AppState, replace: Option<bool>) -> Option<String> {
+    (replace != Some(true) && load_plan_file(state).plan.is_some()).then(|| {
+        "a plan exists; a consultation replaces it and its decisions — pass \"replace\": true to \
+         replace it, or discard it first"
+            .to_string()
+    })
+}
+
 /// Run (or sample) a consultation. Live mode consults the chosen
 /// running backend directly over loopback as a tracked task with
 /// the scoped cancellation handle; sample mode parses a locally
@@ -76,8 +88,16 @@ pub async fn op_optimize_consult(
     sample: Option<bool>,
     directive: Option<String>,
     candidate_repos: Option<Vec<String>>,
+    replace: Option<bool>,
 ) -> crate::ApiResult {
     let sample = sample.unwrap_or(false);
+    // The REST layer answers this one 409 before it starts the
+    // operation; checked here too, where the plan is replaced.
+    if crate::event_bus::current_origin() == crate::event_bus::EventOrigin::Api {
+        if let Some(why) = consult_replace_refusal(state, replace) {
+            return Err(ApiError::Busy(why));
+        }
+    }
     // The operator directive for this consultation (addendum
     // A.2): trimmed; empty (or absent) means no directive. Sample
     // consultations record it the same way live ones do — the
@@ -526,6 +546,31 @@ pub async fn op_optimize_discover(
         ));
     }
     opt_log1(state, &format!("discovery start: directive '{directive}'"));
+    let task_id = state
+        .record_task("optimize-discover", json!({ "directive": directive }))
+        .await;
+    let token = state.tasks.controls.token(&task_id);
+    let outcome = tokio::select! {
+        res = discover(state, directive) => res,
+        _ = token.cancelled() => {
+            opt_log1(state, "discovery cancelled");
+            Err(ApiError::InvalidInput("candidate discovery cancelled".to_string()))
+        }
+    };
+    let (status, detail) = match &outcome {
+        Ok(count) => (TaskStatus::Done, json!({ "candidates": count })),
+        Err(e) => (TaskStatus::Failed, json!({ "error": e.to_string() })),
+    };
+    state.finish_task(&task_id, status, detail).await;
+    outcome?;
+    state_payload(state).await
+}
+
+/// The body of [`op_optimize_discover`]; returns the candidate count.
+async fn discover(
+    state: &std::sync::Arc<crate::AppState>,
+    directive: String,
+) -> Result<usize, ApiError> {
     let cfg = state.config.read().await.clone();
     let gathered = gather(state, &cfg).await;
     let free_vram = gathered.live.free_vram_mib_per_gpu.clone();
@@ -559,6 +604,7 @@ pub async fn op_optimize_discover(
         }
         opt_log(state, &lines);
     }
+    let count = candidates.len();
     save_candidates_file(
         state,
         &CandidatesFile {
@@ -569,7 +615,7 @@ pub async fn op_optimize_discover(
         },
     )
     .map_err(ApiError::InvalidInput)?;
-    state_payload(state).await
+    Ok(count)
 }
 
 /// Cancel the running consultation (design §1.2): fires the

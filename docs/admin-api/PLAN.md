@@ -768,8 +768,12 @@ except where you override them here.
     implemented [impl D7].
     **Recommendation: exclude the peripheral trio from v1;
     include updates policy writes; `updates_apply` local-only.**
-    All exclusions are additive to reverse.
-11. **The broad raw config patch in v1.**
+     All exclusions are additive to reverse.
+    **Reversed by the owner (November 2026):** MCP reads and the
+    connection test, and everything else that had been left
+    desktop-only, have routes; what stays out, and why, is
+    rest-api.md §6.16.
+ **The broad raw config patch in v1.**
     `PATCH /api/v1/config` mirrors `update_config`: one endpoint
     that can merge any field of `AppConfig`, including gateway
     bind and ports [audit §1]. The domain endpoints cover the
@@ -778,6 +782,8 @@ except where you override them here.
     needs arbitrary config merge; the user-store separation
     (§3.4) already removes its worst hazard, and the endpoint
     can be added additively if a real need appears.
+    **Kept (November 2026)** for the raw patch; a section without a
+    domain endpoint gets a narrow route (`PUT /settings/supervision`).
 12. **Remote wizard / install-class operations.**
     `run_wizard_step` installs software, reconciles firewall
     rules with UAC prompts on the server console, and runs for

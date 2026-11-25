@@ -182,6 +182,19 @@ pub(crate) async fn with_origin<F: std::future::Future>(origin: EventOrigin, fut
     ORIGIN.scope(origin, fut).await
 }
 
+/// Drop `fields` from a payload an Admin API caller asked for: facts
+/// only the machine's own window needs (local paths, the Windows
+/// account). Every other origin gets the payload unchanged.
+pub(crate) fn omit_for_api(payload: &mut Value, fields: &[&str]) {
+    if current_origin() == EventOrigin::Api {
+        if let Some(obj) = payload.as_object_mut() {
+            for f in fields {
+                obj.remove(*f);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The operation sink tee
 // ---------------------------------------------------------------------------

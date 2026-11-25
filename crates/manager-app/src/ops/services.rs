@@ -63,13 +63,17 @@ pub async fn op_services_list(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>)
             })
         })
         .collect();
-    Ok(json!({
+    let mut out = json!({
         "mode": serde_json::to_value(cfg.supervision.mode).unwrap_or(Value::Null),
         "account": manager_services::scm::current_user_account(),
         "host_path": host.display().to_string(),
         "host_present": host.exists(),
         "services": services,
-    }))
+    });
+    // The Admin API carries neither local paths nor the Windows
+    // account name (the same rule log_receiver_status follows).
+    event_bus::omit_for_api(&mut out, &["account", "host_path"]);
+    Ok(out)
 }
 
 /// Register one service (`target`: a backend id, or "gateway").

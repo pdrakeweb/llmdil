@@ -255,6 +255,18 @@
             }
           ]
         },
+        "offload_layers": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "parallel": {
           "anyOf": [
             {
@@ -328,6 +340,21 @@
             }
           ]
         },
+        "gpu_indices": {
+          "anyOf": [
+            {
+              "items": {
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "id": {
           "type": "string"
         },
@@ -344,6 +371,18 @@
           ]
         },
         "n_ctx": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "offload_layers": {
           "anyOf": [
             {
               "maximum": 4294967295,
@@ -1919,6 +1958,16 @@
             }
           ]
         },
+        "replace": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "sample": {
           "anyOf": [
             {
@@ -2348,6 +2397,23 @@
         "target"
       ],
       "title": "services_unregister",
+      "type": "object"
+    },
+    "settings_set_supervision": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "process",
+            "service"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "settings_set_supervision",
       "type": "object"
     },
     "setup_get_commands": {

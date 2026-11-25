@@ -112,6 +112,10 @@ fn fill_template(template: &str) -> String {
         .replace("{task_id}", "1")
         .replace("{component_id}", "llama-cpp")
         .replace("{session_id}", "none")
+        .replace("{backend_id}", "planner")
+        .replace("{sweep_id}", "none")
+        .replace("{item_id}", "0")
+        .replace("{experiment_id}", "0")
 }
 
 /// Substitute a real resource id where the template needs one that
@@ -151,6 +155,113 @@ fn class_table_covers_every_route() {
         assert!(role_allows(manager_app::registry::Role::Admin, spec.class));
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The guard resolves a concrete path against the templates in no
+/// particular order, so two templates of one method that match the
+/// same path must carry the same class.
+#[test]
+fn no_two_templates_match_one_path_with_different_classes() {
+    let table = route_class_table();
+    let routes: Vec<_> = table.iter().collect();
+    let is_param = |s: &str| s.starts_with('{') && s.ends_with('}');
+    for (i, ((m1, p1), c1)) in routes.iter().enumerate() {
+        for ((m2, p2), c2) in &routes[i + 1..] {
+            let (a, b): (Vec<&str>, Vec<&str>) = (p1.split('/').collect(), p2.split('/').collect());
+            let overlap = m1 == m2
+                && a.len() == b.len()
+                && a.iter()
+                    .zip(&b)
+                    .all(|(x, y)| x == y || is_param(x) || is_param(y));
+            assert!(!overlap || c1 == c2, "{m1} {p1} and {p2} overlap");
+        }
+    }
+}
+
+/// The classes of the routes added when the v1 exclusions were lifted,
+/// spelled out: a class changed by accident fails here.
+#[test]
+fn lifted_exclusions_carry_the_decided_classes() {
+    use manager_app::registry::CapClass::{self, *};
+    let expected: &[(&str, &str, CapClass)] = &[
+        ("PUT", "/settings/supervision", C),
+        ("POST", "/backends/preview", R),
+        ("POST", "/backends/{id}/cache/preview", R),
+        ("POST", "/backends/{id}/test-tool-call", L),
+        ("POST", "/models/lookup", R),
+        ("POST", "/models/header", R),
+        ("GET", "/mcp/servers", R),
+        ("GET", "/mcp/preflight", R),
+        ("POST", "/mcp/servers/{id}/test", X),
+        ("PUT", "/notifications", C),
+        ("POST", "/notifications/test", L),
+        ("GET", "/services", R),
+        ("GET", "/log-receiver", R),
+        ("GET", "/optimize", R),
+        ("POST", "/optimize/plan/validate", C),
+        ("PUT", "/optimize/purpose", C),
+        ("PUT", "/optimize/plan/items/{item_id}", C),
+        ("PUT", "/optimize/plan/items/{item_id}/outcome", C),
+        ("DELETE", "/optimize/plan", D),
+        ("POST", "/optimize/plan/apply", D),
+        ("PUT", "/optimize/experiments/{experiment_id}", C),
+        ("POST", "/optimize/consult", L),
+        ("POST", "/optimize/discover", L),
+        ("POST", "/optimize/consult/cancel", L),
+        ("POST", "/backends/{backend_id}/measure", L),
+        ("POST", "/backends/{backend_id}/estimate", L),
+        ("POST", "/backends/{backend_id}/baseline", L),
+        ("POST", "/optimize/job/cancel", L),
+        ("POST", "/optimize/experiments/run", L),
+        ("POST", "/optimize/experiments/estimate", L),
+        ("GET", "/backends/{backend_id}/tuning", R),
+        ("POST", "/backends/{backend_id}/tuning/run", L),
+        ("POST", "/optimize/tuning/{sweep_id}/adopt", C),
+        ("GET", "/bench/prompts", R),
+        ("POST", "/bench/prompts", C),
+        ("DELETE", "/bench/prompts/{id}", D),
+        ("POST", "/bench/prompts/generate", L),
+        ("POST", "/bench/prompts/generate/cancel", L),
+        ("POST", "/bench/runs", L),
+        ("POST", "/bench/runs/{sweep_id}/cancel", L),
+        ("GET", "/bench/results", R),
+        ("DELETE", "/bench/results/{sweep_id}", D),
+    ];
+    let table = route_class_table();
+    for (method, path, class) in expected {
+        assert_eq!(
+            table.get(&(method.to_string(), format!("/api/v1{path}"))),
+            Some(&manager_api::auth_routes::AuthClass::Class(*class)),
+            "{method} {path}"
+        );
+    }
+}
+
+/// What stays off the API for security (rest-api.md §6.16): no route
+/// can appear for these by accident.
+#[test]
+fn security_exclusions_have_no_route() {
+    for name in [
+        "update_config",
+        "gateway_master_key",
+        "mcp_save_server",
+        "mcp_set_exposure",
+        "mcp_delete_server",
+        "mcp_store_credential",
+        "services_register",
+        "services_unregister",
+        "log_receiver_deploy",
+        "log_receiver_remove",
+        "open_url",
+        "open_folder",
+        "vscode_install_extensions",
+        "vscode_write_config",
+        "winml_register",
+        "winml_unregister",
+    ] {
+        let spec = OP_SPECS.iter().find(|s| s.name == name).expect(name);
+        assert!(spec.route.is_none(), "{name} must stay without a route");
+    }
 }
 
 #[tokio::test]

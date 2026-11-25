@@ -437,7 +437,7 @@ screen.
 | S-5 | `GET /models`, `GET /models/{id}` | `on_disk`, `size_bytes`, `verified_at`. `GET /models/nope` → `404`. Forms: N/A (screen-only) | File size on disk |
 | S-6 ★ | Block below | | The log file |
 | S-7 ★ | `GET /gateway/config`, `/gateway/status`, `/gateway/generated-config` | `effective_strategy` and `status.groups` (enabled groups); YAML is `text/yaml`. The generated routing file is not returned (G17). Running versus saved labels: N/A (screen-only); `status.port` is the **saved** port (D15) | `gateway/config.yaml` |
-| S-8 | `GET /gateway/groups`, `/activation-plan`, `/activation-plan/history`, `GET /config` (`.mcp`) | 200. MCP list: G07. Optimize: G11. Bench: G15, G16 | Files in the data directory |
+| S-8 | `GET /gateway/groups`, `/activation-plan`, `/activation-plan/history`, `GET /config` (`.mcp`) | 200. `GET /mcp/servers`, `/optimize`, `/bench/prompts`, `/bench/results` → 200 | Files in the data directory |
 | S-9 | `GET /config` | Equal to `config.json` field by field, apart from `config_path` | `config.json` |
 | S-10 | `GET /setup/status`, `/setup/steps`, `/setup/prerequisites`; `POST /setup/audit` | `setup_completed` true; `steps`, `done`, `total`; audit operation `done`. `detail.already_running` true means it did **not** run (D17): repeat | Scope `wizard` in the logs |
 
@@ -537,7 +537,7 @@ Add-QaBackend B-6 @{ id = 'qa-big';     model_id = 'qwen3.8-27b-mtp';  group = '
 |---|---|---|
 | B-1 ★ | `GET /backends/qa-qwen8b`: `n_ctx` 32768, `n_batch` 512, `placement` `GPU 0`, `group` `qa-small` | `config.json`: `tensor_split` 1.0 on GPU 0, `raw_flags` null or the model default |
 | B-2 ★ | `cache` = `{k: q8_0, v: q4_0, flash_attn: auto}`; `placement` `GPU 1` | `raw_flags` contains `--cache-type-k q8_0 --cache-type-v q4_0 --flash-attn auto` |
-| B-3 ★ | Add with a middle position: `offload_layers` = half of `offload.moe_layers`. On a restricted GPU (compute capability 6.x) expected: `400 INVALID_INPUT`, `*outside the verified range*`, and no backend. Then add without `offload_layers` as above and read `offload.guardrail` from `GET /backends/qa-nemo`. The form's preview: G02 | `config.json` has no `qa-nemo` after the 400 |
+| B-3 ★ | Add with a middle position: `offload_layers` = half of `offload.moe_layers`. On a restricted GPU (compute capability 6.x) expected: `400 INVALID_INPUT`, `*outside the verified range*`, and no backend. Then add without `offload_layers` as above and read `offload.guardrail` from `GET /backends/qa-nemo`. The form's preview: `POST /backends/preview` `{"model_id","offload_layers"}` → `memory` | `config.json` has no `qa-nemo` after the 400 |
 | B-4 | `offload.layers` = `offload.green_limit_layers` | `raw_flags` |
 | B-5 `2GPU` | `placement` `GPU 0+1`; group `qa-split` exists | `tensor_split` 0.5 / 0.5 |
 | B-6 | `fit.state` `does_not_fit` (TCC) or `wddm_paged` (WDDM); `enabled` false | `fit.per_gpu[0].required_mib` > `total_mib` from `nvidia-smi` |
@@ -581,7 +581,8 @@ Assert-ApiError B-neg (Invoke-Llmdil GET '/backends/qa-bad') 404 'NOT_FOUND'
 ```
 
 The port of the Admin API itself is **not** checked by the configuration
-rules: don't use it. The live memory lines of the form: G02, G03. Focus and
+rules: don't use it. The live memory lines of the form: `POST
+/backends/preview` and `POST /backends/{id}/cache/preview`. Focus and
 captions: N/A (screen-only).
 
 ## 7. Activation Plan
@@ -653,7 +654,9 @@ Assert R-1 ($l.Body.argv -contains '--port') 'launch command'
 Get-Argv 'qa-qwen8b'                                                 # compare with argv (local only)
 $need = $b.fit.per_gpu | ForEach-Object { "GPU $($_.gpu): $($_.required_mib) MiB" }
 $need; Get-GpuUsed; $gpu0                                            # difference within 512 MiB of required_mib
-# Test tool calls: NOT POSSIBLE VIA API (G04)
+$tc = (Invoke-Llmdil POST '/backends/qa-qwen8b/test-tool-call').Body
+Assert R-1 ($tc.outcome -in 'verified','unparsed','failed' -and $tc.detail) "tool calls: $($tc.outcome) $($tc.detail)"
+Assert R-1 ((Get-Backend 'qa-qwen8b').tool_call_probe.outcome -eq $tc.outcome) 'probe saved'
 
 # R-2: two starts at once (backend stopped)
 $two = @(1..2 | ForEach-Object { Invoke-Llmdil POST '/backends/qa-coder7b/start' -Body @{} })
@@ -873,20 +876,40 @@ Assert W-11 ((Invoke-Gateway 'qa-no-such-model').Status -eq 404) 'wrong model'
 
 ## 11. Optimize and Bench
 
-Almost all of it has no API. Deliberate for v1 (rest-api.md §6.16; registry
-comments at lines 374 and 402).
+The long ones answer `202`: `Assert-OperationDone` or
+`Assert-OperationFailed`. Every Optimize answer (or operation detail) is
+the state of `GET /optimize`.
 
 | Id | API |
 |---|---|
-| O-1 | NOT POSSIBLE VIA API (G11). Only a group's purpose can be written: `PATCH /gateway/groups/{name}` `{"purpose"}` |
-| O-2 ★ | Estimate and Measure: NOT POSSIBLE VIA API (G13). The result is readable: `predicted` on `GET /backends/{id}` (`prompt_per_second`, `predicted_per_second`, `ttft_ms`, `measured_at`, `source`). `POST /measurements/lookup` with the request **itself** as body, e.g. `{"backend_id":"qa-qwen8b"}` → `fingerprint`, `exact`, `near`; an unknown backend → error. Delete only an entry you measured: `DELETE /measurements` `{"fingerprint","measured_at"}` (`admin`); unknown → `404` |
-| O-3, O-4 | NOT POSSIBLE VIA API (G11, G12) |
-| O-5 ★ | NOT POSSIBLE VIA API (G14) |
-| O-6 ★ | Start: NOT POSSIBLE VIA API (G13, G14). Cancel of a sweep started in the window **is** possible: find `id` of the running task in `GET /operations`, `POST /operations/{id}/abort` → `stopped`, `routed_to.op` = `optimize_cancel_job`. Then check every backend it stopped with `GET /backends` |
-| O-7 | NOT POSSIBLE VIA API (G11–G14) |
-| N-1 | NOT POSSIBLE VIA API (G15) |
-| N-2 ★, N-3, N-4 ★ | NOT POSSIBLE VIA API (G16). A sweep started in the window can be watched in `GET /operations` and aborted as in O-6 (`bench_run_cancel`) |
-| N-5 | NOT POSSIBLE VIA API (G16) |
+| O-1 | `GET /optimize` → `context`, `context_summary`, `purpose`. `PUT /optimize/purpose` `{"scope":"backend","target":"qa-qwen8b","text":"qa"}`, read it back, put the old text back. Unknown scope → `400`, unknown target → `404`. Cancel of the edit: N/A (screen-only) |
+| O-2 ★ | `POST /backends/qa-qwen8b/estimate`, then `…/measure` → done; compare `predicted` on `GET /backends/{id}` (`prompt_per_second` within 2×, `ttft_ms` present, `source`). On a stopped backend → failed `*not running*`. `POST /measurements/lookup` with the request **itself** as body, e.g. `{"backend_id":"qa-qwen8b"}` → `fingerprint`, `exact`, `near`; an unknown backend → error. Delete only an entry you measured: `DELETE /measurements` `{"fingerprint","measured_at"}` (`admin`); unknown → `404` |
+| O-3 | `POST /optimize/consult` `{"sample":true}` → done. Again → `409 PLAN_EXISTS`, with `"replace":true` → `202`. Not at once "configuration changed": no item of `plan` is invalid for that reason. **Only when no plan of the owner's exists** (`GET /optimize` → `plan` null) |
+| O-4 | `PUT /optimize/plan/items/{id}` `{"decision":"accepted"}` for `qa-*` items only; `POST /optimize/plan/apply` `{"dry_run":true}`, look at `apply_result.steps`, then without it (`admin`). `GET /activation-plan` shows only those |
+| O-5 ★ | `GET /backends/qa-qwen8b/tuning` → `plan` contains the incumbent; `POST …/tuning/run`; the result is in `GET /optimize` → `tuning` |
+| O-6 ★ | Start O-5, then `POST /optimize/job/cancel` → `cancelled` true (or abort the task in `GET /operations`: `stopped`, `routed_to.op` = `optimize_cancel_job`). Then every backend it stopped is back in `GET /backends`, or named in `restore_failures` |
+| O-7 | `POST /optimize/discover` `{"directive":"…"}` (asks the internet) → `candidates`; experiments: `PUT /optimize/experiments/{id}`, `POST /optimize/experiments/estimate`; `POST /optimize/tuning/{sweep_id}/adopt`; `DELETE /optimize/plan` (`admin`) → `plan` null. Or a refusal that explains itself |
+| N-1 | `POST /bench/prompts` `{"name":"","purpose":"general","body":"x"}` → `400`; with a name → `id`, `updated_ms`; again with that `id` → replaced; `POST /bench/prompts/generate` → detail `text`, or `POST …/generate/cancel`; `DELETE /bench/prompts/{id}` → 200, again `404` |
+| N-2 ★ | Block below |
+| N-3 | `POST /bench/runs` with `"temperature":5` → `400 INVALID_INPUT` |
+| N-4 ★ | Block below. The panel: N/A (screen-only) |
+| N-5 | `GET /bench/results`: a sweep without a measured arm is not `complete`. `DELETE /bench/results/{sweep_id}` (`admin`) → 200, again `404`. Compare view: N/A (screen-only) |
+
+```powershell
+# N-2 / N-4 (qa-qwen8b running: the interlock names it)
+$prompt = (Invoke-Llmdil GET '/bench/prompts').Body.prompts[0].id
+$req = @{ backend_id = 'qa-qwen8b'; prompt_id = $prompt; dimensions = @(, @(@{ depth = 0; cache_k = 'f16' }, @{ depth = 0; cache_k = 'q8_0' })) }
+Assert-ApiError N-4 (Invoke-Llmdil POST '/bench/runs' -Body $req) 400 'INVALID_INPUT' '*qa-qwen8b*'
+$req.stop_backend_ids = @('qa-qwen8b')
+$r = Invoke-Llmdil POST '/bench/runs' -Body $req
+Assert N-2 ($r.Status -eq 202 -and $r.Body.sweep_id -and $r.Body.id) 'answers at once'
+Assert-ApiError N-2 (Invoke-Llmdil POST '/bench/runs' -Body $req) 409 'BUSY'
+do { Start-Sleep 2; $s = (Invoke-Llmdil GET '/bench/results').Body.sweeps | Where-Object id -eq $r.Body.sweep_id } while ($s.status -eq 'running')
+Assert N-2 (@($s.arms).Count -eq 2 -and $s.status -in 'complete','partial','failed') "sweep $($s.status)"
+$null = Wait-Operation $r.Body.id            # the task, settled like the sweep; cancel: POST /bench/runs/{sweep_id}/cancel
+```
+
+The sweep does not start the backends it stopped: start them.
 
 Second source for all of them: `optimize-*.json`, `bench-*.json`.
 
@@ -926,14 +949,15 @@ Assert-ApiError M-2 (Invoke-Llmdil GET '/models/qa-model') 404 'NOT_FOUND'
 | Id | API | Second source |
 |---|---|---|
 | M-1 | Block above. Speed is not in the API; take it from two readings, or from `download-progress` on `GET /events`. The dialog: N/A (screen-only) | Size of the file and of its `.part` file; SHA-256 |
-| M-2 | Block above. Lookup: NOT POSSIBLE VIA API (G05). Form position: N/A (screen-only) | `config.json` |
-| K-1, K-2 | NOT POSSIBLE VIA API (G07). Read-only: `GET /config` → `.mcp.servers` (no credential values) | `config.json` |
+| M-2 | Block above. `POST /models/lookup` `{"query":"qwen3 8b"}` → `repos[]` with files (asks the internet; empty query → `400`); `POST /models/header` `{"repo_id","file"}` → `sha256`, `header`. Form position: N/A (screen-only) | `config.json` |
+| K-1 | Read and test only: `GET /mcp/servers`; `POST /mcp/servers/{id}/test` (`admin`) → `ok`, `detail`; unknown → `404`. Save, exposure and delete: NOT POSSIBLE VIA API by decision (rest-api.md §6.16) | `config.json` |
+| K-2 | `GET /mcp/servers` → `blocked_reason`, `credential_status`; `GET /mcp/preflight` names the gateway servers without a credential | Credential Manager (names only) |
 | T-1 | `PUT /telemetry/interval` `{"ms":-1}` → `400`; `{"ms":"x"}` → `400`; `{"ms":0}` is valid (off). `{"ms":999999999}`: expected `400`, today `200` (D11): put the old value back at once | `telemetry.poll_interval_ms` in `config.json` |
 | T-2 ★ | Block below (ask first) | Listening port; `Get-NetFirewallRule` |
 | T-3 | `PATCH /gateway/config` `{"bind_host":"127.0.0.1"}` → 200, `restart_required: true`; one plan row of kind `gateway_bind`; `{"bind_host":"nope"}` → `400 INVALID_INPUT`. Apply, check, put back, apply | `Get-NetTCPConnection` local address |
 | T-4 ★ | `POST /mxc/self-test` → `cases[]`, `summary.failed` = 0; nothing says whether the runtime is installed (G19). `PUT /mxc/mode` `{"mode":"nonsense"}` → `400`. `{"mode":"enforced"}`: expected a refusal, today `200` (D12): only with the owner's agreement, and put the old mode back | `mxc.mode` in `config.json` |
-| T-5 | NOT POSSIBLE VIA API (G08). Read: `GET /config` → `.notifications` | `config.json` |
-| T-6 | NOT POSSIBLE VIA API (G01, G09). Read: `.supervision.mode`; `service_managed` on backends and gateway | See the Windows services plan |
+| T-5 | `PUT /notifications` `{"enabled":true,"operations":false,"failures":true,"activation":true}` → 200, read `GET /config` → `.notifications`; `{"enabled":true,"nope":1}` → `400`; `POST /notifications/test` → `ok`, `windows_setting`, `detail`. Put back. Seeing the toast: N/A (screen-only) | `config.json` |
+| T-6 | `PUT /settings/supervision` `{"mode":"service"}` → 200, `{"mode":"nope"}` → `400`; put back at once. `GET /services` → `mode`, `services[]` (`registered`, `lifecycle`). Register, unregister: console only | See the Windows services plan |
 | T-7 | Block below (`admin`) | The zip itself |
 
 ```powershell
@@ -1031,7 +1055,7 @@ be done by API. **Partial**: some checks cannot (reason given). **None**.
 | S-5 | partial | Forms |
 | S-6 | partial | Colours, follow, recents, folder; D05 |
 | S-7 | partial | Routing file (G17), labels |
-| S-8 | partial | MCP (G07), Optimize (G11), Bench (G15, G16) |
+| S-8 | full | |
 | S-9 | partial | Styling |
 | S-10 | full | |
 | L-1, L-2 | none | Screen-only |
@@ -1040,15 +1064,15 @@ be done by API. **Partial**: some checks cannot (reason given). **None**.
 | G-1 | full | |
 | G-2 | partial | Name rules (G06) |
 | G-3 | partial | Empty-only rule (G06), confirmation |
-| B-1 … B-5 | full | The form's preview (G02) |
+| B-1 … B-5 | full | |
 | B-6 | full | |
 | B-7 | full | |
-| B-neg (refusals) | full | Form focus, captions, live memory lines (G02, G03) |
+| B-neg (refusals) | full | Form focus, captions |
 | A-1, A-2, A-3, A-4 | full | |
 | A-5 | full | Needs admin |
 | A-6 | partial | Buttons; D09 |
 | A-7 | full | Fails today |
-| R-1 | partial | Tool-call test (G04) |
+| R-1 | full | |
 | R-2 … R-6 | full | |
 | R-7 | full | Confirmation is text only (D03) |
 | R-8, R-9 | full | Fail today |
@@ -1061,50 +1085,50 @@ be done by API. **Partial**: some checks cannot (reason given). **None**.
 | W-9 | partial | Drag, menu |
 | W-10 | partial | "Why" |
 | W-11 | full | |
-| O-1 | none | G11 |
-| O-2 | partial | Run (G13); result readable |
-| O-3, O-4, O-5 | none | G11, G12, G14 |
-| O-6 | partial | Start (G13, G14); cancel possible |
-| O-7 | none | G11–G14 |
-| N-1 | none | G15 |
-| N-2, N-4 | partial | Start (G16); watch and cancel possible |
-| N-3, N-5 | none | G16 |
+| O-1 | partial | Cancel of the edit |
+| O-2 … O-7 | full | |
+| N-1, N-2, N-3 | full | |
+| N-4 | partial | Panel |
+| N-5 | partial | Compare view |
 | M-1 | partial | Speed, dialog |
-| M-2 | partial | Lookup (G05), form |
-| K-1, K-2 | none | G07 |
+| M-2 | partial | Form |
+| K-1 | partial | Save, exposure, remove: excluded (G07) |
+| K-2 | full | |
 | T-1, T-2 | full | Fail today (D11, D15) |
 | T-3 | full | |
 | T-4 | partial | Runtime state (G19) |
-| T-5 | none | G08 |
-| T-6 | none | G01, G09 |
+| T-5 | partial | Seeing the toast |
+| T-6 | partial | Register, unregister: excluded (G09) |
 | T-7 | full | Needs admin |
 | U-1 | partial | Result not readable again (G18) |
 | U-2, U-3, U-4 | full | U-4 fails today (D13) |
 
 ## 16. API gaps
 
-Line numbers are in `crates/manager-app/src/registry.rs`. "Excluded" cites
-the decision; "omission" means no document gives a reason. Of 159
-operations, 89 have a route.
+Of 161 operations, 132 have a route. The owner lifted the exclusions of
+PLAN.md decisions 10 and 11 except the security-sensitive ones
+(rest-api.md §6.16). Closed:
+
+| Gap | Now |
+|---|---|
+| G01 supervision mode | `PUT /settings/supervision`. Raw `update_config`, the PostgreSQL port and the other sections stay without a route; `view_modes` is read by no screen |
+| G02, G03 previews | `POST /backends/preview`, `POST /backends/{id}/cache/preview`, both with `offload_layers` and `gpu_indices` |
+| G04 tool-call test | `POST /backends/{id}/test-tool-call` |
+| G05 model lookup and header | `POST /models/lookup`, `POST /models/header` |
+| G07 MCP | `GET /mcp/servers`, `GET /mcp/preflight`, `POST /mcp/servers/{id}/test`. Save, exposure, delete and credential stay excluded |
+| G08 notifications | `PUT /notifications`, `POST /notifications/test` |
+| G09 Windows services | `GET /services`. Register and unregister stay excluded |
+| G10 log receiver | `GET /log-receiver`, without local paths |
+| G11–G14 Optimize | rest-api.md §6.19, and measure, estimate, baseline, tuning under `/backends/{id}` (§6.2) |
+| G15, G16 Bench | rest-api.md §6.20; `POST /bench/runs` answers at once with the `sweep_id` |
+
+Open when this was written ("omission" means no document gives a
+reason; line numbers are in `crates/manager-app/src/registry.rs` at
+`8187eb6`):
 
 | Gap | UI action that cannot be done | Operation (line) | Why it matters for tests | Excluded or omission | Proposed route |
 |---|---|---|---|---|---|
-| G01 | Supervision mode and other settings sections (PostgreSQL port, WinML, log streaming, view modes) | `update_config` (198) | T-6, and putting settings back, need the window | Excluded: PLAN.md decision 11, rest-api.md §6.12, §6.16 | Section routes, not the raw patch: `PUT /settings/supervision`, `PUT /settings/{section}` with a closed body |
-| G02 | Add-form preview (memory per GPU, offload range, cache choice) | `backend_add_preview` (209) | "Fits" can be checked only after creating the backend | Excluded: §6.16 "desktop-only preview" | `POST /backends/preview` |
-| G03 | Cache and context preview on a backend | `backend_cache_preview` (223) | Memory lines of unsaved edits cannot be compared with the saved result | Excluded: §6.16 | `POST /backends/{id}/cache/preview` |
-| G04 | Test tool calls | `backend_test_tool_call` (347) | R-1 stays partial; `tool_call_probe` can be read but never refreshed | Excluded: §6.16 files it under MCP (decision 10), but it is a backend probe with no MCP state | `POST /backends/{id}/test-tool-call` |
-| G05 | Model lookup and file header | `model_hf_lookup` (271), `model_hf_header` (272) | M-2 lookup | Excluded: registry comment 265–270, §6.16 | `POST /models/lookup`, `POST /models/header` |
 | G06 | Create and delete a group **with the app's rules** | `gateway_create_group` (324), `gateway_delete_group` (325) | The REST group routes accept names the app refuses and delete groups with members, so G-2 and G-3 test a different rule | Excluded with a replacement that is weaker: registry comment 314–322, §6.5 | Let `POST` and `DELETE /gateway/groups` call these operations; keep `?cascade=true` for the old delete |
-| G07 | MCP list, save, test, exposure, delete, preflight | `mcp_list` (340), `mcp_start_preflight` (341), `mcp_test_connection` (342), `mcp_set_exposure` (343), `mcp_save_server` (344), `mcp_delete_server` (345) | K-1, K-2. `mcp_store_credential` (346) should stay without a route | Excluded: PLAN.md decision 10 | `GET /mcp/servers`, `PUT`/`DELETE /mcp/servers/{id}`, `POST …/{id}/test`, `PUT …/{id}/exposure`, `GET /mcp/preflight` |
-| G08 | Notification settings and test toast | `notifications_set_config` (350), `notifications_send_test` (351) | T-5 | Excluded: §6.16 (delivery is a shell concern). The settings half is plain configuration | `PUT /notifications`, `POST /notifications/test` |
-| G09 | Windows services list, register, unregister | `services_list` (354), `services_register` (355), `services_unregister` (356) | T-6 and the services plan cannot read registration state | Excluded: §6.16 (elevation). Reading needs no elevation | `GET /services` first |
-| G10 | Log receiver status | `log_receiver_status` (361) | Start, stop and restart are routed; their result cannot be read back | Excluded: §6.16 (shows local paths) | `GET /log-receiver` without paths |
-| G11 | Optimize: state, purpose, plan items, apply, discard | `optimize_get_state` (374), `optimize_validate_plan` (375), `optimize_save_purpose` (376), `optimize_set_item_state` (377), `optimize_set_item_outcome` (378), `optimize_discard_plan` (379), `optimize_apply_plan` (384), `optimize_set_experiment_state` (385) | O-1, O-3, O-4, O-7 | Excluded: §6.16 "desktop-only in v1" | `GET /optimize`, `PUT /optimize/purpose`, `PUT /optimize/plan/items/{id}`, `POST /optimize/plan/apply`, `DELETE /optimize/plan` |
-| G12 | Optimize: consult, discover, cancel | `optimize_consult` (386), `optimize_discover` (387), `optimize_cancel_consult` (388) | O-3, O-7 | As G11 | `POST /optimize/consult`, `POST /optimize/discover` (operations) |
-| G13 | Optimize: measure, estimate, baseline, experiments, cancel | `optimize_measure_backend` (389), `optimize_estimate_backend` (397), `optimize_cancel_job` (398), `optimize_run_baseline` (399), `optimize_run_experiments` (400), `optimize_estimate_experiments` (401) | O-2, O-6: the best candidates for unattended runs | As G11, although the measurement **store** is routed (395, 396) | `POST /backends/{id}/measure`, `POST /backends/{id}/estimate` (operations, aborted through `/operations`) |
-| G14 | Optimize: tuning preview, run, adopt | `optimize_tuning_preview` (419), `optimize_tuning_run` (420), `optimize_tuning_adopt` (421) | O-5, O-6, O-7 | As G11 | `GET /backends/{id}/tuning`, `POST …/tuning/run`, `POST …/tuning/adopt` |
-| G15 | Bench prompts | `bench_prompts_list` (406), `bench_prompt_save` (407), `bench_prompt_delete` (408), `bench_prompt_generate` (409), `bench_prompt_generate_cancel` (410) | N-1 | Excluded: registry comment 402–405, §6.16 | `GET`/`POST /bench/prompts`, `DELETE /bench/prompts/{id}`, `POST /bench/prompts/generate` |
-| G16 | Bench sweeps and results | `bench_run_start` (411), `bench_run_cancel` (412), `bench_results_list` (413), `bench_result_delete` (414) | N-2 to N-5 | As G15 | `POST /bench/runs` (operation), `POST /bench/runs/{id}/cancel`, `GET /bench/results`, `DELETE /bench/results/{id}` |
 | G17 | The generated routing file (second tab of *generated config*) | none; `gateway_preview_yaml` (311) has `routing_py`, the API layer drops it (`http.rs` 452–461) | W-7 cannot check the rule that will run without reading files | Omission | `GET /gateway/generated-routing` |
 | G18 | Result of the last update check | none (file `updates/last-check.json`) | U-1 "still shown" | Omission | `GET /updates/last-check` |
 | G19 | Is the MXC runtime installed | none | T-4 | Omission | `runtime` in `GET /mxc/policy` |
@@ -1112,14 +1136,7 @@ operations, 89 have a route.
 | G21 | Unattended credential above operator | none; `auth/api_tokens.rs` 19 refuses configurator and admin | An automated run must refresh a 60-minute session | Excluded: auth-plan.md §3.3 and §6; the owner can decide otherwise | Short-lived (≤ 24 h) configurator token, owner-issued in the window |
 | G22 | Wait for readiness on start | `start_backend` (201) has no `wait_ready_secs`; `restart_backend` (203) has it | Every start needs a second polling loop | Omission | Add `wait_ready_secs` to `POST /backends/{id}/start` |
 
-No route and not needed by any case: `open_url` (244), `open_folder` (245),
-`gateway_master_key` (248, decision 4), `gateway_activation_complete`
-(303), `gateway_activation_record_execution` (308), `log_receiver_deploy`
-(362), `log_receiver_remove` (363), `log_receiver_flip_endpoint` (364),
-VS Code (422, 423), WinML (432–435). Served inside another route:
-`gateway_set_bind_host` (251), `model_set_short_name` (261),
-`model_set_enabled` (273), `model_set_offload_spec` (276),
-`model_set_mtp` (280), `activation_apply` (300).
+Every operation without a route, with its reason: rest-api.md §6.16.
 
 ## 17. Defects that break automation
 
@@ -1205,8 +1222,6 @@ Result sheet: as in the UI test, plus `API commit: ____  Role: ____`.
 
 | Document says | Code does |
 |---|---|
-| rest-api.md header, §6.16: 158 operations, 69 without a route; registry test is named "82 commands" | 159 operations, 89 routed, 70 not |
-| rest-api.md §5: 78 registry routes, 117 records | 89 + 15 + 24 = 128 |
 | rest-api.md §2.1: base `http://…` | HTTPS, except a loopback development mode |
 | §2.2, §2.5: unknown fields rejected | Not inside `patch` (D06) or the gateway config (D07) |
 | §2.5, §6.7: `409 BUSY` for a running setup step, download, apply | `202`, then `failed` (D03). A download in flight is kind `Models` |

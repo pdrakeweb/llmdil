@@ -141,3 +141,143 @@ fn temperature_must_be_in_the_sampling_range() {
         assert!(check_temperature(bad).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn offload_expressions_place_tensors_only() {
+    for ok in [
+        "",
+        "-ot exps=CPU",
+        "-ot=exps=CPU,blk.0.attn=CPU",
+        "--override-tensor exps=CPU",
+        "--n-cpu-moe 24",
+        "-ncmoe=46",
+        "--cpu-moe",
+    ] {
+        assert!(check_offload_expr(ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        "--log-file x",
+        "-ot exps=CPU --path x",
+        "--n-cpu-moe",
+        "-ot --api-key=k",
+        "24",
+        "--cpu-moe=1",
+    ] {
+        assert!(check_offload_expr(bad).is_err(), "{bad}");
+    }
+}
+
+fn bench_state(name: &str) -> (Arc<AppState>, PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "llm-mgr-bench-{name}-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = cfg_with(vec![placed_backend("planner", Vec::new(), None)]);
+    cfg.data_dir = dir.clone();
+    let state = Arc::new(AppState::new(cfg, dir.join("config.json"), dir.clone()));
+    (state, dir)
+}
+
+/// A start answers at once with the sweep id and the task record, the
+/// sweep runs on its own, and its end is visible in the results and on
+/// the task (here: nothing can launch, so the sweep fails).
+#[tokio::test]
+async fn a_started_sweep_answers_at_once_and_settles_in_the_background() {
+    let (state, dir) = bench_state("start");
+    let sink: Arc<dyn crate::EventSink> = Arc::new(crate::NoopSink);
+    let prompt_id = load_prompts(&state).entries[0].id.clone();
+    let start = |expr: &str| {
+        json!({
+            "backend_id": "planner",
+            "prompt_id": prompt_id,
+            "dimensions": [[{ "offload_expr": expr }]],
+        })
+    };
+    // Refusals stay errors of the call itself.
+    let bad = op_bench_run_start(&state, &sink, start("--log-file x")).await;
+    assert!(matches!(bad, Err(ApiError::InvalidInput(_))), "{bad:?}");
+    // One sweep at a time.
+    *state.bench.job.lock().await = Some(BenchJob {
+        sweep_id: "other".to_string(),
+        progress: BenchProgress {
+            arm_index: 0,
+            arm_count: 1,
+            phase: "launching".to_string(),
+            run: 0,
+            started_unix_ms: now_ms(),
+        },
+    });
+    let second = op_bench_run_start(&state, &sink, start("")).await;
+    assert!(matches!(second, Err(ApiError::Busy(_))), "{second:?}");
+    *state.bench.job.lock().await = None;
+    let r = op_bench_run_start(&state, &sink, start("")).await.unwrap();
+    let sweep_id = r["sweep_id"].as_str().unwrap().to_string();
+    let task_id = r["id"].as_str().unwrap().to_string();
+    assert_eq!(r["kind"], "bench-run");
+    assert_eq!(r["status"], "running");
+    assert_eq!(r["detail"]["sweep_id"], sweep_id.as_str());
+    assert!(r["sweeps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["id"] == sweep_id.as_str()));
+    for _ in 0..600 {
+        if state.bench.job.lock().await.is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let list = op_bench_results_list(&state, &sink).await.unwrap();
+    let sweep = list["sweeps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == sweep_id.as_str())
+        .unwrap();
+    assert_eq!(sweep["status"], "failed", "{sweep}");
+    // The slot is released just before the task settles.
+    let mut status = Value::Null;
+    for _ in 0..50 {
+        let tasks = crate::op_tasks_list(&state, &sink).await.unwrap();
+        status = tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == task_id.as_str())
+            .unwrap()["status"]
+            .clone();
+        if status != "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(status, "done");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A prompt saved with only the fields a person writes gets the rest,
+/// and the answer names it.
+#[tokio::test]
+async fn a_prompt_needs_only_name_purpose_and_body() {
+    let (state, dir) = bench_state("prompt");
+    let sink: Arc<dyn crate::EventSink> = Arc::new(crate::NoopSink);
+    let r = op_bench_prompt_save(
+        &state,
+        &sink,
+        json!({ "name": "QA one", "purpose": "general", "body": "text" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r["id"], "qa-one");
+    let entry = r["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "qa-one")
+        .unwrap();
+    assert_eq!(entry["origin"], "user");
+    assert_eq!(entry["sha256"].as_str().unwrap().len(), 64);
+    let _ = std::fs::remove_dir_all(&dir);
+}

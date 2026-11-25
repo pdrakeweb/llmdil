@@ -399,6 +399,29 @@ pub(crate) fn snap_default_offload(
     }
 }
 
+/// Put a draft expert-offload position on a transient backend (the
+/// previews' `offload_layers`): the same bounds the save applies. A
+/// guardrail-blocked position is priced, not refused — a preview
+/// saves nothing, and its `offload` row carries the verdict.
+pub(crate) fn apply_offload_draft(
+    cfg: &AppConfig,
+    b: &mut manager_config::BackendConfig,
+    layers: u32,
+) -> Result<(), ApiError> {
+    let info = backend_offload_info(cfg, b).ok_or_else(|| {
+        ApiError::InvalidInput("the model does not support expert offload".to_string())
+    })?;
+    if layers > info.moe_layers {
+        return Err(ApiError::InvalidInput(format!(
+            "offload of {layers} layers exceeds the model's {} MoE layers",
+            info.moe_layers
+        )));
+    }
+    b.raw_flags =
+        manager_models::set_expert_offload(b.raw_flags.as_deref(), info.offload_for(layers));
+    Ok(())
+}
+
 /// The `--split-mode` spelling for a structured split mode.
 pub(crate) fn split_mode_str(mode: manager_config::SplitMode) -> &'static str {
     match mode {
@@ -691,7 +714,9 @@ pub async fn op_backend_add(
 /// Placement chips from this, so the model-dependent behavior
 /// (slider range, guardrail states) is the edit form's, computed by
 /// the same code. `gpu_indices` previews an explicit GPU selection
-/// instead of the telemetry assignment. Nothing is written.
+/// instead of the telemetry assignment; `offload_layers` previews an
+/// explicit MoE position instead of the model's default. Nothing is
+/// written.
 pub async fn op_backend_add_preview(
     state: &Arc<AppState>,
     _sink: &Arc<dyn EventSink>,
@@ -699,6 +724,7 @@ pub async fn op_backend_add_preview(
     gpu_indices: Option<Vec<u32>>,
     n_ctx: Option<u32>,
     parallel: Option<u32>,
+    offload_layers: Option<u32>,
 ) -> ApiResult {
     let cfg = state.config.read().await.clone();
     let model = cfg
@@ -747,7 +773,10 @@ pub async fn op_backend_add_preview(
         tool_call_probe: None,
         purpose: String::new(),
     };
-    snap_default_offload(&cfg, &mut backend, &gpu_inventory);
+    match offload_layers {
+        Some(layers) => apply_offload_draft(&cfg, &mut backend, layers)?,
+        None => snap_default_offload(&cfg, &mut backend, &gpu_inventory),
+    }
     let offload = backend_offload_info(&cfg, &backend).map(|info| {
         let journal = activation::load_journal(&state.data_dir);
         let eval = evaluate_backend_offload(&cfg, &backend, &gpu_inventory, &journal);

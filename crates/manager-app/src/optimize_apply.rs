@@ -871,6 +871,15 @@ pub async fn op_optimize_apply_plan(
     // must describe the state after this apply, not during it.
     drop(guard);
     let mut payload = state_payload(state).await?;
+    // A failed item is a failed operation (lifecycle::payload_failure).
+    if let Some(f) = &failed {
+        payload["ok"] = json!(false);
+        payload["error"] = json!(format!(
+            "plan item {} failed: {}",
+            f["item_id"],
+            f["error"].as_str().unwrap_or("unknown error")
+        ));
+    }
     payload["apply_result"] = json!({
         "dry_run": false,
         "destructive": destructive,
@@ -1241,10 +1250,17 @@ mod tests {
     async fn consultation_refused_during_apply() {
         let (state, dir) = test_state(test_cfg());
         assert!(state.optimize.live.try_begin_apply());
-        let err =
-            crate::optimize::op_optimize_consult(&state, &sink(), None, Some(true), None, None)
-                .await
-                .unwrap_err();
+        let err = crate::optimize::op_optimize_consult(
+            &state,
+            &sink(),
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("plan apply is running"), "{err}");
         state.optimize.live.end_apply();
         std::fs::remove_dir_all(&dir).ok();
