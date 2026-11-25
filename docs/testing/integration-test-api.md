@@ -151,9 +151,12 @@ foreach ($n in 'LLMDIL_BASE_URL', 'LLMDIL_FINGERPRINT') {
 }
 $script:Client  = [LlmdilClient]::new($env:LLMDIL_BASE_URL, $env:LLMDIL_FINGERPRINT)
 $script:Results = [Collections.Generic.List[object]]::new()
+$script:TokenAt = Get-Date
 
 # One call. Never throws on an HTTP status; throws only when there is no
-# HTTP answer (refused, timeout, wrong certificate).
+# HTTP answer (refused, timeout, wrong certificate). Keeps the session
+# alive: refreshes at 45 minutes, and once after a 401 (a 401 comes before
+# the handler, so sending the call again repeats nothing).
 function Invoke-Llmdil {
     param(
         [Parameter(Mandatory)][ValidateSet('GET','POST','PUT','PATCH','DELETE')][string]$Method,
@@ -167,8 +170,14 @@ function Invoke-Llmdil {
     if ($null -ne $Body) {
         $json = if ($Body -is [string]) { $Body } else { ConvertTo-Json -InputObject $Body -Depth 30 -Compress }
     }
+    $session = -not $Anonymous -and $TokenVar -eq 'LLMDIL_TOKEN' -and $env:LLMDIL_REFRESH_TOKEN
+    if ($session -and ((Get-Date) - $script:TokenAt).TotalMinutes -gt 45) { Update-LlmdilToken }
     $token = if ($Anonymous) { $null } else { [Environment]::GetEnvironmentVariable($TokenVar) }
     $r = $script:Client.Send($Method, "/api/v1$Path", $token, $json, $TimeoutSec)
+    if ($session -and $r.Status -eq 401) {
+        Update-LlmdilToken
+        $r = $script:Client.Send($Method, "/api/v1$Path", $env:LLMDIL_TOKEN, $json, $TimeoutSec)
+    }
     $parsed = $null
     if ($r.ContentType -eq 'application/json' -and $r.Bytes.Length) {
         $parsed = ConvertFrom-Json -InputObject $r.Text -Depth 60 -NoEnumerate
@@ -195,6 +204,7 @@ function Update-LlmdilToken {
     if ($r.Status -ne 200) { throw "refresh: $($r.Status) $($r.Code) - ask the owner for a new token" }
     $env:LLMDIL_TOKEN = $r.Body.access_token
     $env:LLMDIL_REFRESH_TOKEN = $r.Body.refresh_token
+    $script:TokenAt = Get-Date
 }
 
 # Record one assertion. Never throws, so a run continues after a failure.
@@ -221,19 +231,15 @@ function Wait-Operation {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while ($true) {
         $r = Invoke-Llmdil GET "/operations/$id"
-        if ($r.Status -eq 401) { Update-LlmdilToken; continue }
         if ($r.Status -ne 200) { throw "operation ${id}: $($r.Status) $($r.Code) $($r.Message)" }
         if ($r.Body.status -in 'done', 'failed', 'aborted') {
-            # API records carry error; app task records carry detail.error.
-            $e = if ($r.Body.error) { $r.Body.error } else { $r.Body.detail.error }
-            return [pscustomobject]@{ Id = $id; Kind = $r.Body.kind; Status = $r.Body.status; Error = $e; Detail = $r.Body.detail }
+            return [pscustomobject]@{ Id = $id; Kind = $r.Body.kind; Status = $r.Body.status; Error = $r.Body.error; Code = $r.Body.error_code; Detail = $r.Body.detail }
         }
         if ($sw.Elapsed.TotalSeconds -gt $TimeoutSec) { throw "operation $id still $($r.Body.status) after $TimeoutSec s" }
         Start-Sleep -Seconds ($sw.Elapsed.TotalSeconds -lt 10 ? 1 : 5)
     }
 }
 
-# Operations carry error text only, no code (D03).
 function Assert-OperationDone {
     param([string]$Case, $Response, [int]$TimeoutSec = 900)
     if ($Response.Status -ne 202) { Assert $Case $false "expected 202; got $($Response.Status) $($Response.Code) $($Response.Message)"; return }
@@ -250,12 +256,12 @@ function Assert-OperationFailed {
 
 function Get-Plan { (Invoke-Llmdil GET '/activation-plan').Body }
 
-# Rows of somebody else (rule 2). Two kinds name nothing: gateway_drift (added
-# for every unapplied gateway change) and gateway_config (D09). They are yours
-# only if the plan was empty when you started, which P-1 checks.
+# Rows of somebody else (rule 2). gateway_drift names nothing, and neither
+# does a gateway_config row about something other than groups. They are
+# yours only if the plan was empty when you started, which P-1 checks.
 function Get-ForeignPlanRows {
     @((Get-Plan).changes | Where-Object {
-        $_.kind -notin 'gateway_drift', 'gateway_config' -and
+        $_.kind -ne 'gateway_drift' -and -not ($_.kind -eq 'gateway_config' -and $_.summary -notmatch '(?i)group `') -and
         "$($_.summary) $($_.targets -join ' ')" -notmatch '(^|[^a-z0-9-])qa-'
     })
 }
@@ -263,7 +269,7 @@ function Get-ForeignPlanRows {
 function Get-Backend([string]$Id) { (Invoke-Llmdil GET "/backends/$Id").Body }
 
 # A start operation is done when the process is spawned, not when the
-# model is loaded: poll the backend itself.
+# model is loaded: send wait_ready_secs, or poll the backend itself.
 function Wait-Backend {
     param([string]$Id, [string[]]$State = @('running', 'failed'), [int]$TimeoutSec = 600)
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -313,10 +319,10 @@ function Invoke-Gateway {
 | Long work (start, stop, restart, gateway, apply, audit, download, verify, diagnostics, setup steps) | `202` with `{id, kind, status, detail, created_ms, started_ms, finished_ms, error}`; poll `GET /operations/{id}` |
 | `POST /updates/components/{id}/apply` | `200` with `task_id` (null when there is nothing to do); `Wait-Operation $taskId` works on it |
 | Error | `{"error": {code, kind, message, details}}`; assert on status and `code`, show `message` |
-| Failed operation | `status: failed`; `error` is **text**. Its prefix gives the kind: `invalid input:`, `not found:`, `supervisor error:`, `config error:`; a busy refusal has no prefix and says "already in progress" |
-| Wrong argument on a `202` route | `202`, then `failed` (D03), not `400` |
-| Busy on a `202` route | `202`, then `failed` (D03), not `409` |
-| `kind` | The operation name (`start_backend`). The app keeps a second record (`backend_start`) with its own id; `GET /operations` lists both (D10) |
+| Failed operation | `status: failed`; `error` is text, `error_code` the code (`OPERATION_FAILED` when the operation's own payload says so) |
+| Wrong argument or unknown id on a `202` route | `400`, `404`: nothing is queued |
+| Busy on a `202` route | `409 BUSY` with `details`; when it became busy a moment later, `202`, then `failed` with `error_code` `BUSY` |
+| `kind` | The operation name (`start_backend`). The app keeps a second record (`backend_start`) with its own id; `GET /operations` lists both, linked by `task_id` and `operation_id` |
 | Wrong method on a known path | `405`, empty body |
 | Unknown path | `404 NOT_FOUND`, with or without a token |
 
@@ -328,12 +334,28 @@ function Invoke-Gateway {
 | `NOT_FOUND` | 404 | Unknown id |
 | `BUSY` | 409 | A synchronous call meets a running operation |
 | `CONFIG` | 422 | The whole configuration would become invalid (ports, splits, fallbacks, rules) |
-| `JSON` | 500 | Some wrong types inside a patch (D06, D07) |
 | `UNSUPPORTED` | 501 | Report-only components |
 | `SUPERVISOR`, `GATEWAY`, `MODELS`, … | 500 | The part that failed |
 
 Operation records live in memory: after the app restarts, an old id is
-`404`. Messages are cut at 400 characters (D16).
+`404`. Messages are cut at 4000 characters.
+
+**An unattended run (G21).** API tokens above operator do not exist, by
+decision. A run keeps the owner-issued session alive instead:
+
+- The access token lasts 60 minutes. Each refresh gives a new pair and
+  starts the refresh token's 30 days again, so a run of any length needs
+  no second pairing code. The session survives an app restart.
+- `Invoke-Llmdil` refreshes by itself. A long wait without calls is fine
+  within 30 days: the next call gets a 401 and refreshes.
+- One process only. Two processes refreshing with the same token, or
+  repeating a refresh whose answer was lost, look like a stolen token:
+  `401 SESSION_REVOKED`, and the owner must issue a new code. After a
+  failed refresh, stop; do not retry it.
+- Never write the tokens to a file. If the process ends, the session is
+  over for the run: the owner pairs again.
+- Changing the user's role, disabling the user or resetting the password
+  ends the session.
 
 ## 2. Rules
 
@@ -369,7 +391,7 @@ The rules of the UI test apply. Adapted to HTTP:
    it reads the same memory.
 7. Keep at least 8 GB of RAM available; run one large MoE model at a time.
 8. **Evidence stays local.** `/config`, `/backends/{id}/launch-command`,
-   operation details and logs contain local paths (D19). Publish ids,
+   operation details (admins only) and logs contain local paths. Publish ids,
    statuses, codes and numbers; nothing else.
 
 Record **PASS**, **FAIL**, **ODD** or **SKIP**, as in the UI test. A case
@@ -421,7 +443,8 @@ Assert P-1 (-not (Get-Plan).pending) 'no pending changes of the owner; otherwise
 
 Second source for what the API did: `GET /admin/audit?limit=20` (`admin`)
 and `logs/admin-api-audit.jsonl`. Every authenticated change that reached
-its handler is there with its status; refusals with 401 and 403 are not.
+its handler is there with its status, and so are 403 refusals and the
+disclosure reads (launch command, bundle content); 401 is not.
 
 ## 4. Screens (read-only)
 
@@ -436,10 +459,10 @@ screen.
 | S-4 ★ | `GET /backends`, `GET /backends/{id}` | Rows have `id`, `group`, `model_file`, `state`; displayed name = `name` of the model with that `gguf_path` in `GET /models`. `GET /backends/nope` → `404 NOT_FOUND`. Sort, filter, menus: N/A (screen-only) | `config.json` |
 | S-5 | `GET /models`, `GET /models/{id}` | `on_disk`, `size_bytes`, `verified_at`. `GET /models/nope` → `404`. Forms: N/A (screen-only) | File size on disk |
 | S-6 ★ | Block below | | The log file |
-| S-7 ★ | `GET /gateway/config`, `/gateway/status`, `/gateway/generated-config` | `effective_strategy` and `status.groups` (enabled groups); YAML is `text/yaml`. The generated routing file is not returned (G17). Running versus saved labels: N/A (screen-only); `status.port` is the **saved** port (D15) | `gateway/config.yaml` |
+| S-7 ★ | `GET /gateway/config`, `/gateway/status`, `/gateway/generated-config` | `effective_strategy` and `status.groups` (enabled groups); YAML is `text/yaml`; `/gateway/generated-routing` is the second file (`404` without a rule). Running versus saved labels: N/A (screen-only); `status.port` is the **saved** port (D15) | `gateway/config.yaml` |
 | S-8 | `GET /gateway/groups`, `/activation-plan`, `/activation-plan/history`, `GET /config` (`.mcp`) | 200. MCP list: G07. Optimize: G11. Bench: G15, G16 | Files in the data directory |
 | S-9 | `GET /config` | Equal to `config.json` field by field, apart from `config_path` | `config.json` |
-| S-10 | `GET /setup/status`, `/setup/steps`, `/setup/prerequisites`; `POST /setup/audit` | `setup_completed` true; `steps`, `done`, `total`; audit operation `done`. `detail.already_running` true means it did **not** run (D17): repeat | Scope `wizard` in the logs |
+| S-10 | `GET /setup/status`, `/setup/steps`, `/setup/prerequisites`; `POST /setup/audit` | `setup_completed` true; `steps`, `done`, `total`; audit operation `done`; `409 BUSY` while another audit runs: repeat | Scope `wizard` in the logs |
 
 ```powershell
 # S-6
@@ -459,9 +482,7 @@ $w = (Invoke-Llmdil GET "/logs?scope=all&since_ms=$($now - 600000)&until_ms=$now
 Assert S-6 (@($w.lines | Where-Object { [DateTimeOffset]$_.ts -lt [DateTimeOffset]::FromUnixTimeMilliseconds($now - 600000) }).Count -eq 0) 'window'
 Assert-ApiError S-6 (Invoke-Llmdil GET '/logs?scope=all&order=up') 400 'INVALID_INPUT'
 Assert-ApiError S-6 (Invoke-Llmdil GET '/logs') 400 'INVALID_INPUT' '*scope*'
-# Expected 200; today 400 INVALID_INPUT, a numeric search is sent on as a number (D05):
 Assert S-6 ((Invoke-Llmdil GET '/logs?scope=all&search=4000').Status -eq 200) 'search for a number'
-# Expected 400; today 200 unfiltered:
 Assert S-6 ((Invoke-Llmdil GET '/logs?scope=all&level=nonsense').Status -eq 400) 'unknown level refused'
 ```
 
@@ -490,15 +511,14 @@ foreach ($g in 'qa-small', 'qa-moe') {
 }
 
 # G-2: refusals the route makes
-Assert-ApiError G-2 (Invoke-Llmdil POST '/gateway/groups' -Body @{ name = '' }) 400 'INVALID_INPUT' '*required*'
+Assert-ApiError G-2 (Invoke-Llmdil POST '/gateway/groups' -Body @{ name = '' }) 400 'INVALID_INPUT'
 Assert-ApiError G-2 (Invoke-Llmdil POST '/gateway/groups' -Body @{ name = 'qa-small' }) 400 'INVALID_INPUT' '*already exists*'
 Assert-ApiError G-2 (Invoke-Llmdil POST '/gateway/groups' -Body @{ name = 'qa-x'; nope = 1 }) 400 'INVALID_INPUT' '*unknown field*'
 Assert-ApiError G-2 (Invoke-Llmdil PATCH '/gateway/groups/qa-none' -Body @{ purpose = 'x' }) 404 'NOT_FOUND'
-# G-2: the name rules. Expected 400; today 201, this route does not have the app's rules (G06, D08).
-foreach ($bad in 'qa bad!', ('qa-' + 'x' * 60)) {
+# G-2: the name rules (the app's own)
+foreach ($bad in 'qa bad!', ('qa-' + 'x' * 60), 'openrouter') {
     $r = Invoke-Llmdil POST '/gateway/groups' -Body @{ name = $bad }
     Assert-ApiError G-2 $r 400 'INVALID_INPUT'
-    if ($r.Status -eq 201) { $null = Invoke-Llmdil DELETE "/gateway/groups/$([uri]::EscapeDataString($bad))" }
 }
 
 # G-3: an empty group (the confirmation is screen-only)
@@ -509,9 +529,9 @@ Assert G-3 ((Get-SavedConfig).gateway.groups.name -notcontains 'qa-empty') 'gone
 Assert-ApiError G-3 (Invoke-Llmdil DELETE '/gateway/groups/qa-empty') 404 'NOT_FOUND'
 ```
 
-Do **not** send `openrouter` as a new group name: it would be created
-(D08), and the name is not yours. Do not delete a group with members to
-see the refusal: this route deletes it with its member list (D08).
+A group with members is refused (`400`) unless `?cascade=true`, which
+deletes it with its member list: never send that for a group that is not
+yours.
 
 ### Backends
 
@@ -634,7 +654,7 @@ Assert A-5 (-not $c.Body.cancelled -and $c.Body.reason -eq 'no pending changes')
 | Id | API |
 |---|---|
 | A-4 | Start a long streaming chat (W-5 block, do not stop it), then `POST /activation-plan/apply` `{"mode":"drain"}`. While it waits: `GET /gateway/status` → `activation_applying.step` = `gateway`. At the end `detail.quiesce` = `{drained, in_flight, timed_out}`; with `timed_out: true` the apply went on and the detail says so. Second source: scope `gateway`, lines "draining in-flight requests" and "drain finished". A second apply meanwhile: `202`, then `failed`, `*activation apply*running*` |
-| A-6 | `GET /activation-plan` twice gives the same rows; `GET /activation-plan/history` and `?execution_id=`. An unknown id returns `200` with `execution: null`. *Later* and *Review*: N/A (screen-only). Rows "Gateway configuration changed" name no target (D09) |
+| A-6 | `GET /activation-plan` twice gives the same rows; `GET /activation-plan/history` and `?execution_id=`. An unknown id returns `200` with `execution: null`. *Later* and *Review*: N/A (screen-only). Group rows name the group and its backends |
 | A-7 | Make a **running** backend not fit: `PUT /backends/qa-qwen8b/flags` with a context whose `fit.state` is not `fits`, plus one group change, then apply. Expected: operation `failed`, item of `qa-qwen8b` `failed` with the memory reason, **other items applied**. Today: the apply **stops** at the first backend that fails; later items and the gateway are `skipped` ("Not attempted …"), `status` `failed`. Put the flags back and apply again |
 
 ## 8. Run and fail
@@ -657,16 +677,17 @@ $need; Get-GpuUsed; $gpu0                                            # differenc
 
 # R-2: two starts at once (backend stopped)
 $two = @(1..2 | ForEach-Object { Invoke-Llmdil POST '/backends/qa-coder7b/start' -Body @{} })
-$x = @($two | ForEach-Object { Wait-Operation $_ })
-Assert R-2 (@($x | Where-Object Status -eq 'done').Count -eq 1) "one starts; the other: $(($x | Where-Object Status -eq 'failed').Error)"
+$x = @($two | ForEach-Object { if ($_.Status -eq 202) { Wait-Operation $_ } else { $_ } })
+Assert R-2 (@($x | Where-Object Status -eq 'done').Count -eq 1) "one starts; the other: $(($x | Where-Object Status -ne 'done').Code)"
 $port = (Get-Backend 'qa-coder7b').port
 Assert R-2 (@(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction Ignore).Count -le 1) 'one process'
 
-# R-3 (the body of stop and restart must contain graceful; without it: 202, then failed)
-Assert-OperationFailed R-3 (Invoke-Llmdil POST '/backends/qa-coder7b/stop' -Body @{}) '*graceful*'
+# R-3 (the body of stop and restart must contain graceful)
+Assert-ApiError R-3 (Invoke-Llmdil POST '/backends/qa-coder7b/stop' -Body @{}) 400 'INVALID_INPUT' '*graceful*'
 $null = Invoke-Llmdil POST '/backends/qa-coder7b/start' -Body @{}
-$s = Wait-Operation (Invoke-Llmdil POST '/backends/qa-coder7b/stop' -Body @{ graceful = $true })
-Assert R-3 ($s.Status -eq 'done' -or $s.Error -match 'already in progress') "stop while starting: $($s.Status) $($s.Error)"
+$s = Invoke-Llmdil POST '/backends/qa-coder7b/stop' -Body @{ graceful = $true }
+if ($s.Status -eq 202) { $s = Wait-Operation $s }
+Assert R-3 ($s.Status -eq 'done' -or $s.Code -eq 'BUSY') "stop while starting: $($s.Status) $($s.Code)"
 $b = Wait-Backend 'qa-coder7b' -State 'running', 'stopped', 'failed'
 Assert R-3 ([bool](Get-Pid 'qa-coder7b') -eq ($b.state -in 'running', 'starting')) 'state matches the process'
 $o = Assert-OperationDone R-3 (Invoke-Llmdil POST '/backends/qa-coder7b/restart' -Body @{ graceful = $true; wait_ready_secs = 300 })
@@ -703,7 +724,7 @@ Assert R-9 ((Get-Backend 'qa-qwen8b').state -eq 'running') 'restarted by its pol
 |---|---|---|---|
 | R-5 ★ | `POST /backends/{id}/start` for a `qa-*` backend that needs more than GPU 0's **free** memory | 202, then `failed`, `*cannot start*GPU 0 needs*only*MiB is free*`, naming the running backends. `fit.state` of the row compares with **total** memory, so it may say `fits` here: record ODD | `nvidia-smi` free memory before and after is unchanged |
 | R-6 | `PATCH /backends/qa-big/config` `{"patch":{"enabled":true},"apply_mode":"OnNextRestart"}`, then start on a TCC GPU 0 | 202, then `failed`, `*weights * MiB + KV cache*exceeds the GPU's total memory*`. Disable again. Disabled: `failed`, `*is disabled*` | No new process |
-| R-7 | `POST /placement/apply` `{"model_id":"qwen3.8-27b-mtp","split": One-Gpu $WDDM,"backend_id":"qa-big"}`, then one start **without** `allow_wddm_overcommit` | `GET /backends/qa-big`: `fit.state` `wddm_paged`, `fit.paged_mib` > 0; 202, then `failed`, `*cannot start without confirmation*will page to system RAM*`. Only the text tells this refusal from R-6 (D03) | No new process |
+| R-7 | `POST /placement/apply` `{"model_id":"qwen3.8-27b-mtp","split": One-Gpu $WDDM,"backend_id":"qa-big"}`, then one start **without** `allow_wddm_overcommit` | `GET /backends/qa-big`: `fit.state` `wddm_paged`, `fit.paged_mib` > 0; 202, then `failed`, `*cannot start without confirmation*will page to system RAM*`. Only the text tells this refusal from R-6 | No new process |
 | R-10 ★ | On a CC 6.x GPU 0: `PUT /backends/qa-nemo/offload` `{"layers": <half>}` | `400 INVALID_INPUT` naming the safe positions; `offload.guardrail.status`, `nearest_verified_layers` from `GET /backends/qa-nemo`. Then `{"layers": <moe_layers>}` → 200; start; `POST …/test` answers | `raw_flags` in `config.json` unchanged by the 400 |
 | R-11 | Start two backends on one GPU until nearly full | Second runs, or 202 then `failed` as R-5 | `nvidia-smi` |
 | R-12 | `POST /backends` `qa-small-missing` with `model_id` `$SMALL` in `qa-small`, then start | 201; 202, then `failed`, `*model file is missing*` (path shown as `<data-dir>`). Delete it (`admin`) | File absent |
@@ -726,7 +747,7 @@ check, put back.
 | Expert cache | `PUT …/moe-cache` `{"mib": n or null}` or `{"auto": true}`; both → `400`; with offload 0 → `400` | `--moe-cache-mib`; `resolved_mib` |
 | MoE offload | `PUT …/offload` `{"layers": 0 / middle / all}`; more than `moe_layers` → `400` | `raw_flags`; RAM and VRAM |
 | Flags as text | `PUT …/flags-mode`, `PUT …/raw-flags` | Command line |
-| Several fields | `PATCH …/config` `{"patch":{…},"apply_mode":"OnNextRestart"}`; preview: `POST …/config/preview-diff` `{"patch":{…}}`. Never `RestartNow` (D01) | `diff.changes` |
+| Several fields | `PATCH …/config` `{"patch":{…},"apply_mode":"OnNextRestart"}`; preview: `POST …/config/preview-diff` `{"patch":{…}}`. `RestartNow` restarts a running backend and is `400` for a stopped one | `diff.changes` |
 | Placement | `POST /placement/propose` and `/apply` `{"model_id","split":[…],"backend_id"}`; GPU 0 → 1 → both. Wrong length → `400` (apply) | `CUDA_VISIBLE_DEVICES`, `--tensor-split`, `nvidia-smi` |
 
 ```powershell
@@ -745,14 +766,14 @@ Assert C-4 ($r.Status -eq 200 -and @($r.Body.warnings).Count -eq 0) 'known flags
 $null = Invoke-Llmdil PUT '/backends/qa-coder7b/flags-mode' -Body @{ advanced = $false }
 Assert-ApiError C-4 (Invoke-Llmdil PUT '/backends/qa-coder7b/raw-flags' -Body @{ raw_flags = '--parallel 1' }) 400 'INVALID_INPUT' '*not in advanced*'
 
-# C-neg: the patch route (own backend, stopped). Expected / today in the comments.
-Assert-ApiError C-neg (Invoke-Llmdil PATCH '/backends/qa-none/config' -Body @{ patch = @{ enabled = $true }; apply_mode = 'OnNextRestart' }) 404 'NOT_FOUND'   # today 422 CONFIG (D06)
-Assert-ApiError C-neg (Invoke-Llmdil PATCH '/backends/qa-coder7b/config' -Body @{ patch = @{ n_ctxx = 1 }; apply_mode = 'OnNextRestart' }) 400 'INVALID_INPUT' # today 200 (D06)
-Assert-ApiError C-neg (Invoke-Llmdil PATCH '/backends/qa-coder7b/config' -Body @{ patch = @{ n_ctx = 'x' }; apply_mode = 'OnNextRestart' }) 400 'INVALID_INPUT' # today 500 JSON (D06)
-Assert-ApiError C-neg (Invoke-Llmdil PATCH '/backends/qa-coder7b/config' -Body @{ patch = @{ }; apply_mode = 'Soon' }) 422 'CONFIG'
+# C-neg: the patch route (own backend, stopped)
+Assert-ApiError C-neg (Invoke-Llmdil PATCH '/backends/qa-none/config' -Body @{ patch = @{ enabled = $true }; apply_mode = 'OnNextRestart' }) 404 'NOT_FOUND'
+Assert-ApiError C-neg (Invoke-Llmdil PATCH '/backends/qa-coder7b/config' -Body @{ patch = @{ n_ctxx = 1 }; apply_mode = 'OnNextRestart' }) 400 'INVALID_INPUT'
+Assert-ApiError C-neg (Invoke-Llmdil PATCH '/backends/qa-coder7b/config' -Body @{ patch = @{ n_ctx = 'x' }; apply_mode = 'OnNextRestart' }) 400 'INVALID_INPUT'
+Assert-ApiError C-neg (Invoke-Llmdil PATCH '/backends/qa-coder7b/config' -Body @{ patch = @{ }; apply_mode = 'Soon' }) 400 'INVALID_INPUT'
 $n = (Get-SavedBackend 'qa-coder7b').flags.n_ctx
 $r = Invoke-Llmdil PATCH '/backends/qa-coder7b/config' -Body @{ patch = @{ n_ctx = 10 }; apply_mode = 'OnNextRestart' }
-Assert-ApiError C-neg $r 400 'INVALID_INPUT'                                                                                                                  # today 200 (D06)
+Assert-ApiError C-neg $r 400 'INVALID_INPUT'
 if ($r.Status -eq 200) { $null = Invoke-Llmdil PUT '/backends/qa-coder7b/flags' -Body @{ n_ctx = $n; n_batch = 512 } }
 ```
 
@@ -833,9 +854,9 @@ $ownEnabled = @((Invoke-Llmdil GET '/gateway/config').Body.routing_rules | Where
 # With an enabled rule of the owner, add yours disabled and skip the two-rule check.
 $on = $ownEnabled -eq 0
 Assert W-7 ((Set-QaRule (New-QaRule 'qa-rule-1' 2000 $on)).Status -eq 200) 'add'
-Assert-ApiError W-7 (Set-QaRule (New-QaRule 'qa-rule-1' -5 $on)) 400 'INVALID_INPUT'                     # today 500 JSON (D07)
-Assert-ApiError W-7 (Set-QaRule (New-QaRule 'qa-rule-1' 0 $on)) 422 'CONFIG' '*optimal_tokens*'
-if ($on) { Assert-ApiError W-7 (Set-QaRule (New-QaRule 'qa-rule-1' 2000), (New-QaRule 'qa-rule-2' 2000)) 422 'CONFIG' '*at most one*' }
+Assert-ApiError W-7 (Set-QaRule (New-QaRule 'qa-rule-1' -5 $on)) 400 'INVALID_INPUT'
+Assert-ApiError W-7 (Set-QaRule (New-QaRule 'qa-rule-1' 0 $on)) 400 'INVALID_INPUT' '*optimal_tokens*'
+if ($on) { Assert-ApiError W-7 (Set-QaRule (New-QaRule 'qa-rule-1' 2000), (New-QaRule 'qa-rule-2' 2000)) 400 'INVALID_INPUT' '*at most one*' }
 Assert W-7 ((Set-QaRule (New-QaRule 'qa-rule-1' 3000 $on)).Status -eq 200) 'edit'
 Assert W-7 ((Set-QaRule (New-QaRule 'qa-rule-1' 3000 $false)).Status -eq 200) 'disable'
 Assert W-7 ((Set-QaRule @()).Status -eq 200) 'delete'
@@ -894,20 +915,18 @@ Second source for all of them: `optimize-*.json`, `bench-*.json`.
 
 ```powershell
 # M-1 (owner's agreement; $SMALL not used by a running backend)
-$o = Assert-OperationDone M-1 (Invoke-Llmdil POST "/models/$SMALL/download")      # done = started, not finished
-$task = $o.Detail.task_id
+$d = Invoke-Llmdil POST "/models/$SMALL/download"      # runs until the transfer ended
 do { Start-Sleep 2; $m = (Invoke-Llmdil GET "/models/$SMALL").Body } until ($m.partial_bytes -gt 0 -or -not $m.downloading)
 Assert M-1 ($m.catalog_size_bytes -and $m.partial_bytes -le $m.catalog_size_bytes) "percentage $([int](100 * $m.partial_bytes / $m.catalog_size_bytes))"
-Assert-OperationFailed M-1 (Invoke-Llmdil POST "/models/$SMALL/download") '*already in flight*'
+Assert-ApiError M-1 (Invoke-Llmdil POST "/models/$SMALL/download") 409 'BUSY' '*already in flight*'
 Assert M-1 ((Invoke-Llmdil POST "/models/$SMALL/download/pause").Body.paused) 'pause'
 Assert M-1 ((Invoke-Llmdil GET "/models/$SMALL").Body.paused) 'paused in the list'
-$null = Assert-OperationDone M-1 (Invoke-Llmdil POST "/models/$SMALL/download/resume")
-Assert M-1 ((Invoke-Llmdil POST "/models/$SMALL/download/cancel").Body.cancelled) 'cancel'
+Assert M-1 ((Invoke-Llmdil POST "/models/$SMALL/download/resume").Status -eq 202) 'resume'
+Assert M-1 ((Invoke-Llmdil POST "/operations/$($d.Body.id)/abort").Body.status -eq 'aborted') 'abort by the 202 id'
 Assert-ApiError M-1 (Invoke-Llmdil POST "/models/$SMALL/download/cancel") 404 'NOT_FOUND'
-Assert-OperationFailed M-1 (Invoke-Llmdil POST "/models/$SMALL/download/resume") '*no download in flight*'
-# after a cancel the partial file is gone: start again, then wait for the app task
-$o = Assert-OperationDone M-1 (Invoke-Llmdil POST "/models/$SMALL/download")
-$null = Wait-Operation $o.Detail.task_id -TimeoutSec 7200
+Assert-ApiError M-1 (Invoke-Llmdil POST "/models/$SMALL/download/resume") 404 'NOT_FOUND'
+# after a cancel the partial file is gone: start again and wait for the end
+$null = Assert-OperationDone M-1 (Invoke-Llmdil POST "/models/$SMALL/download") -TimeoutSec 7200
 do { Start-Sleep 5; $m = (Invoke-Llmdil GET "/models/$SMALL").Body } while ($m.downloading -or $m.verifying)
 Assert M-1 ($m.on_disk -and $m.verified_at -and -not $m.download_error) "verified $($m.download_error)"
 $null = Assert-OperationDone M-1 (Invoke-Llmdil POST "/models/$SMALL/verify") -TimeoutSec 3600
@@ -928,10 +947,10 @@ Assert-ApiError M-2 (Invoke-Llmdil GET '/models/qa-model') 404 'NOT_FOUND'
 | M-1 | Block above. Speed is not in the API; take it from two readings, or from `download-progress` on `GET /events`. The dialog: N/A (screen-only) | Size of the file and of its `.part` file; SHA-256 |
 | M-2 | Block above. Lookup: NOT POSSIBLE VIA API (G05). Form position: N/A (screen-only) | `config.json` |
 | K-1, K-2 | NOT POSSIBLE VIA API (G07). Read-only: `GET /config` → `.mcp.servers` (no credential values) | `config.json` |
-| T-1 | `PUT /telemetry/interval` `{"ms":-1}` → `400`; `{"ms":"x"}` → `400`; `{"ms":0}` is valid (off). `{"ms":999999999}`: expected `400`, today `200` (D11): put the old value back at once | `telemetry.poll_interval_ms` in `config.json` |
+| T-1 | `PUT /telemetry/interval` `{"ms":-1}` → `400`; `{"ms":"x"}` → `400`; `{"ms":0}` is valid (off). `{"ms":999999999}` → `400` | `telemetry.poll_interval_ms` in `config.json` |
 | T-2 ★ | Block below (ask first) | Listening port; `Get-NetFirewallRule` |
 | T-3 | `PATCH /gateway/config` `{"bind_host":"127.0.0.1"}` → 200, `restart_required: true`; one plan row of kind `gateway_bind`; `{"bind_host":"nope"}` → `400 INVALID_INPUT`. Apply, check, put back, apply | `Get-NetTCPConnection` local address |
-| T-4 ★ | `POST /mxc/self-test` → `cases[]`, `summary.failed` = 0; nothing says whether the runtime is installed (G19). `PUT /mxc/mode` `{"mode":"nonsense"}` → `400`. `{"mode":"enforced"}`: expected a refusal, today `200` (D12): only with the owner's agreement, and put the old mode back | `mxc.mode` in `config.json` |
+| T-4 ★ | `POST /mxc/self-test` → `cases[]`, `summary.failed` = 0; `GET /mxc/policy` → `runtime_installed`. `PUT /mxc/mode` `{"mode":"nonsense"}` → `400`. `{"mode":"enforced"}`: expected a refusal, today `200` (D12): only with the owner's agreement, and put the old mode back | `mxc.mode` in `config.json` |
 | T-5 | NOT POSSIBLE VIA API (G08). Read: `GET /config` → `.notifications` | `config.json` |
 | T-6 | NOT POSSIBLE VIA API (G01, G09). Read: `.supervision.mode`; `service_managed` on backends and gateway | See the Windows services plan |
 | T-7 | Block below (`admin`) | The zip itself |
@@ -941,7 +960,7 @@ Assert-ApiError M-2 (Invoke-Llmdil GET '/models/qa-model') 404 'NOT_FOUND'
 $old = (Get-SavedConfig).gateway.port
 Assert-ApiError T-2 (Invoke-Llmdil PATCH '/gateway/config' -Body @{ port = (Get-Backend 'qa-qwen8b').port }) 422 'CONFIG' '*claimed by both*'
 Assert-ApiError T-2 (Invoke-Llmdil PATCH '/gateway/config' -Body @{ port = 0 }) 422 'CONFIG' '*port 0*'
-Assert-ApiError T-2 (Invoke-Llmdil PATCH '/gateway/config' -Body @{ port = 70000 }) 400 'INVALID_INPUT'              # today 500 JSON (D07)
+Assert-ApiError T-2 (Invoke-Llmdil PATCH '/gateway/config' -Body @{ port = 70000 }) 400 'INVALID_INPUT'
 $new = Get-FreePort 18400
 Assert T-2 ((Invoke-Llmdil PATCH '/gateway/config' -Body @{ port = $new }).Status -eq 200) 'saved'
 Assert T-2 ((Get-Plan).pending) 'the plan shows it'                                                                   # today: no row (D15)
@@ -969,7 +988,7 @@ Assert T-7 ((Invoke-Llmdil GET '/diagnostics/bundles/nope/content').Status -eq 4
 
 | Id | API | Second source |
 |---|---|---|
-| U-1 | `POST /updates/check` → `checked_at`, `components[]` `{id, installed_version, latest_available, target_version, pinned, pinned_version, update_available, applyable, note, check_error}`. The result cannot be read again: `GET /updates` gives only pins and `last_checked` (G18). `GET /app-update` is the app's own update state | `updates/last-check.json` |
+| U-1 | `POST /updates/check` → `checked_at`, `components[]` `{id, installed_version, latest_available, target_version, pinned, pinned_version, update_available, applyable, note, check_error}`. Read again: `GET /updates/components`. `GET /app-update` is the app's own update state | `updates/last-check.json` |
 | U-2 | `POST /updates/components/llamacpp/apply` `{}` (`admin`) with only `qa-qwen8b` running → `task_id` and `plan`, or `message: nothing to update`. `Wait-Operation $taskId -TimeoutSec 1800`; `detail.results[]` has the outcome and message. A second apply meanwhile: `400 INVALID_INPUT`, `*already running*` | `updates/history.json`; R-1 again |
 | U-3 | After P-3: `POST /updates/components/litellm/apply` `{"version":"<newer>"}`; wait as U-2; then W-1 and W-2. Without `version` → `400` | `litellm_version` in `GET /gateway/status` |
 | U-4 | Pin: `PUT /updates/components/litellm/pin` `{"version":"0.0.0-qa"}`: expected `400`, today `200` (D13): put the old pin back at once (`{"version": null}` clears). Apply refuses: `…/litellm/apply` `{"version":"not-a-version"}` → `400 INVALID_INPUT`; `…/llamacpp/apply` `{"version":"b1"}` → `400`; `…/postgres/apply` → `501 UNSUPPORTED` | `updates.components` in `config.json` |
@@ -986,7 +1005,7 @@ Assert-ApiError X-1 $r 400 'INVALID_INPUT'
 Assert X-1 ((Get-SavedBackend 'qa-coder7b').flags.n_ctx -eq $n.n_ctx) 'the other backend is untouched'
 if ((Get-SavedBackend 'qa-coder7b').flags.n_ctx -ne $n.n_ctx) { $null = Invoke-Llmdil PUT '/backends/qa-coder7b/flags' -Body @{ n_ctx = $n.n_ctx; n_batch = $n.n_batch } }
 
-# X-2 abort of a finished operation must not rewrite it. Expected done; today aborted (D02).
+# X-2 abort of a finished operation must not rewrite it
 $o = Wait-Operation (Invoke-Llmdil POST '/setup/audit')
 $null = Invoke-Llmdil POST "/operations/$($o.Id)/abort"
 Assert X-2 ((Invoke-Llmdil GET "/operations/$($o.Id)").Body.status -eq $o.Status) 'a finished operation keeps its status'
@@ -994,23 +1013,23 @@ Assert X-2 ((Invoke-Llmdil GET "/operations/$($o.Id)").Body.status -eq $o.Status
 # X-3 unknown operation; list shape
 Assert-ApiError X-3 (Invoke-Llmdil GET '/operations/nope') 404 'NOT_FOUND'
 Assert-ApiError X-3 (Invoke-Llmdil POST '/operations/nope/abort') 404 'NOT_FOUND'
-Assert X-3 ((Invoke-Llmdil GET '/operations').Body -isnot [array]) 'documented envelope {operations}'          # today a bare array (D10)
+$ops = (Invoke-Llmdil GET '/operations').Body
+Assert X-3 ($ops -is [array] -and $ops[0].created_ms -ge $ops[-1].created_ms) 'an array, newest first'
 
-# X-4 RestartNow must restart (qa-qwen8b running). Today it never does (D01): run only once, it leaves a task "running".
+# X-4 RestartNow must restart (qa-qwen8b running)
 $p0 = Get-Pid 'qa-qwen8b'
 $r = Invoke-Llmdil PATCH '/backends/qa-qwen8b/config' -Body @{ patch = @{ max_retries = 5 }; apply_mode = 'RestartNow' }
 Start-Sleep 30
 Assert X-4 ((Get-Pid 'qa-qwen8b') -ne $p0) 'restarted'
-Assert X-4 ((Invoke-Llmdil GET "/operations/$($r.Body.restart_task_id)").Body.status -ne 'running') 'task finished'
-$null = Invoke-Llmdil POST "/operations/$($r.Body.restart_task_id)/abort"      # clear the stuck record
+Assert X-4 ((Wait-Operation $r.Body.restart_task_id).Status -eq 'done') 'task finished'
 
-# X-5 a typed name in a gateway patch must not be ignored. Expected 400; today 200, nothing saved (D07).
+# X-5 a typed name in a gateway patch must not be ignored
 Assert-ApiError X-5 (Invoke-Llmdil PATCH '/gateway/config' -Body @{ no_such_field = 1 }) 400 'INVALID_INPUT'
 
 # X-6 routing test needs a group
 Assert X-6 ((Invoke-Llmdil POST '/gateway/routing/test' -Body @{ group = 'qa-small' }).Body.dry_run) 'dry run'
 Assert-ApiError X-6 (Invoke-Llmdil POST '/gateway/routing/test' -Body @{ group = 'qa-none' }) 404 'NOT_FOUND'
-Assert-ApiError X-6 (Invoke-Llmdil POST '/gateway/routing/test' -Body @{}) 400 'INVALID_INPUT'                 # today 500 GATEWAY
+Assert-ApiError X-6 (Invoke-Llmdil POST '/gateway/routing/test' -Body @{}) 400 'INVALID_INPUT'
 ```
 
 ## 15. Coverage
@@ -1026,11 +1045,11 @@ be done by API. **Partial**: some checks cannot (reason given). **None**.
 | P-4 | full | |
 | S-1 | partial | Layout, pause, views |
 | S-2 | none | Screen-only |
-| S-3 | partial | Snapshot content (G20), labels |
+| S-3 | partial | Labels |
 | S-4 | partial | Sort, filter, menus |
 | S-5 | partial | Forms |
-| S-6 | partial | Colours, follow, recents, folder; D05 |
-| S-7 | partial | Routing file (G17), labels |
+| S-6 | partial | Colours, follow, recents, folder |
+| S-7 | partial | Labels |
 | S-8 | partial | MCP (G07), Optimize (G11), Bench (G15, G16) |
 | S-9 | partial | Styling |
 | S-10 | full | |
@@ -1046,11 +1065,11 @@ be done by API. **Partial**: some checks cannot (reason given). **None**.
 | B-neg (refusals) | full | Form focus, captions, live memory lines (G02, G03) |
 | A-1, A-2, A-3, A-4 | full | |
 | A-5 | full | Needs admin |
-| A-6 | partial | Buttons; D09 |
+| A-6 | partial | Buttons |
 | A-7 | full | Fails today |
 | R-1 | partial | Tool-call test (G04) |
 | R-2 … R-6 | full | |
-| R-7 | full | Confirmation is text only (D03) |
+| R-7 | full | Confirmation is text only |
 | R-8, R-9 | full | Fail today |
 | R-10 … R-13 | full | |
 | C-1 | partial | Screen rules |
@@ -1072,13 +1091,13 @@ be done by API. **Partial**: some checks cannot (reason given). **None**.
 | M-1 | partial | Speed, dialog |
 | M-2 | partial | Lookup (G05), form |
 | K-1, K-2 | none | G07 |
-| T-1, T-2 | full | Fail today (D11, D15) |
+| T-1, T-2 | full | |
 | T-3 | full | |
-| T-4 | partial | Runtime state (G19) |
+| T-4 | full | |
 | T-5 | none | G08 |
 | T-6 | none | G01, G09 |
 | T-7 | full | Needs admin |
-| U-1 | partial | Result not readable again (G18) |
+| U-1 | full | |
 | U-2, U-3, U-4 | full | U-4 fails today (D13) |
 
 ## 16. API gaps
@@ -1094,7 +1113,7 @@ operations, 89 have a route.
 | G03 | Cache and context preview on a backend | `backend_cache_preview` (223) | Memory lines of unsaved edits cannot be compared with the saved result | Excluded: §6.16 | `POST /backends/{id}/cache/preview` |
 | G04 | Test tool calls | `backend_test_tool_call` (347) | R-1 stays partial; `tool_call_probe` can be read but never refreshed | Excluded: §6.16 files it under MCP (decision 10), but it is a backend probe with no MCP state | `POST /backends/{id}/test-tool-call` |
 | G05 | Model lookup and file header | `model_hf_lookup` (271), `model_hf_header` (272) | M-2 lookup | Excluded: registry comment 265–270, §6.16 | `POST /models/lookup`, `POST /models/header` |
-| G06 | Create and delete a group **with the app's rules** | `gateway_create_group` (324), `gateway_delete_group` (325) | The REST group routes accept names the app refuses and delete groups with members, so G-2 and G-3 test a different rule | Excluded with a replacement that is weaker: registry comment 314–322, §6.5 | Let `POST` and `DELETE /gateway/groups` call these operations; keep `?cascade=true` for the old delete |
+| G06 | Create and delete a group **with the app's rules** | `gateway_create_group` (324), `gateway_delete_group` (325) | The REST group routes accept names the app refuses and delete groups with members, so G-2 and G-3 test a different rule | Excluded with a replacement that is weaker: registry comment 314–322, §6.5 | Let `POST` and `DELETE /gateway/groups` call these operations; keep `?cascade=true` for the old delete (**Fixed**) |
 | G07 | MCP list, save, test, exposure, delete, preflight | `mcp_list` (340), `mcp_start_preflight` (341), `mcp_test_connection` (342), `mcp_set_exposure` (343), `mcp_save_server` (344), `mcp_delete_server` (345) | K-1, K-2. `mcp_store_credential` (346) should stay without a route | Excluded: PLAN.md decision 10 | `GET /mcp/servers`, `PUT`/`DELETE /mcp/servers/{id}`, `POST …/{id}/test`, `PUT …/{id}/exposure`, `GET /mcp/preflight` |
 | G08 | Notification settings and test toast | `notifications_set_config` (350), `notifications_send_test` (351) | T-5 | Excluded: §6.16 (delivery is a shell concern). The settings half is plain configuration | `PUT /notifications`, `POST /notifications/test` |
 | G09 | Windows services list, register, unregister | `services_list` (354), `services_register` (355), `services_unregister` (356) | T-6 and the services plan cannot read registration state | Excluded: §6.16 (elevation). Reading needs no elevation | `GET /services` first |
@@ -1105,12 +1124,12 @@ operations, 89 have a route.
 | G14 | Optimize: tuning preview, run, adopt | `optimize_tuning_preview` (419), `optimize_tuning_run` (420), `optimize_tuning_adopt` (421) | O-5, O-6, O-7 | As G11 | `GET /backends/{id}/tuning`, `POST …/tuning/run`, `POST …/tuning/adopt` |
 | G15 | Bench prompts | `bench_prompts_list` (406), `bench_prompt_save` (407), `bench_prompt_delete` (408), `bench_prompt_generate` (409), `bench_prompt_generate_cancel` (410) | N-1 | Excluded: registry comment 402–405, §6.16 | `GET`/`POST /bench/prompts`, `DELETE /bench/prompts/{id}`, `POST /bench/prompts/generate` |
 | G16 | Bench sweeps and results | `bench_run_start` (411), `bench_run_cancel` (412), `bench_results_list` (413), `bench_result_delete` (414) | N-2 to N-5 | As G15 | `POST /bench/runs` (operation), `POST /bench/runs/{id}/cancel`, `GET /bench/results`, `DELETE /bench/results/{id}` |
-| G17 | The generated routing file (second tab of *generated config*) | none; `gateway_preview_yaml` (311) has `routing_py`, the API layer drops it (`http.rs` 452–461) | W-7 cannot check the rule that will run without reading files | Omission | `GET /gateway/generated-routing` |
-| G18 | Result of the last update check | none (file `updates/last-check.json`) | U-1 "still shown" | Omission | `GET /updates/last-check` |
-| G19 | Is the MXC runtime installed | none | T-4 | Omission | `runtime` in `GET /mxc/policy` |
-| G20 | Snapshot content, list, delete | none; `telemetry_save_snapshot` (330) returns a path | The test leaves files it cannot list or remove | Excluded: rest-api.md §7 item 4 | `GET /telemetry/snapshots`, `GET`/`DELETE …/{id}` |
-| G21 | Unattended credential above operator | none; `auth/api_tokens.rs` 19 refuses configurator and admin | An automated run must refresh a 60-minute session | Excluded: auth-plan.md §3.3 and §6; the owner can decide otherwise | Short-lived (≤ 24 h) configurator token, owner-issued in the window |
-| G22 | Wait for readiness on start | `start_backend` (201) has no `wait_ready_secs`; `restart_backend` (203) has it | Every start needs a second polling loop | Omission | Add `wait_ready_secs` to `POST /backends/{id}/start` |
+| G17 | The generated routing file (second tab of *generated config*) | none; `gateway_preview_yaml` (311) has `routing_py`, the API layer drops it (`http.rs` 452–461) | W-7 cannot check the rule that will run without reading files | Omission | **Fixed:** `GET /gateway/generated-routing` |
+| G18 | Result of the last update check | none (file `updates/last-check.json`) | U-1 "still shown" | Omission | **Fixed:** `GET /updates/components` (`checked_at`) |
+| G19 | Is the MXC runtime installed | none | T-4 | Omission | **Fixed:** `runtime_installed`, `runtime_version` in `GET /mxc/policy` |
+| G20 | Snapshot content, list, delete | none; `telemetry_save_snapshot` (330) returns a path | The test leaves files it cannot list or remove | Excluded: rest-api.md §7 item 4 | **Fixed:** `GET /telemetry/snapshots`, `GET`/`DELETE …/{id}` |
+| G21 | Unattended credential above operator | none; `auth/api_tokens.rs` 19 refuses configurator and admin | An automated run must refresh a 60-minute session | Excluded: auth-plan.md §3.3 and §6; the owner can decide otherwise | Short-lived (≤ 24 h) configurator token, owner-issued in the window. Stays so (the owner's decision); a session kept alive: section 1.4 |
+| G22 | Wait for readiness on start | `start_backend` (201) has no `wait_ready_secs`; `restart_backend` (203) has it | Every start needs a second polling loop | Omission | **Fixed:** `wait_ready_secs` on start |
 
 No route and not needed by any case: `open_url` (244), `open_folder` (245),
 `gateway_master_key` (248, decision 4), `gateway_activation_complete`
@@ -1124,31 +1143,32 @@ VS Code (422, 423), WinML (432–435). Served inside another route:
 ## 17. Defects that break automation
 
 A route exists, but its answer or effect makes a test impossible or wrong.
-Read in the code; not yet reproduced on a running app. Tracked in
+Read in the code; not yet reproduced on a running app. A fixed row tells
+the old behaviour; what holds now is in `rest-api.md`. Tracked in
 https://github.com/pdrakeweb/llmdil/issues/6.
 
 | Id | Defect | Where |
 |---|---|---|
-| D01 | `apply_mode: RestartNow` saves and records a `backend_restart` task, but nothing restarts the backend and the task stays `running` for the life of the app. The answer looks like a real restart | `ops/backend_config.rs` 115–123 |
-| D02 | `POST /operations/{id}/abort` with the id of a `202` answer only rewrites the API's record. The work goes on, and a `done` or `failed` record becomes `aborted`. Only the app's own task id (found in `GET /operations` by `kind` and `detail`) really cancels | `http.rs` 296–305, `operations.rs` 144 |
-| D03 | A failed operation has text, no `code`. Argument errors and busy refusals on `202` routes are failed operations, so `400` and `409 BUSY` never come from them; the `409` branch for a busy setup step is dead code (the route is async) | `http.rs` 255–270, 341–355, 443 |
+| D01 | **Fixed.** `apply_mode: RestartNow` saves and records a `backend_restart` task, but nothing restarts the backend and the task stays `running` for the life of the app. The answer looks like a real restart | `ops/backend_config.rs` 115–123 |
+| D02 | **Fixed.** `POST /operations/{id}/abort` with the id of a `202` answer only rewrites the API's record. The work goes on, and a `done` or `failed` record becomes `aborted`. Only the app's own task id (found in `GET /operations` by `kind` and `detail`) really cancels | `http.rs` 296–305, `operations.rs` 144 |
+| D03 | **Fixed.** A failed operation has text, no `code`. Argument errors and busy refusals on `202` routes are failed operations, so `400` and `409 BUSY` never come from them; the `409` branch for a busy setup step is dead code (the route is async) | `http.rs` 255–270, 341–355, 443 |
 | D04 | **Fixed.** A field in the body replaces the path parameter of the same name: `PUT /backends/a/flags` with `"id": "b"` edits `b`, while the audit log names `a` | `http.rs` 367–411 |
-| D05 | Query values that look like a number, `true`, `false`, `inf` or `nan` are converted: `search=8080` is `400`, `search=inf` becomes "no filter" | `http.rs` 425 |
-| D06 | `PATCH /backends/{id}/config` and `preview-diff`: unknown patch fields are ignored (200); wrong types are `500 JSON`; an unknown backend is `422` on apply; `raw_flags: null` cannot clear the flags; context and batch limits of the other routes are not checked | `diff.rs` 28, `ops/backend_config.rs` 60 |
-| D07 | `PATCH /gateway/config`: unknown fields are ignored (200); wrong types and out-of-range numbers are `500 JSON` | `ops/gateway.rs` 49 |
-| D08 | `POST /gateway/groups` accepts any non-empty name (spaces, 63 characters, `openrouter`); `DELETE` removes a group with members (its role class now matches the app's) | `composites.rs` 189, 264 |
-| D09 | Group changes made by REST are journaled as "Gateway configuration changed" with no targets: a test cannot tell its own plan rows from the owner's | `ops/gateway.rs` 55–64 |
-| D10 | `GET /operations` is a bare array in no order. App tasks have no `error`, `started_ms`, `finished_ms`. Most `202` calls appear twice, with two ids and two kinds | `ops/logs.rs` 473, `http.rs` 273–295 |
-| D11 | `PUT /telemetry/interval` accepts any number, and changes memory before saving | `ops/telemetry.rs` 264 |
+| D05 | **Fixed.** Query values that look like a number, `true`, `false`, `inf` or `nan` are converted: `search=8080` is `400`, `search=inf` becomes "no filter" | `http.rs` 425 |
+| D06 | **Fixed.** `PATCH /backends/{id}/config` and `preview-diff`: unknown patch fields are ignored (200); wrong types are `500 JSON`; an unknown backend is `422` on apply; `raw_flags: null` cannot clear the flags; context and batch limits of the other routes are not checked | `diff.rs` 28, `ops/backend_config.rs` 60 |
+| D07 | **Fixed.** `PATCH /gateway/config`: unknown fields are ignored (200); wrong types and out-of-range numbers are `500 JSON` | `ops/gateway.rs` 49 |
+| D08 | **Fixed.** `POST /gateway/groups` accepts any non-empty name (spaces, 63 characters, `openrouter`); `DELETE` removes a group with members (its role class now matches the app's) | `composites.rs` 189, 264 |
+| D09 | **Fixed.** Group changes made by REST are journaled as "Gateway configuration changed" with no targets: a test cannot tell its own plan rows from the owner's | `ops/gateway.rs` 55–64 |
+| D10 | **Fixed.** `GET /operations` is a bare array in no order. App tasks have no `error`, `started_ms`, `finished_ms`. Most `202` calls appear twice, with two ids and two kinds | `ops/logs.rs` 473, `http.rs` 273–295 |
+| D11 | **Fixed.** `PUT /telemetry/interval` accepts any number, and changes memory before saving | `ops/telemetry.rs` 264 |
 | D12 | **Fixed.** `PUT /mxc/mode` accepts `enforced` without the runtime | `ops/platform.rs` 64 |
 | D13 | **Fixed.** `PUT /updates/components/{id}/pin` and `/auto` accept any component and any version, and create the entry | `ops/platform.rs` 234 |
-| D14 | `POST /backends/{id}/test` holds the configuration read lock until the model answers (up to 30 s): a save from anywhere waits, and reads after it wait too | `ops/backends.rs` 838 |
+| D14 | **Fixed.** `POST /backends/{id}/test` holds the configuration read lock until the model answers (up to 30 s): a save from anywhere waits, and reads after it wait too | `ops/backends.rs` 838 |
 | D15 | **Fixed.** A changed gateway port is not a plan row (the generated YAML does not contain it), and `GET /gateway/status` `port` is the saved port while the gateway still listens on the old one | `ops/gateway.rs` 39 and 679 |
-| D16 | Error messages are cut at 400 characters: a memory refusal for two GPUs may lose "who uses it" | `http.rs` 539 |
-| D17 | `POST /setup/audit` during another audit ends `done` with `already_running: true`, zero steps | `ops/wizard.rs` 527–545 |
-| D18 | `done` does not mean finished for start (spawned), download (started) and, by `restart_task_id`, config saves | `backend_lifecycle.rs` 590–650, `ops/models.rs` 526 |
-| D19 | Only error messages are cleaned of local paths. `detail` of downloads, diagnostics and steps, `launch-command`, snapshots and `/config` contain them | `http.rs` 341–355, 529 |
-| D20 | `GET /logs` with an unknown `level` answers unfiltered (200), while an unknown `order` is `400`; a wrong `group` type in the routing test is `500 GATEWAY` | `ops/logs.rs`, `op_gateway_test_routing` |
+| D16 | **Fixed.** Error messages are cut at 400 characters: a memory refusal for two GPUs may lose "who uses it" | `http.rs` 539 |
+| D17 | **Fixed.** `POST /setup/audit` during another audit ends `done` with `already_running: true`, zero steps | `ops/wizard.rs` 527–545 |
+| D18 | **Fixed.** `done` does not mean finished for start (spawned), download (started) and, by `restart_task_id`, config saves | `backend_lifecycle.rs` 590–650, `ops/models.rs` 526 |
+| D19 | **Fixed.** Only error messages are cleaned of local paths. `detail` of downloads, diagnostics and steps, `launch-command`, snapshots and `/config` contain them | `http.rs` 341–355, 529 |
+| D20 | **Fixed.** `GET /logs` with an unknown `level` answers unfiltered (200), while an unknown `order` is `400`; a wrong `group` type in the routing test is `500 GATEWAY` | `ops/logs.rs`, `op_gateway_test_routing` |
 | D21 | **Fixed.** While the gateway runs, any unapplied gateway change adds a `gateway_drift` row next to its own row, so one edit counts as two changes (`activation_changes` too) | `ops/gateway_activation.rs` 109–123 |
 
 ## 18. Put back and compare
@@ -1192,8 +1212,9 @@ Remove-Item Env:LLMDIL_TOKEN, Env:LLMDIL_REFRESH_TOKEN, Env:LLMDIL_GATEWAY_KEY -
 5. Restart the owner's backends that were stopped (`POST
    /backends/{id}/start`, then `Wait-Backend`) **before** the logout.
    Check the gateway, one app process, no leftover llama-server.
-6. Not undone by any route: telemetry snapshots (G20), diagnostics
-   bundles, history rows, audit rows, peaks, the stuck task of X-4.
+6. Delete your telemetry snapshots (`DELETE /telemetry/snapshots/{id}`).
+   Not undone by any route: diagnostics
+   bundles, history rows, audit rows, peaks.
    Dashboard view and the files of section 11: as in the UI test, with the
    app closed. List what stays.
 7. Tell the owner to delete the test user and, if they wish, switch the
@@ -1202,6 +1223,10 @@ Remove-Item Env:LLMDIL_TOKEN, Env:LLMDIL_REFRESH_TOKEN, Env:LLMDIL_GATEWAY_KEY -
 Result sheet: as in the UI test, plus `API commit: ____  Role: ____`.
 
 ## Appendix A: documents that disagree with the code
+
+As found at commit `8187eb6`. The API documents were corrected since,
+and where the code was wrong it was fixed (section 17); the operation and
+route counts follow the registry.
 
 | Document says | Code does |
 |---|---|

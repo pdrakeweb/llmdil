@@ -46,7 +46,9 @@ endpoint requires authentication and says nothing about the scheme.
 
 ### 2.1 Base path and versioning
 
-- Base: `http://<host>:<admin-port>/api/v1`
+- Base: `https://<host>:<admin-port>/api/v1` (self-signed certificate,
+  pinned by fingerprint; plain HTTP exists only on loopback in
+  development)
 - The admin port is new configuration (not the gateway port, not the app's
   internal IPC). It binds per operator configuration; see the auth plan for
   the exposure rules.
@@ -65,7 +67,11 @@ endpoint requires authentication and says nothing about the scheme.
   `GET /diagnostics/bundles/{id}/content` (`application/zip`).
 - Request bodies are JSON objects. Unknown fields are rejected with
   `INVALID_INPUT` (the app's patch objects are closed structs; a typo'd
-  field must not silently no-op).
+  field must not silently no-op). That includes the fields inside a
+  backend `patch` and inside a gateway-config patch.
+- Query values are read by the parameter's declared type: `?limit=20` is
+  a number, `?search=20` is text; a value that does not fit is
+  `INVALID_INPUT`.
 - Field names: snake_case, mirroring the app payloads. The desktop's
   camelCase invoke arguments (`stepId`, `applyMode`) do not cross the wire.
 
@@ -112,8 +118,9 @@ Every error response uses one envelope:
   terminal error, §3), and the auth codes (`UNAUTHENTICATED`,
   `FORBIDDEN`, `INVALID_CREDENTIALS`, `SESSION_REVOKED`,
   `PASSWORD_CHANGE_REQUIRED`; see §6.17).
-- `message` is the app's error string, unparsed. Clients display it; they
-  never branch on it.
+- `message` is the app's error string, unparsed, with the machine's data
+  and home directories replaced, at most 4000 characters. Clients
+  display it; they never branch on it.
 - HTTP status mapping:
 
   | Condition | HTTP | code |
@@ -124,7 +131,7 @@ Every error response uses one envelope:
   | Role may not use the endpoint; API token on account self-service | 403 | `FORBIDDEN` |
   | Account flagged must-change-password (after an admin reset) on any route but `POST /auth/password`, `POST /auth/logout`, `GET /auth/me`; also `POST /auth/refresh` | 403 | `PASSWORD_CHANGE_REQUIRED` |
   | Singleton busy (wizard step already running, download already in flight, plan apply already running), or a lifecycle operation already in flight on the same service (app kind `Busy`, e.g. "gateway restart already in progress (started by activation 12 s ago)") | 409 | `BUSY` |
-  | Config patch fails validation | 422 | `CONFIG` |
+  | Config patch fails validation (a gateway-config patch: 400 `INVALID_INPUT`) | 422 | `CONFIG` |
   | Capability deferred in the app itself | 501 | `UNSUPPORTED` |
   | App contract gap (a crate API cannot express the operation) | 501 | `CONTRACT_GAP` |
   | Everything else (`Supervisor`, `Gateway`, `Wizard`, `Telemetry`, `Models`, `Mxc`, `Mcp`, `WinMl`, `Services`, `Io`, `Json`) | 500 | per kind |
@@ -198,10 +205,33 @@ Why this model, over retained synchronous endpoints:
   "created_ms": 1792200000000,
   "started_ms": 1792200000000,
   "finished_ms": null,
-  "error": null
+  "error": null,
+  "error_code": null,
+  "error_kind": null,
+  "task_id": null
 }
 ```
 
+- `kind` of a `202` record is the operation's registry name
+  (`run_wizard_step`, `restart_backend`, `download_model`, …, plus
+  `gateway_start` and `activation_apply`); an app task has the app's
+  own kind (`wizard_step`, `backend_restart`, `model_download`, …).
+- A `failed` operation carries `error` (text), `error_code` and
+  `error_kind`: the §2.5 code and kind a synchronous route would have
+  answered, or `OPERATION_FAILED` when the operation's own payload
+  reports the failure.
+- One unit of work has up to two rows, which name each other: the `202`
+  record's `task_id` is the app task it runs as (`null` when the work
+  has none), and the task row's `operation_id` is the `202` record
+  (`null` for work that did not come through this API).
+- **Local paths.** `detail` may contain local paths (a download's
+  `dest`, a diagnostics bundle's `path`, step output). Only
+  administrators see them; for every other role the data directory
+  reads `<data-dir>` and the home directory `<home>`, here and in the
+  `task-progress` event. The other routes that deliberately carry
+  local paths are `GET /backends/{id}/launch-command` (admin), the
+  response of `POST /telemetry/snapshots` (admin, like `detail`) and
+  `GET /config` (`data_dir`, `config_path`, model files: any role).
 - `detail` is the kind-specific payload the app already attaches to its
   task records (e.g. `{ "step_id": "start-gateway" }`,
   `{ "backend_id": "coder" }`, `{ "model_id": "…" }`), extended at
@@ -229,25 +259,33 @@ Why this model, over retained synchronous endpoints:
   apply with a failed item are therefore all `failed` operations,
   never `done`. The `error` is the payload's `message`, and the
   `detail` keeps the whole payload (outcome, `manual_command`, items,
-  `execution_id`). A lifecycle operation refused because another one
-  is in flight on the same service fails with the `Busy` message
-  (the same condition is `409 BUSY` on a synchronous route).
+  `execution_id`).
+- **Refused before it is queued.** What can be decided without waiting
+  answers at once instead of `202`: a missing or wrongly typed argument
+  `400`, an unknown backend, model or step `404`, and `409 BUSY` when
+  the service, setup step, audit, plan apply, download or verification
+  it needs is already being worked on (`details` names what is
+  running). Both can still arise after the `202`: the operation then
+  fails with the same `error_code`.
+- **What `done` means.** A start or restart is `done` when the process
+  is spawned; with `wait_ready_secs` only once it answers `/health`. A
+  download is `done` when the file is complete and verified against its
+  pin, `failed` or `aborted` otherwise.
 - **Origin.** Lifecycle operations take an optional `origin` body
   field (`api`, `cli`, …) that lands in the service's lifecycle log
   markers and `service-lifecycle` events. The REST layer fills in
   `api` when the caller names none; the CLI sends `cli`.
-- Cancellation: `POST /operations/{id}/abort` (§6.10). Not every kind is
-  abortable — a wizard step mid-subprocess may only be abandonable; the
-  operation's terminal state says what happened.
+- Cancellation: `POST /operations/{id}/abort` (§6.10), with either id.
+  Not every kind is abortable; the operation's terminal state says what
+  happened.
 
 ### 3.2 What is synchronous, and its bound
 
 Reads (all `GET`s except bundle content), config writes, placement
 propose, routing test, MXC self-test and policy writes, and the gateway
-quiesce wait (bounded by the caller's `timeout_secs`, max 120). The one
-synchronous call with model-scale latency is `POST /backends/{id}/test`
-(a real inference request): documented at §6.2 with a 300 s client-side
-guidance timeout.
+quiesce wait (bounded by the caller's `timeout_secs`, clamped to 5–600).
+The one synchronous call with model-scale latency is
+`POST /backends/{id}/test` (a real inference request, at most 30 s).
 
 ## 4. Resource shapes
 
@@ -335,8 +373,10 @@ saved configuration regardless of run state.
 
 A config patch (`BackendPatch`, `crates/manager-config/src/diff.rs:21`):
 any subset of `enabled`, `model_file`, `port`, `n_ctx`, `n_batch`,
-`tensor_split`, `split_mode`, `raw_flags` (nullable), `max_retries`,
-`backoff_base_secs`. A preview diff (`ConfigDiff`):
+`tensor_split`, `split_mode`, `raw_flags` (`null` clears them),
+`max_retries`, `backoff_base_secs`; `null` in any other field leaves it
+alone. An unknown field or a wrong type is `400`, and `n_ctx`/`n_batch`
+have the limits of `PUT …/flags`. A preview diff (`ConfigDiff`):
 `{ backend_id, changes: [{ field, old, new }], valid }`.
 
 ### 4.3 Model (`list_models` row)
@@ -632,21 +672,26 @@ and the override is journaled, as in `backend_set_offload`), and
 split, replacing the telemetry assignment), and `parallel` (a slot
 count written into the created backend's raw flags as `--parallel N`,
 validated as in `backend_set_parallel`). Each omitted field keeps
-its creation default.
+its creation default. `cache_k`, `cache_v` and `flash_attn` set the
+cache types as in `PUT …/cache`. The response also carries `persisted`.
 
 #### `DELETE /api/v1/backends/{id}` — `destructive`
 `backend_delete` → `{ "backend_id", "deleted": true }`. Refused
-(`409`/`Supervisor`) while the backend is running, as in the app.
+(`400 INVALID_INPUT`) while the backend is running, as in the app.
 
 #### `POST /api/v1/backends/{id}/start` — `control` — **Op**
 #### `POST /api/v1/backends/{id}/stop` — `control` — **Op**
 #### `POST /api/v1/backends/{id}/restart` — `control` — **Op**
 `start_backend` / `stop_backend` / `restart_backend`. Body (stop,
-restart): `{ "graceful": true }`; every one also takes an optional
-`origin` (§3.1). The app commands already return
-`{ task_id, backend_id }`; the REST layer returns `202` with the
-operation for that task. Start runs the app's preflight (port, model
-file, placement) and fails the operation with the preflight message.
+restart): `{ "graceful": true }` (required); every one also takes an
+optional `origin` (§3.1). Start and restart take an optional
+`wait_ready_secs`: the operation then ends only when the backend answers
+`/health` (`detail.ready: true`), and fails with `SUPERVISOR` when the
+time runs out (the backend keeps loading) or the process goes away. The
+app commands already return `{ task_id, backend_id }`; the REST layer
+returns `202` with the operation for that task. Start runs the app's
+preflight (port, model file, placement) and fails the operation with the
+preflight message.
 
 #### `POST /api/v1/backends/{id}/test` — `control` — synchronous
 `test_backend`. Body: `{ "prompt": "…" }`. One inference request
@@ -662,8 +707,8 @@ The request asks for no thinking, temperature 0 and at most 16 tokens.
 either text means the backend is generating.
 
 A non-2xx from the backend is reported in `status`, not as an API
-error, mirroring the app. Duration is model-bound: clients should
-allow up to 300 s. This is the one synchronous control call; it is
+error, mirroring the app. Duration is model-bound, at most 30 s; other
+calls, saves included, are not held up. This is the one synchronous control call; it is
 kept synchronous because the app has no task wrapper for it and its
 result is the response body itself.
 
@@ -680,9 +725,12 @@ result is the response body itself.
 
 → `{ "backend_id", "diff": ConfigDiff, "apply_mode",
 "restart_task_id": "…" | null, "persisted": true }`. With
-`RestartNow`, `restart_task_id` names an operation the client polls
-(the response itself stays `200`: the config save is complete; only
-the restart is asynchronous). The save records activation-plan
+`RestartNow` the save is followed by the normal graceful restart;
+`restart_task_id` names the operation the client polls, which ends
+`done` (process spawned) or `failed` (the response itself stays `200`:
+the config save is complete; only the restart is asynchronous). While
+the backend is not running, `RestartNow` is `400` and saves nothing. The
+save records activation-plan
 changes exactly as the app does.
 
 #### `POST /api/v1/backends/{id}/config/preview-diff` — `read`
@@ -874,8 +922,10 @@ null; null clears the declaration). →
 reflecting the applied fields.
 
 #### `POST /api/v1/models/{id}/download` — `control` — **Op**
-`download_model` → `202` operation (`kind: model_download`, detail
-carries `{ "model_id", "dest" }`). The transfer runs in the app's
+`download_model` → `202` operation, which runs until the transfer and
+its verification ended (detail: `{ "model_id", "dest", "task_id",
+"error", "verified" }`); its abort cancels the transfer and removes the
+partial file. The transfer runs in the app's
 background worker and resumes from any partial file. Progress: poll
 `GET /models/{id}` (`downloading`, `partial_bytes`, then `verifying`,
 then `verified_at` set or `download_error` set — a hash mismatch
@@ -887,18 +937,18 @@ download for this model is already in flight.
 file kept.
 
 #### `POST /api/v1/models/{id}/download/resume` — `control` — **Op**
-`model_resume_download` → `202` operation, as download.
+`model_resume_download` → `202` operation, as download: it follows the
+resumed transfer to its end. `404` when none is in flight.
 
 #### `POST /api/v1/models/{id}/download/cancel` — `destructive`
 `cancel_download` → `{ "model_id", "cancelled": true }`. The partial
 file is discarded. Errors when no download is in flight.
 
 #### `POST /api/v1/models/{id}/verify` — `control` — **Op**
-`model_verify_checksum`. SHA-256 of the on-disk file against the
+`model_verify_checksum` (`400` without a pin). SHA-256 of the on-disk file against the
 pinned hash. Minutes-scale on multi-GiB files (~17 min for 46 GiB on
 the reference machine), hence an operation; its completion detail is
-`{ "id", "ok": true|false }`. Models without a real pin fail with
-`MODELS` (nothing to verify against), as in the app.
+`{ "id", "ok": true|false }`.
 
 #### `POST /api/v1/models/{id}/assign` — `config`
 `model_assign`. Body: `{ "backend_id": "coder", "split": [0.5, 0.5] }`
@@ -915,7 +965,7 @@ split; the split is validated against the discovered GPU count.
 the projection (§4-style payload from the app): `per_gpu_mib`,
 `free_mib`, `current_mib`, `additional_mib`, `per_gpu_fits`, `fits`,
 `snapshot_age_ms`, `gpu_indices`, `down_indices`, `sys_mib`,
-`gpu_weights_mib`, `weights_only: true`. Pure evaluation against the
+`gpu_weights_mib`, `weights_only` (false when a backend is named). Pure evaluation against the
 latest telemetry snapshot; changes nothing. Fails with `TELEMETRY`
 when no telemetry exists yet.
 
@@ -948,7 +998,12 @@ firewall rule at the next start). Body is a JSON merge patch over the
 → `{ "ok": true, "persisted": true }` (plus
 `"restart_required": true` when `bind_host` changed). Group
 membership and routing changes record activation-plan entries, as in
-the app. The granular group endpoints below are conveniences over
+the app; their summary names what changed (each group by name) and
+`targets` the backends concerned. The patch is closed: an unknown or
+read-only field (`effective_strategy`, `group_strategies`), a wrong type
+or an invalid value is `400` and saves nothing, `bind_host` included.
+The computed `enabled`/`enabled_members` of a group may be sent back and
+are ignored. The granular group endpoints below are conveniences over
 this patch.
 
 #### `GET /api/v1/gateway/groups` — `read`
@@ -957,26 +1012,28 @@ The `groups` array of `GET /gateway/config`.
 #### `POST /api/v1/gateway/groups` — `config`
 #### `PATCH /api/v1/gateway/groups/{name}` — `config`
 #### `DELETE /api/v1/gateway/groups/{name}` — `destructive`
-Read-modify-write over `update_gateway_config`: create, patch
-(`members`, `strategy`, `fallbacks`), or remove one group by name.
-`name` is the group's identity (groups have no separate id in the
-app). Derived endpoints; renaming a group is delete + create.
-The desktop Groups page (predicted-throughput design §8) uses
-the app's own membership operations instead —
-`gateway_set_backend_group` (§6.2), `gateway_create_group`, and
-`gateway_delete_group` — whose rules are stricter than these
-routes': the move enforces one-group-per-backend, create takes
-a slug name only and makes an empty group, and delete refuses a
-non-empty group where the DELETE above removes the group with
-its membership. The create/delete operations are routeless in
-the registry (see §6.16): these derived routes are their REST
-surface.
+Create, patch (`members`, `strategy`, `fallbacks`, `purpose`), or
+remove one group by name. `name` is the group's identity (groups have
+no separate id in the app); renaming a group is delete + create.
+The rules are the app's own: a name is lowercase letters, digits and
+hyphens, at most 48 characters, not `openrouter` and not taken (`400`);
+`DELETE` refuses a group with members (`400`) unless `?cascade=true`,
+which removes the group with its membership. `POST` with a name alone
+and `DELETE` without a cascade run `gateway_create_group` and
+`gateway_delete_group`; the other forms are read-modify-write over
+`update_gateway_config`. Unlike `PUT /backends/{id}/group` (§6.2), a
+`members` list does not move a backend out of its other groups.
 
 #### `GET /api/v1/gateway/generated-config` — `read`
 `gateway_preview_yaml` → `200`, `Content-Type: text/yaml`, body the
 generated LiteLLM `config.yaml` exactly as the gateway will read it
 at its next start. (The desktop returns it wrapped as
 `{ "yaml": "…" }`; the API returns the document itself.)
+
+#### `GET /api/v1/gateway/generated-routing` — `read`
+The second generated file, `llmdil_routing.py` (`routing_py` of
+`gateway_preview_yaml`) → `200`, `Content-Type: text/x-python`. `404`
+when no routing rule or overflow setting needs one.
 
 #### `GET /api/v1/gateway/master-key` — `secret` — NOT IMPLEMENTED in v1 (decision 4: the master key is never mirrored over REST; the operation is routeless)
 `gateway_master_key` → `{ "master_key": "…" }`. The LiteLLM master
@@ -1045,7 +1102,7 @@ running or has an operation in flight: stop the gateway first, or use
 
 #### `POST /api/v1/gateway/routing/test` — `read`
 `gateway_test_routing`. Body: `{ "group": "planner" }` (the app's
-request object; `group` is required) → the routing decision trace.
+request object; `group` is required, a string) → the routing decision trace.
 Dry-run: the decision is recorded in the session routing log, as in
 the app; no live request is sent.
 
@@ -1113,7 +1170,7 @@ calls) with `source: "api"`:
   history with `source: "api"` (`execution_id` in the detail), with
   status `completed`, `completed_with_failures` (a gateway failure)
   or `failed` (a backend abort).
-- A second apply while one is running fails with `Busy`, naming the
+- A second apply while one is running is `409 BUSY`, naming the
   running apply's source, step and elapsed time.
 - Nothing pending: `{ ok: true, applied: true, status:
   "nothing_pending" }`; nothing runs and nothing is recorded.
@@ -1127,7 +1184,7 @@ carry `activation_applying`.
 #### `POST /api/v1/activation-plan/quiesce-wait` — `control` — synchronous
 `gateway_quiesce_wait`. Body: `{ "timeout_secs": 120 }` →
 `{ "drained": true, "in_flight": 0, "timed_out": false }`. Bounded
-by the caller's timeout (max 120 s) — the documented exception to
+by the caller's timeout (clamped to 5–600 s) — the documented exception to
 the 30 s synchronous guideline.
 
 #### `POST /api/v1/activation-plan/cancel` — `destructive`
@@ -1212,9 +1269,8 @@ is data; opening it is the client's business (§7).
 
 #### `POST /api/v1/setup/audit` — `control` — **Op**
 `run_audit` → `202` operation; completion detail is the audit
-result: `{ "done", "total", "steps": [ … ] }`. `already_running`
-in the app becomes `409 BUSY` pointing at the in-flight audit
-operation.
+result: `{ "done", "total", "steps": [ … ] }`. `409 BUSY` while
+another audit runs (also one started in the app).
 
 ### 6.8 Logs
 
@@ -1224,7 +1280,7 @@ operation.
 | Param | Meaning |
 |---|---|
 | `scope` (required) | a process/scope id (`coder`, `planner`, …), `gateway`, `wizard`, or `all`; archived scope ids from `scopes` are accepted |
-| `level` | heuristic filter: `error` \| `warn` \| `info` \| `debug` |
+| `level` | heuristic filter: `error` \| `warn` \| `info` \| `debug`; anything else is `400` |
 | `search` | case-insensitive substring over line text |
 | `query` | case-insensitive substring over line text and source |
 | `since_ms`, `until_ms` | epoch-ms bounds, inclusive; a line whose own time is unknown (`ts_estimated: true`) is kept when it can lie inside |
@@ -1244,7 +1300,8 @@ Implemented by the server from the same sources as `get_logs`.
 poll-based — there is no stream, §7).
 
 #### `PUT /api/v1/telemetry/interval` — `config`
-`telemetry_set_interval`. Body: `{ "ms": 2000 }` → `{ "ok": true }`.
+`telemetry_set_interval`. Body: `{ "ms": 2000 }` → `{ "ok": true,
+"poll_interval_ms" }`. `ms` is 0 (off) or 500 to 60000, else `400`.
 Persists immediately; the running poller's cadence changes at app
 restart (the app's semantics, kept and documented).
 
@@ -1252,10 +1309,17 @@ restart (the app's semantics, kept and documented).
 `telemetry_reset_peaks` → `{ "ok": true }`.
 
 #### `POST /api/v1/telemetry/snapshots` — `control`
-`telemetry_save_snapshot` → `{ "path": "…" }`. The snapshot is a file
-on the managed machine; the API returns its path as metadata (the
-diagnostics bundle is the way to get telemetry off the machine —
-§6.11). See §7 on path-returning commands.
+`telemetry_save_snapshot` → `{ "id", "created_ms", "path" }`. The
+snapshot is a file on the managed machine; its path is metadata, shown
+whole to administrators only (§3.1).
+
+#### `GET /api/v1/telemetry/snapshots` — `read`
+#### `GET /api/v1/telemetry/snapshots/{id}` — `read`
+#### `DELETE /api/v1/telemetry/snapshots/{id}` — `destructive`
+The saved snapshots, newest first: `{ "snapshots": [{ "id",
+"created_ms", "size_bytes" }] }`; one of them: `{ "id", "created_ms",
+"samples" }`; and its deletion: `{ "id", "deleted": true }`. No paths;
+an id the list does not name is `404`.
 
 #### `GET /api/v1/telemetry/history/{range}` — `read`
 `get_gpu_history` → §4.8. `range` is `1h`, `24h`, or `7d` (any
@@ -1266,18 +1330,22 @@ argument.
 ### 6.10 Operations
 
 #### `GET /api/v1/operations` — `read`
-`tasks_list` → `{ "operations": [ Operation, … ] }` (§3.1), newest
-first.
+`tasks_list` merged with the `202` records → `[ Operation, … ]`
+(§3.1), a bare array, newest first.
 
 #### `GET /api/v1/operations/{id}` — `read`
-One operation. The app has no get-by-id command; the server filters
-`tasks_list`. `404` when absent.
+One operation, by its `202` id or its app task id. `404` when absent.
 
 #### `POST /api/v1/operations/{task_id}/abort` — `control`
 `task_abort` (the registry route template names the placeholder
-`task_id`) → the operation's resulting state. Aborting is
-best-effort per kind (§3.1); an already-terminal operation returns
-its state unchanged.
+`task_id`; a `202` id is as good) → `{ "ok": true, "task_id",
+"status", … }`, the operation's resulting state. The abort of a `202`
+record cancels the app task it runs as and waits (about 10 s) for the
+work to stop: `stopped: true`. Work without a task, or that does not
+stop, is marked `aborted` with `forced: true` and an `abort_note` in its
+detail; it may still be running, and what it did is kept as
+`late_outcome`. An already-terminal operation is not changed: its
+`status` with `already_finished: true`.
 
 ### 6.11 Diagnostics
 
@@ -1364,17 +1432,14 @@ versions and feed errors from the last check (`checked_at`), installed
 and pinned versions as of now.
 
 #### `POST /api/v1/updates/check` — `read`
-`updates_check_all`. Routed, but the app operation is a stub:
-it returns `501 UNSUPPORTED` ("Update checking ships in P6"),
-exactly like `updates_apply` below. The contract reserves the
-path; per-component results arrive when the app implements
-checking.
+`updates_check_all`. Contacts the feeds and returns the rows with
+`checked_at`; the result is kept (`GET /updates/components`).
 
-#### `POST /api/v1/updates/components/{component_id}/apply` — `control`
-`updates_apply`. **Specified but deferred:** component updates are
-deferred in the app itself (`ApiError::Unsupported` — "Updates are
-P6"). The endpoint returns `501 UNSUPPORTED` until the app
-implements it; the contract reserves the path.
+#### `POST /api/v1/updates/components/{component_id}/apply` — `destructive`
+`updates_apply` (admin). Body: `{ "version": "…" }` (optional) → `200`
+with `task_id` (an operation to poll; `null` when there is nothing to
+do). `501 UNSUPPORTED` for the report-only components `postgres` and
+`mxc`.
 
 #### `PUT /api/v1/updates/components/{component_id}/pin` — `config`
 `updates_pin`. Body: `{ "version": "…" | null }` →
@@ -1477,14 +1542,15 @@ complete list, grouped by reason:
 ### 6.17 API-layer routes (no backing registry operation)
 
 These routes live in `crates/manager-api`, not in the registry.
-The 15 derived routes are enumerated in `DERIVED_ROUTES`
+The derived routes are enumerated in `DERIVED_ROUTES`
 (`manager-api/src/http.rs`) and distributed through §5/§6 above:
 `GET /server`, `GET /backends/{id}`, `GET /models/{id}`,
 `GET /operations/{id}`, `GET /logs/scopes`, `GET /gateway/groups`,
 `GET /updates`, `PATCH /models/{id}`, `POST /gateway/groups`,
 `PATCH /gateway/groups/{name}`, `DELETE /gateway/groups/{name}`,
 `POST /gateway/start`, `POST /activation-plan/apply`,
-`GET /diagnostics/bundles/{bundle_id}/content`, and:
+`GET /gateway/generated-routing`, `GET /telemetry/snapshots`,
+`GET|DELETE /telemetry/snapshots/{id}`, `GET /diagnostics/bundles/{bundle_id}/content`, and:
 
 #### `GET /api/v1/events` — `read` (any authenticated role)
 Server-Sent Events stream of the app event bus
@@ -1585,7 +1651,7 @@ nature — unlike the rest of the Optimize domain (§6.16), which
 stays desktop-only.
 
 #### `POST /api/v1/measurements/lookup` — `read`
-`measurement_lookup`. Body: `{ "request": { … } }` — a draft
+`measurement_lookup`. The body is the request object itself — a draft
 configuration: `backend_id` (edit form: the saved backend, with any
 of `n_ctx`, `n_batch`, `offload_layers`, `mtp_position`,
 `parallel_slots`, `raw_flags` overridden) or `model_id` (add form:
@@ -1628,10 +1694,9 @@ the store; history is otherwise append-only. → `{ "deleted": true,
    not prompt. This is a property of the underlying capability, not
    of the mapping.
 4. **Path-returning commands.** `telemetry_save_snapshot` and
-   `diagnostics_export_bundle` return host filesystem paths. The
-   snapshot endpoint returns the path as metadata only (there is no
-   snapshot download endpoint — snapshots also ride inside
-   diagnostics bundles). The bundle gets a real download endpoint
+   `diagnostics_export_bundle` return host filesystem paths, as
+   metadata for administrators (§3.1). Snapshots are read and deleted
+   by id (§6.9). The bundle gets a real download endpoint
    (§6.11) because remote retrieval is its purpose; that serving
    step is an API-layer addition, not an app behavior.
 5. **Activation apply orchestration** (§6.5): composed in the
@@ -1652,8 +1717,8 @@ the store; history is otherwise append-only. → `{ "deleted": true,
 8. **File pickers: none.** No audited command depends on a file
    dialog — model registration takes a URL, bundle export takes no
    destination. Nothing is lost to their absence remotely.
-9. **`updates_apply`**: deferred in the app (`Unsupported`); the
-   endpoint is a reserved path returning `501` (§6.14).
+9. **`updates_apply`**: implemented since; `501` only for the
+   report-only components (§6.14).
 10. **Routing rules**: no dedicated commands exist; they move only
     as part of the gateway config patch. If rule-level CRUD is ever
     wanted, it is new app behavior first, API second.

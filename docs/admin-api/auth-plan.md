@@ -431,9 +431,11 @@ result (success / denied / error), and request id. Passwords,
 tokens, and the master key are never written — actions are logged
 by name, payloads by target id only.
 
-- Reads are not audited except Class S disclosure endpoints
-  (master key reveal, bundle export, launch command) — those three
-  are audited like mutations.
+- Reads are not audited except Class S disclosure endpoints (bundle
+  export and bundle content, launch command; the master key has no
+  route) — those are audited like mutations.
+- A request the role may not make (403) is audited with result `403`,
+  reads included. A 401 is not: there is no actor to name.
 - The log is append-only from the API's perspective: no endpoint
   truncates or edits it; rotation is by file size with dated
   rollovers, matching the app's existing log handling.
@@ -457,7 +459,9 @@ by name, payloads by target id only.
 
 - **Opt-in, off by default.** The admin API does not listen until
   Pete enables it in the desktop app (Remote Access page). Enabling
-  requires at least one admin user to exist (§3.5). The desktop UI
+  was to require at least one admin user (§3.5); as built the switch
+  starts the listener without that check (nobody can sign in until a
+  user exists). The desktop UI
   shows the listening state, bind address, port (proposed default
   **47821**, unassigned range, distinct from the gateway's 4000),
   and cert fingerprint persistently while enabled — a listening
@@ -562,8 +566,8 @@ integrity. Attacker positions and the controls that answer them:
   credential leaked. Controls: deny-by-default route classification
   with the role check in middleware before any handler code, 403s
   audited with actor identity, and no capability discovery via
-  error differences (a denied route and an unknown route are
-  indistinguishable in shape). The matrix is the control: viewer
+  error differences (the route table is public; as built a denied
+  route is 403 and an unknown one 404). The matrix is the control: viewer
   holds no mutation class at all.
 - **Token leakage** (token pasted into a log, a screenshot, a
   backup). Controls: hashes-only storage server-side (a leaked
