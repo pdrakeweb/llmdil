@@ -345,6 +345,15 @@ pub(crate) fn backend_spec(
     if !raw_has(&["-fit", "--fit"]) {
         args.extend(["--fit".into(), "off".into()]);
     }
+    // llama-server's default lets any web page in the operator's
+    // browser call a backend and read the answer. The gateway and this
+    // app are not browsers, so only localhost pages keep access.
+    if !raw_has(&["--cors-origins"]) {
+        args.extend(["--cors-origins".into(), "localhost".into()]);
+    }
+    if !raw_has(&["--cors-credentials", "--no-cors-credentials"]) {
+        args.push("--no-cors-credentials".into());
+    }
     if let Some(raw) = &b.raw_flags {
         // raw_flags are operator-supplied llama-server arguments, with
         // three reservations:

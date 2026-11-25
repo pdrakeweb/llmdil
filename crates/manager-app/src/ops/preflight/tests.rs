@@ -237,7 +237,7 @@ fn own_residency_is_measured_per_gpu() {
         vram_reading(1, 16_376, 4_600),
     ];
     let credit = |processes: &[manager_telemetry::ProcessSample]| {
-        own_residency(7, processes, &required, &readings)
+        measured_residency(7, processes, &required, &readings)
     };
     // Another process's memory is never credited; a GPU the process
     // holds nothing on gives nothing back.

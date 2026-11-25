@@ -293,6 +293,7 @@ pub async fn op_list_backends(state: &Arc<AppState>, sink: &Arc<dyn EventSink>) 
             }
         }
     }
+    annotate_rows_fits_now(state, &mut backends).await;
     // Expert-offload slider state per configured backend whose
     // model is offload-capable (see backend_offload_info). Absent
     // for every other backend — the Edit Flags form shows the

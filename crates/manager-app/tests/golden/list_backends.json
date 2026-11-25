@@ -15,15 +15,20 @@
       "enabled": true,
       "failure_reason": null,
       "fit": {
+        "fits_now": true,
         "paged_mib": 0,
         "per_gpu": [
           {
             "driver_model": "wddm",
+            "fit_text": "Fits",
+            "fits_free": true,
+            "free_mib": 16372,
             "gpu": 0,
             "paged_mib": 0,
             "required_mib": 13275,
             "state": "fits",
-            "total_mib": 24564
+            "total_mib": 24564,
+            "will_page_mib": 0
           }
         ],
         "state": "fits"
@@ -73,15 +78,20 @@
       "enabled": true,
       "failure_reason": null,
       "fit": {
+        "fits_now": true,
         "paged_mib": 0,
         "per_gpu": [
           {
             "driver_model": "wddm",
+            "fit_text": "Fits",
+            "fits_free": true,
+            "free_mib": 16372,
             "gpu": 0,
             "paged_mib": 0,
             "required_mib": 3242,
             "state": "fits",
-            "total_mib": 24564
+            "total_mib": 24564,
+            "will_page_mib": 0
           }
         ],
         "state": "fits"
@@ -251,15 +261,20 @@
       "enabled": true,
       "failure_reason": null,
       "fit": {
+        "fits_now": true,
         "paged_mib": 0,
         "per_gpu": [
           {
             "driver_model": "wddm",
+            "fit_text": "Fits",
+            "fits_free": true,
+            "free_mib": 16372,
             "gpu": 0,
             "paged_mib": 0,
             "required_mib": 6259,
             "state": "fits",
-            "total_mib": 24564
+            "total_mib": 24564,
+            "will_page_mib": 0
           }
         ],
         "state": "fits"
@@ -309,15 +324,20 @@
       "enabled": true,
       "failure_reason": null,
       "fit": {
+        "fits_now": true,
         "paged_mib": 0,
         "per_gpu": [
           {
             "driver_model": "wddm",
+            "fit_text": "Fits",
+            "fits_free": true,
+            "free_mib": 16372,
             "gpu": 0,
             "paged_mib": 0,
             "required_mib": 9403,
             "state": "fits",
-            "total_mib": 24564
+            "total_mib": 24564,
+            "will_page_mib": 0
           }
         ],
         "state": "fits"

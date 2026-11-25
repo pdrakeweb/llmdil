@@ -239,7 +239,7 @@ pub(crate) fn requirement_breakdown(req: &manager_models::MemoryRequirement) -> 
 /// `required` when a restart stops it: the memory measured for `pid`.
 /// Where telemetry has no figure for the process, its requirement share,
 /// never more than the GPU has in use.
-pub(crate) fn own_residency(
+pub(crate) fn measured_residency(
     pid: u32,
     processes: &[manager_telemetry::ProcessSample],
     required: &[(u32, u64)],
@@ -437,7 +437,7 @@ pub(crate) async fn vram_start_gate(
         .await
         .get(&b.id)
         .and_then(lifecycle::BackendLive::process_pid)
-        .map(|pid| own_residency(pid, &processes, &required, &readings))
+        .map(|pid| measured_residency(pid, &processes, &required, &readings))
         .unwrap_or_default();
     let failures = vram_gate_failures(&placed, &required, &readings, &credit);
     if failures.is_empty() {
