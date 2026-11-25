@@ -48,6 +48,10 @@ mod windows {
     /// How long a second launch waits for the first to answer, or (a
     /// relaunch) to finish exiting and release the name.
     const WAIT: Duration = Duration::from_secs(10);
+    /// How long one attempt to reach the first waits: a connection made
+    /// while it was exiting may never be answered or closed, and waiting
+    /// on it would use up the whole time.
+    const ASK: Duration = Duration::from_secs(3);
     /// How long the first one lets a client read its answer.
     const ANSWER_READ: Duration = Duration::from_secs(2);
     const SHOWN: u8 = 1;
@@ -84,7 +88,7 @@ mod windows {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if matches!(
-                tokio::time::timeout(left, ask_to_show(&name)).await,
+                tokio::time::timeout(left.min(ASK), ask_to_show(&name)).await,
                 Ok(true)
             ) || Instant::now() >= deadline
             {

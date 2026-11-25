@@ -1182,7 +1182,8 @@ fn lower_memory_priority(pid: u32, id: &str) {
     }
 }
 
-/// Whether a process with `pid` currently exists.
+/// Whether a process with `pid` is running. A zombie (exited, not yet
+/// reaped by its parent) is not: it holds no port and no memory.
 pub fn pid_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
@@ -1202,12 +1203,23 @@ pub fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+            && !is_zombie(pid)
     }
     #[cfg(not(any(windows, unix)))]
     {
         let _ = pid;
         false
     }
+}
+
+/// The state field of `/proc/<pid>/stat` ("pid (name) S …"; the name may
+/// hold spaces and parentheses). Without /proc, no process reads as one.
+#[cfg(unix)]
+fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .is_some_and(|(_, rest)| matches!(rest.trim_start().chars().next(), Some('Z' | 'X')))
+    })
 }
 
 /// Kill a process and (on Windows) its whole tree; best effort —
@@ -4228,6 +4240,23 @@ mod tests {
             Some(dead_pid()),
             Path::new("other-program")
         ));
+    }
+
+    /// An adopted process is the child of somebody who may never reap
+    /// it: its exit counts, not its removal from the process table.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_zombie_is_not_alive() {
+        let mut child = ext_sleeper();
+        let pid = child.id();
+        assert!(pid_alive(pid));
+        child.kill().unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!pid_alive(pid), "not reaped, but exited");
+        child.wait().unwrap();
     }
 
     fn dead_pid() -> u32 {
