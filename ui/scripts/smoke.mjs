@@ -1034,5 +1034,32 @@ check(mcpPromptR15.includes('data-prompt-act="cancel">${icon("x")} Cancel start'
 // slot, fed by gateway_status.openrouter_spend.
 check(/const spendRow = spend && spend\.fraction !== null[\s\S]{0,1600}meter\(Math\.min\(100, spend\.fraction \* 100\)/.test(staticSrcNar) && staticSrcNar.includes("${spendRow}"), "OpenRouter tier card renders the spent-vs-cap meter from openrouter_spend");
 
+// UI audit (Nov 2026): behaviours a source pin can hold.
+{
+  const srcAll = walkTs(join(root, "src")).map((p) => [p.slice(root.length + 1).replace(/\\/g, "/"), readFileSync(p, "utf8").replace(/\r\n/g, "\n")]);
+  const srcOf = (name) => srcAll.find(([p]) => p === name)?.[1] ?? "";
+  const native = srcAll.filter(([, s]) => /(?<![\w.])(?:window\.)?(?:confirm|alert|prompt)\(/.test(s.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, ""))).map(([p]) => p);
+  check(native.length === 0, `no native confirm()/alert()/prompt() dialogs${native.length ? ` (found in ${native.join(", ")})` : ""}`);
+  check(!srcAll.some(([, s]) => s.includes('"en-GB"')), "dates use the OS locale");
+  const css = readFileSync(join(root, "src", "styles.css"), "utf8");
+  check(css.includes("color-scheme: dark"), "native controls follow the dark theme");
+  check(/table\.tbl, table\.dtab, table\.opt-table \{/.test(css), "plan, projection and sweep tables share the table style");
+  const mainUi = srcOf("src/main.ts");
+  check(mainUi.indexOf('id="view"') < mainUi.indexOf('id="activationBanner"'), "the activation bar is docked under the view (its arrival shifts nothing)");
+  check(mainUi.includes("rememberScroll();") && mainUi.includes("restoreScroll(route.hash);"), "scroll position is kept per route");
+  for (const v of ["src/views/backends.ts", "src/views/gateway.ts"]) check(!srcOf(v).includes("activationPlanHtml"), `${v} does not repeat the activation plan beside the shell's bar`);
+  const models = srcOf("src/views/models.ts");
+  check(models.indexOf('<div id="modelAddForm">') < models.indexOf('<div id="modelOverview">'), "the Add model form opens at the top of the page");
+  const bench = srcOf("src/views/bench.ts");
+  check(!bench.includes("Sweep started: ${r.data.sweep_id}") && bench.includes("if (disposed || (!runBusy && !sweeps.some("), "bench polls from the moment a sweep is started");
+  check(bench.indexOf("interlock = null;\n    setStatus(\"\", false, \"run\");") > 0, "the interlock panel closes when the run starts");
+  const opt = srcOf("src/views/optimize.ts");
+  check((opt.match(/await confirmReplacePlan\(\)/g) ?? []).length >= 3, "every consultation asks before replacing a stored plan");
+  check(srcOf("src/views/backends.ts").includes("actionJustSwapped(`backend:${id}`)") && srcOf("src/lifecycle.ts").includes("actionJustSwapped(targetKey(target))"), "a click on a just-swapped lifecycle button is ignored");
+  check(srcOf("src/views/groups.ts").includes('ev.key === "Escape" && openMenus.size'), "Escape closes the group move menu");
+  check(srcOf("src/views/mcp.ts").includes("s.blocked_reason"), "MCP cards show why a server is blocked");
+  check(opt.includes("restoreFailuresHtml(sweep.restore_failures)"), "a tuning sweep names the backends it could not start again");
+}
+
 if (failures > 0) { console.error(`\n${failures} smoke check(s) failed`); process.exit(1); }
 console.log("\nsmoke: all checks passed");
