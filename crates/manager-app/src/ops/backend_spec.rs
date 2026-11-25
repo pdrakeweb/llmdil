@@ -328,6 +328,23 @@ pub(crate) fn backend_spec(
     }
     args.push("--split-mode".into());
     args.push(split_mode_str(b.flags.split_mode).into());
+    // llama-server's own defaults (`-ngl auto`, `--fit on`) move layers
+    // to the CPU when the model does not fit, at a fraction of the
+    // speed. A backend that does not fit must fail to load instead;
+    // only the operator's own flags decide otherwise.
+    let raw_has = |flags: &[&str]| {
+        b.raw_flags.as_deref().is_some_and(|raw| {
+            manager_models::split_raw_flags(raw)
+                .iter()
+                .any(|t| flags.contains(&t.split('=').next().unwrap_or(t)))
+        })
+    };
+    if !raw_has(&["-ngl", "--gpu-layers", "--n-gpu-layers"]) {
+        args.extend(["-ngl".into(), "all".into()]);
+    }
+    if !raw_has(&["-fit", "--fit"]) {
+        args.extend(["--fit".into(), "off".into()]);
+    }
     if let Some(raw) = &b.raw_flags {
         // raw_flags are operator-supplied llama-server arguments, with
         // three reservations:

@@ -26,6 +26,38 @@ fn backend_spec_uses_wizard_binary_and_resolves_model() {
     assert_eq!(spec.args[pos + 1], b.port.to_string());
 }
 
+/// A5: llama-server's `-ngl auto` + `--fit on` defaults spill layers to
+/// the CPU silently, so every launch states otherwise.
+#[test]
+fn backend_spec_loads_every_layer_on_the_gpu_unless_raw_flags_decide() {
+    let cfg = test_cfg();
+    let launch = |raw: Option<&str>| {
+        let mut b = backend(&cfg, "planner");
+        b.raw_flags = raw.map(str::to_string);
+        format!(" {} ", backend_spec(&cfg, &b, &[]).args.join(" "))
+    };
+    for raw in [None, Some("--mlock --fit-target 512")] {
+        let args = launch(raw);
+        assert!(args.contains(" -ngl all "), "{args}");
+        assert!(args.contains(" --fit off "), "{args}");
+    }
+    for raw in [
+        "-ngl 12",
+        "--gpu-layers 0",
+        "--n-gpu-layers=7",
+        "\"-ngl\" 12",
+    ] {
+        let args = launch(Some(raw));
+        assert!(!args.contains(" -ngl all "), "{args}");
+        assert!(args.contains(" --fit off "), "{args}");
+    }
+    for raw in ["-fit on", "--fit on", "--fit=on"] {
+        let args = launch(Some(raw));
+        assert!(args.contains(" -ngl all "), "{args}");
+        assert!(!args.contains(" --fit off "), "{args}");
+    }
+}
+
 #[test]
 fn backend_spec_split_modes() {
     let cfg = test_cfg();
