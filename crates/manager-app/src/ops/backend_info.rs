@@ -498,10 +498,8 @@ pub(crate) fn backend_offload_info(
     let canonical = manager_models::set_expert_offload(b.raw_flags.as_deref(), canonical_offload);
     let custom = token_normalized_flags(b.raw_flags.as_deref())
         != token_normalized_flags(canonical.as_deref());
-    let restrictions = layout
-        .catalog
-        .as_ref()
-        .map(|c| c.offload_restrictions.clone())
+    let restrictions = model_for_backend(cfg, b)
+        .map(|m| manager_models::catalog_offload_restrictions(&m.id, &m.source_url))
         .unwrap_or_default();
     let sys_bytes_by_position = manager_models::memory::sys_bytes_by_position_with_tensors(
         expert_bytes,
@@ -597,6 +595,15 @@ pub(crate) fn offload_row_json(o: &OffloadInfo, eval: Option<&OffloadEvaluation>
         "n_cpu_moe_by_position": o.n_cpu_moe_by_position(),
         "custom": o.custom,
         "guardrail": guardrail,
+        // A warning, never a block: partial offload on a compute
+        // capability 6.x GPU with no catalog pin. Additive.
+        "warning": eval.and_then(|e| manager_models::pascal_partial_warning(
+            &e.restrictions,
+            e.layers,
+            e.moe_layers,
+            &e.placed_ccs,
+            e.cpu_only,
+        )),
     })
 }
 

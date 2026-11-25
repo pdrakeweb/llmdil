@@ -930,7 +930,11 @@ pub async fn op_model_assign(
     // calling it under the write lock could deadlock. A count of 0
     // means telemetry has not polled yet — the check is skipped rather
     // than rejecting against an unknown count.
-    let gpu_count = lock_telemetry(&state.telemetry().await).gpu_count();
+    let (gpu_count, gpu_inventory) = {
+        let store = state.telemetry().await;
+        let guard = lock_telemetry(&store);
+        (guard.gpu_count(), guard.inventory())
+    };
     if gpu_count > 0 && split.len() != gpu_count {
         // Same wording as manager_models::validate_split.
         return Err(ApiError::InvalidInput(format!(
@@ -958,6 +962,7 @@ pub async fn op_model_assign(
     // operator's declared default on the model record), resolved
     // before the mutable backend borrow below.
     let default_flags = model_default_raw_flags_at(&cfg.data_dir, model);
+    let took_default;
     let flags_untouched = {
         let backend = cfg
             .backends
@@ -997,6 +1002,7 @@ pub async fn op_model_assign(
         if !untouched {
             manager_models::apply_placement(backend, &split).map_err(ApiError::from)?;
         }
+        took_default = backend.raw_flags != prev_raw_flags;
         // A model-file or raw-flags change invalidates the recorded
         // tool-call probe (MCP design §7.2).
         if backend.model_file != prev_model_file || backend.raw_flags != prev_raw_flags {
@@ -1004,6 +1010,14 @@ pub async fn op_model_assign(
         }
         untouched
     };
+    // A default is never left on a position the placed GPU blocks.
+    if took_default {
+        if let Some(pos) = cfg.backends.iter().position(|b| b.id == backend_id) {
+            let mut b = cfg.backends[pos].clone();
+            snap_default_offload(&cfg, &mut b, &gpu_inventory);
+            cfg.backends[pos] = b;
+        }
+    }
     if let Some(model) = cfg.models.iter_mut().find(|m| m.id == id) {
         if !model.assigned_backends.contains(&backend_id) {
             model.assigned_backends.push(backend_id.clone());

@@ -343,6 +343,19 @@ pub(crate) async fn state_payload(state: &AppState) -> ApiResult {
         "job": job_json(&state.optimize.job.lock().await.clone()),
         "job_error": state.optimize.job_error.lock().await.as_ref().map(|(m, _)| m.clone()),
         "job_error_unix_ms": state.optimize.job_error.lock().await.as_ref().map(|(_, t)| *t),
+        // Backends a sweep or experiment batch stopped and could not
+        // start again, while they are still not running.
+        "restore_failures": state
+            .optimize
+            .restore_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|f| {
+                cfg.backends.iter().any(|b| b.id == f.id)
+                    && gathered.running.get(&f.id).copied() != Some(true)
+            })
+            .collect::<Vec<_>>(),
         // Per-backend running Optimize operations (tracker #70):
         // the mutual-exclusion record the start refusals name,
         // exposed so any page instance can see which operation
@@ -540,6 +553,11 @@ pub(super) async fn resolve_lookup_backend(
             Some(raw.clone())
         };
     } else {
+        if req.offload_layers.is_none() {
+            let store = state.telemetry().await;
+            let inventory = crate::lock_telemetry(&store).inventory();
+            crate::snap_default_offload(cfg, &mut backend, &inventory);
+        }
         if let Some(layers) = req.offload_layers {
             if let Some(info) = crate::backend_offload_info(cfg, &backend) {
                 let target = info.offload_for(layers);

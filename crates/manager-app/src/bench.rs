@@ -129,6 +129,9 @@ fn results_payload(state: &AppState, results: &mb::BenchResults) -> Value {
         .iter()
         .map(|s| {
             let mut v = serde_json::to_value(s).unwrap_or(Value::Null);
+            // Per-condition generation winners; `clear: false` is
+            // "no clear winner".
+            v["winners"] = json!(mb::condition_winners(s));
             if let (Some(job), Some(obj)) = (&job, v.as_object_mut()) {
                 if obj.get("id").and_then(|i| i.as_str()) == Some(job.sweep_id.as_str())
                     && obj.get("status").and_then(|s| s.as_str()) == Some("running")
@@ -404,6 +407,17 @@ fn unique_prompt_id(lib: &mb::PromptLibrary, name: &str) -> String {
 // Sweep ops (§7)
 // ---------------------------------------------------------------------------
 
+/// llama-server's useful sampling range.
+fn check_temperature(t: f32) -> Result<(), ApiError> {
+    if (0.0..=2.0).contains(&t) {
+        Ok(())
+    } else {
+        Err(ApiError::InvalidInput(format!(
+            "temperature {t} is outside 0 to 2"
+        )))
+    }
+}
+
 pub async fn op_bench_run_start(
     state: &Arc<AppState>,
     sink: &Arc<dyn crate::EventSink>,
@@ -411,6 +425,7 @@ pub async fn op_bench_run_start(
 ) -> crate::ApiResult {
     let req: SweepRequest = serde_json::from_value(request)
         .map_err(|e| ApiError::InvalidInput(format!("invalid sweep request: {e}")))?;
+    check_temperature(req.temperature)?;
     // One sweep at a time (§6.4), and never alongside a
     // measurement/experiment job (they contend for the same
     // GPUs the interlock reasons about).
@@ -632,7 +647,15 @@ pub async fn op_bench_run_start(
             _ => None,
         })
         .collect();
-    let projected = mb::project_minutes(&ready_specs);
+    // What this backend and model really took before, when they have
+    // been swept; the design's reasoned constants otherwise.
+    let projected = mb::minutes_per_arm(
+        &load_results(state).sweeps,
+        &target.id,
+        &model_abs.to_string_lossy(),
+    )
+    .map(|per_arm| per_arm * ready_specs.len() as f64)
+    .unwrap_or_else(|| mb::project_minutes(&ready_specs));
     let baseline_arm_index = if req.baseline_arm_index < outcomes.len() {
         req.baseline_arm_index
     } else {
@@ -825,7 +848,9 @@ pub async fn op_bench_run_start(
         .finish_task(&task_id, TaskStatus::Done, json!({ "sweep_id": sweep_id }))
         .await;
     let results = load_results(state);
-    Ok(results_payload(state, &results))
+    let mut payload = results_payload(state, &results);
+    payload["sweep_id"] = json!(sweep_id);
+    Ok(payload)
 }
 
 pub async fn op_bench_run_cancel(

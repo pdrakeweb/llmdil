@@ -534,3 +534,23 @@ fn model_default_raw_flags_render_declared_defaults() {
     model.default_offload_layers = None;
     assert_eq!(model_default_raw_flags(&model), None);
 }
+
+#[test]
+fn default_offload_never_lands_on_a_blocked_position() {
+    let mut cfg = AppConfig::default_config();
+    cfg.data_dir = std::env::temp_dir().join("llm-mgr-no-such-dir");
+    let file = "models/nemotron.gguf";
+    register_test_model(&mut cfg, "nemotron-3.5-lightning-30b", file);
+    let default = catalog_default_raw_flags("nemotron-3.5-lightning-30b");
+    let snapped = |cc: (u32, u32)| {
+        let mut b = uncreated_backend("nemo", file, default.clone());
+        let mut gpus = test_gpus();
+        gpus[0].compute_capability = cc;
+        snap_default_offload(&cfg, &mut b, &gpus);
+        b.raw_flags
+    };
+    // The catalog default is a partial position: kept where it is
+    // allowed, full offload on the P100.
+    assert_eq!(snapped((8, 6)), default);
+    assert_eq!(snapped((6, 0)).as_deref(), Some("-ot exps=CPU"));
+}

@@ -36,8 +36,8 @@ pub use cache::{
 pub use flags::{raw_flag_errors, raw_flag_warnings, split_raw_flags, FlagWarning};
 pub use gguf::{parse_gguf_layout, GgufError, GgufLayout, KvGeometry, RsGeometry};
 pub use guardrails::{
-    nearest_allowed, offload_status, restriction_for, AllowedOffload, OffloadRestriction,
-    OffloadStatus,
+    nearest_allowed, offload_status, pascal_partial_warning, restriction_for, AllowedOffload,
+    OffloadRestriction, OffloadStatus,
 };
 pub use memory::{
     expert_offload, memory_requirement, offload_bands, offload_flag_string, offload_for_layers,

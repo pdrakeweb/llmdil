@@ -770,6 +770,19 @@ pub(crate) fn cache_preview_json(
     })
 }
 
+/// Add the free-memory verdict to a [`cache_preview_json`] payload:
+/// per-target fields (see [`annotate_free_fit`]) and `fits_now`.
+pub(crate) fn annotate_targets_free_fit(
+    payload: &mut Value,
+    free: &HashMap<u32, u64>,
+    credit: &HashMap<u32, u64>,
+) {
+    let now = payload["targets"]
+        .as_array_mut()
+        .and_then(|t| annotate_free_fit(t, free, credit));
+    payload["fits_now"] = json!(now);
+}
+
 /// Preview a backend's cache configuration (the flags form's KV
 /// cache / flash-attention controls): the predicted footprint of
 /// the given selection at the given context and slot count, and
@@ -796,7 +809,7 @@ pub async fn op_backend_cache_preview(
     // inventory is fetched after the guard drops (the telemetry
     // accessor reads the config while initializing — it must
     // never be called while this command holds a config guard).
-    let (layout, backend) = {
+    let (layout, backend, snap) = {
         let cfg = state.config.read().await;
         let b = cfg
             .backends
@@ -808,7 +821,7 @@ pub async fn op_backend_cache_preview(
                 "backend {id}'s model cannot be resolved; its footprint cannot be priced"
             ))
         })?;
-        (layout, b.clone())
+        (layout, b.clone(), cfg.clone())
     };
     let gpus = {
         let store = state.telemetry().await;
@@ -859,6 +872,11 @@ pub async fn op_backend_cache_preview(
         targets.as_ref(),
     );
     payload["backend_id"] = json!(id);
+    // The free-memory verdict beside the against-total one; the
+    // running backend's own (saved) residency is credited.
+    let free = gpu_free_now(state).await;
+    let credit = own_residency(state, &snap, &backend, &gpus).await;
+    annotate_targets_free_fit(&mut payload, &free, &credit);
     Ok(payload)
 }
 

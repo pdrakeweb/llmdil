@@ -131,3 +131,13 @@ fn interlock_unparseable_placement_still_conflicts() {
     let conflicts = interlock_conflicts(&cfg, &running(&["odd"]), &target);
     assert_eq!(conflicts, vec!["odd".to_string()]);
 }
+
+#[test]
+fn temperature_must_be_in_the_sampling_range() {
+    for ok in [0.0, 0.6, 2.0] {
+        assert!(check_temperature(ok).is_ok(), "{ok}");
+    }
+    for bad in [-0.1, 2.1, 5.0, f32::NAN] {
+        assert!(check_temperature(bad).is_err(), "{bad}");
+    }
+}
