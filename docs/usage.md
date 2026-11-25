@@ -37,9 +37,11 @@ it never reinstalls unprompted.
 
 ## Main windows
 
+The sidebar shows *Services running: N of M* with *Start All Services* on
+every page while anything that should run is stopped.
+
 - **Dashboard** — health-at-a-glance: service cards (with gateway
-  statistics), GPU strip, model placement, 24h throughput, and a
-  *Start All Services* bar when anything is stopped. The toolbar's *View*
+  statistics), GPU strip, model placement and 24h throughput. The toolbar's *View*
   selector switches the same data between Appliance (default), Console
   (dense tables), and Topology (node map) presentations; the choice
   persists per window.

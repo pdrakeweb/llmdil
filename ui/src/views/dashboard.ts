@@ -49,12 +49,6 @@ let unwireActions: (() => void) | null = null;
 let lastFetchAt = 0;
 let fetching = false;
 const FULL_FETCH_MS = 4500;
-/** Start All in flight: the bar stays rendered with a busy button so
- *  the action's state is visible while starts complete one by one. */
-let startAllBusy = false;
-/** Failures from the last Start All run; shown in the header notice
- *  area and cleared by the next successful poll. */
-let startAllError: string | null = null;
 /** Gateway-probe failure from the latest successful poll. The probe
  *  failing does not fail the poll (backends/telemetry stay fresh), so
  *  it gets its own banner line instead of the backend-error one. */
@@ -554,34 +548,7 @@ function lifecycleLegend(): string {
   return groups.map((g) => `<span><span class="sw" style="background:${g.color}"></span>${esc(g.states.map((s) => META[s].label).join(" / "))}</span>`).join("");
 }
 
-/** What Start All would start right now: enabled, configured backends
- *  that are stopped or failed (never disabled ones, never ones in
- *  transition), and the gateway when it is stopped or failed — never
- *  while it is restarting/starting (UI-2). An unmeasured gateway
- *  (status call failed) is not a target: its state is unknown. */
-function startAllTargets(m: DashboardModel): { backends: BackendInfo[]; gatewayDown: boolean } {
-  const backends = m.backends.filter(
-    (b) => b.enabled === true && b.configured !== false && (b.lifecycle === "stopped" || b.lifecycle === "failed"),
-  );
-  const gatewayDown = m.gateway !== null && (m.gatewayState === "stopped" || m.gatewayState === "failed");
-  return { backends, gatewayDown };
-}
-
-/** The Start All bar under the topbar: rendered only in live mode
- *  when something that should be running is not (or while a start is
- *  in flight). Count label + one button; no prose. */
-function startAllBar(m: DashboardModel): string {
-  if (!lastLive) return "";
-  const { backends, gatewayDown } = startAllTargets(m);
-  if (!startAllBusy && backends.length === 0 && !gatewayDown) return "";
-  // The shared count rule (enabled + configured backends) plus the gateway.
-  const sum = summarize({ backends: m.backends, gateway: m.gatewayState });
-  const running = sum.backendsRunning + (m.gatewayState === "running" ? 1 : 0);
-  const total = sum.backendsTotal + (m.gateway ? 1 : 0);
-  return `<div style="padding:12px 20px 0"><div class="banner" style="display:flex;align-items:center;gap:10px"><span>Services running: ${running} of ${total}</span><span class="spacer"></span><button class="btn primary" id="startAllBtn" ${startAllBusy ? "disabled" : ""}>${icon("play")} ${startAllBusy ? "Starting…" : "Start All Services"}</button></div></div>`;
-}
-
-function headerHtml(live: boolean, stale: boolean, updatedAgo: string, verdict: SystemVerdict, startAll = ""): string {
+function headerHtml(live: boolean, stale: boolean, updatedAgo: string, verdict: SystemVerdict): string {
   return `<div class="topbar">
     <h1>Dashboard</h1>
     <span class="status-pill"><span class="dot ${verdict.dot}"></span> ${esc(verdict.text)}</span>
@@ -597,12 +564,10 @@ function headerHtml(live: boolean, stale: boolean, updatedAgo: string, verdict: 
     <button class="btn icon-only" id="pauseBtn" title="${paused ? "Resume live" : "Pause live"}" aria-label="${paused ? "Resume live" : "Pause live"}">${icon(paused ? "play" : "pause")}</button>
     <a class="btn" href="#/wizard">Setup wizard</a>
   </div>
-  ${startAll}
   ${lastError ? `<div style="padding:12px 20px 0"><div class="banner">${icon("warn")} backend error — showing last known data: ${esc(lastError)}</div></div>` : ""}
   ${lastGatewayError ? `<div style="padding:12px 20px 0"><div class="banner">${icon("warn")} Gateway status unavailable: ${esc(lastGatewayError)}</div></div>` : ""}
   ${lastSpendBanner ? `<div style="padding:12px 20px 0">${lastSpendBanner}</div>` : ""}
   ${restartError ? `<div style="padding:12px 20px 0"><div class="banner" id="restartNotice">${icon("warn")} ${esc(restartError)}</div></div>` : ""}
-  ${startAllError ? `<div style="padding:12px 20px 0"><div class="banner" id="startAllNotice">${icon("warn")} ${esc(startAllError)}</div></div>` : ""}
   ${!live ? `<div style="padding:12px 20px 0"><div class="banner">${icon("warn")} disconnected — showing sample data (not running under Tauri)</div></div>` : ""}`;
 }
 
@@ -641,7 +606,7 @@ function render(): void {
   const body = mode === "appliance" ? applianceView(m, lastLive) : mode === "console" ? consoleView(m) : topologyView(m);
   // The repaint keeps the scroll position and the keyboard focus.
   const top = el.querySelector(".view")?.scrollTop ?? 0;
-  keepFocus(el, () => { el.innerHTML = headerHtml(lastLive, staleNow, ago(m.updatedAt), verdict, startAllBar(m)) + `<div class="view">${body}</div>`; });
+  keepFocus(el, () => { el.innerHTML = headerHtml(lastLive, staleNow, ago(m.updatedAt), verdict) + `<div class="view">${body}</div>`; });
   const scroller = el.querySelector(".view");
   if (scroller && top) scroller.scrollTop = top;
   el.querySelectorAll("[data-view]").forEach((b) =>
@@ -654,51 +619,12 @@ function render(): void {
     }));
   const pb = el.querySelector("#pauseBtn");
   pb?.addEventListener("click", () => { paused = !paused; render(); });
-  const sab = el.querySelector("#startAllBtn");
-  sab?.addEventListener("click", () => { void startAllServices(); });
   el.querySelectorAll("[data-act]").forEach((b) =>
     b.addEventListener("click", () => {
       const act = (b as HTMLElement).dataset.act;
       const id = (b as HTMLElement).dataset.id;
       if (act === "logs" && id) location.hash = `#/logs?scope=${encodeURIComponent(id)}&follow=1`;
     }));
-}
-
-/** Start everything that should be running and is not, through the
- *  shared lifecycle runner (the same entry points every surface uses:
- *  start_backend per backend — routed to the SCM in service mode —
- *  and the start-gateway step for the gateway, after the MCP
- *  credential prompt). Each start shows as "starting…" on every
- *  surface at once. Sequential, so one failure does not block the
- *  rest; failures are collected and reported together at the end.
- *  The server clears the activation plan itself after a gateway
- *  start — no client-side activationComplete. */
-async function startAllServices(): Promise<void> {
-  if (startAllBusy || !lastModel) return;
-  startAllBusy = true;
-  render();
-  const errors: string[] = [];
-  const { backends, gatewayDown } = startAllTargets(overlayModel(lastModel, serviceStore.get()));
-  for (const b of backends) {
-    if (disposed) break;
-    const r = await runLifecycle({ kind: "backend", id: b.id }, "start", { origin: "dashboard" });
-    if (!r.ok) errors.push(r.message);
-  }
-  if (gatewayDown && !disposed) {
-    // MCP credential prompt (Pete, 2026-10-18): same pre-start step
-    // as the Gateway view's Start button. Cancelling skips only the
-    // gateway leg; the backends above already started.
-    const r = await runLifecycle({ kind: "gateway" }, "start", { origin: "dashboard", promptMcp: true });
-    if (r.cancelled) errors.push("gateway: start cancelled at the MCP credential prompt");
-    else if (!r.ok) errors.push(r.message);
-  }
-  startAllBusy = false;
-  if (disposed) return;
-  await doPoll(serviceStore.get()); // refresh first; a successful poll clears prior notices
-  if (errors.length) {
-    startAllError = `Start All failed — ${errors.join("; ")}`;
-    render();
-  }
 }
 
 /** The full dashboard fetch (telemetry, metrics, config), fed the
@@ -733,7 +659,6 @@ async function doPoll(snap?: ServiceSnapshot): Promise<void> {
     lastLive = r.live;
     lastError = null;
     restartError = null; // a successful poll clears any restart notice
-    startAllError = null; // ...and any Start All notice
     // A gateway-probe failure rides along on an otherwise successful
     // poll: lastOk advances (the data IS fresh) and the failure shows
     // as its own banner, not as backend staleness.

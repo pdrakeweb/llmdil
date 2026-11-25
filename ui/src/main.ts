@@ -11,6 +11,7 @@ import { stackedBar } from "./charts";
 import { esc, setHtml } from "./html";
 import { icon, type IconName } from "./icons";
 import { setupNeedsWizard } from "./setupGate";
+import { onStartAllClick, paintStartAll } from "./startAll";
 import { renderBench, wireBench } from "./views/bench";
 import { mountDashboard } from "./views/dashboard";
 import { renderGroups, wireGroups } from "./views/groups";
@@ -53,6 +54,7 @@ function shell(): string {
   return `<aside class="sidebar">
       <div class="brand"><div class="name">Local LLM Service</div><div class="sub">Dell Precision 7865</div></div>
       <nav class="nav">${ROUTES.map((r) => `<a href="${r.hash}" data-route="${r.hash}">${icon(r.icon)}<span class="lbl">${esc(r.label)}</span></a>`).join("")}</nav>
+      <div id="sideServices"></div>
       <div class="side-foot" id="sideFoot"><div class="row"><span class="dot idle"></span> status…</div></div>
     </aside>
     <div class="main">
@@ -343,6 +345,7 @@ function paintSideFoot(snap: ServiceSnapshot): void {
 let lastApplying = false;
 function onStoreSnapshot(snap: ServiceSnapshot): void {
   paintSideFoot(snap);
+  paintStartAll(snap);
   const applying = Boolean(snap.gateway?.activation_applying);
   if (applying !== lastApplying) {
     lastApplying = applying;
@@ -513,6 +516,7 @@ async function main(): Promise<void> {
   app.innerHTML = shell();
   window.addEventListener("hashchange", () => void render());
   document.getElementById("activationBanner")?.addEventListener("click", (ev) => void onBannerClick(ev));
+  document.getElementById("sideServices")?.addEventListener("click", onStartAllClick);
   document.getElementById("updateBanner")?.addEventListener("click", (ev) => void onUpdateBannerClick(ev));
   void refreshActivationBanner();
   void refreshUpdateBanner();

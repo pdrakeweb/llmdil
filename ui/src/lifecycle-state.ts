@@ -297,8 +297,8 @@ export interface LifecycleSummary {
   gateway: LifecycleState | null;
 }
 
-/** The one count rule for the sidebar, the dashboard pill and Start-all
- *  bar, and the map pill: enabled + configured backends only. */
+/** The one count rule for the sidebar (its counts and Start All), the
+ *  dashboard pill and the map pill: enabled + configured backends only. */
 export function summarize(input: {
   backends: readonly SummarizableBackend[];
   gateway: LifecycleState | null;

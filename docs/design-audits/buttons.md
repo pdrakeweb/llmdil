@@ -328,7 +328,8 @@ sites. The #48 addendum's 8 swapped controls stand as recorded.
 
 - "Dashboard Start All bar — Not present in this tree" (inventory,
   Cross-view shared elements) is superseded: the bar exists in v0.1.40
-  (`startAllBar`, `ui/src/views/dashboard.ts`) and renders
+  (since November 2026 in the sidebar of every page:
+  `startAllHtml`, `ui/src/startAll.ts`) and renders
   *Start All Services* as a words + `play` icon primary button — the
   lifecycle treatment this audit predicted for it.
 - The inventory's scope line ("main.ts shell + activation banner,

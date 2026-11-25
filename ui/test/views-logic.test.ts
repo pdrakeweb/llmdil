@@ -4,6 +4,7 @@ import { optimizeChangeSummary, optimizeIsDestructive, optimizeKindLabel } from 
 import {
   armLabel, expandDims, offloadChoices, offloadExprFor, offloadLayersOf, offloadPosLabel, presetArms, pruneReason,
 } from "../src/views/bench";
+import { startAllHtml, startAllTargets } from "../src/startAll";
 import { mcpIdError } from "../src/views/mcp";
 import { diffInputFields, placementShort } from "../src/views/optimize";
 
@@ -173,5 +174,32 @@ describe("mcpIdError", () => {
     for (const bad of ["Files", "2fs", "my-server", " fs", "fs ", "_fs"]) {
       expect(mcpIdError(bad)).toMatch(/must match/);
     }
+  });
+});
+
+describe("Start All Services", () => {
+  const rows = [
+    { id: "run", state: "running" }, { id: "stop", state: "stopped" }, { id: "fail", state: "failed" },
+    { id: "start", state: "starting" }, { id: "off", state: "stopped", enabled: false },
+    { id: "orphan", state: "stopped", configured: false },
+  ];
+  const stateOf = (b: { state: string }) => b.state as "running";
+  it("starts only enabled, configured backends that are down, and a down gateway", () => {
+    expect(startAllTargets(rows, stateOf, "running")).toEqual({ backends: ["stop", "fail"], gateway: false });
+    expect(startAllTargets(rows, stateOf, "stopped").gateway).toBe(true);
+    expect(startAllTargets(rows, stateOf, "restarting").gateway).toBe(false);
+    expect(startAllTargets(rows, stateOf, null).gateway).toBe(false);
+  });
+  it("shows nothing when everything runs, and keeps a failure until dismissed", () => {
+    const base = { running: 3, total: 3, stopped: false, busy: false, error: null };
+    expect(startAllHtml(base)).toBe("");
+    const html = startAllHtml({ ...base, running: 2, stopped: true });
+    expect(html).toContain("Services running: 2 of 3");
+    expect(html).toContain("data-start-all ");
+    expect(startAllHtml({ ...base, busy: true })).toContain("disabled");
+    const failed = startAllHtml({ ...base, error: "Start All failed — <x>" });
+    expect(failed).toContain("&lt;x&gt;");
+    expect(failed).toContain("data-start-all-dismiss");
+    expect(failed).not.toContain("Services running");
   });
 });
