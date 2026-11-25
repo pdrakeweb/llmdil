@@ -143,6 +143,15 @@ export function modelShortName(m: ModelRow): string {
   return m.name?.trim() || m.id;
 }
 
+/** The one display name of a model, from its id, GGUF path or file
+ *  stem: the registered short name when it matches a model, else the
+ *  given text's file stem. */
+export function modelDisplayName(idOrFile: string, models: readonly ModelRow[]): string {
+  const m = models.find((x) => x.id === idOrFile || sameModelFile(idOrFile, x.gguf_path)
+    || modelFileShortName(x.gguf_path).toLowerCase() === modelFileShortName(idOrFile).toLowerCase());
+  return m ? modelShortName(m) : idOrFile ? modelFileShortName(idOrFile) : "";
+}
+
 /** Compact GPU name for the Placement split chips: the vendor
  *  prefix is dropped ("NVIDIA RTX A4000" -> "RTX A4000") so the
  *  name fits on the chip's second line. The full telemetry name

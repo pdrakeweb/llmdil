@@ -320,6 +320,8 @@ body {
   border: 1px solid var(--border); border-radius: 8px;
   box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
 }
+.advanced-menu.up { top: auto; bottom: calc(100% + 6px); }
+.advanced-menu.left { right: auto; left: 0; }
 .menu-item {
   display: flex; width: 100%; align-items: center; gap: 8px;
   background: transparent; border: 0; border-radius: 6px; color: var(--text);

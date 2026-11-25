@@ -1,17 +1,84 @@
 /* Backends view: the backend card and the view shell (split from
    static.ts). */
 
-import type { BackendRow, CacheSelectionLike, LogRow, ModelRow } from "../api";
+import type { BackendAutoRestart, BackendRow, CacheSelectionLike, LogRow, ModelRow } from "../api";
 import { fmtCount, fmtGb, trim1 } from "../charts";
 import { esc } from "../html";
 import { icon } from "../icons";
-import { LIFECYCLE_STATES, META, applyBlockedReason, fromWire, lifecycleActions, lifecycleChip, lifecycleDot } from "../lifecycle";
+import { LIFECYCLE_STATES, META, applyBlockedReason, fromWire, lifecycleActions, lifecycleChip, lifecycleDot, noteOfferedActions } from "../lifecycle";
 import type { LifecycleState } from "../lifecycle";
 import { enableSwitch } from "../switch";
-import { MOE_CACHE_DEFAULT_MIB, MOE_CACHE_PRESETS_MIB, MTP_POSITIONS, flagsCacheHtml, flagsCtxBatchHtml, flagsParallelHtml, flagsRatedLineHtml, flagsRawWarningsHtml, moeCacheSavedTokenText, mtpConflictText, mtpPosition, mtpSavedTokenText, offloadIsUntested, offloadSliderHtml, predictedCardTip, sameCacheSelection } from "./backendFlags";
+import { pageState } from "../viewState";
+import { MOE_CACHE_DEFAULT_MIB, MOE_CACHE_PRESETS_MIB, MTP_POSITIONS, fitChipHtml, flagsCacheHtml, flagsCtxBatchHtml, flagsParallelHtml, flagsRatedLineHtml, flagsRawWarningsHtml, moeCacheSavedTokenText, moeCacheTokenText, mtpConflictText, mtpPosition, mtpSavedTokenText, mtpTokenText, offloadIsUntested, offloadSliderHtml, predictedCardTip, sameCacheSelection } from "./backendFlags";
 import type { FlagsDraft, PlaceCardState } from "./backendFlags";
 import { SELECT_STYLE, fmtElapsed, fmtTime, fmtUptime, gpuShortName, loadingHtml, modelFileShortName, modelOptions, modelShortName, quoteArg, sameModelFile, topbar } from "./common";
 import type { CardNote } from "./common";
+
+/** One backend's measured VRAM on one GPU (mib null = not measured). */
+export interface ResidencyRow { gpu: number; name: string; mib: number | null }
+
+/** The GPU indices a backend's saved split places it on. */
+export function configuredGpus(b: Pick<BackendRow, "tensor_split">): number[] {
+  return (b.tensor_split ?? []).map((f, i) => (f > 0 ? i : -1)).filter((i) => i >= 0);
+}
+
+/** The overview list's GPUs column: every configured GPU, each saying
+ *  what is measured there. A loaded backend's GPU without a figure reads
+ *  "not measured", never as absent; a stopped backend lists where it
+ *  loads at its next start. */
+export function gpuColumnText(b: Pick<BackendRow, "tensor_split">, active: boolean, res: readonly ResidencyRow[]): string {
+  const configured = configuredGpus(b);
+  const measured = res.filter((r) => r.mib !== null && r.mib >= 1024).map((r) => r.gpu);
+  const unmeasured = res.filter((r) => r.mib === null).map((r) => r.gpu);
+  if (!active && !res.length) return configured.length ? configured.map((i) => `GPU ${i}`).join(", ") : "\u2014";
+  const all = [...new Set([...configured, ...measured, ...unmeasured])].sort((a, z) => a - z);
+  if (!all.length) return res.length ? "context only" : "\u2014";
+  return all.map((i) => {
+    if (measured.includes(i)) return `GPU ${i}`;
+    return res.some((r) => r.gpu === i && r.mib !== null) ? `GPU ${i} (context only)` : `GPU ${i} (not measured)`;
+  }).join(", ");
+}
+
+/** The crash-restart schedule as Label: Value text. */
+export function autoRestartText(a: BackendAutoRestart, now: number = Date.now()): string {
+  if (a.gave_up) return `Auto-restart: gave up after ${a.attempt} of ${a.max} attempts`;
+  const secs = a.next_at_ms !== null ? Math.max(0, Math.ceil((a.next_at_ms - now) / 1000)) : null;
+  return `Auto-restart: attempt ${a.attempt} of ${a.max}${secs === null ? "" : secs > 0 ? ` in ${fmtElapsed(secs)}` : " now"}`;
+}
+
+/** The context length raw flags set themselves, or null. */
+export function rawContext(raw: string): number | null {
+  const m = [...raw.matchAll(/(?:^|\s)(?:-c|--ctx-size)(?:\s+|=)(\d+)(?=\s|$)/g)].pop();
+  return m ? Number(m[1]) : null;
+}
+
+/** What is free for this backend across its placed GPUs, against what
+ *  it needs there: the payload's own figures, else telemetry (free VRAM
+ *  plus what the backend itself already holds). Null = unknown. */
+export function fitNow(
+  b: BackendRow,
+  gpuFreeMiB: Map<number, number>,
+  res: readonly ResidencyRow[],
+): { fitsNow: boolean | null; neededMib: number | null; freeMib: number | null } {
+  const rows = b.fit?.per_gpu ?? [];
+  let need = 0;
+  let free = 0;
+  let known = rows.length > 0;
+  let fits = true;
+  for (const r of rows) {
+    const held = res.find((x) => x.gpu === r.gpu);
+    const f = r.free_mib ?? (gpuFreeMiB.has(r.gpu) && held?.mib !== null ? (gpuFreeMiB.get(r.gpu) ?? 0) + (held?.mib ?? 0) : null);
+    need += r.required_mib;
+    if (f === null) { known = false; continue; }
+    free += f;
+    if (!(r.fits_free ?? r.required_mib <= f)) fits = false;
+  }
+  return {
+    fitsNow: typeof b.fits_now === "boolean" ? b.fits_now : known ? fits : null,
+    neededMib: rows.length ? need : null,
+    freeMib: known ? free : null,
+  };
+}
 
 export function backendCard(
   b: BackendRow,
@@ -23,12 +90,13 @@ export function backendCard(
   inFlight: Set<string>,
   models: ModelRow[],
   confirmRemove: Set<string>,
-  residency: Map<string, { gpu: number; name: string; mib: number | null }[]>,
+  residency: Map<string, ResidencyRow[]>,
   gpuNames: Map<number, string>,
   flags: FlagsDraft | null,
   predictedHtml: string,
   place: PlaceCardState | null,
   gpuTotalsMiB: Map<number, number>,
+  gpuFreeMiB: Map<number, number>,
   detailsOpen: boolean,
   predictRefreshing: Map<string, number>,
   confirmOverride: Set<string>,
@@ -50,6 +118,7 @@ export function backendCard(
     kind: "backend", enabled: b.enabled, configured: b.configured,
     ...(applyBlocked ? { blockedReason: applyBlocked } : {}),
   });
+  noteOfferedActions(`backend:${b.id}`, lcSpecs);
   const lcSpec = (a: "start" | "stop" | "restart") => lcSpecs.find((x) => x.action === a);
   const lcAttrs = (a: "start" | "stop" | "restart"): string => {
     const sp = lcSpec(a);
@@ -92,9 +161,9 @@ export function backendCard(
   // The shared lifecycle rule (lifecycleActions) decides Start /
   // Stop / Restart and their disabled reasons — the same rule as the
   // Dashboard cards and Settings > Supervision:
-  // - Stop while live or in transition, whether the backend is
-  //   configured, enabled, or an orphan — stopping is always allowed
-  //   (disabled mid-restart/stop with the reason).
+  // - Stop while live, whether the backend is configured, enabled, or
+  //   an orphan — stopping is always allowed (disabled, with the
+  //   reason, mid-restart/stop and when nothing runs).
   // - Restart for configured live backends (disabled with the reason
   //   when the backend is disabled — the shared rule).
   // - Start for stopped/failed configured backends (disabled with the
@@ -103,9 +172,10 @@ export function backendCard(
   //   it is toggleable only in the states listed for it above.
   // - Test only while running.
   const parts: string[] = [];
-  if (lcSpec("stop")) parts.push(stopBtn);
-  if (b.configured && lcSpec("restart") && !lcSpec("start")) parts.push(restartBtn);
+  // Fixed slots: Start or Restart first, Stop second.
+  if (b.configured && lcSpec("restart")) parts.push(restartBtn);
   if (b.configured && lcSpec("start")) parts.push(startBtn);
+  if (lcSpec("stop") && (b.configured || !lcSpec("stop")?.disabled)) parts.push(stopBtn);
   if (b.configured) parts.push(enableSw);
   if (st === "running") parts.push(testBtn);
   // Removal is refused by the command layer while running; offer it
@@ -206,9 +276,15 @@ export function backendCard(
     let bars = "";
     let basis = "";
     let titleTip = "";
+    // Configured GPUs no process figure came for are listed too, as not
+    // measured — a two-GPU backend never reads as a one-GPU one.
+    const resAll: ResidencyRow[] = [
+      ...res,
+      ...(active && res.length ? configuredGpus(b).filter((i) => !res.some((r) => r.gpu === i)).map((i) => ({ gpu: i, name: gpuNames.get(i) ?? "", mib: null })) : []),
+    ].sort((x, z) => x.gpu - z.gpu);
     if (knownRes.length) {
       basis = "measured";
-      bars = res.map((r) => {
+      bars = resAll.map((r) => {
         if (r.mib === null) return barRow(r.gpu, 0, "", "", "Not measured — per-process usage is not measured on this GPU; placement follows the configured split.");
         const total = gpuTotalsMiB.get(r.gpu) ?? 0;
         const share = total > 0 ? (r.mib / total) * 100 : 0;
@@ -220,7 +296,7 @@ export function backendCard(
     } else if (res.length) {
       basis = "not measured";
       titleTip = "Per-process usage is not measured on this GPU — placement follows the configured split.";
-      bars = res.map((r) => barRow(r.gpu, 0, "", "", "Not measured — per-process usage is not measured on this GPU; placement follows the configured split.")).join("");
+      bars = resAll.map((r) => barRow(r.gpu, 0, "", "", "Not measured — per-process usage is not measured on this GPU; placement follows the configured split.")).join("");
     } else if (!active) {
       // Ghost bars from the configured split; an unsplit backend
       // loads whole on GPU 0 (the app's standing placement default,
@@ -374,7 +450,7 @@ export function backendCard(
     if (m.custom) {
       lines.push(`<div style="font-size:12px;color:var(--text2);margin-top:6px">MTP: Custom (${esc(mtpSavedTokenText(m))})</div>`);
     }
-    if (m.enabled && m.parallel != null && m.parallel !== 1) {
+    if (m.enabled && m.parallel !== 1) {
       lines.push(`<div style="font-size:12px;color:#e3b341;margin-top:6px">${esc(mtpConflictText(m.parallel))}</div>`);
     }
     return lines.join("");
@@ -390,21 +466,19 @@ export function backendCard(
   // track's green band ends at the model's green limit (its
   // catalog default offload — the most offload that stays fast);
   // yellow and red split the range past it. Sliding updates the
-  // readout in place; releasing the slider saves through
-  // backend_set_offload, which rewrites only the offload tokens in
-  // the backend's raw flags.
-  const offloadHtml = flags && b.offload ? (() => {
+  // readout in place; like every control in the panel the position is
+  // a draft until Save.
+  const offloadHtml = flags && b.offload && !flags.modelChanged ? (() => {
     const o = b.offload;
     const n = flags.offloadLayers ?? o.layers;
-    // A released position the guardrail blocks is not committed:
-    // the form carries an inline decision row until the operator
-    // saves it with an override or snaps to the nearest verified
+    // A released position the guardrail blocks needs a decision before
+    // Save: save it with an override, or snap to the nearest verified
     // position. Both actions are operation-critical, so both keep
     // their words and an icon.
-    const pending = flags.offloadPendingLayers;
-    const decisionHtml = pending !== null && o.guardrail && offloadIsUntested(o, pending) ? `<div data-offload-decision style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
-      <span data-offload-decision-text style="font-size:12px;color:#e3b341">${pending} of ${o.moe_layers} layers is unverified on this GPU</span>
-      <button class="btn" data-back-act="offload-override" data-back-id="${esc(b.id)}"${dis}>${icon("warn")} Save with override</button>
+    const pending = flags.offloadPending;
+    const decisionHtml = pending && o.guardrail && offloadIsUntested(o, pending.layers) ? `<div data-offload-decision style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+      <span data-offload-decision-text style="font-size:12px;color:#e3b341">${pending.layers} of ${o.moe_layers} layers is unverified on this GPU${pending.override ? " \u2014 Save records an override" : ""}</span>
+      ${pending.override ? "" : `<button class="btn" data-back-act="offload-override" data-back-id="${esc(b.id)}"${dis}>${icon("warn")} Save with override</button>`}
       <button class="btn" data-back-act="offload-snap" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Snap to ${o.guardrail.nearest_verified_layers} of ${o.moe_layers} layers</button>
     </div>` : "";
     return offloadSliderHtml({ offload: o, layers: n, ownerId: b.id, disabled: inFlight.has(b.id), decisionHtml });
@@ -418,30 +492,30 @@ export function backendCard(
   // readout naming the flag the value writes. Rendered only for
   // offload-capable backends (the payload carries `moe_cache` —
   // the offload slider's eligibility). Both controls are
-  // disabled while the saved offload is 0: with no experts in
+  // disabled while the drafted offload is 0: with no experts in
   // system RAM there is nothing for the cache to hold, and the
   // label's tip says so.
-  const moeCacheHtml = flags && b.moe_cache ? (() => {
+  const moeCacheHtml = flags && b.moe_cache && !flags.modelChanged ? (() => {
     const mc = b.moe_cache;
     const on = flags.moeCacheOn;
     const size = flags.moeCacheMib ?? mc.mib ?? MOE_CACHE_DEFAULT_MIB;
-    const noOffload = mc.offload_layers === 0;
+    const noOffload = (flags.offloadLayers ?? mc.offload_layers) === 0;
     const ctlDisabled = inFlight.has(b.id) || noOffload;
     const tip = noOffload
       ? "Disabled: this backend offloads 0 MoE layers, so no experts sit in system RAM for the cache to hold. Raise the offload above 0 to enable it."
       : "Keeps the most recently used experts of the offloaded (system-RAM) layers in GPU memory and computes them there; experts not in the cache still run on the CPU. The size is priced into the backend's memory requirement, and a start that cannot fit it is refused with the numbers. The best size is empirical — the optimizer can sweep it once that support lands. Applies on the backend's next start.";
     const sizeOptions = MOE_CACHE_PRESETS_MIB.includes(size) ? MOE_CACHE_PRESETS_MIB : [...MOE_CACHE_PRESETS_MIB, size].sort((x, y) => x - y);
-    const draftIsSaved = on === (mc.mib != null) && (!on || size === mc.mib);
+    const draftIsSaved = !flags.moeCacheAuto && on === (mc.mib != null) && (!on || size === mc.mib);
     return `<div style="margin-top:12px">
       <div style="font-size:12px;color:var(--text2)">Expert cache<span class="info-tip" title="${esc(tip)}">${icon("info")}</span></div>
       <div style="display:flex;gap:6px;margin-top:4px;align-items:center">
         ${enableSwitch({ on, name: `Expert cache for ${b.id}`, attrs: `data-moe-cache-switch data-moe-cache-backend="${esc(b.id)}"`, disabled: ctlDisabled })}
         <select data-moe-cache-select data-moe-cache-backend="${esc(b.id)}" style="${SELECT_STYLE};flex:1;min-width:0" aria-label="Expert cache size for ${esc(b.id)}"${ctlDisabled ? " disabled" : ""}>
-          ${sizeOptions.map((v) => `<option value="${v}"${v === size ? " selected" : ""}>${v} MiB</option>`).join("")}
-          <option value="auto">Auto</option>
+          ${sizeOptions.map((v) => `<option value="${v}"${!flags.moeCacheAuto && v === size ? " selected" : ""}>${v} MiB</option>`).join("")}
+          <option value="auto"${flags.moeCacheAuto ? " selected" : ""}>Auto</option>
         </select>
       </div>
-      <div style="font-size:12px;color:var(--text2);margin-top:4px"><span data-moe-cache-token style="font-family:var(--mono)">${esc(moeCacheSavedTokenText(mc))}</span>${mc.custom && draftIsSaved ? `<span title="The saved flags spell the expert cache in a form the control does not write (an = spelling, a 0 token, ...). Saving from this control writes the canonical token; every other flag is preserved."> · custom flags</span>` : ""}</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:4px"><span data-moe-cache-token style="font-family:var(--mono)">${esc(draftIsSaved ? moeCacheSavedTokenText(mc) : !on ? moeCacheTokenText(null) : flags.moeCacheAuto ? "--moe-cache-mib (size chosen at Save from free VRAM)" : moeCacheTokenText(size))}</span>${mc.custom && draftIsSaved ? `<span title="The saved flags spell the expert cache in a form the control does not write (an = spelling, a 0 token, ...). Saving from this control writes the canonical token; every other flag is preserved."> · custom flags</span>` : ""}</div>
     </div>`;
   })() : "";
   // The MTP draft control (tracker #53), directly under the
@@ -451,15 +525,16 @@ export function backendCard(
   // rest), whose value lives in the wire-level draft state
   // (flags.mtpPosition), with the token readout naming the
   // flags the value writes, and the --parallel conflict line
-  // when the saved flags set a slot count other than 1.
+  // when the drafted slot count is anything other than 1.
   // Rendered only for MTP-capable backends (the payload carries
   // `mtp`). The readout shows the SAVED spelling until the value
   // changes; a backend on without an explicit length reads as
   // llama.cpp's default rather than an implied saved value.
-  const mtpHtml = flags && b.mtp ? (() => {
+  const mtpHtml = flags && b.mtp && !flags.modelChanged ? (() => {
     const m = b.mtp;
     const pos = flags.mtpPosition ?? mtpPosition(m);
-    const conflict = pos > 0 && m.parallel != null && m.parallel !== 1;
+    const conflict = pos > 0 && flags.fields.parallel !== 1;
+    const mtpSaved = pos === mtpPosition(m);
     return `<div style="margin-top:12px">
       <label style="font-size:12px;color:var(--text2);display:block">MTP draft tokens<span class="info-tip" title="Speculative decoding: the model drafts up to this many tokens ahead and verifies them in a single pass. More draft tokens can generate faster, but drafts the verifier rejects are wasted work, so gains depend on how often drafts are accepted. Applies on the backend's next start.">${icon("info")}</span>
         <span style="display:flex;gap:6px;margin-top:4px">
@@ -467,34 +542,32 @@ export function backendCard(
             ${MTP_POSITIONS.map((v) => `<option value="${v}"${v === pos ? " selected" : ""}>${v === 0 ? "Off" : String(v)}</option>`).join("")}
           </select>
         </span></label>
-      <div style="font-size:12px;color:var(--text2);margin-top:4px"><span data-mtp-token style="font-family:var(--mono)">${esc(mtpSavedTokenText(m))}</span>${m.custom ? `<span title="The saved flags spell MTP in a form the control does not write (an = spelling, a shared --spec-type list, ...). Saving from this control writes the canonical tokens; every other flag is preserved."> · custom flags</span>` : ""}</div>
-      <div data-mtp-conflict style="font-size:12px;color:#e3b341;margin-top:4px;${conflict ? "" : "display:none"}">${m.parallel != null ? esc(mtpConflictText(m.parallel)) : ""}</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:4px"><span data-mtp-token style="font-family:var(--mono)">${esc(mtpSaved ? mtpSavedTokenText(m) : mtpTokenText(pos))}</span>${m.custom && mtpSaved ? `<span title="The saved flags spell MTP in a form the control does not write (an = spelling, a shared --spec-type list, ...). Saving from this control writes the canonical tokens; every other flag is preserved."> · custom flags</span>` : ""}</div>
+      <div data-mtp-conflict style="font-size:12px;color:#e3b341;margin-top:4px;${conflict ? "" : "display:none"}">${esc(mtpConflictText(flags.fields.parallel))}</div>
     </div>`;
   })() : "";
   // The Parallel slots field (tracker #61), under the ctx/batch
   // pair: a preset+custom select over the backend's --parallel
-  // count, committing through backend_set_parallel on change —
-  // the sliders' commit model, since the value lives in raw flags
-  // like theirs, not in the Save button's ctx/batch. The custom
+  // count, saved with the rest of the panel. The custom
   // marker shows while the draft still equals the saved value:
   // it describes the saved spelling, and a changed selection has
   // no saved spelling yet.
   const parallelHtml = flags && b.parallel ? flagsParallelHtml({
-    value: flags.parallel,
-    savedCustom: b.parallel.custom && flags.parallel === b.parallel.slots,
+    value: flags.fields.parallel,
+    custom: flags.fields.parallelCustom,
+    savedCustom: b.parallel.custom && flags.fields.parallel === b.parallel.slots,
     fieldAttr: "data-flags-field",
     disabled: inFlight.has(b.id),
   }) : "";
   // The KV cache / flash-attention controls, under the parallel
-  // field: selects committing through backend_set_cache on change
-  // (the MTP/parallel commit model), with the predicted footprint
+  // field: selects saved with the rest of the panel, with the predicted footprint
   // and predicted-best action rendered from the preview payload
   // the wire layer prices for the current draft.
   const cacheSel: CacheSelectionLike = flags?.cacheSel ?? (b.cache ? { k: b.cache.k, v: b.cache.v, flash_attn: b.cache.flash_attn } : { k: "f16", v: "f16", flash_attn: "auto" });
   const cacheHtml = flags && b.cache ? flagsCacheHtml({
     sel: cacheSel,
     savedCustom: b.cache.custom && sameCacheSelection(cacheSel, b.cache),
-    savedPresent: b.cache.present,
+    savedAbsent: !b.cache.present && sameCacheSelection(cacheSel, b.cache),
     preview: flags.cachePreview,
     fieldAttr: "data-cache-field",
     bestAttr: `data-cache-best data-cache-backend="${esc(b.id)}"`,
@@ -517,45 +590,17 @@ export function backendCard(
   // preserves an advanced backend's raw flags verbatim
   // (flags_untouched), so the field is safe in advanced mode too.
   const editModelHtml = flags ? `<div style="margin-top:10px">
-      <label style="font-size:12px;color:var(--text2);display:block">Model<span class="info-tip" title="The model this backend serves. The change applies only when you save from this panel; a running backend picks the new model up on its next start.">${icon("info")}</span>
+      <label style="font-size:12px;color:var(--text2);display:block">Model<span class="info-tip" title="The model this backend serves. The change applies only when you save from this panel; a running backend picks the new model up on its next start. Offload, expert cache and MTP depend on the model and are edited after its change is saved.">${icon("info")}</span>
         <span style="display:flex;gap:6px;margin-top:4px">
           <select data-edit-model="${esc(b.id)}" style="${SELECT_STYLE};flex:1;min-width:0" aria-label="Model for ${esc(b.id)}"${dis}>${modelOptions(b, models, flags.editModelId)}</select>
         </span></label>
     </div>` : "";
-  const flagsHtml = flags ? (flags.advanced ? `<div class="backend-form-panel flags-panel">
-      <div style="font-size:12px;font-weight:600">${icon("pencil")} Edit ${esc(b.id)}</div>
-      ${editModelHtml}
-      <div style="font-size:12px;color:var(--text2);margin-top:6px">Mode: Advanced<span class="info-tip" title="In advanced mode the text below is the backend's launch flags, edited directly. Context, batch, offload, MTP and placement are all set by this string; the structured form and its controls are disabled for this backend until you switch back. Warnings never block a save — unknown flags pass through to llama-server, which decides.">${icon("info")}</span></div>
-      <textarea data-flags-raw="${esc(b.id)}" rows="4" spellcheck="false" style="width:100%;margin-top:8px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 10px;font-family:var(--mono);font-size:12px" aria-label="Raw flags for ${esc(b.id)}">${esc(flags.rawText)}</textarea>
-      <div data-flags-warnings>${flagsRawWarningsHtml(flags.rawWarnings)}</div>
-      <div style="font-size:12px;color:var(--text2);margin-top:6px">Saved to the configuration immediately; applies on the backend's next start.</div>
-      <div data-predicted-slot>${predictedHtml}</div>
-      <div class="card-actions"><button class="btn" data-back-act="flags-raw-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save</button>
-        <button class="btn" data-back-act="flags-mode-structured" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Use structured form</button>
-        <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
-    </div>` : `<div class="backend-form-panel flags-panel">
-      <div style="font-size:12px;font-weight:600">${icon("pencil")} Edit ${esc(b.id)}</div>
-      ${editModelHtml}
-      ${flagsCtxBatchHtml({ ctx: flags.ctx, batch: flags.batch, ctxMax: flags.ctxMax, fieldAttr: "data-flags-field", disabled: inFlight.has(b.id) })}
-      ${parallelHtml}
-      ${cacheHtml}
-      ${offloadHtml}
-      ${moeCacheHtml}
-      ${mtpHtml}
-      ${flagsRatedLineHtml({ ctxMax: flags.ctxMax, modelId: flags.modelId, savedText: "Saved to the configuration immediately; applies on the backend's next start. Tensor split is set in the Placement section below." })}
-      <div data-predicted-slot>${predictedHtml}</div>
-      <div class="card-actions"><button class="btn" data-back-act="flags-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save</button>
-        <button class="btn" data-back-act="flags-mode-advanced" data-back-id="${esc(b.id)}"${dis}>${icon("pencil")} Edit flags as text</button>
-        <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
-    </div>`) : "";
-  // The Placement form renders inside this card (moved from the
-  // GPUs page, Pete's direction, 2026-10-16): the tensor split is a
-  // per-backend setting, so it is edited here like the flags. The
-  // model is derived from the backend's configuration; the
-  // projection renders in the card; Apply is scoped to this
-  // backend. Form state lives in the wire layer (checkbox changes
-  // sync to wire state), so poll repaints keep the form intact.
-  const placeDis = dis || (place && place.busy) ? " disabled" : "";
+  // The Placement section of the Edit panel (moved from the GPUs page,
+  // Pete's direction, 2026-10-16): the tensor split is a per-backend
+  // setting, edited here like the flags and saved by the panel's Save.
+  // Propose prices a selection without saving it. State lives in the
+  // wire layer, so poll repaints keep it intact.
+  const placeDis = dis || (place && (place.busy || !place.modelId)) ? " disabled" : "";
   const projHtml = place && place.projection ? (() => {
     const p = place.projection;
     // When the running backend's current allocation is credited,
@@ -568,14 +613,15 @@ export function backendCard(
       const gi = p.gpu_indices && p.gpu_indices[i] !== undefined ? p.gpu_indices[i] : i;
       const gname = place.gpus.find((g) => g.index === gi)?.name ?? `GPU ${gi}`;
       const free = p.free_mib && p.free_mib[i] !== undefined ? `${fmtCount(p.free_mib[i])} MiB` : "\u2014";
+      const freeOk = p.fits_free?.[i] ?? (p.free_mib?.[i] !== undefined ? (p.additional_mib?.[i] ?? p.per_gpu_mib[i]) <= p.free_mib[i] : null);
       // With a backend in scope the row's state is the three-state
       // classification of the full requirement against total VRAM;
       // the weights-only projection keeps its free-VRAM wording.
       const st = p.fit_states?.[i];
       const fit = frac === 0 ? "not used"
-        : st === "wddm_paged" ? `fits — ${fmtCount(p.paged_mib?.[i] ?? 0)} MiB paged`
+        : st === "wddm_paged" ? `will page ${fmtCount(p.paged_mib?.[i] ?? 0)} MiB`
         : st === "does_not_fit" ? "does not fit"
-        : st === "fits" ? "fits"
+        : st === "fits" ? (freeOk === false ? "not enough free now" : freeOk === true ? "fits" : "within total VRAM")
         : p.per_gpu_fits[i] ? "fits" : "does not fit";
       const creditCells = credited ? `<td>${fmtCount(p.current_mib?.[i] ?? 0)} MiB</td><td>${fmtCount(p.additional_mib?.[i] ?? p.per_gpu_mib[i])} MiB</td>` : "";
       return `<tr><td>${esc(gname)}</td><td>${Math.round(frac * 100)}%</td><td>${fmtCount(p.per_gpu_mib[i])} MiB</td>${creditCells}<td>${free}</td><td>${fit}</td></tr>`;
@@ -587,13 +633,14 @@ export function backendCard(
       : (p.fit_states ?? []).includes("wddm_paged") ? "wddm_paged"
       : p.fit_states?.length ? "fits" : null;
     const pagedTotal = (p.paged_mib ?? []).reduce((a, v) => a + v, 0);
-    const fitChip = worstState === "wddm_paged"
-      ? `<span class="chip status-tag status-transition" title="The requirement exceeds total VRAM on a WDDM GPU; the excess pages to system RAM and the start asks for confirmation.">Fits — ${fmtGb(pagedTotal / 1024)} GiB paged</span>`
-      : worstState === "does_not_fit"
-        ? `<span class="chip status-tag status-bad" title="The requirement exceeds the selected GPUs' total VRAM with this split.">Does not fit</span>`
-        : worstState === "fits"
-          ? `<span class="chip status-tag status-on" title="The backend's full requirement fits the selected GPUs with the projected split.">Fits</span>`
-          : `<span class="chip status-tag ${p.fits ? "status-on" : "status-bad"}" title="${p.fits ? "The model fits the selected GPUs with the projected split." : "The model does not fit the available VRAM with this split."}">${p.fits ? "Fits" : "Does not fit"}</span>`;
+    const additional = p.split.reduce((a, _, i) => a + (p.additional_mib?.[i] ?? p.per_gpu_mib[i] ?? 0), 0);
+    const freeAll = p.split.reduce((a, frac, i) => a + (frac > 0 ? p.free_mib?.[i] ?? 0 : 0), 0);
+    const freeFits = p.split.map((frac, i) => frac === 0 || p.free_mib?.[i] === undefined ? null : (p.fits_free?.[i] ?? (p.additional_mib?.[i] ?? p.per_gpu_mib[i]) <= p.free_mib[i]));
+    const nowFits = p.fits_now ?? (freeFits.some((x) => x === false) ? false : freeFits.some((x) => x === true) ? true : null);
+    const fitChip = fitChipHtml({
+      state: worstState ?? (p.fits ? "fits" : "does_not_fit"), pagedMib: pagedTotal,
+      fitsNow: nowFits, neededMib: additional, freeMib: freeAll,
+    });
     return `<div style="margin-top:10px">
       ${p.down_indices && p.down_indices.length ? `<div style="font-size:12px;color:var(--err);margin-bottom:6px" title="${p.down_indices.map((i) => `GPU ${i}`).join(", ")} ${p.down_indices.length === 1 ? "is" : "are"} down and ${p.down_indices.length === 1 ? "is" : "are"} treated as having no free VRAM.">${p.down_indices.map((i) => `GPU ${i}`).join(", ")}: down — no free VRAM</div>` : ""}
       <div style="font-size:12px">Fit: ${fitChip}<span class="info-tip" title="${p.weights_only === false ? "Projection prices the backend's full requirement: weights, KV cache, state cache, and the expert cache on the GPUs holding offloaded layers." : "Projection uses model weights only; run-time allocations add overhead."}">${icon("info")}</span></div>
@@ -603,12 +650,12 @@ export function backendCard(
       <div style="font-size:12px;color:var(--text2);margin-top:6px">${ageMs === null ? "Snapshot: latest" : `Snapshot age: ${Math.round(ageMs / 1000)} s`}</div></div>`;
   })() : "";
   const placeHtml = place ? `<div class="backend-form-panel placement-panel">
-      <div style="font-size:12px;font-weight:600">${icon("layers")} Placement for ${esc(b.id)}</div>
+      <div style="font-size:12px;font-weight:600">${icon("layers")} Placement</div>
       ${place.modelId
         ? ""
         : `<div style="font-size:12px;color:var(--err);margin-top:4px">Placement: unavailable<span class="info-tip" title="This backend's model file matches no configured model, so a split cannot be proposed or applied for it.">${icon("info")}</span></div>`}
       ${place.gpus.length ? `<div style="margin-top:8px">
-        <span style="font-size:12px;color:var(--text2)">GPUs in the split:</span><span class="info-tip" title="The split divides the model's weights across the selected GPUs, in nvidia-smi index order. Uncheck a GPU to leave it out \u2014 for example the display GPU, whose memory Windows already uses. The split is saved to the backend's configuration and applies on its next start.">${icon("info")}</span>
+        <span style="font-size:12px;color:var(--text2)">GPUs in the split:</span><span class="info-tip" title="The split divides the model's weights across the selected GPUs, in nvidia-smi index order. Uncheck a GPU to leave it out \u2014 for example the display GPU, whose memory Windows already uses. A changed selection is saved with Save, as an even division, and applies on the next start.">${icon("info")}</span>
         <div class="gpu-chip-row">${place.gpus.map((g) => {
           const on = !place.excluded.has(g.index);
           return `<label class="gpu-chip${on ? " on" : ""}${placeDis ? " is-disabled" : ""}" title="${esc(g.name)}"><span class="gpu-chip-top"><input type="checkbox" data-place-gpu="${g.index}" data-place-backend="${esc(b.id)}"${on ? " checked" : ""}${placeDis}> GPU ${g.index}</span><span class="gpu-chip-name">${esc(gpuShortName(g.name))}</span></label>`;
@@ -616,10 +663,35 @@ export function backendCard(
       </div>`
       : `<div style="font-size:12px;color:var(--text2);margin-top:6px">GPUs: none reported<span class="info-tip" title="No GPU telemetry yet \u2014 a split cannot be proposed until telemetry reports the GPUs.">${icon("info")}</span></div>`}
       ${projHtml}
-      <div class="card-actions"><button class="btn" data-back-act="place-propose" data-back-id="${esc(b.id)}" title="Propose split"${placeDis || !place.modelId || !place.gpus.length ? " disabled" : ""}>${icon("search")} Propose split</button>
-        <button class="btn" data-back-act="place-apply" data-back-id="${esc(b.id)}"${place.projection && !place.busy && !dis ? "" : " disabled"}>${icon("check")} Apply split</button>
-        <button class="btn icon-only" data-back-act="place-cancel" data-back-id="${esc(b.id)}" title="Close" aria-label="Close">${icon("x")}</button></div>
+      <div class="card-actions"><button class="btn" data-back-act="place-propose" data-back-id="${esc(b.id)}" title="Propose split"${placeDis || !place.modelId || !place.gpus.length ? " disabled" : ""}>${icon("search")} Propose split</button></div>
     </div>` : "";
+  const flagsHtml = flags ? (flags.advanced ? `<div class="backend-form-panel flags-panel">
+      <div style="font-size:12px;font-weight:600">${icon("pencil")} Edit ${esc(b.id)}</div>
+      ${editModelHtml}
+      <div style="font-size:12px;color:var(--text2);margin-top:6px">Mode: Advanced<span class="info-tip" title="In advanced mode the text below is the backend's launch flags, edited directly. Context, batch, offload, MTP and placement are all set by this string; the structured form and its controls are disabled for this backend until you switch back. Warnings never block a save — unknown flags pass through to llama-server, which decides.">${icon("info")}</span></div>
+      <textarea data-flags-raw="${esc(b.id)}" rows="4" spellcheck="false" style="width:100%;margin-top:8px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 10px;font-family:var(--mono);font-size:12px" aria-label="Raw flags for ${esc(b.id)}">${esc(flags.rawText)}</textarea>
+      <div data-flags-warnings>${flagsRawWarningsHtml(flags.rawWarnings)}</div>
+      ${placeHtml}
+      <div data-predicted-slot>${predictedHtml}</div>
+      <div class="card-actions"><button class="btn" data-back-act="flags-raw-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save</button>
+        <button class="btn" data-back-act="flags-mode-structured" data-back-id="${esc(b.id)}"${dis}>${icon("gear")} Use structured form</button>
+        <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
+    </div>` : `<div class="backend-form-panel flags-panel">
+      <div style="font-size:12px;font-weight:600">${icon("pencil")} Edit ${esc(b.id)}</div>
+      ${editModelHtml}
+      ${flagsCtxBatchHtml({ ctx: flags.fields.ctx, batch: flags.fields.batch, ctxCustom: flags.fields.ctxCustom, batchCustom: flags.fields.batchCustom, ctxMax: flags.ctxMax, fieldAttr: "data-flags-field", disabled: inFlight.has(b.id) })}
+      ${parallelHtml}
+      ${cacheHtml}
+      ${offloadHtml}
+      ${moeCacheHtml}
+      ${mtpHtml}
+      ${flagsRatedLineHtml({ ctxMax: flags.ctxMax, modelId: flags.modelId, savedText: "Saved to the configuration with Save; applies on the backend's next start." })}
+      ${placeHtml}
+      <div data-predicted-slot>${predictedHtml}</div>
+      <div class="card-actions"><button class="btn" data-back-act="flags-save" data-back-id="${esc(b.id)}"${dis}>${icon("check")} Save</button>
+        <button class="btn" data-back-act="flags-mode-advanced" data-back-id="${esc(b.id)}"${dis}>${icon("pencil")} Edit flags as text</button>
+        <button class="btn icon-only" data-back-act="flags-cancel" data-back-id="${esc(b.id)}" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>
+    </div>`) : "";
   // Basis of the memory figures (exact | catalog | estimate): the
   // explanation lives in a tooltip on the RAM line; the word itself
   // stays inline only for estimate, as the qualifier it was before.
@@ -641,32 +713,36 @@ export function backendCard(
     ? `<span class="backend-model-file" title="${esc(b.model_file)}">${esc(matchedModel ? modelShortName(matchedModel) : modelFileShortName(b.model_file))}</span>`
     : `<span class="backend-model-file" title="${esc(b.model_file)}">${esc(b.model_file)}</span>`;
   const stripTiles: [string, string][] = [["Model", modelTileVal]];
-  // Advanced flags mode (tracker #60): the structured readouts the
-  // mode supersedes are not presented as authoritative — the
-  // context value is decoded from flags the structured form no
-  // longer owns, so the tile shows an em dash with the explanation
-  // in its tooltip, and the KV estimate (derived from that
-  // context) is omitted. The raw flags line below carries the
-  // state itself.
-  if (b.n_ctx !== undefined) stripTiles.push(["Context", b.flags_advanced ? `<span title="Set by the raw flags in advanced flags mode">&#8212;</span>` : fmtCount(b.n_ctx)]);
+  // Advanced flags mode (tracker #60): -c is still passed from the
+  // configuration unless the raw flags carry their own context token,
+  // which llama-server then uses (the last one wins).
+  const rawCtx = b.flags_advanced ? rawContext(b.raw_flags ?? "") : null;
+  if (b.n_ctx !== undefined) stripTiles.push(["Context", rawCtx !== null ? `<span title="Set by the raw flags">${fmtCount(rawCtx)}</span>` : fmtCount(b.n_ctx)]);
   if (b.gpu_ram_mib !== undefined) {
-    stripTiles.push(["GPU RAM", `${fmtGb(b.gpu_ram_mib / 1024)} GiB`]);
+    // GPU RAM is everything the backend puts on the GPUs; its parts
+    // follow as their own tiles.
+    const parts: [string, number | null | undefined][] = [["weights", b.gpu_ram_mib], ["KV cache", b.kv_ram_mib], ["state cache", b.rs_ram_mib], ["expert cache", b.moe_cache_mib]];
+    const gpuTotal = parts.reduce((a, [, v]) => a + (v ?? 0), 0);
+    const tip = parts.filter(([, v]) => v).map(([k, v]) => `${k} ${fmtGb((v ?? 0) / 1024)} GiB`).join(" + ");
+    stripTiles.push(["GPU RAM", `<span title="${esc(tip)}">${fmtGb(gpuTotal / 1024)} GiB</span>`]);
+    stripTiles.push(["Weights", `<span title="GPU-resident model weights">${fmtGb(b.gpu_ram_mib / 1024)} GiB</span>`]);
     // An absent sys_ram_mib is unknown, never 0 (principle 12): the
     // tile renders only when the payload carries the figure.
     if (b.sys_ram_mib !== undefined) stripTiles.push(["System RAM", `${fmtGb(b.sys_ram_mib / 1024)} GiB`]);
-    if (!b.flags_advanced && b.kv_ram_mib != null) stripTiles.push(["KV cache", `<span title="KV cache at the configured context">${fmtGb(b.kv_ram_mib / 1024)} GiB</span>`]);
-    if (!b.flags_advanced && b.rs_ram_mib != null) stripTiles.push(["State cache", `<span title="Recurrent-state cache at the configured slot count">${fmtGb(b.rs_ram_mib / 1024)} GiB</span>`]);
-    if (!b.flags_advanced && b.moe_cache_mib) stripTiles.push(["Expert cache", `<span title="MoE expert cache (--moe-cache-mib) priced into the requirement">${fmtGb(b.moe_cache_mib / 1024)} GiB</span>`]);
+    if (b.kv_ram_mib != null) stripTiles.push(["KV cache", `<span title="KV cache at the configured context">${fmtGb(b.kv_ram_mib / 1024)} GiB</span>`]);
+    if (b.rs_ram_mib != null) stripTiles.push(["State cache", `<span title="Recurrent-state cache at the configured slot count">${fmtGb(b.rs_ram_mib / 1024)} GiB</span>`]);
+    if (b.moe_cache_mib) stripTiles.push(["Expert cache", `<span title="MoE expert cache (--moe-cache-mib) priced into the requirement">${fmtGb(b.moe_cache_mib / 1024)} GiB</span>`]);
   }
   // The three-state fit verdict for the saved configuration, from
   // the server's requirement model (the start gate's numbers):
-  // one chip, with the paged amount when the fit is a WDDM paged
-  // fit. Absent when the server could not judge the backend.
-  const fitHtml = b.fit ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Fit: ${b.fit.state === "wddm_paged"
-    ? `<span class="chip status-tag status-transition">Fits — ${fmtGb(b.fit.paged_mib / 1024)} GiB paged</span>`
-    : b.fit.state === "does_not_fit"
-      ? `<span class="chip status-tag status-bad">Does not fit</span>`
-      : `<span class="chip status-tag status-on">Fits</span>`}</div>` : "";
+  // one chip (fitChipHtml), judged against the memory free now for a
+  // backend that is not loaded. Absent when the server could not judge
+  // the backend.
+  const fitHtml = b.fit ? `<div style="font-size:12px;color:var(--text2);margin-top:6px">Fit: ${fitChipHtml({
+    state: b.fit.state, pagedMib: b.fit.paged_mib,
+    // A loaded backend already holds its memory: total VRAM decides.
+    ...(st === "running" ? { fitsNow: true } : fitNow(b, gpuFreeMiB, residency.get(b.id) ?? [])),
+  })}</div>` : "";
   // The strip is a wrapping flex row (styles.css .backend-strip),
   // never a single-row grid sized to the tile count: bare fr
   // tracks cannot shrink below their tiles' min-content widths,
@@ -747,9 +823,12 @@ export function backendCard(
   // state only: it names the cause (e.g. the device-unavailable
   // fail-fast verdict) the state chip cannot. Principle 9 form —
   // a noun label and the value, no sentence.
-  const failureHtml = st === "failed" && b.failure_reason
+  const failureHtml = (st === "failed" && b.failure_reason
     ? `<div style="font-size:12px;color:var(--err);margin-top:6px">Failure: ${esc(b.failure_reason)}</div>`
-    : "";
+    : "")
+    + (b.auto_restart && st !== "running"
+      ? `<div style="font-size:12px;color:${b.auto_restart.gave_up ? "var(--err)" : "#e3b341"};margin-top:6px" data-auto-restart="${esc(b.id)}">${esc(autoRestartText(b.auto_restart))}</div>`
+      : "");
   const detailsBtn = `<button class="btn icon-only" data-back-act="details" data-back-id="${esc(b.id)}" aria-expanded="${detailsOpen}" title="Details" aria-label="Details">${icon(detailsOpen ? "chevD" : "chevR")}</button>`;
   return `<div class="card backend-card" id="card-backend-${esc(b.id)}">
       <h3 class="backend-card-head">${lifecycleDot(st)} ${esc(b.id)} <span class="port">:${b.port}</span>
@@ -769,16 +848,18 @@ export function backendCard(
       ${offloadStatusHtml}
       ${mtpStatusHtml}
       ${flagsHtml}
-      ${placeHtml}
       <div class="card-actions backend-actions">${detailsBtn}
         ${actions}
         ${advancedMenu}</div>
-      <div class="back-msg" style="margin-top:8px;font-size:12px">${msgHtml}</div>
+      <div class="back-msg" style="margin-top:8px;font-size:12px;min-height:16px">${msgHtml}</div>
       ${detailsHtml}
       ${logsBlock}
       ${argv}
     </div>`;
 }
+
+/** The Backends page's list controls, kept across visits. */
+export const backendsView = pageState("backends", { sort: "name", state: "all", filter: "" });
 
 export function renderBackends(): string {
   return `${topbar("Backends", `<button class="btn" id="backAdd" title="Add backend">${icon("plus")} Add backend</button> <button class="btn icon-only" id="backRefresh" title="Refresh" aria-label="Refresh">${icon("restart")}</button>`)}
@@ -787,19 +868,15 @@ export function renderBackends(): string {
   <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
     <label style="font-size:12px;color:var(--text2)">Sort
       <select id="backSortSel" style="${SELECT_STYLE}">
-        <option value="name">Name</option>
-        <option value="port">Port</option>
-        <option value="state">State</option>
-        <option value="requests">Requests (1h)</option>
+        ${([["name", "Name"], ["port", "Port"], ["state", "State"], ["requests", "Requests (1h)"]]).map(([v, l]) => `<option value="${v}"${backendsView.sort === v ? " selected" : ""}>${l}</option>`).join("")}
       </select></label>
     <label style="font-size:12px;color:var(--text2)">State
       <select id="backStateSel" style="${SELECT_STYLE}">
         <option value="all">All</option>
-        ${LIFECYCLE_STATES.filter((s) => s !== "not_installed").map((s) => `<option value="${s}">${esc(META[s].label.charAt(0).toUpperCase() + META[s].label.slice(1))}</option>`).join("")}
+        ${LIFECYCLE_STATES.filter((s) => s !== "not_installed").map((s) => `<option value="${s}"${backendsView.state === s ? " selected" : ""}>${esc(META[s].label.charAt(0).toUpperCase() + META[s].label.slice(1))}</option>`).join("")}
       </select></label>
-    <input id="backFilter" type="text" placeholder="Filter by name, group, or model file" style="background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:5px 8px;font-size:12px;min-width:200px">
+    <input id="backFilter" type="text" value="${esc(backendsView.filter)}" placeholder="Filter by name, group, or model" aria-label="Filter backends" style="min-width:220px">
   </div>
-  <div id="backPlan"></div>
   <div id="backAddForm"></div>
   <div id="backBody">${loadingHtml("Loading backends\u2026")}</div></div>`;
 }

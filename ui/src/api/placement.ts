@@ -62,6 +62,9 @@ export interface PlacementProjectionData {
   fit_states?: FitStateName[];
   /** Per-GPU paged amount, MiB (WDDM-paged GPUs only). */
   paged_mib?: number[];
+  /** Per-GPU and overall fit against the memory free now. */
+  fits_free?: (boolean | null)[];
+  fits_now?: boolean | null;
 }
 
 /** placement_propose — project a tensor split for a catalog model onto

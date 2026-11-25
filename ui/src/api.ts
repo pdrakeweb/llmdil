@@ -109,6 +109,7 @@ export type {
   OffloadOverrideResult,
   RawFlagWarning,
   BackendAddPreview,
+  BackendAutoRestart,
   BackendAddMemory,
   BackendConfigData,
   BackendApplyMode,
