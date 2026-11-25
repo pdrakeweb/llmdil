@@ -900,8 +900,18 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     const r = await benchResultsList();
     if (disposed) return;
     if (r.error) { loadError = r.error; return; }
+    // A sweep runs in the background: the poll that sees it end says so.
+    const wasRunning = new Set(sweeps.filter((s) => s.status === "running").map((s) => s.id));
     sweeps = r.data.sweeps;
     loadError = null;
+    for (const s of sweeps) {
+      if (wasRunning.has(s.id) && s.status !== "running") sweepEnded(s);
+    }
+  }
+
+  function sweepEnded(s: BenchSweepRecord): void {
+    const why = s.status === "failed" ? s.arms.find((a) => a.detail)?.detail : null;
+    setStatus(`Sweep ${s.status === "complete" ? "finished" : s.status}: ${s.backend_name} · ${s.prompt_name}${why ? ` — ${why}` : ""}`, s.status === "failed", "progress");
   }
 
   async function refreshAll(): Promise<void> {
@@ -949,9 +959,8 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     const bad = !selBackend || !selPrompt ? "Pick a backend and a prompt first." : "error" in temp ? temp.error : null;
     if (bad) { setStatus(bad, true, "run"); paint(); return; }
     const req = buildRequest(stopIds);
-    const known = new Set(sweeps.map((s) => s.id));
-    // The call can stay open for the whole sweep: the interlock panel
-    // closes now and the 2 s poll shows the progress meanwhile.
+    // The call answers at once; the 2 s poll shows the progress and
+    // the end.
     runBusy = true;
     stoppingNames = stopIds;
     interlock = null;
@@ -971,8 +980,9 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     }
     await refreshResults();
     if (disposed) return;
-    const mine = sweeps.find((s) => s.id === r.data.sweep_id) ?? sweeps.find((s) => !known.has(s.id));
-    if (mine && mine.status !== "running") setStatus(`Sweep ${mine.status === "complete" ? "finished" : mine.status}: ${mine.backend_name} · ${mine.prompt_name}`, mine.status === "failed", "run");
+    // One that ended before the first poll was never seen running.
+    const mine = sweeps.find((s) => s.id === r.data.sweep_id);
+    if (mine && mine.status !== "running") sweepEnded(mine);
     paint();
   }
 

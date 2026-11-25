@@ -194,10 +194,9 @@ export async function benchPromptGenerateCancel(): Promise<CallResult<Record<str
   }
 }
 
-/** bench_run_start — validate, expand, and run a sweep. The call may
- *  stay open for the whole sweep (progress comes from
- *  bench_results_list meanwhile), so a caller polls from the moment it
- *  calls; `sweep_id` is absent when the payload does not name one. An
+/** bench_run_start — validate, expand, and start a sweep. The call
+ *  answers at once with the sweep id; progress and the outcome come
+ *  from bench_results_list. An
  *  interlock failure rejects with a message listing the conflicting
  *  running backends; the caller parses it for the stop-and-run
  *  confirmation (nothing is stopped without that explicit action). */

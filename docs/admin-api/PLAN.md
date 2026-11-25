@@ -768,12 +768,12 @@ except where you override them here.
     implemented [impl D7].
     **Recommendation: exclude the peripheral trio from v1;
     include updates policy writes; `updates_apply` local-only.**
-     All exclusions are additive to reverse.
-    **Reversed by the owner (November 2026):** MCP reads and the
+    All exclusions are additive to reverse.
+    **Reversed (November 2026):** MCP reads and the
     connection test, and everything else that had been left
     desktop-only, have routes; what stays out, and why, is
     rest-api.md §6.16.
- **The broad raw config patch in v1.**
+11. **The broad raw config patch in v1.**
     `PATCH /api/v1/config` mirrors `update_config`: one endpoint
     that can merge any field of `AppConfig`, including gateway
     bind and ports [audit §1]. The domain endpoints cover the
