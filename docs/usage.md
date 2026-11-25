@@ -80,7 +80,7 @@ it never reinstalls unprompted.
   log (Logs scope `optimize`).
 - **Activation Plan** (`#/activation-plan`) — saved-but-not-live changes
   collected as one plan (pending changes count, drain & apply, apply now,
-  cancel changes). A banner at the top of the main column carries the
+  cancel changes). A bar docked under every view carries the
   same plan summary on every view.
 - **Settings** — tabbed: General, Updates & diagnostics, Notifications
   (Windows toast categories: Operations, Failures, Activation),

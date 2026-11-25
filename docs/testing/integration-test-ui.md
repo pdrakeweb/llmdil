@@ -166,7 +166,8 @@ key presses.
 Change, apply, restart, then check `/props`, the process command line and
 `nvidia-smi`: context, batch, parallel, K/V cache, flash attention, MTP
 draft length, expert cache, MoE offload 0 / middle / all, flags as text and
-back. Then placement: GPU 0 → GPU 1 → both → propose/apply.
+back. Then placement: GPU 0 → GPU 1 → both. Everything in the Edit panel,
+placement included, is a draft until Save.
 
 | Id | Check | Expected |
 |---|---|---|

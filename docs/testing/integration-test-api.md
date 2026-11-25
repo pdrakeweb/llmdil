@@ -1124,31 +1124,32 @@ VS Code (422, 423), WinML (432–435). Served inside another route:
 ## 17. Defects that break automation
 
 A route exists, but its answer or effect makes a test impossible or wrong.
-Read in the code; not yet reproduced on a running app.
+Read in the code; not yet reproduced on a running app. Tracked in
+https://github.com/pdrakeweb/llmdil/issues/6.
 
 | Id | Defect | Where |
 |---|---|---|
 | D01 | `apply_mode: RestartNow` saves and records a `backend_restart` task, but nothing restarts the backend and the task stays `running` for the life of the app. The answer looks like a real restart | `ops/backend_config.rs` 115–123 |
 | D02 | `POST /operations/{id}/abort` with the id of a `202` answer only rewrites the API's record. The work goes on, and a `done` or `failed` record becomes `aborted`. Only the app's own task id (found in `GET /operations` by `kind` and `detail`) really cancels | `http.rs` 296–305, `operations.rs` 144 |
 | D03 | A failed operation has text, no `code`. Argument errors and busy refusals on `202` routes are failed operations, so `400` and `409 BUSY` never come from them; the `409` branch for a busy setup step is dead code (the route is async) | `http.rs` 255–270, 341–355, 443 |
-| D04 | A field in the body replaces the path parameter of the same name: `PUT /backends/a/flags` with `"id": "b"` edits `b`, while the audit log names `a` | `http.rs` 367–411 |
+| D04 | **Fixed.** A field in the body replaces the path parameter of the same name: `PUT /backends/a/flags` with `"id": "b"` edits `b`, while the audit log names `a` | `http.rs` 367–411 |
 | D05 | Query values that look like a number, `true`, `false`, `inf` or `nan` are converted: `search=8080` is `400`, `search=inf` becomes "no filter" | `http.rs` 425 |
 | D06 | `PATCH /backends/{id}/config` and `preview-diff`: unknown patch fields are ignored (200); wrong types are `500 JSON`; an unknown backend is `422` on apply; `raw_flags: null` cannot clear the flags; context and batch limits of the other routes are not checked | `diff.rs` 28, `ops/backend_config.rs` 60 |
 | D07 | `PATCH /gateway/config`: unknown fields are ignored (200); wrong types and out-of-range numbers are `500 JSON` | `ops/gateway.rs` 49 |
-| D08 | `POST /gateway/groups` accepts any non-empty name (spaces, 63 characters, `openrouter`); `DELETE` removes a group with members, in role class C although the app's own delete is class D | `composites.rs` 189, 264 |
+| D08 | `POST /gateway/groups` accepts any non-empty name (spaces, 63 characters, `openrouter`); `DELETE` removes a group with members (its role class now matches the app's) | `composites.rs` 189, 264 |
 | D09 | Group changes made by REST are journaled as "Gateway configuration changed" with no targets: a test cannot tell its own plan rows from the owner's | `ops/gateway.rs` 55–64 |
 | D10 | `GET /operations` is a bare array in no order. App tasks have no `error`, `started_ms`, `finished_ms`. Most `202` calls appear twice, with two ids and two kinds | `ops/logs.rs` 473, `http.rs` 273–295 |
 | D11 | `PUT /telemetry/interval` accepts any number, and changes memory before saving | `ops/telemetry.rs` 264 |
-| D12 | `PUT /mxc/mode` accepts `enforced` without the runtime | `ops/platform.rs` 64 |
-| D13 | `PUT /updates/components/{id}/pin` and `/auto` accept any component and any version, and create the entry | `ops/platform.rs` 234 |
+| D12 | **Fixed.** `PUT /mxc/mode` accepts `enforced` without the runtime | `ops/platform.rs` 64 |
+| D13 | **Fixed.** `PUT /updates/components/{id}/pin` and `/auto` accept any component and any version, and create the entry | `ops/platform.rs` 234 |
 | D14 | `POST /backends/{id}/test` holds the configuration read lock until the model answers (up to 30 s): a save from anywhere waits, and reads after it wait too | `ops/backends.rs` 838 |
-| D15 | A changed gateway port is not a plan row (the generated YAML does not contain it), and `GET /gateway/status` `port` is the saved port while the gateway still listens on the old one | `ops/gateway.rs` 39 and 679 |
+| D15 | **Fixed.** A changed gateway port is not a plan row (the generated YAML does not contain it), and `GET /gateway/status` `port` is the saved port while the gateway still listens on the old one | `ops/gateway.rs` 39 and 679 |
 | D16 | Error messages are cut at 400 characters: a memory refusal for two GPUs may lose "who uses it" | `http.rs` 539 |
 | D17 | `POST /setup/audit` during another audit ends `done` with `already_running: true`, zero steps | `ops/wizard.rs` 527–545 |
 | D18 | `done` does not mean finished for start (spawned), download (started) and, by `restart_task_id`, config saves | `backend_lifecycle.rs` 590–650, `ops/models.rs` 526 |
 | D19 | Only error messages are cleaned of local paths. `detail` of downloads, diagnostics and steps, `launch-command`, snapshots and `/config` contain them | `http.rs` 341–355, 529 |
 | D20 | `GET /logs` with an unknown `level` answers unfiltered (200), while an unknown `order` is `400`; a wrong `group` type in the routing test is `500 GATEWAY` | `ops/logs.rs`, `op_gateway_test_routing` |
-| D21 | While the gateway runs, any unapplied gateway change adds a `gateway_drift` row next to its own row, so one edit counts as two changes (`activation_changes` too) | `ops/gateway_activation.rs` 109–123 |
+| D21 | **Fixed.** While the gateway runs, any unapplied gateway change adds a `gateway_drift` row next to its own row, so one edit counts as two changes (`activation_changes` too) | `ops/gateway_activation.rs` 109–123 |
 
 ## 18. Put back and compare
 
@@ -1228,12 +1229,9 @@ Result sheet: as in the UI test, plus `API commit: ____  Role: ____`.
 | auth-plan.md §6: 403s are audited; denied and unknown routes look alike | 403 is not audited; unknown is `404`, denied `403` |
 | Gateway page tip: the plan tracks a port change | It does not (D15) |
 
-The UI test expects three things the code at this commit does not do: A-7
-(other items still applied; the apply stops), R-8 (naming the program;
-only the port is named) and R-9 (restart by policy; the monitor states
-that nothing is restarted automatically, and nothing calls the crash
-budget). G-2 also expects `openrouter` refused and the long-name message
-to mention the length; neither is in `gateway_create_group`.
+Since this was written, R-8 (the program is named), R-9 (restart by
+policy) and both G-2 cases were implemented. A-7 still stops at the first
+failed backend.
 
 ## Appendix B: not determined from the code
 

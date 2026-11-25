@@ -57,7 +57,7 @@ Every distinct card type in the UI, where it renders, and its source.
 | Gateway group card | Gateway view, one per model group | inline in `gatewayPaint`, `ui/src/views/static.ts` |
 | Routing rules card | Gateway view | inline in `gatewayPaint`, `ui/src/views/static.ts` |
 | Generated config card | Gateway view (LiteLLM YAML preview) | inline in `gatewayPaint`, `ui/src/views/static.ts` |
-| Activation plan card | Activation Plan view; the same markup renders in the activation banner at the top of the main column | `activationPlanHtml`, `ui/src/views/static.ts` |
+| Activation plan card | Activation Plan view; a summary renders in the activation bar docked under every view | `activationPlanHtml`, `ui/src/views/static.ts` |
 | Pending changes card | Activation Plan view (changes table) | inline in `wireActivationPlan`, `ui/src/views/static.ts` |
 | Wizard step card | Setup Wizard view, one row per step | `wizardStepRow`, `ui/src/views/static.ts` |
 | Settings cards | Settings view — tabbed panels: General, Updates & diagnostics, Notifications, MXC sandbox, Remote Access (Admin API + admin users), Supervision | inline in `renderSettings` / `wireSettings`, `ui/src/views/static.ts` |
