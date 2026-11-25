@@ -42,10 +42,18 @@ pub mod lifecycle;
 /// (spec §2.2: 30 s, then kill).
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Upper bound for reaping a child after the kill in `drain()`. If the
-/// child is still alive past this, `drain()` returns `DrainTimeout`
-/// instead of blocking the supervisor forever.
-pub const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound for a killed process to leave the process table. Windows
+/// tears down a killed llama-server that mapped a large model (tens of
+/// GB) over many seconds. A process still alive past this is reported as
+/// `DrainTimeout` instead of being waited on forever.
+pub const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a start waits for a port held by another program.
+const PORT_WAIT: Duration = Duration::from_millis(2500);
+
+/// How long a start waits for a port this backend's own previous process
+/// may still be releasing.
+const OWN_PORT_WAIT: Duration = Duration::from_secs(10);
 
 /// Default ring-buffer capacity per supervised process (spec §2.4: 10k lines).
 pub const DEFAULT_LOG_RING_CAPACITY: usize = 10_000;
@@ -773,15 +781,8 @@ impl SupervisedProcess {
                     }
                     if pid_alive(pid) {
                         kill_pid_tree(pid);
-                        // Confirm the exit before reporting the stop:
-                        // the process holds its listening port until
-                        // it is actually gone.
-                        wait_pid_gone(pid, Duration::from_secs(5)).await;
                     }
-                    self.adopted_pid = None;
-                    self.state = ProcessState::Stopped;
-                    self.abort_readers();
-                    return Ok(());
+                    return self.adopted_killed(pid).await;
                 }
                 self.state = ProcessState::Stopped;
                 return Ok(());
@@ -828,25 +829,43 @@ impl SupervisedProcess {
                 // awaits the exit with no bound, which would defeat the
                 // bounded reap below (finding PL-m3).
                 let _ = child.start_kill();
-                // The kill is best-effort: if the child still will not die,
-                // report DrainTimeout instead of hanging the supervisor on
-                // wait() forever.
-                match tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await {
-                    Ok(Ok(status)) => {
-                        self.record_exit(status, ProcessState::Stopped);
-                        self.abort_readers();
-                        Ok(())
-                    }
-                    _ => {
-                        self.record_exit_unknown();
-                        self.abort_readers();
-                        // `child` drops here; kill_on_drop makes one last
-                        // best-effort attempt. The process is still alive,
-                        // which is the pathological case DrainTimeout exists for.
-                        Err(SupervisorError::DrainTimeout(self.id.clone()))
-                    }
-                }
+                self.reap_killed(child).await
             }
+        }
+    }
+
+    /// Confirm the exit of a killed child, bounded by
+    /// [`KILL_REAP_TIMEOUT`] (finding PL-m3, docs/code-review-v0.1.60.md):
+    /// a process stuck in a driver call may not die on TerminateProcess.
+    /// Only a process that is still there is an error; `child` then drops,
+    /// and kill_on_drop makes one last best-effort attempt.
+    async fn reap_killed(&mut self, mut child: Child) -> Result<(), SupervisorError> {
+        let pid = child.id();
+        let reaped = tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await;
+        self.abort_readers();
+        if let Ok(Ok(status)) = reaped {
+            self.record_exit(status, ProcessState::Stopped);
+            return Ok(());
+        }
+        self.record_exit_unknown();
+        if pid.is_some_and(pid_alive) {
+            return Err(SupervisorError::DrainTimeout(self.id.clone()));
+        }
+        Ok(())
+    }
+
+    /// [`Self::reap_killed`] for an adopted process. It holds its
+    /// listening port until it is actually gone, so the exit is confirmed
+    /// before the stop is reported.
+    async fn adopted_killed(&mut self, pid: u32) -> Result<(), SupervisorError> {
+        let gone = wait_pid_gone(pid, KILL_REAP_TIMEOUT).await;
+        self.adopted_pid = None;
+        self.state = ProcessState::Stopped;
+        self.abort_readers();
+        if gone {
+            Ok(())
+        } else {
+            Err(SupervisorError::DrainTimeout(self.id.clone()))
         }
     }
 
@@ -854,9 +873,9 @@ impl SupervisedProcess {
     pub async fn kill(&mut self) -> Result<(), SupervisorError> {
         let mut child = match self.child.take() {
             None => {
-                if let Some(pid) = self.adopted_pid.take() {
+                if let Some(pid) = self.adopted_pid {
                     kill_pid_tree(pid);
-                    wait_pid_gone(pid, Duration::from_secs(5)).await;
+                    return self.adopted_killed(pid).await;
                 }
                 self.state = ProcessState::Stopped;
                 self.abort_readers();
@@ -865,23 +884,9 @@ impl SupervisedProcess {
             Some(c) => c,
         };
         // May already be dead; ignore the error and reap regardless.
-        // The reap is bounded like `drain`'s (finding PL-m3,
-        // docs/code-review-v0.1.60.md): a process stuck in a driver call
-        // (a GPU TDR, say) may not die on TerminateProcess, and an
-        // unbounded wait here held the whole Supervisor lock — freezing
-        // list_backends, start/stop and the notify monitor. `stop()`
-        // marks the id failed on DrainTimeout.
+        // `stop()` marks the id failed on DrainTimeout.
         let _ = child.start_kill();
-        match tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await {
-            Ok(Ok(status)) => self.record_exit(status, ProcessState::Stopped),
-            Ok(Err(_)) => self.record_exit_unknown(),
-            Err(_) => {
-                self.record_exit_unknown();
-                self.abort_readers();
-                return Err(SupervisorError::DrainTimeout(self.id.clone()));
-            }
-        }
-        self.abort_readers();
+        self.reap_killed(child).await?;
         tracing::info!(process = self.id, "killed");
         Ok(())
     }
@@ -1042,7 +1047,7 @@ pub async fn stop_process(
 }
 
 /// Spawn `id` from `spec` without any supervisor borrow: the bounded
-/// port-free wait (10 s) and the spawn itself. Pair with
+/// port-free wait and the spawn itself. Pair with
 /// [`Supervisor::prepare_spawn`] before and [`Supervisor::commit_spawn`]
 /// (or [`Supervisor::record_spawn_failure`]) after.
 pub async fn spawn_process(
@@ -1052,11 +1057,13 @@ pub async fn spawn_process(
     if let Some(port) = spec.port {
         // Bounded wait, not a single probe: a just-stopped
         // process (above all an adopted one) may still be
-        // releasing this port. A port held by something that is
-        // not going away fails after the wait, with the same
-        // PortInUse error as before.
-        if !wait_port_free(port, Duration::from_secs(10)).await {
-            return Err(SupervisorError::PortInUse(port));
+        // releasing this port. A port held by something else
+        // fails after a short wait, naming the holder.
+        if !wait_port_free(port, PORT_WAIT).await {
+            let own = holder_may_be_dying(port_owner_pid(port), &spec.program);
+            if !own || !wait_port_free(port, OWN_PORT_WAIT - PORT_WAIT).await {
+                return Err(SupervisorError::PortInUse(port, port_holder(port)));
+            }
         }
     }
     let ring = Arc::new(Mutex::new(RingBuffer::new(DEFAULT_LOG_RING_CAPACITY)));
@@ -1070,6 +1077,28 @@ pub async fn spawn_process(
         spec.low_priority,
     )
     .await
+}
+
+/// Whether the process holding a port may be the backend's own previous
+/// process on its way out: it is already gone (the socket is being torn
+/// down) or it runs the backend's own `program`.
+fn holder_may_be_dying(holder: Option<u32>, program: &Path) -> bool {
+    holder.is_some_and(|pid| {
+        !pid_alive(pid) || process_image_path(pid).is_some_and(|image| image == program)
+    })
+}
+
+/// " by <program> (pid N)" for the process listening on `port`, or ""
+/// when it cannot be resolved.
+fn port_holder(port: u16) -> String {
+    let Some(pid) = port_owner_pid(port) else {
+        return String::new();
+    };
+    let image = process_image_path(pid);
+    match image.as_deref().and_then(Path::file_name) {
+        Some(name) => format!(" by {} (pid {pid})", name.to_string_lossy()),
+        None => format!(" by another program (pid {pid})"),
+    }
 }
 
 fn port_free(port: u16) -> bool {
@@ -1277,6 +1306,15 @@ fn windows_port_owner_pid(port: u16) -> Option<u32> {
 /// (case-insensitive) — the guard against adopting whatever
 /// unrelated program happens to sit on a backend's port.
 pub fn process_image_is(pid: u32, name: &str) -> bool {
+    process_image_path(pid)
+        .as_deref()
+        .and_then(Path::file_name)
+        .is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(name))
+}
+
+/// The executable path of `pid` (Windows; `None` elsewhere, or when the
+/// process cannot be opened).
+fn process_image_path(pid: u32) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Threading::{
@@ -1284,25 +1322,18 @@ pub fn process_image_is(pid: u32, name: &str) -> bool {
         };
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
-            return false;
+            return None;
         }
         let mut buf = vec![0u16; 1024];
         let mut len = buf.len() as u32;
         let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) };
         unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
-        if ok == 0 {
-            return false;
-        }
-        let path = String::from_utf16_lossy(&buf[..len as usize]);
-        path.rsplit(['\\', '/'])
-            .next()
-            .map(|f| f.eq_ignore_ascii_case(name))
-            .unwrap_or(false)
+        (ok != 0).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
     }
     #[cfg(not(windows))]
     {
-        let _ = (pid, name);
-        false
+        let _ = pid;
+        None
     }
 }
 
@@ -1443,9 +1474,14 @@ impl Supervisor {
 
     /// Record a spawn that failed (e.g. after [`spawn_process`] returned an
     /// error): `status()` then reads `Failed` with `reason`, instead of an
-    /// idle `Stopped`. A later successful spawn clears both.
+    /// idle `Stopped`. A later successful spawn clears both. The failed
+    /// start has no output, so the previous run's retained ring is archived
+    /// and never reads as this start's.
     pub fn record_spawn_failure(&mut self, id: &str, reason: String) {
         tracing::warn!(process = id, %reason, "spawn failed");
+        if let Some(previous) = self.dead_rings.remove(id) {
+            self.archived_rings.insert(id.to_string(), previous);
+        }
         self.failed_ids.insert(id.to_string());
         self.failure_reasons.insert(id.to_string(), reason);
     }
@@ -2815,9 +2851,10 @@ pub enum SupervisorError {
     NotFound(String),
     #[error("process already running: {0}")]
     AlreadyRunning(String),
-    #[error("port {0} is already in use")]
-    PortInUse(u16),
-    #[error("drain timed out for {0}")]
+    /// The port and who holds it (" by <program> (pid N)", or empty).
+    #[error("port {0} is already in use{1}")]
+    PortInUse(u16, String),
+    #[error("{0} did not exit within {secs} s of being killed", secs = KILL_REAP_TIMEOUT.as_secs())]
     DrainTimeout(String),
     #[error("health probe failed for {0}: {1}")]
     ProbeFailed(String, String),
@@ -3794,7 +3831,7 @@ mod tests {
         sup.register_spec(spec);
 
         let err = sup.spawn_backend("web").await.unwrap_err();
-        assert!(matches!(err, SupervisorError::PortInUse(p) if p == port));
+        assert!(matches!(err, SupervisorError::PortInUse(p, _) if p == port));
         // Nothing was spawned, and the failed start reads as failed
         // with its reason rather than an idle "stopped".
         let st = &sup.status()[0];
@@ -4123,6 +4160,93 @@ mod tests {
         assert_eq!(page.total_matching, 6);
         assert_eq!(page.records[0].line, "b-three");
         assert_eq!(page.records[1].line, "b-two");
+    }
+
+    /// B21: a start that fails before a process exists leaves no output
+    /// of its own, so every retained line is the previous run's.
+    #[tokio::test]
+    async fn a_failed_spawn_archives_the_previous_runs_lines() {
+        let mut sup = Supervisor::new(test_policy());
+        sup.register_spec(ext_spec("a"));
+        sup.spawn_backend("a").await.unwrap();
+        sup.live["a"].note(LogStream::Stderr, "previous run".to_string());
+        sup.stop("a", false).await.unwrap();
+        assert!(sup
+            .logs_query("a", None, None, 10)
+            .records
+            .iter()
+            .all(|r| !r.archived));
+        let mut spec = ext_spec("a");
+        spec.program = PathBuf::from("nonexistent-binary-xyz");
+        sup.register_spec(spec);
+        for _ in 0..2 {
+            sup.spawn_backend("a").await.unwrap_err();
+            let logs = sup.logs_query("a", None, None, 10);
+            assert!(logs.records.iter().any(|r| r.line == "previous run"));
+            assert!(logs.records.iter().all(|r| r.archived), "{logs:?}");
+        }
+    }
+
+    /// B21: a port held by another program fails the start quickly and
+    /// names the holder.
+    #[tokio::test]
+    async fn port_in_use_fails_fast_and_names_the_holder() {
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let mut sup = Supervisor::new(test_policy());
+        let mut spec = ext_spec("web");
+        spec.port = Some(port);
+        sup.register_spec(spec);
+        let started = Instant::now();
+        let err = sup.spawn_backend("web").await.unwrap_err().to_string();
+        assert!(started.elapsed() < Duration::from_secs(5), "{err}");
+        assert!(
+            err.starts_with(&format!("port {port} is already in use")),
+            "{err}"
+        );
+        #[cfg(windows)]
+        {
+            assert!(
+                err.contains(&format!("(pid {})", std::process::id())),
+                "{err}"
+            );
+            assert!(err.contains(".exe"), "{err}");
+        }
+    }
+
+    /// B21: the same program still exiting (or a pid already gone) may
+    /// be this backend's own dying process; anything else is not.
+    #[test]
+    fn only_the_backends_own_dying_process_is_waited_out() {
+        let own = std::env::current_exe().unwrap();
+        let me = std::process::id();
+        assert!(!holder_may_be_dying(None, &own));
+        assert!(!holder_may_be_dying(Some(me), Path::new("other-program")));
+        #[cfg(windows)]
+        assert!(holder_may_be_dying(Some(me), &own));
+        assert!(holder_may_be_dying(
+            Some(dead_pid()),
+            Path::new("other-program")
+        ));
+    }
+
+    fn dead_pid() -> u32 {
+        let mut child = ext_sleeper();
+        let pid = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// A15: a killed process that mapped a large model takes many
+    /// seconds to leave the process table.
+    #[test]
+    fn a_killed_process_gets_half_a_minute_to_exit() {
+        assert_eq!(KILL_REAP_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(
+            SupervisorError::DrainTimeout("a".into()).to_string(),
+            "a did not exit within 30 s of being killed"
+        );
     }
 
     #[tokio::test]
