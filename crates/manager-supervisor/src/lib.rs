@@ -1998,7 +1998,8 @@ impl TestResult {
 /// `{base_url}/v1/chat/completions` with a tiny prompt, returning the first
 /// choice's content plus usage when the server reports it. Thinking is
 /// turned off (templates that do not know the switch ignore it): with 16
-/// tokens a thinking model would never reach its answer.
+/// tokens a thinking model would never reach its answer. Temperature is 0
+/// because a sampled reply can end at once, making a healthy backend fail.
 ///
 /// `base_url` is e.g. `http://127.0.0.1:8081`. Non-2xx responses are not
 /// errors here — the status is reported and content is `None` — but
@@ -2011,6 +2012,7 @@ pub async fn test_request(base_url: &str, prompt: &str) -> Result<TestResult, Su
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 16,
         "stream": false,
+        "temperature": 0,
         "chat_template_kwargs": {"enable_thinking": false},
     });
     // NOTE: built without reqwest's `json` feature (workspace keeps reqwest
@@ -4550,6 +4552,8 @@ mod tests {
             serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(v["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(v["max_tokens"], 16);
+        // Sampled, the field model ended its reply at once in 5 of 40 tests.
+        assert_eq!(v["temperature"], 0);
         let out = serde_json::to_value(&r).unwrap();
         assert_eq!(out["reasoning_content"], "The user wants");
     }

@@ -637,7 +637,7 @@ against the running backend. Response (`BackendTestResult`):
   "prompt_tokens": 12, "completion_tokens": 16, "latency_ms": 1823 }
 ```
 
-The request asks for no thinking and at most 16 tokens.
+The request asks for no thinking, temperature 0 and at most 16 tokens.
 `reasoning_content` is set when the model reasoned anyway; a 2xx with
 either text means the backend is generating.
 
