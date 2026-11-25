@@ -1,7 +1,7 @@
 //! Gateway request statistics from LiteLLM's Prometheus endpoint.
 //!
 //! The generated gateway config enables LiteLLM's `prometheus`
-//! success callback, which mounts `/metrics` on the gateway port
+//! callback, which mounts `/metrics` on the gateway port
 //! (master-key authenticated). A background poller in main.rs
 //! scrapes it on the telemetry cadence and records snapshots here.
 //! The Dashboard's per-backend requests/errors/throughput are
@@ -15,8 +15,12 @@
 //! (`http://127.0.0.1:<port>/v1` for local backends), which maps to a
 //! backend by port. The token counters
 //! (`litellm_input_tokens_metric`, `litellm_output_tokens_metric`)
-//! carry a `model` label (`openai/<backend-id>`), which maps to a
-//! backend by id. Series names gain a `_total` suffix under
+//! carry no `api_base`; they carry the deployment's `model_id`, which
+//! the deployment series map to its `api_base`. Where that join is not
+//! available, the `model` label maps by backend id: `<backend-id>`
+//! (LiteLLM strips the provider) or `openai/<backend-id>`. Failed
+//! client requests that never reached a deployment appear only in
+//! `litellm_proxy_failed_requests_metric`. Series names gain a `_total` suffix under
 //! prometheus_client 0.26 exposition rules, and every counter also
 //! emits a `*_created` series — both handled in the parser.
 //!
@@ -51,9 +55,13 @@ pub struct MetricsSnapshot {
     pub at: Instant,
     /// api_base -> (successful responses, failed responses).
     pub deployments: HashMap<String, (u64, u64)>,
-    /// Deployment model label (`openai/<backend-id>`) -> total
-    /// tokens (input + output summed at parse time).
+    /// Token series `model` label -> total tokens (input + output summed at parse time).
     pub tokens: HashMap<String, u64>,
+    /// api_base -> total tokens, for the token series whose `model_id`
+    /// a deployment series maps to an api_base.
+    pub tokens_by_base: HashMap<String, u64>,
+    /// Client-facing requests answered by the proxy: (all, failed).
+    pub proxy_requests: (u64, u64),
     /// Gateway-wide total of `litellm_in_flight_requests` across
     /// all exposition lines. The gauge carries no labels, so this
     /// number is scoped to the gateway worker, never to a backend
@@ -61,6 +69,57 @@ pub struct MetricsSnapshot {
     /// module docs). It is recorded for diagnostics only; the
     /// per-backend live rate does not use it.
     pub in_flight_total: f64,
+}
+
+impl MetricsSnapshot {
+    /// (successful, failed) responses of the backend on `port`.
+    fn responses(&self, port: u16) -> (u64, u64) {
+        self.deployments
+            .get(&format!("http://127.0.0.1:{port}/v1"))
+            .copied()
+            .unwrap_or((0, 0))
+    }
+
+    /// Total tokens of one backend, `None` when no token series is
+    /// attributable to it: by its api_base (the `model_id` join), else
+    /// by the `model` label with or without the provider prefix.
+    fn backend_tokens(&self, id: &str, port: u16) -> Option<u64> {
+        self.tokens_by_base
+            .get(&format!("http://127.0.0.1:{port}/v1"))
+            .or_else(|| self.tokens.get(&format!("openai/{id}")))
+            .or_else(|| self.tokens.get(id))
+            .copied()
+    }
+}
+
+/// A counter's movement over consecutive readings. A decrease means
+/// the gateway restarted and its counters began again at zero, so
+/// everything counted since is new; summing per step keeps what was
+/// counted before the restart.
+fn counted<'a>(
+    snaps: impl Iterator<Item = &'a MetricsSnapshot>,
+    read: impl Fn(&MetricsSnapshot) -> u64,
+) -> u64 {
+    let mut prev: Option<u64> = None;
+    let mut total = 0;
+    for snap in snaps {
+        let now = read(snap);
+        if let Some(then) = prev {
+            total += if now >= then { now - then } else { now };
+        }
+        prev = Some(now);
+    }
+    total
+}
+
+/// Trailing-window figures for the gateway as a whole.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GatewayWindow {
+    /// Client requests the gateway answered, failures included.
+    pub requests: u64,
+    /// Those it answered with an error.
+    pub errors: u64,
+    pub window_secs: f64,
 }
 
 /// Trailing-window figures for one backend.
@@ -143,13 +202,9 @@ impl GatewayStatsStore {
         self.snapshots.push_back(snap);
     }
 
-    /// Trailing-window stats for every backend, keyed by backend id.
-    /// `backends` maps backend id -> port (for the api_base and model
-    /// label lookups). Returns None until two snapshots exist.
-    pub fn window_stats(
-        &self,
-        backends: &[(String, u16)],
-    ) -> Option<HashMap<String, BackendWindow>> {
+    /// Index of the trailing window's baseline snapshot and the seconds
+    /// from it to the latest. `None` until two snapshots exist.
+    fn window_start(&self) -> Option<(usize, f64)> {
         if self.snapshots.len() < 2 {
             return None;
         }
@@ -160,49 +215,59 @@ impl GatewayStatsStore {
         // latest is the only snapshot inside — polls just crossed
         // the edge — fall back to the previous snapshot, which
         // over-covers by at most one poll interval.
-        let baseline = match self.snapshots.iter().find(|s| s.at >= target) {
-            Some(b) if !std::ptr::eq(b, latest) => b,
-            _ => self.snapshots.iter().rev().nth(1)?,
-        };
-        let window_secs = latest.at.duration_since(baseline.at).as_secs_f64();
-        if window_secs <= 0.0 {
-            return None;
-        }
-        let delta = |now: u64, then: u64| -> u64 {
-            // A decreased counter means the gateway restarted and the
-            // counter restarted from zero: everything counted since
-            // is inside the window.
-            if now >= then {
-                now - then
-            } else {
-                now
-            }
-        };
+        let last = self.snapshots.len() - 1;
+        let start = self
+            .snapshots
+            .iter()
+            .position(|s| s.at >= target)
+            .filter(|i| *i < last)
+            .unwrap_or(last - 1);
+        let secs = latest
+            .at
+            .duration_since(self.snapshots[start].at)
+            .as_secs_f64();
+        (secs > 0.0).then_some((start, secs))
+    }
+
+    /// Trailing-window stats for every backend, keyed by backend id.
+    /// `backends` maps backend id -> port (for the api_base and model
+    /// label lookups). Returns None until two snapshots exist.
+    pub fn window_stats(
+        &self,
+        backends: &[(String, u16)],
+    ) -> Option<HashMap<String, BackendWindow>> {
+        let (start, window_secs) = self.window_start()?;
+        let snaps = || self.snapshots.range(start..);
         let mut out = HashMap::new();
         for (id, port) in backends {
-            let api_base = format!("http://127.0.0.1:{port}/v1");
-            let model = format!("openai/{id}");
-            let (ls, lf) = latest.deployments.get(&api_base).copied().unwrap_or((0, 0));
-            let (bs, bf) = baseline
-                .deployments
-                .get(&api_base)
-                .copied()
-                .unwrap_or((0, 0));
-            let lt = latest.tokens.get(&model).copied().unwrap_or(0);
-            let bt = baseline.tokens.get(&model).copied().unwrap_or(0);
+            let errors = counted(snaps(), |s| s.responses(*port).1);
             out.insert(
                 id.clone(),
                 BackendWindow {
-                    // Total = success delta + failure delta (each
-                    // counter's restart handling is independent).
-                    requests: delta(ls, bs) + delta(lf, bf),
-                    errors: delta(lf, bf),
-                    tokens: delta(lt, bt),
+                    // Total = successes + failures (each counter's
+                    // restart handling is independent).
+                    requests: counted(snaps(), |s| s.responses(*port).0) + errors,
+                    errors,
+                    tokens: counted(snaps(), |s| s.backend_tokens(id, *port).unwrap_or(0)),
                     window_secs,
                 },
             );
         }
         Some(out)
+    }
+
+    /// Trailing-window client requests and errors of the gateway
+    /// itself: unlike the per-backend figures this counts a request
+    /// that never reached a backend, and counts a retried request
+    /// once. `None` until two snapshots exist.
+    pub fn gateway_window(&self) -> Option<GatewayWindow> {
+        let (start, window_secs) = self.window_start()?;
+        let snaps = || self.snapshots.range(start..);
+        Some(GatewayWindow {
+            requests: counted(snaps(), |s| s.proxy_requests.0),
+            errors: counted(snaps(), |s| s.proxy_requests.1),
+            window_secs,
+        })
     }
 
     /// The LIVE per-backend token rate for the cards'
@@ -245,53 +310,37 @@ impl GatewayStatsStore {
         // start (the rate then covers at least the window);
         // when polling began inside the window, the earliest
         // snapshot (the rate covers what exists).
-        let baseline = match self.snapshots.iter().rev().find(|s| s.at <= target) {
-            Some(b) if !std::ptr::eq(b, latest) => b,
-            _ => self.snapshots.front()?,
-        };
-        if std::ptr::eq(baseline, latest) {
-            return None;
-        }
+        let start = self
+            .snapshots
+            .iter()
+            .rposition(|s| s.at <= target)
+            .filter(|i| *i + 1 < self.snapshots.len())
+            .unwrap_or(0);
+        let baseline = &self.snapshots[start];
         let span_secs = latest.at.duration_since(baseline.at).as_secs_f64();
         if span_secs < LIVE_MIN_SPAN.as_secs_f64() {
             return None;
         }
-        let delta = |now: u64, then: u64| -> u64 {
-            if now >= then {
-                now - then
-            } else {
-                now
-            }
-        };
+        let snaps = || self.snapshots.range(start..);
         let mut out = HashMap::new();
         for (id, port) in backends {
-            let api_base = format!("http://127.0.0.1:{port}/v1");
-            let model = format!("openai/{id}");
-            let tokens_delta = delta(
-                latest.tokens.get(&model).copied().unwrap_or(0),
-                baseline.tokens.get(&model).copied().unwrap_or(0),
-            );
-            let (ls, _) = latest.deployments.get(&api_base).copied().unwrap_or((0, 0));
-            let (bs, _) = baseline
-                .deployments
-                .get(&api_base)
-                .copied()
-                .unwrap_or((0, 0));
-            let successes_delta = delta(ls, bs);
+            let tokens_delta = counted(snaps(), |s| s.backend_tokens(id, *port).unwrap_or(0));
+            let successes_delta = counted(snaps(), |s| s.responses(*port).0);
             // No per-backend in-flight term: the gauge is
             // gateway-wide and label-free (see the module docs),
             // so attributing any of it to this backend would
             // fabricate the generating/idle distinction.
-            let token_series_seen =
-                latest.tokens.contains_key(&model) || baseline.tokens.contains_key(&model);
+            let token_series_seen = [latest, baseline]
+                .iter()
+                .any(|s| s.backend_tokens(id, *port).is_some());
             let attribution_missed = tokens_delta == 0 && successes_delta > 0 && !token_series_seen;
             if attribution_missed {
                 if self.miss_reported.insert(id.clone()) {
                     tracing::warn!(
-                        "gateway stats: requests completed for backend '{id}' but its token \
-                         series (model=\"{model}\") is absent from the gateway metrics — \
-                         throughput for '{id}' is not measured (check the token-metric \
-                         attribution)"
+                        "gateway stats: requests completed for backend '{id}' but no token \
+                         series in the gateway metrics is attributable to it — throughput \
+                         for '{id}' is not measured; model labels seen: {}",
+                        model_labels(latest)
                     );
                 }
             } else {
@@ -328,13 +377,6 @@ impl GatewayStatsStore {
         if self.snapshots.len() < 2 {
             return None;
         }
-        let delta = |now: u64, then: u64| -> u64 {
-            if now >= then {
-                now - then
-            } else {
-                now
-            }
-        };
         let mut out: HashMap<String, BackendSeries> = backends
             .iter()
             .map(|(id, _)| {
@@ -355,15 +397,10 @@ impl GatewayStatsStore {
                 continue;
             }
             for (id, port) in backends {
-                let api_base = format!("http://127.0.0.1:{port}/v1");
-                let model = format!("openai/{id}");
-                let (cs, cf) = cur.deployments.get(&api_base).copied().unwrap_or((0, 0));
-                let (ps, pf) = prev.deployments.get(&api_base).copied().unwrap_or((0, 0));
-                let reqs = delta(cs, ps) + delta(cf, pf);
-                let toks = delta(
-                    cur.tokens.get(&model).copied().unwrap_or(0),
-                    prev.tokens.get(&model).copied().unwrap_or(0),
-                );
+                let step = || [prev, cur].into_iter();
+                let reqs = counted(step(), |s| s.responses(*port).0)
+                    + counted(step(), |s| s.responses(*port).1);
+                let toks = counted(step(), |s| s.backend_tokens(id, *port).unwrap_or(0));
                 let series = out.get_mut(id).expect("seeded above");
                 series.req_per_min.push(reqs as f64 * 60.0 / dt);
                 series.toks_per_sec.push(toks as f64 / dt);
@@ -378,6 +415,18 @@ impl GatewayStatsStore {
         }
         Some(out)
     }
+}
+
+/// The distinct `model` labels of a snapshot's token series, for the
+/// missed-attribution warning (label values only, capped).
+fn model_labels(snap: &MetricsSnapshot) -> String {
+    let mut labels: Vec<&str> = snap.tokens.keys().map(String::as_str).collect();
+    if labels.is_empty() {
+        return "none".to_string();
+    }
+    labels.sort_unstable();
+    labels.truncate(20);
+    labels.join(", ")
 }
 
 /// One llama-server `/slots` scrape for one backend: the
@@ -533,8 +582,14 @@ pub fn parse_metrics(text: &str, at: Instant) -> MetricsSnapshot {
         at,
         deployments: HashMap::new(),
         tokens: HashMap::new(),
+        tokens_by_base: HashMap::new(),
+        proxy_requests: (0, 0),
         in_flight_total: 0.0,
     };
+    // The token series carry no api_base; the deployment series tell
+    // which api_base a model_id is.
+    let mut base_of_model_id: HashMap<String, String> = HashMap::new();
+    let mut tokens_of_model_id: Vec<(String, u64)> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -552,6 +607,9 @@ pub fn parse_metrics(text: &str, at: Instant) -> MetricsSnapshot {
                 let Some(api_base) = label_value(labels, "api_base") else {
                     continue;
                 };
+                if let Some(model_id) = label_value(labels, "model_id") {
+                    base_of_model_id.insert(model_id, api_base.clone());
+                }
                 let entry = snap.deployments.entry(api_base).or_insert((0, 0));
                 if base.ends_with("success_responses") {
                     entry.0 += value;
@@ -564,7 +622,12 @@ pub fn parse_metrics(text: &str, at: Instant) -> MetricsSnapshot {
                     continue;
                 };
                 *snap.tokens.entry(model).or_insert(0) += value;
+                if let Some(model_id) = label_value(labels, "model_id") {
+                    tokens_of_model_id.push((model_id, value));
+                }
             }
+            "litellm_proxy_total_requests_metric" => snap.proxy_requests.0 += value,
+            "litellm_proxy_failed_requests_metric" => snap.proxy_requests.1 += value,
             "litellm_in_flight_requests" => {
                 // The gauge carries no labels in real LiteLLM
                 // exposition (a bare `litellm_in_flight_requests
@@ -575,6 +638,11 @@ pub fn parse_metrics(text: &str, at: Instant) -> MetricsSnapshot {
                 snap.in_flight_total += value as f64;
             }
             _ => {}
+        }
+    }
+    for (model_id, value) in tokens_of_model_id {
+        if let Some(base) = base_of_model_id.get(&model_id) {
+            *snap.tokens_by_base.entry(base.clone()).or_insert(0) += value;
         }
     }
     snap
@@ -661,6 +729,73 @@ litellm_input_tokens_metric_total{model=\"openai/coder\"} 500.0
 litellm_in_flight_requests 2.0
 ";
 
+    fn empty(at: Instant) -> MetricsSnapshot {
+        parse_metrics("", at)
+    }
+
+    /// Captured from LiteLLM 1.111.0's own registry (Router + the
+    /// prometheus callback): the token series name the deployment
+    /// without its provider and link to it only by `model_id`.
+    const SAMPLE_1_111: &str = "\
+litellm_proxy_total_requests_metric_total{api_provider=\"openai\",model_id=\"81b8\",requested_model=\"grp\",status_code=\"200\"} 6.0
+litellm_proxy_total_requests_metric_total{api_provider=\"openai\",model_id=\"df3b\",requested_model=\"grp\",status_code=\"500\"} 2.0
+litellm_proxy_failed_requests_metric_total{exception_class=\"Openai.InternalServerError\",exception_status=\"500\",requested_model=\"grp\"} 2.0
+litellm_input_tokens_metric_total{api_provider=\"openai\",model=\"alive-b\",model_id=\"81b8\",requested_model=\"grp\"} 27.0
+litellm_output_tokens_metric_total{api_provider=\"openai\",model=\"alive-b\",model_id=\"81b8\",requested_model=\"grp\"} 6.0
+litellm_deployment_success_responses_total{api_base=\"http://127.0.0.1:8081/v1\",litellm_model_name=\"alive-b\",model_group=\"grp\",model_id=\"81b8\"} 6.0
+litellm_deployment_failure_responses_total{api_base=\"http://127.0.0.1:8082/v1\",exception_class=\"Openai.InternalServerError\",exception_status=\"500\",litellm_model_name=\"dead-b\",model_group=\"grp\",model_id=\"df3b\"} 2.0
+";
+
+    /// A8: tokens are attributed on 1.111's labels — by the model_id
+    /// join, and by the provider-less label when the join is missing.
+    #[test]
+    fn tokens_attribute_on_litellm_1_111_labels() {
+        let t0 = Instant::now();
+        let mut store = GatewayStatsStore::default();
+        store.record(empty(t0));
+        store.record(parse_metrics(SAMPLE_1_111, t0 + Duration::from_secs(60)));
+        // The label text does not matter once model_id joins.
+        let backends = [("renamed".to_string(), 8081), ("dead-b".to_string(), 8082)];
+        let w = store.window_stats(&backends).unwrap();
+        assert_eq!(w["renamed"].tokens, 33);
+        assert_eq!((w["dead-b"].requests, w["dead-b"].errors), (2, 2));
+        let live = store.live_throughput(&backends).unwrap();
+        assert_eq!(live["renamed"].rate, Some(33.0 / 60.0));
+
+        let no_join: String = SAMPLE_1_111
+            .lines()
+            .filter(|l| l.starts_with("litellm_input_tokens"))
+            .collect();
+        let snap = parse_metrics(&no_join, t0);
+        assert_eq!(snap.backend_tokens("alive-b", 8081), Some(27));
+        assert_eq!(snap.backend_tokens("other", 9999), None);
+        assert_eq!(model_labels(&snap), "alive-b");
+    }
+
+    /// B4: failed client requests are counted, and the hour's figures
+    /// survive a gateway restart (counters begin again at zero).
+    #[test]
+    fn gateway_window_counts_failures_and_survives_a_restart() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mk = |s: u64, ok: u64, fail: u64, all: u64, bad: u64| MetricsSnapshot {
+            deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (ok, fail))]),
+            proxy_requests: (all, bad),
+            ..empty(at(s))
+        };
+        let mut store = GatewayStatsStore::default();
+        store.record(mk(0, 100, 5, 110, 10));
+        store.record(mk(60, 120, 6, 132, 12));
+        // Restart: nothing counted yet, then one success and one error.
+        store.record(empty(at(120)));
+        store.record(mk(180, 1, 1, 2, 1));
+        let w = store.window_stats(&[("planner".into(), 8081)]).unwrap()["planner"];
+        assert_eq!((w.requests, w.errors), (21 + 2, 1 + 1));
+        let g = store.gateway_window().unwrap();
+        assert_eq!((g.requests, g.errors), (22 + 2, 2 + 1));
+        assert_eq!(g.window_secs, 180.0);
+    }
+
     #[test]
     fn parses_deployment_and_token_counters() {
         let snap = parse_metrics(SAMPLE, Instant::now());
@@ -689,6 +824,7 @@ litellm_in_flight_requests 2.0
             deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (success, failure))]),
             tokens: HashMap::from([("openai/planner".into(), tokens)]),
             in_flight_total: 0.0,
+            ..empty(at)
         };
         store.record(mk(t0, 10, 1, 1000));
         // 30 minutes later: still inside the hour, baseline stays t0.
@@ -713,6 +849,7 @@ litellm_in_flight_requests 2.0
             deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (success, 0))]),
             tokens: HashMap::new(),
             in_flight_total: 0.0,
+            ..empty(at)
         };
         store.record(mk(t0, 100));
         store.record(mk(t0 + Duration::from_secs(3500), 160));
@@ -735,6 +872,7 @@ litellm_in_flight_requests 2.0
             deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (success, 0))]),
             tokens: HashMap::new(),
             in_flight_total: 0.0,
+            ..empty(at)
         };
         store.record(mk(t0, 900));
         store.record(mk(t0 + Duration::from_secs(60), 7));
@@ -753,6 +891,7 @@ litellm_in_flight_requests 2.0
             deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (success, failure))]),
             tokens: HashMap::from([("openai/planner".into(), tokens)]),
             in_flight_total: 0.0,
+            ..empty(at)
         };
         store.record(mk(t0, 10, 0, 600));
         // 60 s later: +30 successes, +6 failures, +3600 tokens.
@@ -770,21 +909,15 @@ litellm_in_flight_requests 2.0
     #[test]
     fn one_snapshot_is_not_a_window() {
         let mut store = GatewayStatsStore::default();
-        store.record(MetricsSnapshot {
-            at: Instant::now(),
-            deployments: HashMap::new(),
-            tokens: HashMap::new(),
-            in_flight_total: 0.0,
-        });
+        store.record(empty(Instant::now()));
         assert!(store.window_stats(&[("planner".into(), 8081)]).is_none());
     }
 
     fn live_snap(at: Instant, success: u64, tokens: u64) -> MetricsSnapshot {
         MetricsSnapshot {
-            at,
             deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (success, 0))]),
             tokens: HashMap::from([("openai/planner".into(), tokens)]),
-            in_flight_total: 0.0,
+            ..empty(at)
         }
     }
 
@@ -953,6 +1086,7 @@ litellm_in_flight_requests 2.0
             deployments: HashMap::from([("http://127.0.0.1:8081/v1".into(), (success, 0))]),
             tokens: HashMap::new(),
             in_flight_total: 0.0,
+            ..empty(at)
         };
         let mut store = GatewayStatsStore::default();
         store.record(mk(t0, 40));

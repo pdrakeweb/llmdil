@@ -1527,9 +1527,7 @@ impl UpdateEnv for AppUpdateEnv {
         }
     }
     async fn gateway_running(&self) -> bool {
-        let cfg = self.state.config.read().await.clone();
-        let host = manager_wizard::steps::gateway_probe_host(&cfg);
-        let port = cfg.gateway.port;
+        let (host, port) = crate::gateway_endpoint(&self.state).await;
         tokio::task::spawn_blocking(move || crate::probe_gateway(&host, port))
             .await
             .unwrap_or(false)

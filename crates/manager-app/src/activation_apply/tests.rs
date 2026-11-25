@@ -341,3 +341,29 @@ async fn monitor_does_not_fire_applied_while_applying() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A9: a timed-out drain is named in the gateway items' detail.
+#[test]
+fn drain_timeout_is_recorded_on_gateway_items() {
+    let item = |scope: &str| crate::activation_history::ActivationExecutionItem {
+        ts: String::new(),
+        kind: "gateway_config".to_string(),
+        summary: "x".to_string(),
+        scope: scope.to_string(),
+        targets: Vec::new(),
+        activation: "gateway_restart".to_string(),
+        outcome: "applied".to_string(),
+        detail: None,
+    };
+    let mut items = vec![item("gateway"), item("backend")];
+    note_drain_timeout(
+        &mut items,
+        Some(&json!({"drained": true, "timed_out": false})),
+    );
+    assert!(items[0].detail.is_none());
+    let q = json!({"drained": false, "in_flight": 2.0, "timed_out": true});
+    note_drain_timeout(&mut items, Some(&q));
+    let detail = items[0].detail.as_deref().unwrap();
+    assert!(detail.contains("timed out with 2 request(s)"), "{detail}");
+    assert!(items[1].detail.is_none());
+}

@@ -1138,14 +1138,11 @@ pub const GATEWAY_PROBE_MAX_AGE: Duration = Duration::from_secs(2);
 /// gateway pid (`manager_wizard::resolve_gateway_pid`), intent and the
 /// recorded failure.
 pub async fn gateway_view(state: &AppState) -> GatewayView {
-    let (port, probe_host, service_mode) = {
-        let cfg = state.config.read().await;
-        (
-            cfg.gateway.port,
-            manager_wizard::steps::gateway_probe_host(&cfg),
-            cfg.supervision.mode == manager_config::SupervisionMode::Service,
-        )
-    };
+    // The running gateway's endpoint: a saved port change is not live
+    // until the next start.
+    let (probe_host, port) = crate::gateway_endpoint(state).await;
+    let service_mode =
+        state.config.read().await.supervision.mode == manager_config::SupervisionMode::Service;
     let rec = state.lifecycle.record(GATEWAY);
     let scm = scm_snapshot(state, Duration::from_secs(1)).await;
     let scm_row = scm
@@ -1493,7 +1490,7 @@ pub async fn on_app_exit(state: &AppState, reason: &str) {
                 None,
             );
         }
-        let port = state.config.read().await.gateway.port;
+        let (_, port) = crate::gateway_endpoint(state).await;
         let dd = data_dir.clone();
         let gateway_pid =
             tokio::task::spawn_blocking(move || manager_wizard::resolve_gateway_pid(&dd, port))

@@ -13,6 +13,39 @@ const SPLIT_SUM_EPSILON: f32 = 1e-4;
 /// Upper bound for the gateway request ring buffer length.
 const MAX_REQUEST_LOG_LEN: usize = 100_000;
 
+/// Longest accepted model-group name, in characters.
+pub const MAX_GROUP_NAME_LEN: usize = 48;
+
+/// Whether `name` is acceptable for a NEW model group (create, rename,
+/// add-backend's "new group"), as an operator-readable refusal. Not
+/// part of [`validate`]: a stored configuration that predates the rule
+/// must keep loading and saving.
+pub fn validate_group_name(name: &str) -> Result<(), String> {
+    if name.eq_ignore_ascii_case("openrouter") {
+        return Err(
+            "the group name \"openrouter\" is reserved for the OpenRouter cloud fallback; \
+             choose another name"
+                .to_string(),
+        );
+    }
+    let len = name.chars().count();
+    if len > MAX_GROUP_NAME_LEN {
+        return Err(format!(
+            "group name is too long: {len} characters (the limit is {MAX_GROUP_NAME_LEN})"
+        ));
+    }
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if !valid {
+        return Err("group name must be lowercase letters, digits, and hyphens".to_string());
+    }
+    Ok(())
+}
+
 /// Structural validation. Collects every problem found and reports them
 /// together; returns `Ok(())` only when the config is fully consistent.
 ///
@@ -93,12 +126,14 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
     let mut ports: HashMap<u16, String> = HashMap::new();
     let mut claim_port = |port: u16, owner: String| {
         if port == 0 {
-            errors.push(format!("{owner}: port 0 is invalid"));
+            errors.push(format!(
+                "{owner}: port 0 is invalid; use a number from 1 to 65535"
+            ));
         } else if let Some(prev) = ports.insert(port, owner.clone()) {
-            errors.push(format!("port {port} claimed by both {prev} and {owner}"));
+            errors.push(format!("port {port} is used by both {prev} and {owner}"));
         }
     };
-    claim_port(config.gateway.port, "gateway".to_string());
+    claim_port(config.gateway.port, "the gateway".to_string());
     for b in &config.backends {
         claim_port(b.port, format!("backend {:?}", b.id));
     }
@@ -393,6 +428,22 @@ fn normalize_path(p: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// B6: the reserved cloud-tier token and the length limit are
+    /// named in the refusal.
+    #[test]
+    fn group_names_refuse_the_reserved_token_and_name_the_limit() {
+        for n in ["openrouter", "OpenRouter", "OPENROUTER"] {
+            let e = super::validate_group_name(n).unwrap_err();
+            assert!(e.contains("reserved"), "{e}");
+        }
+        let e = super::validate_group_name(&"a".repeat(49)).unwrap_err();
+        assert!(e.contains("49") && e.contains("48"), "{e}");
+        assert!(super::validate_group_name("Bad Name").is_err());
+        assert!(super::validate_group_name("").is_err());
+        assert!(super::validate_group_name(&"a".repeat(48)).is_ok());
+        assert!(super::validate_group_name("qa-small").is_ok());
+    }
+
     use super::*;
     use crate::test_fixtures::*;
     use crate::*;
@@ -639,7 +690,7 @@ mod tests {
         let mut cfg = working_config();
         cfg.backends[1].port = cfg.backends[0].port;
         let err = validate(&cfg).unwrap_err().to_string();
-        assert!(err.contains("claimed by both"), "unexpected: {err}");
+        assert!(err.contains("is used by both"), "unexpected: {err}");
     }
 
     #[test]
@@ -647,7 +698,7 @@ mod tests {
         let mut cfg = working_config();
         cfg.backends[0].port = cfg.gateway.port;
         let err = validate(&cfg).unwrap_err().to_string();
-        assert!(err.contains("claimed by both"), "unexpected: {err}");
+        assert!(err.contains("is used by both"), "unexpected: {err}");
     }
 
     #[test]
@@ -665,7 +716,7 @@ mod tests {
         cfg.winml.model_id = Some("qwen3-8b".to_string());
         cfg.winml.port = cfg.gateway.port;
         let err = validate(&cfg).unwrap_err().to_string();
-        assert!(err.contains("claimed by both"), "unexpected: {err}");
+        assert!(err.contains("is used by both"), "unexpected: {err}");
     }
 
     #[test]

@@ -891,6 +891,82 @@ async fn start_gateway_adds_firewall_rule_when_missing() {
     assert!(text.contains("remoteip=localsubnet"), "{text}");
 }
 
+/// A17: a start on a new port removes this app's rules for earlier
+/// ports in the same elevated script, leaves every other rule alone,
+/// and says beforehand that Windows will ask for approval.
+#[tokio::test]
+async fn start_gateway_on_a_new_port_removes_the_old_ports_rule() {
+    let ops = Arc::new(FakeSystemOps::new());
+    with_bundled_uv(&ops);
+    ops.with_http_get(
+        "http://127.0.0.1:4001/v1/models",
+        FakeSystemOps::http_ok(r#"{"data":[]}"#),
+    );
+    let show = |name: &str| {
+        ["netsh", "advfirewall", "firewall", "show", "rule", name]
+            .map(str::to_string)
+            .to_vec()
+    };
+    let missing = show("name=Local LLM Gateway (TCP 4001)");
+    ops.with_command_failure(
+        &missing.iter().map(String::as_str).collect::<Vec<_>>(),
+        1,
+        "No rules match the specified criteria.",
+    );
+    // What this data directory opened before; 4002's rule is gone.
+    let gone = show("name=Local LLM Gateway (TCP 4002)");
+    ops.with_command_failure(
+        &gone.iter().map(String::as_str).collect::<Vec<_>>(),
+        1,
+        "No rules match the specified criteria.",
+    );
+    ops.with_file(
+        PathBuf::from("/data/gateway/firewall.cmd"),
+        b"netsh advfirewall firewall delete rule name=\"Local LLM Gateway (TCP 4002)\"\r\n\
+          netsh advfirewall firewall add rule name=\"Local LLM Gateway (TCP 4000)\" dir=in\r\n"
+            .to_vec(),
+    );
+    let mut config = test_config_with_models();
+    config.gateway.port = 4001;
+    let ctx = WizardContext::new(
+        config,
+        PathBuf::from("/data"),
+        RunMode::Install,
+        ops.clone(),
+    );
+    let step = StartGateway {
+        health_retries: 3,
+        health_interval_ms: 1,
+        db_sustain_ms: 0,
+    };
+    let out = step.run(&ctx).await.unwrap();
+    assert_eq!(out.state, StepState::Done, "{out:?}");
+    assert_eq!(ops.elevated_calls().len(), 1);
+    let script = ops
+        .file_bytes(&PathBuf::from("/data/gateway/firewall.cmd"))
+        .expect("firewall script written");
+    let text = String::from_utf8(script).unwrap();
+    for port in [4000, 4001] {
+        assert!(
+            text.contains(&format!(
+                "delete rule name=\"Local LLM Gateway (TCP {port})\""
+            )),
+            "{text}"
+        );
+    }
+    assert!(!text.contains("4002"), "{text}");
+    assert!(
+        text.contains("add rule name=\"Local LLM Gateway (TCP 4001)\""),
+        "{text}"
+    );
+    assert!(
+        out.log_tail
+            .iter()
+            .any(|l| l.contains("administrator approval")),
+        "{out:?}"
+    );
+}
+
 /// Firewall reconciliation, remove path: loopback-bound with the
 /// rule present (the fake's default command success) — one
 /// elevated delete.
@@ -951,6 +1027,46 @@ async fn start_gateway_firewall_noop_when_rule_matches() {
     assert!(ops
         .file_bytes(&PathBuf::from("/data/gateway/firewall.cmd"))
         .is_none());
+}
+
+/// A17, the way back: the current port's rule exists, an earlier
+/// port's is left over. Only that one is removed, the current rule is
+/// not touched, and a declined prompt is not repeated.
+#[tokio::test]
+async fn start_gateway_removes_a_leftover_rule_once() {
+    let ops = Arc::new(FakeSystemOps::new());
+    with_bundled_uv(&ops);
+    ops.with_http_get(
+        "http://127.0.0.1:4000/v1/models",
+        FakeSystemOps::http_ok(r#"{"data":[]}"#),
+    );
+    ops.with_file(
+        PathBuf::from("/data/gateway/firewall.cmd"),
+        b"netsh advfirewall firewall add rule name=\"Local LLM Gateway (TCP 4001)\" dir=in\r\n"
+            .to_vec(),
+    );
+    ops.with_elevated_error("declined");
+    let ctx = ctx_with(ops.clone(), RunMode::Install);
+    let step = StartGateway {
+        health_retries: 3,
+        health_interval_ms: 1,
+        db_sustain_ms: 0,
+    };
+    for _ in 0..2 {
+        let out = step.run(&ctx).await.unwrap();
+        assert_eq!(out.state, StepState::Done, "{out:?}");
+        assert_eq!(ops.elevated_calls().len(), 1);
+    }
+    let text = String::from_utf8(
+        ops.file_bytes(&PathBuf::from("/data/gateway/firewall.cmd"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        text.contains("delete rule name=\"Local LLM Gateway (TCP 4001)\""),
+        "{text}"
+    );
+    assert!(!text.contains("4000"), "{text}");
 }
 
 #[test]

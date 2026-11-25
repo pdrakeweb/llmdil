@@ -659,13 +659,7 @@ pub(crate) async fn mcp_test_gateway_connection(
     entry: &manager_config::McpServerConfig,
 ) -> ApiResult {
     let id = entry.id.clone();
-    let (host, port) = {
-        let cfg = state.config.read().await;
-        (
-            manager_wizard::steps::gateway_probe_host(&cfg),
-            cfg.gateway.port,
-        )
-    };
+    let (host, port) = crate::gateway_endpoint(state).await;
     let master = RealSystemOps::default()
         .credential_read(manager_wizard::LITELLM_MASTER_KEY_CRED_TARGET)
         .await

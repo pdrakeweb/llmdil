@@ -419,7 +419,7 @@ export async function getGatewayStatus(): Promise<CallResult<GatewayStatusData>>
       : fromWire(raw.state);
     return {
       data: {
-        port: typeof raw.saved_port === "number" ? raw.saved_port : typeof raw.port === "number" ? raw.port : 0,
+        port: typeof raw.port === "number" ? raw.port : 0,
         groups: typeof raw.groups === "number" ? raw.groups : 0,
         routing_rules: typeof raw.routing_rules === "number" ? raw.routing_rules : 0,
         up,
@@ -441,8 +441,8 @@ export async function getGatewayStatus(): Promise<CallResult<GatewayStatusData>>
         openrouter_spend: parseOpenRouterSpend(raw.openrouter_spend),
         running_port: numOrNull(raw.running_port),
         port_pending: raw.port_pending === true,
-        running_strategy: typeof raw.running_strategy === "string" ? raw.running_strategy : null,
-        applied_strategies: parseAppliedStrategies(raw.applied_strategies ?? raw.group_strategies),
+        running_strategy: typeof raw.effective_strategy === "string" ? raw.effective_strategy : null,
+        applied_strategies: parseAppliedStrategies(raw.group_strategies),
       },
       live: true,
     };

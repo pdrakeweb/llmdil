@@ -216,7 +216,7 @@ impl WizardStep for StartGateway {
                 // Firewall reconciliation for the bind address: a
                 // read-only rule query, plus the elevated script
                 // when the rule state does not match the bind.
-                cmds.push(self.firewall_show_command(ctx));
+                cmds.push(self.firewall_show_command(ctx.config.gateway.port));
                 cmds.push(self.firewall_elevated_command(ctx));
                 cmds
             }

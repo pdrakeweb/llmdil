@@ -35,7 +35,7 @@ pub async fn op_gateway_activation_plan(
     let running = backend_running_ids(state, &cfg).await;
     let configured: std::collections::HashSet<String> =
         cfg.backends.iter().map(|b| b.id.clone()).collect();
-    let view = lifecycle::gateway_view(state).await;
+    let (view, _) = running_gateway_view(state).await;
     // `gateway_up` stays the probe; the plan's pending rule treats a
     // gateway with an operation in flight as up, so a restart's down
     // window never makes the plan vanish (GW-10 / ACT-5).
@@ -62,35 +62,40 @@ pub async fn op_gateway_activation_plan(
     // will regenerate without calling it pending.
     let drift_detail =
         activation::config_drift_detail(&cfg, &state.data_dir, |t| presence.contains(t));
-    let drift = activation::drift_is_pending(drift_detail.any(), up);
+    let drift = activation::drift_unexplained(
+        activation::drift_is_pending(drift_detail.any(), up),
+        &pending_entries,
+    );
     let pending = !pending_entries.is_empty() || drift;
     let entry_ts = |e: &activation::ActivationEntry| {
         chrono::DateTime::parse_from_rfc3339(&e.ts)
             .ok()
             .map(|t| t.with_timezone(&chrono::Utc))
     };
+    // Needs a restart when a target is running a process started
+    // before the change (or with unknown start — an adopted process:
+    // restarting is the safe call).
+    let stale = |e: &activation::ActivationEntry, t: &String| {
+        let ts = entry_ts(e);
+        running.contains(t)
+            && started_at
+                .get(t)
+                .map(|s| ts.map(|ts| *s < ts).unwrap_or(true))
+                .unwrap_or(true)
+    };
     let mut backend_restart_ids: Vec<String> = Vec::new();
-    let mut changes: Vec<Value> = pending_entries
+    for e in pending_entries.iter().filter(|e| e.scope == "backend") {
+        for t in &e.targets {
+            if stale(e, t) && !backend_restart_ids.contains(t) {
+                backend_restart_ids.push(t.clone());
+            }
+        }
+    }
+    let mut changes: Vec<Value> = activation::plan_rows(&pending_entries)
         .iter()
         .map(|e| {
             let activation_kind = if e.scope == "backend" {
-                // Needs a restart when a target is running a process
-                // started before the change (or with unknown start —
-                // an adopted process: restarting is the safe call).
-                let ts = entry_ts(e);
-                let stale = |t: &String| {
-                    running.contains(t)
-                        && started_at
-                            .get(t)
-                            .map(|s| ts.map(|ts| *s < ts).unwrap_or(true))
-                            .unwrap_or(true)
-                };
-                if e.targets.iter().any(stale) {
-                    for t in &e.targets {
-                        if stale(t) && !backend_restart_ids.contains(t) {
-                            backend_restart_ids.push(t.clone());
-                        }
-                    }
+                if e.targets.iter().any(|t| stale(e, t)) {
                     "restart"
                 } else {
                     "next_start"
@@ -127,6 +132,7 @@ pub async fn op_gateway_activation_plan(
         || pending_entries.iter().any(|e| e.scope != "backend")
         || changes.iter().any(|c| c["activation"] == "gateway_restart");
     let actionable = gateway_pending || changes.iter().any(|c| c["activation"] == "restart");
+    let admin_approval = gateway_pending && firewall_update_pending(&cfg, &state.data_dir);
     Ok(json!({
         "pending": pending,
         "gateway_up": probe_up,
@@ -137,6 +143,13 @@ pub async fn op_gateway_activation_plan(
         "applies_at_next_start": pending && !up,
         "actionable": actionable,
         "backend_restart_ids": backend_restart_ids,
+        // Applying changes the gateway's port or network access, so the
+        // firewall rule changes with it (A17).
+        "admin_approval_required": admin_approval,
+        "admin_approval_reason": admin_approval.then_some(
+            "Windows will ask for administrator approval to update the firewall rule \
+             for the gateway."
+        ),
         "changes": changes,
         "snapshot_available": journal.snapshot.is_some() && !pending_entries.is_empty(),
         // The server-side activation apply in flight, null when idle:
@@ -173,14 +186,8 @@ pub async fn op_gateway_activation_cancel(
     // (activation::cancel_plan) then runs under the write lock, after
     // the probe, so it judges exactly the configuration the restore
     // replaces — a change that landed during the probe is seen.
-    let (probe_host, port, live_cfg) = {
-        let cfg = state.config.read().await;
-        (
-            manager_wizard::steps::gateway_probe_host(&cfg),
-            cfg.gateway.port,
-            cfg.clone(),
-        )
-    };
+    let live_cfg = state.config.read().await.clone();
+    let (probe_host, port) = gateway_endpoint(state).await;
     let started_at = backend_start_times(state, &live_cfg).await;
     let running = backend_running_ids(state, &live_cfg).await;
     drop(live_cfg);
@@ -226,18 +233,26 @@ pub async fn op_gateway_activation_cancel(
     manager_config::save(&restored, &state.config_path).map_err(ApiError::from)?;
     *cfg = restored.clone();
     drop(cfg);
-    // Regenerate the gateway YAML from the restored config and
-    // write it immediately (MCP design §10.2): the on-disk YAML is
-    // what the running gateway serves and what the drift check
-    // compares against, so leaving the cancelled changes' YAML in
-    // place would leave disk, config, and gateway disagreeing
-    // until the next start. A regeneration failure does NOT fail
+    // Make the on-disk gateway YAML the one the restored config
+    // generates (MCP design §10.2): a start that failed after writing
+    // it left the cancelled changes there. Generated from the
+    // armed-only MCP view, like every start and the drift check, and
+    // written only when it differs: rewriting it from the raw registry
+    // (or for nothing) made a cancelled backend-only edit show up as
+    // new gateway drift (A18). A regeneration failure does NOT fail
     // the cancel — the config restore already succeeded, and the
     // next gateway start regenerates the YAML from the restored
     // config anyway — so the failure is reported in the result
     // payload instead of as a command error.
     let yaml_path = state.data_dir.join("gateway").join("config.yaml");
-    let yaml_error: Option<String> = match manager_gateway::generate_config_yaml(&restored) {
+    let presence = mcp_credential_presence(&[&restored]).await;
+    let armed =
+        manager_wizard::config_with_armed_gateway_mcp_servers(&restored, |t| presence.contains(t));
+    let yaml_current =
+        !activation::config_drift_detail(&restored, &state.data_dir, |t| presence.contains(t)).yaml
+            && yaml_path.exists();
+    let yaml_error: Option<String> = match manager_gateway::generate_config_yaml(&armed) {
+        Ok(_) if yaml_current => None,
         Ok(yaml) => {
             let write =
                 std::fs::create_dir_all(yaml_path.parent().expect("the YAML path has a parent"))
@@ -281,7 +296,7 @@ pub async fn op_gateway_activation_complete(
     state: &Arc<AppState>,
     sink: &Arc<dyn EventSink>,
 ) -> ApiResult {
-    let view = lifecycle::gateway_view(state).await;
+    let (view, _) = running_gateway_view(state).await;
     if view.state != lifecycle::LifecycleState::Running {
         return Ok(json!({
             "cleared": false,
@@ -367,20 +382,20 @@ pub(crate) fn gateway_restart_execution(
     before: &GatewayPlanBefore,
     finished_at: chrono::DateTime<chrono::Utc>,
 ) -> activation_history::ActivationExecution {
-    let mut items: Vec<activation_history::ActivationExecutionItem> = before
-        .gateway_entries
-        .iter()
-        .map(|e| activation_history::ActivationExecutionItem {
-            ts: e.ts.clone(),
-            kind: e.kind.clone(),
-            summary: e.summary.clone(),
-            scope: e.scope.clone(),
-            targets: e.targets.clone(),
-            activation: "gateway_restart".to_string(),
-            outcome: "applied".to_string(),
-            detail: None,
-        })
-        .collect();
+    let mut items: Vec<activation_history::ActivationExecutionItem> =
+        activation::plan_rows(&before.gateway_entries)
+            .iter()
+            .map(|e| activation_history::ActivationExecutionItem {
+                ts: e.ts.clone(),
+                kind: e.kind.clone(),
+                summary: e.summary.clone(),
+                scope: e.scope.clone(),
+                targets: e.targets.clone(),
+                activation: "gateway_restart".to_string(),
+                outcome: "applied".to_string(),
+                detail: None,
+            })
+            .collect();
     if items.is_empty() && before.drift {
         items.push(activation_history::ActivationExecutionItem {
             ts: before.started_at.unwrap_or(finished_at).to_rfc3339(),
@@ -403,6 +418,7 @@ pub(crate) fn gateway_restart_execution(
         drift: before.drift,
         gateway_up: true,
         gateway_pending: true,
+        quiesce: None,
         items,
     }
 }
@@ -462,6 +478,7 @@ pub async fn op_gateway_activation_history(
                 "status": e.status,
                 "source": e.source,
                 "mode": e.mode,
+                "quiesce": e.quiesce,
                 "drift": e.drift,
                 "gateway_up": e.gateway_up,
                 "gateway_pending": e.gateway_pending,
@@ -475,7 +492,16 @@ pub async fn op_gateway_activation_history(
     Ok(json!({ "executions": summaries }))
 }
 
-/// Quiesce wait: poll the gateway's in-flight request gauge until
+/// What a timed-out drain says in the execution record.
+pub(crate) fn drain_timeout_detail(quiesce: &Value) -> String {
+    format!(
+        "The drain timed out with {} request(s) still in flight; the gateway was restarted anyway.",
+        quiesce["in_flight"].as_f64().unwrap_or(0.0)
+    )
+}
+
+/// Quiesce wait: poll the gateway's in-flight request gauge (less the
+/// poll's own request, [`activation::client_requests_in_flight`]) until
 /// it reaches zero or the timeout expires. A gateway that does not
 /// answer metrics (down, or the metrics config not yet active)
 /// counts as drained — nothing can be in flight through a gateway
@@ -493,13 +519,7 @@ pub async fn op_gateway_quiesce_wait(
 /// phase of [`op_gateway_restart`]: `{drained, in_flight, timed_out}`.
 pub(crate) async fn gateway_quiesce(state: &AppState, timeout_secs: u64) -> Value {
     let timeout = timeout_secs.clamp(5, 600);
-    let (host, port) = {
-        let cfg = state.config.read().await;
-        (
-            manager_wizard::steps::gateway_probe_host(&cfg),
-            cfg.gateway.port,
-        )
-    };
+    let (host, port) = gateway_endpoint(state).await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
     let mut last_in_flight: Option<f64>;
     loop {
@@ -517,7 +537,7 @@ pub(crate) async fn gateway_quiesce(state: &AppState, timeout_secs: u64) -> Valu
                 .flatten()
         };
         match body {
-            Some(text) => match activation::parse_in_flight(&text) {
+            Some(text) => match activation::client_requests_in_flight(&text) {
                 Some(0.0) | None => {
                     return json!({ "drained": true, "in_flight": 0, "timed_out": false })
                 }
@@ -595,10 +615,7 @@ pub async fn op_gateway_restart(
         );
         let q = gateway_quiesce(state, 120).await;
         let detail = if q["timed_out"] == json!(true) {
-            format!(
-                "drain timed out with {} request(s) in flight; restarting anyway",
-                q["in_flight"]
-            )
+            drain_timeout_detail(&q)
         } else {
             "drained".to_string()
         };
@@ -686,7 +703,7 @@ pub async fn op_gateway_stop(
     state
         .lifecycle
         .set_intent(lifecycle::GATEWAY, lifecycle::Intent::Stopped);
-    let port = state.config.read().await.gateway.port;
+    let (_, port) = gateway_endpoint(state).await;
     let data_dir = state.data_dir.clone();
     let result: Result<(bool, Option<u32>, Option<&'static str>), String> = if state
         .service_route_active(manager_services::GATEWAY_SERVICE_NAME)
@@ -832,7 +849,7 @@ pub async fn op_postgres_stop(
     sink: &Arc<dyn EventSink>,
     origin: Option<String>,
 ) -> ApiResult {
-    let view = lifecycle::gateway_view(state).await;
+    let (view, _) = running_gateway_view(state).await;
     if view.state.is_live() || view.transition.is_some() {
         return Err(ApiError::InvalidInput(format!(
             "stop the gateway first (it is {})",
@@ -841,6 +858,58 @@ pub async fn op_postgres_stop(
     }
     let stopped = postgres_stop_inner(state, sink, op_origin(origin.as_deref())).await?;
     Ok(json!({ "ok": true, "stopped": stopped }))
+}
+
+/// Where the RUNNING gateway listens, `(probe host, port)`. A port or
+/// bind address saved while it runs takes effect at its next start, so
+/// until then it answers where the last start put it: the recorded
+/// spawn's endpoint when that answers, else the saved one.
+pub(crate) async fn gateway_endpoint(state: &AppState) -> (String, u16) {
+    let saved = {
+        let cfg = state.config.read().await;
+        (
+            manager_wizard::steps::gateway_probe_host(&cfg),
+            cfg.gateway.port,
+        )
+    };
+    let Some(spawn) = manager_wizard::recorded_gateway_spawn(&state.data_dir) else {
+        return saved;
+    };
+    let recorded = (
+        manager_wizard::steps::probe_host_for_bind(&spawn.fingerprint.bind_host),
+        spawn.fingerprint.port,
+    );
+    if recorded == saved {
+        return saved;
+    }
+    let (host, port) = recorded.clone();
+    match tokio::task::spawn_blocking(move || probe_gateway(&host, port)).await {
+        Ok(true) => recorded,
+        _ => saved,
+    }
+}
+
+/// [`lifecycle::gateway_view`] judged at the running gateway's endpoint
+/// ([`gateway_endpoint`]), and the port that endpoint has.
+pub(crate) async fn running_gateway_view(state: &AppState) -> (lifecycle::GatewayView, u16) {
+    let (_, port) = gateway_endpoint(state).await;
+    if port != state.config.read().await.gateway.port {
+        // It just answered there; the view probes the saved port.
+        state.lifecycle.set_probe(lifecycle::GATEWAY, true);
+    }
+    (lifecycle::gateway_view(state).await, port)
+}
+
+/// Whether applying the saved gateway changes updates the Windows
+/// firewall rule: the port or bind address changes and one side of the
+/// change is reachable from the network.
+pub(crate) fn firewall_update_pending(cfg: &AppConfig, data_dir: &std::path::Path) -> bool {
+    let (port, bind) = manager_wizard::gateway_listen_pending(cfg, data_dir);
+    let loopback = |host: &str| host == "127.0.0.1";
+    (port || bind)
+        && !(loopback(&cfg.gateway.bind_host)
+            && manager_wizard::recorded_gateway_spawn(data_dir)
+                .is_some_and(|s| loopback(&s.fingerprint.bind_host)))
 }
 
 /// One-shot gateway liveness probe: connect to <host>:<port> with a

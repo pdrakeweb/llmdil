@@ -3,8 +3,11 @@
   "activation_changes": 0,
   "activation_pending": false,
   "bind_host": "127.0.0.1",
+  "effective_strategy": null,
+  "errors_1h": null,
   "failure": null,
   "found_by": null,
+  "group_strategies": [],
   "groups": 0,
   "intent": null,
   "lan_ip": null,
@@ -23,6 +26,7 @@
   },
   "pid": null,
   "port": 59100,
+  "port_pending": false,
   "postgres": {
     "installed": false,
     "pid": null,
@@ -31,10 +35,13 @@
     "state": "not_installed",
     "transition": null
   },
+  "requests_1h": null,
   "routing_log_len": 0,
   "routing_rules": 0,
+  "running_port": null,
   "service_managed": false,
   "state": "stopped",
+  "stats_window_secs": null,
   "transition": null,
   "up": false
 }

@@ -53,13 +53,12 @@ export interface ActivationPlanData {
   snapshot_available: boolean;
   /** Applying needs a Windows administrator approval (a firewall rule
    *  change). Absent on older payloads; either spelling. */
-  needs_elevation?: boolean;
-  elevation_required?: boolean;
+  admin_approval_required?: boolean;
 }
 
 /** Whether applying the plan makes Windows ask for approval. */
 export function planNeedsElevation(p: ActivationPlanData): boolean {
-  return p.needs_elevation === true || p.elevation_required === true;
+  return p.admin_approval_required === true;
 }
 
 const EMPTY_PLAN: ActivationPlanData = {

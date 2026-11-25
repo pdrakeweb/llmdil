@@ -90,8 +90,9 @@ pub struct ActivationEntry {
     /// backends' next (re)start).
     #[serde(default = "default_scope")]
     pub scope: String,
-    /// Backend ids a `backend`-scope entry applies to. Empty for
-    /// gateway-scope entries.
+    /// Backend ids the entry is about: for `backend` scope the backends
+    /// whose (re)start activates it; for `gateway` scope the backends
+    /// the edit touched (display only).
     #[serde(default)]
     pub targets: Vec<String>,
     /// Hash of the gateway YAML in effect BEFORE this change — the
@@ -333,6 +334,79 @@ pub fn pending_entries(
                 gateway_up
             }
         })
+        .collect()
+}
+
+/// How close two records of the same command are in time.
+const SAME_EDIT_WINDOW: chrono::Duration = chrono::Duration::seconds(1);
+
+/// The pending entries as plan rows: one row per edit. An edit that
+/// both the gateway and a backend must pick up is journaled once per
+/// scope; the backend record folds into the gateway row (same kind and
+/// summary, recorded together), whose restart is the apply's last step.
+pub fn plan_rows(entries: &[ActivationEntry]) -> Vec<ActivationEntry> {
+    let is_twin = |b: &ActivationEntry, g: &ActivationEntry| {
+        b.scope == "backend"
+            && g.scope != "backend"
+            && b.kind == g.kind
+            && b.summary == g.summary
+            && match (entry_ts(b), entry_ts(g)) {
+                (Some(x), Some(y)) => (x - y).abs() <= SAME_EDIT_WINDOW,
+                _ => false,
+            }
+    };
+    entries
+        .iter()
+        .filter(|e| !entries.iter().any(|g| is_twin(e, g)))
+        .map(|e| {
+            let mut row = e.clone();
+            for twin in entries.iter().filter(|b| is_twin(b, e)) {
+                for t in &twin.targets {
+                    if !row.targets.contains(t) {
+                        row.targets.push(t.clone());
+                    }
+                }
+            }
+            row
+        })
+        .collect()
+}
+
+/// Whether pending drift needs its own plan row: only when no pending
+/// gateway-scope entry explains it (an edit the gateway has not picked
+/// up IS the difference between the files, not a second change).
+pub fn drift_unexplained(drift_pending: bool, pending: &[ActivationEntry]) -> bool {
+    drift_pending && !pending.iter().any(|e| e.scope != "backend")
+}
+
+/// The backends an edit touched, for a gateway-scope entry's
+/// `targets`: those whose own configuration or group membership
+/// differs, in configuration order, then the removed ones.
+pub fn touched_backends(pre: &AppConfig, post: &AppConfig) -> Vec<String> {
+    let view = |cfg: &AppConfig, id: &str| {
+        let backend = cfg
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .and_then(|b| serde_json::to_value(b).ok());
+        let groups: Vec<String> = cfg
+            .gateway
+            .groups
+            .iter()
+            .filter(|g| g.members.iter().any(|m| m == id))
+            .map(|g| g.name.clone())
+            .collect();
+        (backend, groups)
+    };
+    let mut ids: Vec<&String> = post.backends.iter().map(|b| &b.id).collect();
+    for b in &pre.backends {
+        if !ids.contains(&&b.id) {
+            ids.push(&b.id);
+        }
+    }
+    ids.into_iter()
+        .filter(|id| view(pre, id) != view(post, id))
+        .cloned()
         .collect()
 }
 
@@ -921,6 +995,15 @@ pub fn cancel_plan(
         ));
     }
     fields::restored_config(&snapshot, current).map(|cfg| CancelPlan::Restore(Box::new(cfg)))
+}
+
+/// The in-flight client requests a `/metrics` body reports: the
+/// `litellm_in_flight_requests` gauge (all label sets) minus the scrape
+/// itself. LiteLLM counts every HTTP request it is answering, and the
+/// scrape that renders the gauge is one of them. `None` when the series
+/// is absent.
+pub fn client_requests_in_flight(metrics: &str) -> Option<f64> {
+    parse_in_flight(metrics).map(|n| (n - 1.0).max(0.0))
 }
 
 /// Sum the `litellm_in_flight_requests` gauge from a Prometheus

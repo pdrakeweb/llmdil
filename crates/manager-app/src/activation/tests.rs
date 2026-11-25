@@ -12,6 +12,58 @@ litellm_deployment_success_responses_total 9.0
     assert_eq!(parse_in_flight("litellm_other 1.0\n"), None);
 }
 
+/// A9: the scrape that reads the gauge is itself a request in flight,
+/// so an idle gateway reports 1 and is drained.
+#[test]
+fn in_flight_ignores_the_scrape_itself() {
+    let body = |n: &str| format!("litellm_in_flight_requests {n}\n");
+    assert_eq!(client_requests_in_flight(&body("1.0")), Some(0.0));
+    assert_eq!(client_requests_in_flight(&body("3.0")), Some(2.0));
+    assert_eq!(client_requests_in_flight(&body("0.0")), Some(0.0));
+    assert_eq!(client_requests_in_flight("other 1.0\n"), None);
+}
+
+/// B1: one edit is one plan row — the backend record of an edit the
+/// gateway must also pick up folds into the gateway row, and drift that
+/// a pending gateway change explains is not a change of its own.
+#[test]
+fn one_edit_is_one_plan_row() {
+    let mut gateway = entry("gateway", &[]);
+    gateway.ts = "2026-10-16T12:00:00.000+00:00".to_string();
+    let mut twin = entry("backend", &["qa"]);
+    twin.ts = "2026-10-16T12:00:00.009+00:00".to_string();
+    let mut later = entry("backend", &["qa"]);
+    later.ts = "2026-10-16T12:05:00+00:00".to_string();
+    let rows = plan_rows(&[gateway.clone(), twin, later.clone()]);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].scope, "gateway");
+    assert_eq!(rows[0].targets, ["qa"]);
+    assert_eq!(rows[1].ts, later.ts);
+
+    assert!(!drift_unexplained(true, &[gateway]));
+    assert!(drift_unexplained(true, &[later]));
+    assert!(drift_unexplained(true, &[]));
+    assert!(!drift_unexplained(false, &[]));
+}
+
+/// B2: a gateway-scope entry names the backends its edit touched.
+#[test]
+fn touched_backends_names_config_and_membership_changes() {
+    let pre = AppConfig::default_config();
+    let mut post = pre.clone();
+    post.backends[0].enabled = !post.backends[0].enabled;
+    let moved = post.backends[1].id.clone();
+    for g in post.gateway.groups.iter_mut() {
+        g.members.retain(|m| *m != moved);
+    }
+    let removed = post.backends.pop().unwrap().id;
+    assert_eq!(
+        touched_backends(&pre, &post),
+        [pre.backends[0].id.clone(), moved, removed]
+    );
+    assert!(touched_backends(&pre, &pre).is_empty());
+}
+
 #[test]
 fn normalize_yaml_ignores_crlf_and_trailing_newlines() {
     assert_eq!(normalize_yaml("a\r\nb\r\n"), normalize_yaml("a\nb\n\n"));

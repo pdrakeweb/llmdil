@@ -149,13 +149,7 @@ pub(crate) fn fetch_gateway_metrics(host: &str, port: u16, master_key: &str) -> 
 /// must not create credentials), fetch and record a snapshot. Any
 /// missing piece skips the cycle silently.
 pub async fn poll_gateway_metrics_once(state: &AppState) {
-    let (host, port) = {
-        let cfg = state.config.read().await;
-        (
-            manager_wizard::steps::gateway_probe_host(&cfg),
-            cfg.gateway.port,
-        )
-    };
+    let (host, port) = gateway_endpoint(state).await;
     let Some(key) = RealSystemOps::default()
         .credential_read(manager_wizard::LITELLM_MASTER_KEY_CRED_TARGET)
         .await

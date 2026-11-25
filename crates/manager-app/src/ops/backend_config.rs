@@ -82,27 +82,29 @@ pub async fn op_backend_apply_config(
         }
         let diff =
             manager_config::apply_config_diff(&mut new_cfg, &id, &patch).map_err(ApiError::from)?;
+        let summary = backend_change_summary(&id, &diff);
         let mut journaled = record_gateway_change(
             state,
             &live,
             &pre_cfg,
             &new_cfg,
             "backend_apply_config",
-            format!("Backend `{id}` settings changed"),
+            summary.clone(),
             false,
         )
         .await?;
         // The same save is also a backend activation: whatever the
         // gateway does with it, the backend process itself only
-        // picks its settings up at its next (re)start.
-        if !diff.changes.is_empty() {
+        // picks its settings up at its next (re)start. `enabled` is
+        // not one of them (no launch argument carries it).
+        if diff.changes.iter().any(|c| c.field != "enabled") {
             let backend_record = record_backend_change(
                 state,
                 &live,
                 &pre_cfg,
                 &new_cfg,
                 "backend_apply_config",
-                format!("Backend `{id}` settings changed"),
+                summary,
                 &id,
             )
             .await;
@@ -112,6 +114,7 @@ pub async fn op_backend_apply_config(
         *cfg = new_cfg;
         diff
     };
+    drop_net_zero_gateway_entries(state).await;
     let restart_task = if apply_mode == "RestartNow" {
         Some(
             state
@@ -129,6 +132,29 @@ pub async fn op_backend_apply_config(
         "restart_task_id": restart_task,
         "persisted": true,
     }))
+}
+
+/// The plan summary of a backend settings save, naming what changed.
+fn backend_change_summary(id: &str, diff: &ConfigDiff) -> String {
+    match diff.changes.as_slice() {
+        [c] if c.field == "enabled" => {
+            let what = if c.new == json!(true) {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            format!("Backend `{id}` {what}")
+        }
+        [] => format!("Backend `{id}` settings changed"),
+        changes => format!(
+            "Backend `{id}` settings changed: {}",
+            changes
+                .iter()
+                .map(|c| field_change_text(&c.field, &c.old, &c.new))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// The tensor split a newly created backend for `model_id` is
@@ -461,10 +487,8 @@ pub async fn op_backend_add(
     if manager_optimize::is_temp_backend_id(&id) {
         return Err(reserved_temp_backend_id_error(&id));
     }
-    if !valid_slug(&group) {
-        return Err(ApiError::InvalidInput(
-            "group name must be lowercase letters, digits, and hyphens".to_string(),
-        ));
+    if create_group {
+        manager_config::validate_group_name(&group).map_err(ApiError::InvalidInput)?;
     }
     if port == 0 {
         return Err(ApiError::InvalidInput("port must be non-zero".to_string()));
@@ -870,18 +894,25 @@ pub async fn op_backend_update_flags(
     // Advanced flags mode (tracker #60): context/batch are the
     // flags form's fields; the form is inert in the mode.
     ensure_backend_not_advanced(b)?;
-    let changed = b.flags.n_ctx != n_ctx || b.flags.n_batch != n_batch;
+    let changes: Vec<String> = [
+        ("context", b.flags.n_ctx, n_ctx),
+        ("batch", b.flags.n_batch, n_batch),
+    ]
+    .iter()
+    .filter(|(_, old, new)| old != new)
+    .map(|(name, old, new)| field_change_text(name, &json!(old), &json!(new)))
+    .collect();
     b.flags.n_ctx = n_ctx;
     b.flags.n_batch = n_batch;
     manager_config::validate(&new_cfg).map_err(ApiError::from)?;
-    let journaled = if changed {
+    let journaled = if !changes.is_empty() {
         record_backend_change(
             state,
             &live,
             &pre_cfg,
             &new_cfg,
             "backend_flags",
-            format!("Backend `{id}` context/batch changed"),
+            format!("Backend `{id}` settings changed: {}", changes.join(", ")),
             &id,
         )
         .await?
