@@ -406,6 +406,17 @@ fn assemble_args(
                             None,
                         )));
                     }
+                    // The path names the target (and is what the audit
+                    // log records): a body may repeat it, never change it.
+                    if path_params.get(k).is_some_and(|p| v.as_str() != Some(p)) {
+                        return Err(Box::new(error_response_raw(
+                            axum::http::StatusCode::BAD_REQUEST,
+                            "INVALID_INPUT",
+                            "InvalidInput",
+                            &format!("field `{k}` does not match the path"),
+                            None,
+                        )));
+                    }
                     obj.insert(k.clone(), v.clone());
                 }
             }

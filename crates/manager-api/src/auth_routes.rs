@@ -140,9 +140,11 @@ fn derived_class(method: &str, path: &str) -> AuthClass {
         ("GET", "/api/v1/server") => AuthClass::Public,
         ("GET", "/api/v1/gateway/groups") => AuthClass::Class(CapClass::SConfig),
         ("GET", "/api/v1/updates") => AuthClass::Class(CapClass::SConfig),
-        ("POST", "/api/v1/gateway/groups")
-        | ("PATCH", "/api/v1/gateway/groups/{name}")
-        | ("DELETE", "/api/v1/gateway/groups/{name}") => op_class("update_gateway_config"),
+        ("POST", "/api/v1/gateway/groups") | ("PATCH", "/api/v1/gateway/groups/{name}") => {
+            op_class("update_gateway_config")
+        }
+        // Same class as the app's own delete (destructive).
+        ("DELETE", "/api/v1/gateway/groups/{name}") => op_class("gateway_delete_group"),
         ("PATCH", "/api/v1/models/{id}") => op_class("model_set_enabled"),
         ("POST", "/api/v1/gateway/start") => op_class("run_wizard_step"),
         ("POST", "/api/v1/activation-plan/apply") => AuthClass::Class(CapClass::L),

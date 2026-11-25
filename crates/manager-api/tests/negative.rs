@@ -322,3 +322,47 @@ async fn malformed_oversized_and_unknown_requests() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_envelope(&body, "INVALID_INPUT");
 }
+
+#[tokio::test]
+async fn a_body_cannot_retarget_the_path_and_group_delete_is_destructive() {
+    let (ctx, _dir) = test_ctx().await;
+    let (_, admin) = seed(&ctx, "root", RoleName::Admin).await;
+    let (_, conf) = seed(&ctx, "conf", RoleName::Configurator).await;
+    let put = |id: &'static str, token: String| {
+        let ctx = ctx.clone();
+        async move {
+            let body = json!({ "id": id, "slots": 2 }).to_string();
+            let mut headers = bearer(&token);
+            headers.push(("content-type", "application/json".to_string()));
+            call_raw(
+                &ctx,
+                Method::PUT,
+                "/api/v1/backends/planner/parallel",
+                &headers,
+                Body::from(body),
+            )
+            .await
+        }
+    };
+    let (status, body) = put("coder", admin.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_envelope(&body, "INVALID_INPUT");
+    // Repeating the path's own id is harmless.
+    let (status, body) = put("planner", admin).await;
+    assert_ne!(
+        body["error"]["message"],
+        "field `id` does not match the path"
+    );
+    assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Deleting a group needs the destructive class, as in the app.
+    let (status, _) = call_raw(
+        &ctx,
+        Method::DELETE,
+        "/api/v1/gateway/groups/planner",
+        &bearer(&conf),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
