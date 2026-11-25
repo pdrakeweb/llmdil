@@ -221,7 +221,7 @@ pub async fn op_download_model(
     let mut downloads = state.downloads.handles.lock().await;
     downloads.retain(|_, h| !h.is_terminal());
     if downloads.contains_key(&id) {
-        return Err(ApiError::Models(format!(
+        return Err(ApiError::Busy(format!(
             "download already in flight for model {id}"
         )));
     }
@@ -575,6 +575,12 @@ pub async fn op_model_resume_download(
     Ok(json!({ "model_id": id, "resumed": true }))
 }
 
+pub(crate) fn no_pin_error(id: &str) -> ApiError {
+    ApiError::InvalidInput(format!(
+        "no SHA-256 hash is pinned for model {id}; pin one in the app configuration to enable verification"
+    ))
+}
+
 /// SHA-256-verify an installed model file against the hash pinned in
 /// the model's config entry. Records the outcome in `verified_at`
 /// (stamped on success, cleared on mismatch) and persists the config.
@@ -594,9 +600,7 @@ pub async fn op_model_verify_checksum(
             .find(|m| m.id == id)
             .ok_or_else(|| ApiError::NotFound(format!("model {id}")))?;
         if !is_real_pin(&m.sha256) {
-            return Err(ApiError::InvalidInput(format!(
-                "no SHA-256 hash is pinned for model {id}; pin one in the app configuration to enable verification"
-            )));
+            return Err(no_pin_error(&id));
         }
         (
             resolve_under_data_dir(&cfg.data_dir, &m.gguf_path),
@@ -616,7 +620,7 @@ pub async fn op_model_verify_checksum(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if !verifying.insert(id.clone()) {
-            return Err(ApiError::InvalidInput(format!(
+            return Err(ApiError::Busy(format!(
                 "verification already in progress for model {id}"
             )));
         }

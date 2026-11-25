@@ -119,6 +119,7 @@ pub(crate) mod tasks;
 pub mod updates;
 
 mod ops;
+mod precheck;
 mod state;
 #[cfg(test)]
 mod test_support;
@@ -141,7 +142,9 @@ pub(crate) use ops::preflight::*;
 pub use ops::services::*;
 pub use ops::telemetry::*;
 pub use ops::wizard::*;
+pub use precheck::{precheck_operation, Refusal};
 pub use state::*;
+pub use tasks::{wait_task_settled, with_task_link, TaskLink};
 
 // ---------------------------------------------------------------------------
 // Events (Rust -> UI, spec §14)
@@ -280,6 +283,31 @@ pub enum ApiError {
     Busy(String),
 }
 
+impl ApiError {
+    /// The variant's name: the machine-readable error kind.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ApiError::Config(_) => "Config",
+            ApiError::Supervisor(_) => "Supervisor",
+            ApiError::Wizard(_) => "Wizard",
+            ApiError::Telemetry(_) => "Telemetry",
+            ApiError::Gateway(_) => "Gateway",
+            ApiError::Models(_) => "Models",
+            ApiError::Mxc(_) => "Mxc",
+            ApiError::Mcp(_) => "Mcp",
+            ApiError::WinMl(_) => "WinMl",
+            ApiError::Services(_) => "Services",
+            ApiError::NotFound(_) => "NotFound",
+            ApiError::InvalidInput(_) => "InvalidInput",
+            ApiError::ContractGap(_) => "ContractGap",
+            ApiError::Unsupported(_) => "Unsupported",
+            ApiError::Io(_) => "Io",
+            ApiError::Json(_) => "Json",
+            ApiError::Busy(_) => "Busy",
+        }
+    }
+}
+
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -388,6 +416,15 @@ pub struct TaskRecord {
     pub status: TaskStatus,
     pub detail: Value,
     pub created_ms: u64,
+    /// When the work began (a task starts when it is recorded).
+    #[serde(default)]
+    pub started_ms: u64,
+    /// When the task reached its terminal state.
+    #[serde(default)]
+    pub finished_ms: Option<u64>,
+    /// The error text of a failed task (also in `detail.error`).
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 fn now_ms() -> u64 {

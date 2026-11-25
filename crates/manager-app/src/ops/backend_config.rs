@@ -18,6 +18,68 @@ pub async fn op_backend_get_config(
     Ok(serde_json::to_value(b)?)
 }
 
+/// The fields a [`BackendPatch`] has.
+const BACKEND_PATCH_FIELDS: &[&str] = &[
+    "enabled",
+    "model_file",
+    "port",
+    "n_ctx",
+    "n_batch",
+    "tensor_split",
+    "split_mode",
+    "raw_flags",
+    "max_retries",
+    "backoff_base_secs",
+];
+
+/// Parse a backend patch as the closed object it is documented to be: an
+/// unknown field or a wrong type is the caller's error, never a silent
+/// no-op. `raw_flags: null` clears the flags; any other `null` leaves its
+/// field alone.
+fn parse_backend_patch(patch: Value) -> Result<BackendPatch, ApiError> {
+    let fields = patch
+        .as_object()
+        .ok_or_else(|| ApiError::InvalidInput("`patch` must be a JSON object".to_string()))?;
+    for (field, value) in fields {
+        if !BACKEND_PATCH_FIELDS.contains(&field.as_str()) {
+            return Err(ApiError::InvalidInput(format!(
+                "unknown patch field `{field}`"
+            )));
+        }
+        // One field at a time, so the message names it.
+        let one: serde_json::Map<String, Value> =
+            std::iter::once((field.clone(), value.clone())).collect();
+        serde_json::from_value::<BackendPatch>(Value::Object(one))
+            .map_err(|e| ApiError::InvalidInput(format!("patch field `{field}`: {e}")))?;
+    }
+    let clear_raw_flags = fields.get("raw_flags").is_some_and(Value::is_null);
+    let mut parsed: BackendPatch =
+        serde_json::from_value(patch).map_err(|e| ApiError::InvalidInput(format!("patch: {e}")))?;
+    if clear_raw_flags {
+        parsed.raw_flags = Some(None);
+    }
+    Ok(parsed)
+}
+
+/// The limits the single-field operations apply to the patched fields.
+fn check_backend_patch(
+    backend: &manager_config::BackendConfig,
+    patch: &BackendPatch,
+) -> Result<(), ApiError> {
+    if patch.n_ctx.is_some() || patch.n_batch.is_some() {
+        validate_ctx_batch(
+            patch.n_ctx.unwrap_or(backend.flags.n_ctx),
+            patch.n_batch.unwrap_or(backend.flags.n_batch),
+        )?;
+    }
+    if patch.port == Some(0) {
+        return Err(ApiError::InvalidInput(
+            "the port must be a whole number from 1 to 65535".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Preview a config diff before applying (spec §14 `backend_preview_diff`).
 pub async fn op_backend_preview_diff(
     state: &Arc<AppState>,
@@ -25,13 +87,14 @@ pub async fn op_backend_preview_diff(
     id: String,
     patch: Value,
 ) -> ApiResult {
-    let patch: BackendPatch = serde_json::from_value(patch)?;
+    let patch = parse_backend_patch(patch)?;
     let cfg = state.config.read().await;
     let backend = cfg
         .backends
         .iter()
         .find(|b| b.id == id)
         .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+    check_backend_patch(backend, &patch)?;
     let diff: ConfigDiff = manager_config::diff_config(&id, backend, &patch);
     Ok(serde_json::to_value(&diff)?)
 }
@@ -41,26 +104,44 @@ pub async fn op_backend_preview_diff(
 /// config (`apply_config_diff` validates and rolls the clone back on
 /// failure), the clone is persisted via `manager_config::save`, and
 /// only a successful save installs it in memory — `persisted` reports
-/// that truthfully. `apply_mode` is `RestartNow | OnNextRestart` —
-/// `RestartNow` records a restart task for the UI to dispatch; the
-/// restart itself goes through `restart_backend`.
+/// that truthfully. `apply_mode` is `RestartNow | OnNextRestart`:
+/// `RestartNow` starts the normal graceful restart
+/// ([`backend_lifecycle::restart_backend`]) after the save and returns
+/// its task as `restart_task_id`; a backend that is not running is
+/// refused before anything is saved.
 pub async fn op_backend_apply_config(
     state: &Arc<AppState>,
-    _sink: &Arc<dyn EventSink>,
+    sink: &Arc<dyn EventSink>,
     id: String,
     patch: Value,
     apply_mode: String,
 ) -> ApiResult {
-    let patch: BackendPatch = serde_json::from_value(patch)?;
+    let patch = parse_backend_patch(patch)?;
     let apply_mode = match apply_mode.as_str() {
         "RestartNow" => "RestartNow",
         "OnNextRestart" => "OnNextRestart",
         other => {
-            return Err(ApiError::Config(format!(
+            return Err(ApiError::InvalidInput(format!(
                 "unknown apply_mode {other:?}; expected RestartNow | OnNextRestart"
             )))
         }
     };
+    if apply_mode == "RestartNow" {
+        let live = lifecycle::backend_liveness(state).await;
+        let known = state
+            .config
+            .read()
+            .await
+            .backends
+            .iter()
+            .any(|b| b.id == id);
+        if known && !live.get(&id).is_some_and(|l| l.state.is_live()) {
+            return Err(ApiError::InvalidInput(format!(
+                "backend {id} is not running, so there is nothing to restart; \
+                 use OnNextRestart (nothing was saved)"
+            )));
+        }
+    }
     // Advanced flags mode (tracker #60): a patch touching the
     // flags form's fields (context/batch, split, raw flags) is a
     // structured flags write and is refused for an advanced
@@ -75,11 +156,15 @@ pub async fn op_backend_apply_config(
         let (mut cfg, live) = config_write_for_journal(state).await;
         let pre_cfg = cfg.clone();
         let mut new_cfg = cfg.clone();
+        let backend = new_cfg
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
         if touches_flags {
-            if let Some(b) = new_cfg.backends.iter().find(|b| b.id == id) {
-                ensure_backend_not_advanced(b)?;
-            }
+            ensure_backend_not_advanced(backend)?;
         }
+        check_backend_patch(backend, &patch)?;
         let diff =
             manager_config::apply_config_diff(&mut new_cfg, &id, &patch).map_err(ApiError::from)?;
         let summary = backend_change_summary(&id, &diff);
@@ -115,16 +200,12 @@ pub async fn op_backend_apply_config(
         diff
     };
     drop_net_zero_gateway_entries(state).await;
+    state.sync_backend_service_definition(&id).await;
     let restart_task = if apply_mode == "RestartNow" {
-        Some(
-            state
-                .record_task("backend_restart", json!({ "backend_id": id }))
-                .await,
-        )
+        Some(spawn_backend_restart(state, sink, &id).await)
     } else {
         None
     };
-    state.sync_backend_service_definition(&id).await;
     Ok(json!({
         "backend_id": id,
         "diff": diff,
@@ -132,6 +213,52 @@ pub async fn op_backend_apply_config(
         "restart_task_id": restart_task,
         "persisted": true,
     }))
+}
+
+/// Restart a backend in the background through the shared restart; the
+/// returned task settles with its outcome.
+async fn spawn_backend_restart(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    id: &str,
+) -> String {
+    let task_id = state
+        .record_task(
+            "backend_restart",
+            json!({ "backend_id": id, "graceful": true }),
+        )
+        .await;
+    let event_origin = event_bus::current_origin();
+    let opts = backend_lifecycle::BackendOpOpts {
+        graceful: true,
+        record_task: false,
+        ..backend_lifecycle::BackendOpOpts::new(match event_origin {
+            event_bus::EventOrigin::Api => lifecycle::Origin::Api,
+            _ => lifecycle::Origin::Ui,
+        })
+    };
+    let (state, sink, id, task) = (
+        Arc::clone(state),
+        Arc::clone(sink),
+        id.to_string(),
+        task_id.clone(),
+    );
+    let restart = event_bus::with_origin(event_origin, async move {
+        let (status, detail) =
+            match backend_lifecycle::restart_backend(&state, &sink, &id, opts).await {
+                Ok(mut v) => {
+                    v["task_id"] = json!(task);
+                    (TaskStatus::Done, v)
+                }
+                Err(e) => (
+                    TaskStatus::Failed,
+                    json!({ "backend_id": id, "error": e.to_string(), "error_kind": e.kind() }),
+                ),
+            };
+        state.finish_task(&task, status, detail).await;
+    });
+    tokio::spawn(tracing::Instrument::in_current_span(restart));
+    task_id
 }
 
 /// The plan summary of a backend settings save, naming what changed.

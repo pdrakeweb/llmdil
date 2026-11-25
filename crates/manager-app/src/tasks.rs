@@ -92,6 +92,91 @@ impl TaskCanceller {
     }
 }
 
+tokio::task_local! {
+    static LINK: Arc<TaskLink>;
+}
+
+/// The tasks one dispatched operation recorded, filled in while it runs:
+/// how the Admin API knows which app task its own operation record stands
+/// for (tasks recorded by work the operation spawned are not part of it).
+#[derive(Debug, Default)]
+pub struct TaskLink {
+    inner: std::sync::Mutex<LinkInner>,
+}
+
+#[derive(Debug, Default)]
+struct LinkInner {
+    task_ids: Vec<String>,
+    abort: bool,
+}
+
+impl TaskLink {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LinkInner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The recorded task ids, in order.
+    pub fn task_ids(&self) -> Vec<String> {
+        self.lock().task_ids.clone()
+    }
+
+    /// Link a task the operation refers to but did not record itself.
+    pub fn add(&self, task_id: &str) {
+        let mut inner = self.lock();
+        if !inner.task_ids.iter().any(|t| t == task_id) {
+            inner.task_ids.push(task_id.to_string());
+        }
+    }
+
+    /// The operation's abort was requested: tasks it records from now on
+    /// start cancelled.
+    pub fn request_abort(&self) {
+        self.lock().abort = true;
+    }
+
+    pub fn abort_requested(&self) -> bool {
+        self.lock().abort
+    }
+}
+
+/// Run `fut` with `link` collecting the tasks it records.
+pub async fn with_task_link<F: std::future::Future>(link: Arc<TaskLink>, fut: F) -> F::Output {
+    LINK.scope(link, fut).await
+}
+
+/// Note a new task in the enclosing [`with_task_link`], if any.
+pub(crate) fn link_task(state: &AppState, id: &str) {
+    let _ = LINK.try_with(|link| {
+        link.add(id);
+        if link.abort_requested() {
+            if let Some((token, _, _)) = state.tasks.controls.request_abort(id) {
+                token.cancel();
+            }
+        }
+    });
+}
+
+/// Wait until a task reached a terminal state; its record, or `None` for
+/// an unknown id.
+pub async fn wait_task_settled(state: &AppState, id: &str) -> Option<TaskRecord> {
+    loop {
+        let finished = state.tasks.controls.subscribe(id);
+        let record = state.tasks.records.lock().await.get(id).cloned()?;
+        if record.status != TaskStatus::Running {
+            return Some(record);
+        }
+        // Bounded: a forced abort settles the record without the work
+        // having finished.
+        let step = Duration::from_millis(500);
+        match finished {
+            Some(mut rx) => {
+                let _ = tokio::time::timeout(step, rx.wait_for(|done| *done)).await;
+            }
+            None => tokio::time::sleep(step).await,
+        }
+    }
+}
+
 struct Control {
     token: CancellationToken,
     canceller: Option<TaskCanceller>,
@@ -142,6 +227,11 @@ impl TaskControls {
         if let Some(c) = self.lock().get_mut(id) {
             c.canceller = Some(canceller);
         }
+    }
+
+    /// The task's "finished" signal, `None` once it finished.
+    fn subscribe(&self, id: &str) -> Option<watch::Receiver<bool>> {
+        self.lock().get(id).map(|c| c.finished.subscribe())
     }
 
     /// Whether `task_abort` has been requested for this task.
@@ -265,6 +355,11 @@ fn settle(rec: &mut TaskRecord, status: TaskStatus, detail: Value, abort_request
         status
     };
     rec.status = status;
+    rec.finished_ms = Some(crate::now_ms());
+    rec.error = (status == TaskStatus::Failed)
+        .then(|| detail.get("error").and_then(Value::as_str))
+        .flatten()
+        .map(str::to_string);
     rec.detail = detail;
     if abort_requested {
         annotate(&mut rec.detail, "abort_requested", json!(true));
@@ -351,6 +446,7 @@ pub(crate) async fn abort(
             if let Some(rec) = tasks.get_mut(&enforcer_id) {
                 if rec.status == TaskStatus::Running {
                     rec.status = TaskStatus::Aborted;
+                    rec.finished_ms = Some(crate::now_ms());
                     annotate(&mut rec.detail, "abort_forced", json!(true));
                     annotate(
                         &mut rec.detail,
@@ -679,6 +775,9 @@ mod tests {
             status,
             detail: json!({ "a": 1 }),
             created_ms: 0,
+            started_ms: 0,
+            finished_ms: None,
+            error: None,
         }
     }
 

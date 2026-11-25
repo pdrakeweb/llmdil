@@ -131,12 +131,23 @@ async fn async_op_lifecycle_202_poll_terminal() {
     let (ctx, _dir) = test_ctx().await;
     let operator = seed_token(&ctx, "op", RoleName::Operator).await;
 
-    // Starting an unknown backend: accepted, then fails in the
-    // record (the synchronous call would have errored).
-    let (status, record) = call(
+    // An unknown backend is refused before anything is queued (D03).
+    let (status, refused) = call(
         &ctx,
         Method::POST,
         "/api/v1/backends/ghost/start",
+        Some(&operator),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+
+    // A backend whose model file is missing: accepted, then fails in
+    // the record (the synchronous call would have errored).
+    let (status, record) = call(
+        &ctx,
+        Method::POST,
+        "/api/v1/backends/planner/start",
         Some(&operator),
         None,
     )
@@ -177,7 +188,7 @@ async fn async_op_lifecycle_202_poll_terminal() {
 }
 
 #[tokio::test]
-async fn abort_is_bookkeeping_and_sticks() {
+async fn abort_of_work_without_a_task_sticks() {
     let (ctx, _dir) = test_ctx().await;
     let admin = seed_token(&ctx, "root", RoleName::Admin).await;
     // The diagnostics export waits on telemetry, giving a running
@@ -203,6 +214,8 @@ async fn abort_is_bookkeeping_and_sticks() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["ok"], true);
+    assert_eq!(body["status"], "aborted");
+    assert_eq!(body["forced"], true, "nothing to cancel: {body}");
 
     // Even after the underlying work finishes, the record stays
     // aborted (the app's bookkeeping semantics).

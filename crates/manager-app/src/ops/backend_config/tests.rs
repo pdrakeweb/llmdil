@@ -554,3 +554,21 @@ fn default_offload_never_lands_on_a_blocked_position() {
     assert_eq!(snapped((8, 6)), default);
     assert_eq!(snapped((6, 0)).as_deref(), Some("-ot exps=CPU"));
 }
+
+/// D01: the restart of a RestartNow save is the normal restart, and its
+/// task always settles (here it fails: there is no model file).
+#[tokio::test]
+async fn restart_now_settles_its_task() {
+    let (state, dir) = advanced_test_state(test_cfg());
+    let task_id = spawn_backend_restart(&state, &test_sink(), "planner").await;
+    let settled = wait_task_settled(&state, &task_id);
+    let task = tokio::time::timeout(Duration::from_secs(30), settled)
+        .await
+        .expect("settled")
+        .expect("recorded");
+    assert_eq!(task.kind, "backend_restart");
+    assert_eq!(task.status, TaskStatus::Failed, "{:?}", task.detail);
+    assert!(task.error.is_some());
+    assert!(task.detail["error_kind"].is_string());
+    let _ = std::fs::remove_dir_all(&dir);
+}

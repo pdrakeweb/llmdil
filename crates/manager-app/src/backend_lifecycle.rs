@@ -592,7 +592,7 @@ async fn begin_op(
                 state,
                 task_id,
                 TaskStatus::Failed,
-                json!({ "backend_id": id, "error": e.to_string() }),
+                json!({ "backend_id": id, "error": e.to_string(), "error_kind": e.kind() }),
             )
             .await;
             Err(e)
@@ -670,7 +670,7 @@ async fn conclude_start(
                 state,
                 &task_id,
                 TaskStatus::Failed,
-                json!({ "backend_id": id, "error": e.to_string() }),
+                json!({ "backend_id": id, "error": e.to_string(), "error_kind": e.kind() }),
             )
             .await;
             Err(e)
@@ -706,7 +706,7 @@ pub async fn start_backend(
             state,
             &task_id,
             TaskStatus::Failed,
-            json!({ "backend_id": id, "error": e.to_string() }),
+            json!({ "backend_id": id, "error": e.to_string(), "error_kind": e.kind() }),
         )
         .await;
         return Err(e);
@@ -769,7 +769,7 @@ pub async fn stop_backend(
                 state,
                 &task_id,
                 TaskStatus::Failed,
-                json!({ "backend_id": id, "error": e.to_string() }),
+                json!({ "backend_id": id, "error": e.to_string(), "error_kind": e.kind() }),
             )
             .await;
             Err(e)

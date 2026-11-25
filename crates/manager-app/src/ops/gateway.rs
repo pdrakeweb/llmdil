@@ -54,25 +54,11 @@ pub async fn op_update_gateway_config(
 ) -> ApiResult {
     let (mut cfg, live) = config_write_for_journal(state).await;
     let pre_cfg = cfg.clone();
-    let mut new_cfg = cfg.clone();
-    if let Some(port) = patch.get("port") {
-        check_gateway_port(port)?;
-    }
-    let mut v = serde_json::to_value(&new_cfg.gateway)?;
-    merge_json(&mut v, patch);
-    new_cfg.gateway = serde_json::from_value(v)?;
-    // A new or renamed group goes by the one naming rule; stored names
-    // that predate it stay as they are.
-    for g in &new_cfg.gateway.groups {
-        if !pre_cfg.gateway.groups.iter().any(|p| p.name == g.name) {
-            manager_config::validate_group_name(&g.name).map_err(ApiError::InvalidInput)?;
-        }
-    }
     // Validate before journaling, like the other journaling sites: an
     // invalid patch used to write a "Gateway configuration changed"
     // entry and then fail the save, leaving a phantom pending change
     // that cancel refused (finding PS-6, docs/code-review-v0.1.60.md).
-    validate_plain(&new_cfg)?;
+    let new_cfg = patched_gateway_config(&pre_cfg, patch)?;
     // The port and bind address travel on the gateway's command line,
     // not in the YAML: journal them regardless.
     let listen_changed = pre_cfg.gateway.port != new_cfg.gateway.port
@@ -92,6 +78,75 @@ pub async fn op_update_gateway_config(
     drop(cfg);
     drop_net_zero_gateway_entries(state).await;
     Ok(json!({ "ok": true, "persisted": true }))
+}
+
+/// Check a gateway patch without applying it (the Admin API's
+/// composition of this operation with the bind address one).
+pub async fn check_gateway_patch(state: &AppState, patch: Value) -> Result<(), ApiError> {
+    let cfg = state.config.read().await.clone();
+    patched_gateway_config(&cfg, patch).map(|_| ())
+}
+
+/// `cfg` with the gateway patch merged in, validated. The patch is
+/// closed: an unknown field or a wrong type is the caller's error.
+fn patched_gateway_config(cfg: &AppConfig, patch: Value) -> Result<AppConfig, ApiError> {
+    if !patch.is_object() {
+        return Err(ApiError::InvalidInput(
+            "the gateway patch must be a JSON object".to_string(),
+        ));
+    }
+    if let Some(port) = patch.get("port") {
+        check_gateway_port(port)?;
+    }
+    let mut new_cfg = cfg.clone();
+    let mut v = serde_json::to_value(&new_cfg.gateway)?;
+    merge_json(&mut v, patch.clone());
+    new_cfg.gateway = serde_json::from_value(v)
+        .map_err(|e| ApiError::InvalidInput(format!("gateway settings: {e}")))?;
+    // What the typed configuration does not have was ignored by the
+    // parse: the typo would have been a silent no-op.
+    if let Some(field) = unknown_field(&patch, &serde_json::to_value(&new_cfg.gateway)?, "") {
+        return Err(ApiError::InvalidInput(format!(
+            "unknown gateway setting `{field}`"
+        )));
+    }
+    // A new or renamed group goes by the one naming rule; stored names
+    // that predate it stay as they are.
+    for g in &new_cfg.gateway.groups {
+        if !cfg.gateway.groups.iter().any(|p| p.name == g.name) {
+            manager_config::validate_group_name(&g.name).map_err(ApiError::InvalidInput)?;
+        }
+    }
+    validate_plain(&new_cfg)?;
+    Ok(new_cfg)
+}
+
+/// The first field of `patch` that `known` (the same document, typed)
+/// does not have. A group's computed `enabled` and `enabled_members`
+/// (`get_gateway_config`) may ride along, so a read can be written back.
+fn unknown_field(patch: &Value, known: &Value, path: &str) -> Option<String> {
+    match (patch, known) {
+        (Value::Object(p), Value::Object(k)) => p.iter().find_map(|(key, value)| {
+            let computed = path == "groups[]" && (key == "enabled" || key == "enabled_members");
+            let here = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            match k.get(key) {
+                Some(inner) => unknown_field(value, inner, &here),
+                None if computed => None,
+                None => Some(here),
+            }
+        }),
+        (Value::Array(p), Value::Array(k)) => {
+            let here = format!("{path}[]");
+            p.iter()
+                .zip(k)
+                .find_map(|(p, k)| unknown_field(p, k, &here))
+        }
+        _ => None,
+    }
 }
 
 /// Refuse an unusable gateway port in plain words (the typed parse
@@ -116,23 +171,86 @@ fn validate_plain(cfg: &AppConfig) -> Result<(), ApiError> {
 
 /// Which gateway settings an edit changed, with old and new values
 /// where they are short: "Gateway settings changed: port (4000 → 4001),
-/// groups".
+/// group `coder` deleted". An edit of groups alone names them directly:
+/// "Group `coder` changed: strategy (simple-shuffle → least-busy)".
 fn gateway_change_summary(pre: &AppConfig, post: &AppConfig) -> Result<String, ApiError> {
     let (a, b) = (
         serde_json::to_value(&pre.gateway)?,
         serde_json::to_value(&post.gateway)?,
     );
     let mut fields: Vec<String> = Vec::new();
+    let mut groups: Vec<String> = Vec::new();
     for (key, new) in b.as_object().into_iter().flatten() {
         let old = a.get(key).unwrap_or(&Value::Null);
-        if old != new {
+        if old == new {
+            continue;
+        }
+        if key == "groups" {
+            groups = group_changes(&pre.gateway.groups, &post.gateway.groups)?;
+        }
+        if key != "groups" || groups.is_empty() {
             fields.push(field_change_text(key, old, new));
         }
     }
+    if fields.is_empty() && !groups.is_empty() {
+        return Ok(groups.join("; ").replacen("group", "Group", 1));
+    }
+    fields.extend(groups);
     if fields.is_empty() {
         return Ok("Gateway settings changed".to_string());
     }
     Ok(format!("Gateway settings changed: {}", fields.join(", ")))
+}
+
+/// What happened to each group, at most four of them.
+fn group_changes(
+    pre: &[manager_config::ModelGroup],
+    post: &[manager_config::ModelGroup],
+) -> Result<Vec<String>, ApiError> {
+    const SHOWN: usize = 4;
+    let list = |ids: &[String]| match ids {
+        [] => "none".to_string(),
+        ids => ids.join(", "),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for g in post {
+        let Some(old) = pre.iter().find(|p| p.name == g.name) else {
+            out.push(match g.members.as_slice() {
+                [] => format!("group `{}` created", g.name),
+                m => format!("group `{}` created (members: {})", g.name, list(m)),
+            });
+            continue;
+        };
+        let (a, b) = (serde_json::to_value(old)?, serde_json::to_value(g)?);
+        let changed: Vec<String> = b
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(k, v)| a.get(k.as_str()) != Some(v))
+            .map(|(k, v)| match k.as_str() {
+                "members" => format!("members ({} → {})", list(&old.members), list(&g.members)),
+                _ => field_change_text(k, a.get(k.as_str()).unwrap_or(&Value::Null), v),
+            })
+            .collect();
+        if !changed.is_empty() {
+            out.push(format!(
+                "group `{}` changed: {}",
+                g.name,
+                changed.join(", ")
+            ));
+        }
+    }
+    for p in pre {
+        if !post.iter().any(|g| g.name == p.name) {
+            out.push(format!("group `{}` deleted", p.name));
+        }
+    }
+    if out.len() > SHOWN {
+        let more = out.len() - SHOWN;
+        out.truncate(SHOWN);
+        out.push(format!("and {more} more"));
+    }
+    Ok(out)
 }
 
 /// One changed field for a plan summary: `name (old → new)` for short
@@ -946,7 +1064,9 @@ pub async fn op_gateway_test_routing(
     let group_name = request
         .get("group")
         .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::Gateway("request must carry a \"group\" string".to_string()))?;
+        .ok_or_else(|| {
+            ApiError::InvalidInput("request must carry a \"group\" string".to_string())
+        })?;
     let cfg = state.config.read().await;
     let group = cfg
         .gateway
