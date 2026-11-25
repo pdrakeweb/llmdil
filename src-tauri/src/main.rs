@@ -130,6 +130,15 @@ macro_rules! tauri_handler {
     };
 }
 
+/// Bring the main window to the front, hidden or minimized included.
+fn show_main_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
 fn main() {
     // Apply-helper mode (app self-update): a process spawned by the
     // Restart action with --llmdil-apply-update never starts the
@@ -143,6 +152,15 @@ fn main() {
             std::process::exit(manager_app::app_update::run_apply_helper(&args));
         }
     }
+    // One manager per data directory, decided before anything below
+    // reads or writes a file there: a second launch shows the first
+    // one's window and exits.
+    let instance = match tauri::async_runtime::block_on(manager_app::single_instance::acquire(
+        &manager_config::default_data_dir(),
+    )) {
+        manager_app::single_instance::Launch::First(guard) => guard,
+        manager_app::single_instance::Launch::AlreadyRunning => return,
+    };
     // The one logging pipeline (T-05): stderr plus the JSON Lines
     // `<data_dir>/logs/app.log` the diagnostics bundle carries.
     // Installed before anything logs; RUST_LOG overrides the level.
@@ -173,7 +191,7 @@ fn main() {
                 }
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             // Load the persisted config (finding F2,
             // docs/code-review-v0.1.60.md). `load_for_startup` falls
             // back to the `.bak` last-known-good copy on parse or
@@ -208,6 +226,14 @@ fn main() {
                 cert: std::sync::Mutex::new(None),
                 bind: std::sync::Mutex::new(None),
             });
+            // A second launch shows this window (hidden by close-to-tray,
+            // minimized or covered), unless this process is exiting.
+            let handle = app.handle().clone();
+            let exiting = app_state.clone();
+            tauri::async_runtime::spawn(instance.serve(
+                move || !exiting.lifecycle().app_exiting(),
+                move || show_main_window(&handle),
+            ));
             // The API user store + auth service, shared between the
             // HTTP server and this shell's admin commands.
             let users =
@@ -270,6 +296,7 @@ fn main() {
                 manager_app::lifecycle::startup_reconcile(&state, sink.as_ref()).await;
                 loop {
                     manager_app::notify::monitor_tick(&state, sink.as_ref()).await;
+                    manager_app::lifecycle_monitor::run_due_restarts(&state, &sink).await;
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 }
             });
@@ -365,12 +392,7 @@ fn main() {
                             .menu(&menu)
                             .tooltip("LLMdil")
                             .on_menu_event(|app, event| match event.id().as_ref() {
-                                "tray-show" => {
-                                    if let Some(w) = app.get_webview_window("main") {
-                                        let _ = w.show();
-                                        let _ = w.set_focus();
-                                    }
-                                }
+                                "tray-show" => show_main_window(app),
                                 "tray-quit" => app.exit(0),
                                 _ => {}
                             });

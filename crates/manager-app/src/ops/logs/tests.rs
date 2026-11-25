@@ -130,6 +130,32 @@ fn file_scope_records_order_markers_by_their_own_timestamps() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// F-prev: lifecycle lines above the newest start are the previous
+/// run's, like its rotated stderr.
+#[test]
+fn lifecycle_lines_before_the_newest_start_are_archived() {
+    let dir = unique_test_dir("llm-mgr-lifecycle-archived");
+    let key = lifecycle::backend_key("planner");
+    for (event, detail) in [
+        ("start requested", None),
+        ("started", Some("pid 1")),
+        ("crashed", Some("exit code: 1")),
+        ("restart requested", None),
+        ("start failed", Some("port 8081 is already in use")),
+    ] {
+        lifecycle::mark(&dir, &key, event, detail, Some(lifecycle::Origin::Ui));
+    }
+    let files = file_log_scopes(&dir, &["planner".to_string()])
+        .into_iter()
+        .find(|(id, _)| id == "planner")
+        .unwrap()
+        .1;
+    let (records, _) = file_scope_records("planner", &files, true);
+    let archived: Vec<bool> = records.iter().map(|r| r.archived).collect();
+    assert_eq!(archived, [false, false, true, true, true], "{records:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn get_logs_serves_file_backed_lifecycle_scopes() {
     let mut cfg = test_cfg();

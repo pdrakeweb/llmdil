@@ -189,6 +189,10 @@ pub async fn op_list_backends(state: &Arc<AppState>, sink: &Arc<dyn EventSink>) 
                 "tool_call_probe": serde_json::to_value(b.tool_call_probe).unwrap_or(Value::Null),
             });
             apply_liveness(&mut row, liveness.get(&b.id));
+            // Automatic restarts of a crashed backend:
+            // {attempt, max, next_at_ms, gave_up}, or null.
+            row["auto_restart"] =
+                json!(state.lifecycle.auto_restart(&lifecycle::backend_key(&b.id)));
             row
         })
         .collect();

@@ -208,6 +208,9 @@ pub enum Origin {
     Monitor,
     Startup,
     Scm,
+    /// The automatic restart of a crashed backend (`restart_policy`).
+    #[serde(rename = "restart-policy")]
+    RestartPolicy,
 }
 
 impl Origin {
@@ -225,6 +228,7 @@ impl Origin {
             Origin::Monitor => "monitor",
             Origin::Startup => "startup",
             Origin::Scm => "scm",
+            Origin::RestartPolicy => "restart-policy",
         }
     }
 
@@ -245,6 +249,7 @@ impl Origin {
             "monitor" => Origin::Monitor,
             "startup" => Origin::Startup,
             "scm" | "service" => Origin::Scm,
+            "restart-policy" => Origin::RestartPolicy,
             _ => return None,
         })
     }
@@ -536,6 +541,7 @@ mod tests {
             Origin::Monitor,
             Origin::Startup,
             Origin::Scm,
+            Origin::RestartPolicy,
         ] {
             assert_eq!(
                 serde_json::to_string(&o).unwrap(),

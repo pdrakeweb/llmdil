@@ -290,6 +290,72 @@ async fn restart_reads_restarting_in_flight_and_a_second_restart_is_busy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An HTTP server answering every request with `status` and `body`.
+async fn serve(status: &'static str, body: &'static str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let _ = sock.read(&mut [0; 2048]).await;
+            let reply = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(reply.as_bytes()).await;
+        }
+    });
+    port
+}
+
+/// A15: only a server that says it is idle (or is still loading) is
+/// stopped without the drain window.
+#[tokio::test]
+async fn idle_wait_tells_idle_busy_and_unknown_apart() {
+    let wait = |port| wait_backend_idle(port, Duration::ZERO);
+    let idle = serve("200 OK", r#"[{"is_processing":false}]"#).await;
+    assert_eq!(wait(idle).await, Idle::Yes);
+    let busy = serve("200 OK", r#"[{"is_processing":true}]"#).await;
+    assert_eq!(wait(busy).await, Idle::Busy);
+    let loading = serve("503 Service Unavailable", "{}").await;
+    assert_eq!(wait(loading).await, Idle::Yes);
+    let disabled = serve("501 Not Implemented", "{}").await;
+    assert_eq!(wait(disabled).await, Idle::Unknown);
+}
+
+/// A15: an idle stop on Windows (no graceful signal) does not sit out
+/// the 3 s drain window.
+#[cfg(windows)]
+#[tokio::test]
+async fn an_idle_graceful_stop_does_not_wait_for_the_drain_window() {
+    let port = serve("200 OK", r#"[{"is_processing":false}]"#).await;
+    let (state, dir) = test_state(|_| {});
+    {
+        let mut sup = state.supervisor().await.lock().await;
+        let mut spec = ProcessSpec {
+            id: "idle".to_string(),
+            program: "ping".into(),
+            args: ["-n", "30", "127.0.0.1"].map(str::to_string).to_vec(),
+            env: vec![],
+            workdir: None,
+            port: None,
+            low_priority: false,
+        };
+        sup.register_spec(spec.clone());
+        sup.spawn_backend("idle").await.unwrap();
+        // The fake server stands for the process's own listener.
+        spec.port = Some(port);
+        sup.register_spec(spec);
+    }
+    let started = Instant::now();
+    let detail = stop_inner(&state, "idle", Route::Process, true, Origin::Ui)
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2), "{detail}");
+    assert!(detail.starts_with("drained pid"), "{detail}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// BE-1 / BE-5: the supervisor mutex is not held while a stop drains, so
 /// list_backends (and every other reader) completes during the drain;
 /// the stop records intent Stopped first.

@@ -41,6 +41,10 @@ pub(crate) fn file_scope_records(
                 .map(chrono::DateTime::<chrono::Utc>::from)
                 .unwrap_or_else(|_| chrono::Utc::now());
             let text = String::from_utf8_lossy(&bytes);
+            // A lifecycle log is not rotated per run: everything above
+            // the newest start belongs to previous runs.
+            let lifecycle_log = base.to_string_lossy().ends_with(".lifecycle.log");
+            let mut archived = archived;
             for line in text.lines().rev().take(FILE_SCOPE_TAIL_LINES) {
                 records.push(LogRecord {
                     ts: manager_supervisor::lifecycle::parse_line_ts(line).unwrap_or(mtime),
@@ -49,10 +53,30 @@ pub(crate) fn file_scope_records(
                     source: source.to_string(),
                     archived,
                 });
+                archived |= lifecycle_log && begins_run(line);
             }
         }
     }
     (records, has_previous)
+}
+
+/// Whether a lifecycle marker is the first line of a service's run.
+fn begins_run(line: &str) -> bool {
+    use manager_supervisor::lifecycle::{is_marker_line, MARKER_TAG};
+    is_marker_line(line)
+        && line
+            .split_once(MARKER_TAG)
+            .and_then(|(_, rest)| rest.split_once(": "))
+            .is_some_and(|(_, event)| {
+                [
+                    "start requested",
+                    "restart requested",
+                    "adopted",
+                    "started: outside the app",
+                ]
+                .iter()
+                .any(|e| event.starts_with(e))
+            })
 }
 
 /// Whether a file-backed scope has anything to show (a non-empty file

@@ -80,6 +80,7 @@ pub mod optimize_eval;
 pub mod optimize_experiments;
 mod optimize_stream;
 pub mod optimize_tuning;
+pub mod single_instance;
 
 pub use activation_apply::op_activation_apply;
 pub use app_update::{
